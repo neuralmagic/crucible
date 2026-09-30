@@ -61,7 +61,7 @@ mod openshell {
 /// compiler, and executor.
 mod plan {
     pub use crucible::plan::{
-        STAGED_INPUTS, TASK_NAME_ENV, exec, history, ir, machine, record, runner, starlark,
+        STAGED_INPUTS, TASK_NAME_ENV, exec, history, ir, machine, record, resume, runner, starlark,
         term_img, workflow, worktree,
     };
 
@@ -72,9 +72,18 @@ mod plan {
     pub mod turn_log;
 }
 
-use anyhow::Result;
 use clap::Parser;
 
-fn main() -> Result<()> {
-    cli::run::dispatch(cli::Cli::parse())
+fn main() -> std::process::ExitCode {
+    match cli::run::dispatch(cli::Cli::parse()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            std::process::ExitCode::from(if error.is::<plan::cli::NoValidVerdict>() {
+                crucible::plan::INVALID_VERDICT_EXIT
+            } else {
+                1
+            })
+        }
+    }
 }

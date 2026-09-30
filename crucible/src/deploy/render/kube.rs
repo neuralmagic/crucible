@@ -157,6 +157,10 @@ pub struct PackDelivery {
     /// it, so the two never drift. The controller creates the CM under exactly this name and owner-refs
     /// it to the created pod for cascade GC.
     pub configmap_name: String,
+    /// The run's name, in place of the pack directory's. A delivered pack is unpacked under a
+    /// fixed directory name, so without this every run renders under the same name and shares
+    /// its state subtree and claim.
+    pub run_name: String,
 }
 
 /// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
@@ -166,6 +170,10 @@ pub struct PlaybookLaunch {
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
 }
+
+/// How many times a playbook pod starts its run before leaving it unfinished: the first start
+/// and three resumes.
+const MAX_PLAYBOOK_STARTS: u32 = 4;
 
 /// The in-pod mount dir for the projected Tier 2 ingest ServiceAccount token (Tier 2 ingest). The turn
 /// reads `<dir>/token` and sends it as the bearer to the controller's ingest drop-box.
@@ -588,13 +596,27 @@ impl Renderer<'_> {
         sc
     }
 
-    /// The profile's run-state claim, or None when this render persists nothing. A playbook
-    /// persists none: `plan run` neither resumes nor truncates the session log it appends to.
-    fn state_pvc(&self) -> Option<&crate::deploy::profile::StatePvc> {
-        match self.opts.playbook {
-            Some(_) => None,
-            None => self.profile.cluster.state_pvc.as_ref(),
+    /// Whether a restarted container finds this run's state and resumes from it. A claim holds it
+    /// for any run. A delivered pack's domain dir is an emptyDir, which outlives the container, so
+    /// a delivered playbook resumes without one; a loop does not, since its exit code reports what
+    /// the run achieved and a restart on it would repeat a finished run.
+    fn resumable(&self) -> bool {
+        self.state_pvc().is_some() || (self.opts.playbook.is_some() && self.opts.pack.is_some())
+    }
+
+    /// A non-empty session log means an earlier start of this run already produced rows, so this
+    /// start is a continuation, not a fresh run.
+    fn resume_flag(&self) -> &'static str {
+        if self.resumable() {
+            r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
+        } else {
+            ""
         }
+    }
+
+    /// The profile's run-state claim, or None when this render persists nothing.
+    fn state_pvc(&self) -> Option<&crate::deploy::profile::StatePvc> {
+        self.profile.cluster.state_pvc.as_ref()
     }
 
     /// The profile-named existing claim, or `<run>-state` when the profile carries a template.
@@ -703,11 +725,11 @@ impl Renderer<'_> {
                 }]),
                 service_account_name: Some(self.profile.cluster.service_account.clone()),
                 automount_service_account_token: Some(false),
-                // With persistent state a crash is resumable, so let the kubelet restart the pod
-                // (the wrapper detects the session log and passes --resume). Without it a restart
-                // would silently start a fresh run on a blank emptyDir, so the pod stays one-shot.
+                // A resumable run lets the kubelet restart a crashed container: the wrapper finds
+                // the session log and passes --resume. Otherwise a restart would start the run over
+                // from nothing, so the pod stays one-shot.
                 restart_policy: Some(
-                    if self.state_pvc().is_some() {
+                    if self.resumable() {
                         "OnFailure"
                     } else {
                         "Never"
@@ -1009,14 +1031,25 @@ impl Renderer<'_> {
             };
             let harness_flag = harness_flag(self.opts.harness, '=');
             let model_flag = model_flag(self.opts.model.as_ref(), '=');
+            let resume_flag = self.resume_flag();
+            let invalid_verdict = crate::plan::INVALID_VERDICT_EXIT;
             return Ok(format!(
                 r#"D={domain_dir}
-crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}
-rc=$?
+mkdir -p "$D/state"
+n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$D/state/starts"
+if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then
+  crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}{resume_flag}
+  rc=$?
+else
+  echo "[crucible] this run has started $n times; leaving it unfinished" >&2
+  rc=0
+fi
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
+case $rc in 0|{invalid_verdict}) exit 0 ;; esac
 exit $rc
 "#
             ));
@@ -1044,13 +1077,7 @@ exit $rc
         };
         let harness_flag = harness_flag(self.opts.harness, '=');
         let model_flag = model_flag(self.opts.model.as_ref(), '=');
-        // Persistent state: a non-empty session log on the mounted PVC means a prior pod of this
-        // run already produced rows, so this start is a continuation, not a fresh run.
-        let resume_flag = if self.state_pvc().is_some() {
-            r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
-        } else {
-            ""
-        };
+        let resume_flag = self.resume_flag();
         Ok(format!(
             r#"D={domain_dir}
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
@@ -2576,6 +2603,7 @@ mod tests {
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
+                    run_name: "alpha".to_string(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -2653,6 +2681,7 @@ mod tests {
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "pack-cm-name".to_string(),
+                    run_name: "alpha".to_string(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -4231,19 +4260,9 @@ mod tests {
     /// playbook command carrying none of them.
     #[test]
     fn playbook_render_omits_every_loop_only_flag() {
-        let profile = k8s_profile(
-            r#"results_bucket = "s3://crucible-results"
-            state_pvc = "deepgemm-state"
-            "#,
-        );
+        let profile = k8s_profile(r#"results_bucket = "s3://crucible-results""#);
         let yaml = render_playbook(&profile, playbook_launch());
-        for loop_only in [
-            "--results-bucket",
-            "--pr-repo",
-            "--harness",
-            "--model",
-            "--resume",
-        ] {
+        for loop_only in ["--results-bucket", "--pr-repo", "--harness", "--model"] {
             assert!(
                 !yaml.contains(loop_only),
                 "{loop_only} in a playbook: {yaml}"
@@ -4282,15 +4301,20 @@ mod tests {
         );
     }
 
-    /// `plan run` has no `--resume` and opens the session log in append mode, so a playbook must
-    /// neither restart nor reuse a name-keyed subPath a previous launch already wrote.
+    /// With persistent state a playbook pod survives a crash the way a loop pod does: the kubelet
+    /// restarts it and the wrapper resumes the run the claim holds. Without it the pod stays
+    /// one-shot, since a restart would find nothing to resume.
     #[test]
-    fn playbook_pod_never_restarts_or_mounts_persistent_state() {
+    fn a_playbook_pod_with_persistent_state_restarts_and_resumes() {
         let profile = k8s_profile(r#"state_pvc = "deepgemm-state""#);
         let yaml = render_playbook(&profile, playbook_launch());
-        assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
-        assert!(!yaml.contains("run-state"), "{yaml}");
-        assert!(!yaml.contains("deepgemm-state"), "{yaml}");
+        assert!(yaml.contains("restartPolicy: OnFailure"), "{yaml}");
+        assert!(yaml.contains("claimName: deepgemm-state"), "{yaml}");
+        assert!(yaml.contains("subPath: state/alpha"), "{yaml}");
+        assert!(
+            yaml.contains(r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#),
+            "{yaml}"
+        );
 
         let templated = k8s_profile(
             r#"[cluster.state_pvc]
@@ -4299,9 +4323,13 @@ mod tests {
             "#,
         );
         let yaml = render_playbook(&templated, playbook_launch());
-        assert!(!yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
+        assert!(yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
+        assert!(yaml.contains("claimName: alpha-state"), "{yaml}");
 
-        assert!(render_k8s(&profile).contains("restartPolicy: OnFailure"));
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
+        assert!(!yaml.contains("--resume"), "{yaml}");
+        assert!(!yaml.contains("run-state"), "{yaml}");
     }
 
     /// The two shapes a playbook pack actually takes must render: no `[deploy]` block, and (for a
@@ -4363,6 +4391,7 @@ mod tests {
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "alpha-pack".to_string(),
+                    run_name: "alpha".to_string(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -4376,5 +4405,178 @@ mod tests {
         assert!(yaml.contains("pack-stage"), "{yaml}");
         assert!(yaml.contains(PACK_WORKDIR_VOLUME), "{yaml}");
         assert!(yaml.contains("crucible plan run --manifest"), "{yaml}");
+    }
+
+    fn delivered(
+        profile: &DeployProfile,
+        manifest: &Manifest,
+        playbook: Option<PlaybookLaunch>,
+    ) -> String {
+        let tmp = Scratch::new("delivered");
+        let dir = tmp.path().join("pack");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        let input = match playbook {
+            Some(_) => RenderInput::from_playbook_manifest(manifest, "pack"),
+            None => RenderInput::from_manifest(manifest, "pack").expect("loop input"),
+        };
+        render(
+            input,
+            &dir,
+            "crucible.toml",
+            profile,
+            &RenderOpts {
+                pack: Some(PackDelivery {
+                    configmap_name: "crucible-run-7-pack".to_string(),
+                    run_name: "crucible-run-7".to_string(),
+                }),
+                playbook,
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render")
+    }
+
+    /// A delivered pack's state lives on the pod's emptyDir, which a container restart keeps, so a
+    /// delivered playbook resumes with no claim. A loop does not: its exit code reports what the
+    /// run achieved, and a restart would repeat a finished run.
+    #[test]
+    fn a_delivered_playbook_restarts_and_resumes_without_a_claim() {
+        let (loop_manifest, profile) = pack_manifest_and_profile();
+        let yaml = delivered(&profile, &playbook_manifest(), Some(playbook_launch()));
+        assert!(yaml.contains("restartPolicy: OnFailure"), "{yaml}");
+        assert!(
+            yaml.contains(r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#),
+            "{yaml}"
+        );
+        assert!(!yaml.contains("claimName"), "{yaml}");
+
+        let yaml = delivered(&profile, &loop_manifest, None);
+        assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
+        assert!(!yaml.contains("--resume"), "{yaml}");
+    }
+
+    fn wrapper_of(yaml: &str) -> String {
+        use serde::Deserialize;
+        serde_norway::Deserializer::from_str(yaml)
+            .map(|doc| serde_norway::Value::deserialize(doc).expect("yaml doc"))
+            .find(|doc| doc.get("kind").and_then(|k| k.as_str()) == Some("Pod"))
+            .and_then(|pod| {
+                pod["spec"]["containers"][0]["args"][0]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .expect("the pod carries its wrapper")
+    }
+
+    /// Each call is one container start of the same pod: the stand-in `crucible` records its
+    /// arguments, appends a row to the session log, and exits with `FAKE_RC`.
+    struct Starts {
+        _tmp: Scratch,
+        script: String,
+        domain: std::path::PathBuf,
+        path: std::ffi::OsString,
+    }
+
+    impl Starts {
+        fn new(yaml: &str) -> Self {
+            let tmp = Scratch::new("wrapper");
+            let domain = tmp.path().join("domain");
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&domain).expect("mkdir domain");
+            std::fs::create_dir_all(&bin).expect("mkdir bin");
+            let fake = bin.join("crucible");
+            std::fs::write(
+                &fake,
+                "#!/bin/sh\necho \"$*\" >> \"$FAKE_DIR/calls\"\necho row >> \"$FAKE_DIR/state/session.jsonl\"\nexit \"$FAKE_RC\"\n",
+            )
+            .expect("fake crucible");
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            let wrapper = wrapper_of(yaml);
+            let (first, rest) = wrapper.split_once('\n').expect("a D= line");
+            assert!(first.starts_with("D="), "{wrapper}");
+            let mut path = bin.into_os_string();
+            path.push(":");
+            path.push(std::env::var_os("PATH").unwrap_or_default());
+            Starts {
+                script: format!("D={}\n{rest}", domain.display()),
+                domain,
+                path,
+                _tmp: tmp,
+            }
+        }
+
+        fn start(&self, rc: i32) -> Option<i32> {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&self.script)
+                .env("PATH", &self.path)
+                .env("FAKE_RC", rc.to_string())
+                .env("FAKE_DIR", &self.domain)
+                .env("CRUCIBLE_INGEST_URL", "https://ingest.example")
+                .output()
+                .expect("run the wrapper")
+                .status
+                .code()
+        }
+
+        fn calls(&self) -> Vec<String> {
+            std::fs::read_to_string(self.domain.join("calls"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_owned)
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_playbook_wrapper_resumes_a_crash_and_exits_clean_on_any_verdict() {
+        let starts = Starts::new(&render_playbook(
+            &k8s_profile(r#"state_pvc = "shared""#),
+            playbook_launch(),
+        ));
+        assert_eq!(starts.start(137), Some(137), "a killed engine restarts");
+        assert_eq!(starts.start(101), Some(101), "so does a panic");
+        assert_eq!(
+            starts.start(i32::from(crate::plan::INVALID_VERDICT_EXIT)),
+            Some(0),
+            "an invalid verdict is in the log; restarting would repeat it"
+        );
+        let calls = starts.calls();
+        assert!(!calls[0].contains("--resume"), "{calls:?}");
+        assert!(calls[1].ends_with("--resume"), "{calls:?}");
+        assert!(calls[2].ends_with("--resume"), "{calls:?}");
+
+        let clean = Starts::new(&render_playbook(&k8s_profile(""), playbook_launch()));
+        assert_eq!(clean.start(0), Some(0));
+        assert_eq!(clean.start(1), Some(1), "an engine error is still an error");
+        assert!(
+            clean.calls().iter().all(|call| !call.contains("--resume")),
+            "a pod that cannot resume never asks to"
+        );
+    }
+
+    #[test]
+    fn the_playbook_wrapper_stops_resuming_after_its_bound() {
+        let starts = Starts::new(&render_playbook(
+            &k8s_profile(r#"state_pvc = "shared""#),
+            playbook_launch(),
+        ));
+        for n in 1..=MAX_PLAYBOOK_STARTS {
+            assert_eq!(starts.start(137), Some(137), "start {n}");
+        }
+        assert_eq!(
+            starts.start(137),
+            Some(0),
+            "the run is left unfinished for the controller to park"
+        );
+        assert_eq!(starts.calls().len(), MAX_PLAYBOOK_STARTS as usize);
+        assert_eq!(
+            std::fs::read_to_string(starts.domain.join("state/starts"))
+                .expect("starts")
+                .trim(),
+            (MAX_PLAYBOOK_STARTS + 1).to_string()
+        );
     }
 }

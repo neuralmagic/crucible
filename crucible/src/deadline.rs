@@ -29,8 +29,14 @@ pub struct RunCeiling {
 
 impl RunCeiling {
     pub fn starting(at: Instant, ceiling: Duration) -> Option<Self> {
+        Self::after(at, ceiling, Duration::ZERO)
+    }
+
+    /// The ceiling of a run that had already been going for `elapsed` when this process took it
+    /// over at `at`.
+    pub fn after(at: Instant, ceiling: Duration, elapsed: Duration) -> Option<Self> {
         Some(RunCeiling {
-            ends: at.checked_add(ceiling)?,
+            ends: at.checked_add(ceiling.saturating_sub(elapsed))?,
             ceiling,
         })
     }
@@ -317,6 +323,26 @@ mod tests {
         assert_eq!(unbounded_run.bound, Bound::Task(timeout("90s")));
 
         assert_eq!(Deadline::for_attempt(now, None, None), None);
+    }
+
+    #[test]
+    fn a_taken_over_run_keeps_its_ceiling_and_loses_the_time_it_already_spent() {
+        let now = Instant::now();
+        let resumed =
+            RunCeiling::after(now, Duration::from_secs(90), Duration::from_secs(60)).unwrap();
+        assert_eq!(resumed.ceiling, Duration::from_secs(90));
+        assert_eq!(resumed.ends, now + Duration::from_secs(30));
+        let spent =
+            RunCeiling::after(now, Duration::from_secs(90), Duration::from_secs(120)).unwrap();
+        assert_eq!(spent.ends, now);
+        assert!(spent.reached());
+        let note = Deadline::for_attempt(now, None, Some(resumed))
+            .unwrap()
+            .note();
+        assert_eq!(
+            note,
+            "timed out: the run reached its 90s wall-clock ceiling"
+        );
     }
 
     #[test]

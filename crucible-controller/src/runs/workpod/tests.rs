@@ -3104,7 +3104,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
     let before_the_registry = render_run_docs(
         &pack,
         &profile,
-        "cm",
+        "crucible-run-x",
         &RunRenderOpts::Loop {
             iterations: cfg.effective().run_iterations,
             max_cost: cfg.effective().run_max_cost,
@@ -3120,7 +3120,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
     let with_the_registry = render_run_docs(
         &pack,
         &profile,
-        "cm",
+        "crucible-run-x",
         &RunRenderOpts::for_loop(
             &cfg,
             "owner/repo",

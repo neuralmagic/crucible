@@ -263,4 +263,124 @@ mod tests {
         assert_eq!(tasks[0].timeout, "90m");
         assert_eq!(tasks[1].timeout, "");
     }
+
+    /// What a run writes is what a resume reads back: every row the executor settles, encoded as
+    /// the session log carries it, folds to the same result.
+    #[test]
+    fn every_settled_row_folds_back_to_the_result_it_was_written_from() {
+        use crate::plan::exec::{
+            Attempt, AttemptOutcome, ExecCfg, Substrate, TaskResult, TaskRunner, TransportFailure,
+            execute,
+        };
+        use crate::plan::ir::{Task, TaskName};
+        use std::collections::BTreeMap;
+
+        struct Scripted;
+        impl TaskRunner for Scripted {
+            fn run(
+                &mut self,
+                task: &Task,
+                attempt: u32,
+                _inputs: &BTreeMap<TaskName, serde_json::Value>,
+                _deadline: Option<crucible::deadline::Deadline>,
+            ) -> Attempt {
+                let outcome = match (task.name.0.as_str(), attempt) {
+                    ("discover", _) => {
+                        AttemptOutcome::Pass(serde_json::json!({"targets": ["a", "b"]}))
+                    }
+                    ("audit[b]", _) => AttemptOutcome::Fail {
+                        note: "b is broken".into(),
+                        output: Some(serde_json::json!({"why": "b"})),
+                    },
+                    ("flaky", _) => AttemptOutcome::Transport(TransportFailure::new(
+                        crucible_contract::TransportCause::Gateway,
+                        "gateway down",
+                    )),
+                    _ => AttemptOutcome::Pass(serde_json::json!({"ok": true})),
+                };
+                Attempt {
+                    outcome,
+                    cost_usd: 0.25,
+                }
+            }
+        }
+
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 10.0
+            [[task]]
+            name = "discover"
+            kind = "command"
+            command = "true"
+            [[task]]
+            name = "audit"
+            kind = "command"
+            command = "true"
+            depends_on = ["discover"]
+            over = { task = "discover", field = "targets" }
+            max_fanout = 4
+            required = false
+            [[task]]
+            name = "after"
+            kind = "command"
+            command = "true"
+            depends_on = ["audit"]
+            required = false
+            [[task]]
+            name = "flaky"
+            kind = "command"
+            command = "true"
+            required = false
+            [[task]]
+            name = "report"
+            kind = "command"
+            command = "true"
+            stage = "epilogue"
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let mut log = crucible_contract::session::encode(
+            &crate::plan::events::plan_admitted_event(&plan, None),
+        );
+        let mut written: Vec<(TaskName, TaskResult)> = Vec::new();
+        execute(
+            &plan,
+            &Substrate::default(),
+            ExecCfg::default(),
+            &mut Scripted,
+            |task, result| {
+                log.push('\n');
+                log.push_str(&crucible_contract::session::encode(
+                    &crate::plan::events::task_result_event(1, 0, task, result),
+                ));
+                written.push((task.name.clone(), result.clone()));
+            },
+        )
+        .unwrap();
+        let kinds: Vec<&str> = written.iter().map(|(_, r)| r.status.as_str()).collect();
+        for kind in ["pass", "fail", "blocked", "transport"] {
+            assert!(
+                kinds.contains(&kind),
+                "the run settles a {kind} row: {kinds:?}"
+            );
+        }
+        assert!(written.iter().any(|(_, r)| r.fanout.is_some()));
+
+        let prior =
+            crate::plan::resume::fold(&log, &plan, std::time::Duration::ZERO).expect("folds");
+        assert_eq!(
+            prior.order,
+            written.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>()
+        );
+        for (name, result) in &written {
+            assert_eq!(&prior.results[name], result, "{name}");
+        }
+        assert!(prior.admitted);
+        assert!(!prior.shut_down);
+        assert!(!prior.recorded_history);
+    }
 }

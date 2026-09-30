@@ -228,6 +228,9 @@ pub struct ExecCfg<'a> {
     pub history: Option<&'a SeriesHistory>,
     /// Whether a main-graph task returning `"complete": true` stops dispatch.
     pub early_completion: bool,
+    /// What an interrupted run of this plan settled, spent, and took. Its results are terminal:
+    /// none of them dispatches again.
+    pub prior: Option<&'a Prior>,
 }
 
 impl Default for ExecCfg<'_> {
@@ -237,7 +240,68 @@ impl Default for ExecCfg<'_> {
             wall_clock: None,
             history: None,
             early_completion: false,
+            prior: None,
         }
+    }
+}
+
+/// What an interrupted run left in its session log.
+#[derive(Debug, Clone, Default)]
+pub struct Prior {
+    /// Every settled row: tasks of the plan, items of a mapped node, rounds of a revise loop.
+    pub results: BTreeMap<TaskName, TaskResult>,
+    /// The same names, in the order they settled.
+    pub order: Vec<TaskName>,
+    pub elapsed: Duration,
+    /// The run already logged its admitted graph.
+    pub admitted: bool,
+    /// The run already recorded its entry for the launch series.
+    pub recorded_history: bool,
+    /// The log ends in a shutdown: the run finished and there is nothing left to append.
+    pub shut_down: bool,
+}
+
+impl Prior {
+    /// The settled rows in the order they settled, each with the task it names.
+    pub fn rows(&self, plan: &ValidPlan) -> Vec<(Task, &TaskResult)> {
+        self.order
+            .iter()
+            .filter_map(|name| Some((row_task(plan, name)?, self.results.get(name)?)))
+            .collect()
+    }
+
+    /// What the settled rows cost. A mapped node's row and a revise loop's rows already total
+    /// their items and rounds, so a task counts its own row only when none of its items or rounds
+    /// were logged.
+    pub fn spent_usd(&self) -> f64 {
+        let parents: BTreeSet<&str> = self
+            .results
+            .keys()
+            .filter_map(|name| name.0.split_once('[').map(|(node, _)| node))
+            .collect();
+        self.results
+            .iter()
+            .filter(|(name, _)| name.0.contains('[') || !parents.contains(name.0.as_str()))
+            .map(|(_, r)| r.cost_usd)
+            .sum()
+    }
+}
+
+/// How long the run has been going: this process's own time plus whatever the process it took
+/// over from had already used.
+#[derive(Clone, Copy, Debug)]
+struct Clock {
+    started: Instant,
+    before: Duration,
+}
+
+impl Clock {
+    fn elapsed(&self) -> Duration {
+        self.before + self.started.elapsed()
+    }
+
+    fn past(&self, limit: Option<Duration>) -> bool {
+        limit.is_some_and(|limit| self.elapsed() >= limit)
     }
 }
 
@@ -339,14 +403,14 @@ impl std::fmt::Display for TaskStatus {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FanoutSummary {
     pub instances: usize,
     pub passed: usize,
     pub failed: usize,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct TaskResult {
     pub status: TaskStatus,
     pub attempts: u32,
@@ -565,15 +629,33 @@ pub fn execute(
         .iter()
         .flat_map(|l| l.body.iter().map(move |t| (&t.name, l)))
         .collect();
-    let started = Instant::now();
+    let clock = Clock {
+        started: Instant::now(),
+        before: cfg.prior.map_or(Duration::ZERO, |prior| prior.elapsed),
+    };
     let run_ceiling = cfg
         .wall_clock
-        .and_then(|ceiling| RunCeiling::starting(started, ceiling));
+        .and_then(|ceiling| RunCeiling::after(clock.started, ceiling, clock.before));
     let mut results: BTreeMap<TaskName, TaskResult> = BTreeMap::new();
     let mut spent = 0.0f64;
     let budget = plan.plan().budget.usd;
     let mut halted: Option<Halt> = None;
     let mut completed: Option<Completion> = None;
+    if let Some(prior) = cfg.prior {
+        results = prior.results.clone();
+        spent = prior.spent_usd();
+        replay(
+            plan,
+            prior,
+            cfg.early_completion,
+            &mut halted,
+            &mut completed,
+            &mut plan_machine,
+        )?;
+        if spent > budget {
+            halt(&mut halted, &mut plan_machine, Halt::Budget)?;
+        }
+    }
 
     // Readiness scan: repeated topo passes. Each pass settles everything decidable
     // without dispatch (halt-blocked, skipped, dep-failed, over-budget), then dispatches
@@ -666,7 +748,13 @@ pub fn execute(
                 continue;
             }
             if let Some(body) = loop_of.get(&t.name) {
-                let ready = body.body.first().is_some_and(|first| first.name == t.name)
+                // An interrupted run can have settled some of a loop's final rows and not the
+                // rest, so the loop is entered at its first unsettled task.
+                let ready = body
+                    .body
+                    .iter()
+                    .find(|b| !results.contains_key(&b.name))
+                    .is_some_and(|first| first.name == t.name)
                     && body.body.iter().all(|b| {
                         b.depends_on
                             .iter()
@@ -735,10 +823,7 @@ pub fn execute(
             }
             // Elapsed time is known continuously, unlike a cost total, so the ceiling is
             // checked before every dispatch rather than after an attempt settles.
-            if cfg
-                .wall_clock
-                .is_some_and(|limit| started.elapsed() >= limit)
-            {
+            if clock.past(cfg.wall_clock) {
                 halt(&mut halted, &mut plan_machine, Halt::Time)?;
                 let reason = BlockedReason::WallClockCeiling;
                 let r = TaskResult::blocked(&reason);
@@ -799,7 +884,7 @@ pub fn execute(
                     plan_machine: &mut plan_machine,
                     spent: &mut spent,
                     budget,
-                    started,
+                    clock,
                     run_ceiling,
                     completed: &mut completed,
                 },
@@ -884,16 +969,14 @@ pub fn execute(
                     )?;
                 }
                 Ok(keys) => {
-                    let instances: Vec<Task> = keys
+                    let instances: Vec<Task> =
+                        keys.iter().map(|key| instance_task(node, key)).collect();
+                    // An instance an interrupted run already settled keeps that result and is
+                    // not dispatched again.
+                    let folded: BTreeMap<&TaskName, TaskResult> = instances
                         .iter()
-                        .map(|key| Task {
-                            name: instance_name(&node.name, key),
-                            emits_files: node.emits_files.clone(),
-                            over: None,
-                            max_fanout: None,
-                            when: None,
-                            revise: None,
-                            ..node.clone()
+                        .filter_map(|instance| {
+                            Some((&instance.name, results.get(&instance.name)?.clone()))
                         })
                         .collect();
                     // An instance is staged under its own name: it runs in its own root, and
@@ -904,6 +987,7 @@ pub fn execute(
                         .unwrap_or_default();
                     let refused = instances
                         .iter()
+                        .filter(|instance| !folded.contains_key(&instance.name))
                         .find_map(|instance| runner.stage(instance, &producers).err());
                     if let Some(why) = refused {
                         let reason = BlockedReason::StagingRefused(why);
@@ -937,6 +1021,7 @@ pub fn execute(
                         let batch: Vec<BatchItem<'_>> = instances
                             .iter()
                             .zip(&keys)
+                            .filter(|(task, _)| !folded.contains_key(&task.name))
                             .map(|(task, key)| BatchItem {
                                 task,
                                 attempt: 1,
@@ -944,9 +1029,9 @@ pub fn execute(
                                 deadline: None,
                             })
                             .collect();
-                        for instance in &instances {
+                        for item in &batch {
                             machines
-                                .entry(instance.name.clone())
+                                .entry(item.task.name.clone())
                                 .or_default()
                                 .advance(TaskEvent::Dispatched)?;
                         }
@@ -959,7 +1044,15 @@ pub fn execute(
                             budget,
                         );
                         overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
-                        for ((task, result, event), key) in batch_results.into_iter().zip(&keys) {
+                        let mut live = batch_results.into_iter();
+                        for (instance, key) in instances.iter().zip(&keys) {
+                            if let Some(result) = folded.get(&instance.name) {
+                                settled.push((key.clone(), result.clone()));
+                                continue;
+                            }
+                            let Some((task, result, event)) = live.next() else {
+                                break;
+                            };
                             runner.settled(task, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
                             record(
@@ -979,12 +1072,13 @@ pub fn execute(
                         // write the same tree and the same result file, so the next one is not
                         // dispatched until this one has settled.
                         for (instance, key) in instances.iter().zip(&keys) {
+                            if let Some(result) = folded.get(&instance.name) {
+                                settled.push((key.clone(), result.clone()));
+                                continue;
+                            }
                             if spent >= budget {
                                 halt(&mut halted, &mut plan_machine, Halt::Budget)?;
-                            } else if cfg
-                                .wall_clock
-                                .is_some_and(|limit| started.elapsed() >= limit)
-                            {
+                            } else if clock.past(cfg.wall_clock) {
                                 halt(&mut halted, &mut plan_machine, Halt::Time)?;
                             }
                             if let Some(halt) = &halted {
@@ -1584,7 +1678,7 @@ struct Ledger<'r> {
     plan_machine: &'r mut PlanMachine,
     spent: &'r mut f64,
     budget: f64,
-    started: Instant,
+    clock: Clock,
     run_ceiling: Option<RunCeiling>,
     completed: &'r mut Option<Completion>,
 }
@@ -1619,13 +1713,30 @@ where
     let reviewer = body.reviewer;
     let mut view = ledger.results.clone();
     let mut rounds: Vec<Vec<RoundRow<'_>>> = Vec::new();
-    let mut entered = false;
+    // A round an interrupted run settled is replayed from its rows rather than run again.
+    let prior_rounds = ledger.results.clone();
+    let folded = |t: &Task, round: u32| ledger_round(&prior_rounds, t, round);
+    let resumed = |round: u32| body.body.iter().any(|t| folded(t, round).is_some());
+    let mut entered = resumed(1);
+    if entered {
+        for b in body
+            .body
+            .iter()
+            .filter(|b| !ledger.results.contains_key(&b.name))
+        {
+            ledger
+                .machines
+                .entry(b.name.clone())
+                .or_default()
+                .advance(TaskEvent::RoundsStarted)?;
+        }
+    }
     for round in 1..=body.max_rounds {
         let verdict = rounds
             .last()
             .and_then(|rows| rows.iter().find(|row| row.task.name == reviewer.name))
             .map(|row| row.result.clone());
-        if verdict.is_some() {
+        if verdict.is_some() && !resumed(round) {
             if ledger
                 .halted
                 .as_ref()
@@ -1642,6 +1753,22 @@ where
         let mut pending: Vec<usize> = Vec::new();
         let mut stopped = false;
         for t in body.body.iter().copied() {
+            if let Some(result) = folded(t, round) {
+                stopped |= cfg.early_completion
+                    && t.stage == Stage::Iteration
+                    && t.name != reviewer.name
+                    && declared_completion(&result).is_some();
+                view.insert(t.name.clone(), result.clone());
+                rows.push(RoundRow {
+                    task: t,
+                    event: rounds_event(result.status),
+                    result,
+                });
+                if stopped {
+                    break;
+                }
+                continue;
+            }
             let halted = ledger
                 .halted
                 .as_ref()
@@ -1790,7 +1917,10 @@ where
     let Some(last) = rounds.last() else {
         return Ok(());
     };
-    for row in last {
+    for row in last
+        .iter()
+        .filter(|row| !prior_rounds.contains_key(&row.task.name))
+    {
         let (result, event) = if entered {
             let cost_usd = rounds
                 .iter()
@@ -1842,10 +1972,7 @@ fn reports_the_short_circuit(t: &Task, halt: &Halt) -> bool {
 fn ceiling_reached(cfg: ExecCfg<'_>, ledger: &Ledger<'_>) -> Option<Halt> {
     if *ledger.spent >= ledger.budget {
         Some(Halt::Budget)
-    } else if cfg
-        .wall_clock
-        .is_some_and(|limit| ledger.started.elapsed() >= limit)
-    {
+    } else if ledger.clock.past(cfg.wall_clock) {
         Some(Halt::Time)
     } else {
         None
@@ -1860,9 +1987,101 @@ fn halt_on(ledger: &mut Ledger<'_>, why: Halt) -> Result<(), IllegalTransition> 
 /// rounds under their task the way it groups a fan-out's items.
 fn round_task(t: &Task, round: u32) -> Task {
     Task {
-        name: instance_name(&t.name, &format!("round-{round}")),
+        name: round_name(&t.name, round),
         revise: None,
         ..t.clone()
+    }
+}
+
+fn round_name(task: &TaskName, round: u32) -> TaskName {
+    instance_name(task, &format!("round-{round}"))
+}
+
+fn ledger_round(
+    results: &BTreeMap<TaskName, TaskResult>,
+    t: &Task,
+    round: u32,
+) -> Option<TaskResult> {
+    results.get(&round_name(&t.name, round)).cloned()
+}
+
+/// One item of a mapped node, as the task it runs as.
+fn instance_task(node: &Task, key: &str) -> Task {
+    Task {
+        name: instance_name(&node.name, key),
+        emits_files: node.emits_files.clone(),
+        over: None,
+        max_fanout: None,
+        when: None,
+        revise: None,
+        ..node.clone()
+    }
+}
+
+/// The task a settled row names: a task of the plan, one item of a mapped node, or one round of
+/// a revise loop. `None` for a name the plan cannot have produced.
+pub fn row_task(plan: &ValidPlan, name: &TaskName) -> Option<Task> {
+    if let Some(task) = plan.get(name) {
+        return Some(task.clone());
+    }
+    let (node, key) = name.0.strip_suffix(']')?.split_once('[')?;
+    let node = plan.get(&TaskName(node.to_string()))?;
+    let round = key
+        .strip_prefix("round-")
+        .and_then(|round| round.parse::<u32>().ok())
+        .filter(|round| *round >= 1);
+    let in_loop = plan
+        .revise_loops()
+        .iter()
+        .find(|l| l.body.iter().any(|t| t.name == node.name))
+        .map(|l| l.max_rounds);
+    match (round, in_loop, &node.over) {
+        (Some(round), Some(max_rounds), _) if round <= max_rounds => Some(round_task(node, round)),
+        (_, None, Some(_)) => Some(instance_task(node, key)),
+        _ => None,
+    }
+}
+
+/// What an interrupted run's settled results already decided about the plan as a whole: the halt
+/// it stopped on and the early completion it concluded on. Halts first, because the live run
+/// applied them as each result settled and checked for completion only once its batch had.
+fn replay(
+    plan: &ValidPlan,
+    prior: &Prior,
+    early_completion: bool,
+    halted: &mut Option<Halt>,
+    completed: &mut Option<Completion>,
+    plan_machine: &mut PlanMachine,
+) -> Result<(), IllegalTransition> {
+    let settled: Vec<(&Task, &TaskResult)> = prior
+        .order
+        .iter()
+        .filter_map(|name| Some((plan.get(name)?, prior.results.get(name)?)))
+        .collect();
+    for (t, r) in &settled {
+        match r.blocked {
+            Some(BlockedReason::BudgetCeiling) => halt(halted, plan_machine, Halt::Budget)?,
+            Some(BlockedReason::WallClockCeiling) => halt(halted, plan_machine, Halt::Time)?,
+            _ => {}
+        }
+        let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
+        if failed && t.required && t.stage == Stage::Iteration {
+            halt(halted, plan_machine, Halt::ShortCircuit(t.name.clone()))?;
+        }
+    }
+    if !early_completion {
+        return Ok(());
+    }
+    let completion = settled.iter().find_map(|(t, r)| {
+        (t.stage == Stage::Iteration).then_some(())?;
+        Some(Completion {
+            task: t.name.clone(),
+            reason: declared_completion(r)?,
+        })
+    });
+    match completion {
+        Some(completion) => complete(completed, plan_machine, completion),
+        None => Ok(()),
     }
 }
 
@@ -8314,5 +8533,349 @@ mod tests {
         let (out, rows) = run_completing(&plan, &mut r);
         assert_eq!(out.exit, PlanExit::Completed);
         assert_eq!(rows, ["a", "first", "second"]);
+    }
+
+    type Rows = Vec<(TaskName, TaskResult)>;
+
+    /// The name the runner sees for a row: a round runs as its task, an item as itself.
+    fn runner_key(name: &TaskName) -> String {
+        match name.0.strip_suffix(']').and_then(|n| n.split_once('[')) {
+            Some((task, key)) if key.starts_with("round-") => task.to_string(),
+            _ => name.0.clone(),
+        }
+    }
+
+    /// A row that stands for dispatches of its own, not a total over its items or rounds.
+    fn leaf(rows: &Rows, name: &TaskName) -> bool {
+        name.0.contains('[')
+            || !rows
+                .iter()
+                .any(|(n, _)| n.0.starts_with(&format!("{}[", name.0)))
+    }
+
+    fn tally(dispatched: &[(String, u32)]) -> BTreeMap<String, u32> {
+        let mut counts = BTreeMap::new();
+        for (name, _) in dispatched {
+            *counts.entry(name.clone()).or_default() += 1;
+        }
+        counts
+    }
+
+    fn prior_of(rows: &[(TaskName, TaskResult)]) -> Prior {
+        Prior {
+            results: rows.iter().cloned().collect(),
+            order: rows.iter().map(|(name, _)| name.clone()).collect(),
+            ..Prior::default()
+        }
+    }
+
+    /// Run `plan` live, then resume it from every prefix of the rows it settled. A resumed run
+    /// must settle exactly the rows the live run settled after the cut, reach the same verdict,
+    /// exit, and spend, and dispatch only what the rows before the cut did not account for.
+    fn assert_resumes_from_every_cut(
+        plan: &ValidPlan,
+        cfg: ExecCfg<'static>,
+        setup: fn(&mut ScriptRunner),
+    ) {
+        let mut runner = ScriptRunner::new();
+        setup(&mut runner);
+        let mut rows: Rows = Vec::new();
+        let live = execute(plan, &any_substrate(), cfg, &mut runner, |t, r| {
+            rows.push((t.name.clone(), r.clone()))
+        });
+        let dispatched = tally(&runner.dispatched);
+        let statuses = |rows: &[(TaskName, TaskResult)]| -> Vec<(String, TaskStatus)> {
+            rows.iter().map(|(n, r)| (n.0.clone(), r.status)).collect()
+        };
+        for cut in 0..=rows.len() {
+            let (done, rest) = rows.split_at(cut);
+            let prior = prior_of(done);
+            let mut resumed = ScriptRunner::new();
+            setup(&mut resumed);
+            let mut expected = dispatched.clone();
+            for (name, r) in done.iter().filter(|(n, _)| leaf(&rows, n)) {
+                let key = runner_key(name);
+                if let Some(count) = expected.get_mut(&key) {
+                    *count -= r.attempts;
+                }
+                if let Some(queue) = resumed.rounds.get_mut(&key) {
+                    for _ in 0..r.attempts {
+                        queue.pop_front();
+                    }
+                }
+            }
+            expected.retain(|_, count| *count > 0);
+            let mut after: Rows = Vec::new();
+            let out = execute(
+                plan,
+                &any_substrate(),
+                ExecCfg {
+                    prior: Some(&prior),
+                    ..cfg
+                },
+                &mut resumed,
+                |t, r| after.push((t.name.clone(), r.clone())),
+            );
+            assert_eq!(statuses(&after), statuses(rest), "cut {cut}: rows after it");
+            assert_eq!(
+                (out.valid, &out.exit),
+                (live.valid, &live.exit),
+                "cut {cut}: how the run ended"
+            );
+            assert!(
+                (out.spent_usd - live.spent_usd).abs() < 1e-9,
+                "cut {cut}: spent {} against {}",
+                out.spent_usd,
+                live.spent_usd
+            );
+            assert_eq!(
+                tally(&resumed.dispatched),
+                expected,
+                "cut {cut}: only what the settled rows did not cover dispatches"
+            );
+        }
+    }
+
+    #[test]
+    fn a_chain_with_an_epilogue_resumes_from_every_cut() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                task("c", &["b"], "any", false),
+                task("d", &["a"], "any", true),
+                epilogue("report", &[], false),
+            ],
+            10.0,
+        );
+        assert_resumes_from_every_cut(&plan, ExecCfg::default(), |r| {
+            r.on(
+                "b",
+                1,
+                || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+                0.05,
+            );
+            r.on("c", 1, broken, 0.2);
+        });
+    }
+
+    #[test]
+    fn a_fanout_resumes_from_every_cut_in_either_workspace() {
+        for isolation in [None, Some(Isolation::Worktree)] {
+            let mut audit = mapped_node("audit", "discover", "targets", false);
+            audit.isolation = isolation;
+            let plan = valid(
+                vec![
+                    task("discover", &[], "any", true),
+                    audit,
+                    joining(task("wrap", &["audit"], "any", true), Join::Passed),
+                    epilogue("report", &[], false),
+                ],
+                10.0,
+            );
+            assert_resumes_from_every_cut(&plan, ExecCfg::default(), |r| {
+                r.outputs.insert(
+                    "discover".into(),
+                    serde_json::json!({"targets": ["alpha", "beta", "gamma"]}),
+                );
+                r.on("audit[beta]", 1, broken, 0.3);
+            });
+        }
+    }
+
+    #[test]
+    fn a_revise_loop_resumes_from_every_cut_including_mid_round() {
+        let plan = valid(
+            vec![
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 3),
+                task("pick", &["author", "repro"], "any", true),
+                epilogue("report", &[], false),
+            ],
+            10.0,
+        );
+        assert_resumes_from_every_cut(&plan, ExecCfg::default(), |r| {
+            r.rounds("author", &[drafted, drafted, drafted]);
+            r.rounds("repro", &[rejected, rejected, approved]);
+        });
+    }
+
+    #[test]
+    fn a_routed_revise_loop_resumes_from_every_cut() {
+        assert_resumes_from_every_cut(&routed_review(), ExecCfg::default(), |r| {
+            r.on("classify", 1, says_scheduler, 0.1);
+            r.rounds("author", &[drafted, drafted]);
+            r.rounds("repro", &[rejected, approved]);
+        });
+    }
+
+    #[test]
+    fn an_early_completion_resumes_from_every_cut_and_never_reopens_the_main_graph() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                task("c", &["b"], "any", true),
+                task("d", &[], "any", true),
+                epilogue("report", &[], false),
+            ],
+            10.0,
+        );
+        assert_resumes_from_every_cut(&plan, completing_cfg(), |r| {
+            r.rounds("b", &[completes]);
+        });
+    }
+
+    #[test]
+    fn a_required_failure_resumes_from_every_cut_and_still_reports() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                task("c", &["b"], "any", true),
+                epilogue("report", &[], false),
+            ],
+            10.0,
+        );
+        assert_resumes_from_every_cut(&plan, ExecCfg::default(), |r| {
+            r.on("b", 1, broken, 0.1);
+        });
+    }
+
+    #[test]
+    fn a_budget_halt_resumes_from_every_cut() {
+        let plan = valid(
+            vec![
+                task("a", &[], "any", true),
+                task("b", &["a"], "any", true),
+                task("c", &["b"], "any", true),
+                task("d", &["c"], "any", true),
+                epilogue("report", &[], false),
+            ],
+            0.25,
+        );
+        assert_resumes_from_every_cut(&plan, ExecCfg::default(), |_| {});
+    }
+
+    #[test]
+    fn time_spent_before_the_interruption_counts_against_the_ceiling() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), epilogue("report", &[], false)],
+            10.0,
+        );
+        let prior = Prior {
+            elapsed: Duration::from_secs(90),
+            ..Prior::default()
+        };
+        let mut r = ScriptRunner::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                wall_clock: Some(Duration::from_secs(60)),
+                prior: Some(&prior),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        assert!(!out.valid);
+        assert!(r.dispatched.is_empty(), "{:?}", r.dispatched);
+    }
+
+    #[test]
+    fn a_resumed_attempt_gets_only_the_time_the_run_has_left() {
+        let plan = valid(vec![task("a", &[], "any", true)], 10.0);
+        let prior = Prior {
+            elapsed: Duration::from_secs(50),
+            ..Prior::default()
+        };
+        let mut r = ScriptRunner::new();
+        let before = Instant::now();
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                wall_clock: Some(Duration::from_secs(60)),
+                prior: Some(&prior),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        let deadline = r.deadlines[0]
+            .1
+            .expect("the run ceiling bounds the attempt");
+        assert_eq!(deadline.bound, Bound::Run(Duration::from_secs(60)));
+        assert!(deadline.at >= before + Duration::from_secs(10));
+        assert!(deadline.at <= Instant::now() + Duration::from_secs(10));
+    }
+
+    #[test]
+    fn spend_before_the_interruption_counts_against_the_budget() {
+        let plan = valid(
+            vec![task("a", &[], "any", true), task("b", &["a"], "any", true)],
+            1.0,
+        );
+        let mut settled = ScriptRunner::new();
+        settled.on("a", 1, || AttemptOutcome::Pass(serde_json::json!({})), 1.5);
+        let mut rows: Rows = Vec::new();
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut settled,
+            |t, r| rows.push((t.name.clone(), r.clone())),
+        );
+        let prior = prior_of(&rows[..1]);
+        assert!((prior.spent_usd() - 1.5).abs() < 1e-9);
+        let mut r = ScriptRunner::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                prior: Some(&prior),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(r.dispatched.is_empty(), "{:?}", r.dispatched);
+    }
+
+    #[test]
+    fn row_task_names_every_row_a_plan_can_settle_and_nothing_else() {
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                mapped_node("audit", "discover", "targets", true),
+                task("author", &[], "any", true),
+                reviewing("repro", &["author"], "author", 2),
+            ],
+            10.0,
+        );
+        let named = |n: &str| row_task(&plan, &TaskName(n.into())).map(|t| t.name.0);
+        for name in [
+            "discover",
+            "audit",
+            "audit[alpha]",
+            "audit[round-1]",
+            "author[round-2]",
+            "repro[round-1]",
+        ] {
+            assert_eq!(named(name).as_deref(), Some(name), "{name}");
+        }
+        for name in [
+            "ghost",
+            "discover[alpha]",
+            "author[round-3]",
+            "author[round-0]",
+            "author[alpha]",
+            "audit[alpha",
+        ] {
+            assert_eq!(named(name), None, "{name}");
+        }
     }
 }

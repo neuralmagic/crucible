@@ -73,7 +73,7 @@ tokio = { version = "1", features = [
 # `CancellationToken`: the openshell exec (and its upload/download siblings) `select!` it against
 # stream/child progress; a per-turn bridge task trips it from `crate::STOP` on Ctrl-C.
 tokio-util = "0.7"
-jiff = "0.2"
+jiff = { version = "0.2", features = ["serde"] }
 # Turn-trace span hints: parse a candidate URL to scrub `user:pass@` userinfo without hand-rolling
 # authority slicing.
 url = "2"

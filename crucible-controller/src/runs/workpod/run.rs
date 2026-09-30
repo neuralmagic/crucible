@@ -35,6 +35,55 @@ use std::time::Duration;
 /// (overriding whatever the manifest render emitted) so its `work_pods` PK + the pod's ownerRef both
 /// key on a value it chose. The run id already carries a per-launch epoch suffix, so this is unique
 /// per launch of an issue.
+/// Everything the blocking half of a dispatch needs: render the run's pod and pack ConfigMap, then
+/// stamp the pod with what the controller knows about the run.
+struct RunPodRender {
+    pack: std::path::PathBuf,
+    profile: std::path::PathBuf,
+    pod_name: String,
+    issue_key: String,
+    run_id: String,
+    opts: RunRenderOpts,
+    digests: Option<Arc<dyn DigestResolver>>,
+    owner: Option<OwnerReference>,
+    overlay: Option<String>,
+    public_url: Option<String>,
+    git_identity: Option<crate::secrets::github_app::BotIdentity>,
+    secret_name: String,
+    delivery: crate::secrets::deliver::Delivery,
+}
+
+impl RunPodRender {
+    fn render(self) -> Result<(Pod, Option<ConfigMap>)> {
+        let (mut pod, cm) = render_run_docs(
+            &self.pack,
+            &self.profile,
+            &self.pod_name,
+            &self.opts,
+            self.digests,
+        )?;
+        stamp_run_pod(
+            &mut pod,
+            &self.pod_name,
+            &self.issue_key,
+            &self.run_id,
+            self.owner,
+            self.overlay.as_deref(),
+        );
+        if let Some(item) = self.opts.tracker_item(&self.issue_key) {
+            set_container_env(&mut pod, crate::runs::engine::ITEM_ENV, item);
+        }
+        if let Some(url) = self.public_url.as_deref() {
+            set_container_env(&mut pod, "CRUCIBLE_UI_BASE_URL", url.trim_end_matches('/'));
+        }
+        if let Some(who) = self.git_identity.as_ref() {
+            stamp_git_identity(&mut pod, who);
+        }
+        crate::secrets::deliver::stamp(&mut pod, &self.secret_name, &self.delivery);
+        Ok((pod, cm))
+    }
+}
+
 pub fn run_pod_name(run_id: &str) -> String {
     let prefix = "crucible-run-";
     let budget = 63 - prefix.len();
@@ -101,15 +150,16 @@ impl RunRenderOpts {
     }
 
     /// The engine's render options for this run: what `crucible deploy render --pack` would parse
-    /// off its flags. `cm_name` is the pack ConfigMap's run-unique name; `digests` the image-pinning
-    /// resolver ([`crate::config::ControllerCfg::digest_resolver`]).
+    /// off its flags. `pod_name` is the run's pod, which names the run and its pack ConfigMap;
+    /// `digests` the image-pinning resolver ([`crate::config::ControllerCfg::digest_resolver`]).
     fn render_opts(
         &self,
-        cm_name: &str,
+        pod_name: &str,
         digests: Option<Arc<dyn DigestResolver>>,
     ) -> Result<RenderOpts> {
         let pack = Some(PackDelivery {
-            configmap_name: cm_name.to_string(),
+            configmap_name: format!("{pod_name}-pack"),
+            run_name: pod_name.to_string(),
         });
         let agent = self.agent();
         Ok(match self {
@@ -154,13 +204,14 @@ impl RunRenderOpts {
 /// delivery, the library form of `crucible deploy render --pack`), returning the parsed, unstamped
 /// [`Pod`] AND the pack [`ConfigMap`] the pod mounts (the pack lives only on the controller PVC,
 /// never baked into the loop image). Blocking (pack + profile reads, image pinning), so the caller
-/// runs it under `spawn_blocking`. `cm_name` is the run-unique ConfigMap object name the controller
-/// owns; the render uses it for both the CM's name and the pod volume that references it, so the
-/// two never drift. `opts` carries the per-kind run knobs ([`RunRenderOpts`]).
+/// runs it under `spawn_blocking`. `pod_name` is the run's pod: the render names the run after it,
+/// so its state is its own, and names the pack ConfigMap `<pod>-pack`, so the CM and
+/// the pod volume that references it never drift. `opts` carries the per-kind run knobs
+/// ([`RunRenderOpts`]).
 pub fn render_run_docs(
     pack_out: &Path,
     profile_path: &Path,
-    cm_name: &str,
+    pod_name: &str,
     opts: &RunRenderOpts,
     digests: Option<Arc<dyn DigestResolver>>,
 ) -> Result<(Pod, Option<ConfigMap>)> {
@@ -168,7 +219,7 @@ pub fn render_run_docs(
     let yaml = render_yaml(
         &manifest,
         profile_path,
-        &opts.render_opts(cm_name, digests)?,
+        &opts.render_opts(pod_name, digests)?,
     )?;
     extract_run_docs(&yaml)
 }
@@ -638,37 +689,26 @@ pub async fn dispatch_run(
     let namespace = dispatcher
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
-    let digests = cfg.digest_resolver();
-    let owner = owner_reference_from_env();
-    let pack = pack_out.to_path_buf();
-    let issue = issue_key.to_string();
-    let run = run_id.to_string();
-    let name = pod_name.clone();
-    let public_url = cfg.public_url.clone();
-    let secret_for_stamp = secret_name.clone();
-    let delivery_for_stamp = delivery.clone();
-    // The pack ConfigMap's run-unique name: render stamps it onto both the CM and the pod's volume
-    // ref, so the controller never has to reconcile two names.
-    let cm_name = format!("{pod_name}-pack");
+    let job = RunPodRender {
+        pack: pack_out.to_path_buf(),
+        profile,
+        pod_name: pod_name.clone(),
+        issue_key: issue_key.to_string(),
+        run_id: run_id.to_string(),
+        opts,
+        digests: cfg.digest_resolver(),
+        owner: owner_reference_from_env(),
+        overlay,
+        public_url: cfg.public_url.clone(),
+        git_identity,
+        secret_name: secret_name.clone(),
+        delivery: delivery.clone(),
+    };
     // The render reads the pack and pins images, so it stays on a blocking thread; the pod + CM
     // creates are plain async kube calls awaited here.
-    let rendered = tokio::task::spawn_blocking(move || -> Result<(Pod, Option<ConfigMap>)> {
-        let (mut pod, cm) = render_run_docs(&pack, &profile, &cm_name, &opts, digests)?;
-        stamp_run_pod(&mut pod, &name, &issue, &run, owner, overlay.as_deref());
-        if let Some(item) = opts.tracker_item(&issue) {
-            set_container_env(&mut pod, crate::runs::engine::ITEM_ENV, item);
-        }
-        if let Some(url) = public_url.as_deref() {
-            set_container_env(&mut pod, "CRUCIBLE_UI_BASE_URL", url.trim_end_matches('/'));
-        }
-        if let Some(who) = git_identity.as_ref() {
-            stamp_git_identity(&mut pod, who);
-        }
-        crate::secrets::deliver::stamp(&mut pod, &secret_for_stamp, &delivery_for_stamp);
-        Ok((pod, cm))
-    })
-    .await
-    .context("joining the loop-run render task")?;
+    let rendered = tokio::task::spawn_blocking(move || job.render())
+        .await
+        .context("joining the loop-run render task")?;
     let issue_for_cm = issue_key.to_string();
     // Create the pod FIRST (so its UID exists to owner-ref the CM to), then the CM. A pack pod waits
     // in ContainerCreating on its init-container's ConfigMap mount until the CM lands a beat later; the

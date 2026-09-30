@@ -193,6 +193,28 @@ pub struct HarnessRunner {
     pub staged: BTreeMap<TaskName, Vec<StagedInput>>,
 }
 
+impl HarnessRunner {
+    /// Count what an interrupted process of this run already captured against the run's bound,
+    /// which covers the run and not any one process of it.
+    pub fn take_over(&mut self) {
+        self.captured_bytes = AtomicU64::new(tree_bytes(&self.paths.state.join("files")));
+    }
+}
+
+fn tree_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => tree_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map_or(0, |m| m.len()),
+            _ => 0,
+        })
+        .sum()
+}
+
 impl TaskRunner for HarnessRunner {
     fn run(
         &mut self,

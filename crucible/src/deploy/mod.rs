@@ -42,7 +42,10 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
 
     if manifest::is_composite(manifest_path) {
         let composite = CompositeManifest::load(manifest_path)?;
-        let input = RenderInput::from_composite(&composite, manifest_dir)?;
+        let mut input = RenderInput::from_composite(&composite, manifest_dir)?;
+        if let Some(pack) = &opts.pack {
+            input.name = &pack.run_name;
+        }
         render::render(input, manifest_dir, manifest_file, &profile, opts)
     } else {
         let manifest = Manifest::load(manifest_path)?;
@@ -53,10 +56,13 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
             );
         }
         manifest::ensure_injects_resolve(&manifest, manifest_dir)?;
-        let name = manifest_dir
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("manifest dir has a name")?;
+        let name = match &opts.pack {
+            Some(pack) => pack.run_name.as_str(),
+            None => manifest_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .context("manifest dir has a name")?,
+        };
         let input = match opts.playbook {
             Some(_) => RenderInput::from_playbook_manifest(&manifest, name),
             None => RenderInput::from_manifest(&manifest, name)?,

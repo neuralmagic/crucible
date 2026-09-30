@@ -9,12 +9,17 @@ pub mod ir;
 pub mod machine;
 pub mod param;
 pub mod record;
+pub mod resume;
 pub mod route;
 pub mod runner;
 pub mod starlark;
 pub mod term_img;
 pub mod workflow;
 pub mod worktree;
+
+/// The exit code of a `plan run` that finished with an invalid verdict. It is not a crash: the
+/// session log already holds the verdict, so a pod wrapper does not restart the run on it.
+pub const INVALID_VERDICT_EXIT: u8 = 3;
 
 /// The environment variable naming the task a turn runs, set by both the command runner and the
 /// agent harness. Engine-provisioned, so [`crate::exposure`] carries it as standing disclosed

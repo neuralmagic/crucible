@@ -124,7 +124,7 @@ launches it does. `crucible check` validates the manifest, resolves every file i
 and lists the egress and credentials the pack would get, without running anything.
 
 The verdict is `valid` because every required task passed. It is the thing to script
-against: `plan run` exits nonzero on any other verdict.
+against: `plan run` exits 3 on any other verdict, and 1 when it could not run the plan at all.
 
 ## What the run left behind
 
@@ -151,6 +151,26 @@ check[round-2] pass
 poem pass
 check pass
 ```
+
+## If the run is interrupted
+
+`plan run --resume` continues the run in `state/`:
+
+```sh
+crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m --resume
+```
+
+Tasks the session log already settled do not run again, including single items of a fan-out
+and single rounds of a revise loop. The workspace goes back to the commit the run started
+from, so a later task sees what earlier tasks declared in `emits_files`, not what they left in
+the tree. Spend and elapsed time from before the interruption count against the ceilings, and
+elapsed time includes the time the run was down. A resume refuses a pack, parameter, or
+`--max-cost` that differs from the run's start, and a run that already shut down only
+exits with its verdict again.
+
+A pod the control plane dispatches does this itself: when the engine dies, the container
+restarts and resumes, up to three times. A hand-rendered pod does the same when its profile sets
+`[cluster] state_pvc`.
 
 ## Put a real agent on it
 
