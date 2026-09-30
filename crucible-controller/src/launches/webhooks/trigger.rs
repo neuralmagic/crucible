@@ -541,7 +541,7 @@ mod tests {
         let wait = std::time::Duration::from_secs(10);
         register(&pool).await;
         let id = webhook(&pool, 10, "body.docker_url").await;
-        let mut wakes = store::delivery_wakes(pool.clone());
+        let mut wakes = crate::launches::announce::wakes(pool.clone(), &[store::DELIVERY_CHANNEL]);
         tokio::time::timeout(wait, wakes.next())
             .await
             .expect("a wake once listening")
@@ -554,6 +554,40 @@ mod tests {
             .expect("the stream stays open");
 
         assert_eq!(sweep(&pool).await.len(), 1);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_minted_launch_wakes_the_launch_listener(pool: PgPool) {
+        use futures_util::StreamExt;
+        let wait = std::time::Duration::from_secs(10);
+        register(&pool).await;
+        let id = webhook(&pool, 10, "body.docker_url").await;
+        let mut wakes = crate::launches::announce::wakes(
+            pool.clone(),
+            &[crate::launches::store::LAUNCH_CHANNEL],
+        );
+        tokio::time::timeout(wait, wakes.next())
+            .await
+            .expect("a wake once listening")
+            .expect("the stream stays open");
+
+        deliver(&pool, &id, &push("latest", "sha256:a")).await;
+        assert_eq!(sweep(&pool).await.len(), 1);
+        tokio::time::timeout(wait, wakes.next())
+            .await
+            .expect("a wake for the minted launch")
+            .expect("the stream stays open");
+        assert_eq!(
+            crate::launches::pending::pending_launch_keys(&pool)
+                .await
+                .expect("pending"),
+            vec![
+                sqlx::query_scalar::<_, String>("SELECT key FROM playbook_launches")
+                    .fetch_one(&pool)
+                    .await
+                    .expect("launch")
+            ]
+        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
