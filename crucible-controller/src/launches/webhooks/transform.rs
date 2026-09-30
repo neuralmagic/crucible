@@ -156,7 +156,80 @@ fn compile_one(source: &str) -> Result<IdedExpr, String> {
             })
     })??;
     check(&expr, 0)?;
+    let mut free = BTreeSet::new();
+    free_idents(&expr, &BTreeSet::new(), &mut free);
+    if let Some(unknown) = free.iter().find(|n| !VARIABLES.contains(&n.as_str())) {
+        return Err(format!(
+            "reads {unknown}; an expression reads only {}",
+            VARIABLES.join(", ")
+        ));
+    }
+    let mut called = BTreeSet::new();
+    called_functions(&expr, &mut called);
+    if let Some((unknown, _)) = called
+        .iter()
+        .find(|(name, member)| !is_defined(name, *member))
+    {
+        return Err(format!("calls {unknown}, which CEL here does not define"));
+    }
     Ok(expr)
+}
+
+/// The variables a transform is evaluated with.
+const VARIABLES: &[&str] = &["body", "headers", "delivery", "received_at"];
+
+/// The named functions `e` calls, operators excluded, each with whether it is called on a target.
+fn called_functions(e: &IdedExpr, out: &mut BTreeSet<(String, bool)>) {
+    match &e.expr {
+        Expr::Call(c) => {
+            if c.func_name.starts_with(|ch: char| ch.is_ascii_alphabetic()) {
+                out.insert((c.func_name.clone(), c.target.is_some()));
+            }
+            if let Some(target) = &c.target {
+                called_functions(target, out);
+            }
+            c.args.iter().for_each(|a| called_functions(a, out));
+        }
+        Expr::Select(s) => called_functions(&s.operand, out),
+        Expr::List(l) => l.elements.iter().for_each(|x| called_functions(x, out)),
+        Expr::Map(m) => {
+            for entry in &m.entries {
+                if let EntryExpr::MapEntry(me) = &entry.expr {
+                    called_functions(&me.key, out);
+                    called_functions(&me.value, out);
+                }
+            }
+        }
+        Expr::Comprehension(c) => {
+            for part in [
+                &c.iter_range,
+                &c.accu_init,
+                &c.loop_cond,
+                &c.loop_step,
+                &c.result,
+            ] {
+                called_functions(part, out);
+            }
+        }
+        Expr::Ident(_) | Expr::Literal(_) | Expr::Struct(_) | Expr::Unspecified => {}
+    }
+}
+
+/// Whether the interpreter defines `name`, called on a target when `member`. An undefined function
+/// fails as an undeclared reference; a defined one called with no arguments fails any other way.
+fn is_defined(name: &str, member: bool) -> bool {
+    let source = if member {
+        format!("\"\".{name}()")
+    } else {
+        format!("{name}()")
+    };
+    let Ok(probe) = Parser::new().parse(&source) else {
+        return false;
+    };
+    match Value::resolve(&probe, &Context::default()) {
+        Ok(_) => true,
+        Err(e) => !e.to_string().contains("Undeclared reference"),
+    }
 }
 
 /// The deepest `(`, `[`, or `{` nesting in `source`, string literals included.
@@ -588,5 +661,32 @@ mod tests {
         assert!(long.dedupe.is_err_and(|e| e.contains("at most 512")));
         let reason = evaluate("body.ref == 1 ? true : body.missing", "1", json!({}), &body);
         assert!(reason.filter.is_err_and(|e| !e.contains('\0')));
+    }
+
+    #[test]
+    fn a_save_refuses_an_undefined_function_or_variable() {
+        for (source, expect) in [
+            (r#"body.updated_tags.join(",")"#, "calls join"),
+            ("frobnicate(body)", "calls frobnicate"),
+            ("bdy.repository", "reads bdy"),
+            ("request.body", "reads request"),
+        ] {
+            let refused = refusal(source);
+            assert!(
+                refused.len() == 1 && refused[0].1.contains(expect),
+                "{source}: {refused:?}"
+            );
+        }
+        for source in [
+            r#"size(body.updated_tags) > 0 && body.repository.startsWith("org/")"#,
+            r#"body.repository.matches("^org/") && string(body.count) != "" && int("1") == 1"#,
+            r#"body.updated_tags.exists(t, t.contains("sha-")) && has(body.missing)"#,
+            "delivery + received_at + headers[\"x\"]",
+        ] {
+            assert!(
+                Transform::compile(source, "body.repository", &params(json!({}))).is_ok(),
+                "{source}"
+            );
+        }
     }
 }

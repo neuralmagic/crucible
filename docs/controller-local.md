@@ -41,6 +41,9 @@ crux draft-launch notes --max-cost 1 --max-time 5m
 | `KUBECONFIG` | `/dev/null` | The controller never reaches a cluster your kubeconfig happens to point at. |
 | `OPENSHELL_PODMAN_SOCKET` | the podman machine's API socket | Where an OpenShell sandbox is booted. Set it yourself to override. |
 | `CRUCIBLE_BIN` | the built `crucible` | The engine a launch runs. |
+| `CONTROLLER_HOOKS_ADDR` | `127.0.0.1:8871` (`HOOKS_PORT` overrides) | The webhook delivery surface, on its own port. |
+| `CONTROLLER_HOOKS_PUBLIC_URL` | `http://127.0.0.1:8871` | The base a created webhook's delivery URL is built on. |
+| `CONTROLLER_CREDENTIAL_KEY_FILE` | `$CONTROLLER_STATE_DIR/credential.key`, generated once | Seals `hmac_sha256` webhook secrets. |
 
 `CONTROLLER_API_TOKEN`, `CONTROLLER_PROXY_TOKEN`, `CONTROLLER_OIDC_ISSUER` and `VAULT_ADDR` are
 unset for the process, whatever your shell exports.
@@ -84,6 +87,81 @@ A local run starts from an empty environment. It keeps `PATH`, `HOME`, `USER`,
 
 Any other variable a run needs goes in `CONTROLLER_LOCAL_SECRET_ALLOWLIST`, and the pack has to
 disclose it as an agent credential before a run is handed it.
+
+## Webhooks
+
+A webhook launches a registered playbook from a delivery a sender posts. Locally the delivery
+surface is `http://127.0.0.1:8871`, and a command-only pack exercises it with no agent. A pack
+that records the params it was given:
+
+```sh
+mkdir -p /tmp/image-pushed && cd /tmp/image-pushed
+cat > crucible.toml <<'EOF'
+[workspace]
+inject = ["announce.sh"]
+
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "Record which image a registry push named."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
+EOF
+cat > workflow.star <<'EOF'
+params = {
+    "image": {"type": "string", "required": True, "pattern": "^quay\\.io/"},
+    "tags": {"type": "list<string>", "default": ["latest"]},
+}
+
+announce = command(name = "announce", run = "./announce.sh")
+
+workflow(type = "playbook", tasks = [announce], result = announce)
+EOF
+printf '#!/bin/sh\necho "$CRUCIBLE_INPUTS"\n' > announce.sh && chmod +x announce.sh
+```
+
+A webhook targets a registered playbook, so publish the pack as one, then create a quay.io
+webhook. `crux webhook-presets` prints starting points for quay.io and GitHub.
+
+```sh
+crux draft-create image-pushed --description "Record which image a registry push named"
+crux draft-push image-pushed /tmp/image-pushed --base 1
+crux draft-publish image-pushed --playbook on-image-push
+cat > /tmp/quay.json <<'EOF'
+{
+  "playbook": "on-image-push",
+  "verifier": "path_token",
+  "filter": "\"latest\" in body.updated_tags",
+  "dedupe": "delivery",
+  "derive": {"image": "body.docker_url", "tags": "body.updated_tags"},
+  "max_launches_per_hour": 10,
+  "max_cost": 1,
+  "max_time": "5m"
+}
+EOF
+crux webhook-create --file /tmp/quay.json
+```
+
+The response carries `delivery_url`, with the path token in it, and the secret. Neither is shown
+again; `crux webhook-rotate <id>` mints a new one. Post a push the way quay.io would:
+
+```sh
+curl -X POST --data '{"repository":"org/img","docker_url":"quay.io/org/img","updated_tags":["latest"]}' \
+  "$DELIVERY_URL"
+crux webhook-deliveries <id>
+```
+
+The delivery settles on the next sweep (`POST /api/reconcile` forces one): `launched` with the
+launch key, or `filtered`, `duplicate`, `throttled`, or `failed` with the reason. A GitHub
+webhook uses `"verifier": "hmac_sha256"` and `"header": "x-hub-signature-256"`, and a delivery
+carries the signature:
+
+```sh
+sig="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')"
+curl -X POST -H "X-GitHub-Event: release" -H "X-Hub-Signature-256: $sig" --data "$BODY" "$DELIVERY_URL"
+```
 
 ## What is off
 
