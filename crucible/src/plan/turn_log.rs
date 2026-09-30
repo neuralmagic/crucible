@@ -20,6 +20,7 @@ pub struct TurnLog {
     last_line: Option<String>,
     last_beat_at: Option<Instant>,
     tokens_at: Option<Instant>,
+    unprinted_tokens: Option<AgentEvent>,
     thinking: Pending,
     text: Pending,
 }
@@ -39,6 +40,7 @@ impl TurnLog {
             last_line: None,
             last_beat_at: None,
             tokens_at: None,
+            unprinted_tokens: None,
             thinking: Pending::default(),
             text: Pending::default(),
         }
@@ -73,7 +75,10 @@ impl TurnLog {
                     .is_none_or(|at| now.duration_since(at) >= TOKENS_EVERY)
                 {
                     self.tokens_at = Some(now);
+                    self.unprinted_tokens = None;
                     lines.extend(crate::agent::turn::human_line(ev));
+                } else {
+                    self.unprinted_tokens = Some(ev.clone());
                 }
             }
             AgentEvent::Result {
@@ -84,6 +89,11 @@ impl TurnLog {
                 error,
             } => {
                 lines.extend(self.flush_all(now));
+                lines.extend(
+                    self.unprinted_tokens
+                        .take()
+                        .and_then(|t| crate::agent::turn::human_line(&t)),
+                );
                 let mut line = format!("result {subtype} turns={turns} cost=${cost_usd:.4}");
                 if *is_error {
                     line.push_str(&format!(
@@ -230,6 +240,64 @@ mod tests {
             output,
             ..Tokens::default()
         })
+    }
+
+    #[test]
+    fn the_result_prints_the_turn_total_even_inside_the_throttle() {
+        let t0 = Instant::now();
+        let mut log = TurnLog::new(t0);
+        assert_eq!(log.on_event(&tokens(10), at(t0, 1)).len(), 1);
+        assert!(log.on_event(&tokens(20), at(t0, 2)).is_empty());
+        let total = AgentEvent::Tokens(Tokens {
+            input: 4475,
+            output: 15,
+            cache_read: 14376,
+            cache_write: 6439,
+            total: 25305,
+            ..Tokens::default()
+        });
+        assert!(log.on_event(&total, at(t0, 3)).is_empty());
+        let lines = log.on_event(
+            &AgentEvent::Result {
+                subtype: "success".to_string(),
+                is_error: false,
+                turns: 1,
+                cost_usd: 0.09,
+                error: None,
+            },
+            at(t0, 4),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "\u{1f4ca} TOKENS in=4475 out=15 cache_r=14376 cache_w=6439 total=25305"
+                    .to_string(),
+                "result success turns=1 cost=$0.0900".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_turn_total_printed_on_arrival_is_not_repeated_before_the_result() {
+        let t0 = Instant::now();
+        let mut log = TurnLog::new(t0);
+        assert_eq!(log.on_event(&tokens(10), at(t0, 1)).len(), 1);
+        assert!(log.on_event(&tokens(20), at(t0, 2)).is_empty());
+        assert_eq!(log.on_event(&tokens(30), at(t0, 61)).len(), 1);
+        let lines = log.on_event(
+            &AgentEvent::Result {
+                subtype: "success".to_string(),
+                is_error: false,
+                turns: 1,
+                cost_usd: 0.09,
+                error: None,
+            },
+            at(t0, 62),
+        );
+        assert_eq!(
+            lines,
+            vec!["result success turns=1 cost=$0.0900".to_string()]
+        );
     }
 
     #[test]
@@ -397,10 +465,14 @@ mod tests {
             .flat_map(|l| parser.push(l))
             .flat_map(|ev| log.on_event(&ev, at(t0, 1)))
             .collect();
-        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert_eq!(lines.len(), 4, "{lines:?}");
         assert!(lines[0].starts_with("\u{1f4ca} TOKENS"), "{lines:?}");
         assert_eq!(lines[1], "hello");
-        assert!(lines[2].starts_with("result success turns="), "{lines:?}");
+        assert_eq!(
+            lines[2], "\u{1f4ca} TOKENS in=4475 out=15 cache_r=14376 cache_w=6439 total=25305",
+            "the turn total across every model precedes the result"
+        );
+        assert!(lines[3].starts_with("result success turns="), "{lines:?}");
     }
 
     #[test]

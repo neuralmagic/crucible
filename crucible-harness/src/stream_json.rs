@@ -118,6 +118,7 @@ impl StreamJsonParser {
                     .filter(|s| !s.is_empty());
                 let cost_usd = f64_field(&msg, "total_cost_usd");
                 self.stream_cost = self.stream_cost.max(cost_usd);
+                out.extend(turn_tokens(&msg, cost_usd));
                 out.push(AgentEvent::Result {
                     subtype: str_field(&msg, "subtype"),
                     is_error,
@@ -506,6 +507,22 @@ fn result_text(block: &Value) -> String {
 
 pub(crate) fn str_field(v: &Value, key: &str) -> String {
     v.get(key).and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// The whole turn's usage from `result.modelUsage`, summed across every model the turn called.
+/// The per-request `message_start` samples only gauge the latest request.
+fn turn_tokens(msg: &Value, cost_usd: f64) -> Option<AgentEvent> {
+    let models = msg.get("modelUsage")?.as_object()?;
+    let mut tokens = Tokens::default();
+    for usage in models.values() {
+        tokens.input += u64_field(usage, "inputTokens");
+        tokens.output += u64_field(usage, "outputTokens");
+        tokens.cache_read += u64_field(usage, "cacheReadInputTokens");
+        tokens.cache_write += u64_field(usage, "cacheCreationInputTokens");
+    }
+    tokens.total = tokens.input + tokens.output + tokens.cache_read + tokens.cache_write;
+    tokens.cost_usd = (cost_usd > 0.0).then_some(cost_usd);
+    Some(AgentEvent::Tokens(tokens))
 }
 
 pub(crate) fn u64_field(v: &Value, key: &str) -> u64 {
@@ -946,6 +963,7 @@ mod tests {
                 AgentEvent::Init { tools, .. },
                 AgentEvent::Text { delta },
                 AgentEvent::Tokens(t),
+                AgentEvent::Tokens(turn),
                 AgentEvent::Result {
                     subtype,
                     turns,
@@ -963,12 +981,25 @@ mod tests {
                 assert_eq!(t.cache_write, 6439);
                 assert_eq!(t.output, 4);
                 assert_eq!(t.total, 3968 + 4 + 14376 + 6439);
+                assert_eq!(turn.input, 3968 + 507, "every model the turn called");
+                assert_eq!(turn.output, 4 + 11);
+                assert_eq!(turn.cache_read, 14376);
+                assert_eq!(turn.cache_write, 6439);
+                assert_eq!(turn.total, 4475 + 15 + 14376 + 6439);
+                assert_eq!(turn.cost_usd, Some(0.09208));
                 assert_eq!(subtype, "success");
                 assert_eq!(*turns, 1);
                 assert!((cost_usd - 0.09208).abs() < 1e-9, "real total_cost_usd");
             }
             other => panic!("unexpected event sequence from real capture: {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_result_without_model_usage_adds_no_turn_total() {
+        let ev =
+            run(&[r#"{"type":"result","subtype":"success","num_turns":1,"total_cost_usd":0.5}"#]);
+        assert!(matches!(&ev[..], [AgentEvent::Result { .. }]), "{ev:?}");
     }
 
     #[test]
