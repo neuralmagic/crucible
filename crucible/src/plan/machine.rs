@@ -139,6 +139,20 @@ impl BlockedReason {
 }
 
 impl BlockedReason {
+    /// The reason a `task_result` row carries. A refused staging keeps its why only in the row's
+    /// note, so the note comes along.
+    pub fn from_wire(wire: TaskBlocked, note: &str) -> Self {
+        match wire.reason {
+            BlockedReasonKind::RequiredTaskFailed => {
+                BlockedReason::RequiredTaskFailed(TaskName(wire.task.unwrap_or_default()))
+            }
+            BlockedReasonKind::BudgetCeiling => BlockedReason::BudgetCeiling,
+            BlockedReasonKind::WallClockCeiling => BlockedReason::WallClockCeiling,
+            BlockedReasonKind::DependencyDidNotPass => BlockedReason::DependencyDidNotPass,
+            BlockedReasonKind::StagingRefused => BlockedReason::StagingRefused(note.to_string()),
+        }
+    }
+
     pub fn wire(&self) -> TaskBlocked {
         let (reason, task) = match self {
             BlockedReason::RequiredTaskFailed(task) => {

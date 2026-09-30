@@ -157,7 +157,7 @@ Any language works the same way, because the engine reads only the JSON verdict.
 | **Memory** | git-as-memory (kept commits) + `RESULTS.md` | `crucible-vcs/src/vcs.rs` + `write_results` |
 | **Control plane** | steer / stop-park / resume / escalate | `STEER.md` / `state/control.json` / `--resume` / `ESCALATION.json` |
 | **Distress** | the agent pages the operator; `severity=error` suspends the run with the pod alive | `crucible-broker::distress` + `crucible/src/distress.rs` |
-| **Durable run state** | `[cluster] state_pvc` mounts a claim over the domain's `state/` dir, so a replaced pod resumes instead of restarting the run. A named (shared) claim is keyed per run by a `state/<run>` subPath and needs RWX; a `[cluster.state_pvc]` table materializes a dedicated `<run>-state` claim mounted at its root | `deploy/profile.rs` + `deploy/render/kube.rs` |
+| **Durable run state** | `[cluster] state_pvc` mounts a claim over the domain's `state/` dir, so a replaced pod resumes instead of restarting the run, loop or playbook. A named (shared) claim is keyed per run by a `state/<run>` subPath and needs RWX; a `[cluster.state_pvc]` table materializes a dedicated `<run>-state` claim mounted at its root | `deploy/profile.rs` + `deploy/render/kube.rs` |
 | **Provisioning** | mediated MCP broker: the agent asks, the host holds the keys (GPU capture, issue-tracker grounding, draft PRs) | `crucible-broker` (ADR-0002) |
 | **Profiler** | generic profile-over-MCP: pprof for a Go service, GPU traces for a model server | `crucible-broker::profile` (ADR-0006) |
 | **Build + deploy** | engine-side build, and `crucible deploy render` projects the loop/deployment manifests, digest-pinned | `forge` + `crucible/src/deploy/` (ADR-0005 / 0012) |

@@ -237,6 +237,30 @@ pub(crate) fn prep_plan_runner(
     )
 }
 
+/// Put a resumed run's workspace back to the commit it started from, with the manifest's injects
+/// laid over it as a fresh checkout would have them.
+pub(crate) fn restore_pristine(
+    manifest_path: &Path,
+    m: &manifest::Manifest,
+    base: &str,
+) -> Result<()> {
+    let manifest_dir = manifest::manifest_dir(manifest_path);
+    let workspace = manifest_dir.join(&m.workspace.dir);
+    crucible_vcs::git_memory::restore(&workspace, base, &[]).with_context(|| {
+        format!("restoring the workspace to the commit the run started from ({base})")
+    })?;
+    for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
+        manifest::apply_inject(&src, &dst)
+            .context("applying [workspace].inject to the restored workspace")?;
+    }
+    Ok(())
+}
+
+/// Where a manifest run keeps its state: the session log, captured files, and run records.
+pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
+    manifest::manifest_dir(manifest_path).join("state")
+}
+
 pub(crate) fn prep_plan_runner_with_params(
     manifest_path: &Path,
     params: &std::collections::BTreeMap<String, String>,
@@ -247,7 +271,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
     let workspace = manifest_dir.join(&m.workspace.dir);
-    let state = manifest_dir.join("state");
+    let state = state_dir(manifest_path);
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
     let p = crate::args::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
     if !workspace.exists() {

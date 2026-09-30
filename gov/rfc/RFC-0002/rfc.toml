@@ -42,3 +42,4 @@ changed = [
     "converting external text to a plain string, and a supplied value carrying a marker, are compile errors",
     "the run's wall-clock ceiling is the default and maximum per-attempt deadline; a timed-out attempt fails measured and is not retried",
 ]
+fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

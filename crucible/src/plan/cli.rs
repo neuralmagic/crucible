@@ -10,6 +10,7 @@ use crate::plan::exec::{Substrate, TaskStatus, required_tasks_held, runnable_set
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{Plan, Stage, TaskKind, TaskName, ValidPlan};
 use crate::plan::record::declared_output;
+use crate::plan::resume::{Prior, RunStart};
 use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
@@ -498,6 +499,14 @@ pub struct RunOpts {
     pub ceilings: Ceilings,
     pub compute_driver: crate::openshell::gateway::ComputeDriver,
     pub agent: AgentOverride,
+    /// Continue the playbook run the manifest's state dir holds instead of starting one.
+    pub resume: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--resume continues a playbook run; {manifest} does not declare a playbook")]
+struct ResumeNeedsPlaybook {
+    manifest: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -582,12 +591,15 @@ pub fn run(
         ceilings,
         compute_driver,
         agent,
+        resume,
     } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
         return Err(BadDuration { raw: raw.clone() }.into());
     }
     let history = SeriesHistory::from_env()?;
+    let run_name = std::env::var(crucible_contract::ENV_RUN_NAME).ok();
+    let run = run_name.as_deref().unwrap_or("local");
 
     // Either the plan was handed to us, or the manifest names the graph and we compile it.
     let mut evidence: Option<crate::args::Paths> = None;
@@ -595,10 +607,13 @@ pub fn run(
     // names, or an empty one for a precompiled plan, which names none.
     let mut series_entry: Option<Option<TaskName>> = None;
     let mut playbook = false;
+    let mut prior: Option<Prior> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
-                let (prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
+                let state = crate::cli::setup::state_dir(m);
+                let resumed = resume.then(|| RunStart::read(&state)).transpose()?;
+                let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
                     m,
                     params,
                     compute_driver,
@@ -609,6 +624,12 @@ pub fn run(
                 playbook = loaded.workflow.as_ref().is_some_and(|w| {
                     w.workflow_type == crate::plan::workflow::WorkflowType::Playbook
                 });
+                if resume && !playbook {
+                    return Err(ResumeNeedsPlaybook {
+                        manifest: m.display().to_string(),
+                    }
+                    .into());
+                }
                 if playbook {
                     series_entry = Some(None);
                     let missing = match (ceilings.usd, ceilings.wall_clock) {
@@ -655,6 +676,24 @@ pub fn run(
                 if let Some(usd) = ceilings.usd {
                     plan = plan.with_budget(usd)?;
                 }
+                match resumed {
+                    Some(resumed) => {
+                        resumed.continues(run, &plan)?;
+                        crate::cli::setup::restore_pristine(m, &loaded, &resumed.base)?;
+                        prior = Some(crate::plan::resume::fold_log(
+                            &session_log,
+                            &plan,
+                            resumed.elapsed(jiff::Timestamp::now()),
+                        )?);
+                        prepared.take_over();
+                    }
+                    None if playbook => {
+                        let base = crucible_vcs::vcs::head_sha(&prepared.paths.workspace)
+                            .context("reading the workspace's starting commit")?;
+                        RunStart::begin(run, base, &plan).write(&state)?;
+                    }
+                    None => {}
+                }
                 let f = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -694,14 +733,37 @@ pub fn run(
         let mut w = f;
         let _ = writeln!(w, "{}", crate::report::session::encode(ev));
     };
+    // A log that already ends in a shutdown is closed: the run finished, and nothing may follow
+    // its last line.
+    let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
     if let Some(f) = &events {
-        append(
-            f,
-            &crate::plan::events::plan_admitted_event(
-                &plan,
-                series_entry.as_ref().and_then(Option::as_ref),
-            ),
-        );
+        if let Some(prior) = &prior {
+            append(
+                f,
+                &crate::report::session::SessionEvent::Recovery {
+                    class: crucible_contract::session::RecoveryClass::DiedInPlanTask,
+                    iter: 0,
+                    detail: format!(
+                        "{} of {} tasks settled, ${:.4} spent over {} before the interruption",
+                        plan.tasks_topo()
+                            .filter(|t| prior.results.contains_key(&t.name))
+                            .count(),
+                        plan.tasks_topo().count(),
+                        prior.spent_usd(),
+                        crucible::duration::Shown(prior.elapsed),
+                    ),
+                },
+            );
+        }
+        if !prior.as_ref().is_some_and(|p| p.admitted) {
+            append(
+                f,
+                &crate::plan::events::plan_admitted_event(
+                    &plan,
+                    series_entry.as_ref().and_then(Option::as_ref),
+                ),
+            );
+        }
     }
     let selected_results: std::collections::BTreeSet<_> = plan
         .tasks_topo()
@@ -714,11 +776,8 @@ pub fn run(
         })
         .collect();
     let mut report = crucible_contract::RunReport {
-        run: std::env::var(crucible_contract::ENV_RUN_NAME).unwrap_or_else(|_| "local".to_string()),
-        run_url: match (
-            std::env::var("CRUCIBLE_UI_BASE_URL").ok(),
-            std::env::var(crucible_contract::ENV_RUN_NAME).ok(),
-        ) {
+        run: run.to_string(),
+        run_url: match (std::env::var("CRUCIBLE_UI_BASE_URL").ok(), &run_name) {
             (Some(base), Some(run)) => Some(format!("{}/runs/{run}", base.trim_end_matches('/'))),
             _ => None,
         },
@@ -749,6 +808,46 @@ pub fn run(
     write_report(&report);
     let mut statuses: BTreeMap<TaskName, TaskStatus> = BTreeMap::new();
     let mut completed_early = false;
+    let mut observe = |task: &crate::plan::ir::Task, result: &crate::plan::exec::TaskResult| {
+        report.tasks.push(crucible_contract::TaskReport {
+            name: task.name.0.clone(),
+            status: result.status.as_str().to_string(),
+            cost_usd: result.cost_usd,
+            blocked: result
+                .blocked
+                .as_ref()
+                .map(crate::plan::machine::BlockedReason::wire),
+            transport: result.transport,
+        });
+        if let Some(selected) = report.results.get_mut(&task.name.0) {
+            selected.status = result.status.as_str().to_string();
+            selected.output = declared_output(task, result);
+        }
+        statuses.insert(task.name.clone(), result.status);
+        completed_early |= playbook
+            && task.stage == Stage::Iteration
+            && crate::plan::exec::declared_completion(result).is_some();
+        if completed_early
+            || plan
+                .tasks_topo()
+                .filter(|t| t.stage == Stage::Iteration)
+                .all(|t| statuses.contains_key(&t.name))
+        {
+            report.verdict = crucible_contract::RunVerdict::of(required_tasks_held(
+                &plan,
+                |name| match statuses.get(name) {
+                    Some(status) => Some(*status),
+                    None => completed_early.then_some(TaskStatus::NotTaken),
+                },
+            ));
+        }
+        write_report(&report);
+    };
+    if let Some(prior) = &prior {
+        for (task, result) in prior.rows(&plan) {
+            observe(&task, result);
+        }
+    }
     let out = execute(
         &plan,
         &substrate,
@@ -756,43 +855,12 @@ pub fn run(
             wall_clock: ceilings.wall_clock,
             history: Some(&history),
             early_completion: playbook,
+            prior: prior.as_ref(),
             ..ExecCfg::default()
         },
         runner.as_mut(),
         |task, result| {
-            report.tasks.push(crucible_contract::TaskReport {
-                name: task.name.0.clone(),
-                status: result.status.as_str().to_string(),
-                cost_usd: result.cost_usd,
-                blocked: result
-                    .blocked
-                    .as_ref()
-                    .map(crate::plan::machine::BlockedReason::wire),
-                transport: result.transport,
-            });
-            if let Some(selected) = report.results.get_mut(&task.name.0) {
-                selected.status = result.status.as_str().to_string();
-                selected.output = declared_output(task, result);
-            }
-            statuses.insert(task.name.clone(), result.status);
-            completed_early |= playbook
-                && task.stage == Stage::Iteration
-                && crate::plan::exec::declared_completion(result).is_some();
-            if completed_early
-                || plan
-                    .tasks_topo()
-                    .filter(|t| t.stage == Stage::Iteration)
-                    .all(|t| statuses.contains_key(&t.name))
-            {
-                report.verdict =
-                    crucible_contract::RunVerdict::of(required_tasks_held(&plan, |name| {
-                        match statuses.get(name) {
-                            Some(status) => Some(*status),
-                            None => completed_early.then_some(TaskStatus::NotTaken),
-                        }
-                    }));
-            }
-            write_report(&report);
+            observe(task, result);
             if let Some(f) = &events {
                 append(
                     f,
@@ -833,7 +901,9 @@ pub fn run(
             None => format!("completed early by {task}"),
         },
     };
-    if let (Some(f), Some(record)) = (&events, &series_entry) {
+    if let (Some(f), Some(record)) = (&events, &series_entry)
+        && !prior.as_ref().is_some_and(|p| p.recorded_history)
+    {
         append(
             f,
             &crate::report::session::SessionEvent::HistoryEntry {

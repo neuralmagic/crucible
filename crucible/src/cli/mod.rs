@@ -320,6 +320,11 @@ pub(crate) enum PlanAction {
         /// that pins its own model keeps it.
         #[arg(long, requires = "manifest")]
         model: Option<String>,
+        /// Continue the playbook run the manifest's state dir holds: tasks its session log
+        /// settled are not dispatched again, and its spend and elapsed time count against the
+        /// ceilings. The graph compiled now must be the one the run started with.
+        #[arg(long, requires = "manifest")]
+        resume: bool,
     },
 }
 

@@ -161,6 +161,7 @@ fn deploy_render_pack_playbook_matches_render_yaml() {
             pr_repo: None,
             pack: Some(PackDelivery {
                 configmap_name: "crucible-run-42-pack".to_string(),
+                run_name: "roundup".to_string(),
             }),
             clusters_file: None,
             harness: None,
@@ -361,4 +362,50 @@ fn flow_matches_render() {
         let from_lib = render(&input, format).expect("library render");
         assert_eq!(from_cli, from_lib, "{ext}");
     }
+}
+
+/// The controller unpacks every pack into a directory named `pack`, so a render that named the
+/// run after its directory would give every run the same state subtree, and a run resuming from
+/// it would continue whichever run wrote there last.
+#[test]
+fn a_delivered_pack_renders_under_its_run_name_not_its_directory() {
+    let tmp = scratch("run-name");
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).expect("mkdir pack");
+    write_playbook_pack(&pack);
+    let profile = tmp.path().join("profile.toml");
+    std::fs::write(
+        &profile,
+        std::fs::read_to_string(delta_profile())
+            .expect("profile fixture")
+            .replacen(
+                "[cluster]\n",
+                "[cluster]\nstate_pvc = \"shared-state\"\n",
+                1,
+            ),
+    )
+    .expect("profile");
+    let yaml = render_yaml(
+        &pack.join("crucible.toml"),
+        &profile,
+        &RenderOpts {
+            pack: Some(PackDelivery {
+                configmap_name: "crucible-run-7-pack".to_string(),
+                run_name: "crucible-run-7".to_string(),
+            }),
+            playbook: Some(PlaybookLaunch {
+                max_time: "30m".parse().expect("30m is a duration"),
+                max_cost: 1.0,
+                params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+            }),
+            ..RenderOpts::default()
+        },
+    )
+    .expect("render");
+    assert!(yaml.contains("subPath: state/crucible-run-7"), "{yaml}");
+    assert!(
+        yaml.contains("name: CRUCIBLE_RUN_NAME\n      value: crucible-run-7"),
+        "{yaml}"
+    );
+    assert!(!yaml.contains("state/pack"), "{yaml}");
 }

@@ -157,6 +157,10 @@ pub struct PackDelivery {
     /// it, so the two never drift. The controller creates the CM under exactly this name and owner-refs
     /// it to the created pod for cascade GC.
     pub configmap_name: String,
+    /// The run's name, in place of the pack directory's. A delivered pack is unpacked under a
+    /// fixed directory name, so without this every run renders under the same name and shares
+    /// its state subtree and claim.
+    pub run_name: String,
 }
 
 /// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
@@ -588,13 +592,19 @@ impl Renderer<'_> {
         sc
     }
 
-    /// The profile's run-state claim, or None when this render persists nothing. A playbook
-    /// persists none: `plan run` neither resumes nor truncates the session log it appends to.
-    fn state_pvc(&self) -> Option<&crate::deploy::profile::StatePvc> {
-        match self.opts.playbook {
-            Some(_) => None,
-            None => self.profile.cluster.state_pvc.as_ref(),
+    /// Persistent state: a non-empty session log on the mounted claim means an earlier start of
+    /// this run already produced rows, so this start is a continuation, not a fresh run.
+    fn resume_flag(&self) -> &'static str {
+        if self.state_pvc().is_some() {
+            r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
+        } else {
+            ""
         }
+    }
+
+    /// The profile's run-state claim, or None when this render persists nothing.
+    fn state_pvc(&self) -> Option<&crate::deploy::profile::StatePvc> {
+        self.profile.cluster.state_pvc.as_ref()
     }
 
     /// The profile-named existing claim, or `<run>-state` when the profile carries a template.
@@ -1009,9 +1019,10 @@ impl Renderer<'_> {
             };
             let harness_flag = harness_flag(self.opts.harness, '=');
             let model_flag = model_flag(self.opts.model.as_ref(), '=');
+            let resume_flag = self.resume_flag();
             return Ok(format!(
                 r#"D={domain_dir}
-crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}
+crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}{resume_flag}
 rc=$?
 if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
@@ -1044,13 +1055,7 @@ exit $rc
         };
         let harness_flag = harness_flag(self.opts.harness, '=');
         let model_flag = model_flag(self.opts.model.as_ref(), '=');
-        // Persistent state: a non-empty session log on the mounted PVC means a prior pod of this
-        // run already produced rows, so this start is a continuation, not a fresh run.
-        let resume_flag = if self.state_pvc().is_some() {
-            r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
-        } else {
-            ""
-        };
+        let resume_flag = self.resume_flag();
         Ok(format!(
             r#"D={domain_dir}
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
@@ -2576,6 +2581,7 @@ mod tests {
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
+                    run_name: "alpha".to_string(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -2653,6 +2659,7 @@ mod tests {
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "pack-cm-name".to_string(),
+                    run_name: "alpha".to_string(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -4231,19 +4238,9 @@ mod tests {
     /// playbook command carrying none of them.
     #[test]
     fn playbook_render_omits_every_loop_only_flag() {
-        let profile = k8s_profile(
-            r#"results_bucket = "s3://crucible-results"
-            state_pvc = "deepgemm-state"
-            "#,
-        );
+        let profile = k8s_profile(r#"results_bucket = "s3://crucible-results""#);
         let yaml = render_playbook(&profile, playbook_launch());
-        for loop_only in [
-            "--results-bucket",
-            "--pr-repo",
-            "--harness",
-            "--model",
-            "--resume",
-        ] {
+        for loop_only in ["--results-bucket", "--pr-repo", "--harness", "--model"] {
             assert!(
                 !yaml.contains(loop_only),
                 "{loop_only} in a playbook: {yaml}"
@@ -4282,15 +4279,20 @@ mod tests {
         );
     }
 
-    /// `plan run` has no `--resume` and opens the session log in append mode, so a playbook must
-    /// neither restart nor reuse a name-keyed subPath a previous launch already wrote.
+    /// With persistent state a playbook pod survives a crash the way a loop pod does: the kubelet
+    /// restarts it and the wrapper resumes the run the claim holds. Without it the pod stays
+    /// one-shot, since a restart would find nothing to resume.
     #[test]
-    fn playbook_pod_never_restarts_or_mounts_persistent_state() {
+    fn a_playbook_pod_with_persistent_state_restarts_and_resumes() {
         let profile = k8s_profile(r#"state_pvc = "deepgemm-state""#);
         let yaml = render_playbook(&profile, playbook_launch());
-        assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
-        assert!(!yaml.contains("run-state"), "{yaml}");
-        assert!(!yaml.contains("deepgemm-state"), "{yaml}");
+        assert!(yaml.contains("restartPolicy: OnFailure"), "{yaml}");
+        assert!(yaml.contains("claimName: deepgemm-state"), "{yaml}");
+        assert!(yaml.contains("subPath: state/alpha"), "{yaml}");
+        assert!(
+            yaml.contains(r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#),
+            "{yaml}"
+        );
 
         let templated = k8s_profile(
             r#"[cluster.state_pvc]
@@ -4299,9 +4301,13 @@ mod tests {
             "#,
         );
         let yaml = render_playbook(&templated, playbook_launch());
-        assert!(!yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
+        assert!(yaml.contains("kind: PersistentVolumeClaim"), "{yaml}");
+        assert!(yaml.contains("claimName: alpha-state"), "{yaml}");
 
-        assert!(render_k8s(&profile).contains("restartPolicy: OnFailure"));
+        let yaml = render_playbook(&k8s_profile(""), playbook_launch());
+        assert!(yaml.contains("restartPolicy: Never"), "{yaml}");
+        assert!(!yaml.contains("--resume"), "{yaml}");
+        assert!(!yaml.contains("run-state"), "{yaml}");
     }
 
     /// The two shapes a playbook pack actually takes must render: no `[deploy]` block, and (for a
@@ -4363,6 +4369,7 @@ mod tests {
                 pr_repo: None,
                 pack: Some(PackDelivery {
                     configmap_name: "alpha-pack".to_string(),
+                    run_name: "alpha".to_string(),
                 }),
                 clusters_file: None,
                 harness: None,

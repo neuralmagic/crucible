@@ -152,6 +152,24 @@ poem pass
 check pass
 ```
 
+## If the run is interrupted
+
+`plan run --resume` continues the run in `state/`:
+
+```sh
+crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m --resume
+```
+
+Tasks the session log already settled do not run again, including single items of a fan-out
+and single rounds of a revise loop. The workspace goes back to the commit the run started
+from, so a later task sees what earlier tasks declared in `emits_files`, not what they left in
+the tree. Spend and elapsed time from before the interruption count against the ceilings, and
+elapsed time includes the time the run was down. A resume refuses a pack, parameter, or
+`--max-cost` that differs from the run's start, and a run that already shut down only
+exits with its verdict again.
+
+A deployed pod does this itself when its profile sets `[cluster] state_pvc`.
+
 ## Put a real agent on it
 
 Drop `agent_cmd` and pick a backend:

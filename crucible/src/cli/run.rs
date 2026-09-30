@@ -213,6 +213,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 compute_driver,
                 harness,
                 model,
+                resume,
             } => {
                 let _engine = crate::agent::engine::EngineCtx::new()?;
                 crate::plan::cli::run(
@@ -234,6 +235,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                             harness: *harness,
                             model: model.clone(),
                         },
+                        resume: *resume,
                     },
                 )
             }
@@ -287,18 +289,22 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             crate::cli::DeployAction::RenderTurn(_) => unreachable!("handled above"),
         };
         let pack = args.pack.then(|| {
-            // Default the CM name from the pack dir basename; the controller passes a run-unique one.
-            let configmap_name = args.pack_configmap_name.clone().unwrap_or_else(|| {
-                let domain = args
-                    .manifest
-                    .as_deref()
-                    .and_then(Path::parent)
-                    .and_then(Path::file_name)
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("pack");
-                format!("{domain}-pack")
-            });
-            deploy::PackDelivery { configmap_name }
+            // A hand render names the run and its CM after the pack dir; the controller passes
+            // run-unique names.
+            let domain = args
+                .manifest
+                .as_deref()
+                .and_then(Path::parent)
+                .and_then(Path::file_name)
+                .and_then(|n| n.to_str())
+                .unwrap_or("pack");
+            deploy::PackDelivery {
+                configmap_name: args
+                    .pack_configmap_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{domain}-pack")),
+                run_name: domain.to_string(),
+            }
         });
         let playbook = playbook_launch(&args)?;
         let opts = deploy::RenderOpts {
