@@ -62,7 +62,7 @@ describe('diffParamsSchemas', () => {
   /// A schema the form cannot render cannot be diffed either, and saying "no change" about one
   /// would be a lie the importer would act on.
   it('refuses to compare a schema outside the rendered subset', () => {
-    const diff = diffParamsSchemas(schema({ topic: { type: 'number' } }), schema({}));
+    const diff = diffParamsSchemas(schema({ topic: { type: 'object' } }), schema({}));
     expect(diff.comparable).toBe(false);
     expect(diffIsEmpty(diff)).toBe(true);
 

@@ -4,6 +4,7 @@ pub(crate) mod emissions;
 pub(crate) mod playbook_runs;
 pub(crate) mod schedules;
 pub(crate) mod watches;
+pub(crate) mod webhooks;
 
 use crate::api::dto::not_found;
 use crate::api::state::{ApiState, AppError};

@@ -1,6 +1,6 @@
 import { Mono } from '../ui';
 import { FormGrid, TextField } from './formControls';
-import type { ParamFieldSpec } from './playbookLaunchForm';
+import { spellingOf, type ParamFieldSpec } from './playbookLaunchForm';
 
 export interface PlaybookParamFieldsProps {
   idPrefix: string;
@@ -39,7 +39,10 @@ export function PlaybookParamFields({
             onBlur(spec.name);
           }}
           error={errors.get(spec.name) ?? null}
-          hint={spec.description ?? (spec.pattern !== null ? `Must match ${spec.pattern}` : undefined)}
+          hint={
+            spec.description ??
+            (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined))
+          }
         />
       ))}
     </FormGrid>

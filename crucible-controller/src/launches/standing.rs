@@ -287,9 +287,9 @@ pub(crate) async fn authorized(
 /// What one firing adds to the stored authorization.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Firing<'a> {
-    /// A param the trigger supplies per firing (a cursor value, an item identifier), overlaid on
-    /// the stored ones and validated with them.
-    pub overlay: Option<(&'a str, &'a str)>,
+    /// The params the trigger supplies per firing (a cursor value, an item identifier, values a
+    /// delivery derived), overlaid on the stored ones and validated with them.
+    pub overlay: &'a serde_json::Map<String, serde_json::Value>,
     pub origin: LaunchOrigin,
     /// The schedule whose cursor the run may advance; `None` moves nothing.
     pub dedupe_schedule: Option<&'a str>,
@@ -301,11 +301,37 @@ pub(crate) struct Firing<'a> {
 /// not authorize it. The trigger wraps this in its own park reason.
 pub(crate) type StaleOwner = Option<String>;
 
+/// Why a firing did not launch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureCause {
+    /// The target schema refused a value only the trigger's overlay supplied.
+    Overlay,
+    /// Anything else: the pack is gone, the stored params drifted, the policy refused, or a write
+    /// failed.
+    Firing,
+}
+
+/// A firing that did not launch: the message it is recorded under, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FireError {
+    pub message: String,
+    pub cause: FailureCause,
+}
+
+impl From<String> for FireError {
+    fn from(message: String) -> Self {
+        FireError {
+            message,
+            cause: FailureCause::Firing,
+        }
+    }
+}
+
 /// Mint the launch for a locked core row on the trigger's transaction: the launch row, its
 /// dispatch and agent columns, and the adopted tarball copy. `exposure` is the disclosure the
 /// launch row records: a draft-head firing's recomputed one, absent for an adopted pack whose
-/// disclosure is the registry row's. Returns how the owner snapshot stands; an `Err` is the
-/// message the trigger records as a firing failure.
+/// disclosure is the registry row's. Returns how the owner snapshot stands; an `Err` is what the
+/// trigger records as a firing failure.
 pub(crate) async fn fire(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     row: &Authorized,
@@ -314,14 +340,15 @@ pub(crate) async fn fire(
     key: &str,
     now: Timestamp,
     owner_ttl: std::time::Duration,
-) -> Result<StaleOwner, String> {
+) -> Result<StaleOwner, FireError> {
     let core = &row.core;
     let noun = format!("standing launch {}", core.id);
     let (Some(description), Some(schema)) = (row.description.as_deref(), &row.params_schema) else {
         return Err(format!(
             "{noun} names playbook {}, which is no longer registered",
             core.playbook
-        ));
+        )
+        .into());
     };
     let max_time =
         MaxTime::parse(&core.max_time).map_err(|e| format!("{noun} stored max_time: {e}"))?;
@@ -351,9 +378,10 @@ pub(crate) async fn fire(
             return Err(format!(
                 "{noun} names playbook {}, which is no longer registered",
                 core.playbook
-            ));
+            )
+            .into());
         }
-        Err(e) => return Err(format!("{noun} launch insert: {e:#}")),
+        Err(e) => return Err(format!("{noun} launch insert: {e:#}").into()),
     }
     crate::issues::store::set_dispatch_target(&mut **tx, key, core.dispatch_target.as_deref())
         .await
@@ -375,7 +403,7 @@ pub(crate) async fn fire(
             row.adopted_tar_digest.as_ref(),
             row.adopted_tar_bytes,
         ) else {
-            return Err(format!("{noun} has no adopted pack"));
+            return Err(format!("{noun} has no adopted pack").into());
         };
         let slug = crate::model::sanitize_key(key);
         sqlx::query(
@@ -407,18 +435,18 @@ pub(crate) async fn fire(
     Ok(binds.then(|| owner_stale(core, now, owner_ttl)).flatten())
 }
 
-/// The values this firing launches with, after overlaying the trigger's per-firing param. The
+/// The values this firing launches with, after overlaying the trigger's per-firing params. The
 /// complete object goes back through the exact adopted or draft-version schema, so schema drift
-/// or an invalid overlay becomes a firing failure that counts toward auto-disable rather than an
-/// invalid launch.
+/// or an invalid overlay becomes a firing failure rather than an invalid launch. The refusal is
+/// the overlay's when every refused field is one the overlay supplied.
 fn overlaid_params(
     core: &Standing,
     schema: &serde_json::Value,
-    overlay: Option<(&str, &str)>,
-) -> Result<serde_json::Value, String> {
+    overlay: &serde_json::Map<String, serde_json::Value>,
+) -> Result<serde_json::Value, FireError> {
     let mut values = crate::launches::store::stored_params(&core.params);
-    if let Some((param, value)) = overlay {
-        values.insert(param.to_string(), value.to_string());
+    for (param, value) in overlay {
+        values.insert(param.clone(), crate::launches::store::stored_value(value));
     }
     crate::playbooks::registry::validate_params(schema, &values).map_err(|fields| {
         let detail = fields
@@ -426,10 +454,18 @@ fn overlaid_params(
             .map(|f| format!("{}: {}", f.field, f.message))
             .collect::<Vec<_>>()
             .join("; ");
-        format!(
-            "standing launch {} parameters were refused by playbook {}: {detail}",
-            core.id, core.playbook
-        )
+        let cause = if fields.iter().all(|f| overlay.contains_key(&f.field)) {
+            FailureCause::Overlay
+        } else {
+            FailureCause::Firing
+        };
+        FireError {
+            message: format!(
+                "standing launch {} parameters were refused by playbook {}: {detail}",
+                core.id, core.playbook
+            ),
+            cause,
+        }
     })
 }
 
@@ -774,6 +810,10 @@ pub(crate) async fn expire_stale_owner_parks(
             EXPIRE,
             " (SELECT launch_key FROM playbook_watch_hits WHERE watch_id = $2) RETURNING key"
         ),
+        Trigger::Webhook => const_format::concatcp!(
+            EXPIRE,
+            " (SELECT launch_key FROM playbook_webhook_keys WHERE webhook_id = $2) RETURNING key"
+        ),
     };
     sqlx::query_scalar(sql)
         .bind(&prefix)
@@ -814,8 +854,8 @@ impl Recorded {
 #[derive(Debug, Clone)]
 pub struct Claim {
     pub id: String,
-    /// A param the trigger supplies per firing, overlaid on the stored ones.
-    pub overlay: Option<(String, String)>,
+    /// The params the trigger supplies per firing, overlaid on the stored ones.
+    pub overlay: serde_json::Map<String, serde_json::Value>,
     /// The schedule whose cursor the run may advance.
     pub dedupe_schedule: Option<String>,
     /// The launch title; `None` uses the pack's description.
@@ -834,7 +874,7 @@ impl Claim {
     pub(crate) fn new(id: &str, note: String) -> Self {
         Claim {
             id: id.to_string(),
-            overlay: None,
+            overlay: serde_json::Map::new(),
             dedupe_schedule: None,
             title: None,
             subject: None,
@@ -845,13 +885,28 @@ impl Claim {
     }
 }
 
-/// What a trigger does with a claim that could not fire. The core counts every failure; the
-/// trigger decides whether the row is also out of windows to wait for.
+/// What a trigger does with a claim that could not fire: whether the failure counts against the
+/// row, and whether the row is also out of windows to wait for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Failed {
+    /// The failure counts toward auto-disable and skips the row's other claims this pass. A
+    /// trigger that settled the failure on its own sidecar returns `false`.
+    pub counts: bool,
     pub force_disable: bool,
     /// The trigger already recorded the transition on its own key; the core stays quiet.
     pub announced: bool,
+}
+
+/// What [`LaunchTrigger::claim`] did with one firing.
+#[derive(Debug)]
+pub enum Claimed {
+    /// The firing is this sweep's to launch.
+    Taken,
+    /// Another sweep already took it.
+    Lost,
+    /// The trigger settled it without a launch (filtered, a duplicate, over a rate bound). The
+    /// core commits the trigger's writes and records these events; nothing is minted or counted.
+    Settled(Vec<Recorded>),
 }
 
 /// A future a trigger method returns; it may borrow the sweep's transaction.
@@ -874,13 +929,13 @@ pub trait LaunchTrigger: Send + Sync {
         now: Timestamp,
     ) -> TriggerFuture<'a, Result<Vec<Claim>>>;
 
-    /// Claim one firing on the sweep's transaction; `false` when another sweep already did.
+    /// Claim one firing on the sweep's transaction.
     fn claim<'a, 'c>(
         &'a self,
         tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
         claim: &'a mut Claim,
         now: Timestamp,
-    ) -> TriggerFuture<'a, Result<bool>>;
+    ) -> TriggerFuture<'a, Result<Claimed>>;
 
     /// The sidecar bookkeeping after the launch was minted, on the same transaction: the next
     /// window, the launch key, the watermark. Returns extra events to record beside the launch's.
@@ -902,7 +957,7 @@ pub trait LaunchTrigger: Send + Sync {
         &'a self,
         db: &'a Db,
         claim: &'a Claim,
-        message: &'a str,
+        error: &'a FireError,
         now: Timestamp,
     ) -> TriggerFuture<'a, Result<Failed>>;
 }
@@ -951,9 +1006,22 @@ pub(crate) async fn sweep(
             continue;
         }
         let mut tx = db.pool().begin().await.context("sweep: begin")?;
-        if !trigger.claim(&mut tx, &mut claim, now).await? {
-            tx.rollback().await.context("sweep: rollback")?;
-            continue;
+        match trigger.claim(&mut tx, &mut claim, now).await? {
+            Claimed::Taken => {}
+            Claimed::Lost => {
+                tx.rollback().await.context("sweep: rollback")?;
+                continue;
+            }
+            Claimed::Settled(events) => {
+                for event in &events {
+                    crate::event_log::insert(&mut *tx, &event.event()).await?;
+                }
+                tx.commit().await.context("sweep: commit")?;
+                for event in &events {
+                    db.events().publish(&event.event());
+                }
+                continue;
+            }
         }
         match fire_claim(
             &mut tx,
@@ -998,14 +1066,17 @@ pub(crate) async fn sweep(
                     None => fired.push(outcome.key),
                 }
             }
-            Err(message) => {
+            Err(error) => {
                 tx.rollback().await.context("sweep: rollback")?;
-                let failed = trigger.fail(db, &claim, &message, now).await?;
+                let failed = trigger.fail(db, &claim, &error, now).await?;
+                if !failed.counts {
+                    continue;
+                }
                 let state = record_failure(
                     db,
                     kind,
                     &claim.id,
-                    &message,
+                    &error.message,
                     cfg.auto_disable_after,
                     failed.force_disable,
                     !failed.announced,
@@ -1028,7 +1099,7 @@ struct Fired {
 }
 
 /// One claimed firing on its transaction: lock the core row, mint the launch, let the trigger
-/// settle its sidecar, and record the events. `Err` is the message the failure is recorded under.
+/// settle its sidecar, and record the events. `Err` is what the failure is recorded under.
 async fn fire_claim(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     pool: &PgPool,
@@ -1037,7 +1108,7 @@ async fn fire_claim(
     now: Timestamp,
     owner_ttl: std::time::Duration,
     policy: Option<&crate::authz::policy::ActivePolicy>,
-) -> Result<Fired, String> {
+) -> Result<Fired, FireError> {
     let kind = trigger.trigger();
     let noun = format!("{} {}", kind.as_str(), claim.id);
     let authorized = authorized(tx, &claim.id)
@@ -1064,7 +1135,8 @@ async fn fire_claim(
                     .as_deref()
                     .unwrap_or("the platform"),
                 decision.reason()
-            ));
+            )
+            .into());
         }
     }
     let key = format!(
@@ -1078,10 +1150,7 @@ async fn fire_claim(
         _ => None,
     };
     let firing = Firing {
-        overlay: claim
-            .overlay
-            .as_ref()
-            .map(|(p, v)| (p.as_str(), v.as_str())),
+        overlay: &claim.overlay,
         origin: kind.origin(),
         dedupe_schedule: claim.dedupe_schedule.as_deref(),
         title: subject.as_deref(),
@@ -1195,5 +1264,329 @@ impl DiscoverySource for TriggerSweep {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::client::Db;
+    use crate::launches::standing::{
+        self, Claim, Claimed, Failed, FailureCause, FireError, LaunchTrigger, NewStanding,
+        Recorded, SweepCfg, TriggerFuture,
+    };
+    use crate::model::{MaxTime, Trigger};
+    use anyhow::Result;
+    use jiff::Timestamp;
+    use sqlx::{PgPool, Row};
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy)]
+    enum Script {
+        Take,
+        Lose,
+        Settle,
+    }
+
+    /// A trigger that offers one firing with a fixed overlay and claims it as scripted. It writes
+    /// a marker on the core row inside the claim, so a test can tell a committed claim from a
+    /// rolled-back one, and counts only failures that are not the overlay's.
+    struct Scripted {
+        script: Script,
+        overlay: serde_json::Map<String, serde_json::Value>,
+        failures: Mutex<Vec<FailureCause>>,
+    }
+
+    impl Scripted {
+        fn new(script: Script, overlay: serde_json::Value) -> Self {
+            Scripted {
+                script,
+                overlay: overlay.as_object().cloned().unwrap_or_default(),
+                failures: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failures(&self) -> Vec<FailureCause> {
+            self.failures.lock().expect("lock").clone()
+        }
+    }
+
+    impl LaunchTrigger for Scripted {
+        fn trigger(&self) -> Trigger {
+            Trigger::Watch
+        }
+
+        fn due<'a>(
+            &'a self,
+            _db: &'a Db,
+            _cfg: SweepCfg,
+            _now: Timestamp,
+        ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
+            Box::pin(async move {
+                let mut claim = Claim::new(STANDING, "scripted firing".to_string());
+                claim.overlay = self.overlay.clone();
+                Ok(vec![claim])
+            })
+        }
+
+        fn claim<'a, 'c>(
+            &'a self,
+            tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+            claim: &'a mut Claim,
+            _now: Timestamp,
+        ) -> TriggerFuture<'a, Result<Claimed>> {
+            Box::pin(async move {
+                sqlx::query("UPDATE playbook_standing_launches SET updated_at = $2 WHERE id = $1")
+                    .bind(&claim.id)
+                    .bind(format!("{:?}", self.script))
+                    .execute(&mut **tx)
+                    .await?;
+                Ok(match self.script {
+                    Script::Take => Claimed::Taken,
+                    Script::Lose => Claimed::Lost,
+                    Script::Settle => Claimed::Settled(vec![Recorded {
+                        key: format!("scripted:{}", claim.id),
+                        from: "due",
+                        to: "filtered",
+                        reason: Some("the filter did not match".to_string()),
+                        evidence: None,
+                        actor: None,
+                    }]),
+                })
+            })
+        }
+
+        fn settle<'a, 'c>(
+            &'a self,
+            _tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+            _claim: &'a Claim,
+            _key: &'a str,
+            _now: Timestamp,
+        ) -> TriggerFuture<'a, Result<Vec<Recorded>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn fail<'a>(
+            &'a self,
+            _db: &'a Db,
+            _claim: &'a Claim,
+            error: &'a FireError,
+            _now: Timestamp,
+        ) -> TriggerFuture<'a, Result<Failed>> {
+            Box::pin(async move {
+                self.failures.lock().expect("lock").push(error.cause);
+                Ok(Failed {
+                    counts: error.cause != FailureCause::Overlay,
+                    force_disable: false,
+                    announced: false,
+                })
+            })
+        }
+    }
+
+    const STANDING: &str = "standing-1";
+
+    async fn register(pool: &PgPool) {
+        sqlx::query(
+            r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz,
+                                      tar_digest, tar_bytes, params_schema, schema_digest,
+                                      core_rev, created_by, created_at, updated_at)
+               VALUES ('backport', 'Evidence-gated backport', 'neuralmagic/crucible',
+                       'main', 'abc123', 'domains/backport', $1, 'sha256:tar', 3,
+                       $2::jsonb, 'sha256:schema', 'core1', 'tms',
+                       '2026-08-26T00:00:00Z', '2026-08-26T00:00:00Z')"#,
+        )
+        .bind(vec![1u8, 2, 3])
+        .bind(
+            serde_json::json!({
+                "type": "object",
+                "required": ["jira_key"],
+                "additionalProperties": false,
+                "properties": {
+                    "jira_key": {"type": "string", "pattern": "^[A-Z][A-Z0-9]*-[0-9]+$"},
+                    "release": {"type": "string"},
+                    "count": {"type": "string", "pattern": "^[0-9]+$"}
+                }
+            })
+            .to_string(),
+        )
+        .execute(pool)
+        .await
+        .expect("register");
+    }
+
+    async fn standing_with(pool: &PgPool, params: serde_json::Value) {
+        let max_time = MaxTime::parse("4h").expect("duration");
+        let mut tx = pool.begin().await.expect("begin");
+        standing::insert(
+            &mut tx,
+            STANDING,
+            Trigger::Watch,
+            &NewStanding {
+                playbook: "backport",
+                target_kind: "adopted",
+                eligible_draft_version: None,
+                params: &params,
+                schema_digest: "sha256:schema",
+                max_cost: 25.0,
+                max_time: &max_time,
+                advance_dedupe: false,
+                enabled: true,
+                created_by: Some("tms"),
+                owner_principal: None,
+                owner_groups: None,
+                dispatch_target: None,
+                agent_provider: None,
+                agent_model: None,
+            },
+            "2026-08-26T00:00:00Z",
+        )
+        .await
+        .expect("insert standing");
+        tx.commit().await.expect("commit");
+    }
+
+    fn cfg() -> SweepCfg {
+        SweepCfg {
+            auto_disable_after: 5,
+            owner_ttl: std::time::Duration::from_secs(3600),
+        }
+    }
+
+    async fn run(pool: &PgPool, trigger: &Scripted) -> Vec<String> {
+        standing::sweep(
+            &Db::new(pool.clone()),
+            trigger,
+            cfg(),
+            Timestamp::now(),
+            None,
+            None,
+        )
+        .await
+        .expect("sweep")
+    }
+
+    async fn launch_params(pool: &PgPool) -> Vec<serde_json::Value> {
+        sqlx::query("SELECT params FROM playbook_launches ORDER BY created_at, key")
+            .fetch_all(pool)
+            .await
+            .expect("launches")
+            .into_iter()
+            .map(|r| r.get("params"))
+            .collect()
+    }
+
+    async fn core_state(pool: &PgPool) -> (i64, String) {
+        let row = sqlx::query(
+            "SELECT consecutive_failures, updated_at FROM playbook_standing_launches WHERE id = $1",
+        )
+        .bind(STANDING)
+        .fetch_one(pool)
+        .await
+        .expect("core row");
+        (row.get("consecutive_failures"), row.get("updated_at"))
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_overlay_map_launches_every_param_in_stored_form(pool: PgPool) {
+        register(&pool).await;
+        standing_with(&pool, serde_json::json!({"release": "3.2"})).await;
+        let trigger = Scripted::new(
+            Script::Take,
+            serde_json::json!({"jira_key": "ACME-1", "count": 7, "release": "3.3"}),
+        );
+
+        let minted = run(&pool, &trigger).await;
+
+        assert_eq!(minted.len(), 1);
+        assert_eq!(
+            launch_params(&pool).await,
+            vec![serde_json::json!({"jira_key": "ACME-1", "count": "7", "release": "3.3"})],
+            "every overlay param lands, a number in its JSON string form, and an overlay \
+             param replaces the stored one"
+        );
+        assert!(trigger.failures().is_empty());
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_settled_claim_commits_without_a_launch(pool: PgPool) {
+        register(&pool).await;
+        standing_with(&pool, serde_json::json!({})).await;
+        let trigger = Scripted::new(Script::Settle, serde_json::json!({"jira_key": "ACME-1"}));
+
+        let minted = run(&pool, &trigger).await;
+
+        assert!(minted.is_empty());
+        assert!(launch_params(&pool).await.is_empty());
+        assert_eq!(
+            core_state(&pool).await,
+            (0, "Settle".to_string()),
+            "the trigger's writes commit and nothing is counted"
+        );
+        let to: String = sqlx::query_scalar("SELECT to_status FROM events WHERE key = $1")
+            .bind(format!("scripted:{STANDING}"))
+            .fetch_one(&pool)
+            .await
+            .expect("the settlement's event is recorded");
+        assert_eq!(to, "filtered");
+        assert!(trigger.failures().is_empty());
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_lost_claim_rolls_back_its_writes(pool: PgPool) {
+        register(&pool).await;
+        standing_with(&pool, serde_json::json!({})).await;
+        let trigger = Scripted::new(Script::Lose, serde_json::json!({"jira_key": "ACME-1"}));
+
+        assert!(run(&pool, &trigger).await.is_empty());
+        assert!(launch_params(&pool).await.is_empty());
+        assert_eq!(core_state(&pool).await.1, "2026-08-26T00:00:00Z");
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_overlay_refusal_reaches_the_trigger_as_the_overlays(pool: PgPool) {
+        register(&pool).await;
+        standing_with(&pool, serde_json::json!({"release": "3.2"})).await;
+        let trigger = Scripted::new(
+            Script::Take,
+            serde_json::json!({"jira_key": "not a key", "count": "seven"}),
+        );
+
+        assert!(run(&pool, &trigger).await.is_empty());
+
+        assert_eq!(trigger.failures(), vec![FailureCause::Overlay]);
+        assert!(launch_params(&pool).await.is_empty());
+        assert_eq!(
+            core_state(&pool).await,
+            (0, "2026-08-26T00:00:00Z".to_string()),
+            "the claim rolled back and a trigger that does not count it leaves the row alone"
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn stored_param_drift_is_a_firing_failure_that_counts(pool: PgPool) {
+        register(&pool).await;
+        standing_with(&pool, serde_json::json!({"release": "3.2", "retired": "x"})).await;
+        let trigger = Scripted::new(Script::Take, serde_json::json!({"jira_key": "ACME-1"}));
+
+        assert!(run(&pool, &trigger).await.is_empty());
+
+        assert_eq!(trigger.failures(), vec![FailureCause::Firing]);
+        assert_eq!(core_state(&pool).await.0, 1);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refusal_of_both_overlay_and_stored_params_is_a_firing_failure(pool: PgPool) {
+        register(&pool).await;
+        standing_with(&pool, serde_json::json!({"retired": "x"})).await;
+        let trigger = Scripted::new(Script::Take, serde_json::json!({"jira_key": "not a key"}));
+
+        assert!(run(&pool, &trigger).await.is_empty());
+
+        assert_eq!(
+            trigger.failures(),
+            vec![FailureCause::Firing],
+            "a refusal the overlay did not cause alone is the row's, not the sender's"
+        );
+        assert_eq!(core_state(&pool).await.0, 1);
     }
 }

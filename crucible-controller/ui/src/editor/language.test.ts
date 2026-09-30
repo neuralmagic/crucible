@@ -10,6 +10,7 @@ describe('languageOf', () => {
     expect(languageOf('settle.sh')).toBe('shell');
     expect(languageOf('deploy.yaml')).toBe('yaml');
     expect(languageOf('policy/edit.cedar')).toBe('cedar');
+    expect(languageOf('webhook/filter.cel')).toBe('cel');
     expect(languageOf('stored/policy/history/0123abcd.CEDAR')).toBe('cedar');
   });
 

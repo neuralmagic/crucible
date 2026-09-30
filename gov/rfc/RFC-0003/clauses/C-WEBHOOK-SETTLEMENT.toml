@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-WEBHOOK-SETTLEMENT"
+title = "Webhook settlement"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "Recorded deliveries to one webhook MUST settle in the order they were recorded, each to exactly one outcome of launched, filtered, duplicate, throttled, or failed, with the reason, and a delivery MUST NOT launch after it settles to any outcome but launched. Settlement MUST apply these steps in order, stopping at the first that settles: parsing the body as JSON (failed); the filter (filtered, or failed if it cannot be evaluated); deriving the deduplication key (failed); a consumed key (duplicate); the rate bound (throttled); deriving parameters and deciding the firing (failed); launching (launched). A webhook MUST launch only by firing its standing launch, decided under [[RFC-0003:C-DECISION]] as that standing launch's firing; a webhook firing has no submitter, and a firing the decision denies MUST settle failed with the decision's reason. A webhook MUST fire the playbook revision its standing launch pins and MUST NOT fire a draft, and a launch it mints MUST record the delivery that produced it. A key is consumed only by a delivery that settles launched, and a later delivery to the same webhook carrying a consumed key MUST settle duplicate for as long as the webhook exists; removing a delivery record MUST NOT release its key. Every webhook MUST carry a finite maximum number of launches in any 60-minute window, set by its owner and no greater than a platform maximum. Every value a webhook derives from a delivery MUST reach a run only as a parameter value that did not originate inside the pack under [[RFC-0002:C-PLAYBOOK-PARAMS]]; a run principal MUST NOT hold `read` on a webhook or a webhook delivery, whatever [[RFC-0003:C-RUN-PRINCIPAL]] grants on its launch's children. A settled delivery's outcome and reason, and its recorded body and headers, MUST be retrievable under the webhook's read scope for at least a retention period the webhook declares, no longer than a platform maximum, and are removed with the webhook. The recorded headers and address MUST exclude any header value or path segment that carries the webhook's secret or a previous secret."

@@ -122,6 +122,18 @@ pub(crate) mod tests;
         crate::launches::api::watches::set_watch_enabled,
         crate::launches::api::watches::list_watch_hits,
         crate::launches::api::watches::reset_watch_hit,
+        crate::launches::api::webhooks::create_webhook,
+        crate::launches::api::webhooks::list_webhooks,
+        crate::launches::api::webhooks::list_webhook_presets,
+        crate::launches::api::webhooks::preview_webhook,
+        crate::launches::api::webhooks::check_webhook,
+        crate::launches::api::webhooks::webhook_cel_language,
+        crate::launches::api::webhooks::get_webhook,
+        crate::launches::api::webhooks::update_webhook,
+        crate::launches::api::webhooks::delete_webhook,
+        crate::launches::api::webhooks::set_webhook_enabled,
+        crate::launches::api::webhooks::rotate_webhook_secret,
+        crate::launches::api::webhooks::list_webhook_deliveries,
         crate::launches::api::emissions::emit_run,
         crate::runs::api::external_runs::put_external_run_session,
         crate::daemon::api::overrides::get_config,
@@ -291,6 +303,20 @@ pub(crate) mod tests;
         crate::launches::api::watches::WatchPreviewBody,
         crate::launches::api::watches::WatchPreviewDto,
         crate::launches::api::watches::TrackersDto,
+        crate::launches::api::webhooks::WebhookDto,
+        crate::launches::api::webhooks::WebhookBody,
+        crate::launches::api::webhooks::WebhookSecretDto,
+        crate::launches::api::webhooks::WebhookDeliveryDto,
+        crate::launches::api::webhooks::WebhookEnabledBody,
+        crate::launches::api::webhooks::WebhookPreviewBody,
+        crate::launches::api::webhooks::WebhookPreviewDto,
+        crate::launches::api::webhooks::PreviewResultDto,
+        crate::launches::api::webhooks::WebhookPresetDto,
+        crate::launches::api::webhooks::WebhookCheckBody,
+        crate::launches::api::webhooks::WebhookCheckDto,
+        crate::launches::api::webhooks::CelDiagnosticDto,
+        crate::launches::api::webhooks::CelFunctionDto,
+        crate::launches::api::webhooks::CelLanguageDto,
         dto::ValidationErrorBody,
         crate::playbooks::registry::FieldError,
         ErrorBody,
@@ -515,6 +541,30 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(crate::launches::api::watches::set_watch_enabled))
         .routes(routes!(crate::launches::api::watches::list_watch_hits))
         .routes(routes!(crate::launches::api::watches::reset_watch_hit))
+        .routes(routes!(
+            crate::launches::api::webhooks::create_webhook,
+            crate::launches::api::webhooks::list_webhooks
+        ))
+        .routes(routes!(
+            crate::launches::api::webhooks::list_webhook_presets
+        ))
+        .routes(routes!(crate::launches::api::webhooks::preview_webhook))
+        .routes(routes!(crate::launches::api::webhooks::check_webhook))
+        .routes(routes!(
+            crate::launches::api::webhooks::webhook_cel_language
+        ))
+        .routes(routes!(
+            crate::launches::api::webhooks::get_webhook,
+            crate::launches::api::webhooks::update_webhook,
+            crate::launches::api::webhooks::delete_webhook
+        ))
+        .routes(routes!(crate::launches::api::webhooks::set_webhook_enabled))
+        .routes(routes!(
+            crate::launches::api::webhooks::rotate_webhook_secret
+        ))
+        .routes(routes!(
+            crate::launches::api::webhooks::list_webhook_deliveries
+        ))
         .routes(routes!(crate::launches::api::emissions::emit_run))
         .routes(routes!(
             crate::runs::api::external_runs::put_external_run_session

@@ -216,6 +216,20 @@ pub struct WatchArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WebhookArgs {
+    /// Webhook id, as `crucible_webhooks` lists it.
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WebhookDeliveriesArgs {
+    /// Webhook id, as `crucible_webhooks` lists it.
+    pub id: String,
+    #[serde(default)]
+    pub json: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct JsonOnlyArgs {
     #[serde(default)]
     pub json: bool,
@@ -915,6 +929,32 @@ impl CrucibleMcp {
     }
 
     #[tool(
+        description = "Webhooks: ID PLAYBOOK VERIFIER STATE RATE DELIVERED FAILS OWNER. A webhook \
+        launches its playbook from deliveries a sender outside the controller posts. STATE is \
+        `blocked` when the owner must sign in again."
+    )]
+    async fn crucible_webhooks(&self, Parameters(a): Parameters<JsonOnlyArgs>) -> String {
+        flatten(ops::webhooks(&self.client, a.json).await)
+    }
+
+    #[tool(description = "One webhook with its verifier, transform, and authorization, as JSON.")]
+    async fn crucible_webhook(&self, Parameters(a): Parameters<WebhookArgs>) -> String {
+        flatten(ops::webhook(&self.client, &a.id).await)
+    }
+
+    #[tool(
+        description = "A webhook's recorded deliveries, newest first: ID RECEIVED OUTCOME LAUNCH \
+        REASON. OUTCOME is queued until processed, then launched, filtered, duplicate, \
+        throttled, or failed."
+    )]
+    async fn crucible_webhook_deliveries(
+        &self,
+        Parameters(a): Parameters<WebhookDeliveriesArgs>,
+    ) -> String {
+        flatten(ops::webhook_deliveries(&self.client, &a.id, None, None, a.json).await)
+    }
+
+    #[tool(
         description = "The endpoint and credential this session actually uses, and who the \
         controller says that makes you. Run this first when a mutation 403s."
     )]
@@ -974,7 +1014,7 @@ mod tests {
             .into_iter()
             .map(|t| t.name.to_string())
             .collect();
-        assert_eq!(names.len(), 41, "tools: {names:?}");
+        assert_eq!(names.len(), 44, "tools: {names:?}");
         for required in [
             "crucible_issues",
             "crucible_draft_delete",
@@ -994,6 +1034,9 @@ mod tests {
             "crucible_run_log",
             "crucible_watches",
             "crucible_watch",
+            "crucible_webhooks",
+            "crucible_webhook",
+            "crucible_webhook_deliveries",
             "crucible_contracts",
             "crucible_approve",
             "crucible_approval",
