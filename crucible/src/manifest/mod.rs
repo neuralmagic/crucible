@@ -77,13 +77,15 @@ pub enum ManifestError {
     SandboxImage { name: String },
     #[error(
         "[agent.sandbox.{name}] names secret {secret:?}, which no [[secret]] declares with an env \
-         projection; only an env-projected secret can reach a sandbox"
+         projection; a file secret reaches a sandbox only through a relay listed in `relays`"
     )]
     SandboxSecret { name: String, secret: String },
+    #[error("[agent.sandbox.{name}] names relay {dest:?}, which no [[agent.relay]] declares")]
+    SandboxRelay { name: String, dest: String },
+    #[error("[agent.sandbox.{name}] endpoint: {problem}")]
+    SandboxEndpoint { name: String, problem: String },
     #[error("task {task:?} runs in sandbox {name:?}, which no [agent.sandbox.{name}] declares")]
     UnknownSandbox { task: String, name: String },
-    #[error("task {task:?} names a sandbox, which only the openshell backend runs")]
-    SandboxNeedsOpenshell { task: String },
     #[error("manifest has no [judge] (task mode)")]
     NoJudge,
     #[error("{table} requires a [judge]: a task manifest has no scores to rank, grade, or seed")]
@@ -745,9 +747,10 @@ pub struct AgentCfg {
     pub sandbox: BTreeMap<String, SandboxProfile>,
 }
 
-/// One `[agent.sandbox.<name>]`: the image a task's sandbox starts from, the declared secrets
-/// passed into it (every other declared secret is withheld), and egress endpoints added to
-/// `[agent.openshell]`'s.
+/// One `[agent.sandbox.<name>]`: what the engine provisions into a task's sandbox. The image it
+/// starts from, the declared env secrets and `[[agent.relay]]` files passed in (every other one is
+/// withheld), whether it reaches the broker, and egress endpoints added to `[agent.openshell]`'s.
+/// It does not govern data a task reads from upstream tasks' output.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxProfile {
@@ -755,6 +758,12 @@ pub struct SandboxProfile {
     /// `[[secret]]` names. Empty passes no declared secret in.
     #[serde(default)]
     pub secrets: Vec<String>,
+    /// `[[agent.relay]]` destinations. Empty relays no file in.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// Whether the turn reaches the `[agent.broker]`.
+    #[serde(default)]
+    pub broker: bool,
     #[serde(default)]
     pub endpoints: Vec<String>,
 }
@@ -783,6 +792,22 @@ fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), Ma
                 });
             }
         }
+        for dest in &profile.relays {
+            if !agent.relay.iter().any(|relay| relay.dest == *dest) {
+                return Err(ManifestError::SandboxRelay {
+                    name: name.clone(),
+                    dest: dest.clone(),
+                });
+            }
+        }
+        for endpoint in &profile.endpoints {
+            crate::openshell::grpc::parse_endpoint_spec(endpoint).map_err(|problem| {
+                ManifestError::SandboxEndpoint {
+                    name: name.clone(),
+                    problem: problem.to_string(),
+                }
+            })?;
+        }
     }
     Ok(())
 }
@@ -796,11 +821,6 @@ fn validate_task_sandboxes(agent: &AgentCfg, workflow: &WorkflowCfg) -> Result<(
         else {
             continue;
         };
-        if agent.backend != AgentBackend::Openshell {
-            return Err(ManifestError::SandboxNeedsOpenshell {
-                task: task.name.0.clone(),
-            });
-        }
         if !agent.sandbox.contains_key(name) {
             return Err(ManifestError::UnknownSandbox {
                 task: task.name.0.clone(),
@@ -2554,6 +2574,10 @@ mod tests {
         let go = &m.agent.sandbox["go"];
         assert_eq!(go.image, "ghcr.io/acme/sandbox-go@sha256:bb");
         assert_eq!(go.secrets, ["jira"]);
+        assert!(
+            go.relays.is_empty() && !go.broker,
+            "nothing else unless listed"
+        );
         assert_eq!(go.endpoints, ["proxy.golang.org:443:read-only"]);
         let crate::plan::ir::TaskKind::Agent { sandbox, .. } =
             &m.workflow.as_ref().unwrap().tasks[0].task
@@ -2590,7 +2614,15 @@ mod tests {
             ),
             (
                 "[agent.sandbox.go]\nimage = \"i\"\nsecrets = [\"registry\"]",
-                "names secret \"registry\"",
+                "a file secret reaches a sandbox only through a relay",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \"i\"\nrelays = [\".kube/config\"]",
+                "names relay \".kube/config\", which no [[agent.relay]] declares",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \"i\"\nendpoints = [\"proxy.golang.org\"]",
+                "[agent.sandbox.go] endpoint: endpoint 'proxy.golang.org' must be host:port",
             ),
         ] {
             let err = sandbox_manifest("openshell", profile, "")
@@ -2615,7 +2647,10 @@ mod tests {
         )
         .err()
         .expect("a typo in a secret list must not silently pass every secret");
-        assert!(err.to_string().contains("secret"), "{err:#}");
+        assert!(
+            err.to_string().contains("unknown field `secret`"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -2631,14 +2666,10 @@ mod tests {
     }
 
     #[test]
-    fn a_sandbox_needs_the_openshell_backend() {
-        let err = sandbox_manifest("command", GO_PROFILE, r#"sandbox = "go""#)
+    fn a_sandbox_validates_on_any_manifest_backend() {
+        sandbox_manifest("local", GO_PROFILE, r#"sandbox = "go""#)
             .validate()
-            .expect_err("no sandbox to run in");
-        assert!(
-            err.to_string().contains("only the openshell backend runs"),
-            "{err:#}"
-        );
+            .expect("a loop pod runs openshell whatever the manifest says; the turn checks");
     }
 
     #[test]

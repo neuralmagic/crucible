@@ -32,6 +32,8 @@ pub struct PackAgent {
     pub allow_unverified_image: bool,
     /// `[agent.resources]`: GPUs, CPU and memory for the sandbox.
     pub resources: crucible::manifest::SandboxResources,
+    /// `[agent.sandbox.<name>].image`: the image each named sandbox starts from.
+    pub sandboxes: BTreeMap<String, String>,
 }
 
 /// The `[agent]` fields beyond backend and image, as the `agent_requirements` column stores them.
@@ -50,6 +52,8 @@ pub struct AgentRequirements {
         skip_serializing_if = "crucible::manifest::SandboxResources::is_empty"
     )]
     pub resources: crucible::manifest::SandboxResources,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sandboxes: BTreeMap<String, String>,
 }
 
 impl PackAgent {
@@ -74,6 +78,7 @@ impl PackAgent {
             prefers: r.prefers,
             allow_unverified_image: r.allow_unverified_image,
             resources: r.resources,
+            sandboxes: r.sandboxes,
         }
     }
 
@@ -85,6 +90,7 @@ impl PackAgent {
             prefers: self.prefers.clone(),
             allow_unverified_image: self.allow_unverified_image,
             resources: self.resources.clone(),
+            sandboxes: self.sandboxes.clone(),
         }
     }
 
@@ -145,6 +151,14 @@ struct AgentTable {
     allow_unverified_image: bool,
     #[serde(default)]
     resources: crucible::manifest::SandboxResources,
+    #[serde(default)]
+    sandbox: BTreeMap<String, SandboxTable>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SandboxTable {
+    #[serde(default)]
+    image: String,
 }
 
 /// Read a pack tree's `[agent]` backend and sandbox image. `Err` is a manifest that is not there or
@@ -174,6 +188,11 @@ pub fn pack_agent(pack_root: &Path) -> Result<PackAgent> {
         prefers: agent.prefers,
         allow_unverified_image: agent.allow_unverified_image,
         resources: agent.resources,
+        sandboxes: agent
+            .sandbox
+            .into_iter()
+            .map(|(name, table)| (name, table.image.trim().to_string()))
+            .collect(),
     })
 }
 
@@ -480,6 +499,24 @@ mod tests {
         assert_eq!(
             pack_agent(dir.path()).expect("parses"),
             PackAgent::new("openshell".to_string(), Some("quay.io/x/y:tag".to_string()))
+        );
+    }
+
+    #[test]
+    fn named_sandbox_images_are_read_from_the_manifest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("crucible.toml"),
+            concat!(
+                "[agent]\nbackend = \"openshell\"\nsandbox_image = \"quay.io/x/y:tag\"\n\n",
+                "[agent.sandbox.go]\nimage = \" ghcr.io/acme/go@sha256:bb \"\nsecrets = [\"jira\"]\n",
+            ),
+        )
+        .expect("manifest");
+        let agent = pack_agent(dir.path()).expect("parses");
+        assert_eq!(
+            agent.sandboxes,
+            [("go".to_string(), "ghcr.io/acme/go@sha256:bb".to_string())].into()
         );
     }
 

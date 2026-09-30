@@ -104,10 +104,10 @@ pub(crate) struct Args {
     /// The named sandboxes a task may run in (from `[agent.sandbox]`). No CLI flag.
     #[arg(skip)]
     pub sandboxes: std::collections::BTreeMap<String, manifest::SandboxProfile>,
-    /// Each declared secret's env projection, `[[secret]].name -> env var`, so a named sandbox can
-    /// withhold the ones it does not list. No CLI flag.
+    /// The declared secrets relayed into `env`, `[[secret]].name -> env var`, so a named sandbox
+    /// can withhold the ones it does not list. No CLI flag.
     #[arg(skip)]
-    pub secret_env: std::collections::BTreeMap<String, String>,
+    pub relayed_secrets: std::collections::BTreeMap<String, String>,
     /// The model the agent runs. Overrides the manifest's `[agent].model`; when neither is set the
     /// resolved harness's own default applies (see `Args::model`).
     #[arg(long)]

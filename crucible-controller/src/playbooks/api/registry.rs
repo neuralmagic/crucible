@@ -232,19 +232,41 @@ pub(crate) async fn authorize_image(
         .await
         .map_err(|e| AppError::from(e).into_response())?;
     let catalog = catalog(state).await?;
-    let verdict = crate::playbooks::preflight::preflight(agent, resolved.as_ref(), &catalog);
-    if verdict.refused() {
-        return Err(refused(
-            "the pack's sandbox image fails the capability preflight",
-            verdict
+    let mut verdict = crate::playbooks::preflight::preflight(agent, resolved.as_ref(), &catalog);
+    let mut errors: Vec<crate::playbooks::registry::FieldError> = verdict
+        .refusals
+        .iter()
+        .map(|message| crate::playbooks::registry::FieldError {
+            field: "sandbox_image".to_string(),
+            message: message.clone(),
+        })
+        .collect();
+    for (name, named) in
+        crate::playbooks::preflight::preflight_sandboxes(agent, resolved.as_ref(), &catalog)
+    {
+        errors.extend(
+            named
                 .refusals
-                .iter()
+                .into_iter()
+                .filter(|message| !verdict.refusals.contains(message))
                 .map(|message| crate::playbooks::registry::FieldError {
-                    field: "sandbox_image".to_string(),
-                    message: message.clone(),
-                })
-                .collect(),
-        ));
+                    field: format!("sandbox.{name}"),
+                    message,
+                }),
+        );
+        for warning in named.warnings {
+            if !verdict.warnings.contains(&warning) {
+                verdict.warnings.push(format!("sandbox {name}: {warning}"));
+            }
+        }
+    }
+    if !errors.is_empty() {
+        let headline = if errors.iter().all(|e| e.field == "sandbox_image") {
+            "the pack's sandbox image fails the capability preflight"
+        } else {
+            "a sandbox image the pack names fails the capability preflight"
+        };
+        return Err(refused(headline, errors));
     }
     Ok(verdict)
 }

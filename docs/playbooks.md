@@ -200,7 +200,9 @@ it on the task:
 ```toml
 [agent.sandbox.go]
 image = "ghcr.io/acme/sandbox-go@sha256:..."
-secrets = []                                  # [[secret]] names; empty passes none in
+secrets = []                                  # [[secret]] names with an env projection
+relays = []                                   # [[agent.relay]] destinations
+broker = false                                # reach the [agent.broker]
 endpoints = ["proxy.golang.org:443:read-only"]
 ```
 
@@ -208,9 +210,13 @@ endpoints = ["proxy.golang.org:443:read-only"]
 analyze = agent(name = "analyze", prompt = "...", sandbox = "go")
 ```
 
-The turn starts from that image, adds those endpoints to `[agent.openshell]`'s, and receives
-only the declared secrets the sandbox lists. A task without `sandbox` runs in `sandbox_image`
-with every secret the registry lets the agent hold.
+The turn starts from that image and adds those endpoints to `[agent.openshell]`'s. Of what the
+engine provisions, it receives only the listed secrets and relay files, and the broker only
+when `broker = true`. A task without `sandbox` runs in `sandbox_image` with all of it. Tasks that
+share a session must share a sandbox. A sandbox limits what the engine provisions, not what a task
+reads from upstream: output, files, and workspace changes from a task that held a secret still
+reach the tasks after it. The capability disclosure lists each sandbox, and the controller
+checks each sandbox image against the catalog at launch.
 
 ## Parameters
 

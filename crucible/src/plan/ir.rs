@@ -741,6 +741,15 @@ pub enum PlanError {
     )]
     SessionWithIsolation { task: String, session: String },
     #[error(
+        "tasks {first:?} and {second:?} share session {session:?} but run in different \
+         sandboxes; a session's transcript would carry one sandbox's secrets into the other"
+    )]
+    SessionSpansSandboxes {
+        session: String,
+        first: String,
+        second: String,
+    },
+    #[error(
         "task {task:?} contains `[` or `]`; those are reserved for a mapped node's instance \
          names, which are synthesized as `node[item]`"
     )]
@@ -1036,6 +1045,22 @@ impl Plan {
             });
         }
         let mut index: BTreeMap<&TaskName, usize> = BTreeMap::new();
+        let mut session_sandbox: BTreeMap<&str, (&TaskName, Option<&str>)> = BTreeMap::new();
+        for t in &self.tasks {
+            let (Some(session), TaskKind::Agent { sandbox, .. }) = (&t.session, &t.task) else {
+                continue;
+            };
+            let (first, theirs) = *session_sandbox
+                .entry(session.as_str())
+                .or_insert((&t.name, sandbox.as_deref()));
+            if theirs != sandbox.as_deref() {
+                return Err(PlanError::SessionSpansSandboxes {
+                    session: session.clone(),
+                    first: first.0.clone(),
+                    second: t.name.0.clone(),
+                });
+            }
+        }
         for (i, t) in self.tasks.iter().enumerate() {
             if t.name.0.trim().is_empty() {
                 return Err(PlanError::EmptyTaskName { index: i });
@@ -2249,6 +2274,40 @@ mod tests {
             assert_eq!(
                 p.validate().unwrap_err(),
                 PlanError::UnsupportedVersion { version }
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_stays_in_one_sandbox() {
+        let in_session = |name: &str, deps: &[&str], sandbox: Option<&str>| {
+            let mut task = agent(name, deps);
+            if let TaskKind::Agent { sandbox: slot, .. } = &mut task.task {
+                *slot = sandbox.map(str::to_string);
+            }
+            task.session = Some("s".into());
+            task
+        };
+        plan(vec![
+            in_session("a", &[], Some("go")),
+            in_session("b", &["a"], Some("go")),
+        ])
+        .validate()
+        .expect("one sandbox");
+        for second in [Some("jira"), None] {
+            let err = plan(vec![
+                in_session("a", &[], Some("go")),
+                in_session("b", &["a"], second),
+            ])
+            .validate()
+            .expect_err("a transcript would cross sandboxes");
+            assert_eq!(
+                err,
+                PlanError::SessionSpansSandboxes {
+                    session: "s".into(),
+                    first: "a".into(),
+                    second: "b".into(),
+                }
             );
         }
     }

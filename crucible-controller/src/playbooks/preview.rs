@@ -161,6 +161,24 @@ pub(crate) fn preview_pack_for(
         }
     };
 
+    if let Some(agent) = &preview.agent {
+        for task in &compiled.workflow.tasks {
+            if let crucible::plan::ir::TaskKind::Agent {
+                sandbox: Some(name),
+                ..
+            } = &task.task
+                && !agent.sandboxes.contains_key(name)
+            {
+                preview.diagnostics.push(
+                    crucible::manifest::ManifestError::UnknownSandbox {
+                        task: task.name.0.clone(),
+                        name: name.clone(),
+                    }
+                    .to_string(),
+                );
+            }
+        }
+    }
     match graph_from_compiled(compiled.canonical_json.as_bytes()) {
         Ok(graph) => preview.graph = Some(graph),
         Err(message) => preview.diagnostics.push(message),
@@ -174,6 +192,29 @@ mod tests {
     use crate::testing::fixtures::{
         WORKFLOW_BROKEN, WORKFLOW_NO_PARAMS, WORKFLOW_TOPIC, schema_of, write_playbook_pack,
     };
+
+    #[test]
+    fn a_task_naming_an_undeclared_sandbox_is_a_preview_diagnostic() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = write_playbook_pack(
+            dir.path(),
+            "a = agent(name = \"analyze\", prompt = \"p\", sandbox = \"rust\")\n\
+             b = agent(name = \"file\", prompt = \"p\", sandbox = \"go\")\n\
+             workflow(type = \"playbook\", tasks = [a, b])\n",
+        );
+        let manifest = root.join("crucible.toml");
+        let text = std::fs::read_to_string(&manifest).expect("manifest");
+        std::fs::write(
+            &manifest,
+            format!("{text}\n[agent.sandbox.go]\nimage = \"ghcr.io/acme/go@sha256:bb\"\n"),
+        )
+        .expect("manifest");
+        let preview = preview_pack(&root, &BTreeMap::new(), Unvalued::Refuse).expect("previews");
+        assert_eq!(
+            preview.diagnostics,
+            [r#"task "analyze" runs in sandbox "rust", which no [agent.sandbox.rust] declares"#],
+        );
+    }
 
     #[test]
     fn a_compiling_pack_previews_a_schema_a_digest_and_a_graph() {

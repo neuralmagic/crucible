@@ -37,6 +37,16 @@ pub enum Capability {
     BrokerBin { bin: String },
     /// Whether the pack runs commands outside the sandbox, which hold their executor's reach.
     ExternalCommands { present: bool },
+    /// A named `[agent.sandbox]` and what it provisions: its image, the declared secrets and
+    /// relay files passed in, broker reach, and the egress it adds after the pack's deny list.
+    Sandbox {
+        name: String,
+        image: String,
+        secrets: Vec<String>,
+        relays: Vec<String>,
+        broker: bool,
+        egress: Vec<String>,
+    },
 }
 
 /// Whether an egress entry is standing built-in reach or reach the manifest named.
@@ -105,7 +115,26 @@ pub fn capabilities(m: &Manifest) -> Vec<Capability> {
     if runs_external_commands(m) {
         out.push(Capability::ExternalCommands { present: true });
     }
+    out.extend(sandboxes(&m.agent));
     out
+}
+
+fn sandboxes(agent: &crate::manifest::AgentCfg) -> impl Iterator<Item = Capability> + '_ {
+    agent.sandbox.iter().map(|(name, profile)| {
+        let added = crate::manifest::OpenshellCfg {
+            endpoints: profile.endpoints.clone(),
+            inherit_defaults: false,
+            ..agent.openshell.clone()
+        };
+        Capability::Sandbox {
+            name: name.clone(),
+            image: profile.image.trim().to_string(),
+            secrets: profile.secrets.clone(),
+            relays: profile.relays.clone(),
+            broker: profile.broker,
+            egress: crate::openshell::policy::resolve_endpoints(&added, &[], None),
+        }
+    })
 }
 
 /// The credential and relay half of the disclosure, for a shape that is not a single-repo
@@ -120,6 +149,7 @@ pub fn composite_capabilities(
         path: r.dest.clone(),
         sources: relay_sources(r),
     }));
+    out.extend(sandboxes(agent));
     out
 }
 
@@ -408,6 +438,20 @@ fn render_capability(cap: &Capability) -> String {
         Capability::ExternalCommands { present: false } => {
             "external    no commands run outside the sandbox".to_string()
         }
+        Capability::Sandbox {
+            name,
+            image,
+            secrets,
+            relays,
+            broker,
+            egress,
+        } => format!(
+            "sandbox     {name} from {image}; secrets [{}], relays [{}], broker {}, adds egress [{}]",
+            secrets.join(", "),
+            relays.join(", "),
+            if *broker { "yes" } else { "no" },
+            egress.join(", ")
+        ),
     }
 }
 
@@ -429,6 +473,48 @@ mod tests {
         measure_cmd = "./m"
         direction = "higher"
     "#;
+
+    #[test]
+    fn a_named_sandbox_is_disclosed_with_what_it_provisions() {
+        let m = manifest(&format!(
+            "{OPENSHELL}
+            [agent.openshell]
+            deny_endpoints = [\"evil.example:443:full\"]
+            [agent.sandbox.go]
+            image = \" ghcr.io/acme/go@sha256:bb \"
+            secrets = [\"registry\"]
+            endpoints = [\"proxy.golang.org:443:read-only\", \"evil.example:443:full\"]
+            [agent.sandbox.bare]
+            image = \"ghcr.io/acme/bare@sha256:cc\"
+            "
+        ));
+        let sandboxes: Vec<Capability> = capabilities(&m)
+            .into_iter()
+            .filter(|c| matches!(c, Capability::Sandbox { .. }))
+            .collect();
+        assert_eq!(
+            sandboxes,
+            [
+                Capability::Sandbox {
+                    name: "bare".into(),
+                    image: "ghcr.io/acme/bare@sha256:cc".into(),
+                    secrets: vec![],
+                    relays: vec![],
+                    broker: false,
+                    egress: vec![],
+                },
+                Capability::Sandbox {
+                    name: "go".into(),
+                    image: "ghcr.io/acme/go@sha256:bb".into(),
+                    secrets: vec!["registry".into()],
+                    relays: vec![],
+                    broker: false,
+                    egress: vec!["proxy.golang.org:443:read-only".into()],
+                },
+            ],
+            "the pack's deny list binds a sandbox's egress too"
+        );
+    }
 
     #[test]
     fn the_exposure_json_carries_exactly_the_declared_top_level_shape() {

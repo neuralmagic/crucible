@@ -685,26 +685,31 @@ fn prepare_and_run(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Att
 }
 
 /// Point a turn at its named sandbox: the profile's image, its endpoints added to the pack's
-/// egress, and every declared secret it does not list removed from the sandbox env.
-fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), String> {
+/// egress, and every relayed secret, relay file, and broker it does not list withheld.
+pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), String> {
+    if args.agent_backend != crate::manifest::AgentBackend::Openshell {
+        return Err(format!(
+            "task runs in sandbox {name:?}, which only the openshell backend provides; this run's \
+             backend is {:?}",
+            args.agent_backend
+        ));
+    }
     let Some(profile) = args.sandboxes.get(name).cloned() else {
         return Err(format!(
             "task names sandbox {name:?}, which the manifest does not declare"
         ));
     };
-    let kept: std::collections::BTreeSet<&str> = profile
-        .secrets
+    let withheld: std::collections::BTreeSet<&str> = args
+        .relayed_secrets
         .iter()
-        .filter_map(|secret| args.secret_env.get(secret).map(String::as_str))
+        .filter(|(secret, _)| !profile.secrets.contains(secret))
+        .map(|(_, env)| env.as_str())
         .collect();
-    let withheld: std::collections::BTreeSet<String> = args
-        .secret_env
-        .values()
-        .filter(|env| !kept.contains(env.as_str()))
-        .cloned()
-        .collect();
-    args.env.retain(|(key, _)| !withheld.contains(key));
-    args.sandbox_image = Some(profile.image);
+    args.env.retain(|(key, _)| !withheld.contains(key.as_str()));
+    args.relay
+        .retain(|relay| profile.relays.contains(&relay.dest));
+    args.broker.enabled &= profile.broker;
+    args.sandbox_image = Some(profile.image.trim().to_string());
     for endpoint in profile.endpoints {
         if !args.openshell.endpoints.contains(&endpoint) {
             args.openshell.endpoints.push(endpoint);
@@ -917,27 +922,40 @@ mod tests {
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
     use crate::plan::harness::*;
 
+    fn relay(dest: &str) -> crate::manifest::RelayFile {
+        crate::manifest::RelayFile {
+            dest: dest.into(),
+            template: Some("x".into()),
+            from_file: None,
+            from_cmd: None,
+        }
+    }
+
     fn sandboxed_args() -> Args {
-        use clap::Parser;
-        let mut args = crate::cli::Cli::parse_from(["crucible"]).run;
+        let mut args = Args::defaults().expect("the default flags parse");
+        args.agent_backend = crate::manifest::AgentBackend::Openshell;
         args.sandbox_image = Some("ghcr.io/acme/default@sha256:aa".into());
         args.env = vec![
             ("JIRA_TOKEN".into(), "jira".into()),
             ("REGISTRY_TOKEN".into(), "registry".into()),
             ("CLOUD_ML_REGION".into(), "us-east5".into()),
         ];
-        args.secret_env = [
+        args.relayed_secrets = [
             ("jira".to_string(), "JIRA_TOKEN".to_string()),
             ("registry".to_string(), "REGISTRY_TOKEN".to_string()),
         ]
         .into();
+        args.relay = vec![relay(".jira"), relay(".kube/config")];
+        args.broker.enabled = true;
         args.openshell.endpoints = vec!["github.com:443:full".into()];
         args.sandboxes = [
             (
                 "go".to_string(),
                 crate::manifest::SandboxProfile {
-                    image: "ghcr.io/acme/sandbox-go@sha256:bb".into(),
+                    image: " ghcr.io/acme/sandbox-go@sha256:bb ".into(),
                     secrets: vec!["registry".into()],
+                    relays: vec![".kube/config".into()],
+                    broker: true,
                     endpoints: vec![
                         "proxy.golang.org:443:read-only".into(),
                         "github.com:443:full".into(),
@@ -960,8 +978,12 @@ mod tests {
         args.env.iter().map(|(k, _)| k.as_str()).collect()
     }
 
+    fn relay_dests(args: &Args) -> Vec<&str> {
+        args.relay.iter().map(|r| r.dest.as_str()).collect()
+    }
+
     #[test]
-    fn a_named_sandbox_sets_the_image_and_keeps_only_its_secrets() {
+    fn a_named_sandbox_passes_in_only_what_it_lists() {
         let mut args = sandboxed_args();
         enter_sandbox(&mut args, "go").unwrap();
         assert_eq!(
@@ -969,6 +991,8 @@ mod tests {
             Some("ghcr.io/acme/sandbox-go@sha256:bb")
         );
         assert_eq!(env_keys(&args), ["REGISTRY_TOKEN", "CLOUD_ML_REGION"]);
+        assert_eq!(relay_dests(&args), [".kube/config"]);
+        assert!(args.broker.enabled);
         assert_eq!(
             args.openshell.endpoints,
             ["github.com:443:full", "proxy.golang.org:443:read-only"],
@@ -977,11 +1001,41 @@ mod tests {
     }
 
     #[test]
-    fn a_sandbox_that_lists_no_secret_gets_none_but_keeps_the_rest_of_the_env() {
+    fn a_bare_sandbox_gets_no_secret_relay_or_broker() {
         let mut args = sandboxed_args();
         enter_sandbox(&mut args, "bare").unwrap();
         assert_eq!(env_keys(&args), ["CLOUD_ML_REGION"]);
+        assert!(relay_dests(&args).is_empty());
+        assert!(!args.broker.enabled);
         assert_eq!(args.openshell.endpoints, ["github.com:443:full"]);
+    }
+
+    #[test]
+    fn a_sandbox_withholds_only_what_the_secret_relay_added() {
+        let mut args = sandboxed_args();
+        args.env
+            .push(("REGION_LITERAL".into(), "from [agent.env]".into()));
+        args.relayed_secrets.remove("registry");
+        enter_sandbox(&mut args, "bare").unwrap();
+        assert_eq!(
+            env_keys(&args),
+            ["REGISTRY_TOKEN", "CLOUD_ML_REGION", "REGION_LITERAL"],
+            "a value the secret relay did not add is not a withheld secret"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_is_refused_outside_openshell() {
+        for backend in [
+            crate::manifest::AgentBackend::Local,
+            crate::manifest::AgentBackend::Command,
+        ] {
+            let mut args = sandboxed_args();
+            args.agent_backend = backend;
+            let err = enter_sandbox(&mut args, "bare").unwrap_err();
+            assert!(err.contains("only the openshell backend provides"), "{err}");
+            assert_eq!(env_keys(&args).len(), 3, "nothing changed");
+        }
     }
 
     #[test]

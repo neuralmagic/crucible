@@ -1544,13 +1544,15 @@ pub const AGENT_VISIBLE_ENV: &str = "CRUCIBLE_AGENT_VISIBLE_ENV";
 
 /// Seed `env` with the declared secrets the agent may hold: those the manifest declares an `env`
 /// projection for AND [`AGENT_VISIBLE_ENV`] names. An unset or empty list relays nothing. A
-/// manifest-provided value wins, as with the Vertex keys.
+/// manifest-provided value wins, as with the Vertex keys. Returns what it relayed, as
+/// `[[secret]].name -> env var`.
 pub fn relay_agent_visible_secrets(
     secrets: &[crate::manifest::SecretDecl],
     env: &mut Vec<(String, String)>,
-) {
+) -> std::collections::BTreeMap<String, String> {
+    let mut relayed = std::collections::BTreeMap::new();
     let Ok(allowed) = std::env::var(AGENT_VISIBLE_ENV) else {
-        return;
+        return relayed;
     };
     let allowed: Vec<&str> = allowed
         .split(',')
@@ -1573,8 +1575,10 @@ pub fn relay_agent_visible_secrets(
             && !v.is_empty()
         {
             env.push((key.to_string(), v));
+            relayed.insert(secret.name.clone(), key.to_string());
         }
     }
+    relayed
 }
 
 /// Seed `env` with the process values of [`crate::openshell::policy::VERTEX_RELAY_KEYS`]: only keys that are set and

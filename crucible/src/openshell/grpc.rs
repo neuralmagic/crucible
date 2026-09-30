@@ -1463,7 +1463,7 @@ pub enum EndpointProblem {
     EnforcementWithoutProtocol,
 }
 
-fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError> {
+pub(crate) fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError> {
     let reject = |problem| EndpointSpecError {
         spec: spec.to_owned(),
         problem,

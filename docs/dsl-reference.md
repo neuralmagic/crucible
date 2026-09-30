@@ -23,6 +23,7 @@ An agent turn driven by a prompt.
 | `harness` | `str` | Agent harness, overriding `[agent]`. |
 | `model` | `str` | Model, overriding `[agent]`. |
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
+| `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
@@ -54,6 +55,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `harness` | `str` | Agent harness, overriding `[agent]`. |
 | `model` | `str` | Model, overriding `[agent]`. |
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
+| `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |

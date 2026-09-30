@@ -252,6 +252,30 @@ pub fn preflight(
     out
 }
 
+/// Each named sandbox's image, preflighted like the pack's own: catalogued, and fit for the harness
+/// the launch runs. The pack's `requires` and `prefers` describe its default image, so only the
+/// harness predicate applies to a named sandbox.
+pub fn preflight_sandboxes(
+    agent: &PackAgent,
+    resolved: Option<&ResolvedHarness>,
+    catalog: &[CatalogImage],
+) -> Vec<(String, ImagePreflight)> {
+    agent
+        .sandboxes
+        .iter()
+        .map(|(name, image)| {
+            let named = PackAgent {
+                sandbox_image: Some(image.clone()),
+                requires: BTreeMap::new(),
+                prefers: BTreeMap::new(),
+                sandboxes: BTreeMap::new(),
+                ..agent.clone()
+            };
+            (name.clone(), preflight(&named, resolved, catalog))
+        })
+        .collect()
+}
+
 /// One compatible image, with what ranks it: fewer surplus predicates first (the slimmest image
 /// that satisfies everything), more preferred predicates first within that.
 #[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
@@ -351,7 +375,8 @@ mod tests {
     use crate::images::model::CatalogImage;
     use crate::playbooks::dispatch::PackAgent;
     use crate::playbooks::preflight::{
-        HarnessSource, ReferencePin, ResolvedHarness, preflight, split_reference,
+        HarnessSource, ReferencePin, ResolvedHarness, preflight, preflight_sandboxes,
+        split_reference,
     };
 
     const REPO: &str = "ghcr.io/acme/sandbox-go-cc";
@@ -525,6 +550,47 @@ mod tests {
         );
         assert!(!preflight(&declared, Some(&pinned(Harness::Codex)), &catalog).refused());
         assert!(!preflight(&declared, Some(&defaulted(Harness::Claude)), &catalog).refused());
+    }
+
+    #[test]
+    fn a_named_sandbox_image_is_preflighted_like_the_pack_image() {
+        let catalog = vec![image(&[("agent.claude-code", "2.1.270")])];
+        let mut pack = agent(&format!("{REPO}:latest"), &[("toolchain.go", ">=1.0")]);
+        pack.sandboxes = [
+            ("go".to_string(), format!("{REPO}@{DIGEST}")),
+            ("custom".to_string(), "quay.io/acme/custom:dev".to_string()),
+        ]
+        .into();
+        let named: BTreeMap<String, _> = preflight_sandboxes(&pack, None, &catalog)
+            .into_iter()
+            .collect();
+        assert!(
+            !named["go"].refused(),
+            "the pack's requires describe its default image, not a named sandbox: {:?}",
+            named["go"]
+        );
+        assert!(named["custom"].refused());
+        assert!(named["custom"].refusals[0].contains("is not in the image catalog"));
+
+        let codex = preflight_sandboxes(&pack, Some(&pinned(Harness::Codex)), &catalog);
+        assert!(
+            codex.iter().all(|(_, verdict)| verdict.refused()),
+            "a named sandbox still needs the harness the launch runs: {codex:?}"
+        );
+    }
+
+    #[test]
+    fn named_sandboxes_survive_the_stored_columns() {
+        let mut pack = agent(&format!("{REPO}:latest"), &[]);
+        pack.sandboxes = [("go".to_string(), format!("{REPO}@{DIGEST}"))].into();
+        let stored = serde_json::from_value(pack.requirements_json()).expect("decodes");
+        let back = PackAgent::from_columns("openshell".into(), pack.sandbox_image.clone(), stored);
+        assert_eq!(back, pack);
+        let legacy = PackAgent::from_columns("openshell".into(), None, None);
+        assert!(
+            legacy.sandboxes.is_empty(),
+            "a row from before the field declares none"
+        );
     }
 
     #[test]
