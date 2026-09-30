@@ -945,6 +945,73 @@ pub async fn watch(c: &Client, id: &str) -> Result<String> {
     json(&c.watch::<Value>(id).await?)
 }
 
+pub async fn webhooks(c: &Client, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.webhooks::<Value>().await?);
+    }
+    let list: Vec<dto::Webhook> = c.webhooks().await?;
+    Ok(render::webhooks(&list))
+}
+
+pub async fn webhook(c: &Client, id: &str) -> Result<String> {
+    json(&c.webhook::<Value>(id).await?)
+}
+
+pub async fn webhook_deliveries(c: &Client, id: &str, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.webhook_deliveries::<Value>(id).await?);
+    }
+    let list: Vec<dto::WebhookDelivery> = c.webhook_deliveries(id).await?;
+    Ok(render::webhook_deliveries(&list))
+}
+
+pub async fn webhook_presets(c: &Client) -> Result<String> {
+    json(&c.get::<Value>("/api/webhooks/presets").await?)
+}
+
+fn read_body(file: &Path) -> Result<Value> {
+    let text =
+        std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
+    serde_json::from_str(&text).with_context(|| format!("{} is not JSON", file.display()))
+}
+
+/// Create a webhook from a JSON body. The response carries the secret, which the controller never
+/// shows again.
+pub async fn webhook_create(c: &Client, file: &Path) -> Result<String> {
+    json(
+        &c.post::<Value>("/api/webhooks", Some(&read_body(file)?))
+            .await?,
+    )
+}
+
+pub async fn webhook_update(c: &Client, id: &str, file: &Path) -> Result<String> {
+    let path = format!("/api/webhooks/{}", encode(id));
+    json(&c.put::<Value>(&path, &read_body(file)?).await?)
+}
+
+pub async fn webhook_set_enabled(c: &Client, id: &str, enabled: bool) -> Result<String> {
+    let path = format!("/api/webhooks/{}/enabled", encode(id));
+    let body = serde_json::json!({ "enabled": enabled });
+    json(&c.post::<Value>(&path, Some(&body)).await?)
+}
+
+pub async fn webhook_rotate(c: &Client, id: &str) -> Result<String> {
+    let path = format!("/api/webhooks/{}/secret", encode(id));
+    json(&c.post::<Value>(&path, None::<&Value>).await?)
+}
+
+pub async fn webhook_delete(c: &Client, id: &str) -> Result<String> {
+    c.delete(&format!("/api/webhooks/{}", encode(id))).await?;
+    Ok(format!("deleted webhook {id}\n"))
+}
+
+pub async fn webhook_preview(c: &Client, file: &Path) -> Result<String> {
+    json(
+        &c.post::<Value>("/api/webhooks/preview", Some(&read_body(file)?))
+            .await?,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

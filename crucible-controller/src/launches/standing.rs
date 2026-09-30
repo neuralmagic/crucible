@@ -810,6 +810,10 @@ pub(crate) async fn expire_stale_owner_parks(
             EXPIRE,
             " (SELECT launch_key FROM playbook_watch_hits WHERE watch_id = $2) RETURNING key"
         ),
+        Trigger::Webhook => const_format::concatcp!(
+            EXPIRE,
+            " (SELECT launch_key FROM playbook_webhook_keys WHERE webhook_id = $2) RETURNING key"
+        ),
     };
     sqlx::query_scalar(sql)
         .bind(&prefix)

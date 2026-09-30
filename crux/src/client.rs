@@ -238,6 +238,21 @@ impl Client {
         )
     }
 
+    pub async fn put<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+        let value = serde_json::to_value(body).context("encoding the request body")?;
+        parse(
+            self.send(reqwest::Method::PUT, path, Some(&value)).await?,
+            path,
+        )
+    }
+
+    /// DELETE a resource whose success is a 204 with no body.
+    pub async fn delete(&self, path: &str) -> Result<()> {
+        self.send(reqwest::Method::DELETE, path, None)
+            .await
+            .map(|_| ())
+    }
+
     /// Send and enforce the status, returning the body text. A non-2xx becomes an error carrying
     /// the status and the controller's body exactly as written — that body is usually a
     /// `{"error": "…"}` naming the field the caller got wrong.
@@ -438,6 +453,19 @@ impl Client {
 
     pub async fn watch<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
         self.get(&format!("/api/watches/{}", encode(id))).await
+    }
+
+    pub async fn webhooks<T: DeserializeOwned>(&self) -> Result<T> {
+        self.get("/api/webhooks").await
+    }
+
+    pub async fn webhook<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
+        self.get(&format!("/api/webhooks/{}", encode(id))).await
+    }
+
+    pub async fn webhook_deliveries<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
+        self.get(&format!("/api/webhooks/{}/deliveries", encode(id)))
+            .await
     }
 
     pub async fn whoami(&self) -> Result<dto::Whoami> {

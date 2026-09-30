@@ -107,7 +107,9 @@ enum Command {
     },
 
     /// One run with its candidates, as JSON.
-    Run { run_id: String },
+    Run {
+        run_id: String,
+    },
 
     /// Recurrences: what fires when, and what is blocked on an owner signing in.
     Schedules {
@@ -122,7 +124,68 @@ enum Command {
     },
 
     /// One tracker watch, as JSON.
-    Watch { id: String },
+    Watch {
+        id: String,
+    },
+
+    /// Webhooks: what each launches, how it verifies, and when it last took a delivery.
+    Webhooks {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// One webhook, as JSON.
+    Webhook {
+        id: String,
+    },
+
+    /// A webhook's recorded deliveries, newest first, with how each settled.
+    WebhookDeliveries {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Starting points for a webhook body: a sender's verifier and a transform, as JSON.
+    WebhookPresets,
+
+    /// Create a webhook from a JSON body (`POST /api/webhooks`). Prints its secret, once.
+    WebhookCreate {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Replace a webhook from a JSON body. A new verifier prints a new secret.
+    WebhookUpdate {
+        id: String,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Let a webhook record deliveries again.
+    WebhookEnable {
+        id: String,
+    },
+
+    /// Stop a webhook: its address answers not found and its pending deliveries settle failed.
+    WebhookDisable {
+        id: String,
+    },
+
+    /// Replace a webhook's secret and print the new one, once.
+    WebhookRotate {
+        id: String,
+    },
+
+    WebhookDelete {
+        id: String,
+    },
+
+    /// Run a transform on a sample delivery from a JSON body; nothing is stored.
+    WebhookPreview {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
 
     /// List issues. One line each: key, status, tier, git ref, codegen contract, upstream, title.
     Issues {
@@ -484,7 +547,9 @@ enum Command {
     },
 
     /// Delete a draft and every version of it. Admin only; the id is free to create again.
-    DraftDelete { draft_id: String },
+    DraftDelete {
+        draft_id: String,
+    },
 
     /// Publish a draft: register its newest compiling version as a playbook, with no review.
     DraftPublish {
@@ -575,6 +640,19 @@ pub async fn run() -> Result<()> {
         Command::Schedules { json } => ops::schedules(&client, json).await?,
         Command::Watches { json } => ops::watches(&client, json).await?,
         Command::Watch { id } => ops::watch(&client, &id).await?,
+        Command::Webhooks { json } => ops::webhooks(&client, json).await?,
+        Command::Webhook { id } => ops::webhook(&client, &id).await?,
+        Command::WebhookDeliveries { id, json } => {
+            ops::webhook_deliveries(&client, &id, json).await?
+        }
+        Command::WebhookPresets => ops::webhook_presets(&client).await?,
+        Command::WebhookCreate { file } => ops::webhook_create(&client, &file).await?,
+        Command::WebhookUpdate { id, file } => ops::webhook_update(&client, &id, &file).await?,
+        Command::WebhookEnable { id } => ops::webhook_set_enabled(&client, &id, true).await?,
+        Command::WebhookDisable { id } => ops::webhook_set_enabled(&client, &id, false).await?,
+        Command::WebhookRotate { id } => ops::webhook_rotate(&client, &id).await?,
+        Command::WebhookDelete { id } => ops::webhook_delete(&client, &id).await?,
+        Command::WebhookPreview { file } => ops::webhook_preview(&client, &file).await?,
         Command::Issues {
             kind,
             status,

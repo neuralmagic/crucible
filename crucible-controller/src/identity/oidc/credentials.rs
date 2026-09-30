@@ -132,7 +132,7 @@ impl CredentialKeys {
 
     /// Seal a secret under the newest key, bound to `sub`. The stored form is
     /// `base64(nonce || ciphertext || tag)`.
-    fn seal(&self, sub: &str, plaintext: &str) -> anyhow::Result<(String, String)> {
+    pub(crate) fn seal(&self, sub: &str, plaintext: &str) -> anyhow::Result<(String, String)> {
         let key = self
             .keys
             .first()
@@ -155,7 +155,7 @@ impl CredentialKeys {
 
     /// Open a sealed secret. `key_id` picks the key; a row sealed under a key this deployment no
     /// longer mounts cannot be opened and its owner signs in again.
-    fn open(&self, sub: &str, key_id: &str, sealed: &str) -> anyhow::Result<String> {
+    pub(crate) fn open(&self, sub: &str, key_id: &str, sealed: &str) -> anyhow::Result<String> {
         let key = self
             .keys
             .iter()

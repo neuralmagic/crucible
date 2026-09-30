@@ -3262,6 +3262,13 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/watches/{id}/enabled",
         "/api/watches/{id}/hits",
         "/api/watches/{id}/hits/{item}",
+        "/api/webhooks",
+        "/api/webhooks/presets",
+        "/api/webhooks/preview",
+        "/api/webhooks/{id}",
+        "/api/webhooks/{id}/enabled",
+        "/api/webhooks/{id}/secret",
+        "/api/webhooks/{id}/deliveries",
         "/api/secrets",
         "/api/secrets/{id}",
         "/api/secrets/{id}/rotate",
@@ -12682,4 +12689,438 @@ async fn an_import_is_readable_and_drivable_by_its_owner_alone(pool: PgPool) -> 
         ]
     );
     Ok(())
+}
+
+/// A pack declaring what a registry-push webhook derives.
+const WEBHOOK_WORKFLOW: &str = concat!(
+    "params = {\n",
+    "    \"image\": {\"type\": \"string\", \"required\": True, \"pattern\": \"^quay\\\\.io/\"},\n",
+    "    \"tags\": {\"type\": \"list<string>\", \"default\": [\"latest\"]},\n",
+    "    \"release\": {\"type\": \"string\", \"default\": \"main\"},\n",
+    "}\n",
+    "\n",
+    "hello = command(name = \"hello\", run = \"echo hello\")\n",
+    "\n",
+    "workflow(type = \"playbook\", tasks = [hello], result = hello)\n",
+);
+
+fn app_with_webhook_keys(db: Db) -> Router {
+    router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
+        credential_keys: Some(Arc::new(
+            crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![9u8; 32]])
+                .expect("keys"),
+        )),
+        hooks_public_url: Some("https://hooks.example.com/".to_string()),
+        ..ApiState::test(db, Arc::new(Recorder::default()))
+    })
+}
+
+fn quay_webhook_body() -> serde_json::Value {
+    serde_json::json!({
+        "playbook": "survey",
+        "verifier": "path_token",
+        "filter": "size(body.updated_tags) > 0",
+        "dedupe": r#"body.repository + ":" + body.updated_tags[0]"#,
+        "derive": {"image": "body.docker_url", "tags": "body.updated_tags"},
+        "params": {"release": "3.2"},
+        "max_launches_per_hour": 5,
+        "max_cost": 3.0,
+        "max_time": "30m",
+    })
+}
+
+fn quay_push() -> serde_json::Value {
+    serde_json::json!({
+        "name": "img", "repository": "org/img", "namespace": "org",
+        "docker_url": "quay.io/org/img", "homepage": "https://quay.io/repository/org/img",
+        "updated_tags": ["latest"]
+    })
+}
+
+async fn post_delivery(hooks: &Router, path: &str, body: &serde_json::Value) -> StatusCode {
+    let req = HttpRequest::post(path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("req");
+    crate::testing::oneshot_bytes(hooks, req).await.0
+}
+
+async fn sweep_webhooks(db: &Db) -> Vec<String> {
+    crate::launches::standing::sweep(
+        db,
+        &crate::launches::webhooks::trigger::WebhookTrigger,
+        crate::launches::standing::SweepCfg {
+            auto_disable_after: 5,
+            owner_ttl: std::time::Duration::from_secs(3600),
+        },
+        jiff::Timestamp::now(),
+        None,
+        None,
+    )
+    .await
+    .expect("sweep")
+}
+
+async fn delivery_outcomes(app: &Router, id: &str) -> Vec<String> {
+    let (status, body) = send(
+        app,
+        "GET",
+        &format!("/api/webhooks/{id}/deliveries"),
+        "wren",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("json");
+    rows.iter()
+        .map(|r| r["outcome"].as_str().expect("outcome").to_string())
+        .collect()
+}
+
+/// A webhook created through the API takes a delivery on the public surface, the sweep launches
+/// it once with the derived params, and a replay settles duplicate.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_webhook_round_trips_from_save_to_launch(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+    register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
+    let hooks = crate::launches::webhooks::receive::router(
+        crate::launches::webhooks::receive::HooksState::new(db.pool().clone(), None),
+    );
+
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/webhooks",
+        "wren",
+        Some(quay_webhook_body()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = created["webhook"]["id"].as_str().expect("id").to_string();
+    let secret = created["secret"].as_str().expect("secret").to_string();
+    assert_eq!(
+        created["delivery_url"],
+        format!("https://hooks.example.com/hooks/{id}/{secret}")
+    );
+    let (_, read) = get_json_object(&app, &format!("/api/webhooks/{id}")).await;
+    assert!(
+        !read.to_string().contains(&secret),
+        "the secret is never readable after its creation"
+    );
+
+    let path = format!("/hooks/{id}/{secret}");
+    assert_eq!(
+        post_delivery(&hooks, &path, &quay_push()).await,
+        StatusCode::ACCEPTED
+    );
+    let minted = sweep_webhooks(&db).await;
+    assert_eq!(minted.len(), 1);
+    let launch = crate::launches::store::get_playbook_launch(db.pool(), &minted[0])
+        .await?
+        .expect("launch");
+    let mut params = launch.params.clone();
+    params.sort();
+    assert_eq!(
+        params,
+        vec![
+            ("image".to_string(), "quay.io/org/img".to_string()),
+            ("release".to_string(), "3.2".to_string()),
+            ("tags".to_string(), r#"["latest"]"#.to_string()),
+        ]
+    );
+
+    assert_eq!(
+        post_delivery(&hooks, &path, &quay_push()).await,
+        StatusCode::ACCEPTED
+    );
+    assert!(sweep_webhooks(&db).await.is_empty());
+    assert_eq!(
+        delivery_outcomes(&app, &id).await,
+        vec!["duplicate", "launched"]
+    );
+
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        &format!("/api/webhooks/{id}/secret"),
+        "wren",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rotated: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let fresh = rotated["secret"].as_str().expect("secret");
+    assert_eq!(
+        post_delivery(&hooks, &path, &quay_push()).await,
+        StatusCode::NOT_FOUND
+    );
+    let fresh_path = format!("/hooks/{id}/{fresh}");
+    assert_eq!(
+        post_delivery(&hooks, &fresh_path, &quay_push()).await,
+        StatusCode::ACCEPTED
+    );
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/webhooks/{id}/enabled"),
+        "wren",
+        Some(serde_json::json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        delivery_outcomes(&app, &id).await,
+        vec!["failed", "duplicate", "launched"],
+        "disabling settles the pending delivery"
+    );
+    assert_eq!(
+        post_delivery(&hooks, &fresh_path, &quay_push()).await,
+        StatusCode::NOT_FOUND
+    );
+
+    let (status, _) = send(&app, "DELETE", &format!("/api/webhooks/{id}"), "wren", None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = send(&app, "GET", &format!("/api/webhooks/{id}"), "wren", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_webhook_save_refuses_each_bad_field(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+    let keyless = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
+
+    let mut bad = quay_webhook_body();
+    bad["verifier"] = serde_json::json!("header_token");
+    bad["filter"] = serde_json::json!("body.l.map(x, body.l)");
+    bad["dedupe"] = serde_json::json!("(");
+    bad["derive"] = serde_json::json!({"image": "body.docker_url", "unknown": "body.name"});
+    bad["params"] = serde_json::json!({"release": "3.2", "image": "quay.io/fixed"});
+    bad["max_launches_per_hour"] = serde_json::json!(0);
+    bad["retention_days"] = serde_json::json!(365);
+    let (status, bytes) = send(&app, "POST", "/api/webhooks", "wren", Some(bad)).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let mut fields: Vec<&str> = body["fields"]
+        .as_array()
+        .expect("fields")
+        .iter()
+        .map(|f| f["field"].as_str().unwrap_or_default())
+        .collect();
+    fields.sort_unstable();
+    fields.dedup();
+    assert_eq!(
+        fields,
+        vec![
+            "dedupe",
+            "derive.image",
+            "derive.unknown",
+            "filter",
+            "header",
+            "max_launches_per_hour",
+            "retention_days"
+        ],
+        "{body}"
+    );
+
+    let mut signed = quay_webhook_body();
+    signed["verifier"] = serde_json::json!("hmac_sha256");
+    signed["header"] = serde_json::json!("X-Hub-Signature-256");
+    let (status, bytes) = send(
+        &keyless,
+        "POST",
+        "/api/webhooks",
+        "wren",
+        Some(signed.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["fields"][0]["field"], "verifier", "{body}");
+    let (status, bytes) = send(&app, "POST", "/api/webhooks", "wren", Some(signed)).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(created["webhook"]["header"], "x-hub-signature-256");
+    let id = created["webhook"]["id"].as_str().expect("id");
+    assert_eq!(
+        created["delivery_url"],
+        format!("https://hooks.example.com/hooks/{id}"),
+        "a signed webhook's URL carries no token"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_webhook_and_its_deliveries_are_read_scoped_to_its_owner(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+    register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/webhooks",
+        "wren",
+        Some(quay_webhook_body()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = created["webhook"]["id"].as_str().expect("id");
+
+    let (status, bytes) = send(&app, "GET", "/api/webhooks", "rook", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+    assert!(listed.is_empty(), "{listed:?}");
+    for uri in [
+        format!("/api/webhooks/{id}"),
+        format!("/api/webhooks/{id}/deliveries"),
+    ] {
+        let (status, _) = send(&app, "GET", &uri, "rook", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+    }
+    let (status, _) = send(
+        &app,
+        "POST",
+        &format!("/api/webhooks/{id}/secret"),
+        "rook",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_webhook_preview_evaluates_a_sample_and_stores_nothing(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/webhooks/preview",
+        "wren",
+        Some(serde_json::json!({
+            "filter": r#"headers["x-quay-event"] == "push""#,
+            "dedupe": "body.missing",
+            "derive": {"image": "body.docker_url"},
+            "sample": quay_push(),
+            "headers": {"X-Quay-Event": "push"},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let preview: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(preview["filter"]["value"], true);
+    assert!(
+        preview["dedupe"]["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("missing"))
+    );
+    assert_eq!(preview["derive"]["value"]["image"], "quay.io/org/img");
+    let stored: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_webhooks")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(stored, 0);
+
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/webhooks/preview",
+        "wren",
+        Some(serde_json::json!({"dedupe": "(", "sample": {}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn webhook_deliveries_page_back_through_everything_retained(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+    register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
+    let (_, bytes) = send(
+        &app,
+        "POST",
+        "/api/webhooks",
+        "wren",
+        Some(quay_webhook_body()),
+    )
+    .await;
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = created["webhook"]["id"].as_str().expect("id").to_string();
+    let secret = created["secret"].as_str().expect("secret").to_string();
+    let hooks = crate::launches::webhooks::receive::router(
+        crate::launches::webhooks::receive::HooksState::new(db.pool().clone(), None),
+    );
+    for _ in 0..5 {
+        post_delivery(&hooks, &format!("/hooks/{id}/{secret}"), &quay_push()).await;
+    }
+
+    let mut seen = Vec::new();
+    let mut before: Option<String> = None;
+    loop {
+        let uri = match &before {
+            Some(b) => format!("/api/webhooks/{id}/deliveries?limit=2&before={b}"),
+            None => format!("/api/webhooks/{id}/deliveries?limit=2"),
+        };
+        let (status, bytes) = send(&app, "GET", &uri, "wren", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let page: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.len() <= 2);
+        for row in &page {
+            assert_eq!(
+                row["body"],
+                quay_push().to_string(),
+                "the full body, as recorded"
+            );
+            seen.push(row["id"].as_str().expect("id").to_string());
+        }
+        before = seen.last().cloned();
+    }
+    assert_eq!(seen.len(), 5);
+    let mut sorted = seen.clone();
+    sorted.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(seen, sorted, "newest first, no repeats");
+    Ok(())
+}
+
+/// A run principal reads only resources tagged with its own run; the resource the webhook routes
+/// decide on never carries one.
+#[test]
+fn a_run_principal_cannot_read_a_webhook() {
+    let engine = crate::authz::policy::Engine::load(crate::authz::policy::DEFAULT_POLICY)
+        .expect("default policy");
+    let run = crate::authz::decision::Subject::run("r1");
+    let resource = crate::authz::decision::Resource::new(
+        crate::authz::action::ResourceType::StandingLaunch,
+        "webhook-1",
+        crate::authz::model::Principal::User("wren".into()),
+    );
+    assert!(resource.run.is_none());
+    let decision = engine.authorize(
+        &run,
+        crate::authz::action::Action {
+            resource: crate::authz::action::ResourceType::StandingLaunch,
+            verb: crate::authz::action::Verb::Read,
+        },
+        &resource,
+        0,
+    );
+    assert!(!decision.allowed);
 }

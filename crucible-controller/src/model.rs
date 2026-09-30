@@ -426,6 +426,8 @@ pub(crate) enum LaunchOrigin {
     Draft,
     /// A tracker watch's sweep: one launch per item its query matched.
     Watch,
+    /// A webhook delivery a sender outside the controller made.
+    Webhook,
 }
 
 crate::wire_enum::wire_enum!(LaunchOrigin, "launch origin", both, {
@@ -434,6 +436,7 @@ crate::wire_enum::wire_enum!(LaunchOrigin, "launch origin", both, {
     LaunchOrigin::Schedule => "schedule",
     LaunchOrigin::Draft => "draft",
     LaunchOrigin::Watch => "watch",
+    LaunchOrigin::Webhook => "webhook",
 });
 
 /// Which sidecar a core row belongs to. The DB discriminator; a sidecar module knows its own.
@@ -442,12 +445,14 @@ pub enum Trigger {
     Schedule,
     Deferred,
     Watch,
+    Webhook,
 }
 
 crate::wire_enum::wire_enum!(Trigger, "trigger", both, {
     Trigger::Schedule => "schedule",
     Trigger::Deferred => "deferred",
     Trigger::Watch => "watch",
+    Trigger::Webhook => "webhook",
 });
 
 impl Trigger {
@@ -457,6 +462,7 @@ impl Trigger {
             Trigger::Schedule => LaunchOrigin::Schedule,
             Trigger::Deferred => LaunchOrigin::Deferred,
             Trigger::Watch => LaunchOrigin::Watch,
+            Trigger::Webhook => LaunchOrigin::Webhook,
         }
     }
 
