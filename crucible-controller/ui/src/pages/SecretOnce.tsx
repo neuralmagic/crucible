@@ -35,7 +35,7 @@ export function SecretOnce({ secret, url, path, verifier }: SecretOnceProps) {
   return (
     <div role="status" className="grid gap-2 border border-amber bg-sunk px-4.5 py-3">
       <Mono size="label" weight="semibold" uppercase tone="amber" className="tracking-section">
-        Shown once. Copy it now; the controller keeps no readable copy.
+        Shown once. Copy it now.
       </Mono>
       <MetaRow label={url === null ? 'Delivery path' : 'Delivery URL'}>
         <span className="flex items-center gap-2">
@@ -53,17 +53,6 @@ export function SecretOnce({ secret, url, path, verifier }: SecretOnceProps) {
           <CopyButton text={secret} />
         </span>
       </MetaRow>
-      {verifier === 'path_token' ? (
-        <Mono size="data" tone="ink-3">
-          Have the sender POST JSON to the delivery URL above; the token in it is the credential. On
-          quay.io that is a "Webhook POST" notification.
-        </Mono>
-      ) : (
-        <Mono size="data" tone="ink-3">
-          Have the sender POST JSON to the delivery URL, signed with the HMAC secret. On GitHub that is a
-          webhook with content type application/json.
-        </Mono>
-      )}
     </div>
   );
 }

@@ -7,6 +7,7 @@ import {
   Breadcrumb,
   Button,
   Empty,
+  InfoTip,
   formatStamp,
   LoadingBlock,
   Mono,
@@ -50,7 +51,7 @@ function DeliveryPage({ webhookId, before, onOlder }: DeliveryPageProps) {
   return (
     <>
       {before === null && page.data.length === 0 ? (
-        <Notice label="Empty">No delivery recorded yet. Post one to the address above.</Notice>
+        <Notice label="Empty">No deliveries.</Notice>
       ) : null}
       {page.data.map((delivery) => (
         <DeliveryRow key={delivery.id} delivery={delivery} />
@@ -237,14 +238,13 @@ export function WebhookDetailPage() {
                   {w.delivery_url ?? w.delivery_path}
                   {w.verifier === 'path_token' ? '/<token>' : ''}
                 </Mono>
-                {w.verifier === 'hmac_sha256' ? <CopyButton text={w.delivery_url ?? w.delivery_path} /> : null}
+                {w.verifier === 'hmac_sha256' ? (
+                  <CopyButton text={w.delivery_url ?? w.delivery_path} />
+                ) : (
+                  <InfoTip label="About the token">Shown once, at creation. Rotate the secret for a new URL.</InfoTip>
+                )}
               </span>
             </MetaRow>
-            {w.verifier === 'path_token' ? (
-              <Mono size="data" tone="ink-3">
-                The token was shown once, at creation. Rotate the secret to get a new URL.
-              </Mono>
-            ) : null}
             {w.header ? (
               <MetaRow label="Signature header">
                 <Mono size="data">{w.header}</Mono>
@@ -266,7 +266,7 @@ export function WebhookDetailPage() {
       </Section>
 
       <Section>
-        <SectionHeader title="Transform" note="CEL over body, headers, delivery, and received_at" />
+        <SectionHeader title="Transform" />
         <SectionBody>
           <div className="grid gap-2">
             <MetaRow label="Filter">
@@ -292,7 +292,7 @@ export function WebhookDetailPage() {
       </Section>
 
       <Section>
-        <SectionHeader title="Deliveries" note="newest first" />
+        <SectionHeader title="Deliveries" />
         {cursors.map((before, index) => (
           <DeliveryPage
             key={before ?? 'newest'}

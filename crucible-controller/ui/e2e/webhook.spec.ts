@@ -31,9 +31,9 @@ test.describe('the webhook form', () => {
   test('Custom is the default sender and starts the transform over after a preset', async ({ page }) => {
     await stubApi(page);
     await page.goto('/playbooks/survey/webhook');
-    const sender = page.getByLabel('Sender');
+    const sender = page.getByLabel('Sender', { exact: true });
     await expect(sender).toHaveValue('');
-    await expect(sender.locator('option:checked')).toHaveText('Custom: any sender that POSTs JSON');
+    await expect(sender.locator('option:checked')).toHaveText('Custom');
     const filter = page.getByTestId('cel-filter');
     await expect(filter.locator('.monaco-editor')).toBeVisible();
 
@@ -45,5 +45,8 @@ test.describe('the webhook form', () => {
     await expect(filter).toContainText('true');
     await expect(filter).not.toContainText('updated_tags');
     await expect(page.locator('#mode-topic')).toHaveValue('fixed');
+
+    await page.getByRole('button', { name: 'About the transform' }).hover();
+    await expect(page.getByText('CEL over body, headers, delivery, and received_at.')).toBeVisible();
   });
 });

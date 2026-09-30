@@ -30,11 +30,12 @@ describe('webhookView', () => {
     expect(webhookView(row({ owner_signin_required: true, enabled: false })).state).toBe('signin');
   });
 
-  it('says why it is paused and what its address does meanwhile', () => {
+  it('says why it is paused', () => {
     const view = webhookView(row({ enabled: false, consecutive_failures: 3 }));
     expect(view.state).toBe('paused');
-    expect(view.detail).toContain('3 launches in a row failed');
-    expect(view.detail).toContain('not found');
+    expect(view.detail).toBe('Paused after 3 failed launches.');
+    expect(webhookView(row({ enabled: false, consecutive_failures: 1 })).detail).toBe('Paused after 1 failed launch.');
+    expect(webhookView(row({ enabled: false })).detail).toBe('Paused.');
   });
 
   it('surfaces a failing owner refresh', () => {
