@@ -47,10 +47,10 @@ pub struct WebhookDto {
     pub adopted_path: Option<String>,
     pub adopted_rev: Option<String>,
     /// The fixed values every launch carries.
-    #[schema(value_type = Object)]
+    #[schema(value_type = BTreeMap<String, String>)]
     pub params: serde_json::Value,
     /// Param name to the CEL expression that derives it from a delivery.
-    #[schema(value_type = Object)]
+    #[schema(value_type = BTreeMap<String, String>)]
     pub derive: serde_json::Value,
     pub filter: String,
     pub dedupe: String,
@@ -66,6 +66,9 @@ pub struct WebhookDto {
     /// Where deliveries are posted, relative to the delivery surface. A `path_token` webhook's
     /// deliveries add its token as one more segment.
     pub delivery_path: String,
+    /// The full delivery URL when this controller knows its public delivery address. A
+    /// `path_token` webhook's URL is this plus its token, which is never readable again.
+    pub delivery_url: Option<String>,
     pub last_delivery_at: Option<String>,
     pub enabled: bool,
     pub consecutive_failures: i64,
@@ -87,6 +90,7 @@ impl From<Webhook> for WebhookDto {
         let c = w.core;
         WebhookDto {
             delivery_path: format!("/hooks/{}", c.id),
+            delivery_url: None,
             id: c.id,
             playbook: c.playbook,
             adopted_repo: c.adopted_repo,
@@ -247,7 +251,7 @@ pub(crate) struct WebhookPreviewBody {
     #[serde(default)]
     derive: BTreeMap<String, String>,
     /// The sample body, as the sender would post it.
-    #[schema(value_type = Object)]
+    #[schema(value_type = Value)]
     sample: serde_json::Value,
     #[serde(default)]
     headers: BTreeMap<String, String>,
@@ -256,7 +260,7 @@ pub(crate) struct WebhookPreviewBody {
 /// One transform result: the value, or why the delivery would settle failed.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PreviewResultDto {
-    #[schema(value_type = Object)]
+    #[schema(value_type = Option<Value>)]
     pub value: Option<serde_json::Value>,
     pub error: Option<String>,
 }
@@ -308,6 +312,17 @@ fn derive_map(derive: &BTreeMap<String, String>) -> serde_json::Map<String, serd
         .iter()
         .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
         .collect()
+}
+
+/// A webhook as the API answers it, its delivery URL filled in from this controller's public
+/// delivery address.
+fn dto(state: &ApiState, w: Webhook) -> WebhookDto {
+    let mut dto = WebhookDto::from(w);
+    dto.delivery_url = state
+        .hooks_public_url
+        .as_deref()
+        .map(|base| format!("{}{}", base.trim_end_matches('/'), dto.delivery_path));
+    dto
 }
 
 fn delivery_url(state: &ApiState, id: &str, kind: VerifierKind, secret: &str) -> Option<String> {
@@ -611,7 +626,7 @@ pub(crate) async fn create_webhook(
     (
         StatusCode::CREATED,
         Json(WebhookSecretDto {
-            webhook: WebhookDto::from(webhook),
+            webhook: dto(&state, webhook),
             secret: created.secret,
             delivery_url: url,
         }),
@@ -640,7 +655,7 @@ pub(crate) async fn list_webhooks(
         resource_of,
     )
     .await?;
-    Ok(Json(readable.into_iter().map(WebhookDto::from).collect()))
+    Ok(Json(readable.into_iter().map(|w| dto(&state, w)).collect()))
 }
 
 /// `GET /api/webhooks/presets` — starting points for a webhook form.
@@ -709,7 +724,7 @@ pub(crate) async fn get_webhook(
     Path(id): Path<String>,
 ) -> Response {
     match readable_webhook(&state, &caller, &id, Verb::Read).await {
-        Ok(w) => Json(WebhookDto::from(w)).into_response(),
+        Ok(w) => Json(dto(&state, w)).into_response(),
         Err(refusal) => refusal,
     }
 }
@@ -842,7 +857,7 @@ pub(crate) async fn update_webhook(
     {
         return refusal;
     }
-    Json(WebhookDto::from(webhook)).into_response()
+    Json(dto(&state, webhook)).into_response()
 }
 
 /// Delete a webhook. Its deliveries and consumed keys go with it; the launches it made stay.
@@ -944,7 +959,7 @@ pub(crate) async fn set_webhook_enabled(
         return refusal;
     }
     match crate::launches::webhooks::get(state.db.pool(), &id).await {
-        Ok(Some(w)) => Json(WebhookDto::from(w)).into_response(),
+        Ok(Some(w)) => Json(dto(&state, w)).into_response(),
         Ok(None) => not_found(format!("no webhook {id:?}")),
         Err(e) => AppError::from(e).into_response(),
     }
@@ -999,7 +1014,7 @@ pub(crate) async fn rotate_webhook_secret(
         Ok(Some(w)) => {
             let url = delivery_url(&state, &id, w.verifier, &secret);
             Json(WebhookSecretDto {
-                webhook: WebhookDto::from(w),
+                webhook: dto(&state, w),
                 secret,
                 delivery_url: url,
             })
@@ -1012,6 +1027,7 @@ pub(crate) async fn rotate_webhook_secret(
 
 /// A page of a webhook's deliveries.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct DeliveriesQuery {
     /// Only deliveries recorded before this delivery id: the last id of the previous page.
     #[serde(default)]
@@ -1091,4 +1107,95 @@ pub(crate) async fn preview_webhook(axum::Json(body): axum::Json<WebhookPreviewB
         derive: evaluated.params.map(serde_json::Value::Object).into(),
     })
     .into_response()
+}
+
+/// A body to check: the expressions of a transform, with no sample.
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct WebhookCheckBody {
+    #[serde(default = "match_all")]
+    filter: String,
+    #[serde(default)]
+    dedupe: String,
+    #[serde(default)]
+    derive: BTreeMap<String, String>,
+}
+
+/// One refusal of one expression. `line` and `column` are 1-based, present when the parser named a
+/// position; without them the refusal is about the whole expression.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CelDiagnosticDto {
+    /// `filter`, `dedupe`, or `derive.<param>`.
+    pub field: String,
+    pub message: String,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WebhookCheckDto {
+    /// Every refusal a save would answer with; empty when the transform compiles.
+    pub diagnostics: Vec<CelDiagnosticDto>,
+}
+
+/// Check a transform's expressions the way a save does, and say where each refusal is. Nothing is
+/// evaluated or stored.
+#[utoipa::path(
+    post,
+    path = "/api/webhooks/check",
+    request_body = WebhookCheckBody,
+    responses((status = 200, description = "The refusals a save would answer with", body = WebhookCheckDto))
+)]
+pub(crate) async fn check_webhook(
+    axum::Json(body): axum::Json<WebhookCheckBody>,
+) -> Json<WebhookCheckDto> {
+    let diagnostics = crate::launches::webhooks::transform::diagnose(
+        &body.filter,
+        &body.dedupe,
+        &derive_map(&body.derive),
+    )
+    .into_iter()
+    .map(|d| CelDiagnosticDto {
+        field: d.field,
+        message: d.message,
+        line: d.at.map(|(line, _)| line),
+        column: d.at.map(|(_, column)| column),
+    })
+    .collect();
+    Json(WebhookCheckDto { diagnostics })
+}
+
+/// A function an editor offers, and whether it is called on a target (`s.startsWith(p)`).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CelFunctionDto {
+    pub name: String,
+    pub member: bool,
+}
+
+/// What a transform may name: its variables, the functions the interpreter defines, and the macros.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CelLanguageDto {
+    pub variables: Vec<String>,
+    pub functions: Vec<CelFunctionDto>,
+    pub macros: Vec<String>,
+}
+
+/// `GET /api/webhooks/cel` — what a webhook transform may name.
+#[utoipa::path(
+    get,
+    path = "/api/webhooks/cel",
+    responses((status = 200, description = "Variables, functions, and macros", body = CelLanguageDto))
+)]
+pub(crate) async fn webhook_cel_language() -> Json<CelLanguageDto> {
+    use crate::launches::webhooks::transform::{FUNCTIONS, MACROS, VARIABLES};
+    Json(CelLanguageDto {
+        variables: VARIABLES.iter().map(|v| v.to_string()).collect(),
+        functions: FUNCTIONS
+            .iter()
+            .map(|(name, member)| CelFunctionDto {
+                name: name.to_string(),
+                member: *member,
+            })
+            .collect(),
+        macros: MACROS.iter().map(|m| m.to_string()).collect(),
+    })
 }

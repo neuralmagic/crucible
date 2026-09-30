@@ -142,8 +142,21 @@ enum Command {
     /// A webhook's recorded deliveries, newest first, with how each settled.
     WebhookDeliveries {
         id: String,
+        /// Only deliveries recorded before this delivery id: the last id of the previous page.
+        #[arg(long)]
+        before: Option<String>,
+        /// Page size, at most 200.
+        #[arg(long)]
+        limit: Option<i64>,
         #[arg(long)]
         json: bool,
+    },
+
+    /// Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save
+    /// does. Prints `ok`, or fails with one `field:line:col: message` per refusal.
+    WebhookCheck {
+        #[arg(long)]
+        file: std::path::PathBuf,
     },
 
     /// Starting points for a webhook body: a sender's verifier and a transform, as JSON.
@@ -642,9 +655,13 @@ pub async fn run() -> Result<()> {
         Command::Watch { id } => ops::watch(&client, &id).await?,
         Command::Webhooks { json } => ops::webhooks(&client, json).await?,
         Command::Webhook { id } => ops::webhook(&client, &id).await?,
-        Command::WebhookDeliveries { id, json } => {
-            ops::webhook_deliveries(&client, &id, json).await?
-        }
+        Command::WebhookDeliveries {
+            id,
+            before,
+            limit,
+            json,
+        } => ops::webhook_deliveries(&client, &id, before.as_deref(), limit, json).await?,
+        Command::WebhookCheck { file } => ops::webhook_check(&client, &file).await?,
         Command::WebhookPresets => ops::webhook_presets(&client).await?,
         Command::WebhookCreate { file } => ops::webhook_create(&client, &file).await?,
         Command::WebhookUpdate { id, file } => ops::webhook_update(&client, &id, &file).await?,

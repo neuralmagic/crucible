@@ -463,9 +463,26 @@ impl Client {
         self.get(&format!("/api/webhooks/{}", encode(id))).await
     }
 
-    pub async fn webhook_deliveries<T: DeserializeOwned>(&self, id: &str) -> Result<T> {
-        self.get(&format!("/api/webhooks/{}/deliveries", encode(id)))
-            .await
+    /// A page of a webhook's deliveries, newest first: at most `limit`, recorded before `before`.
+    pub async fn webhook_deliveries<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        before: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<T> {
+        let mut query = Vec::new();
+        if let Some(before) = before {
+            query.push(format!("before={}", encode(before)));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        let path = format!("/api/webhooks/{}/deliveries", encode(id));
+        if query.is_empty() {
+            self.get(&path).await
+        } else {
+            self.get(&format!("{path}?{}", query.join("&"))).await
+        }
     }
 
     pub async fn whoami(&self) -> Result<dto::Whoami> {

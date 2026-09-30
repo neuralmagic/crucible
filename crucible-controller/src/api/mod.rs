@@ -126,6 +126,8 @@ pub(crate) mod tests;
         crate::launches::api::webhooks::list_webhooks,
         crate::launches::api::webhooks::list_webhook_presets,
         crate::launches::api::webhooks::preview_webhook,
+        crate::launches::api::webhooks::check_webhook,
+        crate::launches::api::webhooks::webhook_cel_language,
         crate::launches::api::webhooks::get_webhook,
         crate::launches::api::webhooks::update_webhook,
         crate::launches::api::webhooks::delete_webhook,
@@ -310,6 +312,11 @@ pub(crate) mod tests;
         crate::launches::api::webhooks::WebhookPreviewDto,
         crate::launches::api::webhooks::PreviewResultDto,
         crate::launches::api::webhooks::WebhookPresetDto,
+        crate::launches::api::webhooks::WebhookCheckBody,
+        crate::launches::api::webhooks::WebhookCheckDto,
+        crate::launches::api::webhooks::CelDiagnosticDto,
+        crate::launches::api::webhooks::CelFunctionDto,
+        crate::launches::api::webhooks::CelLanguageDto,
         dto::ValidationErrorBody,
         crate::playbooks::registry::FieldError,
         ErrorBody,
@@ -542,6 +549,10 @@ pub fn router(state: ApiState) -> Router {
             crate::launches::api::webhooks::list_webhook_presets
         ))
         .routes(routes!(crate::launches::api::webhooks::preview_webhook))
+        .routes(routes!(crate::launches::api::webhooks::check_webhook))
+        .routes(routes!(
+            crate::launches::api::webhooks::webhook_cel_language
+        ))
         .routes(routes!(
             crate::launches::api::webhooks::get_webhook,
             crate::launches::api::webhooks::update_webhook,

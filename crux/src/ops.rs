@@ -957,11 +957,17 @@ pub async fn webhook(c: &Client, id: &str) -> Result<String> {
     json(&c.webhook::<Value>(id).await?)
 }
 
-pub async fn webhook_deliveries(c: &Client, id: &str, as_json: bool) -> Result<String> {
+pub async fn webhook_deliveries(
+    c: &Client,
+    id: &str,
+    before: Option<&str>,
+    limit: Option<i64>,
+    as_json: bool,
+) -> Result<String> {
     if as_json {
-        return json(&c.webhook_deliveries::<Value>(id).await?);
+        return json(&c.webhook_deliveries::<Value>(id, before, limit).await?);
     }
-    let list: Vec<dto::WebhookDelivery> = c.webhook_deliveries(id).await?;
+    let list: Vec<dto::WebhookDelivery> = c.webhook_deliveries(id, before, limit).await?;
     Ok(render::webhook_deliveries(&list))
 }
 
@@ -1003,6 +1009,20 @@ pub async fn webhook_rotate(c: &Client, id: &str) -> Result<String> {
 pub async fn webhook_delete(c: &Client, id: &str) -> Result<String> {
     c.delete(&format!("/api/webhooks/{}", encode(id))).await?;
     Ok(format!("deleted webhook {id}\n"))
+}
+
+/// Check a transform the way a save does. Clean prints `ok`; otherwise one `field:line:col: message`
+/// per refusal, and the command fails so a script can gate on it.
+pub async fn webhook_check(c: &Client, file: &Path) -> Result<String> {
+    let checked: dto::WebhookCheck = c
+        .post("/api/webhooks/check", Some(&read_body(file)?))
+        .await?;
+    let out = render::webhook_check(&checked);
+    if checked.diagnostics.is_empty() {
+        Ok(out)
+    } else {
+        bail!("{}", out.trim_end())
+    }
 }
 
 pub async fn webhook_preview(c: &Client, file: &Path) -> Result<String> {

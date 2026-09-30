@@ -3265,6 +3265,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/webhooks",
         "/api/webhooks/presets",
         "/api/webhooks/preview",
+        "/api/webhooks/check",
+        "/api/webhooks/cel",
         "/api/webhooks/{id}",
         "/api/webhooks/{id}/enabled",
         "/api/webhooks/{id}/secret",
@@ -13178,6 +13180,66 @@ async fn a_webhook_keeps_the_verifier_it_was_created_with(pool: PgPool) -> Resul
     assert!(
         stored.get("secret").is_none(),
         "an edit never discloses a secret"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_webhook_transform_is_checked_with_positions_and_its_url_is_readable(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/webhooks/check",
+        "wren",
+        Some(serde_json::json!({
+            "filter": "body.repository ==",
+            "dedupe": "body.tags.join(\",\")",
+            "derive": {"image": "body.docker_url"},
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let checked: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let diagnostics = checked["diagnostics"].as_array().expect("diagnostics");
+    assert_eq!(diagnostics.len(), 2, "{checked}");
+    assert_eq!(diagnostics[0]["field"], "filter");
+    assert_eq!(diagnostics[0]["line"], 1);
+    assert_eq!(diagnostics[0]["column"], 19);
+    assert_eq!(diagnostics[1]["field"], "dedupe");
+    assert!(diagnostics[1]["line"].is_null());
+    assert!(
+        diagnostics[1]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("join"))
+    );
+
+    let (_, language) = get_json_object(&app, "/api/webhooks/cel").await;
+    assert_eq!(
+        language["variables"],
+        serde_json::json!(["body", "headers", "delivery", "received_at"])
+    );
+    assert!(language["functions"].as_array().is_some_and(|f| {
+        f.iter()
+            .any(|f| f["name"] == "startsWith" && f["member"] == true)
+    }));
+
+    register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
+    let mut signed = quay_webhook_body();
+    signed["verifier"] = serde_json::json!("hmac_sha256");
+    signed["header"] = serde_json::json!("x-hub-signature-256");
+    let (_, bytes) = send(&app, "POST", "/api/webhooks", "wren", Some(signed)).await;
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = created["webhook"]["id"].as_str().expect("id");
+    let (_, read) = get_json_object(&app, &format!("/api/webhooks/{id}")).await;
+    assert_eq!(
+        read["delivery_url"],
+        format!("https://hooks.example.com/hooks/{id}"),
+        "a signed webhook's full address is readable, since it carries no secret"
     );
     Ok(())
 }

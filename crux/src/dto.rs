@@ -885,6 +885,22 @@ pub struct WebhookDelivery {
     pub launch_key: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct CelDiagnostic {
+    pub field: String,
+    pub message: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub column: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebhookCheck {
+    #[serde(default)]
+    pub diagnostics: Vec<CelDiagnostic>,
+}
+
 /// The launch acknowledgement: which issue the launch became.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LaunchAck {

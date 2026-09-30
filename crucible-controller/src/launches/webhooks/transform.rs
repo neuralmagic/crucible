@@ -122,39 +122,100 @@ impl Transform {
     }
 }
 
+/// One refusal of one expression, at the 1-based line and column the parser named, when it named one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Diagnostic {
+    pub field: String,
+    pub message: String,
+    pub at: Option<(u32, u32)>,
+}
+
+/// Every refusal a save would answer for this transform. Empty means it compiles.
+pub(crate) fn diagnose(
+    filter: &str,
+    dedupe: &str,
+    derive: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<Diagnostic> {
+    let mut found = Vec::new();
+    diagnose_one(&mut found, "filter".to_string(), Some(filter));
+    diagnose_one(&mut found, "dedupe".to_string(), Some(dedupe));
+    for (name, source) in derive {
+        diagnose_one(&mut found, format!("derive.{name}"), source.as_str());
+    }
+    found
+}
+
+fn diagnose_one(found: &mut Vec<Diagnostic>, field: String, source: Option<&str>) {
+    let refused = match source {
+        Some(source) => compile_one(source).err(),
+        None => Some(Located::from("an expression is a string".to_string())),
+    };
+    if let Some(located) = refused {
+        found.push(Diagnostic {
+            field,
+            message: located.message,
+            at: located.at,
+        });
+    }
+}
+
+/// Why an expression was refused, and where in it when the parser said.
+struct Located {
+    message: String,
+    at: Option<(u32, u32)>,
+}
+
+impl From<String> for Located {
+    fn from(message: String) -> Self {
+        Located { message, at: None }
+    }
+}
+
 fn compile_field(field: &str, source: &str, refused: &mut Vec<FieldError>) -> Option<IdedExpr> {
     compile_one(source)
-        .map_err(|message| {
+        .map_err(|located| {
             refused.push(FieldError {
                 field: field.to_string(),
-                message,
+                message: match located.at {
+                    Some((line, column)) => format!("{line}:{column}: {}", located.message),
+                    None => located.message,
+                },
             })
         })
         .ok()
 }
 
-fn compile_one(source: &str) -> Result<IdedExpr, String> {
+fn compile_one(source: &str) -> Result<IdedExpr, Located> {
     if source.len() > MAX_EXPRESSION_BYTES {
         return Err(format!(
             "is {} bytes; an expression is at most {MAX_EXPRESSION_BYTES}",
             source.len()
-        ));
+        )
+        .into());
     }
     let depth = bracket_depth(source);
     if depth > usize::from(MAX_PARSE_DEPTH) {
         return Err(format!(
             "nests brackets {depth} deep; an expression nests at most {MAX_PARSE_DEPTH}"
-        ));
+        )
+        .into());
     }
     let expr = on_parser_stack(|| {
         Parser::new()
             .max_recursion_depth(MAX_PARSE_DEPTH)
             .parse(source)
-            .map_err(|e| {
-                let text = e.to_string();
-                text.lines().next().unwrap_or("does not parse").to_string()
+            .map_err(|e| match e.errors.first() {
+                Some(first) => Located {
+                    message: first.msg.clone(),
+                    at: u32::try_from(first.pos.0)
+                        .ok()
+                        .zip(u32::try_from(first.pos.1).ok())
+                        .filter(|(line, column)| *line > 0 && *column > 0),
+                },
+                None => Located::from("does not parse".to_string()),
             })
-    })??;
+    })
+    .map_err(Located::from)??;
     check(&expr, 0)?;
     let mut free = BTreeSet::new();
     free_idents(&expr, &BTreeSet::new(), &mut free);
@@ -162,7 +223,8 @@ fn compile_one(source: &str) -> Result<IdedExpr, String> {
         return Err(format!(
             "reads {unknown}; an expression reads only {}",
             VARIABLES.join(", ")
-        ));
+        )
+        .into());
     }
     let mut called = BTreeSet::new();
     called_functions(&expr, &mut called);
@@ -170,13 +232,34 @@ fn compile_one(source: &str) -> Result<IdedExpr, String> {
         .iter()
         .find(|(name, member)| !is_defined(name, *member))
     {
-        return Err(format!("calls {unknown}, which CEL here does not define"));
+        return Err(format!("calls {unknown}, which CEL here does not define").into());
     }
     Ok(expr)
 }
 
 /// The variables a transform is evaluated with.
-const VARIABLES: &[&str] = &["body", "headers", "delivery", "received_at"];
+pub(crate) const VARIABLES: &[&str] = &["body", "headers", "delivery", "received_at"];
+
+/// The functions an editor offers: `(name, called on a target)`. A test holds each to
+/// [`is_defined`], so the list cannot name one the interpreter lacks.
+pub(crate) const FUNCTIONS: &[(&str, bool)] = &[
+    ("size", false),
+    ("int", false),
+    ("uint", false),
+    ("double", false),
+    ("string", false),
+    ("bytes", false),
+    ("type", false),
+    ("timestamp", false),
+    ("duration", false),
+    ("contains", true),
+    ("startsWith", true),
+    ("endsWith", true),
+    ("matches", true),
+];
+
+/// The macros an editor offers, which expand before evaluation rather than being called.
+pub(crate) const MACROS: &[&str] = &["has", "all", "exists", "exists_one", "map", "filter"];
 
 /// The named functions `e` calls, operators excluded, each with whether it is called on a target.
 fn called_functions(e: &IdedExpr, out: &mut BTreeSet<(String, bool)>) {
@@ -688,5 +771,39 @@ mod tests {
                 "{source}"
             );
         }
+    }
+
+    #[test]
+    fn every_offered_function_is_one_the_interpreter_defines() {
+        for (name, member) in crate::launches::webhooks::transform::FUNCTIONS {
+            assert!(
+                crate::launches::webhooks::transform::is_defined(name, *member),
+                "{name} is offered but not defined"
+            );
+        }
+    }
+
+    #[test]
+    fn a_syntax_error_names_its_line_and_column() {
+        let found = crate::launches::webhooks::transform::diagnose(
+            "body.repository ==",
+            "1 +\n  )",
+            &params(json!({"image": "body.l.map(x, body.l)"})),
+        );
+        let by_field: Vec<(&str, Option<(u32, u32)>)> =
+            found.iter().map(|d| (d.field.as_str(), d.at)).collect();
+        assert_eq!(
+            by_field,
+            vec![
+                ("filter", Some((1, 19))),
+                ("dedupe", Some((2, 3))),
+                ("derive.image", None),
+            ]
+        );
+        assert!(found[0].message.starts_with("Syntax error"));
+        assert!(
+            crate::launches::webhooks::transform::diagnose("true", "delivery", &params(json!({})))
+                .is_empty()
+        );
     }
 }

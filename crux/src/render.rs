@@ -1257,6 +1257,21 @@ pub fn webhook_deliveries(list: &[dto::WebhookDelivery]) -> String {
     )
 }
 
+/// A transform check: `ok`, or one `field:line:col: message` per refusal.
+pub fn webhook_check(checked: &dto::WebhookCheck) -> String {
+    if checked.diagnostics.is_empty() {
+        return "ok\n".to_string();
+    }
+    checked
+        .diagnostics
+        .iter()
+        .map(|d| match (d.line, d.column) {
+            (Some(line), Some(column)) => format!("{}:{line}:{column}: {}\n", d.field, d.message),
+            _ => format!("{}: {}\n", d.field, d.message),
+        })
+        .collect()
+}
+
 /// What a launch became, and where to watch it.
 pub fn launched(ack: &dto::LaunchAck, run_url: &str) -> String {
     let mut out = format!(
@@ -2669,5 +2684,35 @@ mod tests {
             "{row}"
         );
         assert_eq!(webhook_deliveries(&[]), "no deliveries\n");
+    }
+
+    #[test]
+    fn a_webhook_check_prints_ok_or_each_refusal_where_it_is() {
+        assert_eq!(
+            webhook_check(&dto::WebhookCheck {
+                diagnostics: vec![]
+            }),
+            "ok\n"
+        );
+        let checked = dto::WebhookCheck {
+            diagnostics: vec![
+                dto::CelDiagnostic {
+                    field: "filter".to_string(),
+                    message: "Syntax error".to_string(),
+                    line: Some(1),
+                    column: Some(19),
+                },
+                dto::CelDiagnostic {
+                    field: "derive.image".to_string(),
+                    message: "calls join".to_string(),
+                    line: None,
+                    column: None,
+                },
+            ],
+        };
+        assert_eq!(
+            webhook_check(&checked),
+            "filter:1:19: Syntax error\nderive.image: calls join\n"
+        );
     }
 }

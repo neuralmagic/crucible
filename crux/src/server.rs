@@ -950,7 +950,7 @@ impl CrucibleMcp {
         &self,
         Parameters(a): Parameters<WebhookDeliveriesArgs>,
     ) -> String {
-        flatten(ops::webhook_deliveries(&self.client, &a.id, a.json).await)
+        flatten(ops::webhook_deliveries(&self.client, &a.id, None, None, a.json).await)
     }
 
     #[tool(

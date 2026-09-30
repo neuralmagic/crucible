@@ -647,6 +647,20 @@ pub static BINDINGS: &[Binding] = &[
         Route,
     ),
     bind(
+        "POST",
+        "/api/webhooks/check",
+        R::StandingLaunch,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "GET",
+        "/api/webhooks/cel",
+        R::StandingLaunch,
+        V::Read,
+        Route,
+    ),
+    bind(
         "GET",
         "/api/webhooks/{id}",
         R::StandingLaunch,
