@@ -82,8 +82,6 @@ pub enum ManifestError {
     SandboxSecret { name: String, secret: String },
     #[error("[agent.sandbox.{name}] names relay {dest:?}, which no [[agent.relay]] declares")]
     SandboxRelay { name: String, dest: String },
-    #[error("[agent.sandbox.{name}] endpoint: {problem}")]
-    SandboxEndpoint { name: String, problem: String },
     #[error(
         "[[secret]] {secret:?} projects to {env}, which the engine sets itself for the model; a \
          pack with named sandboxes cannot withhold it, so use another name"
@@ -818,14 +816,6 @@ fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), Ma
                     dest: dest.clone(),
                 });
             }
-        }
-        for endpoint in &profile.endpoints {
-            crate::openshell::grpc::parse_endpoint_spec(endpoint).map_err(|problem| {
-                ManifestError::SandboxEndpoint {
-                    name: name.clone(),
-                    problem: problem.to_string(),
-                }
-            })?;
         }
     }
     Ok(())
@@ -2643,10 +2633,6 @@ mod tests {
             (
                 "[agent.sandbox.go]\nimage = \"i\"\nrelays = [\".kube/config\"]",
                 "names relay \".kube/config\", which no [[agent.relay]] declares",
-            ),
-            (
-                "[agent.sandbox.go]\nimage = \"i\"\nendpoints = [\"proxy.golang.org\"]",
-                "[agent.sandbox.go] endpoint: endpoint 'proxy.golang.org' must be host:port",
             ),
         ] {
             let err = sandbox_manifest("openshell", profile, "")
