@@ -647,6 +647,9 @@ export const ROUTES: Record<string, Json> = {
     required: ['topic'],
     additionalProperties: false,
   },
+  '/api/webhooks/presets': [],
+  '/api/webhooks/cel': { variables: ['body', 'headers', 'delivery', 'received_at'], functions: [], macros: ['has'] },
+  '/api/webhooks/check': { diagnostics: [] },
   '/api/playbooks/import/candidates': {
     rev: '4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f8',
     candidates: [
