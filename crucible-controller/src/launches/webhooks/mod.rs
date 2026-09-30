@@ -211,8 +211,62 @@ pub(crate) async fn record_delivery(
         .execute(&mut *tx)
         .await
         .context("stamp the last delivery")?;
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(DELIVERY_CHANNEL)
+        .bind(webhook_id)
+        .execute(&mut *tx)
+        .await
+        .context("announce the delivery")?;
     tx.commit().await.context("record delivery: commit")?;
     Ok(id)
+}
+
+/// The channel a committed delivery is announced on. Any replica records deliveries; only the
+/// leader's launch loop listens.
+pub(crate) const DELIVERY_CHANNEL: &str = "crucible_webhook_delivery";
+
+/// How long a failed listen waits before it tries again.
+const LISTEN_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wakes the launch loop when deliveries are recorded, so they settle now rather than on the next
+/// discovery tick. It yields once on connecting and once after every reconnect as well, since a
+/// delivery announced while it was not listening is never announced again. Nothing connects until
+/// the stream is first polled.
+pub fn delivery_wakes(pool: PgPool) -> crate::daemon::WakeStream {
+    Box::pin(futures_util::stream::unfold(
+        (pool, None::<sqlx::postgres::PgListener>),
+        |(pool, listener)| async move {
+            let Some(mut listener) = listener else {
+                let listener = listen(&pool).await;
+                return Some(((), (pool, Some(listener))));
+            };
+            match listener.recv().await {
+                Ok(_) => while listener.next_buffered().is_some() {},
+                Err(e) => {
+                    tracing::warn!(error = %e, "webhooks: delivery listener lost its connection");
+                    tokio::time::sleep(LISTEN_RETRY).await;
+                }
+            }
+            Some(((), (pool, Some(listener))))
+        },
+    ))
+}
+
+async fn listen(pool: &PgPool) -> sqlx::postgres::PgListener {
+    loop {
+        let connected = async {
+            let mut listener = sqlx::postgres::PgListener::connect_with(pool).await?;
+            listener.listen(DELIVERY_CHANNEL).await?;
+            Ok::<_, sqlx::Error>(listener)
+        };
+        match connected.await {
+            Ok(listener) => return listener,
+            Err(e) => {
+                tracing::warn!(error = %e, "webhooks: cannot listen for deliveries");
+                tokio::time::sleep(LISTEN_RETRY).await;
+            }
+        }
+    }
 }
 
 /// How many webhooks and deliveries a list returns.
