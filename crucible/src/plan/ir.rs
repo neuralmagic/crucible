@@ -1047,13 +1047,21 @@ impl Plan {
         let mut index: BTreeMap<&TaskName, usize> = BTreeMap::new();
         let mut session_sandbox: BTreeMap<&str, (&TaskName, Option<&str>)> = BTreeMap::new();
         for t in &self.tasks {
-            let (Some(session), TaskKind::Agent { sandbox, .. }) = (&t.session, &t.task) else {
+            let Some(session) = &t.session else {
                 continue;
+            };
+            let sandbox = match &t.task {
+                TaskKind::Agent { sandbox, .. } => sandbox.as_deref(),
+                TaskKind::Engine {
+                    op: EngineOp::Propose,
+                    ..
+                } => None,
+                _ => continue,
             };
             let (first, theirs) = *session_sandbox
                 .entry(session.as_str())
-                .or_insert((&t.name, sandbox.as_deref()));
-            if theirs != sandbox.as_deref() {
+                .or_insert((&t.name, sandbox));
+            if theirs != sandbox {
                 return Err(PlanError::SessionSpansSandboxes {
                     session: session.clone(),
                     first: first.0.clone(),
@@ -2310,6 +2318,41 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_propose_session_runs_in_the_default_sandbox() {
+        let propose = || {
+            let mut task = agent("propose", &[]);
+            task.task = TaskKind::Engine {
+                op: EngineOp::Propose,
+                source: None,
+                tiebreak: None,
+            };
+            task.session = Some("s".into());
+            task
+        };
+        let review = |sandbox: Option<&str>| {
+            let mut task = agent("review", &["propose"]);
+            if let TaskKind::Agent { sandbox: slot, .. } = &mut task.task {
+                *slot = sandbox.map(str::to_string);
+            }
+            task.session = Some("s".into());
+            task
+        };
+        plan(vec![propose(), review(None)])
+            .validate()
+            .expect("both in the default sandbox");
+        assert_eq!(
+            plan(vec![propose(), review(Some("bare"))])
+                .validate()
+                .unwrap_err(),
+            PlanError::SessionSpansSandboxes {
+                session: "s".into(),
+                first: "propose".into(),
+                second: "review".into(),
+            }
+        );
     }
 
     #[test]

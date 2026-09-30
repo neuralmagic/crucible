@@ -684,20 +684,30 @@ fn prepare_and_run(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Att
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SandboxError {
+    #[error(
+        "task runs in sandbox {name:?}, which only the openshell backend provides; this run's \
+         backend is {backend}"
+    )]
+    NotOpenshell { name: String, backend: String },
+    #[error("task names sandbox {name:?}, which the manifest does not declare")]
+    Undeclared { name: String },
+}
+
 /// Point a turn at its named sandbox: the profile's image, its endpoints added to the pack's
 /// egress, and every relayed secret, relay file, and broker it does not list withheld.
-pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), String> {
+pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxError> {
     if args.agent_backend != crate::manifest::AgentBackend::Openshell {
-        return Err(format!(
-            "task runs in sandbox {name:?}, which only the openshell backend provides; this run's \
-             backend is {:?}",
-            args.agent_backend
-        ));
+        return Err(SandboxError::NotOpenshell {
+            name: name.to_string(),
+            backend: args.agent_backend.as_str().to_string(),
+        });
     }
     let Some(profile) = args.sandboxes.get(name).cloned() else {
-        return Err(format!(
-            "task names sandbox {name:?}, which the manifest does not declare"
-        ));
+        return Err(SandboxError::Undeclared {
+            name: name.to_string(),
+        });
     };
     let withheld: std::collections::BTreeSet<&str> = args
         .relayed_secrets
@@ -784,9 +794,9 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         }
     }
     if let Some(name) = sandbox
-        && let Err(note) = enter_sandbox(&mut args, name)
+        && let Err(err) = enter_sandbox(&mut args, name)
     {
-        return Attempt::failed(0.0, note);
+        return Attempt::failed(0.0, err.to_string());
     }
     if let Err(e) = crate::cli::workspace::install_toolbox(
         paths,
@@ -1033,7 +1043,13 @@ mod tests {
             let mut args = sandboxed_args();
             args.agent_backend = backend;
             let err = enter_sandbox(&mut args, "bare").unwrap_err();
-            assert!(err.contains("only the openshell backend provides"), "{err}");
+            assert_eq!(
+                err,
+                SandboxError::NotOpenshell {
+                    name: "bare".into(),
+                    backend: backend.as_str().into(),
+                }
+            );
             assert_eq!(env_keys(&args).len(), 3, "nothing changed");
         }
     }
@@ -1042,7 +1058,12 @@ mod tests {
     fn an_undeclared_sandbox_is_a_failed_attempt_not_the_default_one() {
         let mut args = sandboxed_args();
         let err = enter_sandbox(&mut args, "rust").unwrap_err();
-        assert!(err.contains("\"rust\""), "{err}");
+        assert_eq!(
+            err,
+            SandboxError::Undeclared {
+                name: "rust".into()
+            }
+        );
         assert_eq!(
             args.sandbox_image.as_deref(),
             Some("ghcr.io/acme/default@sha256:aa"),

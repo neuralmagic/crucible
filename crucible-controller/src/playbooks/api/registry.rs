@@ -232,43 +232,29 @@ pub(crate) async fn authorize_image(
         .await
         .map_err(|e| AppError::from(e).into_response())?;
     let catalog = catalog(state).await?;
-    let mut verdict = crate::playbooks::preflight::preflight(agent, resolved.as_ref(), &catalog);
-    let mut errors: Vec<crate::playbooks::registry::FieldError> = verdict
-        .refusals
-        .iter()
-        .map(|message| crate::playbooks::registry::FieldError {
-            field: "sandbox_image".to_string(),
-            message: message.clone(),
-        })
-        .collect();
-    for (name, named) in
-        crate::playbooks::preflight::preflight_sandboxes(agent, resolved.as_ref(), &catalog)
-    {
-        errors.extend(
-            named
+    let verdict = crate::playbooks::preflight::preflight_pack(agent, resolved.as_ref(), &catalog);
+    if verdict.refused() {
+        return Err(refused(
+            refusal_headline(&verdict.refusals),
+            verdict
                 .refusals
                 .into_iter()
-                .filter(|message| !verdict.refusals.contains(message))
-                .map(|message| crate::playbooks::registry::FieldError {
-                    field: format!("sandbox.{name}"),
-                    message,
-                }),
-        );
-        for warning in named.warnings {
-            if !verdict.warnings.contains(&warning) {
-                verdict.warnings.push(format!("sandbox {name}: {warning}"));
-            }
-        }
+                .map(|r| crate::playbooks::registry::FieldError {
+                    field: r.field,
+                    message: r.message,
+                })
+                .collect(),
+        ));
     }
-    if !errors.is_empty() {
-        let headline = if errors.iter().all(|e| e.field == "sandbox_image") {
-            "the pack's sandbox image fails the capability preflight"
-        } else {
-            "a sandbox image the pack names fails the capability preflight"
-        };
-        return Err(refused(headline, errors));
+    Ok(verdict.image)
+}
+
+fn refusal_headline(refusals: &[crate::playbooks::preflight::ImageRefusal]) -> &'static str {
+    if refusals.iter().all(|r| r.field == "sandbox_image") {
+        "the pack's sandbox image fails the capability preflight"
+    } else {
+        "a sandbox image the pack names fails the capability preflight"
     }
-    Ok(verdict)
 }
 
 /// One registered playbook: what it is, where it is pinned, and the digest of the launch form the

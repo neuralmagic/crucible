@@ -210,9 +210,10 @@ endpoints = ["proxy.golang.org:443:read-only"]
 analyze = agent(name = "analyze", prompt = "...", sandbox = "go")
 ```
 
-The turn starts from that image and adds those endpoints to `[agent.openshell]`'s. Of what the
-engine provisions, it receives only the listed secrets and relay files, and the broker only
-when `broker = true`. A task without `sandbox` runs in `sandbox_image` with all of it. Tasks that
+The turn starts from that image and adds those endpoints to `[agent.openshell]`'s. Of the pack's
+declared secrets and relay files it receives only the ones listed, and it reaches the broker only
+when `broker = true`. The deployment's own model credentials still reach every turn. A task
+without `sandbox` runs in `sandbox_image` with every declared secret and relay. Tasks that
 share a session must share a sandbox. A sandbox limits what the engine provisions, not what a task
 reads from upstream: output, files, and workspace changes from a task that held a secret still
 reach the tasks after it. The capability disclosure lists each sandbox, and the controller

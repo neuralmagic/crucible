@@ -84,6 +84,11 @@ pub enum ManifestError {
     SandboxRelay { name: String, dest: String },
     #[error("[agent.sandbox.{name}] endpoint: {problem}")]
     SandboxEndpoint { name: String, problem: String },
+    #[error(
+        "[[secret]] {secret:?} projects to {env}, which the engine sets itself for the model; a \
+         pack with named sandboxes cannot withhold it, so use another name"
+    )]
+    SandboxReservedEnv { secret: String, env: String },
     #[error("task {task:?} runs in sandbox {name:?}, which no [agent.sandbox.{name}] declares")]
     UnknownSandbox { task: String, name: String },
     #[error("manifest has no [judge] (task mode)")]
@@ -747,10 +752,12 @@ pub struct AgentCfg {
     pub sandbox: BTreeMap<String, SandboxProfile>,
 }
 
-/// One `[agent.sandbox.<name>]`: what the engine provisions into a task's sandbox. The image it
-/// starts from, the declared env secrets and `[[agent.relay]]` files passed in (every other one is
-/// withheld), whether it reaches the broker, and egress endpoints added to `[agent.openshell]`'s.
-/// It does not govern data a task reads from upstream tasks' output.
+/// The env vars the engine writes for the model's own credential on every turn.
+pub const MODEL_API_KEY_ENVS: [&str; 2] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+
+/// One `[agent.sandbox.<name>]`: the image a task's sandbox starts from, the declared env secrets
+/// and `[[agent.relay]]` files passed in (every other one is withheld), whether it reaches the
+/// broker, and egress endpoints added to `[agent.openshell]`'s.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxProfile {
@@ -764,11 +771,23 @@ pub struct SandboxProfile {
     /// Whether the turn reaches the `[agent.broker]`.
     #[serde(default)]
     pub broker: bool,
+    /// `host:port[:access...]` entries added to the pack's egress allowlist.
     #[serde(default)]
     pub endpoints: Vec<String>,
 }
 
 fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), ManifestError> {
+    if !agent.sandbox.is_empty()
+        && let Some((decl, env)) = secrets.iter().find_map(|decl| {
+            let env = decl.env.as_deref().map(str::trim)?;
+            MODEL_API_KEY_ENVS.contains(&env).then_some((decl, env))
+        })
+    {
+        return Err(ManifestError::SandboxReservedEnv {
+            secret: decl.name.clone(),
+            env: env.to_string(),
+        });
+    }
     for (name, profile) in &agent.sandbox {
         let valid_name = !name.is_empty()
             && name.len() <= 64
@@ -813,22 +832,27 @@ fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), Ma
 }
 
 fn validate_task_sandboxes(agent: &AgentCfg, workflow: &WorkflowCfg) -> Result<(), ManifestError> {
-    for task in &workflow.tasks {
-        let crate::plan::ir::TaskKind::Agent {
+    match undeclared_sandbox(&workflow.tasks, |name| agent.sandbox.contains_key(name)) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// The first task naming a sandbox `declared` does not know.
+pub fn undeclared_sandbox(
+    tasks: &[crate::plan::ir::Task],
+    declared: impl Fn(&str) -> bool,
+) -> Option<ManifestError> {
+    tasks.iter().find_map(|task| match &task.task {
+        crate::plan::ir::TaskKind::Agent {
             sandbox: Some(name),
             ..
-        } = &task.task
-        else {
-            continue;
-        };
-        if !agent.sandbox.contains_key(name) {
-            return Err(ManifestError::UnknownSandbox {
-                task: task.name.0.clone(),
-                name: name.clone(),
-            });
-        }
-    }
-    Ok(())
+        } if !declared(name) => Some(ManifestError::UnknownSandbox {
+            task: task.name.0.clone(),
+            name: name.clone(),
+        }),
+        _ => None,
+    })
 }
 
 fn default_model() -> String {
@@ -2630,6 +2654,35 @@ mod tests {
                 .expect_err(profile);
             assert!(err.to_string().contains(expected), "{profile}: {err:#}");
         }
+    }
+
+    #[test]
+    fn a_pack_with_sandboxes_cannot_declare_a_model_key_as_a_secret() {
+        let with_key = |profile: &str| {
+            let text = format!(
+                r#"
+                [repo]
+                path = "."
+                [agent]
+                goal = "g"
+                {profile}
+                [[secret]]
+                name = "key"
+                kind = "opaque"
+                env = "ANTHROPIC_API_KEY"
+            "#
+            );
+            toml::from_str::<Manifest>(&text)
+                .expect("parses")
+                .validate()
+        };
+        with_key("").expect("no sandbox withholds anything");
+        let err = with_key("[agent.sandbox.bare]\nimage = \"i\"").expect_err("reserved");
+        assert!(
+            err.to_string()
+                .contains(r#"[[secret]] "key" projects to ANTHROPIC_API_KEY"#),
+            "{err:#}"
+        );
     }
 
     #[test]

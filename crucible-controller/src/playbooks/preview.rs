@@ -161,23 +161,13 @@ pub(crate) fn preview_pack_for(
         }
     };
 
-    if let Some(agent) = &preview.agent {
-        for task in &compiled.workflow.tasks {
-            if let crucible::plan::ir::TaskKind::Agent {
-                sandbox: Some(name),
-                ..
-            } = &task.task
-                && !agent.sandboxes.contains_key(name)
-            {
-                preview.diagnostics.push(
-                    crucible::manifest::ManifestError::UnknownSandbox {
-                        task: task.name.0.clone(),
-                        name: name.clone(),
-                    }
-                    .to_string(),
-                );
-            }
-        }
+    if let Some(err) = crucible::manifest::undeclared_sandbox(&compiled.workflow.tasks, |name| {
+        preview
+            .agent
+            .as_ref()
+            .is_some_and(|agent| agent.sandboxes.contains_key(name))
+    }) {
+        preview.diagnostics.push(err.to_string());
     }
     match graph_from_compiled(compiled.canonical_json.as_bytes()) {
         Ok(graph) => preview.graph = Some(graph),

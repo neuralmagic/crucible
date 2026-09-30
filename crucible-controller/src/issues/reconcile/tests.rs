@@ -7349,6 +7349,70 @@ async fn a_playbook_launch_without_its_row_parks(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Dispatch preflights every image a pack runs, not only its default: a named sandbox on an image
+/// the catalog does not know parks the launch, naming the sandbox, even when the pack's own image
+/// passes and even when the pack waves its default image through with `allow_unverified_image`.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_named_sandbox_image_fails_preflight_parks(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-9";
+    seed_registered_playbook(&db, "survey").await;
+    let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    crate::images::store::upsert_image(
+        db.pool(),
+        &crate::images::model::CatalogImage {
+            repository: "registry.example.com/sandbox".into(),
+            digest: digest.into(),
+            tags: vec!["latest".into()],
+            arches: vec!["amd64".into()],
+            created_at: None,
+            capabilities: Some(crucible_capability::CapabilityDoc {
+                features: vec!["base".into()],
+                image: "sandbox".into(),
+                predicates: [("agent.claude-code".to_string(), "2.1.270".to_string())].into(),
+                schema: crucible_capability::CAPABILITIES_SCHEMA.into(),
+            }),
+            capability_digest: Some("sha256:cap".into()),
+            intro_digest: None,
+            first_seen: "2026-09-30T00:00:00Z".into(),
+            last_seen: "2026-09-30T00:00:00Z".into(),
+        },
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE playbooks SET agent_backend = 'openshell', agent_sandbox_image = $2, \
+         agent_requirements = $3 WHERE id = $1",
+    )
+    .bind("survey")
+    .bind(format!("registry.example.com/sandbox@{digest}"))
+    .bind(serde_json::json!({
+        "allow_unverified_image": true,
+        "sandboxes": {"go": "quay.io/acme/uncatalogued:dev"},
+    }))
+    .execute(db.pool())
+    .await?;
+    adopt_launch(&db, key, 3.0).await;
+
+    reconcile(&db, &cfg, key).await?;
+
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    match issue.parked_reason.as_deref().map(ParkReason::parse) {
+        Some(ParkReason::ImagePreflightRefused { detail, .. }) => assert!(
+            detail.contains(
+                "sandbox.go: sandbox image quay.io/acme/uncatalogued:dev is not in the image catalog"
+            ),
+            "{detail}"
+        ),
+        other => panic!("expected an image preflight park, got {other:?}"),
+    }
+    Ok(())
+}
+
 /// The concurrency cap declines a launch the same way it declines a loop run: the row stays at
 /// `new` and re-drives when a slot frees, with a `capped` ledger row for the audit.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
