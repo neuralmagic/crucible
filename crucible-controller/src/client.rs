@@ -418,7 +418,7 @@ mod tests {
             ),
             (
                 "0047_webhooks.sql",
-                "8429279782785aed871ee9ddd62ad347421162641a8cc95d4a49c6f29b09b715",
+                "69024bd84c15a5a5e0d5fb459f358087cb0f658db7e4efc5508ad9b7e7273a27",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

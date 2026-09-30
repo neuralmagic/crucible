@@ -155,7 +155,7 @@ enum Command {
         file: std::path::PathBuf,
     },
 
-    /// Replace a webhook from a JSON body. A new verifier prints a new secret.
+    /// Replace a webhook from a JSON body. Its verifier and secret stay as created.
     WebhookUpdate {
         id: String,
         #[arg(long)]

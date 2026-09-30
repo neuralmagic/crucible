@@ -304,7 +304,6 @@ pub(crate) mod tests;
         crate::launches::api::webhooks::WebhookDto,
         crate::launches::api::webhooks::WebhookBody,
         crate::launches::api::webhooks::WebhookSecretDto,
-        crate::launches::api::webhooks::WebhookUpdatedDto,
         crate::launches::api::webhooks::WebhookDeliveryDto,
         crate::launches::api::webhooks::WebhookEnabledBody,
         crate::launches::api::webhooks::WebhookPreviewBody,

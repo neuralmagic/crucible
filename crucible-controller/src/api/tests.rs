@@ -12902,7 +12902,7 @@ async fn a_webhook_save_refuses_each_bad_field(pool: PgPool) -> Result<()> {
     register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
 
     let mut bad = quay_webhook_body();
-    bad["verifier"] = serde_json::json!("header_token");
+    bad["verifier"] = serde_json::json!("hmac_sha256");
     bad["filter"] = serde_json::json!("body.l.map(x, body.l)");
     bad["dedupe"] = serde_json::json!("(");
     bad["derive"] = serde_json::json!({"image": "body.docker_url", "unknown": "body.name"});
@@ -13123,4 +13123,61 @@ fn a_run_principal_cannot_read_a_webhook() {
         0,
     );
     assert!(!decision.allowed);
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_webhook_keeps_the_verifier_it_was_created_with(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+    register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
+    let (_, bytes) = send(
+        &app,
+        "POST",
+        "/api/webhooks",
+        "wren",
+        Some(quay_webhook_body()),
+    )
+    .await;
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = created["webhook"]["id"].as_str().expect("id");
+
+    let mut switched = quay_webhook_body();
+    switched["verifier"] = serde_json::json!("hmac_sha256");
+    switched["header"] = serde_json::json!("x-hub-signature-256");
+    let (status, bytes) = send(
+        &app,
+        "PUT",
+        &format!("/api/webhooks/{id}"),
+        "wren",
+        Some(switched),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(body["fields"][0]["field"], "verifier", "{body}");
+
+    let mut edited = quay_webhook_body();
+    edited["filter"] = serde_json::json!(r#""latest" in body.updated_tags"#);
+    let (status, bytes) = send(
+        &app,
+        "PUT",
+        &format!("/api/webhooks/{id}"),
+        "wren",
+        Some(edited),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(stored["verifier"], "path_token");
+    assert_eq!(stored["filter"], r#""latest" in body.updated_tags"#);
+    assert!(
+        stored.get("secret").is_none(),
+        "an edit never discloses a secret"
+    );
+    Ok(())
 }

@@ -13,17 +13,14 @@ ALTER TABLE playbook_launches
     ADD CONSTRAINT playbook_launches_origin_check
     CHECK (origin IN ('manual', 'deferred', 'schedule', 'draft', 'watch', 'webhook'));
 
--- `token_digest` holds the SHA-256 of a path or header token; `secret_sealed` holds an HMAC
+-- `token_digest` holds the SHA-256 of a path token; `secret_sealed` holds an HMAC
 -- secret sealed under the credential key named by `secret_key_id`. Exactly one is set, by
 -- verifier. `derive` maps a playbook param name to the CEL expression that derives it.
--- `withheld_headers` names every header a past verifier of this webhook read, which a recorded
--- delivery never keeps.
 CREATE TABLE playbook_webhooks (
     id                    TEXT PRIMARY KEY
                               REFERENCES playbook_standing_launches(id) ON DELETE CASCADE,
     verifier              TEXT NOT NULL
-                              CHECK (verifier IN ('path_token', 'header_token', 'hmac_sha256',
-                                                  'standard_webhooks')),
+                              CHECK (verifier IN ('path_token', 'hmac_sha256')),
     header                TEXT,
     token_digest          TEXT,
     secret_sealed         TEXT,
@@ -33,16 +30,15 @@ CREATE TABLE playbook_webhooks (
     derive                JSONB NOT NULL,
     max_launches_per_hour INTEGER NOT NULL CHECK (max_launches_per_hour > 0),
     retention_days        INTEGER NOT NULL CHECK (retention_days > 0),
-    withheld_headers      JSONB NOT NULL DEFAULT '[]',
     last_delivery_at      TEXT,
     CONSTRAINT playbook_webhooks_secret_shape CHECK (
-        (verifier IN ('path_token', 'header_token')
+        (verifier = 'path_token'
          AND token_digest IS NOT NULL AND secret_sealed IS NULL AND secret_key_id IS NULL)
-        OR (verifier IN ('hmac_sha256', 'standard_webhooks')
+        OR (verifier = 'hmac_sha256'
             AND token_digest IS NULL AND secret_sealed IS NOT NULL AND secret_key_id IS NOT NULL)
     ),
     CONSTRAINT playbook_webhooks_header_shape CHECK (
-        (verifier IN ('header_token', 'hmac_sha256')) = (header IS NOT NULL)
+        (verifier = 'hmac_sha256') = (header IS NOT NULL)
     )
 );
 

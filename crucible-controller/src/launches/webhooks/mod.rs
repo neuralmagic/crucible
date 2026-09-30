@@ -43,7 +43,6 @@ pub(crate) struct Webhook {
     pub derive: serde_json::Value,
     pub max_launches_per_hour: i32,
     pub retention_days: i32,
-    pub withheld_headers: sqlx::types::Json<Vec<String>>,
     pub last_delivery_at: Option<String>,
 }
 
@@ -71,7 +70,7 @@ const SELECT: &str = const_format::concatcp!(
     "SELECT ",
     standing::COLUMNS,
     ", w.verifier, w.header, w.token_digest, w.secret_sealed, w.secret_key_id, w.filter, \
-     w.dedupe, w.derive, w.max_launches_per_hour, w.retention_days, w.withheld_headers, w.last_delivery_at \
+     w.dedupe, w.derive, w.max_launches_per_hour, w.retention_days, w.last_delivery_at \
      FROM playbook_standing_launches c JOIN playbook_webhooks w USING (id)"
 );
 
@@ -85,6 +84,8 @@ pub(crate) struct Created {
 pub(crate) enum SaveError {
     #[error(transparent)]
     Mint(#[from] MintError),
+    #[error("a webhook's verifier and header are fixed at creation; delete it and create another")]
+    VerifierFixed,
     #[error("{0:#}")]
     Internal(#[from] anyhow::Error),
 }
@@ -228,26 +229,18 @@ pub(crate) async fn list(pool: &PgPool, limit: i64) -> Result<Vec<Webhook>> {
     .context("list webhooks")
 }
 
-/// Replace a webhook's authorization and transform. A new verifier kind mints a new secret, which
-/// is returned; otherwise the secret stays. `None` when there is no webhook under `id`.
+/// Replace a webhook's authorization and transform. Its verifier and secret stay; a save that
+/// names another verifier is refused. `None` when there is no webhook under `id`.
 pub(crate) async fn update(
     pool: &PgPool,
-    keys: Option<&CredentialKeys>,
     id: &str,
     new: &NewWebhook<'_>,
-) -> Result<Option<(Webhook, Option<String>)>, SaveError> {
+) -> Result<Option<Webhook>, SaveError> {
     let Some(prior) = get(pool, id).await? else {
         return Ok(None);
     };
-    let minted = (prior.verifier != new.verifier.kind)
-        .then(|| verify::mint(new.verifier.kind, id, keys))
-        .transpose()?;
-    let mut withheld = prior.withheld_headers.0.clone();
-    if let Some(old) = prior.header.as_ref()
-        && new.verifier.header.as_ref() != Some(old)
-        && !withheld.contains(old)
-    {
-        withheld.push(old.clone());
+    if prior.verifier() != *new.verifier {
+        return Err(SaveError::VerifierFixed);
     }
     let now = crate::clock::now_rfc3339();
     let mut tx = pool.begin().await.context("update webhook: begin")?;
@@ -255,41 +248,21 @@ pub(crate) async fn update(
         return Ok(None);
     }
     sqlx::query(
-        "UPDATE playbook_webhooks SET verifier = $2, header = $3, filter = $4, dedupe = $5,
-             derive = $6, max_launches_per_hour = $7, retention_days = $8, withheld_headers = $9
+        "UPDATE playbook_webhooks SET filter = $2, dedupe = $3, derive = $4,
+             max_launches_per_hour = $5, retention_days = $6
          WHERE id = $1",
     )
     .bind(id)
-    .bind(new.verifier.kind)
-    .bind(new.verifier.header.as_deref())
     .bind(new.filter)
     .bind(new.dedupe)
     .bind(serde_json::Value::Object(new.derive.clone()))
     .bind(new.max_launches_per_hour)
     .bind(new.retention_days)
-    .bind(sqlx::types::Json(&withheld))
     .execute(&mut *tx)
     .await
     .context("update webhook")?;
-    if let Some(minted) = &minted {
-        let (digest, sealed, key_id) = secret_columns(&minted.stored);
-        sqlx::query(
-            "UPDATE playbook_webhooks SET token_digest = $2, secret_sealed = $3, secret_key_id = $4
-             WHERE id = $1",
-        )
-        .bind(id)
-        .bind(digest)
-        .bind(sealed)
-        .bind(key_id)
-        .execute(&mut *tx)
-        .await
-        .context("replace the webhook secret")?;
-    }
     tx.commit().await.context("update webhook: commit")?;
-    let webhook = get(pool, id)
-        .await?
-        .context("the webhook just updated is gone")?;
-    Ok(Some((webhook, minted.map(|m| m.shown))))
+    get(pool, id).await.map_err(SaveError::from)
 }
 
 pub(crate) async fn expire_stale_owner_parks(pool: &PgPool, id: &str) -> Result<Vec<String>> {

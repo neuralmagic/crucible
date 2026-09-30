@@ -57,9 +57,9 @@ pub struct WebhookDto {
     pub schema_digest: String,
     pub max_cost: f64,
     pub max_time: String,
-    /// `path_token`, `header_token`, `hmac_sha256`, or `standard_webhooks`.
+    /// `path_token` or `hmac_sha256`.
     pub verifier: String,
-    /// The header the verifier reads, for `header_token` and `hmac_sha256`.
+    /// The header an `hmac_sha256` signature is in.
     pub header: Option<String>,
     pub max_launches_per_hour: i32,
     pub retention_days: i32,
@@ -131,14 +131,6 @@ pub struct WebhookSecretDto {
     pub delivery_url: Option<String>,
 }
 
-/// A replaced webhook, and its new secret when the verifier kind changed.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct WebhookUpdatedDto {
-    pub webhook: WebhookDto,
-    pub secret: Option<String>,
-    pub delivery_url: Option<String>,
-}
-
 /// One recorded delivery and how it settled.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct WebhookDeliveryDto {
@@ -193,9 +185,9 @@ pub(crate) struct WebhookBody {
     owner: Option<String>,
     /// The registry id every launch runs. Webhooks target adopted revisions only.
     playbook: String,
-    /// `path_token`, `header_token`, `hmac_sha256`, or `standard_webhooks`.
+    /// `path_token` or `hmac_sha256`. Fixed at creation.
     verifier: String,
-    /// The header `header_token` and `hmac_sha256` read (`x-gitlab-token`, `x-hub-signature-256`).
+    /// The header an `hmac_sha256` signature is in (`x-hub-signature-256`). Fixed at creation.
     #[serde(default)]
     header: Option<String>,
     /// A CEL bool over `body`, `headers`, `delivery`, and `received_at`; absent matches every
@@ -331,6 +323,9 @@ fn save_refusal(e: SaveError) -> Response {
         SaveError::Mint(e @ MintError::NoCredentialKey(_)) => {
             invalid_fields(vec![field_error("verifier", e.to_string())])
         }
+        e @ SaveError::VerifierFixed => {
+            invalid_fields(vec![field_error("verifier", e.to_string())])
+        }
         other => AppError::from(anyhow::Error::new(other)).into_response(),
     }
 }
@@ -346,7 +341,7 @@ struct AuthorizedWebhook {
 fn check_verifier(body: &WebhookBody) -> Result<Verifier, Vec<FieldError>> {
     let kind = VerifierKind::parse(&body.verifier)
         .map_err(|e| vec![field_error("verifier", e.to_string())])?;
-    let header = match (kind.reads_header(), body.header.as_deref()) {
+    let header = match (kind.signs(), body.header.as_deref()) {
         (true, Some(raw)) => {
             let name = raw.trim().to_ascii_lowercase();
             axum::http::HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
@@ -719,15 +714,15 @@ pub(crate) async fn get_webhook(
     }
 }
 
-/// Replace a webhook: the launch, the verifier, the transform, and the bounds. A new verifier
-/// kind mints a new secret, returned once; otherwise the secret stays.
+/// Replace a webhook: the launch, the transform, and the bounds. The verifier and its secret stay;
+/// a body naming another verifier is refused.
 #[utoipa::path(
     put,
     path = "/api/webhooks/{id}",
     params(("id" = String, Path, description = "Webhook id")),
     request_body = WebhookBody,
     responses(
-        (status = 200, description = "The webhook as stored", body = WebhookUpdatedDto),
+        (status = 200, description = "The webhook as stored", body = WebhookDto),
         (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
         (status = 404, description = "No webhook (or no playbook) with that id", body = ErrorBody),
         (status = 409, description = "The form was rendered against a schema this playbook no longer serves", body = ErrorBody),
@@ -788,7 +783,6 @@ pub(crate) async fn update_webhook(
         || prior.core.dispatch_target.as_deref() != Some(saver.dispatch_target.as_str())
         || prior.core.agent_provider != saver.provider
         || prior.core.agent_model != saver.model
-        || prior.verifier() != authorized.verifier
         || prior.filter != body.filter
         || prior.dedupe != body.dedupe
         || prior.derive != serde_json::Value::Object(authorized.derive.clone())
@@ -800,9 +794,11 @@ pub(crate) async fn update_webhook(
     {
         return denied;
     }
-    let (webhook, secret) = match crate::launches::webhooks::update(
+    if prior.verifier() != authorized.verifier {
+        return save_refusal(SaveError::VerifierFixed);
+    }
+    let webhook = match crate::launches::webhooks::update(
         state.db.pool(),
-        state.credential_keys.as_deref(),
         &id,
         &new_webhook(&authorized, &body, &saver),
     )
@@ -829,14 +825,11 @@ pub(crate) async fn update_webhook(
     {
         return AppError::from(e).into_response();
     }
-    let mut reason = format!(
+    let reason = format!(
         "playbook {} on {} deliveries",
         webhook.core.playbook,
         webhook.verifier.as_str()
     );
-    if secret.is_some() {
-        reason.push_str("; verifier changed, secret replaced");
-    }
     if let Err(refusal) = audit(
         &state,
         &id,
@@ -849,15 +842,7 @@ pub(crate) async fn update_webhook(
     {
         return refusal;
     }
-    let url = secret
-        .as_deref()
-        .and_then(|s| delivery_url(&state, &id, webhook.verifier, s));
-    Json(WebhookUpdatedDto {
-        webhook: WebhookDto::from(webhook),
-        secret,
-        delivery_url: url,
-    })
-    .into_response()
+    Json(WebhookDto::from(webhook)).into_response()
 }
 
 /// Delete a webhook. Its deliveries and consumed keys go with it; the launches it made stay.

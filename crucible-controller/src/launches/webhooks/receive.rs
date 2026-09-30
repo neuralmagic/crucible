@@ -2,8 +2,8 @@
 //! `POST /hooks/{id}/{token}`, served on their own listener.
 
 use crate::identity::oidc::credentials::CredentialKeys;
-use crate::launches::webhooks::verify::{self, Material, Presented, Stored, VerifierKind};
-use crate::launches::webhooks::{self as store, Webhook};
+use crate::launches::webhooks as store;
+use crate::launches::webhooks::verify::{self, Presented};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
@@ -26,46 +26,17 @@ pub struct HooksState {
     pool: PgPool,
     keys: Option<Arc<CredentialKeys>>,
     permits: Arc<Semaphore>,
-    /// A sealed secret a delivery that opens no real one opens instead.
-    dummy: Option<Arc<Stored>>,
 }
 
 impl HooksState {
     pub fn new(pool: PgPool, keys: Option<Arc<CredentialKeys>>) -> Self {
-        let dummy = verify::mint(VerifierKind::HmacSha256, DUMMY_ID, keys.as_deref())
-            .ok()
-            .map(|minted| Arc::new(minted.stored));
         HooksState {
             pool,
             keys,
             permits: Arc::new(Semaphore::new(CONCURRENCY)),
-            dummy,
-        }
-    }
-
-    /// Open this delivery's one sealed secret: the webhook's own when it keeps one, the dummy
-    /// otherwise.
-    fn open(&self, webhook: Option<&Webhook>) -> Option<Material> {
-        let keys = self.keys.as_deref();
-        match webhook.and_then(|w| w.stored().map(|s| (w, s))) {
-            Some((w, stored @ Stored::Sealed { .. })) => {
-                verify::material(&w.core.id, &stored, keys)
-                    .map_err(|e| {
-                        tracing::error!(webhook = %w.core.id, error = format!("{e:#}"), "webhooks: secret unusable");
-                    })
-                    .ok()
-            }
-            other => {
-                if let Some(dummy) = &self.dummy {
-                    let _ = verify::material(DUMMY_ID, dummy, keys);
-                }
-                other.and_then(|(w, stored)| verify::material(&w.core.id, &stored, keys).ok())
-            }
         }
     }
 }
-
-const DUMMY_ID: &str = "no-such-webhook";
 
 pub fn router(state: HooksState) -> Router {
     Router::new()
@@ -131,32 +102,36 @@ async fn deliver(
     let Ok(body) = axum::body::to_bytes(body, MAX_BODY).await else {
         return refused().await;
     };
-    let addressable =
-        !id.is_empty() && !id.contains('\0') && !path_token.is_some_and(|t| t.contains('\0'));
-    let webhook =
-        match store::receivable(&state.pool, if addressable { id } else { DUMMY_ID }).await {
-            Ok(webhook) => webhook.filter(|_| addressable),
-            Err(e) => {
-                tracing::error!(error = format!("{e:#}"), "webhooks: lookup failed");
-                return unavailable();
-            }
-        };
-    let verifier = webhook.as_ref().map(Webhook::verifier);
-    let material = state.open(webhook.as_ref());
+    if id.is_empty() || id.contains('\0') || path_token.is_some_and(|t| t.contains('\0')) {
+        return refused().await;
+    }
+    let webhook = match store::receivable(&state.pool, id).await {
+        Ok(Some(webhook)) => webhook,
+        Ok(None) => return refused().await,
+        Err(e) => {
+            tracing::error!(error = format!("{e:#}"), "webhooks: lookup failed");
+            return unavailable();
+        }
+    };
+    let verifier = webhook.verifier();
+    let Some(material) = webhook.stored().and_then(|stored| {
+        verify::material(&webhook.core.id, &stored, state.keys.as_deref())
+            .map_err(|e| {
+                tracing::error!(webhook = %webhook.core.id, error = format!("{e:#}"), "webhooks: secret unusable");
+            })
+            .ok()
+    }) else {
+        return refused().await;
+    };
     let presented = Presented {
         path_token,
         headers,
         body: &body,
-        now: jiff::Timestamp::now(),
     };
-    let (Some(webhook), Some(verifier)) = (webhook, verifier) else {
-        verify::verify(None, None, &presented);
-        return refused().await;
-    };
-    if !verify::verify(Some(&verifier), material.as_ref(), &presented) {
+    if !verify::verify(&verifier, &material, &presented) {
         return refused().await;
     }
-    let recorded = verify::recorded_headers(&verifier, &webhook.withheld_headers.0, headers);
+    let recorded = verify::recorded_headers(&verifier, headers);
     match store::record_delivery(&state.pool, &webhook.core.id, &recorded, &body).await {
         Ok(delivery) => (
             StatusCode::ACCEPTED,
@@ -557,77 +532,6 @@ mod tests {
         .await
         .expect("counts");
         assert_eq!(left, (0, 0, 0));
-    }
-
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_header_a_past_verifier_read_is_never_recorded(pool: PgPool) {
-        register(&pool).await;
-        let keys = keys();
-        let created = webhook(
-            &pool,
-            &keys,
-            VerifierKind::HeaderToken,
-            Some("x-gitlab-token"),
-        )
-        .await;
-        let id = created.webhook.core.id.clone();
-        let max_time = MaxTime::parse("1h").expect("duration");
-        let params = serde_json::json!({});
-        let derive = serde_json::json!({"image": "body.repository"});
-        let (_, secret) = store::update(
-            &pool,
-            Some(&keys),
-            &id,
-            &NewWebhook {
-                standing: NewStanding {
-                    playbook: "rebuild",
-                    target_kind: "adopted",
-                    eligible_draft_version: None,
-                    params: &params,
-                    schema_digest: "sha256:schema",
-                    max_cost: 5.0,
-                    max_time: &max_time,
-                    advance_dedupe: false,
-                    enabled: true,
-                    created_by: Some("tms"),
-                    owner_principal: None,
-                    owner_groups: None,
-                    dispatch_target: None,
-                    agent_provider: None,
-                    agent_model: None,
-                },
-                verifier: &Verifier {
-                    kind: VerifierKind::PathToken,
-                    header: None,
-                },
-                filter: "true",
-                dedupe: "body.repository",
-                derive: derive.as_object().expect("object"),
-                max_launches_per_hour: 10,
-                retention_days: 7,
-            },
-        )
-        .await
-        .expect("update")
-        .expect("webhook");
-        let secret = secret.expect("a new verifier kind mints a new secret");
-        let state = HooksState::new(pool.clone(), Some(keys));
-
-        let (status, _, _) = post(
-            &state,
-            &format!("/hooks/{id}/{secret}"),
-            &[("x-gitlab-token", &created.secret)],
-            BODY,
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-        let recorded = deliveries(&pool).await;
-        assert!(
-            recorded[0].1.get("x-gitlab-token").is_none(),
-            "the old secret never lands in a delivery record: {:?}",
-            recorded[0].1
-        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
