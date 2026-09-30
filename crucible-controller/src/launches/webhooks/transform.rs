@@ -5,7 +5,7 @@ use crate::playbooks::registry::FieldError;
 use cel::common::ast::{EntryExpr, Expr};
 use cel::objects::{Key, Map as CelMap};
 use cel::parser::Parser;
-use cel::{Context, IdedExpr, Value};
+use cel::{Context, ExecutionError, IdedExpr, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -459,7 +459,14 @@ fn scope(input: &Input<'_>) -> Context<'static, 'static> {
 }
 
 fn run(expr: &IdedExpr, context: &Context<'_, '_>) -> Result<Value, String> {
-    Value::resolve(expr, context).map_err(|e| truncate(e.to_string()))
+    Value::resolve(expr, context).map_err(|e| {
+        truncate(match e {
+            ExecutionError::NoSuchKey(key) => {
+                format!("no key {key:?}; guard a key a delivery may omit with has() or `in`")
+            }
+            other => other.to_string(),
+        })
+    })
 }
 
 fn truncate(message: String) -> String {
@@ -612,6 +619,38 @@ mod tests {
             .into_iter()
             .map(|e| (e.field, e.message))
             .collect()
+    }
+
+    #[test]
+    fn a_missing_key_fails_with_how_to_guard_it_and_the_guards_hold() {
+        let hint = "guard a key a delivery may omit with has() or `in`";
+        let unguarded = evaluate(r#"body.action == "opened""#, "delivery", json!({}), &quay());
+        assert_eq!(unguarded.filter, Err(format!("no key \"action\"; {hint}")));
+        let header = evaluate(
+            r#"headers["x-gitlab-event"] == "push""#,
+            "delivery",
+            json!({}),
+            &quay(),
+        );
+        assert_eq!(
+            header.filter,
+            Err(format!("no key \"x-gitlab-event\"; {hint}"))
+        );
+
+        let guarded = evaluate(
+            r#"has(body.action) && body.action == "opened""#,
+            "delivery",
+            json!({}),
+            &quay(),
+        );
+        assert_eq!(guarded.filter, Ok(false));
+        let membership = evaluate(
+            r#""x-gitlab-event" in headers"#,
+            "delivery",
+            json!({}),
+            &quay(),
+        );
+        assert_eq!(membership.filter, Ok(false));
     }
 
     #[test]

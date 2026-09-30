@@ -37,6 +37,15 @@ use tokio::time::{MissedTickBehavior, interval};
 /// harness feeds a channel-backed one so the daemon runs for real without a cluster.
 pub type CompletionStream = Pin<Box<dyn futures_util::Stream<Item = IssueKey> + Send>>;
 
+/// Signals that work is waiting for a source outside the discovery cadence.
+pub type WakeStream = Pin<Box<dyn futures_util::Stream<Item = ()> + Send>>;
+
+/// A source polled whenever its stream yields, in addition to every discovery tick.
+pub struct Wake {
+    pub(crate) signals: WakeStream,
+    pub(crate) source: Arc<dyn DiscoverySource>,
+}
+
 /// The periodic drift check: rebuild into a temp DB and diff it against the live one. `run`
 /// invokes it on its own long interval and logs the outcome; the callable itself (`verify`)
 /// lives in [`crate::daemon::rebuild`].
@@ -58,6 +67,8 @@ pub struct Wiring {
     park: ParkFn,
     discovery: Arc<dyn DiscoverySource>,
     completions: CompletionStream,
+    /// Recorded webhook deliveries, settled as they arrive. `None` leaves them to the cadence.
+    wake: Option<Wake>,
     verify: Option<VerifyFn>,
     /// Fresh non-terminal keys for the manual reconcile-now pass (the API's kick-it-now button):
     /// the pass runs a discovery poll AND a full re-enqueue, so stuck rows re-drive immediately
@@ -144,29 +155,38 @@ pub fn assemble(
                 None
             }
         };
+    let trigger_sweep = |triggers: Vec<Arc<dyn crate::launches::standing::LaunchTrigger>>| {
+        crate::launches::standing::TriggerSweep::new(
+            db.clone(),
+            triggers,
+            cfg.schedule_auto_disable_failures,
+            std::time::Duration::from_secs(cfg.schedule_owner_ttl_secs),
+            owner_refresh.clone(),
+            Some(policy.clone()),
+        )
+    };
+    let wake = Wake {
+        signals: crate::launches::webhooks::delivery_wakes(db.pool().clone()),
+        source: Arc::new(trigger_sweep(vec![Arc::new(
+            crate::launches::webhooks::trigger::WebhookTrigger,
+        )])),
+    };
     #[allow(unused_mut)]
     let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
         // The only source that writes: every launch trigger (a due one-shot, a due schedule, a
         // watch hit, a webhook delivery) claims its row and mints the launch in one transaction,
         // then enqueues the key.
-        Arc::new(crate::launches::standing::TriggerSweep::new(
-            db.clone(),
-            vec![
-                Arc::new(crate::launches::one_shots::OneShotTrigger),
-                Arc::new(crate::launches::schedules::ScheduleTrigger::new(
-                    db.clone(),
-                    cfg.overrides.clone(),
-                )),
-                Arc::new(crate::launches::watches::WatchTrigger::new(
-                    crate::launches::jira::trackers(cfg.jira_config()),
-                )),
-                Arc::new(crate::launches::webhooks::trigger::WebhookTrigger),
-            ],
-            cfg.schedule_auto_disable_failures,
-            std::time::Duration::from_secs(cfg.schedule_owner_ttl_secs),
-            owner_refresh,
-            Some(policy),
-        )),
+        Arc::new(trigger_sweep(vec![
+            Arc::new(crate::launches::one_shots::OneShotTrigger),
+            Arc::new(crate::launches::schedules::ScheduleTrigger::new(
+                db.clone(),
+                cfg.overrides.clone(),
+            )),
+            Arc::new(crate::launches::watches::WatchTrigger::new(
+                crate::launches::jira::trackers(cfg.jira_config()),
+            )),
+            Arc::new(crate::launches::webhooks::trigger::WebhookTrigger),
+        ])),
     ];
     #[cfg(feature = "autoresearch")]
     if cfg.autoresearch_enabled() {
@@ -235,6 +255,7 @@ pub fn assemble(
         park,
         discovery,
         completions,
+        wake: Some(wake),
         verify: Some(verify),
         reenqueue_all,
     }
@@ -559,6 +580,7 @@ pub async fn run_led(
         park,
         discovery,
         mut completions,
+        mut wake,
         verify,
         reenqueue_all,
     } = wiring;
@@ -639,6 +661,12 @@ pub async fn run_led(
                     queue.enqueue(key);
                 }
             }
+            _ = wake_next(&mut wake) => {
+                if let Some(w) = &wake
+                    && let Err(e) = w.source.poll(enqueue.clone()).await {
+                        tracing::warn!(error = format!("{e:#}"), "daemon: woken poll failed (continuing)");
+                    }
+            }
             // The manual pass: a discovery poll (what a tick does) plus a full non-terminal
             // re-enqueue (what startup does), so stuck rows re-drive without waiting out the
             // cadence. Best-effort — a button press must never take the daemon down. A fresh
@@ -676,6 +704,18 @@ async fn manual_trigger(trigger: Option<&Arc<tokio::sync::Notify>>) {
     match trigger {
         Some(n) => n.notified().await,
         None => std::future::pending().await,
+    }
+}
+
+/// The next wake, or never when nothing is wired. A stream that ends stops waking.
+async fn wake_next(wake: &mut Option<Wake>) {
+    use futures_util::StreamExt;
+    let woke = match wake {
+        Some(w) => w.signals.next().await,
+        None => None,
+    };
+    if woke.is_none() {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -1049,7 +1089,11 @@ mod tests {
 
     /// `notify` is passed in (not minted here) so a test can fire it BEFORE the loop starts
     /// listening — the deterministic way to prove stacked fires coalesce into one permit.
-    fn manual_rig(reenqueue_keys: Vec<String>, notify: Arc<tokio::sync::Notify>) -> ManualRig {
+    fn manual_rig(
+        reenqueue_keys: Vec<String>,
+        notify: Arc<tokio::sync::Notify>,
+        wake: Option<Wake>,
+    ) -> ManualRig {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_cl = seen.clone();
         let reconcile: ReconcileFn = Arc::new(move |key: IssueKey| {
@@ -1071,6 +1115,7 @@ mod tests {
             park,
             discovery,
             completions: Box::pin(futures_util::stream::pending()),
+            wake,
             verify: None,
             reenqueue_all: Arc::new(move || {
                 let keys = reenqueue_keys.clone();
@@ -1105,11 +1150,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_wake_polls_its_own_source_without_a_discovery_pass() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let woken = Arc::new(AtomicU32::new(0));
+        let wake = Wake {
+            signals: Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|()| ((), rx))
+            })),
+            source: Arc::new(CountingDiscovery {
+                polls: woken.clone(),
+                key: IssueKey("owner/repo#7".into()),
+            }),
+        };
+        let rig = manual_rig(Vec::new(), Arc::new(tokio::sync::Notify::new()), Some(wake));
+        tx.send(()).expect("send");
+        rig.sync.wait_for_count(1).await;
+        drop(tx);
+        rig.shutdown.notify_waiters();
+        rig.handle.await.expect("join").expect("run");
+
+        assert_eq!(*rig.seen.lock().expect("lock"), vec!["owner/repo#7"]);
+        assert_eq!(woken.load(Ordering::SeqCst), 1);
+        assert_eq!(rig.polls.load(Ordering::SeqCst), 0, "no discovery pass ran");
+    }
+
+    #[tokio::test]
     async fn manual_trigger_runs_a_discovery_poll_plus_a_full_reenqueue() {
         let notify = Arc::new(tokio::sync::Notify::new());
         let rig = manual_rig(
             vec!["owner/repo#2".into(), "owner/repo#3".into()],
             notify.clone(),
+            None,
         );
         notify.notify_one();
         rig.sync.wait_for_count(3).await;
@@ -1130,7 +1201,7 @@ mod tests {
         notify.notify_one();
         notify.notify_one();
         notify.notify_one();
-        let rig = manual_rig(Vec::new(), notify.clone());
+        let rig = manual_rig(Vec::new(), notify.clone(), None);
         rig.sync.wait_for_count(1).await;
         assert_eq!(
             rig.polls.load(Ordering::SeqCst),
