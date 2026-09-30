@@ -3,6 +3,7 @@ import type { ParamFieldSpec } from './playbookLaunchForm';
 import {
   applyPreset,
   createBody,
+  customState,
   headerLines,
   stateFromWebhook,
   initialState,
@@ -43,6 +44,23 @@ describe('applyPreset', () => {
     const github: WebhookPresetDto = { ...QUAY, verifier: 'hmac_sha256', header: 'x-hub-signature-256', derive: {} };
     const { state } = applyPreset(github, SPECS, initialState(SPECS));
     expect(state).toMatchObject({ verifier: 'hmac_sha256', header: 'x-hub-signature-256' });
+  });
+});
+
+describe('customState', () => {
+  it('starts the transform over after a preset and keeps the sender and bounds', () => {
+    const github: WebhookPresetDto = { ...QUAY, verifier: 'hmac_sha256', header: 'x-hub-signature-256' };
+    const preset = applyPreset(github, SPECS, initialState(SPECS)).state;
+    const custom = customState(SPECS, { ...preset, maxLaunchesPerHour: 3, maxCost: 2 });
+    expect(custom).toMatchObject({
+      verifier: 'hmac_sha256',
+      header: 'x-hub-signature-256',
+      filter: 'true',
+      dedupe: 'delivery',
+      maxLaunchesPerHour: 3,
+      maxCost: 2,
+    });
+    expect(custom.choices).toEqual(initialState(SPECS).choices);
   });
 });
 

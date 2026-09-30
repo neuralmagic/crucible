@@ -50,6 +50,13 @@ export function initialState(specs: readonly ParamFieldSpec[]): WebhookFormState
   };
 }
 
+/// A custom sender: any sender that POSTs JSON. The transform starts over (every delivery matches
+/// and is its own event, every param fixed) and the verifier, header, and bounds stay as set.
+export function customState(specs: readonly ParamFieldSpec[], state: WebhookFormState): WebhookFormState {
+  const fresh = initialState(specs);
+  return { ...state, filter: fresh.filter, dedupe: fresh.dedupe, choices: fresh.choices };
+}
+
 export interface PresetApplied {
   state: WebhookFormState;
   /// Derivations the preset suggests for params this playbook does not declare.

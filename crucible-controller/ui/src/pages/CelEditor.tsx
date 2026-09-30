@@ -43,7 +43,6 @@ export interface CelEditorProps {
   diagnostics: readonly CelDiagnosticDto[];
   completions: CodeCompletions | undefined;
   lines?: number;
-  hint?: ReactNode;
 }
 
 /// One CEL expression: highlighted, completed, and marked where the server's check refused it.
@@ -55,7 +54,6 @@ export function CelEditor({
   diagnostics,
   completions,
   lines = 1,
-  hint,
 }: CelEditorProps) {
   return (
     <div className="grid gap-1">
@@ -78,11 +76,6 @@ export function CelEditor({
           {d.message}
         </Mono>
       ))}
-      {hint !== undefined && diagnostics.length === 0 ? (
-        <Mono size="data" tone="ink-3">
-          {hint}
-        </Mono>
-      ) : null}
     </div>
   );
 }

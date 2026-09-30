@@ -96,7 +96,6 @@ export function WebhooksPage() {
       <PageHeader
         eyebrow="Queue"
         title="Webhooks"
-        description="Playbooks that launch when a sender outside the controller posts a delivery, and what each delivery became."
       />
 
       <QueryState query={webhooks} noun="webhooks">
@@ -105,7 +104,7 @@ export function WebhooksPage() {
           empty={
             <Empty
               title="No webhooks"
-              description="Add a webhook from a playbook's page to see it here."
+              description="Add one from a playbook's page."
             />
           }
           footer={

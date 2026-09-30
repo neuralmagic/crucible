@@ -58,6 +58,8 @@ export type {
   ToolbarProps,
   ToolbarSearchProps,
 } from './Toolbar';
+export { InfoTip } from './InfoTip';
+export type { InfoTipProps } from './InfoTip';
 export { Tooltip } from './Tooltip';
 export type { TooltipProps, TooltipSide } from './Tooltip';
 export { Facets, Applied } from './Facets';

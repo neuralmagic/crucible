@@ -34,8 +34,7 @@ export function webhookView(row: WebhookRow): WebhookView {
       state: 'signin',
       headline: 'SIGN-IN NEEDED',
       detail:
-        failure ??
-        'The owner has no usable offline credential, so team membership cannot be re-checked.',
+        failure ?? 'The owner has to sign in again.',
     };
   }
   if (!row.enabled) {
@@ -44,13 +43,11 @@ export function webhookView(row: WebhookRow): WebhookView {
       state: 'paused',
       headline: 'PAUSED',
       detail:
-        failures > 0
-          ? `Paused after ${failures} launch${failures === 1 ? '' : 'es'} in a row failed. Its address answers not found until it is resumed.`
-          : 'Paused. Its address answers not found until it is resumed.',
+        failures > 0 ? `Paused after ${failures} failed launch${failures === 1 ? '' : 'es'}.` : 'Paused.',
     };
   }
   if (failure !== null) {
-    return { state: 'failing', headline: 'REFRESH FAILING', detail: `${failure}; it is tried again shortly.` };
+    return { state: 'failing', headline: 'REFRESH FAILING', detail: failure };
   }
   const last = relativeTime(row.last_delivery_at);
   return {

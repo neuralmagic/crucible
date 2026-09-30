@@ -8,6 +8,7 @@ import {
   Breadcrumb,
   Button,
   Empty,
+  InfoTip,
   LoadingBlock,
   Mono,
   PageHeader,
@@ -31,6 +32,7 @@ import { CelEditor, useCelCheck } from './CelEditor';
 import { byField, celCompletions, type CelDiagnosticDto } from './celTooling';
 import {
   applyPreset,
+  customState,
   createBody,
   headerLines,
   initialState,
@@ -47,8 +49,8 @@ type WebhookPreviewDto = components['schemas']['WebhookPreviewDto'];
 type PreviewResultDto = components['schemas']['PreviewResultDto'];
 
 const VERIFIERS: readonly { value: Verifier; label: string }[] = [
-  { value: 'path_token', label: 'path_token: a token in the URL (quay.io)' },
-  { value: 'hmac_sha256', label: 'hmac_sha256: a signed body (GitHub)' },
+  { value: 'path_token', label: 'URL token' },
+  { value: 'hmac_sha256', label: 'HMAC-SHA256 signature' },
 ];
 
 const MODES = [
@@ -261,7 +263,12 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
   const choose = (preset: string) => {
     setPresetId(preset);
     const found = presets.data?.find((p) => p.id === preset);
-    if (found === undefined) return;
+    if (found === undefined) {
+      setForm(customState(specs, form));
+      setUnmatched([]);
+      setPreviewed(null);
+      return;
+    }
     const applied = applyPreset(found, specs, form);
     setForm(applied.state);
     setUnmatched(applied.unmatched);
@@ -333,7 +340,7 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
     return (
       <>
         <Breadcrumb items={crumbs} />
-        <PageHeader eyebrow="Webhook" title={`Webhook for ${playbookId}`} description="Created." />
+        <PageHeader eyebrow="Webhook" title={`Webhook for ${playbookId}`} />
         <SecretOnce
           secret={created.secret}
           url={created.delivery_url ?? null}
@@ -359,29 +366,29 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
       <PageHeader
         eyebrow="Webhook"
         title={existing === null ? `Webhook for ${playbookId}` : `Edit webhook for ${playbookId}`}
-        description="Launch this playbook when a sender posts a delivery. The filter decides which deliveries launch, the dedupe key launches each event once, and every param is fixed or derived from the delivery."
       />
 
       <Section>
-        <SectionHeader title="Sender" note="fixed once created" />
+        <SectionHeader
+          title="Sender"
+          note={<InfoTip label="About the sender">The verifier is fixed once created.</InfoTip>}
+        />
         <SectionBody>
           {existing === null ? (
             <FormGrid>
               <SelectField
                 id="preset"
-                label="Preset"
+                label="Sender"
                 value={presetId}
                 onChange={choose}
                 options={[
-                  { value: '', label: 'none' },
+                  { value: '', label: 'Custom' },
                   ...(presets.data ?? []).map((p) => ({ value: p.id, label: p.title })),
                 ]}
-                hint="Fills the verifier, the transform, and the params it can match by name."
               />
               {unmatched.length > 0 ? (
                 <Mono size="data" tone="ink-3">
-                  This playbook declares no {unmatched.join(', ')}; the preset's derivation for{' '}
-                  {unmatched.length === 1 ? 'it' : 'them'} was skipped.
+                  Not declared here: {unmatched.join(', ')}
                 </Mono>
               ) : null}
               <SelectField
@@ -425,7 +432,15 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
       </Section>
 
       <Section>
-        <SectionHeader title="Transform" note="CEL over body, headers, delivery, and received_at; checked as you type" />
+        <SectionHeader
+          title="Transform"
+          note={
+            <InfoTip label="About the transform">
+              CEL over body, headers, delivery, and received_at. A dedupe key that already launched ends duplicate;
+              delivery makes each delivery its own event.
+            </InfoTip>
+          }
+        />
         <SectionBody>
           <FormGrid>
             <CelEditor
@@ -438,7 +453,6 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
               }}
               diagnostics={diagnosticsOf('filter')}
               completions={completions}
-              hint="A bool. A delivery it rejects settles filtered and launches nothing."
             />
             <FieldNote error={errorOf('filter')} />
             <CelEditor
@@ -450,7 +464,6 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
               }}
               diagnostics={diagnosticsOf('dedupe')}
               completions={completions}
-              hint="A string or int. A key that already launched settles duplicate; `delivery` makes every delivery its own event."
             />
             <FieldNote error={errorOf('dedupe')} />
             {specs.map((spec) => {
@@ -526,7 +539,7 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
       </Section>
 
       <Section>
-        <SectionHeader title="Preview" note="runs the transform above; stores nothing" />
+        <SectionHeader title="Preview" />
         <SectionBody>
           <FormGrid>
             {existing !== null ? (
@@ -542,7 +555,6 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
                     label: `${d.received_at} · ${d.outcome}${d.reason ? ` · ${d.reason}` : ''}`,
                   })),
                 ]}
-                hint="Loads its body and headers as the sample, so the preview runs on what the sender actually posted."
               />
             ) : null}
             <TextAreaField id="sample" label="Sample body" rows={8} value={sample} onChange={setSample} />
