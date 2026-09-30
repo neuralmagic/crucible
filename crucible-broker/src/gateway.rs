@@ -151,34 +151,107 @@ async fn exec_collect_async(name: &str, command: &[String]) -> Result<ExecOutput
         .map_err(rpc_err("exec_sandbox"))?
         .into_inner();
 
-    let mut out = ExecOutput {
-        stdout: String::new(),
-        stderr: String::new(),
-        // The exit payload carries the code; anything nonzero (or a broken stream) is not ok.
-        exit_ok: false,
-    };
-    let mut saw_exit = false;
+    let mut collected = ExecCollector::default();
     loop {
         let msg = stream.message().await.map_err(rpc_err("exec_sandbox"))?;
         let Some(event) = msg else { break };
-        match event.payload {
-            Some(ExecPayload::Stdout(chunk)) => {
-                out.stdout.push_str(&String::from_utf8_lossy(&chunk.data));
-            }
-            Some(ExecPayload::Stderr(chunk)) => {
-                out.stderr.push_str(&String::from_utf8_lossy(&chunk.data));
-            }
-            Some(ExecPayload::Exit(exit)) => {
-                saw_exit = true;
-                out.exit_ok = exit.exit_code == 0;
-            }
-            None => {}
+        if let Some(payload) = event.payload {
+            collected.push(payload);
         }
     }
-    if !saw_exit {
-        return Err(GatewayError::NoExit {
-            name: name.to_string(),
-        });
+    collected.finish().ok_or_else(|| GatewayError::NoExit {
+        name: name.to_string(),
+    })
+}
+
+/// The raw bytes of an exec stream, decoded once in [`ExecCollector::finish`].
+#[derive(Default)]
+struct ExecCollector {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    exit_code: Option<i32>,
+}
+
+impl ExecCollector {
+    fn push(&mut self, payload: ExecPayload) {
+        match payload {
+            ExecPayload::Stdout(chunk) => self.stdout.extend_from_slice(&chunk.data),
+            ExecPayload::Stderr(chunk) => self.stderr.extend_from_slice(&chunk.data),
+            ExecPayload::Exit(exit) => self.exit_code = Some(exit.exit_code),
+        }
     }
-    Ok(out)
+
+    /// `None` when the stream ended without an exit payload.
+    fn finish(self) -> Option<ExecOutput> {
+        let code = self.exit_code?;
+        Some(ExecOutput {
+            stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
+            exit_ok: code == 0,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::gateway::ExecCollector;
+    use openshell_core::proto::exec_sandbox_event::Payload as ExecPayload;
+    use openshell_core::proto::{ExecSandboxExit, ExecSandboxStderr, ExecSandboxStdout};
+
+    fn stdout(bytes: &[u8]) -> ExecPayload {
+        ExecPayload::Stdout(ExecSandboxStdout {
+            data: bytes.to_vec(),
+        })
+    }
+
+    fn stderr(bytes: &[u8]) -> ExecPayload {
+        ExecPayload::Stderr(ExecSandboxStderr {
+            data: bytes.to_vec(),
+        })
+    }
+
+    fn exit(code: i32) -> ExecPayload {
+        ExecPayload::Exit(ExecSandboxExit { exit_code: code })
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_survives() {
+        let text = "héllo → wörld";
+        let bytes = text.as_bytes();
+        let arrow = text.find('→').unwrap();
+        let mut c = ExecCollector::default();
+        c.push(stdout(&bytes[..2]));
+        c.push(stdout(&bytes[2..arrow + 1]));
+        c.push(stdout(&bytes[arrow + 1..]));
+        c.push(stderr(&"ß".as_bytes()[..1]));
+        c.push(stderr(&"ß".as_bytes()[1..]));
+        c.push(exit(0));
+        let out = c.finish().unwrap();
+        assert_eq!(out.stdout, text);
+        assert_eq!(out.stderr, "ß");
+        assert!(out.exit_ok);
+    }
+
+    #[test]
+    fn a_nonzero_exit_is_not_ok() {
+        let mut c = ExecCollector::default();
+        c.push(stdout(b"x"));
+        c.push(exit(2));
+        assert!(!c.finish().unwrap().exit_ok);
+    }
+
+    #[test]
+    fn a_stream_without_an_exit_is_none() {
+        let mut c = ExecCollector::default();
+        c.push(stdout(b"partial"));
+        assert!(c.finish().is_none());
+    }
+
+    #[test]
+    fn only_invalid_bytes_are_replaced() {
+        let mut c = ExecCollector::default();
+        c.push(stdout(b"ok \xff ok"));
+        c.push(exit(0));
+        assert_eq!(c.finish().unwrap().stdout, "ok \u{fffd} ok");
+    }
 }

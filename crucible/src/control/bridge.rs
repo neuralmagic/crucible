@@ -272,7 +272,7 @@ impl ControlState {
     /// Assign the next monotonic `seq` and stamp it onto the line, returning both (the seq feeds the
     /// replay ring, the stamped line goes on the wire). `None` for a blank/torn line, the seq is
     /// still consumed so the numbering matches the file's line count.
-    fn stamp_session_line(&self, line: &str) -> Option<(u64, String)> {
+    fn stamp_session_line(&self, line: &[u8]) -> Option<(u64, String)> {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst) + 1;
         stamp_session_line(line, seq).map(|stamped| (seq, stamped))
     }
@@ -340,13 +340,13 @@ fn read_new_lines(file: &mut File, start: u64, state: &ControlState, hub: &Hub) 
     let mut pos = start;
     let mut reader = BufReader::new(file);
     loop {
-        let mut line = String::new();
-        let n = match reader.read_line(&mut line) {
+        let mut line = Vec::new();
+        let n = match reader.read_until(b'\n', &mut line) {
             Ok(0) => break,
             Ok(n) => n as u64,
             Err(_) => break,
         };
-        if !line.ends_with('\n') {
+        if line.last() != Some(&b'\n') {
             break;
         }
         pos += n;
@@ -401,7 +401,7 @@ fn replay_file_range(path: &Path, writer: &Client, after: u64, upto: u64) -> u64
     };
     let reader = BufReader::new(file);
     let mut idx: u64 = 0;
-    for line in reader.lines() {
+    for line in reader.split(b'\n') {
         let Ok(line) = line else { break };
         idx += 1;
         if idx > upto {
@@ -839,8 +839,8 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn stamp_session_line(line: &str, seq: u64) -> Option<String> {
-    let mut value: Value = serde_json::from_str(line.trim()).ok()?;
+fn stamp_session_line(line: &[u8], seq: u64) -> Option<String> {
+    let mut value: Value = serde_json::from_slice(line.trim_ascii()).ok()?;
     let Value::Object(obj) = &mut value else {
         return None;
     };
@@ -1090,10 +1090,10 @@ mod tests {
     fn stamps_session_lines_with_monotonic_seq() {
         let state = ControlState::default();
         let (seq_one, one) = state
-            .stamp_session_line(r#"{"v":1,"kind":"note","msg":"a"}"#)
+            .stamp_session_line(br#"{"v":1,"kind":"note","msg":"a"}"#)
             .unwrap();
         let (seq_two, two) = state
-            .stamp_session_line(r#"{"v":1,"kind":"note","msg":"b"}"#)
+            .stamp_session_line(br#"{"v":1,"kind":"note","msg":"b"}"#)
             .unwrap();
         assert_eq!(seq_one, 1);
         assert_eq!(seq_two, 2);
@@ -1209,8 +1209,61 @@ mod tests {
 
     #[test]
     fn ignores_blank_or_torn_session_lines() {
-        assert!(stamp_session_line("", 1).is_none());
-        assert!(stamp_session_line(r#"{"v":1,"kind":"note""#, 1).is_none());
+        assert!(stamp_session_line(b"", 1).is_none());
+        assert!(stamp_session_line(br#"{"v":1,"kind":"note""#, 1).is_none());
+    }
+
+    const NON_UTF8_SESSION: &[u8] =
+        b"{\"v\":1,\"kind\":\"note\",\"msg\":\"a\"}\n\xff\xfe torn\n{\"v\":1,\"kind\":\"note\",\"msg\":\"b\"}\n";
+
+    #[test]
+    fn the_tail_steps_past_a_non_utf8_line() {
+        let path = tempdir("tail-non-utf8").join("session.jsonl");
+        std::fs::write(&path, NON_UTF8_SESSION).unwrap();
+        let state = ControlState::default();
+        let hub = Hub::default();
+        let mut file = File::open(&path).unwrap();
+        let end = read_new_lines(&mut file, 0, &state, &hub);
+        assert_eq!(
+            end,
+            NON_UTF8_SESSION.len() as u64,
+            "the tail reaches the end"
+        );
+        let history: Vec<(u64, Value)> = hub
+            .inner
+            .lock()
+            .unwrap()
+            .history
+            .iter()
+            .map(|s| (s.seq, serde_json::from_str(&s.line).unwrap()))
+            .collect();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].0, 1);
+        assert_eq!(history[1].0, 3, "the bad line still consumes its seq");
+        assert_eq!(history[1].1["msg"], "b");
+    }
+
+    #[test]
+    fn replay_steps_past_a_non_utf8_line() {
+        let path = tempdir("replay-non-utf8").join("session.jsonl");
+        std::fs::write(&path, NON_UTF8_SESSION).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (receiver, _) = listener.accept().unwrap();
+        let client: Client = Arc::new(Mutex::new(sender));
+        assert_eq!(replay_file_range(&path, &client, 0, 3), 3);
+        drop(client);
+        let mut got = String::new();
+        std::io::Read::read_to_string(&mut &receiver, &mut got).unwrap();
+        let seqs: Vec<u64> = got
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["seq"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(seqs, vec![1, 3]);
     }
 
     #[test]
