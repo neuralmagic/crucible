@@ -949,7 +949,10 @@ impl Renderer<'_> {
         // Run identity for anything that has to name this run to a human (today: the broker's
         // distress page). The broker inherits the loop pod's env wholesale, so naming them here is
         // the whole plumbing. Before the profile's [env] so a profile can override them.
-        env.push(plain("CRUCIBLE_RUN_NAME", self.input.name.to_string()));
+        env.push(plain(
+            crucible_contract::ENV_RUN_NAME,
+            self.input.name.to_string(),
+        ));
         env.push(plain(
             "CRUCIBLE_ITERATIONS",
             self.opts.iterations.to_string(),

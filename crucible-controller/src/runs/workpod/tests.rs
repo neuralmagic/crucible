@@ -2029,6 +2029,55 @@ fn stamp_run_pod_sets_name_workkind_runid_and_managed_meta() {
     );
 }
 
+/// A controller run renders from a pack unpacked to `<scratch>/pack`, so the render names every
+/// run `pack`. The stamp replaces that with the run id, which the UI's run page and the report's
+/// link key on.
+#[test]
+fn stamp_run_pod_names_every_container_after_the_run_id() {
+    let container = |name: &str| Container {
+        name: name.to_string(),
+        env: Some(vec![EnvVar {
+            name: crucible_contract::ENV_RUN_NAME.to_string(),
+            value: Some("pack".to_string()),
+            value_from: None,
+        }]),
+        ..Default::default()
+    };
+    let mut pod = Pod {
+        spec: Some(k8s_openapi::api::core::v1::PodSpec {
+            containers: vec![container("loop"), container("broker")],
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    stamp_run_pod(
+        &mut pod,
+        "crucible-run-playbook-7-1730000000",
+        "playbook:7:0192",
+        "playbook_7_0192-1730000000",
+        None,
+        None,
+    );
+
+    for c in pod.spec.expect("spec").containers {
+        let names: Vec<Option<&str>> = c
+            .env
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|v| v.name == crucible_contract::ENV_RUN_NAME)
+            .map(|v| v.value.as_deref())
+            .collect();
+        assert_eq!(
+            names,
+            [Some("playbook_7_0192-1730000000")],
+            "{}: one copy, the run id",
+            c.name
+        );
+    }
+}
+
 /// The run-dispatch half of a codegen contract: the resolved contract JSON lands on every MAIN
 /// container as `BROKER_CODEGEN_TOOLS_OVERLAY` (the broker merges it over the profile-wide
 /// `BROKER_CODEGEM_TOOLS_DEFAULTS`), init containers are left alone (they stage, they never dial the

@@ -47,6 +47,10 @@ pub const MANAGED_BY_VALUE: &str = "crucible";
 /// The `key=value` label selector form of the `managed-by` label, for kube list/watch calls.
 pub const MANAGED_BY_SELECTOR: &str = "app.kubernetes.io/managed-by=crucible";
 
+/// Env var naming the run a pod belongs to. A controller-dispatched run carries the controller's
+/// run id, which is what the UI's `/runs/{id}` page and every report link key on.
+pub const ENV_RUN_NAME: &str = "CRUCIBLE_RUN_NAME";
+
 /// Env var carrying the controller's Tier 2 ingest base URL into a turn pod (Tier 2 ingest).
 /// Absent means no drop-box is available, and the engine falls back to marker emission.
 pub const ENV_INGEST_URL: &str = "CRUCIBLE_INGEST_URL";
