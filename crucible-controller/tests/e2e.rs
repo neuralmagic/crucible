@@ -620,6 +620,7 @@ fn daemon_cfg() -> DaemonConfig {
         verify_interval: Duration::from_secs(3600),
         // No API surface in the harness — the manual reconcile trigger never fires.
         reconcile_now: None,
+        launch_probe: Duration::from_millis(50),
     }
 }
 
@@ -1605,5 +1606,192 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
         jira.received_requests().await.expect("requests").len() >= 2,
         "the watch was swept more than once and launched once"
     );
+    Ok(())
+}
+
+/// A running assembled daemon with its discovery tick an hour away, the fake cluster behind it, a
+/// registered `survey` playbook, and an API to drive it.
+struct LaunchRig {
+    _root: tempfile::TempDir,
+    _launcher_guard: DispatcherGuard,
+    db: Db,
+    app: axum::Router,
+    launcher: Arc<FakePodDispatcher>,
+    shutdown: Arc<tokio::sync::Notify>,
+    handle: tokio::task::JoinHandle<Result<()>>,
+}
+
+/// `standby` gives the API a queue of its own that no worker drains, as on the replica that is
+/// not the leader; otherwise the API shares the daemon's queue.
+async fn launch_rig(standby: bool) -> Result<LaunchRig> {
+    let root = tempfile::tempdir()?;
+    let state_dir = root.path().join("state");
+    let mut cfg = test_cfg(&state_dir, Vec::new());
+    cfg.admins = vec!["wren".to_string()];
+    let db = Db::open(cfg.db_url()).await?;
+
+    let (tx, completions) = channel_completions();
+    let launcher = Arc::new(FakePodDispatcher {
+        pool: db.pool().clone(),
+        deliver: true,
+        tx,
+        session: PLAYBOOK_SESSION_LOG,
+        launches: Mutex::new(Vec::new()),
+        keys: Mutex::new(Vec::new()),
+        deleted: Mutex::new(Vec::new()),
+    });
+    crucible_controller::install_dispatcher(launcher.clone());
+
+    let queue = WorkQueue::new();
+    let api_queue = if standby {
+        WorkQueue::new()
+    } else {
+        queue.clone()
+    };
+    let overrides = Arc::new(OverrideStore::new());
+    let wiring = daemon::assemble(
+        &db,
+        &cfg,
+        queue,
+        overrides.clone(),
+        completions,
+        crucible_controller::authz::policy::ActivePolicy::default_set()
+            .expect("the shipped default policy set loads"),
+    );
+    let app = crucible_controller::api::router(crucible_controller::api::state::ApiState::new(
+        db.clone(),
+        Arc::new(crucible_controller::QueueOverrideSink::new(
+            overrides,
+            api_queue.clone(),
+        )),
+        Arc::new(api_queue),
+        Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
+            None,
+        )),
+        None,
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(crucible_controller::runs::contract::ContractRegistry::new(
+            Arc::new(PermissiveContracts),
+        )),
+        crucible_controller::authz::policy::ActivePolicy::default_set()
+            .expect("the shipped default policy set loads"),
+        &cfg,
+    ));
+
+    let repo = write_playbook_repo(root.path());
+    let (status, registered) = api(
+        &app,
+        "POST",
+        "/api/playbooks",
+        Some(serde_json::json!({
+            "id": "survey",
+            "description": "reads a paper and files a spec",
+            "repo": repo,
+            "git_ref": "main",
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::CREATED, "{registered}");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let handle = {
+        let shutdown = shutdown.clone();
+        let daemon_cfg = DaemonConfig {
+            discovery_interval: Duration::from_secs(3600),
+            ..daemon_cfg()
+        };
+        tokio::spawn(daemon::run(Vec::new(), daemon_cfg, wiring, shutdown, None))
+    };
+    Ok(LaunchRig {
+        _root: root,
+        _launcher_guard: DispatcherGuard,
+        db,
+        app,
+        launcher,
+        shutdown,
+        handle,
+    })
+}
+
+impl LaunchRig {
+    /// The first key the fake cluster was asked to run, within `within`.
+    async fn first_dispatch(&self, within: Duration) -> String {
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if let Some(key) = self.launcher.keys.lock().expect("keys").first().cloned() {
+                return key;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "nothing dispatched within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    async fn stop(self) -> usize {
+        self.shutdown.notify_waiters();
+        join_daemon(self.handle).await;
+        self.launcher.launches.lock().expect("launches").len()
+    }
+}
+
+/// A launch accepted by the replica that is not the leader lands in a queue nothing drains; the
+/// leader's launch loop still picks it up and dispatches it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_launch_the_standby_accepts_dispatches_on_the_leader() -> Result<()> {
+    let _g = E2E_LOCK.lock().await;
+    let rig = launch_rig(true).await?;
+
+    let (status, launch) = api(
+        &rig.app,
+        "POST",
+        "/api/playbooks/survey/launch",
+        Some(serde_json::json!({
+            "params": {"topic": "standby topic", "depth": "deep"},
+            "max_cost": 3.5,
+            "max_time": "30m",
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::CREATED, "{launch}");
+
+    let key = rig.first_dispatch(Duration::from_secs(10)).await;
+    wait_for_status(&rig.db, &key, Status::Done).await;
+    assert_eq!(rig.stop().await, 1);
+    Ok(())
+}
+
+/// A one-shot saved while the daemon runs launches at its instant, with the discovery tick an hour
+/// away: only the launch loop can have fired it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_one_shot_launches_at_its_instant_without_a_discovery_tick() -> Result<()> {
+    let _g = E2E_LOCK.lock().await;
+    let rig = launch_rig(false).await?;
+
+    let fire_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(2);
+    let (status, one_shot) = api(
+        &rig.app,
+        "POST",
+        "/api/one-shots",
+        Some(serde_json::json!({
+            "playbook": "survey",
+            "params": {"topic": "deferred topic", "depth": "deep"},
+            "max_cost": 3.5,
+            "max_time": "30m",
+            "fire_at": fire_at.to_string(),
+        })),
+    )
+    .await;
+    assert_eq!(status, http::StatusCode::CREATED, "{one_shot}");
+
+    let key = rig.first_dispatch(Duration::from_secs(10)).await;
+    let dispatched = jiff::Timestamp::now();
+    assert!(
+        dispatched >= fire_at - jiff::SignedDuration::from_secs(1),
+        "fired before its instant: {dispatched} < {fire_at}"
+    );
+    wait_for_status(&rig.db, &key, Status::Done).await;
+    assert_eq!(rig.stop().await, 1);
     Ok(())
 }

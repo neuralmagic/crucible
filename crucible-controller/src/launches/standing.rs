@@ -10,8 +10,7 @@
 //! trigger's transaction, so a claimed row can never end up without the launch it was claimed for.
 
 use crate::client::Db;
-use crate::daemon::queue::DiscoverySource;
-use crate::daemon::queue::{BoxFuture, Enqueue, IssueKey};
+use crate::daemon::queue::{BoxFuture, DiscoverySource, DueSource, Enqueue, IssueKey, Pass};
 use crate::event_log::Event;
 use crate::launches::model::NewPlaybookLaunch;
 use crate::model::LaunchOrigin;
@@ -832,7 +831,7 @@ pub(crate) struct FailureState {
 /// Record a firing that did not launch, and disable the row once it has failed
 /// `auto_disable_after` times in a row, or outright when the trigger has nothing left to wait for
 /// (`force_disable`). Runs after the claim's transaction rolled back, so it is what keeps a
-/// failing row from retrying on every discovery tick. `None` when the row is gone.
+/// failing row from retrying on every pass. `None` when the row is gone.
 pub(crate) async fn record_failure(
     db: &Db,
     trigger: Trigger,
@@ -1025,15 +1024,26 @@ pub type TriggerFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output
 pub trait LaunchTrigger: Send + Sync {
     fn trigger(&self) -> Trigger;
 
-    /// The firings due at `now`, oldest-first, bounded by the trigger's own cap. Read without
-    /// claiming: a second sweep may take one before [`claim`](Self::claim) does, which then
-    /// returns `None` for it.
+    /// The firings due at `now`, oldest-first, bounded by the trigger's own cap, leaving out the
+    /// core rows in `held`. Read without claiming: a second sweep may take one before
+    /// [`claim`](Self::claim) does, which then returns `None` for it.
     fn due<'a>(
         &'a self,
         db: &'a Db,
         cfg: SweepCfg,
         now: Timestamp,
+        held: &'a [String],
     ) -> TriggerFuture<'a, Result<Vec<Claim>>>;
+
+    /// The earliest time [`due`](Self::due) would return a firing, under the same filters.
+    /// `None` for a trigger with nothing pending, or one that polls rather than waits.
+    fn next_due<'a>(
+        &'a self,
+        _db: &'a Db,
+        _held: &'a [String],
+    ) -> TriggerFuture<'a, Result<Option<Timestamp>>> {
+        Box::pin(async { Ok(None) })
+    }
 
     /// Claim one firing on the sweep's transaction.
     fn claim<'a, 'c>(
@@ -1084,6 +1094,7 @@ pub struct SweepCfg {
 ///
 /// `refresh` is the offline credential the owner's live groups are re-read through before a
 /// row's first claim of the pass; `None` leaves every firing on the stored snapshot alone.
+/// Core rows in `held` are left out of the pass.
 pub(crate) async fn sweep(
     db: &Db,
     trigger: &dyn LaunchTrigger,
@@ -1091,12 +1102,14 @@ pub(crate) async fn sweep(
     now: Timestamp,
     refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
     policy: Option<&crate::authz::policy::ActivePolicy>,
-) -> Result<Vec<String>> {
+    held: &[String],
+) -> Result<Swept> {
     let kind = trigger.trigger();
     let mut fired = Vec::new();
+    let mut claimed = 0;
     let mut refreshed: BTreeSet<String> = BTreeSet::new();
     let mut skipped: BTreeSet<String> = BTreeSet::new();
-    for mut claim in trigger.due(db, cfg, now).await? {
+    for mut claim in trigger.due(db, cfg, now, held).await? {
         if skipped.contains(&claim.id) {
             continue;
         }
@@ -1112,7 +1125,9 @@ pub(crate) async fn sweep(
             continue;
         }
         let mut tx = db.pool().begin().await.context("sweep: begin")?;
-        match trigger.claim(&mut tx, &mut claim, now).await? {
+        let outcome = trigger.claim(&mut tx, &mut claim, now).await?;
+        claimed += 1;
+        match outcome {
             Claimed::Taken => {}
             Claimed::Lost => {
                 tx.rollback().await.context("sweep: rollback")?;
@@ -1195,7 +1210,32 @@ pub(crate) async fn sweep(
             }
         }
     }
-    Ok(fired)
+    Ok(Swept {
+        fired,
+        claimed,
+        skipped: skipped.into_iter().collect(),
+    })
+}
+
+/// The `MIN(...)` stamp a [`LaunchTrigger::next_due`] query returns, parsed.
+pub(crate) fn due_at(stamp: Option<String>) -> Result<Option<Timestamp>> {
+    stamp
+        .map(|s| {
+            s.parse::<Timestamp>()
+                .with_context(|| format!("due time {s:?}"))
+        })
+        .transpose()
+}
+
+/// What one [`sweep`] did.
+#[derive(Debug, Default)]
+pub(crate) struct Swept {
+    /// The launches that may dispatch.
+    pub fired: Vec<String>,
+    /// Claims attempted, won or lost.
+    pub claimed: usize,
+    /// Core rows the pass deferred or skipped after a failure.
+    pub skipped: Vec<String>,
 }
 
 struct Fired {
@@ -1298,8 +1338,8 @@ async fn fire_claim(
     Ok(Fired { key, stale, events })
 }
 
-/// The daemon's one launch-trigger sweep: every registered trigger, in order, on the discovery
-/// cadence, so `POST /api/reconcile` forces a pass over all of them.
+/// A sweep over a set of triggers, in order. The daemon runs two: the due-time triggers on the
+/// launch loop and the watches on the discovery cadence.
 pub struct TriggerSweep {
     db: Db,
     triggers: Vec<Arc<dyn LaunchTrigger>>,
@@ -1332,10 +1372,10 @@ impl TriggerSweep {
             policy,
         }
     }
-}
 
-impl DiscoverySource for TriggerSweep {
-    fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+    /// Sweep every trigger once and enqueue what fired ahead of the backlog. One trigger's error
+    /// is logged and the rest still run: a tracker outage must not stop the schedules.
+    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<Result<Pass>> {
         let db = self.db.clone();
         let triggers = self.triggers.clone();
         let cfg = self.cfg;
@@ -1343,9 +1383,8 @@ impl DiscoverySource for TriggerSweep {
         let policy = self.policy.clone();
         Box::pin(async move {
             let now = Timestamp::now();
+            let mut pass = Pass::default();
             for trigger in &triggers {
-                // One trigger's error is logged and the rest still run: a tracker outage must not
-                // stop the schedules from firing.
                 match sweep(
                     &db,
                     trigger.as_ref(),
@@ -1353,13 +1392,16 @@ impl DiscoverySource for TriggerSweep {
                     now,
                     refresh.as_deref(),
                     policy.as_ref(),
+                    &held,
                 )
                 .await
                 {
-                    Ok(keys) => {
-                        for key in keys {
-                            enqueue.enqueue(IssueKey(key));
+                    Ok(swept) => {
+                        for key in swept.fired {
+                            enqueue.enqueue_urgent(IssueKey(key));
                         }
+                        pass.claimed += swept.claimed;
+                        pass.held.extend(swept.skipped);
                     }
                     Err(e) => tracing::error!(
                         trigger = trigger.trigger().as_str(),
@@ -1368,8 +1410,35 @@ impl DiscoverySource for TriggerSweep {
                     ),
                 }
             }
-            Ok(())
+            Ok(pass)
         })
+    }
+}
+
+impl DiscoverySource for TriggerSweep {
+    fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+        let pass = self.pass(enqueue, Vec::new());
+        Box::pin(async move { pass.await.map(|_| ()) })
+    }
+}
+
+impl DueSource for TriggerSweep {
+    fn next_due(&self, held: Vec<String>) -> BoxFuture<Result<Option<Timestamp>>> {
+        let db = self.db.clone();
+        let triggers = self.triggers.clone();
+        Box::pin(async move {
+            let mut earliest: Option<Timestamp> = None;
+            for trigger in &triggers {
+                if let Some(due) = trigger.next_due(&db, &held).await? {
+                    earliest = Some(earliest.map_or(due, |e| e.min(due)));
+                }
+            }
+            Ok(earliest)
+        })
+    }
+
+    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<Result<Pass>> {
+        TriggerSweep::pass(self, enqueue, held)
     }
 }
 
@@ -1426,6 +1495,7 @@ mod tests {
             _db: &'a Db,
             _cfg: SweepCfg,
             _now: Timestamp,
+            _held: &'a [String],
         ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
             Box::pin(async move {
                 let mut claim = Claim::new(STANDING, "scripted firing".to_string());
@@ -1568,9 +1638,11 @@ mod tests {
             Timestamp::now(),
             None,
             None,
+            &[],
         )
         .await
         .expect("sweep")
+        .fired
     }
 
     async fn launch_params(pool: &PgPool) -> Vec<serde_json::Value> {

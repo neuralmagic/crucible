@@ -1,0 +1,117 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0056"
+title = "Launch triggers wake the launch loop at their due time, off the discovery tick"
+status = "proposed"
+date = "2026-09-30"
+refs = [
+    "ADR-0037",
+    "ADR-0049",
+    "ADR-0055",
+]
+
+[content]
+context = """
+Every [[ADR-0037]] trigger fires from one `TriggerSweep`, and the daemon runs that sweep as a discovery source on the discovery timer (300 s default, and in prod). A one-shot, including one created to fire now, and a cron window both wait for the next tick. On average that is 150 s after the due time; at worst it is 300 s. [[ADR-0055]] added a Postgres LISTEN wake for webhook deliveries, and a second channel wakes the leader's pending-launch source for launches another replica accepted. `PgListener::recv` reconnects silently, though, so anything announced during a reconnect also waits for the tick.
+
+The daemon's `select!` runs each arm inline. A discovery poll runs the trigger sweep and then the autoresearch GitHub polls, and in prod it holds the loop for 24 to 30 s of every 300 s. While it runs, a webhook wake and a pod-completion edge both wait.
+
+Launches minted by the sweep go into the queue with plain `enqueue`, so they sit behind the startup re-enqueue. Prod restarted three times in one hour, and each restart replays about 1,400 non-terminal keys through the single worker, which takes about 30 s. Launches from the UI already use `enqueue_urgent`, which pushes to the front of the queue, so a burst of urgent keys runs newest first.
+
+Dispatch itself is not the bottleneck. `dispatch_run` takes 0.76 s at the median and 5.6 s at p95, and one worker drains 1,400 keys in 30 s.
+
+Constraints:
+- Only the [[ADR-0049]] leader fires and dispatches. Any replica can write a one-shot, a schedule, a delivery, or a launch, and a launch the standby accepts lands in a queue no worker drains.
+- The durable state is already in Postgres, and every trigger's due column has a partial index: `playbook_one_shots (fire_at) WHERE status = 'pending'`, `playbook_schedules (next_due_at) WHERE enabled`, and pending deliveries. Undispatched launches (`issues` at `new` with input kind `playbook`) have none. The claim is a CAS, so an extra pass cannot double-fire.
+- Each trigger claims at most 32 rows per pass.
+- Watches poll an external tracker, so they have no due time to wait for."""
+decision = """
+The one-shot, schedule, and webhook triggers move out of the discovery source into a launch loop, which runs inside the leader's `run` scope and is cancelled on step-down like the other daemon tasks. The watch trigger and the autoresearch polls stay on the discovery timer. The pod-completion stream feeds the queue from its own task in the same scope, so it no longer waits behind a discovery poll.
+
+**Probe instead of notify.** The launch loop asks Postgres for the earliest due time across four sources: the three trigger tables, limited to enabled standing launches, and undispatched launches, due from their `updated_at`. A partial index on the last makes all four index lookups. It runs a pass when that time has arrived. Otherwise it sleeps until that time or for a short probe interval (2 s), whichever is sooner. A row written on any replica is seen within one probe interval, and a known due time is met on the dot. No SQL trigger or LISTEN connection is involved, so a reconnect cannot lose a wake. This replaces the [[ADR-0055]] delivery channel and the launch channel, whose notifies and listener are removed.
+
+**Rows that stay due.** After a pass, a row it deferred (owner refresh) or skipped (an earlier failure on the same standing launch) is still due. The loop keeps those ids in memory with a retry time one discovery interval out, and excludes them from the probe until then. A trigger that hit its 32-row cap gets another pass straight away. An undispatched launch the pass enqueued is held the same way, so one waiting on the concurrent-pod cap, which stays `new`, is re-enqueued once per discovery interval rather than on every probe. A freed slot still re-drives it at once.
+
+**Webhook housekeeping.** Settling a disabled webhook's pending deliveries and pruning deliveries past retention ran inside the webhook sweep. A pass now runs only when something is due, so both move to a discovery source of their own.
+
+**Queue order.** The launch loop enqueues what it fires with `enqueue_urgent`. Urgent keys keep FIFO order among themselves, so a burst of firings runs in due order ahead of the backlog.
+
+The manual reconcile also wakes the launch loop. The daemon's `select!` keeps shutdown, leadership, verify, manual reconcile, and the discovery tick."""
+consequences = """
+- A one-shot for now fires within the probe interval, and a cron window fires at its time. Webhook deliveries no longer wait behind a GitHub poll or a reconnect.
+- The probe costs four index lookups every 2 s on the leader. It is independent of the number of rows.
+- A launch the standby accepts dispatches within one probe interval, with no connection whose loss could strand it.
+- For launches, the discovery interval now serves only as the retry delay for deferred rows and the webhook housekeeping cadence. Lowering it no longer speeds launches up.
+- Removing the delivery notify drops a Postgres connection the leader held open and the reconnect handling that went with it. Delivery latency goes from roughly immediate to at most the probe interval.
+- A launch minted during a restart skips the replay backlog. Machine-discovered keys stay FIFO behind it.
+- Two sweeps can run at once: the launch loop's and the discovery tick's (watches). They cover disjoint triggers, and the per-row claim already guards against the concurrent-sweep case that [[ADR-0049]] handles across replicas.
+- Still one queue worker. The cap check in `dispatch_run` (`count_running`, then a later claim) is only correct under one worker, so more workers would first need an atomic admission. The prod numbers do not justify that yet."""
+
+[[content.alternatives]]
+text = "A launch loop on its own task that probes the indexed due columns every 2 s and sleeps to the earliest due time"
+status = "accepted"
+pros = [
+    "Firing latency drops from a tick to at most 2 s, and to zero for a known due time.",
+    "Sees every writer on every replica with no per-writer code.",
+    "No LISTEN connection, so no reconnect gap.",
+    "Keeps the one fire path and the CAS claim from [[ADR-0037]].",
+]
+cons = [
+    "A constant, small query load on the leader.",
+    "A second task that sweeps triggers beside the discovery tick.",
+]
+
+[[content.alternatives]]
+text = "Postgres triggers on the due-time tables fire one notify channel that wakes the launch loop"
+status = "rejected"
+pros = [
+    "Latency close to zero for new rows.",
+    "Covers every writer, including future ones.",
+]
+cons = [
+    "The first SQL triggers in the schema, holding logic the Rust reader does not see.",
+    "`UPDATE OF enabled` fires on every write that sets the column, so failures and the leader's own claims cause extra passes unless each trigger has a `WHEN` clause.",
+    "`PgListener::recv` reconnects without telling the caller. Closing that gap needs `try_recv`, and the wake still depends on one long-lived connection.",
+]
+rejection_reason = "It adds SQL triggers and a connection whose failure is silent, to beat a 2 s probe on a launch whose pod takes tens of seconds to start."
+
+[[content.alternatives]]
+text = "Call pg_notify from each writer in Rust"
+status = "rejected"
+pros = ["All logic stays in Rust."]
+cons = [
+    "Seven production `next_due_at` writers plus the one-shot, delivery and enable writers, each needing its own call.",
+    "A writer that forgets the call fails silently, and it has the same listener reconnect gap.",
+]
+rejection_reason = "A missed call only shows up as slow firing in prod, and the probe covers the same writers with no per-writer code."
+
+[[content.alternatives]]
+text = "Lower the discovery interval to a few seconds"
+status = "rejected"
+pros = ["One config change."]
+cons = [
+    "The discovery poll takes 24 to 30 s, so it cannot finish within a short interval.",
+    "Multiplies GitHub and Jira calls by the same factor.",
+]
+rejection_reason = "The tick carries the autoresearch polls, and their cadence has nothing to do with firing latency."
+
+[[content.alternatives]]
+text = "A durable job queue (SKIP LOCKED table or a queue crate) that triggers insert jobs into"
+status = "rejected"
+pros = ["A familiar model with per-job retry and visibility."]
+cons = [
+    "Duplicates state the trigger tables already hold (due time, claim, settlement).",
+    "A second claim protocol beside the [[ADR-0037]] CAS.",
+]
+rejection_reason = "The trigger tables already form an indexed, durable due-time queue. What is missing is a loop that watches it closely."
+
+[[content.alternatives]]
+text = "Several queue workers so launches stop waiting behind other reconciles"
+status = "rejected"
+pros = ["Launch latency no longer depends on the other keys in the queue."]
+cons = [
+    "The concurrent-pod cap and the daily ceiling are read-then-claim and would need atomic admission first.",
+    "Reconcile arms that are not per-issue would need an audit for concurrency.",
+]
+rejection_reason = "Prod shows one worker draining 1,400 keys in 30 s, and urgent enqueue removes the only case where a launch waits. Revisit if the reconcile histogram shows contention."
