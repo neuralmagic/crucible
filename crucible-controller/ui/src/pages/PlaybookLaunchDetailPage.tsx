@@ -23,6 +23,7 @@ import { issueStatusColor } from './issueStatus';
 import { absoluteTime, relativeTime } from './journeyView';
 import { dispatchTone, graphRunId, originLabel, originLinks, relaunchPath } from './launchView';
 import { AgentProviderTag } from './ProviderIcon';
+import { runLabel } from './runLabel';
 import { formatCost } from './runReport';
 import { RunTaskGraph } from './RunTaskGraph';
 
@@ -183,7 +184,7 @@ function RunList({ launchKey, runs }: { launchKey: string; runs: readonly Launch
             variant="inline"
             to={`/playbook-runs/${encodeURIComponent(launchKey)}/runs/${encodeURIComponent(run.run_id)}`}
           >
-            {run.run_id}
+            {runLabel(run)}
           </Identifier>
           <Mono size="data" tone="ink-2">
             {run.status}

@@ -269,6 +269,9 @@ impl From<Scope> for ScopeDto {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunDto {
     pub run_id: String,
+    /// The name people read the run by (`benevolent-monkey`); null for a run from before names.
+    #[schema(value_type = Option<String>)]
+    pub name: Option<crate::runs::names::RunName>,
     pub scope: Option<i64>,
     /// The issue key + repo this run belongs to (via `runs.scope → scopes.issue → issues.repo`,
     /// the same join the leaderboard uses). Both `None` when the run has no scope; carried on the
@@ -326,6 +329,7 @@ impl RunDto {
             capability_digest: r.image.capability_digest,
             image_override: r.image.overridden,
             run_id: r.run_id,
+            name: r.name,
             scope: r.scope,
             issue_key,
             repo,

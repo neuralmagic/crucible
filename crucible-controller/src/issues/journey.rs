@@ -81,6 +81,8 @@ pub enum JourneyStep {
     Run {
         at: Option<String>,
         run_id: String,
+        #[schema(value_type = Option<String>)]
+        name: Option<crate::runs::names::RunName>,
         status: String,
         best_score: Option<f64>,
         live: bool,
@@ -244,6 +246,7 @@ pub(crate) async fn assemble_journey(db: &Db, key: &str) -> Result<Option<Journe
         steps.push(JourneyStep::Run {
             at: crate::runs::model::run_id_created(&run.run_id),
             run_id: run.run_id.clone(),
+            name: run.name.clone(),
             status: run.status.clone(),
             best_score: run.best_score,
             live,

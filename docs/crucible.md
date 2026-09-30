@@ -348,7 +348,9 @@ finds the dangling distress bracket does not re-park. Info/warn notes ride
 
 Env the render stamps on the loop pod (the broker inherits it, so the page can name the run):
 `CRUCIBLE_RUN_NAME`, `CRUCIBLE_ITERATIONS`, `CRUCIBLE_LOOP_IMAGE`, alongside the existing
-downward-API `CRUCIBLE_POD_NAME` / `CRUCIBLE_POD_NAMESPACE`. Slack is webhook-only: point
+downward-API `CRUCIBLE_POD_NAME` / `CRUCIBLE_POD_NAMESPACE`. A controller-dispatched pod also
+carries `CRUCIBLE_RUN_DISPLAY_NAME`, the run's two-word name (`benevolent-monkey`), which the page
+and report cards show in place of the run id; links still use the id. Slack is webhook-only: point
 `SLACK_WEBHOOK_URL` at an incoming webhook through the profile's `[[secret_env]]`, and set
 `DATADOG_BASE_URL` if your Datadog site is not `app.datadoghq.com`. With no webhook configured
 the suspend still happens; delivery is fire-and-forget by design.

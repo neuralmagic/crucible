@@ -214,8 +214,12 @@ async fn launch_approved_run(
             return Err(e);
         }
     };
-    let (pod_name, location) = match admission {
-        crate::runs::workpod::RunAdmission::Launched { pod_name, location } => (pod_name, location),
+    let (pod_name, name, location) = match admission {
+        crate::runs::workpod::RunAdmission::Launched {
+            pod_name,
+            name,
+            location,
+        } => (pod_name, name, location),
         crate::runs::workpod::RunAdmission::SecretsRefused { reason } => {
             crate::issues::transitions::park(
                 db.pool(),
@@ -255,6 +259,7 @@ async fn launch_approved_run(
         )
         .await?;
         crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
+        crate::runs::names::set(&mut *tx, &run_id, &name).await?;
         let ev = Event::now(
             &issue.key,
             from.as_str(),

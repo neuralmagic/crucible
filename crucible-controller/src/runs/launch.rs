@@ -198,15 +198,21 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         .await?;
         return Ok(());
     }
-    let (pod, dispatch, location, reason) = match &started {
-        Started::Pod { pod_name, location } => (
+    let (pod, name, dispatch, location, reason) = match &started {
+        Started::Pod {
+            pod_name,
+            name,
+            location,
+        } => (
             Some(pod_name.clone()),
+            name.clone(),
             RunDispatch::Pod,
             location.clone(),
             "playbook pod launched",
         ),
         Started::Local(_) => (
             None,
+            crate::runs::names::reserve(db.pool()).await?,
             RunDispatch::Local,
             crate::runs::model::RunLocation::hub(),
             "playbook running locally",
@@ -238,6 +244,7 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         crate::runs::store::set_run_dispatch(&mut *tx, &run_id, dispatch).await?;
         crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
         crate::runs::store::set_run_image(&mut *tx, &run_id, &image).await?;
+        crate::runs::names::set(&mut *tx, &run_id, &name).await?;
         let ev = Event::now(&issue.key, "new", "running", Some(reason), Some(&run_id));
         crate::event_log::insert(&mut *tx, &ev).await?;
         tx.commit().await?;
@@ -290,6 +297,7 @@ async fn resolve_local_secrets(
 enum Started {
     Pod {
         pod_name: String,
+        name: crate::runs::names::RunName,
         location: crate::runs::model::RunLocation,
     },
     Local(Box<crate::runs::local_run::LocalRun>),
@@ -328,9 +336,15 @@ async fn dispatch_pod(
     )
     .await?;
     Ok(match admission {
-        crate::runs::workpod::RunAdmission::Launched { pod_name, location } => {
-            Some(Started::Pod { pod_name, location })
-        }
+        crate::runs::workpod::RunAdmission::Launched {
+            pod_name,
+            name,
+            location,
+        } => Some(Started::Pod {
+            pod_name,
+            name,
+            location,
+        }),
         crate::runs::workpod::RunAdmission::Capped => None,
         crate::runs::workpod::RunAdmission::SecretsRefused { reason } => {
             Some(Started::SecretsRefused(reason))

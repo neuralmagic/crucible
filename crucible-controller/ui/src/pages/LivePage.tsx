@@ -4,6 +4,7 @@ import { $api } from '../api/client';
 import { LiveSession } from '../live/LiveSession';
 import { Empty, Identifier, PageHeader } from '../ui';
 import { detailPath } from './launchView';
+import { runLabel } from './runLabel';
 
 /// Mission control: every running run streaming at once — one compact live tile per run (status
 /// header, live score sparkline, auto-following feed), each backed by its own SSE relay connection.
@@ -48,7 +49,7 @@ export function LivePage() {
           {rows.map((run) => (
             <div key={run.run_id} className="min-w-0">
               <div className="flex flex-wrap items-center gap-2.5 pb-1.5">
-                <Identifier to={`/runs/${encodeURIComponent(run.run_id)}`}>{run.run_id}</Identifier>
+                <Identifier to={`/runs/${encodeURIComponent(run.run_id)}`}>{runLabel(run)}</Identifier>
                 {run.issue_key && (
                   <Identifier variant="inline" to={detailPath(run.issue_key)}>
                     {run.issue_key}

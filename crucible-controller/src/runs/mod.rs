@@ -23,6 +23,7 @@ pub mod local_run;
 pub mod migrate_state;
 pub mod mlflow;
 pub mod model;
+pub mod names;
 pub mod run_files;
 pub mod store;
 pub mod task_evidence;

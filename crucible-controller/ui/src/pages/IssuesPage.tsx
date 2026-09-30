@@ -34,6 +34,7 @@ import {
 import type { AppliedFilter, FacetOption, FacetRow, MonoTone, ToolbarOption } from '../ui';
 import { ISSUE_STATUSES, issueStatusColor, tierTone } from './issueStatus';
 import { Stamp } from './Stamp';
+import { runLabel } from './runLabel';
 import {
   DEFAULT_RECENCY,
   ISSUE_KINDS,
@@ -722,7 +723,7 @@ function IssueDetailView({ issueKey }: { issueKey: string }) {
                     {scope.runs.map((runDetail) => (
                       <li key={runDetail.run.run_id} className="flex flex-wrap items-center gap-2">
                         <Identifier variant="inline" to={`/runs/${runDetail.run.run_id}`}>
-                          {runDetail.run.run_id}
+                          {runLabel(runDetail.run)}
                         </Identifier>
                         {runDetail.run.best_score !== null && runDetail.run.best_score !== undefined && (
                           <Mono>score {runDetail.run.best_score.toFixed(1)}</Mono>

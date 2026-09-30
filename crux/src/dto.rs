@@ -173,6 +173,9 @@ pub struct Exposure {
 #[derive(Debug, Clone, Deserialize)]
 pub struct Run {
     pub run_id: String,
+    /// The name people read the run by. Absent on a run from before names.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub status: String,
     #[serde(default)]
@@ -785,6 +788,9 @@ pub struct PlaybookRun {
 #[derive(Debug, Clone, Deserialize)]
 pub struct RunRow {
     pub run_id: String,
+    /// The name people read the run by. Absent on a run from before names.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub status: String,
     #[serde(default)]

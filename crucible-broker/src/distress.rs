@@ -181,10 +181,14 @@ impl Page {
     fn from_env(severity: Severity, reason: &str, evidence: &[String]) -> Self {
         let env = |k: &str| std::env::var(k).unwrap_or_default();
         let pod = env(crucible_contract::ENV_POD_NAME);
-        let run = match env(crucible_contract::ENV_RUN_NAME) {
-            s if s.is_empty() => pod.clone(),
-            s => s,
-        };
+        let run = [
+            env(crucible_contract::ENV_RUN_DISPLAY_NAME),
+            env(crucible_contract::ENV_RUN_NAME),
+            pod.clone(),
+        ]
+        .into_iter()
+        .find(|s| !s.is_empty())
+        .unwrap_or_default();
         let dd_base = std::env::var("DATADOG_BASE_URL")
             .unwrap_or_else(|_| "https://app.datadoghq.com".to_string());
         Self {
@@ -606,5 +610,42 @@ mod tests {
             listener.accept().is_err(),
             "no page for a suspend that did not happen"
         );
+    }
+
+    /// A page names the run the way people know it, then by its id, then by its pod.
+    #[test]
+    fn a_page_names_the_run_by_its_display_name_first() {
+        let _g = env_lock();
+        let vars = [
+            crucible_contract::ENV_RUN_DISPLAY_NAME,
+            crucible_contract::ENV_RUN_NAME,
+            crucible_contract::ENV_POD_NAME,
+        ];
+        let page = |set: &[(&str, &str)]| {
+            for var in vars {
+                unsafe { std::env::remove_var(var) };
+            }
+            for (var, value) in set {
+                unsafe { std::env::set_var(var, value) };
+            }
+            let run = Page::from_env(Severity::Error, "r", &[]).run;
+            for var in vars {
+                unsafe { std::env::remove_var(var) };
+            }
+            run
+        };
+        assert_eq!(
+            page(&[
+                (vars[0], "benevolent-monkey"),
+                (vars[1], "playbook_7-1730000000"),
+                (vars[2], "crucible-run-benevolent-monkey"),
+            ]),
+            "benevolent-monkey"
+        );
+        assert_eq!(
+            page(&[(vars[1], "playbook_7-1730000000"), (vars[2], "pod")]),
+            "playbook_7-1730000000"
+        );
+        assert_eq!(page(&[(vars[2], "pod")]), "pod");
     }
 }

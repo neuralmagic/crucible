@@ -33,6 +33,7 @@ import {
 import type { SpecItem } from '../ui';
 import { issueStatusColor, tierTone } from './issueStatus';
 import { runStatusColor } from './runStatus';
+import { runLabel } from './runLabel';
 import {
   absoluteTime,
   ghostTitle,
@@ -463,7 +464,7 @@ function RunDetail({ step }: { step: Extract<JourneyStep, { kind: 'run' }> }) {
         />
         {hasScore && <Mono>best {step.best_score?.toFixed(1)}</Mono>}
         <Identifier variant="inline" to={`/runs/${encodeURIComponent(step.run_id)}`}>
-          {step.run_id}
+          {runLabel(step)}
         </Identifier>
         {step.live && isRunning && (
           <Button

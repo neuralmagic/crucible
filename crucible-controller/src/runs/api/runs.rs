@@ -20,6 +20,9 @@ const RUNS_LIST_MAX: i64 = 500;
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RunRowDto {
     pub run_id: String,
+    /// The name people read the run by (`benevolent-monkey`); null for a run from before names.
+    #[schema(value_type = Option<String>)]
+    pub name: Option<crate::runs::names::RunName>,
     pub issue_key: Option<String>,
     pub repo: Option<String>,
     pub status: String,
@@ -43,6 +46,7 @@ impl RunRowDto {
         RunRowDto {
             transport_losses: r.transport_losses,
             run_id: r.run_id,
+            name: r.name,
             issue_key: r.issue_key,
             repo: r.repo,
             status: r.status,
