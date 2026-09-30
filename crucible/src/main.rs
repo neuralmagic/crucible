@@ -72,9 +72,18 @@ mod plan {
     pub mod turn_log;
 }
 
-use anyhow::Result;
 use clap::Parser;
 
-fn main() -> Result<()> {
-    cli::run::dispatch(cli::Cli::parse())
+fn main() -> std::process::ExitCode {
+    match cli::run::dispatch(cli::Cli::parse()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:?}");
+            std::process::ExitCode::from(if error.is::<plan::cli::NoValidVerdict>() {
+                crucible::plan::INVALID_VERDICT_EXIT
+            } else {
+                1
+            })
+        }
+    }
 }

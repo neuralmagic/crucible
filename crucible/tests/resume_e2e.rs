@@ -223,3 +223,30 @@ fn a_resume_refuses_a_run_it_did_not_start() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// An invalid verdict is a finished run, not a crash: it exits with its own code, and resuming it
+/// reports the same verdict without running or writing anything.
+#[test]
+fn a_finished_invalid_run_exits_with_its_own_code_every_time() {
+    let dir = pack("invalid");
+    std::fs::write(
+        dir.join("workflow.star"),
+        r#"
+broken = command(name = "broken", run = "echo broken >> ../ran.log && exit 1")
+workflow(type = "playbook", tasks = [broken])
+"#,
+    )
+    .unwrap();
+    let first = run(&dir, false);
+    assert_eq!(first.status.code(), Some(3), "{}", describe(&first));
+    let log = std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap();
+
+    let again = run(&dir, true);
+    assert_eq!(again.status.code(), Some(3), "{}", describe(&again));
+    assert_eq!(
+        std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap(),
+        log
+    );
+    assert_eq!(ran(&dir), ["broken"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

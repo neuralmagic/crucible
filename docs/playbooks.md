@@ -124,7 +124,7 @@ launches it does. `crucible check` validates the manifest, resolves every file i
 and lists the egress and credentials the pack would get, without running anything.
 
 The verdict is `valid` because every required task passed. It is the thing to script
-against: `plan run` exits nonzero on any other verdict.
+against: `plan run` exits 3 on any other verdict, and 1 when it could not run the plan at all.
 
 ## What the run left behind
 
@@ -168,7 +168,9 @@ elapsed time includes the time the run was down. A resume refuses a pack, parame
 `--max-cost` that differs from the run's start, and a run that already shut down only
 exits with its verdict again.
 
-A deployed pod does this itself when its profile sets `[cluster] state_pvc`.
+A pod the control plane dispatches does this itself: when the engine dies, the container
+restarts and resumes, up to three times. A hand-rendered pod does the same when its profile sets
+`[cluster] state_pvc`.
 
 ## Put a real agent on it
 

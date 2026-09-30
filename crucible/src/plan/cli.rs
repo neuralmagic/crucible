@@ -22,7 +22,7 @@ struct MermaidRenderFailed {
 
 #[derive(Debug, thiserror::Error)]
 #[error("plan did not reach a valid verdict ({exit})")]
-struct NoValidVerdict {
+pub(crate) struct NoValidVerdict {
     exit: String,
 }
 
