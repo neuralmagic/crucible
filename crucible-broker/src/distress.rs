@@ -180,8 +180,8 @@ pub(crate) struct Page {
 impl Page {
     fn from_env(severity: Severity, reason: &str, evidence: &[String]) -> Self {
         let env = |k: &str| std::env::var(k).unwrap_or_default();
-        let pod = env("CRUCIBLE_POD_NAME");
-        let run = match env("CRUCIBLE_RUN_NAME") {
+        let pod = env(crucible_contract::ENV_POD_NAME);
+        let run = match env(crucible_contract::ENV_RUN_NAME) {
             s if s.is_empty() => pod.clone(),
             s => s,
         };

@@ -714,10 +714,10 @@ pub fn run(
         })
         .collect();
     let mut report = crucible_contract::RunReport {
-        run: std::env::var("CRUCIBLE_RUN_NAME").unwrap_or_else(|_| "local".to_string()),
+        run: std::env::var(crucible_contract::ENV_RUN_NAME).unwrap_or_else(|_| "local".to_string()),
         run_url: match (
             std::env::var("CRUCIBLE_UI_BASE_URL").ok(),
-            std::env::var("CRUCIBLE_RUN_NAME").ok(),
+            std::env::var(crucible_contract::ENV_RUN_NAME).ok(),
         ) {
             (Some(base), Some(run)) => Some(format!("{}/runs/{run}", base.trim_end_matches('/'))),
             _ => None,

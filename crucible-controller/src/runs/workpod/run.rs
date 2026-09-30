@@ -265,6 +265,7 @@ pub fn stamp_run_pod(
             crate::daemon::RUN_ID_ANNOTATION.to_string(),
             run_id.to_string(),
         );
+    set_container_env(pod, crucible_contract::ENV_RUN_NAME, run_id);
     if let Some(contract) = codegen_contract {
         set_container_env(pod, CODEGEN_OVERLAY_ENV, contract);
     }
