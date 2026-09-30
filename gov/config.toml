@@ -15,17 +15,6 @@ docs_output = "docs"
 [schema]
 version = 5
 
-# [work_item]
-# ID strategy for work items (default: sequential)
-# - sequential: WI-YYYY-MM-DD-NNN (solo projects)
-# - author-hash: WI-YYYY-MM-DD-{hash}-NNN (multi-person teams, uses git email)
-# - random: WI-YYYY-MM-DD-{rand} (simple uniqueness)
-# id_strategy = "author-hash"
-
-[verification]
-enabled = true
-default_guards = ["GUARD-GOVCTL-CHECK", "GUARD-CARGO-FMT", "GUARD-CARGO-CLIPPY", "GUARD-CARGO-TEST"]
-
 # [source_scan]
 # Scan source files for [[artifact-id]] references during `govctl check`
 # enabled = false

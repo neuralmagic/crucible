@@ -111,5 +111,6 @@ Before handing off engine changes:
 
 Contracted behavior lives in `gov/` (govctl); RFC-0001/RFC-0002 clauses are the
 spec for manifest, egress, outputs, and disclosure semantics. Read the
-governing clause before changing enforcement, and file a work item for
-follow-ups instead of leaving TODOs in code.
+governing clause before changing enforcement, and open a GitHub issue for
+follow-ups instead of leaving TODOs in code. Work items are not tracked:
+do not create anything under `gov/work/`.
