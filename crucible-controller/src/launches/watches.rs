@@ -15,7 +15,8 @@
 
 use crate::client::Db;
 use crate::launches::standing::{
-    self, Claim, Failed, LaunchTrigger, NewStanding, Recorded, Standing, SweepCfg, TriggerFuture,
+    self, Claim, Claimed, Failed, FireError, LaunchTrigger, NewStanding, Recorded, Standing,
+    SweepCfg, TriggerFuture,
 };
 use crate::launches::tracker::{TrackerKind, Trackers};
 use crate::model::Trigger;
@@ -339,7 +340,10 @@ impl WatchTrigger {
                 continue;
             }
             let mut claim = Claim::new(&watch.id, format!("watch {} matched {}", watch.id, hit.id));
-            claim.overlay = Some((watch.key_param.clone(), hit.id.clone()));
+            claim.overlay.insert(
+                watch.key_param.clone(),
+                serde_json::Value::String(hit.id.clone()),
+            );
             claim.subject = Some(hit.id.clone());
             claim.reference = Some(hit.id.clone());
             claim.payload = serde_json::json!({"item": hit.id, "updated": updated});
@@ -418,7 +422,7 @@ impl LaunchTrigger for WatchTrigger {
         tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
         claim: &'a mut Claim,
         now: Timestamp,
-    ) -> TriggerFuture<'a, Result<bool>> {
+    ) -> TriggerFuture<'a, Result<Claimed>> {
         Box::pin(async move {
             let (item, updated) = item_of(claim);
             // The launch key is filled in at settle; the row is the claim.
@@ -433,7 +437,11 @@ impl LaunchTrigger for WatchTrigger {
             .execute(&mut **tx)
             .await
             .context("record the hit")?;
-            Ok(seen.rows_affected() > 0)
+            Ok(if seen.rows_affected() > 0 {
+                Claimed::Taken
+            } else {
+                Claimed::Lost
+            })
         })
     }
 
@@ -473,11 +481,12 @@ impl LaunchTrigger for WatchTrigger {
         &'a self,
         _db: &'a Db,
         _claim: &'a Claim,
-        _message: &'a str,
+        _error: &'a FireError,
         _now: Timestamp,
     ) -> TriggerFuture<'a, Result<Failed>> {
         Box::pin(async move {
             Ok(Failed {
+                counts: true,
                 force_disable: false,
                 announced: false,
             })

@@ -850,6 +850,57 @@ pub struct Watch {
     pub owner_signin_required: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Webhook {
+    pub id: String,
+    #[serde(default)]
+    pub playbook: String,
+    #[serde(default)]
+    pub verifier: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub max_launches_per_hour: i64,
+    #[serde(default)]
+    pub last_delivery_at: Option<String>,
+    #[serde(default)]
+    pub consecutive_failures: i64,
+    #[serde(default)]
+    pub owner_principal: Option<String>,
+    /// The owner has to sign in again before this can launch.
+    #[serde(default)]
+    pub owner_signin_required: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebhookDelivery {
+    pub id: String,
+    #[serde(default)]
+    pub received_at: String,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub launch_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CelDiagnostic {
+    pub field: String,
+    pub message: String,
+    #[serde(default)]
+    pub line: Option<u32>,
+    #[serde(default)]
+    pub column: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WebhookCheck {
+    #[serde(default)]
+    pub diagnostics: Vec<CelDiagnostic>,
+}
+
 /// The launch acknowledgement: which issue the launch became.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LaunchAck {

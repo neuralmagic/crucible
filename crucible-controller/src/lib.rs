@@ -126,6 +126,19 @@ pub(crate) fn human_router(
         .layer(identity::session::layer(store, secure_cookies))
 }
 
+/// The webhook delivery surface's bind address, `CONTROLLER_HOOKS_ADDR` (host:port). Unset serves
+/// no delivery surface.
+fn hooks_addr_from_env() -> anyhow::Result<Option<SocketAddr>> {
+    match std::env::var("CONTROLLER_HOOKS_ADDR") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .trim()
+            .parse()
+            .map(Some)
+            .with_context(|| format!("CONTROLLER_HOOKS_ADDR {raw:?} is not host:port")),
+        _ => Ok(None),
+    }
+}
+
 /// Mount the API + React SPA on one axum router and serve it at `addr`. The daemon owns calling
 /// this; it does not wire itself into the daemon. Without `CONTROLLER_API_TOKEN` set, the guard is
 /// off — so this forces the bind to loopback regardless of the requested `addr`'s host, matching
@@ -147,7 +160,12 @@ pub async fn serve(
             "no credential key mounted: logins store no offline credential, so scheduled launches stay on the schedule-row snapshot"
         );
     }
-    let state = state.with_oidc(oidc.clone(), credential_keys.clone());
+    let webhook_keys = identity::oidc::credentials::CredentialKeys::webhook_from_env()
+        .context("reading the webhook key")?;
+    let pool_for_hooks = state.db.pool().clone();
+    let state = state
+        .with_oidc(oidc.clone(), credential_keys.clone())
+        .with_webhook_keys(webhook_keys.clone());
     let auth_mode = identity::auth::AuthMode::from_env();
     let guard = Arc::new(
         identity::auth::BearerGuard::from_env(
@@ -275,6 +293,21 @@ pub async fn serve(
         .merge(push_router)
         .merge(mcp_router)
         .merge(oidc_mirror::router(mirror));
+
+    if let Some(hooks_addr) = hooks_addr_from_env()? {
+        let hooks = launches::webhooks::receive::router(
+            launches::webhooks::receive::HooksState::new(pool_for_hooks, webhook_keys.clone()),
+        );
+        let listener = tokio::net::TcpListener::bind(hooks_addr)
+            .await
+            .with_context(|| format!("binding the webhook delivery surface to {hooks_addr}"))?;
+        tracing::info!(%hooks_addr, "crucible-controller webhook delivery surface listening");
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(listener, hooks).await {
+                tracing::error!(error = %e, "webhook delivery surface exited");
+            }
+        });
+    }
 
     let listener = tokio::net::TcpListener::bind(bind_addr)
         .await

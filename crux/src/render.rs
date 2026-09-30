@@ -1194,6 +1194,84 @@ pub fn watches(list: &[dto::Watch]) -> String {
     )
 }
 
+/// The webhooks. Same state vocabulary as schedules and watches.
+pub fn webhooks(list: &[dto::Webhook]) -> String {
+    if list.is_empty() {
+        return "no webhooks\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|w| {
+            vec![
+                w.id.clone(),
+                w.playbook.clone(),
+                w.verifier.clone(),
+                owner_state(w.enabled, w.owner_signin_required).to_string(),
+                format!("{}/h", w.max_launches_per_hour),
+                or_dash(w.last_delivery_at.as_deref()),
+                w.consecutive_failures.to_string(),
+                or_dash(w.owner_principal.as_deref()),
+            ]
+        })
+        .collect();
+    format!(
+        "{} webhooks\n{}",
+        list.len(),
+        table(
+            &[
+                "ID",
+                "PLAYBOOK",
+                "VERIFIER",
+                "STATE",
+                "RATE",
+                "DELIVERED",
+                "FAILS",
+                "OWNER"
+            ],
+            &rows
+        )
+    )
+}
+
+/// A webhook's deliveries, newest first, with how each settled.
+pub fn webhook_deliveries(list: &[dto::WebhookDelivery]) -> String {
+    if list.is_empty() {
+        return "no deliveries\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|d| {
+            vec![
+                d.id.clone(),
+                d.received_at.clone(),
+                d.outcome.clone(),
+                or_dash(d.launch_key.as_deref()),
+                or_dash(d.reason.as_deref()),
+            ]
+        })
+        .collect();
+    format!(
+        "{} deliveries\n{}",
+        list.len(),
+        table(&["ID", "RECEIVED", "OUTCOME", "LAUNCH", "REASON"], &rows)
+    )
+}
+
+/// A transform check: `ok`, or one `field:line:col: message` per refusal.
+pub fn webhook_check(checked: &dto::WebhookCheck) -> String {
+    if checked.diagnostics.is_empty() {
+        return "ok\n".to_string();
+    }
+    checked
+        .diagnostics
+        .iter()
+        .map(|d| match (d.line, d.column) {
+            (Some(line), Some(column)) => format!("{}:{line}:{column}: {}\n", d.field, d.message),
+            _ => format!("{}: {}\n", d.field, d.message),
+        })
+        .collect()
+}
+
 /// What a launch became, and where to watch it.
 pub fn launched(ack: &dto::LaunchAck, run_url: &str) -> String {
     let mut out = format!(
@@ -2552,6 +2630,89 @@ mod tests {
         assert!(
             out.ends_with("publishing it again re-pins mlr-pack.\n"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn webhooks_list_state_rate_and_last_delivery() {
+        let list = vec![
+            dto::Webhook {
+                id: "w1".to_string(),
+                playbook: "rebuild".to_string(),
+                verifier: "path_token".to_string(),
+                enabled: true,
+                max_launches_per_hour: 5,
+                last_delivery_at: Some("2026-09-29T12:00:00Z".to_string()),
+                consecutive_failures: 0,
+                owner_principal: Some("user:wren".to_string()),
+                owner_signin_required: false,
+            },
+            dto::Webhook {
+                id: "w2".to_string(),
+                playbook: "release".to_string(),
+                verifier: "hmac_sha256".to_string(),
+                enabled: true,
+                max_launches_per_hour: 1,
+                last_delivery_at: None,
+                consecutive_failures: 2,
+                owner_principal: None,
+                owner_signin_required: true,
+            },
+        ];
+        let out = webhooks(&list);
+        assert!(out.starts_with("2 webhooks\n"), "{out}");
+        let w1 = out.lines().find(|l| l.starts_with("w1")).expect("w1");
+        assert!(w1.contains("path_token") && w1.contains("5/h") && w1.contains("2026-09-29"));
+        let w2 = out.lines().find(|l| l.starts_with("w2")).expect("w2");
+        assert!(w2.contains("blocked"), "{w2}");
+        assert_eq!(webhooks(&[]), "no webhooks\n");
+    }
+
+    #[test]
+    fn webhook_deliveries_show_how_each_settled() {
+        let list = vec![dto::WebhookDelivery {
+            id: "d1".to_string(),
+            received_at: "2026-09-29T12:00:00Z".to_string(),
+            outcome: "duplicate".to_string(),
+            reason: Some("key \"a\" already launched".to_string()),
+            launch_key: None,
+        }];
+        let out = webhook_deliveries(&list);
+        let row = out.lines().find(|l| l.starts_with("d1")).expect("d1");
+        assert!(
+            row.contains("duplicate") && row.contains("already launched"),
+            "{row}"
+        );
+        assert_eq!(webhook_deliveries(&[]), "no deliveries\n");
+    }
+
+    #[test]
+    fn a_webhook_check_prints_ok_or_each_refusal_where_it_is() {
+        assert_eq!(
+            webhook_check(&dto::WebhookCheck {
+                diagnostics: vec![]
+            }),
+            "ok\n"
+        );
+        let checked = dto::WebhookCheck {
+            diagnostics: vec![
+                dto::CelDiagnostic {
+                    field: "filter".to_string(),
+                    message: "Syntax error".to_string(),
+                    line: Some(1),
+                    column: Some(19),
+                },
+                dto::CelDiagnostic {
+                    field: "derive.image".to_string(),
+                    message: "calls join".to_string(),
+                    line: None,
+                    column: None,
+                },
+            ],
+        };
+        assert_eq!(
+            webhook_check(&checked),
+            "filter:1:19: Syntax error\nderive.image: calls join\n"
         );
     }
 }

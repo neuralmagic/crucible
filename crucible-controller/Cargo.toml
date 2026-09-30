@@ -124,6 +124,9 @@ percent-encoding = "2"
 # AES-256-GCM for the offline credential at rest, under the chart-mounted key. Already the crypto
 # provider under rustls and jsonwebtoken in this tree, so it adds no new build.
 aws-lc-rs = "1.18"
+# Evaluates webhook transforms (ADR-0055). Pinned to master by rev until a release carries
+# cel-rust#341, which makes `map` and `filter` linear.
+cel = { git = "https://github.com/cel-rust/cel-rust", rev = "92f4376e200124e8dbafe5323a69cbe6bc3765c6" }
 # Mints the ranker's Vertex access token from ADC (the crucible::openshell::provider pattern,
 # in-process here since ranking never shells out to a `claude` CLI the loop image doesn't carry).
 # genai's vertex adapter expects a pre-minted OAuth2 bearer (it does no ADC itself), so the mint

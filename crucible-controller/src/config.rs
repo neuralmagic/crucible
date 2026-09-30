@@ -608,6 +608,11 @@ pub struct ControllerCfg {
     /// comments. Unset ⇒ comments omit the link.
     #[arg(long = "public-url", env = "CONTROLLER_PUBLIC_URL")]
     pub public_url: Option<String>,
+    /// The externally reachable base URL of the webhook delivery surface (e.g.
+    /// `https://hooks.crucible.example.com`). A created webhook's delivery URL is built on it;
+    /// unset ⇒ the API returns the delivery path alone.
+    #[arg(long = "hooks-public-url", env = "CONTROLLER_HOOKS_PUBLIC_URL")]
+    pub hooks_public_url: Option<String>,
     /// The Jira project emitted experiment epics/tasks land in (e.g. `ACME`). All three
     /// `jira_emission_*` fields plus the Jira creds must be set for emission to be on.
     #[arg(long = "jira-emission-project", env = "JIRA_EMISSION_PROJECT")]

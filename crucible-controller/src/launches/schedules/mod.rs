@@ -19,7 +19,8 @@ use crate::clock::stamp;
 use crate::event_log::Event;
 use crate::launches::model::CursorSpec;
 use crate::launches::standing::{
-    self, Claim, Failed, LaunchTrigger, NewStanding, Recorded, Standing, SweepCfg, TriggerFuture,
+    self, Claim, Claimed, Failed, FireError, LaunchTrigger, NewStanding, Recorded, Standing,
+    SweepCfg, TriggerFuture,
 };
 use crate::model::Trigger;
 use crate::playbooks::registry::FieldError;
@@ -557,7 +558,7 @@ impl ScheduleStore {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         claim: &mut Claim,
         now: Timestamp,
-    ) -> Result<bool> {
+    ) -> Result<Claimed> {
         // The window being fired is read under the row lock before the claim nulls it; a
         // second sweep re-checks the predicate after the lock and finds nothing.
         let due_at: Option<String> = sqlx::query_scalar(
@@ -576,10 +577,10 @@ impl ScheduleStore {
         .await
         .context("claim due schedule")?;
         let Some(due_at) = due_at else {
-            return Ok(false);
+            return Ok(Claimed::Lost);
         };
         claim.payload["due_at"] = serde_json::Value::String(due_at);
-        Ok(true)
+        Ok(Claimed::Taken)
     }
 
     async fn settle(
@@ -642,6 +643,7 @@ impl ScheduleStore {
             .await
             .context("record schedule failure")?;
         Ok(Failed {
+            counts: true,
             force_disable: next_due_at.is_none(),
             announced: false,
         })
@@ -740,10 +742,11 @@ impl LaunchTrigger for ScheduleTrigger {
                 .map(|row| {
                     let mut claim = Claim::new(&row.id, format!("schedule {} fired", row.id));
                     claim.dedupe_schedule = Some(row.id.clone());
-                    claim.overlay = match (row.cursor_param, row.cursor_value) {
-                        (Some(param), Some(value)) => Some((param, value)),
-                        _ => None,
-                    };
+                    if let (Some(param), Some(value)) = (row.cursor_param, row.cursor_value) {
+                        claim
+                            .overlay
+                            .insert(param, serde_json::Value::String(value));
+                    }
                     claim.payload = serde_json::json!({"cron_expr": row.cron_expr, "tz": row.tz});
                     claim
                 })
@@ -756,7 +759,7 @@ impl LaunchTrigger for ScheduleTrigger {
         tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
         claim: &'a mut Claim,
         now: Timestamp,
-    ) -> TriggerFuture<'a, Result<bool>> {
+    ) -> TriggerFuture<'a, Result<Claimed>> {
         Box::pin(async move { self.store.claim_due(tx, claim, now).await })
     }
 
@@ -774,7 +777,7 @@ impl LaunchTrigger for ScheduleTrigger {
         &'a self,
         _db: &'a Db,
         claim: &'a Claim,
-        _message: &'a str,
+        _error: &'a FireError,
         now: Timestamp,
     ) -> TriggerFuture<'a, Result<Failed>> {
         Box::pin(async move { self.store.fail(claim, now).await })

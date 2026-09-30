@@ -147,7 +147,8 @@ pub fn assemble(
     #[allow(unused_mut)]
     let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
         // The only source that writes: every launch trigger (a due one-shot, a due schedule, a
-        // watch hit) claims its row and mints the launch in one transaction, then enqueues the key.
+        // watch hit, a webhook delivery) claims its row and mints the launch in one transaction,
+        // then enqueues the key.
         Arc::new(crate::launches::standing::TriggerSweep::new(
             db.clone(),
             vec![
@@ -159,6 +160,7 @@ pub fn assemble(
                 Arc::new(crate::launches::watches::WatchTrigger::new(
                     crate::launches::jira::trackers(cfg.jira_config()),
                 )),
+                Arc::new(crate::launches::webhooks::trigger::WebhookTrigger),
             ],
             cfg.schedule_auto_disable_failures,
             std::time::Duration::from_secs(cfg.schedule_owner_ttl_secs),

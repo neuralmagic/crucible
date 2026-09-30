@@ -36,6 +36,9 @@ import { DraftStudioPage } from './pages/DraftStudioPage';
 import { PlaybookLaunchPage } from './pages/PlaybookLaunchPage';
 import { PlaybookRunsPage } from './pages/PlaybookRunsPage';
 import { SchedulesPage } from './pages/SchedulesPage';
+import { WebhooksPage } from './pages/WebhooksPage';
+import { WebhookDetailPage } from './pages/WebhookDetailPage';
+import { EditWebhookPage, NewWebhookPage } from './pages/NewWebhookPage';
 import { MoltenLogo } from './MoltenLogo';
 import { PlaybookLaunchDetailPage } from './pages/PlaybookLaunchDetailPage';
 import { TurnsPage } from './pages/TurnsPage';
@@ -271,6 +274,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
         { to: '/playbooks', label: 'Playbooks', icon: 'PB' },
         { to: '/playbooks/drafts', label: 'Drafts', icon: 'DR' },
         { to: '/schedules', label: 'Schedules', icon: 'SC' },
+        { to: '/webhooks', label: 'Webhooks', icon: 'WH' },
       ],
     },
     {
@@ -441,6 +445,10 @@ export function App() {
             <Route path="/playbooks/:id/launch" element={<PlaybookLaunchPage />} />
             <Route path="/playbook-runs" element={<PlaybookRunsPage />} />
             <Route path="/schedules" element={<SchedulesPage />} />
+            <Route path="/webhooks" element={<WebhooksPage />} />
+            <Route path="/webhooks/:id" element={<WebhookDetailPage />} />
+            <Route path="/webhooks/:id/edit" element={<EditWebhookPage />} />
+            <Route path="/playbooks/:id/webhook" element={<NewWebhookPage />} />
             <Route path="/playbook-runs/:key" element={<PlaybookLaunchDetailPage />} />
             <Route path="/playbook-runs/:key/runs/:runId" element={<RunDetailPage />} />
             <Route path="/playbook-runs/:key/runs/:runId/files/*" element={<RunDetailPage />} />

@@ -147,16 +147,19 @@ pub(crate) fn stored_params(params: &serde_json::Value) -> BTreeMap<String, Stri
         .as_object()
         .map(|map| {
             map.iter()
-                .map(|(k, v)| {
-                    let value = match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    (k.clone(), value)
-                })
+                .map(|(k, v)| (k.clone(), stored_value(v)))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// One param value in the string form a launch stores: a string as itself, anything else as its
+/// JSON.
+pub(crate) fn stored_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
 }
 
 /// The stored `{name: value}` object as ordered pairs. Sorted by name so a launch always renders

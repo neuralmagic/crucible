@@ -40,20 +40,22 @@ describe('parseParamsSchema', () => {
     expect(specsOf(FIXTURE)).toEqual([
       {
         name: 'topic',
+        valueType: 'string',
         required: true,
         defaultValue: null,
         pattern: '^[a-z ]+$',
         description: 'What the survey covers.',
       },
-      { name: 'depth', required: false, defaultValue: 'shallow', pattern: null, description: null },
+      { name: 'depth', valueType: 'string', required: false, defaultValue: 'shallow', pattern: null, description: null },
       {
         name: 'since',
+        valueType: 'string',
         required: false,
         defaultValue: '2026-01-01',
         pattern: '^\\d{4}-\\d{2}-\\d{2}$',
         description: null,
       },
-      { name: 'note', required: false, defaultValue: null, pattern: null, description: null },
+      { name: 'note', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null },
     ]);
   });
 
@@ -65,7 +67,7 @@ describe('parseParamsSchema', () => {
       additionalProperties: false,
     });
     expect(specs).toEqual([
-      { name: 'topic', required: false, defaultValue: null, pattern: null, description: null },
+      { name: 'topic', valueType: 'string', required: false, defaultValue: null, pattern: null, description: null },
     ]);
   });
 
@@ -79,7 +81,9 @@ describe('parseParamsSchema', () => {
       null,
       ['topic'],
       { type: 'array' },
-      { type: 'object', properties: { n: { type: 'integer' } } },
+      { type: 'object', properties: { n: { type: 'object' } } },
+      { type: 'object', properties: { n: { type: 'array', items: { type: 'integer' } } } },
+      { type: 'object', properties: { n: { type: 'integer', default: '3' } } },
       { type: 'object', properties: { n: { type: 'string', default: 3 } } },
       { type: 'object', properties: { n: { type: 'string', pattern: 7 } } },
       { type: 'object', properties: { n: 'string' } },
@@ -87,6 +91,43 @@ describe('parseParamsSchema', () => {
     ]) {
       expect(parseParamsSchema(schema).kind, JSON.stringify(schema)).toBe('unrenderable');
     }
+  });
+});
+
+describe('typed params', () => {
+  const TYPED = {
+    type: 'object',
+    properties: {
+      rounds: { type: 'integer', default: 3 },
+      ratio: { type: 'number' },
+      deep: { type: 'boolean', default: false },
+      topics: { type: 'array', items: { type: 'string' }, default: ['a', 'b'] },
+    },
+  };
+
+  it('renders each type with its default in the spelling the engine reads', () => {
+    const specs = specsOf(TYPED);
+    expect(specs.map((s) => [s.name, s.valueType, s.defaultValue])).toEqual([
+      ['rounds', 'integer', '3'],
+      ['ratio', 'number', null],
+      ['deep', 'boolean', 'false'],
+      ['topics', 'list', '["a","b"]'],
+    ]);
+  });
+
+  it('refuses a value that does not read as its type', () => {
+    const [rounds, ratio, deep, topics] = specsOf(TYPED);
+    if (!rounds || !ratio || !deep || !topics) throw new Error('four specs');
+    expect(validateParam(rounds, '7')).toBeNull();
+    expect(validateParam(rounds, 'seven')).toBe('rounds must be a whole number');
+    expect(validateParam(rounds, '3000000000')).toBe('rounds must be a whole number');
+    expect(validateParam(ratio, '0.25')).toBeNull();
+    expect(validateParam(ratio, 'inf')).toBe('ratio must be a number');
+    expect(validateParam(deep, 'True')).toBeNull();
+    expect(validateParam(deep, 'yes')).toBe('deep must be true or false');
+    expect(validateParam(topics, 'a, b')).toBeNull();
+    expect(validateParam(topics, '["a"]')).toBeNull();
+    expect(validateParam(topics, '[1]')).toBe('topics must be a JSON array of strings, or comma-separated');
   });
 });
 
@@ -130,6 +171,7 @@ describe('validateParam', () => {
   it('skips a pattern the browser cannot compile, leaving the endpoint to enforce it', () => {
     const rustOnly: ParamFieldSpec = {
       name: 'topic',
+      valueType: 'string',
       required: true,
       defaultValue: null,
       pattern: '(?P<year>\\d{4})',

@@ -71,13 +71,22 @@ export function PlaybookDetailPage() {
         title={playbook.id}
         description={playbook.description}
         actions={
-          <Button
-            variant="filled"
-            className="uppercase"
-            render={<Link to={`/playbooks/${encodeURIComponent(playbook.id)}/launch`} />}
-          >
-            Launch
-          </Button>
+          <div className="flex gap-2">
+            <Button
+              variant="quiet"
+              className="uppercase"
+              render={<Link to={`/playbooks/${encodeURIComponent(playbook.id)}/webhook`} />}
+            >
+              Add webhook
+            </Button>
+            <Button
+              variant="filled"
+              className="uppercase"
+              render={<Link to={`/playbooks/${encodeURIComponent(playbook.id)}/launch`} />}
+            >
+              Launch
+            </Button>
+          </div>
         }
       />
 

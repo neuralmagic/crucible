@@ -17,6 +17,7 @@
 use crate::playbooks::packs::MaterializedPack;
 use anyhow::{Context, Result};
 use crucible::plan::starlark::declared_params;
+use crucible::plan::starlark::params::ParamType;
 use crucible_contract::content_digest;
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
@@ -1091,16 +1092,35 @@ pub struct FieldError {
 
 /// Validate a launcher's values against a pack's stored params schema. The schema is the pack's
 /// declaration, extracted at registration; this is the enforcement the SPA form is only a
-/// convenience over. Compiled per call — a params schema is a handful of properties, and a cache
-/// would be one more thing to invalidate on a pin bump.
+/// convenience over. Each value is read into its declared type with the engine's own reader before
+/// the schema sees it, so the controller accepts exactly the spellings a run will bind. The
+/// returned object keeps the launcher's text, which is what a launch stores and renders. Compiled
+/// per call — a params schema is a handful of properties, and a cache would be one more thing to
+/// invalidate on a pin bump.
 pub fn validate_params(
     schema: &serde_json::Value,
     params: &std::collections::BTreeMap<String, String>,
 ) -> Result<serde_json::Value, Vec<FieldError>> {
-    let instance = serde_json::Value::Object(
+    let mut errors = Vec::new();
+    let typed = serde_json::Value::Object(
         params
             .iter()
-            .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+            .map(|(k, v)| {
+                let value = match schema.pointer(&format!("/properties/{}", pointer_token(k))) {
+                    Some(property) => match ParamType::from_schema(property).read(v) {
+                        Ok(read) => read.json(),
+                        Err(expected) => {
+                            errors.push(FieldError {
+                                field: k.clone(),
+                                message: format!("{v:?} is not {expected}"),
+                            });
+                            serde_json::Value::Null
+                        }
+                    },
+                    None => serde_json::Value::String(v.clone()),
+                };
+                (k.clone(), value)
+            })
             .collect(),
     );
     let validator = jsonschema::validator_for(schema).map_err(|e| {
@@ -1109,18 +1129,31 @@ pub fn validate_params(
             message: format!("the stored params schema is not a usable JSON Schema: {e}"),
         }]
     })?;
-    let errors: Vec<FieldError> = validator
-        .iter_errors(&instance)
-        .map(|e| FieldError {
-            field: field_of(&e),
-            message: e.to_string(),
-        })
-        .collect();
+    let unread: Vec<String> = errors.iter().map(|e| e.field.clone()).collect();
+    errors.extend(
+        validator
+            .iter_errors(&typed)
+            .map(|e| FieldError {
+                field: field_of(&e),
+                message: e.to_string(),
+            })
+            .filter(|e| !unread.contains(&e.field)),
+    );
     if errors.is_empty() {
-        Ok(instance)
+        Ok(serde_json::Value::Object(
+            params
+                .iter()
+                .map(|(k, v)| (k.clone(), serde_json::Value::String(v.clone())))
+                .collect(),
+        ))
     } else {
         Err(errors)
     }
+}
+
+/// A param name as one JSON Pointer reference token.
+fn pointer_token(name: &str) -> String {
+    name.replace('~', "~0").replace('/', "~1")
 }
 
 /// Which param a validation error belongs to. A value error points at `/name`; a missing required
@@ -1250,6 +1283,91 @@ mod tests {
             validate_params(&schema, &extra).is_err(),
             "a param the pack never declared is a mistake, not a passthrough"
         );
+    }
+
+    /// The schema the engine emits for a pack declaring one param of every type.
+    fn typed_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "rounds": {"type": "integer", "minimum": 1, "maximum": 10},
+                "ratio": {"type": "number"},
+                "deep": {"type": "boolean"},
+                "topics": {"type": "array", "items": {"type": "string"}},
+                "tier": {"type": "string", "enum": ["low", "high"]}
+            }
+        })
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn typed_values_are_read_before_the_schema_sees_them() {
+        let supplied = params(&[
+            ("rounds", "7"),
+            ("ratio", "0.25"),
+            ("deep", "true"),
+            ("topics", "ci, flaky"),
+            ("tier", "high"),
+        ]);
+        assert_eq!(
+            validate_params(&typed_schema(), &supplied).expect("valid"),
+            serde_json::json!({
+                "rounds": "7", "ratio": "0.25", "deep": "true", "topics": "ci, flaky",
+                "tier": "high"
+            }),
+            "the launcher's text is what a launch stores"
+        );
+        for spelling in [r#"["a, b", "c"]"#, "a,b", "False"] {
+            let key = if spelling == "False" {
+                "deep"
+            } else {
+                "topics"
+            };
+            assert!(
+                validate_params(&typed_schema(), &params(&[(key, spelling)])).is_ok(),
+                "{key}={spelling} is a spelling the engine binds"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_is_not_its_type_names_the_param_and_the_type() {
+        for (key, value, expected) in [
+            ("rounds", "seven", "a whole number"),
+            ("rounds", "3000000000", "a whole number"),
+            ("ratio", "inf", "a number"),
+            ("deep", "yes", "true or false"),
+            ("topics", "[1, 2]", "a JSON array of strings"),
+        ] {
+            let errors =
+                validate_params(&typed_schema(), &params(&[(key, value)])).expect_err("refused");
+            assert_eq!(
+                errors,
+                vec![FieldError {
+                    field: key.to_string(),
+                    message: format!("{value:?} is not {expected}"),
+                }],
+                "one error per unreadable value, and no schema type mismatch beside it"
+            );
+        }
+    }
+
+    #[test]
+    fn constraints_apply_to_the_typed_value() {
+        for (key, value) in [("rounds", "0"), ("rounds", "11"), ("tier", "mid")] {
+            let errors =
+                validate_params(&typed_schema(), &params(&[(key, value)])).expect_err("refused");
+            let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
+            assert_eq!(fields, vec![key], "{errors:?}");
+        }
+        assert!(validate_params(&typed_schema(), &params(&[("rounds", "10")])).is_ok());
     }
 
     /// The tarball of a playbook pack whose source the engine refuses.

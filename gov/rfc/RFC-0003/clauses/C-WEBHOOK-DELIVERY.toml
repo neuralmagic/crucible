@@ -1,0 +1,11 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-WEBHOOK-DELIVERY"
+title = "Webhook delivery surface"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = "A webhook is a trigger under [[RFC-0003:C-HIERARCHY]] whose firing is requested by a sender outside the controller; a standing launch has at most one webhook. The delivery address MUST carry an opaque webhook identifier and MUST NOT carry the owner principal or the playbook identifier. The delivery surface MUST authenticate every delivery by the webhook's own secret, using one verifier the owner chose from this set: an HMAC-SHA256 of the body in a named header, given as `sha256=` followed by the lowercase hex digest; a shared token in the delivery path. Adding a verifier is a compatible change; removing one is a breaking change under the RFC lifecycle. The surface MUST NOT record or act on a delivery its webhook's verifier does not prove. The body size limit MUST be the same for every webhook and MUST be applied before the webhook is looked up. Every delivery the surface does not record, whatever the cause (an unknown or deleted webhook, a disabled webhook, failed verification, or a body over the limit), MUST receive the same status code, body, and headers apart from per-response values such as the date and a request id. A presented secret MUST be compared in constant time. A refusal applied before the webhook is looked up and independent of its identifier, such as load shedding, MAY differ from that response. A delivery MUST be durably recorded before it is acknowledged. The acknowledgement MUST be the same whatever the delivery later settles to and MUST NOT wait for filtering, parameter derivation, or launch; a verified delivery that cannot be recorded MUST receive a response the sender can retry, distinct from the acknowledgement. The sender is not a principal and MUST NOT be granted any action from [[RFC-0003:C-ACTIONS]]."

@@ -41,6 +41,9 @@ crux draft-launch notes --max-cost 1 --max-time 5m
 | `KUBECONFIG` | `/dev/null` | The controller never reaches a cluster your kubeconfig happens to point at. |
 | `OPENSHELL_PODMAN_SOCKET` | the podman machine's API socket | Where an OpenShell sandbox is booted. Set it yourself to override. |
 | `CRUCIBLE_BIN` | the built `crucible` | The engine a launch runs. |
+| `CONTROLLER_HOOKS_ADDR` | `127.0.0.1:8871` (`HOOKS_PORT` overrides) | The webhook delivery surface, on its own port. |
+| `CONTROLLER_HOOKS_PUBLIC_URL` | `http://127.0.0.1:8871` | The base a created webhook's delivery URL is built on. |
+| `CONTROLLER_WEBHOOK_KEY_FILE` | `$CONTROLLER_STATE_DIR/webhook.key`, generated once | Seals `hmac_sha256` webhook secrets. |
 
 `CONTROLLER_API_TOKEN`, `CONTROLLER_PROXY_TOKEN`, `CONTROLLER_OIDC_ISSUER` and `VAULT_ADDR` are
 unset for the process, whatever your shell exports.
@@ -84,6 +87,12 @@ A local run starts from an empty environment. It keeps `PATH`, `HOME`, `USER`,
 
 Any other variable a run needs goes in `CONTROLLER_LOCAL_SECRET_ALLOWLIST`, and the pack has to
 disclose it as an agent credential before a run is handed it.
+
+## Webhooks
+
+The recipe serves the webhook delivery listener on `127.0.0.1:8871`. [Launching from
+webhooks](./webhooks.md#trying-it-locally) walks a command-only pack from a `curl` delivery to a
+finished run.
 
 ## What is off
 

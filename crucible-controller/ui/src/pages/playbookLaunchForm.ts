@@ -8,8 +8,13 @@ type SchedulePreviewDto = components['schemas']['SchedulePreviewDto'];
 /// One rendered input, narrowed out of the pack's stored JSON Schema. The subset the engine's
 /// `plan params` emits is closed — a string-typed property with an optional pattern, default and
 /// doc string — so this is the whole vocabulary the form speaks.
+/// The declared type, which decides the spelling a value is typed in: a string as itself, an int or
+/// number as its digits, a bool as true or false, a list as a JSON array or comma-separated.
+export type ParamValueType = 'string' | 'integer' | 'number' | 'boolean' | 'list';
+
 export interface ParamFieldSpec {
   name: string;
+  valueType: ParamValueType;
   required: boolean;
   defaultValue: string | null;
   pattern: string | null;
@@ -37,6 +42,86 @@ function stringField(
   return { ok: true, value: raw };
 }
 
+function valueTypeOf(property: Record<string, unknown>): ParamValueType | null {
+  switch (property.type) {
+    case undefined:
+    case 'string':
+      return 'string';
+    case 'integer':
+      return 'integer';
+    case 'number':
+      return 'number';
+    case 'boolean':
+      return 'boolean';
+    case 'array': {
+      const items = property.items;
+      return items === undefined || (isRecord(items) && items.type === 'string') ? 'list' : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/// A declared default in the spelling the form types it in.
+function defaultText(
+  raw: unknown,
+  valueType: ParamValueType
+): { ok: true; value: string | null } | { ok: false } {
+  if (raw === undefined || raw === null) return { ok: true, value: null };
+  switch (valueType) {
+    case 'string':
+      return typeof raw === 'string' ? { ok: true, value: raw } : { ok: false };
+    case 'integer':
+    case 'number':
+      return typeof raw === 'number' ? { ok: true, value: String(raw) } : { ok: false };
+    case 'boolean':
+      return typeof raw === 'boolean' ? { ok: true, value: String(raw) } : { ok: false };
+    case 'list':
+      return Array.isArray(raw) && raw.every((item) => typeof item === 'string')
+        ? { ok: true, value: JSON.stringify(raw) }
+        : { ok: false };
+  }
+}
+
+/// What a value of this type is typed as, for a field hint and a refusal.
+export function spellingOf(valueType: ParamValueType): string | null {
+  switch (valueType) {
+    case 'string':
+      return null;
+    case 'integer':
+      return 'a whole number';
+    case 'number':
+      return 'a number';
+    case 'boolean':
+      return 'true or false';
+    case 'list':
+      return 'a JSON array of strings, or comma-separated';
+  }
+}
+
+/// Whether `text` reads as `valueType`, mirroring the engine's reader. The endpoint checks again with
+/// the reader itself.
+function readsAs(valueType: ParamValueType, text: string): boolean {
+  switch (valueType) {
+    case 'string':
+      return true;
+    case 'integer':
+      return /^[+-]?\d+$/.test(text) && Math.abs(Number(text)) <= 2147483647;
+    case 'number':
+      return text.length > 0 && Number.isFinite(Number(text));
+    case 'boolean':
+      return ['true', 'True', 'false', 'False'].includes(text);
+    case 'list':
+      if (!text.trimStart().startsWith('[')) return true;
+      try {
+        const parsed: unknown = JSON.parse(text);
+        return Array.isArray(parsed) && parsed.every((item) => typeof item === 'string');
+      } catch {
+        return false;
+      }
+  }
+}
+
 export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
   if (!isRecord(schema)) return { kind: 'unrenderable', reason: 'the schema is not an object' };
   const type = schema.type;
@@ -59,16 +144,16 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     if (!isRecord(raw)) {
       return { kind: 'unrenderable', reason: `param ${name} is not an object` };
     }
-    const propertyType = raw.type;
-    if (propertyType !== undefined && propertyType !== 'string') {
+    const valueType = valueTypeOf(raw);
+    if (valueType === null) {
       return {
         kind: 'unrenderable',
-        reason: `param ${name} is typed ${describe(propertyType)}; the form renders strings only`,
+        reason: `param ${name} is typed ${describe(raw.type)}; the form renders strings, numbers, bools, and lists of strings`,
       };
     }
-    const defaultValue = stringField(raw, 'default');
+    const defaultValue = defaultText(raw.default, valueType);
     if (!defaultValue.ok) {
-      return { kind: 'unrenderable', reason: `param ${name} has a non-string default` };
+      return { kind: 'unrenderable', reason: `param ${name} has a default that is not its type` };
     }
     const pattern = stringField(raw, 'pattern');
     if (!pattern.ok) {
@@ -77,6 +162,7 @@ export function parseParamsSchema(schema: unknown): ParsedParamsSchema {
     const description = stringField(raw, 'description');
     specs.push({
       name,
+      valueType,
       required: required.has(name),
       defaultValue: defaultValue.value,
       pattern: pattern.value,
@@ -107,6 +193,9 @@ export function validateParam(spec: ParamFieldSpec, value: string): string | nul
   const trimmed = value.trim();
   if (trimmed.length === 0) {
     return spec.required ? `${spec.name} is required` : null;
+  }
+  if (!readsAs(spec.valueType, trimmed)) {
+    return `${spec.name} must be ${spellingOf(spec.valueType) ?? 'text'}`;
   }
   if (spec.pattern === null) return null;
   let re: RegExp;
