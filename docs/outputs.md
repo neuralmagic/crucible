@@ -134,7 +134,7 @@ image and dispatch targets).
   not routed through admission; bounds cover writes only.
 - **Asks are not outputs.** Work emission is bounded by `C-ASKS`'s own
   operator-configured cap, not by `[outputs]`.
-- **Known enforcement gaps, tracked as work items:**
+- **Known enforcement gaps:**
   - `crucible build --check` neither spends nor checks the dispatch bound
     (it dispatches nothing); an out-of-scope repo is refused only on the real
     dispatch.
