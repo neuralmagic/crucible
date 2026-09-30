@@ -232,7 +232,9 @@ const LISTEN_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
 /// discovery tick. It yields once on connecting and once after every reconnect as well, since a
 /// delivery announced while it was not listening is never announced again. Nothing connects until
 /// the stream is first polled.
-pub fn delivery_wakes(pool: PgPool) -> crate::daemon::WakeStream {
+pub fn delivery_wakes(
+    pool: PgPool,
+) -> std::pin::Pin<Box<dyn futures_util::Stream<Item = ()> + Send>> {
     Box::pin(futures_util::stream::unfold(
         (pool, None::<sqlx::postgres::PgListener>),
         |(pool, listener)| async move {
