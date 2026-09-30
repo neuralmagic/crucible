@@ -6,7 +6,7 @@ import { refreshFailure } from './schedulesView';
 export type WebhookDto = components['schemas']['WebhookDto'];
 export type WebhookDeliveryDto = components['schemas']['WebhookDeliveryDto'];
 
-export type WebhookState = 'signin' | 'disabled' | 'failing' | 'live';
+export type WebhookState = 'signin' | 'paused' | 'failing' | 'live';
 
 export interface WebhookView {
   state: WebhookState;
@@ -41,16 +41,16 @@ export function webhookView(row: WebhookRow): WebhookView {
   if (!row.enabled) {
     const failures = row.consecutive_failures;
     return {
-      state: 'disabled',
-      headline: 'DISABLED',
+      state: 'paused',
+      headline: 'PAUSED',
       detail:
         failures > 0
-          ? `Disabled after ${failures} firing${failures === 1 ? '' : 's'} in a row that did not launch. Its address answers not found until it is enabled.`
-          : 'Disabled. Its address answers not found until it is enabled.',
+          ? `Paused after ${failures} launch${failures === 1 ? '' : 'es'} in a row failed. Its address answers not found until it is resumed.`
+          : 'Paused. Its address answers not found until it is resumed.',
     };
   }
   if (failure !== null) {
-    return { state: 'failing', headline: 'REFRESH FAILING', detail: `${failure}; the next sweep tries again.` };
+    return { state: 'failing', headline: 'REFRESH FAILING', detail: `${failure}; it is tried again shortly.` };
   }
   const last = relativeTime(row.last_delivery_at);
   return {
@@ -62,13 +62,13 @@ export function webhookView(row: WebhookRow): WebhookView {
 
 export const STATE_TONE: Record<WebhookState, StatusTone> = {
   signin: 'red',
-  disabled: 'grey',
+  paused: 'grey',
   failing: 'amber',
   live: 'green',
 };
 
 const OUTCOME_TONE: Record<string, StatusTone> = {
-  pending: 'blue',
+  queued: 'blue',
   launched: 'green',
   filtered: 'grey',
   duplicate: 'grey',

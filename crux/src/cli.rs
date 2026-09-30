@@ -175,13 +175,13 @@ enum Command {
         file: std::path::PathBuf,
     },
 
-    /// Let a webhook record deliveries again.
-    WebhookEnable {
+    /// Resume a paused webhook: its address takes deliveries again.
+    WebhookResume {
         id: String,
     },
 
-    /// Stop a webhook: its address answers not found and its pending deliveries settle failed.
-    WebhookDisable {
+    /// Pause a webhook: its address answers not found and its queued deliveries fail.
+    WebhookPause {
         id: String,
     },
 
@@ -665,8 +665,8 @@ pub async fn run() -> Result<()> {
         Command::WebhookPresets => ops::webhook_presets(&client).await?,
         Command::WebhookCreate { file } => ops::webhook_create(&client, &file).await?,
         Command::WebhookUpdate { id, file } => ops::webhook_update(&client, &id, &file).await?,
-        Command::WebhookEnable { id } => ops::webhook_set_enabled(&client, &id, true).await?,
-        Command::WebhookDisable { id } => ops::webhook_set_enabled(&client, &id, false).await?,
+        Command::WebhookResume { id } => ops::webhook_set_enabled(&client, &id, true).await?,
+        Command::WebhookPause { id } => ops::webhook_set_enabled(&client, &id, false).await?,
         Command::WebhookRotate { id } => ops::webhook_rotate(&client, &id).await?,
         Command::WebhookDelete { id } => ops::webhook_delete(&client, &id).await?,
         Command::WebhookPreview { file } => ops::webhook_preview(&client, &file).await?,

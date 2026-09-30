@@ -26,14 +26,14 @@ describe('webhookView', () => {
     });
   });
 
-  it('puts a needed sign-in ahead of being disabled', () => {
+  it('puts a needed sign-in ahead of being paused', () => {
     expect(webhookView(row({ owner_signin_required: true, enabled: false })).state).toBe('signin');
   });
 
-  it('says why it is disabled and what its address does meanwhile', () => {
+  it('says why it is paused and what its address does meanwhile', () => {
     const view = webhookView(row({ enabled: false, consecutive_failures: 3 }));
-    expect(view.state).toBe('disabled');
-    expect(view.detail).toContain('3 firings in a row');
+    expect(view.state).toBe('paused');
+    expect(view.detail).toContain('3 launches in a row failed');
     expect(view.detail).toContain('not found');
   });
 
@@ -47,7 +47,7 @@ describe('webhookView', () => {
 describe('outcomeTone', () => {
   it('paints each outcome, and an unknown one grey', () => {
     expect(outcomeTone('launched')).toBe('green');
-    expect(outcomeTone('pending')).toBe('blue');
+    expect(outcomeTone('queued')).toBe('blue');
     expect(outcomeTone('throttled')).toBe('amber');
     expect(outcomeTone('failed')).toBe('red');
     expect(outcomeTone('filtered')).toBe('grey');

@@ -70,7 +70,7 @@ function DeliveryRow({ delivery }: { delivery: WebhookDeliveryDto }) {
   return (
     <details className="border-b border-rule">
       <summary className="flex cursor-pointer flex-wrap items-center gap-3 px-4.5 py-2">
-        <Status status={delivery.outcome} tone={outcomeTone(delivery.outcome)} pulse={delivery.outcome === 'pending'} />
+        <Status status={delivery.outcome} tone={outcomeTone(delivery.outcome)} pulse={delivery.outcome === 'queued'} />
         <Mono size="data" tone="ink-2">
           {formatStamp(delivery.received_at)}
         </Mono>
@@ -209,7 +209,7 @@ export function WebhookDetailPage() {
                 Edit
               </Button>
               <Button variant="quiet" className="uppercase" onClick={() => void toggle()} disabled={setEnabled.isPending}>
-                {w.enabled ? 'Disable' : 'Enable'}
+                {w.enabled ? 'Pause' : 'Resume'}
               </Button>
               <Button variant="quiet" className="uppercase" onClick={() => void rotateSecret()} disabled={rotate.isPending}>
                 Rotate secret

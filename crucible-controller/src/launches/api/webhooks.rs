@@ -140,7 +140,8 @@ pub struct WebhookSecretDto {
 pub struct WebhookDeliveryDto {
     pub id: String,
     pub received_at: String,
-    /// `pending`, `launched`, `filtered`, `duplicate`, `throttled`, or `failed`.
+    /// `queued` until it is processed, then `launched`, `filtered`, `duplicate`, `throttled`, or
+    /// `failed`.
     pub outcome: String,
     pub reason: Option<String>,
     pub dedupe_key: Option<String>,
@@ -168,7 +169,7 @@ impl From<Delivery> for WebhookDeliveryDto {
         WebhookDeliveryDto {
             id: d.id,
             received_at: d.received_at,
-            outcome: d.outcome.unwrap_or_else(|| "pending".to_string()),
+            outcome: d.outcome.unwrap_or_else(|| "queued".to_string()),
             reason: d.reason,
             dedupe_key: d.dedupe_key,
             launch_key: d.launch_key,
@@ -906,8 +907,8 @@ pub(crate) async fn delete_webhook(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Enable or disable a webhook without re-authorizing it. Enabling clears the failure count;
-/// disabling settles every pending delivery failed.
+/// Pause or resume a webhook without re-authorizing it. A paused webhook's address answers not
+/// found and its queued deliveries fail; resuming clears the failure count.
 #[utoipa::path(
     post,
     path = "/api/webhooks/{id}/enabled",

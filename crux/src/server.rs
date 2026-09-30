@@ -944,7 +944,8 @@ impl CrucibleMcp {
 
     #[tool(
         description = "A webhook's recorded deliveries, newest first: ID RECEIVED OUTCOME LAUNCH \
-        REASON. OUTCOME is pending, launched, filtered, duplicate, throttled, or failed."
+        REASON. OUTCOME is queued until processed, then launched, filtered, duplicate, \
+        throttled, or failed."
     )]
     async fn crucible_webhook_deliveries(
         &self,

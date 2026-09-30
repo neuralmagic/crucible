@@ -94,6 +94,10 @@ Put an OIDC login in front of it before exposing the Service outside the cluster
 [Authentication](./controller-auth.md). The machine paths (`/api`, `/mcp`) can be exposed on
 their own hostname since they authenticate by bearer.
 
+The webhook delivery listener is a third surface, on its own port, meant to be the one thing
+published to the internet. Its variables and the chart's `webhooks` values are in
+[Launching from webhooks](./webhooks.md#deploying).
+
 The image's labels carry the contract version the engine was built with
 (`io.crucible.contract-version`); the controller reads the same label off every dispatch
 image before it launches a pod, and refuses a mismatch.
