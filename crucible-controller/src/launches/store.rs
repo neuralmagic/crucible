@@ -78,6 +78,12 @@ pub(crate) async fn insert_playbook_launch_with(
     .execute(&mut **tx)
     .await
     .context("insert_playbook_launch: insert launch")?;
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(LAUNCH_CHANNEL)
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .context("insert_playbook_launch: announce")?;
     let slug = crate::model::sanitize_key(key);
     match launch.draft_version {
         Some(version) => {
@@ -87,6 +93,10 @@ pub(crate) async fn insert_playbook_launch_with(
         None => crate::playbooks::registry::copy_pack_to(&mut **tx, launch.playbook, &slug).await,
     }
 }
+
+/// The channel a committed launch is announced on. Any replica mints launches; only the leader
+/// dispatches them.
+pub(crate) const LAUNCH_CHANNEL: &str = "crucible_launch";
 
 /// Read back what a launch was authorized to run with. `None` when the key names no launch — a
 /// row whose launch went missing parks rather than dispatching on guessed values.
