@@ -647,7 +647,17 @@ export const ROUTES: Record<string, Json> = {
     required: ['topic'],
     additionalProperties: false,
   },
-  '/api/webhooks/presets': [],
+  '/api/webhooks/presets': [
+    {
+      id: 'quay-push',
+      title: 'quay.io repository push',
+      verifier: 'path_token',
+      header: null,
+      filter: 'size(body.updated_tags) > 0',
+      dedupe: 'delivery',
+      derive: { topic: 'body.repository' },
+    },
+  ],
   '/api/webhooks/cel': { variables: ['body', 'headers', 'delivery', 'received_at'], functions: [], macros: ['has'] },
   '/api/webhooks/check': { diagnostics: [] },
   '/api/playbooks/import/candidates': {

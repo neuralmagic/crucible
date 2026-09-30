@@ -55,11 +55,13 @@ export function SecretOnce({ secret, url, path, verifier }: SecretOnceProps) {
       </MetaRow>
       {verifier === 'path_token' ? (
         <Mono size="data" tone="ink-3">
-          quay.io: add a "Webhook POST" notification with the delivery URL above.
+          Have the sender POST JSON to the delivery URL above; the token in it is the credential. On
+          quay.io that is a "Webhook POST" notification.
         </Mono>
       ) : (
         <Mono size="data" tone="ink-3">
-          GitHub: add a webhook with the delivery URL, content type application/json, and the HMAC secret.
+          Have the sender POST JSON to the delivery URL, signed with the HMAC secret. On GitHub that is a
+          webhook with content type application/json.
         </Mono>
       )}
     </div>

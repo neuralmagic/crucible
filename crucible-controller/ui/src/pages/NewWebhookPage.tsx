@@ -31,6 +31,7 @@ import { CelEditor, useCelCheck } from './CelEditor';
 import { byField, celCompletions, type CelDiagnosticDto } from './celTooling';
 import {
   applyPreset,
+  customState,
   createBody,
   headerLines,
   initialState,
@@ -47,8 +48,8 @@ type WebhookPreviewDto = components['schemas']['WebhookPreviewDto'];
 type PreviewResultDto = components['schemas']['PreviewResultDto'];
 
 const VERIFIERS: readonly { value: Verifier; label: string }[] = [
-  { value: 'path_token', label: 'path_token: a token in the URL (quay.io)' },
-  { value: 'hmac_sha256', label: 'hmac_sha256: a signed body (GitHub)' },
+  { value: 'path_token', label: 'Token in the URL: any sender' },
+  { value: 'hmac_sha256', label: 'HMAC-SHA256 signature header: GitHub and compatible senders' },
 ];
 
 const MODES = [
@@ -261,7 +262,12 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
   const choose = (preset: string) => {
     setPresetId(preset);
     const found = presets.data?.find((p) => p.id === preset);
-    if (found === undefined) return;
+    if (found === undefined) {
+      setForm(customState(specs, form));
+      setUnmatched([]);
+      setPreviewed(null);
+      return;
+    }
     const applied = applyPreset(found, specs, form);
     setForm(applied.state);
     setUnmatched(applied.unmatched);
@@ -369,14 +375,14 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
             <FormGrid>
               <SelectField
                 id="preset"
-                label="Preset"
+                label="Sender"
                 value={presetId}
                 onChange={choose}
                 options={[
-                  { value: '', label: 'none' },
+                  { value: '', label: 'Custom: any sender that POSTs JSON' },
                   ...(presets.data ?? []).map((p) => ({ value: p.id, label: p.title })),
                 ]}
-                hint="Fills the verifier, the transform, and the params it can match by name."
+                hint="Custom starts from a transform that launches on every delivery; write your own below. A named sender fills the verifier, the transform, and the params it can match by name."
               />
               {unmatched.length > 0 ? (
                 <Mono size="data" tone="ink-3">
@@ -392,6 +398,11 @@ function WebhookEditor({ playbookId, existing }: WebhookEditorProps) {
                   update({ verifier: value === 'hmac_sha256' ? 'hmac_sha256' : 'path_token' });
                 }}
                 options={VERIFIERS}
+                hint={
+                  form.verifier === 'path_token'
+                    ? 'The delivery URL carries a secret token. Works with any sender you can give a URL to.'
+                    : 'The sender signs the raw body: the header holds sha256= and the lowercase hex HMAC-SHA256 of it, under a secret the controller mints.'
+                }
               />
               <FieldNote error={errorOf('verifier')} />
               {form.verifier === 'hmac_sha256' ? (

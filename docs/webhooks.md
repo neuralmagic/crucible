@@ -1,7 +1,8 @@
 # Launching from webhooks
 
-A webhook launches a registered playbook when a sender outside the controller posts a delivery:
-quay.io after an image push, GitHub after a release or a push. The controller checks the delivery
+A webhook launches a registered playbook when a sender outside the controller posts a delivery.
+The sender can be anything that POSTs JSON to a URL: quay.io after an image push, GitHub after a
+release, a CI job, or your own script. The controller checks the delivery
 is genuine and queues it. Within a few seconds it takes the delivery off the queue and runs a small
 CEL transform that decides whether it launches, which event it is, and what params the launch
 gets.
@@ -28,8 +29,11 @@ that. To switch, delete the webhook and create another.
 
 | Verifier | Sender | What a delivery carries |
 | --- | --- | --- |
-| `path_token` | quay.io, or anything that can only call a URL | The secret as the last path segment: `/hooks/<id>/<token>` |
-| `hmac_sha256` | GitHub | `sha256=` and the lowercase hex HMAC-SHA256 of the body, in the header you name (`x-hub-signature-256`) |
+| `path_token` | Any sender: quay.io, GitLab, a CI job, `curl` | The secret as the last path segment: `/hooks/<id>/<token>` |
+| `hmac_sha256` | GitHub, or any sender that signs the same way | `sha256=` and the lowercase hex HMAC-SHA256 of the raw body, in the header you name (`x-hub-signature-256`) |
+
+A sender that signs some other way (a base64 signature, or a signature over a timestamp and the
+body) cannot use `hmac_sha256`. Give it a `path_token` URL instead; the token is the credential.
 
 The controller generates every secret (256 random bits) and shows it once, in the response that
 created or rotated it. Path tokens are stored as SHA-256 digests. HMAC secrets are sealed with
@@ -44,22 +48,55 @@ nothing.
 
 ### From the UI
 
-Open a playbook and choose **Add webhook**. The form has a **Preset** list (quay.io repository push,
-GitHub release, GitHub push) that fills the verifier and transform. For each param the playbook
+Open a playbook and choose **Add webhook**. **Sender** starts on **Custom**, for any sender that
+POSTs JSON: the filter launches every delivery, the dedupe key is `delivery`, and every param is
+fixed until you derive it. The named senders (quay.io repository push, GitHub release, GitHub push)
+fill the verifier, the transform, and the params they can match by name; switching back to
+**Custom** starts the transform over. For each param the playbook
 declares, choose **fixed value** or **derived (CEL)**. Expressions are checked as you type and
 marked where they fail. **Run preview** evaluates the transform on a sample body and headers
 without storing anything.
 
 Saving shows the delivery URL and the secret once. Configure the sender with them:
 
+- **Any sender:** POST JSON to the delivery URL (it includes the token). See
+  [A custom sender](#a-custom-sender).
 - **quay.io:** repository settings, **Create Notification**, event *Push to Repository*,
-  method *Webhook POST*, URL = the delivery URL (it includes the token).
+  method *Webhook POST*, URL = the delivery URL.
 - **GitHub:** repository settings, **Webhooks**, **Add webhook**, payload URL = the delivery URL,
   content type `application/json`, secret = the HMAC secret, then choose the events.
 
 **Webhooks** in the navigation lists every webhook you can read. A webhook's page shows its
 delivery URL, its transform, the pause/resume, rotate, and delete controls, and its delivery log.
 **Edit** reopens the form, and its preview can load any recorded delivery as the sample.
+
+### A custom sender
+
+Anything that can send an HTTP POST with a JSON body works with a `path_token` webhook:
+
+```sh
+curl -X POST -H 'content-type: application/json' \
+  -d '{"service": "api", "version": "1.4.2", "env": "staging"}' \
+  "$DELIVERY_URL"
+```
+
+The body is yours to shape. Write the transform against it: a filter such as
+`body.env == "staging"`, a dedupe key such as `body.service + "@" + body.version` so a retried
+POST launches once, and a derive for each param (`version: body.version`). Load a recorded delivery
+into the edit form's preview to try the transform on what the sender actually posted. Keys a sender
+sometimes omits need a guard: `has(body.env) && body.env == "staging"`.
+
+An `hmac_sha256` sender also signs the raw body, in the header the webhook was created with
+(`x-signature` here):
+
+```sh
+body='{"service": "api", "version": "1.4.2"}'
+sig=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$SECRET" -hex | sed 's/^.* //')
+curl -X POST -H 'content-type: application/json' -H "x-signature: sha256=$sig" \
+  -d "$body" "$DELIVERY_URL"
+```
+
+The body must be JSON; anything else is recorded and ends `failed`.
 
 ### From crux
 
