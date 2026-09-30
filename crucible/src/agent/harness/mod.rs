@@ -599,11 +599,16 @@ mod tests {
 
     #[test]
     fn only_the_codex_harness_grows_the_openai_endpoints() {
-        // A claude turn's allowlist must stay byte-identical to the shared defaults.
+        // A claude turn's allowlist is the shared defaults plus Claude Code's log intake.
         let endpoints = crate::openshell::policy::default_endpoints;
+        let claude = endpoints(Harness::Claude);
         assert_eq!(
-            endpoints(Harness::Claude),
+            &claude[..crate::openshell::policy::DEFAULT_ENDPOINTS.len()],
             crate::openshell::policy::DEFAULT_ENDPOINTS
+        );
+        assert_eq!(
+            &claude[crate::openshell::policy::DEFAULT_ENDPOINTS.len()..],
+            crate::openshell::policy::CLAUDE_ENDPOINTS
         );
         assert_eq!(
             endpoints(Harness::Hermes),
@@ -645,6 +650,19 @@ mod tests {
                 "{harness:?}"
             );
             assert!(!got.iter().any(|e| e.contains("chatgpt.com")));
+        }
+        for harness in [
+            Harness::Codex,
+            Harness::OpenCode,
+            Harness::Pi,
+            Harness::Hermes,
+        ] {
+            assert!(
+                !endpoints(harness)
+                    .iter()
+                    .any(|e| e.contains("datadoghq.com")),
+                "only claude posts to its own log intake: {harness:?}"
+            );
         }
     }
 
