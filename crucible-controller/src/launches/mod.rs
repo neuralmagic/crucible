@@ -2,11 +2,13 @@
 //! that fire it (a cron schedule, a one-shot, a tracker watch, a webhook), with the tracker clients and the
 //! review-trail emission that follow a launch.
 
+pub mod announce;
 pub(crate) mod api;
 pub mod emission;
 pub mod jira;
 pub mod model;
 pub mod one_shots;
+pub mod pending;
 pub mod schedules;
 pub mod standing;
 pub mod store;

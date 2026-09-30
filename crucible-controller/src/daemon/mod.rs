@@ -23,7 +23,7 @@ pub mod store;
 use crate::daemon::queue::DiscoverySource;
 use crate::daemon::queue::TestSyncMarker;
 use crate::daemon::queue::{
-    BoxFuture, Enqueue, IssueKey, ParkFn, QueueConfig, ReconcileFn, WorkQueue,
+    BoxFuture, Enqueue, IssueKey, ParkFn, QueueConfig, ReconcileFn, WakeStream, WorkQueue,
 };
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Pod;
@@ -36,9 +36,6 @@ use tokio::time::{MissedTickBehavior, interval};
 /// `run` doesn't name a concrete stream type: production is [`kube_completion_stream`], the test
 /// harness feeds a channel-backed one so the daemon runs for real without a cluster.
 pub type CompletionStream = Pin<Box<dyn futures_util::Stream<Item = IssueKey> + Send>>;
-
-/// Signals that work is waiting for a source outside the discovery cadence.
-pub type WakeStream = Pin<Box<dyn futures_util::Stream<Item = ()> + Send>>;
 
 /// A source polled whenever its stream yields, in addition to every discovery tick.
 pub struct Wake {
@@ -166,10 +163,21 @@ pub fn assemble(
         )
     };
     let wake = Wake {
-        signals: crate::launches::webhooks::delivery_wakes(db.pool().clone()),
-        source: Arc::new(trigger_sweep(vec![Arc::new(
-            crate::launches::webhooks::trigger::WebhookTrigger,
-        )])),
+        signals: crate::launches::announce::wakes(
+            db.pool().clone(),
+            &[
+                crate::launches::webhooks::DELIVERY_CHANNEL,
+                crate::launches::store::LAUNCH_CHANNEL,
+            ],
+        ),
+        source: Arc::new(MultiDiscovery::new(vec![
+            Arc::new(trigger_sweep(vec![Arc::new(
+                crate::launches::webhooks::trigger::WebhookTrigger,
+            )])),
+            Arc::new(crate::launches::pending::PendingLaunches::new(
+                db.pool().clone(),
+            )),
+        ])),
     };
     #[allow(unused_mut)]
     let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
@@ -187,6 +195,9 @@ pub fn assemble(
             )),
             Arc::new(crate::launches::webhooks::trigger::WebhookTrigger),
         ])),
+        Arc::new(crate::launches::pending::PendingLaunches::new(
+            db.pool().clone(),
+        )),
     ];
     #[cfg(feature = "autoresearch")]
     if cfg.autoresearch_enabled() {

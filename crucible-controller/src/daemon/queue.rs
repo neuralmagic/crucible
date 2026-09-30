@@ -352,6 +352,9 @@ pub trait DiscoverySource: Send + Sync {
     fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<anyhow::Result<()>>;
 }
 
+/// Signals that work is waiting for a source outside the discovery cadence.
+pub type WakeStream = Pin<Box<dyn futures_util::Stream<Item = ()> + Send>>;
+
 /// A monotonically increasing counter plus a `Notify`. [`WorkQueue::run`](crate::daemon::queue::WorkQueue::run)
 /// calls [`mark`](TestSyncMarker::mark) once per processed item (success, backoff-requeue, or
 /// park all count as "processed" — the point is "the worker looked at this item and moved on").
