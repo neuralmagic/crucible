@@ -335,7 +335,7 @@ fn delivery_url(state: &ApiState, id: &str, kind: VerifierKind, secret: &str) ->
 
 fn save_refusal(e: SaveError) -> Response {
     match e {
-        SaveError::Mint(e @ MintError::NoCredentialKey(_)) => {
+        SaveError::Mint(e @ MintError::NoWebhookKey(_)) => {
             invalid_fields(vec![field_error("verifier", e.to_string())])
         }
         e @ SaveError::VerifierFixed => {
@@ -595,7 +595,7 @@ pub(crate) async fn create_webhook(
     }
     let created = match crate::launches::webhooks::create(
         state.db.pool(),
-        state.credential_keys.as_deref(),
+        state.webhook_keys.as_deref(),
         &new_webhook(&authorized, &body, &saver),
     )
     .await
@@ -989,7 +989,7 @@ pub(crate) async fn rotate_webhook_secret(
     }
     let secret = match crate::launches::webhooks::rotate_secret(
         state.db.pool(),
-        state.credential_keys.as_deref(),
+        state.webhook_keys.as_deref(),
         &id,
     )
     .await

@@ -99,8 +99,8 @@ controller-local port="8870" user=env_var("USER"):
     state="${XDG_STATE_HOME:-$HOME/.local/state}/crucible-controller"
     mkdir -p "$state"
     hooks="${HOOKS_PORT:-8871}"
-    if [ ! -s "$state/credential.key" ]; then
-        (umask 077 && head -c 32 /dev/urandom | base64 > "$state/credential.key")
+    if [ ! -s "$state/webhook.key" ]; then
+        (umask 077 && head -c 32 /dev/urandom | base64 > "$state/webhook.key")
     fi
     if [ -z "${OPENSHELL_PODMAN_SOCKET:-}" ] && command -v podman >/dev/null \
         && podman machine inspect >/dev/null 2>&1; then
@@ -116,7 +116,7 @@ controller-local port="8870" user=env_var("USER"):
         CONTROLLER_PUBLIC_URL=http://127.0.0.1:{{port}} \
         CONTROLLER_HOOKS_ADDR=127.0.0.1:$hooks \
         CONTROLLER_HOOKS_PUBLIC_URL=http://127.0.0.1:$hooks \
-        CONTROLLER_CREDENTIAL_KEY_FILE="$state/credential.key" \
+        CONTROLLER_WEBHOOK_KEY_FILE="$state/webhook.key" \
         CONTROLLER_DEV_IDENTITY={{user}} \
         CONTROLLER_ADMINS={{user}} \
         CONTROLLER_AUTH_MODE=proxy \

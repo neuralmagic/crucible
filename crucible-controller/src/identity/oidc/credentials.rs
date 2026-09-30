@@ -97,21 +97,36 @@ impl CredentialKeys {
     /// whitespace-separated). `None` when neither is configured, which turns the offline credential
     /// off and leaves scheduled launches on the schedule-row snapshot.
     pub fn from_env() -> anyhow::Result<Option<Arc<Self>>> {
-        let raw = match std::env::var("CONTROLLER_CREDENTIAL_KEY_FILE")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-        {
-            Some(path) => std::fs::read_to_string(&path)
-                .with_context(|| format!("reading the credential key file {path}"))?,
-            None => match std::env::var("CONTROLLER_CREDENTIAL_KEY")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-            {
-                Some(inline) => inline,
-                None => return Ok(None),
-            },
+        Self::from_sources(
+            "credential key",
+            env_value("CONTROLLER_CREDENTIAL_KEY_FILE"),
+            env_value("CONTROLLER_CREDENTIAL_KEY"),
+        )
+    }
+
+    /// The key webhook secrets are sealed under: `CONTROLLER_WEBHOOK_KEY_FILE` or
+    /// `CONTROLLER_WEBHOOK_KEY`, in the same format as the credential key and independent of it.
+    /// `None` refuses `hmac_sha256` webhooks.
+    pub fn webhook_from_env() -> anyhow::Result<Option<Arc<Self>>> {
+        Self::from_sources(
+            "webhook key",
+            env_value("CONTROLLER_WEBHOOK_KEY_FILE"),
+            env_value("CONTROLLER_WEBHOOK_KEY"),
+        )
+    }
+
+    /// Keys from a key file path or inline material: base64 keys, newest first, one per line or
+    /// separated by commas or whitespace. The file wins. `None` when neither is given.
+    pub fn from_sources(
+        noun: &str,
+        file: Option<String>,
+        inline: Option<String>,
+    ) -> anyhow::Result<Option<Arc<Self>>> {
+        let raw = match (file, inline) {
+            (Some(path), _) => std::fs::read_to_string(&path)
+                .with_context(|| format!("reading the {noun} file {path}"))?,
+            (None, Some(inline)) => inline,
+            (None, None) => return Ok(None),
         };
         let materials = raw
             .split(['\n', '\r', ',', ' ', '\t'])
@@ -120,12 +135,12 @@ impl CredentialKeys {
             .map(|s| {
                 b64()
                     .decode(s)
-                    .context("a credential key is not valid base64")
+                    .with_context(|| format!("a {noun} is not valid base64"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
         anyhow::ensure!(
             !materials.is_empty(),
-            "the configured credential key material is empty"
+            "the configured {noun} material is empty"
         );
         CredentialKeys::new(materials).map(|k| Some(Arc::new(k)))
     }
@@ -182,6 +197,14 @@ impl CredentialKeys {
             .map_err(|_| anyhow::anyhow!("the stored credential did not authenticate"))?;
         String::from_utf8(opened.to_vec()).context("the stored credential is not utf-8")
     }
+}
+
+/// A set, non-blank environment value, trimmed.
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Store (or replace) a subject's offline credential. Runs on the caller's connection so the
@@ -686,5 +709,55 @@ mod tests {
     fn a_key_of_the_wrong_length_is_refused() {
         assert!(CredentialKeys::new(vec![vec![0u8; 16]]).is_err());
         assert!(CredentialKeys::new(vec![]).is_err());
+    }
+
+    #[test]
+    fn keys_load_from_a_file_or_inline_and_the_file_wins() {
+        use base64::Engine;
+        let a = base64::engine::general_purpose::STANDARD.encode([1u8; 32]);
+        let b = base64::engine::general_purpose::STANDARD.encode([2u8; 32]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("webhook.key");
+        std::fs::write(&file, format!("{a}\n\n{b}\n")).expect("write");
+        let path = file.display().to_string();
+
+        let from_file = crate::identity::oidc::credentials::CredentialKeys::from_sources(
+            "webhook key",
+            Some(path),
+            Some("not base64!".to_string()),
+        )
+        .expect("file keys")
+        .expect("some");
+        let (sealed, _) = from_file.seal("webhook:w1", "s3cret").expect("seal");
+        let inline = crate::identity::oidc::credentials::CredentialKeys::from_sources(
+            "webhook key",
+            None,
+            Some(format!("{a}, {b}")),
+        )
+        .expect("inline keys")
+        .expect("some");
+        let key_id = from_file.seal("webhook:w1", "x").expect("seal").1;
+        assert_eq!(
+            inline.open("webhook:w1", &key_id, &sealed).expect("open"),
+            "s3cret",
+            "the newest key seals, and the same material opens it however it was given"
+        );
+        assert!(
+            crate::identity::oidc::credentials::CredentialKeys::from_sources(
+                "webhook key",
+                None,
+                None
+            )
+            .expect("none")
+            .is_none()
+        );
+        let refused = crate::identity::oidc::credentials::CredentialKeys::from_sources(
+            "webhook key",
+            None,
+            Some("not base64!".to_string()),
+        )
+        .map(|_| ())
+        .expect_err("refused");
+        assert!(refused.to_string().contains("webhook key"), "{refused}");
     }
 }

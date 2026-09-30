@@ -12709,7 +12709,7 @@ const WEBHOOK_WORKFLOW: &str = concat!(
 fn app_with_webhook_keys(db: Db) -> Router {
     router(ApiState {
         roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
-        credential_keys: Some(Arc::new(
+        webhook_keys: Some(Arc::new(
             crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![9u8; 32]])
                 .expect("keys"),
         )),
@@ -12900,7 +12900,14 @@ async fn a_webhook_round_trips_from_save_to_launch(pool: PgPool) -> Result<()> {
 async fn a_webhook_save_refuses_each_bad_field(pool: PgPool) -> Result<()> {
     let (db, dir) = db_with(pool);
     let app = app_with_webhook_keys(db.clone());
-    let keyless = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let keyless = router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
+        credential_keys: Some(Arc::new(
+            crate::identity::oidc::credentials::CredentialKeys::new(vec![vec![5u8; 32]])
+                .expect("keys"),
+        )),
+        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+    });
     register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
 
     let mut bad = quay_webhook_body();

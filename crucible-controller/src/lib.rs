@@ -160,9 +160,12 @@ pub async fn serve(
             "no credential key mounted: logins store no offline credential, so scheduled launches stay on the schedule-row snapshot"
         );
     }
-    let credential_keys_for_hooks = credential_keys.clone();
+    let webhook_keys = identity::oidc::credentials::CredentialKeys::webhook_from_env()
+        .context("reading the webhook key")?;
     let pool_for_hooks = state.db.pool().clone();
-    let state = state.with_oidc(oidc.clone(), credential_keys.clone());
+    let state = state
+        .with_oidc(oidc.clone(), credential_keys.clone())
+        .with_webhook_keys(webhook_keys.clone());
     let auth_mode = identity::auth::AuthMode::from_env();
     let guard = Arc::new(
         identity::auth::BearerGuard::from_env(
@@ -293,7 +296,7 @@ pub async fn serve(
 
     if let Some(hooks_addr) = hooks_addr_from_env()? {
         let hooks = launches::webhooks::receive::router(
-            launches::webhooks::receive::HooksState::new(pool_for_hooks, credential_keys_for_hooks),
+            launches::webhooks::receive::HooksState::new(pool_for_hooks, webhook_keys.clone()),
         );
         let listener = tokio::net::TcpListener::bind(hooks_addr)
             .await

@@ -68,9 +68,9 @@ pub(crate) struct Minted {
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MintError {
     #[error(
-        "the {0} verifier needs a credential key to keep its secret, and this controller has none mounted"
+        "the {0} verifier needs a webhook key to keep its secret, and this controller has none (CONTROLLER_WEBHOOK_KEY)"
     )]
-    NoCredentialKey(&'static str),
+    NoWebhookKey(&'static str),
     #[error("the system random source refused to mint a webhook secret")]
     Random,
     #[error("sealing a webhook secret: {0:#}")]
@@ -79,8 +79,8 @@ pub(crate) enum MintError {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum OpenError {
-    #[error("webhook {0} has a sealed secret and no credential key is mounted")]
-    NoCredentialKey(String),
+    #[error("webhook {0} has a sealed secret and no webhook key is mounted")]
+    NoWebhookKey(String),
     #[error("opening webhook {id}'s secret: {source:#}")]
     Open { id: String, source: anyhow::Error },
 }
@@ -100,7 +100,7 @@ pub(crate) fn mint(
     aws_lc_rs::rand::fill(&mut bytes).map_err(|_| MintError::Random)?;
     let shown = URL_SAFE_NO_PAD.encode(bytes);
     let stored = if kind.signs() {
-        let keys = keys.ok_or(MintError::NoCredentialKey(kind.as_str()))?;
+        let keys = keys.ok_or(MintError::NoWebhookKey(kind.as_str()))?;
         let (sealed, key_id) = keys
             .seal(&seal_subject(id), &shown)
             .map_err(MintError::Seal)?;
@@ -120,7 +120,7 @@ pub(crate) fn material(
     match stored {
         Stored::Digest(digest) => Ok(Material::TokenDigest(digest.clone())),
         Stored::Sealed { sealed, key_id } => {
-            let keys = keys.ok_or_else(|| OpenError::NoCredentialKey(id.to_string()))?;
+            let keys = keys.ok_or_else(|| OpenError::NoWebhookKey(id.to_string()))?;
             keys.open(&seal_subject(id), key_id, sealed)
                 .map(Material::Secret)
                 .map_err(|source| OpenError::Open {
