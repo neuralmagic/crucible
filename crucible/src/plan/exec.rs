@@ -26,7 +26,6 @@ use crate::plan::ir::{
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
 };
-use crate::plan::resume::Prior;
 use crucible_contract::TransportCause;
 use crucible_contract::decision::{
     Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId,
@@ -243,6 +242,48 @@ impl Default for ExecCfg<'_> {
             early_completion: false,
             prior: None,
         }
+    }
+}
+
+/// What an interrupted run left in its session log.
+#[derive(Debug, Clone, Default)]
+pub struct Prior {
+    /// Every settled row: tasks of the plan, items of a mapped node, rounds of a revise loop.
+    pub results: BTreeMap<TaskName, TaskResult>,
+    /// The same names, in the order they settled.
+    pub order: Vec<TaskName>,
+    pub elapsed: Duration,
+    /// The run already logged its admitted graph.
+    pub admitted: bool,
+    /// The run already recorded its entry for the launch series.
+    pub recorded_history: bool,
+    /// The log ends in a shutdown: the run finished and there is nothing left to append.
+    pub shut_down: bool,
+}
+
+impl Prior {
+    /// The settled rows in the order they settled, each with the task it names.
+    pub fn rows(&self, plan: &ValidPlan) -> Vec<(Task, &TaskResult)> {
+        self.order
+            .iter()
+            .filter_map(|name| Some((row_task(plan, name)?, self.results.get(name)?)))
+            .collect()
+    }
+
+    /// What the settled rows cost. A mapped node's row and a revise loop's rows already total
+    /// their items and rounds, so a task counts its own row only when none of its items or rounds
+    /// were logged.
+    pub fn spent_usd(&self) -> f64 {
+        let parents: BTreeSet<&str> = self
+            .results
+            .keys()
+            .filter_map(|name| name.0.split_once('[').map(|(node, _)| node))
+            .collect();
+        self.results
+            .iter()
+            .filter(|(name, _)| name.0.contains('[') || !parents.contains(name.0.as_str()))
+            .map(|(_, r)| r.cost_usd)
+            .sum()
     }
 }
 

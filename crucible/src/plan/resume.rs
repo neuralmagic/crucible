@@ -1,15 +1,16 @@
 //! Resuming a playbook from its session log: what the interrupted run settled, what it spent, and
 //! how long it had been running (RFC-0002:C-PLAYBOOK-RESUME).
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crucible_contract::session::SessionEvent;
 use serde::{Deserialize, Serialize};
 
-use crate::plan::exec::{FanoutSummary, TaskResult, TaskStatus, UnknownTaskStatus, row_task};
-use crate::plan::ir::{Task, TaskName, ValidPlan};
+use crate::plan::exec::{
+    FanoutSummary, Prior, TaskResult, TaskStatus, UnknownTaskStatus, row_task,
+};
+use crate::plan::ir::{TaskName, ValidPlan};
 use crate::plan::machine::BlockedReason;
 
 const RUN_START_FILE: &str = "playbook-run.json";
@@ -145,48 +146,6 @@ impl RunStart {
     }
 }
 
-/// What an interrupted run left in its session log.
-#[derive(Debug, Clone, Default)]
-pub struct Prior {
-    /// Every settled row: tasks of the plan, items of a mapped node, rounds of a revise loop.
-    pub results: BTreeMap<TaskName, TaskResult>,
-    /// The same names, in the order they settled.
-    pub order: Vec<TaskName>,
-    pub elapsed: Duration,
-    /// The run already logged its admitted graph.
-    pub admitted: bool,
-    /// The run already recorded its entry for the launch series.
-    pub recorded_history: bool,
-    /// The log ends in a shutdown: the run finished and there is nothing left to append.
-    pub shut_down: bool,
-}
-
-impl Prior {
-    /// The settled rows in the order they settled, each with the task it names.
-    pub fn rows(&self, plan: &ValidPlan) -> Vec<(Task, &TaskResult)> {
-        self.order
-            .iter()
-            .filter_map(|name| Some((row_task(plan, name)?, self.results.get(name)?)))
-            .collect()
-    }
-
-    /// What the settled rows cost. A mapped node's row and a revise loop's rows already total
-    /// their items and rounds, so a task counts its own row only when none of its items or rounds
-    /// were logged.
-    pub fn spent_usd(&self) -> f64 {
-        let parents: BTreeSet<&str> = self
-            .results
-            .keys()
-            .filter_map(|name| name.0.split_once('[').map(|(node, _)| node))
-            .collect();
-        self.results
-            .iter()
-            .filter(|(name, _)| name.0.contains('[') || !parents.contains(name.0.as_str()))
-            .map(|(_, r)| r.cost_usd)
-            .sum()
-    }
-}
-
 /// Fold a session log into what the run settled by the time it had been going for `elapsed`.
 /// Torn lines are skipped: a process killed mid-write leaves one.
 pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, ResumeError> {
@@ -271,10 +230,11 @@ pub fn fold_log(
 
 #[cfg(test)]
 mod tests {
+    use crate::plan::exec::Prior;
     use crate::plan::exec::TaskStatus;
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::machine::BlockedReason;
-    use crate::plan::resume::{Prior, ResumeError, RunStart, fold, plan_digest};
+    use crate::plan::resume::{ResumeError, RunStart, fold, plan_digest};
     use std::time::Duration;
 
     const ADMITTED: &str =

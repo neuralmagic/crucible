@@ -6,11 +6,12 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use crate::plan::exec::Prior;
 use crate::plan::exec::{Substrate, TaskStatus, required_tasks_held, runnable_set};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{Plan, Stage, TaskKind, TaskName, ValidPlan};
 use crate::plan::record::declared_output;
-use crate::plan::resume::{Prior, RunStart};
+use crate::plan::resume::RunStart;
 use crucible::crucible::Direction;
 use xai_grok_mermaid::{MermaidTheme, RenderLimits, RenderParams, default_engine, render_checked};
 
