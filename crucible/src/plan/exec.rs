@@ -2248,6 +2248,9 @@ fn emits_violation(emits: &crate::plan::ir::Emits, value: &Value) -> Option<Stri
             return Some(format!("output missing declared field {:?}", field.0));
         };
         let ty = ty.filter(|ty| !ty.admits(found))?;
+        if let Some(why) = ty.link_refusal(found) {
+            return Some(format!("output field {:?} declared {ty}: {why}", field.0));
+        }
         Some(match (ty, found) {
             (crucible_contract::emits::FieldType::OneOf(_), Value::String(label)) => {
                 format!("output field {:?} is {label:?}, declared {ty}", field.0)
@@ -4122,6 +4125,30 @@ mod tests {
                 json!("high"),
                 json!(true),
                 "is boolean, declared one of high|low",
+            ),
+            (
+                FieldType::Link,
+                json!("https://github.com/o/r/pull/1"),
+                json!("javascript:alert(1)"),
+                "declared link: scheme \"javascript\" is not linked",
+            ),
+            (
+                FieldType::Link,
+                json!("https://github.com/o/r/tree/topic"),
+                json!("/o/r/pull/1"),
+                "declared link: \"/o/r/pull/1\" is not a url",
+            ),
+            (
+                FieldType::Links,
+                json!(["https://github.com/o/r/pull/1"]),
+                json!(["https://github.com/o/r/pull/1", "data:text/html,x"]),
+                "declared links: item 1: scheme \"data\" is not linked",
+            ),
+            (
+                FieldType::Links,
+                json!([]),
+                json!("https://github.com/o/r/pull/1"),
+                "declared links: string is not a list",
             ),
         ];
         for (ty, good, bad, note) in cases {

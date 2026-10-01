@@ -55,6 +55,8 @@ croner = "3"
 # stored schema can never make the controller fetch a URL.
 jsonschema = { version = "0.50", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
+url = "2"
+percent-encoding = "2"
 
 [profile.release]
 opt-level = 2

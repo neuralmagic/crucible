@@ -749,6 +749,13 @@ satisfied, or it joins `all` on a task that settled that way. It was never dispa
 nothing, and is not a failure. A `plan_admitted` task carries an additive `when` string,
 `route.question in a|b`, empty when the task is unconditional.
 
+A `task_result` event carries an additive `links` array (contract 1.12.0), omitted when empty:
+the external results the task reported, one object per url with `url`, `provider`
+(`github`/`gitlab`/`jira`/`other`), `kind` (`pull_request`/`merge_request`/`branch`/`commit`/
+`compare`/`issue`/`page`) and a short `label`. The engine fills it from the output fields the
+task declared `link` or `links`, so every url in it is an http(s) url it validated. A reader
+renders these rather than reading urls out of `output`.
+
 A `plan_admitted` task carries an additive `timeout` string (contract 1.8.0), the task's own
 per-attempt limit in the `--max-time` syntax (`90s`, `20m`, `2h`), empty when only the run's
 wall-clock ceiling bounds it. A task killed at its deadline settles `fail` with a `note` naming

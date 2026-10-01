@@ -11,3 +11,7 @@ serde_json.workspace = true
 # Tier 2 content-addressing: engine and controller MUST compute the same `sha256:<hex>` digest,
 # so the one spelling lives here where both sides call it.
 sha2 = "0.10"
+# External-result links: scheme/host/path parsing for the urls a task reports, so the engine and
+# the controller refuse the same ones.
+url.workspace = true
+percent-encoding.workspace = true

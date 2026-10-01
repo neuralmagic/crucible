@@ -26,6 +26,7 @@ const result = (
   cost_usd: null,
   secs: null,
   blocked: null,
+  links: [],
   ...extra,
 });
 
@@ -223,5 +224,25 @@ describe('formatting', () => {
     expect(barShare(null, 10)).toBe(0);
     expect(barShare(5, null)).toBe(0);
     expect(barShare(5, 0)).toBe(0);
+  });
+});
+
+describe('reported links', () => {
+  it('ride the attempt that reported them, retry and all', () => {
+    const pr = {
+      url: 'https://github.com/o/r/pull/9',
+      provider: 'github',
+      kind: 'pull_request',
+      label: '#9',
+    };
+    const grid = runGridView(
+      [task('deliver')],
+      [
+        result(0, 'deliver', 'fail'),
+        result(1, 'deliver', 'pass', { links: [pr] }),
+      ],
+    );
+    expect(grid.rows[0].cells[0]?.links).toEqual([]);
+    expect(grid.rows[0].cells[1]?.links).toEqual([pr]);
   });
 });

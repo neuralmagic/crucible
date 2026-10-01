@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links)\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n        ON CONFLICT (run_id, iter, task) DO UPDATE SET\n            status = excluded.status,\n            note = excluded.note,\n            cost_usd = excluded.cost_usd,\n            secs = excluded.secs,\n            blocked = excluded.blocked,\n            links = excluded.links\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8",
+        "Text",
+        "Text",
+        "Text",
+        "Float8",
+        "Float8",
+        "Jsonb",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4a9dbfbcc62d1fa56c0b4c8ba2bd660ac8e214d87dcbe10eb13271d417609f77"
+}

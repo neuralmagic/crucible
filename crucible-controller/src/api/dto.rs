@@ -420,6 +420,24 @@ dto! {
         pub secs: Option<f64>,
         /// Why the executor never dispatched the task; present exactly when `status` is `blocked`.
         pub blocked: Option<TaskBlockedDto> = r.blocked.map(TaskBlockedDto::from),
+        /// The external results the attempt reported, in declaration order.
+        pub links: Vec<ExternalLinkDto> = r.links.into_iter().map(ExternalLinkDto::from).collect(),
+    }
+}
+
+dto! {
+    /// One result a task produced outside the run. The url is the only stored field; the rest the
+    /// engine read off it, so a reader renders a mark and a label without parsing urls itself.
+    pub struct ExternalLinkDto: From<l: crucible_contract::ExternalLink> {
+        pub url: String = l.url.into(),
+        /// `github`/`gitlab`/`jira`/`other`.
+        #[schema(value_type = String)]
+        pub provider: crucible_contract::LinkProvider,
+        /// `pull_request`/`merge_request`/`branch`/`commit`/`compare`/`issue`/`page`.
+        #[schema(value_type = String)]
+        pub kind: crucible_contract::LinkKind,
+        /// `#123`, a branch, a short sha, an issue key, or the host.
+        pub label: String,
     }
 }
 

@@ -152,6 +152,28 @@ poem pass
 check pass
 ```
 
+## Report a pull request or a pushed branch
+
+A task that produces something outside the run declares the field holding its url as `link`,
+or a list of them as `links`:
+
+```python
+deliver = skill(
+    name = "deliver",
+    skill = "open-pr",
+    depends_on = [check],
+    emits = {"pushed": "links", "pr": "link"},
+)
+```
+
+```json
+{"pushed": ["https://github.com/neuralmagic/crucible/tree/haiku"], "pr": "https://github.com/neuralmagic/crucible/pull/123"}
+```
+
+Only http(s) urls pass; anything else fails the task where it happened. The engine reads the
+host and path of each one to name it (`github`, a pull request, `#123`), and the run and task
+views render a provider mark linking out to it.
+
 ## If the run is interrupted
 
 `plan run --resume` continues the run in `state/`:

@@ -46,6 +46,7 @@ const result = (iter: number, taskName: string, status: string): TaskResult => (
   note: '',
   cost_usd: null,
   secs: null,
+  links: [],
 });
 
 describe('status folding', () => {

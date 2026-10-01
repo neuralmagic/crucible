@@ -1210,6 +1210,47 @@ async fn run_iterations_ordered_by_iter_or_404(pool: PgPool) -> Result<()> {
 }
 
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let graph = r#"[{"name":"deliver","kind":"skill","depends_on":[],"session":"","needs":"all","required":true}]"#;
+    crate::runs::task_results::upsert_run_plan(db.pool(), "run-links", 1, graph).await?;
+    let links = ["https://github.com/neuralmagic/crucible/pull/42"]
+        .iter()
+        .map(|u| crucible_contract::ExternalLink::parse(u))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    crate::runs::task_results::upsert_task_result(
+        db.pool(),
+        "run-links",
+        &crate::runs::model::TaskResult {
+            iter: 1,
+            task: "deliver".to_string(),
+            status: "pass".to_string(),
+            note: String::new(),
+            cost_usd: None,
+            secs: None,
+            blocked: None,
+            links,
+        },
+    )
+    .await?;
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-links/graph").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        v["results"][0]["links"][0],
+        serde_json::json!({
+            "url": "https://github.com/neuralmagic/crucible/pull/42",
+            "provider": "github",
+            "kind": "pull_request",
+            "label": "#42",
+        }),
+        "the field names the SPA reads: {v}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     let graph = r#"[{"name":"propose","kind":"agent","depends_on":[],"session":"solver","needs":"all","required":true},
@@ -1228,6 +1269,7 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
                 cost_usd: Some(0.25),
                 secs: Some(3.0),
                 blocked: None,
+                links: Vec::new(),
             },
         )
         .await?;
@@ -9596,6 +9638,7 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
                 cost_usd: Some(cost),
                 secs: Some(4.0),
                 blocked: None,
+                links: Vec::new(),
             },
         )
         .await?;
