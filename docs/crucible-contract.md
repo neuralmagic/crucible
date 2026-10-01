@@ -464,8 +464,10 @@ scope   = "read + comment on PROJ"
 
 The rest of the disclosure is read from what the manifest already declares: the resolved egress
 allowlist (each entry labelled `builtin` or `manifest`), every `[agent].env` name, every
-`[[agent.relay]]` destination, a substituted `[agent.broker].bin`, and whether the pack runs
-commands outside the sandbox (workflow `command`/`evaluate` tasks, world and judge hooks). At run
+`[[agent.relay]]` destination, a substituted `[agent.broker].bin`, each MCP server the run starts
+(its catalog entry or binary, its tool selection, and which turns reach it), what each named
+sandbox reaches, and whether the pack runs commands outside the sandbox (workflow
+`command`/`evaluate` tasks, world and judge hooks). At run
 start, an agent-visible env value or a relay file the disclosure does not cover is refused, naming
 the grant and what is missing.
 
@@ -702,15 +704,16 @@ binaries included. This is the only way to subtract a default, and it is require
   allowlist, read the upstream *fix* for that issue on `github.com`. A measurement that must
   not be polluted by the open web has to drop that endpoint, and dropping it means opting out.
 
-The broker endpoint is **auto-appended** by the engine when `[agent.broker].enabled` is true
-(ADR-0019 P2). The engine first resolves the broker URL (an explicit `[agent.broker].url`
-override, or derived from the active compute driver's hostname), then derives the egress
+The endpoint of each `[mcp]` server the turn reaches is **auto-appended** by the engine
+(ADR-0019 P2). The engine resolves the server's URL (the compute driver's hostname and the
+server's port, or a desugared broker's explicit `[agent.broker].url`), then derives the egress
 `host:port:full` entry from that URL's authority. When no explicit port is present, the scheme
 default applies (`http` = 80, `https` = 443). Because both are derived from the same resolved
-URL, the allowlist entry and the address the sandbox contacts cannot disagree. The broker
-endpoint is appended regardless of `inherit_defaults`, because the broker is engine plumbing
-the domain opted into, not a built-in the domain can subtract. A broker-less opt-out with both
-lists empty is still a legal total air-gap: nothing resolves, and no binary may open a socket.
+URL, the allowlist entry and the address the sandbox contacts cannot disagree. The entries are
+appended regardless of `inherit_defaults`, because a server is engine plumbing the pack scoped the
+turn to, not a built-in the pack can subtract. A turn that reaches no server and opts out with
+both lists empty is still a legal total air-gap: nothing resolves, and no binary may open a
+socket.
 
 ---
 

@@ -224,7 +224,7 @@ it on the task:
 image = "ghcr.io/acme/sandbox-go@sha256:..."
 secrets = []                                  # [[secret]] names with an env projection
 relays = []                                   # [[agent.relay]] destinations
-broker = false                                # reach the [agent.broker]
+mcp = []                                      # [mcp] servers this sandbox reaches
 endpoints = ["proxy.golang.org:443:read-only"]
 ```
 
@@ -233,13 +233,71 @@ analyze = agent(name = "analyze", prompt = "...", sandbox = "go")
 ```
 
 The turn starts from that image and adds those endpoints to `[agent.openshell]`'s. Of the pack's
-declared secrets and relay files it receives only the ones listed, and it reaches the broker only
-when `broker = true`. The deployment's own model credentials still reach every turn. A task
+declared secrets, relay files, and MCP servers it receives only the ones listed. The deployment's own model credentials still reach every turn. A task
 without `sandbox` runs in `sandbox_image` with every declared secret and relay. Tasks that
 share a session must share a sandbox. A sandbox limits what the engine provisions, not what a task
 reads from upstream: output, files, and workspace changes from a task that held a secret still
 reach the tasks after it. The capability disclosure lists each sandbox, and the controller
 checks each sandbox image against the catalog at launch.
+
+## MCP servers
+
+Under `openshell`, the agent reaches tools that hold credentials (JIRA, a GPU queue, a build
+service) through MCP servers on the loop pod. The loop image ships a catalog of them, one
+`/etc/crucible/mcp.d/<name>.toml` per server, and the pack picks entries:
+
+```toml
+[[capabilities.secret]]
+name = "JIRA_API_TOKEN"
+context = "broker"                  # the value stays on the loop pod
+system = "jira"
+scope = "comment on PROJ"
+
+[mcp.jira]
+catalog = "ujira"                   # the catalog entry; defaults to the key
+secrets = ["JIRA_API_TOKEN"]        # handed to this server only
+env = { JIRA_PROJECTS = "PROJ" }
+tools = ["comment"]                 # passed to the server as MCP_TOOLS
+
+[agent]
+mcp = ["jira"]                      # turns without a named sandbox
+
+[agent.sandbox.go]
+image = "ghcr.io/acme/sandbox-go@sha256:..."
+mcp = []                            # this sandbox reaches none
+```
+
+Nothing is reached by default. A server starts only when `[agent].mcp` or some sandbox's `mcp`
+names it, and each turn's harness config lists exactly the servers in its scope (Claude runs with
+`--strict-mcp-config`, so a stray `.mcp.json` adds nothing). A secret must be declared with
+`context = "broker"`.
+
+A catalog entry names the binary and what it needs:
+
+```toml
+description = "JIRA issues and comments"
+bin = "/usr/local/bin/ujira-mcp"
+args = ["serve"]
+transport = "http"                  # the only transport so far
+env_required = ["JIRA_URL"]         # the run is refused if the loop pod lacks one
+env_optional = ["JIRA_PROJECTS", "UJIRA_*"]
+secrets = ["jira"]                  # disclosed
+reach = ["issues.redhat.com:443"]   # disclosed
+```
+
+Each server runs as its own process on its own port, from 8849 in key order, with only `PATH`,
+`HOME`, the entry's env, the pack's `env` and `secrets`, the run's output bounds, and `MCP_NAME`,
+`MCP_BIND`, `MCP_TOKENS_FILE` (plus `MCP_CONTROL_ADDR` on a scored loop). The engine mints one token per server per sandbox and
+writes `<token> <sandbox>` lines to `MCP_TOKENS_FILE`, which the server re-reads per request, so
+the server knows which sandbox is calling and a sandbox cannot act as another. The token reaches
+the sandbox only as an egress-proxy placeholder. `CRUCIBLE_MCP_CATALOG` points at another catalog
+directory, for local runs.
+
+`[agent.broker]` still works for one release, with a deprecation warning: it becomes
+`[mcp.<name>]` with every tool, reached by turns without a named sandbox and by each sandbox with
+`broker = true`. It keeps the loop pod's whole environment and one shared token. `crucible check`
+lists every started server, who reaches it, and any catalog entry the machine running the check
+cannot read.
 
 ## Parameters
 
