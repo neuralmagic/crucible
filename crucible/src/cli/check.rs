@@ -306,8 +306,8 @@ fn render_exposure(mut exposure: crate::exposure::Exposure) -> Vec<String> {
     crate::exposure::render(&exposure)
 }
 
-/// A desugared `[agent.broker]` is deprecated, and a catalog entry this machine cannot read is
-/// one the loop image has to carry.
+/// A desugared `[agent.broker]` is deprecated, a catalog entry this machine cannot read is one the
+/// loop image has to carry, and a pack env name the entry does not offer refuses the run.
 fn mcp_warnings(set: &manifest::McpSet, catalog: &Path) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(key) = &set.legacy {
@@ -317,13 +317,23 @@ fn mcp_warnings(set: &manifest::McpSet, catalog: &Path) -> Vec<String> {
         ));
     }
     for server in &set.servers {
-        if let manifest::McpSource::Catalog(name) = &server.source
-            && let Err(e) = crate::control::mcp::catalog::load(catalog, name)
-        {
-            out.push(format!(
+        let manifest::McpSource::Catalog(name) = &server.source else {
+            continue;
+        };
+        match crate::control::mcp::catalog::load(catalog, name) {
+            Ok(entry) => out.extend(server.env.keys().filter(|env| !entry.offers(env)).map(
+                |env| {
+                    format!(
+                        "[mcp.{}].env sets {env}, which catalog entry {name:?} does not list \
+                             in pack_env; the run will be refused",
+                        server.key
+                    )
+                },
+            )),
+            Err(e) => out.push(format!(
                 "[mcp.{}]: {e}; the loop image must carry it",
                 server.key
-            ));
+            )),
         }
     }
     out
@@ -1416,17 +1426,22 @@ workflow(type = "playbook", tasks = [a])
             [mcp.jira]
             catalog = "ujira"
             [mcp.trace]
+            env = { TRACE_LEVEL = "debug", LD_PRELOAD = "/x.so" }
             "#,
         )
         .expect("parses");
         let dir = tempfile::tempdir().expect("scratch");
         std::fs::write(
             dir.path().join("trace.toml"),
-            "description = \"t\"\nbin = \"trace-mcp\"\n",
+            "description = \"t\"\nbin = \"trace-mcp\"\npack_env = [\"TRACE_LEVEL\"]\n",
         )
         .expect("entry");
         let warnings = mcp_warnings(&m.mcp_set().expect("resolves"), dir.path());
-        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(
+            warnings[2].starts_with("[mcp.trace].env sets LD_PRELOAD"),
+            "{warnings:?}"
+        );
         assert!(
             warnings[0].contains("[agent.broker] is deprecated"),
             "{warnings:?}"

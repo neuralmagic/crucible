@@ -3,8 +3,9 @@
 //! The sandboxed agent has no direct authority to spend GPU, comment on JIRA, or roll a deployment;
 //! it asks a server on the loop pod, which holds the privilege. crucible starts each server once per
 //! run on its own port and blocks until the port accepts a connection, so the first turn's MCP calls
-//! never race the boot. A catalog server gets only the env its catalog entry and the pack name, and
-//! authenticates each sandbox by a token minted for that sandbox alone ([`tokens`]).
+//! never race the boot. A catalog server gets only the env its catalog entry names or offers the
+//! pack, authenticates each sandbox by a token minted for that sandbox alone ([`tokens`]), and must
+//! answer a request without one with 401 before the run uses it.
 //!
 //! A desugared `[agent.broker]` keeps its old contract for one release: crucible's whole
 //! environment, one per-run `BROKER_TOKEN`, and the `BROKER_*` names.
@@ -36,6 +37,27 @@ pub enum McpStartError {
     MissingSecret { key: String, name: String },
     #[error("MCP server `{key}` cannot listen on port {port}: something already does")]
     PortInUse { key: String, port: u16 },
+    #[error(
+        "[mcp.{key}].env sets {name}, which catalog entry {catalog:?} does not list in pack_env"
+    )]
+    EnvNotOffered {
+        key: String,
+        catalog: String,
+        name: String,
+    },
+    #[error(
+        "MCP server `{key}` (`{bin}`) answered a request without a token with {answer}, not 401"
+    )]
+    Unauthenticated {
+        key: String,
+        bin: String,
+        answer: String,
+    },
+    #[error(
+        "something already listens on the [agent.broker] bind {bind} and BROKER_TOKEN is unset; \
+         set BROKER_TOKEN to adopt it, or free the port"
+    )]
+    UnauthenticatedBroker { bind: String },
 }
 
 /// How long to wait for a server to start listening before giving up.
@@ -44,9 +66,8 @@ const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 /// What a started server checks a sandbox's bearer against.
 #[derive(Debug, Clone)]
 pub enum ServerAuth {
-    /// The desugared `[agent.broker]`: one token for every sandbox. `None` only when the broker was
-    /// already listening and no `BROKER_TOKEN` is set.
-    Shared(Option<String>),
+    /// The desugared `[agent.broker]`: one token for every sandbox.
+    Shared(String),
     /// One token per sandbox.
     PerSandbox(tokens::TokenRegistry),
 }
@@ -72,14 +93,37 @@ impl RunningServer {
     }
 }
 
-/// Kills its child when the last handle drops: a server no handle reaches has no caller.
+/// Kills its child's process group when the last handle drops: a server no handle reaches has no
+/// caller, and a wrapper `bin` (`uvx`, a shell script) leaves the real server in that group.
 #[derive(Debug)]
-struct ChildGuard(Mutex<Child>);
+struct ChildGuard {
+    child: Mutex<Child>,
+    group: crucible::deadline::Group,
+}
+
+impl ChildGuard {
+    /// Spawn `cmd` as the leader of a new process group.
+    fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt;
+        let mut child = cmd.process_group(0).spawn()?;
+        match crucible::deadline::Group::track(&child) {
+            Ok(group) => Ok(Self {
+                child: Mutex::new(child),
+                group,
+            }),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(e)
+            }
+        }
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Ok(child) = self.0.get_mut() {
-            let _ = child.kill();
+        self.group.kill();
+        if let Ok(child) = self.child.get_mut() {
             let _ = child.wait();
         }
     }
@@ -145,6 +189,15 @@ pub struct StartCtx<'a> {
     pub bind_host: &'a str,
 }
 
+impl StartCtx<'_> {
+    fn var(&self, name: &str) -> Option<&str> {
+        self.vars
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
 /// Start every server in `set`. A missing catalog entry, an unset required env, or a missing
 /// secret refuses the run before any catalog server starts.
 pub fn start(set: McpSet, ctx: &StartCtx<'_>) -> Result<McpRuntime> {
@@ -170,14 +223,13 @@ pub fn start(set: McpSet, ctx: &StartCtx<'_>) -> Result<McpRuntime> {
         };
         let registry =
             tokens::TokenRegistry::create(dir.path().join(format!("{}.tokens", decl.key)))?;
-        let cmd = catalog_command(decl, &entry, &registry, ctx)?;
+        let cmd = catalog_command(decl, name, &entry, &registry, ctx)?;
         planned.push((decl, entry.bin, cmd, registry));
     }
     for (decl, bin, cmd, registry) in planned {
         let child = spawn_and_wait(cmd, decl, &bin)?;
-        runtime
-            .children
-            .push(Arc::new(ChildGuard(Mutex::new(child))));
+        runtime.children.push(Arc::new(child));
+        refuse_anonymous(decl, &bin)?;
         runtime.servers.push(RunningServer {
             key: decl.key.clone(),
             port: decl.port,
@@ -195,9 +247,7 @@ pub fn start(set: McpSet, ctx: &StartCtx<'_>) -> Result<McpRuntime> {
             decl.key
         );
         let (token, child) = start_broker(cfg, ctx)?;
-        runtime
-            .children
-            .extend(child.map(|c| Arc::new(ChildGuard(Mutex::new(c)))));
+        runtime.children.extend(child.map(Arc::new));
         runtime.servers.push(RunningServer {
             key: decl.key.clone(),
             port: decl.port,
@@ -210,22 +260,26 @@ pub fn start(set: McpSet, ctx: &StartCtx<'_>) -> Result<McpRuntime> {
 }
 
 /// A catalog server's command: the entry's binary and args over an env holding only `PATH`,
-/// `HOME`, the entry's required and optional names, the pack's env and secrets, the engine's
-/// `MCP_*` names, and the output bounds.
+/// `HOME`, the entry's required and optional names, the pack's env (only names the entry offers)
+/// and secrets, the engine's `MCP_*` names, and the output bounds.
 fn catalog_command(
     decl: &McpServerDecl,
+    catalog: &str,
     entry: &catalog::McpCatalogEntry,
     registry: &tokens::TokenRegistry,
     ctx: &StartCtx<'_>,
 ) -> Result<Command> {
     use crucible_contract::mcp as wire;
-    let lookup = |name: &str| {
-        ctx.vars
-            .iter()
-            .find(|(k, _)| k == name)
-            .map(|(_, v)| v.as_str())
-    };
+    let lookup = |name: &str| ctx.var(name);
     let key = decl.key.to_string();
+    if let Some(name) = decl.env.keys().find(|name| !entry.offers(name)) {
+        return Err(McpStartError::EnvNotOffered {
+            key,
+            catalog: catalog.to_string(),
+            name: name.clone(),
+        }
+        .into());
+    }
     let mut cmd = Command::new(&entry.bin);
     cmd.args(&entry.args).env_clear();
     for name in ["PATH", "HOME"] {
@@ -266,7 +320,7 @@ fn catalog_command(
     Ok(cmd)
 }
 
-fn spawn_and_wait(mut cmd: Command, decl: &McpServerDecl, bin: &str) -> Result<Child> {
+fn spawn_and_wait(mut cmd: Command, decl: &McpServerDecl, bin: &str) -> Result<ChildGuard> {
     let probe = format!("127.0.0.1:{}", decl.port);
     if port_open(&probe) {
         return Err(McpStartError::PortInUse {
@@ -275,17 +329,16 @@ fn spawn_and_wait(mut cmd: Command, decl: &McpServerDecl, bin: &str) -> Result<C
         }
         .into());
     }
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .with_context(|| format!("spawning MCP server `{}` (`{bin}`)", decl.key))?;
+    let child = ChildGuard::spawn(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit()),
+    )
+    .with_context(|| format!("spawning MCP server `{}` (`{bin}`)", decl.key))?;
     if wait_listening(&probe) {
         return Ok(child);
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     Err(McpStartError::BootTimeout {
         key: decl.key.to_string(),
         bin: bin.to_string(),
@@ -295,6 +348,47 @@ fn spawn_and_wait(mut cmd: Command, decl: &McpServerDecl, bin: &str) -> Result<C
     .into())
 }
 
+/// Refuse a server that serves a request carrying no bearer: it ignores `MCP_TOKENS_FILE`, and it
+/// listens on every interface.
+fn refuse_anonymous(decl: &McpServerDecl, bin: &str) -> Result<()> {
+    let answer = match anonymous_status(decl.port) {
+        Ok(401) => return Ok(()),
+        Ok(status) => format!("HTTP {status}"),
+        Err(e) => format!("no HTTP status ({e})"),
+    };
+    Err(McpStartError::Unauthenticated {
+        key: decl.key.to_string(),
+        bin: bin.to_string(),
+        answer,
+    }
+    .into())
+}
+
+/// The status `POST /mcp` without `Authorization` gets on loopback `port`.
+fn anonymous_status(port: u16) -> std::io::Result<u16> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect_timeout(
+        &SocketAddr::from(([127, 0, 0, 1], port)),
+        Duration::from_millis(300),
+    )?;
+    stream.set_read_timeout(Some(BOOT_TIMEOUT))?;
+    stream.set_write_timeout(Some(BOOT_TIMEOUT))?;
+    write!(
+        stream,
+        "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\nContent-Length: 0\r\n\
+         Connection: close\r\n\r\n"
+    )?;
+    let mut head = [0u8; 12];
+    stream.read_exact(&mut head)?;
+    std::str::from_utf8(&head)
+        .ok()
+        .filter(|line| line.starts_with("HTTP/1."))
+        .and_then(|line| line.get(9..12))
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| std::io::Error::other("not an HTTP status line"))
+}
+
 /// Start the desugared `[agent.broker]` if it isn't already listening. `[agent].env` is
 /// forwarded so the broker's backends see the same config the agent does; crucible's own
 /// environment (KUBECONFIG, the PR token, ...) is inherited too, including `TRACEPARENT`,
@@ -302,13 +396,22 @@ fn spawn_and_wait(mut cmd: Command, decl: &McpServerDecl, bin: &str) -> Result<C
 ///
 /// Returns the bearer token guarding the broker and the child it started. `BROKER_TOKEN` in
 /// crucible's env wins (an operator pairing with an externally-started broker); otherwise a fresh
-/// random token is minted per run. No token only when the broker was already listening and no
-/// `BROKER_TOKEN` is set: we can't retrofit a token onto a process we didn't start.
-fn start_broker(cfg: &BrokerCfg, ctx: &StartCtx<'_>) -> Result<(Option<String>, Option<Child>)> {
-    let env_token = std::env::var("BROKER_TOKEN").ok().filter(|t| !t.is_empty());
+/// random token is minted per run. A listener already on the port is adopted only with
+/// `BROKER_TOKEN` set: we can't retrofit a token onto a process we didn't start.
+fn start_broker(cfg: &BrokerCfg, ctx: &StartCtx<'_>) -> Result<(String, Option<ChildGuard>)> {
+    let env_token = ctx
+        .var("BROKER_TOKEN")
+        .filter(|t| !t.is_empty())
+        .map(str::to_string);
     let probe = probe_addr(&cfg.bind);
     if port_open(&probe) {
-        return Ok((env_token, None));
+        return match env_token {
+            Some(token) => Ok((token, None)),
+            None => Err(McpStartError::UnauthenticatedBroker {
+                bind: cfg.bind.clone(),
+            }
+            .into()),
+        };
     }
     let token = match env_token {
         Some(t) => t,
@@ -339,14 +442,12 @@ fn start_broker(cfg: &BrokerCfg, ctx: &StartCtx<'_>) -> Result<(Option<String>, 
     // The frozen manifest's output bounds, applied after `[agent].env` so a manifest key can
     // never shadow the bounds it is bounded by.
     cmd.envs(ctx.bounds_env.iter().map(|(k, v)| (k, v)));
-    let mut child = cmd
-        .spawn()
+    let child = ChildGuard::spawn(&mut cmd)
         .with_context(|| format!("spawning the provisioning broker (`{}`)", cfg.bin))?;
     if wait_listening(&probe) {
-        return Ok((Some(token), Some(child)));
+        return Ok((token, Some(child)));
     }
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
     Err(McpStartError::BootTimeout {
         key: cfg.name.clone(),
         bin: cfg.bin.clone(),
@@ -411,6 +512,8 @@ mod tests {
 import http.server, json, os
 host, port = os.environ["MCP_BIND"].rsplit(":", 1)
 class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.do_GET()
     def do_GET(self):
         bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
         sandbox = None
@@ -493,14 +596,18 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
     }
 
     fn write_catalog(dir: &Path, script: &Path) {
-        let entry = |desc: &str, required: &str| {
+        let entry = |desc: &str, run: &str, required: &str| {
             format!(
-                "description = \"{desc}\"\nbin = \"python3\"\nargs = [\"{}\"]\nenv_required = [{required}]\nenv_optional = [\"ECHO_*\"]\n",
-                script.display()
+                "description = \"{desc}\"\n{run}\nenv_required = [{required}]\nenv_optional = [\"ECHO_*\"]\npack_env = [\"PACK_SETTING\"]\n"
             )
         };
-        std::fs::write(dir.join("echo-a.toml"), entry("a", "\"ECHO_URL\"")).unwrap();
-        std::fs::write(dir.join("echo-b.toml"), entry("b", "")).unwrap();
+        let direct = format!("bin = \"python3\"\nargs = [\"{}\"]", script.display());
+        let wrapped = format!(
+            "bin = \"sh\"\nargs = [\"-c\", \"python3 {} ; exit 0\"]",
+            script.display()
+        );
+        std::fs::write(dir.join("echo-a.toml"), entry("a", &direct, "\"ECHO_URL\"")).unwrap();
+        std::fs::write(dir.join("echo-b.toml"), entry("b", &wrapped, "")).unwrap();
     }
 
     const MANIFEST: &str = r#"
@@ -635,6 +742,154 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
             !port_open(&format!("127.0.0.1:{base}")),
             "dropping the last handle stops the servers"
         );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while port_open(&format!("127.0.0.1:{}", base + 1)) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "beta's `sh` wrapper is gone, and so is the python3 it started"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn bare_ctx<'a>(dir: &'a Path, vars: &'a [(String, String)]) -> StartCtx<'a> {
+        StartCtx {
+            catalog_dir: dir,
+            vars,
+            agent_env: &[],
+            bounds_env: &[],
+            control_port: None,
+            sandbox_name: "ci",
+            bind_host: "127.0.0.1",
+        }
+    }
+
+    #[test]
+    fn a_pack_env_name_the_entry_does_not_offer_refuses_the_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("echo.py");
+        std::fs::write(&script, ECHO_SERVER).unwrap();
+        write_catalog(dir.path(), &script);
+        let base = free_port_pair();
+        let vars = vec![
+            ("ECHO_URL".to_string(), "u".to_string()),
+            ("BETA_TOKEN".to_string(), "s".to_string()),
+        ];
+        for (name, value) in [
+            ("LD_PRELOAD", "/opt/pack/x.so"),
+            ("PATH", "/opt/pack/bin"),
+            ("ECHO_URL", "https://attacker"),
+        ] {
+            let manifest = MANIFEST.replace(
+                "env = { PACK_SETTING = \"on\" }",
+                &format!("env = {{ {name} = \"{value}\" }}"),
+            );
+            let err = start(set_for(&manifest, base), &bare_ctx(dir.path(), &vars))
+                .expect_err("not offered");
+            assert!(
+                matches!(
+                    err.downcast_ref::<McpStartError>(),
+                    Some(McpStartError::EnvNotOffered { key, name: got, .. })
+                        if key == "alpha" && got == name
+                ),
+                "{name}: {err:#}"
+            );
+            assert!(!port_open(&format!("127.0.0.1:{base}")), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_server_that_answers_without_a_token_is_refused_and_stopped() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("open.py");
+        std::fs::write(
+            &script,
+            r#"
+import http.server, os
+host, port = os.environ["MCP_BIND"].rsplit(":", 1)
+class H(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+    def log_message(self, *args):
+        pass
+http.server.HTTPServer((host, int(port)), H).serve_forever()
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("open.toml"),
+            format!(
+                "description = \"o\"\nbin = \"python3\"\nargs = [\"{}\"]\n",
+                script.display()
+            ),
+        )
+        .unwrap();
+        let base = free_port_pair();
+        let set = set_for(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            mcp = ["open"]
+            [mcp.open]
+            "#,
+            base,
+        );
+        let vars: Vec<(String, String)> = std::env::vars().collect();
+        let err = start(set, &bare_ctx(dir.path(), &vars)).expect_err("serves anyone");
+        assert!(
+            matches!(
+                err.downcast_ref::<McpStartError>(),
+                Some(McpStartError::Unauthenticated { answer, .. }) if answer == "HTTP 200"
+            ),
+            "{err:#}"
+        );
+        assert!(
+            !port_open(&format!("127.0.0.1:{base}")),
+            "the refused server is stopped"
+        );
+    }
+
+    #[test]
+    fn a_legacy_broker_port_held_without_broker_token_is_refused() {
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = holder.local_addr().unwrap().port();
+        let set = set_for(
+            &format!(
+                r#"
+                [repo]
+                path = "."
+                [agent]
+                backend = "openshell"
+                goal = "g"
+                [agent.broker]
+                enabled = true
+                bin = "/nonexistent/broker"
+                bind = "127.0.0.1:{port}"
+                "#
+            ),
+            1,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let err = start(set.clone(), &bare_ctx(dir.path(), &[])).expect_err("no token");
+        assert!(
+            matches!(
+                err.downcast_ref::<McpStartError>(),
+                Some(McpStartError::UnauthenticatedBroker { bind }) if *bind == format!("127.0.0.1:{port}")
+            ),
+            "{err:#}"
+        );
+
+        let vars = vec![("BROKER_TOKEN".to_string(), "operator".to_string())];
+        let runtime = start(set, &bare_ctx(dir.path(), &vars)).expect("adopted with a token");
+        assert!(matches!(
+            &runtime.servers()[0].auth,
+            ServerAuth::Shared(token) if token == "operator"
+        ));
     }
 
     #[test]

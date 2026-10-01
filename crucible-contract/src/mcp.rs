@@ -4,7 +4,8 @@
 //! The engine mints one bearer token per (server, sandbox) and writes `<token> <sandbox>` lines to
 //! the file named by [`ENV_TOKENS_FILE`], replacing it atomically. The server re-reads the file on
 //! every request and takes the caller's sandbox from the token, so a sandbox cannot claim another
-//! sandbox's identity: it only ever holds its own token.
+//! sandbox's identity: it only ever holds its own token. A request carrying no known token gets 401;
+//! the engine checks this with an unauthenticated `POST /mcp` before the run uses the server.
 
 use std::fmt;
 

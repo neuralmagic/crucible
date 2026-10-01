@@ -256,7 +256,7 @@ scope = "comment on PROJ"
 [mcp.jira]
 catalog = "ujira"                   # the catalog entry; defaults to the key
 secrets = ["JIRA_API_TOKEN"]        # handed to this server only
-env = { JIRA_PROJECTS = "PROJ" }
+env = { JIRA_PROJECTS = "PROJ" }      # only names the catalog entry lists in pack_env
 tools = ["comment"]                 # passed to the server as MCP_TOOLS
 
 [agent]
@@ -280,7 +280,8 @@ bin = "/usr/local/bin/ujira-mcp"
 args = ["serve"]
 transport = "http"                  # the only transport so far
 env_required = ["JIRA_URL"]         # the run is refused if the loop pod lacks one
-env_optional = ["JIRA_PROJECTS", "UJIRA_*"]
+env_optional = ["UJIRA_*"]          # passed through from the loop pod when set
+pack_env = ["JIRA_PROJECTS"]        # the names a pack's env may set
 secrets = ["jira"]                  # disclosed
 reach = ["issues.redhat.com:443"]   # disclosed
 ```
@@ -290,12 +291,16 @@ Each server runs as its own process on its own port, from 8849 in key order, wit
 `MCP_BIND`, `MCP_TOKENS_FILE` (plus `MCP_CONTROL_ADDR` on a scored loop). The engine mints one token per server per sandbox and
 writes `<token> <sandbox>` lines to `MCP_TOKENS_FILE`, which the server re-reads per request, so
 the server knows which sandbox is calling and a sandbox cannot act as another. The token reaches
-the sandbox only as an egress-proxy placeholder. `CRUCIBLE_MCP_CATALOG` points at another catalog
+the sandbox only as an egress-proxy placeholder. A server that answers `POST /mcp` without a token
+with anything but 401 is stopped and the run refused. A `pack_env` entry cannot name `PATH`,
+`HOME`, `LD_*`, `DYLD_*`, `MCP_*`, or a name the entry already passes through. `CRUCIBLE_MCP_CATALOG` points at another catalog
 directory, for local runs.
 
 `[agent.broker]` still works for one release, with a deprecation warning: it becomes
 `[mcp.<name>]` with every tool, reached by turns without a named sandbox and by each sandbox with
-`broker = true`. It keeps the loop pod's whole environment and one shared token. `crucible check`
+`broker = true`. It keeps the loop pod's whole environment and one shared token, and is
+disclosed as before. Something already listening on its port is adopted only when
+`BROKER_TOKEN` is set. `crucible check`
 lists every started server, who reaches it, and any catalog entry the machine running the check
 cannot read.
 

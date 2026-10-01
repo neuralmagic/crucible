@@ -43,6 +43,9 @@ pub struct McpCatalogEntry {
     /// Env names passed through when set. A trailing `*` matches a prefix.
     #[serde(default)]
     pub env_optional: Vec<String>,
+    /// Env names a pack's `[mcp.<key>].env` may set. Nothing else from the pack reaches the env.
+    #[serde(default)]
+    pub pack_env: Vec<String>,
     /// The classes of secret the server holds. Disclosed, not enforced.
     #[serde(default)]
     pub secrets: Vec<String>,
@@ -61,6 +64,40 @@ impl McpCatalogEntry {
                 None => name == pattern,
             })
     }
+
+    /// Whether a pack may set `name` (see [`McpCatalogEntry::pack_env`]).
+    pub fn offers(&self, name: &str) -> bool {
+        self.pack_env.iter().any(|offered| offered == name)
+    }
+
+    /// The first `pack_env` name the engine or the entry already owns: the loader, `PATH`, `HOME`,
+    /// the `MCP_*` names, or a name the entry passes through from the loop pod.
+    fn owned_pack_env(&self) -> Option<&str> {
+        self.pack_env
+            .iter()
+            .find(|name| {
+                engine_owned(name)
+                    || self.env_required.contains(name)
+                    || self.passes_optional(name)
+                    || !env_name(name)
+            })
+            .map(String::as_str)
+    }
+}
+
+fn engine_owned(name: &str) -> bool {
+    matches!(name, "PATH" | "HOME")
+        || ["LD_", "DYLD_", "MCP_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+
+fn env_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_uppercase() || b == b'_')
+        && bytes.all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +136,15 @@ pub fn load(dir: &Path, name: &str) -> Result<McpCatalogEntry, CatalogError> {
             reason: "bin is empty".to_string(),
         });
     }
+    if let Some(name) = entry.owned_pack_env() {
+        return Err(CatalogError::Invalid {
+            path,
+            reason: format!(
+                "pack_env {name:?} is not an env name, or is one the engine or env_required/\
+                 env_optional already sets"
+            ),
+        });
+    }
     Ok(entry)
 }
 
@@ -117,6 +163,7 @@ mod tests {
             args = ["serve"]
             env_required = ["JIRA_URL"]
             env_optional = ["JIRA_PROJECTS", "UJIRA_*"]
+            pack_env = ["JIRA_LABEL"]
             secrets = ["jira"]
             reach = ["issues.redhat.com:443"]
             "#,
@@ -131,6 +178,9 @@ mod tests {
         assert!(entry.passes_optional("UJIRA_DEBUG"));
         assert!(!entry.passes_optional("JIRA_TOKEN"));
         assert!(!entry.passes_optional("JIRA_PROJECTS_EXTRA"));
+        assert!(entry.offers("JIRA_LABEL"));
+        assert!(!entry.offers("JIRA_URL"), "required, so the loop pod's");
+        assert!(!entry.offers("JIRA_PROJECTS"));
     }
 
     #[test]
@@ -155,6 +205,34 @@ mod tests {
             ),
             ("nobin", "description = \"d\"\nbin = \" \"\n"),
             ("nodesc", "bin = \"b\"\n"),
+            (
+                "packpath",
+                "description = \"d\"\nbin = \"b\"\npack_env = [\"PATH\"]\n",
+            ),
+            (
+                "packpreload",
+                "description = \"d\"\nbin = \"b\"\npack_env = [\"LD_PRELOAD\"]\n",
+            ),
+            (
+                "packdyld",
+                "description = \"d\"\nbin = \"b\"\npack_env = [\"DYLD_INSERT_LIBRARIES\"]\n",
+            ),
+            (
+                "packmcp",
+                "description = \"d\"\nbin = \"b\"\npack_env = [\"MCP_BIND\"]\n",
+            ),
+            (
+                "packrequired",
+                "description = \"d\"\nbin = \"b\"\nenv_required = [\"URL\"]\npack_env = [\"URL\"]\n",
+            ),
+            (
+                "packoptional",
+                "description = \"d\"\nbin = \"b\"\nenv_optional = [\"X_*\"]\npack_env = [\"X_Y\"]\n",
+            ),
+            (
+                "packlower",
+                "description = \"d\"\nbin = \"b\"\npack_env = [\"lower\"]\n",
+            ),
         ] {
             std::fs::write(dir.path().join(format!("{name}.toml")), body).unwrap();
             assert!(
