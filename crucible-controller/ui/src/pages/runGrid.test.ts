@@ -9,6 +9,8 @@ const task = (name: string, depends_on: string[] = []): PlanTask => ({
   session: '',
   needs: 'all',
   required: true,
+  over: '',
+  max_fanout: 0,
 });
 
 const result = (

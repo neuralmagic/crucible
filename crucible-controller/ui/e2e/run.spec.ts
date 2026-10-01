@@ -21,8 +21,9 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph).toBeVisible();
-    // Instances hang off their mapped task and become the producers for its downstream edge.
-    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(6);
+    // Instances hang off their mapped task and become the producers for its downstream edge; the
+    // seventh edge reaches the marker for a revision that stored no exposure.
+    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(7);
 
     const read = graph.locator('[data-task="read"]');
     await expect(read).toContainText('pass');
@@ -35,6 +36,40 @@ test.describe('the run task graph', () => {
     await expect(failed).toContainText('fail');
     await expect(graph.locator('[data-task="summarize[paged-attention]"]')).toContainText('pass');
     await expect(page.getByText('red = failed')).toBeVisible();
+  });
+
+  /// A mapped task says what the run made of it: three papers went in, two instances started, one
+  /// of those failed. The run is still going, so what it has not reached is pending, not missed.
+  test('counts a mapped task against the items it was spread over', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-fanout="summarize"]')).toHaveText(
+      '1 of 3 passed · 1 fail · 1 pending',
+    );
+    await expect(graph.locator('[data-task="file"]')).toContainText('pending');
+
+    await graph.locator('[data-task="summarize"]').click();
+    const panel = page.getByRole('complementary', { name: 'Task summarize' });
+    const value = (label: string) =>
+      panel.locator('dt', { hasText: new RegExp(`^${label}$`) }).locator('+ dd');
+    await expect(value('items')).toHaveText('3');
+    await expect(value('started')).toHaveText('2');
+    await expect(value('passed')).toHaveText('1');
+    await expect(value('fail')).toHaveText('1');
+  });
+
+  /// The case the panel exists for: twenty tickets were handed to `triage` and only two needed an
+  /// agent, which the result rows alone cannot show.
+  test('shows a fan-out most of whose items never started', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-fanout="triage"]')).toHaveText(
+      '2 of 20 passed · 18 never started',
+    );
   });
 
   /// Clicking a task opens what only a run knows about it, its result payload included.

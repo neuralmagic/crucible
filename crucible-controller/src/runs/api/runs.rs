@@ -181,13 +181,42 @@ pub(crate) async fn get_run_graph(
             .map(|o| GraphOutputDto::from((o, names.as_slice())))
             .collect()
     });
+    let mapped = tasks.iter().any(|t| !t.over.is_empty());
+    let session = match mapped {
+        true => {
+            crate::runs::task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id)
+                .await?
+        }
+        false => None,
+    };
+    let fanout = mapped_widths(session.as_deref(), &tasks);
     Ok(Json(RunGraphDto {
         plan_version: plan.plan_version,
         tasks,
         results: results.into_iter().map(TaskResultDto::from).collect(),
         outputs,
+        fanout,
     })
     .into_response())
+}
+
+/// How wide the session says each mapped task was spread. A run with no stored session reports
+/// none: the width is unknown, not zero.
+fn mapped_widths(session: Option<&str>, tasks: &[PlanTaskDto]) -> Vec<FanOutCountDto> {
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    tasks
+        .iter()
+        .filter(|t| !t.over.is_empty())
+        .filter_map(|t| {
+            let items = crate::runs::task_evidence::fanout_width(session, &t.name, &t.over)?;
+            Some(FanOutCountDto {
+                task: t.name.clone(),
+                items: i64::try_from(items).unwrap_or(i64::MAX),
+            })
+        })
+        .collect()
 }
 
 /// `?from_seq=N` resume point for `GET /api/runs/{run_id}/live`. The `Last-Event-ID` header (set by
@@ -467,4 +496,52 @@ pub(crate) async fn export_iterations(State(state): State<ApiState>) -> Result<R
         m.record_export("iterations");
     }
     Ok(parquet_response(bytes, "iterations.parquet"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan task as the admitted plan stores it, with only the fields the fan-out count reads.
+    fn task(name: &str, over: &str) -> PlanTaskDto {
+        PlanTaskDto {
+            name: name.to_string(),
+            kind: "agent".to_string(),
+            depends_on: Vec::new(),
+            session: String::new(),
+            needs: "all".to_string(),
+            required: true,
+            over: over.to_string(),
+            max_fanout: 0,
+        }
+    }
+
+    /// A triage run's session: `triage` folded over three issues, and `audit` is still fanning
+    /// out over a field `scan` never emitted.
+    const SESSION: &str = concat!(
+        "{\"v\":1,\"kind\":\"plan_admitted\",\"plan_version\":1}\n",
+        "{\"v\":1,\"kind\":\"task_result\",\"task\":\"scan\",\"status\":\"pass\",\"attempts\":1,\"output\":{\"issues\":[\"a\",\"b\",\"c\"]}}\n",
+        "{\"v\":1,\"kind\":\"task_result\",\"task\":\"triage[a]\",\"status\":\"pass\",\"attempts\":1,\"output\":null}\n",
+        "{\"v\":1,\"kind\":\"task_result\",\"task\":\"triage\",\"status\":\"pass\",\"attempts\":1,\"output\":{\"instances\":3,\"passed\":3,\"failed\":0}}\n",
+    );
+
+    #[test]
+    fn only_mapped_tasks_the_session_can_count_are_reported() {
+        let tasks = [
+            task("scan", ""),
+            task("triage", "scan.issues"),
+            task("audit", "scan.missing"),
+            task("report", ""),
+        ];
+        let widths = mapped_widths(Some(SESSION), &tasks);
+        assert_eq!(widths.len(), 1, "{widths:?}");
+        assert_eq!(widths[0].task, "triage");
+        assert_eq!(widths[0].items, 3);
+    }
+
+    #[test]
+    fn a_run_with_no_session_reports_no_widths() {
+        let tasks = [task("triage", "scan.issues")];
+        assert!(mapped_widths(None, &tasks).is_empty());
+    }
 }

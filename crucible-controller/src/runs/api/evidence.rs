@@ -91,12 +91,7 @@ pub(crate) async fn get_task_evidence(
     }
     let latest = mine.iter().max_by_key(|r| r.iter);
 
-    // The store first, then the log a local run published in its own directory: a run whose
-    // session never reached the store still has its evidence on this disk.
-    let session = match crate::runs::blob_store::get_run_session(state.db.pool(), &run_id).await? {
-        Some(stored) => Some(stored),
-        None => task_evidence::local_session(&state.scratch_dir, &run_id).await,
-    };
+    let session = task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id).await?;
     let from_session = session
         .as_deref()
         .and_then(|s| task_evidence::session_result(s, &task));

@@ -9,6 +9,7 @@ export type PlanTask = components['schemas']['PlanTaskDto'];
 export type TaskResult = components['schemas']['TaskResultDto'];
 export type GraphOutput = components['schemas']['GraphOutputDto'];
 export type OutputTarget = components['schemas']['OutputTargetDto'];
+export type FanOutCount = components['schemas']['FanOutCountDto'];
 type TaskKind = WorkflowGraphNode['kind'];
 type Needs = WorkflowGraphNode['needs'];
 
@@ -22,6 +23,9 @@ export type TaskTone = 'pass' | 'fail' | 'none';
 export interface TaskRuntime {
   tone: TaskTone;
   status: string;
+  /// False for a declared task no attempt was ever recorded against: `status` then says so, and
+  /// every figure below it is empty rather than zero.
+  reported: boolean;
   /// The latest iteration the task reported in.
   latestIter: number;
   attempts: number;
@@ -30,6 +34,25 @@ export interface TaskRuntime {
   secs: number | null;
   /// The latest attempt's payload.
   note: string;
+}
+
+/// One status a mapped task's instances reported in, and how many reported it.
+export interface FanOutStatus {
+  status: string;
+  count: number;
+}
+
+/// A mapped task against what the run made of it: how wide it was spread, and how the instances
+/// that started ended up. `items` is null when the session cannot say how wide.
+export interface FanOutState {
+  items: number | null;
+  started: number;
+  passed: number;
+  /// Everything that reported something other than a pass, by the status it reported: a blocked
+  /// or skipped instance is neither a pass nor a failure, and dropping it loses the run's work.
+  other: FanOutStatus[];
+  /// Whether the run can still start the instances that have not.
+  running: boolean;
 }
 
 /// Where a bound came from. `unknown` is a stored exposure that predates the field, treated as
@@ -69,6 +92,19 @@ export interface RunGraphView {
   /// Bounds the engine filled in for kinds the pack never declared. Listed, never drawn: they are
   /// not work the pack asked for.
   engineDefaults: OutputNode[];
+  /// What each mapped task's fan-out came to, by the mapped task's name.
+  fanout: ReadonlyMap<string, FanOutState>;
+}
+
+/// Everything the run graph endpoint answers with, plus whether the run is still going — which is
+/// what tells a task with no result apart from one that will never get one.
+export interface RunGraphSource {
+  tasks: PlanTask[];
+  results: TaskResult[];
+  /// Null for a revision that stored no exposure.
+  outputs: GraphOutput[] | null;
+  fanout: FanOutCount[];
+  running: boolean;
 }
 
 /// The node name one declared bound gets. A task name can be anything, so the prefix and the index
@@ -115,6 +151,21 @@ interface NodeSpec {
   needs: Needs;
   required: boolean;
   session: string | null;
+  fanout?: WorkflowGraphNode['fanout'];
+}
+
+/// What a plan task maps over, as the graph document carries it. The wire writes `producer.field`
+/// in one string and 0 for an uncapped mapping.
+export function fanoutOf(task: PlanTask): WorkflowGraphNode['fanout'] {
+  const over = task.over;
+  if (over === '') return null;
+  const cut = over.lastIndexOf('.');
+  if (cut <= 0) return null;
+  return {
+    over_task: over.slice(0, cut),
+    over_field: over.slice(cut + 1),
+    max_fanout: task.max_fanout === 0 ? null : task.max_fanout,
+  };
 }
 
 /// A plan task carries a fraction of what a compiled pack does: the rest of the document's fields
@@ -126,7 +177,7 @@ function nodeOf(spec: NodeSpec): WorkflowGraphNode {
     isolation: null,
     emits: [],
     emits_files: [],
-    fanout: null,
+    fanout: spec.fanout ?? null,
     harness: null,
     model: null,
     effort: null,
@@ -152,12 +203,64 @@ function runtimeOf(attempts: TaskResult[], latest: TaskResult): TaskRuntime {
   return {
     tone: toneOf(latest.status),
     status: latest.status,
+    reported: true,
     latestIter: latest.iter,
     attempts: attempts.length,
     costUsd: sum(attempts.map((r) => r.cost_usd)),
     secs: sum(attempts.map((r) => r.secs)),
     note: latest.note,
   };
+}
+
+/// The state of a declared task nothing reported on. A run still going may yet get to it; a run
+/// that is over never will, and the card has to say which.
+function unreportedRuntime(running: boolean): TaskRuntime {
+  return {
+    tone: 'none',
+    status: running ? 'pending' : 'never ran',
+    reported: false,
+    latestIter: 0,
+    attempts: 0,
+    costUsd: null,
+    secs: null,
+    note: '',
+  };
+}
+
+/// What a mapped task's instances came to. An instance is named `task[item]`, so the results carry
+/// the width the run reached; the item count the producer emitted comes off the wire.
+export function fanoutStates(
+  tasks: PlanTask[],
+  latest: ReadonlyMap<string, TaskResult>,
+  counts: FanOutCount[],
+  running: boolean,
+): Map<string, FanOutState> {
+  const items = new Map(counts.map((c) => [c.task, c.items]));
+  const states = new Map<string, FanOutState>();
+  for (const task of tasks) {
+    if (task.over === '') continue;
+    states.set(task.name, {
+      items: items.get(task.name) ?? null,
+      started: 0,
+      passed: 0,
+      other: [],
+      running,
+    });
+  }
+  for (const [name, result] of latest) {
+    const from = mappedFrom(name);
+    const state = from === null ? undefined : states.get(from);
+    if (state === undefined) continue;
+    state.started += 1;
+    if (result.status === 'pass') {
+      state.passed += 1;
+      continue;
+    }
+    const seen = state.other.find((s) => s.status === result.status);
+    if (seen === undefined) state.other.push({ status: result.status, count: 1 });
+    else seen.count += 1;
+  }
+  return states;
 }
 
 /// The mapped task an instance came from. The executor names an instance `node[item]` and a
@@ -195,12 +298,9 @@ function transitiveReduction(edges: WorkflowGraphEdge[]): WorkflowGraphEdge[] {
 /// Fold the admitted plan and everything recorded against it into one graph document. Dependencies
 /// on names the plan does not carry are dropped. A result whose task the plan never declared still
 /// renders: an instance hangs off the task it was mapped from, and anything else stands alone.
-export function runGraphView(
-  tasks: PlanTask[],
-  reported: TaskResult[],
-  declaredOutputs: GraphOutput[] | null = [],
-): RunGraphView {
-  const results = timedResults(reported);
+export function runGraphView(source: RunGraphSource): RunGraphView {
+  const { tasks, outputs: declaredOutputs } = source;
+  const results = timedResults(source.results);
   const known = new Set(tasks.map((t) => t.name));
   const latest = latestResults(results);
   const declared = new Map(tasks.map((t) => [t.name, t]));
@@ -220,6 +320,7 @@ export function runGraphView(
       needs: needsOf(t.needs),
       required: t.required,
       session: t.session === '' ? null : t.session,
+      fanout: fanoutOf(t),
     }),
   );
   const declaredEdges: WorkflowGraphEdge[] = [];
@@ -285,6 +386,14 @@ export function runGraphView(
   for (const r of results) attempts.set(r.task, [...(attempts.get(r.task) ?? []), r]);
   const runtime = new Map<string, TaskRuntime>();
   for (const [name, last] of latest) runtime.set(name, runtimeOf(attempts.get(name) ?? [last], last));
+  // A mapped task is the deck, not an attempt: its instances report, it does not, and saying it
+  // never ran would contradict the instances hanging off it.
+  for (const task of tasks) {
+    if (runtime.has(task.name)) continue;
+    if (task.over !== '') continue;
+    runtime.set(task.name, unreportedRuntime(source.running));
+  }
+  const fanout = fanoutStates(tasks, latest, source.fanout, source.running);
 
   // A revision that stored no exposure (`declaredOutputs === null`) gets one marker node: an
   // unextracted pack must never read as a pack that writes nothing.
@@ -345,5 +454,6 @@ export function runGraphView(
     runtime,
     outputs,
     engineDefaults,
+    fanout,
   };
 }
