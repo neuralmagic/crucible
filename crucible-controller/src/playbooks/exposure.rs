@@ -122,22 +122,6 @@ pub enum KnownCapability {
     BrokerBin {
         bin: String,
     },
-    McpServer {
-        name: String,
-        catalog: String,
-        #[serde(default)]
-        bin: Option<String>,
-        #[serde(default)]
-        env: std::collections::BTreeMap<String, String>,
-        #[serde(default)]
-        secrets: Vec<String>,
-        #[serde(default)]
-        tools: Vec<String>,
-        #[serde(default)]
-        agent: bool,
-        #[serde(default)]
-        sandboxes: Vec<String>,
-    },
     ExternalCommands {
         present: bool,
     },
@@ -150,8 +134,6 @@ pub enum KnownCapability {
         relays: Vec<String>,
         #[serde(default)]
         broker: bool,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        mcp: Vec<String>,
         #[serde(default)]
         egress: Vec<String>,
     },
@@ -200,30 +182,6 @@ impl Capability {
                 format!("relay {path} <- {}", sources.join(", "))
             }
             KnownCapability::BrokerBin { bin } => format!("broker-bin {bin}"),
-            KnownCapability::McpServer {
-                name,
-                catalog,
-                bin,
-                env,
-                secrets,
-                tools,
-                agent,
-                sandboxes,
-            } => {
-                let bin = bin
-                    .as_deref()
-                    .map(|b| format!(" ({b})"))
-                    .unwrap_or_default();
-                let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                format!(
-                    "mcp {name} catalog:{catalog}{bin} agent:{agent} sandboxes [{}] secrets [{}] \
-                     env [{}] tools [{}]",
-                    sandboxes.join(", "),
-                    secrets.join(", "),
-                    env.join(", "),
-                    tools.join(", ")
-                )
-            }
             KnownCapability::ExternalCommands { present } => {
                 format!("external-commands present:{present}")
             }
@@ -233,13 +191,11 @@ impl Capability {
                 secrets,
                 relays,
                 broker,
-                mcp,
                 egress,
             } => format!(
-                "sandbox {name} {image} secrets [{}] relays [{}] broker:{broker} mcp [{}] egress [{}]",
+                "sandbox {name} {image} secrets [{}] relays [{}] broker:{broker} egress [{}]",
                 secrets.join(", "),
                 relays.join(", "),
-                mcp.join(", "),
                 egress.join(", ")
             ),
         }
@@ -519,7 +475,7 @@ mod tests {
         assert!(
             narrow.capability_lines().contains(
                 &"sandbox go ghcr.io/acme/go@sha256:bb secrets [registry] relays [] broker:false \
-                  mcp [] egress [proxy.golang.org:443:read-only]"
+                  egress [proxy.golang.org:443:read-only]"
                     .to_string()
             ),
             "{:?}",
@@ -527,34 +483,6 @@ mod tests {
         );
         let widened: Exposure =
             serde_json::from_str(&with_sandbox("evil.example:443:full")).expect("decodes");
-        assert_ne!(
-            narrow.digest().expect("digest"),
-            widened.digest().expect("digest")
-        );
-    }
-
-    #[test]
-    fn an_mcp_server_renders_and_wider_reach_changes_the_digest() {
-        let with_server = |sandboxes: &str| {
-            DOC.replace(
-                r#"{"kind":"time-travel","era":"cretaceous"}"#,
-                &format!(
-                    r#"{{"kind":"mcp-server","name":"jira","catalog":"ujira","bin":null,"env":{{"JIRA_LABEL":"x"}},"secrets":["JIRA_TOKEN"],"tools":["comment"],"agent":false,"sandboxes":[{sandboxes}]}}"#
-                ),
-            )
-        };
-        let narrow: Exposure = serde_json::from_str(&with_server(r#""go""#)).expect("decodes");
-        assert!(
-            narrow.capability_lines().contains(
-                &"mcp jira catalog:ujira agent:false sandboxes [go] secrets [JIRA_TOKEN] \
-                  env [JIRA_LABEL=x] tools [comment]"
-                    .to_string()
-            ),
-            "{:?}",
-            narrow.capability_lines()
-        );
-        let widened: Exposure =
-            serde_json::from_str(&with_server(r#""go","bare""#)).expect("decodes");
         assert_ne!(
             narrow.digest().expect("digest"),
             widened.digest().expect("digest")

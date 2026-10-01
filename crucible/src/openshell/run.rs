@@ -14,7 +14,8 @@
 
 use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
 use crate::agent::harness::{
-    AuthProvider, HarnessRuntime, SandboxAuth, SandboxLayout, TranscriptLocator, TurnArtifacts,
+    AuthProvider, HarnessRuntime, McpServer, SandboxAuth, SandboxLayout, TranscriptLocator,
+    TurnArtifacts,
 };
 use crate::agent::relay;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
@@ -378,20 +379,91 @@ async fn try_turn(
         _ => false,
     };
 
-    let holder = token_holder(p)?;
-    let name = holder.sandbox().to_string();
-    tracing::Span::current().record("sandbox", name.as_str());
+    // 2c. Broker token hardening: the per-run bearer token becomes a static credential on the
+    //     `crucible-broker` provider, and the sandbox's `.mcp.json` carries only the
+    //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
+    //     policy endpoint bound to this provider (the step-4 `credential_binding`), so the real
+    //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
+    let broker_provider = match args.broker_token.as_deref() {
+        Some(token) if args.broker.enabled => {
+            ensure_broker_provider(&gw, token).await?;
+            true
+        }
+        _ => false,
+    };
 
-    // 3. Clear a stale sandbox of this name before granting it anything. A prior turn whose
-    //    create failed (e.g. ContainerExited mid-provision) leaves the name behind, a bare
-    //    create then fails "already exists" for the rest of the run, and a sandbox still
-    //    alive under the name must never hold this turn's MCP tokens.
+    // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
+    //    turn whose create failed (e.g. ContainerExited mid-provision) leaves the name behind,
+    //    and a bare create then fails "already exists" for the rest of the run. Clearing it
+    //    makes create idempotent. Labels make the sandbox discoverable via `list --selector`.
+    let name = sandbox::name_for(&p.workspace);
+    tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
     let _ = gw.delete_sandbox(&name).await;
     // Deletion is async; creating against a still-terminating CR fails "already exists".
     gw.wait_deleted(&name)
         .await
         .context("clearing a stale sandbox before create")?;
+    stage(
+        sink,
+        &format!(
+            "creating sandbox from {} (pulls the image on first use, up to {}s before the wait gives up)",
+            args.sandbox_image.as_deref().unwrap_or("the default image"),
+            grpc::pull_timeout().as_secs()
+        ),
+    );
+    let labels = [
+        ("crucible-pid".to_string(), std::process::id().to_string()),
+        ("crucible-workspace".to_string(), label_value(&basename)),
+    ];
+    let mut providers = match auth {
+        AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
+        AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => Vec::new(),
+    };
+    if aws_provider {
+        providers.push(provider::AWS_PROVIDER_NAME.to_string());
+    }
+    if broker_provider {
+        providers.push(provider::BROKER_PROVIDER_NAME.to_string());
+    }
+    gw.create_sandbox(
+        &name,
+        args.sandbox_image.as_deref(),
+        &providers,
+        &labels,
+        &args.openshell.read_only_paths,
+        &args.sandbox_resources,
+    )
+    .await
+    .context("creating the openshell sandbox")?;
+
+    // 3b. Hand the broker this turn's boundary: a fresh token at `<storage>/turn-token`. The
+    //     broker's per-turn candidate budget resets when the value changes. Best-effort, on a
+    //     host without the forge storage dir (a laptop run) the budget just stays uncapped.
+    //     Alongside it, this turn's W3C traceparent at `<storage>/turn-traceparent`: the broker is
+    //     run-lifetime, so it reads the per-turn parent from this file fresh per call (a static pod
+    //     env would collapse every turn's broker spans onto the first turn's trace).
+    if args.broker.enabled {
+        if let Err(e) = write_turn_token().await {
+            let ev = AgentEvent::Raw {
+                text: format!("turn-token write failed (candidate budget stays uncapped): {e:#}"),
+                stream: RawStream::Stderr,
+            };
+            sink("", RawStream::Stderr, Some(&ev));
+        }
+        if let Err(e) = write_traceparent_files(
+            &forge::storage_root(),
+            crate::agent::engine::current_trace_env(),
+        )
+        .await
+        {
+            let ev = AgentEvent::Raw {
+                text: format!("turn-traceparent write failed (broker spans self-root): {e:#}"),
+                stream: RawStream::Stderr,
+            };
+            sink("", RawStream::Stderr, Some(&ev));
+        }
+    }
 
     // In-process OTLP collector for the sandboxed turn: binds `0.0.0.0` on the turn pod so the
     // sandbox reaches it over the driver-resolved host (same egress pattern as the broker). The
@@ -433,92 +505,31 @@ async fn try_turn(
     };
     let meters = collector.as_ref().map(OtelCollector::meters);
 
-    let mut mcp: Vec<TurnServer> = Vec::new();
     // Best-effort sandbox teardown from here on, so a mid-turn failure still cleans up.
     let result: Result<f64> = async {
-        // 3a. MCP server credentials: each server the turn reaches gets its bearer as a static
-        //     credential on a gateway provider, and the sandbox's config carries only the
-        //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
-        //     policy endpoint bound to that provider (the step-4 `credential_binding`), so the real
-        //     token never enters the sandbox and a leaked placeholder resolves nowhere else. A catalog
-        //     server's token is this sandbox's alone; the server maps it back to the sandbox and its workdir.
-        grant_mcp(&gw, &args.mcp, &holder, args.compute_driver.broker_host(), &mut mcp).await?;
-        let mcp = mcp.as_slice();
-
-        // 3b. Create the sandbox, attaching the managed providers. Labels make the sandbox
-        //     discoverable via `list --selector`.
-        stage(
-            sink,
-            &format!(
-                "creating sandbox from {} (pulls the image on first use, up to {}s before the wait gives up)",
-                args.sandbox_image.as_deref().unwrap_or("the default image"),
-                grpc::pull_timeout().as_secs()
-            ),
-        );
-        let labels = [
-            ("crucible-pid".to_string(), std::process::id().to_string()),
-            ("crucible-workspace".to_string(), label_value(&basename)),
-        ];
-        let mut providers = match auth {
-            AuthProvider::Vertex => vec![provider::PROVIDER_NAME.to_string()],
-            AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => Vec::new(),
-        };
-        if aws_provider {
-            providers.push(provider::AWS_PROVIDER_NAME.to_string());
-        }
-        for server in mcp {
-            if !providers.contains(&server.provider) {
-                providers.push(server.provider.clone());
-            }
-        }
-        gw.create_sandbox(
-            &name,
-            args.sandbox_image.as_deref(),
-            &providers,
-            &labels,
-            &args.openshell.read_only_paths,
-            &args.sandbox_resources,
-        )
-        .await
-        .context("creating the openshell sandbox")?;
-
-        // 3c. Hand the servers this turn's boundary: a fresh token at `<storage>/turn-token`. The
-        //     broker's per-turn candidate budget resets when the value changes. Best-effort, on a
-        //     host without the forge storage dir (a laptop run) the budget just stays uncapped.
-        //     Alongside it, this turn's W3C traceparent at `<storage>/turn-traceparent`: a server is
-        //     run-lifetime, so it reads the per-turn parent from this file fresh per call (a static pod
-        //     env would collapse every turn's server spans onto the first turn's trace).
-        if !mcp.is_empty() {
-            if let Err(e) = write_turn_token().await {
-                let ev = AgentEvent::Raw {
-                    text: format!("turn-token write failed (candidate budget stays uncapped): {e:#}"),
-                    stream: RawStream::Stderr,
-                };
-                sink("", RawStream::Stderr, Some(&ev));
-            }
-            if let Err(e) = write_traceparent_files(
-                &forge::storage_root(),
-                crate::agent::engine::current_trace_env(),
-            )
-            .await
-            {
-                let ev = AgentEvent::Raw {
-                    text: format!("turn-traceparent write failed (broker spans self-root): {e:#}"),
-                    stream: RawStream::Stderr,
-                };
-                sink("", RawStream::Stderr, Some(&ev));
-            }
-        }
-
-        // 4. Egress policy (deny-by-default; merge domain extras over the built-ins). Each MCP
-        //    server the turn reaches is auto-appended, and the collector's egress rule is
-        //    appended when on.
+        // 4. Egress policy (deny-by-default; merge domain extras over the built-ins). The
+        //    broker endpoint is auto-appended when the broker is enabled, and
+        //    the collector's egress rule is appended when on.
         let driver = args.compute_driver;
-        let mcp_endpoints: Vec<String> = mcp.iter().map(|s| s.endpoint.clone()).collect();
+        let broker_url = if args.broker.enabled {
+            Some(crate::manifest::resolve_broker_url(
+                &args.broker,
+                driver.broker_host(),
+            ))
+        } else {
+            None
+        };
+        let broker_ep = match &broker_url {
+            Some(url) => Some(
+                crate::manifest::broker_endpoint_from_url(url)
+                    .context("deriving broker egress endpoint from resolved URL")?,
+            ),
+            None => None,
+        };
         let mut endpoints = policy::resolve_endpoints(
             &args.openshell,
             &policy::default_endpoints(harness),
-            &mcp_endpoints,
+            broker_ep.as_deref(),
         );
         if let Some(c) = &collector {
             endpoints.push(c.sandbox_egress(driver.broker_host()));
@@ -529,8 +540,34 @@ async fn try_turn(
         {
             endpoints.push(ep);
         }
-        let mut credential_bindings: Vec<grpc::EndpointCredentialBinding> =
-            mcp.iter().filter_map(TurnServer::binding).collect();
+        // Each `[mcp]` server in the turn's scope, appended after the deny list like the broker.
+        let mcp: Vec<_> = args
+            .mcp
+            .iter()
+            .filter(|s| args.mcp_scope.contains(&s.key))
+            .map(|s| (s, format!("http://{}:{}/mcp", driver.broker_host(), s.port)))
+            .collect();
+        for (_, url) in &mcp {
+            let ep = crate::manifest::broker_endpoint_from_url(url)?;
+            if !endpoints.contains(&ep) {
+                endpoints.push(ep);
+            }
+        }
+        let mut credential_bindings: Vec<grpc::EndpointCredentialBinding> = broker_ep
+            .as_deref()
+            .filter(|_| broker_provider)
+            .and_then(|ep| {
+                let mut it = ep.split(':');
+                let host = it.next()?.to_string();
+                let port: u32 = it.next()?.parse().ok()?;
+                Some(grpc::EndpointCredentialBinding {
+                    host,
+                    port,
+                    provider: provider::BROKER_PROVIDER_NAME.to_string(),
+                })
+            })
+            .into_iter()
+            .collect();
         if auth == AuthProvider::Vertex {
             credential_bindings.extend(policy::VERTEX_CREDENTIAL_HOSTS.iter().map(|host| {
                 grpc::EndpointCredentialBinding {
@@ -606,17 +643,33 @@ async fn try_turn(
         )
         .await?;
 
-        // 7b. Seed the harness's pre-exec files (claude: `.mcp.json` listing exactly the turn's
-        //     MCP servers, loaded via `--mcp-config`). Each URL was resolved in step 3a, so the URL
-        //     and its egress entry agree.
-        let servers: Vec<crate::agent::harness::McpServer<'_>> = mcp
+        // 7b. Seed the harness's pre-exec files (claude: `.mcp.json` toward the provisioning
+        //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
+        //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
+        //     a fresh token naming this sandbox and its workdir.
+        let seed_token = if broker_provider {
+            Some(provider::broker_token_placeholder())
+        } else {
+            args.broker_token.clone()
+        };
+        let holder = TokenHolder::new(&name, &SandboxLayout::workdir(&basename))?;
+        let tokens = mcp
             .iter()
-            .map(|s| crate::agent::harness::McpServer {
-                name: s.key.as_str(),
-                url: &s.url,
-                token: Some(&s.seed_token),
+            .map(|(s, _)| s.tokens.grant(holder.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        let mut servers: Vec<McpServer<'_>> = broker_url
+            .iter()
+            .map(|url| McpServer {
+                name: &args.broker.name,
+                url,
+                token: seed_token.as_deref(),
             })
             .collect();
+        servers.extend(mcp.iter().zip(&tokens).map(|((s, url), token)| McpServer {
+            name: &s.key,
+            url,
+            token: Some(token),
+        }));
         let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
@@ -639,7 +692,7 @@ async fn try_turn(
 
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
         stage(sink, "sandbox ready — starting the agent");
-        let mcp_seeded = !mcp.is_empty();
+        let mcp_seeded = !servers.is_empty();
         let argv = match session {
             Some(session) => backend
                 .sandbox_session_argv(args, mcp_seeded, session)
@@ -751,7 +804,11 @@ async fn try_turn(
     {
         let _ = gw.delete_sandbox(&name).await;
     }
-    release_mcp(&gw, &args.mcp, &name, &mcp).await;
+    for server in &args.mcp {
+        if let Err(e) = server.tokens.revoke(&name) {
+            tracing::warn!("revoking {name}'s token on [mcp.{}]: {e:#}", server.key);
+        }
+    }
     let _ = fs::write(forge::storage_root().join("turn-token"), "").await;
     result
 }
@@ -827,108 +884,10 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     }
 }
 
-/// One MCP server as this turn reaches it.
-struct TurnServer {
-    key: crate::manifest::McpKey,
-    url: String,
-    /// The `host:port:access` egress entry, derived from `url` so the two cannot disagree.
-    endpoint: String,
-    /// What the seeded config sends as the bearer: the provider's placeholder.
-    seed_token: String,
-    provider: String,
-    /// Whether `provider` holds this sandbox's token alone, and goes when the sandbox does.
-    per_sandbox: bool,
-}
-
-impl TurnServer {
-    fn binding(&self) -> Option<grpc::EndpointCredentialBinding> {
-        let mut fields = self.endpoint.split(':');
-        let host = fields.next()?.to_string();
-        let port: u32 = fields.next()?.parse().ok()?;
-        Some(grpc::EndpointCredentialBinding {
-            host,
-            port,
-            provider: self.provider.clone(),
-        })
-    }
-}
-
-/// Grant `sandbox` a credential for every server in the turn's scope, and revoke whatever it held
-/// on the rest: a turn never inherits an earlier turn's reach. Each grant lands in `granted` before
-/// its provider is set, so [`release_mcp`] undoes a grant that failed partway.
-async fn grant_mcp(
-    gw: &Gateway,
-    runtime: &crate::control::mcp::McpRuntime,
-    holder: &TokenHolder,
-    host: &str,
-    granted: &mut Vec<TurnServer>,
-) -> Result<()> {
-    use crate::control::mcp::ServerAuth;
-    let sandbox = holder.sandbox();
-    for server in runtime.servers() {
-        if let ServerAuth::PerSandbox(registry) = &server.auth {
-            registry
-                .revoke(sandbox)
-                .with_context(|| format!("revoking {sandbox}'s token on [mcp.{}]", server.key))?;
-        }
-    }
-    for server in runtime.in_scope() {
-        let url = server.url(host);
-        let endpoint = crate::manifest::broker_endpoint_from_url(&url)
-            .with_context(|| format!("deriving the egress endpoint of [mcp.{}]", server.key))?;
-        match &server.auth {
-            ServerAuth::Shared(token) => {
-                ensure_broker_provider(gw, token).await?;
-                granted.push(TurnServer {
-                    key: server.key.clone(),
-                    url,
-                    endpoint,
-                    seed_token: provider::broker_token_placeholder(),
-                    provider: provider::BROKER_PROVIDER_NAME.to_string(),
-                    per_sandbox: false,
-                });
-            }
-            ServerAuth::PerSandbox(registry) => {
-                let token = registry.grant(holder).with_context(|| {
-                    format!("granting {sandbox} a token on [mcp.{}]", server.key)
-                })?;
-                let name = provider::mcp_provider_name(&server.key, sandbox);
-                granted.push(TurnServer {
-                    key: server.key.clone(),
-                    url,
-                    endpoint,
-                    seed_token: provider::mcp_token_placeholder(&server.key),
-                    provider: name.clone(),
-                    per_sandbox: true,
-                });
-                ensure_mcp_provider(gw, &server.key, &name, &token).await?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Undo [`grant_mcp`] once the sandbox is gone. Best-effort: the next turn's grant revokes again.
-async fn release_mcp(
-    gw: &Gateway,
-    runtime: &crate::control::mcp::McpRuntime,
-    sandbox: &str,
-    granted: &[TurnServer],
-) {
-    for server in runtime.servers() {
-        if let crate::control::mcp::ServerAuth::PerSandbox(registry) = &server.auth
-            && let Err(e) = registry.revoke(sandbox)
-        {
-            tracing::warn!("revoking {sandbox}'s token on [mcp.{}]: {e:#}", server.key);
-        }
-    }
-    for server in granted.iter().filter(|s| s.per_sandbox) {
-        if let Err(e) = gw.delete_provider(&server.provider).await {
-            tracing::warn!("deleting provider {}: {e:#}", server.provider);
-        }
-    }
-}
-
+/// Idempotent AWS provider setup: create the `aws-s3` provider if absent, (re)configure its
+/// web-identity STS refresh, then rotate once so the credentials exist BEFORE the sandbox's
+/// first request, the proxy fails closed on unminted credentials and the refresh worker's
+/// tick is up to 60s away. Re-configuring each turn keeps a rotated role ARN current.
 /// Import the endpointless broker profile and set this run's token on the `crucible-broker`
 /// provider, update-or-create like the Vertex provider: the token changes every run, the
 /// provider object survives across runs on a shared gateway.
@@ -936,58 +895,26 @@ async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
     gw.import_provider_profile(provider::broker_profile())
         .await
         .context("importing the broker provider profile")?;
-    ensure_static_provider(
-        gw,
-        provider::BROKER_PROVIDER_NAME,
-        provider::BROKER_CRED_KEY,
-        token,
-        provider::BROKER_PROFILE_ID,
-    )
-    .await
-    .context("setting the broker provider token")
-}
-
-/// Import the server's profile and set `sandbox`'s token on its per-sandbox provider.
-async fn ensure_mcp_provider(
-    gw: &Gateway,
-    key: &crate::manifest::McpKey,
-    name: &str,
-    token: &str,
-) -> Result<()> {
-    gw.import_provider_profile(provider::mcp_profile(key))
+    if gw.provider_exists(provider::BROKER_PROVIDER_NAME).await {
+        gw.update_provider(
+            provider::BROKER_PROVIDER_NAME,
+            provider::BROKER_CRED_KEY,
+            token,
+        )
         .await
-        .with_context(|| format!("importing the [mcp.{key}] provider profile"))?;
-    ensure_static_provider(
-        gw,
-        name,
-        &key.token_env(),
-        token,
-        &provider::mcp_profile_id(key),
-    )
-    .await
-    .with_context(|| format!("setting the [mcp.{key}] provider token"))
-}
-
-/// Update-or-create a static provider holding one credential.
-async fn ensure_static_provider(
-    gw: &Gateway,
-    name: &str,
-    cred_key: &str,
-    token: &str,
-    profile_id: &str,
-) -> Result<()> {
-    if gw.provider_exists(name).await {
-        gw.update_provider(name, cred_key, token).await
+        .context("updating the broker provider token")
     } else {
-        gw.create_static_provider(name, cred_key, token, profile_id)
-            .await
+        gw.create_static_provider(
+            provider::BROKER_PROVIDER_NAME,
+            provider::BROKER_CRED_KEY,
+            token,
+            provider::BROKER_PROFILE_ID,
+        )
+        .await
+        .context("creating the broker provider")
     }
 }
 
-/// Idempotent AWS provider setup: create the `aws-s3` provider if absent, (re)configure its
-/// web-identity STS refresh, then rotate once so the credentials exist BEFORE the sandbox's
-/// first request, the proxy fails closed on unminted credentials and the refresh worker's
-/// tick is up to 60s away. Re-configuring each turn keeps a rotated role ARN current.
 async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     use openshell_core::proto::ProviderCredentialRefreshStrategy;
     // The STS refresh strategy is gated behind the gateway's providers-v2 global setting
@@ -1594,14 +1521,6 @@ async fn mtime_or_epoch(path: &std::path::Path) -> std::time::SystemTime {
         .await
         .and_then(|m| m.modified())
         .unwrap_or(std::time::UNIX_EPOCH)
-}
-
-/// The sandbox a turn over `p` runs in and the workdir its agent runs in, as the MCP token file
-/// names them.
-pub(crate) fn token_holder(p: &Paths) -> Result<TokenHolder> {
-    let workdir = SandboxLayout::workdir(&workdir_basename(p)?);
-    TokenHolder::new(&sandbox::name_for(&p.workspace), &workdir)
-        .context("naming the turn's sandbox in the MCP token file")
 }
 
 /// The basename the workspace uploads under (`/sandbox/<basename>`).

@@ -46,17 +46,12 @@ fn resolve_service_name(configured: Option<String>, fallback: &'static str) -> &
 /// pod-log narration), plus the OTLP span layer when an endpoint is configured.
 /// Must run inside a tokio runtime (the OTLP batch processor spawns on it).
 ///
-/// The service name is `MCP_NAME` or `BROKER_NAME` (the server's agent-visible name) falling back to
+/// The service name is `BROKER_NAME` (the engine passes `[agent.broker].name`) falling back to
 /// `fallback`, the binary's own name. Domains share one generic broker binary, so naming spans
 /// after the binary makes every domain look alike — and worse, a domain reusing another's binary
 /// reports that domain's name.
 pub fn init(fallback: &'static str) -> Telemetry {
-    let service_name = resolve_service_name(
-        std::env::var(crucible_contract::mcp::ENV_NAME)
-            .or_else(|_| std::env::var("BROKER_NAME"))
-            .ok(),
-        fallback,
-    );
+    let service_name = resolve_service_name(std::env::var("BROKER_NAME").ok(), fallback);
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,rmcp=debug"));
     let fmt_layer = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);

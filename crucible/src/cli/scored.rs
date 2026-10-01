@@ -118,7 +118,7 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         harness.spec().skills_dir,
     )?;
 
-    // Fold the manifest's [agent] config onto Args (+ start the MCP servers for openshell).
+    // Fold the manifest's [agent] config onto Args (+ spawn the broker for openshell).
     let frozen = crate::cli::setup::frozen_projection(
         &m,
         m.publish
@@ -271,10 +271,10 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     let frozen = crate::cli::setup::FrozenProjection {
         broker_env: crate::cli::setup::broker_bounds_env(&bounds, &p.session_log)?,
         disclosure: Some(crate::exposure::covered_from(
-            crate::exposure::composite_capabilities(&m.agent, &m.capabilities, &m.mcp_set()?),
+            crate::exposure::composite_capabilities(&m.agent, &m.capabilities, &m.mcp),
         )),
         bounds: Some(bounds),
-        mcp: m.mcp_set()?,
+        mcp: m.mcp.clone(),
     };
     crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.

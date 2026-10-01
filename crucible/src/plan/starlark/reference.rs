@@ -212,8 +212,8 @@ fn agent_knobs() -> Vec<Kwarg> {
         Kwarg::new(
             "sandbox",
             "str",
-            "An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, MCP \
-             servers, and egress it lists. Unset runs in the `[agent]` sandbox.",
+            "An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker \
+             reach, and egress it lists. Unset runs in the `[agent]` sandbox.",
         ),
         Kwarg::new(
             "session",

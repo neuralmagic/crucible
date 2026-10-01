@@ -435,15 +435,14 @@ fn run_task(cx: &Dispatch<'_>, task: &Task, job: Job<'_>, pending: Option<&str>)
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
     // coding tasks whose diff has to survive (the wide tournament carries those out itself).
-    let worktree = task_worktree(paths, &task.name);
-    if let Some(root) = worktree.parent()
-        && let Err(e) = std::fs::create_dir_all(root)
-    {
+    let root = paths.state.join("plan-iso");
+    if let Err(e) = std::fs::create_dir_all(&root) {
         return Attempt::transport(
             TransportCause::Workspace,
             format!("creating the isolation root failed: {e}"),
         );
     }
+    let worktree = root.join(task_worktree_name(&task.name));
     let captured;
     let pending = match pending {
         Some(p) => p,
@@ -697,7 +696,7 @@ pub(crate) enum SandboxError {
 }
 
 /// Point a turn at its named sandbox: the profile's image, its endpoints added to the pack's
-/// egress, and every relayed secret, relay file, and MCP server it does not list withheld.
+/// egress, and every relayed secret, relay file, broker, and MCP server it does not list withheld.
 pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxError> {
     if args.agent_backend != crate::manifest::AgentBackend::Openshell {
         return Err(SandboxError::NotOpenshell {
@@ -719,7 +718,8 @@ pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxEr
     args.env.retain(|(key, _)| !withheld.contains(key.as_str()));
     args.relay
         .retain(|relay| profile.relays.contains(&relay.dest));
-    args.mcp.enter_sandbox(name);
+    args.broker.enabled &= profile.broker;
+    args.mcp_scope = profile.mcp;
     args.sandbox_image = Some(profile.image.trim().to_string());
     for endpoint in profile.endpoints {
         if !args.openshell.endpoints.contains(&endpoint) {
@@ -968,11 +968,6 @@ fn agent_transport_error(event: &AgentEvent) -> Option<TransportFailure> {
     }
 }
 
-/// Where an isolated task's private clone of the workspace lives.
-pub(crate) fn task_worktree(paths: &Paths, name: &TaskName) -> PathBuf {
-    paths.state.join("plan-iso").join(task_worktree_name(name))
-}
-
 fn task_worktree_name(name: &TaskName) -> String {
     let digest = crucible_contract::artifact::content_digest(name.0.as_bytes());
     format!("task-{}", digest.trim_start_matches("sha256:"))
@@ -1007,33 +1002,8 @@ mod tests {
         ]
         .into();
         args.relay = vec![relay(".jira"), relay(".kube/config")];
-        let broker = crate::manifest::BrokerCfg {
-            enabled: true,
-            bin: "broker-bin".into(),
-            ..Default::default()
-        };
-        let set = crate::manifest::McpSet::resolve(
-            &Default::default(),
-            &broker,
-            &crate::manifest::McpScopes {
-                agent: &[],
-                sandboxes: vec![
-                    crate::manifest::SandboxScope {
-                        name: "go",
-                        mcp: &[],
-                        broker: true,
-                    },
-                    crate::manifest::SandboxScope {
-                        name: "bare",
-                        mcp: &[],
-                        broker: false,
-                    },
-                ],
-            },
-            &Default::default(),
-        )
-        .expect("resolves");
-        args.mcp = crate::control::mcp::McpRuntime::idle(set);
+        args.broker.enabled = true;
+        args.mcp_scope = vec!["jira".into()];
         args.openshell.endpoints = vec!["github.com:443:full".into()];
         args.sandboxes = [
             (
@@ -1043,7 +1013,7 @@ mod tests {
                     secrets: vec!["registry".into()],
                     relays: vec![".kube/config".into()],
                     broker: true,
-                    mcp: vec![],
+                    mcp: vec!["buildit".into()],
                     endpoints: vec![
                         "proxy.golang.org:443:read-only".into(),
                         "github.com:443:full".into(),
@@ -1070,10 +1040,6 @@ mod tests {
         args.relay.iter().map(|r| r.dest.as_str()).collect()
     }
 
-    fn mcp_scope(args: &Args) -> Vec<&str> {
-        args.mcp.scope().iter().map(|k| k.as_str()).collect()
-    }
-
     #[test]
     fn a_named_sandbox_passes_in_only_what_it_lists() {
         let mut args = sandboxed_args();
@@ -1084,7 +1050,8 @@ mod tests {
         );
         assert_eq!(env_keys(&args), ["REGISTRY_TOKEN", "CLOUD_ML_REGION"]);
         assert_eq!(relay_dests(&args), [".kube/config"]);
-        assert_eq!(mcp_scope(&args), ["broker"]);
+        assert!(args.broker.enabled);
+        assert_eq!(args.mcp_scope, ["buildit"]);
         assert_eq!(
             args.openshell.endpoints,
             ["github.com:443:full", "proxy.golang.org:443:read-only"],
@@ -1093,17 +1060,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_sandbox_gets_no_secret_relay_or_mcp_server() {
+    fn a_bare_sandbox_gets_no_secret_relay_or_broker() {
         let mut args = sandboxed_args();
-        assert_eq!(
-            mcp_scope(&args),
-            ["broker"],
-            "a profileless turn keeps the broker"
-        );
         enter_sandbox(&mut args, "bare").unwrap();
         assert_eq!(env_keys(&args), ["CLOUD_ML_REGION"]);
         assert!(relay_dests(&args).is_empty());
-        assert!(mcp_scope(&args).is_empty());
+        assert!(!args.broker.enabled);
+        assert!(args.mcp_scope.is_empty());
         assert_eq!(args.openshell.endpoints, ["github.com:443:full"]);
     }
 

@@ -224,6 +224,7 @@ it on the task:
 image = "ghcr.io/acme/sandbox-go@sha256:..."
 secrets = []                                  # [[secret]] names with an env projection
 relays = []                                   # [[agent.relay]] destinations
+broker = false                                # reach the [agent.broker]
 mcp = []                                      # [mcp] servers this sandbox reaches
 endpoints = ["proxy.golang.org:443:read-only"]
 ```
@@ -233,7 +234,8 @@ analyze = agent(name = "analyze", prompt = "...", sandbox = "go")
 ```
 
 The turn starts from that image and adds those endpoints to `[agent.openshell]`'s. Of the pack's
-declared secrets, relay files, and MCP servers it receives only the ones listed. The deployment's own model credentials still reach every turn. A task
+declared secrets, relay files, and `[mcp]` servers it receives only the ones listed, and it
+reaches the broker only when `broker = true`. The deployment's own model credentials still reach every turn. A task
 without `sandbox` runs in `sandbox_image` with every declared secret and relay. Tasks that
 share a session must share a sandbox. A sandbox limits what the engine provisions, not what a task
 reads from upstream: output, files, and workspace changes from a task that held a secret still
@@ -242,69 +244,28 @@ checks each sandbox image against the catalog at launch.
 
 ## MCP servers
 
-Under `openshell`, the agent reaches tools that hold credentials (JIRA, a GPU queue, a build
-service) through MCP servers on the loop pod. The loop image ships a catalog of them, one
-`/etc/crucible/mcp.d/<name>.toml` per server, and the pack picks entries:
+Under `openshell`, a pack can start MCP servers on the loop pod for tools that hold credentials
+the sandbox must not:
 
 ```toml
-[[capabilities.secret]]
-name = "JIRA_API_TOKEN"
-context = "broker"                  # the value stays on the loop pod
-system = "jira"
-scope = "comment on PROJ"
-
-[mcp.jira]
-catalog = "ujira"                   # the catalog entry; defaults to the key
-secrets = ["JIRA_API_TOKEN"]        # handed to this server only
-env = { JIRA_PROJECTS = "PROJ" }      # only names the catalog entry lists in pack_env
-tools = ["comment"]                 # passed to the server as MCP_TOOLS
+[mcp.buildit]
+bin = "/usr/local/bin/buildit"
+args = ["mcp"]
+env = { BUILDIT_NAMESPACE = "builds" }        # set on the server
+inherit = ["KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"]  # copied from the loop pod
+tools = ["build", "run", "logs"]              # passed as MCP_TOOLS
 
 [agent]
-mcp = ["jira"]                      # turns without a named sandbox
-
-[agent.sandbox.go]
-image = "ghcr.io/acme/sandbox-go@sha256:..."
-mcp = []                            # this sandbox reaches none
+mcp = ["buildit"]                             # turns without a named sandbox
 ```
 
-Nothing is reached by default. A server starts only when `[agent].mcp` or some sandbox's `mcp`
-names it, and each turn's harness config lists exactly the servers in its scope (Claude runs with
-`--strict-mcp-config`, so a stray `.mcp.json` adds nothing). A secret must be declared with
-`context = "broker"`.
-
-A catalog entry names the binary and what it needs:
-
-```toml
-description = "JIRA issues and comments"
-bin = "/usr/local/bin/ujira-mcp"
-args = ["serve"]
-transport = "http"                  # the only transport so far
-env_required = ["JIRA_URL"]         # the run is refused if the loop pod lacks one
-env_optional = ["UJIRA_*"]          # passed through from the loop pod when set
-pack_env = ["JIRA_PROJECTS"]        # the names a pack's env may set
-secrets = ["jira"]                  # disclosed
-reach = ["issues.redhat.com:443"]   # disclosed
-```
-
-Each server runs as its own process on its own port, from 8849 in key order, with only `PATH`,
-`HOME`, the entry's env, the pack's `env` and `secrets`, the run's output bounds, and `MCP_NAME`,
-`MCP_BIND`, `MCP_TOKENS_FILE` (plus `MCP_CONTROL_ADDR` on a scored loop). The engine mints one token per server per sandbox and
-writes `<token> <sandbox> <workdir>` lines to `MCP_TOKENS_FILE` (format in
-[the contract](crucible-contract.md#62-mcp-token-file-mcp_tokens_file)), which the server re-reads
-per request, so the server knows which sandbox is calling and where its agent works, and a sandbox
-cannot act as another. The token reaches
-the sandbox only as an egress-proxy placeholder. A server that answers `POST /mcp` without a token
-with anything but 401 is stopped and the run refused. A `pack_env` entry cannot name `PATH`,
-`HOME`, `LD_*`, `DYLD_*`, `MCP_*`, or a name the entry already passes through. `CRUCIBLE_MCP_CATALOG` points at another catalog
-directory, for local runs.
-
-`[agent.broker]` still works for one release, with a deprecation warning: it becomes
-`[mcp.<name>]` with every tool, reached by turns without a named sandbox and by each sandbox with
-`broker = true`. It keeps the loop pod's whole environment and one shared token, and is
-disclosed as before. Something already listening on its port is adopted only when
-`BROKER_TOKEN` is set. `crucible check`
-lists every started server, who reaches it, and any catalog entry the machine running the check
-cannot read.
+A turn reaches only the servers its scope names: `[agent].mcp`, or the `mcp` of the named sandbox
+it runs in. The default is none, and the turn's harness config lists exactly those servers.
+Each server runs as its own process on its own port, from 8850 in key order, with only `PATH`,
+`HOME`, its `env` and `inherit` names, and `MCP_NAME`, `MCP_BIND`, `MCP_TOKENS_FILE` and
+`MCP_TOOLS`. Every turn gets a fresh token per server, written to `MCP_TOKENS_FILE` with the
+turn's sandbox and workdir ([format](crucible-contract.md#62-mcp-token-file-mcp_tokens_file)) and
+revoked when the sandbox is deleted, so the server knows who is calling from the token alone.
 
 ## Parameters
 

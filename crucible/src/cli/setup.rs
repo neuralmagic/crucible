@@ -3,13 +3,14 @@
 
 use crate::agent::harness::HarnessRuntime;
 use crate::args::Args;
+use crate::control::broker;
 use crate::manifest;
 use anyhow::{Context, Result};
 use crucible_vcs::vcs;
 use std::path::Path;
 
-/// What the frozen manifest projects onto a run: the bounds the broker enforces, the grants the
-/// capability disclosure covers, and the MCP servers it starts.
+/// What the frozen manifest projects onto a run: the bounds the broker enforces, and the grants
+/// the capability disclosure covers.
 #[derive(Default)]
 pub(crate) struct FrozenProjection {
     /// `BROKER_OUTPUTS` and friends, handed to the broker child only. The agent never sees them,
@@ -18,8 +19,8 @@ pub(crate) struct FrozenProjection {
     pub(crate) disclosure: Option<crate::exposure::Covered>,
     /// The same resolved bounds the broker is handed, for the two kinds the engine writes itself.
     pub(crate) bounds: Option<crate::outputs::RunBounds>,
-    /// The `[mcp]` servers the run starts and which turns reach each.
-    pub(crate) mcp: manifest::McpSet,
+    /// The `[mcp]` servers the run starts.
+    pub(crate) mcp: std::collections::BTreeMap<String, manifest::McpCfg>,
 }
 
 /// Resolve the frozen manifest's output bounds and capability disclosure for a run.
@@ -34,7 +35,7 @@ pub(crate) fn frozen_projection(
         broker_env: broker_bounds_env(&bounds, session_log)?,
         disclosure: Some(crate::exposure::covered(m)),
         bounds: Some(bounds),
-        mcp: m.mcp_set()?,
+        mcp: m.mcp.clone(),
     })
 }
 
@@ -122,8 +123,8 @@ pub(crate) struct ResourcesWithoutSandbox {
     backend: manifest::AgentBackend,
 }
 
-/// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, start the run's
-/// MCP servers. Shared by the single-domain and composite run paths.
+/// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
+/// provisioning broker and the `[mcp]` servers. Shared by the single-domain and composite run paths.
 pub(crate) fn apply_agent_cfg(
     args: &mut Args,
     agent: &manifest::AgentCfg,
@@ -200,38 +201,31 @@ pub(crate) fn apply_agent_cfg(
         .into());
     }
     args.sandbox_resources = agent.resources.clone();
-    args.mcp = start_mcp(args, workspace, frozen)?;
-    Ok(())
-}
+    args.broker = agent.broker.clone();
 
-/// Start the run's MCP servers. Only the openshell backend has a sandbox to reach them from, so
-/// any other backend starts none.
-fn start_mcp(
-    args: &Args,
-    workspace: &Path,
-    frozen: &FrozenProjection,
-) -> Result<crate::control::mcp::McpRuntime> {
-    use crate::control::mcp;
-    if args.agent_backend != manifest::AgentBackend::Openshell || frozen.mcp.servers.is_empty() {
-        return Ok(mcp::McpRuntime::idle(frozen.mcp.clone()));
+    // The provisioning broker: a run-lifetime child crucible spawns for the openshell
+    // backend, reached by the sandboxed agent over streamable-http. Only that backend can reach it,
+    // so don't spawn it for local/command.
+    if args.broker.enabled && args.agent_backend == manifest::AgentBackend::Openshell {
+        // Hand the broker the deep loop's per-workspace sandbox name, its build sync must download
+        // from the same sandbox the turns run in.
+        let sandbox_name = crate::openshell::sandbox::name_for(workspace);
+        args.broker_token = broker::ensure_running(
+            &args.broker,
+            &args.env,
+            &frozen.broker_env,
+            args.control_port,
+            &sandbox_name,
+        )
+        .context("starting the provisioning broker")?;
     }
-    let vars: Vec<(String, String)> = std::env::vars().collect();
-    let catalog_dir = mcp::catalog::dir();
-    // A desugared broker's build sync downloads from the deep loop's per-workspace sandbox.
-    let sandbox_name = crate::openshell::sandbox::name_for(workspace);
-    mcp::start(
-        frozen.mcp.clone(),
-        &mcp::StartCtx {
-            catalog_dir: &catalog_dir,
-            vars: &vars,
-            agent_env: &args.env,
-            bounds_env: &frozen.broker_env,
-            control_port: args.control_port,
-            sandbox_name: &sandbox_name,
-            bind_host: "0.0.0.0",
-        },
-    )
-    .context("starting the run's MCP servers")
+    args.mcp_scope = agent.mcp.clone();
+    if args.agent_backend == manifest::AgentBackend::Openshell {
+        let vars: Vec<(String, String)> = std::env::vars().collect();
+        args.mcp =
+            crate::control::mcp::start(&frozen.mcp, &vars).context("starting the [mcp] servers")?;
+    }
+    Ok(())
 }
 
 /// Build a plan runner over a manifest's agent config: the workspace is set up (or reused)

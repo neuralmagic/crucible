@@ -105,36 +105,6 @@ fn kill_group(pgid: i32) {
     let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
 }
 
-/// A process group led by a child spawned with `process_group(0)`, which an interrupt reaches
-/// through [`terminate_live_groups`] until [`Group::kill`].
-#[derive(Debug)]
-pub struct Group(i32);
-
-impl Group {
-    pub fn track(child: &Child) -> io::Result<Self> {
-        let pgid = i32::try_from(child.id()).map_err(|e| {
-            io::Error::other(format!(
-                "child pid {} does not fit a process group id: {e}",
-                child.id()
-            ))
-        })?;
-        LIVE_GROUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(pgid);
-        Ok(Self(pgid))
-    }
-
-    /// SIGKILL the whole group and stop tracking it.
-    pub fn kill(&self) {
-        kill_group(self.0);
-        LIVE_GROUPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|&g| g != self.0);
-    }
-}
-
 /// How often a reap under a deadline polls. Only reached once the child's output is drained, so
 /// the child has almost always exited already.
 const REAP_POLL: Duration = Duration::from_millis(10);
