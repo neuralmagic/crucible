@@ -170,6 +170,29 @@ const RUN_GRAPH = {
 };
 
 
+/** A run that flapped: one task retried across nine iterations, passing five times, failing once
+ * and passing three more. The long stretches are what the grid melds. */
+export const RETRY_RUN = 'RUN-0901';
+
+const RETRY_STATUSES = ['pass', 'pass', 'pass', 'pass', 'pass', 'fail', 'pass', 'pass', 'pass'];
+
+const RETRY_GRAPH = {
+  plan_version: 1,
+  tasks: [
+    { name: 'probe', kind: 'command', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
+  ],
+  fanout: [],
+  results: RETRY_STATUSES.map((status, iter) => ({
+    iter,
+    task: 'probe',
+    status,
+    note: status === 'fail' ? 'exit 7: the endpoint refused' : '',
+    cost_usd: 0.01,
+    secs: 3,
+    links: [],
+  })),
+};
+
 /** The triage run this machine actually ran, as the endpoints answer for it: the plan it admitted,
  * what each task reported, and the evidence `triage[1027]` left behind — its payload and the
  * TRIAGE.md it captured, verbatim from the run's own state directory. */
@@ -184,10 +207,10 @@ const TRIAGE_GRAPH = {
   ],
   fanout: [{ task: 'triage', items: 20 }],
   results: [
-    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [] },
-    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [] },
-    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [] },
-    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [] },
+    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'high' } },
+    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [], agent: null },
   ],
 };
 
@@ -620,7 +643,10 @@ export const ROUTES: Record<string, Json> = {
     files: [],
     running: false,
   },
-  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38 }, candidates: [] },
+  [`/api/runs/${RETRY_RUN}`]: { run: { ...RUNS[0], run_id: RETRY_RUN }, candidates: [] },
+  [`/api/runs/${RETRY_RUN}/iterations`]: [],
+  [`/api/runs/${RETRY_RUN}/graph`]: RETRY_GRAPH,
+  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38, agent_provider: 'pricetag-glm', agent_model: 'glm-5.3' }, candidates: [] },
   [`/api/runs/${TRIAGE_RUN}/iterations`]: [],
   [`/api/runs/${TRIAGE_RUN}/graph`]: TRIAGE_GRAPH,
   [`/api/runs/${TRIAGE_RUN}/log`]: TRIAGE_LOG,

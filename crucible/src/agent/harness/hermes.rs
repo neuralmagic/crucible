@@ -59,12 +59,8 @@ impl Hermes {
             "chat".to_string(),
             "--yolo".to_string(),
             "--model".to_string(),
-            Self::model(args).to_string(),
+            Hermes.model(args).to_string(),
         ]
-    }
-
-    fn model(args: &Args) -> &str {
-        args.hermes.model.as_deref().unwrap_or_else(|| args.model())
     }
 }
 
@@ -104,6 +100,11 @@ impl Backend for Hermes {
         &Self::SPEC
     }
 
+    /// `[agent.hermes].model` overrides the shared `[agent].model`.
+    fn model<'a>(&self, args: &'a Args) -> &'a str {
+        args.hermes.model.as_deref().unwrap_or_else(|| args.model())
+    }
+
     /// The prompt rides inline as the `-q` value (a local spawn feeds argv directly, no stdin
     /// redirect).
     fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
@@ -131,7 +132,7 @@ impl Backend for Hermes {
         broker: Option<&Broker<'_>>,
         _inference: &InferenceEnv,
     ) -> Option<String> {
-        Some(config_yaml(Self::model(args), broker))
+        Some(config_yaml(self.model(args), broker))
     }
 
     fn decoder(

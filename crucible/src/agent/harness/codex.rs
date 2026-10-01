@@ -69,7 +69,7 @@ impl Codex {
             "--color".to_string(),
             "never".to_string(),
             "-m".to_string(),
-            model(args).to_string(),
+            Codex.model(args).to_string(),
         ];
         if let Some(effort) = args.reasoning_effort {
             a.push("-c".to_string());
@@ -79,18 +79,6 @@ impl Codex {
             ));
         }
         a
-    }
-}
-
-/// The model for this turn: `[agent.codex].model` overrides the shared `[agent].model`, and a
-/// Claude name in the shared slot falls back to the codex default model. Both `--model` and the
-/// manifest's `[agent].model` default to a Claude model (the default harness owns that default),
-/// and the ChatGPT backend rejects an Anthropic model name with a 400.
-fn model(args: &Args) -> &str {
-    match args.codex.model.as_deref() {
-        Some(m) => m,
-        None if args.model().starts_with("claude") => Harness::Codex.default_model(),
-        None => args.model(),
     }
 }
 
@@ -188,6 +176,18 @@ impl Backend for Codex {
         &Self::SPEC
     }
 
+    /// `[agent.codex].model` overrides the shared `[agent].model`, and a Claude name in the shared
+    /// slot falls back to the codex default. Both `--model` and the manifest's `[agent].model`
+    /// default to a Claude model (the default harness owns that default), and the ChatGPT backend
+    /// rejects an Anthropic model name with a 400.
+    fn model<'a>(&self, args: &'a Args) -> &'a str {
+        match args.codex.model.as_deref() {
+            Some(m) => m,
+            None if args.model().starts_with("claude") => Harness::Codex.default_model(),
+            None => args.model(),
+        }
+    }
+
     /// The prompt rides inline as the trailing positional.
     fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String> {
         let mut a = Self::base_args(args);
@@ -221,7 +221,7 @@ impl Backend for Codex {
                     .wire_api
                     .unwrap_or(crate::agent::inference::WireApi::Chat),
             });
-        Some(config_toml(model(args), broker, endpoint.as_ref()))
+        Some(config_toml(self.model(args), broker, endpoint.as_ref()))
     }
 
     /// `auth.json` whenever Codex auth was resolved; the credential reaches Codex only through it,
@@ -240,7 +240,7 @@ impl Backend for Codex {
         tool_io: bool,
     ) -> Box<dyn StreamDecoder> {
         Box::new(
-            CodexJsonParser::new(model(args))
+            CodexJsonParser::new(self.model(args))
                 .with_price(crate::agent::event::estimate_cost)
                 .with_tool_io(tool_io),
         )

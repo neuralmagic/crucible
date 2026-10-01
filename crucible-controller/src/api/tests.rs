@@ -1230,6 +1230,7 @@ async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> 
             secs: None,
             blocked: None,
             links,
+            agent: None,
         },
     )
     .await?;
@@ -1247,6 +1248,62 @@ async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> 
         }),
         "the field names the SPA reads: {v}"
     );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_serves_what_each_agent_task_ran_on(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let graph = r#"[{"name":"analyze","kind":"agent","depends_on":[],"session":"","needs":"all","required":true},
+                    {"name":"build","kind":"command","depends_on":[],"session":"","needs":"all","required":true}]"#;
+    crate::runs::task_results::upsert_run_plan(db.pool(), "run-agent", 1, graph).await?;
+    for (task, agent) in [
+        (
+            "analyze",
+            Some(crucible_contract::session::TaskAgent {
+                harness: "claude".to_string(),
+                model: "glm-5.3".to_string(),
+                effort: "low".to_string(),
+            }),
+        ),
+        ("build", None),
+    ] {
+        crate::runs::task_results::upsert_task_result(
+            db.pool(),
+            "run-agent",
+            &crate::runs::model::TaskResult {
+                iter: 1,
+                task: task.to_string(),
+                status: "pass".to_string(),
+                note: String::new(),
+                cost_usd: None,
+                secs: None,
+                blocked: None,
+                links: Vec::new(),
+                agent,
+            },
+        )
+        .await?;
+    }
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-agent/graph").await;
+    assert_eq!(st, StatusCode::OK);
+    let of = |task: &str| {
+        v["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|r| r["task"] == task)
+            .expect("the task")["agent"]
+            .clone()
+    };
+    assert_eq!(
+        of("analyze"),
+        serde_json::json!({"harness": "claude", "model": "glm-5.3", "effort": "low"}),
+        "the field names the SPA reads: {v}"
+    );
+    assert_eq!(of("build"), serde_json::Value::Null, "a command ran none");
     Ok(())
 }
 
@@ -1270,6 +1327,7 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
                 secs: Some(3.0),
                 blocked: None,
                 links: Vec::new(),
+                agent: None,
             },
         )
         .await?;
@@ -9639,6 +9697,7 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
                 secs: Some(4.0),
                 blocked: None,
                 links: Vec::new(),
+                agent: None,
             },
         )
         .await?;

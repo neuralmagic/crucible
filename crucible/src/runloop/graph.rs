@@ -103,6 +103,7 @@ pub(crate) fn run_iteration<R: Reporter>(
     // The runner and the on_result hook both need the reporter; collect the wire lines
     // here and append them after the executor returns (they're additive either way).
     let mut task_events = Vec::new();
+    let agent_args = runner.args.clone();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -118,6 +119,7 @@ pub(crate) fn run_iteration<R: Reporter>(
                 cx.it,
                 task,
                 result,
+                Some(&agent_args),
             ));
         },
     )?;
@@ -272,6 +274,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
                 kept.iter,
                 task,
                 result,
+                Some(args),
             ));
         },
     )?;
@@ -919,6 +922,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
                 0,
                 task,
                 result,
+                Some(args),
             ));
         },
     )?;

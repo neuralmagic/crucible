@@ -422,6 +422,8 @@ dto! {
         pub blocked: Option<TaskBlockedDto> = r.blocked.map(TaskBlockedDto::from),
         /// The external results the attempt reported, in declaration order.
         pub links: Vec<ExternalLinkDto> = r.links.into_iter().map(ExternalLinkDto::from).collect(),
+        /// What the attempts ran on, resolved; null for a command task.
+        pub agent: Option<TaskAgentDto> = r.agent.map(TaskAgentDto::from),
     }
 }
 
@@ -438,6 +440,16 @@ dto! {
         pub kind: crucible_contract::LinkKind,
         /// `#123`, a branch, a short sha, an issue key, or the host.
         pub label: String,
+    }
+}
+
+dto! {
+    /// What an agent task's attempts ran on, after the task's own knobs were applied over the
+    /// run's. `effort` is empty when nothing pinned one.
+    pub struct TaskAgentDto: From<a: crucible_contract::session::TaskAgent> {
+        pub harness: String,
+        pub model: String,
+        pub effort: String,
     }
 }
 

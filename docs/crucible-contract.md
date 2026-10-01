@@ -756,6 +756,15 @@ the external results the task reported, one object per url with `url`, `provider
 task declared `link` or `links`, so every url in it is an http(s) url it validated. A reader
 renders these rather than reading urls out of `output`.
 
+A `task_result` event carries an additive `agent` object (contract 1.13.0) on an `agent` task and
+on the loop's candidate turn, omitted on every task that runs no agent: `harness`, `model` and
+`effort`, as the executor resolved them for the attempts it made. The task's own knobs have
+already been applied over the CLI flags and the manifest's `[agent]` defaults, so a task that
+pinned its own model reports that model rather than the run's, and `model` is what the harness
+hands the turn, which for a harness carrying a model slot of its own is not always
+`[agent].model`. `effort` is empty when nothing pinned one. Every field defaults, so a reader
+older than the writer keeps the fields it knows.
+
 A `plan_admitted` task carries an additive `timeout` string (contract 1.8.0), the task's own
 per-attempt limit in the `--max-time` syntax (`90s`, `20m`, `2h`), empty when only the run's
 wall-clock ceiling bounds it. A task killed at its deadline settles `fail` with a `note` naming

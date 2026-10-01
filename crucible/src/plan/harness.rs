@@ -728,6 +728,68 @@ pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxEr
     Ok(())
 }
 
+/// The run's agent knobs with a task's own applied over them. Err names the knob the plan got
+/// wrong.
+fn agent_knobs(
+    args: &Args,
+    harness: Option<&String>,
+    model: Option<&String>,
+    effort: Option<&String>,
+) -> Result<Args, String> {
+    let mut args = args.clone();
+    if let Some(h) = harness {
+        args.harness = Some(
+            crate::manifest::Harness::from_str(h, true)
+                .map_err(|e| format!("task names unknown harness {h:?}: {e}"))?,
+        );
+    }
+    if let Some(m) = model {
+        args.model = Some(m.clone());
+    }
+    if let Some(e) = effort {
+        args.reasoning_effort = Some(
+            crate::manifest::ReasoningEffort::from_str(e, true)
+                .map_err(|err| format!("task names unknown effort {e:?}: {err}"))?,
+        );
+    }
+    Ok(args)
+}
+
+/// What a task's attempts run on, as the result event reports it. None for a task that runs no
+/// agent and for one whose knobs do not parse. The model comes off the backend rather than off
+/// `Args`, so a harness with a model slot of its own reports what it hands the turn. An unset
+/// effort stays empty rather than naming a default the harness may not use.
+pub(crate) fn resolved_agent(
+    args: &Args,
+    task: &Task,
+) -> Option<crucible_contract::session::TaskAgent> {
+    let knobs = match &task.task {
+        TaskKind::Agent {
+            harness,
+            model,
+            effort,
+            ..
+        } => (harness.as_ref(), model.as_ref(), effort.as_ref()),
+        // The loop's candidate turn is the only engine op that runs an agent, and it runs on the
+        // run's knobs with none of its own.
+        TaskKind::Engine {
+            op: crate::plan::ir::EngineOp::Propose,
+            ..
+        } => (None, None, None),
+        _ => return None,
+    };
+    let args = agent_knobs(args, knobs.0, knobs.1, knobs.2).ok()?;
+    let backend = crate::agent::harness::HarnessRuntime::backend(args.harness());
+    Some(crucible_contract::session::TaskAgent {
+        harness: args.harness().as_str().to_string(),
+        model: backend.model(&args).to_string(),
+        effort: args
+            .reasoning_effort
+            .map(|e| e.as_flag().to_string())
+            .unwrap_or_default(),
+    })
+}
+
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
 /// tasks run through the real [`crate::agent::run_turn`] with the task's knob overrides.
 fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
@@ -767,32 +829,15 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     };
 
     // Per-task knob overrides on a cloned Args: the heterogeneity axis. Unknown values
-    // are a measured failure: a plan naming a harness we can't parse is wrong, not
-    // unlucky.
-    let mut args = args.clone();
+    // are a measured failure.
+    let mut args = match agent_knobs(args, harness.as_ref(), model.as_ref(), effort.as_ref()) {
+        Ok(args) => args,
+        Err(note) => return Attempt::failed(0.0, note),
+    };
     // Name the task to the turn. A deterministic stand-in needs to know which task it is
     // without matching prompt prose, and a real harness gets it for free in its transcript.
     args.env
         .push((crate::plan::TASK_NAME_ENV.to_string(), task.name.0.clone()));
-    if let Some(h) = harness {
-        match crate::manifest::Harness::from_str(h, true) {
-            Ok(h) => args.harness = Some(h),
-            Err(e) => {
-                return Attempt::failed(0.0, format!("task names unknown harness {h:?}: {e}"));
-            }
-        }
-    }
-    if let Some(m) = model {
-        args.model = Some(m.clone());
-    }
-    if let Some(e) = effort {
-        match crate::manifest::ReasoningEffort::from_str(e, true) {
-            Ok(e) => args.reasoning_effort = Some(e),
-            Err(err) => {
-                return Attempt::failed(0.0, format!("task names unknown effort {e:?}: {err}"));
-            }
-        }
-    }
     if let Some(name) = sandbox
         && let Err(err) = enter_sandbox(&mut args, name)
     {
@@ -1118,6 +1163,98 @@ mod tests {
             }
             _ => panic!("expected a measured failure"),
         }
+    }
+
+    #[test]
+    fn a_task_reports_the_knobs_it_resolved_and_a_command_reports_none() {
+        let agent = |harness: Option<&str>, model: Option<&str>, effort: Option<&str>| {
+            crate::plan::ir::Task {
+                task: TaskKind::Agent {
+                    prompt: "go".into(),
+                    harness: harness.map(str::to_string),
+                    model: model.map(str::to_string),
+                    effort: effort.map(str::to_string),
+                    sandbox: None,
+                },
+                ..emitting("a", &[])
+            }
+        };
+        let mut args = sandboxed_args();
+        args.harness = Some(crate::manifest::Harness::Claude);
+        args.model = Some("opus".into());
+
+        let run = resolved_agent(&args, &agent(None, None, None)).expect("an agent task");
+        assert_eq!(
+            (run.harness.as_str(), run.model.as_str()),
+            ("claude", "opus")
+        );
+        assert_eq!(run.effort, "", "nothing pinned an effort");
+
+        let pinned = resolved_agent(&args, &agent(Some("codex"), Some("glm-5.3"), Some("low")))
+            .expect("an agent task");
+        assert_eq!(
+            (
+                pinned.harness.as_str(),
+                pinned.model.as_str(),
+                pinned.effort.as_str()
+            ),
+            ("codex", "glm-5.3", "low"),
+            "the task's own knobs win over the run's"
+        );
+
+        let mut claude_named = args.clone();
+        claude_named.model = Some("claude-opus-4-6".into());
+        let codex = resolved_agent(&claude_named, &agent(Some("codex"), None, None))
+            .expect("an agent task");
+        assert_eq!(
+            codex.model,
+            crate::manifest::Harness::Codex.default_model(),
+            "codex refuses a Claude name and runs its own default"
+        );
+
+        let mut slotted = claude_named.clone();
+        slotted.codex.model = Some("gpt-5.6-terra".into());
+        assert_eq!(
+            resolved_agent(&slotted, &agent(Some("codex"), None, None))
+                .expect("an agent task")
+                .model,
+            "gpt-5.6-terra",
+            "the harness's own model slot is what it hands the turn"
+        );
+
+        let propose = crate::plan::ir::Task {
+            task: TaskKind::Engine {
+                op: crate::plan::ir::EngineOp::Propose,
+                source: None,
+                tiebreak: None,
+            },
+            ..emitting("a", &[])
+        };
+        assert_eq!(
+            resolved_agent(&args, &propose).map(|a| a.model),
+            Some("opus".to_string()),
+            "the loop's candidate turn runs on the run's knobs"
+        );
+        let measure = crate::plan::ir::Task {
+            task: TaskKind::Engine {
+                op: crate::plan::ir::EngineOp::Measure,
+                source: None,
+                tiebreak: None,
+            },
+            ..emitting("a", &[])
+        };
+        assert_eq!(
+            resolved_agent(&args, &measure),
+            None,
+            "measure runs no agent"
+        );
+
+        assert_eq!(
+            resolved_agent(&args, &agent(Some("nope"), None, None)),
+            None,
+            "a task whose knobs do not parse never runs"
+        );
+        assert_eq!(resolved_agent(&args, &emitting("a", &[])), None);
     }
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
