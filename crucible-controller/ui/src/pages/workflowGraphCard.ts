@@ -2,7 +2,7 @@
 // kept out of the renderer so the mapping is testable without a flow.
 
 import { formatCost } from './runReport';
-import type { TaskRuntime } from './taskGraph';
+import type { FanOutState, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
 
 /// A field the wire may carry as absent, null, or a string.
@@ -81,12 +81,49 @@ export function sourceFor(node: WorkflowGraphNode): { label: string; body: strin
 
 /// A run's node state, as the card's status line reads it: where the task ended, how many attempts
 /// it took, and what those attempts cost.
-export function runtimeLine(runtime: TaskRuntime): string {
+export function runtimeLine(runtime: TaskRuntime): string | null {
+  if (!runtime.reported) return null;
   const parts = [`iter ${runtime.latestIter}`];
   if (runtime.attempts > 1) parts.push(`${runtime.attempts} attempts`);
   if (runtime.costUsd !== null) parts.push(formatCost(runtime.costUsd));
   if (runtime.secs !== null) parts.push(formatSecs(runtime.secs));
   return parts.join(' · ');
+}
+
+/// The width to read a fan-out against, or null when there is none to read it against. A run
+/// that started more instances than the last fan-out asked for (one task refanned across
+/// iterations) has no single width, and claiming one would print "5 of 3 passed".
+function widthOf(state: FanOutState): number | null {
+  if (state.items === null || state.started > state.items) return null;
+  return state.items;
+}
+
+/// What a run made of a mapped task: how wide it was spread against how the instances that
+/// started ended. A fan-out over nothing says so — zero work asked for is a result, not an
+/// absence.
+export function fanoutLine(state: FanOutState): string {
+  if (state.items === 0 && state.started === 0) return '0 items';
+  const width = widthOf(state);
+  const parts = [
+    width === null
+      ? `${state.started} started · ${state.passed} passed`
+      : `${state.passed} of ${width} passed`,
+  ];
+  for (const other of state.other) parts.push(`${other.count} ${other.status}`);
+  if (width !== null && state.started < width) {
+    parts.push(`${width - state.started} ${state.running ? 'pending' : 'never started'}`);
+  }
+  return parts.join(' · ');
+}
+
+/// The fan-out's own rows in the task panel, listed above the run's.
+export function fanoutRows(state: FanOutState): DetailRow[] {
+  return [
+    { label: 'items', value: state.items === null ? '—' : String(state.items) },
+    { label: 'started', value: String(state.started) },
+    { label: 'passed', value: String(state.passed) },
+    ...state.other.map((other) => ({ label: other.status, value: String(other.count) })),
+  ];
 }
 
 export function formatSecs(secs: number): string {
@@ -97,6 +134,7 @@ export function formatSecs(secs: number): string {
 
 /// The run's own rows, listed above the scheduling ones a plan task shares with a compiled pack.
 export function runtimeRows(runtime: TaskRuntime): DetailRow[] {
+  if (!runtime.reported) return [{ label: 'status', value: runtime.status }];
   return [
     { label: 'status', value: runtime.status },
     { label: 'iteration', value: String(runtime.latestIter) },

@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
+  fanoutStates,
   latestResults,
   runGraphView,
   targetLabel,
   toneOf,
   UNDECLARED_OUTPUTS,
+  type FanOutCount,
   type GraphOutput,
   type OutputTarget,
   type PlanTask,
@@ -18,7 +20,24 @@ const task = (name: string, depends_on: string[] = [], session = ''): PlanTask =
   session,
   needs: 'all',
   required: true,
+  over: '',
+  max_fanout: 0,
 });
+
+/// A task mapped over a producer's field, as the wire writes it.
+const mapped = (name: string, over: string, depends_on: string[]): PlanTask => ({
+  ...task(name, depends_on),
+  over,
+  max_fanout: 0,
+});
+
+const fold = (
+  tasks: PlanTask[],
+  results: TaskResult[] = [],
+  outputs: GraphOutput[] | null = [],
+  fanout: FanOutCount[] = [],
+  running = false,
+) => runGraphView({ tasks, results, outputs, fanout, running });
 
 const result = (iter: number, taskName: string, status: string): TaskResult => ({
   iter,
@@ -50,7 +69,7 @@ describe('status folding', () => {
 
 describe('the graph document a run folds to', () => {
   const view = (tasks: PlanTask[], results: TaskResult[] = []) => {
-    const folded = runGraphView(tasks, results);
+    const folded = fold(tasks, results);
     return {
       node: (name: string) => folded.graph.nodes.find((n) => n.name === name),
       edges: folded.graph.edges,
@@ -77,7 +96,7 @@ describe('the graph document a run folds to', () => {
     ]);
     expect(g.runtime.get('propose-a')?.tone).toBe('pass');
     expect(g.runtime.get('measure')?.tone).toBe('fail');
-    expect(g.runtime.has('pick')).toBe(false);
+    expect(g.runtime.get('pick')).toMatchObject({ status: 'never ran', reported: false });
   });
 
   it('maps a kind the document has no case for onto a plain task', () => {
@@ -218,7 +237,7 @@ describe('the declared outputs a graph terminates in', () => {
   const plan = [task('scan'), task('work', ['scan']), task('publish', ['work'])];
 
   it('hangs a bound off the task that spends it and a homeless one off every sink', () => {
-    const folded = runGraphView(plan, [], [
+    const folded = fold(plan, [], [
       output('draft-pr', 1, address('owner/repo'), 'publish'),
       output('gpu-capture', 2, null, null),
     ]);
@@ -247,7 +266,7 @@ describe('the declared outputs a graph terminates in', () => {
   /// declaring nothing reads as one. A bound with no source comes from an older controller and
   /// still counts as declared.
   it('keeps engine-default bounds out of the graph and lists them apart', () => {
-    const folded = runGraphView(plan, [], [
+    const folded = fold(plan, [], [
       output('image-push', 100, null, null, 'engine-default'),
       output('tracker-comment', 3, address('PROJ-1'), 'publish'),
       output('chat-message', 8, address('operator-channel'), null, null),
@@ -261,7 +280,7 @@ describe('the declared outputs a graph terminates in', () => {
   });
 
   it('draws nothing and lists everything for a pack that declares no outputs', () => {
-    const folded = runGraphView(plan, [], [
+    const folded = fold(plan, [], [
       output('draft-pr', 2, null, null, 'engine-default'),
       output('gpu-capture', 100, null, null, 'engine-default'),
     ]);
@@ -272,7 +291,7 @@ describe('the declared outputs a graph terminates in', () => {
 
   /// Two bounds of the same kind are two nodes, not one overwriting the other.
   it('keeps one node per bound even when the kinds repeat', () => {
-    const folded = runGraphView(plan, [], [
+    const folded = fold(plan, [], [
       output('tracker-comment', 3, address('PROJ-1'), 'publish'),
       output('tracker-comment', 1, { kind: 'scope', scope: 'PROJ-', param: 'issue' }, null),
     ]);
@@ -286,7 +305,7 @@ describe('the declared outputs a graph terminates in', () => {
   /// Every terminal is a place the run could have ended, so a homeless bound hangs off all of them
   /// rather than off whichever one happens to be first.
   it('hangs a homeless bound off every sink when the plan has more than one', () => {
-    const folded = runGraphView(
+    const folded = fold(
       [task('scan'), task('measure', ['scan']), task('notify', ['scan'])],
       [],
       [output('chat-message', 4, address('operator-channel'), null)],
@@ -300,7 +319,7 @@ describe('the declared outputs a graph terminates in', () => {
   /// A bound naming a task this plan does not carry still renders, off the sink. An output the
   /// graph dropped would be showing less than the pack disclosed.
   it('falls back to the sink when the named producer is not in the plan', () => {
-    const folded = runGraphView(plan, [], [output('deploy', 1, address('cluster'), 'deploy_candidate')]);
+    const folded = fold(plan, [], [output('deploy', 1, address('cluster'), 'deploy_candidate')]);
     const [name] = [...folded.outputs.keys()];
     expect(folded.graph.edges).toContainEqual({ from: 'publish', to: name, join: 'all', required: true });
   });
@@ -308,7 +327,7 @@ describe('the declared outputs a graph terminates in', () => {
   /// Absent-legacy: the revision stored no exposure. That is not a pack that writes nothing, so it
   /// gets its own marker node rather than silence.
   it('draws an explicit undeclared marker for a revision that stored no exposure', () => {
-    const folded = runGraphView(plan, [], null);
+    const folded = fold(plan, [], null);
     const marker = folded.outputs.get(UNDECLARED_OUTPUTS);
     expect(marker).toEqual({
       kind: 'outputs undeclared',
@@ -329,8 +348,124 @@ describe('the declared outputs a graph terminates in', () => {
 
   /// A pack that declares an empty output set is a pack that declared: no marker, no nodes.
   it('draws nothing extra for a pack that declares no outputs', () => {
-    const folded = runGraphView(plan, [], []);
+    const folded = fold(plan, [], []);
     expect(folded.outputs.size).toBe(0);
     expect(folded.graph.nodes.map((n) => n.name)).toEqual(['scan', 'work', 'publish']);
+  });
+});
+
+/// The triage plan a real CVE run admits: one agent scans, the next is mapped over what it
+/// emitted, and a command rounds the instances up.
+describe('what a run made of a mapped task', () => {
+  const plan = [
+    task('scan'),
+    mapped('triage', 'scan.issues', ['scan']),
+    task('roundup', ['triage']),
+  ];
+  const ran = [
+    result(0, 'scan', 'pass'),
+    result(0, 'triage[1027]', 'pass'),
+    result(0, 'triage[952]', 'fail'),
+    result(0, 'roundup', 'pass'),
+  ];
+
+  it('counts the items emitted against the instances that started and how they ended', () => {
+    const folded = fold(plan, ran, [], [{ task: 'triage', items: 20 }]);
+    expect(folded.fanout.get('triage')).toEqual({
+      items: 20,
+      started: 2,
+      passed: 1,
+      other: [{ status: 'fail', count: 1 }],
+      running: false,
+    });
+  });
+
+  /// A run whose session never reached the controller cannot say how wide the mapping was asked
+  /// to be; what started is still known, and an unknown width must not read as none.
+  it('leaves the item count unknown when the wire carries no width', () => {
+    expect(fold(plan, ran).fanout.get('triage')).toEqual({
+      items: null,
+      started: 2,
+      passed: 1,
+      other: [{ status: 'fail', count: 1 }],
+      running: false,
+    });
+  });
+
+  it('keeps a fan-out whose producer emitted nothing, as zero rather than absent', () => {
+    const folded = fold(
+      [task('scan'), mapped('triage', 'scan.issues', ['scan'])],
+      [result(0, 'scan', 'pass')],
+      [],
+      [{ task: 'triage', items: 0 }],
+    );
+    expect(folded.fanout.get('triage')).toEqual({
+      items: 0,
+      started: 0,
+      passed: 0,
+      other: [],
+      running: false,
+    });
+  });
+
+  it('carries the producer field onto the node so the card draws it as a deck', () => {
+    const node = fold(plan, ran).graph.nodes.find((n) => n.name === 'triage');
+    expect(node?.fanout).toEqual({ over_task: 'scan', over_field: 'issues', max_fanout: null });
+    expect(fold(plan, ran).graph.nodes.find((n) => n.name === 'scan')?.fanout).toBeNull();
+  });
+
+  it('reads a declared cap as the cap and an uncapped mapping as none', () => {
+    const capped = [{ ...mapped('triage', 'scan.issues', ['scan']), max_fanout: 4 }];
+    expect(fold(capped).graph.nodes[0]?.fanout?.max_fanout).toBe(4);
+  });
+
+  /// The CVE case: twenty tickets were handed to the mapped task and only a couple needed an
+  /// agent. The rest settled without running, which is neither a pass nor a failure and is most
+  /// of what the run did.
+  it('keeps every status its instances reported, not just pass and fail', () => {
+    const settled = [
+      result(0, 'scan', 'pass'),
+      result(0, 'triage[1]', 'pass'),
+      result(0, 'triage[2]', 'skipped'),
+      result(0, 'triage[3]', 'skipped'),
+      result(0, 'triage[4]', 'blocked'),
+    ];
+    expect(fold(plan, settled, [], [{ task: 'triage', items: 4 }]).fanout.get('triage')).toEqual({
+      items: 4,
+      started: 4,
+      passed: 1,
+      other: [
+        { status: 'skipped', count: 2 },
+        { status: 'blocked', count: 1 },
+      ],
+      running: false,
+    });
+  });
+
+  it('counts instances against their mapped task alone', () => {
+    const states = fanoutStates(plan, latestResults(ran), [], false);
+    expect([...states.keys()]).toEqual(['triage']);
+  });
+});
+
+describe('a declared task nothing reported on', () => {
+  const plan = [task('scan'), mapped('triage', 'scan.issues', ['scan']), task('roundup', ['triage'])];
+
+  it('never ran once the run is over, and is pending while it is not', () => {
+    const over = fold(plan, [result(0, 'scan', 'pass')]);
+    expect(over.runtime.get('roundup')).toMatchObject({
+      status: 'never ran',
+      reported: false,
+      tone: 'none',
+    });
+    const going = fold(plan, [result(0, 'scan', 'pass')], [], [], true);
+    expect(going.runtime.get('roundup')?.status).toBe('pending');
+  });
+
+  /// A mapped task is the deck its instances came out of, so its own silence is not a verdict.
+  it('says nothing about a mapped task whose instances reported', () => {
+    const folded = fold(plan, [result(0, 'scan', 'pass'), result(0, 'triage[1027]', 'pass')]);
+    expect(folded.runtime.has('triage')).toBe(false);
+    expect(folded.runtime.get('scan')?.reported).toBe(true);
   });
 });

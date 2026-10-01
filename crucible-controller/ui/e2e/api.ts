@@ -115,15 +115,17 @@ const RUNS = [
 ];
 
 /** A run's admitted work graph: a fanned-out task whose instances land in the results without ever
- * being declared, one of them failed, plus a task nothing has reported on yet. */
+ * being declared, one of them failed, plus a task nothing has reported on yet. `read` emitted
+ * three papers and only two instances started. */
 const RUN_GRAPH = {
   plan_version: 3,
   tasks: [
-    { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true },
-    { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'all', required: true },
-    { name: 'rank', kind: 'top_k', depends_on: ['summarize'], session: '', needs: 'all', required: true },
-    { name: 'file', kind: 'command', depends_on: ['rank'], session: '', needs: 'all', required: true },
+    { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true, over: '', max_fanout: 0 },
+    { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'all', required: true, over: 'read.papers', max_fanout: 8 },
+    { name: 'rank', kind: 'top_k', depends_on: ['summarize'], session: '', needs: 'all', required: true, over: '', max_fanout: 0 },
+    { name: 'file', kind: 'command', depends_on: ['rank'], session: '', needs: 'all', required: true, over: '', max_fanout: 0 },
   ],
+  fanout: [{ task: 'summarize', items: 3 }],
   results: [
     { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31 },
     { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240 },
@@ -142,10 +144,11 @@ export const TRIAGE_RUN = 'playbook_triage-local_01a030fe-2592-7902-a02c-3e3b8d9
 const TRIAGE_GRAPH = {
   plan_version: 1,
   tasks: [
-    { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true },
-    { name: 'triage', kind: 'agent', depends_on: ['scan'], session: '', needs: 'any', required: false },
-    { name: 'roundup', kind: 'command', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true },
+    { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
+    { name: 'triage', kind: 'agent', depends_on: ['scan'], session: '', needs: 'any', required: false, over: 'scan.issues', max_fanout: 0 },
+    { name: 'roundup', kind: 'command', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
   ],
+  fanout: [{ task: 'triage', items: 20 }],
   results: [
     { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0 },
     { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0 },
@@ -1020,6 +1023,23 @@ export const ROUTES: Record<string, Json> = {
 };
 
 function fallback(path: string): Json {
+  // Evidence is answered for every task of a run, so a task with no fixture of its own gets the
+  // shape the endpoint always serves rather than an empty object the page cannot read.
+  if (path.endsWith('/evidence')) {
+    return {
+      run_id: '',
+      task: path.split('/').at(-2) ?? '',
+      status: null,
+      iter: null,
+      note: null,
+      attempts: null,
+      cost_usd: null,
+      secs: null,
+      payload: null,
+      files: [],
+      running: false,
+    };
+  }
   return path.endsWith('s') ? [] : {};
 }
 

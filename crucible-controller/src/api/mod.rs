@@ -226,6 +226,7 @@ pub(crate) mod tests;
         dto::PlanTaskDto,
         dto::TaskResultDto,
         dto::RunGraphDto,
+        dto::FanOutCountDto,
         dto::GraphOutputDto,
         dto::OutputSourceDto,
         dto::OutputTargetDto,

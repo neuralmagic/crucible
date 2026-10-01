@@ -62,7 +62,7 @@ import {
 import { runStatusColor } from './runStatus';
 import { runLabel } from './runLabel';
 import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
-import { type RunGraph } from './RunTaskGraph';
+import { RunTaskGraph, type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
 import { RunTaskGrid } from './RunTaskGrid';
 import { absoluteTime, relativeTime } from './journeyView';
@@ -248,6 +248,8 @@ export function RunDetailPage() {
           </SectionBody>
         </Section>
       )}
+
+      <RunTaskGraph runId={runId} />
 
       <RunTaskGrid runId={runId} />
 

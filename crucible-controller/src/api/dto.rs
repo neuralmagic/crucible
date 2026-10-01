@@ -400,6 +400,11 @@ dto! {
         pub needs: String,
         /// Whether a failure of this task fails the plan.
         pub required: bool,
+        /// `producer.field` when the task runs once per element of an upstream list, empty
+        /// otherwise.
+        pub over: String,
+        /// The most instances `over` may produce; 0 when the task is not mapped.
+        pub max_fanout: u32,
     }
 }
 
@@ -444,6 +449,17 @@ pub struct RunGraphDto {
     /// unextracted pack off as one that writes nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<GraphOutputDto>>,
+    /// How wide each mapped task's producer actually made it. A mapped task is absent here when
+    /// the run stored no session or its producer emitted no list: how many instances started is
+    /// in `results`, but how many were asked for is only knowable from the producer's payload.
+    pub fanout: Vec<FanOutCountDto>,
+}
+
+/// One mapped task against the number of items its producer emitted.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FanOutCountDto {
+    pub task: String,
+    pub items: i64,
 }
 
 /// Where an output bound came from.

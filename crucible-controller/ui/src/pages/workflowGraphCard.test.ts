@@ -2,13 +2,15 @@ import { describe, expect, it } from 'vitest';
 import {
   badgeFor,
   detailRows,
+  fanoutLine,
+  fanoutRows,
   metaFor,
   runsLine,
   runtimeLine,
   runtimeRows,
   sourceFor,
 } from './workflowGraphCard';
-import type { TaskRuntime } from './taskGraph';
+import type { FanOutState, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
 
 function task(name: string, overrides: Partial<WorkflowGraphNode> = {}): WorkflowGraphNode {
@@ -164,6 +166,7 @@ function ran(overrides: Partial<TaskRuntime> = {}): TaskRuntime {
   return {
     tone: 'pass',
     status: 'pass',
+    reported: true,
     latestIter: 2,
     attempts: 1,
     costUsd: null,
@@ -197,5 +200,97 @@ describe('what a run adds to the card', () => {
     expect(rowValue(runtime, 'iteration')).toBe('2');
     expect(rowValue(runtime, 'cost')).toBe('$1.50');
     expect(rowValue(runtime, 'took')).toBe('—');
+  });
+});
+
+describe('what a run made of a mapped task', () => {
+  const spread = (overrides: Partial<FanOutState> = {}): FanOutState => ({
+    items: 4,
+    started: 4,
+    passed: 4,
+    other: [],
+    running: false,
+    ...overrides,
+  });
+  const failed = (count: number) => [{ status: 'fail', count }];
+
+  it('reads what passed against what went in', () => {
+    expect(fanoutLine(spread())).toBe('4 of 4 passed');
+    expect(fanoutLine(spread({ passed: 3, other: failed(1) }))).toBe('3 of 4 passed · 1 fail');
+  });
+
+  /// The case the panel exists for: 20 tickets went in, 4 needed an agent, 16 never started.
+  it('says how many of the items never started', () => {
+    expect(fanoutLine(spread({ items: 20, started: 4, passed: 4 }))).toBe(
+      '4 of 20 passed · 16 never started'
+    );
+  });
+
+  /// A run still going may yet reach them, so they are not a verdict yet.
+  it('says the items it has not reached are pending while the run is going', () => {
+    expect(fanoutLine(spread({ items: 20, started: 4, passed: 4, running: true }))).toBe(
+      '4 of 20 passed · 16 pending'
+    );
+  });
+
+  /// An instance that settled without running is neither a pass nor a failure, and on a triage
+  /// fan-out it is most of the run.
+  it('names every status its instances reported in', () => {
+    const state = spread({
+      items: 20,
+      started: 20,
+      passed: 2,
+      other: [
+        { status: 'skipped', count: 17 },
+        { status: 'blocked', count: 1 },
+      ],
+    });
+    expect(fanoutLine(state)).toBe('2 of 20 passed · 17 skipped · 1 blocked');
+  });
+
+  it('says zero for a fan-out over nothing rather than going quiet', () => {
+    expect(fanoutLine(spread({ items: 0, started: 0, passed: 0 }))).toBe('0 items');
+  });
+
+  /// A run with no stored session knows what started, not what was asked for.
+  it('reports what started when the item count is unknown', () => {
+    expect(fanoutLine(spread({ items: null, passed: 3, other: failed(1) }))).toBe(
+      '4 started · 3 passed · 1 fail'
+    );
+  });
+
+  /// A task refanned across iterations starts more instances than the last fan-out asked for,
+  /// and "5 of 3 passed" is not a count anyone can read.
+  it('drops a width the run has already run past', () => {
+    expect(fanoutLine(spread({ items: 3, started: 5, passed: 5 }))).toBe('5 started · 5 passed');
+    expect(fanoutLine(spread({ items: 0, started: 2, passed: 2 }))).toBe('2 started · 2 passed');
+  });
+
+  it('spells the counts out in the panel, the unknown one included', () => {
+    const value = (state: FanOutState, label: string) =>
+      fanoutRows(state).find((row) => row.label === label)?.value;
+    expect(value(spread({ items: 20, started: 4, passed: 4 }), 'items')).toBe('20');
+    expect(value(spread({ items: 20, started: 4, passed: 4 }), 'started')).toBe('4');
+    expect(value(spread({ other: failed(2) }), 'fail')).toBe('2');
+    expect(value(spread({ items: null }), 'items')).toBe('—');
+  });
+});
+
+describe('a task the run never reported on', () => {
+  const never: TaskRuntime = {
+    tone: 'none',
+    status: 'never ran',
+    reported: false,
+    latestIter: 0,
+    attempts: 0,
+    costUsd: null,
+    secs: null,
+    note: '',
+  };
+
+  /// An iteration and a zero cost would be inventions: nothing reported, so nothing is stated.
+  it('states its status and no figures at all', () => {
+    expect(runtimeLine(never)).toBeNull();
+    expect(runtimeRows(never)).toEqual([{ label: 'status', value: 'never ran' }]);
   });
 });

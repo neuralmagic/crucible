@@ -208,6 +208,42 @@ pub fn session_result(session: &str, task: &str) -> Option<SessionTaskResult> {
     found
 }
 
+/// The session log a run has: the store first, then the log a local run published in its own
+/// directory, because a run whose session never reached the store still has its evidence on this
+/// disk.
+pub async fn run_session(
+    pool: &sqlx::PgPool,
+    scratch_root: &Path,
+    run_id: &str,
+) -> anyhow::Result<Option<String>> {
+    match crate::runs::blob_store::get_run_session(pool, run_id).await? {
+        Some(stored) => Ok(Some(stored)),
+        None => Ok(local_session(scratch_root, run_id).await),
+    }
+}
+
+/// How many instances a mapped task was spread over, and `None` when the session cannot say.
+///
+/// The executor folds a finished fan-out into one result for the node itself, counting the
+/// instances it made after the rules that can refuse a fan-out outright (a producer that did not
+/// pass, a list over `max_fanout`, an item that cannot name an instance). That count is the
+/// answer whenever the node has settled, and a node that settled without one was refused, so its
+/// width is nothing rather than its producer's list length.
+///
+/// Until the node settles the producer's own `producer.field` list is the only count there is.
+pub fn fanout_width(session: &str, task: &str, over: &str) -> Option<usize> {
+    if let Some(folded) = session_result(session, task) {
+        let instances = folded.payload?.get("instances")?.as_u64()?;
+        return usize::try_from(instances).ok();
+    }
+    let (producer, field) = over.rsplit_once('.')?;
+    let emitted = session_result(session, producer)?;
+    if !emitted.passed() {
+        return None;
+    }
+    Some(emitted.payload?.get(field)?.as_array()?.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -372,5 +408,57 @@ mod tests {
         let (tail, truncated) = engine_log_tail(scratch, "run-1").await.expect("a log");
         assert!(truncated, "the head was dropped");
         assert_eq!(tail, "last line\n", "cut on a line boundary");
+    }
+
+    /// The fold the executor writes for a mapped node counts the instances it made, so that is
+    /// the width even when the producer's list says something else.
+    #[test]
+    fn a_settled_fan_out_is_counted_off_its_own_fold() {
+        let session = concat!(
+            "{\"kind\":\"task_result\",\"task\":\"scan\",\"status\":\"pass\",\"output\":{\"issues\":[\"a\",\"b\",\"c\"]}}\n",
+            "{\"kind\":\"task_result\",\"task\":\"triage\",\"status\":\"fail\",\"output\":{\"instances\":20,\"passed\":4,\"failed\":16}}\n",
+        );
+        assert_eq!(fanout_width(session, "triage", "scan.issues"), Some(20));
+    }
+
+    /// A fan-out the executor refused settles the node with no fold, and a refused fan-out is no
+    /// instances at all: the producer's list is not evidence that any of it ran.
+    #[test]
+    fn a_refused_fan_out_reports_no_width() {
+        let session = concat!(
+            "{\"kind\":\"task_result\",\"task\":\"scan\",\"status\":\"pass\",\"output\":{\"issues\":[\"a\",\"b\"]}}\n",
+            "{\"kind\":\"task_result\",\"task\":\"triage\",\"status\":\"fail\",\"output\":null,\"note\":\"scan.issues has 2 items; max_fanout is 1\"}\n",
+        );
+        assert_eq!(fanout_width(session, "triage", "scan.issues"), None);
+    }
+
+    /// Before the node settles, the producer's list is the count — and only a producer that
+    /// passed is one the executor would map over.
+    #[test]
+    fn a_running_fan_out_is_counted_off_its_producer() {
+        let session = concat!(
+            "{\"kind\":\"task_result\",\"task\":\"scan\",\"status\":\"pass\",\"output\":{\"issues\":[\"a\",\"b\",\"c\"],\"count\":3}}\n",
+            "{\"kind\":\"task_result\",\"task\":\"flaky\",\"status\":\"fail\",\"output\":{\"issues\":[\"a\"]}}\n",
+            "{\"kind\":\"task_result\",\"task\":\"quiet\",\"status\":\"pass\",\"output\":null}\n",
+            "{\"kind\":\"task_result\",\"task\":\"with.dots\",\"status\":\"pass\",\"output\":{\"issues\":[\"a\"]}}\n",
+        );
+        let width = |over: &str| fanout_width(session, "triage", over);
+        assert_eq!(width("scan.issues"), Some(3));
+        assert_eq!(width("with.dots.issues"), Some(1), "split on the last dot");
+        assert_eq!(width("flaky.issues"), None, "the producer failed");
+        assert_eq!(width("scan.count"), None, "not a list");
+        assert_eq!(width("scan.missing"), None, "no such field");
+        assert_eq!(width("quiet.issues"), None, "no payload");
+        assert_eq!(width("absent.issues"), None, "never reported");
+        assert_eq!(width("scan"), None, "not producer.field");
+    }
+
+    /// Zero items is a width, not an absence.
+    #[test]
+    fn a_fan_out_over_nothing_is_zero_wide() {
+        let empty = "{\"kind\":\"task_result\",\"task\":\"scan\",\"status\":\"pass\",\"output\":{\"issues\":[]}}";
+        assert_eq!(fanout_width(empty, "triage", "scan.issues"), Some(0));
+        let folded = "{\"kind\":\"task_result\",\"task\":\"triage\",\"status\":\"pass\",\"output\":{\"instances\":0,\"passed\":0,\"failed\":0}}";
+        assert_eq!(fanout_width(folded, "triage", "scan.issues"), Some(0));
     }
 }

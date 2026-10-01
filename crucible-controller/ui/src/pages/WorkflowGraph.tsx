@@ -43,13 +43,21 @@ import {
 import {
   badgeFor,
   detailRows,
+  fanoutLine,
+  fanoutRows,
   metaFor,
   runsLine,
   runtimeLine,
   runtimeRows,
   sourceFor,
 } from './workflowGraphCard';
-import { targetLabel, type OutputNode, type TaskRuntime, type TaskTone } from './taskGraph';
+import {
+  targetLabel,
+  type FanOutState,
+  type OutputNode,
+  type TaskRuntime,
+  type TaskTone,
+} from './taskGraph';
 import { TaskEvidence } from './TaskEvidence';
 
 export interface WorkflowGraphProps {
@@ -61,6 +69,8 @@ export interface WorkflowGraphProps {
   /// The nodes that are declared outputs rather than tasks, keyed by node name. Drawn in their own
   /// style: they must not read as work the graph does.
   outputs?: ReadonlyMap<string, OutputNode>;
+  /// What each mapped task's fan-out came to, keyed by the mapped task's name.
+  fanoutState?: ReadonlyMap<string, FanOutState>;
   className?: string;
 }
 
@@ -114,6 +124,7 @@ interface GraphView {
   nodes: ReadonlyMap<string, LaidOutNode>;
   runtime: ReadonlyMap<string, TaskRuntime>;
   outputs: ReadonlyMap<string, OutputNode>;
+  fanoutState: ReadonlyMap<string, FanOutState>;
   edges: ReadonlyMap<string, LaidOutEdge>;
   /// The hovered or focused task and everything it depends on; null when nothing is traced. A
   /// picked task is not traced: reading its metadata should not dim the graph it sits in.
@@ -161,6 +172,8 @@ function TaskCard({ id }: NodeProps) {
   const runs = runsLine(node);
   const meta = metaFor(node);
   const runtime = view.runtime.get(node.name) ?? null;
+  const spread = view.fanoutState.get(node.name) ?? null;
+  const ran = runtime === null ? null : runtimeLine(runtime);
   const ports = PORTS[view.direction];
 
   return (
@@ -241,10 +254,17 @@ function TaskCard({ id }: NodeProps) {
             {meta}
           </span>
         )}
-        {runtime !== null && (
-          <span className="block truncate font-mono text-micro text-ink-2">
-            {runtimeLine(runtime)}
+        {spread !== null && (
+          <span
+            data-fanout={node.name}
+            title={fanoutLine(spread)}
+            className="block truncate font-mono text-micro text-ink-2"
+          >
+            {fanoutLine(spread)}
           </span>
+        )}
+        {ran !== null && (
+          <span className="block truncate font-mono text-micro text-ink-2">{ran}</span>
         )}
         {emitted.length > 0 && (
           <span className="flex min-w-0 gap-1 overflow-hidden">
@@ -359,16 +379,21 @@ const EDGE_TYPES: EdgeTypes = { plan: PlanEdge };
 interface TaskPanelProps {
   laid: LaidOutNode;
   runtime: TaskRuntime | null;
+  spread: FanOutState | null;
   runId: string | undefined;
   onClose: () => void;
 }
 
 /// Everything the graph document holds about one task, the source it runs included: too long for a
 /// card, and the thing an importer most wants to read before registering a pack.
-function TaskPanel({ laid, runtime, runId, onClose }: TaskPanelProps) {
+function TaskPanel({ laid, runtime, spread, runId, onClose }: TaskPanelProps) {
   const { node } = laid;
   const source = sourceFor(node);
-  const rows = runtime === null ? detailRows(node) : [...runtimeRows(runtime), ...detailRows(node)];
+  const rows = [
+    ...(runtime === null ? [] : runtimeRows(runtime)),
+    ...(spread === null ? [] : fanoutRows(spread)),
+    ...detailRows(node),
+  ];
 
   return (
     <aside
@@ -422,11 +447,12 @@ function TaskPanel({ laid, runtime, runId, onClose }: TaskPanelProps) {
 
 const NO_RUNTIME: ReadonlyMap<string, TaskRuntime> = new Map();
 const NO_OUTPUTS: ReadonlyMap<string, OutputNode> = new Map();
+const NO_FANOUT: ReadonlyMap<string, FanOutState> = new Map();
 
 const CANVAS_ONLY = ['canvas'];
 const CANVAS_AND_PANEL = ['canvas', 'panel'];
 
-function GraphCanvas({ graph, runtime, runId, outputs, className }: WorkflowGraphProps) {
+function GraphCanvas({ graph, runtime, runId, outputs, fanoutState, className }: WorkflowGraphProps) {
   const marker = useId().replace(/:/g, '');
   const markers = useMemo(
     () => ({ arrow: `arrow-${marker}`, arrowLit: `arrow-lit-${marker}` }),
@@ -493,13 +519,14 @@ function GraphCanvas({ graph, runtime, runId, outputs, className }: WorkflowGrap
       nodes: new Map(layout.nodes.map((laid) => [laid.node.name, laid])),
       runtime: runtime ?? NO_RUNTIME,
       outputs: outputs ?? NO_OUTPUTS,
+      fanoutState: fanoutState ?? NO_FANOUT,
       edges: new Map(layout.edges.map((laid) => [edgeId(laid.from, laid.to), laid])),
       lit: traced === null ? null : (layout.ancestry.get(traced) ?? new Set([traced])),
       picked,
       onTrace: setTraced,
       onPick: setPicked,
     };
-  }, [direction, layout, runtime, outputs, traced, picked]);
+  }, [direction, layout, runtime, outputs, fanoutState, traced, picked]);
 
   const canvasRef = useRef<HTMLDivElement | null>(null);
   // The canvas changes size when a divider is dragged, the rail collapses, or the window resizes;
@@ -672,6 +699,7 @@ function GraphCanvas({ graph, runtime, runId, outputs, className }: WorkflowGrap
                   <TaskPanel
                     laid={pickedNode}
                     runtime={view.runtime.get(pickedNode.node.name) ?? null}
+                    spread={view.fanoutState.get(pickedNode.node.name) ?? null}
                     runId={runId}
                     onClose={close}
                   />
