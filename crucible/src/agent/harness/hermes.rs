@@ -76,10 +76,7 @@ fn config_yaml(model: &str, broker: Option<&Broker<'_>>) -> String {
         serde_json::json!({ "tool_progress": "all" }),
     );
     if let Some(b) = broker {
-        let mut server = serde_json::json!({ "url": b.url });
-        if let Some(t) = b.token {
-            server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {t}") });
-        }
+        let server = serde_json::json!({ "url": b.url, "headers": b.json_headers() });
         cfg.insert("mcp_servers".into(), serde_json::json!({ b.name: server }));
     }
     serde_norway::to_string(&serde_json::Value::Object(cfg)).unwrap_or_default()
@@ -184,6 +181,8 @@ mod tests {
     use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
 
+    const SANDBOX: &str = "ci-0123456789abcdef";
+
     const CONFIG: &str = Hermes::SPEC.config;
     const DEFAULT_BINARIES: &[&str] = Hermes::SPEC.binaries;
 
@@ -200,6 +199,7 @@ mod tests {
             args,
             broker_url,
             broker_token,
+            SANDBOX,
             &SandboxAuth::Gateway,
             &Default::default(),
         )
@@ -270,19 +270,25 @@ mod tests {
             "http://host.containers.internal:8849/mcp"
         );
         assert_eq!(
-            v["mcp_servers"]["epp-broker"]["headers"]["Authorization"],
-            "Bearer s3cr3t"
+            v["mcp_servers"]["epp-broker"]["headers"],
+            serde_json::json!({
+                "Authorization": "Bearer s3cr3t",
+                "X-Crucible-Sandbox": SANDBOX,
+            })
         );
     }
 
     #[test]
-    fn config_yaml_omits_headers_without_a_token() {
+    fn config_yaml_sends_only_the_sandbox_header_without_a_token() {
         let mut a = args();
         a.broker.name = "b".into();
         let seeds = seed_files(&a, Some("http://x/mcp"), None);
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
         assert_eq!(v["mcp_servers"]["b"]["url"], "http://x/mcp");
-        assert!(v["mcp_servers"]["b"].get("headers").is_none());
+        assert_eq!(
+            v["mcp_servers"]["b"]["headers"],
+            serde_json::json!({ "X-Crucible-Sandbox": SANDBOX })
+        );
     }
 
     #[test]

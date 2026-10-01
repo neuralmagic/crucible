@@ -293,6 +293,31 @@ pub(crate) struct Broker<'a> {
     pub name: &'a str,
     pub url: &'a str,
     pub token: Option<&'a str>,
+    /// The sandbox this turn runs in, sent as [`crucible_broker::auth::SANDBOX_HEADER`].
+    pub sandbox: &'a str,
+}
+
+impl Broker<'_> {
+    /// The HTTP headers every seeded MCP config sends to the broker.
+    pub fn headers(&self) -> Vec<(&'static str, String)> {
+        let mut headers = vec![(
+            crucible_broker::auth::SANDBOX_HEADER,
+            self.sandbox.to_string(),
+        )];
+        if let Some(t) = self.token {
+            headers.push(("Authorization", format!("Bearer {t}")));
+        }
+        headers
+    }
+
+    /// [`Broker::headers`] as a JSON object.
+    pub fn json_headers(&self) -> serde_json::Value {
+        self.headers()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v)))
+            .collect::<serde_json::Map<_, _>>()
+            .into()
+    }
 }
 
 /// One agent harness: its [`HarnessSpec`] plus what genuinely differs per CLI (the argv grammar,
@@ -418,12 +443,13 @@ pub(crate) trait Backend: Sync {
     /// Files uploaded into the sandbox before the agent execs: the config at the spec's path when
     /// the backend renders one, then its credential file. `broker_token` is what the seeded
     /// config sends as its bearer: the raw per-run token, or the provider placeholder when the
-    /// openshell egress proxy resolves it.
+    /// openshell egress proxy resolves it. `sandbox` is the sandbox the files land in.
     fn seed_files(
         &self,
         args: &Args,
         broker_url: Option<&str>,
         broker_token: Option<&str>,
+        sandbox: &str,
         auth: &SandboxAuth,
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
@@ -431,6 +457,7 @@ pub(crate) trait Backend: Sync {
             name: &args.broker.name,
             url,
             token: broker_token,
+            sandbox,
         });
         let mut seeds: Vec<SeedFile> = self
             .config(args, broker.as_ref(), inference)

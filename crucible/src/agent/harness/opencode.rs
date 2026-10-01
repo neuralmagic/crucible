@@ -176,10 +176,12 @@ fn config_json(model: &str, endpoint: &ApiEndpoint, broker: Option<&Broker<'_>>)
         "provider": { provider_id: provider },
     });
     if let Some(b) = broker {
-        let mut server = json!({ "type": "remote", "url": b.url, "enabled": true });
-        if let Some(t) = b.token {
-            server["headers"] = json!({ "Authorization": format!("Bearer {t}") });
-        }
+        let server = json!({
+            "type": "remote",
+            "url": b.url,
+            "enabled": true,
+            "headers": b.json_headers(),
+        });
         cfg["mcp"] = json!({ b.name: server });
     }
     cfg.to_string()
@@ -454,6 +456,8 @@ mod tests {
     use clap::Parser;
     use crucible_contract::event::AgentEvent;
 
+    const SANDBOX: &str = "ci-0123456789abcdef";
+
     const CONFIG: &str = OpenCode::SPEC.config;
 
     fn args() -> Args {
@@ -470,6 +474,7 @@ mod tests {
             args,
             broker_url,
             broker_token,
+            SANDBOX,
             &SandboxAuth::ApiKey,
             inference,
         )
@@ -525,6 +530,7 @@ mod tests {
             &a,
             None,
             None,
+            SANDBOX,
             &SandboxAuth::Gateway,
             &InferenceEnv::default(),
         );
@@ -677,7 +683,10 @@ mod tests {
         assert_eq!(server["type"], "remote");
         assert_eq!(server["url"], "http://10.0.0.1:8000/mcp");
         assert_eq!(server["enabled"], true);
-        assert_eq!(server["headers"]["Authorization"], "Bearer tok\"quoted");
+        assert_eq!(
+            server["headers"],
+            json!({ "Authorization": "Bearer tok\"quoted", "X-Crucible-Sandbox": SANDBOX })
+        );
 
         let bare = seed_files(
             &a,
@@ -686,7 +695,10 @@ mod tests {
             &custom_endpoint(),
         );
         let v: Value = serde_json::from_str(&bare[0].content).expect("valid json");
-        assert!(v["mcp"][a.broker.name.as_str()].get("headers").is_none());
+        assert_eq!(
+            v["mcp"][a.broker.name.as_str()]["headers"],
+            json!({ "X-Crucible-Sandbox": SANDBOX })
+        );
     }
 
     const EXPORT_FIXTURE: &[u8] = include_bytes!("../../testdata/opencode_export_fixture.json");

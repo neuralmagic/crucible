@@ -11,6 +11,10 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use std::sync::Arc;
 
+/// The header every engine-seeded MCP config sends with the turn's sandbox name, so one broker
+/// serving several sandboxes can tell their requests apart.
+pub const SANDBOX_HEADER: &str = "X-Crucible-Sandbox";
+
 /// The expected token from `BROKER_TOKEN` (`None`/empty = guard off). The binaries pass this to
 /// [`require_bearer`] via `middleware::from_fn_with_state`.
 pub fn expected_token() -> Option<String> {

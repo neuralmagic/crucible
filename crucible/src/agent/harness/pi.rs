@@ -120,10 +120,11 @@ pub(crate) const MCP_ADAPTER: &str = "/usr/local/lib/node_modules/pi-mcp-adapter
 pub(crate) const MCP_CONFIG: &str = "/sandbox/.pi/agent/mcp.json";
 
 fn mcp_json(broker: &Broker<'_>) -> String {
-    let mut server = json!({ "url": broker.url, "protocolVersion": "auto" });
-    if let Some(token) = broker.token {
-        server["headers"] = json!({ "Authorization": format!("Bearer {token}") });
-    }
+    let server = json!({
+        "url": broker.url,
+        "protocolVersion": "auto",
+        "headers": broker.json_headers(),
+    });
     json!({ "mcpServers": { broker.name: server } }).to_string()
 }
 
@@ -513,6 +514,8 @@ mod tests {
     use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
 
+    const SANDBOX: &str = "ci-0123456789abcdef";
+
     const CONFIG: &str = Pi::SPEC.config;
 
     fn args() -> Args {
@@ -528,6 +531,7 @@ mod tests {
             args,
             broker_url,
             Some("tok"),
+            SANDBOX,
             &SandboxAuth::ApiKey,
             inference,
         )
@@ -657,13 +661,17 @@ mod tests {
         let server = &m["mcpServers"][a.broker.name.as_str()];
         assert_eq!(server["url"], "http://10.0.0.1:8000/mcp");
         assert_eq!(server["protocolVersion"], "auto");
-        assert_eq!(server["headers"]["Authorization"], "Bearer tok");
+        assert_eq!(
+            server["headers"],
+            json!({ "Authorization": "Bearer tok", "X-Crucible-Sandbox": SANDBOX })
+        );
         assert_eq!(seeds[1].content.matches("Bearer").count(), 1);
 
         let tokenless = Pi.seed_files(
             &a,
             Some("http://10.0.0.1:8000/mcp"),
             None,
+            SANDBOX,
             &SandboxAuth::ApiKey,
             &custom_endpoint(),
         );
@@ -672,10 +680,9 @@ mod tests {
             m["mcpServers"][a.broker.name.as_str()]["protocolVersion"],
             "auto"
         );
-        assert!(
-            m["mcpServers"][a.broker.name.as_str()]
-                .get("headers")
-                .is_none()
+        assert_eq!(
+            m["mcpServers"][a.broker.name.as_str()]["headers"],
+            json!({ "X-Crucible-Sandbox": SANDBOX })
         );
 
         let responses = InferenceEnv {
@@ -718,6 +725,7 @@ mod tests {
             &a,
             None,
             None,
+            SANDBOX,
             &SandboxAuth::Gateway,
             &InferenceEnv::default(),
         );
@@ -744,6 +752,7 @@ mod tests {
             &a,
             None,
             None,
+            SANDBOX,
             &SandboxAuth::Gateway,
             &InferenceEnv::default(),
         );

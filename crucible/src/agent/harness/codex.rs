@@ -156,14 +156,15 @@ fn config_toml(
     if let Some(b) = broker {
         let mut server = toml::Table::new();
         server.insert("url".into(), b.url.into());
-        if let Some(t) = b.token {
-            // Codex's schema has no inline `bearer_token`; the choices are `bearer_token_env_var`
-            // (an env name) or static `http_headers`. The header keeps the token in the seeded
-            // file rather than the sandbox env, same posture as hermes's config.yaml.
-            let mut headers = toml::Table::new();
-            headers.insert("Authorization".into(), format!("Bearer {t}").into());
-            server.insert("http_headers".into(), headers.into());
-        }
+        // Codex's schema has no inline `bearer_token`; the choices are `bearer_token_env_var`
+        // (an env name) or static `http_headers`. The header keeps the token in the seeded
+        // file rather than the sandbox env, same posture as hermes's config.yaml.
+        let headers: toml::Table = b
+            .headers()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.into()))
+            .collect();
+        server.insert("http_headers".into(), headers.into());
         let mut servers = toml::Table::new();
         servers.insert(b.name.into(), server.into());
         cfg.insert("mcp_servers".into(), servers.into());
@@ -536,6 +537,8 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    const SANDBOX: &str = "ci-0123456789abcdef";
+
     const CONFIG: &str = Codex::SPEC.config;
     const DEFAULT_BINARIES: &[&str] = Codex::SPEC.binaries;
 
@@ -551,7 +554,7 @@ mod tests {
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
         let auth = auth.map_or(SandboxAuth::Gateway, |a| SandboxAuth::Codex(a.clone()));
-        Codex.seed_files(args, broker_url, broker_token, &auth, inference)
+        Codex.seed_files(args, broker_url, broker_token, SANDBOX, &auth, inference)
     }
 
     fn sandbox_argv(args: &Args, mcp_seeded: bool) -> Vec<String> {
@@ -717,16 +720,28 @@ mod tests {
             server["http_headers"]["Authorization"].as_str(),
             Some("Bearer s3cr3t")
         );
+        assert_eq!(
+            server["http_headers"]["X-Crucible-Sandbox"].as_str(),
+            Some(SANDBOX)
+        );
+        assert_eq!(
+            server["http_headers"].as_table().map(toml::Table::len),
+            Some(2)
+        );
     }
 
     #[test]
-    fn config_toml_omits_the_bearer_token_when_there_is_none() {
+    fn config_toml_sends_only_the_sandbox_header_without_a_token() {
         let mut a = args();
         a.broker.name = "b".into();
         let seeds = seed_files(&a, Some("http://x/mcp"), None, None, &Default::default());
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
         assert_eq!(v["mcp_servers"]["b"]["url"].as_str(), Some("http://x/mcp"));
-        assert!(v["mcp_servers"]["b"].get("http_headers").is_none());
+        let headers = v["mcp_servers"]["b"]["http_headers"]
+            .as_table()
+            .expect("http_headers table");
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers["X-Crucible-Sandbox"].as_str(), Some(SANDBOX));
     }
 
     #[test]

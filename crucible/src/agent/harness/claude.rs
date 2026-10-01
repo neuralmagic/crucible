@@ -99,16 +99,15 @@ fn insert_session_flags(a: &mut Vec<String>, session: &crate::agent::agent_sessi
     a.insert(at, flag.to_string());
 }
 
-/// The `.mcp.json` seeded into the sandbox: one streamable-http server pointing at the broker.
-/// `name` is the agent-visible MCP server name (the `mcp__<name>__…` tool prefix), domain-owned.
-/// `token`, when set, rides as an `Authorization: Bearer` header, the broker's port sits on a
-/// `0.0.0.0` bind, so the header is what makes the sandbox the only caller it answers.
-fn mcp_config_json(name: &str, url: &str, token: Option<&str>) -> String {
-    let mut server = serde_json::json!({ "type": "http", "url": url });
-    if let Some(t) = token {
-        server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {t}") });
-    }
-    serde_json::json!({ "mcpServers": { name: server } }).to_string()
+/// The `.mcp.json` seeded into the sandbox: one streamable-http server pointing at the broker,
+/// under the agent-visible MCP server name (the `mcp__<name>__…` tool prefix), domain-owned.
+fn mcp_config_json(broker: &Broker<'_>) -> String {
+    let server = serde_json::json!({
+        "type": "http",
+        "url": broker.url,
+        "headers": broker.json_headers(),
+    });
+    serde_json::json!({ "mcpServers": { broker.name: server } }).to_string()
 }
 
 impl Backend for Claude {
@@ -171,7 +170,7 @@ impl Backend for Claude {
         broker: Option<&Broker<'_>>,
         _inference: &InferenceEnv,
     ) -> Option<String> {
-        broker.map(|b| mcp_config_json(b.name, b.url, b.token))
+        broker.map(mcp_config_json)
     }
 
     fn decoder(
@@ -218,6 +217,8 @@ mod tests {
     use crate::agent::harness::{SandboxAuth, SeedFile};
     use clap::Parser;
 
+    const SANDBOX: &str = "ci-0123456789abcdef";
+
     const MCP_CONFIG: &str = Claude::SPEC.config;
 
     /// Parse a bare arg list into [`Args`] via the top-level CLI (the loop is the
@@ -233,6 +234,7 @@ mod tests {
             args,
             broker_url,
             broker_token,
+            SANDBOX,
             &SandboxAuth::Gateway,
             &Default::default(),
         )
@@ -411,30 +413,45 @@ mod tests {
         assert_eq!(v.last().unwrap(), "-p");
     }
 
+    fn broker<'a>(name: &'a str, url: &'a str, token: Option<&'a str>) -> Broker<'a> {
+        Broker {
+            name,
+            url,
+            token,
+            sandbox: SANDBOX,
+        }
+    }
+
     #[test]
     fn mcp_config_json_points_one_http_server_at_the_url() {
         let url = "http://host.containers.internal:8849/mcp";
         let v: serde_json::Value =
-            serde_json::from_str(&mcp_config_json("epp-broker", url, None)).expect("valid json");
-        assert_eq!(v["mcpServers"]["epp-broker"]["type"], "http");
-        assert_eq!(v["mcpServers"]["epp-broker"]["url"], url);
-        assert!(
-            v["mcpServers"]["epp-broker"].get("headers").is_none(),
-            "no token, no headers block"
+            serde_json::from_str(&mcp_config_json(&broker("epp-broker", url, None)))
+                .expect("valid json");
+        let server = &v["mcpServers"]["epp-broker"];
+        assert_eq!(server["type"], "http");
+        assert_eq!(server["url"], url);
+        assert_eq!(
+            server["headers"],
+            serde_json::json!({ "X-Crucible-Sandbox": SANDBOX }),
+            "no token, only the sandbox header"
         );
     }
 
     #[test]
     fn mcp_config_json_carries_the_bearer_header_when_token_set() {
-        let v: serde_json::Value = serde_json::from_str(&mcp_config_json(
+        let v: serde_json::Value = serde_json::from_str(&mcp_config_json(&broker(
             "broker",
             "http://host.containers.internal:8849/mcp",
             Some("s3cr3t"),
-        ))
+        )))
         .expect("valid json");
         assert_eq!(
-            v["mcpServers"]["broker"]["headers"]["Authorization"],
-            "Bearer s3cr3t"
+            v["mcpServers"]["broker"]["headers"],
+            serde_json::json!({
+                "Authorization": "Bearer s3cr3t",
+                "X-Crucible-Sandbox": SANDBOX,
+            })
         );
     }
 
@@ -443,7 +460,7 @@ mod tests {
     #[test]
     fn mcp_config_json_escapes_hostile_values() {
         let v: serde_json::Value =
-            serde_json::from_str(&mcp_config_json(r#"we"ird"#, "http://x/mcp", None))
+            serde_json::from_str(&mcp_config_json(&broker(r#"we"ird"#, "http://x/mcp", None)))
                 .expect("valid json even with a quote in the name");
         assert_eq!(v["mcpServers"][r#"we"ird"#]["url"], "http://x/mcp");
     }
@@ -457,6 +474,9 @@ mod tests {
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].dest, MCP_CONFIG);
         let v: serde_json::Value = serde_json::from_str(&seeds[0].content).expect("valid json");
-        assert!(v["mcpServers"].is_object());
+        assert_eq!(
+            v["mcpServers"][a.broker.name.as_str()]["headers"]["X-Crucible-Sandbox"],
+            SANDBOX
+        );
     }
 }

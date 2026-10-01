@@ -640,6 +640,7 @@ async fn try_turn(
             args,
             broker_url.as_deref(),
             seed_token.as_deref(),
+            &name,
             &sandbox_auth,
             &inference,
         );
