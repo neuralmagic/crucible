@@ -72,9 +72,9 @@ pub(crate) fn spawn_approval_watch(broker: Arc<Broker>, handle: String, regime: 
 
 /// The control-bridge address, if crucible gave us one.
 fn control_addr() -> Option<String> {
-    std::env::var(CONTROL_ADDR_ENV)
-        .ok()
-        .filter(|s| !s.is_empty())
+    [crucible_contract::mcp::ENV_CONTROL_ADDR, CONTROL_ADDR_ENV]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|s| !s.is_empty()))
 }
 
 /// Send one NDJSON control command to the loop's control bridge and return once it's flushed. The

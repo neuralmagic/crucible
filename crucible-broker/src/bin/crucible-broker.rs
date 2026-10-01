@@ -145,7 +145,9 @@ async fn main() -> anyhow::Result<()> {
         long_frac: 0.0,
     };
 
-    let bind = std::env::var("BROKER_BIND").unwrap_or_else(|_| DEFAULT_BIND.into());
+    let bind = std::env::var(crucible_contract::mcp::ENV_BIND)
+        .or_else(|_| std::env::var("BROKER_BIND"))
+        .unwrap_or_else(|_| DEFAULT_BIND.into());
     // Only reaches clients negotiating a protocol older than 2026-07-28; from that version on,
     // sessions are gone from the transport and every request is served statelessly regardless.
     let legacy_sessions = std::env::var("BROKER_STATEFUL").is_ok_and(|v| v == "1" || v == "true");
@@ -184,14 +186,19 @@ async fn main() -> anyhow::Result<()> {
         Default::default(),
         config,
     );
-    // Bearer guard (crucible mints BROKER_TOKEN and seeds it into the sandbox's `.mcp.json`):
+    // Bearer guard (crucible mints the tokens and seeds them into the sandbox's MCP config):
     // without it, the 0.0.0.0 bind answers any pod that can route to this port.
-    let token = std::sync::Arc::new(crucible_broker::auth::expected_token());
-    if token.is_none() {
-        eprintln!("warning: BROKER_TOKEN unset — the broker endpoint is unauthenticated");
+    let guard = crucible_broker::auth::guard();
+    if guard == crucible_broker::auth::Guard::Open {
+        eprintln!(
+            "warning: neither MCP_TOKENS_FILE nor BROKER_TOKEN is set; the broker endpoint is unauthenticated"
+        );
     }
     let app = axum::Router::new().nest_service(MCP_PATH, service).layer(
-        axum::middleware::from_fn_with_state(token, crucible_broker::auth::require_bearer),
+        axum::middleware::from_fn_with_state(
+            std::sync::Arc::new(guard),
+            crucible_broker::auth::require_guard,
+        ),
     );
 
     let listener = tokio::net::TcpListener::bind(&bind)
