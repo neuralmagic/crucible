@@ -7,6 +7,7 @@ mod broker;
 mod capability;
 mod deploy;
 mod judge;
+mod mcp;
 mod measure;
 mod openshell;
 pub mod outputs;
@@ -25,6 +26,9 @@ pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broke
 pub use capability::{CapabilitiesCfg, CredentialContext};
 pub use deploy::DeployCfg;
 pub use judge::JudgeCfg;
+pub use mcp::{
+    McpCfg, McpError, McpKey, McpScopes, McpServerDecl, McpSet, McpSource, SandboxScope,
+};
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
@@ -313,6 +317,10 @@ pub struct Manifest {
     /// Declared credentials, the half of the capability disclosure a name alone cannot state.
     #[serde(default)]
     pub capabilities: CapabilitiesCfg,
+    /// MCP servers by `[mcp.<key>]`. None is reached unless `[agent].mcp` or a sandbox's `mcp`
+    /// names it.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpCfg>,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -741,9 +749,13 @@ pub struct AgentCfg {
     /// GPUs, CPU and memory for the `openshell` backend's sandbox.
     #[serde(default)]
     pub resources: SandboxResources,
-    /// The loop-pod provisioning broker. Off unless a domain opts in.
+    /// The loop-pod provisioning broker. Off unless a domain opts in. Deprecated: it desugars to
+    /// `[mcp.<name>]`, reached by turns without a named sandbox.
     #[serde(default)]
     pub broker: BrokerCfg,
+    /// The `[mcp]` servers turns without a named sandbox reach. Empty reaches none.
+    #[serde(default)]
+    pub mcp: Vec<String>,
     /// Named sandboxes, by `[agent.sandbox.<name>]`. An `agent(sandbox = "<name>")` task runs in
     /// that sandbox instead of the defaults above.
     #[serde(default)]
@@ -754,8 +766,8 @@ pub struct AgentCfg {
 pub const MODEL_API_KEY_ENVS: [&str; 2] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
 
 /// One `[agent.sandbox.<name>]`: the image a task's sandbox starts from, the declared env secrets
-/// and `[[agent.relay]]` files passed in (every other one is withheld), whether it reaches the
-/// broker, and egress endpoints added to `[agent.openshell]`'s.
+/// and `[[agent.relay]]` files passed in (every other one is withheld), the MCP servers it reaches,
+/// and egress endpoints added to `[agent.openshell]`'s.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxProfile {
@@ -766,9 +778,12 @@ pub struct SandboxProfile {
     /// `[[agent.relay]]` destinations. Empty relays no file in.
     #[serde(default)]
     pub relays: Vec<String>,
-    /// Whether the turn reaches the `[agent.broker]`.
+    /// Whether the turn reaches the `[agent.broker]`. Deprecated: list the broker in `mcp`.
     #[serde(default)]
     pub broker: bool,
+    /// The `[mcp]` servers the turn reaches. Empty reaches none.
+    #[serde(default)]
+    pub mcp: Vec<String>,
     /// `host:port[:access...]` entries added to the pack's egress allowlist.
     #[serde(default)]
     pub endpoints: Vec<String>,
@@ -826,6 +841,27 @@ fn validate_task_sandboxes(agent: &AgentCfg, workflow: &WorkflowCfg) -> Result<(
         Some(err) => Err(err),
         None => Ok(()),
     }
+}
+
+/// The servers a run starts and which turns reach each, `[agent.broker]` desugared.
+pub fn mcp_set(
+    table: &BTreeMap<String, McpCfg>,
+    agent: &AgentCfg,
+    capabilities: &CapabilitiesCfg,
+) -> Result<McpSet, McpError> {
+    let scopes = McpScopes {
+        agent: &agent.mcp,
+        sandboxes: agent
+            .sandbox
+            .iter()
+            .map(|(name, profile)| SandboxScope {
+                name,
+                mcp: &profile.mcp,
+                broker: profile.broker,
+            })
+            .collect(),
+    };
+    McpSet::resolve(table, &agent.broker, &scopes, capabilities)
 }
 
 /// The first task naming a sandbox `declared` does not know.
@@ -902,12 +938,14 @@ struct CommonCfg<'a> {
     secrets: &'a [SecretDecl],
     outputs: &'a OutputsCfg,
     capabilities: &'a CapabilitiesCfg,
+    mcp: &'a BTreeMap<String, McpCfg>,
 }
 
 fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     if c.agent.broker.enabled && c.agent.broker.bin.is_empty() {
         return Err(ManifestError::BrokerBinRequired.into());
     }
+    mcp_set(c.mcp, c.agent, c.capabilities)?;
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
     validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
@@ -1015,6 +1053,11 @@ fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
 }
 
 impl Manifest {
+    /// The MCP servers this pack starts and who reaches them.
+    pub fn mcp_set(&self) -> Result<McpSet, McpError> {
+        mcp_set(&self.mcp, &self.agent, &self.capabilities)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading manifest {}", path.display()))?;
@@ -1069,6 +1112,7 @@ impl Manifest {
             secrets: &self.secrets,
             outputs: &self.outputs,
             capabilities: &self.capabilities,
+            mcp: &self.mcp,
         })
     }
 
@@ -1232,6 +1276,10 @@ pub struct CompositeManifest {
     /// Declared credentials, the half of the capability disclosure a name alone cannot state.
     #[serde(default)]
     pub capabilities: CapabilitiesCfg,
+    /// MCP servers by `[mcp.<key>]`. None is reached unless `[agent].mcp` or a sandbox's `mcp`
+    /// names it.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpCfg>,
 }
 
 #[derive(Deserialize)]
@@ -1278,6 +1326,11 @@ pub fn is_composite(path: &Path) -> bool {
 }
 
 impl CompositeManifest {
+    /// The MCP servers this pack starts and who reaches them.
+    pub fn mcp_set(&self) -> Result<McpSet, McpError> {
+        mcp_set(&self.mcp, &self.agent, &self.capabilities)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading composite manifest {}", path.display()))?;
@@ -1341,6 +1394,7 @@ impl CompositeManifest {
             secrets: &self.secrets,
             outputs: &self.outputs,
             capabilities: &self.capabilities,
+            mcp: &self.mcp,
         })
     }
 

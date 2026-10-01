@@ -15,7 +15,7 @@ pub struct EmptyBrokerAuthority {
 /// domain manifest never names the transport. When `enabled`, the engine also auto-appends the
 /// broker's `host:port` to the resolved egress allowlist, so a domain does not need to list it in
 /// `[agent.openshell].endpoints`.
-#[derive(Deserialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct BrokerCfg {
     #[serde(default)]
