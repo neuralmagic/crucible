@@ -124,10 +124,13 @@ pub enum KnownCapability {
     },
     McpServer {
         name: String,
-        #[serde(default)]
-        catalog: Option<String>,
+        catalog: String,
         #[serde(default)]
         bin: Option<String>,
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        secrets: Vec<String>,
         #[serde(default)]
         tools: Vec<String>,
         #[serde(default)]
@@ -145,7 +148,6 @@ pub enum KnownCapability {
         secrets: Vec<String>,
         #[serde(default)]
         relays: Vec<String>,
-        /// Older documents state broker reach as a flag instead of [`KnownCapability::Sandbox::mcp`].
         #[serde(default)]
         broker: bool,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -202,18 +204,23 @@ impl Capability {
                 name,
                 catalog,
                 bin,
+                env,
+                secrets,
                 tools,
                 agent,
                 sandboxes,
             } => {
-                let source = catalog
+                let bin = bin
                     .as_deref()
-                    .map(|c| format!("catalog:{c}"))
-                    .or_else(|| bin.as_deref().map(|b| format!("bin:{b}")))
+                    .map(|b| format!(" ({b})"))
                     .unwrap_or_default();
+                let env: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
                 format!(
-                    "mcp {name} {source} agent:{agent} sandboxes [{}] tools [{}]",
+                    "mcp {name} catalog:{catalog}{bin} agent:{agent} sandboxes [{}] secrets [{}] \
+                     env [{}] tools [{}]",
                     sandboxes.join(", "),
+                    secrets.join(", "),
+                    env.join(", "),
                     tools.join(", ")
                 )
             }
@@ -532,14 +539,16 @@ mod tests {
             DOC.replace(
                 r#"{"kind":"time-travel","era":"cretaceous"}"#,
                 &format!(
-                    r#"{{"kind":"mcp-server","name":"jira","catalog":"ujira","bin":null,"tools":["comment"],"agent":false,"sandboxes":[{sandboxes}]}}"#
+                    r#"{{"kind":"mcp-server","name":"jira","catalog":"ujira","bin":null,"env":{{"JIRA_LABEL":"x"}},"secrets":["JIRA_TOKEN"],"tools":["comment"],"agent":false,"sandboxes":[{sandboxes}]}}"#
                 ),
             )
         };
         let narrow: Exposure = serde_json::from_str(&with_server(r#""go""#)).expect("decodes");
         assert!(
             narrow.capability_lines().contains(
-                &"mcp jira catalog:ujira agent:false sandboxes [go] tools [comment]".to_string()
+                &"mcp jira catalog:ujira agent:false sandboxes [go] secrets [JIRA_TOKEN] \
+                  env [JIRA_LABEL=x] tools [comment]"
+                    .to_string()
             ),
             "{:?}",
             narrow.capability_lines()

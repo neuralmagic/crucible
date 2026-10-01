@@ -464,8 +464,9 @@ scope   = "read + comment on PROJ"
 
 The rest of the disclosure is read from what the manifest already declares: the resolved egress
 allowlist (each entry labelled `builtin` or `manifest`), every `[agent].env` name, every
-`[[agent.relay]]` destination, a substituted `[agent.broker].bin`, each MCP server the run starts
-(its catalog entry or binary, its tool selection, and which turns reach it), what each named
+`[[agent.relay]]` destination, a substituted `[agent.broker].bin`, each `[mcp]` server the run starts
+(its catalog entry, the env values and secrets the pack hands it, its tool selection, and which
+turns reach it), what each named
 sandbox reaches, and whether the pack runs commands outside the sandbox (workflow
 `command`/`evaluate` tasks, world and judge hooks). At run
 start, an agent-visible env value or a relay file the disclosure does not cover is refused, naming
