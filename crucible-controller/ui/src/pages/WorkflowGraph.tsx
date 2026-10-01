@@ -96,7 +96,8 @@ const TONE_TEXT: Record<TaskTone, string> = {
 /// page it is already the overview.
 const MINIMAP_FROM = 8;
 
-/// The rule down a node's left edge: what runs the task.
+/// The rule down a node's left edge: what runs the task. A mapped task runs nothing itself and
+/// takes the full-ink rule instead.
 const KIND_RULE: Record<string, string> = {
   agent: 'bg-blue',
   command: 'bg-ink-2',
@@ -267,7 +268,7 @@ function TaskCard({ id }: NodeProps) {
           aria-hidden
           className={cn(
             'absolute top-1 bottom-1 left-0 w-[2px]',
-            KIND_RULE[node.kind] ?? 'bg-ink-3'
+            fanout !== null ? 'bg-ink' : (KIND_RULE[node.kind] ?? 'bg-ink-3')
           )}
         />
         {/* The result task ends the graph: a solid end bar, the way a column ends. */}
@@ -632,7 +633,7 @@ function GraphCanvas({
     tones.has('pass') ? 'green = passed' : null,
     tones.has('fail') ? 'red = failed' : null,
     layout.nodes.some((laid) => (laid.node.fanout ?? null) !== null)
-      ? 'stacked = mapped over a producer field'
+      ? 'MAP = mapped over a producer field'
       : null,
     layout.nodes.some((laid) => !laid.node.required) ? 'dashed = advisory' : null,
     layout.edges.some((laid) => laid.label !== null) ? 'passed = joins only on what passed' : null,

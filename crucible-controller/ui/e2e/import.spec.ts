@@ -351,7 +351,9 @@ test.describe('pack import wizard', () => {
     await page.keyboard.press('Escape');
     await expect(panel).toBeHidden();
 
-    // A mapped task says what it maps over and how wide it may get.
+    // A mapped task says what it maps over and how wide it may get, and the preview surface
+    // badges it as the fan-out it is rather than as what its instances run.
+    await expect(graph.locator('[data-task="summarize"]')).toContainText('MAP');
     await graph.locator('[data-task="summarize"]').click();
     const mapped = page.getByRole('complementary', { name: 'Task summarize' });
     await expect(mapped).toContainText('read.paper');

@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { stubApi, TRIAGE_RUN } from './api';
+import { RETRY_RUN, stubApi, TRIAGE_RUN } from './api';
 
 const RUN = '/runs/RUN-0412';
 
@@ -36,6 +36,32 @@ test.describe('the run task graph', () => {
     await expect(failed).toContainText('fail');
     await expect(graph.locator('[data-task="summarize[paged-attention]"]')).toContainText('pass');
     await expect(page.getByText('red = failed')).toBeVisible();
+  });
+
+  /// A mapped task is the fan-out, not the work: it says MAP, and the instances under it say what
+  /// they actually run.
+  test('badges a mapped task as a map and its instances as what they run', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    const deck = graph.locator('[data-task="summarize"]');
+    await expect(deck).toContainText('MAP');
+    await expect(deck).toContainText('over read.papers ≤8');
+    await expect(graph.locator('[data-task="summarize[flashinfer]"]')).toContainText('CMD');
+    await expect(graph.locator('[data-task="read"]')).toContainText('AGENT');
+    await expect(page.getByText('MAP = mapped over a producer field')).toBeVisible();
+  });
+
+  /// The case the badge exists for: a mapped agent task whose deck runs nothing itself.
+  test('badges a mapped agent task as a map, not as an agent', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-task="triage"]')).toContainText('MAP');
+    await expect(graph.locator('[data-task="triage[1027]"]')).toContainText('AGENT');
+    await expect(graph.locator('[data-task="scan"]')).toContainText('AGENT');
   });
 
   /// A mapped task says what the run made of it: three papers went in, two instances started, one
@@ -198,6 +224,58 @@ test.describe('the run task grid', () => {
 
     await expect(page.getByText('pass 3', { exact: true })).toBeVisible();
     await expect(page.getByText('fail 2', { exact: true })).toBeVisible();
+  });
+
+  /// What an agent instance actually ran with, beside the attempt it ran. The mapped parent runs
+  /// nothing itself, so it reports a value only where its instances agreed on one, and a command
+  /// task reports none at all.
+  test('names the provider, model and effort each agent task ran with', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    const grid = page.getByTestId('run-grid');
+    const cell = (task: string, col: string) =>
+      grid.locator(`[data-task-agent="${task}"][data-col="${col}"]`);
+
+    await expect(cell('scan', 'provider')).toHaveText('pricetag-glm');
+    await expect(cell('scan', 'model')).toHaveText('glm-5.3');
+    await expect(cell('scan', 'effort')).toHaveText('low');
+
+    await expect(cell('triage[952]', 'model')).toHaveText('glm-5.3');
+    await expect(cell('triage[952]', 'effort')).toHaveText('high');
+
+    await expect(cell('triage', 'model')).toHaveText('glm-5.3');
+    await expect(cell('triage', 'effort')).toHaveText('\u2014');
+
+    for (const col of ['provider', 'model', 'effort']) {
+      await expect(cell('roundup', col)).toHaveText('');
+    }
+  });
+
+  /// A task that reported the same status nine iterations running is drawn as three blocks, not
+  /// nine squares: the stretches carry their length and the failure keeps its own column.
+  test('melds a run of attempts that ended the same way', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${RETRY_RUN}`);
+
+    const row = page.getByTestId('run-grid').locator('[data-task="probe"]');
+    await expect(row).toHaveCount(3);
+    await expect(row).toHaveText(['5', '', '3']);
+    await expect(row.nth(0)).toHaveAttribute('data-status', 'pass');
+    await expect(row.nth(0)).toHaveAttribute('data-iter', '0');
+    await expect(row.nth(1)).toHaveAttribute('data-status', 'fail');
+    await expect(row.nth(1)).toHaveAttribute('data-span', '1');
+    await expect(row.nth(2)).toHaveAttribute('data-iter', '6');
+    await expect(row.nth(2)).toHaveAttribute('data-span', '3');
+  });
+
+  /// Picking a melded block opens the first attempt under it, not the last.
+  test('opens the first attempt of a melded block', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${RETRY_RUN}`);
+
+    await page.getByTestId('run-grid').locator('[data-task="probe"]').nth(2).click();
+    await expect(page.getByText('iter 6', { exact: true })).toBeVisible();
   });
 
   /// Picking a cell reads that task's evidence without leaving the grid.

@@ -45,6 +45,13 @@ describe('the badge', () => {
     expect(badgeFor(task('a', { kind: 'engine' }))).toBe('ENGINE');
     expect(badgeFor(task('a', { kind: 'other' }))).toBe('TASK');
   });
+
+  it('calls a mapped task a map, whatever its instances run', () => {
+    const over = { over_task: 'fan', over_field: 'idea', max_fanout: null };
+    expect(badgeFor(task('a', { kind: 'agent', fanout: over }))).toBe('MAP');
+    expect(badgeFor(task('a', { kind: 'command', fanout: over }))).toBe('MAP');
+    expect(badgeFor(task('a[one]', { kind: 'agent' }))).toBe('AGENT');
+  });
 });
 
 describe('the line under the name', () => {
