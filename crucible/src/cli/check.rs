@@ -68,13 +68,13 @@ pub fn run(manifest_path: &Path) -> Result<CheckOutcome> {
 pub fn run_parse_only(manifest_path: &Path) -> Result<CheckOutcome> {
     let result = if manifest::is_composite(manifest_path) {
         CompositeManifest::load(manifest_path)
-            .map(|m| crate::exposure::render(&crate::exposure::compute_composite(&m)))
+            .map(|m| render_exposure(crate::exposure::compute_composite(&m)))
             .map_err(|e| format!("composite manifest parse failed: {e:#}"))
     } else {
         Manifest::load(manifest_path)
             .map_err(|e| format!("manifest parse failed: {e:#}"))
             .and_then(|m| {
-                let mut exposure = crate::exposure::render(&crate::exposure::compute(&m, None));
+                let mut exposure = render_exposure(crate::exposure::compute(&m, None));
                 exposure.extend(history_limit_line(&m, operator_history_limit().as_deref())?);
                 Ok(exposure)
             })
@@ -194,7 +194,7 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
     let workspace = manifest_dir.join(&m.workspace.dir);
 
     let mut out = CheckOutcome {
-        exposure: crate::exposure::render(&crate::exposure::compute(&m, None)),
+        exposure: render_exposure(crate::exposure::compute(&m, None)),
         ..CheckOutcome::default()
     };
     match history_limit_line(&m, operator_history_limit().as_deref()) {
@@ -203,6 +203,10 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
     }
     out.warnings.extend(undeclared_credential_warnings(&m));
     out.warnings.extend(shadowed_deny_warnings(&m.agent));
+    out.warnings.extend(mcp_warnings(
+        &m.mcp_set().unwrap_or_default(),
+        &crate::control::mcp::catalog::dir(),
+    ));
     check_referenced_files(&m, &manifest_dir, &mut out);
     if !out.ok() {
         // Missing goal/prompt/inject files means the run would fail before ever measuring,
@@ -289,6 +293,40 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         }
     }
     Ok(out)
+}
+
+/// The exposure for a human, each catalog server's binary read from this machine's catalog.
+fn render_exposure(mut exposure: crate::exposure::Exposure) -> Vec<String> {
+    let dir = crate::control::mcp::catalog::dir();
+    crate::exposure::with_catalog_bins(&mut exposure, |name| {
+        crate::control::mcp::catalog::load(&dir, name)
+            .ok()
+            .map(|entry| entry.bin)
+    });
+    crate::exposure::render(&exposure)
+}
+
+/// A desugared `[agent.broker]` is deprecated, and a catalog entry this machine cannot read is
+/// one the loop image has to carry.
+fn mcp_warnings(set: &manifest::McpSet, catalog: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(key) = &set.legacy {
+        out.push(format!(
+            "[agent.broker] is deprecated: declare it as [mcp.{key}] and list it in [agent].mcp \
+             and each sandbox's mcp"
+        ));
+    }
+    for server in &set.servers {
+        if let manifest::McpSource::Catalog(name) = &server.source
+            && let Err(e) = crate::control::mcp::catalog::load(catalog, name)
+        {
+            out.push(format!(
+                "[mcp.{}]: {e}; the loop image must carry it",
+                server.key
+            ));
+        }
+    }
+    out
 }
 
 /// One warning per `[agent.openshell].deny_endpoints` entry the resolved allowlist still admits:
@@ -389,10 +427,14 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
     let manifest_dir = crate::manifest::manifest_dir(manifest_path);
 
     let mut out = CheckOutcome {
-        exposure: crate::exposure::render(&crate::exposure::compute_composite(&m)),
+        exposure: render_exposure(crate::exposure::compute_composite(&m)),
         ..CheckOutcome::default()
     };
     out.warnings.extend(shadowed_deny_warnings(&m.agent));
+    out.warnings.extend(mcp_warnings(
+        &m.mcp_set().unwrap_or_default(),
+        &crate::control::mcp::catalog::dir(),
+    ));
     if let Some(f) = &m.agent.goal_file {
         check_file_exists("[agent].goal_file", &manifest_dir, f, &mut out);
     }
@@ -1356,5 +1398,43 @@ workflow(type = "playbook", tasks = [a])
             out.findings
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mcp_warnings_flag_a_desugared_broker_and_a_catalog_entry_this_machine_lacks() {
+        let m: Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            mcp = ["jira", "trace"]
+            [agent.broker]
+            enabled = true
+            bin = "b"
+            [mcp.jira]
+            catalog = "ujira"
+            [mcp.trace]
+            "#,
+        )
+        .expect("parses");
+        let dir = tempfile::tempdir().expect("scratch");
+        std::fs::write(
+            dir.path().join("trace.toml"),
+            "description = \"t\"\nbin = \"trace-mcp\"\n",
+        )
+        .expect("entry");
+        let warnings = mcp_warnings(&m.mcp_set().expect("resolves"), dir.path());
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(
+            warnings[0].contains("[agent.broker] is deprecated"),
+            "{warnings:?}"
+        );
+        assert!(warnings[0].contains("[mcp.broker]"), "{warnings:?}");
+        assert!(
+            warnings[1].starts_with("[mcp.jira]") && warnings[1].contains("ujira"),
+            "{warnings:?}"
+        );
     }
 }

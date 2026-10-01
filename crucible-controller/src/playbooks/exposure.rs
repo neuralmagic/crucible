@@ -122,6 +122,19 @@ pub enum KnownCapability {
     BrokerBin {
         bin: String,
     },
+    McpServer {
+        name: String,
+        #[serde(default)]
+        catalog: Option<String>,
+        #[serde(default)]
+        bin: Option<String>,
+        #[serde(default)]
+        tools: Vec<String>,
+        #[serde(default)]
+        agent: bool,
+        #[serde(default)]
+        sandboxes: Vec<String>,
+    },
     ExternalCommands {
         present: bool,
     },
@@ -132,8 +145,11 @@ pub enum KnownCapability {
         secrets: Vec<String>,
         #[serde(default)]
         relays: Vec<String>,
+        /// Older documents state broker reach as a flag instead of [`KnownCapability::Sandbox::mcp`].
         #[serde(default)]
         broker: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        mcp: Vec<String>,
         #[serde(default)]
         egress: Vec<String>,
     },
@@ -182,6 +198,25 @@ impl Capability {
                 format!("relay {path} <- {}", sources.join(", "))
             }
             KnownCapability::BrokerBin { bin } => format!("broker-bin {bin}"),
+            KnownCapability::McpServer {
+                name,
+                catalog,
+                bin,
+                tools,
+                agent,
+                sandboxes,
+            } => {
+                let source = catalog
+                    .as_deref()
+                    .map(|c| format!("catalog:{c}"))
+                    .or_else(|| bin.as_deref().map(|b| format!("bin:{b}")))
+                    .unwrap_or_default();
+                format!(
+                    "mcp {name} {source} agent:{agent} sandboxes [{}] tools [{}]",
+                    sandboxes.join(", "),
+                    tools.join(", ")
+                )
+            }
             KnownCapability::ExternalCommands { present } => {
                 format!("external-commands present:{present}")
             }
@@ -191,11 +226,13 @@ impl Capability {
                 secrets,
                 relays,
                 broker,
+                mcp,
                 egress,
             } => format!(
-                "sandbox {name} {image} secrets [{}] relays [{}] broker:{broker} egress [{}]",
+                "sandbox {name} {image} secrets [{}] relays [{}] broker:{broker} mcp [{}] egress [{}]",
                 secrets.join(", "),
                 relays.join(", "),
+                mcp.join(", "),
                 egress.join(", ")
             ),
         }
@@ -475,7 +512,7 @@ mod tests {
         assert!(
             narrow.capability_lines().contains(
                 &"sandbox go ghcr.io/acme/go@sha256:bb secrets [registry] relays [] broker:false \
-                  egress [proxy.golang.org:443:read-only]"
+                  mcp [] egress [proxy.golang.org:443:read-only]"
                     .to_string()
             ),
             "{:?}",
@@ -483,6 +520,32 @@ mod tests {
         );
         let widened: Exposure =
             serde_json::from_str(&with_sandbox("evil.example:443:full")).expect("decodes");
+        assert_ne!(
+            narrow.digest().expect("digest"),
+            widened.digest().expect("digest")
+        );
+    }
+
+    #[test]
+    fn an_mcp_server_renders_and_wider_reach_changes_the_digest() {
+        let with_server = |sandboxes: &str| {
+            DOC.replace(
+                r#"{"kind":"time-travel","era":"cretaceous"}"#,
+                &format!(
+                    r#"{{"kind":"mcp-server","name":"jira","catalog":"ujira","bin":null,"tools":["comment"],"agent":false,"sandboxes":[{sandboxes}]}}"#
+                ),
+            )
+        };
+        let narrow: Exposure = serde_json::from_str(&with_server(r#""go""#)).expect("decodes");
+        assert!(
+            narrow.capability_lines().contains(
+                &"mcp jira catalog:ujira agent:false sandboxes [go] tools [comment]".to_string()
+            ),
+            "{:?}",
+            narrow.capability_lines()
+        );
+        let widened: Exposure =
+            serde_json::from_str(&with_server(r#""go","bare""#)).expect("decodes");
         assert_ne!(
             narrow.digest().expect("digest"),
             widened.digest().expect("digest")

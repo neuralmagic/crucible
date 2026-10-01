@@ -271,7 +271,7 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     let frozen = crate::cli::setup::FrozenProjection {
         broker_env: crate::cli::setup::broker_bounds_env(&bounds, &p.session_log)?,
         disclosure: Some(crate::exposure::covered_from(
-            crate::exposure::composite_capabilities(&m.agent, &m.capabilities),
+            crate::exposure::composite_capabilities(&m.agent, &m.capabilities, &m.mcp_set()?),
         )),
         bounds: Some(bounds),
         mcp: m.mcp_set()?,

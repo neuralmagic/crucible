@@ -5,7 +5,7 @@
 //! content executes, so `crucible check` and `crucible plan exposure` can print a pack's reach
 //! before anything of the pack has run.
 
-use crate::manifest::{CapabilitiesCfg, CredentialContext, Manifest};
+use crate::manifest::{CapabilitiesCfg, CredentialContext, Manifest, McpSet, McpSource};
 use crate::openshell::gateway::ComputeDriver;
 use crucible_contract::outputs::{BoundSource, ResolvedOutputs, ResolvedTarget};
 use serde::Serialize;
@@ -35,16 +35,30 @@ pub enum Capability {
     Relay { path: String, sources: Vec<String> },
     /// A broker binary the pack substitutes for the engine's own.
     BrokerBin { bin: String },
+    /// An MCP server the run starts, what starts it, and which turns reach it. `catalog` is the
+    /// loop-image entry; a desugared `[agent.broker]` names its `bin` instead. A catalog entry's
+    /// `bin` is filled in only where the catalog is readable (see [`with_catalog_bins`]).
+    McpServer {
+        name: String,
+        catalog: Option<String>,
+        bin: Option<String>,
+        tools: Vec<String>,
+        /// Whether turns without a named sandbox reach it.
+        agent: bool,
+        /// The named sandboxes that reach it.
+        sandboxes: Vec<String>,
+    },
     /// Whether the pack runs commands outside the sandbox, which hold their executor's reach.
     ExternalCommands { present: bool },
     /// A named `[agent.sandbox]` and what it provisions: its image, the declared secrets and
-    /// relay files passed in, broker reach, and the egress it adds after the pack's deny list.
+    /// relay files passed in, the MCP servers it reaches, and the egress it adds after the pack's
+    /// deny list.
     Sandbox {
         name: String,
         image: String,
         secrets: Vec<String>,
         relays: Vec<String>,
-        broker: bool,
+        mcp: Vec<String>,
         egress: Vec<String>,
     },
 }
@@ -99,9 +113,10 @@ pub fn resolved_outputs(m: &Manifest, pr_repo: Option<&str>) -> ResolvedOutputs 
 }
 
 /// Every disclosed capability, in a stable order: egress, credentials, relays, broker
-/// substitution, then the external-command statement.
+/// substitution, MCP servers, the external-command statement, then the named sandboxes.
 pub fn capabilities(m: &Manifest) -> Vec<Capability> {
-    let mut out = egress(m);
+    let mcp = m.mcp_set().unwrap_or_default();
+    let mut out = egress(m, &mcp);
     out.extend(credentials(&m.agent.env, &m.capabilities));
     out.extend(m.agent.relay.iter().map(|r| Capability::Relay {
         path: r.dest.clone(),
@@ -112,15 +127,57 @@ pub fn capabilities(m: &Manifest) -> Vec<Capability> {
             bin: m.agent.broker.bin.clone(),
         });
     }
+    out.extend(mcp_servers(&mcp));
     if runs_external_commands(m) {
         out.push(Capability::ExternalCommands { present: true });
     }
-    out.extend(sandboxes(&m.agent));
+    out.extend(sandboxes(&m.agent, &mcp));
     out
 }
 
-fn sandboxes(agent: &crate::manifest::AgentCfg) -> impl Iterator<Item = Capability> + '_ {
-    agent.sandbox.iter().map(|(name, profile)| {
+/// One [`Capability::McpServer`] per server the run starts, in key order.
+fn mcp_servers(set: &McpSet) -> impl Iterator<Item = Capability> + '_ {
+    set.servers.iter().map(|server| {
+        let (catalog, bin) = match &server.source {
+            McpSource::Catalog(name) => (Some(name.clone()), None),
+            McpSource::Broker(cfg) => (None, Some(cfg.bin.clone())),
+        };
+        Capability::McpServer {
+            name: server.key.to_string(),
+            catalog,
+            bin,
+            tools: server.tools.clone(),
+            agent: set.agent.contains(&server.key),
+            sandboxes: set
+                .sandboxes
+                .iter()
+                .filter(|(_, reach)| reach.contains(&server.key))
+                .map(|(name, _)| name.clone())
+                .collect(),
+        }
+    })
+}
+
+/// Fill each catalog server's `bin` from `lookup` (the catalog this process can read). A server
+/// `lookup` does not know keeps `bin` empty.
+pub fn with_catalog_bins(exposure: &mut Exposure, lookup: impl Fn(&str) -> Option<String>) {
+    for cap in &mut exposure.capabilities {
+        if let Capability::McpServer {
+            catalog: Some(catalog),
+            bin,
+            ..
+        } = cap
+        {
+            *bin = lookup(catalog);
+        }
+    }
+}
+
+fn sandboxes<'a>(
+    agent: &'a crate::manifest::AgentCfg,
+    mcp: &'a McpSet,
+) -> impl Iterator<Item = Capability> + 'a {
+    agent.sandbox.iter().map(move |(name, profile)| {
         let added = crate::manifest::OpenshellCfg {
             endpoints: profile.endpoints.clone(),
             inherit_defaults: false,
@@ -131,50 +188,58 @@ fn sandboxes(agent: &crate::manifest::AgentCfg) -> impl Iterator<Item = Capabili
             image: profile.image.trim().to_string(),
             secrets: profile.secrets.clone(),
             relays: profile.relays.clone(),
-            broker: profile.broker,
+            mcp: mcp
+                .scope(Some(name))
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             egress: crate::openshell::policy::resolve_endpoints(&added, &[], &[]),
         }
     })
 }
 
-/// The credential and relay half of the disclosure, for a shape that is not a single-repo
-/// manifest. A composite's egress and broker reach are its components'; what it grants directly is
-/// what its own `[agent]` carries.
+/// The credential, relay, and MCP half of the disclosure, for a shape that is not a single-repo
+/// manifest. A composite's egress is its components'; what it grants directly is what its own
+/// `[agent]` and `[mcp]` carry.
 pub fn composite_capabilities(
     agent: &crate::manifest::AgentCfg,
     declared: &CapabilitiesCfg,
+    mcp: &McpSet,
 ) -> Vec<Capability> {
     let mut out = credentials(&agent.env, declared);
     out.extend(agent.relay.iter().map(|r| Capability::Relay {
         path: r.dest.clone(),
         sources: relay_sources(r),
     }));
-    out.extend(sandboxes(agent));
+    out.extend(mcp_servers(mcp));
+    out.extend(sandboxes(agent, mcp));
     out
 }
 
 /// The exposure of a composite pack. Its output bounds resolve the same way; its disclosure names
-/// only what the composite itself grants, since the egress and broker reach belong to the
-/// components.
+/// only what the composite itself grants, since the egress belongs to the components.
 pub fn compute_composite(m: &crate::manifest::CompositeManifest) -> Exposure {
     let defaults = crate::manifest::outputs::default_targets(None, &m.build);
     Exposure {
         version: EXPOSURE_VERSION,
         outputs: crate::manifest::outputs::resolve(&m.outputs, &defaults).outputs,
-        capabilities: composite_capabilities(&m.agent, &m.capabilities),
+        capabilities: composite_capabilities(
+            &m.agent,
+            &m.capabilities,
+            &m.mcp_set().unwrap_or_default(),
+        ),
     }
 }
 
 /// The resolved egress allowlist, each entry classified as built-in or manifest reach. With
 /// `inherit_defaults = false` every entry the manifest names is manifest reach, built-in
 /// lookalikes included.
-fn egress(m: &Manifest) -> Vec<Capability> {
+fn egress(m: &Manifest, mcp: &McpSet) -> Vec<Capability> {
     let harness_defaults = crate::openshell::policy::default_endpoints(m.agent.harness);
-    let broker_endpoint: Vec<String> = broker_endpoint(m).into_iter().collect();
     let resolved = crate::openshell::policy::resolve_endpoints(
         &m.agent.openshell,
         &harness_defaults,
-        &broker_endpoint,
+        &mcp_endpoints(mcp),
     );
     resolved
         .iter()
@@ -197,18 +262,22 @@ fn egress(m: &Manifest) -> Vec<Capability> {
         .collect()
 }
 
-/// The broker's own allowlist entry, when the pack enables one. The sandbox reaches the loop pod
-/// through the compute driver's alias; both drivers name the same pod, so the disclosure states
-/// the in-cluster one.
-fn broker_endpoint(m: &Manifest) -> Option<String> {
-    if !m.agent.broker.enabled {
-        return None;
-    }
-    let url = crate::manifest::resolve_broker_url(
-        &m.agent.broker,
-        ComputeDriver::Kubernetes.broker_host(),
-    );
-    crate::manifest::broker_endpoint_from_url(&url).ok()
+/// The allowlist entries of the servers turns without a named sandbox reach. The sandbox reaches
+/// the loop pod through the compute driver's alias; both drivers name the same pod, so the
+/// disclosure states the in-cluster one.
+fn mcp_endpoints(mcp: &McpSet) -> Vec<String> {
+    let host = ComputeDriver::Kubernetes.broker_host();
+    mcp.servers
+        .iter()
+        .filter(|server| mcp.agent.contains(&server.key))
+        .filter_map(|server| {
+            let url = match &server.source {
+                McpSource::Broker(cfg) => crate::manifest::resolve_broker_url(cfg, host),
+                McpSource::Catalog(_) => format!("http://{host}:{}/mcp", server.port),
+            };
+            crate::manifest::broker_endpoint_from_url(&url).ok()
+        })
+        .collect()
 }
 
 /// Split an openshell `host:port:access[:proto[:enforcement]]` entry. A bracketed IPv6 literal
@@ -431,6 +500,35 @@ fn render_capability(cap: &Capability) -> String {
             format!("relay       {path} from {}", sources.join(", "))
         }
         Capability::BrokerBin { bin } => format!("broker-bin  {bin}"),
+        Capability::McpServer {
+            name,
+            catalog,
+            bin,
+            tools,
+            agent,
+            sandboxes,
+        } => {
+            let source = match (catalog, bin) {
+                (Some(c), Some(b)) => format!("catalog {c} ({b})"),
+                (Some(c), None) => format!("catalog {c}"),
+                (None, Some(b)) => format!("[agent.broker] {b}"),
+                (None, None) => "unresolved".to_string(),
+            };
+            let mut reach: Vec<&str> = Vec::new();
+            if *agent {
+                reach.push("[agent]");
+            }
+            reach.extend(sandboxes.iter().map(String::as_str));
+            let tools = if tools.is_empty() {
+                String::new()
+            } else {
+                format!("; tools [{}]", tools.join(", "))
+            };
+            format!(
+                "mcp         {name} from {source}; reached by [{}]{tools}",
+                reach.join(", ")
+            )
+        }
         Capability::ExternalCommands { present: true } => {
             "external    this pack runs commands outside the sandbox, holding their executor's reach"
                 .to_string()
@@ -443,13 +541,13 @@ fn render_capability(cap: &Capability) -> String {
             image,
             secrets,
             relays,
-            broker,
+            mcp,
             egress,
         } => format!(
-            "sandbox     {name} from {image}; secrets [{}], relays [{}], broker {}, adds egress [{}]",
+            "sandbox     {name} from {image}; secrets [{}], relays [{}], mcp [{}], adds egress [{}]",
             secrets.join(", "),
             relays.join(", "),
-            if *broker { "yes" } else { "no" },
+            mcp.join(", "),
             egress.join(", ")
         ),
     }
@@ -500,7 +598,7 @@ mod tests {
                     image: "ghcr.io/acme/bare@sha256:cc".into(),
                     secrets: vec![],
                     relays: vec![],
-                    broker: false,
+                    mcp: vec![],
                     egress: vec![],
                 },
                 Capability::Sandbox {
@@ -508,7 +606,7 @@ mod tests {
                     image: "ghcr.io/acme/go@sha256:bb".into(),
                     secrets: vec!["registry".into()],
                     relays: vec![],
-                    broker: false,
+                    mcp: vec![],
                     egress: vec!["proxy.golang.org:443:read-only".into()],
                 },
             ],
@@ -773,5 +871,129 @@ mod tests {
         }
         assert!(text.contains("capability disclosure:"));
         assert!(text.contains("egress"));
+    }
+
+    const MCP: &str = r#"
+        [repo]
+        path = "."
+        [agent]
+        backend = "openshell"
+        goal = "g"
+        mcp = ["trace"]
+        [agent.openshell]
+        inherit_defaults = false
+        [agent.sandbox.go]
+        image = "img"
+        mcp = ["jira", "trace"]
+        [agent.sandbox.bare]
+        image = "img"
+        [mcp.jira]
+        catalog = "ujira"
+        tools = ["comment"]
+        [mcp.trace]
+        [mcp.idle]
+    "#;
+
+    #[test]
+    fn every_started_mcp_server_is_disclosed_with_who_reaches_it() {
+        let m = manifest(MCP);
+        let caps = capabilities(&m);
+        let servers: Vec<&Capability> = caps
+            .iter()
+            .filter(|c| matches!(c, Capability::McpServer { .. }))
+            .collect();
+        assert_eq!(
+            servers,
+            [
+                &Capability::McpServer {
+                    name: "jira".into(),
+                    catalog: Some("ujira".into()),
+                    bin: None,
+                    tools: vec!["comment".into()],
+                    agent: false,
+                    sandboxes: vec!["go".into()],
+                },
+                &Capability::McpServer {
+                    name: "trace".into(),
+                    catalog: Some("trace".into()),
+                    bin: None,
+                    tools: vec![],
+                    agent: true,
+                    sandboxes: vec!["go".into()],
+                },
+            ],
+            "an unscoped server is never started, so never disclosed"
+        );
+        let sandbox_mcp: Vec<(&str, &[String])> = caps
+            .iter()
+            .filter_map(|c| match c {
+                Capability::Sandbox { name, mcp, .. } => Some((name.as_str(), mcp.as_slice())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sandbox_mcp,
+            [
+                ("bare", &[][..]),
+                ("go", &["jira".to_string(), "trace".to_string()][..])
+            ]
+        );
+        let egress: Vec<String> = caps
+            .iter()
+            .filter_map(|c| match c {
+                Capability::Egress { host, port, .. } => Some(format!("{host}:{port}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            egress,
+            ["host.openshell.internal:8850"],
+            "a profileless turn reaches trace (the second port) and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_catalog_bin_is_filled_where_the_catalog_is_readable_and_rendered() {
+        let m = manifest(MCP);
+        let mut exposure = compute(&m, None);
+        with_catalog_bins(&mut exposure, |name| {
+            (name == "ujira").then(|| "/usr/local/bin/ujira-mcp".to_string())
+        });
+        let text = render(&exposure).join("\n");
+        assert!(
+            text.contains(
+                "mcp         jira from catalog ujira (/usr/local/bin/ujira-mcp); reached by [go]; tools [comment]"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("mcp         trace from catalog trace; reached by [[agent], go]"),
+            "{text}"
+        );
+        assert!(text.contains("mcp [jira, trace]"), "{text}");
+    }
+
+    #[test]
+    fn a_desugared_broker_is_disclosed_as_an_mcp_server_with_its_bin() {
+        let m = manifest(&format!(
+            "{OPENSHELL}
+            [agent.broker]
+            enabled = true
+            bin = \"vllm-broker\"
+            name = \"vllm-broker\"
+            [agent.sandbox.go]
+            image = \"img\"
+            broker = true
+            "
+        ));
+        let caps = capabilities(&m);
+        assert!(caps.contains(&Capability::McpServer {
+            name: "vllm-broker".into(),
+            catalog: None,
+            bin: Some("vllm-broker".into()),
+            tools: vec!["*".into()],
+            agent: true,
+            sandboxes: vec!["go".into()],
+        }));
     }
 }
