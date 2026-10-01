@@ -26,7 +26,7 @@ test.describe('the launch view', () => {
     await expect(params).toContainText('topic');
     await expect(params).toContainText('attention kernels');
     await expect(page.getByText('max $12.00 / 2h')).toBeVisible();
-    await expect(page.getByRole('link', { name: 'survey' })).toHaveAttribute(
+    await expect(page.getByRole('link', { name: 'survey', exact: true })).toHaveAttribute(
       'href',
       '/playbooks/survey/launch',
     );

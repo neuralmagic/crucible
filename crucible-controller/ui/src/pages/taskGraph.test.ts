@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
+import type { ExternalLinkRef } from '../ui/ExternalLink';
 import {
   fanoutStates,
   latestResults,
+  nodeLinks,
   runGraphView,
   targetLabel,
   toneOf,
@@ -468,5 +470,75 @@ describe('a declared task nothing reported on', () => {
     const folded = fold(plan, [result(0, 'scan', 'pass'), result(0, 'triage[1027]', 'pass')]);
     expect(folded.runtime.has('triage')).toBe(false);
     expect(folded.runtime.get('scan')?.reported).toBe(true);
+  });
+});
+
+describe('the external results a node links out to', () => {
+  const plan = [task('scan'), mapped('triage', 'scan.issues', ['scan']), task('roundup', ['triage'])];
+  const linked = (iter: number, taskName: string, links: ExternalLinkRef[]): TaskResult => ({
+    ...result(iter, taskName, 'pass'),
+    links,
+  });
+  const pr = (n: number): ExternalLinkRef => ({
+    url: `https://github.com/o/r/pull/${n}`,
+    provider: 'github',
+    kind: 'pull_request',
+    label: `#${n}`,
+  });
+  const issue = (key: string): ExternalLinkRef => ({
+    url: `https://example.atlassian.net/browse/${key}`,
+    provider: 'jira',
+    kind: 'issue',
+    label: key,
+  });
+
+  it('gives a task every url it reported, once, in the order it reported them', () => {
+    const drawn = nodeLinks(plan, [
+      linked(0, 'scan', [pr(1)]),
+      linked(1, 'scan', [pr(1), issue('ENG-9')]),
+    ]);
+    expect(drawn.get('scan')).toEqual({ kind: 'links', links: [pr(1), issue('ENG-9')] });
+  });
+
+  it('tallies a mapped task by provider and leaves its instances their own', () => {
+    const drawn = nodeLinks(plan, [
+      linked(0, 'triage[1]', [pr(1)]),
+      linked(0, 'triage[2]', [pr(2), issue('ENG-9')]),
+    ]);
+    expect(drawn.get('triage')).toEqual({
+      kind: 'counts',
+      counts: [
+        { provider: 'github', count: 2 },
+        { provider: 'jira', count: 1 },
+      ],
+    });
+    expect(drawn.get('triage[2]')).toEqual({ kind: 'links', links: [pr(2), issue('ENG-9')] });
+  });
+
+  it('counts a url two instances both reported once', () => {
+    const drawn = nodeLinks(plan, [linked(0, 'triage[1]', [pr(1)]), linked(0, 'triage[2]', [pr(1)])]);
+    expect(drawn.get('triage')).toEqual({ kind: 'counts', counts: [{ provider: 'github', count: 1 }] });
+  });
+
+  /// A fan-out over nothing reports under the mapped task's own name, and the deck is still a
+  /// deck: what it reported is tallied there with whatever its instances reported.
+  it('tallies a mapped task that reported under its own name', () => {
+    const drawn = nodeLinks(plan, [linked(0, 'triage', [pr(1)]), linked(0, 'triage[2]', [pr(2)])]);
+    expect(drawn.get('triage')).toEqual({ kind: 'counts', counts: [{ provider: 'github', count: 2 }] });
+  });
+
+  it('draws nothing for a task that reported none, and nothing for a url it may not follow', () => {
+    const drawn = nodeLinks(plan, [
+      result(0, 'scan', 'pass'),
+      linked(0, 'roundup', [{ ...pr(1), url: 'javascript:alert(1)' }]),
+    ]);
+    expect(drawn.size).toBe(0);
+  });
+
+  it('reaches the folded view', () => {
+    expect(fold(plan, [linked(0, 'scan', [pr(1)])]).links.get('scan')).toEqual({
+      kind: 'links',
+      links: [pr(1)],
+    });
   });
 });

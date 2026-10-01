@@ -217,22 +217,27 @@ test.describe('the run task grid', () => {
 });
 
 test.describe('external results', () => {
+  const sectionOf = (page: Page, header: string) =>
+    page
+      .locator('[data-ui="section"]')
+      .filter({ has: page.locator('[data-ui="section-header"]', { hasText: header }) });
+
   /// What the run produced outside itself reaches the page as a link per result, each under the
   /// mark of the service it points at.
   test('lists every link the run reported, with its provider mark', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
 
-    const links = page.getByRole('link', { name: /#412|survey-412|INFERENG-77/ });
-    await expect(links).toHaveCount(3);
+    const section = sectionOf(page, 'Links');
+    await expect(section.getByRole('link')).toHaveCount(6);
 
-    const pr = page.getByRole('link', { name: /#412/ }).first();
+    const pr = section.getByRole('link', { name: /#412/ });
     await expect(pr).toHaveAttribute('href', 'https://github.com/neuralmagic/crucible/pull/412');
     await expect(pr).toHaveAttribute('target', '_blank');
     await expect(pr).toHaveAttribute('rel', 'noopener noreferrer');
     await expect(pr.locator('svg[aria-label="GitHub"]')).toBeVisible();
     await expect(
-      page.getByRole('link', { name: /INFERENG-77/ }).first().locator('svg[aria-label="Jira"]'),
+      section.getByRole('link', { name: /INFERENG-77/ }).locator('svg[aria-label="Jira"]'),
     ).toBeVisible();
   });
 
@@ -241,10 +246,60 @@ test.describe('external results', () => {
     await stubApi(page);
     await ready(page, RUN);
 
+    const attempts = sectionOf(page, 'Grid');
     await page.getByTestId('run-grid').locator('[data-task="rank"][data-iter="1"]').click();
-    await expect(page.getByRole('link', { name: /survey-412/ })).toHaveCount(2);
+    await expect(attempts.getByRole('link', { name: /survey-412/ })).toHaveCount(1);
 
     await page.getByTestId('run-grid').locator('[data-task="summarize[flashinfer]"][data-iter="1"]').click();
-    await expect(page.getByRole('link', { name: /survey-412/ })).toHaveCount(1);
+    await expect(attempts.getByRole('link', { name: /survey-412/ })).toHaveCount(0);
+  });
+
+  /// A task's node carries what it opened: the mark of the service and the label, linking out
+  /// from the graph itself.
+  test('draws a task its own links on its node', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const node = page.getByTestId('workflow-graph').locator('[data-node-links="rank"]');
+    const pr = node.getByRole('link', { name: /#412/ });
+    await expect(pr).toHaveAttribute('href', 'https://github.com/neuralmagic/crucible/pull/412');
+    await expect(pr).toHaveAttribute('target', '_blank');
+    await expect(pr).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(pr.locator('svg[aria-label="GitHub"]')).toBeVisible();
+    await expect(node.getByRole('link')).toHaveCount(2);
+    await expect(node).toContainText('+1');
+  });
+
+  /// A mapped task has as many links as the run spread it over, so its deck carries the tally and
+  /// the instances carry the links.
+  test('tallies a mapped task and leaves its instances their own links', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    const deck = graph.locator('[data-node-links="summarize"]');
+    await expect(deck.locator('span')).toHaveText(['GitHub2', 'GitLab1']);
+    await expect(deck.locator('svg[aria-label="GitHub"]')).toBeVisible();
+    await expect(deck.locator('svg[aria-label="GitLab"]')).toBeVisible();
+    await expect(deck.getByRole('link')).toHaveCount(0);
+
+    const instance = graph.locator('[data-node-links="summarize[paged-attention]"]');
+    await expect(instance.getByRole('link', { name: /#418/ })).toHaveAttribute(
+      'href',
+      'https://github.com/neuralmagic/crucible/pull/418',
+    );
+    await expect(
+      graph.locator('[data-node-links="summarize[flashinfer]"]').getByRole('link', { name: /!9/ }),
+    ).toHaveAttribute('href', 'https://gitlab.com/vllm/kernels/-/merge_requests/9');
+  });
+
+  /// A task that reported nothing outside the run gets no row at all.
+  test('draws no marks on a task that reported no links', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-node-links="read"]')).toHaveCount(0);
+    await expect(graph.locator('[data-node-links="file"]')).toHaveCount(0);
   });
 });
