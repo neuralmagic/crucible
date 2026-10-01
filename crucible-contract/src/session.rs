@@ -470,6 +470,11 @@ pub enum SessionEvent {
         metric: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<serde_json::Value>,
+        /// The external results the task reported: the urls of every field it declared `link` or
+        /// `links`, parsed by the engine that validated them. A reader renders these rather than
+        /// re-reading urls out of `output`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<crate::link::ExternalLink>,
         #[serde(default)]
         note: String,
         /// Present exactly when `status` is `blocked`; `note` is its rendered form.
@@ -1013,6 +1018,7 @@ mod tests {
             cost_usd: 0.3,
             metric: None,
             output: Some(serde_json::json!({"score": 234.0})),
+            links: Vec::new(),
             note: String::new(),
             blocked: None,
             transport: None,
@@ -1059,6 +1065,7 @@ mod tests {
             cost_usd: 0.0,
             metric: None,
             output: None,
+            links: Vec::new(),
             note: "required task brief failed".into(),
             blocked: Some(TaskBlocked {
                 reason: BlockedReasonKind::RequiredTaskFailed,
@@ -1116,6 +1123,7 @@ mod tests {
             cost_usd: 0.0,
             metric: None,
             output: None,
+            links: Vec::new(),
             note: "transport retries exhausted (3 attempts): gateway did not become healthy".into(),
             blocked: None,
             transport: Some(TransportCause::Gateway),

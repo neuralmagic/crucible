@@ -89,6 +89,11 @@ pub(crate) fn task_result_event(
         cost_usd: r.cost_usd,
         metric: None,
         output: r.output.clone(),
+        links: r
+            .output
+            .as_ref()
+            .map(|output| reported_links(&task.emits, output))
+            .unwrap_or_default(),
         note: r.note.clone().unwrap_or_default(),
         blocked: r
             .blocked
@@ -99,6 +104,20 @@ pub(crate) fn task_result_event(
         trace_id,
         span_id,
     }
+}
+
+/// The external results an output carries, read only out of the fields declared `link`/`links`.
+/// A url anywhere else in the output is data, not a reported result.
+fn reported_links(
+    emits: &crate::plan::ir::Emits,
+    output: &serde_json::Value,
+) -> Vec<crucible_contract::link::ExternalLink> {
+    emits
+        .fields()
+        .into_iter()
+        .filter_map(|(field, ty)| Some((output.get(&field.0)?, ty?)))
+        .flat_map(|(value, ty)| ty.links(value))
+        .collect()
 }
 
 #[cfg(test)]
@@ -231,6 +250,64 @@ mod tests {
             line.contains(r#""emits":[{"field":"score","type":"number"},{"field":"tier","type":["high","low"]}]"#),
             "{line}"
         );
+    }
+
+    /// The urls a reader renders come off the declared `link`/`links` fields alone, parsed by the
+    /// engine that validated them. A url elsewhere in the output is data.
+    #[test]
+    fn a_task_result_carries_the_links_of_its_declared_link_fields() {
+        use crucible_contract::link::{LinkKind, LinkProvider};
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "deliver"
+            kind = "command"
+            command = "true"
+            emits = { pr = "link", pushed = "links", homepage = "string" }
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let result = crate::plan::exec::TaskResult {
+            status: crate::plan::exec::TaskStatus::Pass,
+            attempts: 1,
+            cost_usd: 0.0,
+            output: Some(serde_json::json!({
+                "pr": "https://github.com/neuralmagic/crucible/pull/42",
+                "pushed": ["https://github.com/neuralmagic/crucible/tree/topic"],
+                "homepage": "https://example.com/not-a-result",
+            })),
+            note: None,
+            fanout: None,
+            blocked: None,
+            transport: None,
+        };
+        let SessionEvent::TaskResult { links, .. } =
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result)
+        else {
+            panic!("not a task_result event");
+        };
+        assert_eq!(links.len(), 2, "the string field contributed nothing");
+        assert_eq!(links[0].provider, LinkProvider::GitHub);
+        assert_eq!(links[0].kind, LinkKind::PullRequest);
+        assert_eq!(links[0].label, "#42");
+        assert_eq!(links[1].kind, LinkKind::Branch);
+        assert_eq!(links[1].label, "topic");
+
+        let none = crate::plan::exec::TaskResult {
+            output: None,
+            ..result
+        };
+        let SessionEvent::TaskResult { links, .. } =
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none)
+        else {
+            panic!("not a task_result event");
+        };
+        assert!(links.is_empty(), "no output, no links");
     }
 
     #[test]

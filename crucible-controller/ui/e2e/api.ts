@@ -127,11 +127,23 @@ const RUN_GRAPH = {
   ],
   fanout: [{ task: 'summarize', items: 3 }],
   results: [
-    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31 },
-    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240 },
-    { iter: 1, task: 'summarize[paged-attention]', status: 'pass', note: 'one entry per citation', cost_usd: 0.2, secs: 18 },
-    { iter: 1, task: 'summarize[flashinfer]', status: 'fail', note: 'exit 1: no citations parsed\n  at summarize.sh:14', cost_usd: 0.05, secs: 6 },
-    { iter: 1, task: 'rank', status: 'pass', note: 'kept 1 of 2', cost_usd: null, secs: 2 },
+    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [] },
+    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [] },
+    { iter: 1, task: 'summarize[paged-attention]', status: 'pass', note: 'one entry per citation', cost_usd: 0.2, secs: 18, links: [] },
+    { iter: 1, task: 'summarize[flashinfer]', status: 'fail', note: 'exit 1: no citations parsed\n  at summarize.sh:14', cost_usd: 0.05, secs: 6, links: [] },
+    {
+      iter: 1,
+      task: 'rank',
+      status: 'pass',
+      note: 'kept 1 of 2',
+      cost_usd: null,
+      secs: 2,
+      links: [
+        { url: 'https://github.com/neuralmagic/crucible/pull/412', provider: 'github', kind: 'pull_request', label: '#412' },
+        { url: 'https://github.com/neuralmagic/crucible/tree/survey-412', provider: 'github', kind: 'branch', label: 'survey-412' },
+        { url: 'https://crucible.atlassian.net/browse/INFERENG-77', provider: 'jira', kind: 'issue', label: 'INFERENG-77' },
+      ],
+    },
   ],
 };
 
@@ -150,10 +162,10 @@ const TRIAGE_GRAPH = {
   ],
   fanout: [{ task: 'triage', items: 20 }],
   results: [
-    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0 },
-    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0 },
-    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0 },
-    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0 },
+    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [] },
+    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [] },
+    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [] },
+    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [] },
   ],
 };
 
@@ -569,6 +581,19 @@ export const ROUTES: Record<string, Json> = {
     attempts: 1,
     cost_usd: 0.05,
     secs: 6,
+    payload: null,
+    files: [],
+    running: false,
+  },
+  '/api/runs/RUN-0412/tasks/rank/evidence': {
+    run_id: 'RUN-0412',
+    task: 'rank',
+    status: 'pass',
+    iter: 1,
+    note: 'kept 1 of 2',
+    attempts: 1,
+    cost_usd: null,
+    secs: 2,
     payload: null,
     files: [],
     running: false,

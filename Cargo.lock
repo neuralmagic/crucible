@@ -1920,9 +1920,11 @@ dependencies = [
 name = "crucible-contract"
 version = "0.3.1"
 dependencies = [
+ "percent-encoding",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "url",
 ]
 
 [[package]]

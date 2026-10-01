@@ -12,6 +12,13 @@ export { DetailHeader } from './DetailHeader';
 export type { DetailHeaderProps } from './DetailHeader';
 export { Empty } from './Empty';
 export type { EmptyProps } from './Empty';
+export { ExternalLinkChip, ExternalLinkMark, ExternalLinks, shownLinks } from './ExternalLink';
+export type {
+  ExternalLinkChipProps,
+  ExternalLinkMarkProps,
+  ExternalLinkRef,
+  ExternalLinksProps,
+} from './ExternalLink';
 export { Identifier } from './Identifier';
 export type { IdentifierProps, IdentifierVariant } from './Identifier';
 export { LoadingBlock } from './LoadingBlock';

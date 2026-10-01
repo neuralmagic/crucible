@@ -11,6 +11,7 @@ import {
   type TaskResult,
   type TaskTone,
 } from './taskGraph';
+import type { ExternalLinkRef } from '../ui';
 
 /// One attempt, in the column of the iteration it reported from.
 export interface GridCell {
@@ -22,6 +23,8 @@ export interface GridCell {
   note: string;
   /// Why the executor never dispatched the task; set exactly when `status` is `blocked`.
   blocked: { reason: string; task: string | null } | null;
+  /// The external results the attempt reported, in declaration order.
+  links: ExternalLinkRef[];
 }
 
 export interface GridRow {
@@ -110,6 +113,7 @@ function cellOf(r: TaskResult): GridCell {
     costUsd: r.cost_usd ?? null,
     note: r.note,
     blocked: r.blocked ? { reason: r.blocked.reason, task: r.blocked.task ?? null } : null,
+    links: r.links,
   };
 }
 

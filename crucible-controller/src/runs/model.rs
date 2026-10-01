@@ -298,6 +298,9 @@ pub struct TaskResult {
     pub secs: Option<f64>,
     /// Present exactly when `status` is `blocked`.
     pub blocked: Option<crucible_contract::TaskBlocked>,
+    /// The external results the attempt reported, as the engine parsed them off the fields it
+    /// declared `link`/`links`.
+    pub links: Vec<crucible_contract::ExternalLink>,
 }
 
 /// The sort column for `GET /api/runs` (the leaderboard). `Created` orders by `run_id`, whose

@@ -13,6 +13,7 @@ import { flowEnrichedMessage, validTraceId } from './flowEnriched';
 import { MarkdownView } from './MarkdownView';
 import { flowThemeStyle, injectFlowTheme } from './flowTheme';
 import { AgentProviderTag } from './ProviderIcon';
+import { RunLinks } from './RunLinks';
 import { useLiveEvents } from '../api/useLiveEvents';
 import { formatError } from '../api/errors';
 import { LiveSession } from '../live/LiveSession';
@@ -239,6 +240,8 @@ export function RunDetailPage() {
           </SectionBody>
         </Section>
       )}
+
+      <RunLinks runId={runId} />
 
       {isLiveRun && (
         <Section>

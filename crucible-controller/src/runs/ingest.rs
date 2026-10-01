@@ -115,6 +115,11 @@ enum Ev {
         /// it after a successful run.
         #[serde(default)]
         output: Option<serde_json::Value>,
+        /// The external results the engine parsed off the attempt's declared `link`/`links`
+        /// fields, decoded one entry at a time: a link this build cannot read must not cost the
+        /// reader the attempt it rode in on.
+        #[serde(default)]
+        links: serde_json::Value,
         #[serde(default)]
         blocked: Option<TaskBlocked>,
     },
@@ -428,6 +433,7 @@ fn parse_session(content: &str) -> ParsedRun {
                 cost_usd,
                 secs,
                 output,
+                links,
                 blocked,
             } => {
                 if task.is_empty() {
@@ -449,6 +455,7 @@ fn parse_session(content: &str) -> ParsedRun {
                     // runs in zero time, so 0 is "unknown", not a measurement.
                     secs: Some(secs).filter(|s| s.is_finite() && *s > 0.0),
                     blocked,
+                    links: crucible_contract::decode_links(&links),
                 });
             }
             Ev::Shutdown { outcome, reason } => {
@@ -1125,7 +1132,7 @@ mod tests {
             r#"{"v":1,"kind":"plan_admitted","plan_version":1,"reason":"","budget_usd":5.0,"tasks":[{"name":"propose","kind":"agent","depends_on":[],"session":"solver","needs":"all","required":true},{"name":"measure","kind":"command","depends_on":["propose"],"session":"","needs":"all","required":true}]}"#,
             r#"{"v":1,"kind":"task_result","task":"propose","status":"pass","plan_version":1,"task_kind":"agent","iter":0,"attempts":1,"cost_usd":0.75,"note":"","secs":12.0}"#,
             r#"{"v":1,"kind":"task_result","task":"measure","status":"pass","plan_version":1,"task_kind":"command","iter":0,"attempts":1,"cost_usd":0.0,"note":"","secs":30.0}"#,
-            r#"{"v":1,"kind":"task_result","task":"propose","status":"pass","plan_version":1,"task_kind":"agent","iter":1,"attempts":1,"cost_usd":0.5,"note":"","secs":9.0}"#,
+            r##"{"v":1,"kind":"task_result","task":"propose","status":"pass","plan_version":1,"task_kind":"agent","iter":1,"attempts":1,"cost_usd":0.5,"note":"","secs":9.0,"links":[{"url":"https://github.com/neuralmagic/crucible/pull/7","provider":"github","kind":"pull_request","label":"#7"}]}"##,
             r#"{"v":1,"kind":"task_result","task":"measure","status":"transport","plan_version":1,"task_kind":"command","iter":1,"attempts":1,"cost_usd":0.0,"note":"rig unreachable","secs":1.0}"#,
             r#"{"v":1,"kind":"task_result","task":"measure","status":"fail","plan_version":1,"task_kind":"command","iter":1,"attempts":2,"cost_usd":0.0,"note":"regressed","secs":28.0}"#,
             r#"{"v":1,"kind":"task_result","task":"report","status":"blocked","plan_version":1,"task_kind":"command","iter":1,"attempts":0,"cost_usd":0.0,"note":"required task measure failed","blocked":{"reason":"required_task_failed","task":"measure"},"secs":0.0}"#,
@@ -1184,6 +1191,21 @@ mod tests {
         assert_eq!(results[2].blocked, None);
         assert_eq!(results[3].cost_usd, Some(0.5));
         assert_eq!(results[3].secs, Some(9.0));
+        assert_eq!(
+            results[3]
+                .links
+                .iter()
+                .map(|l| (l.url.as_str(), l.provider, l.kind, l.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(
+                "https://github.com/neuralmagic/crucible/pull/7",
+                crucible_contract::LinkProvider::GitHub,
+                crucible_contract::LinkKind::PullRequest,
+                "#7",
+            )],
+            "the links the engine parsed ride the event into the row"
+        );
+        assert!(results[0].links.is_empty(), "a task that reported none");
         assert_eq!(
             results[4].blocked,
             Some(TaskBlocked {

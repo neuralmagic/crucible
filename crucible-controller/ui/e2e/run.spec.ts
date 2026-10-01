@@ -215,3 +215,36 @@ test.describe('the run task grid', () => {
     await expect(page.getByTestId('task-result')).toContainText('at summarize.sh:14');
   });
 });
+
+test.describe('external results', () => {
+  /// What the run produced outside itself reaches the page as a link per result, each under the
+  /// mark of the service it points at.
+  test('lists every link the run reported, with its provider mark', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const links = page.getByRole('link', { name: /#412|survey-412|INFERENG-77/ });
+    await expect(links).toHaveCount(3);
+
+    const pr = page.getByRole('link', { name: /#412/ }).first();
+    await expect(pr).toHaveAttribute('href', 'https://github.com/neuralmagic/crucible/pull/412');
+    await expect(pr).toHaveAttribute('target', '_blank');
+    await expect(pr).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(pr.locator('svg[aria-label="GitHub"]')).toBeVisible();
+    await expect(
+      page.getByRole('link', { name: /INFERENG-77/ }).first().locator('svg[aria-label="Jira"]'),
+    ).toBeVisible();
+  });
+
+  /// The task that reported them says so too: picking its cell lists that attempt's links.
+  test('shows a picked attempt its own links', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    await page.getByTestId('run-grid').locator('[data-task="rank"][data-iter="1"]').click();
+    await expect(page.getByRole('link', { name: /survey-412/ })).toHaveCount(2);
+
+    await page.getByTestId('run-grid').locator('[data-task="summarize[flashinfer]"][data-iter="1"]').click();
+    await expect(page.getByRole('link', { name: /survey-412/ })).toHaveCount(1);
+  });
+});

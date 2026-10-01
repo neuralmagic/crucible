@@ -99,10 +99,13 @@ fn task_knobs() -> Vec<Kwarg> {
             "list[str] | dict[str, type]",
             "Result fields the task promises in its JSON output. The dict form also promises each \
              field's type: `\"string\"`, `\"integer\"`, `\"number\"`, `\"boolean\"`, \
-             `\"list\"`, `\"object\"`, or a list of labels the value is one of. A passing \
-             output missing a field, or holding one of the wrong type, fails the task. Types are \
-             checked where the graph reads them: `over` needs a list, a `top_k` or grade score a \
-             number, and a `route(source = ...)` question labels it can answer.",
+             `\"list\"`, `\"object\"`, `\"link\"`, `\"links\"`, or a list of labels the value is \
+             one of. A passing output missing a field, or holding one of the wrong type, fails \
+             the task. Types are checked where the graph reads them: `over` needs a list, a \
+             `top_k` or grade score a number, and a `route(source = ...)` question labels it can \
+             answer. A `link` is one http(s) url and `links` a list of them, each naming a result \
+             the task produced outside the run (a pull request, a pushed branch, an issue), \
+             which the run and task views then link out to.",
         ),
         Kwarg::new(
             "emits_files",

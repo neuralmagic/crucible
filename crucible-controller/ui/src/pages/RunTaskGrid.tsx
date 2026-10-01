@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { $api } from '../api/client';
-import { cn, Empty, Section, SectionBody, SectionHeader, Tooltip } from '../ui';
+import { cn, Empty, ExternalLinks, Section, SectionBody, SectionHeader, Tooltip } from '../ui';
 import { barShare, blockedLine, formatSecs, type GridCell, type GridRow, runGridView } from './runGrid';
 import { formatCost } from './runReport';
 import { TaskEvidence } from './TaskEvidence';
@@ -232,6 +232,7 @@ function GridBody({ runId, graph }: GridBodyProps) {
           {pickedCell !== null && pickedCell.note !== '' && (
             <p className="mt-1 mb-0 font-mono text-data break-words text-ink-3">{pickedCell.note}</p>
           )}
+          {pickedCell !== null && <ExternalLinks links={pickedCell.links} className="mt-2" />}
           <TaskEvidence key={picked.task} runId={runId} task={picked.task} />
         </SectionBody>
       )}
