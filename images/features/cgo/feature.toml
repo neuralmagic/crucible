@@ -1,0 +1,37 @@
+summary = "C toolchain plus the libraries Go modules link through cgo"
+layer = 21
+rpms = ["gcc", "gcc-c++", "make", "pkgconf-pkg-config", "python3.12-devel"]
+
+intro = """
+gcc, g++, make, pkg-config and the CPython 3.12 headers are present, and
+CGO_ENABLED=1 is set.
+
+libzmq {pin.libzmq} is installed under /usr with its pkg-config file, so
+`github.com/pebbe/zmq4` builds with no extra flags.
+
+A build that embeds CPython needs
+`CGO_CFLAGS="$(python3.12-config --cflags)"` and
+`CGO_LDFLAGS="$(python3.12-config --ldflags --embed)"`.
+
+`github.com/daulet/tokenizers` needs a static Rust library, prebuilt here at
+/opt/libtokenizers/v{pin.tokenizers}/libtokenizers.a and
+/opt/libtokenizers/v{pin.tokenizers-prev}/libtokenizers.a. Link the one matching
+the version in go.mod with `-L/opt/libtokenizers/v<version> -ltokenizers`; the
+exported symbol names differ between the two, so the other one fails to link.
+crates.io is unreachable from the sandbox, so do not build it from source.
+"""
+
+[pins]
+libzmq = "4.3.5"
+tokenizers = "1.22.2"
+tokenizers-prev = "1.20.2"
+
+[env]
+CGO_ENABLED = "1"
+
+[capabilities]
+"toolchain.cc" = "gcc"
+"python.devel" = "3.12"
+"lib.zeromq" = { pin = "libzmq" }
+"lib.tokenizers" = { pin = "tokenizers" }
+"lib.tokenizers-prev" = { pin = "tokenizers-prev" }
