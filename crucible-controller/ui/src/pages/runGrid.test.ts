@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { barShare, blockedLine, formatSecs, runGridView } from './runGrid';
+import { barShare, blockedLine, formatSecs, meldRow, runGridView } from './runGrid';
 import type { PlanTask, TaskResult } from './taskGraph';
 
 const task = (name: string, depends_on: string[] = []): PlanTask => ({
@@ -244,5 +244,144 @@ describe('reported links', () => {
     );
     expect(grid.rows[0].cells[0]?.links).toEqual([]);
     expect(grid.rows[0].cells[1]?.links).toEqual([pr]);
+  });
+});
+
+describe('what a row ran on', () => {
+  const agent = (model: string, effort = 'low') => ({ harness: 'claude', model, effort });
+
+  it('reads off the attempts, and a command task ran on nothing', () => {
+    const grid = runGridView(
+      [task('analyze'), task('build')],
+      [
+        result(0, 'analyze', 'pass', { agent: agent('glm-5.3') }),
+        result(0, 'build', 'pass'),
+      ],
+    );
+    expect(grid.rows[0].agent).toEqual({ harness: 'claude', model: 'glm-5.3', effort: 'low' });
+    expect(grid.rows[1].agent).toBeNull();
+  });
+
+  it('names a mapped parent only what every instance agreed on', () => {
+    const grid = runGridView(
+      [task('analyze')],
+      [
+        result(0, 'analyze[a]', 'pass', { agent: agent('glm-5.3') }),
+        result(0, 'analyze[b]', 'pass', { agent: agent('glm-5.3', 'high') }),
+      ],
+    );
+    const parent = grid.rows[0];
+    expect(parent.task).toBe('analyze');
+    expect(parent.agent).toEqual({ harness: 'claude', model: 'glm-5.3', effort: null });
+  });
+
+  it('leaves a mapped parent with no instance that ran an agent running nothing', () => {
+    const grid = runGridView(
+      [task('fan')],
+      [result(0, 'fan[a]', 'pass'), result(0, 'fan[b]', 'pass')],
+    );
+    expect(grid.rows[0].agent).toBeNull();
+  });
+
+  it('takes the attempts of a retried task together, not its last one alone', () => {
+    const grid = runGridView(
+      [task('analyze')],
+      [
+        result(0, 'analyze', 'fail', { agent: agent('glm-5.3') }),
+        result(1, 'analyze', 'pass', { agent: agent('glm-5.4') }),
+      ],
+    );
+    expect(grid.rows[0].agent).toEqual({ harness: 'claude', model: null, effort: 'low' });
+  });
+});
+
+describe('melding a row', () => {
+  const run = (statuses: (string | null)[]) => {
+    const iters = statuses.map((_, i) => i);
+    const results = statuses
+      .map((status, i) => (status === null ? null : result(i, 'work', status)))
+      .filter((r): r is TaskResult => r !== null);
+    const grid = runGridView([task('work')], results);
+    expect(grid.iters).toEqual(iters.filter((i) => statuses[i] !== null));
+    return meldRow(grid.rows[0].cells, grid.iters);
+  };
+
+  it('joins adjacent iterations of the same status and breaks on every change', () => {
+    const melded = run(['pass', 'pass', 'pass', 'pass', 'pass', 'fail', 'pass', 'pass', 'pass']);
+    expect(melded.map((s) => [s.cells[0]?.status, s.span])).toEqual([
+      ['pass', 5],
+      ['fail', 1],
+      ['pass', 3],
+    ]);
+    expect(melded[0].iters).toEqual([0, 1, 2, 3, 4]);
+    expect(melded[2].cells.map((c) => c.iter)).toEqual([6, 7, 8]);
+  });
+
+  it('never joins statuses that merely look alike', () => {
+    const melded = run(['fail', 'transport', 'blocked', 'truncated']);
+    expect(melded.map((s) => s.span)).toEqual([1, 1, 1, 1]);
+  });
+
+  it('melds a stretch a task sat out, and keeps it apart from what it reported', () => {
+    const grid = runGridView(
+      [task('work'), task('other')],
+      [
+        result(0, 'other', 'pass'),
+        result(1, 'other', 'pass'),
+        result(2, 'work', 'pass'),
+        result(3, 'work', 'pass'),
+      ],
+    );
+    const work = grid.rows[0];
+    expect(work.task).toBe('work');
+    const melded = meldRow(work.cells, grid.iters);
+    expect(melded.map((s) => [s.cells.length, s.span])).toEqual([
+      [0, 2],
+      [2, 2],
+    ]);
+    expect(melded[0].iters).toEqual([0, 1]);
+  });
+
+  it('spans every column exactly once', () => {
+    const melded = run(['pass', 'pass', 'fail', 'fail', 'fail', 'pass']);
+    expect(melded.reduce((wide, s) => wide + s.span, 0)).toBe(6);
+    expect(melded.flatMap((s) => s.iters)).toEqual([0, 1, 2, 3, 4, 5]);
+  });
+
+  it('leaves an attempt that said something of its own in its own cell', () => {
+    const grid = runGridView(
+      [task('work')],
+      [
+        result(0, 'work', 'fail'),
+        result(1, 'work', 'fail', { note: 'exit 7: the endpoint refused' }),
+        result(2, 'work', 'fail'),
+        result(3, 'work', 'fail'),
+      ],
+    );
+    const melded = meldRow(grid.rows[0].cells, grid.iters);
+    expect(melded.map((s) => [s.iters, s.span])).toEqual([
+      [[0], 1],
+      [[1], 1],
+      [[2, 3], 2],
+    ]);
+  });
+
+  it('keeps a blocked attempt and one that reported a link out of a block', () => {
+    const grid = runGridView(
+      [task('work')],
+      [
+        result(0, 'work', 'blocked', { blocked: { reason: 'budget_ceiling', task: null } }),
+        result(1, 'work', 'blocked', { blocked: { reason: 'budget_ceiling', task: null } }),
+        result(2, 'work', 'pass', {
+          links: [{ url: 'https://github.com/o/r/pull/9', provider: 'github', kind: 'pull_request', label: '#9' }],
+        }),
+        result(3, 'work', 'pass'),
+      ],
+    );
+    expect(meldRow(grid.rows[0].cells, grid.iters).map((s) => s.span)).toEqual([1, 1, 1, 1]);
+  });
+
+  it('has nothing to meld in an empty row', () => {
+    expect(meldRow([], [])).toEqual([]);
   });
 });
