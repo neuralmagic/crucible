@@ -132,7 +132,7 @@ fn sandboxes(agent: &crate::manifest::AgentCfg) -> impl Iterator<Item = Capabili
             secrets: profile.secrets.clone(),
             relays: profile.relays.clone(),
             broker: profile.broker,
-            egress: crate::openshell::policy::resolve_endpoints(&added, &[], None),
+            egress: crate::openshell::policy::resolve_endpoints(&added, &[], &[]),
         }
     })
 }
@@ -170,11 +170,11 @@ pub fn compute_composite(m: &crate::manifest::CompositeManifest) -> Exposure {
 /// lookalikes included.
 fn egress(m: &Manifest) -> Vec<Capability> {
     let harness_defaults = crate::openshell::policy::default_endpoints(m.agent.harness);
-    let broker_endpoint = broker_endpoint(m);
+    let broker_endpoint: Vec<String> = broker_endpoint(m).into_iter().collect();
     let resolved = crate::openshell::policy::resolve_endpoints(
         &m.agent.openshell,
         &harness_defaults,
-        broker_endpoint.as_deref(),
+        &broker_endpoint,
     );
     resolved
         .iter()

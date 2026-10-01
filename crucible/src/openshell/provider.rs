@@ -338,6 +338,45 @@ pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
     }
 }
 
+/// The profile backing every sandbox's provider for one MCP server: one required bearer credential
+/// under the server's own env key, so two servers' placeholders never collide on one sandbox.
+pub fn mcp_profile(key: &crate::manifest::McpKey) -> openshell_core::proto::ProviderProfile {
+    openshell_core::proto::ProviderProfile {
+        id: mcp_profile_id(key),
+        display_name: format!("Crucible MCP server {key}"),
+        description: format!("Per-sandbox bearer token for the {key} MCP server"),
+        category: openshell_core::proto::ProviderProfileCategory::Agent as i32,
+        credentials: vec![openshell_core::proto::ProviderProfileCredential {
+            name: "token".to_string(),
+            description: "MCP server bearer token".to_string(),
+            env_vars: vec![key.token_env()],
+            required: true,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+pub fn mcp_profile_id(key: &crate::manifest::McpKey) -> String {
+    format!("crucible-mcp-{key}")
+}
+
+/// The provider holding `sandbox`'s token for one MCP server. Per sandbox, because a provider's
+/// credential is shared by every sandbox it attaches to, and two concurrent sandboxes must not
+/// hold each other's token.
+pub fn mcp_provider_name(key: &crate::manifest::McpKey, sandbox: &str) -> String {
+    format!("crucible-mcp-{key}-{sandbox}")
+}
+
+/// The placeholder the sandbox sends in place of its token for one MCP server.
+pub fn mcp_token_placeholder(key: &crate::manifest::McpKey) -> String {
+    format!(
+        "{}{}",
+        openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
+        key.token_env()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

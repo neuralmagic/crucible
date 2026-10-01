@@ -11,7 +11,7 @@
 //! uses an L4 WebSocket tunnel. The real credential therefore has to be in the auth file.
 
 use crate::agent::harness::{
-    AuthProvider, Backend, Broker, HarnessSpec, SandboxAuth, SeedFile, StreamDecoder,
+    AuthProvider, Backend, HarnessSpec, McpServer, SandboxAuth, SeedFile, StreamDecoder,
     TranscriptLocator, TurnArtifacts, json_str,
 };
 use crate::agent::inference::InferenceEnv;
@@ -132,7 +132,7 @@ pub(crate) const CUSTOM_PROVIDER_ID: &str = "crucible";
 /// token or server name carrying a quote cannot break out of its value.
 fn config_toml(
     model: &str,
-    broker: Option<&Broker<'_>>,
+    servers: &[McpServer<'_>],
     endpoint: Option<&CustomEndpoint<'_>>,
 ) -> String {
     let mut cfg = toml::Table::new();
@@ -153,20 +153,23 @@ fn config_toml(
         providers.insert(CUSTOM_PROVIDER_ID.into(), provider.into());
         cfg.insert("model_providers".into(), providers.into());
     }
-    if let Some(b) = broker {
-        let mut server = toml::Table::new();
-        server.insert("url".into(), b.url.into());
-        if let Some(t) = b.token {
-            // Codex's schema has no inline `bearer_token`; the choices are `bearer_token_env_var`
-            // (an env name) or static `http_headers`. The header keeps the token in the seeded
-            // file rather than the sandbox env, same posture as hermes's config.yaml.
-            let mut headers = toml::Table::new();
-            headers.insert("Authorization".into(), format!("Bearer {t}").into());
-            server.insert("http_headers".into(), headers.into());
+    if !servers.is_empty() {
+        let mut table = toml::Table::new();
+        for s in servers {
+            let mut server = toml::Table::new();
+            server.insert("url".into(), s.url.into());
+            if let Some(t) = s.token {
+                // Codex's schema has no inline `bearer_token`; the choices are
+                // `bearer_token_env_var` (an env name) or static `http_headers`. The header keeps
+                // the token in the seeded file rather than the sandbox env, same posture as
+                // hermes's config.yaml.
+                let mut headers = toml::Table::new();
+                headers.insert("Authorization".into(), format!("Bearer {t}").into());
+                server.insert("http_headers".into(), headers.into());
+            }
+            table.insert(s.name.into(), server.into());
         }
-        let mut servers = toml::Table::new();
-        servers.insert(b.name.into(), server.into());
-        cfg.insert("mcp_servers".into(), servers.into());
+        cfg.insert("mcp_servers".into(), table.into());
     }
     toml::to_string(&cfg).unwrap_or_default()
 }
@@ -204,12 +207,12 @@ impl Backend for Codex {
         a
     }
 
-    /// `config.toml`, ALWAYS (it carries the model and the approval/sandbox posture). When the
-    /// broker is on, its streamable-HTTP MCP server is merged in with a bearer token.
+    /// `config.toml`, ALWAYS (it carries the model and the approval/sandbox posture), with each
+    /// of the turn's streamable-HTTP MCP servers and its bearer token.
     fn config(
         &self,
         args: &Args,
-        broker: Option<&Broker<'_>>,
+        servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String> {
         let endpoint = inference
@@ -221,7 +224,7 @@ impl Backend for Codex {
                     .wire_api
                     .unwrap_or(crate::agent::inference::WireApi::Chat),
             });
-        Some(config_toml(self.model(args), broker, endpoint.as_ref()))
+        Some(config_toml(self.model(args), servers, endpoint.as_ref()))
     }
 
     /// `auth.json` whenever Codex auth was resolved; the credential reaches Codex only through it,
@@ -545,13 +548,12 @@ mod tests {
 
     fn seed_files(
         args: &Args,
-        broker_url: Option<&str>,
-        broker_token: Option<&str>,
+        servers: &[McpServer<'_>],
         auth: Option<&CodexAuth>,
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
         let auth = auth.map_or(SandboxAuth::Gateway, |a| SandboxAuth::Codex(a.clone()));
-        Codex.seed_files(args, broker_url, broker_token, &auth, inference)
+        Codex.seed_files(args, servers, &auth, inference)
     }
 
     fn sandbox_argv(args: &Args, mcp_seeded: bool) -> Vec<String> {
@@ -685,29 +687,42 @@ mod tests {
     fn config_toml_always_seeds_model_and_approval_posture() {
         let mut a = args();
         a.codex.model = Some("gpt-5.6-sol".to_string());
-        let seeds = seed_files(&a, None, None, None, &Default::default());
+        let seeds = seed_files(&a, &[], None, &Default::default());
         assert_eq!(seeds.len(), 1, "config.toml is always seeded");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
         assert_eq!(v["model"].as_str(), Some("gpt-5.6-sol"));
         assert_eq!(v["approval_policy"].as_str(), Some("never"));
         assert_eq!(v["sandbox_mode"].as_str(), Some("danger-full-access"));
-        assert!(v.get("mcp_servers").is_none(), "no broker ⇒ no mcp_servers");
+        assert!(
+            v.get("mcp_servers").is_none(),
+            "no server in scope, no mcp_servers"
+        );
     }
 
     #[test]
-    fn config_toml_merges_the_broker_mcp_server_with_a_bearer_token() {
-        let mut a = args();
-        a.broker.name = "epp-broker".into();
-        a.broker_token = Some("s3cr3t".into());
+    fn config_toml_lists_exactly_the_turns_servers() {
+        let a = args();
         let seeds = seed_files(
             &a,
-            Some("http://host.containers.internal:8849/mcp"),
-            a.broker_token.as_deref(),
+            &[
+                McpServer {
+                    name: "epp-broker",
+                    url: "http://host.containers.internal:8849/mcp",
+                    token: Some("s3cr3t"),
+                },
+                McpServer {
+                    name: "jira",
+                    url: "http://host.containers.internal:8850/mcp",
+                    token: None,
+                },
+            ],
             None,
             &Default::default(),
         );
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
+        let names: Vec<&String> = v["mcp_servers"].as_table().unwrap().keys().collect();
+        assert_eq!(names, ["epp-broker", "jira"]);
         let server = &v["mcp_servers"]["epp-broker"];
         assert_eq!(
             server["url"].as_str(),
@@ -717,26 +732,22 @@ mod tests {
             server["http_headers"]["Authorization"].as_str(),
             Some("Bearer s3cr3t")
         );
+        assert!(
+            v["mcp_servers"]["jira"].get("http_headers").is_none(),
+            "no token, no header"
+        );
     }
 
     #[test]
-    fn config_toml_omits_the_bearer_token_when_there_is_none() {
-        let mut a = args();
-        a.broker.name = "b".into();
-        let seeds = seed_files(&a, Some("http://x/mcp"), None, None, &Default::default());
-        let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
-        assert_eq!(v["mcp_servers"]["b"]["url"].as_str(), Some("http://x/mcp"));
-        assert!(v["mcp_servers"]["b"].get("http_headers").is_none());
-    }
-
-    #[test]
-    fn a_quote_in_a_broker_token_cannot_break_the_config() {
-        let mut a = args();
-        a.broker.name = "b".into();
+    fn a_quote_in_a_token_cannot_break_the_config() {
+        let a = args();
         let seeds = seed_files(
             &a,
-            Some("http://x/mcp"),
-            Some("a\"b\nc"),
+            &[McpServer {
+                name: "b",
+                url: "http://x/mcp",
+                token: Some("a\"b\nc"),
+            }],
             None,
             &Default::default(),
         );
@@ -779,12 +790,12 @@ mod tests {
     fn auth_json_is_seeded_only_when_the_turn_has_codex_auth() {
         let a = args();
         let auth = CodexAuth::ApiKey("sk-test".to_string());
-        let seeds = seed_files(&a, None, None, Some(&auth), &Default::default());
+        let seeds = seed_files(&a, &[], Some(&auth), &Default::default());
         assert_eq!(seeds.len(), 2);
         assert_eq!(seeds[1].dest, AUTH);
         assert!(seeds[1].content.contains("sk-test"));
         assert!(
-            seed_files(&a, None, None, None, &Default::default())
+            seed_files(&a, &[], None, &Default::default())
                 .iter()
                 .all(|s| s.dest != AUTH)
         );
@@ -801,7 +812,7 @@ mod tests {
             wire_api: Some(crate::agent::inference::WireApi::Responses),
             ..Default::default()
         };
-        let seeds = seed_files(&a, None, None, None, &inference);
+        let seeds = seed_files(&a, &[], None, &inference);
         let v: toml::Table = toml::from_str(&seeds[0].content).expect("valid toml");
         assert_eq!(v["model_provider"].as_str(), Some(CUSTOM_PROVIDER_ID));
         let provider = &v["model_providers"][CUSTOM_PROVIDER_ID];
@@ -812,7 +823,7 @@ mod tests {
         assert_eq!(provider["wire_api"].as_str(), Some("responses"));
         assert_eq!(provider["env_key"].as_str(), Some("OPENAI_API_KEY"));
 
-        let plain = seed_files(&a, None, None, None, &Default::default());
+        let plain = seed_files(&a, &[], None, &Default::default());
         let v: toml::Table = toml::from_str(&plain[0].content).expect("valid toml");
         assert!(v.get("model_provider").is_none());
         assert!(v.get("model_providers").is_none());

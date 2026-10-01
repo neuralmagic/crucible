@@ -129,22 +129,22 @@ pub const IDENTITY_RELAY_KEYS: &[&str] = &[
 ///
 /// A deny entry with no parseable `host:port` prefix falls back to exact-string equality.
 ///
-/// `broker_endpoint`, when `Some`, is the engine-resolved broker `host:port:access` entry. It is
-/// appended **after** the deny subtraction and regardless of `inherit_defaults`, because the
-/// broker is engine plumbing the domain opted into by enabling `[agent.broker]`, not a built-in
-/// the domain can subtract. A broker-less domain (no broker_endpoint) with
-/// `inherit_defaults = false` still resolves to exactly what its manifest lists.
+/// `mcp_endpoints` are the engine-resolved `host:port:access` entries of the MCP servers the turn
+/// reaches. They are appended **after** the deny subtraction and regardless of
+/// `inherit_defaults`, because a server is engine plumbing the pack scoped the turn to, not a
+/// built-in the pack can subtract. A turn that reaches no server with `inherit_defaults = false`
+/// still resolves to exactly what its manifest lists.
 pub fn resolve_endpoints(
     cfg: &OpenshellCfg,
     defaults: &[&str],
-    broker_endpoint: Option<&str>,
+    mcp_endpoints: &[String],
 ) -> Vec<String> {
     let merged = merge(inherited(cfg, defaults), &cfg.endpoints);
     let mut out = subtract_endpoints(merged, &cfg.deny_endpoints);
-    if let Some(ep) = broker_endpoint
-        && !out.iter().any(|seen| seen == ep)
-    {
-        out.push(ep.to_string());
+    for ep in mcp_endpoints {
+        if !out.contains(ep) {
+            out.push(ep.clone());
+        }
     }
     out
 }
@@ -313,7 +313,7 @@ mod tests {
     fn defaults_when_no_extras() {
         let c = OpenshellCfg::default();
         assert_eq!(
-            resolve_endpoints(&c, DEFAULT_ENDPOINTS, None).len(),
+            resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]).len(),
             DEFAULT_ENDPOINTS.len()
         );
         assert_eq!(resolve_binaries(&c, DEFAULT_BINARIES), DEFAULT_BINARIES);
@@ -325,7 +325,7 @@ mod tests {
             &["api.internal.example:443:read-write"],
             &["/usr/local/bin/kubectl"],
         );
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert_eq!(eps.first().unwrap(), DEFAULT_ENDPOINTS[0], "defaults first");
         assert_eq!(eps.last().unwrap(), "api.internal.example:443:read-write");
         assert!(
@@ -340,7 +340,7 @@ mod tests {
             &["/usr/local/bin/claude"],
         );
         assert_eq!(
-            resolve_endpoints(&c, DEFAULT_ENDPOINTS, None),
+            resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]),
             ["registry.internal:443:read-only"]
         );
         assert_eq!(
@@ -356,7 +356,7 @@ mod tests {
         // of #192, `deny_endpoints` can too without losing the rest of the built-ins).
         let appended = cfg(&["registry.internal:443:read-only"], &[]);
         assert!(
-            resolve_endpoints(&appended, DEFAULT_ENDPOINTS, None)
+            resolve_endpoints(&appended, DEFAULT_ENDPOINTS, &[])
                 .iter()
                 .any(|e| e.contains("github.com"))
         );
@@ -366,7 +366,7 @@ mod tests {
             &["/usr/local/bin/claude"],
         );
         assert!(
-            !resolve_endpoints(&c, DEFAULT_ENDPOINTS, None)
+            !resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[])
                 .iter()
                 .any(|e| e.contains("github.com")),
             "github must not survive an opt-out"
@@ -378,7 +378,7 @@ mod tests {
         // A total air-gap is expressible: no endpoints, and no binary may open a socket.
         // The broker is NOT enabled here, so no broker_endpoint is passed.
         let c = sealed(&[], &[]);
-        assert!(resolve_endpoints(&c, DEFAULT_ENDPOINTS, None).is_empty());
+        assert!(resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]).is_empty());
         assert!(resolve_binaries(&c, DEFAULT_BINARIES).is_empty());
     }
 
@@ -388,7 +388,7 @@ mod tests {
         let c = OpenshellCfg::default();
         assert!(c.inherit_defaults);
         assert_eq!(
-            resolve_endpoints(&c, DEFAULT_ENDPOINTS, None).len(),
+            resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]).len(),
             DEFAULT_ENDPOINTS.len()
         );
     }
@@ -397,7 +397,7 @@ mod tests {
     fn duplicate_extras_are_dropped() {
         // An extra that repeats a default must not appear twice.
         let c = cfg(&["github.com:443:full", "github.com:443:full"], &[]);
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert_eq!(
             eps.iter().filter(|e| *e == "github.com:443:full").count(),
             1,
@@ -410,7 +410,7 @@ mod tests {
         );
     }
 
-    // --- broker endpoint auto-append ---
+    // --- MCP endpoint auto-append ---
 
     #[test]
     fn broker_endpoint_appended_with_defaults() {
@@ -418,7 +418,7 @@ mod tests {
         // auto-appended at the end, without duplicates.
         let c = OpenshellCfg::default();
         let ep = "host.containers.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[ep.to_string()]);
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() + 1);
         assert_eq!(eps.last().unwrap(), ep);
     }
@@ -429,7 +429,7 @@ mod tests {
         // endpoint: the broker is engine plumbing, not a domain-subtractable built-in.
         let c = sealed(&[], &[]);
         let ep = "host.containers.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[ep.to_string()]);
         assert_eq!(eps, vec![ep]);
     }
 
@@ -439,7 +439,7 @@ mod tests {
         // it, it must not appear twice.
         let ep = "host.containers.internal:8849:full";
         let c = cfg(&[ep], &[]);
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[ep.to_string()]);
         assert_eq!(
             eps.iter().filter(|e| *e == ep).count(),
             1,
@@ -452,9 +452,20 @@ mod tests {
         // Under the kubernetes driver, the broker host is `host.openshell.internal`.
         let c = OpenshellCfg::default();
         let ep = "host.openshell.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[ep.to_string()]);
         assert!(eps.contains(&ep.to_string()));
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() + 1);
+    }
+
+    #[test]
+    fn every_server_in_scope_is_appended_once_in_order() {
+        let c = sealed(&[], &[]);
+        let eps = [
+            "host.openshell.internal:8849:full".to_string(),
+            "host.openshell.internal:8850:full".to_string(),
+            "host.openshell.internal:8849:full".to_string(),
+        ];
+        assert_eq!(resolve_endpoints(&c, DEFAULT_ENDPOINTS, &eps), eps[..2]);
     }
 
     #[test]
@@ -462,9 +473,9 @@ mod tests {
         // A broker-less domain: None broker_endpoint, nothing extra appended.
         let c = OpenshellCfg::default();
         assert_eq!(
-            resolve_endpoints(&c, DEFAULT_ENDPOINTS, None).len(),
+            resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]).len(),
             DEFAULT_ENDPOINTS.len(),
-            "no broker means no extra endpoint"
+            "no server in scope means no extra endpoint"
         );
     }
 
@@ -478,7 +489,7 @@ mod tests {
             deny_endpoints: vec!["github.com:443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(
             !eps.iter().any(|e| e.contains("github.com")),
             "apex deny must take the wildcard too: {eps:?}"
@@ -497,7 +508,7 @@ mod tests {
             ],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(!eps.iter().any(|e| e.contains("github.com")));
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() - 2);
     }
@@ -508,7 +519,7 @@ mod tests {
             deny_endpoints: vec!["*.github.com:443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(eps.contains(&"github.com:443:full".to_string()));
         assert!(!eps.contains(&"*.github.com:443:full".to_string()));
         assert!(
@@ -524,7 +535,7 @@ mod tests {
             deny_endpoints: vec!["registry.internal:443:read-only".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(!eps.iter().any(|e| e.starts_with("registry.internal:")));
     }
 
@@ -539,7 +550,7 @@ mod tests {
             deny_endpoints: vec!["registry.internal:443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(eps.contains(&"registry.internal:8443:full".to_string()));
         assert!(eps.contains(&"*.registry.internal:8443:full".to_string()));
         assert!(!eps.contains(&"registry.internal:443:full".to_string()));
@@ -555,7 +566,7 @@ mod tests {
             deny_endpoints: vec!["github.com:443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(!eps.contains(&"api.github.com:443:full".to_string()));
         assert!(
             eps.contains(&"raw.githubusercontent.com:443:full".to_string()),
@@ -569,7 +580,7 @@ mod tests {
             deny_endpoints: vec!["GitHub.COM:443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(!eps.iter().any(|e| e.to_lowercase().contains("github.com")));
     }
 
@@ -579,7 +590,7 @@ mod tests {
             deny_endpoints: vec!["api.github.com:443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(eps.contains(&"*.github.com:443:full".to_string()));
         let shadowed = shadowed_denies(&eps, &c.deny_endpoints);
         assert_eq!(shadowed.len(), 1);
@@ -593,7 +604,7 @@ mod tests {
             deny_endpoints: vec!["github.com:443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(shadowed_denies(&eps, &c.deny_endpoints).is_empty());
     }
 
@@ -603,7 +614,7 @@ mod tests {
             endpoints: vec!["*.registry.internal:8443:full".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(
             shadowed_denies(&eps, &["one.registry.internal:443:full".to_string()]).is_empty(),
             "a :443 deny is not shadowed by an :8443 allow"
@@ -621,7 +632,7 @@ mod tests {
             deny_endpoints: vec!["registry.internal:443:read-only".to_string()],
             ..OpenshellCfg::default()
         };
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, None);
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]);
         assert!(!eps.contains(&"registry.internal:443:read-only".to_string()));
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len());
     }
@@ -633,7 +644,7 @@ mod tests {
             ..OpenshellCfg::default()
         };
         assert_eq!(
-            resolve_endpoints(&c, DEFAULT_ENDPOINTS, None).len(),
+            resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[]).len(),
             DEFAULT_ENDPOINTS.len()
         );
 
@@ -653,7 +664,7 @@ mod tests {
             ..OpenshellCfg::default()
         };
         let ep = "host.containers.internal:8849:full";
-        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, Some(ep));
+        let eps = resolve_endpoints(&c, DEFAULT_ENDPOINTS, &[ep.to_string()]);
         assert!(!eps.iter().any(|e| e.contains("github.com")));
         assert_eq!(eps.last().unwrap(), ep);
         assert_eq!(eps.len(), DEFAULT_ENDPOINTS.len() - 1);

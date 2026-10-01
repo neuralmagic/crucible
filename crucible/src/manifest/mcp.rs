@@ -175,7 +175,7 @@ impl McpSet {
     }
 
     /// [`McpSet::resolve`] with the first port given.
-    pub(crate) fn resolve_from(
+    pub fn resolve_from(
         table: &BTreeMap<String, McpCfg>,
         broker: &BrokerCfg,
         scopes: &McpScopes<'_>,

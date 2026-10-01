@@ -11,8 +11,8 @@ use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
-    DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    DeleteProviderRequest, DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy,
+    GetProviderRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
     GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, NetworkBinary,
     NetworkCredentialBinding, NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation,
     PolicyStatus, Provider, ProviderCredentialRefreshStrategy, ProviderProfile,
@@ -636,6 +636,23 @@ impl Gateway {
             Ok(_) => Ok(()),
             Err(s) if s.code() == tonic::Code::NotFound => Ok(()),
             Err(s) => Err(GrpcError::rpc(format!("delete_sandbox({name})"))(s).into()),
+        }
+    }
+
+    /// Delete a provider (`DeleteProvider`). Already gone is success.
+    #[tracing::instrument(skip_all, fields(rpc = "delete_provider", provider = name))]
+    pub async fn delete_provider(&self, name: &str) -> Result<()> {
+        let mut client = self.client();
+        match client
+            .delete_provider(DeleteProviderRequest {
+                name: name.to_string(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(s) if s.code() == tonic::Code::NotFound => Ok(()),
+            Err(s) => Err(GrpcError::rpc(format!("delete_provider({name})"))(s).into()),
         }
     }
 

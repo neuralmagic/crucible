@@ -131,8 +131,8 @@ impl SandboxLayout {
     pub(crate) const HOME: &'static str = "/sandbox";
 }
 
-/// One file uploaded into the sandbox before the agent execs (claude: `.mcp.json` when the
-/// broker is on; hermes: its `config.yaml`). Rendered host-side, targeted-uploaded to `dest`.
+/// One file uploaded into the sandbox before the agent execs (claude: `.mcp.json` when the turn
+/// reaches an MCP server; hermes: its `config.yaml`). Rendered host-side, targeted-uploaded to `dest`.
 pub(crate) struct SeedFile {
     pub content: String,
     pub dest: &'static str,
@@ -285,14 +285,33 @@ pub(crate) struct HarnessSpec {
     pub backfill_required: bool,
 }
 
-/// The provisioning broker a seeded config points the agent at. `token`, when set, rides as an
-/// `Authorization: Bearer` header: the broker's port sits on a `0.0.0.0` bind, so the header is
+/// One MCP server a seeded config points the agent at. `token`, when set, rides as an
+/// `Authorization: Bearer` header: the server's port sits on a `0.0.0.0` bind, so the header is
 /// what makes the sandbox the only caller it answers.
-pub(crate) struct Broker<'a> {
-    /// The agent-visible MCP server name (the `mcp__<name>__…` tool prefix), domain-owned.
+pub(crate) struct McpServer<'a> {
+    /// The agent-visible MCP server name (the `mcp__<name>__…` tool prefix).
     pub name: &'a str,
     pub url: &'a str,
     pub token: Option<&'a str>,
+}
+
+/// The servers as a JSON object keyed by name: `base(server)` for each, plus a `headers` block
+/// carrying the bearer when the server has a token.
+pub(crate) fn json_servers(
+    servers: &[McpServer<'_>],
+    base: impl Fn(&McpServer<'_>) -> serde_json::Value,
+) -> serde_json::Value {
+    let entries: serde_json::Map<String, serde_json::Value> = servers
+        .iter()
+        .map(|s| {
+            let mut server = base(s);
+            if let Some(t) = s.token {
+                server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {t}") });
+            }
+            (s.name.to_string(), server)
+        })
+        .collect();
+    serde_json::Value::Object(entries)
 }
 
 /// One agent harness: its [`HarnessSpec`] plus what genuinely differs per CLI (the argv grammar,
@@ -313,7 +332,7 @@ pub(crate) trait Backend: Sync {
     fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String>;
 
     /// The sandbox exec argv (program name first, no prompt, it arrives over stdin).
-    /// `mcp_seeded` says whether the broker is on this turn, and so whether
+    /// `mcp_seeded` says whether the turn reaches any MCP server, and so whether
     /// [`Backend::seed_files`] delivered an MCP config, so a harness that takes it on argv
     /// (claude's `--mcp-config`, pi's `-e` for the adapter) can point at it.
     fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String>;
@@ -343,7 +362,7 @@ pub(crate) trait Backend: Sync {
     fn config(
         &self,
         args: &Args,
-        broker: Option<&Broker<'_>>,
+        servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String>;
 
@@ -353,10 +372,10 @@ pub(crate) trait Backend: Sync {
         None
     }
 
-    /// The MCP config a harness seeds beside its own config when the broker is on: pi's
-    /// `mcp.json` for the adapter extension. Claude and hermes carry the broker inside
+    /// The MCP config a harness seeds beside its own config when the turn reaches any server: pi's
+    /// `mcp.json` for the adapter extension. The others carry the servers inside
     /// [`Backend::config`] instead.
-    fn mcp_config(&self, _broker: &Broker<'_>) -> Option<SeedFile> {
+    fn mcp_config(&self, _servers: &[McpServer<'_>]) -> Option<SeedFile> {
         None
     }
 
@@ -416,24 +435,18 @@ pub(crate) trait Backend: Sync {
     }
 
     /// Files uploaded into the sandbox before the agent execs: the config at the spec's path when
-    /// the backend renders one, then its credential file. `broker_token` is what the seeded
-    /// config sends as its bearer: the raw per-run token, or the provider placeholder when the
-    /// openshell egress proxy resolves it.
+    /// the backend renders one, then its credential file, then the MCP config. `servers` are
+    /// exactly the ones in the turn's scope, each token the raw value or the provider placeholder
+    /// the openshell egress proxy resolves.
     fn seed_files(
         &self,
         args: &Args,
-        broker_url: Option<&str>,
-        broker_token: Option<&str>,
+        servers: &[McpServer<'_>],
         auth: &SandboxAuth,
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
-        let broker = broker_url.map(|url| Broker {
-            name: &args.broker.name,
-            url,
-            token: broker_token,
-        });
         let mut seeds: Vec<SeedFile> = self
-            .config(args, broker.as_ref(), inference)
+            .config(args, servers, inference)
             .map(|content| SeedFile {
                 content,
                 dest: self.spec().config,
@@ -441,8 +454,8 @@ pub(crate) trait Backend: Sync {
             .into_iter()
             .collect();
         seeds.extend(self.credential(args, auth));
-        if let Some(b) = broker.as_ref() {
-            seeds.extend(self.mcp_config(b));
+        if !servers.is_empty() {
+            seeds.extend(self.mcp_config(servers));
         }
         seeds
     }

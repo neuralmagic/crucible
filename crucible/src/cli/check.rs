@@ -297,7 +297,7 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
 fn shadowed_deny_warnings(agent: &AgentCfg) -> Vec<String> {
     let cfg = &agent.openshell;
     let defaults = crate::openshell::policy::default_endpoints(agent.harness);
-    let resolved = openshell::policy::resolve_endpoints(cfg, &defaults, None);
+    let resolved = openshell::policy::resolve_endpoints(cfg, &defaults, &[]);
     openshell::policy::shadowed_denies(&resolved, &cfg.deny_endpoints)
         .into_iter()
         .map(|s| {

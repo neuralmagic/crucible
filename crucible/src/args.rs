@@ -93,14 +93,10 @@ pub(crate) struct Args {
     /// CLI flag.
     #[arg(skip)]
     pub sandbox_resources: manifest::SandboxResources,
-    /// The loop-pod provisioning broker for the `openshell` backend (from `[agent.broker]`). The
-    /// agent asks, the loop pod holds the keys. No CLI flag.
+    /// The run's MCP servers (from `[mcp]` and `[agent.broker]`) and the scope of the turn about
+    /// to run. The agent asks, the loop pod holds the keys. Runtime state, so no CLI flag.
     #[arg(skip)]
-    pub broker: manifest::BrokerCfg,
-    /// Bearer token guarding the broker endpoint, set when the broker is spawned and seeded into
-    /// the sandbox's `.mcp.json` headers. Runtime state rather than config, so there is no CLI flag.
-    #[arg(skip)]
-    pub broker_token: Option<String>,
+    pub mcp: crate::control::mcp::McpRuntime,
     /// The named sandboxes a task may run in (from `[agent.sandbox]`). No CLI flag.
     #[arg(skip)]
     pub sandboxes: std::collections::BTreeMap<String, manifest::SandboxProfile>,

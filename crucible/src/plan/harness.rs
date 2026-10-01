@@ -696,7 +696,7 @@ pub(crate) enum SandboxError {
 }
 
 /// Point a turn at its named sandbox: the profile's image, its endpoints added to the pack's
-/// egress, and every relayed secret, relay file, and broker it does not list withheld.
+/// egress, and every relayed secret, relay file, and MCP server it does not list withheld.
 pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxError> {
     if args.agent_backend != crate::manifest::AgentBackend::Openshell {
         return Err(SandboxError::NotOpenshell {
@@ -718,7 +718,7 @@ pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxEr
     args.env.retain(|(key, _)| !withheld.contains(key.as_str()));
     args.relay
         .retain(|relay| profile.relays.contains(&relay.dest));
-    args.broker.enabled &= profile.broker;
+    args.mcp.enter_sandbox(name);
     args.sandbox_image = Some(profile.image.trim().to_string());
     for endpoint in profile.endpoints {
         if !args.openshell.endpoints.contains(&endpoint) {
@@ -1001,7 +1001,33 @@ mod tests {
         ]
         .into();
         args.relay = vec![relay(".jira"), relay(".kube/config")];
-        args.broker.enabled = true;
+        let broker = crate::manifest::BrokerCfg {
+            enabled: true,
+            bin: "broker-bin".into(),
+            ..Default::default()
+        };
+        let set = crate::manifest::McpSet::resolve(
+            &Default::default(),
+            &broker,
+            &crate::manifest::McpScopes {
+                agent: &[],
+                sandboxes: vec![
+                    crate::manifest::SandboxScope {
+                        name: "go",
+                        mcp: &[],
+                        broker: true,
+                    },
+                    crate::manifest::SandboxScope {
+                        name: "bare",
+                        mcp: &[],
+                        broker: false,
+                    },
+                ],
+            },
+            &Default::default(),
+        )
+        .expect("resolves");
+        args.mcp = crate::control::mcp::McpRuntime::idle(set);
         args.openshell.endpoints = vec!["github.com:443:full".into()];
         args.sandboxes = [
             (
@@ -1011,6 +1037,7 @@ mod tests {
                     secrets: vec!["registry".into()],
                     relays: vec![".kube/config".into()],
                     broker: true,
+                    mcp: vec![],
                     endpoints: vec![
                         "proxy.golang.org:443:read-only".into(),
                         "github.com:443:full".into(),
@@ -1037,6 +1064,10 @@ mod tests {
         args.relay.iter().map(|r| r.dest.as_str()).collect()
     }
 
+    fn mcp_scope(args: &Args) -> Vec<&str> {
+        args.mcp.scope().iter().map(|k| k.as_str()).collect()
+    }
+
     #[test]
     fn a_named_sandbox_passes_in_only_what_it_lists() {
         let mut args = sandboxed_args();
@@ -1047,7 +1078,7 @@ mod tests {
         );
         assert_eq!(env_keys(&args), ["REGISTRY_TOKEN", "CLOUD_ML_REGION"]);
         assert_eq!(relay_dests(&args), [".kube/config"]);
-        assert!(args.broker.enabled);
+        assert_eq!(mcp_scope(&args), ["broker"]);
         assert_eq!(
             args.openshell.endpoints,
             ["github.com:443:full", "proxy.golang.org:443:read-only"],
@@ -1056,12 +1087,17 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_sandbox_gets_no_secret_relay_or_broker() {
+    fn a_bare_sandbox_gets_no_secret_relay_or_mcp_server() {
         let mut args = sandboxed_args();
+        assert_eq!(
+            mcp_scope(&args),
+            ["broker"],
+            "a profileless turn keeps the broker"
+        );
         enter_sandbox(&mut args, "bare").unwrap();
         assert_eq!(env_keys(&args), ["CLOUD_ML_REGION"]);
         assert!(relay_dests(&args).is_empty());
-        assert!(!args.broker.enabled);
+        assert!(mcp_scope(&args).is_empty());
         assert_eq!(args.openshell.endpoints, ["github.com:443:full"]);
     }
 
