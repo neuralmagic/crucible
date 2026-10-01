@@ -13,6 +13,12 @@ features = ["go", "claude-code", "gws"]
 name = "sandbox-go-codex"
 features = ["go", "codex", "gws"]
 
+# The cgo column: a Go module that links libzmq, libtokenizers or libpython
+# needs them in the image, since a sandbox cannot fetch them at turn time.
+[[image]]
+name = "sandbox-go-cgo-cc"
+features = ["go", "cgo", "claude-code", "gws"]
+
 [[image]]
 name = "sandbox-rust-cc"
 features = ["rust", "claude-code", "gws"]
