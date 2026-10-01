@@ -155,7 +155,7 @@ pub(crate) fn apply_agent_cfg(
     if args.agent_backend == manifest::AgentBackend::Local {
         args.agent_backend = agent.backend;
     }
-    // CLI `--sandbox-image` wins; else the manifest's.
+    // CLI `--sandbox-image` wins; else the manifest's. A task's named sandbox wins over both.
     if args.sandbox_image.is_none() {
         args.sandbox_image = agent.sandbox_image.clone();
     }
@@ -181,10 +181,12 @@ pub(crate) fn apply_agent_cfg(
     }
     // The pack's declared secrets, for the ones the registry says this agent may hold. The kubelet
     // put them in this process's environment; without this the sandbox never sees them.
-    crate::openshell::run::relay_agent_visible_secrets(secrets, &mut args.env);
+    args.relayed_secrets =
+        crate::openshell::run::relay_agent_visible_secrets(secrets, &mut args.env);
     // Who the agent's commits are attributed to. Same reason: the sandbox never sees the pod's env,
     // so the identity the controller named for this run has to be relayed like everything else.
     crate::openshell::run::relay_identity_env(&mut args.env);
+    args.sandboxes = agent.sandbox.clone();
     args.relay = agent.relay.clone();
     args.disclosure = frozen.disclosure.clone();
     args.output_bounds = frozen.bounds.clone();
@@ -736,6 +738,76 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .collect();
         assert_eq!(vals, ["proj-from-manifest"]);
+    }
+
+    /// A named sandbox's env script carries the secrets it lists and none of the others, through
+    /// the same relay a loop pod runs.
+    #[test]
+    fn a_named_sandbox_env_script_holds_only_its_secrets() {
+        let _guard = crucible::test_support::env_lock();
+        unsafe {
+            std::env::set_var("JIRA_TOKEN", "jira-value");
+            std::env::set_var("REGISTRY_TOKEN", "registry-value");
+            std::env::set_var(
+                crate::openshell::run::AGENT_VISIBLE_ENV,
+                "JIRA_TOKEN,REGISTRY_TOKEN",
+            );
+        }
+        let m: manifest::Manifest = toml::from_str(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            [agent.sandbox.go]
+            image = "ghcr.io/acme/sandbox-go@sha256:bb"
+            secrets = ["registry"]
+            [agent.sandbox.bare]
+            image = "ghcr.io/acme/bare@sha256:cc"
+            [[secret]]
+            name = "jira"
+            kind = "opaque"
+            env = "JIRA_TOKEN"
+            [[secret]]
+            name = "registry"
+            kind = "opaque"
+            env = "REGISTRY_TOKEN"
+        "#,
+        )
+        .unwrap();
+        let mut a = args_from(&["crucible"]);
+        let result = apply_agent_cfg(
+            &mut a,
+            &m.agent,
+            &m.secrets,
+            Path::new("ws"),
+            &FrozenProjection::default(),
+        );
+        unsafe {
+            std::env::remove_var("JIRA_TOKEN");
+            std::env::remove_var("REGISTRY_TOKEN");
+            std::env::remove_var(crate::openshell::run::AGENT_VISIBLE_ENV);
+        }
+        result.unwrap();
+        let script = |sandbox: Option<&str>| {
+            let mut turn = a.clone();
+            if let Some(name) = sandbox {
+                crate::plan::harness::enter_sandbox(&mut turn, name).unwrap();
+            }
+            turn.harness().backend().env_script(&turn.env)
+        };
+
+        let default = script(None);
+        assert!(default.contains("jira-value") && default.contains("registry-value"));
+        let go = script(Some("go"));
+        assert!(go.contains("registry-value"), "{go}");
+        assert!(
+            !go.contains("jira-value") && !go.contains("JIRA_TOKEN"),
+            "{go}"
+        );
+        let bare = script(Some("bare"));
+        assert!(!bare.contains("-value"), "{bare}");
     }
 
     /// The relay is an openshell-only bridge: a command/local turn inherits the process env

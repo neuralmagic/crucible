@@ -3008,6 +3008,8 @@ mod tests {
             sandbox_resources: Default::default(),
             broker: Default::default(),
             broker_token: None,
+            sandboxes: Default::default(),
+            relayed_secrets: Default::default(),
             model: Some("test-model".into()),
             harness: None,
             hermes: Default::default(),

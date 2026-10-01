@@ -300,8 +300,9 @@ impl Join {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TaskKind {
-    /// An agent turn. Harness, model family, and effort are per-task knobs: the openshell
-    /// heterogeneity axis. `None` inherits the manifest's `[agent]` defaults.
+    /// An agent turn. Harness, model family, effort, and sandbox are per-task knobs: the
+    /// openshell heterogeneity axis. `None` inherits the manifest's `[agent]` defaults; `sandbox`
+    /// names an `[agent.sandbox.<name>]`.
     Agent {
         prompt: String,
         #[serde(default)]
@@ -310,6 +311,8 @@ pub enum TaskKind {
         model: Option<String>,
         #[serde(default)]
         effort: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<String>,
     },
     /// A plan-authored command. Trusted scripts require frozen manifest injects.
     Command { command: String },
@@ -738,6 +741,15 @@ pub enum PlanError {
     )]
     SessionWithIsolation { task: String, session: String },
     #[error(
+        "tasks {first:?} and {second:?} share session {session:?} but run in different \
+         sandboxes; a session's transcript would carry one sandbox's secrets into the other"
+    )]
+    SessionSpansSandboxes {
+        session: String,
+        first: String,
+        second: String,
+    },
+    #[error(
         "task {task:?} contains `[` or `]`; those are reserved for a mapped node's instance \
          names, which are synthesized as `node[item]`"
     )]
@@ -1033,6 +1045,30 @@ impl Plan {
             });
         }
         let mut index: BTreeMap<&TaskName, usize> = BTreeMap::new();
+        let mut session_sandbox: BTreeMap<&str, (&TaskName, Option<&str>)> = BTreeMap::new();
+        for t in &self.tasks {
+            let Some(session) = &t.session else {
+                continue;
+            };
+            let sandbox = match &t.task {
+                TaskKind::Agent { sandbox, .. } => sandbox.as_deref(),
+                TaskKind::Engine {
+                    op: EngineOp::Propose,
+                    ..
+                } => None,
+                _ => continue,
+            };
+            let (first, theirs) = *session_sandbox
+                .entry(session.as_str())
+                .or_insert((&t.name, sandbox));
+            if theirs != sandbox {
+                return Err(PlanError::SessionSpansSandboxes {
+                    session: session.clone(),
+                    first: first.0.clone(),
+                    second: t.name.0.clone(),
+                });
+            }
+        }
         for (i, t) in self.tasks.iter().enumerate() {
             if t.name.0.trim().is_empty() {
                 return Err(PlanError::EmptyTaskName { index: i });
@@ -1726,6 +1762,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: deps.iter().map(|d| (*d).into()).collect(),
             session: None,
@@ -2247,6 +2284,75 @@ mod tests {
                 PlanError::UnsupportedVersion { version }
             );
         }
+    }
+
+    #[test]
+    fn a_session_stays_in_one_sandbox() {
+        let in_session = |name: &str, deps: &[&str], sandbox: Option<&str>| {
+            let mut task = agent(name, deps);
+            if let TaskKind::Agent { sandbox: slot, .. } = &mut task.task {
+                *slot = sandbox.map(str::to_string);
+            }
+            task.session = Some("s".into());
+            task
+        };
+        plan(vec![
+            in_session("a", &[], Some("go")),
+            in_session("b", &["a"], Some("go")),
+        ])
+        .validate()
+        .expect("one sandbox");
+        for second in [Some("jira"), None] {
+            let err = plan(vec![
+                in_session("a", &[], Some("go")),
+                in_session("b", &["a"], second),
+            ])
+            .validate()
+            .expect_err("a transcript would cross sandboxes");
+            assert_eq!(
+                err,
+                PlanError::SessionSpansSandboxes {
+                    session: "s".into(),
+                    first: "a".into(),
+                    second: "b".into(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_propose_session_runs_in_the_default_sandbox() {
+        let propose = || {
+            let mut task = agent("propose", &[]);
+            task.task = TaskKind::Engine {
+                op: EngineOp::Propose,
+                source: None,
+                tiebreak: None,
+            };
+            task.session = Some("s".into());
+            task
+        };
+        let review = |sandbox: Option<&str>| {
+            let mut task = agent("review", &["propose"]);
+            if let TaskKind::Agent { sandbox: slot, .. } = &mut task.task {
+                *slot = sandbox.map(str::to_string);
+            }
+            task.session = Some("s".into());
+            task
+        };
+        plan(vec![propose(), review(None)])
+            .validate()
+            .expect("both in the default sandbox");
+        assert_eq!(
+            plan(vec![propose(), review(Some("bare"))])
+                .validate()
+                .unwrap_err(),
+            PlanError::SessionSpansSandboxes {
+                session: "s".into(),
+                first: "propose".into(),
+                second: "review".into(),
+            }
+        );
     }
 
     #[test]

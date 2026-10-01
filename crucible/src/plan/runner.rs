@@ -102,7 +102,17 @@ impl ShellRunner {
                 harness,
                 model,
                 effort,
+                sandbox,
             } => {
+                if let Some(name) = sandbox {
+                    return Attempt::failed(
+                        0.0,
+                        format!(
+                            "agent task runs in sandbox {name:?}, which only the openshell \
+                             backend provides; this runner runs agents as local commands"
+                        ),
+                    );
+                }
                 let Some(agent_cmd) = &self.agent_cmd else {
                     return Attempt::failed(
                         0.0,
@@ -785,6 +795,46 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_task_naming_a_sandbox_is_refused_by_the_command_runner() {
+        let t = Task {
+            name: "a".into(),
+            task: TaskKind::Agent {
+                prompt: "do it".into(),
+                harness: None,
+                model: None,
+                effort: None,
+                sandbox: Some("bare".into()),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::default(),
+            stage: Stage::Iteration,
+            emits: crate::plan::ir::Emits::default(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
+            when: None,
+            revise: None,
+            timeout: None,
+            history: None,
+        };
+        let mut r = ShellRunner {
+            workdir: std::env::temp_dir(),
+            agent_cmd: Some("true".into()),
+        };
+        let a = r.run(&t, 1, &BTreeMap::new(), None);
+        match a.outcome {
+            AttemptOutcome::Fail { note, .. } => {
+                assert!(note.contains("sandbox \"bare\""), "{note}");
+            }
+            other => panic!("expected a measured failure, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn agent_task_without_agent_cmd_is_refused() {
         let t = Task {
             name: "a".into(),
@@ -793,6 +843,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -824,6 +875,7 @@ mod tests {
                 harness: Some("hermes".into()),
                 model: Some("codex".into()),
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -865,6 +917,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -941,6 +994,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,

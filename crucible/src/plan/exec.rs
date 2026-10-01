@@ -8100,6 +8100,7 @@ mod tests {
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             ..task(name, deps, "any", true)
         }

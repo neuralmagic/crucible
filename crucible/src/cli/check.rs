@@ -210,9 +210,11 @@ fn check_single(manifest_path: &Path) -> Result<CheckOutcome> {
         return Ok(out);
     }
     // A parameterised graph has no values here; the lint then has no tasks to read.
-    if m.resolve_workflow(&manifest_dir).is_ok() {
-        out.warnings
-            .extend(uninjected_script_warnings(&m, &manifest_dir));
+    match m.resolve_workflow(&manifest_dir) {
+        Ok(()) => out
+            .warnings
+            .extend(uninjected_script_warnings(&m, &manifest_dir)),
+        Err(e) => out.findings.extend(sandbox_finding(&e)),
     }
 
     if !workspace.exists() {
@@ -306,6 +308,21 @@ fn shadowed_deny_warnings(agent: &AgentCfg) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// The sandbox error in a failed resolve: a task naming an undeclared sandbox, or a session
+/// spanning two sandboxes.
+fn sandbox_finding(e: &anyhow::Error) -> Option<String> {
+    e.chain().find_map(|cause| {
+        let sandbox = matches!(
+            cause.downcast_ref::<manifest::ManifestError>(),
+            Some(manifest::ManifestError::UnknownSandbox { .. })
+        ) || matches!(
+            cause.downcast_ref::<crate::plan::ir::PlanError>(),
+            Some(crate::plan::ir::PlanError::SessionSpansSandboxes { .. })
+        );
+        sandbox.then(|| cause.to_string())
+    })
 }
 
 /// `[[workspace.inject]]` entries with `frozen = true`, resolved to absolute `(src, dst)`, the
@@ -1302,6 +1319,42 @@ workflow(type = "playbook", tasks = [r, h])
         // The repo-less playbook got a workspace seeded from its injects alone.
         assert!(dir.join("workspace/roundup.py").is_file());
         assert!(!dir.join("workspace/helper.py").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_reports_a_starlark_task_naming_an_undeclared_sandbox() {
+        let dir = tempdir("undeclared-sandbox");
+        fs::write(
+            dir.join("workflow.star"),
+            r#"
+a = agent(name = "analyze", prompt = "p", sandbox = "rust")
+workflow(type = "playbook", tasks = [a])
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.join(MANIFEST),
+            r#"
+            [agent]
+            backend = "openshell"
+            goal = "goal"
+            [agent.sandbox.go]
+            image = "ghcr.io/acme/go@sha256:bb"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .unwrap();
+        let out = run(&dir.join(MANIFEST)).expect("check runs");
+        assert!(
+            out.findings.iter().any(|f| f.contains(
+                r#"task "analyze" runs in sandbox "rust", which no [agent.sandbox.rust] declares"#
+            )),
+            "findings: {:?}",
+            out.findings
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

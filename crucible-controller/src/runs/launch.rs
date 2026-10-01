@@ -83,25 +83,38 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
                         },
                     });
             let catalog = crate::images::store::list_images(db.pool()).await?;
-            let verdict =
-                crate::playbooks::preflight::preflight(pack_agent, resolved.as_ref(), &catalog);
-            if verdict.refused() {
+            let pack = crate::playbooks::preflight::preflight_pack(
+                pack_agent,
+                resolved.as_ref(),
+                &catalog,
+            );
+            if pack.refused() {
                 crate::issues::transitions::park(
                     db.pool(),
                     db.events(),
                     &issue.key,
                     Status::New,
                     &ParkReason::ImagePreflightRefused {
-                        image: verdict
+                        image: pack
+                            .image
                             .reference
                             .unwrap_or_else(|| "(no image)".to_string()),
-                        detail: verdict.refusals.join("; "),
+                        detail: pack
+                            .refusals
+                            .iter()
+                            .map(|r| match r.field.as_str() {
+                                "sandbox_image" => r.message.clone(),
+                                field => format!("{field}: {}", r.message),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; "),
                     },
                     ParkedBy::Machine,
                 )
                 .await?;
                 return Ok(());
             }
+            let verdict = pack.image;
             crate::runs::model::RunImage {
                 reference: verdict.reference,
                 digest: verdict.digest,

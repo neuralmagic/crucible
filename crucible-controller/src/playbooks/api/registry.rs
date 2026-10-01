@@ -232,21 +232,29 @@ pub(crate) async fn authorize_image(
         .await
         .map_err(|e| AppError::from(e).into_response())?;
     let catalog = catalog(state).await?;
-    let verdict = crate::playbooks::preflight::preflight(agent, resolved.as_ref(), &catalog);
+    let verdict = crate::playbooks::preflight::preflight_pack(agent, resolved.as_ref(), &catalog);
     if verdict.refused() {
         return Err(refused(
-            "the pack's sandbox image fails the capability preflight",
+            refusal_headline(&verdict.refusals),
             verdict
                 .refusals
-                .iter()
-                .map(|message| crate::playbooks::registry::FieldError {
-                    field: "sandbox_image".to_string(),
-                    message: message.clone(),
+                .into_iter()
+                .map(|r| crate::playbooks::registry::FieldError {
+                    field: r.field,
+                    message: r.message,
                 })
                 .collect(),
         ));
     }
-    Ok(verdict)
+    Ok(verdict.image)
+}
+
+fn refusal_headline(refusals: &[crate::playbooks::preflight::ImageRefusal]) -> &'static str {
+    if refusals.iter().all(|r| r.field == "sandbox_image") {
+        "the pack's sandbox image fails the capability preflight"
+    } else {
+        "a sandbox image the pack names fails the capability preflight"
+    }
 }
 
 /// One registered playbook: what it is, where it is pinned, and the digest of the launch form the
