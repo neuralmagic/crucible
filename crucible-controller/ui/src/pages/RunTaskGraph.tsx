@@ -50,6 +50,7 @@ export function RunTaskGraph({ runId }: { runId: string }) {
           runId={runId}
           outputs={view.outputs}
           fanoutState={view.fanout}
+          links={view.links}
         />
         <EngineDefaults bounds={view.engineDefaults} />
       </SectionBody>

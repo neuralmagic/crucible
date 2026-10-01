@@ -51,9 +51,11 @@ export interface WorkflowLayout {
 }
 
 /// Every task is drawn in the same box: the card holds a badge, the name, what the task runs, what
-/// it maps over and what it emits, and a uniform box is what keeps the layers readable.
+/// it maps over and what it emits, and a uniform box is what keeps the layers readable. The foot
+/// of the box is kept clear of text for what the task linked out to.
 export const NODE_W = 176;
-export const NODE_H = 72;
+export const NODE_H = 86;
+export const LINK_STRIP = 14;
 /// Gap between layers, along the direction the graph runs, and between the cards of one layer.
 const LAYER_GAP = 44;
 const ROW_GAP = 12;

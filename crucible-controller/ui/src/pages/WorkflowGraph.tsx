@@ -29,10 +29,11 @@ import {
   type NodeProps,
   type NodeTypes,
 } from '@xyflow/react';
-import { cn, Split, SplitHandle, SplitPane } from '../ui';
+import { cn, ExternalLinkChip, ExternalLinkMark, Split, SplitHandle, SplitPane } from '../ui';
 import { useDeviceFlag } from '../useDeviceFlag';
 import {
   layoutWorkflow,
+  LINK_STRIP,
   STACK_CARDS,
   STACK_STEP,
   type LaidOutEdge,
@@ -54,6 +55,7 @@ import {
 import {
   targetLabel,
   type FanOutState,
+  type NodeLinks,
   type OutputNode,
   type TaskRuntime,
   type TaskTone,
@@ -71,6 +73,8 @@ export interface WorkflowGraphProps {
   outputs?: ReadonlyMap<string, OutputNode>;
   /// What each mapped task's fan-out came to, keyed by the mapped task's name.
   fanoutState?: ReadonlyMap<string, FanOutState>;
+  /// The external results each node links out to, keyed by node name.
+  links?: ReadonlyMap<string, NodeLinks>;
   className?: string;
 }
 
@@ -125,6 +129,7 @@ interface GraphView {
   runtime: ReadonlyMap<string, TaskRuntime>;
   outputs: ReadonlyMap<string, OutputNode>;
   fanoutState: ReadonlyMap<string, FanOutState>;
+  links: ReadonlyMap<string, NodeLinks>;
   edges: ReadonlyMap<string, LaidOutEdge>;
   /// The hovered or focused task and everything it depends on; null when nothing is traced. A
   /// picked task is not traced: reading its metadata should not dim the graph it sits in.
@@ -154,6 +159,44 @@ function Chip({ children }: ChipProps) {
   );
 }
 
+/// How many links, or how many providers, fit across a card before the rest become a count.
+const LINKS_SHOWN = 2;
+const PROVIDERS_SHOWN = 4;
+
+/// Drawn over the strip the card reserves rather than inside it: the card is a button, and a link
+/// inside a button is neither valid nor reachable from the keyboard.
+function NodeLinkRow({ name, drawn, dim }: { name: string; drawn: NodeLinks; dim: boolean }) {
+  const cap = drawn.kind === 'counts' ? PROVIDERS_SHOWN : LINKS_SHOWN;
+  const total = drawn.kind === 'counts' ? drawn.counts.length : drawn.links.length;
+  return (
+    <span
+      data-node-links={name}
+      style={{ opacity: dim ? 0.2 : 1, height: LINK_STRIP, transition: 'opacity 120ms linear' }}
+      className="pointer-events-none absolute right-1.5 bottom-0.5 left-2 flex min-w-0 items-center gap-2 overflow-hidden"
+    >
+      {drawn.kind === 'counts'
+        ? drawn.counts.slice(0, cap).map((count) => (
+            <span
+              key={count.provider}
+              aria-label={`${count.count} ${count.provider}`}
+              className="pointer-events-auto inline-flex items-center gap-1 font-mono text-micro text-ink-2"
+            >
+              <ExternalLinkMark provider={count.provider} />
+              {count.count}
+            </span>
+          ))
+        : drawn.links.slice(0, cap).map((link) => (
+            <ExternalLinkChip
+              key={link.url}
+              link={link}
+              className="pointer-events-auto min-w-0 border-b-0 text-micro"
+            />
+          ))}
+      {total > cap && <Chip>{`+${total - cap}`}</Chip>}
+    </span>
+  );
+}
+
 /// One task, drawn. The card is a button: pressing it opens the task's metadata, and focusing it
 /// traces the same ancestry hovering does, so the graph reads from the keyboard.
 function TaskCard({ id }: NodeProps) {
@@ -173,6 +216,7 @@ function TaskCard({ id }: NodeProps) {
   const meta = metaFor(node);
   const runtime = view.runtime.get(node.name) ?? null;
   const spread = view.fanoutState.get(node.name) ?? null;
+  const links = view.links.get(node.name) ?? null;
   const ran = runtime === null ? null : runtimeLine(runtime);
   const ports = PORTS[view.direction];
 
@@ -206,7 +250,11 @@ function TaskCard({ id }: NodeProps) {
           if (event.currentTarget.matches(':focus-visible')) view.onTrace(node.name);
         }}
         onBlur={() => view.onTrace(null)}
-        style={{ opacity: dim ? 0.2 : 1, transition: 'opacity 120ms linear' }}
+        style={{
+          opacity: dim ? 0.2 : 1,
+          transition: 'opacity 120ms linear',
+          paddingBottom: links === null ? undefined : LINK_STRIP,
+        }}
         className={cn(
           'relative flex h-full w-full flex-col overflow-hidden bg-raised py-0.5 pr-1.5 pl-2 text-left leading-tight',
           advisory ? 'border border-dashed border-rule-hard' : 'border border-ink-3',
@@ -275,6 +323,7 @@ function TaskCard({ id }: NodeProps) {
           </span>
         )}
       </button>
+      {links !== null && <NodeLinkRow name={node.name} drawn={links} dim={dim} />}
       <Handle type="source" position={ports.out} isConnectable={false} className="opacity-0" />
     </>
   );
@@ -448,11 +497,20 @@ function TaskPanel({ laid, runtime, spread, runId, onClose }: TaskPanelProps) {
 const NO_RUNTIME: ReadonlyMap<string, TaskRuntime> = new Map();
 const NO_OUTPUTS: ReadonlyMap<string, OutputNode> = new Map();
 const NO_FANOUT: ReadonlyMap<string, FanOutState> = new Map();
+const NO_LINKS: ReadonlyMap<string, NodeLinks> = new Map();
 
 const CANVAS_ONLY = ['canvas'];
 const CANVAS_AND_PANEL = ['canvas', 'panel'];
 
-function GraphCanvas({ graph, runtime, runId, outputs, fanoutState, className }: WorkflowGraphProps) {
+function GraphCanvas({
+  graph,
+  runtime,
+  runId,
+  outputs,
+  fanoutState,
+  links,
+  className,
+}: WorkflowGraphProps) {
   const marker = useId().replace(/:/g, '');
   const markers = useMemo(
     () => ({ arrow: `arrow-${marker}`, arrowLit: `arrow-lit-${marker}` }),
@@ -520,13 +578,14 @@ function GraphCanvas({ graph, runtime, runId, outputs, fanoutState, className }:
       runtime: runtime ?? NO_RUNTIME,
       outputs: outputs ?? NO_OUTPUTS,
       fanoutState: fanoutState ?? NO_FANOUT,
+      links: links ?? NO_LINKS,
       edges: new Map(layout.edges.map((laid) => [edgeId(laid.from, laid.to), laid])),
       lit: traced === null ? null : (layout.ancestry.get(traced) ?? new Set([traced])),
       picked,
       onTrace: setTraced,
       onPick: setPicked,
     };
-  }, [direction, layout, runtime, outputs, fanoutState, traced, picked]);
+  }, [direction, layout, runtime, outputs, fanoutState, links, traced, picked]);
 
   const canvasRef = useRef<HTMLDivElement | null>(null);
   // The canvas changes size when a divider is dragged, the rail collapses, or the window resizes;

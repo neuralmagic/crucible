@@ -3,6 +3,7 @@
 // folding is testable without a flow — same split as workflowGraphLayout.ts.
 
 import type { components } from '../api/schema';
+import { shownLinks, type ExternalLinkRef } from '../ui/ExternalLink';
 import type { WorkflowGraphDoc, WorkflowGraphEdge, WorkflowGraphNode } from './workflowGraphLayout';
 
 export type PlanTask = components['schemas']['PlanTaskDto'];
@@ -94,6 +95,8 @@ export interface RunGraphView {
   engineDefaults: OutputNode[];
   /// What each mapped task's fan-out came to, by the mapped task's name.
   fanout: ReadonlyMap<string, FanOutState>;
+  /// The external results each node links out to, by node name.
+  links: ReadonlyMap<string, NodeLinks>;
 }
 
 /// Everything the run graph endpoint answers with, plus whether the run is still going — which is
@@ -269,6 +272,54 @@ export function mappedFrom(name: string): string | null {
   const cut = name.indexOf('[');
   if (cut <= 0 || !name.endsWith(']')) return null;
   return name.slice(0, cut);
+}
+
+/// One provider a mapped task's instances linked out to, and how many urls they reported there.
+export interface ProviderCount {
+  provider: string;
+  count: number;
+}
+
+/// What a node says about the external results its task reported: the links themselves, or for a
+/// mapped task a tally by provider.
+export type NodeLinks =
+  | { kind: 'links'; links: ExternalLinkRef[] }
+  | { kind: 'counts'; counts: ProviderCount[] };
+
+function providerCounts(links: ExternalLinkRef[]): ProviderCount[] {
+  const counts: ProviderCount[] = [];
+  for (const link of links) {
+    const seen = counts.find((c) => c.provider === link.provider);
+    if (seen === undefined) counts.push({ provider: link.provider, count: 1 });
+    else seen.count += 1;
+  }
+  return counts;
+}
+
+/// Every link each node draws, by node name. A task's own links are every url it reported across
+/// its attempts; a mapped task's node tallies every url reported under it, itself and its
+/// instances both, each url counted once however many instances reported it.
+export function nodeLinks(tasks: PlanTask[], results: TaskResult[]): Map<string, NodeLinks> {
+  const reported = new Map<string, ExternalLinkRef[]>();
+  for (const result of results) {
+    if (result.links.length === 0) continue;
+    reported.set(result.task, [...(reported.get(result.task) ?? []), ...result.links]);
+  }
+  const mapped = new Set(tasks.filter((task) => task.over !== '').map((task) => task.name));
+  const spread = new Map<string, ExternalLinkRef[]>();
+  const drawn = new Map<string, NodeLinks>();
+  for (const [task, links] of reported) {
+    const shown = shownLinks(links);
+    if (shown.length > 0) drawn.set(task, { kind: 'links', links: shown });
+    const deck = mapped.has(task) ? task : mappedFrom(task);
+    if (deck === null || !mapped.has(deck)) continue;
+    spread.set(deck, [...(spread.get(deck) ?? []), ...links]);
+  }
+  for (const [deck, links] of spread) {
+    const counts = providerCounts(shownLinks(links));
+    if (counts.length > 0) drawn.set(deck, { kind: 'counts', counts });
+  }
+  return drawn;
 }
 
 /// Hide a dependency already implied by a longer path. The executor may retain such dependencies
@@ -455,5 +506,6 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
     outputs,
     engineDefaults,
     fanout,
+    links: nodeLinks(tasks, results),
   };
 }

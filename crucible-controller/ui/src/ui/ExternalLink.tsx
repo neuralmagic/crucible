@@ -89,7 +89,7 @@ export function ExternalLinkChip({ link, className }: ExternalLinkChipProps) {
       )}
     >
       <ExternalLinkMark provider={link.provider} />
-      {link.label}
+      <span className="min-w-0 truncate">{link.label}</span>
     </a>
   );
 }

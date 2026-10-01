@@ -116,7 +116,8 @@ const RUNS = [
 
 /** A run's admitted work graph: a fanned-out task whose instances land in the results without ever
  * being declared, one of them failed, plus a task nothing has reported on yet. `read` emitted
- * three papers and only two instances started. */
+ * three papers and only two instances started. Both instances and the reducer reported what they
+ * opened outside the run. */
 const RUN_GRAPH = {
   plan_version: 3,
   tasks: [
@@ -129,8 +130,29 @@ const RUN_GRAPH = {
   results: [
     { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [] },
     { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [] },
-    { iter: 1, task: 'summarize[paged-attention]', status: 'pass', note: 'one entry per citation', cost_usd: 0.2, secs: 18, links: [] },
-    { iter: 1, task: 'summarize[flashinfer]', status: 'fail', note: 'exit 1: no citations parsed\n  at summarize.sh:14', cost_usd: 0.05, secs: 6, links: [] },
+    {
+      iter: 1,
+      task: 'summarize[paged-attention]',
+      status: 'pass',
+      note: 'one entry per citation',
+      cost_usd: 0.2,
+      secs: 18,
+      links: [
+        { url: 'https://github.com/neuralmagic/crucible/pull/418', provider: 'github', kind: 'pull_request', label: '#418' },
+        { url: 'https://github.com/neuralmagic/crucible/tree/paged-attention', provider: 'github', kind: 'branch', label: 'paged-attention' },
+      ],
+    },
+    {
+      iter: 1,
+      task: 'summarize[flashinfer]',
+      status: 'fail',
+      note: 'exit 1: no citations parsed\n  at summarize.sh:14',
+      cost_usd: 0.05,
+      secs: 6,
+      links: [
+        { url: 'https://gitlab.com/vllm/kernels/-/merge_requests/9', provider: 'gitlab', kind: 'merge_request', label: '!9' },
+      ],
+    },
     {
       iter: 1,
       task: 'rank',
