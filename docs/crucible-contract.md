@@ -728,13 +728,15 @@ every grant and revoke, and the server re-reads it on every request. One line pe
 
 - `<token>`: the bearer the sandbox's requests carry (`Authorization: Bearer <token>`), 48 hex
   characters.
-- `<sandbox>`: the gateway's name for the sandbox (`ci-<16 hex>`).
+- `<sandbox>`: the gateway's name for the sandbox (`ci-<16 hex>`). At most 63 ASCII letters,
+  digits, `-`, `_` or `.`, starting and ending with a letter or digit.
 - `<workdir>`: the absolute path the sandbox's agent runs in, `/sandbox/<basename>` where
   `<basename>` is the uploaded workspace's directory name: `/sandbox/workspace` for a loop turn,
-  `/sandbox/task-<sha256 of the task name>` for an isolated plan task.
+  `/sandbox/task-<sha256 of the task name>` for an isolated plan task. No empty, `.` or `..`
+  segment, and no control character.
 
 Fields are separated by whitespace and hold none. Blank lines are skipped. A line of any other
-shape, a relative workdir, or a repeated token makes the whole file invalid, and the server
+shape, a sandbox or workdir outside those rules, or a repeated token makes the whole file invalid, and the server
 refuses every request until it is rewritten. A two-field `<token> <sandbox>` line, the format
 before the workdir was added, still parses with the workdir unknown. A request whose bearer is in
 no line gets 401.

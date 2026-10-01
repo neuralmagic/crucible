@@ -27,19 +27,19 @@ pub const ENV_CONTROL_ADDR: &str = "MCP_CONTROL_ADDR";
 /// Why a [`TokenHolder`] cannot be written to a token file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HolderError {
-    /// An empty sandbox name, or one holding whitespace.
+    /// A sandbox name that is not 1 to 63 ASCII letters, digits, `-`, `_` or `.`, starting and
+    /// ending with a letter or digit.
     Sandbox(String),
-    /// A workdir that is not absolute, or holds whitespace.
+    /// A workdir that is not an absolute path of plain segments: no empty, `.` or `..` segment,
+    /// no whitespace or control character.
     Workdir(String),
 }
 
 impl fmt::Display for HolderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Sandbox(name) => write!(f, "sandbox name {name:?} is empty or holds whitespace"),
-            Self::Workdir(path) => {
-                write!(f, "workdir {path:?} is not absolute or holds whitespace")
-            }
+            Self::Sandbox(name) => write!(f, "invalid sandbox name {name:?}"),
+            Self::Workdir(path) => write!(f, "invalid sandbox workdir {path:?}"),
         }
     }
 }
@@ -54,11 +54,10 @@ pub struct TokenHolder {
 }
 
 impl TokenHolder {
-    /// A holder whose workdir is known. Both fields are single whitespace-free words, and the
-    /// workdir is absolute.
+    /// A holder whose workdir is known. See [`HolderError`] for what each field allows.
     pub fn new(sandbox: &str, workdir: &str) -> Result<Self, HolderError> {
         let mut holder = Self::without_workdir(sandbox)?;
-        if !workdir.starts_with('/') || workdir.chars().any(char::is_whitespace) {
+        if !valid_workdir(workdir) {
             return Err(HolderError::Workdir(workdir.to_string()));
         }
         holder.workdir = Some(workdir.to_string());
@@ -67,7 +66,7 @@ impl TokenHolder {
 
     /// A holder from a two-field line, whose workdir is unknown.
     pub fn without_workdir(sandbox: &str) -> Result<Self, HolderError> {
-        if sandbox.is_empty() || sandbox.chars().any(char::is_whitespace) {
+        if !valid_sandbox(sandbox) {
             return Err(HolderError::Sandbox(sandbox.to_string()));
         }
         Ok(Self {
@@ -83,6 +82,26 @@ impl TokenHolder {
     pub fn workdir(&self) -> Option<&str> {
         self.workdir.as_deref()
     }
+}
+
+fn valid_sandbox(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+fn valid_workdir(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix('/') else {
+        return false;
+    };
+    let rest = rest.trim_end_matches('/');
+    !rest.is_empty()
+        && rest.split('/').all(|part| !matches!(part, "" | "." | ".."))
+        && !path.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 
 /// Why a token file did not parse.
@@ -264,6 +283,69 @@ mod tests {
         assert_eq!(
             TokenMap::parse("tok ci-a\ntok ci-b /sandbox/w\n"),
             Err(TokenMapError::DuplicateToken { line: 2 })
+        );
+    }
+
+    #[test]
+    fn sandbox_names_follow_the_servers_charset() {
+        for ok in ["ci-0123456789abcdef", "a", "sb_1.x", &"a".repeat(63)] {
+            assert!(TokenHolder::without_workdir(ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "-ci",
+            "ci-",
+            ".ci",
+            "ci.",
+            "ci/a",
+            "ci:a",
+            "ci\u{7f}a",
+            "cï",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(
+                TokenHolder::without_workdir(bad),
+                Err(HolderError::Sandbox(bad.to_string())),
+                "{bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn workdirs_are_absolute_paths_of_plain_segments() {
+        for ok in [
+            "/sandbox/workspace",
+            "/sandbox/task-0123abcd",
+            "/sandbox/workspace/",
+            "/w",
+        ] {
+            assert!(TokenHolder::new("ci-a", ok).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            "/",
+            "//",
+            "sandbox/w",
+            "/sandbox//w",
+            "/sandbox/./w",
+            "/sandbox/../etc",
+            "/sandbox/..",
+            "/sandbox/w\u{1}",
+            "/sandbox/w\u{85}",
+        ] {
+            assert_eq!(
+                TokenHolder::new("ci-a", bad),
+                Err(HolderError::Workdir(bad.to_string())),
+                "{bad:?}"
+            );
+        }
+        assert_eq!(
+            TokenMap::parse("tok ci-a /sandbox/../etc\n"),
+            Err(TokenMapError::Malformed { line: 1 })
+        );
+        assert_eq!(
+            TokenMap::parse("tok -ci\n"),
+            Err(TokenMapError::Malformed { line: 1 })
         );
     }
 
