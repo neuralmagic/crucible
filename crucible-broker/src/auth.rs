@@ -11,7 +11,7 @@ use axum::extract::{Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use crucible_contract::mcp::{ENV_TOKENS_FILE, TokenMap};
+use crucible_contract::mcp::{ENV_TOKENS_FILE, TokenHolder, TokenMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,11 +26,6 @@ pub enum Guard {
     PerSandbox(PathBuf),
 }
 
-/// The sandbox a per-sandbox token belongs to, attached to the request for the tools behind the
-/// guard.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Sandbox(pub String);
-
 /// The guard the env configures: `MCP_TOKENS_FILE` over `BROKER_TOKEN` over open.
 pub fn guard() -> Guard {
     if let Some(path) = std::env::var_os(ENV_TOKENS_FILE).filter(|p| !p.is_empty()) {
@@ -43,7 +38,8 @@ pub fn guard() -> Guard {
 }
 
 /// Middleware over [`guard`]: 401 any request whose bearer the guard does not know. A per-sandbox
-/// token also attaches its [`Sandbox`]. An unreadable token file refuses everything.
+/// token also attaches its [`TokenHolder`] (the sandbox and its agent's workdir) for the tools
+/// behind the guard. An unreadable token file refuses everything.
 pub async fn require_guard(
     State(guard): State<Arc<Guard>>,
     mut req: Request,
@@ -57,9 +53,9 @@ pub async fn require_guard(
     let pass = match guard.as_ref() {
         Guard::Open => true,
         Guard::Token(want) => authorized(got.as_deref(), Some(want)),
-        Guard::PerSandbox(path) => match sandbox_for(path, got.as_deref()).await {
-            Some(sandbox) => {
-                req.extensions_mut().insert(Sandbox(sandbox));
+        Guard::PerSandbox(path) => match holder_for(path, got.as_deref()).await {
+            Some(holder) => {
+                req.extensions_mut().insert(holder);
                 true
             }
             None => false,
@@ -71,8 +67,8 @@ pub async fn require_guard(
     unauthorized()
 }
 
-/// The sandbox the bearer in `header` belongs to, per the token file at `path`.
-async fn sandbox_for(path: &std::path::Path, header: Option<&str>) -> Option<String> {
+/// The holder of the bearer in `header`, per the token file at `path`.
+async fn holder_for(path: &std::path::Path, header: Option<&str>) -> Option<TokenHolder> {
     let token = header?.strip_prefix("Bearer ")?;
     let text = match tokio::fs::read_to_string(path).await {
         Ok(text) => text,
@@ -82,7 +78,7 @@ async fn sandbox_for(path: &std::path::Path, header: Option<&str>) -> Option<Str
         }
     };
     match TokenMap::parse(&text) {
-        Ok(map) => map.sandbox_for(token).map(str::to_owned),
+        Ok(map) => map.holder_for(token).cloned(),
         Err(e) => {
             tracing::error!("parsing the token file {}: {e}", path.display());
             None
@@ -271,14 +267,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("tokens");
         let mut map = TokenMap::default();
-        map.grant("ci-a", "tok-a");
-        map.grant("ci-b", "tok-b");
+        map.grant(
+            TokenHolder::new("ci-a", "/sandbox/workspace").unwrap(),
+            "tok-a",
+        );
+        map.grant(
+            TokenHolder::new("ci-b", "/sandbox/task-b").unwrap(),
+            "tok-b",
+        );
         std::fs::write(&file, map.render()).unwrap();
 
         async fn who(req: Request) -> String {
             req.extensions()
-                .get::<Sandbox>()
-                .map(|s| s.0.clone())
+                .get::<TokenHolder>()
+                .map(|h| format!("{} {}", h.sandbox(), h.workdir().unwrap_or("?")))
                 .unwrap_or_default()
         }
         let app = axum::Router::new()
@@ -294,8 +296,14 @@ mod tests {
         let call = move |bearer: Option<&'static str>| {
             tokio::task::spawn_blocking(move || get(addr, bearer))
         };
-        assert_eq!(call(Some("tok-a")).await.unwrap(), (200, "ci-a".into()));
-        assert_eq!(call(Some("tok-b")).await.unwrap(), (200, "ci-b".into()));
+        assert_eq!(
+            call(Some("tok-a")).await.unwrap(),
+            (200, "ci-a /sandbox/workspace".into())
+        );
+        assert_eq!(
+            call(Some("tok-b")).await.unwrap(),
+            (200, "ci-b /sandbox/task-b".into())
+        );
         assert_eq!(call(None).await.unwrap().0, 401);
         assert_eq!(call(Some("tok-c")).await.unwrap().0, 401);
         assert_eq!(
@@ -311,7 +319,17 @@ mod tests {
             401,
             "the file is re-read, so a revoked token stops working"
         );
-        assert_eq!(call(Some("tok-b")).await.unwrap(), (200, "ci-b".into()));
+        assert_eq!(
+            call(Some("tok-b")).await.unwrap(),
+            (200, "ci-b /sandbox/task-b".into())
+        );
+
+        std::fs::write(&file, "tok-old ci-old\n").unwrap();
+        assert_eq!(
+            call(Some("tok-old")).await.unwrap(),
+            (200, "ci-old ?".into()),
+            "a two-field line authenticates with the workdir unknown"
+        );
 
         std::fs::remove_file(&file).unwrap();
         assert_eq!(

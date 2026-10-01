@@ -24,6 +24,7 @@ use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};
 use crucible_contract::TransportCause;
+use crucible_contract::mcp::TokenHolder;
 use std::time::Instant;
 
 /// Which step of the turn an orchestration error came from, read off the typed errors in its
@@ -377,7 +378,8 @@ async fn try_turn(
         _ => false,
     };
 
-    let name = sandbox::name_for(&p.workspace);
+    let holder = token_holder(p)?;
+    let name = holder.sandbox().to_string();
     tracing::Span::current().record("sandbox", name.as_str());
 
     // 3. Clear a stale sandbox of this name before granting it anything. A prior turn whose
@@ -439,8 +441,8 @@ async fn try_turn(
         //     `openshell:resolve:env:` placeholder. The proxy resolves it at egress, solely for the
         //     policy endpoint bound to that provider (the step-4 `credential_binding`), so the real
         //     token never enters the sandbox and a leaked placeholder resolves nowhere else. A catalog
-        //     server's token is this sandbox's alone; the server maps it back to the sandbox.
-        grant_mcp(&gw, &args.mcp, &name, args.compute_driver.broker_host(), &mut mcp).await?;
+        //     server's token is this sandbox's alone; the server maps it back to the sandbox and its workdir.
+        grant_mcp(&gw, &args.mcp, &holder, args.compute_driver.broker_host(), &mut mcp).await?;
         let mcp = mcp.as_slice();
 
         // 3b. Create the sandbox, attaching the managed providers. Labels make the sandbox
@@ -719,7 +721,7 @@ async fn try_turn(
 
         // 9. Download the workspace back (the agent's edits round-trip to the host).
         stage(sink, "agent turn done — downloading the workspace");
-        let sandbox_workdir = format!("{}/{basename}", SandboxLayout::HOME);
+        let sandbox_workdir = SandboxLayout::workdir(&basename);
         retrieve_workspace(&name, &sandbox_workdir, p.workspace.as_path(), &cancel).await?;
 
         // Save the updated native transcript before telemetry parsing and teardown. It is private
@@ -857,11 +859,12 @@ impl TurnServer {
 async fn grant_mcp(
     gw: &Gateway,
     runtime: &crate::control::mcp::McpRuntime,
-    sandbox: &str,
+    holder: &TokenHolder,
     host: &str,
     granted: &mut Vec<TurnServer>,
 ) -> Result<()> {
     use crate::control::mcp::ServerAuth;
+    let sandbox = holder.sandbox();
     for server in runtime.servers() {
         if let ServerAuth::PerSandbox(registry) = &server.auth {
             registry
@@ -886,7 +889,7 @@ async fn grant_mcp(
                 });
             }
             ServerAuth::PerSandbox(registry) => {
-                let token = registry.grant(sandbox).with_context(|| {
+                let token = registry.grant(holder).with_context(|| {
                     format!("granting {sandbox} a token on [mcp.{}]", server.key)
                 })?;
                 let name = provider::mcp_provider_name(&server.key, sandbox);
@@ -1591,6 +1594,14 @@ async fn mtime_or_epoch(path: &std::path::Path) -> std::time::SystemTime {
         .await
         .and_then(|m| m.modified())
         .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+/// The sandbox a turn over `p` runs in and the workdir its agent runs in, as the MCP token file
+/// names them.
+pub(crate) fn token_holder(p: &Paths) -> Result<TokenHolder> {
+    let workdir = SandboxLayout::workdir(&workdir_basename(p)?);
+    TokenHolder::new(&sandbox::name_for(&p.workspace), &workdir)
+        .context("naming the turn's sandbox in the MCP token file")
 }
 
 /// The basename the workspace uploads under (`/sandbox/<basename>`).

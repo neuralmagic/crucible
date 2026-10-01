@@ -2,7 +2,7 @@
 //! for a sandbox, grant it, revoke it at teardown.
 
 use anyhow::{Context, Result};
-use crucible_contract::mcp::TokenMap;
+use crucible_contract::mcp::{TokenHolder, TokenMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -28,10 +28,10 @@ impl TokenRegistry {
         &self.path
     }
 
-    /// Mint a fresh token for `sandbox`, replacing any it held, and return it.
-    pub fn grant(&self, sandbox: &str) -> Result<String> {
+    /// Mint a fresh token for `holder`'s sandbox, replacing any it held, and return it.
+    pub fn grant(&self, holder: &TokenHolder) -> Result<String> {
         let token = mint_token()?;
-        self.update(|map| map.grant(sandbox, &token))?;
+        self.update(|map| map.grant(holder.clone(), &token))?;
         Ok(token)
     }
 
@@ -81,7 +81,11 @@ pub fn mint_token() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use crate::control::mcp::tokens::{TokenRegistry, mint_token};
-    use crucible_contract::mcp::TokenMap;
+    use crucible_contract::mcp::{TokenHolder, TokenMap};
+
+    fn holder(sandbox: &str) -> TokenHolder {
+        TokenHolder::new(sandbox, &format!("/sandbox/{sandbox}")).unwrap()
+    }
 
     fn read(registry: &TokenRegistry) -> TokenMap {
         TokenMap::parse(&std::fs::read_to_string(registry.path()).unwrap()).unwrap()
@@ -103,25 +107,46 @@ mod tests {
         let registry = TokenRegistry::create(dir.path().join("jira.tokens")).unwrap();
         assert!(read(&registry).is_empty());
 
-        let a = registry.grant("ci-a").unwrap();
-        let b = registry.grant("ci-b").unwrap();
+        let a = registry.grant(&holder("ci-a")).unwrap();
+        let b = registry.grant(&holder("ci-b")).unwrap();
         let map = read(&registry);
-        assert_eq!(map.sandbox_for(&a), Some("ci-a"));
-        assert_eq!(map.sandbox_for(&b), Some("ci-b"));
+        assert_eq!(map.holder_for(&a), Some(&holder("ci-a")));
+        assert_eq!(map.holder_for(&b), Some(&holder("ci-b")));
 
-        let a2 = registry.grant("ci-a").unwrap();
+        let a2 = registry.grant(&holder("ci-a")).unwrap();
         let map = read(&registry);
         assert_eq!(
-            map.sandbox_for(&a),
+            map.holder_for(&a),
             None,
             "a new grant retires the old token"
         );
-        assert_eq!(map.sandbox_for(&a2), Some("ci-a"));
+        assert_eq!(map.holder_for(&a2), Some(&holder("ci-a")));
 
         registry.revoke("ci-a").unwrap();
         let map = read(&registry);
-        assert_eq!(map.sandbox_for(&a2), None);
-        assert_eq!(map.sandbox_for(&b), Some("ci-b"));
+        assert_eq!(map.holder_for(&a2), None);
+        assert_eq!(map.holder_for(&b), Some(&holder("ci-b")));
+    }
+
+    /// A file written before the workdir field keeps its lines through a grant and a revoke.
+    #[test]
+    fn a_two_field_file_survives_an_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = TokenRegistry::create(dir.path().join("t.tokens")).unwrap();
+        std::fs::write(registry.path(), "tok-old ci-old\n").unwrap();
+
+        let fresh = registry.grant(&holder("ci-new")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(registry.path()).unwrap(),
+            format!("tok-old ci-old\n{fresh} ci-new /sandbox/ci-new\n")
+        );
+        let map = read(&registry);
+        let old = map.holder_for("tok-old").unwrap();
+        assert_eq!((old.sandbox(), old.workdir()), ("ci-old", None));
+
+        registry.revoke("ci-old").unwrap();
+        assert_eq!(read(&registry).holder_for("tok-old"), None);
+        assert_eq!(read(&registry).holder_for(&fresh), Some(&holder("ci-new")));
     }
 
     #[test]
@@ -134,7 +159,7 @@ mod tests {
                     let registry = registry.clone();
                     scope.spawn(move || {
                         let sandbox = format!("ci-{i}");
-                        let token = registry.grant(&sandbox).unwrap();
+                        let token = registry.grant(&holder(&sandbox)).unwrap();
                         (sandbox, token)
                     })
                 })
@@ -143,7 +168,7 @@ mod tests {
         });
         let map = read(&registry);
         for (sandbox, token) in &tokens {
-            assert_eq!(map.sandbox_for(token), Some(sandbox.as_str()));
+            assert_eq!(map.holder_for(token), Some(&holder(sandbox)));
         }
     }
 }

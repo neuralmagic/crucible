@@ -435,14 +435,15 @@ fn run_task(cx: &Dispatch<'_>, task: &Task, job: Job<'_>, pending: Option<&str>)
     // A private clone of the workspace. Its edits are discarded on cleanup: what leaves an
     // isolated task is its declared output, so this is for review/analysis work, not for
     // coding tasks whose diff has to survive (the wide tournament carries those out itself).
-    let root = paths.state.join("plan-iso");
-    if let Err(e) = std::fs::create_dir_all(&root) {
+    let worktree = task_worktree(paths, &task.name);
+    if let Some(root) = worktree.parent()
+        && let Err(e) = std::fs::create_dir_all(root)
+    {
         return Attempt::transport(
             TransportCause::Workspace,
             format!("creating the isolation root failed: {e}"),
         );
     }
-    let worktree = root.join(task_worktree_name(&task.name));
     let captured;
     let pending = match pending {
         Some(p) => p,
@@ -965,6 +966,11 @@ fn agent_transport_error(event: &AgentEvent) -> Option<TransportFailure> {
         )),
         _ => None,
     }
+}
+
+/// Where an isolated task's private clone of the workspace lives.
+pub(crate) fn task_worktree(paths: &Paths, name: &TaskName) -> PathBuf {
+    paths.state.join("plan-iso").join(task_worktree_name(name))
 }
 
 fn task_worktree_name(name: &TaskName) -> String {

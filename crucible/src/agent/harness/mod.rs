@@ -129,6 +129,11 @@ impl SandboxLayout {
     pub(crate) const PROMPT: &'static str = "/tmp/.crucible-prompt";
     /// The sandbox home/workdir base (the workdir uploads to `<HOME>/<basename>`).
     pub(crate) const HOME: &'static str = "/sandbox";
+
+    /// The agent's workdir for a workspace uploaded under `basename`.
+    pub(crate) fn workdir(basename: &str) -> String {
+        format!("{}/{basename}", Self::HOME)
+    }
 }
 
 /// One file uploaded into the sandbox before the agent execs (claude: `.mcp.json` when the turn
@@ -499,7 +504,7 @@ impl HarnessRuntime for Harness {
 pub(crate) fn exec_wrapper(workdir_basename: &str, agent_args: &[String]) -> Vec<String> {
     let script = format!(
         "cd {} && . {} && exec \"$@\" < {}",
-        sh_quote(&format!("{}/{workdir_basename}", SandboxLayout::HOME)),
+        sh_quote(&SandboxLayout::workdir(workdir_basename)),
         sh_quote(SandboxLayout::ENV_SCRIPT),
         sh_quote(SandboxLayout::PROMPT),
     );

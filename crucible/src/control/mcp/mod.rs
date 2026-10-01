@@ -491,6 +491,7 @@ mod tests {
         McpRuntime, McpStartError, ServerAuth, StartCtx, port_open, probe_addr, start,
     };
     use crate::manifest::{Manifest, McpSet};
+    use crucible_contract::mcp::TokenHolder;
     use std::path::Path;
 
     #[test]
@@ -516,14 +517,15 @@ class H(http.server.BaseHTTPRequestHandler):
         self.do_GET()
     def do_GET(self):
         bearer = (self.headers.get("Authorization") or "").removeprefix("Bearer ")
-        sandbox = None
+        sandbox = workdir = None
         with open(os.environ["MCP_TOKENS_FILE"]) as f:
             for line in f:
                 fields = line.split()
-                if len(fields) == 2 and fields[0] == bearer:
+                if len(fields) in (2, 3) and fields[0] == bearer:
                     sandbox = fields[1]
+                    workdir = fields[2] if len(fields) == 3 else None
         body = json.dumps({"name": os.environ["MCP_NAME"], "sandbox": sandbox,
-                           "env": sorted(os.environ)}).encode()
+                           "workdir": workdir, "env": sorted(os.environ)}).encode()
         self.send_response(200 if sandbox else 401)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -680,14 +682,16 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
             }
         };
 
-        let alpha_a = registry("alpha").grant("ci-a").unwrap();
-        let alpha_b = registry("alpha").grant("ci-b").unwrap();
-        let beta_b = registry("beta").grant("ci-b").unwrap();
+        let holder = |sandbox: &str| TokenHolder::new(sandbox, "/sandbox/workspace").unwrap();
+        let alpha_a = registry("alpha").grant(&holder("ci-a")).unwrap();
+        let alpha_b = registry("alpha").grant(&holder("ci-b")).unwrap();
+        let beta_b = registry("beta").grant(&holder("ci-b")).unwrap();
 
         let (status, alpha) = get(base, &alpha_a);
         assert_eq!(status, 200);
         assert_eq!(alpha["name"], "alpha");
         assert_eq!(alpha["sandbox"], "ci-a");
+        assert_eq!(alpha["workdir"], "/sandbox/workspace");
         assert_eq!(get(base, &alpha_b).1["sandbox"], "ci-b");
         assert_eq!(
             get(base, &beta_b).0,
@@ -749,6 +753,79 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
                 "beta's `sh` wrapper is gone, and so is the python3 it started"
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// A plan fanning out to two isolated tasks: each task's sandbox gets its own token, and the
+    /// server reads back the workdir that task's agent runs in, next to the loop turn's.
+    #[test]
+    fn an_isolated_fan_out_names_each_sandboxs_workdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("echo.py");
+        std::fs::write(&script, ECHO_SERVER).unwrap();
+        write_catalog(dir.path(), &script);
+        let base = free_port_pair();
+        let vars = vec![
+            ("ECHO_URL".to_string(), "u".to_string()),
+            ("BETA_TOKEN".to_string(), "s".to_string()),
+        ];
+        let runtime = start(set_for(MANIFEST, base), &bare_ctx(dir.path(), &vars)).unwrap();
+        let Some(ServerAuth::PerSandbox(registry)) = runtime
+            .servers()
+            .iter()
+            .find(|s| s.key.as_str() == "alpha")
+            .map(|s| &s.auth)
+        else {
+            panic!("alpha has per-sandbox tokens");
+        };
+
+        let run = crate::args::Paths::for_manifest(
+            dir.path().join("workspace"),
+            dir.path().join("state"),
+            dir.path(),
+            None,
+        );
+        let tasks = [
+            (
+                "review/a",
+                "/sandbox/task-26eb38badad9541f79ac17a40d91c9a0dbc62c0f117dbd7eae27d29f1fd5bc2c",
+            ),
+            (
+                "review/b",
+                "/sandbox/task-2d3a567e3f50d556ccb00be368bfd9437c497654cbca422a4fefec83272099ef",
+            ),
+        ];
+        let mut turns = vec![(run.clone(), "/sandbox/workspace")];
+        for (name, workdir) in tasks {
+            let worktree = crate::plan::harness::task_worktree(&run, &name.into());
+            turns.push((crate::args::Paths::for_worktree(worktree, None), workdir));
+        }
+
+        let mut granted = Vec::new();
+        for (paths, workdir) in &turns {
+            let holder = crate::openshell::run::token_holder(paths).unwrap();
+            assert_eq!(holder.workdir(), Some(*workdir));
+            let token = registry.grant(&holder).unwrap();
+            granted.push((token, holder.sandbox().to_string(), *workdir));
+        }
+        let sandboxes: std::collections::BTreeSet<&str> =
+            granted.iter().map(|(_, s, _)| s.as_str()).collect();
+        assert_eq!(sandboxes.len(), 3, "each turn runs in its own sandbox");
+
+        for (token, sandbox, workdir) in &granted {
+            let (status, body) = get(base, token);
+            assert_eq!(status, 200, "{sandbox}");
+            assert_eq!(body["sandbox"], sandbox.as_str());
+            assert_eq!(body["workdir"], *workdir);
+        }
+
+        let text = std::fs::read_to_string(registry.path()).unwrap();
+        for (token, sandbox, workdir) in &granted {
+            assert!(
+                text.lines()
+                    .any(|l| l == format!("{token} {sandbox} {workdir}")),
+                "{text}"
+            );
         }
     }
 
