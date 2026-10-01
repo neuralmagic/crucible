@@ -46,17 +46,24 @@ pub(crate) async fn upsert_task_result(
         .transpose()
         .context("encoding the blocked reason")?;
     let links = serde_json::to_value(&result.links).context("encoding the reported links")?;
+    let agent = result
+        .agent
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .context("encoding the resolved agent")?;
     sqlx::query!(
         r#"
-        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links, agent)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
         ON CONFLICT (run_id, iter, task) DO UPDATE SET
             status = excluded.status,
             note = excluded.note,
             cost_usd = excluded.cost_usd,
             secs = excluded.secs,
             blocked = excluded.blocked,
-            links = excluded.links
+            links = excluded.links,
+            agent = excluded.agent
         "#,
         run_id,
         result.iter,
@@ -67,6 +74,7 @@ pub(crate) async fn upsert_task_result(
         result.secs,
         blocked,
         links,
+        agent,
     )
     .execute(ex)
     .await
@@ -106,7 +114,7 @@ pub(crate) async fn list_task_results(
     let rows = sqlx::query!(
         r#"
         SELECT iter AS "iter!: i64", task AS "task!", status AS "status!", note AS "note!",
-               cost_usd, secs, blocked, links AS "links!"
+               cost_usd, secs, blocked, links AS "links!", agent
         FROM run_task_results WHERE run_id = $1 ORDER BY iter, task
         "#,
         run_id,
@@ -124,6 +132,9 @@ pub(crate) async fn list_task_results(
             // A stored link this build cannot read drops out of the list; failing here would
             // take the whole run's attempt history with it.
             let links = crucible_contract::decode_links(&r.links);
+            // Same reasoning as the links above: a stored agent this build cannot read drops to
+            // None rather than failing the run's whole attempt history.
+            let agent = r.agent.and_then(|a| serde_json::from_value(a).ok());
             Ok(TaskResult {
                 iter: r.iter,
                 task: r.task,
@@ -133,6 +144,7 @@ pub(crate) async fn list_task_results(
                 secs: r.secs,
                 blocked,
                 links,
+                agent,
             })
         })
         .collect()
@@ -166,6 +178,7 @@ mod tests {
             secs: Some(2.0),
             blocked: None,
             links: Vec::new(),
+            agent: None,
         }
     }
 
@@ -261,6 +274,48 @@ mod tests {
         let rows = list_task_results(&pool, "run-3").await?;
         assert_eq!(rows[1].links.len(), 1, "the retry's links replaced them");
         assert_eq!(rows[1].links[0].label, "#124");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn the_resolved_agent_round_trips_and_a_command_stores_none(pool: PgPool) -> Result<()> {
+        let agent = crucible_contract::session::TaskAgent {
+            harness: "claude".to_string(),
+            model: "glm-5.3".to_string(),
+            effort: "low".to_string(),
+        };
+        upsert_task_result(
+            &pool,
+            "run-4",
+            &TaskResult {
+                agent: Some(agent.clone()),
+                ..result(0, "analyze", "pass")
+            },
+        )
+        .await?;
+        upsert_task_result(&pool, "run-4", &result(0, "build", "pass")).await?;
+        let rows = list_task_results(&pool, "run-4").await?;
+        assert_eq!(rows[0].agent.as_ref(), Some(&agent));
+        assert_eq!(rows[1].agent, None, "a command task ran on no agent");
+
+        upsert_task_result(
+            &pool,
+            "run-4",
+            &TaskResult {
+                agent: Some(crucible_contract::session::TaskAgent {
+                    model: "glm-5.4".to_string(),
+                    ..agent
+                }),
+                ..result(0, "analyze", "pass")
+            },
+        )
+        .await?;
+        let rows = list_task_results(&pool, "run-4").await?;
+        assert_eq!(
+            rows[0].agent.as_ref().map(|a| a.model.as_str()),
+            Some("glm-5.4"),
+            "the retry's agent replaced it"
+        );
         Ok(())
     }
 }

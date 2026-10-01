@@ -609,6 +609,8 @@ pub fn run(
     let mut series_entry: Option<Option<TaskName>> = None;
     let mut playbook = false;
     let mut prior: Option<Prior> = None;
+    // The run's agent knobs; None for a precompiled plan, which has no manifest.
+    let mut agent_args: Option<crate::args::Args> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
@@ -621,6 +623,7 @@ pub fn run(
                     agent,
                 )?;
                 let session_log = prepared.paths.session_log.clone();
+                agent_args = Some(prepared.args.clone());
                 evidence = Some(prepared.paths.clone());
                 playbook = loaded.workflow.as_ref().is_some_and(|w| {
                     w.workflow_type == crate::plan::workflow::WorkflowType::Playbook
@@ -866,7 +869,13 @@ pub fn run(
             if let Some(f) = &events {
                 append(
                     f,
-                    &crate::plan::events::task_result_event(plan.plan().version, 0, task, result),
+                    &crate::plan::events::task_result_event(
+                        plan.plan().version,
+                        0,
+                        task,
+                        result,
+                        agent_args.as_ref(),
+                    ),
                 );
             }
         },
@@ -1296,7 +1305,7 @@ mod tests {
             transport: None,
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
-            &crate::plan::events::task_result_event(1, 0, t, &r),
+            &crate::plan::events::task_result_event(1, 0, t, &r, None),
         ))
         .unwrap();
         match back {

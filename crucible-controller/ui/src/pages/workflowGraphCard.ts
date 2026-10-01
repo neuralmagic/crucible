@@ -10,7 +10,10 @@ export function said(value: string | null | undefined): value is string {
   return typeof value === 'string' && value.length > 0;
 }
 
+/// A mapped task is a fan-out over a producer's field, not the work itself: the agent or command
+/// is what each of its instances runs, and the instances carry that badge.
 export function badgeFor(node: WorkflowGraphNode): string {
+  if ((node.fanout ?? null) !== null) return 'MAP';
   if (node.kind === 'agent') return 'AGENT';
   if (node.kind === 'command') return 'CMD';
   if (node.kind === 'engine') return 'ENGINE';

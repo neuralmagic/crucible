@@ -61,12 +61,14 @@ pub(crate) fn plan_admitted_event(
 /// One terminal task result on the wire. `iter` is the loop round (0 for a standalone
 /// `plan run`); fields belonging to other emitters stay at their defaults. `trace_id`/`span_id`
 /// carry the emitter's current trace context (the iteration's span) so a RESULTS row links
-/// straight to its trace; no active span leaves them empty.
+/// straight to its trace; no active span leaves them empty. `args` carries the run's agent knobs
+/// a task's own are resolved against; None reports no agent.
 pub(crate) fn task_result_event(
     plan_version: u32,
     iter: u32,
     task: &crate::plan::ir::Task,
     r: &crate::plan::exec::TaskResult,
+    args: Option<&crate::args::Args>,
 ) -> crate::report::session::SessionEvent {
     let (trace_id, span_id) = crate::agent::engine::current_trace_env()
         .and_then(|(tp, _)| {
@@ -103,6 +105,7 @@ pub(crate) fn task_result_event(
         secs: 0.0,
         trace_id,
         span_id,
+        agent: args.and_then(|args| crate::plan::harness::resolved_agent(args, task)),
     }
 }
 
@@ -287,7 +290,7 @@ mod tests {
             transport: None,
         };
         let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result)
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None)
         else {
             panic!("not a task_result event");
         };
@@ -303,7 +306,7 @@ mod tests {
             ..result
         };
         let SessionEvent::TaskResult { links, .. } =
-            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none)
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &none, None)
         else {
             panic!("not a task_result event");
         };
@@ -432,7 +435,7 @@ mod tests {
             |task, result| {
                 log.push('\n');
                 log.push_str(&crucible_contract::session::encode(
-                    &crate::plan::events::task_result_event(1, 0, task, result),
+                    &crate::plan::events::task_result_event(1, 0, task, result, None),
                 ));
                 written.push((task.name.clone(), result.clone()));
             },

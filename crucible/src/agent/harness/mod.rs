@@ -302,6 +302,13 @@ pub(crate) struct Broker<'a> {
 pub(crate) trait Backend: Sync {
     fn spec(&self) -> &'static HarnessSpec;
 
+    /// The model this backend hands its turn. Most take the shared `[agent].model` as-is; one that
+    /// reads a `[agent.<harness>].model` of its own, or rejects a name from another vendor,
+    /// overrides this and its argv builders call it.
+    fn model<'a>(&self, args: &'a Args) -> &'a str {
+        args.model()
+    }
+
     /// The full local-spawn argv (program name first): flags + the prompt as an argument.
     fn local_argv(&self, args: &Args, prompt: &str) -> Vec<String>;
 
