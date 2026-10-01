@@ -46,6 +46,8 @@ pub enum McpError {
     BadEnv { key: String, name: String },
     #[error("[mcp.{key}].tools has an empty entry")]
     EmptyTool { key: String },
+    #[error("[mcp.{key}] has no free port left after {first_port}")]
+    NoPort { key: String, first_port: u16 },
     #[error(
         "[mcp.{a}] and [mcp.{b}] differ only in `-` versus `_`, so their sandbox credentials \
          would collide; rename one"
@@ -264,7 +266,10 @@ impl McpSet {
                 (McpSource::Broker(_), Some(port)) => port,
                 _ => {
                     while taken.contains(&next) {
-                        next = next.saturating_add(1);
+                        next = next.checked_add(1).ok_or_else(|| McpError::NoPort {
+                            key: key.to_string(),
+                            first_port,
+                        })?;
                     }
                     taken.insert(next);
                     next
@@ -600,6 +605,37 @@ mod tests {
             ),
             McpError::BadLegacyName {
                 name: "Broker".into()
+            }
+        );
+    }
+
+    #[test]
+    fn port_assignment_stops_at_the_last_port() {
+        let m = parse(
+            "mcp = [\"alpha\", \"beta\"]\n[agent.broker]\nenabled = true\nbin = \"b\"\nbind = \"0.0.0.0:65535\"",
+            "[mcp.alpha]\n[mcp.beta]\n",
+        )
+        .expect("valid");
+        let scopes = crate::manifest::McpScopes {
+            agent: &m.agent.mcp,
+            sandboxes: Vec::new(),
+        };
+        let resolve = |first| {
+            crate::manifest::McpSet::resolve_from(
+                &m.mcp,
+                &m.agent.broker,
+                &scopes,
+                &m.capabilities,
+                first,
+            )
+        };
+        let set = resolve(65533).expect("65533 and 65534 are free");
+        assert_eq!(set.ports(), [65533, 65534, 65535], "alpha, beta, broker");
+        assert_eq!(
+            resolve(65534).expect_err("beta has nowhere to go"),
+            McpError::NoPort {
+                key: "beta".into(),
+                first_port: 65534
             }
         );
     }
