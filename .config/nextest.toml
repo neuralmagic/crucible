@@ -2,5 +2,5 @@
 mcp-ports = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(crucible) & (test(/^control::mcp::tests::/) | test(/^plan::cli::tests::an_mcp_server/))'
+filter = 'package(crucible) & (test(/^control::mcp::tests::/) | test(/^(plan::cli|cli::scored)::tests::an_mcp_server/))'
 test-group = 'mcp-ports'

@@ -21,6 +21,10 @@ const STDERR_TAIL: usize = 50;
 /// How much of each of those lines it keeps.
 const STDERR_LINE_CHARS: usize = 500;
 
+/// The longest line read before the rest of it is dropped: [`STDERR_LINE_CHARS`] of the widest
+/// UTF-8.
+const STDERR_LINE_BYTES: usize = STDERR_LINE_CHARS * 4;
+
 /// How long an exited server's stderr gets to drain before the failure reports it.
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 
@@ -70,7 +74,8 @@ impl std::fmt::Display for StderrShown {
     }
 }
 
-/// A server's last [`STDERR_TAIL`] stderr lines. Every line is also copied to crucible's stderr.
+/// A server's last [`STDERR_TAIL`] stderr lines, redacted. Its raw stderr is copied to crucible's
+/// stderr as it arrives.
 #[derive(Clone, Default)]
 struct StderrTail(Arc<Mutex<VecDeque<String>>>);
 
@@ -79,21 +84,40 @@ impl StderrTail {
         let tail = Self::default();
         let lines = tail.clone();
         let reader = std::thread::spawn(move || {
-            use std::io::{BufRead, Write};
-            let Some(stderr) = stderr else { return };
-            let mut stderr = std::io::BufReader::new(stderr);
+            use std::io::{Read, Write};
+            let Some(mut stderr) = stderr else { return };
+            let mut chunk = [0u8; 8192];
             let mut line = Vec::new();
-            while matches!(stderr.read_until(b'\n', &mut line), Ok(n) if n > 0) {
-                let _ = std::io::stderr().write_all(&line);
-                let text = String::from_utf8_lossy(&line);
-                lines.push(text.trim_end().chars().take(STDERR_LINE_CHARS).collect());
-                line.clear();
+            let mut capped = false;
+            while let Ok(n @ 1..) = stderr.read(&mut chunk) {
+                let _ = std::io::stderr().write_all(&chunk[..n]);
+                for &byte in &chunk[..n] {
+                    if byte == b'\n' {
+                        if !capped {
+                            lines.push(&line);
+                        }
+                        line.clear();
+                        capped = false;
+                    } else if !capped {
+                        line.push(byte);
+                        if line.len() == STDERR_LINE_BYTES {
+                            lines.push(&line);
+                            line.clear();
+                            capped = true;
+                        }
+                    }
+                }
+            }
+            if !line.is_empty() {
+                lines.push(&line);
             }
         });
         (tail, reader)
     }
 
-    fn push(&self, line: String) {
+    fn push(&self, line: &[u8]) {
+        let redacted = crate::turn_trace::redact(&String::from_utf8_lossy(line));
+        let line = redacted.chars().take(STDERR_LINE_CHARS).collect();
         let mut lines = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if lines.len() == STDERR_TAIL {
             lines.pop_front();
@@ -471,6 +495,29 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
         assert_eq!(
             lines.last(),
             Some(&"buildit: no kubeconfig at /var/run/kube"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn stderr_without_newlines_is_capped_and_the_tail_is_redacted() {
+        let (error, _) = start_one(
+            "sh",
+            &[
+                "-c",
+                "head -c 100000 /dev/zero | tr '\\0' x >&2; \
+                 printf '\\nlogin with KUBE_TOKEN=s3cret\\nno newline at exit' >&2; exit 2",
+            ],
+        );
+        let message = error.to_string();
+        let lines: Vec<&str> = message.lines().skip(1).collect();
+        assert_eq!(
+            lines,
+            [
+                "x".repeat(STDERR_LINE_CHARS).as_str(),
+                "login with KUBE_TOKEN=***",
+                "no newline at exit"
+            ],
             "{message}"
         );
     }

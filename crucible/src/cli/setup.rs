@@ -19,8 +19,6 @@ pub(crate) struct FrozenProjection {
     pub(crate) disclosure: Option<crate::exposure::Covered>,
     /// The same resolved bounds the broker is handed, for the two kinds the engine writes itself.
     pub(crate) bounds: Option<crate::outputs::RunBounds>,
-    /// The `[mcp]` servers the run starts.
-    pub(crate) mcp: std::collections::BTreeMap<String, manifest::McpCfg>,
 }
 
 /// Resolve the frozen manifest's output bounds and capability disclosure for a run.
@@ -35,7 +33,6 @@ pub(crate) fn frozen_projection(
         broker_env: broker_bounds_env(&bounds, session_log)?,
         disclosure: Some(crate::exposure::covered(m)),
         bounds: Some(bounds),
-        mcp: m.mcp.clone(),
     })
 }
 
@@ -124,7 +121,7 @@ pub(crate) struct ResourcesWithoutSandbox {
 }
 
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
-/// provisioning broker and the `[mcp]` servers. Shared by the single-domain and composite run paths.
+/// provisioning broker. Shared by the single-domain and composite run paths.
 pub(crate) fn apply_agent_cfg(
     args: &mut Args,
     agent: &manifest::AgentCfg,
@@ -220,10 +217,18 @@ pub(crate) fn apply_agent_cfg(
         .context("starting the provisioning broker")?;
     }
     args.mcp_scope = agent.mcp.clone();
+    Ok(())
+}
+
+/// Start the pack's `[mcp]` servers for the openshell backend.
+pub(crate) fn start_mcp(
+    args: &mut Args,
+    table: &std::collections::BTreeMap<String, manifest::McpCfg>,
+) -> Result<()> {
     if args.agent_backend == manifest::AgentBackend::Openshell {
         let vars: Vec<(String, String)> = std::env::vars().collect();
         args.mcp =
-            crate::control::mcp::start(&frozen.mcp, &vars).context("starting the [mcp] servers")?;
+            crate::control::mcp::start(table, &vars).context("starting the [mcp] servers")?;
     }
     Ok(())
 }
@@ -237,7 +242,7 @@ pub(crate) struct EndedAtSetup;
 /// End the run on an `[mcp]` server that could not start: append an `error` shutdown carrying the
 /// cause to the session log and deliver the log as a finished run does. Any other error passes
 /// through untouched.
-pub(crate) fn end_run_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Error {
+fn end_run_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Error {
     if !error.is::<crate::control::mcp::StartError>() {
         return error;
     }
@@ -259,6 +264,11 @@ pub(crate) fn end_run_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> 
             p.session_log.display()
         ));
     }
+    ended_at_setup(p, error)
+}
+
+/// Deliver a run whose session log already records the setup failure it ended on.
+pub(crate) fn ended_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Error {
     crate::report::ingest_client::deliver_run_evidence(p);
     error.context(EndedAtSetup)
 }
@@ -356,8 +366,8 @@ pub(crate) fn prep_plan_runner_with_params(
         params,
         &p.session_log,
     )?;
-    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)
-        .map_err(|e| end_run_at_setup(&p, e))?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
+    start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(&p, e))?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     // A playbook's git memory is per task; the scored loop owns the same repository for
