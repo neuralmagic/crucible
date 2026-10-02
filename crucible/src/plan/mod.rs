@@ -17,8 +17,8 @@ pub mod term_img;
 pub mod workflow;
 pub mod worktree;
 
-/// The exit code of a `plan run` that finished with an invalid verdict. It is not a crash: the
-/// session log already holds the verdict, so a pod wrapper does not restart the run on it.
+/// The exit code of a run that finished with an invalid verdict, or ended at setup. It is not a
+/// crash: the session log already holds the outcome, so a pod wrapper does not restart the run on it.
 pub const INVALID_VERDICT_EXIT: u8 = 3;
 
 /// The environment variable naming the task a turn runs, set by both the command runner and the

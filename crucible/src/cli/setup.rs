@@ -228,6 +228,41 @@ pub(crate) fn apply_agent_cfg(
     Ok(())
 }
 
+/// A run whose session log records the setup failure it ended on. Like an invalid verdict, it is
+/// not a crash: a pod wrapper does not restart the run on it.
+#[derive(Debug, thiserror::Error)]
+#[error("the run ended at setup")]
+pub(crate) struct EndedAtSetup;
+
+/// End the run on an `[mcp]` server that could not start: append an `error` shutdown carrying the
+/// cause to the session log and deliver the log as a finished run does. Any other error passes
+/// through untouched.
+pub(crate) fn end_run_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Error {
+    if !error.is::<crate::control::mcp::StartError>() {
+        return error;
+    }
+    let shutdown = crate::report::session::SessionEvent::Shutdown {
+        outcome: "error".to_string(),
+        reason: format!("{error:#}"),
+    };
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&p.session_log)
+        .and_then(|mut log| {
+            use std::io::Write;
+            writeln!(log, "{}", crate::report::session::encode(&shutdown))
+        });
+    if let Err(e) = appended {
+        return error.context(format!(
+            "recording the setup failure in {}: {e}",
+            p.session_log.display()
+        ));
+    }
+    crate::report::ingest_client::deliver_run_evidence(p);
+    error.context(EndedAtSetup)
+}
+
 /// Build a plan runner over a manifest's agent config: the workspace is set up (or reused)
 /// exactly as a loop run would, and `Agent` tasks run through the real harness path with the
 /// manifest's `[agent]` defaults. Shares the loop's setup helpers so a plan run and a loop
@@ -321,7 +356,8 @@ pub(crate) fn prep_plan_runner_with_params(
         params,
         &p.session_log,
     )?;
-    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
+    apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)
+        .map_err(|e| end_run_at_setup(&p, e))?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     // A playbook's git memory is per task; the scored loop owns the same repository for

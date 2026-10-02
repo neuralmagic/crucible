@@ -128,7 +128,8 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
         &std::collections::BTreeMap::new(),
         &p.session_log,
     )?;
-    crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
+    crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)
+        .map_err(|e| crate::cli::setup::end_run_at_setup(&p, e))?;
     // Single-repo publish target: a `[publish] pr_repo` in the manifest wins over any `--pr-repo` the
     // caller passed (the controller passes its per-repo default via the flag; a pack that names its
     // own fork overrides it). Absent → keep the flag value (empty by default, so no PR opens).
@@ -276,7 +277,8 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
         bounds: Some(bounds),
         mcp: m.mcp.clone(),
     };
-    crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
+    crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)
+        .map_err(|e| crate::cli::setup::end_run_at_setup(&p, e))?;
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
     args.component_pr_repos = m.component_pr_repos();
     let (goal, template) = resolve_goal_template(&args, &m.agent, &manifest_dir)?;

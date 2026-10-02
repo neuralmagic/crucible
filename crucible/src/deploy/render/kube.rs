@@ -1082,6 +1082,7 @@ exit $rc
         let harness_flag = harness_flag(self.opts.harness, '=');
         let model_flag = model_flag(self.opts.model.as_ref(), '=');
         let resume_flag = self.resume_flag();
+        let ended = crate::plan::INVALID_VERDICT_EXIT;
         Ok(format!(
             r#"D={domain_dir}
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
@@ -1091,6 +1092,7 @@ if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
+case $rc in {ended}) exit 0 ;; esac
 exit $rc
 "#
         ))
@@ -4585,6 +4587,22 @@ mod tests {
             clean.calls().iter().all(|call| !call.contains("--resume")),
             "a pod that cannot resume never asks to"
         );
+    }
+
+    #[test]
+    fn the_loop_wrapper_ends_a_run_its_log_already_closed() {
+        let starts = Starts::new(&render_loop_pod(&k8s_profile(r#"state_pvc = "shared""#)));
+        assert_eq!(
+            starts.start(i32::from(crate::plan::INVALID_VERDICT_EXIT)),
+            Some(0),
+            "a setup failure is in the log; restarting would repeat it"
+        );
+        assert_eq!(
+            starts.start(1),
+            Some(1),
+            "an engine error is still an error"
+        );
+        assert_eq!(starts.start(137), Some(137), "a killed engine restarts");
     }
 
     #[test]
