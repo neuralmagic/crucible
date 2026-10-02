@@ -197,7 +197,7 @@ pub async fn verify(
         tracing::error!(login = %row.login, error = %e, "unreadable stored groups; treating the key as group-less");
         Vec::new()
     });
-    let groups = crate::identity::oidc::users::current_groups(
+    let groups = crate::identity::oidc::credentials::current_groups(
         refresh,
         &row.sub,
         groups,

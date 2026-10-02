@@ -433,7 +433,7 @@ impl OwnerRefresh {
             .await
             .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
         if let Some((groups, Some(at))) = stamp
-            && !crate::identity::auth::stale(&at, jiff::Timestamp::now(), window)
+            && !crate::identity::oidc::users::stale(&at, jiff::Timestamp::now(), window)
         {
             return Ok(groups);
         }
@@ -620,6 +620,27 @@ async fn record_refusal(
     tx.commit()
         .await
         .map_err(|e| OidcError::Unavailable(format!("committing the refresh refusal: {e}")))
+}
+
+/// The groups `sub` holds now: the stored ones while their stamp is younger than the window a
+/// session re-reads its own groups at, and past it whatever a refresh of the owner's offline
+/// credential answers. A refusal, no credential, no refresher, or an unreachable issuer is none.
+pub async fn current_groups(
+    refresh: Option<&OwnerRefresh>,
+    sub: &str,
+    stored: Vec<String>,
+    groups_at: Option<&str>,
+) -> Vec<String> {
+    let window = crate::identity::oidc::users::session_group_refresh_interval();
+    if groups_at
+        .is_some_and(|at| !crate::identity::oidc::users::stale(at, jiff::Timestamp::now(), window))
+    {
+        return stored;
+    }
+    match refresh {
+        Some(refresh) => refresh.current_groups(sub, window).await,
+        None => Vec::new(),
+    }
 }
 
 #[cfg(test)]

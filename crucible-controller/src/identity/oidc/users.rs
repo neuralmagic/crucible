@@ -107,23 +107,35 @@ pub async fn clear_groups_on(
     Ok(())
 }
 
-/// The groups `sub` holds now: the stored ones while their stamp is younger than the window a
-/// session re-reads its own groups at, and past it whatever a refresh of the owner's offline
-/// credential answers. A refusal, no credential, no refresher, or an unreachable issuer is none.
-pub async fn current_groups(
-    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
-    sub: &str,
-    stored: Vec<String>,
-    groups_at: Option<&str>,
-) -> Vec<String> {
-    let window = crate::identity::auth::session_group_refresh_interval();
-    if groups_at.is_some_and(|at| !crate::identity::auth::stale(at, jiff::Timestamp::now(), window))
-    {
-        return stored;
-    }
-    match refresh {
-        Some(refresh) => refresh.current_groups(sub, window).await,
-        None => Vec::new(),
+/// How stale a live session's group list may get before the next request re-reads it from the
+/// owner's offline credential.
+pub(crate) const DEFAULT_SESSION_GROUP_REFRESH: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
+/// `CONTROLLER_SESSION_GROUP_REFRESH_MINUTES`. Unset, unparseable, or zero is
+/// [`DEFAULT_SESSION_GROUP_REFRESH`] — a deployment must not be able to turn the check into a
+/// per-request round trip against the issuer by typo.
+pub(crate) fn session_group_refresh_interval() -> std::time::Duration {
+    std::env::var("CONTROLLER_SESSION_GROUP_REFRESH_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|m| *m > 0)
+        .map(|m| std::time::Duration::from_secs(m * 60))
+        .unwrap_or(DEFAULT_SESSION_GROUP_REFRESH)
+}
+
+/// Whether a stamped instant is older than `max_age`. An unparseable or missing stamp is stale:
+/// a session whose groups have no provenance has to prove them again.
+pub(crate) fn stale(at: &str, now: jiff::Timestamp, max_age: std::time::Duration) -> bool {
+    let Ok(at) = at.parse::<jiff::Timestamp>() else {
+        return true;
+    };
+    let Ok(span) = jiff::SignedDuration::try_from(max_age) else {
+        return true;
+    };
+    match at.checked_add(span) {
+        Ok(expires) => expires <= now,
+        Err(_) => true,
     }
 }
 

@@ -13863,8 +13863,9 @@ async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
     let (db, _d) = db_with(pool.clone());
     let _ = team_secret_drafts(&pool, db, None, &[]).await?;
     let team = [TEAM_GROUP.to_string()];
-    let window =
-        jiff::SignedDuration::try_from(crate::identity::auth::session_group_refresh_interval())?;
+    let window = jiff::SignedDuration::try_from(
+        crate::identity::oidc::users::session_group_refresh_interval(),
+    )?;
     let now = jiff::Timestamp::now();
     let young = now.checked_sub(window / 2)?.to_string();
     let old = now

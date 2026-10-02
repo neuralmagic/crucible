@@ -199,15 +199,20 @@ pub async fn dispatch_principals(
     };
     let current = match row {
         Some((sub, groups, at)) => Some(
-            crate::identity::oidc::users::current_groups(refresh, &sub, groups, at.as_deref())
-                .await,
+            crate::identity::oidc::credentials::current_groups(
+                refresh,
+                &sub,
+                groups,
+                at.as_deref(),
+            )
+            .await,
         ),
         None => match mode {
             crate::identity::auth::AuthMode::Proxy => None,
-            crate::identity::auth::AuthMode::Native => crate::identity::auth::stale(
+            crate::identity::auth::AuthMode::Native => crate::identity::oidc::users::stale(
                 launched_at,
                 jiff::Timestamp::now(),
-                crate::identity::auth::session_group_refresh_interval(),
+                crate::identity::oidc::users::session_group_refresh_interval(),
             )
             .then(Vec::new),
         },
