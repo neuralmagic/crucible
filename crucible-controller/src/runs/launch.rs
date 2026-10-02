@@ -133,7 +133,7 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
     };
     let secrets = Some(crate::runs::workpod::LaunchSecrets {
         scope: crate::secrets::launch::Scope::playbook(&launch.playbook),
-        launcher: crate::authz::resolve::recorded_principals(
+        launcher: crate::authz::resolve::dispatch_principals(
             db.pool(),
             launch.created_by.as_deref(),
             &launch.launcher_groups,

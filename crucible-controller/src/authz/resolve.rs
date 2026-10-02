@@ -180,6 +180,35 @@ pub async fn recorded_principals(
     Ok(crate::authz::model::Principals::new(login, groups).with_teams(teams))
 }
 
+/// A launch's principals at dispatch: the groups it recorded that its launcher's `users` row still
+/// holds, and the teams those reach now. A launcher with no `users` row keeps the recorded groups.
+pub async fn dispatch_principals(
+    pool: &sqlx::PgPool,
+    login: Option<&str>,
+    recorded: &[String],
+) -> anyhow::Result<crate::authz::model::Principals> {
+    let current = match login {
+        Some(login) => crate::identity::oidc::users::stamped(pool, login)
+            .await?
+            .map(|(_, groups, _)| groups),
+        None => None,
+    };
+    let held = held_groups(recorded, current.as_deref());
+    recorded_principals(pool, login, &held).await
+}
+
+/// The recorded groups the current record still holds, in recorded order. No record keeps them all.
+fn held_groups(recorded: &[String], current: Option<&[String]>) -> Vec<String> {
+    match current {
+        Some(current) => recorded
+            .iter()
+            .filter(|g| current.contains(g))
+            .cloned()
+            .collect(),
+        None => recorded.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +373,19 @@ mod tests {
         assert!(!reachable(&members, &[], &slug("by-group")));
         assert!(!reachable(&members, &users, &slug("missing")));
         let _ = MembershipRule::EmailDomain("x.io".into());
+    }
+
+    #[test]
+    fn a_dispatch_holds_only_the_recorded_groups_the_current_record_still_has() {
+        let recorded = vec!["/g/a".to_string(), "/g/b".to_string(), "/g/c".to_string()];
+        let current = vec!["/g/c".to_string(), "/g/a".to_string(), "/g/new".to_string()];
+        assert_eq!(
+            held_groups(&recorded, Some(&current)),
+            vec!["/g/a".to_string(), "/g/c".to_string()],
+            "a group gained since the launch is not added, one lost is dropped"
+        );
+        assert!(held_groups(&recorded, Some(&[])).is_empty());
+        assert_eq!(held_groups(&recorded, None), recorded);
+        assert!(held_groups(&[], Some(&current)).is_empty());
     }
 }

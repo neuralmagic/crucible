@@ -275,6 +275,103 @@ pub(crate) async fn issuer_answering(
     (server, Arc::new(provider))
 }
 
+/// A real HTTP issuer that signs: discovery, a key set holding a freshly generated RS256 key, and
+/// a token endpoint answering every grant with an ID token for `sub` carrying `groups`, signed by
+/// that key, plus the rotated refresh token `rotated`.
+pub(crate) async fn issuer_signing_for(
+    sub: &str,
+    groups: &[&str],
+) -> (wiremock::MockServer, Arc<OidcProvider>) {
+    use aws_lc_rs::rsa::{KeyPair, KeySize, PublicKeyComponents};
+    use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256};
+    use base64::Engine;
+    use wiremock::matchers::{method, path};
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let server = wiremock::MockServer::start().await;
+    let base = server.uri();
+    let key = KeyPair::generate(KeySize::Rsa2048).expect("rsa key");
+    let public = PublicKeyComponents::<Vec<u8>>::from(key.public_key());
+    let now = jiff::Timestamp::now().as_second();
+    let header = serde_json::json!({"alg": "RS256", "typ": "JWT", "kid": "local"});
+    let claims = serde_json::json!({
+        "iss": base,
+        "aud": "rp",
+        "sub": sub,
+        "iat": now,
+        "exp": now + 300,
+        "preferred_username": "local-user",
+        "groups": groups,
+    });
+    let signing_input = format!(
+        "{}.{}",
+        b64.encode(header.to_string()),
+        b64.encode(claims.to_string())
+    );
+    let mut signature = vec![0u8; key.public_modulus_len()];
+    key.sign(
+        &RSA_PKCS1_SHA256,
+        &aws_lc_rs::rand::SystemRandom::new(),
+        signing_input.as_bytes(),
+        &mut signature,
+    )
+    .expect("sign");
+    let id_token = format!("{signing_input}.{}", b64.encode(signature));
+
+    wiremock::Mock::given(method("GET"))
+        .and(path("/.well-known/openid-configuration"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/auth"),
+                "token_endpoint": format!("{base}/token"),
+                "jwks_uri": format!("{base}/certs"),
+                "response_types_supported": ["code"],
+                "subject_types_supported": ["public"],
+                "id_token_signing_alg_values_supported": ["RS256"],
+            })),
+        )
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(method("GET"))
+        .and(path("/certs"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
+            serde_json::json!({ "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": "local",
+                "n": b64.encode(&public.n),
+                "e": b64.encode(&public.e),
+            }]}),
+        ))
+        .mount(&server)
+        .await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/token"))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "opaque-access",
+                "token_type": "Bearer",
+                "expires_in": 300,
+                "id_token": id_token,
+                "refresh_token": "rotated",
+            })),
+        )
+        .mount(&server)
+        .await;
+    let provider = OidcProvider::new(OidcCfg {
+        issuer: base,
+        client_id: "rp".to_string(),
+        client_secret: None,
+        redirect_url: "http://localhost/auth/callback".to_string(),
+        scopes: vec!["openid".to_string()],
+        device_client_id: None,
+        post_logout_redirect: None,
+    })
+    .expect("provider");
+    (server, Arc::new(provider))
+}
+
 /// Everything short of an issuer-authored refusal is the issuer being unreachable. A 5xx from the
 /// route in front of a restarting Keycloak carries an HTML or empty body, which the oauth2 client
 /// reports as a parse or "other" failure — classifying those as refusals would count a failure on

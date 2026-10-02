@@ -7171,6 +7171,95 @@ async fn a_launch_reaches_a_team_owned_secret_through_its_recorded_groups(
     Ok(())
 }
 
+/// A queued launch keeps only the recorded groups its launcher's `users` row still holds at
+/// dispatch: once the owner loses the group, a launch recorded with it no longer reaches the team.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
+    pool: PgPool,
+) -> Result<()> {
+    use crate::authz::model::{Member, MemberRef, TeamRole, TeamSlug};
+    const GROUP: &str = "/groups/tibrahim-all";
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let cfg = ControllerCfg {
+        playbook_executor: crucible_controller::PlaybookExecutor::Local,
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let team = TeamSlug::parse("tibrahim-all")?;
+    let stamped = jiff::Timestamp::now();
+    let now = stamped.to_string();
+    let mut conn = db.pool().acquire().await?;
+    crate::authz::store::insert_team(&mut conn, &team, "tibrahim-all", None, &now).await?;
+    crate::authz::store::replace_members(
+        &mut conn,
+        &team,
+        &[Member {
+            member: MemberRef::Group(GROUP.to_string()),
+            role: TeamRole::Member,
+        }],
+        None,
+        &now,
+    )
+    .await?;
+    drop(conn);
+    crate::identity::oidc::users::record_login(db.pool(), "sub-wren", "wren", None, stamped)
+        .await?;
+    let set_groups = |groups: Vec<String>| {
+        let pool = db.pool().clone();
+        async move {
+            let mut conn = pool.acquire().await?;
+            crate::identity::oidc::users::record_groups_on(&mut conn, "sub-wren", &groups, stamped)
+                .await
+        }
+    };
+    set_groups(vec![GROUP.to_string()]).await?;
+    seed_registered_playbook(&db, "survey").await;
+    bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
+
+    let recorded = serde_json::json!([GROUP]);
+    let held = "playbook:survey:0199c0de-7c2c-71a5-8000-e";
+    adopt_launch_with_groups(&db, held, 3.5, Some(&recorded)).await;
+    let lost = "playbook:survey:0199c0de-7c2c-71a5-8000-f";
+    adopt_launch_with_groups(&db, lost, 3.5, Some(&recorded)).await;
+
+    let res = async {
+        reconcile(&db, &cfg, held).await?;
+        set_groups(Vec::new()).await?;
+        reconcile(&db, &cfg, lost).await
+    }
+    .await;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+    res?;
+
+    let reason = |key: &'static str| {
+        let db = db.clone();
+        async move {
+            let issue = crate::issues::store::get_issue(db.pool(), key)
+                .await?
+                .expect("issue");
+            assert_eq!(issue.status, Status::Parked, "{:?}", issue.parked_reason);
+            anyhow::Ok(format!("{:?}", issue.parked_reason))
+        }
+    };
+    let resolved = reason(held).await?;
+    assert!(
+        resolved.contains("local executor delivers no secrets"),
+        "the owner still held the group, so the binding resolved: {resolved}"
+    );
+    let refused = reason(lost).await?;
+    assert!(
+        refused.contains("owned by team:tibrahim-all"),
+        "the owner lost the group before dispatch: {refused}"
+    );
+    Ok(())
+}
+
 /// Local mode: the launch runs as a supervised subprocess with the launcher's own values and
 /// ceilings, and its session lands in the same ledger rows a pod run's would — marked as the local
 /// run it was.

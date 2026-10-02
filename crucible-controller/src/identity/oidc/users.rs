@@ -88,6 +88,25 @@ pub async fn record_groups_on(
     Ok(())
 }
 
+/// Drop a subject's stored groups and their stamp, for when the offline credential that answered
+/// for them is refused or revoked. An API key then holds what a session would: nothing.
+pub async fn clear_groups_on(
+    conn: &mut sqlx::PgConnection,
+    sub: &str,
+    now: jiff::Timestamp,
+) -> anyhow::Result<()> {
+    let now = now.to_string();
+    sqlx::query!(
+        "UPDATE users SET groups = '[]'::jsonb, groups_at = NULL, updated_at = $2 WHERE sub = $1",
+        sub,
+        now,
+    )
+    .execute(&mut *conn)
+    .await
+    .context("clearing the stored groups")?;
+    Ok(())
+}
+
 /// A signed-in user's subject, and the groups and stamp their last sign-in recorded, by login.
 pub async fn stamped(
     pool: &PgPool,

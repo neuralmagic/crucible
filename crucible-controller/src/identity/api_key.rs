@@ -12,7 +12,8 @@
 //! A key carries its owner's identity and its owner's groups, which is why [`Authenticated`] holds
 //! both. Groups are whatever the owner's last sign-in or offline credential refresh stamped on their
 //! `users` row: a key is never more powerful than the person it belongs to, and never fresher than
-//! the issuer's last answer about them. An owner with no stamp yet holds no groups.
+//! the issuer's last answer about them. An owner with no stamp yet holds no groups, and a refused or
+//! revoked offline credential clears the stamp.
 
 use crate::clock::now_rfc3339;
 use anyhow::{Context, Result};
