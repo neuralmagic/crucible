@@ -106,8 +106,10 @@ fresh-turn behavior.
 A task's output is JSON and becomes its dependents' input.
 
 - `command`: the last non-empty stdout line. Nonzero exit is a measured failure; a spawn
-  failure is a transport failure. Upstream outputs arrive as `CRUCIBLE_INPUTS` (a JSON object
-  keyed by task name), plus `CRUCIBLE_TASK`.
+  failure is a transport failure. Upstream outputs arrive as a JSON object keyed by task name,
+  in the file `CRUCIBLE_INPUTS_FILE` names, plus `CRUCIBLE_TASK`. The same JSON is also in
+  `CRUCIBLE_INPUTS` while it is at most 64 KiB; past that the variable is unset, because Linux
+  refuses an environment string over 128 KiB. Read the file.
 - `agent` under `--manifest`: the turn writes a single JSON object to `PLAN_TASK_RESULT.json`
   in the workspace root. A missing file after a normal turn is a measured failure; an explicit
   spawn, harness, or stream error is a transport failure and follows the retry policy.

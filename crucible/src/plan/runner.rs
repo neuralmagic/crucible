@@ -21,6 +21,14 @@ use crate::plan::ir::{Decider, Task, TaskKind, TaskName};
 use crucible_contract::TransportCause;
 use crucible_contract::inference::{ENV_INFERENCE, InferenceRole};
 
+/// Upstream results as JSON, set only while they fit [`INPUTS_ENV_MAX`].
+pub const INPUTS_ENV: &str = "CRUCIBLE_INPUTS";
+/// Path to a file holding the same JSON, always set.
+pub const INPUTS_FILE_ENV: &str = "CRUCIBLE_INPUTS_FILE";
+/// Linux refuses any one environment string over 128 KiB, and the whole environment shares
+/// `ARG_MAX` with argv.
+const INPUTS_ENV_MAX: usize = 64 * 1024;
+
 pub struct ShellRunner {
     pub workdir: PathBuf,
     /// Stand-in command for `Agent` tasks (receives the prompt and knobs via env). `None`
@@ -85,13 +93,24 @@ impl ShellRunner {
             }
             _ => None,
         };
-        match serde_json::to_string(&env_inputs) {
-            Ok(json) => {
-                cmd.env("CRUCIBLE_INPUTS", json);
-            }
+        let json = match serde_json::to_string(&env_inputs) {
+            Ok(json) => json,
             Err(e) => {
                 return Attempt::failed(0.0, format!("inputs not serializable: {e}"));
             }
+        };
+        let inputs_file = match inputs_file(&json) {
+            Ok(file) => file,
+            Err(e) => {
+                return Attempt::transport(
+                    TransportCause::Workspace,
+                    format!("writing the task inputs file: {e}"),
+                );
+            }
+        };
+        cmd.env(INPUTS_FILE_ENV, inputs_file.path());
+        if json.len() <= INPUTS_ENV_MAX {
+            cmd.env(INPUTS_ENV, &json);
         }
         match &task.task {
             TaskKind::Command { command } | TaskKind::Evaluate { command, .. } => {
@@ -250,6 +269,16 @@ impl ShellRunner {
             ),
         }
     }
+}
+
+/// The task's inputs JSON in a temp file outside the workspace, removed when the handle drops.
+fn inputs_file(json: &str) -> std::io::Result<tempfile::NamedTempFile> {
+    let mut file = tempfile::Builder::new()
+        .prefix("crucible-inputs-")
+        .suffix(".json")
+        .tempfile()?;
+    std::io::Write::write_all(&mut file, json.as_bytes())?;
+    Ok(file)
 }
 
 /// How a command ended: on its own, or killed at its deadline.
@@ -544,6 +573,53 @@ mod tests {
         assert_eq!(
             out.results[&"check".into()].output.as_ref().unwrap()["score"],
             14
+        );
+    }
+
+    #[test]
+    fn small_inputs_arrive_in_both_the_env_and_the_file() {
+        let out = run_plan(
+            vec![
+                command("emit", r#"echo '{"score": 7}'"#, &[]),
+                command(
+                    "check",
+                    r#"python3 -c 'import json,os; e=json.loads(os.environ["CRUCIBLE_INPUTS"]); f=json.load(open(os.environ["CRUCIBLE_INPUTS_FILE"])); print(json.dumps({"same": e == f, "score": f["emit"]["score"]}))'"#,
+                    &["emit"],
+                ),
+            ],
+            None,
+        );
+        assert!(out.valid, "{:?}", out.results);
+        let check = out.results[&"check".into()].output.as_ref().unwrap();
+        assert_eq!(check["same"], true);
+        assert_eq!(check["score"], 7);
+    }
+
+    #[test]
+    fn inputs_past_the_env_limit_arrive_only_in_the_file() {
+        let out = run_plan(
+            vec![
+                command(
+                    "emit",
+                    r#"python3 -c 'import json; print(json.dumps({"blob": "x" * 300 * 1024}))'"#,
+                    &[],
+                ),
+                command(
+                    "check",
+                    r#"python3 -c 'import json,os; f=json.load(open(os.environ["CRUCIBLE_INPUTS_FILE"])); print(json.dumps({"env": "CRUCIBLE_INPUTS" in os.environ, "len": len(f["emit"]["blob"]), "path": os.environ["CRUCIBLE_INPUTS_FILE"]}))'"#,
+                    &["emit"],
+                ),
+            ],
+            None,
+        );
+        assert!(out.valid, "{:?}", out.results);
+        let check = out.results[&"check".into()].output.as_ref().unwrap();
+        assert_eq!(check["env"], false);
+        assert_eq!(check["len"], 300 * 1024);
+        let path = check["path"].as_str().unwrap();
+        assert!(
+            !std::path::Path::new(path).exists(),
+            "the inputs file outlived its task: {path}"
         );
     }
 

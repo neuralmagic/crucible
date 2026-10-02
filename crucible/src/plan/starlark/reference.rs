@@ -371,8 +371,8 @@ pub fn functions() -> Vec<Function> {
                       value may reach a prompt, with `+` and inside a region marked as external \
                       input, or a skill argument; `str()`, `%`, `.format()`, and string methods \
                       on it are refused, as is a value carrying the marker text. A command or \
-                      evaluate task reads it from `params` in `CRUCIBLE_INPUTS` instead of its \
-                      command line.",
+                      evaluate task reads it from `params` in the inputs JSON at \
+                      `CRUCIBLE_INPUTS_FILE` instead of its command line.",
             positional: Some("name"),
             kwargs: vec![],
         },

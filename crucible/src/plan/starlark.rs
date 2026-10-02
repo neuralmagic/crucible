@@ -5720,7 +5720,7 @@ workflow(type = "playbook", tasks = [a])
                 "{what}: {error}"
             );
             assert!(
-                error.contains("\"params\" entry of $CRUCIBLE_INPUTS"),
+                error.contains("\"params\" entry of the inputs JSON in $CRUCIBLE_INPUTS_FILE"),
                 "{what}: the refusal does not say where a command reads the value: {error}"
             );
         }

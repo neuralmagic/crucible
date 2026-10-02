@@ -155,7 +155,7 @@ Declare a durable agent conversation. Tasks that share one run serially under on
 
 ### `param()`
 
-Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run. A supplied value may reach a prompt, with `+` and inside a region marked as external input, or a skill argument; `str()`, `%`, `.format()`, and string methods on it are refused, as is a value carrying the marker text. A command or evaluate task reads it from `params` in `CRUCIBLE_INPUTS` instead of its command line.
+Read a launch parameter. The `params` block must be the source's first statement, and a source that declares one compiles per run. A supplied value may reach a prompt, with `+` and inside a region marked as external input, or a skill argument; `str()`, `%`, `.format()`, and string methods on it are refused, as is a value carrying the marker text. A command or evaluate task reads it from `params` in the inputs JSON at `CRUCIBLE_INPUTS_FILE` instead of its command line.
 
 Takes one positional argument, `name`.
 
