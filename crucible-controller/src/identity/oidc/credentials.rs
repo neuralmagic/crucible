@@ -273,6 +273,9 @@ pub async fn take(
         .begin()
         .await
         .context("opening the credential revoke")?;
+    lock(&mut tx, sub)
+        .await
+        .context("taking the credential lock")?;
     let row = sqlx::query!(
         r#"DELETE FROM user_credentials WHERE sub = $1
            RETURNING token_cipher AS "token_cipher!", key_id AS "key_id!""#,
@@ -343,7 +346,8 @@ impl OwnerRefresh {
     /// invalidated.
     ///
     /// A definitive refusal, including an answer for another subject, is recorded on the row and
-    /// clears the owner's stored groups, as does a missing credential. An unreachable issuer rolls the transaction back and counts nothing.
+    /// clears the owner's stored groups, as does a credential that is gone before or after the
+    /// exchange. An unreachable issuer rolls the transaction back and counts nothing.
     pub async fn refresh(&self, sub: &str) -> Result<RefreshOutcome, OidcError> {
         let mut tx =
             self.pool.begin().await.map_err(|e| {
@@ -392,15 +396,7 @@ impl OwnerRefresh {
 
         let stamped = jiff::Timestamp::now();
         let now = stamped.to_string();
-        crate::identity::oidc::users::record_groups_on(
-            &mut tx,
-            sub,
-            &refreshed.claims.groups,
-            stamped,
-        )
-        .await
-        .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
-        if let Some(rotated) = refreshed.refresh_token.as_deref() {
+        let updated = if let Some(rotated) = refreshed.refresh_token.as_deref() {
             let (cipher, key_id) = self
                 .keys
                 .seal(sub, rotated)
@@ -417,7 +413,7 @@ impl OwnerRefresh {
             )
             .execute(&mut *tx)
             .await
-            .map_err(|e| OidcError::Unavailable(format!("persisting the rotated token: {e}")))?;
+            .map_err(|e| OidcError::Unavailable(format!("persisting the rotated token: {e}")))?
         } else {
             sqlx::query!(
                 "UPDATE user_credentials
@@ -428,8 +424,19 @@ impl OwnerRefresh {
             )
             .execute(&mut *tx)
             .await
-            .map_err(|e| OidcError::Unavailable(format!("stamping the refresh: {e}")))?;
+            .map_err(|e| OidcError::Unavailable(format!("stamping the refresh: {e}")))?
+        };
+        if updated.rows_affected() == 0 {
+            return absent(tx, sub).await;
         }
+        crate::identity::oidc::users::record_groups_on(
+            &mut tx,
+            sub,
+            &refreshed.claims.groups,
+            stamped,
+        )
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
         tx.commit()
             .await
             .map_err(|e| OidcError::Unavailable(format!("committing the refresh: {e}")))?;
@@ -856,6 +863,80 @@ mod tests {
         );
         assert_eq!(status(&pool, "sub-alice").await.expect("status"), None);
         assert_eq!(stored_groups(&pool, "sub-alice").await, (Vec::new(), None));
+    }
+
+    /// Wait until a backend in this database is blocked on `wait_event`, running `query_prefix`.
+    async fn blocked_on(pool: &PgPool, wait_event: &str, query_prefix: &str) {
+        for _ in 0..500 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND wait_event = $1 AND query LIKE $2 || '%'",
+            )
+            .bind(wait_event)
+            .bind(query_prefix)
+            .fetch_one(pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("nothing blocked on {wait_event} running {query_prefix}");
+    }
+
+    /// A credential deleted while its refresh is in flight takes the groups with it: the refresh's
+    /// credential update matches nothing, so the issuer's answer is never stamped on the owner.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refresh_whose_credential_is_deleted_mid_flight_writes_no_groups(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_groups(&pool, "sub-alice", &["/groups/stale"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (_server, provider) =
+            crate::identity::oidc::tests::issuer_signing_for("sub-alice", &["/groups/team-x"])
+                .await;
+
+        let mut deleter = pool.begin().await.expect("deleter");
+        sqlx::query("DELETE FROM user_credentials WHERE sub = 'sub-alice'")
+            .execute(&mut *deleter)
+            .await
+            .expect("delete");
+        let refresh = OwnerRefresh::new(pool.clone(), provider, keys);
+        let flight = tokio::spawn(async move { refresh.refresh("sub-alice").await });
+        blocked_on(&pool, "transactionid", "UPDATE user_credentials").await;
+        deleter.commit().await.expect("commit the delete");
+
+        assert_eq!(
+            flight.await.expect("join").expect("refresh"),
+            RefreshOutcome::Absent
+        );
+        assert_eq!(stored_groups(&pool, "sub-alice").await, (Vec::new(), None));
+    }
+
+    /// A revoke waits for a refresh holding the subject's credential lock, so the two never
+    /// interleave.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_revoke_waits_for_the_credential_lock(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+
+        let mut holder = pool.begin().await.expect("holder");
+        lock(&mut holder, "sub-alice").await.expect("lock");
+        let revoke = {
+            let pool = pool.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move { take(&pool, &keys, "sub-alice").await })
+        };
+        blocked_on(&pool, "advisory", "SELECT pg_advisory_xact_lock").await;
+        assert!(!revoke.is_finished());
+        holder.commit().await.expect("release");
+        assert_eq!(
+            revoke.await.expect("join").expect("take"),
+            Some("offline".to_string())
+        );
     }
 
     fn keys(count: usize) -> CredentialKeys {
