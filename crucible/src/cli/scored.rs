@@ -552,8 +552,6 @@ fn open_admission_ledger(
 mod tests {
     use crate::report::session::{SessionEvent, decode, encode};
 
-    /// A scored run whose `[mcp]` server dies at boot replaces a reused state dir's log with its
-    /// own header and an `error` shutdown quoting the server's redacted stderr.
     #[test]
     fn an_mcp_server_that_fails_to_start_ends_the_scored_run_in_its_own_log() {
         let _env = crucible::test_support::env_lock();

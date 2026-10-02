@@ -21,10 +21,6 @@ const STDERR_TAIL: usize = 50;
 /// How much of each of those lines it keeps.
 const STDERR_LINE_CHARS: usize = 500;
 
-/// The longest line read before the rest of it is dropped: [`STDERR_LINE_CHARS`] of the widest
-/// UTF-8.
-const STDERR_LINE_BYTES: usize = STDERR_LINE_CHARS * 4;
-
 /// How long an exited server's stderr gets to drain before the failure reports it.
 const STDERR_DRAIN: Duration = Duration::from_secs(1);
 
@@ -100,7 +96,7 @@ impl StderrTail {
                         capped = false;
                     } else if !capped {
                         line.push(byte);
-                        if line.len() == STDERR_LINE_BYTES {
+                        if line.len() == STDERR_LINE_CHARS * 4 {
                             lines.push(&line);
                             line.clear();
                             capped = true;
@@ -201,11 +197,11 @@ pub(crate) fn start(
         let (tail, reader) = StderrTail::follow(child.0.stderr.take());
         let deadline = Instant::now() + BOOT_TIMEOUT;
         while !port_open(&probe) {
-            let exited = child
+            if let Some(status) = child
                 .0
                 .try_wait()
-                .with_context(|| format!("waiting on [mcp.{key}] (`{}`)", cfg.bin))?;
-            if let Some(status) = exited {
+                .with_context(|| format!("waiting on [mcp.{key}] (`{}`)", cfg.bin))?
+            {
                 return Err(StartError::Exited {
                     key: key.clone(),
                     bin: cfg.bin.clone(),

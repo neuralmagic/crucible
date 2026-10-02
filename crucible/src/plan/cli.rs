@@ -1625,9 +1625,6 @@ workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A pack whose `[mcp]` server dies at boot ends the run there: the session log closes on an
-    /// `error` shutdown quoting the server's stderr, and the error is the one a pod wrapper does
-    /// not restart on.
     #[test]
     fn an_mcp_server_that_fails_to_start_ends_the_run_with_its_stderr() {
         let _env = crucible::test_support::env_lock();
