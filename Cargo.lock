@@ -1869,6 +1869,7 @@ dependencies = [
  "toml 0.8.23",
  "toml_edit 0.22.27",
  "tonic",
+ "tonic-prost",
  "tracing",
  "tracing-opentelemetry 0.33.0",
  "tracing-subscriber",
