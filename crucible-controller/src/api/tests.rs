@@ -13441,7 +13441,7 @@ async fn launch_draft_with_key(
         &launch.launcher_groups,
         &launch.created_at,
     )
-    .await?;
+    .await??;
     let resolved = crate::secrets::launch::resolve(
         pool,
         &crate::secrets::launch::Scope::playbook(id),
@@ -13781,7 +13781,8 @@ async fn a_refused_refresh_leaves_a_stale_api_key_outside_the_team(pool: PgPool)
 }
 
 /// At dispatch a stale stamp is refreshed: the recorded groups the issuer still asserts are kept,
-/// one it dropped is removed, and an issuer that cannot be reached holds nothing.
+/// one it dropped is removed, and an issuer that cannot be reached defers the dispatch. With no
+/// refresher the stale stamp stands, as a session's does.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
     let recorded = [TEAM_GROUP.to_string(), "/groups/left".to_string()];
@@ -13799,7 +13800,7 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
         &recorded,
         &jiff::Timestamp::now().to_string(),
     )
-    .await?;
+    .await??;
     assert_eq!(launcher.group_paths().collect::<Vec<_>>(), vec![TEAM_GROUP]);
     assert!(!launcher.teams().is_empty(), "{launcher:?}");
 
@@ -13813,7 +13814,7 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
         &recorded,
         &jiff::Timestamp::now().to_string(),
     )
-    .await?;
+    .await??;
     assert_eq!(
         launcher.group_paths().collect::<Vec<_>>(),
         vec!["/groups/left"]
@@ -13845,11 +13846,23 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
         &jiff::Timestamp::now().to_string(),
     )
     .await?;
-    assert_eq!(launcher.group_paths().count(), 0, "{launcher:?}");
+    assert!(launcher.is_err(), "{launcher:?}");
     let (_, stored, _) = crate::identity::oidc::users::stamped(&pool, "tibrahim")
         .await?
         .expect("users row");
     assert_eq!(stored, recorded, "an outage leaves the stored groups alone");
+
+    let launcher = crate::authz::resolve::dispatch_principals(
+        &pool,
+        None,
+        native,
+        Some("tibrahim"),
+        &recorded,
+        &jiff::Timestamp::now().to_string(),
+    )
+    .await??;
+    assert_eq!(launcher.group_paths().collect::<Vec<_>>(), recorded);
+    assert!(!launcher.teams().is_empty(), "{launcher:?}");
     Ok(())
 }
 
@@ -13879,7 +13892,7 @@ async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
         &team,
         &old,
     )
-    .await?;
+    .await??;
     assert!(!edge.teams().is_empty(), "{edge:?}");
     for login in [Some("cli-user"), None] {
         let fresh = crate::authz::resolve::dispatch_principals(
@@ -13890,7 +13903,7 @@ async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
             &team,
             &young,
         )
-        .await?;
+        .await??;
         assert_eq!(
             fresh.group_paths().collect::<Vec<_>>(),
             vec![TEAM_GROUP],
@@ -13905,7 +13918,7 @@ async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
             &team,
             &old,
         )
-        .await?;
+        .await??;
         assert_eq!(aged.group_paths().count(), 0, "{login:?}: {aged:?}");
         assert!(aged.teams().is_empty(), "{login:?}: {aged:?}");
     }

@@ -7260,6 +7260,122 @@ async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
     Ok(())
 }
 
+/// An issuer that cannot be asked for a stale launcher's groups defers a launch whose scope binds a
+/// secret: it stays `new` for a later tick, and nothing runs or parks. A scope that binds nothing
+/// dispatches anyway. An issuer that refuses holds no groups, so the deferred launch parks.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
+    pool: PgPool,
+) -> Result<()> {
+    use crate::authz::model::{Member, MemberRef, TeamRole, TeamSlug};
+    use crate::identity::oidc::credentials::{CredentialKeys, OwnerRefresh};
+    const GROUP: &str = "/groups/tibrahim-all";
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let team = TeamSlug::parse("tibrahim-all")?;
+    let now = jiff::Timestamp::now();
+    let mut conn = db.pool().acquire().await?;
+    crate::authz::store::insert_team(&mut conn, &team, "tibrahim-all", None, &now.to_string())
+        .await?;
+    crate::authz::store::replace_members(
+        &mut conn,
+        &team,
+        &[Member {
+            member: MemberRef::Group(GROUP.to_string()),
+            role: TeamRole::Member,
+        }],
+        None,
+        &now.to_string(),
+    )
+    .await?;
+    crate::identity::oidc::users::record_login(db.pool(), "sub-wren", "wren", None, now).await?;
+    crate::identity::oidc::users::record_groups_on(
+        &mut conn,
+        "sub-wren",
+        &[GROUP.to_string()],
+        now.checked_sub(jiff::SignedDuration::from_hours(2))?,
+    )
+    .await?;
+    let keys = std::sync::Arc::new(CredentialKeys::new(vec![vec![7u8; 32]])?);
+    crate::identity::oidc::credentials::upsert(&mut conn, &keys, "sub-wren", "offline", now)
+        .await?;
+    drop(conn);
+    let cfg_for = |provider| ControllerCfg {
+        playbook_executor: crucible_controller::PlaybookExecutor::Local,
+        owner_refresh: Some(std::sync::Arc::new(OwnerRefresh::new(
+            db.pool().clone(),
+            provider,
+            keys.clone(),
+        ))),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let unreachable = cfg_for(std::sync::Arc::new(
+        crate::identity::oidc::OidcProvider::new(crate::identity::oidc::OidcCfg {
+            issuer: "http://127.0.0.1:1/realms/nobody".to_string(),
+            client_id: "rp".to_string(),
+            client_secret: None,
+            redirect_url: "http://localhost/auth/callback".to_string(),
+            scopes: vec!["openid".to_string()],
+            device_client_id: None,
+            post_logout_redirect: None,
+        })?,
+    ));
+    let (_issuer, provider) = crate::identity::oidc::tests::issuer_answering(
+        wiremock::ResponseTemplate::new(400)
+            .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
+    )
+    .await;
+    let refusing = cfg_for(provider);
+    seed_registered_playbook(&db, "survey").await;
+    let recorded = serde_json::json!([GROUP]);
+    let unbound = "playbook:survey:0199c0de-7c2c-71a5-8000-10";
+    adopt_launch_with_groups(&db, unbound, 3.5, Some(&recorded)).await;
+    let bound = "playbook:survey:0199c0de-7c2c-71a5-8000-11";
+    adopt_launch_with_groups(&db, bound, 3.5, Some(&recorded)).await;
+
+    let res = async {
+        reconcile(&db, &unreachable, unbound).await?;
+        bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
+        reconcile(&db, &unreachable, bound).await?;
+        let deferred = crate::issues::store::get_issue(db.pool(), bound)
+            .await?
+            .expect("issue");
+        reconcile(&db, &refusing, bound).await?;
+        anyhow::Ok(deferred)
+    }
+    .await;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+    let deferred = res?;
+
+    let started = crate::issues::store::get_issue(db.pool(), unbound)
+        .await?
+        .expect("issue");
+    assert_eq!(
+        started.status,
+        Status::Running,
+        "{:?}",
+        started.parked_reason
+    );
+    assert_eq!(deferred.status, Status::New, "{:?}", deferred.parked_reason);
+    let refused = crate::issues::store::get_issue(db.pool(), bound)
+        .await?
+        .expect("issue");
+    assert_eq!(refused.status, Status::Parked);
+    let reason = format!("{:?}", refused.parked_reason);
+    assert!(reason.contains("owned by team:tibrahim-all"), "{reason}");
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(runs, 1, "only the launch binding nothing ran");
+    Ok(())
+}
+
 /// Local mode: the launch runs as a supervised subprocess with the launcher's own values and
 /// ceilings, and its session lands in the same ledger rows a pod run's would — marked as the local
 /// run it was.

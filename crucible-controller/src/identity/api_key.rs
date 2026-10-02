@@ -12,9 +12,9 @@
 //! A key carries its owner's identity and its owner's groups, which is why [`Authenticated`] holds
 //! both. Groups are whatever the owner's last sign-in or offline credential refresh stamped on their
 //! `users` row: a key is never more powerful than the person it belongs to, and never fresher than
-//! the issuer's last answer about them. A stamp missing or older than a session's group refresh
-//! window is re-read through the owner's offline credential, and a refused, revoked, or absent
-//! credential, or an issuer that cannot be reached, holds no groups.
+//! the issuer's last answer about them. Where a refresher is configured, a stamp missing or older
+//! than a session's group refresh window is re-read through the owner's offline credential, and a
+//! refused, revoked, or absent credential, or an issuer that cannot be reached, holds no groups.
 
 use crate::clock::now_rfc3339;
 use anyhow::{Context, Result};
@@ -203,7 +203,8 @@ pub async fn verify(
         groups,
         row.groups_at.as_deref(),
     )
-    .await;
+    .await
+    .unwrap_or_default();
     Ok(Authenticated {
         id: id.to_string(),
         sub: row.sub,

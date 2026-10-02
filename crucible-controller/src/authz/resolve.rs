@@ -181,10 +181,10 @@ pub async fn recorded_principals(
 }
 
 /// A launch's principals at dispatch: the groups it recorded that its launcher still holds, and the
-/// teams those reach now. What the launcher holds is their stamp while it is fresh, and otherwise
-/// what a refresh of their offline credential answers. A launcher with no `users` row keeps the
-/// recorded groups behind the edge, and in native mode only while the launch is younger than the
-/// session group refresh window.
+/// teams those reach now. What the launcher holds is their stored groups, re-read through their
+/// offline credential as a session's are; an issuer that cannot be asked is the inner error. A
+/// launcher with no `users` row keeps the recorded groups behind the edge, and in native mode only
+/// while the launch is younger than the session group refresh window.
 pub async fn dispatch_principals(
     pool: &sqlx::PgPool,
     refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
@@ -192,21 +192,27 @@ pub async fn dispatch_principals(
     login: Option<&str>,
     recorded: &[String],
     launched_at: &str,
-) -> anyhow::Result<crate::authz::model::Principals> {
+) -> anyhow::Result<
+    Result<crate::authz::model::Principals, crate::identity::oidc::credentials::GroupsUnavailable>,
+> {
     let row = match login {
         Some(login) => crate::identity::oidc::users::stamped(pool, login).await?,
         None => None,
     };
     let current = match row {
-        Some((sub, groups, at)) => Some(
-            crate::identity::oidc::credentials::current_groups(
+        Some((sub, groups, at)) => {
+            match crate::identity::oidc::credentials::current_groups(
                 refresh,
                 &sub,
                 groups,
                 at.as_deref(),
             )
-            .await,
-        ),
+            .await
+            {
+                Ok(groups) => Some(groups),
+                Err(unavailable) => return Ok(Err(unavailable)),
+            }
+        }
         None => match mode {
             crate::identity::auth::AuthMode::Proxy => None,
             crate::identity::auth::AuthMode::Native => crate::identity::oidc::users::stale(
@@ -218,7 +224,7 @@ pub async fn dispatch_principals(
         },
     };
     let held = held_groups(recorded, current.as_deref());
-    recorded_principals(pool, login, &held).await
+    recorded_principals(pool, login, &held).await.map(Ok)
 }
 
 /// The recorded groups the current record still holds, in recorded order. No record keeps them all.
@@ -235,8 +241,8 @@ fn held_groups(recorded: &[String], current: Option<&[String]>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::authz::model::{MemberKind, MembershipRule, TeamRole};
+    use crate::authz::resolve::*;
 
     fn row(team: &str, kind: MemberKind, member: &str, role: TeamRole) -> MemberRow {
         MemberRow {
