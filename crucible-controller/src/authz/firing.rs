@@ -6,7 +6,7 @@
 
 use crate::authz::action::{Action, ResourceType, Verb};
 use crate::authz::decision::{Decision, Resource, Subject};
-use crate::authz::model::{Principal, Principals, TeamRole};
+use crate::authz::model::{Principal, TeamRole};
 use crate::authz::policy::ActivePolicy;
 use crate::authz::store::{self, AuditEvent};
 use anyhow::{Context, Result};
@@ -26,11 +26,9 @@ pub async fn subject_for_owner(
                 .cloned()
                 .and_then(|v| serde_json::from_value(v).ok())
                 .unwrap_or_default();
-            let proves_groups = !groups.is_empty();
-            let teams =
-                crate::authz::resolve::teams_for(pool, Some(login), &groups, proves_groups).await?;
-            let principals = Principals::new(Some(login), &groups).with_teams(teams);
-            Subject::of(&principals, proves_groups)
+            let principals =
+                crate::authz::resolve::recorded_principals(pool, Some(login), &groups).await?;
+            Subject::of(&principals, !groups.is_empty())
                 .context("a user owner always resolves to a subject")
         }
         other => anyhow::bail!("{other} cannot own a standing launch"),

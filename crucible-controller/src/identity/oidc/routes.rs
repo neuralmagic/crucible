@@ -221,7 +221,8 @@ async fn callback(
     Redirect::to(&flow.redirect_to).into_response()
 }
 
-/// The user row, the groups its claim carried, and the offline credential, in one transaction.
+/// The user row, the groups its claim carried, and the offline credential, in one transaction under
+/// the subject's credential lock.
 /// Either all of it lands or none does: a `users` row with no credential is a user whose schedules
 /// silently stop following live groups, and one with stale groups is an API key answering for a
 /// membership its owner no longer holds.
@@ -237,6 +238,9 @@ async fn record_login(
         .begin()
         .await
         .context("opening the login write")?;
+    crate::identity::oidc::credentials::lock(&mut tx, &claims.sub)
+        .await
+        .context("taking the credential lock")?;
     crate::identity::oidc::users::record_login_on(
         &mut tx,
         &claims.sub,
@@ -297,7 +301,7 @@ fn urlencode(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::identity::oidc::routes::*;
 
     /// The post-login destination is the one attacker-influenced value the callback echoes, so it
     /// is a same-origin path or it is `/`.
@@ -321,5 +325,48 @@ mod tests {
             );
         }
         assert_eq!(safe_redirect(None), "/");
+    }
+
+    /// The callback's write waits on a held credential lock, and lands once it is released.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_login_write_waits_on_the_credential_lock(pool: sqlx::PgPool) {
+        let state = AuthState {
+            mode: AuthMode::Native,
+            oidc: None,
+            pool: pool.clone(),
+            credential_keys: None,
+            proxy_prefix: String::new(),
+        };
+        let claims = crate::identity::oidc::VerifiedClaims {
+            sub: "sub-alice".to_string(),
+            login: "alice".to_string(),
+            email: None,
+            groups: vec!["/groups/team-x".to_string()],
+        };
+        let mut held = pool.begin().await.expect("tx");
+        crate::identity::oidc::credentials::lock(&mut held, "sub-alice")
+            .await
+            .expect("lock");
+
+        let write = tokio::spawn(async move {
+            record_login(&state, &claims, None, jiff::Timestamp::now()).await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!write.is_finished(), "the write ran under a held lock");
+        assert_eq!(
+            crate::identity::oidc::users::stamped(&pool, "alice")
+                .await
+                .expect("read"),
+            None
+        );
+
+        held.commit().await.expect("release");
+        write.await.expect("join").expect("record login");
+        let (_, groups, at) = crate::identity::oidc::users::stamped(&pool, "alice")
+            .await
+            .expect("read")
+            .expect("users row");
+        assert_eq!(groups, vec!["/groups/team-x".to_string()]);
+        assert!(at.is_some());
     }
 }

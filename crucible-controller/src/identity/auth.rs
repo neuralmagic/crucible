@@ -148,8 +148,8 @@ pub enum AuthPath {
     /// A valid cluster token whose OpenShift username matches no `users` row, so it names nobody
     /// this controller has an SSO identity for.
     UnknownClusterToken,
-    /// An opaque `crk_…` key its owner minted, carrying their login and the groups their last
-    /// login stamped. It authenticates only on the MCP surface, which runs its own guard.
+    /// An opaque `crk_…` key its owner minted, carrying their login and the groups their `users`
+    /// row holds. It authenticates only on the MCP surface, which runs its own guard.
     ApiKey,
     /// No expected token configured — the guard is off and the surface is loopback-bound.
     Open,
@@ -241,22 +241,6 @@ pub(crate) fn expected_token() -> Option<SharedToken> {
     SharedToken::from_env("CONTROLLER_API_TOKEN")
 }
 
-/// How stale a live session's group list may get before the next request re-reads it from the
-/// owner's offline credential.
-const DEFAULT_SESSION_GROUP_REFRESH: std::time::Duration = std::time::Duration::from_secs(600);
-
-/// `CONTROLLER_SESSION_GROUP_REFRESH_MINUTES`. Unset, unparseable, or zero is
-/// [`DEFAULT_SESSION_GROUP_REFRESH`] — a deployment must not be able to turn the check into a
-/// per-request round trip against the issuer by typo.
-fn session_group_refresh_interval() -> std::time::Duration {
-    std::env::var("CONTROLLER_SESSION_GROUP_REFRESH_MINUTES")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|m| *m > 0)
-        .map(|m| std::time::Duration::from_secs(m * 60))
-        .unwrap_or(DEFAULT_SESSION_GROUP_REFRESH)
-}
-
 /// What the auth middleware checks against: the mode, the SSO edge's own token, the static machine
 /// token, the cluster-token path that resolves any OTHER bearer to an OpenShift username via
 /// `users/~`, and (native mode) the issuer the sessions and JWT bearers are proved against.
@@ -291,7 +275,7 @@ impl Default for BearerGuard {
             oidc: None,
             users: None,
             refresh: None,
-            refresh_after: DEFAULT_SESSION_GROUP_REFRESH,
+            refresh_after: crate::identity::oidc::users::DEFAULT_SESSION_GROUP_REFRESH,
         }
     }
 }
@@ -316,7 +300,7 @@ impl BearerGuard {
         guard.refresh = users.and_then(|pool| {
             crate::identity::oidc::credentials::OwnerRefresh::from_parts(pool, oidc, keys)
         });
-        guard.refresh_after = session_group_refresh_interval();
+        guard.refresh_after = crate::identity::oidc::users::session_group_refresh_interval();
         if guard.mode == AuthMode::Native && guard.oidc.is_none() {
             anyhow::bail!(
                 "CONTROLLER_AUTH_MODE=native without CONTROLLER_OIDC_ISSUER: native mode has no identity provider to run a login against"
@@ -392,7 +376,7 @@ impl BearerGuard {
             oidc: None,
             users: None,
             refresh: None,
-            refresh_after: DEFAULT_SESSION_GROUP_REFRESH,
+            refresh_after: crate::identity::oidc::users::DEFAULT_SESSION_GROUP_REFRESH,
         })
     }
 
@@ -655,7 +639,11 @@ pub(crate) async fn require_auth_or_api_key(
     next: Next,
 ) -> Response {
     if presented_api_key(req.headers()) {
-        return require_api_key(State(both.pool), req, next).await;
+        let keys = KeyGuard {
+            pool: both.pool,
+            refresh: both.guard.refresh.clone(),
+        };
+        return require_api_key(State(keys), req, next).await;
     }
     require_auth(State(both.guard), req, next).await
 }
@@ -670,6 +658,14 @@ fn presented_api_key(headers: &header::HeaderMap) -> bool {
         .is_some_and(crate::identity::api_key::looks_like_key)
 }
 
+/// What [`require_api_key`] checks a key against: the pool it is stored in, and the offline
+/// credential its owner's stale groups are re-read through.
+#[derive(Clone)]
+pub struct KeyGuard {
+    pub(crate) pool: sqlx::PgPool,
+    pub(crate) refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
+}
+
 /// Middleware: admit a request only on an API key its owner minted.
 ///
 /// Deliberately not part of [`require_auth`]. The surfaces this guards are reached by agents
@@ -680,9 +676,9 @@ fn presented_api_key(headers: &header::HeaderMap) -> bool {
 /// carrying its own credential check.
 ///
 /// What it stamps is what every handler already reads, so nothing downstream needs to know an API
-/// key was involved: the owner's login, their subject, and the groups their last login recorded.
+/// key was involved: the owner's login, their subject, and the groups their `users` row holds.
 pub async fn require_api_key(
-    State(pool): State<sqlx::PgPool>,
+    State(KeyGuard { pool, refresh }): State<KeyGuard>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -695,13 +691,14 @@ pub async fn require_api_key(
     let Some(presented) = presented else {
         return key_refused("this surface needs an api key as its bearer");
     };
-    let authenticated = match crate::identity::api_key::verify(&pool, presented).await {
-        Ok(authenticated) => authenticated,
-        Err(refusal) => {
-            tracing::debug!(reason = %refusal, "api key refused");
-            return key_refused(&refusal.to_string());
-        }
-    };
+    let authenticated =
+        match crate::identity::api_key::verify(&pool, refresh.as_deref(), presented).await {
+            Ok(authenticated) => authenticated,
+            Err(refusal) => {
+                tracing::debug!(reason = %refusal, "api key refused");
+                return key_refused(&refusal.to_string());
+            }
+        };
 
     // The client wrote no identity that survives: every X-Auth-Request-* header goes, exactly as
     // native mode drops them, so the key is the only thing naming this caller.
@@ -774,7 +771,7 @@ async fn refresh_session_groups(
         return claims;
     }
     let now = jiff::Timestamp::now();
-    if !stale(&claims.groups_at, now, guard.refresh_after) {
+    if !crate::identity::oidc::users::stale(&claims.groups_at, now, guard.refresh_after) {
         return claims;
     }
     let mut next = claims.clone();
@@ -801,21 +798,6 @@ async fn refresh_session_groups(
         tracing::error!(error = %e, "restamping the refreshed session claims");
     }
     next
-}
-
-/// Whether a stamped instant is older than `max_age`. An unparseable or missing stamp is stale:
-/// a session whose groups have no provenance has to prove them again.
-fn stale(at: &str, now: jiff::Timestamp, max_age: std::time::Duration) -> bool {
-    let Ok(at) = at.parse::<jiff::Timestamp>() else {
-        return true;
-    };
-    let Ok(span) = jiff::SignedDuration::try_from(max_age) else {
-        return true;
-    };
-    match at.checked_add(span) {
-        Ok(expires) => expires <= now,
-        Err(_) => true,
-    }
 }
 
 /// The native claims on the request's session. A store that cannot answer is a 500, never a 401:

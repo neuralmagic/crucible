@@ -131,12 +131,32 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
             .await?
             .flatten(),
     };
+    let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
+    let launcher = match crate::authz::resolve::dispatch_principals(
+        db.pool(),
+        cfg.owner_refresh.as_deref(),
+        cfg.auth_mode,
+        launch.created_by.as_deref(),
+        &launch.launcher_groups,
+        &launch.created_at,
+    )
+    .await?
+    {
+        Ok(launcher) => launcher,
+        Err(unavailable) => {
+            if !crate::secrets::store::bindings_for_scope(db.pool(), scope.kind, &scope.id)
+                .await?
+                .is_empty()
+            {
+                tracing::warn!(issue_key = %issue.key, error = %unavailable, "playbook dispatch deferred");
+                return Ok(());
+            }
+            crate::authz::model::Principals::new(launch.created_by.as_deref(), &[])
+        }
+    };
     let secrets = Some(crate::runs::workpod::LaunchSecrets {
-        scope: crate::secrets::launch::Scope::playbook(&launch.playbook),
-        launcher: crate::authz::model::Principals::new(
-            launch.created_by.as_deref(),
-            &launch.launcher_groups,
-        ),
+        scope,
+        launcher,
         revision,
         provider: cfg.secret_provider.clone(),
         inference_provider: dispatch.map(|d| d.provider),

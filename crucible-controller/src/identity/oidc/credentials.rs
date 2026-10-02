@@ -25,6 +25,9 @@ use crate::identity::oidc::{OidcError, OidcProvider, VerifiedClaims};
 /// [`crate::client::MAINTENANCE_ADVISORY_LOCK`] lives in.
 const CREDENTIAL_LOCK_CLASS: i32 = 0x6372_7563;
 
+/// How long a failed group refresh keeps its subject off the issuer.
+const FAILED_REFRESH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// AES-256 key material length.
 const KEY_LEN: usize = 32;
 
@@ -262,20 +265,32 @@ pub async fn status(pool: &PgPool, sub: &str) -> anyhow::Result<Option<Credentia
     }))
 }
 
-/// Drop a subject's credential. Returns the token it held, so the caller can tell the issuer too.
+/// Drop a subject's credential and the groups it answered for. Returns the token it held, so the
+/// caller can tell the issuer too.
 pub async fn take(
     pool: &PgPool,
     keys: &CredentialKeys,
     sub: &str,
 ) -> anyhow::Result<Option<String>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the credential revoke")?;
+    lock(&mut tx, sub)
+        .await
+        .context("taking the credential lock")?;
     let row = sqlx::query!(
         r#"DELETE FROM user_credentials WHERE sub = $1
            RETURNING token_cipher AS "token_cipher!", key_id AS "key_id!""#,
         sub
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await
     .context("deleting the offline credential")?;
+    crate::identity::oidc::users::clear_groups_on(&mut tx, sub, jiff::Timestamp::now()).await?;
+    tx.commit()
+        .await
+        .context("committing the credential revoke")?;
     let Some(row) = row else { return Ok(None) };
     // A row sealed under a key this deploy no longer mounts is still gone; only the issuer-side
     // revoke is lost.
@@ -288,6 +303,66 @@ pub struct OwnerRefresh {
     pool: PgPool,
     provider: Arc<OidcProvider>,
     keys: Arc<CredentialKeys>,
+    failed: FailedRefreshes,
+    subjects: SubjectLocks,
+}
+
+/// One async lock per subject a refresh is in flight for in this process, taken before a pooled
+/// connection is. An entry nothing holds or waits on is pruned on the next lookup.
+#[derive(Default)]
+struct SubjectLocks(
+    std::sync::Mutex<std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
+);
+
+impl SubjectLocks {
+    async fn lock(&self, sub: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut held = self
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            held.retain(|_, gate| gate.strong_count() > 0);
+            match held.get(sub).and_then(std::sync::Weak::upgrade) {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(tokio::sync::Mutex::new(()));
+                    held.insert(sub.to_string(), Arc::downgrade(&gate));
+                    gate
+                }
+            }
+        };
+        gate.lock_owned().await
+    }
+}
+
+/// The issuer could not be asked for a subject's current groups.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the owner's groups could not be refreshed: {0}")]
+pub struct GroupsUnavailable(pub String);
+
+/// The subjects whose last group refresh failed, and when. Expired entries are pruned on every
+/// insert, so the map holds only subjects that failed within [`FAILED_REFRESH_BACKOFF`].
+#[derive(Default)]
+struct FailedRefreshes(std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>);
+
+impl FailedRefreshes {
+    fn holds(&self, sub: &str, now: std::time::Instant) -> bool {
+        let at = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        at.get(sub)
+            .is_some_and(|failed| now.duration_since(*failed) < FAILED_REFRESH_BACKOFF)
+    }
+
+    fn note(&self, sub: &str, now: std::time::Instant) {
+        let mut at = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        at.retain(|_, failed| now.duration_since(*failed) < FAILED_REFRESH_BACKOFF);
+        at.insert(sub.to_string(), now);
+    }
 }
 
 /// What one refresh attempt produced.
@@ -300,12 +375,23 @@ pub enum RefreshOutcome {
     Absent,
 }
 
+impl std::fmt::Debug for OwnerRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerRefresh")
+            .field("issuer", &self.provider.cfg().issuer)
+            .field("keys", &self.keys)
+            .finish_non_exhaustive()
+    }
+}
+
 impl OwnerRefresh {
     pub fn new(pool: PgPool, provider: Arc<OidcProvider>, keys: Arc<CredentialKeys>) -> Self {
         OwnerRefresh {
             pool,
             provider,
             keys,
+            failed: FailedRefreshes::default(),
+            subjects: SubjectLocks::default(),
         }
     }
 
@@ -333,20 +419,89 @@ impl OwnerRefresh {
     /// for the first to commit the rotated token instead of spending the one the first just
     /// invalidated.
     ///
-    /// A definitive refusal is recorded on the row and the credential is dropped — nothing about it
-    /// will work again. An unreachable issuer rolls the transaction back and counts nothing.
+    /// A definitive refusal, including an answer for another subject, is recorded on the row and
+    /// clears the owner's stored groups, as does a credential that is gone before or after the
+    /// exchange. An unreachable issuer rolls the transaction back and counts nothing.
     pub async fn refresh(&self, sub: &str) -> Result<RefreshOutcome, OidcError> {
+        let _subject = self.subjects.lock(sub).await;
+        let tx = self.locked(sub).await?;
+        self.exchange(tx, sub).await
+    }
+
+    /// The groups `sub` holds now, for a caller that found their stamp older than `window`. Another
+    /// caller may have restamped it while this one waited on the credential lock, and then the
+    /// stored groups stand; otherwise the issuer answers. A refusal holds no groups. An unreachable
+    /// issuer is [`GroupsUnavailable`] and keeps `sub` off the issuer for
+    /// [`FAILED_REFRESH_BACKOFF`], including callers already queued on the lock.
+    pub async fn current_groups(
+        &self,
+        sub: &str,
+        window: std::time::Duration,
+    ) -> Result<Vec<String>, GroupsUnavailable> {
+        match self.groups_unless_fresh(sub, window).await {
+            Ok(groups) => Ok(groups),
+            Err(OidcError::Rejected(why)) => {
+                tracing::info!(sub, reason = %why, "group refresh refused; no groups");
+                Ok(Vec::new())
+            }
+            Err(OidcError::Unavailable(why)) => {
+                tracing::warn!(sub, error = %why, "group refresh failed");
+                Err(GroupsUnavailable(why))
+            }
+        }
+    }
+
+    async fn groups_unless_fresh(
+        &self,
+        sub: &str,
+        window: std::time::Duration,
+    ) -> Result<Vec<String>, OidcError> {
+        let _subject = self.subjects.lock(sub).await;
+        if self.failed.holds(sub, std::time::Instant::now()) {
+            return Err(OidcError::Unavailable(
+                "a refresh of this subject failed within the backoff".to_string(),
+            ));
+        }
+        let mut tx = self.locked(sub).await?;
+        let stamp = crate::identity::oidc::users::stamp_on(&mut tx, sub)
+            .await
+            .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
+        if let Some((groups, Some(at))) = stamp
+            && !crate::identity::oidc::users::stale(&at, jiff::Timestamp::now(), window)
+        {
+            return Ok(groups);
+        }
+        let outcome = self.exchange(tx, sub).await;
+        if let Err(OidcError::Unavailable(_)) = outcome {
+            self.failed.note(sub, std::time::Instant::now());
+        }
+        match outcome? {
+            RefreshOutcome::Claims(claims) => Ok(claims.groups),
+            RefreshOutcome::Absent => Ok(Vec::new()),
+        }
+    }
+
+    /// A transaction holding `sub`'s credential lock.
+    async fn locked(
+        &self,
+        sub: &str,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, OidcError> {
         let mut tx =
             self.pool.begin().await.map_err(|e| {
                 OidcError::Unavailable(format!("opening the refresh transaction: {e}"))
             })?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
-            .bind(CREDENTIAL_LOCK_CLASS)
-            .bind(sub)
-            .execute(&mut *tx)
+        lock(&mut tx, sub)
             .await
             .map_err(|e| OidcError::Unavailable(format!("taking the credential lock: {e}")))?;
+        Ok(tx)
+    }
 
+    /// Spend `sub`'s credential inside `tx`, which holds its lock.
+    async fn exchange(
+        &self,
+        mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+        sub: &str,
+    ) -> Result<RefreshOutcome, OidcError> {
         let row = sqlx::query!(
             r#"SELECT token_cipher AS "token_cipher!", key_id AS "key_id!"
                FROM user_credentials WHERE sub = $1"#,
@@ -356,7 +511,7 @@ impl OwnerRefresh {
         .await
         .map_err(|e| OidcError::Unavailable(format!("reading the offline credential: {e}")))?;
         let Some(row) = row else {
-            return Ok(RefreshOutcome::Absent);
+            return absent(tx, sub).await;
         };
         let token = match self.keys.open(sub, &row.key_id, &row.token_cipher) {
             Ok(token) => token,
@@ -379,8 +534,14 @@ impl OwnerRefresh {
             }
         };
 
-        let now = jiff::Timestamp::now().to_string();
-        if let Some(rotated) = refreshed.refresh_token.as_deref() {
+        if let Err(why) = answers_for(sub, &refreshed.claims) {
+            record_refusal(tx, sub, &why).await?;
+            return Err(OidcError::Rejected(why));
+        }
+
+        let stamped = jiff::Timestamp::now();
+        let now = stamped.to_string();
+        let updated = if let Some(rotated) = refreshed.refresh_token.as_deref() {
             let (cipher, key_id) = self
                 .keys
                 .seal(sub, rotated)
@@ -397,7 +558,7 @@ impl OwnerRefresh {
             )
             .execute(&mut *tx)
             .await
-            .map_err(|e| OidcError::Unavailable(format!("persisting the rotated token: {e}")))?;
+            .map_err(|e| OidcError::Unavailable(format!("persisting the rotated token: {e}")))?
         } else {
             sqlx::query!(
                 "UPDATE user_credentials
@@ -408,8 +569,19 @@ impl OwnerRefresh {
             )
             .execute(&mut *tx)
             .await
-            .map_err(|e| OidcError::Unavailable(format!("stamping the refresh: {e}")))?;
+            .map_err(|e| OidcError::Unavailable(format!("stamping the refresh: {e}")))?
+        };
+        if updated.rows_affected() == 0 {
+            return absent(tx, sub).await;
         }
+        crate::identity::oidc::users::record_groups_on(
+            &mut tx,
+            sub,
+            &refreshed.claims.groups,
+            stamped,
+        )
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
         tx.commit()
             .await
             .map_err(|e| OidcError::Unavailable(format!("committing the refresh: {e}")))?;
@@ -417,15 +589,52 @@ impl OwnerRefresh {
     }
 }
 
-/// Record a definitive refusal against the credential and COMMIT: the refusal has to survive the
-/// error the caller is about to be handed, or the next tick spends the dead token again. The row
-/// stays so its owner can read why they have to sign in again.
+/// Take the per-subject credential lock for the rest of `tx`.
+pub(crate) async fn lock(tx: &mut PgConnection, sub: &str) -> sqlx::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(CREDENTIAL_LOCK_CLASS)
+        .bind(sub)
+        .execute(tx)
+        .await
+        .map(|_| ())
+}
+
+/// No credential to spend: clear the owner's stored groups, as a session is downgraded, and commit.
+async fn absent(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    sub: &str,
+) -> Result<RefreshOutcome, OidcError> {
+    crate::identity::oidc::users::clear_groups_on(&mut tx, sub, jiff::Timestamp::now())
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("committing the absent credential: {e}")))?;
+    Ok(RefreshOutcome::Absent)
+}
+
+/// Whether a refresh's claims are about the subject whose credential was spent.
+fn answers_for(sub: &str, claims: &VerifiedClaims) -> Result<(), String> {
+    if claims.sub == sub {
+        Ok(())
+    } else {
+        Err(format!(
+            "the refreshed ID token names subject {}, not {sub}",
+            claims.sub
+        ))
+    }
+}
+
+/// Record a definitive refusal against the credential, clear the owner's stored groups, and
+/// COMMIT: the refusal has to survive the error the caller is about to be handed, or the next tick
+/// spends the dead token again. The row stays so its owner can read why they have to sign in again.
 async fn record_refusal(
     mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
     sub: &str,
     why: &str,
 ) -> Result<(), OidcError> {
-    let now = jiff::Timestamp::now().to_string();
+    let stamped = jiff::Timestamp::now();
+    let now = stamped.to_string();
     sqlx::query!(
         "UPDATE user_credentials SET last_error = $2, failures = failures + 1, updated_at = $3
          WHERE sub = $1",
@@ -436,39 +645,192 @@ async fn record_refusal(
     .execute(&mut *tx)
     .await
     .map_err(|e| OidcError::Unavailable(format!("recording the refresh refusal: {e}")))?;
+    crate::identity::oidc::users::clear_groups_on(&mut tx, sub, stamped)
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
     tx.commit()
         .await
         .map_err(|e| OidcError::Unavailable(format!("committing the refresh refusal: {e}")))
 }
 
+/// The groups `sub` holds now, re-read as a session re-reads its own: the stored ones with no
+/// refresher, or while their stamp is younger than the session refresh window, and past it
+/// whatever a refresh of the owner's offline credential answers. A refusal or no credential is
+/// none.
+pub async fn current_groups(
+    refresh: Option<&OwnerRefresh>,
+    sub: &str,
+    stored: Vec<String>,
+    groups_at: Option<&str>,
+) -> Result<Vec<String>, GroupsUnavailable> {
+    let Some(refresh) = refresh else {
+        return Ok(stored);
+    };
+    let window = crate::identity::oidc::users::session_group_refresh_interval();
+    if groups_at
+        .is_some_and(|at| !crate::identity::oidc::users::stale(at, jiff::Timestamp::now(), window))
+    {
+        return Ok(stored);
+    }
+    refresh.current_groups(sub, window).await
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::identity::oidc::OidcCfg;
+    use crate::identity::oidc::credentials::*;
 
     /// An issuer nothing is listening on: a real unreachable endpoint, not a stubbed one, so the
     /// transport failure the refresh has to treat as transient is the genuine article.
-    const DEAD_ISSUER: &str = "http://127.0.0.1:1/realms/nobody";
-
     fn dead_provider() -> Arc<OidcProvider> {
-        Arc::new(
-            OidcProvider::new(OidcCfg {
-                issuer: DEAD_ISSUER.to_string(),
-                client_id: "rp".to_string(),
-                client_secret: None,
-                redirect_url: "http://localhost/auth/callback".to_string(),
-                scopes: vec!["openid".to_string()],
-                device_client_id: None,
-                post_logout_redirect: None,
-            })
-            .expect("provider"),
-        )
+        crate::identity::oidc::tests::provider_at("http://127.0.0.1:1/realms/nobody")
     }
 
     async fn seed_user(pool: &PgPool, sub: &str, login: &str) {
         crate::identity::oidc::users::record_login(pool, sub, login, None, jiff::Timestamp::now())
             .await
             .expect("record login");
+    }
+
+    async fn seed_groups(pool: &PgPool, sub: &str, groups: &[&str]) {
+        let groups = groups.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::identity::oidc::users::record_groups_on(
+            &mut conn,
+            sub,
+            &groups,
+            jiff::Timestamp::now(),
+        )
+        .await
+        .expect("record groups");
+    }
+
+    async fn seed_credential(pool: &PgPool, keys: &CredentialKeys, sub: &str) {
+        let mut conn = pool.acquire().await.expect("conn");
+        upsert(&mut conn, keys, sub, "offline", jiff::Timestamp::now())
+            .await
+            .expect("store");
+    }
+
+    /// The groups and stamp a subject's `users` row holds.
+    async fn stored_groups(pool: &PgPool, sub: &str) -> (Vec<String>, Option<String>) {
+        let (groups, at): (sqlx::types::Json<Vec<String>>, Option<String>) =
+            sqlx::query_as("SELECT groups, groups_at FROM users WHERE sub = $1")
+                .bind(sub)
+                .fetch_one(pool)
+                .await
+                .expect("users row");
+        (groups.0, at)
+    }
+
+    /// The subject's row holds no groups, stamped as the issuer's current answer.
+    async fn assert_cleared(pool: &PgPool, sub: &str) {
+        let (groups, at) = stored_groups(pool, sub).await;
+        assert!(groups.is_empty(), "{groups:?}");
+        assert!(at.is_some(), "an empty answer is stamped like any other");
+    }
+
+    /// A successful refresh stamps the groups the issuer's signed ID token carried on the owner's
+    /// row, replacing what was there, and stores the rotated token.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refresh_stamps_the_issuers_groups_on_the_owners_row(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_groups(&pool, "sub-alice", &["/groups/stale"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+
+        let (_server, provider) =
+            crate::identity::oidc::tests::issuer_signing_for("sub-alice", &["/Groups/Team-X"])
+                .await;
+        let refresh = OwnerRefresh::new(pool.clone(), provider, keys.clone());
+        let RefreshOutcome::Claims(claims) = refresh.refresh("sub-alice").await.expect("refresh")
+        else {
+            panic!("the credential is stored");
+        };
+        assert_eq!(claims.groups, vec!["/groups/team-x".to_string()]);
+        let (groups, at) = stored_groups(&pool, "sub-alice").await;
+        assert_eq!(groups, vec!["/groups/team-x".to_string()]);
+        assert!(at.is_some(), "the stamp records when the issuer answered");
+        assert_eq!(
+            take(&pool, &keys, "sub-alice").await.expect("take"),
+            Some("rotated".to_string()),
+            "the rotated token replaced the spent one"
+        );
+    }
+
+    /// An issuer answering a credential with an ID token for another subject is a refusal: no
+    /// groups are written to either row, the owner's are cleared, and the token is not rotated.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refresh_answering_for_another_subject_is_refused(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_user(&pool, "sub-mallory", "mallory").await;
+        seed_groups(&pool, "sub-mallory", &["/groups/mallory"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+
+        let (_server, provider) =
+            crate::identity::oidc::tests::issuer_signing_for("sub-mallory", &["/groups/admins"])
+                .await;
+        let refresh = OwnerRefresh::new(pool.clone(), provider, keys.clone());
+        let err = refresh.refresh("sub-alice").await.expect_err("mismatch");
+        assert!(
+            matches!(&err, OidcError::Rejected(why) if why.contains("sub-mallory")),
+            "{err:?}"
+        );
+        assert_cleared(&pool, "sub-alice").await;
+        assert_eq!(
+            stored_groups(&pool, "sub-mallory").await.0,
+            vec!["/groups/mallory".to_string()],
+            "the other subject's row is untouched"
+        );
+        let status = status(&pool, "sub-alice")
+            .await
+            .expect("status")
+            .expect("the row stays so its owner can read why");
+        assert_eq!(status.failures, 1);
+        assert_eq!(
+            take(&pool, &keys, "sub-alice").await.expect("take"),
+            Some("offline".to_string()),
+            "the rotated token from the wrong answer is not stored"
+        );
+    }
+
+    #[test]
+    fn claims_answer_only_for_their_own_subject() {
+        let claims = |sub: &str| VerifiedClaims {
+            sub: sub.to_string(),
+            login: "alice".to_string(),
+            email: None,
+            groups: vec!["/groups/a".to_string()],
+        };
+        assert!(answers_for("sub-alice", &claims("sub-alice")).is_ok());
+        let why = answers_for("sub-alice", &claims("sub-mallory")).expect_err("mismatch");
+        assert!(
+            why.contains("sub-mallory") && why.contains("sub-alice"),
+            "{why}"
+        );
+        assert!(answers_for("sub-alice", &claims("SUB-ALICE")).is_err());
+    }
+
+    /// A revoke drops the credential and the groups it answered for in one write.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_revoke_clears_the_owners_groups(pool: PgPool) {
+        let keys = keys(1);
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_user(&pool, "sub-bob", "bob").await;
+        seed_groups(&pool, "sub-bob", &["/groups/bob"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+
+        assert_eq!(
+            take(&pool, &keys, "sub-alice").await.expect("take"),
+            Some("offline".to_string())
+        );
+        assert_cleared(&pool, "sub-alice").await;
+        assert_eq!(
+            stored_groups(&pool, "sub-bob").await.0,
+            vec!["/groups/bob".to_string()]
+        );
     }
 
     /// The callback's write: one row per subject, latest login wins, and the stored bytes are not
@@ -530,17 +892,8 @@ mod tests {
     async fn an_unreachable_issuer_leaves_the_credential_untouched(pool: PgPool) {
         let keys = Arc::new(keys(1));
         seed_user(&pool, "sub-alice", "alice").await;
-        let mut conn = pool.acquire().await.expect("conn");
-        upsert(
-            &mut conn,
-            &keys,
-            "sub-alice",
-            "offline",
-            jiff::Timestamp::now(),
-        )
-        .await
-        .expect("store");
-        drop(conn);
+        seed_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
 
         let refresh = OwnerRefresh::new(pool.clone(), dead_provider(), keys.clone());
         let err = refresh.refresh("sub-alice").await.expect_err("unreachable");
@@ -555,6 +908,11 @@ mod tests {
         assert_eq!(status.failures, 0, "a transient failure counts nothing");
         assert_eq!(status.last_error, None);
         assert_eq!(
+            stored_groups(&pool, "sub-alice").await.0,
+            vec!["/groups/alice".to_string()],
+            "an outage keeps the last answer"
+        );
+        assert_eq!(
             take(&pool, &keys, "sub-alice").await.expect("take"),
             Some("offline".to_string()),
             "the stored token is unchanged"
@@ -568,17 +926,7 @@ mod tests {
     async fn an_issuer_behind_a_failing_route_leaves_the_credential_untouched(pool: PgPool) {
         let keys = Arc::new(keys(1));
         seed_user(&pool, "sub-alice", "alice").await;
-        let mut conn = pool.acquire().await.expect("conn");
-        upsert(
-            &mut conn,
-            &keys,
-            "sub-alice",
-            "offline",
-            jiff::Timestamp::now(),
-        )
-        .await
-        .expect("store");
-        drop(conn);
+        seed_credential(&pool, &keys, "sub-alice").await;
 
         let (_server, provider) = crate::identity::oidc::tests::issuer_answering(
             wiremock::ResponseTemplate::new(503)
@@ -610,17 +958,8 @@ mod tests {
     async fn a_credential_sealed_under_a_dropped_key_is_a_refusal(pool: PgPool) {
         let old = CredentialKeys::new(vec![vec![7u8; KEY_LEN]]).expect("old");
         seed_user(&pool, "sub-alice", "alice").await;
-        let mut conn = pool.acquire().await.expect("conn");
-        upsert(
-            &mut conn,
-            &old,
-            "sub-alice",
-            "offline",
-            jiff::Timestamp::now(),
-        )
-        .await
-        .expect("store");
-        drop(conn);
+        seed_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_credential(&pool, &old, "sub-alice").await;
 
         let rotated = Arc::new(CredentialKeys::new(vec![vec![8u8; KEY_LEN]]).expect("rotated"));
         let refresh = OwnerRefresh::new(pool.clone(), dead_provider(), rotated);
@@ -632,20 +971,318 @@ mod tests {
             .expect("the row stays so its owner can read why");
         assert_eq!(status.failures, 1);
         assert!(status.last_error.is_some());
+        assert_cleared(&pool, "sub-alice").await;
     }
 
     /// No credential at all is neither an error nor a refusal: it is the shape a deployment whose
-    /// realm grants no `offline_access` runs in.
+    /// realm grants no `offline_access` runs in. The owner's stored groups are cleared, as a
+    /// session's are.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_subject_with_no_credential_is_absent(pool: PgPool) {
         let keys = Arc::new(keys(1));
         seed_user(&pool, "sub-alice", "alice").await;
+        seed_groups(&pool, "sub-alice", &["/groups/team-x"]).await;
         let refresh = OwnerRefresh::new(pool.clone(), dead_provider(), keys);
         assert_eq!(
             refresh.refresh("sub-alice").await.expect("absent"),
             RefreshOutcome::Absent
         );
         assert_eq!(status(&pool, "sub-alice").await.expect("status"), None);
+        assert_cleared(&pool, "sub-alice").await;
+    }
+
+    /// Wait until a backend in this database is blocked on `wait_event`, running `query_prefix`.
+    async fn blocked_on(pool: &PgPool, wait_event: &str, query_prefix: &str) {
+        for _ in 0..500 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND wait_event = $1 AND query LIKE $2 || '%'",
+            )
+            .bind(wait_event)
+            .bind(query_prefix)
+            .fetch_one(pool)
+            .await
+            .expect("pg_stat_activity");
+            if waiting > 0 {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("nothing blocked on {wait_event} running {query_prefix}");
+    }
+
+    /// A credential deleted while its refresh is in flight takes the groups with it: the refresh's
+    /// credential update matches nothing, so the issuer's answer is never stamped on the owner.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refresh_whose_credential_is_deleted_mid_flight_writes_no_groups(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_groups(&pool, "sub-alice", &["/groups/stale"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (_server, provider) =
+            crate::identity::oidc::tests::issuer_signing_for("sub-alice", &["/groups/team-x"])
+                .await;
+
+        let mut deleter = pool.begin().await.expect("deleter");
+        sqlx::query("DELETE FROM user_credentials WHERE sub = 'sub-alice'")
+            .execute(&mut *deleter)
+            .await
+            .expect("delete");
+        let refresh = OwnerRefresh::new(pool.clone(), provider, keys);
+        let flight = tokio::spawn(async move { refresh.refresh("sub-alice").await });
+        blocked_on(&pool, "transactionid", "UPDATE user_credentials").await;
+        deleter.commit().await.expect("commit the delete");
+
+        assert_eq!(
+            flight.await.expect("join").expect("refresh"),
+            RefreshOutcome::Absent
+        );
+        assert_cleared(&pool, "sub-alice").await;
+    }
+
+    /// A revoke waits for a refresh holding the subject's credential lock, so the two never
+    /// interleave.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_revoke_waits_for_the_credential_lock(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+
+        let mut holder = pool.begin().await.expect("holder");
+        lock(&mut holder, "sub-alice").await.expect("lock");
+        let revoke = {
+            let pool = pool.clone();
+            let keys = keys.clone();
+            tokio::spawn(async move { take(&pool, &keys, "sub-alice").await })
+        };
+        blocked_on(&pool, "advisory", "SELECT pg_advisory_xact_lock").await;
+        assert!(!revoke.is_finished());
+        holder.commit().await.expect("release");
+        assert_eq!(
+            revoke.await.expect("join").expect("take"),
+            Some("offline".to_string())
+        );
+    }
+
+    /// Stamp `sub`'s stored groups two hours ago, past any session refresh window.
+    async fn seed_stale_groups(pool: &PgPool, sub: &str, groups: &[&str]) {
+        let groups = groups.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let aged = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(2))
+            .expect("aged");
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::identity::oidc::users::record_groups_on(&mut conn, sub, &groups, aged)
+            .await
+            .expect("record groups");
+    }
+
+    /// How many token requests the local issuer has answered.
+    async fn token_requests(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .iter()
+            .filter(|r| r.url.path() == "/token")
+            .count()
+    }
+
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Stale callers for one subject queue in process, so only the first holds a connection: a
+    /// one-connection pool whose acquire times out long before the credential lock is released
+    /// serves them all. The first spends the credential; the rest take its fresh stamp.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn concurrent_stale_callers_share_one_connection_and_one_refresh(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_stale_groups(&pool, "sub-alice", &["/groups/stale"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (server, provider) =
+            crate::identity::oidc::tests::issuer_signing_for("sub-alice", &["/groups/team-x"])
+                .await;
+        let acquire_timeout = std::time::Duration::from_millis(200);
+        let narrow = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(acquire_timeout)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .expect("narrow pool");
+        let refresh = Arc::new(OwnerRefresh::new(narrow, provider, keys.clone()));
+
+        let mut holder = pool.begin().await.expect("holder");
+        lock(&mut holder, "sub-alice").await.expect("lock");
+        let callers = [(); 5].map(|()| {
+            let refresh = refresh.clone();
+            tokio::spawn(async move { refresh.current_groups("sub-alice", WINDOW).await })
+        });
+        blocked_on(&pool, "advisory", "SELECT pg_advisory_xact_lock").await;
+        tokio::time::sleep(acquire_timeout * 3).await;
+        holder.commit().await.expect("release");
+        for caller in callers {
+            assert_eq!(
+                caller.await.expect("join"),
+                Ok(vec!["/groups/team-x".to_string()])
+            );
+        }
+        assert_eq!(token_requests(&server).await, 1, "one exchange for all");
+        assert_eq!(
+            take(&pool, &keys, "sub-alice").await.expect("take"),
+            Some("rotated".to_string()),
+            "the credential rotated once and the rotation stands"
+        );
+    }
+
+    /// An unreachable issuer is unavailable, not a refusal. Callers queued on the lock behind the
+    /// failed exchange, and the next caller inside the backoff, are told the same without reaching
+    /// the issuer.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_failed_refresh_keeps_the_subject_off_the_issuer(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_stale_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (server, provider) = crate::identity::oidc::tests::issuer_answering(
+            wiremock::ResponseTemplate::new(503).set_body_string("unavailable"),
+        )
+        .await;
+        let refresh = Arc::new(OwnerRefresh::new(pool.clone(), provider, keys));
+
+        let mut holder = pool.begin().await.expect("holder");
+        lock(&mut holder, "sub-alice").await.expect("lock");
+        let callers = [(); 3].map(|()| {
+            let refresh = refresh.clone();
+            tokio::spawn(async move { refresh.current_groups("sub-alice", WINDOW).await })
+        });
+        blocked_on(&pool, "advisory", "SELECT pg_advisory_xact_lock").await;
+        holder.commit().await.expect("release");
+        for caller in callers {
+            assert!(caller.await.expect("join").is_err());
+        }
+        let attempted = server.received_requests().await.expect("recording").len();
+        assert_eq!(
+            token_requests(&server).await,
+            1,
+            "one exchange for all three"
+        );
+        assert!(refresh.current_groups("sub-alice", WINDOW).await.is_err());
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            attempted,
+            "the next caller made no request"
+        );
+        assert_eq!(
+            stored_groups(&pool, "sub-alice").await.0,
+            vec!["/groups/alice".to_string()],
+            "an outage leaves the stored groups alone"
+        );
+    }
+
+    /// A database failure before the exchange does not put a healthy subject in the backoff.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_database_failure_leaves_the_subject_out_of_the_backoff(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_stale_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (_server, provider) =
+            crate::identity::oidc::tests::issuer_signing_for("sub-alice", &["/groups/team-x"])
+                .await;
+        let refresh = OwnerRefresh::new(pool.clone(), provider, keys);
+
+        pool.close().await;
+        assert!(refresh.current_groups("sub-alice", WINDOW).await.is_err());
+        assert!(!refresh.failed.holds("sub-alice", std::time::Instant::now()));
+    }
+
+    /// A refusal holds no groups, stamps that answer on the row, and leaves the subject out of the
+    /// backoff: the next caller reads the fresh empty stamp.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refused_refresh_holds_no_groups(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_stale_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (server, provider) = crate::identity::oidc::tests::issuer_answering(
+            wiremock::ResponseTemplate::new(400)
+                .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
+        )
+        .await;
+        let refresh = OwnerRefresh::new(pool.clone(), provider, keys);
+
+        assert_eq!(
+            refresh.current_groups("sub-alice", WINDOW).await,
+            Ok(Vec::new())
+        );
+        assert!(!refresh.failed.holds("sub-alice", std::time::Instant::now()));
+        assert_cleared(&pool, "sub-alice").await;
+        assert_eq!(
+            refresh.current_groups("sub-alice", WINDOW).await,
+            Ok(Vec::new())
+        );
+        assert_eq!(token_requests(&server).await, 1);
+    }
+
+    /// With no refresher the stored groups stand at any age, as a session's do.
+    #[tokio::test]
+    async fn without_a_refresher_a_stale_stamp_keeps_its_groups() {
+        let stored = vec!["/groups/alice".to_string()];
+        let aged = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(48))
+            .expect("aged")
+            .to_string();
+        for at in [Some(aged.as_str()), None] {
+            assert_eq!(
+                current_groups(None, "sub-alice", stored.clone(), at).await,
+                Ok(stored.clone())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_subject_lock_serializes_one_subject_and_is_pruned_once_released() {
+        let locks = SubjectLocks::default();
+        let alice = locks.lock("sub-alice").await;
+        let bob = tokio::time::timeout(std::time::Duration::from_secs(1), locks.lock("sub-bob"))
+            .await
+            .expect("another subject does not wait");
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                locks.lock("sub-alice")
+            )
+            .await
+            .is_err(),
+            "a second caller for one subject waits"
+        );
+        drop((alice, bob));
+        let _carol = locks.lock("sub-carol").await;
+        let held = locks.0.lock().expect("lock");
+        assert_eq!(held.keys().collect::<Vec<_>>(), vec!["sub-carol"]);
+    }
+
+    #[test]
+    fn a_failed_refresh_expires_after_the_backoff_and_is_pruned() {
+        let failed = FailedRefreshes::default();
+        let t0 = std::time::Instant::now();
+        let later = |secs| {
+            t0.checked_add(std::time::Duration::from_secs(secs))
+                .expect("instant")
+        };
+        assert!(!failed.holds("sub-alice", t0));
+        failed.note("sub-alice", t0);
+        assert!(failed.holds("sub-alice", t0));
+        assert!(failed.holds("sub-alice", later(29)));
+        assert!(!failed.holds("sub-bob", later(29)));
+        assert!(!failed.holds("sub-alice", later(30)));
+        failed.note("sub-bob", later(31));
+        let held = failed.0.lock().expect("lock");
+        assert_eq!(
+            held.keys().collect::<Vec<_>>(),
+            vec!["sub-bob"],
+            "an expired entry is pruned on the next insert"
+        );
     }
 
     fn keys(count: usize) -> CredentialKeys {

@@ -62,6 +62,8 @@ pub(crate) struct PlaybookLaunch {
     /// these rather than a live claim.
     pub created_by: Option<String>,
     pub launcher_groups: Vec<String>,
+    /// When the launch was authorized.
+    pub created_at: String,
     /// The draft version this launch froze, if any. A draft test-fire resolves no bindings.
     pub draft_version: Option<i64>,
     /// The exposure recorded on the launch row itself, which a draft one-shot recomputes from the
