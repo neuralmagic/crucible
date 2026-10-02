@@ -12,8 +12,8 @@
 //! A key carries its owner's identity and its owner's groups, which is why [`Authenticated`] holds
 //! both. Groups are whatever the owner's last sign-in or offline credential refresh stamped on their
 //! `users` row: a key is never more powerful than the person it belongs to, and never fresher than
-//! the issuer's last answer about them. An owner with no stamp yet holds no groups, and a refused or
-//! revoked offline credential clears the stamp.
+//! the issuer's last answer about them. A stamp missing or older than a session's group refresh
+//! window holds no groups, and a refused, revoked, or absent offline credential clears it.
 
 use crate::clock::now_rfc3339;
 use anyhow::{Context, Result};
@@ -157,7 +157,7 @@ pub async fn verify(pool: &PgPool, presented: &str) -> Result<Authenticated, Key
     };
     let row = sqlx::query!(
         r#"SELECT k.secret_hash AS "secret_hash!", k.expires_at, k.revoked_at,
-                  u.sub AS "sub!", u.login AS "login!", u.groups AS "groups!"
+                  u.sub AS "sub!", u.login AS "login!", u.groups AS "groups!", u.groups_at
            FROM api_keys k JOIN users u ON u.sub = k.sub
            WHERE k.id = $1"#,
         id,
@@ -192,6 +192,11 @@ pub async fn verify(pool: &PgPool, presented: &str) -> Result<Authenticated, Key
         tracing::error!(login = %row.login, error = %e, "unreadable stored groups; treating the key as group-less");
         Vec::new()
     });
+    let groups = crate::identity::oidc::users::fresh_groups(
+        groups,
+        row.groups_at.as_deref(),
+        jiff::Timestamp::now(),
+    );
     Ok(Authenticated {
         id: id.to_string(),
         sub: row.sub,

@@ -107,11 +107,26 @@ pub async fn clear_groups_on(
     Ok(())
 }
 
+/// The stored groups a stamp still vouches for: none once the stamp is missing or older than the
+/// window a session re-reads its own groups at.
+pub fn fresh_groups(
+    groups: Vec<String>,
+    groups_at: Option<&str>,
+    now: jiff::Timestamp,
+) -> Vec<String> {
+    let window = crate::identity::auth::session_group_refresh_interval();
+    match groups_at {
+        Some(at) if !crate::identity::auth::stale(at, now, window) => groups,
+        _ => Vec::new(),
+    }
+}
+
 /// A signed-in user's subject, and the groups and stamp their last sign-in recorded, by login.
 pub async fn stamped(
     pool: &PgPool,
     login: &str,
 ) -> anyhow::Result<Option<(String, Vec<String>, Option<String>)>> {
+    let login = login.trim().to_lowercase();
     let row = sqlx::query!(
         r#"SELECT sub, groups AS "groups: sqlx::types::Json<Vec<String>>", groups_at FROM users WHERE login = $1"#,
         login

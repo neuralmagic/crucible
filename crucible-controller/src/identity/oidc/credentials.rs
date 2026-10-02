@@ -343,17 +343,13 @@ impl OwnerRefresh {
     /// invalidated.
     ///
     /// A definitive refusal, including an answer for another subject, is recorded on the row and
-    /// clears the owner's stored groups. An unreachable issuer rolls the transaction back and
-    /// counts nothing.
+    /// clears the owner's stored groups, as does a missing credential. An unreachable issuer rolls the transaction back and counts nothing.
     pub async fn refresh(&self, sub: &str) -> Result<RefreshOutcome, OidcError> {
         let mut tx =
             self.pool.begin().await.map_err(|e| {
                 OidcError::Unavailable(format!("opening the refresh transaction: {e}"))
             })?;
-        sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
-            .bind(CREDENTIAL_LOCK_CLASS)
-            .bind(sub)
-            .execute(&mut *tx)
+        lock(&mut tx, sub)
             .await
             .map_err(|e| OidcError::Unavailable(format!("taking the credential lock: {e}")))?;
 
@@ -366,7 +362,7 @@ impl OwnerRefresh {
         .await
         .map_err(|e| OidcError::Unavailable(format!("reading the offline credential: {e}")))?;
         let Some(row) = row else {
-            return Ok(RefreshOutcome::Absent);
+            return absent(tx, sub).await;
         };
         let token = match self.keys.open(sub, &row.key_id, &row.token_cipher) {
             Ok(token) => token,
@@ -439,6 +435,30 @@ impl OwnerRefresh {
             .map_err(|e| OidcError::Unavailable(format!("committing the refresh: {e}")))?;
         Ok(RefreshOutcome::Claims(refreshed.claims))
     }
+}
+
+/// Take the per-subject credential lock for the rest of `tx`.
+async fn lock(tx: &mut PgConnection, sub: &str) -> sqlx::Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
+        .bind(CREDENTIAL_LOCK_CLASS)
+        .bind(sub)
+        .execute(tx)
+        .await
+        .map(|_| ())
+}
+
+/// No credential to spend: clear the owner's stored groups, as a session is downgraded, and commit.
+async fn absent(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    sub: &str,
+) -> Result<RefreshOutcome, OidcError> {
+    crate::identity::oidc::users::clear_groups_on(&mut tx, sub, jiff::Timestamp::now())
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
+    tx.commit()
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("committing the absent credential: {e}")))?;
+    Ok(RefreshOutcome::Absent)
 }
 
 /// Whether a refresh's claims are about the subject whose credential was spent.
@@ -822,17 +842,20 @@ mod tests {
     }
 
     /// No credential at all is neither an error nor a refusal: it is the shape a deployment whose
-    /// realm grants no `offline_access` runs in.
+    /// realm grants no `offline_access` runs in. The owner's stored groups are cleared, as a
+    /// session's are.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_subject_with_no_credential_is_absent(pool: PgPool) {
         let keys = Arc::new(keys(1));
         seed_user(&pool, "sub-alice", "alice").await;
+        seed_groups(&pool, "sub-alice", &["/groups/team-x"]).await;
         let refresh = OwnerRefresh::new(pool.clone(), dead_provider(), keys);
         assert_eq!(
             refresh.refresh("sub-alice").await.expect("absent"),
             RefreshOutcome::Absent
         );
         assert_eq!(status(&pool, "sub-alice").await.expect("status"), None);
+        assert_eq!(stored_groups(&pool, "sub-alice").await, (Vec::new(), None));
     }
 
     fn keys(count: usize) -> CredentialKeys {

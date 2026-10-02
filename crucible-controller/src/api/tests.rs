@@ -13654,3 +13654,62 @@ async fn a_refused_credential_leaves_an_api_key_launch_outside_the_team(
     );
     Ok(())
 }
+
+/// An api key answers with its owner's groups only while their stamp is younger than a session's
+/// group refresh window, and the dispatch drops groups whose stamp has aged past it since launch.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_stale_group_stamp_leaves_an_api_key_launch_outside_the_team(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let keyed = team_secret_drafts(&pool, db, &[("tibrahim", "cve-triage")]).await?;
+    let now = jiff::Timestamp::now();
+    let aged = now.checked_sub(jiff::SignedDuration::from_hours(2))?;
+    let team = [TEAM_GROUP.to_string()];
+    crate::identity::oidc::users::record_login(&pool, "sub-tibrahim", "tibrahim", None, now)
+        .await?;
+    let mut conn = pool.acquire().await?;
+    crate::identity::oidc::users::record_groups_on(&mut conn, "sub-tibrahim", &team, aged).await?;
+    let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
+
+    let (groups, resolved) =
+        launch_draft_with_key(&keyed, &pool, "cve-triage", &key.secret).await?;
+    assert!(
+        groups.is_empty(),
+        "a stale stamp holds no groups: {groups:?}"
+    );
+    assert!(
+        matches!(
+            &resolved,
+            Err(crate::secrets::launch::Refusal::NotOwned { owner, .. }) if owner == "team:tibrahim-all"
+        ),
+        "{resolved:?}"
+    );
+
+    crate::identity::oidc::users::record_groups_on(&mut conn, "sub-tibrahim", &team, now).await?;
+    let (groups, resolved) =
+        launch_draft_with_key(&keyed, &pool, "cve-triage", &key.secret).await?;
+    assert_eq!(groups, team);
+    assert!(resolved.is_ok(), "{resolved:?}");
+
+    crate::identity::oidc::users::record_groups_on(&mut conn, "sub-tibrahim", &team, aged).await?;
+    for login in ["tibrahim", " TIBRAHIM "] {
+        let launcher =
+            crate::authz::resolve::dispatch_principals(&pool, Some(login), &team).await?;
+        assert!(launcher.teams().is_empty(), "{login:?}: {launcher:?}");
+    }
+    sqlx::query("UPDATE users SET groups_at = NULL WHERE sub = 'sub-tibrahim'")
+        .execute(&mut *conn)
+        .await?;
+    let launcher =
+        crate::authz::resolve::dispatch_principals(&pool, Some("tibrahim"), &team).await?;
+    assert!(
+        launcher.teams().is_empty(),
+        "no stamp, no groups: {launcher:?}"
+    );
+    let unknown =
+        crate::authz::resolve::dispatch_principals(&pool, Some("proxy-user"), &team).await?;
+    assert!(
+        !unknown.teams().is_empty(),
+        "a launcher with no users row keeps the recorded groups"
+    );
+    Ok(())
+}

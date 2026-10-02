@@ -248,7 +248,7 @@ const DEFAULT_SESSION_GROUP_REFRESH: std::time::Duration = std::time::Duration::
 /// `CONTROLLER_SESSION_GROUP_REFRESH_MINUTES`. Unset, unparseable, or zero is
 /// [`DEFAULT_SESSION_GROUP_REFRESH`] — a deployment must not be able to turn the check into a
 /// per-request round trip against the issuer by typo.
-fn session_group_refresh_interval() -> std::time::Duration {
+pub(crate) fn session_group_refresh_interval() -> std::time::Duration {
     std::env::var("CONTROLLER_SESSION_GROUP_REFRESH_MINUTES")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -805,7 +805,7 @@ async fn refresh_session_groups(
 
 /// Whether a stamped instant is older than `max_age`. An unparseable or missing stamp is stale:
 /// a session whose groups have no provenance has to prove them again.
-fn stale(at: &str, now: jiff::Timestamp, max_age: std::time::Duration) -> bool {
+pub(crate) fn stale(at: &str, now: jiff::Timestamp, max_age: std::time::Duration) -> bool {
     let Ok(at) = at.parse::<jiff::Timestamp>() else {
         return true;
     };

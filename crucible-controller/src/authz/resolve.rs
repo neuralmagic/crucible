@@ -181,7 +181,8 @@ pub async fn recorded_principals(
 }
 
 /// A launch's principals at dispatch: the groups it recorded that its launcher's `users` row still
-/// holds, and the teams those reach now. A launcher with no `users` row keeps the recorded groups.
+/// holds under a fresh stamp, and the teams those reach now. A launcher with no `users` row keeps
+/// the recorded groups.
 pub async fn dispatch_principals(
     pool: &sqlx::PgPool,
     login: Option<&str>,
@@ -190,7 +191,13 @@ pub async fn dispatch_principals(
     let current = match login {
         Some(login) => crate::identity::oidc::users::stamped(pool, login)
             .await?
-            .map(|(_, groups, _)| groups),
+            .map(|(_, groups, at)| {
+                crate::identity::oidc::users::fresh_groups(
+                    groups,
+                    at.as_deref(),
+                    jiff::Timestamp::now(),
+                )
+            }),
         None => None,
     };
     let held = held_groups(recorded, current.as_deref());
