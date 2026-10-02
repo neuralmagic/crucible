@@ -392,9 +392,9 @@ async fn try_turn(
     };
 
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
-    //    turn whose create failed (e.g. ContainerExited mid-provision) leaves the name behind,
-    //    and a bare create then fails "already exists" for the rest of the run. Clearing it
-    //    makes create idempotent. Labels make the sandbox discoverable via `list --selector`.
+    //    turn killed mid-create, or whose cleanup delete failed, leaves the name behind, and a
+    //    bare create then fails "already exists" for the rest of the run. Clearing it makes
+    //    create idempotent. Labels make the sandbox discoverable via `list --selector`.
     let name = sandbox::name_for(&p.workspace);
     tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
