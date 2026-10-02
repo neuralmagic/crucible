@@ -79,11 +79,14 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("Error: {error:?}");
-            std::process::ExitCode::from(if error.is::<plan::cli::NoValidVerdict>() {
-                crucible::plan::INVALID_VERDICT_EXIT
-            } else {
-                1
-            })
+            std::process::ExitCode::from(
+                if error.is::<plan::cli::NoValidVerdict>() || error.is::<cli::setup::EndedAtSetup>()
+                {
+                    crucible::plan::INVALID_VERDICT_EXIT
+                } else {
+                    1
+                },
+            )
         }
     }
 }

@@ -16,6 +16,7 @@ use crate::runloop::publish;
 use anyhow::{Context, Result};
 use crucible::crucible::{Judge, World};
 use crucible_vcs::vcs;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -185,7 +186,7 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     let world = m.build_world(workspace.clone());
     let judge = m.build_judge(workspace, frozen_injects)?;
 
-    drive_loop(args, p, prep, world, judge)
+    drive_loop(args, p, prep, world, judge, &m.mcp)
 }
 
 /// Read the `[agent].seed_diff` content for iteration 1's prompt. The identity build hashes the
@@ -274,7 +275,6 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
             crate::exposure::composite_capabilities(&m.agent, &m.capabilities, &m.mcp),
         )),
         bounds: Some(bounds),
-        mcp: m.mcp.clone(),
     };
     crate::cli::setup::apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;
     // The per-component fork map for publish-on-keep, manifest-owned via [[component]].pr_repo.
@@ -303,7 +303,7 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
     let world = m.build_world(&manifest_dir)?;
     let judge = m.build_judge(&manifest_dir)?;
-    drive_loop(args, p, prep, world, judge)
+    drive_loop(args, p, prep, world, judge, &m.mcp)
 }
 
 /// Resolve the run's goal + method-prompt template. `--goal`/`--goal-file` override the manifest (the
@@ -340,11 +340,12 @@ fn resolve_goal_template(
 /// The shared loop tail: install Ctrl+C, then pick the front-end (resume / jsonl / stream /
 /// console) and drive [`run_loop`]. Single-domain and composite runs both end here.
 fn drive_loop(
-    args: Args,
+    mut args: Args,
     p: Paths,
     prep: Prepared,
     world: Arc<dyn World>,
     judge: Arc<dyn Judge>,
+    mcp: &BTreeMap<String, manifest::McpCfg>,
 ) -> Result<()> {
     install_ctrlc()?;
     if args.control_port.is_some() && !args.resume && args.ui != Ui::Stream {
@@ -398,7 +399,8 @@ fn drive_loop(
                         pending_regime,
                     };
                     let meta = report::reporter::RunMeta::from_args(&args);
-                    let r = stream::SessionReporter::resume(&p, meta)?;
+                    let mut r = stream::SessionReporter::resume(&p, meta)?;
+                    start_mcp(&mut args, &p, mcp, &mut r, None)?;
                     // Fold the prior run's admissions before the bridge is up, so no
                     // inbound command can land on a half-built index.
                     let ledger = open_admission_ledger(&p, forge::ndjson::Open::Fold)?;
@@ -423,9 +425,11 @@ fn drive_loop(
             }
         } else {
             let meta = report::reporter::RunMeta::from_args(&args);
+            let gate = judge.objective();
             match args.ui {
                 Ui::Jsonl => {
-                    let r = stream::SessionReporter::stdout(meta);
+                    let mut r = stream::SessionReporter::stdout(meta);
+                    start_mcp(&mut args, &p, mcp, &mut r, Some((&prep.goal, &gate)))?;
                     let (_reporter, outcome) = run_loop(
                         &args,
                         &p,
@@ -441,7 +445,8 @@ fn drive_loop(
                     outcome?
                 }
                 Ui::Stream => {
-                    let r = stream::SessionReporter::stream(&p, meta)?;
+                    let mut r = stream::SessionReporter::stream(&p, meta)?;
+                    start_mcp(&mut args, &p, mcp, &mut r, Some((&prep.goal, &gate)))?;
                     // A fresh run must not inherit the last run's un-drained inputs.
                     let ledger = open_admission_ledger(&p, forge::ndjson::Open::Truncate)?;
                     let control = start_control_bridge(&args, &p, &ledger)?;
@@ -462,7 +467,8 @@ fn drive_loop(
                     outcome?
                 }
                 _ => {
-                    let r = console::ConsoleReporter;
+                    let mut r = console::ConsoleReporter;
+                    start_mcp(&mut args, &p, mcp, &mut r, Some((&prep.goal, &gate)))?;
                     let (_reporter, outcome) = run_loop(
                         &args,
                         &p,
@@ -489,6 +495,28 @@ fn drive_loop(
     drop(run_span);
     crate::agent::engine::flush();
     std::process::exit(outcome.exit_code());
+}
+
+/// Start the `[mcp]` servers once `r` is up. One that cannot start ends the run: `r` records the
+/// cause, after the run's header (goal, gate) on a fresh run.
+fn start_mcp<R: report::reporter::Reporter>(
+    args: &mut Args,
+    p: &Paths,
+    mcp: &BTreeMap<String, manifest::McpCfg>,
+    r: &mut R,
+    header: Option<(&str, &str)>,
+) -> Result<()> {
+    let Err(error) = crate::cli::setup::start_mcp(args, mcp) else {
+        return Ok(());
+    };
+    if !error.is::<crate::control::mcp::StartError>() {
+        return Err(error);
+    }
+    if let Some((goal, gate)) = header {
+        r.start(goal, gate);
+    }
+    r.shutdown("error", &format!("{error:#}"));
+    Err(crate::cli::setup::ended_at_setup(p, error))
 }
 
 /// Ctrl+C stops cleanly at the next checkpoint.
@@ -518,4 +546,69 @@ fn open_admission_ledger(
     mode: forge::ndjson::Open,
 ) -> Result<std::sync::Arc<crate::control::admission::AdmissionLedger>> {
     crate::control::admission::AdmissionLedger::open(&p.admissions, mode).map(std::sync::Arc::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::report::session::{SessionEvent, decode, encode};
+
+    #[test]
+    fn an_mcp_server_that_fails_to_start_ends_the_scored_run_in_its_own_log() {
+        let _env = crucible::test_support::env_lock();
+        let dir = crate::testing::tempdir("scored-mcp-start-fails");
+        let manifest = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest,
+            r#"
+            [repo]
+            path = "."
+            [judge]
+            measure_cmd = "m"
+            direction = "higher"
+            objective = "v"
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            mcp = ["buildit"]
+            [mcp.buildit]
+            bin = "sh"
+            args = ["-c", "echo 'buildit: KUBE_TOKEN=s3cret names no cluster' >&2; exit 3"]
+            "#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.join("workspace")).unwrap();
+        std::fs::write(dir.join("workspace/README"), "w\n").unwrap();
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let previous = SessionEvent::Shutdown {
+            outcome: "done".to_string(),
+            reason: "a previous run".to_string(),
+        };
+        std::fs::write(state.join("session.jsonl"), encode(&previous) + "\n").unwrap();
+        let mut args = crate::args::Args::defaults().unwrap();
+        args.manifest = Some(manifest);
+        args.ui = crate::args::Ui::Stream;
+
+        let error = crate::cli::scored::run_from_manifest(args)
+            .expect_err("the run cannot start its server");
+
+        assert!(error.is::<crate::cli::setup::EndedAtSetup>(), "{error:#}");
+        let log = std::fs::read_to_string(state.join("session.jsonl")).unwrap();
+        let events: Vec<SessionEvent> = log.lines().filter_map(decode).collect();
+        let [
+            SessionEvent::Start { goal, gate, .. },
+            SessionEvent::Shutdown { outcome, reason },
+        ] = &events[..]
+        else {
+            panic!("the log is not this run's header and shutdown: {log}");
+        };
+        assert_eq!((goal.as_str(), gate.as_str()), ("g", "v"));
+        assert_eq!(outcome, "error");
+        assert!(
+            reason.contains("[mcp.buildit] (`sh`) exited")
+                && reason.ends_with("buildit: KUBE_TOKEN=*** names no cluster"),
+            "{reason}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
