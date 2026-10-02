@@ -147,10 +147,22 @@ impl TokenFile {
     }
 }
 
+/// Grant `sandbox` a fresh token on each of `servers`, in order.
+pub(crate) fn grant_all<'a>(
+    servers: impl IntoIterator<Item = &'a Server>,
+    sandbox: &str,
+    workdir: &str,
+) -> Result<Vec<String>> {
+    servers
+        .into_iter()
+        .map(|s| s.tokens.grant(TokenHolder::new(sandbox, workdir)?))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use crate::control::broker::port_open;
-    use crate::control::mcp::start;
+    use crate::control::mcp::{grant_all, start};
     use crate::manifest::McpCfg;
     use crucible_contract::mcp::TokenHolder;
     use std::collections::BTreeMap;
@@ -275,6 +287,14 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
         assert!(
             !port_open(&format!("127.0.0.1:{port}")),
             "dropping the servers stops them"
+        );
+    }
+
+    #[test]
+    fn a_turn_without_servers_needs_no_valid_holder() {
+        assert_eq!(
+            grant_all([], "ci-a", "/sandbox/my work").unwrap(),
+            Vec::<String>::new()
         );
     }
 }

@@ -25,7 +25,6 @@ use crate::openshell::grpc::Gateway;
 use crate::openshell::{gateway, grpc, policy, provider, sandbox};
 use anyhow::{Context, Result};
 use crucible_contract::TransportCause;
-use crucible_contract::mcp::TokenHolder;
 use std::time::Instant;
 
 /// Which step of the turn an orchestration error came from, read off the typed errors in its
@@ -652,11 +651,11 @@ async fn try_turn(
         } else {
             args.broker_token.clone()
         };
-        let holder = TokenHolder::new(&name, &SandboxLayout::workdir(&basename))?;
-        let tokens = mcp
-            .iter()
-            .map(|(s, _)| s.tokens.grant(holder.clone()))
-            .collect::<Result<Vec<_>>>()?;
+        let tokens = crate::control::mcp::grant_all(
+            mcp.iter().map(|(s, _)| *s),
+            &name,
+            &SandboxLayout::workdir(&basename),
+        )?;
         let mut servers: Vec<McpServer<'_>> = broker_url
             .iter()
             .map(|url| McpServer {
