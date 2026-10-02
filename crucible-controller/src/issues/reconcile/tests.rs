@@ -6531,6 +6531,15 @@ async fn seed_registered_playbook(db: &Db, id: &str) {
 }
 
 async fn adopt_launch(db: &Db, key: &str, max_cost: f64) {
+    adopt_launch_with_groups(db, key, max_cost, None).await;
+}
+
+async fn adopt_launch_with_groups(
+    db: &Db,
+    key: &str,
+    max_cost: f64,
+    launcher_groups: Option<&serde_json::Value>,
+) {
     let params = serde_json::json!({"topic": "attention sinks", "depth": "deep"});
     let max_time = crate::model::MaxTime::parse("30m").expect("duration");
     assert!(
@@ -6551,7 +6560,7 @@ async fn adopt_launch(db: &Db, key: &str, max_cost: f64) {
                     origin: crate::model::LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
-                    launcher_groups: None,
+                    launcher_groups,
                 },
             )
             .await
@@ -7086,6 +7095,79 @@ async fn a_local_launch_with_a_binding_parks_instead_of_running_without_it(
         reason.contains("local executor delivers no secrets"),
         "{reason}"
     );
+    Ok(())
+}
+
+/// A dispatch resolves the teams the launch row's groups reach: a launcher whose recorded group is
+/// a member of the owning team resolves a team-owned binding, and one recorded with no groups does
+/// not.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_reaches_a_team_owned_secret_through_its_recorded_groups(
+    pool: PgPool,
+) -> Result<()> {
+    use crate::authz::model::{Member, MemberRef, TeamRole, TeamSlug};
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let cfg = ControllerCfg {
+        playbook_executor: crucible_controller::PlaybookExecutor::Local,
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let team = TeamSlug::parse("tibrahim-all")?;
+    let now = jiff::Timestamp::now().to_string();
+    let mut conn = db.pool().acquire().await?;
+    crate::authz::store::insert_team(&mut conn, &team, "tibrahim-all", None, &now).await?;
+    crate::authz::store::replace_members(
+        &mut conn,
+        &team,
+        &[Member {
+            member: MemberRef::Group("/groups/tibrahim-all".to_string()),
+            role: TeamRole::Member,
+        }],
+        None,
+        &now,
+    )
+    .await?;
+    drop(conn);
+    seed_registered_playbook(&db, "survey").await;
+    bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
+
+    let member = "playbook:survey:0199c0de-7c2c-71a5-8000-c";
+    let groups = serde_json::json!(["/groups/tibrahim-all"]);
+    adopt_launch_with_groups(&db, member, 3.5, Some(&groups)).await;
+    let outsider = "playbook:survey:0199c0de-7c2c-71a5-8000-d";
+    adopt_launch_with_groups(&db, outsider, 3.5, Some(&serde_json::json!([]))).await;
+
+    let res = async {
+        reconcile(&db, &cfg, member).await?;
+        reconcile(&db, &cfg, outsider).await
+    }
+    .await;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+    res?;
+
+    let reason = |key: &'static str| {
+        let db = db.clone();
+        async move {
+            let issue = crate::issues::store::get_issue(db.pool(), key)
+                .await?
+                .expect("issue");
+            assert_eq!(issue.status, Status::Parked, "{:?}", issue.parked_reason);
+            anyhow::Ok(format!("{:?}", issue.parked_reason))
+        }
+    };
+    let resolved = reason(member).await?;
+    assert!(
+        resolved.contains("local executor delivers no secrets"),
+        "the binding resolved, so only the local executor refused it: {resolved}"
+    );
+    let refused = reason(outsider).await?;
+    assert!(refused.contains("owned by team:tibrahim-all"), "{refused}");
     Ok(())
 }
 

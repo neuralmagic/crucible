@@ -62,12 +62,12 @@ pub async fn record_login_on(
     Ok(())
 }
 
-/// Stamp the groups a login's claim carried, so a credential that carries no claim of its own —
-/// an API key — can still answer for its owner's membership.
+/// Stamp the groups a login's or an offline credential refresh's claim carried, so a credential
+/// that carries no claim of its own — an API key — can still answer for its owner's membership.
 ///
 /// Separate from [`record_login_on`] rather than an argument to it, because the paths that write a
-/// user row without seeing a claim (a schedule's fire-time backfill, a credential refresh) know
-/// nothing about groups, and must leave the last real answer standing instead of clearing it.
+/// user row without seeing a claim (a schedule's fire-time backfill) know nothing about groups,
+/// and must leave the last real answer standing instead of clearing it.
 pub async fn record_groups_on(
     conn: &mut sqlx::PgConnection,
     sub: &str,

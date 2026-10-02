@@ -10,8 +10,9 @@
 //! here would buy no resistance and charge a hash to every request the key ever makes.
 //!
 //! A key carries its owner's identity and its owner's groups, which is why [`Authenticated`] holds
-//! both. Groups are whatever the owner's last login stamped on their `users` row: a key is never
-//! more powerful than the person it belongs to, and never fresher than their last sign-in.
+//! both. Groups are whatever the owner's last sign-in or offline credential refresh stamped on their
+//! `users` row: a key is never more powerful than the person it belongs to, and never fresher than
+//! the issuer's last answer about them. An owner with no stamp yet holds no groups.
 
 use crate::clock::now_rfc3339;
 use anyhow::{Context, Result};
@@ -55,7 +56,7 @@ pub struct Authenticated {
     pub id: String,
     pub sub: String,
     pub login: String,
-    /// The owner's groups as their last login stamped them.
+    /// The owner's groups as the issuer last answered them.
     pub groups: Vec<String>,
 }
 

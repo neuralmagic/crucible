@@ -13352,3 +13352,218 @@ async fn a_webhook_transform_is_checked_with_positions_and_its_url_is_readable(
     );
     Ok(())
 }
+
+/// Register `owner`'s secret and bind it, unpinned, to each playbook scope in `playbooks`.
+async fn bind_playbook_secret(pool: &PgPool, owner: &str, playbooks: &[&str]) -> Result<()> {
+    let id = uuid::Uuid::now_v7().to_string();
+    let name = crate::secrets::SecretName::parse("buildit_kubeconfig")?;
+    let mut conn = pool.acquire().await?;
+    crate::secrets::store::insert(
+        &mut conn,
+        &crate::secrets::store::NewSecret {
+            id: &id,
+            name: &name,
+            owner: &crate::authz::model::Principal::parse(owner)?,
+            kind: crate::secrets::SecretKind::Opaque,
+            visibility: crate::secrets::Visibility::BrokerOnly,
+            consumer: crate::secrets::ConsumerClass::Run,
+            mode: crate::secrets::SecretMode::Managed,
+            vault_path: "team:x/y",
+            current_version: Some(1),
+            created_by: Some("reed"),
+        },
+    )
+    .await?;
+    for playbook in playbooks {
+        crate::secrets::store::insert_binding(
+            &mut conn,
+            &crate::secrets::store::NewBinding {
+                id: &uuid::Uuid::now_v7().to_string(),
+                secret_id: &id,
+                scope_kind: crate::secrets::ScopeKind::Playbook,
+                scope_id: playbook,
+                projection_kind: crate::secrets::ProjectionKind::Env,
+                projection: "KUBECONFIG",
+                declared_name: &name,
+                pack_rev: None,
+                schema_digest: None,
+                created_by: Some("reed"),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Launch draft `id` with `key` as the bearer, then resolve its playbook scope the way the
+/// dispatch does: against the principals the launch row recorded and the teams they reach now.
+async fn launch_draft_with_key(
+    app: &Router,
+    pool: &PgPool,
+    id: &str,
+    key: &str,
+) -> Result<(
+    Vec<String>,
+    std::result::Result<Vec<crate::secrets::grant::GrantMint>, crate::secrets::launch::Refusal>,
+)> {
+    let req = HttpRequest::post(format!("/api/playbook-drafts/{id}/launch"))
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "params": {"topic": "attention", "depth": "deep"},
+                "max_cost": 1.0,
+                "max_time": "30m",
+            })
+            .to_string(),
+        ))?;
+    let (status, body) = crate::testing::oneshot_bytes(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let ack: serde_json::Value = serde_json::from_slice(&body)?;
+    let launch_key = ack["key"].as_str().expect("key");
+    let launch = crate::launches::store::get_playbook_launch(pool, launch_key)
+        .await?
+        .expect("launch row");
+    let launcher = crate::authz::resolve::recorded_principals(
+        pool,
+        launch.created_by.as_deref(),
+        &launch.launcher_groups,
+    )
+    .await?;
+    let resolved = crate::secrets::launch::resolve(
+        pool,
+        &crate::secrets::launch::Scope::playbook(id),
+        &[],
+        &launcher,
+        crate::secrets::launch::OwnedRevision::Draft.as_revision(),
+        launch.exposure.as_ref(),
+    )
+    .await?;
+    Ok((launch.launcher_groups, resolved))
+}
+
+/// An api key launches with the groups its owner's `users` row holds, and the dispatch reaches the
+/// teams those groups are members of: a team-owned secret follows the group, and stops following
+/// once the owner's record drops it. An owner with no stamped groups launches with none.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_api_key_launch_reaches_the_teams_its_owners_stored_groups_reach(
+    pool: PgPool,
+) -> Result<()> {
+    const GROUP: &str = "/groups/tibrahim-all";
+    let (db, _d) = db_with(pool.clone());
+    let state = ApiState {
+        playbook_caps: crate::config::PlaybookCaps {
+            max_cost: 10.0,
+            max_time: crate::model::MaxTime::parse("2h").expect("cap"),
+        },
+        ..ApiState::test(db, Arc::new(Recorder::default()))
+    };
+    let open = router(state.clone());
+    let guard = crate::identity::auth::BearerGuard::new(
+        crate::identity::auth::SharedToken::new("s3cr3t"),
+        None,
+        None,
+        None,
+        crate::identity::auth::AuthMode::Native,
+    )?;
+    let keyed = router(state).layer(axum::middleware::from_fn_with_state(
+        crate::identity::auth::HumanOrKeyGuard {
+            guard: Arc::new(guard),
+            pool: pool.clone(),
+        },
+        crate::identity::auth::require_auth_or_api_key,
+    ));
+
+    let (status, body) = send_as(
+        &open,
+        "POST",
+        "/api/teams",
+        "reed",
+        serde_json::json!({
+            "slug": "tibrahim-all",
+            "display_name": "tibrahim-all",
+            "members": [
+                {"kind": "user", "member": "reed", "role": "owner"},
+                {"kind": "group", "member": GROUP, "role": "member"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(LAUNCH_WORKFLOW);
+    for (user, draft) in [("tibrahim", "cve-triage"), ("nora", "nora-triage")] {
+        let (status, body) = send_as(
+            &open,
+            "POST",
+            "/api/playbook-drafts",
+            user,
+            serde_json::json!({"id": draft, "description": "d"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let (status, body) = send_as(
+            &open,
+            "POST",
+            &format!("/api/playbook-drafts/{draft}/versions"),
+            user,
+            serde_json::json!({"files": files}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    bind_playbook_secret(&pool, "team:tibrahim-all", &["cve-triage", "nora-triage"]).await?;
+
+    let now = jiff::Timestamp::now();
+    crate::identity::oidc::users::record_login(&pool, "sub-tibrahim", "tibrahim", None, now)
+        .await?;
+    let mut conn = pool.acquire().await?;
+    crate::identity::oidc::users::record_groups_on(
+        &mut conn,
+        "sub-tibrahim",
+        &[GROUP.to_string()],
+        now,
+    )
+    .await?;
+    let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
+
+    let (groups, resolved) =
+        launch_draft_with_key(&keyed, &pool, "cve-triage", &key.secret).await?;
+    assert_eq!(groups, vec![GROUP.to_string()]);
+    let mints = resolved.expect("the group reaches the owning team");
+    assert_eq!(mints.len(), 1);
+
+    crate::identity::oidc::users::record_groups_on(&mut conn, "sub-tibrahim", &[], now).await?;
+    let (groups, resolved) =
+        launch_draft_with_key(&keyed, &pool, "cve-triage", &key.secret).await?;
+    assert!(groups.is_empty(), "{groups:?}");
+    let refusal = resolved.expect_err("the group is gone from the record");
+    assert!(
+        matches!(
+            &refusal,
+            crate::secrets::launch::Refusal::NotOwned { owner, .. } if owner == "team:tibrahim-all"
+        ),
+        "{refusal}"
+    );
+
+    crate::identity::oidc::users::record_login(&pool, "sub-nora", "nora", None, now).await?;
+    drop(conn);
+    let key = crate::identity::api_key::mint(&pool, "sub-nora", "laptop", None).await?;
+    let (groups, resolved) =
+        launch_draft_with_key(&keyed, &pool, "nora-triage", &key.secret).await?;
+    assert!(groups.is_empty(), "no stamp, no groups: {groups:?}");
+    assert!(
+        matches!(
+            resolved,
+            Err(crate::secrets::launch::Refusal::NotOwned { .. })
+        ),
+        "{resolved:?}"
+    );
+    Ok(())
+}

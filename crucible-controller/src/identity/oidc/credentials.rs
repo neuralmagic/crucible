@@ -379,7 +379,16 @@ impl OwnerRefresh {
             }
         };
 
-        let now = jiff::Timestamp::now().to_string();
+        let stamped = jiff::Timestamp::now();
+        let now = stamped.to_string();
+        crate::identity::oidc::users::record_groups_on(
+            &mut tx,
+            sub,
+            &refreshed.claims.groups,
+            stamped,
+        )
+        .await
+        .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
         if let Some(rotated) = refreshed.refresh_token.as_deref() {
             let (cipher, key_id) = self
                 .keys

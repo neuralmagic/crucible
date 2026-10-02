@@ -977,6 +977,61 @@ async fn two_refreshes_of_one_owner_serialize_and_both_land(pool: PgPool) {
     assert!(status.refreshed_at.is_some(), "the refresh was stamped");
 }
 
+/// A credential refresh stamps the issuer's live groups on the owner's `users` row, which is what
+/// an api key of theirs answers with.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_credential_refresh_restamps_the_groups_an_api_key_answers_with(pool: PgPool) {
+    let Some(base) = keycloak().await else { return };
+    let provider = Arc::new(OidcProvider::new(cfg_offline(&base)).expect("provider"));
+    let keys = test_keys();
+    let app = native_router_with(
+        &pool,
+        provider.clone(),
+        Some(keys.clone()),
+        DEFAULT_REFRESH_AFTER,
+    )
+    .await;
+    sign_in(&app).await;
+    let sub: String = sqlx::query_scalar("SELECT sub FROM user_credentials")
+        .fetch_one(&pool)
+        .await
+        .expect("the login stored one");
+    sqlx::query("UPDATE users SET groups = '[\"/stale-group\"]'::jsonb WHERE sub = $1")
+        .bind(&sub)
+        .execute(&pool)
+        .await
+        .expect("stale groups");
+    let key = crate::identity::api_key::mint(&pool, &sub, "laptop", None)
+        .await
+        .expect("mint");
+    let before = crate::identity::api_key::verify(&pool, &key.secret)
+        .await
+        .expect("verify");
+    assert_eq!(before.groups, vec!["/stale-group".to_string()]);
+
+    let refresh =
+        crate::identity::oidc::credentials::OwnerRefresh::new(pool.clone(), provider, keys);
+    assert!(matches!(
+        refresh.refresh(&sub).await,
+        Ok(crate::identity::oidc::credentials::RefreshOutcome::Claims(
+            _
+        ))
+    ));
+    let after = crate::identity::api_key::verify(&pool, &key.secret)
+        .await
+        .expect("verify");
+    assert!(
+        after.groups.iter().any(|g| g == USER_GROUP),
+        "{:?}",
+        after.groups
+    );
+    assert!(
+        !after.groups.iter().any(|g| g == "/stale-group"),
+        "{:?}",
+        after.groups
+    );
+}
+
 /// A due schedule's owner groups are re-read from their offline credential before the row is
 /// claimed, so the launch carries what the issuer says NOW and not what the last save recorded.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

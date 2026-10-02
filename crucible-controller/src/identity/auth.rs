@@ -148,8 +148,8 @@ pub enum AuthPath {
     /// A valid cluster token whose OpenShift username matches no `users` row, so it names nobody
     /// this controller has an SSO identity for.
     UnknownClusterToken,
-    /// An opaque `crk_…` key its owner minted, carrying their login and the groups their last
-    /// login stamped. It authenticates only on the MCP surface, which runs its own guard.
+    /// An opaque `crk_…` key its owner minted, carrying their login and the groups their `users`
+    /// row holds. It authenticates only on the MCP surface, which runs its own guard.
     ApiKey,
     /// No expected token configured — the guard is off and the surface is loopback-bound.
     Open,
@@ -680,7 +680,7 @@ fn presented_api_key(headers: &header::HeaderMap) -> bool {
 /// carrying its own credential check.
 ///
 /// What it stamps is what every handler already reads, so nothing downstream needs to know an API
-/// key was involved: the owner's login, their subject, and the groups their last login recorded.
+/// key was involved: the owner's login, their subject, and the groups their `users` row holds.
 pub async fn require_api_key(
     State(pool): State<sqlx::PgPool>,
     mut req: Request,

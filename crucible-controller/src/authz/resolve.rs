@@ -169,6 +169,17 @@ pub async fn teams_for(
     Ok(resolve(&members, &claims))
 }
 
+/// A recorded launcher's principals: its login, the groups the record carries, and the teams
+/// those reach now. An empty group list proves nothing, so group and rule members stay unmatched.
+pub async fn recorded_principals(
+    pool: &sqlx::PgPool,
+    login: Option<&str>,
+    groups: &[String],
+) -> anyhow::Result<crate::authz::model::Principals> {
+    let teams = teams_for(pool, login, groups, !groups.is_empty()).await?;
+    Ok(crate::authz::model::Principals::new(login, groups).with_teams(teams))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
