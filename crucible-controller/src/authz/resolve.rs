@@ -195,30 +195,24 @@ pub async fn dispatch_principals(
 ) -> anyhow::Result<
     Result<crate::authz::model::Principals, crate::identity::oidc::credentials::GroupsUnavailable>,
 > {
+    use crate::identity::oidc::{credentials, users};
     let row = match login {
-        Some(login) => crate::identity::oidc::users::stamped(pool, login).await?,
+        Some(login) => users::stamped(pool, login).await?,
         None => None,
     };
     let current = match row {
         Some((sub, groups, at)) => {
-            match crate::identity::oidc::credentials::current_groups(
-                refresh,
-                &sub,
-                groups,
-                at.as_deref(),
-            )
-            .await
-            {
+            match credentials::current_groups(refresh, &sub, groups, at.as_deref()).await {
                 Ok(groups) => Some(groups),
                 Err(unavailable) => return Ok(Err(unavailable)),
             }
         }
         None => match mode {
             crate::identity::auth::AuthMode::Proxy => None,
-            crate::identity::auth::AuthMode::Native => crate::identity::oidc::users::stale(
+            crate::identity::auth::AuthMode::Native => users::stale(
                 launched_at,
                 jiff::Timestamp::now(),
-                crate::identity::oidc::users::session_group_refresh_interval(),
+                users::session_group_refresh_interval(),
             )
             .then(Vec::new),
         },

@@ -222,7 +222,7 @@ async fn callback(
 }
 
 /// The user row, the groups its claim carried, and the offline credential, in one transaction under
-/// the subject's credential lock, so a refresh in flight cannot stamp over them.
+/// the subject's credential lock.
 /// Either all of it lands or none does: a `users` row with no credential is a user whose schedules
 /// silently stop following live groups, and one with stale groups is an API key answering for a
 /// membership its owner no longer holds.

@@ -7098,24 +7098,12 @@ async fn a_local_launch_with_a_binding_parks_instead_of_running_without_it(
     Ok(())
 }
 
-/// A dispatch resolves the teams the launch row's groups reach: a launcher whose recorded group is
-/// a member of the owning team resolves a team-owned binding, and one recorded with no groups does
-/// not.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_launch_reaches_a_team_owned_secret_through_its_recorded_groups(
-    pool: PgPool,
-) -> Result<()> {
+const TEAM_GROUP: &str = "/groups/tibrahim-all";
+
+/// Team `tibrahim-all` with [`TEAM_GROUP`] as a member, the `survey` playbook, and `wren` signed in
+/// holding that group as of `stamped`.
+async fn seed_team_launcher(db: &Db, stamped: jiff::Timestamp) -> Result<()> {
     use crate::authz::model::{Member, MemberRef, TeamRole, TeamSlug};
-    let _g = crate::ENV_LOCK.lock().await;
-    let (db, dir) = db_with(pool);
-    let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
-    unsafe {
-        std::env::set_var("CRUCIBLE_BIN", &bin);
-    }
-    let cfg = ControllerCfg {
-        playbook_executor: crucible_controller::PlaybookExecutor::Local,
-        ..cfg_with(dir.path(), Profile::default())
-    };
     let team = TeamSlug::parse("tibrahim-all")?;
     let now = jiff::Timestamp::now().to_string();
     let mut conn = db.pool().acquire().await?;
@@ -7124,51 +7112,33 @@ async fn a_launch_reaches_a_team_owned_secret_through_its_recorded_groups(
         &mut conn,
         &team,
         &[Member {
-            member: MemberRef::Group("/groups/tibrahim-all".to_string()),
+            member: MemberRef::Group(TEAM_GROUP.to_string()),
             role: TeamRole::Member,
         }],
         None,
         &now,
     )
     .await?;
-    drop(conn);
-    seed_registered_playbook(&db, "survey").await;
-    bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
-
-    let member = "playbook:survey:0199c0de-7c2c-71a5-8000-c";
-    let groups = serde_json::json!(["/groups/tibrahim-all"]);
-    adopt_launch_with_groups(&db, member, 3.5, Some(&groups)).await;
-    let outsider = "playbook:survey:0199c0de-7c2c-71a5-8000-d";
-    adopt_launch_with_groups(&db, outsider, 3.5, Some(&serde_json::json!([]))).await;
-
-    let res = async {
-        reconcile(&db, &cfg, member).await?;
-        reconcile(&db, &cfg, outsider).await
-    }
-    .await;
-    unsafe {
-        std::env::remove_var("CRUCIBLE_BIN");
-    }
-    res?;
-
-    let reason = |key: &'static str| {
-        let db = db.clone();
-        async move {
-            let issue = crate::issues::store::get_issue(db.pool(), key)
-                .await?
-                .expect("issue");
-            assert_eq!(issue.status, Status::Parked, "{:?}", issue.parked_reason);
-            anyhow::Ok(format!("{:?}", issue.parked_reason))
-        }
-    };
-    let resolved = reason(member).await?;
-    assert!(
-        resolved.contains("local executor delivers no secrets"),
-        "the binding resolved, so only the local executor refused it: {resolved}"
-    );
-    let refused = reason(outsider).await?;
-    assert!(refused.contains("owned by team:tibrahim-all"), "{refused}");
+    crate::identity::oidc::users::record_login(db.pool(), "sub-wren", "wren", None, stamped)
+        .await?;
+    crate::identity::oidc::users::record_groups_on(
+        &mut conn,
+        "sub-wren",
+        &[TEAM_GROUP.to_string()],
+        stamped,
+    )
+    .await?;
+    seed_registered_playbook(db, "survey").await;
     Ok(())
+}
+
+/// The parked reason of `key`, which must be parked.
+async fn parked_reason(db: &Db, key: &str) -> Result<String> {
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked, "{:?}", issue.parked_reason);
+    Ok(format!("{:?}", issue.parked_reason))
 }
 
 /// A queued launch keeps only the recorded groups its launcher's `users` row still holds at
@@ -7177,8 +7147,6 @@ async fn a_launch_reaches_a_team_owned_secret_through_its_recorded_groups(
 async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
     pool: PgPool,
 ) -> Result<()> {
-    use crate::authz::model::{Member, MemberRef, TeamRole, TeamSlug};
-    const GROUP: &str = "/groups/tibrahim-all";
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
@@ -7189,38 +7157,9 @@ async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
         playbook_executor: crucible_controller::PlaybookExecutor::Local,
         ..cfg_with(dir.path(), Profile::default())
     };
-    let team = TeamSlug::parse("tibrahim-all")?;
-    let stamped = jiff::Timestamp::now();
-    let now = stamped.to_string();
-    let mut conn = db.pool().acquire().await?;
-    crate::authz::store::insert_team(&mut conn, &team, "tibrahim-all", None, &now).await?;
-    crate::authz::store::replace_members(
-        &mut conn,
-        &team,
-        &[Member {
-            member: MemberRef::Group(GROUP.to_string()),
-            role: TeamRole::Member,
-        }],
-        None,
-        &now,
-    )
-    .await?;
-    drop(conn);
-    crate::identity::oidc::users::record_login(db.pool(), "sub-wren", "wren", None, stamped)
-        .await?;
-    let set_groups = |groups: Vec<String>| {
-        let pool = db.pool().clone();
-        async move {
-            let mut conn = pool.acquire().await?;
-            crate::identity::oidc::users::record_groups_on(&mut conn, "sub-wren", &groups, stamped)
-                .await
-        }
-    };
-    set_groups(vec![GROUP.to_string()]).await?;
-    seed_registered_playbook(&db, "survey").await;
+    seed_team_launcher(&db, jiff::Timestamp::now()).await?;
     bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
-
-    let recorded = serde_json::json!([GROUP]);
+    let recorded = serde_json::json!([TEAM_GROUP]);
     let held = "playbook:survey:0199c0de-7c2c-71a5-8000-e";
     adopt_launch_with_groups(&db, held, 3.5, Some(&recorded)).await;
     let lost = "playbook:survey:0199c0de-7c2c-71a5-8000-f";
@@ -7228,7 +7167,14 @@ async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
 
     let res = async {
         reconcile(&db, &cfg, held).await?;
-        set_groups(Vec::new()).await?;
+        let mut conn = db.pool().acquire().await?;
+        crate::identity::oidc::users::record_groups_on(
+            &mut conn,
+            "sub-wren",
+            &[],
+            jiff::Timestamp::now(),
+        )
+        .await?;
         reconcile(&db, &cfg, lost).await
     }
     .await;
@@ -7237,22 +7183,12 @@ async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
     }
     res?;
 
-    let reason = |key: &'static str| {
-        let db = db.clone();
-        async move {
-            let issue = crate::issues::store::get_issue(db.pool(), key)
-                .await?
-                .expect("issue");
-            assert_eq!(issue.status, Status::Parked, "{:?}", issue.parked_reason);
-            anyhow::Ok(format!("{:?}", issue.parked_reason))
-        }
-    };
-    let resolved = reason(held).await?;
+    let resolved = parked_reason(&db, held).await?;
     assert!(
         resolved.contains("local executor delivers no secrets"),
         "the owner still held the group, so the binding resolved: {resolved}"
     );
-    let refused = reason(lost).await?;
+    let refused = parked_reason(&db, lost).await?;
     assert!(
         refused.contains("owned by team:tibrahim-all"),
         "the owner lost the group before dispatch: {refused}"
@@ -7267,40 +7203,17 @@ async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
 async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
     pool: PgPool,
 ) -> Result<()> {
-    use crate::authz::model::{Member, MemberRef, TeamRole, TeamSlug};
     use crate::identity::oidc::credentials::{CredentialKeys, OwnerRefresh};
-    const GROUP: &str = "/groups/tibrahim-all";
     let _g = crate::ENV_LOCK.lock().await;
     let (db, dir) = db_with(pool);
     let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
     unsafe {
         std::env::set_var("CRUCIBLE_BIN", &bin);
     }
-    let team = TeamSlug::parse("tibrahim-all")?;
     let now = jiff::Timestamp::now();
-    let mut conn = db.pool().acquire().await?;
-    crate::authz::store::insert_team(&mut conn, &team, "tibrahim-all", None, &now.to_string())
-        .await?;
-    crate::authz::store::replace_members(
-        &mut conn,
-        &team,
-        &[Member {
-            member: MemberRef::Group(GROUP.to_string()),
-            role: TeamRole::Member,
-        }],
-        None,
-        &now.to_string(),
-    )
-    .await?;
-    crate::identity::oidc::users::record_login(db.pool(), "sub-wren", "wren", None, now).await?;
-    crate::identity::oidc::users::record_groups_on(
-        &mut conn,
-        "sub-wren",
-        &[GROUP.to_string()],
-        now.checked_sub(jiff::SignedDuration::from_hours(2))?,
-    )
-    .await?;
+    seed_team_launcher(&db, now.checked_sub(jiff::SignedDuration::from_hours(2))?).await?;
     let keys = std::sync::Arc::new(CredentialKeys::new(vec![vec![7u8; 32]])?);
+    let mut conn = db.pool().acquire().await?;
     crate::identity::oidc::credentials::upsert(&mut conn, &keys, "sub-wren", "offline", now)
         .await?;
     drop(conn);
@@ -7313,16 +7226,8 @@ async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
         ))),
         ..cfg_with(dir.path(), Profile::default())
     };
-    let unreachable = cfg_for(std::sync::Arc::new(
-        crate::identity::oidc::OidcProvider::new(crate::identity::oidc::OidcCfg {
-            issuer: "http://127.0.0.1:1/realms/nobody".to_string(),
-            client_id: "rp".to_string(),
-            client_secret: None,
-            redirect_url: "http://localhost/auth/callback".to_string(),
-            scopes: vec!["openid".to_string()],
-            device_client_id: None,
-            post_logout_redirect: None,
-        })?,
+    let unreachable = cfg_for(crate::identity::oidc::tests::provider_at(
+        "http://127.0.0.1:1/realms/nobody",
     ));
     let (_issuer, provider) = crate::identity::oidc::tests::issuer_answering(
         wiremock::ResponseTemplate::new(400)
@@ -7330,8 +7235,7 @@ async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
     )
     .await;
     let refusing = cfg_for(provider);
-    seed_registered_playbook(&db, "survey").await;
-    let recorded = serde_json::json!([GROUP]);
+    let recorded = serde_json::json!([TEAM_GROUP]);
     let unbound = "playbook:survey:0199c0de-7c2c-71a5-8000-10";
     adopt_launch_with_groups(&db, unbound, 3.5, Some(&recorded)).await;
     let bound = "playbook:survey:0199c0de-7c2c-71a5-8000-11";
@@ -7363,11 +7267,7 @@ async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
         started.parked_reason
     );
     assert_eq!(deferred.status, Status::New, "{:?}", deferred.parked_reason);
-    let refused = crate::issues::store::get_issue(db.pool(), bound)
-        .await?
-        .expect("issue");
-    assert_eq!(refused.status, Status::Parked);
-    let reason = format!("{:?}", refused.parked_reason);
+    let reason = parked_reason(&db, bound).await?;
     assert!(reason.contains("owned by team:tibrahim-all"), "{reason}");
     let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs")
         .fetch_one(db.pool())

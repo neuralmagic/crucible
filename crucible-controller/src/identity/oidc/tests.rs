@@ -226,58 +226,37 @@ fn a_forced_jwks_refresh_is_granted_once_per_interval() {
     );
 }
 
+/// A provider for the relying party `rp` at `issuer`.
+pub(crate) fn provider_at(issuer: &str) -> Arc<OidcProvider> {
+    Arc::new(
+        OidcProvider::new(OidcCfg {
+            issuer: issuer.to_string(),
+            client_id: "rp".to_string(),
+            client_secret: None,
+            redirect_url: "http://localhost/auth/callback".to_string(),
+            scopes: vec!["openid".to_string()],
+            device_client_id: None,
+            post_logout_redirect: None,
+        })
+        .expect("provider"),
+    )
+}
+
 /// A real HTTP issuer: discovery and the key set answer normally, the token endpoint answers
 /// whatever the test hands it. This is the one shape a live Keycloak cannot be asked for — a
 /// router answering on behalf of a pod that is restarting — and it is the shape production runs.
 pub(crate) async fn issuer_answering(
     token: wiremock::ResponseTemplate,
 ) -> (wiremock::MockServer, Arc<OidcProvider>) {
-    use wiremock::matchers::{method, path};
     let server = wiremock::MockServer::start().await;
-    let base = server.uri();
-    wiremock::Mock::given(method("GET"))
-        .and(path("/.well-known/openid-configuration"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "issuer": base,
-                "authorization_endpoint": format!("{base}/auth"),
-                "token_endpoint": format!("{base}/token"),
-                "jwks_uri": format!("{base}/certs"),
-                "response_types_supported": ["code"],
-                "subject_types_supported": ["public"],
-                "id_token_signing_alg_values_supported": ["RS256"],
-            })),
-        )
-        .mount(&server)
-        .await;
-    wiremock::Mock::given(method("GET"))
-        .and(path("/certs"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({ "keys": [] })),
-        )
-        .mount(&server)
-        .await;
-    wiremock::Mock::given(method("POST"))
-        .and(path("/token"))
-        .respond_with(token)
-        .mount(&server)
-        .await;
-    let provider = OidcProvider::new(OidcCfg {
-        issuer: base,
-        client_id: "rp".to_string(),
-        client_secret: None,
-        redirect_url: "http://localhost/auth/callback".to_string(),
-        scopes: vec!["openid".to_string()],
-        device_client_id: None,
-        post_logout_redirect: None,
-    })
-    .expect("provider");
-    (server, Arc::new(provider))
+    serve_issuer(&server, serde_json::json!({ "keys": [] }), token).await;
+    let provider = provider_at(&server.uri());
+    (server, provider)
 }
 
-/// A real HTTP issuer that signs: discovery, a key set holding a freshly generated RS256 key, and
-/// a token endpoint answering every grant with an ID token for `sub` carrying `groups`, signed by
-/// that key, plus the rotated refresh token `rotated`.
+/// A real HTTP issuer that signs: its key set holds a freshly generated RS256 key, and its token
+/// endpoint answers every grant with an ID token for `sub` carrying `groups`, signed by that key,
+/// plus the rotated refresh token `rotated`.
 pub(crate) async fn issuer_signing_for(
     sub: &str,
     groups: &[&str],
@@ -285,7 +264,6 @@ pub(crate) async fn issuer_signing_for(
     use aws_lc_rs::rsa::{KeyPair, KeySize, PublicKeyComponents};
     use aws_lc_rs::signature::{KeyPair as _, RSA_PKCS1_SHA256};
     use base64::Engine;
-    use wiremock::matchers::{method, path};
     let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
     let server = wiremock::MockServer::start().await;
     let base = server.uri();
@@ -315,8 +293,32 @@ pub(crate) async fn issuer_signing_for(
         &mut signature,
     )
     .expect("sign");
-    let id_token = format!("{signing_input}.{}", b64.encode(signature));
+    let jwks = serde_json::json!({ "keys": [{
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "local",
+        "n": b64.encode(&public.n),
+        "e": b64.encode(&public.e),
+    }]});
+    let token = wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+        "access_token": "opaque-access",
+        "token_type": "Bearer",
+        "expires_in": 300,
+        "id_token": format!("{signing_input}.{}", b64.encode(signature)),
+        "refresh_token": "rotated",
+    }));
+    serve_issuer(&server, jwks, token).await;
+    (server, provider_at(&base))
+}
 
+async fn serve_issuer(
+    server: &wiremock::MockServer,
+    jwks: serde_json::Value,
+    token: wiremock::ResponseTemplate,
+) {
+    use wiremock::matchers::{method, path};
+    let base = server.uri();
     wiremock::Mock::given(method("GET"))
         .and(path("/.well-known/openid-configuration"))
         .respond_with(
@@ -330,46 +332,18 @@ pub(crate) async fn issuer_signing_for(
                 "id_token_signing_alg_values_supported": ["RS256"],
             })),
         )
-        .mount(&server)
+        .mount(server)
         .await;
     wiremock::Mock::given(method("GET"))
         .and(path("/certs"))
-        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({ "keys": [{
-                "kty": "RSA",
-                "use": "sig",
-                "alg": "RS256",
-                "kid": "local",
-                "n": b64.encode(&public.n),
-                "e": b64.encode(&public.e),
-            }]}),
-        ))
-        .mount(&server)
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(jwks))
+        .mount(server)
         .await;
     wiremock::Mock::given(method("POST"))
         .and(path("/token"))
-        .respond_with(
-            wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "opaque-access",
-                "token_type": "Bearer",
-                "expires_in": 300,
-                "id_token": id_token,
-                "refresh_token": "rotated",
-            })),
-        )
-        .mount(&server)
+        .respond_with(token)
+        .mount(server)
         .await;
-    let provider = OidcProvider::new(OidcCfg {
-        issuer: base,
-        client_id: "rp".to_string(),
-        client_secret: None,
-        redirect_url: "http://localhost/auth/callback".to_string(),
-        scopes: vec!["openid".to_string()],
-        device_client_id: None,
-        post_logout_redirect: None,
-    })
-    .expect("provider");
-    (server, Arc::new(provider))
 }
 
 /// Everything short of an issuer-authored refusal is the issuer being unreachable. A 5xx from the
