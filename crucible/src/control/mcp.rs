@@ -6,20 +6,135 @@ use crate::control::broker::{mint_token, port_open};
 use crate::manifest::McpCfg;
 use anyhow::{Context, Result};
 use crucible_contract::mcp::{self as wire, TokenHolder, TokenMap};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStderr, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const BOOT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many of a server's last stderr lines a start failure carries.
+const STDERR_TAIL: usize = 50;
+
+/// How much of each of those lines it keeps.
+const STDERR_LINE_CHARS: usize = 500;
+
+/// How long an exited server's stderr gets to drain before the failure reports it.
+const STDERR_DRAIN: Duration = Duration::from_secs(1);
+
+/// A server that could not start. The run ends on it.
 #[derive(Debug, thiserror::Error)]
-enum StartError {
+pub(crate) enum StartError {
     #[error("[mcp.{key}] cannot listen on port {port}: something already does")]
     PortInUse { key: String, port: u16 },
-    #[error("[mcp.{key}] (`{bin}`) did not listen on port {port} within {BOOT_TIMEOUT:?}")]
-    BootTimeout { key: String, bin: String, port: u16 },
+    #[error("spawning [mcp.{key}] (`{bin}`)")]
+    Spawn {
+        key: String,
+        bin: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("[mcp.{key}] (`{bin}`) exited ({status}) before listening on port {port}{stderr}")]
+    Exited {
+        key: String,
+        bin: String,
+        port: u16,
+        status: ExitStatus,
+        stderr: StderrShown,
+    },
+    #[error("[mcp.{key}] (`{bin}`) did not listen on port {port} within {BOOT_TIMEOUT:?}{stderr}")]
+    BootTimeout {
+        key: String,
+        bin: String,
+        port: u16,
+        stderr: StderrShown,
+    },
+}
+
+/// The stderr lines a start failure quotes.
+#[derive(Debug)]
+pub(crate) struct StderrShown(Vec<String>);
+
+impl std::fmt::Display for StderrShown {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.is_empty() {
+            return write!(f, "; it wrote nothing to stderr");
+        }
+        write!(f, "; its last {} stderr line(s):", self.0.len())?;
+        for line in &self.0 {
+            write!(f, "\n{line}")?;
+        }
+        Ok(())
+    }
+}
+
+/// A server's last [`STDERR_TAIL`] stderr lines, redacted. Its raw stderr is copied to crucible's
+/// stderr as it arrives.
+#[derive(Clone, Default)]
+struct StderrTail(Arc<Mutex<VecDeque<String>>>);
+
+impl StderrTail {
+    fn follow(stderr: Option<ChildStderr>) -> (Self, JoinHandle<()>) {
+        let tail = Self::default();
+        let lines = tail.clone();
+        let reader = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let Some(mut stderr) = stderr else { return };
+            let mut chunk = [0u8; 8192];
+            let mut line = Vec::new();
+            let mut capped = false;
+            while let Ok(n @ 1..) = stderr.read(&mut chunk) {
+                let _ = std::io::stderr().write_all(&chunk[..n]);
+                for &byte in &chunk[..n] {
+                    if byte == b'\n' {
+                        if !capped {
+                            lines.push(&line);
+                        }
+                        line.clear();
+                        capped = false;
+                    } else if !capped {
+                        line.push(byte);
+                        if line.len() == STDERR_LINE_CHARS * 4 {
+                            lines.push(&line);
+                            line.clear();
+                            capped = true;
+                        }
+                    }
+                }
+            }
+            if !line.is_empty() {
+                lines.push(&line);
+            }
+        });
+        (tail, reader)
+    }
+
+    fn push(&self, line: &[u8]) {
+        let redacted = crate::turn_trace::redact(&String::from_utf8_lossy(line));
+        let line = redacted.chars().take(STDERR_LINE_CHARS).collect();
+        let mut lines = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if lines.len() == STDERR_TAIL {
+            lines.pop_front();
+        }
+        lines.push_back(line);
+    }
+
+    fn shown(&self) -> StderrShown {
+        let lines = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        StderrShown(lines.iter().cloned().collect())
+    }
+
+    /// The tail once the server's stderr closes, or after [`STDERR_DRAIN`] when something else
+    /// still holds it open.
+    fn drained(&self, reader: &JoinHandle<()>) -> StderrShown {
+        let until = Instant::now() + STDERR_DRAIN;
+        while !reader.is_finished() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        self.shown()
+    }
 }
 
 /// One started server. Clones share the process, which is killed when the last one drops.
@@ -71,15 +186,39 @@ pub(crate) fn start(
         let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("spawning [mcp.{key}] (`{}`)", cfg.bin))?;
-        let child = Arc::new(KillOnDrop(child));
+            .map_err(|source| StartError::Spawn {
+                key: key.clone(),
+                bin: cfg.bin.clone(),
+                source,
+            })?;
+        let mut child = KillOnDrop(child);
+        let (tail, reader) = StderrTail::follow(child.0.stderr.take());
         let deadline = Instant::now() + BOOT_TIMEOUT;
         while !port_open(&probe) {
+            if let Some(status) = child
+                .0
+                .try_wait()
+                .with_context(|| format!("waiting on [mcp.{key}] (`{}`)", cfg.bin))?
+            {
+                return Err(StartError::Exited {
+                    key: key.clone(),
+                    bin: cfg.bin.clone(),
+                    port,
+                    status,
+                    stderr: tail.drained(&reader),
+                }
+                .into());
+            }
             if Instant::now() > deadline {
-                let (key, bin) = (key.clone(), cfg.bin.clone());
-                return Err(StartError::BootTimeout { key, bin, port }.into());
+                return Err(StartError::BootTimeout {
+                    key: key.clone(),
+                    bin: cfg.bin.clone(),
+                    port,
+                    stderr: tail.shown(),
+                }
+                .into());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -87,7 +226,7 @@ pub(crate) fn start(
             key: key.clone(),
             port,
             tokens,
-            _child: child,
+            _child: Arc::new(child),
         });
     }
     Ok(servers)
@@ -162,7 +301,7 @@ pub(crate) fn grant_all<'a>(
 #[cfg(test)]
 mod tests {
     use crate::control::broker::port_open;
-    use crate::control::mcp::{grant_all, start};
+    use crate::control::mcp::{STDERR_LINE_CHARS, STDERR_TAIL, StartError, grant_all, start};
     use crate::manifest::McpCfg;
     use crucible_contract::mcp::TokenHolder;
     use std::collections::BTreeMap;
@@ -210,6 +349,7 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
 
     #[test]
     fn each_server_gets_a_minimal_env_and_maps_tokens_to_their_own_sandbox() {
+        let _env = crucible::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("echo.py");
         std::fs::write(&script, ECHO_SERVER).unwrap();
@@ -296,5 +436,110 @@ http.server.HTTPServer((host, int(port)), H).serve_forever()
             grant_all([], "ci-a", "/sandbox/my work").unwrap(),
             Vec::<String>::new()
         );
+    }
+
+    fn start_one(bin: &str, args: &[&str]) -> (StartError, std::time::Duration) {
+        let _env = crucible::test_support::env_lock();
+        let table = BTreeMap::from([(
+            "buildit".to_string(),
+            McpCfg {
+                bin: bin.into(),
+                args: args.iter().map(|s| s.to_string()).collect(),
+                env: BTreeMap::new(),
+                inherit: Vec::new(),
+                tools: Vec::new(),
+            },
+        )]);
+        let vars: Vec<(String, String)> = std::env::vars().collect();
+        let started = std::time::Instant::now();
+        let error = match start(&table, &vars) {
+            Ok(_) => panic!("{bin} started"),
+            Err(e) => e,
+        };
+        let elapsed = started.elapsed();
+        match error.downcast::<StartError>() {
+            Ok(e) => (e, elapsed),
+            Err(e) => panic!("not a StartError: {e:#}"),
+        }
+    }
+
+    #[test]
+    fn a_server_that_exits_at_boot_fails_at_once_with_its_last_stderr_lines() {
+        let (error, elapsed) = start_one(
+            "sh",
+            &[
+                "-c",
+                "for i in $(seq 1 59); do echo \"noise $i\" >&2; done; \
+                 printf '%02000d\\n' 0 >&2; \
+                 echo 'buildit: no kubeconfig at /var/run/kube' >&2; exit 7",
+            ],
+        );
+        assert!(matches!(error, StartError::Exited { .. }), "{error:?}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(4),
+            "an exited server fails without waiting out the boot timeout: {elapsed:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.starts_with("[mcp.buildit] (`sh`) exited (exit status: 7) before listening"),
+            "{message}"
+        );
+        let lines: Vec<&str> = message.lines().skip(1).collect();
+        assert_eq!(lines.len(), STDERR_TAIL, "{message}");
+        assert_eq!(lines.first(), Some(&"noise 12"), "{message}");
+        assert_eq!(lines[STDERR_TAIL - 2], "0".repeat(STDERR_LINE_CHARS));
+        assert_eq!(
+            lines.last(),
+            Some(&"buildit: no kubeconfig at /var/run/kube"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn stderr_without_newlines_is_capped_and_the_tail_is_redacted() {
+        let (error, _) = start_one(
+            "sh",
+            &[
+                "-c",
+                "head -c 100000 /dev/zero | tr '\\0' x >&2; \
+                 printf '\\nlogin with KUBE_TOKEN=s3cret\\nno newline at exit' >&2; exit 2",
+            ],
+        );
+        let message = error.to_string();
+        let lines: Vec<&str> = message.lines().skip(1).collect();
+        assert_eq!(
+            lines,
+            [
+                "x".repeat(STDERR_LINE_CHARS).as_str(),
+                "login with KUBE_TOKEN=***",
+                "no newline at exit"
+            ],
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_server_that_never_listens_times_out_with_its_stderr() {
+        let (error, _) = start_one(
+            "sh",
+            &["-c", "echo 'waiting on the gateway' >&2; exec sleep 30"],
+        );
+        assert!(matches!(error, StartError::BootTimeout { .. }), "{error:?}");
+        let message = error.to_string();
+        assert!(
+            message.ends_with("stderr line(s):\nwaiting on the gateway"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_silent_server_says_so_and_a_missing_binary_is_a_start_error() {
+        let (error, _) = start_one("sh", &["-c", "exit 1"]);
+        assert!(
+            error.to_string().ends_with("; it wrote nothing to stderr"),
+            "{error}"
+        );
+        let (error, _) = start_one("/nonexistent/buildit-mcp", &[]);
+        assert!(matches!(error, StartError::Spawn { .. }), "{error:?}");
     }
 }
