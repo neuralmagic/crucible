@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT groups AS \"groups: sqlx::types::Json<Vec<String>>\", groups_at FROM users WHERE sub = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "groups: sqlx::types::Json<Vec<String>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "groups"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "groups_at",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "groups_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "1b85fed54444bc435f9a6299239138fe124b235da10d750b15c4932bc7823ceb"
+}

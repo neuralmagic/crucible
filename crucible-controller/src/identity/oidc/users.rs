@@ -116,27 +116,14 @@ pub async fn current_groups(
     stored: Vec<String>,
     groups_at: Option<&str>,
 ) -> Vec<String> {
-    use crate::identity::oidc::OidcError;
-    use crate::identity::oidc::credentials::RefreshOutcome;
     let window = crate::identity::auth::session_group_refresh_interval();
     if groups_at.is_some_and(|at| !crate::identity::auth::stale(at, jiff::Timestamp::now(), window))
     {
         return stored;
     }
-    let Some(refresh) = refresh else {
-        return Vec::new();
-    };
-    match refresh.refresh(sub).await {
-        Ok(RefreshOutcome::Claims(claims)) => claims.groups,
-        Ok(RefreshOutcome::Absent) => Vec::new(),
-        Err(OidcError::Rejected(why)) => {
-            tracing::info!(sub, reason = %why, "group refresh refused; no groups");
-            Vec::new()
-        }
-        Err(OidcError::Unavailable(why)) => {
-            tracing::warn!(sub, error = %why, "group refresh failed; no groups for this request");
-            Vec::new()
-        }
+    match refresh {
+        Some(refresh) => refresh.current_groups(sub, window).await,
+        None => Vec::new(),
     }
 }
 
@@ -154,6 +141,21 @@ pub async fn stamped(
     .await
     .context("reading a user's stamped groups")?;
     Ok(row.map(|r| (r.sub, r.groups.0, r.groups_at)))
+}
+
+/// The groups and stamp `sub`'s row holds, read on `conn`.
+pub(crate) async fn stamp_on(
+    conn: &mut sqlx::PgConnection,
+    sub: &str,
+) -> anyhow::Result<Option<(Vec<String>, Option<String>)>> {
+    let row = sqlx::query!(
+        r#"SELECT groups AS "groups: sqlx::types::Json<Vec<String>>", groups_at FROM users WHERE sub = $1"#,
+        sub
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .context("reading a subject's stamped groups")?;
+    Ok(row.map(|r| (r.groups.0, r.groups_at)))
 }
 
 /// The subject a login currently belongs to, if any. The fire-time refresh starts from a

@@ -25,6 +25,9 @@ use crate::identity::oidc::{OidcError, OidcProvider, VerifiedClaims};
 /// [`crate::client::MAINTENANCE_ADVISORY_LOCK`] lives in.
 const CREDENTIAL_LOCK_CLASS: i32 = 0x6372_7563;
 
+/// How long a failed group refresh keeps its subject off the issuer.
+const FAILED_REFRESH_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// AES-256 key material length.
 const KEY_LEN: usize = 32;
 
@@ -300,6 +303,41 @@ pub struct OwnerRefresh {
     pool: PgPool,
     provider: Arc<OidcProvider>,
     keys: Arc<CredentialKeys>,
+    failed: FailedRefreshes,
+}
+
+/// The subjects whose last group refresh failed, and when. Expired entries are pruned on every
+/// insert, so the map holds only subjects that failed within the backoff.
+struct FailedRefreshes {
+    backoff: std::time::Duration,
+    at: std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+}
+
+impl FailedRefreshes {
+    fn new(backoff: std::time::Duration) -> Self {
+        FailedRefreshes {
+            backoff,
+            at: std::sync::Mutex::default(),
+        }
+    }
+
+    fn holds(&self, sub: &str, now: std::time::Instant) -> bool {
+        let at = self
+            .at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        at.get(sub)
+            .is_some_and(|failed| now.duration_since(*failed) < self.backoff)
+    }
+
+    fn note(&self, sub: &str, now: std::time::Instant) {
+        let mut at = self
+            .at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        at.retain(|_, failed| now.duration_since(*failed) < self.backoff);
+        at.insert(sub.to_string(), now);
+    }
 }
 
 /// What one refresh attempt produced.
@@ -327,6 +365,7 @@ impl OwnerRefresh {
             pool,
             provider,
             keys,
+            failed: FailedRefreshes::new(FAILED_REFRESH_BACKOFF),
         }
     }
 
@@ -358,6 +397,60 @@ impl OwnerRefresh {
     /// clears the owner's stored groups, as does a credential that is gone before or after the
     /// exchange. An unreachable issuer rolls the transaction back and counts nothing.
     pub async fn refresh(&self, sub: &str) -> Result<RefreshOutcome, OidcError> {
+        let tx = self.locked(sub).await?;
+        self.exchange(tx, sub).await
+    }
+
+    /// The groups `sub` holds now, for a caller that found their stamp older than `window`. Another
+    /// caller may have restamped it while this one waited on the credential lock, and then the
+    /// stored groups stand; otherwise the issuer answers. A failed refresh holds no groups and keeps
+    /// `sub` off the issuer for [`FAILED_REFRESH_BACKOFF`].
+    pub async fn current_groups(&self, sub: &str, window: std::time::Duration) -> Vec<String> {
+        if self.failed.holds(sub, std::time::Instant::now()) {
+            return Vec::new();
+        }
+        match self.groups_unless_fresh(sub, window).await {
+            Ok(groups) => groups,
+            Err(e) => {
+                match &e {
+                    OidcError::Rejected(why) => {
+                        tracing::info!(sub, reason = %why, "group refresh refused; no groups");
+                    }
+                    OidcError::Unavailable(why) => {
+                        tracing::warn!(sub, error = %why, "group refresh failed; no groups");
+                    }
+                }
+                self.failed.note(sub, std::time::Instant::now());
+                Vec::new()
+            }
+        }
+    }
+
+    async fn groups_unless_fresh(
+        &self,
+        sub: &str,
+        window: std::time::Duration,
+    ) -> Result<Vec<String>, OidcError> {
+        let mut tx = self.locked(sub).await?;
+        let stamp = crate::identity::oidc::users::stamp_on(&mut tx, sub)
+            .await
+            .map_err(|e| OidcError::Unavailable(format!("{e:#}")))?;
+        if let Some((groups, Some(at))) = stamp
+            && !crate::identity::auth::stale(&at, jiff::Timestamp::now(), window)
+        {
+            return Ok(groups);
+        }
+        match self.exchange(tx, sub).await? {
+            RefreshOutcome::Claims(claims) => Ok(claims.groups),
+            RefreshOutcome::Absent => Ok(Vec::new()),
+        }
+    }
+
+    /// A transaction holding `sub`'s credential lock.
+    async fn locked(
+        &self,
+        sub: &str,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, OidcError> {
         let mut tx =
             self.pool.begin().await.map_err(|e| {
                 OidcError::Unavailable(format!("opening the refresh transaction: {e}"))
@@ -365,7 +458,15 @@ impl OwnerRefresh {
         lock(&mut tx, sub)
             .await
             .map_err(|e| OidcError::Unavailable(format!("taking the credential lock: {e}")))?;
+        Ok(tx)
+    }
 
+    /// Spend `sub`'s credential inside `tx`, which holds its lock.
+    async fn exchange(
+        &self,
+        mut tx: sqlx::Transaction<'static, sqlx::Postgres>,
+        sub: &str,
+    ) -> Result<RefreshOutcome, OidcError> {
         let row = sqlx::query!(
             r#"SELECT token_cipher AS "token_cipher!", key_id AS "key_id!"
                FROM user_credentials WHERE sub = $1"#,
@@ -877,8 +978,9 @@ mod tests {
         assert_cleared(&pool, "sub-alice").await;
     }
 
-    /// Wait until a backend in this database is blocked on `wait_event`, running `query_prefix`.
-    async fn blocked_on(pool: &PgPool, wait_event: &str, query_prefix: &str) {
+    /// Wait until `count` backends in this database are blocked on `wait_event`, running
+    /// `query_prefix`.
+    async fn blocked_on(pool: &PgPool, wait_event: &str, query_prefix: &str, count: i64) {
         for _ in 0..500 {
             let waiting: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM pg_stat_activity
@@ -890,7 +992,7 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("pg_stat_activity");
-            if waiting > 0 {
+            if waiting >= count {
                 return;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -917,7 +1019,7 @@ mod tests {
             .expect("delete");
         let refresh = OwnerRefresh::new(pool.clone(), provider, keys);
         let flight = tokio::spawn(async move { refresh.refresh("sub-alice").await });
-        blocked_on(&pool, "transactionid", "UPDATE user_credentials").await;
+        blocked_on(&pool, "transactionid", "UPDATE user_credentials", 1).await;
         deleter.commit().await.expect("commit the delete");
 
         assert_eq!(
@@ -942,12 +1044,127 @@ mod tests {
             let keys = keys.clone();
             tokio::spawn(async move { take(&pool, &keys, "sub-alice").await })
         };
-        blocked_on(&pool, "advisory", "SELECT pg_advisory_xact_lock").await;
+        blocked_on(&pool, "advisory", "SELECT pg_advisory_xact_lock", 1).await;
         assert!(!revoke.is_finished());
         holder.commit().await.expect("release");
         assert_eq!(
             revoke.await.expect("join").expect("take"),
             Some("offline".to_string())
+        );
+    }
+
+    /// Stamp `sub`'s stored groups two hours ago, past any session refresh window.
+    async fn seed_stale_groups(pool: &PgPool, sub: &str, groups: &[&str]) {
+        let groups = groups.iter().map(|g| g.to_string()).collect::<Vec<_>>();
+        let aged = jiff::Timestamp::now()
+            .checked_sub(jiff::SignedDuration::from_hours(2))
+            .expect("aged");
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::identity::oidc::users::record_groups_on(&mut conn, sub, &groups, aged)
+            .await
+            .expect("record groups");
+    }
+
+    /// How many token requests the local issuer has answered.
+    async fn token_requests(server: &wiremock::MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .expect("recording is on")
+            .iter()
+            .filter(|r| r.url.path() == "/token")
+            .count()
+    }
+
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// Two callers that both found the stamp stale queue on the credential lock. The first spends
+    /// the credential and restamps the row; the second finds the fresh stamp and takes it without
+    /// asking the issuer again.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn concurrent_stale_callers_refresh_once(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_stale_groups(&pool, "sub-alice", &["/groups/stale"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (server, provider) =
+            crate::identity::oidc::tests::issuer_signing_for("sub-alice", &["/groups/team-x"])
+                .await;
+        let refresh = Arc::new(OwnerRefresh::new(pool.clone(), provider, keys.clone()));
+
+        let mut holder = pool.begin().await.expect("holder");
+        lock(&mut holder, "sub-alice").await.expect("lock");
+        let callers = [(); 2].map(|()| {
+            let refresh = refresh.clone();
+            tokio::spawn(async move { refresh.current_groups("sub-alice", WINDOW).await })
+        });
+        blocked_on(&pool, "advisory", "SELECT pg_advisory_xact_lock", 2).await;
+        holder.commit().await.expect("release");
+        for caller in callers {
+            assert_eq!(
+                caller.await.expect("join"),
+                vec!["/groups/team-x".to_string()]
+            );
+        }
+        assert_eq!(token_requests(&server).await, 1, "one exchange for both");
+        assert_eq!(
+            take(&pool, &keys, "sub-alice").await.expect("take"),
+            Some("rotated".to_string()),
+            "the credential rotated once and the rotation stands"
+        );
+    }
+
+    /// A failed refresh holds no groups, and the next caller inside the backoff gets none without
+    /// reaching the issuer.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_failed_refresh_keeps_the_subject_off_the_issuer(pool: PgPool) {
+        let keys = Arc::new(keys(1));
+        seed_user(&pool, "sub-alice", "alice").await;
+        seed_stale_groups(&pool, "sub-alice", &["/groups/alice"]).await;
+        seed_credential(&pool, &keys, "sub-alice").await;
+        let (server, provider) = crate::identity::oidc::tests::issuer_answering(
+            wiremock::ResponseTemplate::new(503).set_body_string("unavailable"),
+        )
+        .await;
+        let refresh = OwnerRefresh::new(pool.clone(), provider, keys);
+
+        assert!(refresh.current_groups("sub-alice", WINDOW).await.is_empty());
+        let attempted = server.received_requests().await.expect("recording").len();
+        assert_eq!(token_requests(&server).await, 1);
+        assert!(refresh.current_groups("sub-alice", WINDOW).await.is_empty());
+        assert_eq!(
+            server.received_requests().await.expect("recording").len(),
+            attempted,
+            "the second caller made no request"
+        );
+        assert_eq!(
+            stored_groups(&pool, "sub-alice").await.0,
+            vec!["/groups/alice".to_string()],
+            "an outage leaves the stored groups alone"
+        );
+    }
+
+    #[test]
+    fn a_failed_refresh_expires_after_the_backoff_and_is_pruned() {
+        let backoff = std::time::Duration::from_secs(30);
+        let failed = FailedRefreshes::new(backoff);
+        let t0 = std::time::Instant::now();
+        let later = |secs| {
+            t0.checked_add(std::time::Duration::from_secs(secs))
+                .expect("instant")
+        };
+        assert!(!failed.holds("sub-alice", t0));
+        failed.note("sub-alice", t0);
+        assert!(failed.holds("sub-alice", t0));
+        assert!(failed.holds("sub-alice", later(29)));
+        assert!(!failed.holds("sub-bob", later(29)));
+        assert!(!failed.holds("sub-alice", later(30)));
+        failed.note("sub-bob", later(31));
+        let held = failed.at.lock().expect("lock");
+        assert_eq!(
+            held.keys().collect::<Vec<_>>(),
+            vec!["sub-bob"],
+            "an expired entry is pruned on the next insert"
         );
     }
 
