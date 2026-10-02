@@ -183,13 +183,15 @@ pub async fn recorded_principals(
 /// A launch's principals at dispatch: the groups it recorded that its launcher still holds, and the
 /// teams those reach now. What the launcher holds is their stamp while it is fresh, and otherwise
 /// what a refresh of their offline credential answers. A launcher with no `users` row keeps the
-/// recorded groups behind the edge, and holds none in native mode.
+/// recorded groups behind the edge, and in native mode only while the launch is younger than the
+/// session group refresh window.
 pub async fn dispatch_principals(
     pool: &sqlx::PgPool,
     refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
     mode: crate::identity::auth::AuthMode,
     login: Option<&str>,
     recorded: &[String],
+    launched_at: &str,
 ) -> anyhow::Result<crate::authz::model::Principals> {
     let row = match login {
         Some(login) => crate::identity::oidc::users::stamped(pool, login).await?,
@@ -202,7 +204,12 @@ pub async fn dispatch_principals(
         ),
         None => match mode {
             crate::identity::auth::AuthMode::Proxy => None,
-            crate::identity::auth::AuthMode::Native => Some(Vec::new()),
+            crate::identity::auth::AuthMode::Native => crate::identity::auth::stale(
+                launched_at,
+                jiff::Timestamp::now(),
+                crate::identity::auth::session_group_refresh_interval(),
+            )
+            .then(Vec::new),
         },
     };
     let held = held_groups(recorded, current.as_deref());

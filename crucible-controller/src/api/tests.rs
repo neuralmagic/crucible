@@ -13439,6 +13439,7 @@ async fn launch_draft_with_key(
         crate::identity::auth::AuthMode::Native,
         launch.created_by.as_deref(),
         &launch.launcher_groups,
+        &launch.created_at,
     )
     .await?;
     let resolved = crate::secrets::launch::resolve(
@@ -13796,6 +13797,7 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
         native,
         Some("tibrahim"),
         &recorded,
+        &jiff::Timestamp::now().to_string(),
     )
     .await?;
     assert_eq!(launcher.group_paths().collect::<Vec<_>>(), vec![TEAM_GROUP]);
@@ -13809,6 +13811,7 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
         native,
         Some("tibrahim"),
         &recorded,
+        &jiff::Timestamp::now().to_string(),
     )
     .await?;
     assert_eq!(
@@ -13839,6 +13842,7 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
         native,
         Some("tibrahim"),
         &recorded,
+        &jiff::Timestamp::now().to_string(),
     )
     .await?;
     assert_eq!(launcher.group_paths().count(), 0, "{launcher:?}");
@@ -13849,35 +13853,60 @@ async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
-/// A launcher with no `users` row keeps its recorded groups behind the edge and holds none in
-/// native mode, as does a launch that names no launcher.
+/// A launcher with no `users` row keeps its recorded groups behind the edge. In native mode it keeps
+/// them while the launch is younger than the session group refresh window and holds none after,
+/// as does a launch that names no launcher.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_launcher_with_no_users_row_holds_groups_only_behind_the_edge(
+async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
     pool: PgPool,
 ) -> Result<()> {
     let (db, _d) = db_with(pool.clone());
     let _ = team_secret_drafts(&pool, db, None, &[]).await?;
     let team = [TEAM_GROUP.to_string()];
+    let window =
+        jiff::SignedDuration::try_from(crate::identity::auth::session_group_refresh_interval())?;
+    let now = jiff::Timestamp::now();
+    let young = now.checked_sub(window / 2)?.to_string();
+    let old = now
+        .checked_sub(window + jiff::SignedDuration::from_mins(1))?
+        .to_string();
     let edge = crate::authz::resolve::dispatch_principals(
         &pool,
         None,
         crate::identity::auth::AuthMode::Proxy,
         Some("proxy-user"),
         &team,
+        &old,
     )
     .await?;
     assert!(!edge.teams().is_empty(), "{edge:?}");
-    for login in [Some("proxy-user"), None] {
-        let native = crate::authz::resolve::dispatch_principals(
+    for login in [Some("cli-user"), None] {
+        let fresh = crate::authz::resolve::dispatch_principals(
             &pool,
             None,
             crate::identity::auth::AuthMode::Native,
             login,
             &team,
+            &young,
         )
         .await?;
-        assert_eq!(native.group_paths().count(), 0, "{login:?}: {native:?}");
-        assert!(native.teams().is_empty(), "{login:?}: {native:?}");
+        assert_eq!(
+            fresh.group_paths().collect::<Vec<_>>(),
+            vec![TEAM_GROUP],
+            "{login:?}"
+        );
+        assert!(!fresh.teams().is_empty(), "{login:?}: {fresh:?}");
+        let aged = crate::authz::resolve::dispatch_principals(
+            &pool,
+            None,
+            crate::identity::auth::AuthMode::Native,
+            login,
+            &team,
+            &old,
+        )
+        .await?;
+        assert_eq!(aged.group_paths().count(), 0, "{login:?}: {aged:?}");
+        assert!(aged.teams().is_empty(), "{login:?}: {aged:?}");
     }
     Ok(())
 }

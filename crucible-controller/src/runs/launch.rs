@@ -139,6 +139,7 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
             cfg.auth_mode,
             launch.created_by.as_deref(),
             &launch.launcher_groups,
+            &launch.created_at,
         )
         .await?,
         revision,

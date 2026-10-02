@@ -107,7 +107,7 @@ pub(crate) async fn get_playbook_launch(
 ) -> Result<Option<PlaybookLaunch>> {
     let row = sqlx::query!(
         "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, \
-         launcher_groups, draft_version, exposure FROM playbook_launches WHERE key = $1",
+         launcher_groups, created_at, draft_version, exposure FROM playbook_launches WHERE key = $1",
         key,
     )
     .fetch_optional(pool)
@@ -126,6 +126,7 @@ pub(crate) async fn get_playbook_launch(
         max_time,
         created_by: row.created_by,
         launcher_groups: decode_groups(row.launcher_groups.as_ref()),
+        created_at: row.created_at,
         draft_version: row.draft_version,
         exposure: row
             .exposure
