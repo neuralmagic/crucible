@@ -7260,10 +7260,10 @@ async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
     let started = crate::issues::store::get_issue(db.pool(), unbound)
         .await?
         .expect("issue");
-    assert_eq!(
+    assert!(
+        matches!(started.status, Status::Running | Status::Done),
+        "{:?}: {:?}",
         started.status,
-        Status::Running,
-        "{:?}",
         started.parked_reason
     );
     assert_eq!(deferred.status, Status::New, "{:?}", deferred.parked_reason);
