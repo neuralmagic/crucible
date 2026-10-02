@@ -894,6 +894,16 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         serve_vault.clone(),
         cfg.github_app.clone(),
     );
+    cfg.owner_refresh =
+        match crucible_controller::identity::oidc::credentials::OwnerRefresh::from_env(
+            db.pool().clone(),
+        ) {
+            Ok(refresh) => refresh,
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "no owner group refresh");
+                None
+            }
+        };
     let clusters =
         crucible_controller::runs::clusters::ClusterClients::new(cfg.clusters_dir.clone());
     // Personal dispatch targets are kubeconfig secrets, so they resolve only where the registry

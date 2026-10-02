@@ -180,25 +180,30 @@ pub async fn recorded_principals(
     Ok(crate::authz::model::Principals::new(login, groups).with_teams(teams))
 }
 
-/// A launch's principals at dispatch: the groups it recorded that its launcher's `users` row still
-/// holds under a fresh stamp, and the teams those reach now. A launcher with no `users` row keeps
-/// the recorded groups.
+/// A launch's principals at dispatch: the groups it recorded that its launcher still holds, and the
+/// teams those reach now. What the launcher holds is their stamp while it is fresh, and otherwise
+/// what a refresh of their offline credential answers. A launcher with no `users` row keeps the
+/// recorded groups behind the edge, and holds none in native mode.
 pub async fn dispatch_principals(
     pool: &sqlx::PgPool,
+    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
+    mode: crate::identity::auth::AuthMode,
     login: Option<&str>,
     recorded: &[String],
 ) -> anyhow::Result<crate::authz::model::Principals> {
-    let current = match login {
-        Some(login) => crate::identity::oidc::users::stamped(pool, login)
-            .await?
-            .map(|(_, groups, at)| {
-                crate::identity::oidc::users::fresh_groups(
-                    groups,
-                    at.as_deref(),
-                    jiff::Timestamp::now(),
-                )
-            }),
+    let row = match login {
+        Some(login) => crate::identity::oidc::users::stamped(pool, login).await?,
         None => None,
+    };
+    let current = match row {
+        Some((sub, groups, at)) => Some(
+            crate::identity::oidc::users::current_groups(refresh, &sub, groups, at.as_deref())
+                .await,
+        ),
+        None => match mode {
+            crate::identity::auth::AuthMode::Proxy => None,
+            crate::identity::auth::AuthMode::Native => Some(Vec::new()),
+        },
     };
     let held = held_groups(recorded, current.as_deref());
     recorded_principals(pool, login, &held).await

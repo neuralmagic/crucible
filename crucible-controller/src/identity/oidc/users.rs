@@ -88,8 +88,8 @@ pub async fn record_groups_on(
     Ok(())
 }
 
-/// Drop a subject's stored groups and their stamp, for when the offline credential that answered
-/// for them is refused or revoked. An API key then holds what a session would: nothing.
+/// Stamp a subject's stored groups empty, for when the offline credential that answered for them is
+/// refused, revoked, or gone. An API key then holds what a session would: nothing.
 pub async fn clear_groups_on(
     conn: &mut sqlx::PgConnection,
     sub: &str,
@@ -97,7 +97,7 @@ pub async fn clear_groups_on(
 ) -> anyhow::Result<()> {
     let now = now.to_string();
     sqlx::query!(
-        "UPDATE users SET groups = '[]'::jsonb, groups_at = NULL, updated_at = $2 WHERE sub = $1",
+        "UPDATE users SET groups = '[]'::jsonb, groups_at = $2, updated_at = $2 WHERE sub = $1",
         sub,
         now,
     )
@@ -107,17 +107,36 @@ pub async fn clear_groups_on(
     Ok(())
 }
 
-/// The stored groups a stamp still vouches for: none once the stamp is missing or older than the
-/// window a session re-reads its own groups at.
-pub fn fresh_groups(
-    groups: Vec<String>,
+/// The groups `sub` holds now: the stored ones while their stamp is younger than the window a
+/// session re-reads its own groups at, and past it whatever a refresh of the owner's offline
+/// credential answers. A refusal, no credential, no refresher, or an unreachable issuer is none.
+pub async fn current_groups(
+    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
+    sub: &str,
+    stored: Vec<String>,
     groups_at: Option<&str>,
-    now: jiff::Timestamp,
 ) -> Vec<String> {
+    use crate::identity::oidc::OidcError;
+    use crate::identity::oidc::credentials::RefreshOutcome;
     let window = crate::identity::auth::session_group_refresh_interval();
-    match groups_at {
-        Some(at) if !crate::identity::auth::stale(at, now, window) => groups,
-        _ => Vec::new(),
+    if groups_at.is_some_and(|at| !crate::identity::auth::stale(at, jiff::Timestamp::now(), window))
+    {
+        return stored;
+    }
+    let Some(refresh) = refresh else {
+        return Vec::new();
+    };
+    match refresh.refresh(sub).await {
+        Ok(RefreshOutcome::Claims(claims)) => claims.groups,
+        Ok(RefreshOutcome::Absent) => Vec::new(),
+        Err(OidcError::Rejected(why)) => {
+            tracing::info!(sub, reason = %why, "group refresh refused; no groups");
+            Vec::new()
+        }
+        Err(OidcError::Unavailable(why)) => {
+            tracing::warn!(sub, error = %why, "group refresh failed; no groups for this request");
+            Vec::new()
+        }
     }
 }
 

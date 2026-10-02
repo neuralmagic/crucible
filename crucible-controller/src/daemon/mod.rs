@@ -144,14 +144,7 @@ pub fn assemble(
 
     // The fire-time group refresh's credential. A deployment with no issuer or no mounted key runs
     // the sweep exactly as it did before: on the schedule-row snapshot alone.
-    let owner_refresh =
-        match crate::identity::oidc::credentials::OwnerRefresh::from_env(db.pool().clone()) {
-            Ok(refresh) => refresh,
-            Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "schedules: no fire-time group refresh");
-                None
-            }
-        };
+    let owner_refresh = cfg.owner_refresh.clone();
     let trigger_sweep = |triggers: Vec<Arc<dyn crate::launches::standing::LaunchTrigger>>| {
         crate::launches::standing::TriggerSweep::new(
             db.clone(),

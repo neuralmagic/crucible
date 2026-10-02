@@ -655,7 +655,11 @@ pub(crate) async fn require_auth_or_api_key(
     next: Next,
 ) -> Response {
     if presented_api_key(req.headers()) {
-        return require_api_key(State(both.pool), req, next).await;
+        let keys = KeyGuard {
+            pool: both.pool,
+            refresh: both.guard.refresh.clone(),
+        };
+        return require_api_key(State(keys), req, next).await;
     }
     require_auth(State(both.guard), req, next).await
 }
@@ -670,6 +674,14 @@ fn presented_api_key(headers: &header::HeaderMap) -> bool {
         .is_some_and(crate::identity::api_key::looks_like_key)
 }
 
+/// What [`require_api_key`] checks a key against: the pool it is stored in, and the offline
+/// credential its owner's stale groups are re-read through.
+#[derive(Clone)]
+pub struct KeyGuard {
+    pub(crate) pool: sqlx::PgPool,
+    pub(crate) refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
+}
+
 /// Middleware: admit a request only on an API key its owner minted.
 ///
 /// Deliberately not part of [`require_auth`]. The surfaces this guards are reached by agents
@@ -682,7 +694,7 @@ fn presented_api_key(headers: &header::HeaderMap) -> bool {
 /// What it stamps is what every handler already reads, so nothing downstream needs to know an API
 /// key was involved: the owner's login, their subject, and the groups their `users` row holds.
 pub async fn require_api_key(
-    State(pool): State<sqlx::PgPool>,
+    State(KeyGuard { pool, refresh }): State<KeyGuard>,
     mut req: Request,
     next: Next,
 ) -> Response {
@@ -695,13 +707,14 @@ pub async fn require_api_key(
     let Some(presented) = presented else {
         return key_refused("this surface needs an api key as its bearer");
     };
-    let authenticated = match crate::identity::api_key::verify(&pool, presented).await {
-        Ok(authenticated) => authenticated,
-        Err(refusal) => {
-            tracing::debug!(reason = %refusal, "api key refused");
-            return key_refused(&refusal.to_string());
-        }
-    };
+    let authenticated =
+        match crate::identity::api_key::verify(&pool, refresh.as_deref(), presented).await {
+            Ok(authenticated) => authenticated,
+            Err(refusal) => {
+                tracing::debug!(reason = %refusal, "api key refused");
+                return key_refused(&refusal.to_string());
+            }
+        };
 
     // The client wrote no identity that survives: every X-Auth-Request-* header goes, exactly as
     // native mode drops them, so the key is the only thing naming this caller.

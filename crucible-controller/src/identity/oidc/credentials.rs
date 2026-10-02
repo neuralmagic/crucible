@@ -312,6 +312,15 @@ pub enum RefreshOutcome {
     Absent,
 }
 
+impl std::fmt::Debug for OwnerRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OwnerRefresh")
+            .field("issuer", &self.provider.cfg().issuer)
+            .field("keys", &self.keys)
+            .finish_non_exhaustive()
+    }
+}
+
 impl OwnerRefresh {
     pub fn new(pool: PgPool, provider: Arc<OidcProvider>, keys: Arc<CredentialKeys>) -> Self {
         OwnerRefresh {
@@ -445,7 +454,7 @@ impl OwnerRefresh {
 }
 
 /// Take the per-subject credential lock for the rest of `tx`.
-async fn lock(tx: &mut PgConnection, sub: &str) -> sqlx::Result<()> {
+pub(crate) async fn lock(tx: &mut PgConnection, sub: &str) -> sqlx::Result<()> {
     sqlx::query("SELECT pg_advisory_xact_lock($1, hashtext($2))")
         .bind(CREDENTIAL_LOCK_CLASS)
         .bind(sub)
@@ -569,6 +578,13 @@ mod tests {
         (groups.0, at)
     }
 
+    /// The subject's row holds no groups, stamped as the issuer's current answer.
+    async fn assert_cleared(pool: &PgPool, sub: &str) {
+        let (groups, at) = stored_groups(pool, sub).await;
+        assert!(groups.is_empty(), "{groups:?}");
+        assert!(at.is_some(), "an empty answer is stamped like any other");
+    }
+
     /// A successful refresh stamps the groups the issuer's signed ID token carried on the owner's
     /// row, replacing what was there, and stores the rotated token.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -617,7 +633,7 @@ mod tests {
             matches!(&err, OidcError::Rejected(why) if why.contains("sub-mallory")),
             "{err:?}"
         );
-        assert_eq!(stored_groups(&pool, "sub-alice").await, (Vec::new(), None));
+        assert_cleared(&pool, "sub-alice").await;
         assert_eq!(
             stored_groups(&pool, "sub-mallory").await.0,
             vec!["/groups/mallory".to_string()],
@@ -666,7 +682,7 @@ mod tests {
             take(&pool, &keys, "sub-alice").await.expect("take"),
             Some("offline".to_string())
         );
-        assert_eq!(stored_groups(&pool, "sub-alice").await, (Vec::new(), None));
+        assert_cleared(&pool, "sub-alice").await;
         assert_eq!(
             stored_groups(&pool, "sub-bob").await.0,
             vec!["/groups/bob".to_string()]
@@ -841,11 +857,7 @@ mod tests {
             .expect("the row stays so its owner can read why");
         assert_eq!(status.failures, 1);
         assert!(status.last_error.is_some());
-        assert_eq!(
-            stored_groups(&pool, "sub-alice").await,
-            (Vec::new(), None),
-            "a refused credential answers for no groups"
-        );
+        assert_cleared(&pool, "sub-alice").await;
     }
 
     /// No credential at all is neither an error nor a refusal: it is the shape a deployment whose
@@ -862,7 +874,7 @@ mod tests {
             RefreshOutcome::Absent
         );
         assert_eq!(status(&pool, "sub-alice").await.expect("status"), None);
-        assert_eq!(stored_groups(&pool, "sub-alice").await, (Vec::new(), None));
+        assert_cleared(&pool, "sub-alice").await;
     }
 
     /// Wait until a backend in this database is blocked on `wait_event`, running `query_prefix`.
@@ -912,7 +924,7 @@ mod tests {
             flight.await.expect("join").expect("refresh"),
             RefreshOutcome::Absent
         );
-        assert_eq!(stored_groups(&pool, "sub-alice").await, (Vec::new(), None));
+        assert_cleared(&pool, "sub-alice").await;
     }
 
     /// A revoke waits for a refresh holding the subject's credential lock, so the two never

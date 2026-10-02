@@ -1004,7 +1004,7 @@ async fn a_credential_refresh_restamps_the_groups_an_api_key_answers_with(pool: 
     let key = crate::identity::api_key::mint(&pool, &sub, "laptop", None)
         .await
         .expect("mint");
-    let before = crate::identity::api_key::verify(&pool, &key.secret)
+    let before = crate::identity::api_key::verify(&pool, None, &key.secret)
         .await
         .expect("verify");
     assert_eq!(before.groups, vec!["/stale-group".to_string()]);
@@ -1017,7 +1017,7 @@ async fn a_credential_refresh_restamps_the_groups_an_api_key_answers_with(pool: 
             _
         ))
     ));
-    let after = crate::identity::api_key::verify(&pool, &key.secret)
+    let after = crate::identity::api_key::verify(&pool, None, &key.secret)
         .await
         .expect("verify");
     assert!(

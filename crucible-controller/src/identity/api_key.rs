@@ -13,7 +13,8 @@
 //! both. Groups are whatever the owner's last sign-in or offline credential refresh stamped on their
 //! `users` row: a key is never more powerful than the person it belongs to, and never fresher than
 //! the issuer's last answer about them. A stamp missing or older than a session's group refresh
-//! window holds no groups, and a refused, revoked, or absent offline credential clears it.
+//! window is re-read through the owner's offline credential, and a refused, revoked, or absent
+//! credential, or an issuer that cannot be reached, holds no groups.
 
 use crate::clock::now_rfc3339;
 use anyhow::{Context, Result};
@@ -151,7 +152,11 @@ pub async fn mint(
 /// An unknown id and a wrong secret answer the same [`KeyRefusal::Unknown`]: telling the two apart
 /// would confirm which ids exist. Expiry and revocation are told apart from both, because their
 /// owner is entitled to know a key of theirs died and how.
-pub async fn verify(pool: &PgPool, presented: &str) -> Result<Authenticated, KeyRefusal> {
+pub async fn verify(
+    pool: &PgPool,
+    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
+    presented: &str,
+) -> Result<Authenticated, KeyRefusal> {
     let Some((id, secret)) = split(presented) else {
         return Err(KeyRefusal::Malformed);
     };
@@ -192,11 +197,13 @@ pub async fn verify(pool: &PgPool, presented: &str) -> Result<Authenticated, Key
         tracing::error!(login = %row.login, error = %e, "unreadable stored groups; treating the key as group-less");
         Vec::new()
     });
-    let groups = crate::identity::oidc::users::fresh_groups(
+    let groups = crate::identity::oidc::users::current_groups(
+        refresh,
+        &row.sub,
         groups,
         row.groups_at.as_deref(),
-        jiff::Timestamp::now(),
-    );
+    )
+    .await;
     Ok(Authenticated {
         id: id.to_string(),
         sub: row.sub,

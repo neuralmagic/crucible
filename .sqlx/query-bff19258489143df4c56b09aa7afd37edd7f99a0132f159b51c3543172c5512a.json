@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users SET groups = '[]'::jsonb, groups_at = $2, updated_at = $2 WHERE sub = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bff19258489143df4c56b09aa7afd37edd7f99a0132f159b51c3543172c5512a"
+}
