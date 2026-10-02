@@ -818,7 +818,7 @@ The engine orders the records by end time, oldest first, and gives a task declar
 records exactly as supplied, less whole records from the oldest end until the compact JSON
 encoding of that object fits `CRUCIBLE_HISTORY_MAX_BYTES` (default 65536), with `k` the number
 removed. A run outside a series gives such a task `{"records": [], "dropped": 0}`. A command or
-evaluate task reads it from `CRUCIBLE_INPUTS`; an agent task reads it in its prompt, inside the
+evaluate task reads it from the inputs file `CRUCIBLE_INPUTS_FILE` names; an agent task reads it in its prompt, inside the
 external-input markers, and never in its upstream-results JSON. `crucible check` prints the
 bound a playbook's run will apply, and refuses a malformed one.
 

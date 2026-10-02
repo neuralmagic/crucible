@@ -333,7 +333,7 @@ pub enum CompileError {
         "argument {argument:?} carries a value supplied from outside the pack. A prompt marks \
          such a span so an agent can tell it from an instruction; nothing else can, so do not \
          build it into {argument:?}. A command or evaluate task reads it as data from the \
-         \"params\" entry of $CRUCIBLE_INPUTS."
+         \"params\" entry of the inputs JSON in $CRUCIBLE_INPUTS_FILE."
     )]
     ExternalOutsidePrompt { argument: String },
     #[error(
