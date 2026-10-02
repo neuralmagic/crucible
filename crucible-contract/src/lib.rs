@@ -18,6 +18,7 @@ pub mod inference;
 pub mod json;
 pub mod link;
 pub mod markers;
+pub mod mcp;
 pub mod outputs;
 pub mod refine;
 pub mod report;

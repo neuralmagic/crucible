@@ -19,6 +19,8 @@ pub(crate) struct FrozenProjection {
     pub(crate) disclosure: Option<crate::exposure::Covered>,
     /// The same resolved bounds the broker is handed, for the two kinds the engine writes itself.
     pub(crate) bounds: Option<crate::outputs::RunBounds>,
+    /// The `[mcp]` servers the run starts.
+    pub(crate) mcp: std::collections::BTreeMap<String, manifest::McpCfg>,
 }
 
 /// Resolve the frozen manifest's output bounds and capability disclosure for a run.
@@ -33,6 +35,7 @@ pub(crate) fn frozen_projection(
         broker_env: broker_bounds_env(&bounds, session_log)?,
         disclosure: Some(crate::exposure::covered(m)),
         bounds: Some(bounds),
+        mcp: m.mcp.clone(),
     })
 }
 
@@ -121,7 +124,7 @@ pub(crate) struct ResourcesWithoutSandbox {
 }
 
 /// Fold a manifest's `[agent]` config onto `Args` and, for the openshell backend, spawn the
-/// provisioning broker. Shared by the single-domain and composite run paths.
+/// provisioning broker and the `[mcp]` servers. Shared by the single-domain and composite run paths.
 pub(crate) fn apply_agent_cfg(
     args: &mut Args,
     agent: &manifest::AgentCfg,
@@ -215,6 +218,12 @@ pub(crate) fn apply_agent_cfg(
             &sandbox_name,
         )
         .context("starting the provisioning broker")?;
+    }
+    args.mcp_scope = agent.mcp.clone();
+    if args.agent_backend == manifest::AgentBackend::Openshell {
+        let vars: Vec<(String, String)> = std::env::vars().collect();
+        args.mcp =
+            crate::control::mcp::start(&frozen.mcp, &vars).context("starting the [mcp] servers")?;
     }
     Ok(())
 }

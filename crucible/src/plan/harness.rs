@@ -696,7 +696,7 @@ pub(crate) enum SandboxError {
 }
 
 /// Point a turn at its named sandbox: the profile's image, its endpoints added to the pack's
-/// egress, and every relayed secret, relay file, and broker it does not list withheld.
+/// egress, and every relayed secret, relay file, broker, and MCP server it does not list withheld.
 pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxError> {
     if args.agent_backend != crate::manifest::AgentBackend::Openshell {
         return Err(SandboxError::NotOpenshell {
@@ -719,6 +719,7 @@ pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxEr
     args.relay
         .retain(|relay| profile.relays.contains(&relay.dest));
     args.broker.enabled &= profile.broker;
+    args.mcp_scope = profile.mcp;
     args.sandbox_image = Some(profile.image.trim().to_string());
     for endpoint in profile.endpoints {
         if !args.openshell.endpoints.contains(&endpoint) {
@@ -1002,6 +1003,7 @@ mod tests {
         .into();
         args.relay = vec![relay(".jira"), relay(".kube/config")];
         args.broker.enabled = true;
+        args.mcp_scope = vec!["jira".into()];
         args.openshell.endpoints = vec!["github.com:443:full".into()];
         args.sandboxes = [
             (
@@ -1011,6 +1013,7 @@ mod tests {
                     secrets: vec!["registry".into()],
                     relays: vec![".kube/config".into()],
                     broker: true,
+                    mcp: vec!["buildit".into()],
                     endpoints: vec![
                         "proxy.golang.org:443:read-only".into(),
                         "github.com:443:full".into(),
@@ -1048,6 +1051,7 @@ mod tests {
         assert_eq!(env_keys(&args), ["REGISTRY_TOKEN", "CLOUD_ML_REGION"]);
         assert_eq!(relay_dests(&args), [".kube/config"]);
         assert!(args.broker.enabled);
+        assert_eq!(args.mcp_scope, ["buildit"]);
         assert_eq!(
             args.openshell.endpoints,
             ["github.com:443:full", "proxy.golang.org:443:read-only"],
@@ -1062,6 +1066,7 @@ mod tests {
         assert_eq!(env_keys(&args), ["CLOUD_ML_REGION"]);
         assert!(relay_dests(&args).is_empty());
         assert!(!args.broker.enabled);
+        assert!(args.mcp_scope.is_empty());
         assert_eq!(args.openshell.endpoints, ["github.com:443:full"]);
     }
 

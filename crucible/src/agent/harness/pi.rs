@@ -16,13 +16,14 @@
 //! the token the metadata emulator serves.
 //!
 //! Pi has no MCP client of its own; the sandbox image carries the `pi-mcp-adapter` extension,
-//! which the turn loads by path when the broker is on ([`MCP_ADAPTER`]) and points at the
-//! broker through a seeded `mcp.json` ([`MCP_CONFIG`]). The agent sees one proxy `mcp` tool
-//! that discovers and calls the broker's tools on demand.
+//! which the turn loads by path when it reaches an MCP server ([`MCP_ADAPTER`]) and points at the
+//! turn's servers through a seeded `mcp.json` ([`MCP_CONFIG`]). The agent sees one proxy `mcp`
+//! tool that discovers and calls their tools on demand.
 
 use crate::agent::harness::{
-    ApiEndpoint, AuthProvider, Backend, Broker, CRUCIBLE_PROVIDER_ID, HarnessSpec, SandboxAuth,
-    SeedFile, StreamDecoder, TranscriptLocator, TurnArtifacts, api_endpoint, json_str,
+    ApiEndpoint, AuthProvider, Backend, CRUCIBLE_PROVIDER_ID, HarnessSpec, McpServer, SandboxAuth,
+    SeedFile, StreamDecoder, TranscriptLocator, TurnArtifacts, api_endpoint, json_servers,
+    json_str,
 };
 use crate::agent::inference::{InferenceEnv, VertexConfig, WireApi};
 use crate::args::Args;
@@ -111,20 +112,20 @@ fn heredoc_delimiter(prompt: &str) -> String {
 pub(crate) const VERTEX_EXTENSION: &str = "/sandbox/.pi/agent/extensions/crucible-vertex.ts";
 
 /// The MCP adapter extension's entry, where the sandbox image's global npm install puts it.
-/// Loaded with `-e` only when the broker is on, so a brokerless turn carries no `mcp` tool.
+/// Loaded with `-e` only when the turn reaches a server, so any other turn carries no `mcp` tool.
 pub(crate) const MCP_ADAPTER: &str = "/usr/local/lib/node_modules/pi-mcp-adapter/index.ts";
 
-/// The adapter's Pi-owned config under the relocated agent dir: the broker as one remote
-/// server, its bearer in a header (the per-run token, or the provider placeholder the egress
+/// The adapter's Pi-owned config under the relocated agent dir: one remote server per server in
+/// the turn's scope, each bearer in a header (the token, or the provider placeholder the egress
 /// proxy resolves).
 pub(crate) const MCP_CONFIG: &str = "/sandbox/.pi/agent/mcp.json";
 
-fn mcp_json(broker: &Broker<'_>) -> String {
-    let mut server = json!({ "url": broker.url, "protocolVersion": "auto" });
-    if let Some(token) = broker.token {
-        server["headers"] = json!({ "Authorization": format!("Bearer {token}") });
-    }
-    json!({ "mcpServers": { broker.name: server } }).to_string()
+fn mcp_json(servers: &[McpServer<'_>]) -> String {
+    let servers = json_servers(
+        servers,
+        |s| json!({ "url": s.url, "protocolVersion": "auto" }),
+    );
+    json!({ "mcpServers": servers }).to_string()
 }
 
 /// The Vertex extension, with the turn's project, region, host, and model spliced in as JS
@@ -276,8 +277,8 @@ impl Backend for Pi {
     }
 
     /// No message positional: `--print` reads a piped stdin as the prompt, which the shared exec
-    /// wrapper redirects from the uploaded prompt file. With the broker on, the MCP adapter is
-    /// loaded by path; it reads the seeded [`MCP_CONFIG`] itself.
+    /// wrapper redirects from the uploaded prompt file. With an MCP server in scope, the adapter
+    /// is loaded by path; it reads the seeded [`MCP_CONFIG`] itself.
     fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String> {
         let mut a = Self::base_args(args);
         if mcp_seeded {
@@ -288,11 +289,11 @@ impl Backend for Pi {
     }
 
     /// `models.json` for a keyed endpoint (it is where the `crucible` provider and the model come
-    /// from); a Vertex turn seeds the extension instead. The broker rides [`Backend::mcp_config`].
+    /// from); a Vertex turn seeds the extension instead. MCP servers ride [`Backend::mcp_config`].
     fn config(
         &self,
         args: &Args,
-        _broker: Option<&Broker<'_>>,
+        _servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String> {
         models_json(
@@ -301,10 +302,10 @@ impl Backend for Pi {
         )
     }
 
-    /// The broker as the adapter's one remote server.
-    fn mcp_config(&self, broker: &Broker<'_>) -> Option<SeedFile> {
+    /// The turn's servers as the adapter's remote servers.
+    fn mcp_config(&self, servers: &[McpServer<'_>]) -> Option<SeedFile> {
         Some(SeedFile {
-            content: mcp_json(broker),
+            content: mcp_json(servers),
             dest: MCP_CONFIG,
         })
     }
@@ -521,16 +522,18 @@ mod tests {
 
     fn seed_files(
         args: &Args,
-        broker_url: Option<&str>,
+        servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
-        Pi.seed_files(
-            args,
-            broker_url,
-            Some("tok"),
-            &SandboxAuth::ApiKey,
-            inference,
-        )
+        Pi.seed_files(args, servers, &SandboxAuth::ApiKey, inference)
+    }
+
+    fn server<'a>(name: &'a str, token: Option<&'a str>) -> McpServer<'a> {
+        McpServer {
+            name,
+            url: "http://10.0.0.1:8000/mcp",
+            token,
+        }
     }
 
     fn custom_endpoint() -> InferenceEnv {
@@ -562,13 +565,13 @@ mod tests {
         assert_eq!(
             sandbox.len(),
             PREFIX.len() + 1,
-            "no message positional: stdin carries it; no broker, no adapter"
+            "no message positional: stdin carries it; no server, no adapter"
         );
 
-        // With the broker on, the MCP adapter is loaded by its image path.
-        let with_broker = Pi.sandbox_argv(&a, true);
-        assert_eq!(&with_broker[..sandbox.len()], &sandbox[..]);
-        assert_eq!(&with_broker[sandbox.len()..], &["-e", MCP_ADAPTER]);
+        // With a server in scope, the MCP adapter is loaded by its image path.
+        let with_mcp = Pi.sandbox_argv(&a, true);
+        assert_eq!(&with_mcp[..sandbox.len()], &sandbox[..]);
+        assert_eq!(&with_mcp[sandbox.len()..], &["-e", MCP_ADAPTER]);
 
         a.reasoning_effort = Some(ReasoningEffort::Max);
         let sandbox = Pi.sandbox_argv(&a, false);
@@ -636,13 +639,17 @@ mod tests {
     }
 
     /// A custom OpenAI-speaking endpoint becomes the `crucible` provider on the completions API
-    /// (or responses, per the wire API), keyed off `OPENAI_API_KEY`. The broker rides the
+    /// (or responses, per the wire API), keyed off `OPENAI_API_KEY`. The MCP servers ride the
     /// adapter's `mcp.json`, never `models.json`.
     #[test]
-    fn models_json_registers_a_custom_endpoint_and_the_broker_rides_mcp_json() {
+    fn models_json_registers_a_custom_endpoint_and_the_servers_ride_mcp_json() {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
-        let seeds = seed_files(&a, Some("http://10.0.0.1:8000/mcp"), &custom_endpoint());
+        let seeds = seed_files(
+            &a,
+            &[server("broker", Some("tok")), server("jira", None)],
+            &custom_endpoint(),
+        );
         assert_eq!(seeds.len(), 2, "models.json, then the adapter's mcp.json");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
@@ -654,35 +661,21 @@ mod tests {
         assert!(!seeds[0].content.contains("10.0.0.1"));
         assert_eq!(seeds[1].dest, MCP_CONFIG);
         let m: Value = serde_json::from_str(&seeds[1].content).expect("valid json");
-        let server = &m["mcpServers"][a.broker.name.as_str()];
-        assert_eq!(server["url"], "http://10.0.0.1:8000/mcp");
-        assert_eq!(server["protocolVersion"], "auto");
-        assert_eq!(server["headers"]["Authorization"], "Bearer tok");
+        let names: Vec<&String> = m["mcpServers"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["broker", "jira"]);
+        let broker = &m["mcpServers"]["broker"];
+        assert_eq!(broker["url"], "http://10.0.0.1:8000/mcp");
+        assert_eq!(broker["protocolVersion"], "auto");
+        assert_eq!(broker["headers"]["Authorization"], "Bearer tok");
         assert_eq!(seeds[1].content.matches("Bearer").count(), 1);
-
-        let tokenless = Pi.seed_files(
-            &a,
-            Some("http://10.0.0.1:8000/mcp"),
-            None,
-            &SandboxAuth::ApiKey,
-            &custom_endpoint(),
-        );
-        let m: Value = serde_json::from_str(&tokenless[1].content).expect("valid json");
-        assert_eq!(
-            m["mcpServers"][a.broker.name.as_str()]["protocolVersion"],
-            "auto"
-        );
-        assert!(
-            m["mcpServers"][a.broker.name.as_str()]
-                .get("headers")
-                .is_none()
-        );
+        assert_eq!(m["mcpServers"]["jira"]["protocolVersion"], "auto");
+        assert!(m["mcpServers"]["jira"].get("headers").is_none());
 
         let responses = InferenceEnv {
             wire_api: Some(WireApi::Responses),
             ..custom_endpoint()
         };
-        let seeds = seed_files(&a, None, &responses);
+        let seeds = seed_files(&a, &[], &responses);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         assert_eq!(v["providers"]["crucible"]["api"], "openai-responses");
     }
@@ -695,7 +688,7 @@ mod tests {
             anthropic_base_url: Some("https://claude.corp".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, None, &inference);
+        let seeds = seed_files(&a, &[], &inference);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["providers"]["crucible"];
         assert_eq!(p["api"], "anthropic-messages");
@@ -714,13 +707,7 @@ mod tests {
             ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
             ("CLOUD_ML_REGION".into(), "us-east5".into()),
         ];
-        let seeds = Pi.seed_files(
-            &a,
-            None,
-            None,
-            &SandboxAuth::Gateway,
-            &InferenceEnv::default(),
-        );
+        let seeds = Pi.seed_files(&a, &[], &SandboxAuth::Gateway, &InferenceEnv::default());
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].dest, VERTEX_EXTENSION);
         assert!(VERTEX_EXTENSION.starts_with("/sandbox/.pi/agent/extensions/"));
@@ -740,17 +727,11 @@ mod tests {
 
         // A model name is a JS string literal, so a quote in it cannot break out.
         a.model = Some("odd\"name".to_string());
-        let seeds = Pi.seed_files(
-            &a,
-            None,
-            None,
-            &SandboxAuth::Gateway,
-            &InferenceEnv::default(),
-        );
+        let seeds = Pi.seed_files(&a, &[], &SandboxAuth::Gateway, &InferenceEnv::default());
         assert!(seeds[0].content.contains("const MODEL = \"odd\\\"name\";"));
 
         // A keyed turn seeds no extension.
-        let keyed = seed_files(&a, None, &custom_endpoint());
+        let keyed = seed_files(&a, &[], &custom_endpoint());
         assert_eq!(keyed.len(), 1);
         assert_eq!(keyed[0].dest, CONFIG);
     }

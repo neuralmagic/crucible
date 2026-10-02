@@ -15,8 +15,8 @@
 //! reaches the metadata emulator like claude's does.
 
 use crate::agent::harness::{
-    ApiEndpoint, AuthProvider, Backend, Broker, CRUCIBLE_PROVIDER_ID, HarnessSpec, StreamDecoder,
-    TranscriptLocator, TurnArtifacts, api_endpoint, json_str,
+    ApiEndpoint, AuthProvider, Backend, CRUCIBLE_PROVIDER_ID, HarnessSpec, McpServer,
+    StreamDecoder, TranscriptLocator, TurnArtifacts, api_endpoint, json_servers, json_str,
 };
 use crate::agent::inference::{InferenceEnv, WireApi};
 use crate::args::Args;
@@ -128,9 +128,9 @@ fn local_export_path() -> std::path::PathBuf {
 
 /// Render `opencode.json`: every permission allowed, the turn's model under its provider (a
 /// keyed endpoint as `crucible`: the URL, its API family, and the env var the key is read from;
-/// Vertex as opencode's own provider carrying the project and region), and the broker as a
-/// remote MCP server when it is on.
-fn config_json(model: &str, endpoint: &ApiEndpoint, broker: Option<&Broker<'_>>) -> String {
+/// Vertex as opencode's own provider carrying the project and region), and each of the turn's MCP
+/// servers as a remote server.
+fn config_json(model: &str, endpoint: &ApiEndpoint, servers: &[McpServer<'_>]) -> String {
     let keyed = |npm: &str, base_url: &str, key_env: &str| {
         json!({
             "npm": npm,
@@ -175,12 +175,11 @@ fn config_json(model: &str, endpoint: &ApiEndpoint, broker: Option<&Broker<'_>>)
         "permission": { "*": "allow" },
         "provider": { provider_id: provider },
     });
-    if let Some(b) = broker {
-        let mut server = json!({ "type": "remote", "url": b.url, "enabled": true });
-        if let Some(t) = b.token {
-            server["headers"] = json!({ "Authorization": format!("Bearer {t}") });
-        }
-        cfg["mcp"] = json!({ b.name: server });
+    if !servers.is_empty() {
+        cfg["mcp"] = json_servers(
+            servers,
+            |s| json!({ "type": "remote", "url": s.url, "enabled": true }),
+        );
     }
     cfg.to_string()
 }
@@ -213,13 +212,13 @@ impl Backend for OpenCode {
     fn config(
         &self,
         args: &Args,
-        broker: Option<&Broker<'_>>,
+        servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Option<String> {
         Some(config_json(
             args.model(),
             &api_endpoint(args.model(), inference, &args.env),
-            broker,
+            servers,
         ))
     }
 
@@ -462,17 +461,10 @@ mod tests {
 
     fn seed_files(
         args: &Args,
-        broker_url: Option<&str>,
-        broker_token: Option<&str>,
+        servers: &[McpServer<'_>],
         inference: &InferenceEnv,
     ) -> Vec<SeedFile> {
-        OpenCode.seed_files(
-            args,
-            broker_url,
-            broker_token,
-            &SandboxAuth::ApiKey,
-            inference,
-        )
+        OpenCode.seed_files(args, servers, &SandboxAuth::ApiKey, inference)
     }
 
     fn custom_endpoint() -> InferenceEnv {
@@ -521,13 +513,7 @@ mod tests {
             ("ANTHROPIC_VERTEX_PROJECT_ID".into(), "proj-x".into()),
             ("CLOUD_ML_REGION".into(), "us-east5".into()),
         ];
-        let seeds = OpenCode.seed_files(
-            &a,
-            None,
-            None,
-            &SandboxAuth::Gateway,
-            &InferenceEnv::default(),
-        );
+        let seeds = OpenCode.seed_files(&a, &[], &SandboxAuth::Gateway, &InferenceEnv::default());
         assert_eq!(seeds.len(), 1);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         assert_eq!(v["model"], "google-vertex-anthropic/claude-sonnet-5");
@@ -608,7 +594,7 @@ mod tests {
     fn config_registers_a_custom_endpoint_as_the_crucible_provider() {
         let mut a = args();
         a.model = Some("qwen-3-8-27b".to_string());
-        let seeds = seed_files(&a, None, None, &custom_endpoint());
+        let seeds = seed_files(&a, &[], &custom_endpoint());
         assert_eq!(
             seeds.len(),
             1,
@@ -636,7 +622,7 @@ mod tests {
             openai_key: Some("sk-oa".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, None, None, &key_only);
+        let seeds = seed_files(&a, &[], &key_only);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["provider"]["crucible"];
         assert_eq!(
@@ -654,7 +640,7 @@ mod tests {
             anthropic_key: Some("sk-ant".into()),
             ..Default::default()
         };
-        let seeds = seed_files(&a, None, None, &inference);
+        let seeds = seed_files(&a, &[], &inference);
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
         let p = &v["provider"]["crucible"];
         assert_eq!(p["npm"], "@ai-sdk/anthropic");
@@ -664,29 +650,33 @@ mod tests {
     }
 
     #[test]
-    fn config_merges_the_broker_as_a_remote_mcp_server_with_a_bearer_header() {
+    fn config_lists_exactly_the_turns_servers_as_remote_mcp_servers() {
         let a = args();
         let seeds = seed_files(
             &a,
-            Some("http://10.0.0.1:8000/mcp"),
-            Some("tok\"quoted"),
+            &[
+                McpServer {
+                    name: "broker",
+                    url: "http://10.0.0.1:8000/mcp",
+                    token: Some("tok\"quoted"),
+                },
+                McpServer {
+                    name: "jira",
+                    url: "http://10.0.0.1:8001/mcp",
+                    token: None,
+                },
+            ],
             &custom_endpoint(),
         );
         let v: Value = serde_json::from_str(&seeds[0].content).expect("valid json");
-        let server = &v["mcp"][a.broker.name.as_str()];
+        let names: Vec<&String> = v["mcp"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["broker", "jira"]);
+        let server = &v["mcp"]["broker"];
         assert_eq!(server["type"], "remote");
         assert_eq!(server["url"], "http://10.0.0.1:8000/mcp");
         assert_eq!(server["enabled"], true);
         assert_eq!(server["headers"]["Authorization"], "Bearer tok\"quoted");
-
-        let bare = seed_files(
-            &a,
-            Some("http://10.0.0.1:8000/mcp"),
-            None,
-            &custom_endpoint(),
-        );
-        let v: Value = serde_json::from_str(&bare[0].content).expect("valid json");
-        assert!(v["mcp"][a.broker.name.as_str()].get("headers").is_none());
+        assert!(v["mcp"]["jira"].get("headers").is_none());
     }
 
     const EXPORT_FIXTURE: &[u8] = include_bytes!("../../testdata/opencode_export_fixture.json");

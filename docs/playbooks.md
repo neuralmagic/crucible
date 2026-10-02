@@ -225,6 +225,7 @@ image = "ghcr.io/acme/sandbox-go@sha256:..."
 secrets = []                                  # [[secret]] names with an env projection
 relays = []                                   # [[agent.relay]] destinations
 broker = false                                # reach the [agent.broker]
+mcp = []                                      # [mcp] servers this sandbox reaches
 endpoints = ["proxy.golang.org:443:read-only"]
 ```
 
@@ -233,13 +234,38 @@ analyze = agent(name = "analyze", prompt = "...", sandbox = "go")
 ```
 
 The turn starts from that image and adds those endpoints to `[agent.openshell]`'s. Of the pack's
-declared secrets and relay files it receives only the ones listed, and it reaches the broker only
-when `broker = true`. The deployment's own model credentials still reach every turn. A task
+declared secrets, relay files, and `[mcp]` servers it receives only the ones listed, and it
+reaches the broker only when `broker = true`. The deployment's own model credentials still reach every turn. A task
 without `sandbox` runs in `sandbox_image` with every declared secret and relay. Tasks that
 share a session must share a sandbox. A sandbox limits what the engine provisions, not what a task
 reads from upstream: output, files, and workspace changes from a task that held a secret still
 reach the tasks after it. The capability disclosure lists each sandbox, and the controller
 checks each sandbox image against the catalog at launch.
+
+## MCP servers
+
+Under `openshell`, a pack can start MCP servers on the loop pod for tools that hold credentials
+the sandbox must not:
+
+```toml
+[mcp.buildit]
+bin = "/usr/local/bin/buildit"
+args = ["mcp"]
+env = { BUILDIT_NAMESPACE = "builds" }        # set on the server
+inherit = ["KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"]  # copied from the loop pod
+tools = ["build", "run", "logs"]              # passed as MCP_TOOLS
+
+[agent]
+mcp = ["buildit"]                             # turns without a named sandbox
+```
+
+A turn reaches only the servers its scope names: `[agent].mcp`, or the `mcp` of the named sandbox
+it runs in. The default is none, and the turn's harness config lists exactly those servers.
+Each server runs as its own process on its own port, from 8850 in key order, with only `PATH`,
+`HOME`, its `env` and `inherit` names, and `MCP_NAME`, `MCP_BIND`, `MCP_TOKENS_FILE` and
+`MCP_TOOLS`. Every turn gets a fresh token per server, written to `MCP_TOKENS_FILE` with the
+turn's sandbox and workdir ([format](crucible-contract.md#62-mcp-token-file-mcp_tokens_file)) and
+revoked when the sandbox is deleted, so the server knows who is calling from the token alone.
 
 ## Parameters
 

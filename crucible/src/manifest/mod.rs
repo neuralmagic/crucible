@@ -7,6 +7,7 @@ mod broker;
 mod capability;
 mod deploy;
 mod judge;
+pub mod mcp;
 mod measure;
 mod openshell;
 pub mod outputs;
@@ -25,6 +26,7 @@ pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broke
 pub use capability::{CapabilitiesCfg, CredentialContext};
 pub use deploy::DeployCfg;
 pub use judge::JudgeCfg;
+pub use mcp::McpCfg;
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
@@ -313,6 +315,9 @@ pub struct Manifest {
     /// Declared credentials, the half of the capability disclosure a name alone cannot state.
     #[serde(default)]
     pub capabilities: CapabilitiesCfg,
+    /// MCP servers by `[mcp.<key>]`, started on the loop pod.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpCfg>,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -744,6 +749,9 @@ pub struct AgentCfg {
     /// The loop-pod provisioning broker. Off unless a domain opts in.
     #[serde(default)]
     pub broker: BrokerCfg,
+    /// The `[mcp]` servers turns without a named sandbox reach. Empty reaches none.
+    #[serde(default)]
+    pub mcp: Vec<String>,
     /// Named sandboxes, by `[agent.sandbox.<name>]`. An `agent(sandbox = "<name>")` task runs in
     /// that sandbox instead of the defaults above.
     #[serde(default)]
@@ -769,6 +777,9 @@ pub struct SandboxProfile {
     /// Whether the turn reaches the `[agent.broker]`.
     #[serde(default)]
     pub broker: bool,
+    /// The `[mcp]` servers the turn reaches. Empty reaches none.
+    #[serde(default)]
+    pub mcp: Vec<String>,
     /// `host:port[:access...]` entries added to the pack's egress allowlist.
     #[serde(default)]
     pub endpoints: Vec<String>,
@@ -787,12 +798,7 @@ fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), Ma
         });
     }
     for (name, profile) in &agent.sandbox {
-        let valid_name = !name.is_empty()
-            && name.len() <= 64
-            && name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_');
-        if !valid_name {
+        if !plain_name(name) {
             return Err(ManifestError::SandboxName { name: name.clone() });
         }
         if profile.image.trim().is_empty() {
@@ -819,6 +825,15 @@ fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), Ma
         }
     }
     Ok(())
+}
+
+/// 1 to 64 characters of `[a-z0-9_-]`.
+pub(crate) fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
 fn validate_task_sandboxes(agent: &AgentCfg, workflow: &WorkflowCfg) -> Result<(), ManifestError> {
@@ -902,6 +917,7 @@ struct CommonCfg<'a> {
     secrets: &'a [SecretDecl],
     outputs: &'a OutputsCfg,
     capabilities: &'a CapabilitiesCfg,
+    mcp: &'a BTreeMap<String, McpCfg>,
 }
 
 fn validate_common(c: CommonCfg<'_>) -> Result<()> {
@@ -912,6 +928,7 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     validate_artifacts(&c.workspace.artifact)?;
     validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
     validate_sandboxes(c.agent, c.secrets)?;
+    mcp::validate(c.mcp, c.agent)?;
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
@@ -1069,6 +1086,7 @@ impl Manifest {
             secrets: &self.secrets,
             outputs: &self.outputs,
             capabilities: &self.capabilities,
+            mcp: &self.mcp,
         })
     }
 
@@ -1232,6 +1250,9 @@ pub struct CompositeManifest {
     /// Declared credentials, the half of the capability disclosure a name alone cannot state.
     #[serde(default)]
     pub capabilities: CapabilitiesCfg,
+    /// MCP servers by `[mcp.<key>]`, started on the loop pod.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpCfg>,
 }
 
 #[derive(Deserialize)]
@@ -1341,6 +1362,7 @@ impl CompositeManifest {
             secrets: &self.secrets,
             outputs: &self.outputs,
             capabilities: &self.capabilities,
+            mcp: &self.mcp,
         })
     }
 

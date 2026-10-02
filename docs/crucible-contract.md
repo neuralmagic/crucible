@@ -712,6 +712,21 @@ endpoint is appended regardless of `inherit_defaults`, because the broker is eng
 the domain opted into, not a built-in the domain can subtract. A broker-less opt-out with both
 lists empty is still a legal total air-gap: nothing resolves, and no binary may open a socket.
 
+### 6.2 MCP token file (`MCP_TOKENS_FILE`)
+
+An `[mcp]` server authenticates sandboxes against the file `MCP_TOKENS_FILE` names. The engine
+replaces it by rename on every grant and revoke; the server re-reads it on every request. One line
+per sandbox, fields separated by whitespace:
+
+```text
+<token> <sandbox> <workdir>
+```
+
+`<token>` is the bearer the sandbox's requests carry, `<sandbox>` the gateway's name for the
+sandbox, and `<workdir>` the absolute path its agent runs in (`/sandbox/workspace` for a loop
+turn, `/sandbox/task-<sha256>` for an isolated plan task). A two-field `<token> <sandbox>` line
+parses with the workdir unknown. A request whose bearer is in no line gets 401.
+
 ---
 
 ## 7. Session wire format (compatibility)

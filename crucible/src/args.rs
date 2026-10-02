@@ -101,6 +101,12 @@ pub(crate) struct Args {
     /// the sandbox's `.mcp.json` headers. Runtime state rather than config, so there is no CLI flag.
     #[arg(skip)]
     pub broker_token: Option<String>,
+    /// The run's started `[mcp]` servers. Runtime state, so no CLI flag.
+    #[arg(skip)]
+    pub mcp: Vec<crate::control::mcp::Server>,
+    /// The `[mcp]` keys the turn about to run reaches. No CLI flag.
+    #[arg(skip)]
+    pub mcp_scope: Vec<String>,
     /// The named sandboxes a task may run in (from `[agent.sandbox]`). No CLI flag.
     #[arg(skip)]
     pub sandboxes: std::collections::BTreeMap<String, manifest::SandboxProfile>,

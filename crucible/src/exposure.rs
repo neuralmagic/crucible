@@ -35,6 +35,8 @@ pub enum Capability {
     Relay { path: String, sources: Vec<String> },
     /// A broker binary the pack substitutes for the engine's own.
     BrokerBin { bin: String },
+    /// An `[mcp]` server the run starts on the loop pod, and its binary.
+    McpServer { name: String, bin: String },
     /// Whether the pack runs commands outside the sandbox, which hold their executor's reach.
     ExternalCommands { present: bool },
     /// A named `[agent.sandbox]` and what it provisions: its image, the declared secrets and
@@ -99,7 +101,7 @@ pub fn resolved_outputs(m: &Manifest, pr_repo: Option<&str>) -> ResolvedOutputs 
 }
 
 /// Every disclosed capability, in a stable order: egress, credentials, relays, broker
-/// substitution, then the external-command statement.
+/// substitution, MCP servers, then the external-command statement.
 pub fn capabilities(m: &Manifest) -> Vec<Capability> {
     let mut out = egress(m);
     out.extend(credentials(&m.agent.env, &m.capabilities));
@@ -112,11 +114,21 @@ pub fn capabilities(m: &Manifest) -> Vec<Capability> {
             bin: m.agent.broker.bin.clone(),
         });
     }
+    out.extend(mcp_servers(&m.mcp));
     if runs_external_commands(m) {
         out.push(Capability::ExternalCommands { present: true });
     }
     out.extend(sandboxes(&m.agent));
     out
+}
+
+fn mcp_servers(
+    table: &std::collections::BTreeMap<String, crate::manifest::McpCfg>,
+) -> impl Iterator<Item = Capability> + '_ {
+    table.iter().map(|(name, cfg)| Capability::McpServer {
+        name: name.clone(),
+        bin: cfg.bin.clone(),
+    })
 }
 
 fn sandboxes(agent: &crate::manifest::AgentCfg) -> impl Iterator<Item = Capability> + '_ {
@@ -143,12 +155,14 @@ fn sandboxes(agent: &crate::manifest::AgentCfg) -> impl Iterator<Item = Capabili
 pub fn composite_capabilities(
     agent: &crate::manifest::AgentCfg,
     declared: &CapabilitiesCfg,
+    mcp: &std::collections::BTreeMap<String, crate::manifest::McpCfg>,
 ) -> Vec<Capability> {
     let mut out = credentials(&agent.env, declared);
     out.extend(agent.relay.iter().map(|r| Capability::Relay {
         path: r.dest.clone(),
         sources: relay_sources(r),
     }));
+    out.extend(mcp_servers(mcp));
     out.extend(sandboxes(agent));
     out
 }
@@ -161,7 +175,7 @@ pub fn compute_composite(m: &crate::manifest::CompositeManifest) -> Exposure {
     Exposure {
         version: EXPOSURE_VERSION,
         outputs: crate::manifest::outputs::resolve(&m.outputs, &defaults).outputs,
-        capabilities: composite_capabilities(&m.agent, &m.capabilities),
+        capabilities: composite_capabilities(&m.agent, &m.capabilities, &m.mcp),
     }
 }
 
@@ -431,6 +445,7 @@ fn render_capability(cap: &Capability) -> String {
             format!("relay       {path} from {}", sources.join(", "))
         }
         Capability::BrokerBin { bin } => format!("broker-bin  {bin}"),
+        Capability::McpServer { name, bin } => format!("mcp         {name} runs {bin}"),
         Capability::ExternalCommands { present: true } => {
             "external    this pack runs commands outside the sandbox, holding their executor's reach"
                 .to_string()
@@ -634,7 +649,7 @@ mod tests {
     }
 
     #[test]
-    fn relays_and_a_substituted_broker_binary_are_disclosed() {
+    fn relays_a_substituted_broker_binary_and_mcp_servers_are_disclosed() {
         let m = manifest(&format!(
             "{OPENSHELL}
             [[agent.relay]]
@@ -643,6 +658,8 @@ mod tests {
             [agent.broker]
             enabled = true
             bin = \"my-broker\"
+            [mcp.buildit]
+            bin = \"/usr/local/bin/buildit\"
         "
         ));
         let caps = capabilities(&m);
@@ -652,6 +669,10 @@ mod tests {
         }));
         assert!(caps.contains(&Capability::BrokerBin {
             bin: "my-broker".into()
+        }));
+        assert!(caps.contains(&Capability::McpServer {
+            name: "buildit".into(),
+            bin: "/usr/local/bin/buildit".into()
         }));
         assert!(
             caps.iter().any(

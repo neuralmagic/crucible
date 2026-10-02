@@ -226,6 +226,8 @@ pub struct RenderInput<'a> {
     /// (`/sandbox/<basename>`, the openshell driver's upload rule), projected as
     /// BROKER_SANDBOX_WORKDIR so the broker's live-sandbox pull targets the real tree.
     pub workspace_dir: &'a str,
+    /// The `[mcp]` servers the loop pod starts, one ingress port apiece.
+    pub mcp: &'a BTreeMap<String, crate::manifest::McpCfg>,
 }
 
 impl<'a> RenderInput<'a> {
@@ -245,6 +247,7 @@ impl<'a> RenderInput<'a> {
             deploy_targets,
             measure: composite.measure.as_ref(),
             workspace_dir: &composite.workspace.dir,
+            mcp: &composite.mcp,
         })
     }
 
@@ -280,6 +283,7 @@ impl<'a> RenderInput<'a> {
             deploy_targets,
             measure: manifest.measure.as_ref(),
             workspace_dir: &manifest.workspace.dir,
+            mcp: &manifest.mcp,
         }
     }
 }
@@ -1395,9 +1399,9 @@ exit $rc
     /// NetworkPolicy on the loop pod. Under `podman` the sandbox is nested inside the loop pod and
     /// reaches the broker over the pod-internal bridge (traffic a NetworkPolicy never sees), so this
     /// is a pure deny-all-ingress lockdown. Under `kubernetes` the sandbox is a sibling pod, so
-    /// gateway (:17670), broker (:8849), and OTLP collector (:17671) traffic becomes real cluster
-    /// networking. The policy then allows ingress **only** from sandbox pods, **only** on those
-    /// three ports. Sandbox pods are
+    /// gateway (:17670), broker (:8849), OTLP collector (:17671), and `[mcp]` server traffic becomes
+    /// real cluster networking. The policy then allows ingress **only** from sandbox pods, **only**
+    /// on those ports. Sandbox pods are
     /// matched by either identity they may carry: the OpenShell managed-by label (the driver only
     /// stamps it on SPIFFE-enabled pods since the CRD path landed), or the agent-sandbox
     /// controller's name-hash label, which every Sandbox-CR pod gets. Dropping either selector
@@ -1406,6 +1410,13 @@ exit $rc
     /// survives either way. Defense in depth alongside the broker's bearer token. Egress is
     /// untouched (registry, k8s API, forges, Vertex).
     fn netpol(&self) -> networking::NetworkPolicy {
+        let mcp_ports = crate::manifest::mcp::ports(self.input.mcp).map(|(_, port)| {
+            networking::NetworkPolicyPort {
+                port: Some(IntOrString::Int(port.into())),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }
+        });
         let ingress = match self.driver {
             ComputeDriver::Podman => None,
             ComputeDriver::Kubernetes => Some(vec![networking::NetworkPolicyIngressRule {
@@ -1432,30 +1443,35 @@ exit $rc
                         ..Default::default()
                     },
                 ]),
-                ports: Some(vec![
-                    networking::NetworkPolicyPort {
-                        port: Some(IntOrString::Int(GATEWAY_PORT.into())),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    networking::NetworkPolicyPort {
-                        // The manifest's `[agent.broker].bind` port, never a second constant: a
-                        // domain that moves the broker must not silently lose its ingress rule.
-                        port: Some(IntOrString::Int(broker_ingress_port(
-                            &self.input.agent.broker.bind,
-                        ))),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    networking::NetworkPolicyPort {
-                        // The turn's in-process OTLP collector; the agent's exporter posts here
-                        // from the sandbox. Rendered unconditionally: with telemetry off nothing
-                        // listens and the rule is inert.
-                        port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                ]),
+                ports: Some(
+                    vec![
+                        networking::NetworkPolicyPort {
+                            port: Some(IntOrString::Int(GATEWAY_PORT.into())),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                        networking::NetworkPolicyPort {
+                            // The manifest's `[agent.broker].bind` port, never a second constant: a
+                            // domain that moves the broker must not silently lose its ingress rule.
+                            port: Some(IntOrString::Int(broker_ingress_port(
+                                &self.input.agent.broker.bind,
+                            ))),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                        networking::NetworkPolicyPort {
+                            // The turn's in-process OTLP collector; the agent's exporter posts here
+                            // from the sandbox. Rendered unconditionally: with telemetry off nothing
+                            // listens and the rule is inert.
+                            port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                    ]
+                    .into_iter()
+                    .chain(mcp_ports)
+                    .collect(),
+                ),
             }]),
         };
         networking::NetworkPolicy {
@@ -3231,9 +3247,12 @@ mod tests {
     }
 
     fn render_k8s(profile: &DeployProfile) -> String {
-        let manifest = k8s_manifest();
+        render_k8s_manifest(&k8s_manifest(), profile)
+    }
+
+    fn render_k8s_manifest(manifest: &Manifest, profile: &DeployProfile) -> String {
         let dir = std::path::Path::new("/opt/crucible/domains/alpha");
-        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let input = RenderInput::from_manifest(manifest, "alpha").expect("render input");
         render(
             input,
             dir,
@@ -3789,12 +3808,20 @@ mod tests {
     }
 
     /// The NetworkPolicy under kubernetes allows ingress from sandbox pods (the openshell
-    /// managed-by label) on exactly the gateway port (17670), broker port (8849), and OTLP
-    /// collector port (17671).
+    /// managed-by label) on the gateway port (17670), broker port (8849), OTLP collector port
+    /// (17671), and each `[mcp]` server's port.
     #[test]
-    fn kubernetes_netpol_allows_sandbox_ingress_on_three_ports() {
+    fn kubernetes_netpol_allows_sandbox_ingress_on_the_engines_ports() {
         let profile = k8s_profile("");
-        let yaml = render_k8s(&profile);
+        let mut manifest = k8s_manifest();
+        manifest.mcp.insert(
+            "buildit".into(),
+            crate::manifest::McpCfg {
+                bin: "buildit".into(),
+                ..Default::default()
+            },
+        );
+        let yaml = render_k8s_manifest(&manifest, &profile);
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
         let netpol = docs
             .iter()
@@ -3811,7 +3838,6 @@ mod tests {
             netpol.contains("openshell.ai/managed-by: openshell"),
             "sandbox podSelector: {netpol}"
         );
-        // Exactly three ports: gateway (17670), broker (8849), OTLP collector (17671).
         assert!(
             netpol.contains("port: 17670"),
             "gateway port in netpol: {netpol}"
@@ -3823,6 +3849,10 @@ mod tests {
         assert!(
             netpol.contains("port: 17671"),
             "otel collector port in netpol: {netpol}"
+        );
+        assert!(
+            netpol.contains("port: 8850"),
+            "mcp port in netpol: {netpol}"
         );
         // policyTypes still declares Ingress.
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");
