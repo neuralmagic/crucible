@@ -319,6 +319,17 @@ pub(crate) enum AdoptPlaybookOutcome {
     },
 }
 
+/// What adopting a draft launch did, decided under a share lock on the draft version.
+pub(crate) enum AdoptDraftOutcome {
+    Adopted,
+    UnknownDraft,
+    /// The draft was saved between the endpoint's validation and this transaction: `current` is
+    /// the version's schema digest, or the newer version that superseded it.
+    Saved {
+        current: String,
+    },
+}
+
 /// Mint one draft launch. The registry foreign key cannot cover a draft, so this is where the
 /// integrity lives: the draft version the endpoint authorized against is re-read `FOR SHARE`, and
 /// a save that landed in between is the same drift refusal the registered path answers with.
@@ -328,7 +339,7 @@ pub(crate) async fn adopt_draft_launch(
     key: &str,
     launch: &NewPlaybookLaunch<'_>,
     exposure: &crate::playbooks::exposure::Extraction,
-) -> Result<AdoptPlaybookOutcome> {
+) -> Result<AdoptDraftOutcome> {
     let version = launch
         .draft_version
         .context("adopt_draft_launch: a draft launch names its version")?;
@@ -349,21 +360,21 @@ pub(crate) async fn adopt_draft_launch(
     .await
     .context("adopt_draft_launch: re-read the newest version")?;
     let outcome = match current {
-        None => AdoptPlaybookOutcome::UnknownPlaybook,
+        None => AdoptDraftOutcome::UnknownDraft,
         Some(stored) if stored.as_deref() != Some(launch.schema_digest) => {
-            AdoptPlaybookOutcome::SchemaDrifted {
+            AdoptDraftOutcome::Saved {
                 current: stored.unwrap_or_default(),
             }
         }
-        Some(_) if newest != Some(version) => AdoptPlaybookOutcome::SchemaDrifted {
+        Some(_) if newest != Some(version) => AdoptDraftOutcome::Saved {
             current: format!("version {}", newest.unwrap_or_default()),
         },
         Some(_) => {
             if insert_playbook_launch_with(&mut tx, key, launch, exposure).await? {
                 tx.commit().await.context("adopt_draft_launch: commit")?;
-                return Ok(AdoptPlaybookOutcome::Adopted);
+                return Ok(AdoptDraftOutcome::Adopted);
             }
-            AdoptPlaybookOutcome::UnknownPlaybook
+            AdoptDraftOutcome::UnknownDraft
         }
     };
     tx.rollback()

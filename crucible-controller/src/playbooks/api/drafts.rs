@@ -950,22 +950,19 @@ pub(crate) async fn launch_playbook_draft(
         Err(e) => return AppError::from(e).into_response(),
     };
 
-    use crate::launches::store::AdoptPlaybookOutcome;
+    use crate::launches::store::AdoptDraftOutcome;
     match crate::launches::store::adopt_draft_launch(state.db.pool(), &key, &launch, &exposure)
         .await
     {
-        Ok(AdoptPlaybookOutcome::Adopted) => {
+        Ok(AdoptDraftOutcome::Adopted) => {
             if let Err(refusal) =
                 crate::playbooks::api::saver::pin_dispatch(&state, &key, &saver).await
             {
                 return refusal;
             }
         }
-        Ok(AdoptPlaybookOutcome::UnknownPlaybook) => return not_found(format!("no draft {id:?}")),
-        Ok(
-            AdoptPlaybookOutcome::SchemaDrifted { current }
-            | AdoptPlaybookOutcome::Repinned { rev: current },
-        ) => {
+        Ok(AdoptDraftOutcome::UnknownDraft) => return not_found(format!("no draft {id:?}")),
+        Ok(AdoptDraftOutcome::Saved { current }) => {
             return (
                 StatusCode::CONFLICT,
                 Json(ErrorBody::new(format!(
