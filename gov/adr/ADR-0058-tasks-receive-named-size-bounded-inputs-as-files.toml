@@ -1,0 +1,133 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0058"
+title = "Tasks receive named, size-bounded inputs as files"
+status = "proposed"
+date = "2026-10-02"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0002:C-TASK-FILES",
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "RFC-0002:C-PLAYBOOK-RESUME",
+    "RFC-0004:C-CONTRACT-VERSION",
+    "ADR-0027",
+]
+
+[content]
+context = """
+Upstream results reach a task three ways today. None is named by the consumer and only one is bounded.
+
+- Command and evaluate tasks get one JSON object holding every direct dependency's whole output plus the reserved inputs. `ShellRunner` writes it to a temp file named by `CRUCIBLE_INPUTS_FILE` and also sets `CRUCIBLE_INPUTS` when it is at most 64 KiB (crucible/src/plan/runner.rs:24-30, 106-114). The file exists because a command downstream of a 23-instance fan-out failed to spawn with E2BIG: Linux refuses any single environment string over 128 KiB, and the folded fan-out was larger. The file fixes spawn and changes nothing about what is delivered. A consumer that needs one field of one producer still receives and parses everything.
+- Agent tasks get the same object, pretty-printed, inside the prompt (crucible/src/plan/harness.rs:610-629). The sandbox path sends the prompt over stdin (crucible/src/openshell/run.rs:692); the local claude and hermes paths pass it as one argv element (crucible/src/agent/harness/claude.rs:56-59, crucible/src/agent/harness/hermes.rs:107-113), which has the same 128 KiB limit. Every path pays input tokens for every upstream byte on every turn, read or not.
+- Declared files (`emits_files`) are staged read-only under `inputs/<producer>/` for every ancestor (harness.rs:631-665, [[RFC-0002:C-TASK-FILES]]). This is the bulk channel, and its run total is bounded.
+
+Declared JSON fields have names and optional types ([[RFC-0001:C-WORKFLOW]], crucible/src/plan/ir.rs:469-473); nothing bounds their size. A pack with a large shared core and per-component overlays fans out once per component and folds the results into a consumer, so that consumer's input grows with the component count times whatever each instance chose to return.
+
+Constraints on changing this:
+
+- Packs are stored as source, with the controller holding pins ([[ADR-0027]]), and compiled per run (crucible/src/manifest/mod.rs:1095-1119). The registry pins a pack by its source tarball digest (crucible-controller/src/playbooks/registry.rs:715) and a standing launch by its params schema digest (registry.rs:596-601, crucible-controller/src/launches/store.rs:385). Neither covers the compiled plan, so an engine release that changes what an unchanged pack compiles to changes an approved pack's behaviour with no re-approval.
+- Resume recompiles and refuses when the plan digest differs from the one the run started with (crucible/src/plan/resume.rs:32-38, 100-107). An engine upgrade that changes the compiled bytes of an unchanged pack breaks resume of every in-flight run.
+- The plan IR version is a hard 1 (crucible/src/plan/workflow.rs:337-338, refused otherwise at ir.rs:1034-1038). `Task` fields are serde defaults and `Task` does not deny unknown fields (ir.rs:443-501), so an engine that predates a new task field drops it silently.
+- Task names are refused only when empty or bracketed (ir.rs:1072-1080), so any directory name under `inputs/` can be some task's staging directory, and a name containing `/` nests: task `a/b` stages at the same path as task `a`'s declared file `b/...`.
+- Fan-out keys are any non-empty, bracket-free, unique string (crucible/src/plan/exec.rs:1655-1667), `..` and strings containing `/` included."""
+decision = """
+Follow Tekton's split of params, results, workspaces, and artifacts: a task names the small typed values it reads, those travel as files by name, and bulk data travels as declared files.
+
+**Declared inputs.** A task may declare `inputs = {name: "producer.field"}`. Validation refuses an input whose producer is not a direct dependency, declares no emits, or does not declare that field; the input's type is the field's declared type, and an untyped field delivers any JSON. JSON outputs stay on the direct-dependency rule of [[RFC-0002:C-TASK-FILES]]. Input names use the session-name charset (crucible/src/plan/starlark.rs:1604-1610) and may not be a reserved input name (ir.rs:31-40). A task receives no upstream value it did not declare.
+
+**Staging.** Before dispatch the engine writes each input read-only to `inputs/@in/<name>.json`, beside the producer directories `materialize_inputs` already lays down. A mapped producer's fold stages as `inputs/@in/<name>/<key>.json`, one file per instance, with `/`, `%`, and a leading `.` percent-escaped so a key cannot form a path. The reserved inputs a task receives today stage the same way under their own names: `params` for command and evaluate tasks only ([[RFC-0002:C-PLAYBOOK-PARAMS]]), `item`, `history`, `revision`, `kept`, `outcome`. `inputs/@in/index.json` has one entry per input: name, producer, field, attempt, producer status and note, type, size in bytes, sha256, path, and the raw key per instance. An input whose producer did not pass, which only a task joining "settled" can see ([[RFC-0002:C-SETTLED-JOIN]]), has an index entry and no value file. The environment carries `CRUCIBLE_INPUTS_DIR` and neither `CRUCIBLE_INPUTS` nor `CRUCIBLE_INPUTS_FILE`. Under edition 2 a task name is 1 to 64 characters of `[A-Za-z0-9_.-]` not starting with `.`, so `@in` cannot be a producer directory and no name nests.
+
+**Output cap.** Each declared emits field's serialized value is capped at the producer, default 256 KiB, operator-configurable and readable before a run like the file bound in [[RFC-0002:C-TASK-FILES]]. A passing attempt over the cap settles as a measured failure at the producer and is not retried; the note names the field, its size, the cap, and `emits_files` as the place for bulk data. Nothing downstream truncates, because nothing downstream ever sees an oversized value.
+
+**Agent prompts.** The inputs section lists each input by name, type, size, and path, and inlines a value only when it is at most 4 KiB. The agent reads the rest from the files, which reach the sandbox with the workspace as staged files do today. History keeps its marked region.
+
+**Editions and IR versions**, modelled on Rust editions and MSRV:
+
+- A pack opts in with `edition = 2` under `[workflow]`. Absent is edition 1. The edition selects input semantics and nothing else.
+- The compiler emits the lowest IR version that expresses the plan: edition 1 lowers to v1, edition 2 to v2. v2-only fields are skipped when empty and v1 output does not change, so an unchanged source compiles to the same bytes on an engine that knows v2. Source rev, schema digest, and plan digest all stay put: no re-approval, and resume works across the upgrade.
+- An engine runs each version with that version's semantics. v1 is the behaviour after #210: the whole-object JSON in `CRUCIBLE_INPUTS_FILE`, the env copy up to 64 KiB, inline prompts, and the emit cap as a warning event naming field and size. v2 is the above.
+- An engine that predates v2 refuses an edition-2 manifest at parse, because `WorkflowCfg` denies unknown fields (crucible/src/plan/workflow.rs:245-247), and a v2 plan with `UnsupportedVersion`. The version is the gate, not the presence of `inputs`, since an older engine drops an unknown task field instead of refusing it.
+- A run keeps the IR version it started with ([[RFC-0002:C-PLAYBOOK-RESUME]] folds results against the same graph). Resume recompiles the same source to the same version, and the digest check refuses anything else.
+
+**Migration**, after #210:
+
+1. Engine: accept v2 in `Plan::validate`; add `Task.inputs` and its validation, the staging directory and index, `CRUCIBLE_INPUTS_DIR`, and the v2 prompt section. Add a test that every checked-in example pack compiles byte-identical to its output before the change.
+2. Engine: the per-field emit cap, warning under v1 and failing under v2.
+3. DSL: `inputs=` on task constructors, `edition` in `[workflow]`, the edition-2 task-name rule, did-you-mean on input references.
+4. Port one pack with a large shared core and per-component overlays to edition 2, and compare prompt size and per-turn input tokens before and after.
+5. Update dsl-reference, work-graphs, playbooks, and crucible-contract docs, and amend [[RFC-0002:C-SETTLED-JOIN]] and [[RFC-0002:C-PLAYBOOK-PARAMS]] to scope their delivery rules by edition.
+6. Keep v1 while any pack or resumable run uses it. Warning on edition 1 is a later decision."""
+consequences = """
+- A consumer's input is what it named, so a fan-out's width costs a consumer one directory, not one environment string or one prompt.
+- Agent prompts stop growing with upstream output. An agent that needs a large value reads a file, which costs a tool call where it used to cost prompt tokens on every turn.
+- A producer that returns a large blob in a JSON field fails under edition 2 with a note pointing at `emits_files`. Under edition 1 it warns and keeps working.
+- Edition 2 needs a declaration per value read. Every consumer of a pack is rewritten when the pack opts in; nothing is ported implicitly.
+- `index.json` gives a consumer size and digest before it reads, and gives a run record what each task was handed.
+- The engine carries two input paths until no pack or resumable run uses v1. The v1 path is the current code and changes only by gaining the cap warning.
+- Edition 2 rejects task names edition 1 accepts (anything outside `[A-Za-z0-9_.-]`), so a pack renames such tasks when it opts in.
+- A dispatch image older than the edition is refused at parse, not degraded. [[RFC-0004:C-CONTRACT-VERSION]] already keeps dispatch images in step with the linked engine; this adds no second check.
+- The direct-dependency rule for JSON outputs is unchanged. Reading a value from a grandparent still means the parent re-emits it or the producer writes a file."""
+
+[[content.alternatives]]
+text = "Named, typed inputs staged as files with a producer-side emit cap, gated by a pack edition that lowers to the lowest IR version expressing the plan"
+status = "accepted"
+pros = [
+    "A consumer receives only what it declared, so input size tracks what it reads.",
+    "Nothing large crosses argv, the environment, or a prompt.",
+    "Unchanged packs compile byte-identical, so no re-approval and no broken resume.",
+]
+cons = [
+    "Two input paths in the engine until v1 is retired.",
+    "Opting in means declaring every input of every consumer.",
+]
+
+[[content.alternatives]]
+text = "Stop at #210: keep the whole-object file and the bounded env copy"
+status = "rejected"
+pros = ["Already shipped; no pack changes."]
+cons = [
+    "Every consumer still parses every upstream output.",
+    "Agent prompts still inline everything, and the local agent paths still pass the prompt in argv.",
+    "Emit fields stay unbounded.",
+]
+rejection_reason = "It fixes spawn for commands only and leaves size, prompt cost, and the argv path for agents as they are."
+
+[[content.alternatives]]
+text = "Change input delivery for every pack in one engine release, with no edition"
+status = "rejected"
+pros = ["One input path."]
+cons = [
+    "Every pack's compiled plan changes on upgrade, so every in-flight run fails resume with PlanChanged.",
+    "Approved packs change behaviour without a source change or a re-approval.",
+    "Every consumer reading CRUCIBLE_INPUTS breaks at once.",
+]
+rejection_reason = "Breaks running work and approved behaviour in exchange for not carrying v1."
+
+[[content.alternatives]]
+text = "Add inputs as a serde-default task field under IR version 1"
+status = "rejected"
+pros = ["No version bump."]
+cons = ["Task does not deny unknown fields, so an older engine drops inputs and runs the plan with v1 delivery while the author expects v2."]
+rejection_reason = "Silent downgrade on older engines; the version has to be the gate."
+
+[[content.alternatives]]
+text = "Pass large values by reference to an external artifact store (Tekton artifacts, Argo S3 artifacts)"
+status = "rejected"
+pros = ["No size limit on values."]
+cons = [
+    "A new storage dependency for data that already fits emits_files inside the run.",
+    "[[RFC-0002:C-TASK-FILES]] keeps in-run files from becoming a channel between runs; an external store would need the same rule enforced elsewhere.",
+]
+rejection_reason = "emits_files is already the bulk channel inside a run; the gap is naming and bounding, not storage."
+
+[[content.alternatives]]
+text = "Feed a command its inputs on stdin"
+status = "rejected"
+pros = ["No temp files."]
+cons = [
+    "Takes stdin from commands that read their own input.",
+    "Readable once, still the whole object, and does nothing for agent prompts.",
+]
+rejection_reason = "Moves the blob to another stream without making it smaller or named."
