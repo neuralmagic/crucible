@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0059"
 title = "Packs are flattened and stored by tree digest, and may be published to an OCI registry"
-status = "proposed"
+status = "accepted"
 date = "2026-10-03"
 refs = [
     "ADR-0057",

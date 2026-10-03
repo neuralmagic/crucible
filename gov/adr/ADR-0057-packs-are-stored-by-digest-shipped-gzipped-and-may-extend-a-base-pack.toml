@@ -3,8 +3,9 @@
 [govctl]
 id = "ADR-0057"
 title = "Packs are stored by digest, shipped gzipped, and may extend a base pack"
-status = "accepted"
+status = "superseded"
 date = "2026-10-02"
+superseded_by = "ADR-0059"
 refs = [
     "ADR-0009",
     "ADR-0033",
