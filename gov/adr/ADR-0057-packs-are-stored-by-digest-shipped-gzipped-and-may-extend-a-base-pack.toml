@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0057"
 title = "Packs are stored by digest, shipped gzipped, and may extend a base pack"
-status = "proposed"
+status = "accepted"
 date = "2026-10-02"
 refs = [
     "ADR-0009",
@@ -55,7 +55,7 @@ Three changes. They land together because a base pack is a reference by digest, 
 
 **Storage: blobs by digest.** Pack tarballs move to one table keyed by `content_digest`. `playbooks`, `playbook_draft_versions`, `pack_imports`, adopted standing launches, and `pack_tarballs` reference a digest instead of holding bytes; a launch inserts a reference, not a copy. `tar_pack_tree` writes the deterministic tar above, so an unchanged tree keeps its digest across saves. A blob is deleted when no row references it. Every digest column keeps one meaning: SHA-256 of gzip bytes.
 
-**Base packs.** A draft may name a base: a registered pack, pinned at its stored digest. The draft holds only its overlay, and the 128-file and 512 KiB caps apply to the overlay. The composed tree is the base tree with the overlay laid over it. An overlay path that exists in the base replaces it, and the editor lists every replaced path. The overlay may replace `crucible.toml` or inherit it. A base has no base of its own. The base is recorded on the draft version, and on the pack published from it, in a second digest column, `base_digest`, beside the overlay's `tar_digest`. A pack's identity is the pair, and a launch, a standing launch, and a draft-head schedule ([[ADR-0033]]) pin the pair. One function composes the pair into a tree, and draft save, registration, publication, exposure extraction, and dispatch materialization all call it, so every reader sees the same composed tree and delivery stays one key. Moving to a new base is a new draft version with a new pair; nothing follows a base automatically. A base is a registered pack, so it compiles on its own.
+**Base packs.** A draft may name a base: a registered pack, pinned at its stored digest. The draft holds only its overlay, and the 128-file and 512 KiB caps apply to the overlay. The composed tree is the base tree with the overlay laid over it. An overlay path that exists in the base replaces it, and the editor lists every replaced path. The overlay may replace `crucible.toml` or inherit it. A base has no base of its own. The base is recorded on the draft version, and on the pack published from it, in a second digest column, `base_digest`, beside the overlay's `tar_digest`. A pack's identity is the pair. A launch and a standing launch pin the pair, and a draft-head schedule ([[ADR-0033]]) records the head's pair on each launch it creates. One function composes the pair into a tree, and draft save, registration, publication, exposure extraction, and dispatch materialization all call it, so every reader sees the same composed tree and delivery stays one key. Moving to a new base is a new draft version with a new pair; nothing follows a base automatically. A base is a registered pack, so it compiles on its own.
 
 The base is controller metadata, not a manifest key. The engine only ever sees a composed tree, and the manifest is unchanged. Naming a base is a read of that pack under [[RFC-0003:C-READ-SCOPING]].
 
@@ -112,9 +112,7 @@ cons = [
 [[content.alternatives]]
 text = "Ship one pack holding every variant, selected by a launch parameter"
 status = "rejected"
-pros = [
-    "No composition; works for a git-registered pack once delivery is gzipped (297 KiB).",
-]
+pros = ["No composition; works for a git-registered pack once delivery is gzipped (297 KiB)."]
 cons = [
     "157 files is over the 128-file draft cap, and every save carries the whole tree.",
     "One exposure and one approval cover every variant, so a change to one overlay re-approves all of them.",
