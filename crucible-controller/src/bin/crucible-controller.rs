@@ -1155,6 +1155,22 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         return Ok(());
     };
 
+    // Convert legacy pack bytes to stored trees before anything below reads a pack, and rewrite the
+    // pins that still name an old gzip digest. A failure leaves rows on their legacy bytes, which
+    // every reader still falls back to.
+    match crucible_controller::playbooks::pack_migration::convert_pack_trees(db.pool()).await {
+        Ok(report) if report == Default::default() => {}
+        Ok(report) => tracing::info!(
+            converted = report.converted,
+            unconvertible = report.unconvertible,
+            pins_rewritten = report.pins_rewritten,
+            "autopilot: legacy packs converted to stored trees"
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "autopilot: pack tree conversion failed; unconverted packs read their legacy bytes"
+        ),
+    }
     // Re-extract the params schema of every registered playbook whose stored engine pin is not
     // this binary's. Startup, not a discovery tick: the trigger is a new binary. The maintenance
     // advisory lock above is what keeps it single-writer.

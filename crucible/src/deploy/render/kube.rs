@@ -412,16 +412,28 @@ fn pack_configmap(manifest_dir: &Path, name: &str, namespace: &str) -> Result<co
     })
 }
 
-/// The gzipped tar a run receives for the pack at `manifest_dir`: every file
-/// [`collect_pack_files`] returns, in path order, as a regular file with mode 0755, owner 0, and
-/// mtime 0, in a gzip stream with no name or timestamp. The same tree always yields the same bytes,
-/// so the in-process and command-line renders agree and the controller can size a pack before it
-/// is stored.
+/// The gzipped tar a run receives for the pack at `manifest_dir`: [`encode_pack_tarball`] of every
+/// file [`collect_pack_files`] returns. The controller sizes a pack with it before it is stored.
 pub fn pack_delivery_tarball(manifest_dir: &Path) -> Result<Vec<u8>> {
     let files = collect_pack_files(manifest_dir)?;
+    encode_pack_tarball(
+        files
+            .iter()
+            .map(|(rel, bytes)| (rel.as_str(), bytes.as_slice())),
+    )
+}
+
+/// A deterministic gzipped tar of `files`: entries in path order, each a regular file with mode
+/// 0755, owner 0, and mtime 0, in a gzip stream with no name or timestamp. The same files always
+/// yield the same bytes, so the in-process and command-line renders agree.
+pub fn encode_pack_tarball<'a>(
+    files: impl IntoIterator<Item = (&'a str, &'a [u8])>,
+) -> Result<Vec<u8>> {
+    let mut files: Vec<(&str, &[u8])> = files.into_iter().collect();
+    files.sort_by(|a, b| a.0.cmp(b.0));
     let gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(gz);
-    for (rel, bytes) in &files {
+    for (rel, bytes) in files {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
         header.set_size(bytes.len() as u64);
@@ -430,7 +442,7 @@ pub fn pack_delivery_tarball(manifest_dir: &Path) -> Result<Vec<u8>> {
         header.set_gid(0);
         header.set_mtime(0);
         builder
-            .append_data(&mut header, rel, bytes.as_slice())
+            .append_data(&mut header, rel, bytes)
             .with_context(|| format!("adding {rel} to the pack tarball"))?;
     }
     let gz = builder.into_inner().context("finishing the pack tar")?;

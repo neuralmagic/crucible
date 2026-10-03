@@ -431,6 +431,9 @@ mod tests {
             (
                 "0050_task_agent.sql",
                 "b0adbc05a74f871f31b5366b635c213d44fef5133a7c0c66947684efc1a83138",
+            ),            (
+                "0051_pack_trees.sql",
+                "c17905a7e80284c04b2c11eeb11e8b6e43acb4f317bd3e165151c6ee08d3f518",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -927,11 +930,11 @@ mod tests {
             sqlx::Postgres::database_exists(&url).await?,
             "connect creates the database"
         );
-        assert_eq!(crate::schema_version(&pool).await?, 50);
+        assert_eq!(crate::schema_version(&pool).await?, 51);
 
         // Idempotent: re-opening an already-migrated DB is a no-op, not an error.
         let pool2 = connect(&url).await?;
-        assert_eq!(crate::schema_version(&pool2).await?, 50);
+        assert_eq!(crate::schema_version(&pool2).await?, 51);
         pool.close().await;
         pool2.close().await;
         let _ = sqlx::Postgres::drop_database(&url).await;

@@ -67,7 +67,9 @@ impl From<crate::playbooks::packs::ReadTreeError> for DraftError {
             crate::playbooks::packs::ReadTreeError::NotText(rel) => DraftError::Invalid(format!(
                 "{rel} is not text, so it cannot be edited as a draft"
             )),
-            crate::playbooks::packs::ReadTreeError::Io(e) => DraftError::Internal(e),
+            crate::playbooks::packs::ReadTreeError::NotAPack(e) => {
+                DraftError::Invalid(e.to_string())
+            }
         }
     }
 }
