@@ -27,6 +27,10 @@ pub(crate) const MAX_DRAFT_FILES: usize = 128;
 /// How large one draft file may be, before gzip.
 pub(crate) const MAX_DRAFT_FILE_BYTES: usize = 512 * 1024;
 
+/// The largest draft save request body. Above axum's 2 MiB default so a compressible pack under
+/// the delivery budget can be saved.
+pub(crate) const MAX_DRAFT_SAVE_BYTES: usize = 16 * 1024 * 1024;
+
 /// The manifest a draft starts from when no template seeds it.
 const SKELETON_MANIFEST: &str =
     "[agent]\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n";

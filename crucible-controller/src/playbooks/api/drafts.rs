@@ -429,6 +429,8 @@ pub(crate) struct PlaybookLimits {
     max_draft_files: usize,
     /// The largest single draft file, in bytes.
     max_draft_file_bytes: usize,
+    /// The largest draft save request body, in bytes.
+    max_draft_save_bytes: usize,
     /// The most gzipped bytes a pack may deliver to a run. Save, registration, and publication
     /// refuse a pack over it.
     delivery_budget_bytes: usize,
@@ -444,6 +446,7 @@ pub(crate) async fn get_playbook_limits() -> Json<PlaybookLimits> {
     Json(PlaybookLimits {
         max_draft_files: crate::playbooks::drafts::MAX_DRAFT_FILES,
         max_draft_file_bytes: crate::playbooks::drafts::MAX_DRAFT_FILE_BYTES,
+        max_draft_save_bytes: crate::playbooks::drafts::MAX_DRAFT_SAVE_BYTES,
         delivery_budget_bytes: crucible_contract::pack_tree::DELIVERY_BUDGET_BYTES,
     })
 }

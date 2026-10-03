@@ -11,7 +11,7 @@
 use axum::Router;
 use axum::routing::get;
 use utoipa::OpenApi;
-use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouterExt};
 use utoipa_axum::routes;
 
 pub mod state;
@@ -490,7 +490,13 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(
             crate::playbooks::api::drafts::get_playbook_draft_tarball
         ))
-        .routes(routes!(crate::playbooks::api::drafts::save_playbook_draft))
+        .routes(
+            routes!(crate::playbooks::api::drafts::save_playbook_draft).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    crate::playbooks::drafts::MAX_DRAFT_SAVE_BYTES,
+                ),
+            ),
+        )
         .routes(routes!(
             crate::playbooks::api::drafts::launch_playbook_draft
         ))

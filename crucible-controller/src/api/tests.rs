@@ -1,6 +1,6 @@
-use super::*;
 #[cfg(feature = "autoresearch")]
 use crate::api::dto::*;
+use crate::api::*;
 #[cfg(feature = "autoresearch")]
 use crate::builds::model::NewBuild;
 #[cfg(feature = "autoresearch")]
@@ -3267,6 +3267,7 @@ async fn playbook_limits_report_the_draft_caps_and_the_delivery_budget(pool: PgP
         serde_json::json!({
             "max_draft_files": 128,
             "max_draft_file_bytes": 512 * 1024,
+            "max_draft_save_bytes": 16 * 1024 * 1024,
             "delivery_budget_bytes": crucible_contract::pack_tree::DELIVERY_BUDGET_BYTES,
         })
     );
@@ -8593,6 +8594,41 @@ async fn saving_a_draft_returns_the_form_the_graph_or_the_anchored_diagnostic(
         .await
     };
     assert_eq!(escaped.0, StatusCode::UNPROCESSABLE_ENTITY, "{}", escaped.1);
+    Ok(())
+}
+
+/// A save body over axum's 2 MiB default is read when the pack fits the delivery budget; one over
+/// the save cap is refused before it is buffered.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_save_body_is_capped_above_the_axum_default(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let with_filler = |count: usize| {
+        let mut files = draft_files();
+        for i in 0..count {
+            files[format!("filler/{i}.txt")] = serde_json::json!("pack filler\n".repeat(40_000));
+        }
+        serde_json::json!({"files": files})
+    };
+
+    let big = with_filler(8);
+    assert!(serde_json::to_vec(&big)?.len() > 2 * 1024 * 1024);
+    let (status, saved) = post_admin(&app, "/api/playbook-drafts/studio/versions", big).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["version"], 2);
+
+    let huge = with_filler(40);
+    assert!(serde_json::to_vec(&huge)?.len() > crate::playbooks::drafts::MAX_DRAFT_SAVE_BYTES);
+    let (status, _) = post_admin(&app, "/api/playbook-drafts/studio/versions", huge).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
     Ok(())
 }
 
