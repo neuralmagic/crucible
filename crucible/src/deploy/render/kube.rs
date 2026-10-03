@@ -2717,6 +2717,20 @@ mod tests {
         }
     }
 
+    /// A pack holding a symlink is refused at render with the link named, not delivered without it.
+    #[test]
+    fn a_pack_with_a_symlink_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("pack");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        std::os::unix::fs::symlink("crucible.toml", dir.join("link.toml")).expect("symlink");
+
+        let err = pack_configmap(&dir, "cm", "ns").expect_err("symlink");
+
+        assert!(format!("{err:#}").contains("link.toml"), "{err:#}");
+    }
+
     #[test]
     fn avoid_nodes_render_the_notin_affinity_on_every_pod() {
         let manifest: Manifest = toml::from_str(

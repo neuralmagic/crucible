@@ -392,15 +392,21 @@ SHORT="$KEY"
 launch R-long draft-launch "$DRAFT-long"
 LONG="$KEY"
 wait_for 120 "both run pods to be running" pods_in '.status.containerStatuses[]?.state.running' 2
+SHORT_RUN=$(crux playbook-run "$SHORT" | jq -r '.runs[0].run_id')
+LONG_RUN=$(crux playbook-run "$LONG" | jq -r '.runs[0].run_id')
 stop_controller
 log "[R] controller down; waiting for the short run to finish"
 wait_for 60 "the short run's pod to succeed" pods_in '.status.phase == "Succeeded"' 1
 pods_in '.status.containerStatuses[]?.state.running' 1 || fail "[R] the long run finished before the controller came back"
 start_controller
-settle R-short "$SHORT"
-expect_finished R-short
-settle R-long "$LONG"
-expect_finished R-long
+for run in "R-short $SHORT $SHORT_RUN" "R-long $LONG $LONG_RUN"; do
+    read -r label key run_id <<<"$run"
+    settle "$label" "$key"
+    expect_finished "$label"
+    [ "$(jq -r '[.runs[].run_id] | join(" ")' "$WORK/run-$label.json")" = "$run_id" ] ||
+        fail "[$label] expected only run $run_id, got $(jq -c '[.runs[].run_id]' "$WORK/run-$label.json")"
+done
+pass "[R] both runs were collected, not re-dispatched"
 
 # ---- scenario B ----------------------------------------------------------------------------
 stop_controller
