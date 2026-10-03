@@ -448,7 +448,7 @@ pub(crate) async fn list_scopes_for_issue(
 /// new column is a one-line edit here plus [`decode_scope`].
 const SCOPE_COLS: &str = "id, issue, pack_digest, check_outcome, stale, approval_pr, approved_by, \
      approved_at, frozen_issue_hash, stale_comment_id, exposure, exposure_digest, \
-     approved_exposure_digest";
+     approved_exposure_digest, tree_digest";
 
 /// Decode one `scopes` row. Shared by every `scopes` read; these use `sqlx::query` (not the
 /// `query!` macro), so a new column needs no `.sqlx` cache entry, at the cost of compile-time
@@ -471,6 +471,11 @@ fn decode_scope(r: &sqlx::postgres::PgRow) -> Result<Scope> {
             .transpose()?,
         exposure_digest: r.try_get("exposure_digest")?,
         approved_exposure_digest: r.try_get("approved_exposure_digest")?,
+        tree_digest: r
+            .try_get::<Option<String>, _>("tree_digest")?
+            .map(|d| d.parse())
+            .transpose()
+            .map_err(anyhow::Error::msg)?,
     })
 }
 
@@ -822,6 +827,23 @@ pub async fn insert_scope(ex: impl PgExecutor<'_>, s: &NewScope) -> Result<i64> 
     Ok(row.id)
 }
 
+/// Record the stored pack tree a scope froze.
+#[cfg(feature = "autoresearch")]
+#[tracing::instrument(name = "db.set_scope_tree", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
+pub(crate) async fn set_scope_tree(
+    ex: impl PgExecutor<'_>,
+    scope_id: i64,
+    tree: &crucible_contract::pack_tree::TreeDigest,
+) -> Result<()> {
+    sqlx::query("UPDATE scopes SET tree_digest = $2 WHERE id = $1")
+        .bind(scope_id)
+        .bind(tree.as_str())
+        .execute(ex)
+        .await
+        .context("set_scope_tree")?;
+    Ok(())
+}
+
 /// Record the exposure the engine computed from a frozen scope pack.
 #[cfg(feature = "autoresearch")]
 #[tracing::instrument(name = "db.set_scope_exposure", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
@@ -1010,6 +1032,7 @@ pub(crate) async fn adopt_direct_pack(
         },
     )
     .await?;
+    set_scope_tree(&mut *tx, scope_id, launch.tree).await?;
     record_approval(&mut *tx, scope_id, launch.created_by, &now).await?;
     tx.commit()
         .await
@@ -2251,6 +2274,12 @@ pub(crate) mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn direct_pack_adoption_lands_as_an_approved_frozen_scope(pool: PgPool) -> Result<()> {
         let key = "scenario:direct-pack-test";
+        let tree = crucible_contract::pack_tree::PackTree::from_pairs(&[("crucible.toml", b"m")])?;
+        let tree = crate::playbooks::pack_trees::put_tree(
+            &mut *pool.acquire().await?,
+            &crate::playbooks::pack_trees::EncodedPack::new(tree)?,
+        )
+        .await?;
         let scope_id = adopt_direct_pack(
             &pool,
             &crate::issues::model::NewDirectPack {
@@ -2260,6 +2289,7 @@ pub(crate) mod tests {
                 repo: "owner/repo",
                 git_ref: "0123456789abcdef",
                 pack_digest: "sha256:pack",
+                tree: &tree,
                 created_by: "admin",
             },
         )
@@ -2273,6 +2303,7 @@ pub(crate) mod tests {
             .expect("frozen scope");
         assert_eq!(scope.id, scope_id);
         assert_eq!(scope.pack_digest.as_deref(), Some("sha256:pack"));
+        assert_eq!(scope.tree_digest, Some(tree));
         assert_eq!(scope.check_outcome.as_deref(), Some("DIRECT"));
         assert_eq!(scope.approved_by.as_deref(), Some("admin"));
         assert!(scope.approved_at.is_some());

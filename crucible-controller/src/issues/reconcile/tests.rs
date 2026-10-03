@@ -573,6 +573,16 @@ async fn new_with_a_surviving_pack_goes_scoped_with_ledger_and_event(pool: PgPoo
         .expect("scope row");
     assert_eq!(scope.pack_digest.as_deref(), Some("v1:deadbeefcafef00d"));
     assert_eq!(scope.check_outcome.as_deref(), Some("PASS"));
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT tree_digest FROM pack_tarballs WHERE issue_slug = 'owner_repo_1'",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    assert_eq!(
+        scope.tree_digest.map(String::from),
+        stored,
+        "the scope records the tree it froze"
+    );
 
     let report = crate::issues::store::latest_scope_report(db.pool(), "owner/repo#1")
         .await?
@@ -1649,6 +1659,111 @@ async fn approved_pack_with_a_build_blocks_the_run_at_building(pool: PgPool) -> 
         .fetch_one(db.pool())
         .await?;
     assert_eq!(runs.n, 0, "no loop run launched while building");
+    Ok(())
+}
+
+/// A fake run dispatcher that keeps the pack ConfigMaps it was asked to create.
+#[cfg(feature = "autoresearch")]
+#[derive(Default)]
+struct PackCapturingDispatcher {
+    configmaps: std::sync::Mutex<Vec<k8s_openapi::api::core::v1::ConfigMap>>,
+}
+
+#[cfg(feature = "autoresearch")]
+#[async_trait::async_trait]
+impl crate::runs::workpod::PodDispatcher for PackCapturingDispatcher {
+    async fn create(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        mut pod: k8s_openapi::api::core::v1::Pod,
+    ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        pod.metadata.uid = Some("run-pod-uid".to_string());
+        Ok(pod)
+    }
+    async fn create_configmap(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        cm: k8s_openapi::api::core::v1::ConfigMap,
+    ) -> Result<()> {
+        self.configmaps.lock().expect("lock").push(cm);
+        Ok(())
+    }
+    async fn await_terminal(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _name: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::runs::workpod::TerminalState> {
+        Ok(crate::runs::workpod::TerminalState {
+            phase: crate::runs::workpod::TurnPhase::Succeeded,
+            message: None,
+        })
+    }
+    async fn logs(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+        Ok(String::new())
+    }
+    async fn delete(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// An approved scope runs the tree it froze. A later write of the issue's pack (a re-scope that
+/// stored its pack and has not recorded its scope yet) changes neither build planning, which here
+/// would see a `[build]` block, nor the pack the run is delivered.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_approved_scope_runs_the_tree_it_froze_after_the_pack_is_rewritten(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "owner/repo#51";
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue(key)).await?;
+    assert!(
+        crate::issues::store::claim_issue(db.pool(), key, Status::New, Status::AwaitingApproval)
+            .await?
+    );
+    let frozen = tempfile::tempdir()?;
+    std::fs::write(
+        frozen.path().join("crucible.toml"),
+        crate::testing::fixtures::LOOP_PACK_MANIFEST,
+    )?;
+    let stored = crate::playbooks::packs::store_pack_tree(db.pool(), key, frozen.path()).await?;
+    let scope_id = approve_scope(&db, key).await?;
+    crate::issues::store::set_scope_tree(db.pool(), scope_id, &stored.tree).await?;
+    write_build_pack(&db, key).await;
+
+    let dispatcher = std::sync::Arc::new(PackCapturingDispatcher::default());
+    crate::runs::workpod::install_dispatcher(dispatcher.clone());
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    res?;
+
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .expect("issue")
+            .status,
+        Status::Running,
+        "planning read the frozen tree, which declares no builds"
+    );
+    let configmaps = dispatcher.configmaps.lock().expect("lock");
+    assert_eq!(configmaps.len(), 1, "one pack delivered");
+    let tarball = configmaps[0]
+        .binary_data
+        .as_ref()
+        .and_then(|data| data.get("pack.tar.gz"))
+        .expect("pack.tar.gz");
+    let delivered = crucible_contract::pack_tree::read_tar_gz(&tarball.0)?.tree;
+    assert_eq!(delivered.digest(), stored.tree);
     Ok(())
 }
 

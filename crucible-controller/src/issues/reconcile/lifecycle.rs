@@ -100,7 +100,12 @@ pub(super) async fn reconcile_awaiting(db: &Db, cfg: &ControllerCfg, issue: &Iss
     // the `building` state and let [`reconcile_building`] own the dispatch/poll — a pack with no
     // `[build]` block launches directly here, exactly as before the feature. Planning is a
     // hermetic manifest read (no `spawn_blocking`).
-    let pack = crate::playbooks::packs::materialize_pack_or_empty(db.pool(), &issue.key).await?;
+    let pack = crate::playbooks::packs::materialize_pack_or_empty(
+        db.pool(),
+        &issue.key,
+        scope.tree_digest.as_ref(),
+    )
+    .await?;
     let Some(requests) =
         plan_builds_or_park(db, issue, Status::AwaitingApproval, pack.path()).await?
     else {
@@ -283,7 +288,12 @@ pub(super) async fn reconcile_building(db: &Db, cfg: &ControllerCfg, issue: &Iss
     else {
         return Ok(());
     };
-    let pack = crate::playbooks::packs::materialize_pack_or_empty(db.pool(), &issue.key).await?;
+    let pack = crate::playbooks::packs::materialize_pack_or_empty(
+        db.pool(),
+        &issue.key,
+        scope.tree_digest.as_ref(),
+    )
+    .await?;
     let Some(requests) = plan_builds_or_park(db, issue, Status::Building, pack.path()).await?
     else {
         return Ok(());

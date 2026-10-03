@@ -1,8 +1,9 @@
 //! Pack storage over Postgres: a frozen scope pack is the stored tree its `pack_tarballs` row
 //! (keyed by the sanitized issue key) names, beside the gzipped tarball older controllers read,
 //! and human steering lives beside it as `pack_steering` rows. Readers that need a working tree
-//! (the engine's PR push, `crucible deploy render`, `[build]` planning) call [`materialize_pack`],
-//! which writes exactly the stored tree into a scratch [`tempfile::TempDir`]. A run receives the
+//! call [`materialize_pack`], which writes exactly the stored tree into a scratch
+//! [`tempfile::TempDir`]; readers acting for a scope (the approval PR push, `[build]` planning, a
+//! loop run's render) call `materialize_frozen`, which writes the tree the scope froze. A run receives the
 //! steering rows beside that tree as [`steer_md`], in the exact marker-wrapped shape
 //! `crucible/src/control.rs::append_steer` writes. Readers that need one file (`SCOPE.md`) read
 //! it alone via [`read_pack_file`].
@@ -273,15 +274,37 @@ pub(crate) async fn steer_md(pool: &PgPool, key: &str, pack_dir: &Path) -> Resul
 /// The pack-relative path a run reads steering from.
 pub(crate) const STEER_MD: &str = "STEER.md";
 
-/// [`materialize_pack`], falling back to an empty scratch tree when no pack is stored — the
+/// Write the pack a scope of `key` froze into a scratch tree: the stored tree `frozen` names, or
+/// `key`'s stored pack for a scope that recorded none. `None` when that is no pack.
+#[cfg(feature = "autoresearch")]
+pub(crate) async fn materialize_frozen(
+    pool: &PgPool,
+    key: &str,
+    frozen: Option<&TreeDigest>,
+) -> Result<Option<MaterializedPack>> {
+    let Some(digest) = frozen else {
+        return materialize_pack(pool, key).await;
+    };
+    let tree = crate::playbooks::pack_trees::get_tree(pool, digest)
+        .await?
+        .with_context(|| format!("the pack tree {digest} {key} froze is not stored"))?;
+    tokio::task::spawn_blocking(move || materialize_tree(&tree))
+        .await
+        .context("joining the pack materialization worker")?
+        .with_context(|| format!("writing the frozen pack for {key}"))
+        .map(Some)
+}
+
+/// [`materialize_frozen`], falling back to an empty scratch tree when no pack is stored — the
 /// pre-tarball semantics of a missing `packs/<key>/` dir (`plan_builds` sees no manifest; a real
 /// `deploy render` fails loudly at dispatch).
 #[cfg(feature = "autoresearch")]
 pub(crate) async fn materialize_pack_or_empty(
     pool: &PgPool,
     key: &str,
+    frozen: Option<&TreeDigest>,
 ) -> Result<MaterializedPack> {
-    if let Some(pack) = materialize_pack(pool, key).await? {
+    if let Some(pack) = materialize_frozen(pool, key, frozen).await? {
         return Ok(pack);
     }
     materialize_tree(&PackTree::default())
@@ -426,7 +449,7 @@ mod tests {
                 .expect("materialize")
                 .is_none()
         );
-        let pack = materialize_pack_or_empty(&pool, "owner/repo#404")
+        let pack = materialize_pack_or_empty(&pool, "owner/repo#404", None)
             .await
             .expect("or_empty");
         assert!(pack.path().is_dir());

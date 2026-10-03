@@ -205,11 +205,12 @@ pub(crate) async fn launch_pack(
     }
 
     let key = format!("scenario:{}", uuid::Uuid::now_v7());
-    let digest =
+    let stored =
         match crate::playbooks::packs::store_pack(state.db.pool(), &key, &fetched.pack).await {
-            Ok(stored) => stored.digest,
+            Ok(stored) => stored,
             Err(e) => return AppError::from(e).into_response(),
         };
+    let digest = stored.digest;
     let actor = identity.as_deref().unwrap_or("unknown");
     let justification = body.justification.trim();
     let title = format!(
@@ -229,6 +230,7 @@ pub(crate) async fn launch_pack(
             repo: &repo,
             git_ref: &fetched.rev,
             pack_digest: &digest,
+            tree: &stored.tree,
             created_by: actor,
         },
     )
