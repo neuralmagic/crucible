@@ -1,0 +1,168 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0057"
+title = "Packs are distributed as OCI artifacts"
+status = "proposed"
+date = "2026-10-02"
+refs = [
+    "ADR-0001",
+    "ADR-0033",
+    "ADR-0048",
+    "ADR-0049",
+    "RFC-0001:C-MANIFEST",
+    "RFC-0003:C-APPROVALS",
+    "RFC-0004:C-CONTRACT-VERSION",
+    "RFC-0004:C-LINKED-RENDER",
+]
+
+[content]
+context = """
+A playbook pack is stored as one gzipped tarball in a Postgres `bytea` column and delivered to the run pod as one ConfigMap. Three limits apply, and they disagree:
+
+- A draft holds at most 128 files of at most 512 KiB each (`crucible-controller/src/playbooks/drafts.rs:25`, `:28`, enforced at `:403-421`).
+- A stored tarball is at most 8 MiB gzipped (`MAX_PACK_TAR_BYTES`, `crucible-controller/src/playbooks/registry.rs:32`), checked on git registration (`registry.rs:472`), draft publication (`registry.rs:680`), and draft save (`drafts.rs:663`).
+- Delivery renders every pack file into one ConfigMap capped at 900 KiB of raw file bytes (`CONFIGMAP_MAX_BYTES`, `crucible/src/deploy/render/kube.rs:199`, guard at `:396-402`). An init container copies the ConfigMap projection into an emptyDir at the domain path (`kube.rs:769-795`, volumes at `:1288-1315`), because the loop writes `STEER.md`, `state/` and the workspace into that directory and gate scripts need their execute bit.
+
+The controller never checks the 900 KiB budget, so the effective cap is the ConfigMap, found at dispatch: a pack between roughly 900 KiB raw and 8 MiB gzipped registers, launches, and fails with `PackOverConfigMapBudget` (`kube.rs:43-50`). The comment at `kube.rs:197` says packs are capped well under the budget upstream; the 8 MiB gzip cap does not do that.
+
+The tarball is copied whole, not referenced. Registration stores it in `playbooks.tar_gz` (`crucible-controller/migrations/0006_playbooks.sql:20`), each draft version in `playbook_draft_versions.tar_gz` (`0012_playbook_drafts.sql:28`), each import in `pack_imports.tar_gz` (`0013_pack_imports.sql:15`), and each adopted standing launch in `adopted_tar_gz` (`0033_standing_launches.sql:17`). Every launch copies it again into `pack_tarballs` under the launch's slug (`0004_shared_state.sql:46-52`; `registry.rs:1000-1022`, `drafts.rs:1170-1190`, `crucible-controller/src/launches/standing.rs:400-420`), so a run executes the bytes it was authorized against after the registry moves.
+
+Pinning is already by content. `content_digest` is SHA-256 over the gzip bytes (`crucible-contract/src/artifact.rs:19`); a published draft's `rev` is that digest (`registry.rs:715`); an import registers only at the commit it was fetched at (`crucible-controller/src/playbooks/imports.rs:363`); a changed exposure needs its new digest accepted (`registry.rs:82-84`). Approvals of imports, scopes, and graduations go through [[RFC-0003:C-APPROVALS]].
+
+The case that breaks this is a pack with a large shared core and per-component overlays: one workflow and its tools reused across many components, each component adding a small directory of its own. Every component variant is a full copy of the core in every table above and in every ConfigMap, a draft for one component must hold the whole core inside its 128-file cap, and the core alone can exceed the ConfigMap budget.
+
+OCI registries already do content-addressed, layered, deduplicated distribution of file trees, and every cluster pulls from one on every pod start. Run pods carry pull credentials: `imagePullSecrets` (`kube.rs:727-729`) and an authfile mount (`kube.rs:1111`). The controller already speaks the distribution API through `oci-client` to read engine image labels (`crucible-controller/src/runs/contract.rs:537-544`) and for the image catalog (`crucible-controller/src/images/registry.rs:6`), and `forge` links the same client (`forge/Cargo.toml:24`).
+
+Kubernetes image volumes (KEP-4639) mount an OCI object read-only into a pod, pulled by the kubelet with the pod's pull secrets and cached on the node. Alpha in 1.31 behind the `ImageVolume` feature gate, beta and off by default in 1.33 and 1.34, beta and on by default in 1.35, GA targeted for 1.36 (https://github.com/kubernetes/enhancements/issues/4639). OpenShift 4.20 (Kubernetes 1.33, CRI-O 1.33) ships the OCI image volume source as GA (https://docs.redhat.com/en/documentation/openshift_container_platform/4.20/html/release_notes/ocp-4-20-release-notes, https://github.com/openshift/api/pull/2403). The mount is read-only and noexec (https://kubernetes.io/blog/2024/08/16/kubernetes-1-31-image-volume-source/). CRI-O mounts non-image OCI artifacts (https://github.com/cri-o/cri-o/pull/8953); containerd mounts images but not generic artifacts yet (https://github.com/containerd/containerd/issues/11381).
+
+Prior art: Helm charts are OCI artifacts with their own config and layer media types, installable by digest (https://helm.sh/docs/topics/registries/); Flux `OCIRepository` sources pin by digest and verify cosign signatures (https://fluxcd.io/flux/components/source/ocirepositories/); Tekton Bundles store one resource per layer and resolve by digest (https://tekton.dev/docs/pipelines/bundle-resolver/); ORAS is the generic client for typed artifacts (https://oras.land/docs/). The OCI image spec v1.1 defines `artifactType` and the empty config for non-image artifacts (https://github.com/opencontainers/image-spec/blob/main/manifest.md)."""
+decision = """
+A pack may be published as an OCI artifact. The inline tarball path stays and remains the default.
+
+**Artifact shape.** The manifest is an OCI image manifest with `artifactType` `application/vnd.crucible.pack.v1`, the empty config descriptor, and one `tar+gzip` layer per top-level part of the pack, in order:
+
+1. `crucible.toml` and the workflow source.
+2. Shared code: tools, gate scripts, and files injected into the workspace.
+3. One layer per component overlay directory.
+4. Skills.
+
+Each layer carries an `org.opencontainers.image.title` annotation naming its part. Layer bytes are deterministic (sorted entries, zeroed mtimes and owners, fixed gzip level), so an unchanged part keeps its blob digest across versions and the registry stores it once. Paths are validated with the rules a draft uses (`validate_path`, `registry.rs:264`); two layers may not write the same path, and a publish that would is refused.
+
+**Pinning.** The manifest digest is the pack's identity. It goes in the columns that hold `tar_digest` today, and a published draft's `rev` becomes the manifest digest instead of `content_digest` of the tarball. A launch pins the manifest digest; for an OCI pack the per-launch `pack_tarballs` copy becomes a digest reference, and for an inline pack it stays a copy. A standing launch adopts a digest instead of a tarball. Nothing that pins today stops pinning: the manifest names every layer by its own digest, so its digest covers the content.
+
+**Base packs.** `crucible.toml` may declare `[pack] base = "<repository>@sha256:<digest>"`. The derived pack's manifest lists the base's layer descriptors first and its own layers after, so the derived digest covers the whole tree and an approval of it covers the base. The base's blobs are cross-repository mounted, not re-uploaded. A draft built on a base holds only its overlay files, and the 128-file and 512 KiB caps apply to those. A base is named by digest only; a tag is refused, so a base cannot move under a pinned pack. The derived pack carries its own `crucible.toml`; the base's first layer is not part of the derived tree.
+
+**Delivery.** The controller resolves the pack's digest before render and passes it in as a render input; the render emits a reference by digest and never contacts a registry ([[RFC-0004:C-LINKED-RENDER]]). Two paths, chosen per dispatch target:
+
+- Image volume, where the target's runtime mounts OCI artifacts: the pod gets an `image` volume at the pinned digest with `pullPolicy: IfNotPresent`, and the existing `pack-stage` init container (`kube.rs:769-795`) extracts the mounted layers into the domain emptyDir in manifest order. The copy stays because the mount is read-only and noexec.
+- Init-container pull, everywhere else (containerd, an older cluster, an unknown runtime): `pack-stage` pulls the manifest and layers by digest with the authfile the pod already mounts, verifies each blob digest, and extracts into the same emptyDir.
+
+Whether a target mounts artifact image volumes is a setting on its cluster entry, defaulting to the pull path. Steering rows are per run and never part of the artifact; they ride the existing inline ConfigMap, which then carries only `STEER.md`, staged after the artifact layers so it appends the way `materialize_pack` does today (`crucible-controller/src/playbooks/packs.rs:101-135`). The engine's frozen-inject handling ([[RFC-0001:C-MANIFEST]], [[ADR-0001]]) is unchanged: it reads the emptyDir as it does now.
+
+**Signing and approvals.** An approval is a cosign signature over the manifest digest, made with a controller-held key and stored beside the artifact through the OCI referrers API, with the approver, the decision, and the policy that admitted it as signed annotations (https://docs.sigstore.dev/cosign/signing/signing_with_containers/). Who may approve is unchanged ([[RFC-0003:C-APPROVALS]]); the Postgres approval row stays the record, and the signature makes it checkable by anything that can read the registry. Dispatch of an OCI pack verifies the signature against the digest it is about to run and refuses on mismatch. Author signatures from CI (keyless, Fulcio) verify the same way and are not required.
+
+**Registry.** quay.io is the default store: a configured repository prefix, one repository per pack id, a tag per published version for people to read, and pins always by digest. The controller pushes with a push credential; run pods pull with the credentials they already have. A tag stays while any launch or standing launch references its digest, so registry tag expiry never deletes a pinned pack. A controller-hosted distribution API is the considered alternative below.
+
+**Compatibility.** Modeled on Rust editions and `rust-version`. `[pack] edition` selects pack semantics; edition 1 is today's tree and is assumed when absent. Edition 2 permits OCI publication and `base`. `[pack] requires` names the minimum contract version the pack needs, compared in semver order against the dispatch image's contract version (`crucible-contract/src/lib.rs:36`, read per [[RFC-0004:C-CONTRACT-VERSION]] in `runs/contract.rs`); a dispatch to an older engine is refused before any row is written, with both versions in the refusal. That ordering is between a pack and an engine; the controller-to-engine match stays exact. An older engine reading an edition 2 manifest fails at parse because `Manifest` denies unknown fields (`crucible/src/manifest/mod.rs:264-266`), and an older controller refuses it at registration the same way, since registration compiles through the linked engine (`registry.rs:1-7`). OCI is opt-in per pack; a pack that does not opt in is stored, pinned, and delivered exactly as today."""
+consequences = """
+- A pack with a shared core and per-component overlays stores its core once per digest in the registry instead of once per variant per table, and a component draft is its overlay.
+- The ConfigMap budget stops being the size limit for OCI packs. What remains is registry and node disk, and the draft caps still bound what one draft holds.
+- The gap between the 8 MiB stored cap and the 900 KiB delivery cap remains for inline packs. Registration should check the delivery budget for an inline pack and point at OCI publication; that is a separate change.
+- Dispatch of an OCI pack depends on the registry. A quay.io outage fails new pod starts for OCI packs; inline packs are unaffected. Image volumes cache on the node, so a retry on the same node does not re-pull.
+- Spoke clusters ([[ADR-0048]]) pull from the registry directly, so pack bytes stop going through the hub-rendered ConfigMap.
+- The controller holds a push credential and a signing key. Neither reaches a run pod. Old signatures must stay verifiable across key rotation, so the controller publishes all its verification keys, not only the current one.
+- Two delivery paths exist until containerd mounts artifacts. Every target can use the pull path, so CI runs it on every change; the image-volume path needs a CRI-O cluster to test.
+- A base pack is a new dependency between packs. Moving to a new base is publishing a new derived pack, with a new digest and a new approval; nothing follows a base automatically.
+- Retention becomes the controller's job: it keeps tags on pinned digests, and a blob deleted by hand fails dispatch with a pull error naming the digest.
+- Approvals become portable: another controller, or an audit, can check that a digest was approved without reading the controller's database.
+- The pull path needs a registry client in the loop image. The engine can link `oci-client` as `forge` does, so this is an engine subcommand, not a new binary.
+- Draft saves stay in Postgres. Only publication pushes to the registry, so the editor's save latency does not change."""
+
+[[content.alternatives]]
+text = "Publish packs as OCI artifacts with a layer per part, pin the manifest digest, deliver by image volume with an init-container pull fallback"
+status = "accepted"
+pros = [
+    "Content-addressed layers deduplicate a shared core across variants.",
+    "The digest maps onto the existing content-digest pins.",
+    "Run pods already carry pull credentials.",
+    "Signatures over the digest make approvals verifiable outside the controller.",
+    "Same mechanism as Helm, Flux, and Tekton Bundles.",
+]
+cons = [
+    "A registry becomes a dispatch dependency.",
+    "Two delivery paths until containerd mounts artifacts.",
+    "The controller holds a push credential and a signing key.",
+]
+
+[[content.alternatives]]
+text = "Fetch the pack from a git ref inside the run pod"
+status = "rejected"
+pros = [
+    "No new store; registered packs already come from git.",
+    "Imports already pin by commit.",
+]
+cons = [
+    "Drafts have no git ref.",
+    "Every run pod needs forge credentials and forge reachability.",
+    "A commit pins a repository, not a pack subtree, and gives no layer reuse.",
+]
+rejection_reason = "Drafts and draft-head launches ([[ADR-0033]]) have no ref to fetch, and it puts forge credentials and forge availability on every run start."
+
+[[content.alternatives]]
+text = "Store pack tarballs in S3 and have the pod download by key"
+status = "rejected"
+pros = ["A plain blob store with no size pressure."]
+cons = [
+    "Run pods carry no S3 credentials; each cluster needs a new one.",
+    "No layer model, so no deduplication of a shared core.",
+    "No standard signature or referrer mechanism.",
+    "No kubelet-side pull or node cache.",
+]
+rejection_reason = "Adds a credential to every cluster and gets none of the dedupe, signing, or node-level pull a registry already provides."
+
+[[content.alternatives]]
+text = "Split a large pack across several ConfigMaps in a projected volume"
+status = "rejected"
+pros = ["No new dependency; extends the current path."]
+cons = [
+    "Each object is still under 1 MiB, and every run writes the whole pack to etcd again.",
+    "Object count per run grows with pack size and counts against namespace quota.",
+    "Does nothing about the copies in Postgres.",
+]
+rejection_reason = "Moves the limit instead of removing it, and writes the full pack into etcd once per run."
+
+[[content.alternatives]]
+text = "Raise the Postgres tarball cap"
+status = "rejected"
+pros = ["One constant."]
+cons = [
+    "Delivery is still bounded by the ConfigMap budget, so larger stored packs fail at dispatch instead of at save.",
+    "Each launch copies the whole tarball into `pack_tarballs`, so the table grows with launches times pack size.",
+    "The controller unpacks it in memory on every materialization.",
+]
+rejection_reason = "The binding limit is delivery, not storage; raising the store cap widens the gap between what registers and what runs."
+
+[[content.alternatives]]
+text = "Serve the OCI distribution API from the controller, with blobs in Postgres or on its volume"
+status = "considered"
+pros = [
+    "No external registry or push credential.",
+    "Approval and retention stay entirely in the controller.",
+]
+cons = [
+    "Kubelets on every cluster, spokes included ([[ADR-0048]]), must reach the controller as a registry over TLS, which is a new ingress path.",
+    "Blob storage and serving become controller HA state ([[ADR-0049]]).",
+    "Reimplements what quay.io already runs.",
+]
+rejection_reason = "Kept for a deployment with no reachable registry. The artifact format and digest pins are the same, so it can sit behind the registry setting later."
+
+[[content.alternatives]]
+text = "Publish the pack as a container image (image config, files as image layers) instead of a typed artifact"
+status = "rejected"
+pros = ["containerd image volumes mount it today, so one delivery path everywhere."]
+cons = [
+    "Registries, scanners, and the image catalog treat it as a runnable image.",
+    "No `artifactType` to tell a pack from an image by its manifest.",
+]
+rejection_reason = "The init-container pull already covers containerd, and a pack that looks like a runnable image invites being run as one."
