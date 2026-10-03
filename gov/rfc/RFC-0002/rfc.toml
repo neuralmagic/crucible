@@ -32,13 +32,19 @@ clauses = [
     "clauses/C-REVISE-LOOP.toml",
     "clauses/C-RUN-HISTORY.toml",
     "clauses/C-PACK-BASE.toml",
+    "clauses/C-PACK-PUBLISH.toml",
 ]
 
 [[changelog]]
 version = "0.1.0"
 date = "2026-08-21"
 notes = "Initial draft"
-added = ["C-PACK-BASE: a pack may extend a base pack; composition by path, the base and overlay digest pair as identity, refusal of an unstored or unreadable base, and the delivery budget checked at save"]
+added = [
+    "C-PACK-PUBLISH: registered, imported, and approved packs are published to a configured OCI registry under immutable tags; saves and launches never depend on the registry",
+    "C-PACK-BASE: a pack's digest is SHA-256 over its canonical tree; a draft may name a base, flattened at save into one tree with one digest, base and overlay digests kept as provenance; an unavailable base refused at save; the delivery budget checked at save and dispatch",
+    "C-PACK-BASE: a pack's digest is a tree hash (tree1:); a draft may name a base, flattened at save into one tree with one digest and recorded provenance; an unavailable base is refused at save; the delivery budget is checked at save, registration, import, and dispatch; old digests are rewritten",
+    "C-PACK-PUBLISH: optional OCI publication of registered, imported, and approved packs, readable only by the controller and dispatch targets, under digest-derived tags with a publication state",
+]
 changed = [
     "a settled join forwards a dependency that settled not taken",
     "converting external text to a plain string, and a supplied value carrying a marker, are compile errors",

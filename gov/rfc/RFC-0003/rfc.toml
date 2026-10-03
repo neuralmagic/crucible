@@ -52,5 +52,5 @@ added = [
 changed = [
     "C-PRINCIPALS and C-TEAM-UX defer to C-ACT-AS",
     "C-OWNERSHIP, C-HIERARCHY, C-DECISION, and C-ENFORCEMENT name webhooks and their deliveries",
-    "C-APPROVALS: an approval of a pack built on a base binds the base and overlay digest pair",
+    "C-APPROVALS: a draft graduation binds the pack's digest, which for a pack saved on a base covers the flattened tree",
 ]
