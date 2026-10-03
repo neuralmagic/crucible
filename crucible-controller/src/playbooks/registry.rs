@@ -902,9 +902,10 @@ async fn store(
     {
         return Err(RegisterError::Conflict(msg));
     }
-    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, &row.pack.tree)
-        .await
-        .map_err(RegisterError::Internal)?;
+    let tree_digest =
+        crate::playbooks::pack_trees::put_tree(&mut tx, &row.pack.tree, &row.pack.tarball)
+            .await
+            .map_err(RegisterError::Internal)?;
     sqlx::query(
         r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz, tar_digest,
                                   tar_bytes, params_schema, schema_digest, agent_backend,

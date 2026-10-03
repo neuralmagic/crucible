@@ -233,7 +233,8 @@ pub async fn propose(
         .begin()
         .await
         .context("opening the pack import transaction")?;
-    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree).await?;
+    let tree_digest =
+        crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree, &pack.tarball).await?;
     let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO pack_imports (id, repo, git_ref, path, rev, tar_gz, tar_digest, tar_bytes,
                                      params_schema, schema_digest, graph, diagnostics,

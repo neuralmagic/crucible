@@ -932,11 +932,14 @@ mod tests {
     /// Point registry row `id` at `tree` the way registration stores it: the tree, its tarball as
     /// the legacy bytes, and the tree column. Inserts the row when it is not registered yet.
     async fn pin_tree(pool: &PgPool, id: &str, rev: &str, tree: &PackTree) -> TreeDigest {
-        let digest =
-            crate::playbooks::pack_trees::put_tree(&mut pool.acquire().await.expect("conn"), tree)
-                .await
-                .expect("put tree");
         let tarball = tree.tarball().expect("encode");
+        let digest = crate::playbooks::pack_trees::put_tree(
+            &mut pool.acquire().await.expect("conn"),
+            tree,
+            &tarball,
+        )
+        .await
+        .expect("put tree");
         sqlx::query(
             r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz,
                                       tar_digest, tar_bytes, params_schema, schema_digest,
@@ -1089,9 +1092,12 @@ mod tests {
             params(),
         );
         let new = adopted(PackRevision::Bytes("sha256:tar"), &params, &max_time, &spec);
-        let converted =
-            crate::playbooks::pack_trees::put_tree(&mut *pool.acquire().await?, &tree(b"v1"))
-                .await?;
+        let converted = crate::playbooks::pack_trees::put_tree(
+            &mut *pool.acquire().await?,
+            &tree(b"v1"),
+            &tree(b"v1").tarball()?,
+        )
+        .await?;
         sqlx::query("UPDATE playbooks SET tree_digest = $1")
             .bind(converted.as_str())
             .execute(&pool)

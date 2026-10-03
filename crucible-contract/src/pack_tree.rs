@@ -20,6 +20,10 @@ pub const EXCLUDED_SEGMENTS: [&str; 3] = ["state", ".git", "workspace"];
 /// ConfigMap key, and Kubernetes caps a ConfigMap at 1 MiB of decoded values.
 pub const DELIVERY_BUDGET_BYTES: usize = 900 * 1024;
 
+/// The most bytes [`read_tar_gz`] will gunzip: a pack within the delivery budget expands far less,
+/// and an archive past it is refused before it is held in memory.
+pub const MAX_EXPANDED_BYTES: u64 = 64 * 1024 * 1024;
+
 const PREFIX: &str = "tree1:";
 
 /// A pack's `tree1:<hex>` digest.
@@ -135,6 +139,7 @@ pub enum TreeError {
     NonRegular { path: String },
     PrefixCollision { file: String, under: String },
     Io { path: String, message: String },
+    Expands { limit: u64 },
 }
 
 impl fmt::Display for TreeError {
@@ -156,6 +161,9 @@ impl fmt::Display for TreeError {
                 )
             }
             Self::Io { path, message } => write!(f, "reading {path}: {message}"),
+            Self::Expands { limit } => {
+                write!(f, "the pack archive expands past {limit} bytes")
+            }
         }
     }
 }
@@ -406,13 +414,54 @@ pub fn walk_dir(root: &Path) -> Result<ReadPack, TreeError> {
 }
 
 /// Read a gzipped tar as a pack. An absolute or escaping entry is refused; `./` prefixes are
-/// dropped.
+/// dropped. An archive that gunzips past [`MAX_EXPANDED_BYTES`] is refused.
 pub fn read_tar_gz(tgz: &[u8]) -> Result<ReadPack, TreeError> {
+    read_tar_gz_within(tgz, MAX_EXPANDED_BYTES)
+}
+
+/// A reader that fails once its inner reader yields more than `remaining` bytes.
+struct Bounded<R> {
+    inner: R,
+    remaining: u64,
+    exceeded: bool,
+}
+
+impl<R: std::io::Read> std::io::Read for Bounded<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let cap = usize::try_from(self.remaining.saturating_add(1))
+            .map_or(buf.len(), |cap| cap.min(buf.len()));
+        let n = self.inner.read(&mut buf[..cap])?;
+        match self.remaining.checked_sub(n as u64) {
+            Some(left) => {
+                self.remaining = left;
+                Ok(n)
+            }
+            None => {
+                self.exceeded = true;
+                Err(std::io::Error::other("the pack archive is too large"))
+            }
+        }
+    }
+}
+
+fn read_tar_gz_within(tgz: &[u8], limit: u64) -> Result<ReadPack, TreeError> {
+    let mut archive = tar::Archive::new(Bounded {
+        inner: flate2::read::GzDecoder::new(tgz),
+        remaining: limit,
+        exceeded: false,
+    });
+    let read = collect_archive(&mut archive);
+    if archive.into_inner().exceeded {
+        return Err(TreeError::Expands { limit });
+    }
+    read
+}
+
+fn collect_archive<R: std::io::Read>(archive: &mut tar::Archive<R>) -> Result<ReadPack, TreeError> {
     let archive_err = |message: String| TreeError::Io {
         path: "the pack archive".to_string(),
         message,
     };
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
     let mut pack = Collector::default();
     for entry in archive.entries().map_err(|e| archive_err(e.to_string()))? {
         let mut entry = entry.map_err(|e| archive_err(e.to_string()))?;
@@ -769,6 +818,39 @@ mod tests {
 
         let err = read_tar_gz(&tgz).expect_err("escapes").to_string();
         assert!(err.contains("escapes"), "{err}");
+    }
+
+    #[test]
+    fn an_archive_that_expands_past_the_limit_is_refused() {
+        let pack = tree(&[("big", &[0u8; 4096])]);
+        let tarball = pack.tarball().expect("tarball");
+
+        let mut expanded = Vec::new();
+        std::io::Read::read_to_end(
+            &mut flate2::read::GzDecoder::new(&tarball[..]),
+            &mut expanded,
+        )
+        .expect("gunzip");
+        assert!(
+            read_tar_gz_within(&tarball, expanded.len() as u64)
+                .expect("the whole stream fits")
+                .tree
+                == pack
+        );
+        for limit in [4096, 600, 0] {
+            assert!(
+                read_tar_gz_within(&tarball, limit) == Err(TreeError::Expands { limit }),
+                "limit {limit}"
+            );
+        }
+        let bomb = tree(&[("zeros", &vec![0u8; 8 * 1024 * 1024])])
+            .tarball()
+            .expect("tarball");
+        assert!(bomb.len() < 64 * 1024, "{} gzipped bytes", bomb.len());
+        assert!(
+            read_tar_gz_within(&bomb, 1024 * 1024)
+                == Err(TreeError::Expands { limit: 1024 * 1024 })
+        );
     }
 
     #[test]

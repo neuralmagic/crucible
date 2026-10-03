@@ -338,7 +338,8 @@ async fn migrate_pack(
 
     let mut tx = pool.begin().await.context("begin pack import")?;
     if store_pack {
-        crate::runs::blob_store::put_pack(&mut tx, slug, &pack).await?;
+        let tarball = pack.tarball().context("encoding the pack tarball")?;
+        crate::runs::blob_store::put_pack(&mut tx, slug, &pack, &tarball).await?;
     }
     if import_blocks {
         for (i, (block, created_at)) in blocks.iter().zip(&created_ats).enumerate() {
@@ -985,9 +986,14 @@ mod tests {
         std::fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
         let other = PackTree::from_pairs(&[("crucible.toml", b"other")]).expect("tree");
         let mut conn = pool.acquire().await.expect("conn");
-        crate::runs::blob_store::put_pack(&mut conn, "owner_repo_7", &other)
-            .await
-            .expect("seed");
+        crate::runs::blob_store::put_pack(
+            &mut conn,
+            "owner_repo_7",
+            &other,
+            &other.tarball().expect("tarball"),
+        )
+        .await
+        .expect("seed");
 
         let report = migrate_state(&pool, state.path(), false)
             .await
@@ -1013,9 +1019,14 @@ mod tests {
         let (frozen, _) = split_steer(STEER_FILE).expect("split");
         let stored = pack_tree_of(&pack, Some(&frozen)).expect("tree");
         let mut conn = pool.acquire().await.expect("conn");
-        crate::runs::blob_store::put_pack(&mut conn, "owner_repo_7", &stored)
-            .await
-            .expect("seed the pack without its rows");
+        crate::runs::blob_store::put_pack(
+            &mut conn,
+            "owner_repo_7",
+            &stored,
+            &stored.tarball().expect("tarball"),
+        )
+        .await
+        .expect("seed the pack without its rows");
 
         let report = migrate_state(&pool, state.path(), false)
             .await

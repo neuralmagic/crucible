@@ -124,11 +124,19 @@ async fn convert_column(pool: &PgPool, c: &Column, report: &mut ConversionReport
         .await?;
         let target = match known {
             Some(tree) => AliasTarget::Tree(tree.parse().map_err(anyhow::Error::msg)?),
-            None => match tokio::task::spawn_blocking(move || read_tar_gz(&bytes))
-                .await
-                .context("joining the pack conversion worker")?
+            None => match tokio::task::spawn_blocking(move || {
+                read_tar_gz(&bytes).map(|read| {
+                    let tarball = read.tree.tarball();
+                    (read.tree, tarball)
+                })
+            })
+            .await
+            .context("joining the pack conversion worker")?
             {
-                Ok(read) => AliasTarget::Tree(put_tree(&mut tx, &read.tree).await?),
+                Ok((tree, tarball)) => {
+                    let tarball = tarball.context("encoding the pack tarball")?;
+                    AliasTarget::Tree(put_tree(&mut tx, &tree, &tarball).await?)
+                }
                 Err(reason) => AliasTarget::Unconvertible(reason.to_string()),
             },
         };
@@ -405,7 +413,9 @@ mod tests {
         seed_launch_pack(&pool, "a", &second).await;
 
         let mut tx = pool.begin().await.expect("tx");
-        let stale = put_tree(&mut tx, &pack(&[("a", b"1")])).await.expect("put");
+        let stale = put_tree(&mut tx, &pack(&[("a", b"1")]), &first)
+            .await
+            .expect("put");
         let launch_packs = COLUMNS
             .iter()
             .find(|c| c.table == "pack_tarballs")

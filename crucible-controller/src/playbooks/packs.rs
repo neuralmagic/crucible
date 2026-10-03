@@ -112,29 +112,45 @@ fn append_dir(
     Ok(())
 }
 
-/// Store `tree` as `key`'s durable pack.
-pub(crate) async fn store_pack(pool: &PgPool, key: &str, tree: &PackTree) -> Result<StoredPack> {
+/// Store `pack` as `key`'s durable pack.
+pub(crate) async fn store_pack(pool: &PgPool, key: &str, pack: &Deliverable) -> Result<StoredPack> {
     let mut conn = pool.acquire().await.context("pack store connection")?;
-    crate::runs::blob_store::put_pack(&mut conn, &crate::model::sanitize_key(key), tree).await
+    crate::runs::blob_store::put_pack(
+        &mut conn,
+        &crate::model::sanitize_key(key),
+        &pack.tree,
+        &pack.tarball,
+    )
+    .await
 }
 
 /// Store a pod-delivered pack tarball as `key`'s durable pack. The tarball is read as a pack
-/// first, so a hostile or non-pack blob is refused before anything is stored.
+/// first, so a hostile, non-pack, or over-budget blob is refused before anything is stored.
 #[cfg(feature = "autoresearch")]
 pub(crate) async fn store_pack_tarball(
     pool: &PgPool,
     key: &str,
     tar_gz: &[u8],
 ) -> Result<StoredPack> {
-    let read =
-        crucible_contract::pack_tree::read_tar_gz(tar_gz).context("reading the pack tarball")?;
-    store_pack(pool, key, &read.tree).await
+    let tar_gz = tar_gz.to_vec();
+    let pack = tokio::task::spawn_blocking(move || {
+        Deliverable::new(crucible_contract::pack_tree::read_tar_gz(&tar_gz)?)
+    })
+    .await
+    .context("joining the pack read worker")?
+    .context("reading the pack tarball")?;
+    store_pack(pool, key, &pack).await
 }
 
-/// Store the pack in a local directory as `key`'s durable pack.
+/// Store the pack in a local directory as `key`'s durable pack, refused when it is not a pack or
+/// is over the delivery budget.
 pub async fn store_pack_tree(pool: &PgPool, key: &str, dir: &Path) -> Result<StoredPack> {
-    let read = walk_dir(dir).with_context(|| format!("reading the pack at {}", dir.display()))?;
-    store_pack(pool, key, &read.tree).await
+    let root = dir.to_path_buf();
+    let pack = tokio::task::spawn_blocking(move || deliverable(&root))
+        .await
+        .context("joining the pack read worker")?
+        .with_context(|| format!("reading the pack at {}", dir.display()))?;
+    store_pack(pool, key, &pack).await
 }
 
 /// Unpack a stored tarball into a scratch tree, through the same traversal rejection every
@@ -484,6 +500,65 @@ mod tests {
                 .is_none(),
             "nothing was stored"
         );
+    }
+
+    /// Bytes gzip cannot shrink, so a tree of them delivers about its own size.
+    #[cfg(feature = "autoresearch")]
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "autoresearch")]
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_oversize_pack_is_refused_before_it_is_stored(pool: sqlx::PgPool) {
+        let budget = crucible_contract::pack_tree::DELIVERY_BUDGET_BYTES;
+        let over_budget = PackTree::from_pairs(&[("blob", &incompressible(budget + 4096))])
+            .expect("tree")
+            .tarball()
+            .expect("tarball");
+        let expansion = crucible_contract::pack_tree::MAX_EXPANDED_BYTES as usize;
+        let bomb = PackTree::from_pairs(&[("zeros", &vec![0u8; expansion + 1])])
+            .expect("tree")
+            .tarball()
+            .expect("tarball");
+        assert!(bomb.len() < budget, "{} gzipped bytes", bomb.len());
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("blob"), incompressible(budget + 4096)).expect("write");
+
+        let refusals = [
+            store_pack_tarball(&pool, "owner/repo#7", &over_budget)
+                .await
+                .expect_err("over budget"),
+            store_pack_tarball(&pool, "owner/repo#7", &bomb)
+                .await
+                .expect_err("expands too far"),
+            store_pack_tree(&pool, "owner/repo#7", dir.path())
+                .await
+                .expect_err("over budget on disk"),
+        ];
+
+        for (err, says) in
+            refusals
+                .iter()
+                .zip(["delivery budget", "expands past", "delivery budget"])
+        {
+            assert!(format!("{err:#}").contains(says), "{err:#}");
+        }
+        let stored: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM pack_tarballs) + (SELECT count(*) FROM pack_trees)",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+        assert_eq!(stored, 0, "nothing was stored");
     }
 
     #[cfg(feature = "autoresearch")]

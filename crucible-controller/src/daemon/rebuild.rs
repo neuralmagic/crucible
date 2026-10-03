@@ -1116,10 +1116,12 @@ mod tests {
                 None,
             ))
             .await?;
+        let scope = crucible_contract::pack_tree::PackTree::from_pairs(&[("SCOPE.md", b"s")])?;
         crate::runs::blob_store::put_pack(
             &mut *live.pool().acquire().await?,
             "owner_repo_2",
-            &crucible_contract::pack_tree::PackTree::from_pairs(&[("SCOPE.md", b"s")])?,
+            &scope,
+            &scope.tarball()?,
         )
         .await?;
         crate::runs::blob_store::put_run_session(live.pool(), "run-1", b"{\"v\":1}\n").await?;
@@ -1390,6 +1392,7 @@ mod tests {
             &mut *live_pool.acquire().await?,
             "owner_repo_7",
             &tree,
+            &tgz,
         )
         .await?
         .digest;
@@ -1402,8 +1405,12 @@ mod tests {
         .await?;
         let unreferenced =
             crucible_contract::pack_tree::PackTree::from_pairs(&[("crucible.toml", b"draft")])?;
-        crate::playbooks::pack_trees::put_tree(&mut *live_pool.acquire().await?, &unreferenced)
-            .await?;
+        crate::playbooks::pack_trees::put_tree(
+            &mut *live_pool.acquire().await?,
+            &unreferenced,
+            &unreferenced.tarball()?,
+        )
+        .await?;
         sqlx::query(
             "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
              VALUES ('sha256:old', $1, 'then')",

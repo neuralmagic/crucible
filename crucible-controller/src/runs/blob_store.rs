@@ -408,18 +408,19 @@ pub struct StoredPack {
     pub tree: TreeDigest,
 }
 
-/// Store (or replace) one sanitized issue key's frozen pack: the tree, and its tarball beside it.
+/// Store (or replace) one sanitized issue key's frozen pack: the tree, and its tarball
+/// (`tree.tarball()`) beside it.
 pub async fn put_pack(
     conn: &mut sqlx::PgConnection,
     issue_slug: &str,
     tree: &PackTree,
+    tarball: &[u8],
 ) -> Result<StoredPack> {
-    let tarball = tree.tarball().context("encoding the pack tarball")?;
-    let digest = content_digest(&tarball);
+    let digest = content_digest(tarball);
     let mut tx = sqlx::Connection::begin(&mut *conn)
         .await
         .context("opening the pack store transaction")?;
-    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, tree).await?;
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, tree, tarball).await?;
     sqlx::query(
         r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
            VALUES ($1, $2, $3, $4, $5, $6)
@@ -428,7 +429,7 @@ pub async fn put_pack(
                created_at = excluded.created_at, tree_digest = excluded.tree_digest"#,
     )
     .bind(issue_slug)
-    .bind(&tarball)
+    .bind(tarball)
     .bind(&digest)
     .bind(i64::try_from(tarball.len()).context("pack size")?)
     .bind(crate::clock::now_rfc3339())
@@ -969,10 +970,10 @@ mod tests {
 
         let first = PackTree::from_pairs(&[("crucible.toml", b"m"), ("big", &payload(2048))])
             .expect("tree");
-        let stored = put_pack(&mut conn, "owner_repo_7", &first)
+        let tarball = first.tarball().expect("tarball");
+        let stored = put_pack(&mut conn, "owner_repo_7", &first, &tarball)
             .await
             .expect("put");
-        let tarball = first.tarball().expect("tarball");
         assert_eq!(
             stored,
             StoredPack {
@@ -987,9 +988,14 @@ mod tests {
         assert_eq!(stored_tree().await, Some(first.digest().to_string()));
 
         let second = PackTree::from_pairs(&[("crucible.toml", b"n")]).expect("tree");
-        put_pack(&mut conn, "owner_repo_7", &second)
-            .await
-            .expect("replace");
+        put_pack(
+            &mut conn,
+            "owner_repo_7",
+            &second,
+            &second.tarball().expect("tarball"),
+        )
+        .await
+        .expect("replace");
         assert_eq!(
             get_pack_tarball(&pool, "owner_repo_7").await.expect("get"),
             Some(second.tarball().expect("tarball"))

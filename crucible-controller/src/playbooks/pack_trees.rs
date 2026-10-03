@@ -7,8 +7,13 @@ use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use sqlx::PgConnection;
 
-/// Store `tree` under its digest unless it is already stored, and return the digest.
-pub(crate) async fn put_tree(conn: &mut PgConnection, tree: &PackTree) -> Result<TreeDigest> {
+/// Store `tree` under its digest unless it is already stored, and return the digest. `tarball` is
+/// `tree.tarball()`, the bytes the caller writes to the legacy column.
+pub(crate) async fn put_tree(
+    conn: &mut PgConnection,
+    tree: &PackTree,
+    tarball: &[u8],
+) -> Result<TreeDigest> {
     let (digest, file_hashes) = tree.digest_with_file_hashes();
     let stored: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pack_trees WHERE digest = $1")
         .bind(digest.as_str())
@@ -18,7 +23,6 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, tree: &PackTree) -> Result
     if stored.is_some() {
         return Ok(digest);
     }
-    let tarball = tree.tarball().context("encoding the pack tarball")?;
     let total: usize = tree.files().values().map(Vec::len).sum();
     let inserted = sqlx::query(
         "INSERT INTO pack_trees
@@ -29,7 +33,7 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, tree: &PackTree) -> Result
     .bind(i32::try_from(tree.files().len()).context("pack file count")?)
     .bind(i64::try_from(total).context("pack size")?)
     .bind(i64::try_from(tarball.len()).context("pack delivered size")?)
-    .bind(crucible_contract::content_digest(&tarball))
+    .bind(crucible_contract::content_digest(tarball))
     .bind(crate::clock::now_rfc3339())
     .execute(&mut *conn)
     .await
@@ -67,8 +71,11 @@ mod tests {
         let tree = pack(&[("crucible.toml", b"m"), ("tools/run.sh", b"r")]);
         let mut conn = pool.acquire().await.expect("conn");
 
-        let first = put_tree(&mut conn, &tree).await.expect("put");
-        let second = put_tree(&mut conn, &tree).await.expect("put again");
+        let tarball = tree.tarball().expect("encode");
+        let first = put_tree(&mut conn, &tree, &tarball).await.expect("put");
+        let second = put_tree(&mut conn, &tree, &tarball)
+            .await
+            .expect("put again");
 
         assert_eq!(first, second);
         assert_eq!(first, tree.digest());
@@ -128,7 +135,9 @@ mod tests {
     async fn a_tree_digest_survives_only_its_own_tarball(pool: PgPool) {
         let tree = pack(&[("a", b"1")]);
         let mut conn = pool.acquire().await.expect("conn");
-        let digest = put_tree(&mut conn, &tree).await.expect("put");
+        let digest = put_tree(&mut conn, &tree, &tree.tarball().expect("encode"))
+            .await
+            .expect("put");
         let pinned = Some(digest.to_string());
 
         seed_legacy_row(&pool, digest.as_str()).await;

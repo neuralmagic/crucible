@@ -767,7 +767,7 @@ pub async fn save_version(
             saved_at,
         }));
     }
-    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree)
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree, &pack.tarball)
         .await
         .map_err(DraftError::Internal)?;
     let version: i64 = sqlx::query_scalar(
