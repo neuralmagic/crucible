@@ -177,7 +177,7 @@ pub(crate) async fn launch_pack(
             },
         )?;
         let preview = crate::playbooks::preview::preview_pack_for(
-            fetched.pack.path(),
+            fetched.scratch.path(),
             crate::playbooks::registry::PackWorkflowKind::Autoresearch,
             &std::collections::BTreeMap::new(),
             crate::playbooks::preview::Unvalued::Refuse,
@@ -205,13 +205,16 @@ pub(crate) async fn launch_pack(
     }
 
     let key = format!("scenario:{}", uuid::Uuid::now_v7());
-    let digest =
-        match crate::playbooks::packs::store_pack_tarball(state.db.pool(), &key, &fetched.tar_gz)
-            .await
-        {
-            Ok(d) => d,
-            Err(e) => return AppError::from(e).into_response(),
-        };
+    let digest = match crate::playbooks::packs::store_pack(
+        state.db.pool(),
+        &key,
+        &fetched.pack.tree,
+    )
+    .await
+    {
+        Ok(stored) => stored.digest,
+        Err(e) => return AppError::from(e).into_response(),
+    };
     let actor = identity.as_deref().unwrap_or("unknown");
     let justification = body.justification.trim();
     let title = format!(

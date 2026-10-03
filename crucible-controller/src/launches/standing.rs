@@ -116,7 +116,7 @@ pub(crate) async fn insert(
             owner_groups, owner_groups_at, dispatch_target, agent_provider, agent_model,
             created_at, updated_at,
             adopted_repo, adopted_path, adopted_rev, adopted_tar_gz, adopted_tar_digest,
-            adopted_tar_bytes, adopted_params_schema)
+            adopted_tar_bytes, adopted_params_schema, adopted_tree_digest)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
                 CASE WHEN $13::text IS NULL THEN NULL ELSE $18 END, $15, $16, $17, $18, $18,
                 (SELECT repo FROM playbooks WHERE id = $3),
@@ -125,7 +125,8 @@ pub(crate) async fn insert(
                 (SELECT tar_gz FROM playbooks WHERE id = $3),
                 (SELECT tar_digest FROM playbooks WHERE id = $3),
                 (SELECT tar_bytes FROM playbooks WHERE id = $3),
-                (SELECT params_schema FROM playbooks WHERE id = $3))
+                (SELECT params_schema FROM playbooks WHERE id = $3),
+                (SELECT tree_digest FROM playbooks WHERE id = $3))
         "#,
     )
     .bind(id)
@@ -177,7 +178,8 @@ pub(crate) async fn replace(
             adopted_tar_gz = (SELECT tar_gz FROM playbooks WHERE id = $2),
             adopted_tar_digest = (SELECT tar_digest FROM playbooks WHERE id = $2),
             adopted_tar_bytes = (SELECT tar_bytes FROM playbooks WHERE id = $2),
-            adopted_params_schema = (SELECT params_schema FROM playbooks WHERE id = $2)
+            adopted_params_schema = (SELECT params_schema FROM playbooks WHERE id = $2),
+            adopted_tree_digest = (SELECT tree_digest FROM playbooks WHERE id = $2)
         WHERE id = $1
         "#,
     )
@@ -250,6 +252,7 @@ pub(crate) struct Authorized {
     pub adopted_tar_gz: Option<Vec<u8>>,
     pub adopted_tar_digest: Option<String>,
     pub adopted_tar_bytes: Option<i64>,
+    pub adopted_tree_digest: Option<String>,
 }
 
 /// Lock the core row for the firing the trigger just claimed.
@@ -264,7 +267,7 @@ pub(crate) async fn authorized(
                COALESCE(p.description, d.description) AS description,
                COALESCE(c.adopted_params_schema, dv.params_schema) AS params_schema,
                dv.version AS draft_version,
-               c.adopted_tar_gz, c.adopted_tar_digest, c.adopted_tar_bytes
+               c.adopted_tar_gz, c.adopted_tar_digest, c.adopted_tar_bytes, c.adopted_tree_digest
         FROM playbook_standing_launches c
         LEFT JOIN playbooks p ON p.id = c.playbook AND c.target_kind = 'adopted'
         LEFT JOIN playbook_drafts d ON d.id = c.playbook AND c.target_kind = 'draft_head'
@@ -407,7 +410,8 @@ pub(crate) async fn fire(
         };
         let slug = crate::model::sanitize_key(key);
         sqlx::query(
-            r#"UPDATE pack_tarballs SET tar_gz = $2, digest = $3, bytes = $4, created_at = $5
+            r#"UPDATE pack_tarballs SET tar_gz = $2, digest = $3, bytes = $4, created_at = $5,
+                                        tree_digest = $6
                WHERE issue_slug = $1"#,
         )
         .bind(&slug)
@@ -415,6 +419,7 @@ pub(crate) async fn fire(
         .bind(digest)
         .bind(bytes)
         .bind(crate::clock::now_rfc3339())
+        .bind(row.adopted_tree_digest.as_deref())
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("{noun} adopted pack copy: {e}"))?;

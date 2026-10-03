@@ -1,5 +1,6 @@
 //! Pack storage over Postgres: the durable form of a frozen scope pack is the gzipped tarball in
-//! `pack_tarballs` (keyed by the sanitized issue key), and human steering lives beside it as
+//! `pack_tarballs` (keyed by the sanitized issue key) and the stored tree it encodes, and human
+//! steering lives beside it as
 //! `pack_steering` rows. Readers that need a working tree — the engine's PR push, `crucible
 //! deploy render`, `[build]` planning — call [`materialize_pack`], which unpacks the tarball into
 //! a scratch [`tempfile::TempDir`] and injects the steering rows onto `STEER.md`, in the exact
@@ -8,8 +9,11 @@
 
 #![allow(clippy::disallowed_macros)]
 
+use crate::runs::blob_store::StoredPack;
 use anyhow::{Context, Result, bail};
-use crucible_contract::pack_tree::{OverBudget, TreeError, check_delivery_budget, walk_dir};
+use crucible_contract::pack_tree::{
+    OverBudget, PackTree, ReadPack, TreeError, check_delivery_budget, walk_dir,
+};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,16 +42,36 @@ pub(crate) enum PackRefusal {
     Encode(#[from] std::io::Error),
 }
 
-/// The pack at `root` as the tarball a run receives, refused when it is not a pack or is over the
-/// delivery budget (RFC-0002:C-PACK-BASE).
-pub(crate) fn deliverable_tarball(root: &Path) -> Result<Vec<u8>, PackRefusal> {
-    let tarball = walk_dir(root)?.tree.tarball()?;
-    check_delivery_budget(&tarball)?;
-    Ok(tarball)
+/// A pack ready to store: its tree, the tarball a run receives, and the excluded paths the read
+/// skipped.
+#[derive(Debug, Clone)]
+pub(crate) struct Deliverable {
+    pub tree: PackTree,
+    pub tarball: Vec<u8>,
+    pub ignored: Vec<String>,
 }
 
-/// Gzip-tar a pack working tree (regular files + symlinks, relative paths, `.git` excluded — a
-/// pack is authored files, never a repo; the PR push `git init`s its own scratch copy).
+impl Deliverable {
+    /// Encode `read`, refused when its tarball is over the delivery budget
+    /// (RFC-0002:C-PACK-BASE).
+    pub(crate) fn new(read: ReadPack) -> Result<Self, PackRefusal> {
+        let tarball = read.tree.tarball()?;
+        check_delivery_budget(&tarball)?;
+        Ok(Self {
+            tree: read.tree,
+            tarball,
+            ignored: read.ignored,
+        })
+    }
+}
+
+/// The pack at `root`, refused when it is not a pack or is over the delivery budget.
+pub(crate) fn deliverable(root: &Path) -> Result<Deliverable, PackRefusal> {
+    Deliverable::new(walk_dir(root)?)
+}
+
+/// Gzip-tar a pack working tree the way the controller stored packs before tree storage.
+#[cfg(test)]
 pub(crate) fn tar_pack_tree(tree: &Path) -> Result<Vec<u8>> {
     let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut builder = tar::Builder::new(enc);
@@ -56,6 +80,7 @@ pub(crate) fn tar_pack_tree(tree: &Path) -> Result<Vec<u8>> {
     enc.finish().context("gzipping the pack tar")
 }
 
+#[cfg(test)]
 fn append_dir(
     builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>,
     dir: &Path,
@@ -87,20 +112,29 @@ fn append_dir(
     Ok(())
 }
 
-/// Store a pod-delivered pack tarball for `key`, validating it first (a scratch unpack runs the
-/// same traversal rejection every materialization does, so a hostile blob is refused before it
-/// becomes the durable pack). Returns the stored digest.
-#[cfg(feature = "autoresearch")]
-pub(crate) async fn store_pack_tarball(pool: &PgPool, key: &str, tar_gz: &[u8]) -> Result<String> {
-    let scratch = tempfile::tempdir().context("pack validation scratch dir")?;
-    unpack_pack_tgz(tar_gz, &scratch.path().join("pack")).context("validating the pack tarball")?;
-    crate::runs::blob_store::put_pack_tarball(pool, &crate::model::sanitize_key(key), tar_gz).await
+/// Store `tree` as `key`'s durable pack.
+pub(crate) async fn store_pack(pool: &PgPool, key: &str, tree: &PackTree) -> Result<StoredPack> {
+    let mut conn = pool.acquire().await.context("pack store connection")?;
+    crate::runs::blob_store::put_pack(&mut conn, &crate::model::sanitize_key(key), tree).await
 }
 
-/// Tar a locally-written pack tree and store it as `key`'s durable tarball.
-pub async fn store_pack_tree(pool: &PgPool, key: &str, tree: &Path) -> Result<String> {
-    let tar_gz = tar_pack_tree(tree)?;
-    crate::runs::blob_store::put_pack_tarball(pool, &crate::model::sanitize_key(key), &tar_gz).await
+/// Store a pod-delivered pack tarball as `key`'s durable pack. The tarball is read as a pack
+/// first, so a hostile or non-pack blob is refused before anything is stored.
+#[cfg(feature = "autoresearch")]
+pub(crate) async fn store_pack_tarball(
+    pool: &PgPool,
+    key: &str,
+    tar_gz: &[u8],
+) -> Result<StoredPack> {
+    let read =
+        crucible_contract::pack_tree::read_tar_gz(tar_gz).context("reading the pack tarball")?;
+    store_pack(pool, key, &read.tree).await
+}
+
+/// Store the pack in a local directory as `key`'s durable pack.
+pub async fn store_pack_tree(pool: &PgPool, key: &str, dir: &Path) -> Result<StoredPack> {
+    let read = walk_dir(dir).with_context(|| format!("reading the pack at {}", dir.display()))?;
+    store_pack(pool, key, &read.tree).await
 }
 
 /// Unpack a stored tarball into a scratch tree, through the same traversal rejection every
@@ -214,9 +248,12 @@ pub enum ReadTreeError {
 /// dropped: an editor that round-trips the whole map on every save would delete a file it
 /// cannot show.
 pub(crate) fn read_tree(root: &Path) -> Result<BTreeMap<String, String>, ReadTreeError> {
-    walk_dir(root)?
-        .tree
-        .into_files()
+    text_files(walk_dir(root)?.tree)
+}
+
+/// `tree` as a `{path: content}` map, refusing a file that is not UTF-8.
+pub(crate) fn text_files(tree: PackTree) -> Result<BTreeMap<String, String>, ReadTreeError> {
+    tree.into_files()
         .into_iter()
         .map(|(path, bytes)| {
             let path = String::from(path);
@@ -268,7 +305,7 @@ pub(crate) fn unpack_pack_tgz(tgz: &[u8], dest: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::playbooks::packs::*;
 
     fn sample_tree() -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -304,6 +341,49 @@ mod tests {
             ".git never rides the tarball"
         );
         assert!(!pack.path().join("STEER.md").exists(), "no steering rows");
+    }
+
+    /// A scope pack is stored as its tree beside that tree's own tarball, whether it arrives as a
+    /// directory or as a pod-delivered tarball in any encoding.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_stored_scope_pack_records_its_tree(pool: sqlx::PgPool) {
+        let dir = sample_tree();
+        let tree = walk_dir(dir.path()).expect("walk").tree;
+        let tarball = tree.tarball().expect("tarball");
+        let stored_row = || async {
+            sqlx::query_as::<_, (Option<String>, Vec<u8>, String)>(
+                "SELECT tree_digest, tar_gz, digest FROM pack_tarballs WHERE issue_slug = $1",
+            )
+            .bind("owner_repo_7")
+            .fetch_one(&pool)
+            .await
+            .expect("pack row")
+        };
+        let expected = (
+            Some(tree.digest().to_string()),
+            tarball.clone(),
+            crucible_contract::content_digest(&tarball),
+        );
+
+        let stored = store_pack_tree(&pool, "owner/repo#7", dir.path())
+            .await
+            .expect("store");
+        assert_eq!(stored.tree, tree.digest());
+        assert_eq!(stored_row().await, expected);
+
+        #[cfg(feature = "autoresearch")]
+        {
+            sqlx::query("DELETE FROM pack_tarballs")
+                .execute(&pool)
+                .await
+                .expect("clear");
+            let legacy = tar_pack_tree(dir.path()).expect("legacy tar");
+            assert_ne!(legacy, tarball, "a different encoding of the same tree");
+            store_pack_tarball(&pool, "owner/repo#7", &legacy)
+                .await
+                .expect("store");
+            assert_eq!(stored_row().await, expected);
+        }
     }
 
     #[cfg(feature = "autoresearch")]
@@ -436,31 +516,26 @@ mod tests {
     /// A pack within the budget yields the tarball a run receives; one over it is refused with
     /// its size, and one holding a symlink is refused as not a pack.
     #[test]
-    fn deliverable_tarball_refuses_an_oversize_or_invalid_pack() {
+    fn deliverable_refuses_an_oversize_or_invalid_pack() {
         use crate::testing::fixtures::{
             WORKFLOW_TOPIC, write_over_budget_blobs, write_playbook_pack,
         };
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
-        let tarball = deliverable_tarball(&pack).expect("within budget");
-        assert_eq!(
-            tarball,
-            walk_dir(&pack)
-                .expect("walk")
-                .tree
-                .tarball()
-                .expect("tarball")
-        );
+        let delivered = deliverable(&pack).expect("within budget");
+        let walked = walk_dir(&pack).expect("walk").tree;
+        assert_eq!(delivered.tarball, walked.tarball().expect("tarball"));
+        assert_eq!(delivered.tree, walked);
 
         std::os::unix::fs::symlink("crucible.toml", pack.join("link")).expect("symlink");
         assert!(matches!(
-            deliverable_tarball(&pack),
+            deliverable(&pack),
             Err(PackRefusal::NotAPack(TreeError::Symlink { .. }))
         ));
         std::fs::remove_file(pack.join("link")).expect("rm");
 
         write_over_budget_blobs(&pack);
-        match deliverable_tarball(&pack) {
+        match deliverable(&pack) {
             Err(PackRefusal::OverBudget(over)) => {
                 assert!(over.to_string().contains("delivery budget"), "{over}")
             }

@@ -1,8 +1,8 @@
 //! Draft packs: a pack authored in the controller instead of imported from a git pin. A draft is
-//! a versioned blob — every save tars the editor's `{path: content}` map, compiles it with the
-//! pinned engine, and stores the tarball beside whatever the engine made of it. A save that does
-//! not compile is still a version: the diagnostics are the payload the studio renders, not an
-//! error that loses the bytes.
+//! a versioned blob — every save stores the editor's `{path: content}` map as a pack tree, compiles
+//! it with the pinned engine, and stores the tree and its tarball beside whatever the engine made
+//! of it. A save that does not compile is still a version: the diagnostics are the payload the
+//! studio renders, not an error that loses the bytes.
 //!
 //! Drafts never enter the registry. [`graduate`] exports one as a PR over the same branch-pair
 //! push the scope-pack approval uses, and [`retire_matching`] stamps the draft retired once the
@@ -15,6 +15,7 @@ use crate::playbooks::plan_graph::WorkflowGraphDto;
 use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
+use crucible_contract::pack_tree::PackTree;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
@@ -503,8 +504,8 @@ pub enum DraftSeed<'a> {
         expected_rev: Option<&'a str>,
         expected_digest: Option<&'a str>,
     },
-    /// A pending import's frozen tarball, at the rev it was taken at.
-    Import { id: &'a str, tar_gz: &'a [u8] },
+    /// A pending import's frozen tree, at the rev it was taken at.
+    Import { id: &'a str, tree: &'a PackTree },
 }
 
 /// The origin columns one create writes.
@@ -594,7 +595,7 @@ pub async fn create(
                 },
             )
         }
-        DraftSeed::Import { id: import, tar_gz } => {
+        DraftSeed::Import { id: import, tree } => {
             let rev: Option<String> =
                 sqlx::query_scalar("SELECT rev FROM pack_imports WHERE id = $1")
                     .bind(import)
@@ -602,11 +603,8 @@ pub async fn create(
                     .await
                     .context("reading the rev a draft is seeded at")
                     .map_err(DraftError::Internal)?;
-            let pack = crate::playbooks::packs::unpack_to_scratch(tar_gz)
-                .context("unpacking the pack tarball the draft is seeded from")
-                .map_err(DraftError::Internal)?;
             (
-                crate::playbooks::packs::read_tree(pack.path())?,
+                crate::playbooks::packs::text_files(tree.clone())?,
                 SeededOrigin {
                     playbook: None,
                     import_id: Some(import.to_string()),
@@ -648,10 +646,10 @@ pub async fn create(
     save_version(pool, id, files, actor, None).await
 }
 
-/// Store a save: tar the file map, compile it, and write the next version row either way. A
-/// `base_version` that is not the newest save is refused with [`DraftError::StaleBase`] carrying
-/// the version that overtook it, so the writer re-reads and merges instead of clobbering the other
-/// editor; `None` appends onto whatever is latest.
+/// Store a save: store the file map's tree, compile it, and write the next version row either
+/// way. A `base_version` that is not the newest save is refused with [`DraftError::StaleBase`]
+/// carrying the version that overtook it, so the writer re-reads and merges instead of clobbering
+/// the other editor; `None` appends onto whatever is latest.
 pub async fn save_version(
     pool: &PgPool,
     id: &str,
@@ -678,14 +676,14 @@ pub async fn save_version(
             .context("creating the draft tree")
             .map_err(DraftError::Internal)?;
         write_tree(&files, &root)?;
-        let tar_gz = crate::playbooks::packs::deliverable_tarball(&root)?;
-        Ok::<_, DraftError>((tar_gz, compile_tree(&root)))
+        let pack = crate::playbooks::packs::deliverable(&root)?;
+        Ok::<_, DraftError>((pack, compile_tree(&root)))
     })
     .await
     .context("joining the draft compile worker")
     .map_err(DraftError::Internal)?;
     let (
-        tar_gz,
+        pack,
         CompiledTree {
             params_schema,
             schema_digest,
@@ -696,7 +694,7 @@ pub async fn save_version(
     ) = compiled?;
 
     let core_rev = crate::playbooks::registry::core_rev().map_err(DraftError::Internal)?;
-    let tar_digest = content_digest(&tar_gz);
+    let tar_digest = content_digest(&pack.tarball);
     let now = crate::clock::now_rfc3339();
     let graph_json = graph
         .as_ref()
@@ -769,18 +767,26 @@ pub async fn save_version(
             saved_at,
         }));
     }
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree)
+        .await
+        .map_err(DraftError::Internal)?;
     let version: i64 = sqlx::query_scalar(
         r#"INSERT INTO playbook_draft_versions (draft_id, version, tar_gz, tar_digest, tar_bytes,
                                                 params_schema, schema_digest, graph, diagnostics,
                                                 agent_backend, agent_sandbox_image, core_rev,
-                                                created_by, created_at, agent_requirements)
-           VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15)
+                                                created_by, created_at, agent_requirements,
+                                                tree_digest)
+           VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16)
            RETURNING version"#,
     )
     .bind(id)
-    .bind(&tar_gz)
+    .bind(&pack.tarball)
     .bind(&tar_digest)
-    .bind(tar_gz.len() as i64)
+    .bind(
+        i64::try_from(pack.tarball.len())
+            .context("pack size")
+            .map_err(DraftError::Internal)?,
+    )
     .bind(&params_schema)
     .bind(&schema_digest)
     .bind(&graph_json)
@@ -792,6 +798,7 @@ pub async fn save_version(
     .bind(&now)
     .bind(current + 1)
     .bind(agent.as_ref().map(|a| a.requirements_json()))
+    .bind(tree_digest.as_str())
     .fetch_one(&mut *tx)
     .await
     .context("storing a draft version")
@@ -1189,12 +1196,12 @@ pub(crate) async fn copy_draft_pack_to<'e>(
     slug: &str,
 ) -> Result<bool> {
     let res = sqlx::query(
-        r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at)
-           SELECT $3, tar_gz, tar_digest, tar_bytes, $4 FROM playbook_draft_versions
+        r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
+           SELECT $3, tar_gz, tar_digest, tar_bytes, $4, tree_digest FROM playbook_draft_versions
            WHERE draft_id = $1 AND version = $2
            ON CONFLICT (issue_slug) DO UPDATE SET
                tar_gz = excluded.tar_gz, digest = excluded.digest, bytes = excluded.bytes,
-               created_at = excluded.created_at"#,
+               created_at = excluded.created_at, tree_digest = excluded.tree_digest"#,
     )
     .bind(id)
     .bind(version)
@@ -1360,7 +1367,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::playbooks::drafts::*;
 
     fn skeleton() -> BTreeMap<String, String> {
         BTreeMap::from([
@@ -1554,6 +1561,51 @@ mod tests {
         ));
     }
 
+    /// Saving the same file map twice appends two versions on one stored tree, and each version
+    /// stores that tree's own tarball beside the tree it names.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_identical_file_map_saved_twice_shares_one_tree(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("create");
+        let again = save_version(&pool, "studio", skeleton(), None, None)
+            .await
+            .expect("save");
+        assert_eq!(again.version, 2);
+
+        let expected = PackTree::from_pairs(&[
+            ("crucible.toml", SKELETON_MANIFEST.as_bytes()),
+            ("workflow.star", SKELETON_WORKFLOW.as_bytes()),
+        ])
+        .expect("tree");
+        let tarball = expected.tarball().expect("tarball");
+        let rows: Vec<(Option<String>, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT tree_digest, tar_gz, tar_digest FROM playbook_draft_versions \
+             WHERE draft_id = 'studio' ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("versions");
+        let row = (
+            Some(expected.digest().to_string()),
+            tarball.clone(),
+            content_digest(&tarball),
+        );
+        assert_eq!(rows, vec![row.clone(), row]);
+        let trees: i64 = sqlx::query_scalar("SELECT count(*) FROM pack_trees")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(trees, 1);
+    }
+
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn saves_version_and_round_trip_the_file_map(pool: PgPool) {
         let (first, second, third) = {
@@ -1595,10 +1647,6 @@ mod tests {
         assert_ne!(
             history[0].tar_digest, history[1].tar_digest,
             "an edited file is different bytes"
-        );
-        assert_eq!(
-            history[1].tar_digest, history[1].tar_digest,
-            "a digest is stable"
         );
 
         assert_eq!(
@@ -1942,7 +1990,9 @@ mod tests {
             "d",
             DraftSeed::Import {
                 id: "imp-1",
-                tar_gz: &import_tar,
+                tree: &crucible_contract::pack_tree::read_tar_gz(&import_tar)
+                    .expect("read")
+                    .tree,
             },
             None,
             &crate::authz::model::Principal::platform(),

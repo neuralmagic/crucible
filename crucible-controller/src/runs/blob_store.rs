@@ -11,6 +11,7 @@
 
 use anyhow::{Context, Result, ensure};
 use crucible_contract::content_digest;
+use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -399,30 +400,47 @@ pub fn gunzip_maybe(raw: &[u8]) -> Result<String> {
     }
 }
 
-/// Store (or replace) the frozen pack tarball for one sanitized issue key. Returns the digest.
-/// Generic over the executor so the write can join a caller's transaction.
-pub async fn put_pack_tarball(
-    ex: impl sqlx::PgExecutor<'_>,
+/// What a pack write stored: the content digest of the tarball written to the legacy bytes
+/// column, and the tree it encodes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPack {
+    pub digest: String,
+    pub tree: TreeDigest,
+}
+
+/// Store (or replace) one sanitized issue key's frozen pack: the tree, and its tarball beside it.
+pub async fn put_pack(
+    conn: &mut sqlx::PgConnection,
     issue_slug: &str,
-    tar_gz: &[u8],
-) -> Result<String> {
-    let digest = content_digest(tar_gz);
+    tree: &PackTree,
+) -> Result<StoredPack> {
+    let tarball = tree.tarball().context("encoding the pack tarball")?;
+    let digest = content_digest(&tarball);
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .context("opening the pack store transaction")?;
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, tree).await?;
     sqlx::query(
-        r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at)
-           VALUES ($1, $2, $3, $4, $5)
+        r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
+           VALUES ($1, $2, $3, $4, $5, $6)
            ON CONFLICT (issue_slug) DO UPDATE SET
                tar_gz = excluded.tar_gz, digest = excluded.digest, bytes = excluded.bytes,
-               created_at = excluded.created_at"#,
+               created_at = excluded.created_at, tree_digest = excluded.tree_digest"#,
     )
     .bind(issue_slug)
-    .bind(tar_gz)
+    .bind(&tarball)
     .bind(&digest)
-    .bind(tar_gz.len() as i64)
+    .bind(i64::try_from(tarball.len()).context("pack size")?)
     .bind(crate::clock::now_rfc3339())
-    .execute(ex)
+    .bind(tree_digest.as_str())
+    .execute(&mut *tx)
     .await
     .context("storing pack tarball")?;
-    Ok(digest)
+    tx.commit().await.context("committing the pack store")?;
+    Ok(StoredPack {
+        digest,
+        tree: tree_digest,
+    })
 }
 
 /// Read one pack tarball back, digest-verified, or `None` if never stored.
@@ -580,7 +598,7 @@ impl Chunker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::blob_store::*;
     use futures_util::stream;
 
     #[test]
@@ -930,32 +948,53 @@ mod tests {
         );
     }
 
+    /// A pack write stores the tree's own tarball beside the tree, and a replacement moves both.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn pack_tarball_roundtrips_and_replaces(pool: sqlx::PgPool) {
+    async fn a_pack_roundtrips_and_replaces_with_its_tree(pool: sqlx::PgPool) {
         assert!(
             get_pack_tarball(&pool, "owner_repo_7")
                 .await
                 .expect("get")
                 .is_none()
         );
-        let first = payload(2048);
-        let digest = put_pack_tarball(&pool, "owner_repo_7", &first)
+        let mut conn = pool.acquire().await.expect("conn");
+        let stored_tree = || async {
+            sqlx::query_scalar::<_, Option<String>>(
+                "SELECT tree_digest FROM pack_tarballs WHERE issue_slug = 'owner_repo_7'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("tree column")
+        };
+
+        let first = PackTree::from_pairs(&[("crucible.toml", b"m"), ("big", &payload(2048))])
+            .expect("tree");
+        let stored = put_pack(&mut conn, "owner_repo_7", &first)
             .await
             .expect("put");
-        assert_eq!(digest, content_digest(&first));
+        let tarball = first.tarball().expect("tarball");
+        assert_eq!(
+            stored,
+            StoredPack {
+                digest: content_digest(&tarball),
+                tree: first.digest(),
+            }
+        );
         assert_eq!(
             get_pack_tarball(&pool, "owner_repo_7").await.expect("get"),
-            Some(first)
+            Some(tarball)
         );
+        assert_eq!(stored_tree().await, Some(first.digest().to_string()));
 
-        let second = payload(10);
-        put_pack_tarball(&pool, "owner_repo_7", &second)
+        let second = PackTree::from_pairs(&[("crucible.toml", b"n")]).expect("tree");
+        put_pack(&mut conn, "owner_repo_7", &second)
             .await
             .expect("replace");
         assert_eq!(
             get_pack_tarball(&pool, "owner_repo_7").await.expect("get"),
-            Some(second)
+            Some(second.tarball().expect("tarball"))
         );
+        assert_eq!(stored_tree().await, Some(second.digest().to_string()));
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

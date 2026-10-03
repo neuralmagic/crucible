@@ -1048,8 +1048,12 @@ mod tests {
                 None,
             ))
             .await?;
-        crate::runs::blob_store::put_pack_tarball(live.pool(), "owner_repo_2", b"tarball bytes")
-            .await?;
+        crate::runs::blob_store::put_pack(
+            &mut *live.pool().acquire().await?,
+            "owner_repo_2",
+            &crucible_contract::pack_tree::PackTree::from_pairs(&[("SCOPE.md", b"s")])?,
+        )
+        .await?;
         crate::runs::blob_store::put_run_session(live.pool(), "run-1", b"{\"v\":1}\n").await?;
 
         let into = db_with(pool);
@@ -1308,13 +1312,18 @@ mod tests {
         let live_url = crate::test_ledger_url();
         let live_pool = crate::client::connect(&live_url).await?;
 
-        let tgz = {
-            let tree = tempfile::tempdir()?;
-            std::fs::write(tree.path().join("SCOPE.md"), "identity: v1:beef\n")?;
-            crate::playbooks::packs::tar_pack_tree(tree.path())?
-        };
-        let digest =
-            crate::runs::blob_store::put_pack_tarball(&live_pool, "owner_repo_7", &tgz).await?;
+        let tree = crucible_contract::pack_tree::PackTree::from_pairs(&[(
+            "SCOPE.md",
+            b"identity: v1:beef\n",
+        )])?;
+        let tgz = tree.tarball()?;
+        let digest = crate::runs::blob_store::put_pack(
+            &mut *live_pool.acquire().await?,
+            "owner_repo_7",
+            &tree,
+        )
+        .await?
+        .digest;
         crate::runs::blob_store::append_steering(
             &live_pool,
             "owner_repo_7",

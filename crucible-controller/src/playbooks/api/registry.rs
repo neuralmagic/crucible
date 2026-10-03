@@ -49,6 +49,8 @@ pub(crate) struct RegisterAck {
     pub(crate) exposure_digest: Option<String>,
     /// True when re-registering an existing id changed the declared exposure.
     pub(crate) exposure_changed: bool,
+    /// Paths under an excluded segment (`state`, `.git`, `workspace`) that were not stored.
+    pub(crate) ignored_paths: Vec<String>,
 }
 
 impl From<crate::playbooks::registry::Registered> for RegisterAck {
@@ -61,6 +63,7 @@ impl From<crate::playbooks::registry::Registered> for RegisterAck {
             schema_changed: r.schema_changed,
             exposure_digest: r.exposure_digest,
             exposure_changed: r.exposure_changed,
+            ignored_paths: r.ignored,
         }
     }
 }

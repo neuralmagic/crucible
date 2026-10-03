@@ -6293,11 +6293,17 @@ async fn an_operator_proposes_an_import_and_an_admin_registers_it(pool: PgPool) 
         "the mapped task carries what it maps over: {import}"
     );
     assert_eq!(import["diagnostics"], serde_json::json!([]));
+    assert_eq!(import["ignored_paths"], serde_json::json!([]));
 
-    // The link, opened cold: the same gate, without re-fetching anything.
+    // The link, opened cold: the same gate, without re-fetching anything. Ignored paths are
+    // reported by the fetch alone.
     let (status, reread) = get_json_object(&app, &format!("/api/playbooks/imports/{id}")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(reread, import, "a shared link rehydrates the proposal");
+    let mut proposed = import.clone();
+    if let Some(fields) = proposed.as_object_mut() {
+        fields.remove("ignored_paths");
+    }
+    assert_eq!(reread, proposed, "a shared link rehydrates the proposal");
 
     let (status, approvals) = get_json_object(&app, "/api/approvals").await;
     assert_eq!(status, StatusCode::OK);

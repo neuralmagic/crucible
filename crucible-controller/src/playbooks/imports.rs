@@ -17,6 +17,7 @@ use crate::playbooks::registry::{
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
+use crucible_contract::pack_tree::read_tar_gz;
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 
@@ -160,6 +161,13 @@ impl PackImport {
     }
 }
 
+/// A just-proposed import, and the excluded paths its fetch skipped.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Proposed {
+    pub import: PackImport,
+    pub ignored: Vec<String>,
+}
+
 /// Fetch a pack at a ref, compile it with the pinned engine, and store the result as a pending
 /// import. The compile is the same one the preview gate renders, so a source the engine refuses
 /// still lands a row: its diagnostics are what the proposal is.
@@ -169,7 +177,7 @@ pub async fn propose(
     source: PackSource<'_>,
     actor: Option<&str>,
     owner: &crate::authz::model::Principal,
-) -> Result<PackImport, ImportError> {
+) -> Result<Proposed, ImportError> {
     validate_path(source.path).map_err(RegisterError::Invalid)?;
     let core_rev = crate::playbooks::registry::core_rev()?;
 
@@ -191,19 +199,19 @@ pub async fn propose(
             },
         )?;
         let preview = crate::playbooks::preview::preview_pack(
-            fetched.pack.path(),
+            fetched.scratch.path(),
             &BTreeMap::new(),
             crate::playbooks::preview::Unvalued::Refuse,
         )?;
-        Ok::<_, RegisterError>((fetched.rev, fetched.tar_gz, preview))
+        Ok::<_, RegisterError>((fetched.rev, fetched.pack, preview))
     })
     .await
     .context("joining the pack import worker")?;
-    let (rev, tar_gz, preview) = fetched?;
+    let (rev, pack, preview) = fetched?;
     let (repo, git_ref, path) = (source.repo, source.git_ref, source.path);
 
     let id = uuid::Uuid::now_v7().to_string();
-    let tar_digest = content_digest(&tar_gz);
+    let tar_digest = content_digest(&pack.tarball);
     let graph = preview
         .graph
         .as_ref()
@@ -221,15 +229,20 @@ pub async fn propose(
         .transpose()?;
     let now = crate::clock::now_rfc3339();
 
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the pack import transaction")?;
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree).await?;
     let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO pack_imports (id, repo, git_ref, path, rev, tar_gz, tar_digest, tar_bytes,
                                      params_schema, schema_digest, graph, diagnostics,
                                      agent_backend, agent_sandbox_image, declared_secrets,
                                      exposure, exposure_digest,
                                      core_rev, status, proposed_by, created_at, agent_requirements,
-                                     owner)
+                                     owner, tree_digest)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                   'pending', $19, $20, $21, $22)
+                   'pending', $19, $20, $21, $22, $23)
            RETURNING {COLUMNS}"#
     ))
     .bind(&id)
@@ -237,9 +250,9 @@ pub async fn propose(
     .bind(git_ref)
     .bind(path)
     .bind(&rev)
-    .bind(&tar_gz)
+    .bind(&pack.tarball)
     .bind(&tar_digest)
-    .bind(tar_gz.len() as i64)
+    .bind(i64::try_from(pack.tarball.len()).context("pack size")?)
     .bind(&preview.params_schema)
     .bind(&preview.schema_digest)
     .bind(&graph)
@@ -254,10 +267,16 @@ pub async fn propose(
     .bind(&now)
     .bind(preview.agent.as_ref().map(|a| a.requirements_json()))
     .bind(owner.to_string())
-    .fetch_one(pool)
+    .bind(tree_digest.as_str())
+    .fetch_one(&mut *tx)
     .await
     .context("storing a pack import")?;
-    Ok(PackImport::from_row(&row)?)
+    let import = PackImport::from_row(&row)?;
+    tx.commit().await.context("committing a pack import")?;
+    Ok(Proposed {
+        import,
+        ignored: pack.ignored,
+    })
 }
 
 /// One import row.
@@ -431,14 +450,16 @@ pub async fn open_as_draft(
     let tar_gz = tarball(pool, id)
         .await?
         .ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
+    let tree = tokio::task::spawn_blocking(move || read_tar_gz(&tar_gz))
+        .await
+        .context("joining the import read worker")?
+        .context("reading the frozen import tarball")?
+        .tree;
     let saved = crate::playbooks::drafts::create(
         pool,
         draft_id,
         description,
-        DraftSeed::Import {
-            id,
-            tar_gz: &tar_gz,
-        },
+        DraftSeed::Import { id, tree: &tree },
         actor,
         &import.owner,
     )
@@ -463,16 +484,16 @@ pub async fn propose_as_draft(
     description: &str,
     actor: Option<&str>,
     owner: &crate::authz::model::Principal,
-) -> Result<(PackImport, SavedVersion), ImportError> {
+) -> Result<(Proposed, SavedVersion), ImportError> {
     crate::playbooks::drafts::ensure_available(pool, draft_id, description).await?;
-    let import = propose(pool, git, source, actor, owner).await?;
-    let saved = open_as_draft(pool, &import.id, draft_id, description, actor).await?;
-    Ok((import, saved))
+    let proposed = propose(pool, git, source, actor, owner).await?;
+    let saved = open_as_draft(pool, &proposed.import.id, draft_id, description, actor).await?;
+    Ok((proposed, saved))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::playbooks::imports::*;
 
     fn source(repo: &str) -> PackSource<'_> {
         PackSource {
@@ -517,7 +538,8 @@ mod tests {
             &crate::authz::model::Principal::platform(),
         )
         .await
-        .expect("proposes");
+        .expect("proposes")
+        .import;
 
         let declared: Vec<&str> = import
             .declared_secrets
@@ -562,7 +584,8 @@ mod tests {
             &crate::authz::model::Principal::platform(),
         )
         .await
-        .expect("proposes");
+        .expect("proposes")
+        .import;
         move_branch(&repo, &format!("{WORKFLOW_NO_PARAMS}# moved on\n"));
 
         assert_eq!(import.status, ImportStatus::Pending);
@@ -617,7 +640,8 @@ mod tests {
             &crate::authz::model::Principal::platform(),
         )
         .await
-        .expect("proposes");
+        .expect("proposes")
+        .import;
         let registered = register(
             &pool,
             &PackGit::default(),
@@ -686,7 +710,8 @@ mod tests {
             &crate::authz::model::Principal::platform(),
         )
         .await
-        .expect("proposes");
+        .expect("proposes")
+        .import;
         let discarded = discard(&pool, &import.id, Some("wren"))
             .await
             .expect("discards");
@@ -732,7 +757,8 @@ mod tests {
             &crate::authz::model::Principal::platform(),
         )
         .await
-        .expect("proposes");
+        .expect("proposes")
+        .import;
         move_branch(&repo, &format!("{WORKFLOW_NO_PARAMS}# moved on\n"));
         open_as_draft(&pool, &import.id, "survey-draft", "edit it", Some("wren"))
             .await
@@ -773,7 +799,8 @@ mod tests {
             &crate::authz::model::Principal::platform(),
         )
         .await
-        .expect("proposes");
+        .expect("proposes")
+        .import;
         let second = propose(
             &pool,
             &PackGit::default(),
@@ -782,7 +809,8 @@ mod tests {
             &crate::authz::model::Principal::platform(),
         )
         .await
-        .expect("proposes");
+        .expect("proposes")
+        .import;
         discard(&pool, &first.id, Some("wren"))
             .await
             .expect("discards");
@@ -793,5 +821,70 @@ mod tests {
             vec![second.id.as_str()]
         );
         assert_eq!(waiting[0].proposed_by.as_deref(), Some("wren"));
+    }
+
+    /// An import stores its tree once beside that tree's own tarball and reports the excluded
+    /// paths it skipped; the draft opened from it starts at version 1 on that same tree, with no
+    /// second tree row.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_import_and_the_draft_opened_from_it_share_one_tree(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = fixture_repo(dir.path(), WORKFLOW_NO_PARAMS);
+        std::fs::create_dir_all(Path::new(&repo).join("state")).expect("mkdir");
+        std::fs::write(Path::new(&repo).join("state/run.log"), "runtime").expect("write");
+        run_git(&["-C", &repo, "add", "-A"]);
+        run_git(&["-C", &repo, "commit", "--quiet", "-m", "state"]);
+        let expected = crucible_contract::pack_tree::PackTree::from_pairs(&[
+            ("crucible.toml", PLAYBOOK_REPO_MANIFEST.as_bytes()),
+            ("workflow.star", WORKFLOW_NO_PARAMS.as_bytes()),
+        ])
+        .expect("tree");
+
+        let proposed = propose(
+            &pool,
+            &PackGit::default(),
+            source(&repo),
+            Some("agent"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("proposes");
+        assert_eq!(proposed.ignored, vec![".git", "state"]);
+        let stored: (Option<String>, Vec<u8>) =
+            sqlx::query_as("SELECT tree_digest, tar_gz FROM pack_imports WHERE id = $1")
+                .bind(&proposed.import.id)
+                .fetch_one(&pool)
+                .await
+                .expect("import row");
+        assert_eq!(
+            stored,
+            (
+                Some(expected.digest().to_string()),
+                expected.tarball().expect("tarball")
+            )
+        );
+
+        let saved = open_as_draft(
+            &pool,
+            &proposed.import.id,
+            "survey-draft",
+            "edit it",
+            Some("wren"),
+        )
+        .await
+        .expect("opens as a draft");
+        assert_eq!(saved.version, 1);
+        let version_tree: Option<String> = sqlx::query_scalar(
+            "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = 'survey-draft'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("version row");
+        assert_eq!(version_tree, stored.0);
+        let trees: i64 = sqlx::query_scalar("SELECT count(*) FROM pack_trees")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(trees, 1);
     }
 }
