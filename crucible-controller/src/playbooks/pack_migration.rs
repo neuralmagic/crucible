@@ -2,9 +2,9 @@
 //!
 //! Every row that holds a gzipped pack and no tree digest is read as a tree, the tree is stored,
 //! the row's old gzip digest is recorded as an alias, and the row is pointed at the tree. A
-//! tarball that cannot be a pack is recorded as unconvertible and never retried. Pins that hold
-//! an old digest are then rewritten to its tree. Safe to run on every start: converted rows are
-//! skipped, and each step is idempotent.
+//! tarball that cannot be a pack is recorded as unconvertible and never retried. Revision pins
+//! are not touched. Safe to run on every start: converted rows are skipped, and each step is
+//! idempotent.
 
 #![allow(clippy::disallowed_macros)]
 
@@ -20,7 +20,6 @@ use sqlx::{PgConnection, PgPool, Row};
 pub struct ConversionReport {
     pub converted: usize,
     pub unconvertible: usize,
-    pub pins_rewritten: u64,
 }
 
 /// A legacy pack-byte column, its tree column, and a SQL expression naming one row as text.
@@ -64,17 +63,6 @@ const COLUMNS: [Column; 5] = [
     },
 ];
 
-/// Pin columns that may hold an old gzip pack digest. Only values with an alias are rewritten, so
-/// a git commit or an engine identity in the same column is left alone.
-const PINS: [(&str, &str); 6] = [
-    ("playbooks", "rev"),
-    ("playbook_standing_launches", "adopted_rev"),
-    ("playbook_drafts", "origin_rev"),
-    ("secret_bindings", "pack_rev"),
-    ("scopes", "pack_digest"),
-    ("runs", "identity_digest"),
-];
-
 /// What an old gzip digest became.
 enum AliasTarget {
     Tree(TreeDigest),
@@ -86,22 +74,12 @@ fn content_digest_sql(column: &str) -> String {
     format!("'sha256:' || encode(sha256({column}), 'hex')")
 }
 
-/// Convert every unconverted legacy pack row and rewrite the pins that name an old digest. The
-/// caller holds the maintenance lock, so this is the only writer of tree columns.
+/// Convert every unconverted legacy pack row. The caller holds the maintenance lock, so this is
+/// the only writer of tree columns.
 pub async fn convert_pack_trees(pool: &PgPool) -> Result<ConversionReport> {
     let mut report = ConversionReport::default();
     for column in &COLUMNS {
         convert_column(pool, column, &mut report).await?;
-    }
-    for (table, pin) in PINS {
-        report.pins_rewritten += sqlx::query(sqlx::AssertSqlSafe(format!(
-            "UPDATE {table} t SET {pin} = a.tree_digest FROM pack_digest_aliases a
-             WHERE t.{pin} = a.old_digest AND a.tree_digest IS NOT NULL"
-        )))
-        .execute(pool)
-        .await
-        .with_context(|| format!("rewriting {table}.{pin} to tree digests"))?
-        .rows_affected();
     }
     sqlx::query(
         "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at)
@@ -157,8 +135,9 @@ async fn convert_column(pool: &PgPool, c: &Column, report: &mut ConversionReport
         record_alias(&mut tx, &old, &target).await?;
         match &target {
             AliasTarget::Tree(tree) => {
-                pin_tree(&mut tx, c, &key, tree, &old).await?;
-                report.converted += 1;
+                if pin_tree(&mut tx, c, &key, tree, &old).await? == 1 {
+                    report.converted += 1;
+                }
             }
             AliasTarget::Unconvertible(reason) => {
                 tracing::warn!(table = c.table, key, %reason, "pack cannot be a tree; recorded unconvertible");
@@ -342,38 +321,79 @@ mod tests {
         );
     }
 
-    /// A pin holding an old gzip digest is rewritten to the tree; a git commit or an engine
-    /// identity in the same column is left alone.
+    /// Every legacy column converts, the composite draft-version key included, and a revision
+    /// pin naming the old digest is left as it was.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn pins_naming_an_old_digest_are_rewritten(pool: PgPool) {
-        let tree = pack(&[("crucible.toml", b"m")]);
-        let legacy = tree.tarball().expect("encode");
+    async fn every_legacy_column_converts_and_pins_are_untouched(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("crucible.toml"), "m").expect("write");
+        let legacy = crate::playbooks::packs::tar_pack_tree(dir.path()).expect("tar");
         let old = content_digest(&legacy);
+        let size = legacy.len() as i64;
         seed_launch_pack(&pool, "a", &legacy).await;
-        sqlx::query(
-            "INSERT INTO playbook_drafts (id, description, created_by, created_at, updated_at, origin_rev)
-             VALUES ('d1', 'x', 'w', 'now', 'now', $1), ('d2', 'x', 'w', 'now', 'now', 'abc123')",
-        )
-        .bind(&old)
-        .execute(&pool)
-        .await
-        .expect("seed drafts");
+        for statement in [
+            "INSERT INTO playbook_drafts (id, description, created_at, updated_at, origin_rev)
+             VALUES ('d', 'x', 'now', 'now', $3)",
+            "INSERT INTO playbook_draft_versions
+                 (draft_id, version, tar_gz, tar_digest, tar_bytes, diagnostics, core_rev, created_at)
+             VALUES ('d', 2, $1, $3, $2, '[]', 'c', 'now')",
+            "INSERT INTO playbooks (id, description, repo, path, rev, tar_gz, tar_digest, tar_bytes,
+                 params_schema, schema_digest, core_rev, created_at, updated_at)
+             VALUES ('p', 'x', 'o/r', '.', $3, $1, $3, $2, '{}', 's', 'c', 'now', 'now')",
+            "INSERT INTO pack_imports (id, repo, path, rev, tar_gz, tar_digest, tar_bytes,
+                 diagnostics, core_rev, status, created_at)
+             VALUES ('i', 'o/r', '.', 'abc', $1, $3, $2, '[]', 'c', 'pending', 'now')",
+            "INSERT INTO playbook_standing_launches (id, trigger, playbook, params, schema_digest,
+                 max_cost, max_time, created_at, updated_at, target_kind, adopted_rev,
+                 adopted_tar_gz, adopted_tar_digest, adopted_tar_bytes, adopted_params_schema)
+             VALUES ('s', 'schedule', 'p', '{}', 's', 1, '5m', 'now', 'now', 'adopted', $3,
+                 $1, $3, $2, '{}')",
+        ] {
+            sqlx::query(statement)
+                .bind(&legacy)
+                .bind(size)
+                .bind(&old)
+                .execute(&pool)
+                .await
+                .expect(statement);
+        }
 
         let report = convert_pack_trees(&pool).await.expect("convert");
 
-        let revs: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT id, origin_rev FROM playbook_drafts ORDER BY id")
+        let tree = pack(&[("crucible.toml", b"m")]).digest().to_string();
+        assert_eq!(
+            report,
+            ConversionReport {
+                converted: 5,
+                unconvertible: 0
+            }
+        );
+        let trees: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT tree_digest FROM playbooks
+             UNION ALL SELECT tree_digest FROM pack_imports
+             UNION ALL SELECT tree_digest FROM playbook_draft_versions
+             UNION ALL SELECT adopted_tree_digest FROM playbook_standing_launches
+             UNION ALL SELECT tree_digest FROM pack_tarballs",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("trees");
+        assert_eq!(trees, vec![Some(tree.clone()); 5]);
+        let pins: Vec<String> = sqlx::query_scalar(
+            "SELECT rev FROM playbooks
+             UNION ALL SELECT adopted_rev FROM playbook_standing_launches
+             UNION ALL SELECT origin_rev FROM playbook_drafts",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("pins");
+        assert_eq!(pins, vec![old; 3]);
+        let revisions: Vec<(String, String)> =
+            sqlx::query_as("SELECT playbook_id, tree_digest FROM playbook_revisions")
                 .fetch_all(&pool)
                 .await
-                .expect("read");
-        assert_eq!(
-            revs,
-            vec![
-                ("d1".to_string(), Some(tree.digest().to_string())),
-                ("d2".to_string(), Some("abc123".to_string())),
-            ]
-        );
-        assert_eq!(report.pins_rewritten, 1);
+                .expect("revisions");
+        assert_eq!(revisions, vec![("p".to_string(), tree)]);
     }
 
     /// An older controller that rewrites the bytes of a row while it is being converted does not

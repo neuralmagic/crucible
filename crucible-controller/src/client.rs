@@ -434,7 +434,7 @@ mod tests {
             ),
             (
                 "0051_pack_trees.sql",
-                "c17905a7e80284c04b2c11eeb11e8b6e43acb4f317bd3e165151c6ee08d3f518",
+                "1eed2f9a22894d99151160140c7fc7f5e78a5a60d094071f9a5d9fdcf681efc2",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

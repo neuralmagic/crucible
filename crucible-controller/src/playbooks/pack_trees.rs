@@ -18,16 +18,18 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, tree: &PackTree) -> Result
     if stored.is_some() {
         return Ok(digest);
     }
-    let delivered = tree.tarball().context("encoding the pack tarball")?.len();
+    let tarball = tree.tarball().context("encoding the pack tarball")?;
     let total: usize = tree.files().values().map(Vec::len).sum();
     let inserted = sqlx::query(
-        "INSERT INTO pack_trees (digest, file_count, total_bytes, delivered_bytes, created_at)
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (digest) DO NOTHING",
+        "INSERT INTO pack_trees
+             (digest, file_count, total_bytes, delivered_bytes, tarball_digest, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (digest) DO NOTHING",
     )
     .bind(digest.as_str())
     .bind(i32::try_from(tree.files().len()).context("pack file count")?)
     .bind(i64::try_from(total).context("pack size")?)
-    .bind(i64::try_from(delivered).context("pack delivered size")?)
+    .bind(i64::try_from(tarball.len()).context("pack delivered size")?)
+    .bind(crucible_contract::content_digest(&tarball))
     .bind(crate::clock::now_rfc3339())
     .execute(&mut *conn)
     .await
@@ -93,46 +95,59 @@ mod tests {
         );
     }
 
-    /// A controller that predates tree storage rewrites the bytes without the tree column; the
-    /// trigger clears the column so conversion picks the row up again.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn rewriting_legacy_bytes_alone_clears_the_tree_digest(pool: PgPool) {
-        let mut conn = pool.acquire().await.expect("conn");
-        let digest = put_tree(&mut conn, &pack(&[("a", b"1")]))
+    async fn seed_legacy_row(pool: &PgPool, tree: &str) {
+        sqlx::query("DELETE FROM pack_tarballs")
+            .execute(pool)
             .await
-            .expect("put");
+            .expect("clear");
         sqlx::query(
             "INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
-             VALUES ('s', 'old', 'sha256:x', 1, 'now', $1)",
+             VALUES ('s', 'legacy', 'sha256:x', 1, 'now', $1)",
         )
-        .bind(digest.as_str())
-        .execute(&pool)
+        .bind(tree)
+        .execute(pool)
         .await
         .expect("seed");
+    }
 
-        sqlx::query("UPDATE pack_tarballs SET tar_gz = 'new' WHERE issue_slug = 's'")
-            .execute(&pool)
+    async fn update_and_read(
+        pool: &PgPool,
+        update: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    ) -> Option<String> {
+        update.execute(pool).await.expect("update");
+        sqlx::query_scalar("SELECT tree_digest FROM pack_tarballs WHERE issue_slug = 's'")
+            .fetch_one(pool)
             .await
-            .expect("old writer");
-        let cleared: Option<String> =
-            sqlx::query_scalar("SELECT tree_digest FROM pack_tarballs WHERE issue_slug = 's'")
-                .fetch_one(&pool)
-                .await
-                .expect("read");
-        assert_eq!(cleared, None);
+            .expect("read")
+    }
 
-        sqlx::query(
-            "UPDATE pack_tarballs SET tar_gz = 'newer', tree_digest = $1 WHERE issue_slug = 's'",
-        )
-        .bind(digest.as_str())
-        .execute(&pool)
-        .await
-        .expect("new writer");
-        let kept: Option<String> =
-            sqlx::query_scalar("SELECT tree_digest FROM pack_tarballs WHERE issue_slug = 's'")
-                .fetch_one(&pool)
-                .await
-                .expect("read");
-        assert_eq!(kept.as_deref(), Some(digest.as_str()));
+    /// The tree digest survives a byte rewrite only when the new bytes are that tree's own
+    /// tarball, whether or not the writer names the tree, and an update that leaves the bytes
+    /// alone never touches it.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_tree_digest_survives_only_its_own_tarball(pool: PgPool) {
+        let tree = pack(&[("a", b"1")]);
+        let mut conn = pool.acquire().await.expect("conn");
+        let digest = put_tree(&mut conn, &tree).await.expect("put");
+        let pinned = Some(digest.to_string());
+
+        seed_legacy_row(&pool, digest.as_str()).await;
+        let other_column = sqlx::query("UPDATE pack_tarballs SET created_at = 'later'");
+        assert_eq!(update_and_read(&pool, other_column).await, pinned);
+
+        seed_legacy_row(&pool, digest.as_str()).await;
+        let old_writer = sqlx::query("UPDATE pack_tarballs SET tar_gz = 'other'");
+        assert_eq!(update_and_read(&pool, old_writer).await, None);
+
+        seed_legacy_row(&pool, digest.as_str()).await;
+        let mislabelled =
+            sqlx::query("UPDATE pack_tarballs SET tar_gz = 'other', tree_digest = $1")
+                .bind(digest.as_str());
+        assert_eq!(update_and_read(&pool, mislabelled).await, None);
+
+        seed_legacy_row(&pool, digest.as_str()).await;
+        let own_tarball = sqlx::query("UPDATE pack_tarballs SET tar_gz = $1")
+            .bind(tree.tarball().expect("encode"));
+        assert_eq!(update_and_read(&pool, own_tarball).await, pinned);
     }
 }

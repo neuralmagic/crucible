@@ -7,6 +7,8 @@ CREATE TABLE pack_trees (
     file_count      INT    NOT NULL,
     total_bytes     BIGINT NOT NULL,
     delivered_bytes BIGINT NOT NULL,
+    -- sha256 of the tree's deterministic delivery tarball, in content_digest form.
+    tarball_digest  TEXT   NOT NULL,
     created_at      TEXT   NOT NULL
 );
 
@@ -43,23 +45,36 @@ ALTER TABLE playbook_standing_launches ADD COLUMN adopted_tree_digest TEXT REFER
 ALTER TABLE pack_tarballs              ADD COLUMN tree_digest TEXT REFERENCES pack_trees(digest);
 
 -- A controller that predates tree storage rewrites legacy bytes without knowing the tree column.
--- Clear the tree column when the bytes change alone, so startup conversion picks the row up again.
+-- When the bytes change, keep the tree only if the new bytes are that tree's own tarball; otherwise
+-- clear it so startup conversion picks the row up again.
 CREATE FUNCTION pack_legacy_bytes_changed() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    bytes_digest TEXT;
+    tree         TEXT;
 BEGIN
-    IF to_jsonb(NEW) -> TG_ARGV[0] IS DISTINCT FROM to_jsonb(OLD) -> TG_ARGV[0]
-       AND to_jsonb(NEW) -> TG_ARGV[1] IS NOT DISTINCT FROM to_jsonb(OLD) -> TG_ARGV[1] THEN
+    EXECUTE format('SELECT ''sha256:'' || encode(sha256(($1).%I), ''hex''), ($1).%I',
+                   TG_ARGV[0], TG_ARGV[1])
+        INTO bytes_digest, tree USING NEW;
+    IF tree IS NOT NULL AND NOT EXISTS (
+        SELECT 1 FROM pack_trees WHERE digest = tree AND tarball_digest = bytes_digest) THEN
         NEW := jsonb_populate_record(NEW, jsonb_build_object(TG_ARGV[1], NULL));
     END IF;
     RETURN NEW;
 END $$;
 
-CREATE TRIGGER playbooks_legacy_bytes BEFORE UPDATE ON playbooks
-    FOR EACH ROW EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
-CREATE TRIGGER pack_imports_legacy_bytes BEFORE UPDATE ON pack_imports
-    FOR EACH ROW EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
-CREATE TRIGGER playbook_draft_versions_legacy_bytes BEFORE UPDATE ON playbook_draft_versions
-    FOR EACH ROW EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
-CREATE TRIGGER playbook_standing_launches_legacy_bytes BEFORE UPDATE ON playbook_standing_launches
-    FOR EACH ROW EXECUTE FUNCTION pack_legacy_bytes_changed('adopted_tar_gz', 'adopted_tree_digest');
-CREATE TRIGGER pack_tarballs_legacy_bytes BEFORE UPDATE ON pack_tarballs
-    FOR EACH ROW EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
+CREATE TRIGGER playbooks_legacy_bytes BEFORE UPDATE OF tar_gz ON playbooks
+    FOR EACH ROW WHEN (NEW.tar_gz IS DISTINCT FROM OLD.tar_gz)
+    EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
+CREATE TRIGGER pack_imports_legacy_bytes BEFORE UPDATE OF tar_gz ON pack_imports
+    FOR EACH ROW WHEN (NEW.tar_gz IS DISTINCT FROM OLD.tar_gz)
+    EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
+CREATE TRIGGER playbook_draft_versions_legacy_bytes BEFORE UPDATE OF tar_gz ON playbook_draft_versions
+    FOR EACH ROW WHEN (NEW.tar_gz IS DISTINCT FROM OLD.tar_gz)
+    EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
+CREATE TRIGGER playbook_standing_launches_legacy_bytes
+    BEFORE UPDATE OF adopted_tar_gz ON playbook_standing_launches
+    FOR EACH ROW WHEN (NEW.adopted_tar_gz IS DISTINCT FROM OLD.adopted_tar_gz)
+    EXECUTE FUNCTION pack_legacy_bytes_changed('adopted_tar_gz', 'adopted_tree_digest');
+CREATE TRIGGER pack_tarballs_legacy_bytes BEFORE UPDATE OF tar_gz ON pack_tarballs
+    FOR EACH ROW WHEN (NEW.tar_gz IS DISTINCT FROM OLD.tar_gz)
+    EXECUTE FUNCTION pack_legacy_bytes_changed('tar_gz', 'tree_digest');
