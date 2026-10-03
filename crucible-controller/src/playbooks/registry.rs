@@ -27,8 +27,8 @@ use std::process::Command;
 /// Upper bound on a registry id. It rides a launch key and a pod label hint, so it stays short.
 const ID_MAX_LEN: usize = 64;
 
-/// Upper bound on a registered pack's gzipped tarball. A playbook pack is authored files, not a
-/// data set; a repo subtree that misses by this much is a mis-pointed `path`.
+/// Upper bound on a draft tarball publication unpacks, checked before it is read. The delivery
+/// budget is checked on what it unpacks to.
 pub(crate) const MAX_PACK_TAR_BYTES: usize = 8 * 1024 * 1024;
 
 /// The manifest table name a registered pack must declare its graph in.
@@ -476,10 +476,8 @@ pub(crate) fn fetch_pack(git: &PackGit, req: PackSource<'_>) -> Result<FetchedPa
 
     let root = pack_root(&checkout.path(), req.path)?;
     let tar_gz = crate::playbooks::packs::deliverable_tarball(&root)?;
-    // The stored bytes go through the same traversal rejection every materialization runs, before
-    // they become the durable pack.
     let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-        .context("validating the playbook pack tarball")
+        .context("unpacking the playbook pack tarball")
         .map_err(RegisterError::Internal)?;
     Ok(FetchedPack {
         rev: checkout.rev,

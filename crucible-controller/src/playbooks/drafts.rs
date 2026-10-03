@@ -425,9 +425,15 @@ fn write_tree(files: &BTreeMap<String, String>, root: &Path) -> Result<(), Draft
         if path.trim().is_empty() {
             return Err(DraftError::Invalid("a draft file needs a path".to_string()));
         }
-        validate_path(path).map_err(|_| {
+        let pack_path: crucible_contract::pack_tree::PackFilePath = path.parse().map_err(|_| {
             DraftError::Invalid(format!("{path:?} is not a relative path inside the pack"))
         })?;
+        if pack_path.is_excluded() {
+            return Err(DraftError::Invalid(format!(
+                "{path} is under {}, which a pack never carries",
+                crucible_contract::pack_tree::EXCLUDED_SEGMENTS.join(", ")
+            )));
+        }
         if content.len() > MAX_DRAFT_FILE_BYTES {
             return Err(DraftError::Invalid(format!(
                 "{path} is {} bytes, over the {MAX_DRAFT_FILE_BYTES}-byte per-file limit",
@@ -1363,10 +1369,6 @@ mod tests {
         ])
     }
 
-    /// The docs-drift case, at the layer that reported it clean: a draft whose manifest declares
-    /// no `[agent]` compiles, and its agent task still cannot be spawned where a pod launch would
-    /// put it. The save has to say so, anchored on the manifest, marked as the dispatch verdict
-    /// rather than a compile failure.
     /// A save whose files each fit the per-file cap, but whose delivered tarball is over the
     /// delivery budget, is refused and stores no version.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -1400,6 +1402,10 @@ mod tests {
         );
     }
 
+    /// The docs-drift case, at the layer that reported it clean: a draft whose manifest declares
+    /// no `[agent]` compiles, and its agent task still cannot be spawned where a pod launch would
+    /// put it. The save has to say so, anchored on the manifest, marked as the dispatch verdict
+    /// rather than a compile failure.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_save_that_compiles_still_reports_what_cannot_be_spawned(pool: PgPool) {
         let pod = crate::playbooks::dispatch::DispatchCapability::new(
@@ -1525,9 +1531,17 @@ mod tests {
     }
 
     #[test]
-    fn a_file_map_that_escapes_the_pack_is_refused() {
+    fn a_file_map_that_escapes_the_pack_or_names_an_excluded_dir_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for bad in ["../escape.star", "/etc/passwd", ""] {
+        for bad in [
+            "../escape.star",
+            "/etc/passwd",
+            "",
+            "a\\b",
+            "skills/state/notes.md",
+            "workspace/flow.star",
+            ".git/config",
+        ] {
             let files = BTreeMap::from([(bad.to_string(), "x".to_string())]);
             assert!(
                 matches!(write_tree(&files, dir.path()), Err(DraftError::Invalid(_))),
