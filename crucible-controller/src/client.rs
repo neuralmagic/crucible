@@ -431,7 +431,8 @@ mod tests {
             (
                 "0050_task_agent.sql",
                 "b0adbc05a74f871f31b5366b635c213d44fef5133a7c0c66947684efc1a83138",
-            ),            (
+            ),
+            (
                 "0051_pack_trees.sql",
                 "c17905a7e80284c04b2c11eeb11e8b6e43acb4f317bd3e165151c6ee08d3f518",
             ),

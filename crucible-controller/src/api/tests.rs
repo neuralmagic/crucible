@@ -3267,7 +3267,7 @@ async fn playbook_limits_report_the_draft_caps_and_the_delivery_budget(pool: PgP
         serde_json::json!({
             "max_draft_files": 128,
             "max_draft_file_bytes": 512 * 1024,
-            "delivery_budget_bytes": crucible::deploy::PACK_DELIVERY_BUDGET_BYTES,
+            "delivery_budget_bytes": crucible_contract::pack_tree::DELIVERY_BUDGET_BYTES,
         })
     );
     Ok(())

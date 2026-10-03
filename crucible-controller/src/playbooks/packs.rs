@@ -9,7 +9,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use anyhow::{Context, Result, bail};
-use crucible_contract::pack_tree::{EXCLUDED_SEGMENTS, PackPath, PackTree, TreeError, walk_dir};
+use crucible_contract::pack_tree::{OverBudget, TreeError, check_delivery_budget, walk_dir};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,17 +27,23 @@ impl MaterializedPack {
     }
 }
 
-/// Why the pack tree at `root` is over the run delivery budget, or `None` when it fits: its
-/// delivered tarball (the engine's [`crucible::deploy::pack_delivery_tarball`]) against
-/// [`crucible::deploy::PACK_DELIVERY_BUDGET_BYTES`].
-pub(crate) fn over_delivery_budget(root: &Path) -> Result<Option<String>> {
-    let budget = crucible::deploy::PACK_DELIVERY_BUDGET_BYTES;
-    let bytes = crucible::deploy::pack_delivery_tarball(root)
-        .context("sizing the pack's delivered tarball")?
-        .len();
-    Ok((bytes > budget).then(|| {
-        format!("the pack delivers {bytes} gzipped bytes to a run, over the {budget}-byte delivery budget")
-    }))
+/// Why a pack tree is refused before it is stored.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PackRefusal {
+    #[error(transparent)]
+    NotAPack(#[from] TreeError),
+    #[error(transparent)]
+    OverBudget(#[from] OverBudget),
+    #[error("encoding the pack tarball: {0}")]
+    Encode(#[from] std::io::Error),
+}
+
+/// The pack at `root` as the tarball a run receives, refused when it is not a pack or is over the
+/// delivery budget (RFC-0002:C-PACK-BASE).
+pub(crate) fn deliverable_tarball(root: &Path) -> Result<Vec<u8>, PackRefusal> {
+    let tarball = walk_dir(root)?.tree.tarball()?;
+    check_delivery_budget(&tarball)?;
+    Ok(tarball)
 }
 
 /// Gzip-tar a pack working tree (regular files + symlinks, relative paths, `.git` excluded — a
@@ -219,92 +225,6 @@ pub(crate) fn read_tree(root: &Path) -> Result<BTreeMap<String, String>, ReadTre
                 .map_err(|_| ReadTreeError::NotText(path))
         })
         .collect()
-}
-
-/// A stored archive read as a pack: the tree, and the excluded paths it held.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Ingested {
-    pub tree: PackTree,
-    pub ignored: Vec<String>,
-}
-
-/// Read a gzipped tar as a pack under RFC-0002:C-PACK-BASE. Entries under an excluded segment are
-/// dropped and reported, whatever their type. Outside them a symlink, hard link, or special file,
-/// an absolute or escaping path, or a path no pack may hold is refused, naming the entry. Modes
-/// and timestamps are dropped; a later entry for the same path replaces an earlier one, as `tar`
-/// extraction does.
-pub(crate) fn tree_from_tar_gz(tgz: &[u8]) -> Result<Ingested, TreeError> {
-    let archive_err = |message: String| TreeError::Io {
-        path: "the pack archive".to_string(),
-        message,
-    };
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
-    let mut files: BTreeMap<PackPath, Vec<u8>> = BTreeMap::new();
-    let mut ignored: Vec<String> = Vec::new();
-    for entry in archive.entries().map_err(|e| archive_err(e.to_string()))? {
-        let mut entry = entry.map_err(|e| archive_err(e.to_string()))?;
-        let raw = entry
-            .path()
-            .map_err(|e| archive_err(e.to_string()))?
-            .into_owned();
-        let shown = raw.to_string_lossy().into_owned();
-        let mut segments = Vec::new();
-        for component in raw.components() {
-            match component {
-                std::path::Component::Normal(seg) => {
-                    segments.push(seg.to_str().ok_or_else(|| TreeError::InvalidPath {
-                        path: shown.clone(),
-                        reason: "is not valid UTF-8".to_string(),
-                    })?)
-                }
-                std::path::Component::CurDir => {}
-                _ => {
-                    return Err(TreeError::InvalidPath {
-                        path: shown,
-                        reason: "escapes the pack root".to_string(),
-                    });
-                }
-            }
-        }
-        if segments.is_empty() {
-            continue;
-        }
-        if let Some(i) = segments.iter().position(|s| EXCLUDED_SEGMENTS.contains(s)) {
-            let excluded = segments[..=i].join("/");
-            if !ignored.contains(&excluded) {
-                ignored.push(excluded);
-            }
-            continue;
-        }
-        let rel = segments.join("/");
-        match entry.header().entry_type() {
-            tar::EntryType::Directory => {}
-            tar::EntryType::Regular | tar::EntryType::Continuous => {
-                let path: PackPath = rel.parse()?;
-                let mut bytes = Vec::new();
-                std::io::Read::read_to_end(&mut entry, &mut bytes)
-                    .map_err(|e| archive_err(format!("{rel}: {e}")))?;
-                files.insert(path, bytes);
-            }
-            tar::EntryType::Symlink => return Err(TreeError::Symlink { path: rel }),
-            _ => return Err(TreeError::NonRegular { path: rel }),
-        }
-    }
-    ignored.sort();
-    Ok(Ingested {
-        tree: PackTree::new(files)?,
-        ignored,
-    })
-}
-
-/// The gzipped tar a legacy pack-byte column holds for `tree`, so a controller that predates
-/// tree storage reads the same files.
-pub(crate) fn encode_legacy_tar_gz(tree: &PackTree) -> Result<Vec<u8>> {
-    crucible::deploy::encode_pack_tarball(
-        tree.files()
-            .iter()
-            .map(|(path, bytes)| (path.as_str(), bytes.as_slice())),
-    )
 }
 
 /// Unpack a scope pack blob (gzip'd tar) into `dest`, replacing whatever was there — a stale pack
@@ -513,111 +433,45 @@ mod tests {
         );
     }
 
-    /// A tree within the budget fits; one whose delivered tarball is over it is refused with the
-    /// size, and an empty tree (a draft not yet written) delivers nothing and fits.
+    /// A pack within the budget yields the tarball a run receives; one over it is refused with
+    /// its size, and one holding a symlink is refused as not a pack.
     #[test]
-    fn over_delivery_budget_names_an_oversize_tree() {
-        use crate::testing::fixtures::{WORKFLOW_TOPIC, incompressible_text, write_playbook_pack};
+    fn deliverable_tarball_refuses_an_oversize_or_invalid_pack() {
+        use crate::testing::fixtures::{
+            WORKFLOW_TOPIC, write_over_budget_blobs, write_playbook_pack,
+        };
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
-        assert_eq!(over_delivery_budget(&pack).expect("sized"), None);
-
-        for seed in 1..=3 {
-            std::fs::write(
-                pack.join(format!("blob{seed}.txt")),
-                incompressible_text(500 * 1024, seed),
-            )
-            .expect("blob");
-        }
-        let over = over_delivery_budget(&pack)
-            .expect("sized")
-            .expect("over the budget");
-        assert!(over.contains("delivery budget"), "{over}");
-
-        let empty = dir.path().join("empty");
-        std::fs::create_dir_all(&empty).expect("mkdir");
-        assert_eq!(over_delivery_budget(&empty).expect("sized"), None);
-    }
-
-    fn pack(files: &[(&str, &[u8])]) -> PackTree {
-        PackTree::new(
-            files
-                .iter()
-                .map(|(p, b)| (p.parse().expect("path"), b.to_vec()))
-                .collect(),
-        )
-        .expect("tree")
-    }
-
-    /// Path, type, mode, mtime, bytes, and link target of one hand-built tar entry.
-    type RawEntry<'a> = (&'a str, tar::EntryType, u32, u64, &'a [u8], Option<&'a str>);
-
-    /// Build a tar.gz entry by entry, so a test controls every header field.
-    fn raw_tgz(level: u32, entries: &[RawEntry<'_>]) -> Vec<u8> {
-        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::new(level));
-        let mut builder = tar::Builder::new(gz);
-        for (path, kind, mode, mtime, bytes, link) in entries {
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(*kind);
-            header.set_mode(*mode);
-            header.set_mtime(*mtime);
-            header.set_size(bytes.len() as u64);
-            match link {
-                Some(target) => builder
-                    .append_link(&mut header, path, target)
-                    .expect("append link"),
-                None => builder
-                    .append_data(&mut header, path, *bytes)
-                    .expect("append"),
-            }
-        }
-        builder.into_inner().expect("tar").finish().expect("gzip")
-    }
-
-    #[test]
-    fn a_tree_round_trips_through_its_legacy_tarball() {
-        let tree = pack(&[("crucible.toml", b"m"), ("tools/run.sh", b"#!/bin/sh\n")]);
-        let ingested =
-            tree_from_tar_gz(&encode_legacy_tar_gz(&tree).expect("encode")).expect("ingest");
-        assert_eq!(ingested.tree.digest(), tree.digest());
-        assert!(ingested.ignored.is_empty());
-    }
-
-    /// Two archives of the same files that differ in modes, timestamps, gzip level, and `./`
-    /// prefixes name one pack.
-    #[test]
-    fn archives_of_the_same_files_name_one_pack() {
-        use tar::EntryType::{Directory, Regular};
-        let a = raw_tgz(
-            1,
-            &[
-                ("tools", Directory, 0o755, 1, b"", None),
-                ("tools/run.sh", Regular, 0o644, 1, b"x", None),
-                ("crucible.toml", Regular, 0o600, 2, b"m", None),
-            ],
-        );
-        let b = raw_tgz(
-            9,
-            &[
-                ("./crucible.toml", Regular, 0o755, 999, b"m", None),
-                ("./tools/run.sh", Regular, 0o755, 999, b"x", None),
-            ],
-        );
-        let (a, b) = (
-            tree_from_tar_gz(&a).expect("a"),
-            tree_from_tar_gz(&b).expect("b"),
-        );
-        assert_eq!(a.tree.digest(), b.tree.digest());
+        let tarball = deliverable_tarball(&pack).expect("within budget");
         assert_eq!(
-            a.tree.digest(),
-            pack(&[("crucible.toml", b"m"), ("tools/run.sh", b"x")]).digest()
+            tarball,
+            walk_dir(&pack)
+                .expect("walk")
+                .tree
+                .tarball()
+                .expect("tarball")
         );
+
+        std::os::unix::fs::symlink("crucible.toml", pack.join("link")).expect("symlink");
+        assert!(matches!(
+            deliverable_tarball(&pack),
+            Err(PackRefusal::NotAPack(TreeError::Symlink { .. }))
+        ));
+        std::fs::remove_file(pack.join("link")).expect("rm");
+
+        write_over_budget_blobs(&pack);
+        match deliverable_tarball(&pack) {
+            Err(PackRefusal::OverBudget(over)) => {
+                assert!(over.to_string().contains("delivery budget"), "{over}")
+            }
+            other => panic!("expected an over-budget refusal, got {other:?}"),
+        }
     }
 
     /// What the controller stored before tree storage, `tar_pack_tree` of a directory with a
-    /// state dir, ingests to the same tree a fresh walk of the directory gives.
+    /// state dir, reads back as the tree a fresh walk of the directory gives.
     #[test]
-    fn a_legacy_stored_tarball_ingests_to_the_walked_tree() {
+    fn a_legacy_stored_tarball_reads_as_the_walked_tree() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path();
         std::fs::create_dir_all(root.join("tools")).expect("mkdir");
@@ -626,88 +480,12 @@ mod tests {
         std::fs::write(root.join("tools/run.sh"), "r").expect("write");
         std::fs::write(root.join("state/session.jsonl"), "s").expect("write");
 
-        let ingested = tree_from_tar_gz(&tar_pack_tree(root).expect("legacy tar")).expect("ingest");
+        let read =
+            crucible_contract::pack_tree::read_tar_gz(&tar_pack_tree(root).expect("legacy tar"))
+                .expect("read");
 
-        assert_eq!(
-            ingested.tree.digest(),
-            walk_dir(root).expect("walk").tree.digest()
-        );
-        assert_eq!(ingested.ignored, vec!["state"]);
-    }
-
-    #[test]
-    fn excluded_entries_are_dropped_and_reported_whatever_their_type() {
-        use tar::EntryType::{Regular, Symlink};
-        let tgz = raw_tgz(
-            6,
-            &[
-                ("crucible.toml", Regular, 0o644, 0, b"m", None),
-                ("state/session.jsonl", Regular, 0o644, 0, b"s", None),
-                ("workspace/repo/a", Regular, 0o644, 0, b"w", None),
-                ("x/.git/link", Symlink, 0o777, 0, b"", Some("../y")),
-            ],
-        );
-        let ingested = tree_from_tar_gz(&tgz).expect("ingest");
-        assert_eq!(
-            ingested.tree.digest(),
-            pack(&[("crucible.toml", b"m")]).digest()
-        );
-        assert_eq!(ingested.ignored, vec!["state", "workspace", "x/.git"]);
-    }
-
-    #[test]
-    fn an_archive_no_pack_may_be_is_refused_naming_the_entry() {
-        use tar::EntryType::{Link, Regular, Symlink};
-        let cases: Vec<(Vec<u8>, &str)> = vec![
-            (
-                raw_tgz(
-                    6,
-                    &[("link", Symlink, 0o777, 0, b"", Some("crucible.toml"))],
-                ),
-                "link",
-            ),
-            (
-                raw_tgz(
-                    6,
-                    &[
-                        ("a", Regular, 0o644, 0, b"x", None),
-                        ("hard", Link, 0o644, 0, b"", Some("a")),
-                    ],
-                ),
-                "hard",
-            ),
-            (
-                raw_tgz(
-                    6,
-                    &[
-                        ("a", Regular, 0o644, 0, b"x", None),
-                        ("a/b", Regular, 0o644, 0, b"y", None),
-                    ],
-                ),
-                "a/b",
-            ),
-        ];
-        for (tgz, named) in cases {
-            let err = tree_from_tar_gz(&tgz).expect_err(named).to_string();
-            assert!(err.contains(named), "{named}: {err}");
-        }
-    }
-
-    #[test]
-    fn an_escaping_entry_is_refused() {
-        // The tar crate refuses to write a `..` path, so set the name bytes by hand.
-        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        let mut builder = tar::Builder::new(gz);
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(1);
-        header.as_gnu_mut().expect("gnu").name[..7].copy_from_slice(b"../evil");
-        header.set_cksum();
-        builder.append(&header, &b"x"[..]).expect("append");
-        let tgz = builder.into_inner().expect("tar").finish().expect("gzip");
-
-        let err = tree_from_tar_gz(&tgz).expect_err("escapes").to_string();
-        assert!(err.contains("escapes"), "{err}");
+        assert_eq!(read.tree, walk_dir(root).expect("walk").tree);
+        assert_eq!(read.ignored, vec!["state"]);
     }
 
     #[test]

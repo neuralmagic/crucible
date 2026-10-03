@@ -8,9 +8,12 @@
 
 #![allow(clippy::disallowed_macros)]
 
+use crate::playbooks::pack_trees::put_tree;
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
-use sqlx::{PgPool, Row};
+use crucible_contract::pack_tree::{TreeDigest, read_tar_gz};
+use futures_util::TryStreamExt;
+use sqlx::{PgConnection, PgPool, Row};
 
 /// What one conversion pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -20,10 +23,10 @@ pub struct ConversionReport {
     pub pins_rewritten: u64,
 }
 
-/// A legacy pack-byte column and how to address its rows.
+/// A legacy pack-byte column, its tree column, and a SQL expression naming one row as text.
 struct Column {
     table: &'static str,
-    key: &'static [&'static str],
+    key: &'static str,
     bytes: &'static str,
     tree: &'static str,
 }
@@ -31,31 +34,31 @@ struct Column {
 const COLUMNS: [Column; 5] = [
     Column {
         table: "playbooks",
-        key: &["id"],
+        key: "id",
         bytes: "tar_gz",
         tree: "tree_digest",
     },
     Column {
         table: "pack_imports",
-        key: &["id"],
+        key: "id",
         bytes: "tar_gz",
         tree: "tree_digest",
     },
     Column {
         table: "playbook_draft_versions",
-        key: &["draft_id", "version"],
+        key: "draft_id || '/' || version",
         bytes: "tar_gz",
         tree: "tree_digest",
     },
     Column {
         table: "playbook_standing_launches",
-        key: &["id"],
+        key: "id",
         bytes: "adopted_tar_gz",
         tree: "adopted_tree_digest",
     },
     Column {
         table: "pack_tarballs",
-        key: &["issue_slug"],
+        key: "issue_slug",
         bytes: "tar_gz",
         tree: "tree_digest",
     },
@@ -71,6 +74,17 @@ const PINS: [(&str, &str); 6] = [
     ("scopes", "pack_digest"),
     ("runs", "identity_digest"),
 ];
+
+/// What an old gzip digest became.
+enum AliasTarget {
+    Tree(TreeDigest),
+    Unconvertible(String),
+}
+
+/// SQL for the `content_digest` of a bytea column, so a guard compares like with like.
+fn content_digest_sql(column: &str) -> String {
+    format!("'sha256:' || encode(sha256({column}), 'hex')")
+}
 
 /// Convert every unconverted legacy pack row and rewrite the pins that name an old digest. The
 /// caller holds the maintenance lock, so this is the only writer of tree columns.
@@ -102,71 +116,52 @@ pub async fn convert_pack_trees(pool: &PgPool) -> Result<ConversionReport> {
 }
 
 async fn convert_column(pool: &PgPool, c: &Column, report: &mut ConversionReport) -> Result<()> {
-    let keys = c.key.join(", ");
-    let pending = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {keys} FROM {table} t
+    let mut rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SELECT ({key})::TEXT AS row_key, {bytes} AS bytes FROM {table} t
          WHERE t.{tree} IS NULL AND t.{bytes} IS NOT NULL
            AND NOT EXISTS (
                SELECT 1 FROM pack_digest_aliases a
-               WHERE a.old_digest = 'sha256:' || encode(sha256(t.{bytes}), 'hex')
-                 AND a.unconvertible_reason IS NOT NULL)",
+               WHERE a.old_digest = {digest} AND a.unconvertible_reason IS NOT NULL)",
+        key = c.key,
         table = c.table,
         tree = c.tree,
         bytes = c.bytes,
+        digest = content_digest_sql(&format!("t.{}", c.bytes)),
     )))
-    .fetch_all(pool)
-    .await
-    .with_context(|| format!("listing unconverted {} rows", c.table))?;
-    let filter = c
-        .key
-        .iter()
-        .enumerate()
-        .map(|(i, k)| format!("{k}::TEXT = ${}", i + 1))
-        .collect::<Vec<_>>()
-        .join(" AND ");
-    for row in pending {
-        let key: Vec<String> = c
-            .key
-            .iter()
-            .map(|k| {
-                row.try_get::<String, _>(*k)
-                    .or_else(|_| row.try_get::<i64, _>(*k).map(|v| v.to_string()))
-            })
-            .collect::<Result<_, _>>()?;
-        let select = format!("SELECT {} FROM {} WHERE {filter}", c.bytes, c.table);
-        let mut query = sqlx::query_scalar::<_, Option<Vec<u8>>>(sqlx::AssertSqlSafe(select));
-        for k in &key {
-            query = query.bind(k);
-        }
-        let Some(Some(bytes)) = query.fetch_optional(pool).await? else {
-            continue;
-        };
+    .fetch(pool);
+    while let Some(row) = rows
+        .try_next()
+        .await
+        .with_context(|| format!("reading unconverted {} rows", c.table))?
+    {
+        let key: String = row.try_get("row_key")?;
+        let bytes: Vec<u8> = row.try_get("bytes")?;
         let old = content_digest(&bytes);
         let mut tx = pool.begin().await?;
-        match crate::playbooks::packs::tree_from_tar_gz(&bytes) {
-            Ok(ingested) => {
-                let tree = crate::playbooks::pack_trees::put_tree(&mut tx, &ingested.tree).await?;
-                record_alias(&mut tx, &old, Some(tree.as_str()), None).await?;
-                let n = key.len();
-                let update = format!(
-                    "UPDATE {table} SET {tree} = ${} WHERE {filter}
-                       AND 'sha256:' || encode(sha256({bytes}), 'hex') = ${}",
-                    n + 1,
-                    n + 2,
-                    table = c.table,
-                    tree = c.tree,
-                    bytes = c.bytes,
-                );
-                let mut q = sqlx::query(sqlx::AssertSqlSafe(update));
-                for k in &key {
-                    q = q.bind(k);
-                }
-                q.bind(tree.as_str()).bind(&old).execute(&mut *tx).await?;
+        let known: Option<String> = sqlx::query_scalar(
+            "SELECT tree_digest FROM pack_digest_aliases WHERE old_digest = $1 AND tree_digest IS NOT NULL",
+        )
+        .bind(&old)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let target = match known {
+            Some(tree) => AliasTarget::Tree(tree.parse().map_err(anyhow::Error::msg)?),
+            None => match tokio::task::spawn_blocking(move || read_tar_gz(&bytes))
+                .await
+                .context("joining the pack conversion worker")?
+            {
+                Ok(read) => AliasTarget::Tree(put_tree(&mut tx, &read.tree).await?),
+                Err(reason) => AliasTarget::Unconvertible(reason.to_string()),
+            },
+        };
+        record_alias(&mut tx, &old, &target).await?;
+        match &target {
+            AliasTarget::Tree(tree) => {
+                pin_tree(&mut tx, c, &key, tree, &old).await?;
                 report.converted += 1;
             }
-            Err(reason) => {
-                tracing::warn!(table = c.table, key = ?key, %reason, "pack cannot be a tree; recorded unconvertible");
-                record_alias(&mut tx, &old, None, Some(&reason.to_string())).await?;
+            AliasTarget::Unconvertible(reason) => {
+                tracing::warn!(table = c.table, key, %reason, "pack cannot be a tree; recorded unconvertible");
                 report.unconvertible += 1;
             }
         }
@@ -175,12 +170,36 @@ async fn convert_column(pool: &PgPool, c: &Column, report: &mut ConversionReport
     Ok(())
 }
 
-async fn record_alias(
-    conn: &mut sqlx::PgConnection,
+/// Point one row at `tree`, but only while its bytes still have the digest `old`: a controller
+/// that predates trees may have rewritten them since they were read. Returns the rows updated.
+async fn pin_tree(
+    conn: &mut PgConnection,
+    c: &Column,
+    key: &str,
+    tree: &TreeDigest,
     old: &str,
-    tree: Option<&str>,
-    reason: Option<&str>,
-) -> Result<()> {
+) -> Result<u64> {
+    Ok(sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table} SET {tree_col} = $2 WHERE ({key})::TEXT = $1 AND {digest} = $3",
+        table = c.table,
+        tree_col = c.tree,
+        key = c.key,
+        digest = content_digest_sql(c.bytes),
+    )))
+    .bind(key)
+    .bind(tree.as_str())
+    .bind(old)
+    .execute(conn)
+    .await
+    .with_context(|| format!("pinning {} {key} to its tree", c.table))?
+    .rows_affected())
+}
+
+async fn record_alias(conn: &mut PgConnection, old: &str, target: &AliasTarget) -> Result<()> {
+    let (tree, reason) = match target {
+        AliasTarget::Tree(tree) => (Some(tree.as_str()), None),
+        AliasTarget::Unconvertible(reason) => (None, Some(reason.as_str())),
+    };
     sqlx::query(
         "INSERT INTO pack_digest_aliases (old_digest, tree_digest, unconvertible_reason, recorded_at)
          VALUES ($1, $2, $3, $4) ON CONFLICT (old_digest) DO NOTHING",
@@ -201,13 +220,7 @@ mod tests {
     use crucible_contract::pack_tree::PackTree;
 
     fn pack(files: &[(&str, &[u8])]) -> PackTree {
-        PackTree::new(
-            files
-                .iter()
-                .map(|(p, b)| (p.parse().expect("path"), b.to_vec()))
-                .collect(),
-        )
-        .expect("tree")
+        PackTree::from_pairs(files).expect("tree")
     }
 
     async fn seed_launch_pack(pool: &PgPool, slug: &str, tar_gz: &[u8]) {
@@ -276,7 +289,7 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn differently_encoded_copies_share_one_tree(pool: PgPool) {
         let tree = pack(&[("crucible.toml", b"m")]);
-        let a = crate::playbooks::packs::encode_legacy_tar_gz(&tree).expect("encode");
+        let a = tree.tarball().expect("encode");
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("crucible.toml"), "m").expect("write");
         let b = crate::playbooks::packs::tar_pack_tree(dir.path()).expect("tar");
@@ -334,7 +347,7 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn pins_naming_an_old_digest_are_rewritten(pool: PgPool) {
         let tree = pack(&[("crucible.toml", b"m")]);
-        let legacy = crate::playbooks::packs::encode_legacy_tar_gz(&tree).expect("encode");
+        let legacy = tree.tarball().expect("encode");
         let old = content_digest(&legacy);
         seed_launch_pack(&pool, "a", &legacy).await;
         sqlx::query(
@@ -367,27 +380,19 @@ mod tests {
     /// get a tree digest pinned to bytes it no longer holds.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_row_rewritten_after_it_was_read_is_not_pinned(pool: PgPool) {
-        let first =
-            crate::playbooks::packs::encode_legacy_tar_gz(&pack(&[("a", b"1")])).expect("encode");
-        let second =
-            crate::playbooks::packs::encode_legacy_tar_gz(&pack(&[("a", b"2")])).expect("encode");
+        let first = pack(&[("a", b"1")]).tarball().expect("encode");
+        let second = pack(&[("a", b"2")]).tarball().expect("encode");
         seed_launch_pack(&pool, "a", &second).await;
 
         let mut tx = pool.begin().await.expect("tx");
-        let stale = crate::playbooks::pack_trees::put_tree(&mut tx, &pack(&[("a", b"1")]))
+        let stale = put_tree(&mut tx, &pack(&[("a", b"1")])).await.expect("put");
+        let launch_packs = COLUMNS
+            .iter()
+            .find(|c| c.table == "pack_tarballs")
+            .expect("pack_tarballs column");
+        let updated = pin_tree(&mut tx, launch_packs, "a", &stale, &content_digest(&first))
             .await
-            .expect("put");
-        let updated = sqlx::query(
-            "UPDATE pack_tarballs SET tree_digest = $2 WHERE issue_slug::TEXT = $1
-               AND 'sha256:' || encode(sha256(tar_gz), 'hex') = $3",
-        )
-        .bind("a")
-        .bind(stale.as_str())
-        .bind(content_digest(&first))
-        .execute(&mut *tx)
-        .await
-        .expect("guarded update")
-        .rows_affected();
+            .expect("guarded update");
         tx.commit().await.expect("commit");
 
         assert_eq!(
@@ -395,5 +400,32 @@ mod tests {
             "the bytes changed, so the stale tree is not pinned"
         );
         assert_eq!(tree_of(&pool, "a").await, None);
+    }
+
+    /// Every legacy column the conversion walks has its tree column and the trigger that clears it
+    /// when an older controller rewrites the bytes, so the list and migration 0051 cannot drift.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn every_converted_column_exists_with_its_trigger(pool: PgPool) {
+        for c in &COLUMNS {
+            let columns: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM information_schema.columns
+                 WHERE table_name = $1 AND column_name IN ($2, $3)",
+            )
+            .bind(c.table)
+            .bind(c.bytes)
+            .bind(c.tree)
+            .fetch_one(&pool)
+            .await
+            .expect("columns");
+            assert_eq!(columns, 2, "{}: {} and {}", c.table, c.bytes, c.tree);
+            let trigger: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_trigger WHERE tgname = $1 || '_legacy_bytes'",
+            )
+            .bind(c.table)
+            .fetch_one(&pool)
+            .await
+            .expect("trigger");
+            assert_eq!(trigger, 1, "{} has no legacy-bytes trigger", c.table);
+        }
     }
 }

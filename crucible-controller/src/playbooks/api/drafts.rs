@@ -444,7 +444,7 @@ pub(crate) async fn get_playbook_limits() -> Json<PlaybookLimits> {
     Json(PlaybookLimits {
         max_draft_files: crate::playbooks::drafts::MAX_DRAFT_FILES,
         max_draft_file_bytes: crate::playbooks::drafts::MAX_DRAFT_FILE_BYTES,
-        delivery_budget_bytes: crucible::deploy::PACK_DELIVERY_BUDGET_BYTES,
+        delivery_budget_bytes: crucible_contract::pack_tree::DELIVERY_BUDGET_BYTES,
     })
 }
 

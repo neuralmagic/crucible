@@ -5,13 +5,20 @@
 
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{PackTree, TreeDigest};
-use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 
 /// Store `tree` under its digest unless it is already stored, and return the digest.
 pub(crate) async fn put_tree(conn: &mut PgConnection, tree: &PackTree) -> Result<TreeDigest> {
-    let digest = tree.digest();
-    let delivered = crate::playbooks::packs::encode_legacy_tar_gz(tree)?.len();
+    let (digest, file_hashes) = tree.digest_with_file_hashes();
+    let stored: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pack_trees WHERE digest = $1")
+        .bind(digest.as_str())
+        .fetch_optional(&mut *conn)
+        .await
+        .context("looking up a pack tree")?;
+    if stored.is_some() {
+        return Ok(digest);
+    }
+    let delivered = tree.tarball().context("encoding the pack tarball")?.len();
     let total: usize = tree.files().values().map(Vec::len).sum();
     let inserted = sqlx::query(
         "INSERT INTO pack_trees (digest, file_count, total_bytes, delivered_bytes, created_at)
@@ -27,27 +34,21 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, tree: &PackTree) -> Result
     .context("storing a pack tree")?
     .rows_affected();
     if inserted == 1 {
-        for (path, bytes) in tree.files() {
-            sqlx::query(
-                "INSERT INTO pack_tree_files (digest, path, sha256, content) VALUES ($1, $2, $3, $4)",
-            )
-            .bind(digest.as_str())
-            .bind(path.as_str())
-            .bind(sha256_hex(bytes))
-            .bind(bytes)
-            .execute(&mut *conn)
-            .await
-            .with_context(|| format!("storing pack file {path}"))?;
-        }
+        let paths: Vec<&str> = tree.files().keys().map(|p| p.as_str()).collect();
+        let contents: Vec<&[u8]> = tree.files().values().map(Vec::as_slice).collect();
+        sqlx::query(
+            "INSERT INTO pack_tree_files (digest, path, sha256, content)
+             SELECT $1, * FROM UNNEST($2::TEXT[], $3::TEXT[], $4::BYTEA[])",
+        )
+        .bind(digest.as_str())
+        .bind(&paths)
+        .bind(&file_hashes)
+        .bind(&contents)
+        .execute(&mut *conn)
+        .await
+        .context("storing pack files")?;
     }
     Ok(digest)
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
 }
 
 #[cfg(test)]
@@ -56,13 +57,7 @@ mod tests {
     use sqlx::PgPool;
 
     fn pack(files: &[(&str, &[u8])]) -> PackTree {
-        PackTree::new(
-            files
-                .iter()
-                .map(|(p, b)| (p.parse().expect("path"), b.to_vec()))
-                .collect(),
-        )
-        .expect("tree")
+        PackTree::from_pairs(files).expect("tree")
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

@@ -12,7 +12,7 @@
 
 use crate::playbooks::packs::MaterializedPack;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
-use crate::playbooks::registry::{MAX_PACK_TAR_BYTES, RegisterError, validate_id, validate_path};
+use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,15 @@ impl std::fmt::Display for StaleBase {
             self.current_version,
             self.saved_at
         )
+    }
+}
+
+impl From<crate::playbooks::packs::PackRefusal> for DraftError {
+    fn from(e: crate::playbooks::packs::PackRefusal) -> Self {
+        match e {
+            crate::playbooks::packs::PackRefusal::Encode(e) => Self::Internal(e.into()),
+            refusal => Self::Invalid(refusal.to_string()),
+        }
     }
 }
 
@@ -659,20 +668,7 @@ pub async fn save_version(
             .context("creating the draft tree")
             .map_err(DraftError::Internal)?;
         write_tree(&files, &root)?;
-        if let Some(reason) =
-            crate::playbooks::packs::over_delivery_budget(&root).map_err(DraftError::Internal)?
-        {
-            return Err(DraftError::Invalid(reason));
-        }
-        let tar_gz = crate::playbooks::packs::tar_pack_tree(&root)
-            .context("taring the draft tree")
-            .map_err(DraftError::Internal)?;
-        if tar_gz.len() > MAX_PACK_TAR_BYTES {
-            return Err(DraftError::Invalid(format!(
-                "the draft tarball is {} bytes, over the {MAX_PACK_TAR_BYTES}-byte limit",
-                tar_gz.len()
-            )));
-        }
+        let tar_gz = crate::playbooks::packs::deliverable_tarball(&root)?;
         Ok::<_, DraftError>((tar_gz, compile_tree(&root)))
     })
     .await

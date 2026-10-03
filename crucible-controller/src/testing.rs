@@ -421,6 +421,18 @@ pub mod fixtures {
             .collect()
     }
 
+    /// Write three files that each fit the draft per-file cap but together gzip past the delivery
+    /// budget.
+    pub fn write_over_budget_blobs(dir: &Path) {
+        for seed in 1..=3 {
+            std::fs::write(
+                dir.join(format!("blob{seed}.txt")),
+                incompressible_text(500 * 1024, seed),
+            )
+            .expect("blob");
+        }
+    }
+
     /// The params schema the engine extracts from `source`, for asserting what a registration
     /// stored against what the pack declares.
     pub fn schema_of(source: &str) -> serde_json::Value {

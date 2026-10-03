@@ -4,6 +4,7 @@ use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureC
 use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, OTEL_COLLECTOR_PORT};
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
+use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, check_delivery_budget, walk_dir};
 use forge::fleet::ClusterEntry;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::networking::v1 as networking;
@@ -41,7 +42,7 @@ pub enum RenderError {
     )]
     EmptyPackDir { path: std::path::PathBuf },
     #[error(
-        "pack at {} delivers {bytes} gzipped bytes, over the {PACK_DELIVERY_BUDGET_BYTES}-byte \
+        "pack at {} delivers {bytes} gzipped bytes, over the {DELIVERY_BUDGET_BYTES}-byte \
          delivery budget; shrink the pack",
         .path.display()
     )]
@@ -194,10 +195,6 @@ const PACK_CM_VOLUME: &str = "pack-cm";
 /// manifest dir, so a bare read-only ConfigMap mount would break it; extracting the tarball here is
 /// what makes the whole tree writable while still frozen-inject honest (see `command_judge`'s re-copy).
 const PACK_WORKDIR_VOLUME: &str = "pack-workdir";
-/// The most gzipped bytes a pack may deliver to a run: its [`pack_delivery_tarball`] rides one
-/// ConfigMap key, and Kubernetes caps a ConfigMap at 1 MiB of decoded values. The controller refuses
-/// a pack over this at save, registration, and publication, and the render refuses it at dispatch.
-pub const PACK_DELIVERY_BUDGET_BYTES: usize = 900 * 1024;
 /// The pack ConfigMap's one key: the gzipped tar `pack-stage` extracts into the domain dir.
 const PACK_TARBALL_KEY: &str = "pack.tar.gz";
 
@@ -379,21 +376,25 @@ pub fn render(
     Ok(out)
 }
 
-/// The pack ConfigMap: one `binaryData` key holding [`pack_delivery_tarball`] of `manifest_dir`.
-/// Fails with [`RenderError::EmptyPackDir`] when the pack has no files and with
-/// [`RenderError::PackOverDeliveryBudget`] when the tarball is over [`PACK_DELIVERY_BUDGET_BYTES`].
+/// The pack ConfigMap: one `binaryData` key holding the
+/// [`crucible_contract::pack_tree::PackTree::tarball`] of the pack at
+/// `manifest_dir`. Fails with [`RenderError::EmptyPackDir`] when the pack has no files and with
+/// [`RenderError::PackOverDeliveryBudget`] when the tarball is over [`DELIVERY_BUDGET_BYTES`].
 fn pack_configmap(manifest_dir: &Path, name: &str, namespace: &str) -> Result<core::ConfigMap> {
-    if collect_pack_files(manifest_dir)?.is_empty() {
+    let tree = walk_dir(manifest_dir)
+        .with_context(|| format!("reading the pack at {}", manifest_dir.display()))?
+        .tree;
+    if tree.is_empty() {
         return Err(RenderError::EmptyPackDir {
             path: manifest_dir.to_path_buf(),
         }
         .into());
     }
-    let tarball = pack_delivery_tarball(manifest_dir)?;
-    if tarball.len() > PACK_DELIVERY_BUDGET_BYTES {
+    let tarball = tree.tarball().context("encoding the pack tarball")?;
+    if let Err(over) = check_delivery_budget(&tarball) {
         return Err(RenderError::PackOverDeliveryBudget {
             path: manifest_dir.to_path_buf(),
-            bytes: tarball.len(),
+            bytes: over.bytes,
         }
         .into());
     }
@@ -410,80 +411,6 @@ fn pack_configmap(manifest_dir: &Path, name: &str, namespace: &str) -> Result<co
         immutable: Some(true),
         ..Default::default()
     })
-}
-
-/// The gzipped tar a run receives for the pack at `manifest_dir`: [`encode_pack_tarball`] of every
-/// file [`collect_pack_files`] returns. The controller sizes a pack with it before it is stored.
-pub fn pack_delivery_tarball(manifest_dir: &Path) -> Result<Vec<u8>> {
-    let files = collect_pack_files(manifest_dir)?;
-    encode_pack_tarball(
-        files
-            .iter()
-            .map(|(rel, bytes)| (rel.as_str(), bytes.as_slice())),
-    )
-}
-
-/// A deterministic gzipped tar of `files`: entries in path order, each a regular file with mode
-/// 0755, owner 0, and mtime 0, in a gzip stream with no name or timestamp. The same files always
-/// yield the same bytes, so the in-process and command-line renders agree.
-pub fn encode_pack_tarball<'a>(
-    files: impl IntoIterator<Item = (&'a str, &'a [u8])>,
-) -> Result<Vec<u8>> {
-    let mut files: Vec<(&str, &[u8])> = files.into_iter().collect();
-    files.sort_by(|a, b| a.0.cmp(b.0));
-    let gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
-    let mut builder = tar::Builder::new(gz);
-    for (rel, bytes) in files {
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_size(bytes.len() as u64);
-        header.set_mode(0o755);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mtime(0);
-        builder
-            .append_data(&mut header, rel, bytes)
-            .with_context(|| format!("adding {rel} to the pack tarball"))?;
-    }
-    let gz = builder.into_inner().context("finishing the pack tar")?;
-    gz.finish().context("gzipping the pack tar")
-}
-
-/// Walk `manifest_dir` and return `(relative-path, bytes)` for every pack file, sorted by path (a
-/// stable render). Skips pod-side runtime dirs (`state/`, `.git/`, `workspace/`) at any depth. Paths
-/// use `/` separators (the in-pod layout), independent of the host OS.
-fn collect_pack_files(manifest_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
-    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .with_context(|| format!("reading pack dir {}", dir.display()))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("listing pack dir {}", dir.display()))?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            let file_type = entry.file_type().with_context(|| format!("stat {rel}"))?;
-            if file_type.is_dir() {
-                // Pod-side runtime, never pack content, the loop creates these IN the pod.
-                if matches!(name.as_str(), "state" | ".git" | "workspace") {
-                    continue;
-                }
-                walk(&entry.path(), &rel, out)?;
-            } else if file_type.is_file() {
-                let bytes = std::fs::read(entry.path())
-                    .with_context(|| format!("reading pack file {rel}"))?;
-                out.push((rel, bytes));
-            }
-        }
-        Ok(())
-    }
-    let mut out = Vec::new();
-    walk(manifest_dir, "", &mut out)?;
-    Ok(out)
 }
 
 /// One render's resolved inputs, the shared context every builder method reads, so the helpers stop
@@ -2644,6 +2571,16 @@ mod tests {
         assert!(docs[0].contains("mountPath: /opt/crucible/domains/llm-d_llm-d-router_1650"));
     }
 
+    /// The tarball the pack ConfigMap for `dir` delivers.
+    fn delivered_tarball(dir: &Path) -> Vec<u8> {
+        let cm = pack_configmap(dir, "cm", "ns").expect("configmap");
+        cm.binary_data
+            .expect("binary data")
+            .remove(PACK_TARBALL_KEY)
+            .expect("the pack tarball key")
+            .0
+    }
+
     /// Unpack a delivery tarball into `(path, mode, bytes)` rows, in archive order.
     fn unpack_delivery(tarball: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
         let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
@@ -2668,13 +2605,13 @@ mod tests {
     /// The delivered tarball holds every pack file at its nested path, executable, and skips the
     /// pod-side `state/` dir, so extraction rebuilds the tree the loop expects.
     #[test]
-    fn pack_delivery_tarball_round_trips_the_tree() {
+    fn the_delivered_tarball_round_trips_the_tree() {
         let tmp = Scratch::new("tarball");
         let dir = tmp.path().join("pack");
         std::fs::create_dir_all(&dir).expect("mkdir pack");
         write_pack_dir(&dir);
 
-        let rows = unpack_delivery(&pack_delivery_tarball(&dir).expect("tarball"));
+        let rows = unpack_delivery(&delivered_tarball(&dir));
 
         assert_eq!(
             rows,
@@ -2705,7 +2642,7 @@ mod tests {
         std::fs::create_dir_all(&out).expect("mkdir domain");
         write_pack_dir(&dir);
         let tarball = tmp.path().join(PACK_TARBALL_KEY);
-        std::fs::write(&tarball, pack_delivery_tarball(&dir).expect("tarball")).expect("write");
+        std::fs::write(&tarball, delivered_tarball(&dir)).expect("write");
 
         let status = std::process::Command::new("tar")
             .arg("-xzf")
@@ -2732,7 +2669,7 @@ mod tests {
     /// The same tree yields the same bytes whatever the files' timestamps or the walk's timing, so
     /// the in-process and command-line renders agree.
     #[test]
-    fn pack_delivery_tarball_is_byte_identical_for_the_same_tree() {
+    fn the_delivered_tarball_is_byte_identical_for_the_same_tree() {
         let tmp = Scratch::new("deterministic");
         let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
         for dir in [&a, &b] {
@@ -2747,10 +2684,7 @@ mod tests {
             .set_modified(old)
             .expect("set mtime");
 
-        assert_eq!(
-            pack_delivery_tarball(&a).expect("tarball a"),
-            pack_delivery_tarball(&b).expect("tarball b")
-        );
+        assert_eq!(delivered_tarball(&a), delivered_tarball(&b));
     }
 
     /// A pack whose gzipped tarball is over the delivery budget fails the render with the size, so
@@ -2763,7 +2697,7 @@ mod tests {
         write_pack_dir(&dir);
         // Incompressible bytes: a xorshift stream, so gzip cannot shrink it under the budget.
         let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
-        let noise: Vec<u8> = (0..PACK_DELIVERY_BUDGET_BYTES + 64 * 1024)
+        let noise: Vec<u8> = (0..DELIVERY_BUDGET_BYTES + 64 * 1024)
             .map(|_| {
                 x ^= x << 13;
                 x ^= x >> 7;
@@ -2777,7 +2711,7 @@ mod tests {
 
         match err.downcast_ref::<RenderError>() {
             Some(RenderError::PackOverDeliveryBudget { bytes, .. }) => {
-                assert!(*bytes > PACK_DELIVERY_BUDGET_BYTES, "{bytes}");
+                assert!(*bytes > DELIVERY_BUDGET_BYTES, "{bytes}");
             }
             other => panic!("expected PackOverDeliveryBudget, got {other:?}: {err:#}"),
         }
