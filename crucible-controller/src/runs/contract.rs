@@ -534,18 +534,16 @@ async fn image_label(
     reference: &str,
     authfile: Option<&Path>,
 ) -> Result<Option<String>, ContractReadError> {
-    use oci_client::client::{ClientConfig, linux_amd64_resolver};
     let parsed: oci_client::Reference = reference
         .parse()
         .map_err(|e| ContractReadError(format!("parsing image ref {reference}: {e}")))?;
     let auth = forge::oci::resolve_auth(authfile, parsed.registry()).map_err(|e| {
         ContractReadError(format!("resolving registry auth for {reference}: {e:#}"))
     })?;
-    let client = oci_client::Client::new(ClientConfig {
-        platform_resolver: Some(Box::new(linux_amd64_resolver)),
+    let client = oci_client::Client::new(oci_client::client::ClientConfig {
         connect_timeout: Some(READ_TIMEOUT),
         read_timeout: Some(READ_TIMEOUT),
-        ..ClientConfig::default()
+        ..forge::oci::client_config()
     });
     let (_manifest, _digest, config) = client
         .pull_manifest_and_config(&parsed, &auth)
