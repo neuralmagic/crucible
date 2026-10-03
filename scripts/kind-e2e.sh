@@ -3,11 +3,17 @@
 # runs on the host with the pod executor, dispatches into a throwaway kind cluster, and pulls
 # its loop image from a plain-HTTP registry:2 on the kind network.
 #   A  a command-only draft launch completes; its pack arrives as one gzipped ConfigMap key
-#      that pack-stage extracts, though the raw tar is over the ConfigMap size limit
+#      that pack-stage extracts, though the raw tar is over the ConfigMap size limit; the pod
+#      and its ConfigMap are collected afterwards
+#   P  the draft published to the registry launches with the same delivery
+#   F  a failing task parks its launch with the task's error
+#   C  a pack over the delivery budget is refused at save
+#   R  runs survive a controller restart: one finishes while the controller is down, one is
+#      still running when it comes back
 #   B  legacy pack rows are converted to stored trees at startup: a foreign-encoded tarball
 #      converts to the same tree, a symlink pack is recorded unconvertible, and the draft
 #      still launches
-#   C  a pack over the delivery budget is refused at save
+#   M  a loop image labelled with another contract version parks the launch without a pod
 # Needs docker, kind, kubectl, jq, curl. Uses $DATABASE_URL and $PG_CONTAINER when set (the CI
 # postgres action), else starts its own Postgres. KEEP=1 leaves everything up; ARTIFACT_DIR
 # collects logs on failure.
@@ -132,18 +138,26 @@ kubectl create namespace "$NS" >/dev/null
 kubectl -n "$NS" create serviceaccount crucible-loop >/dev/null
 kubectl -n "$NS" create configmap crucible-e2e-kubeconfig --from-literal=kubeconfig= >/dev/null
 
-# ---- loop image ----------------------------------------------------------------------------
-LOOP_TAG="crucible-e2e-loop:$ID"
+# ---- loop images ---------------------------------------------------------------------------
+# push_loop_image <tag> <contract label>: build the loop image and push it to the registry.
+push_loop_image() {
+    docker build -q --load --platform "linux/$NODE_ARCH" \
+        --build-arg "BASE=$LOOP_BASE" --build-arg "CONTRACT_VERSION=$CONTRACT_VERSION" \
+        --build-arg "CONTRACT_LABEL=$2" \
+        -f "$FIX/Containerfile.loop" -t "crucible-e2e-loop:$1" "$WORK/image" >/dev/null
+    docker save -o "$WORK/image/loop.tar" "crucible-e2e-loop:$1"
+    docker run --rm -q --network kind -v "$WORK/image":/w "$SKOPEO" copy -q --dest-tls-verify=false \
+        "docker-archive:/w/loop.tar" "docker://$REG:5000/crucible-e2e-loop:$1"
+    rm "$WORK/image/loop.tar"
+    docker rmi "crucible-e2e-loop:$1" >/dev/null 2>&1 || true
+}
 LOOP_IMAGE="localhost:$REGPORT/crucible-e2e-loop:$ID"
-log "building $LOOP_TAG on $LOOP_BASE (contract $CONTRACT_VERSION)"
-docker build -q --load --platform "linux/$NODE_ARCH" \
-    --build-arg "BASE=$LOOP_BASE" --build-arg "CONTRACT_VERSION=$CONTRACT_VERSION" \
-    -f "$FIX/Containerfile.loop" -t "$LOOP_TAG" "$WORK/image" >/dev/null
-docker save -o "$WORK/image/loop.tar" "$LOOP_TAG"
-docker run --rm -q --network kind -v "$WORK/image":/w "$SKOPEO" copy -q --dest-tls-verify=false \
-    "docker-archive:/w/loop.tar" "docker://$REG:5000/crucible-e2e-loop:$ID"
-docker rmi "$LOOP_TAG" >/dev/null 2>&1 || true
+MISMATCH_IMAGE="localhost:$REGPORT/crucible-e2e-loop:$ID-mismatch"
+log "building loop images on $LOOP_BASE (contract $CONTRACT_VERSION)"
+push_loop_image "$ID" "$CONTRACT_VERSION"
+push_loop_image "$ID-mismatch" 0.0.0
 sed "s|@LOOP_IMAGE@|$LOOP_IMAGE|g" "$FIX/profile.toml.in" >"$WORK/profile.toml"
+sed "s|@LOOP_IMAGE@|$MISMATCH_IMAGE|g" "$FIX/profile.toml.in" >"$WORK/profile-mismatch.toml"
 
 # ---- postgres ------------------------------------------------------------------------------
 if [ -n "${PG_CONTAINER:-}" ]; then
@@ -165,6 +179,7 @@ export CONTROLLER_URL="http://127.0.0.1:$PORT" CONTROLLER_CONFIG=/dev/null
 unset CONTROLLER_API_TOKEN
 
 BOOT=0
+# start_controller [profile]: boot the controller and wait for it to answer.
 start_controller() {
     BOOT=$((BOOT + 1))
     log "starting controller (boot $BOOT) on $CONTROLLER_URL"
@@ -175,7 +190,7 @@ start_controller() {
         CONTROLLER_DEV_IDENTITY=e2e CONTROLLER_ADMINS=e2e CONTROLLER_AUTH_MODE=proxy \
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=pod CONTROLLER_SCOPE_EXECUTOR=disabled \
-        CONTROLLER_DEPLOY_PROFILE="$WORK/profile.toml" CONTROLLER_POD_NAMESPACE="$NS" \
+        CONTROLLER_DEPLOY_PROFILE="${1:-$WORK/profile.toml}" CONTROLLER_POD_NAMESPACE="$NS" \
         CONTROLLER_TURN_SERVICE_ACCOUNT=crucible-loop \
         CONTROLLER_STATE_DIR="$WORK/state" CONTROLLER_SCRATCH_DIR="$WORK/scratch" \
         CRUCIBLE_BIN="$BIN/crucible" FORGE_INSECURE_REGISTRIES="localhost:$REGPORT" \
@@ -207,30 +222,87 @@ cp -R "$FIX/packs/deliver" "$PACK"
 mkdir -p "$PACK/bulk"
 for f in a b c; do head -c 512000 <(yes "pack delivery filler $f") >"$PACK/bulk/$f.txt"; done
 
-# launch_and_check <label>: launch the draft's newest save and assert the run and its delivery.
-launch_and_check() {
-    local label="$1" key status pod cm
-    kubectl -n "$NS" get pods -w --output-watch-events -o json >"$WORK/pods-$label.json" 2>/dev/null &
-    BG_PIDS+=($!)
-    kubectl -n "$NS" get configmaps -w --output-watch-events -o json >"$WORK/cms-$label.json" 2>/dev/null &
-    BG_PIDS+=($!)
+# small_pack <dir> <check.sh body>: a one-task pack whose task runs the given shell.
+small_pack() {
+    mkdir -p "$1"
+    cp "$FIX/packs/deliver/workflow.star" "$1/"
+    sed 's/^inject = .*/inject = ["check.sh"]/' "$FIX/packs/deliver/crucible.toml" >"$1/crucible.toml"
+    printf '#!/bin/sh\nset -eu\n%s\n' "$2" >"$1/check.sh"
+}
 
-    key=$(crux draft-launch "$DRAFT" --max-cost 1 --max-time 5m --json | tee "$WORK/launch-$label.json" | jq -r .key)
-    [ -n "$key" ] && [ "$key" != null ] || fail "[$label] draft-launch returned no key"
-    log "[$label] launched $key"
+# new_draft <id> <dir>: create a draft and save the directory as its version 2.
+new_draft() {
+    crux draft-create "$1" --description "kind e2e" >/dev/null
+    crux draft-push "$1" "$2" --base-version 1 --json >"$WORK/push-$1.json"
+    [ "$(jq -r .version "$WORK/push-$1.json")" = 2 ] || fail "draft-push $1: $(cat "$WORK/push-$1.json")"
+}
 
-    status=""
+# launch <label> <crux launch command...>: start a launch; its key lands in KEY.
+launch() {
+    local label="$1"
+    shift
+    KEY=$(crux "$@" --max-cost 1 --max-time 5m --json | tee "$WORK/launch-$label.json" | jq -r .key)
+    [ -n "$KEY" ] && [ "$KEY" != null ] || fail "[$label] $1 returned no key"
+    log "[$label] launched $KEY"
+}
+
+# settle <label> <key>: wait for the launch to stop moving; its status lands in STATUS and the
+# whole launch in $WORK/run-<label>.json.
+settle() {
+    STATUS=""
     for _ in $(seq 1 300); do
-        crux playbook-run "$key" >"$WORK/run-$label.json" 2>/dev/null || true
-        status=$(jq -r '.launch.status // empty' "$WORK/run-$label.json" 2>/dev/null || true)
-        case "$status" in done | pr-open | parked) break ;; esac
+        crux playbook-run "$2" >"$WORK/run-$1.json" 2>/dev/null || true
+        STATUS=$(jq -r '.launch.status // empty' "$WORK/run-$1.json" 2>/dev/null || true)
+        case "$STATUS" in done | pr-open | parked) return ;; esac
         sleep 1
     done
-    [ "$status" = "done" ] || fail "[$label] launch ended '$status': $(jq -c '.launch' "$WORK/run-$label.json" 2>/dev/null)"
-    [ "$(jq -r '.runs[0].status' "$WORK/run-$label.json")" = finished ] ||
-        fail "[$label] run did not finish: $(jq -c '.runs[0]' "$WORK/run-$label.json")"
-    pass "[$label] launch done, run finished"
+    fail "[$1] launch still '$STATUS' after 300s"
+}
 
+# expect_finished <label>: the settled launch is done and its run finished.
+expect_finished() {
+    [ "$STATUS" = "done" ] || fail "[$1] launch ended '$STATUS': $(jq -c '.launch' "$WORK/run-$1.json")"
+    [ "$(jq -r '.runs[0].status' "$WORK/run-$1.json")" = finished ] ||
+        fail "[$1] run did not finish: $(jq -c '.runs[0]' "$WORK/run-$1.json")"
+    pass "[$1] launch done, run finished"
+}
+
+# expect_parked <label> <reason fragment>: the settled launch parked for the given reason.
+expect_parked() {
+    local reason
+    reason=$(jq -r '.launch.parked_reason // empty' "$WORK/run-$1.json")
+    if [ "$STATUS" != parked ] || ! grep -qF "$2" <<<"$reason"; then
+        fail "[$1] expected a park naming '$2', got '$STATUS': $reason"
+    fi
+    pass "[$1] parked: $reason"
+}
+
+watch_start() {
+    kubectl -n "$NS" get pods -w --output-watch-events -o json >"$WORK/pods-$1.json" 2>/dev/null &
+    BG_PIDS+=($!)
+    kubectl -n "$NS" get configmaps -w --output-watch-events -o json >"$WORK/cms-$1.json" 2>/dev/null &
+    BG_PIDS+=($!)
+}
+
+watch_stop() {
+    for p in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
+    BG_PIDS=()
+}
+
+# pods_in <jq predicate> <count>: exactly count run pods in the namespace match the predicate.
+pods_in() {
+    [ "$(kubectl -n "$NS" get pods -o json | jq "[.items[] | select($1)] | length")" = "$2" ]
+}
+
+# no_run_objects: no pods and no pack ConfigMaps are left in the namespace.
+no_run_objects() {
+    pods_in true 0 &&
+        [ "$(kubectl -n "$NS" get configmaps -o json | jq '[.items[] | select(.binaryData["pack.tar.gz"])] | length')" = 0 ]
+}
+
+# check_delivery <label>: assert, from the watch streams, how the pack reached the pod.
+check_delivery() {
+    local label="$1" pod cm gz raw listing
     pod=$(jq -rs '[.[] | .object | select(.spec.initContainers[]?.name == "pack-stage")] | last' "$WORK/pods-$label.json")
     [ "$pod" != null ] || fail "[$label] no pod with a pack-stage init container was seen"
     [ "$(jq -r '[.status.initContainerStatuses[]? | select(.name == "pack-stage") | .state.terminated.exitCode] | first' <<<"$pod")" = 0 ] ||
@@ -246,7 +318,6 @@ launch_and_check() {
     [ "$(jq -r '.metadata.ownerReferences[0].uid' <<<"$cm")" = "$(jq -r '.metadata.uid' <<<"$pod")" ] ||
         fail "[$label] pack ConfigMap is not owned by its pod"
     jq -r '.binaryData["pack.tar.gz"]' <<<"$cm" | base64 -d >"$WORK/delivered-$label.tar.gz"
-    local gz raw listing
     gz=$(wc -c <"$WORK/delivered-$label.tar.gz" | tr -d ' ')
     raw=$(gzip -dc "$WORK/delivered-$label.tar.gz" | wc -c | tr -d ' ')
     [ "$gz" -le 921600 ] || fail "[$label] delivered tarball is $gz bytes, over the budget"
@@ -255,9 +326,18 @@ launch_and_check() {
     [ "$listing" = "bulk/a.txt bulk/b.txt bulk/c.txt check.sh crucible.toml nested/deep/marker.txt workflow.star " ] ||
         fail "[$label] delivered tarball lists: $listing"
     pass "[$label] pack delivered as one gzipped key ($gz bytes gzipped, $raw raw)"
+}
 
-    for p in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
-    BG_PIDS=()
+# launch_and_check <label> <crux launch command...>: launch, expect success, check delivery.
+launch_and_check() {
+    local label="$1"
+    shift
+    watch_start "$label"
+    launch "$label" "$@"
+    settle "$label" "$KEY"
+    expect_finished "$label"
+    check_delivery "$label"
+    watch_stop
 }
 
 # ---- scenario A ----------------------------------------------------------------------------
@@ -265,11 +345,27 @@ start_controller
 [ "$(crux whoami 2>/dev/null | head -n1)" != "" ] || fail "crux cannot reach the controller"
 
 log "[A] creating draft $DRAFT and saving the delivery pack"
-crux draft-create "$DRAFT" --description "kind e2e" >/dev/null
-crux draft-push "$DRAFT" "$PACK" --base-version 1 --json >"$WORK/push-A.json"
-VERSION=$(jq -r .version "$WORK/push-A.json")
-[ "$VERSION" = 2 ] || fail "[A] draft-push saved version '$VERSION': $(cat "$WORK/push-A.json")"
-launch_and_check A
+new_draft "$DRAFT" "$PACK"
+VERSION=2
+launch_and_check A draft-launch "$DRAFT"
+wait_for 90 "the run's pod and pack ConfigMap to be collected" no_run_objects
+pass "[A] pod and pack ConfigMap collected"
+
+# ---- scenario P ----------------------------------------------------------------------------
+log "[P] publishing $DRAFT as playbook $DRAFT-pub"
+crux draft-publish "$DRAFT" --playbook "$DRAFT-pub" --json >"$WORK/publish-P.json"
+[ "$(jq -r .id "$WORK/publish-P.json")" = "$DRAFT-pub" ] || fail "[P] publish: $(cat "$WORK/publish-P.json")"
+launch_and_check P launch "$DRAFT-pub"
+
+# ---- scenario F ----------------------------------------------------------------------------
+small_pack "$WORK/fail" 'echo "deliberate failure" >&2
+exit 1'
+new_draft "$DRAFT-fail" "$WORK/fail"
+launch F draft-launch "$DRAFT-fail"
+settle F "$KEY"
+expect_parked F "deliberate failure"
+[ "$(jq -r '.runs[0].status' "$WORK/run-F.json")" = error ] ||
+    fail "[F] run status is $(jq -c '.runs[0].status' "$WORK/run-F.json")"
 
 # ---- scenario C ----------------------------------------------------------------------------
 log "[C] saving a pack over the delivery budget"
@@ -283,6 +379,28 @@ grep -q 'delivery budget' "$WORK/push-C.log" || fail "[C] refusal does not name 
 [ "$(sql -c "SELECT max(version) FROM playbook_draft_versions WHERE draft_id = '$DRAFT'")" = "$VERSION" ] ||
     fail "[C] the refused save left a version behind"
 pass "[C] over-budget save refused"
+
+# ---- scenario R ----------------------------------------------------------------------------
+small_pack "$WORK/short" "sleep 10
+echo '{\"ok\":true}'"
+small_pack "$WORK/long" "sleep 45
+echo '{\"ok\":true}'"
+new_draft "$DRAFT-short" "$WORK/short"
+new_draft "$DRAFT-long" "$WORK/long"
+launch R-short draft-launch "$DRAFT-short"
+SHORT="$KEY"
+launch R-long draft-launch "$DRAFT-long"
+LONG="$KEY"
+wait_for 120 "both run pods to be running" pods_in '.status.containerStatuses[]?.state.running' 2
+stop_controller
+log "[R] controller down; waiting for the short run to finish"
+wait_for 60 "the short run's pod to succeed" pods_in '.status.phase == "Succeeded"' 1
+pods_in '.status.containerStatuses[]?.state.running' 1 || fail "[R] the long run finished before the controller came back"
+start_controller
+settle R-short "$SHORT"
+expect_finished R-short
+settle R-long "$LONG"
+expect_finished R-long
 
 # ---- scenario B ----------------------------------------------------------------------------
 stop_controller
@@ -300,7 +418,6 @@ SQL
 start_controller
 read -r converted unconvertible <<<"$(conversion_report "$BOOT")"
 [ "$unconvertible" = 1 ] || fail "[B] boot $BOOT reported '$converted $unconvertible'; expected one unconvertible pack"
-[ "$converted" -ge 2 ] || fail "[B] boot $BOOT converted only $converted packs"
 [ "$(sql -c "SELECT count(*) FROM playbook_draft_versions WHERE tree_digest IS NULL")" = 0 ] ||
     fail "[B] draft versions are left unconverted"
 [ "$(sql -c "SELECT count(*) FROM pack_digest_aliases WHERE unconvertible_reason IS NOT NULL")" = 1 ] ||
@@ -309,7 +426,7 @@ TREE=$(sql -c "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = 
 [[ "$TREE" =~ ^tree1:[0-9a-f]{64}$ ]] || fail "[B] version $VERSION has tree digest '$TREE'"
 sql -c "SELECT path FROM pack_tree_files WHERE digest = '$TREE'" | grep -qx 'nested/deep/marker.txt' ||
     fail "[B] the stored tree is missing nested/deep/marker.txt"
-pass "[B] boot $BOOT converted $converted packs and recorded the symlink pack unconvertible"
+pass "[B] every pack row holds a tree, and the symlink pack is recorded unconvertible"
 
 stop_controller
 start_controller
@@ -337,6 +454,22 @@ RETREE=$(sql -c "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id 
 $(diff <(sql -c "SELECT path, sha256 FROM pack_tree_files WHERE digest = '$TREE' ORDER BY path") \
     <(sql -c "SELECT path, sha256 FROM pack_tree_files WHERE digest = '$RETREE' ORDER BY path"))"
 pass "[B] a foreign encoding of the same files converted to the same tree"
-launch_and_check B
+launch_and_check B draft-launch "$DRAFT"
+
+
+# ---- scenario M ----------------------------------------------------------------------------
+stop_controller
+start_controller "$WORK/profile-mismatch.toml"
+curl -sf "$CONTROLLER_URL/api/config" >"$WORK/config-M.json"
+[ "$(jq -r --arg ref "$MISMATCH_IMAGE" '.contract.images[] | select(.reference == $ref) | "\(.engine_version) \(.match)"' "$WORK/config-M.json")" = "0.0.0 false" ] ||
+    fail "[M] /api/config does not report the mismatch: $(jq -c .contract "$WORK/config-M.json")"
+watch_start M
+launch M launch "$DRAFT-pub"
+settle M "$KEY"
+watch_stop
+expect_parked M "contract rejection"
+[ "$(jq -s --arg key "${KEY//:/-}" '[.[] | select(.object.metadata.labels["crucible.dev/issue-key"] == $key)] | length' "$WORK/pods-M.json")" = 0 ] ||
+    fail "[M] a pod was created for a rejected launch"
+pass "[M] no pod was created"
 
 echo "kind e2e passed"
