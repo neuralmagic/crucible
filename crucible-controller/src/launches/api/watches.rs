@@ -341,7 +341,9 @@ pub(crate) async fn create_watch(
         &crate::launches::watches::NewWatch {
             standing: crate::launches::standing::NewStanding {
                 playbook: &authorized.pack.id,
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    authorized.pack.revision(),
+                ),
                 eligible_draft_version: None,
                 params: &authorized.params,
                 schema_digest: &authorized.pack.schema_digest,
@@ -366,7 +368,7 @@ pub(crate) async fn create_watch(
     .await;
     let stored = match stored {
         Ok(w) => w,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return crate::launches::api::save_failed(e),
     };
     let audit_reason = format!(
         "playbook {} watching {} {:?} from {} as revision {}",
@@ -533,7 +535,9 @@ pub(crate) async fn update_watch(
         &crate::launches::watches::NewWatch {
             standing: crate::launches::standing::NewStanding {
                 playbook: &authorized.pack.id,
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    authorized.pack.revision(),
+                ),
                 eligible_draft_version: None,
                 params: &authorized.params,
                 schema_digest: &authorized.pack.schema_digest,
@@ -558,7 +562,7 @@ pub(crate) async fn update_watch(
     let stored = match stored {
         Ok(Some(w)) => w,
         Ok(None) => return not_found(format!("no watch {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return crate::launches::api::save_failed(e),
     };
     // The re-save re-owned the row, so the launches that parked under the old snapshot will never
     // run.

@@ -828,14 +828,18 @@ pub(crate) async fn fire_due_refreshing(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::daemon::queue::DiscoverySource;
     use crate::daemon::queue::{Enqueue, IssueKey};
     use crate::launches::model::NewPlaybookLaunch;
-    use crate::launches::standing::{clear_owner_signin, require_owner_signin};
+    use crate::launches::schedules::*;
+    use crate::launches::standing::{
+        StandingTarget, Unadoptable, clear_owner_signin, require_owner_signin,
+    };
     use crate::model::LaunchOrigin;
     use crate::model::MaxTime;
     use crate::model::Status;
+    use crate::playbooks::registry::PackRevision;
+    use crucible_contract::pack_tree::{PackTree, TreeDigest};
     use sqlx::PgPool;
     use std::sync::Arc;
 
@@ -870,39 +874,15 @@ mod tests {
     async fn schedule_due_at(pool: &PgPool, expr: &str, due: Option<&str>) -> Schedule {
         let max_time = MaxTime::parse("30m").expect("duration");
         let spec = CronSpec::parse(expr, "UTC").expect("expr");
+        let params = params();
         let stored = ScheduleStore::new(Db::new(pool.clone()))
             .create(
-                &NewSchedule {
-                    standing: NewStanding {
-                        playbook: "survey",
-                        target_kind: "adopted",
-                        eligible_draft_version: None,
-                        params: &params(),
-                        schema_digest: "sha256:schema",
-                        max_cost: 3.5,
-                        max_time: &max_time,
-                        advance_dedupe: true,
-                        enabled: true,
-                        created_by: Some("wren"),
-                        owner_principal: None,
-                        owner_groups: None,
-                        dispatch_target: None,
-                        agent_provider: None,
-                        agent_model: None,
-                    },
-                    cursor: None,
-                    spec: &spec,
-                },
+                &adopted(PackRevision::Bytes("sha256:tar"), &params, &max_time, &spec),
                 Timestamp::now(),
             )
             .await
             .expect("create");
-        sqlx::query("UPDATE playbook_schedules SET next_due_at = $2 WHERE id = $1")
-            .bind(&stored.id)
-            .bind(due)
-            .execute(pool)
-            .await
-            .expect("backdate");
+        set_due(pool, &stored.id, due).await;
         ScheduleStore::new(Db::new(pool.clone()))
             .get(&stored.id)
             .await
@@ -910,21 +890,116 @@ mod tests {
             .expect("row")
     }
 
-    /// A schedule adopts bytes once. Moving the registry pin afterward affects new schedules, not
-    /// the launch this existing recurrence materializes.
+    async fn set_due(pool: &PgPool, id: &str, due: Option<&str>) {
+        sqlx::query("UPDATE playbook_schedules SET next_due_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(due)
+            .execute(pool)
+            .await
+            .expect("backdate");
+    }
+
+    /// An hourly schedule of `survey` adopting `pin`.
+    fn adopted<'a>(
+        pin: PackRevision<'a>,
+        params: &'a serde_json::Value,
+        max_time: &'a MaxTime,
+        spec: &'a CronSpec,
+    ) -> NewSchedule<'a> {
+        NewSchedule {
+            standing: NewStanding {
+                playbook: "survey",
+                target: StandingTarget::Adopted(pin),
+                eligible_draft_version: None,
+                params,
+                schema_digest: "sha256:schema",
+                max_cost: 3.5,
+                max_time,
+                advance_dedupe: true,
+                enabled: true,
+                created_by: Some("wren"),
+                owner_principal: None,
+                owner_groups: None,
+                dispatch_target: None,
+                agent_provider: None,
+                agent_model: None,
+            },
+            cursor: None,
+            spec,
+        }
+    }
+
+    /// Point registry row `id` at `tree` the way registration stores it: the tree, its tarball as
+    /// the legacy bytes, and the tree column. Inserts the row when it is not registered yet.
+    async fn pin_tree(pool: &PgPool, id: &str, rev: &str, tree: &PackTree) -> TreeDigest {
+        let digest =
+            crate::playbooks::pack_trees::put_tree(&mut pool.acquire().await.expect("conn"), tree)
+                .await
+                .expect("put tree");
+        let tarball = tree.tarball().expect("encode");
+        sqlx::query(
+            r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz,
+                                      tar_digest, tar_bytes, params_schema, schema_digest,
+                                      core_rev, created_by, created_at, updated_at, tree_digest)
+               VALUES ($1, 'reads a paper', 'owner/packs', 'main', $2, '', $3, $4, $5,
+                       '{"type":"object"}'::jsonb, 'sha256:schema', 'core1', 'wren',
+                       '2026-08-23T00:00:00Z', '2026-08-23T00:00:00Z', $6)
+               ON CONFLICT (id) DO UPDATE SET rev = excluded.rev, tar_gz = excluded.tar_gz,
+                   tar_digest = excluded.tar_digest, tar_bytes = excluded.tar_bytes,
+                   tree_digest = excluded.tree_digest"#,
+        )
+        .bind(id)
+        .bind(rev)
+        .bind(&tarball)
+        .bind(crucible_contract::content_digest(&tarball))
+        .bind(i64::try_from(tarball.len()).expect("size"))
+        .bind(digest.as_str())
+        .execute(pool)
+        .await
+        .expect("pin");
+        digest
+    }
+
+    fn tree(body: &[u8]) -> PackTree {
+        PackTree::from_pairs(&[("crucible.toml", b"m"), ("workflow.star", body)]).expect("tree")
+    }
+
+    async fn launch_tree(pool: &PgPool, key: &str) -> (Option<String>, String) {
+        sqlx::query_as("SELECT tree_digest, digest FROM pack_tarballs WHERE issue_slug = $1")
+            .bind(crate::model::sanitize_key(key))
+            .fetch_one(pool)
+            .await
+            .expect("the launch's pack")
+    }
+
+    /// A schedule adopts a tree once. Moving the registry pin afterward affects new schedules, not
+    /// the launch this existing recurrence materializes: the firing records the adopted tree and
+    /// copies its bytes.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_schedule_fires_the_revision_it_adopted_before_a_repin(pool: PgPool) -> Result<()> {
-        register_row(&pool, "survey").await;
-        let scheduled = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
+        let first = tree(b"v1");
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &first).await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let scheduled = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
         assert_eq!(scheduled.adopted_rev.as_deref(), Some("abc123"));
-        sqlx::query(
-            "UPDATE playbooks SET rev = 'def456', tar_gz = $2, tar_digest = 'sha256:new', \
-             tar_bytes = 4 WHERE id = $1",
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT adopted_tree_digest FROM playbook_standing_launches WHERE id = $1",
         )
-        .bind("survey")
-        .bind(vec![9u8, 8, 7, 6])
-        .execute(&pool)
+        .bind(&scheduled.id)
+        .fetch_one(&pool)
         .await?;
+        assert_eq!(stored.as_deref(), Some(adopted_tree.as_str()));
+        set_due(&pool, &scheduled.id, Some("2026-08-23T12:00:00Z")).await;
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
 
         let db = Db::new(pool.clone());
         let keys = fire_due(
@@ -936,13 +1011,162 @@ mod tests {
         )
         .await?;
         assert_eq!(keys.len(), 1);
-        let slug = crate::model::sanitize_key(&keys[0]);
-        let digest: String =
-            sqlx::query_scalar("SELECT digest FROM pack_tarballs WHERE issue_slug = $1")
-                .bind(slug)
-                .fetch_one(&pool)
+        let (recorded, digest) = launch_tree(&pool, &keys[0]).await;
+        assert_eq!(recorded.as_deref(), Some(adopted_tree.as_str()));
+        assert_eq!(digest, crucible_contract::content_digest(&first.tarball()?));
+        Ok(())
+    }
+
+    /// The endpoint authorizes against the registry row it read; a repin that lands before the
+    /// save commits refuses the save instead of adopting a revision nobody validated, and a
+    /// deregistration refuses it as gone. Nothing is written either way.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_repin_between_authorize_and_save_is_refused(pool: PgPool) -> Result<()> {
+        let authorized = pin_tree(&pool, "survey", "abc123", &tree(b"v1")).await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let new = adopted(PackRevision::Tree(&authorized), &params, &max_time, &spec);
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        let kept = store.create(&new, Timestamp::now()).await?;
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+
+        let refused = store
+            .create(&new, Timestamp::now())
+            .await
+            .expect_err("a repinned registry row refuses the save");
+        assert_eq!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(&Unadoptable::Repinned {
+                playbook: "survey".to_string(),
+                rev: "def456".to_string()
+            })
+        );
+        let refused = store
+            .update(&kept.id, &new, Timestamp::now())
+            .await
+            .expect_err("a repinned registry row refuses the edit");
+        assert!(matches!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(Unadoptable::Repinned { .. })
+        ));
+        let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT adopted_rev, adopted_tree_digest FROM playbook_standing_launches",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            rows,
+            vec![(Some("abc123".to_string()), Some(authorized.to_string()))],
+            "the refused create wrote nothing and the refused edit kept the adopted tree"
+        );
+
+        sqlx::query("DELETE FROM playbook_standing_launches")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM playbooks").execute(&pool).await?;
+        let refused = store
+            .create(&new, Timestamp::now())
+            .await
+            .expect_err("a deregistered playbook refuses the save");
+        assert!(matches!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(Unadoptable::Gone { .. })
+        ));
+        Ok(())
+    }
+
+    /// A save authorized against a row with no tree pins its bytes, and still lands when startup
+    /// conversion records the tree in between: the bytes did not move.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_bytes_pin_survives_conversion_but_not_a_repin(pool: PgPool) -> Result<()> {
+        register_row(&pool, "survey").await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let new = adopted(PackRevision::Bytes("sha256:tar"), &params, &max_time, &spec);
+        let converted =
+            crate::playbooks::pack_trees::put_tree(&mut *pool.acquire().await?, &tree(b"v1"))
                 .await?;
-        assert_eq!(digest, "sha256:tar");
+        sqlx::query("UPDATE playbooks SET tree_digest = $1")
+            .bind(converted.as_str())
+            .execute(&pool)
+            .await?;
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        store.create(&new, Timestamp::now()).await?;
+
+        sqlx::query("UPDATE playbooks SET tar_gz = 'moved', tar_digest = 'sha256:moved'")
+            .execute(&pool)
+            .await?;
+        let refused = store
+            .create(&new, Timestamp::now())
+            .await
+            .expect_err("moved bytes refuse a bytes pin");
+        assert!(matches!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(Unadoptable::Repinned { .. })
+        ));
+        Ok(())
+    }
+
+    /// An immediate launch copies the registered pack and records its tree, and refuses when the
+    /// registry row moved off the revision the endpoint authorized.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_launch_records_the_tree_it_was_authorized_against(pool: PgPool) -> Result<()> {
+        let first = tree(b"v1");
+        let authorized = pin_tree(&pool, "survey", "abc123", &first).await;
+        let max_time = MaxTime::parse("30m").expect("duration");
+        let params = params();
+        let launch = NewPlaybookLaunch {
+            playbook: "survey",
+            repo: "owner/packs",
+            title: "reads a paper",
+            params: &params,
+            schema_digest: "sha256:schema",
+            max_cost: 1.0,
+            max_time: &max_time,
+            advance_dedupe: false,
+            dedupe_schedule: None,
+            origin: LaunchOrigin::Manual,
+            draft_version: None,
+            created_by: Some("wren"),
+            launcher_groups: None,
+        };
+        let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
+        assert!(matches!(
+            crate::launches::store::adopt_playbook_launch(
+                &pool,
+                key,
+                &launch,
+                PackRevision::Tree(&authorized)
+            )
+            .await?,
+            crate::launches::store::AdoptPlaybookOutcome::Adopted
+        ));
+        let (recorded, digest) = launch_tree(&pool, key).await;
+        assert_eq!(recorded.as_deref(), Some(authorized.as_str()));
+        assert_eq!(digest, crucible_contract::content_digest(&first.tarball()?));
+
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+        let stale = "playbook:survey:0199c0de-7c2c-71a5-8000-b";
+        assert!(matches!(
+            crate::launches::store::adopt_playbook_launch(
+                &pool,
+                stale,
+                &launch,
+                PackRevision::Tree(&authorized)
+            )
+            .await?,
+            crate::launches::store::AdoptPlaybookOutcome::Repinned { ref rev } if rev == "def456"
+        ));
+        let launches: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launches, 1, "the refused launch wrote nothing");
         Ok(())
     }
 
@@ -958,7 +1182,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -1045,7 +1271,7 @@ mod tests {
                 &NewSchedule {
                     standing: NewStanding {
                         playbook: "studio",
-                        target_kind: "draft_head",
+                        target: crate::launches::standing::StandingTarget::DraftHead,
                         eligible_draft_version: Some(saved.version),
                         params: &serde_json::json!({}),
                         schema_digest: &schema_digest,
@@ -1089,6 +1315,118 @@ mod tests {
             launch.exposure.is_some(),
             "a draft-head launch carries its version's exposure"
         );
+        Ok(())
+    }
+
+    /// A draft-head row records no tree. Each firing records the tree of the draft's latest saved
+    /// version that compiles at that firing, so a later save moves the next firing and a save
+    /// that does not compile does not.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_draft_head_firing_records_the_latest_compiled_tree(pool: PgPool) -> Result<()> {
+        let saved = crate::playbooks::drafts::create(
+            &pool,
+            "studio",
+            "iterative pack",
+            crate::playbooks::drafts::DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("draft");
+        let schema_digest = saved.schema_digest.clone().expect("the skeleton compiles");
+        let max_time = MaxTime::parse("30m").expect("duration");
+        let spec = CronSpec::parse("0 * * * *", "UTC").expect("expr");
+        let params = serde_json::json!({});
+        let schedule = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &NewSchedule {
+                    standing: NewStanding {
+                        playbook: "studio",
+                        target: StandingTarget::DraftHead,
+                        eligible_draft_version: Some(saved.version),
+                        params: &params,
+                        schema_digest: &schema_digest,
+                        max_cost: 1.0,
+                        max_time: &max_time,
+                        advance_dedupe: false,
+                        enabled: true,
+                        created_by: Some("wren"),
+                        owner_principal: None,
+                        owner_groups: None,
+                        dispatch_target: None,
+                        agent_provider: None,
+                        agent_model: None,
+                    },
+                    cursor: None,
+                    spec: &spec,
+                },
+                ts("2026-08-23T11:00:00Z"),
+            )
+            .await?;
+        let adopted: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT adopted_tree_digest, adopted_tar_gz FROM playbook_standing_launches WHERE id = $1",
+        )
+        .bind(&schedule.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(adopted, (None, None), "a draft-head row adopts nothing");
+
+        let version_tree = |version: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT tree_digest FROM playbook_draft_versions \
+                     WHERE draft_id = 'studio' AND version = $1",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("version tree")
+                .expect("a saved version records its tree")
+            }
+        };
+        let db = Db::new(pool.clone());
+        let fire_at = |due: &'static str, now: &'static str| {
+            let (db, pool, id) = (db.clone(), pool.clone(), schedule.id.clone());
+            async move {
+                set_due(&pool, &id, Some(due)).await;
+                let keys = fire_due(&db, ts(now), 1, 5, std::time::Duration::from_secs(3600))
+                    .await
+                    .expect("fire");
+                assert_eq!(keys.len(), 1, "one firing at {now}");
+                launch_tree(&pool, &keys[0]).await.0
+            }
+        };
+
+        let first = fire_at("2026-08-23T12:00:00Z", "2026-08-23T12:01:00Z").await;
+        assert_eq!(first, Some(version_tree(saved.version).await));
+
+        let mut files = crate::playbooks::drafts::files(&pool, "studio", None)
+            .await
+            .expect("files")
+            .expect("the draft")
+            .files;
+        files.insert("NOTES.md".to_string(), "second save".to_string());
+        let second =
+            crate::playbooks::drafts::save_version(&pool, "studio", files.clone(), None, None)
+                .await
+                .expect("second save");
+        assert!(second.schema_digest.is_some(), "the second save compiles");
+        files.insert(
+            "workflow.star".to_string(),
+            "this is not starlark(".to_string(),
+        );
+        let broken = crate::playbooks::drafts::save_version(&pool, "studio", files, None, None)
+            .await
+            .expect("third save");
+        assert!(
+            broken.schema_digest.is_none(),
+            "the third save does not compile"
+        );
+
+        let next = fire_at("2026-08-23T13:00:00Z", "2026-08-23T13:01:00Z").await;
+        assert_eq!(next, Some(version_tree(second.version).await));
+        assert_ne!(next, first, "the later save moved the next firing");
         Ok(())
     }
 
@@ -1560,7 +1898,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -1621,7 +1961,9 @@ mod tests {
                 &NewSchedule {
                     standing: NewStanding {
                         playbook: "survey",
-                        target_kind: "adopted",
+                        target: crate::launches::standing::StandingTarget::Adopted(
+                            crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                        ),
                         eligible_draft_version: None,
                         params: &params(),
                         schema_digest: "sha256:schema",
@@ -1915,6 +2257,7 @@ mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                 },
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
             .await?,
             crate::launches::store::AdoptPlaybookOutcome::Adopted
@@ -2331,7 +2674,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -2384,7 +2729,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -2632,7 +2979,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",

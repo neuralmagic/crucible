@@ -617,7 +617,9 @@ mod tests {
             &NewWatch {
                 standing: NewStanding {
                     playbook: "backport",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:schema",
@@ -782,7 +784,9 @@ mod tests {
             &NewWatch {
                 standing: NewStanding {
                     playbook: "backport",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:schema",
@@ -1042,7 +1046,9 @@ mod tests {
             &NewWatch {
                 standing: NewStanding {
                     playbook: "backport",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:schema",

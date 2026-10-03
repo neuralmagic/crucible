@@ -2031,7 +2031,7 @@ pub(crate) mod tests {
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-2";
         assert!(matches!(
-            adopt_playbook_launch(&pool, key, &launch).await?,
+            adopt_playbook_launch(&pool, key, &launch, crate::playbooks::registry::PackRevision::Bytes("sha256:tar")).await?,
             AdoptPlaybookOutcome::SchemaDrifted { ref current } if current == "sha256:after"
         ));
         let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
@@ -2039,12 +2039,17 @@ pub(crate) mod tests {
             .await?;
         assert_eq!(rows, 0, "nothing was written");
         assert!(matches!(
-            adopt_playbook_launch(&pool, "playbook:gone:0199c0de-7c2c-71a5-8000-3", &{
-                NewPlaybookLaunch {
-                    playbook: "gone",
-                    ..launch
-                }
-            })
+            adopt_playbook_launch(
+                &pool,
+                "playbook:gone:0199c0de-7c2c-71a5-8000-3",
+                &{
+                    NewPlaybookLaunch {
+                        playbook: "gone",
+                        ..launch
+                    }
+                },
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
+            )
             .await?,
             AdoptPlaybookOutcome::UnknownPlaybook
         ));
@@ -2151,6 +2156,7 @@ pub(crate) mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                 },
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
             .await?,
             AdoptPlaybookOutcome::Adopted

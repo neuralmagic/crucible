@@ -962,7 +962,10 @@ pub(crate) async fn launch_playbook_draft(
             }
         }
         Ok(AdoptPlaybookOutcome::UnknownPlaybook) => return not_found(format!("no draft {id:?}")),
-        Ok(AdoptPlaybookOutcome::SchemaDrifted { current }) => {
+        Ok(
+            AdoptPlaybookOutcome::SchemaDrifted { current }
+            | AdoptPlaybookOutcome::Repinned { rev: current },
+        ) => {
             return (
                 StatusCode::CONFLICT,
                 Json(ErrorBody::new(format!(

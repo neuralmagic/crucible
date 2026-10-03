@@ -194,6 +194,8 @@ pub struct PlaybookRow {
     pub source: PlaybookSource,
     pub rev: String,
     pub tar_digest: String,
+    /// The stored tree, `None` on a row startup conversion has not reached.
+    pub tree_digest: Option<TreeDigest>,
     pub schema_digest: String,
     /// The substrate the pack's `[agent]` asks for, read off its manifest at registration. `None`
     /// when it was never recorded: a manifest that did not parse, or a row the startup backfill
@@ -209,8 +211,9 @@ pub struct PlaybookRow {
 }
 
 const PLAYBOOK_COLS: &str = "id, description, repo, git_ref, rev, path, source_draft, \
-     source_draft_version, tar_digest, schema_digest, agent_backend, agent_sandbox_image, \
-     agent_requirements, core_rev, exposure_digest, owner, created_by, created_at, updated_at";
+     source_draft_version, tar_digest, tree_digest, schema_digest, agent_backend, \
+     agent_sandbox_image, agent_requirements, core_rev, exposure_digest, owner, created_by, \
+     created_at, updated_at";
 
 impl PlaybookRow {
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
@@ -220,6 +223,11 @@ impl PlaybookRow {
             source: PlaybookSource::from_row(row)?,
             rev: row.try_get("rev")?,
             tar_digest: row.try_get("tar_digest")?,
+            tree_digest: row
+                .try_get::<Option<String>, _>("tree_digest")?
+                .map(TreeDigest::try_from)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
             schema_digest: row.try_get("schema_digest")?,
             agent: crate::playbooks::dispatch::agent_from_row(row)?,
             core_rev: row.try_get("core_rev")?,
@@ -229,6 +237,57 @@ impl PlaybookRow {
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
         })
+    }
+
+    /// The revision this row holds, as a launch authorized against it pins it.
+    pub(crate) fn revision(&self) -> PackRevision<'_> {
+        match &self.tree_digest {
+            Some(tree) => PackRevision::Tree(tree),
+            None => PackRevision::Bytes(&self.tar_digest),
+        }
+    }
+}
+
+/// The registered revision a launch was authorized against: its stored tree, or the digest of its
+/// legacy bytes on a row with no tree recorded yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackRevision<'a> {
+    Tree(&'a TreeDigest),
+    Bytes(&'a str),
+}
+
+/// The registered row `id` locked `FOR SHARE` until the transaction ends, so a revision checked
+/// against it cannot move before the caller's writes commit. `None` when the id is unknown.
+pub(crate) async fn lock_revision(
+    conn: &mut sqlx::PgConnection,
+    id: &str,
+) -> Result<Option<LockedRevision>> {
+    sqlx::query_as::<_, LockedRevision>(
+        "SELECT rev, tar_digest, tree_digest, schema_digest FROM playbooks WHERE id = $1 FOR SHARE",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await
+    .context("locking a registered playbook's revision")
+}
+
+/// A registry row's revision columns, read under [`lock_revision`].
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct LockedRevision {
+    pub rev: String,
+    pub tar_digest: String,
+    pub tree_digest: Option<String>,
+    pub schema_digest: String,
+}
+
+impl LockedRevision {
+    /// Whether this row still holds `pinned`. A tree pin needs the same tree; a bytes pin needs
+    /// the same bytes, whether or not conversion has since recorded their tree.
+    pub(crate) fn holds(&self, pinned: PackRevision<'_>) -> bool {
+        match pinned {
+            PackRevision::Tree(tree) => self.tree_digest.as_deref() == Some(tree.as_str()),
+            PackRevision::Bytes(digest) => self.tar_digest == digest,
+        }
     }
 }
 

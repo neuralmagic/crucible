@@ -7890,7 +7890,9 @@ async fn a_launch_cannot_advance_another_playbooks_cursor(pool: PgPool) -> Resul
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: "triage",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &serde_json::json!({}),
                     schema_digest: "sha256:other",

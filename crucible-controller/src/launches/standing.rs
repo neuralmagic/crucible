@@ -18,6 +18,7 @@ use crate::model::LaunchOrigin;
 use crate::model::MaxTime;
 use crate::model::Trigger;
 use crate::model::{ParkReason, ParkedBy, Status};
+use crate::playbooks::registry::PackRevision;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use sqlx::PgPool;
@@ -29,7 +30,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub(crate) struct NewStanding<'a> {
     pub playbook: &'a str,
-    pub target_kind: &'a str,
+    pub target: StandingTarget<'a>,
     pub eligible_draft_version: Option<i64>,
     /// The validated `{name: value}` object every firing launches.
     pub params: &'a serde_json::Value,
@@ -49,6 +50,61 @@ pub(crate) struct NewStanding<'a> {
     /// resolves the dispatch defaults at fire time.
     pub agent_provider: Option<&'a str>,
     pub agent_model: Option<&'a str>,
+}
+
+/// What a standing launch fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandingTarget<'a> {
+    /// The registered pack at the revision the endpoint authorized. The save copies that revision
+    /// and refuses when the registry row no longer holds it.
+    Adopted(PackRevision<'a>),
+    /// The draft's latest saved version that compiles, resolved at each firing.
+    DraftHead,
+}
+
+impl StandingTarget<'_> {
+    /// The stored `target_kind`.
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            StandingTarget::Adopted(_) => "adopted",
+            StandingTarget::DraftHead => "draft_head",
+        }
+    }
+}
+
+/// Why a save could not adopt the revision its endpoint authorized.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Unadoptable {
+    #[error("playbook {playbook:?} was deregistered while the save was being authorized")]
+    Gone { playbook: String },
+    #[error(
+        "playbook {playbook:?} was re-registered at revision {rev} while the save was being \
+         authorized; reload the form"
+    )]
+    Repinned { playbook: String, rev: String },
+}
+
+/// Hold the registry row an adopted save copies `FOR SHARE` and check it still holds the revision
+/// the endpoint authorized. A draft-head save copies nothing.
+async fn lock_adopted(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    new: &NewStanding<'_>,
+) -> Result<()> {
+    let StandingTarget::Adopted(pinned) = new.target else {
+        return Ok(());
+    };
+    let playbook = new.playbook.to_string();
+    let Some(locked) = crate::playbooks::registry::lock_revision(tx, new.playbook).await? else {
+        return Err(Unadoptable::Gone { playbook }.into());
+    };
+    if !locked.holds(pinned) {
+        return Err(Unadoptable::Repinned {
+            playbook,
+            rev: locked.rev,
+        }
+        .into());
+    }
+    Ok(())
 }
 
 /// One `playbook_standing_launches` row. Sidecar reads `#[sqlx(flatten)]` this into their own
@@ -99,8 +155,8 @@ pub(crate) const COLUMNS: &str = "c.id, c.playbook, c.target_kind, c.adopted_rep
     c.owner_refresh_at, c.dispatch_target, c.agent_provider, c.agent_model, c.created_at, \
     c.updated_at";
 
-/// Store the core row under `id`. The adopted snapshot is copied from the registry in the same
-/// statement, so a later repin cannot move an existing recurrence.
+/// Store the core row under `id`. The adopted snapshot is copied from the registry row held by
+/// [`lock_adopted`], so it is the authorized revision and a later repin cannot move it.
 pub(crate) async fn insert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
@@ -108,6 +164,7 @@ pub(crate) async fn insert(
     new: &NewStanding<'_>,
     now: &str,
 ) -> Result<()> {
+    lock_adopted(tx, new).await?;
     sqlx::query(
         r#"
         INSERT INTO playbook_standing_launches (
@@ -117,22 +174,18 @@ pub(crate) async fn insert(
             created_at, updated_at,
             adopted_repo, adopted_path, adopted_rev, adopted_tar_gz, adopted_tar_digest,
             adopted_tar_bytes, adopted_params_schema, adopted_tree_digest)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                CASE WHEN $13::text IS NULL THEN NULL ELSE $18 END, $15, $16, $17, $18, $18,
-                (SELECT repo FROM playbooks WHERE id = $3),
-                (SELECT path FROM playbooks WHERE id = $3),
-                (SELECT rev FROM playbooks WHERE id = $3),
-                (SELECT tar_gz FROM playbooks WHERE id = $3),
-                (SELECT tar_digest FROM playbooks WHERE id = $3),
-                (SELECT tar_bytes FROM playbooks WHERE id = $3),
-                (SELECT params_schema FROM playbooks WHERE id = $3),
-                (SELECT tree_digest FROM playbooks WHERE id = $3))
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+               CASE WHEN $13::text IS NULL THEN NULL ELSE $18 END, $15, $16, $17, $18, $18,
+               p.repo, p.path, p.rev, p.tar_gz, p.tar_digest, p.tar_bytes, p.params_schema,
+               p.tree_digest
+        FROM (VALUES (1)) one
+        LEFT JOIN playbooks p ON p.id = $3 AND $4 = 'adopted'
         "#,
     )
     .bind(id)
     .bind(trigger.as_str())
     .bind(new.playbook)
-    .bind(new.target_kind)
+    .bind(new.target.kind())
     .bind(new.eligible_draft_version)
     .bind(new.params)
     .bind(new.schema_digest)
@@ -162,9 +215,10 @@ pub(crate) async fn replace(
     new: &NewStanding<'_>,
     now: &str,
 ) -> Result<bool> {
+    lock_adopted(tx, new).await?;
     let updated = sqlx::query(
         r#"
-        UPDATE playbook_standing_launches
+        UPDATE playbook_standing_launches c
         SET playbook = $2, target_kind = $3, eligible_draft_version = $4, params = $5,
             schema_digest = $6, max_cost = $7, max_time = $8, advance_dedupe = $9, enabled = $10,
             created_by = $11, owner_principal = $12, owner_groups = $13,
@@ -172,20 +226,18 @@ pub(crate) async fn replace(
             owner_signin_required = false, owner_refresh_error = NULL,
             dispatch_target = $14, agent_provider = $15, agent_model = $16,
             consecutive_failures = 0, updated_at = $17,
-            adopted_repo = (SELECT repo FROM playbooks WHERE id = $2),
-            adopted_path = (SELECT path FROM playbooks WHERE id = $2),
-            adopted_rev = (SELECT rev FROM playbooks WHERE id = $2),
-            adopted_tar_gz = (SELECT tar_gz FROM playbooks WHERE id = $2),
-            adopted_tar_digest = (SELECT tar_digest FROM playbooks WHERE id = $2),
-            adopted_tar_bytes = (SELECT tar_bytes FROM playbooks WHERE id = $2),
-            adopted_params_schema = (SELECT params_schema FROM playbooks WHERE id = $2),
-            adopted_tree_digest = (SELECT tree_digest FROM playbooks WHERE id = $2)
-        WHERE id = $1
+            adopted_repo = p.repo, adopted_path = p.path, adopted_rev = p.rev,
+            adopted_tar_gz = p.tar_gz, adopted_tar_digest = p.tar_digest,
+            adopted_tar_bytes = p.tar_bytes, adopted_params_schema = p.params_schema,
+            adopted_tree_digest = p.tree_digest
+        FROM (VALUES (1)) one
+        LEFT JOIN playbooks p ON p.id = $2 AND $3 = 'adopted'
+        WHERE c.id = $1
         "#,
     )
     .bind(id)
     .bind(new.playbook)
-    .bind(new.target_kind)
+    .bind(new.target.kind())
     .bind(new.eligible_draft_version)
     .bind(new.params)
     .bind(new.schema_digest)
@@ -1428,7 +1480,9 @@ mod tests {
             Trigger::Watch,
             &NewStanding {
                 playbook: "backport",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params,
                 schema_digest: "sha256:schema",

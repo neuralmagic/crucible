@@ -335,6 +335,7 @@ async fn authorize_schedule(
         },
         rev: format!("draft-v{version}"),
         tar_digest: String::new(),
+        tree_digest: None,
         schema_digest,
         agent: latest.agent,
         core_rev: crate::playbooks::registry::core_rev().unwrap_or_default(),
@@ -438,7 +439,12 @@ pub(crate) async fn create_schedule(
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: &authorized.pack.id,
-                    target_kind: &body.target_kind,
+                    target: match draft_version {
+                        Some(_) => crate::launches::standing::StandingTarget::DraftHead,
+                        None => crate::launches::standing::StandingTarget::Adopted(
+                            authorized.pack.revision(),
+                        ),
+                    },
                     eligible_draft_version: draft_version,
                     params: &authorized.params,
                     schema_digest: &authorized.pack.schema_digest,
@@ -461,7 +467,7 @@ pub(crate) async fn create_schedule(
         .await;
     let stored = match stored {
         Ok(s) => s,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return crate::launches::api::save_failed(e),
     };
 
     let audit_key = format!("schedule:{}", stored.id);
@@ -653,7 +659,12 @@ pub(crate) async fn update_schedule(
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: &authorized.pack.id,
-                    target_kind: &body.target_kind,
+                    target: match draft_version {
+                        Some(_) => crate::launches::standing::StandingTarget::DraftHead,
+                        None => crate::launches::standing::StandingTarget::Adopted(
+                            authorized.pack.revision(),
+                        ),
+                    },
                     eligible_draft_version: draft_version,
                     params: &authorized.params,
                     schema_digest: &authorized.pack.schema_digest,
@@ -677,7 +688,7 @@ pub(crate) async fn update_schedule(
     let stored = match stored {
         Ok(Some(s)) => s,
         Ok(None) => return not_found(format!("no schedule {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return crate::launches::api::save_failed(e),
     };
     // The re-save re-owned the row, so the firings that parked under the old snapshot will never
     // launch.

@@ -9,6 +9,7 @@
 use crate::launches::model::{NewPlaybookLaunch, PlaybookLaunch, PlaybookRun};
 use crate::model::{LaunchOrigin, Status};
 use crate::playbooks::exposure::Exposure;
+use crate::playbooks::registry::PackRevision;
 use crate::runs::model::Run;
 use crate::runs::store::RUN_COLS;
 use anyhow::{Context, Result};
@@ -311,6 +312,11 @@ pub(crate) enum AdoptPlaybookOutcome {
     SchemaDrifted {
         current: String,
     },
+    /// The registry row was repinned to another revision between the endpoint's authorization and
+    /// this transaction.
+    Repinned {
+        rev: String,
+    },
 }
 
 /// Mint one draft launch. The registry foreign key cannot cover a draft, so this is where the
@@ -366,24 +372,27 @@ pub(crate) async fn adopt_draft_launch(
     Ok(outcome)
 }
 
+/// Mint one registered launch. The registry row is re-read `FOR SHARE`, and the launch is refused
+/// unless it still serves the schema and holds the revision the endpoint authorized, so the pack
+/// copied to the launch is the one its values were validated against.
 #[tracing::instrument(name = "db.adopt_playbook_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn adopt_playbook_launch(
     pool: &PgPool,
     key: &str,
     launch: &NewPlaybookLaunch<'_>,
+    authorized: PackRevision<'_>,
 ) -> Result<AdoptPlaybookOutcome> {
     let mut tx = pool.begin().await.context("adopt_playbook_launch: begin")?;
-    let current = sqlx::query_scalar!(
-        "SELECT schema_digest FROM playbooks WHERE id = $1 FOR SHARE",
-        launch.playbook,
-    )
-    .fetch_optional(&mut *tx)
-    .await
-    .context("adopt_playbook_launch: re-read the schema digest")?;
+    let current = crate::playbooks::registry::lock_revision(&mut tx, launch.playbook).await?;
     let outcome = match current {
         None => AdoptPlaybookOutcome::UnknownPlaybook,
-        Some(current) if current != launch.schema_digest => {
-            AdoptPlaybookOutcome::SchemaDrifted { current }
+        Some(current) if current.schema_digest != launch.schema_digest => {
+            AdoptPlaybookOutcome::SchemaDrifted {
+                current: current.schema_digest,
+            }
+        }
+        Some(current) if !current.holds(authorized) => {
+            AdoptPlaybookOutcome::Repinned { rev: current.rev }
         }
         Some(_) => {
             if insert_playbook_launch_with(

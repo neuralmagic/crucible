@@ -290,8 +290,8 @@ async fn rebuild_mode(into: &Db, cfg: &ControllerCfg, mode: RebuildMode) -> Resu
 
 /// Copy the artifact payloads and their pointer rows verbatim into the rebuilt DB: `artifacts` +
 /// `artifact_chunks` (ids preserved, chunks moved one row at a time so a 128 MiB session never
-/// materializes whole), `pod_artifacts`, `pack_tarballs`, and `pack_steering`. Runs against a
-/// freshly-migrated empty target.
+/// materializes whole), `pod_artifacts`, `pack_tarballs` with their trees, and `pack_steering`.
+/// Runs against a freshly-migrated empty target.
 async fn copy_artifact_store(live: &sqlx::PgPool, into: &Db) -> Result<()> {
     use sqlx::Row as _;
     let arts = sqlx::query(
@@ -355,20 +355,23 @@ async fn copy_artifact_store(live: &sqlx::PgPool, into: &Db) -> Result<()> {
         .execute(into.pool())
         .await?;
     }
-    let packs =
-        sqlx::query("SELECT issue_slug, tar_gz, digest, bytes, created_at FROM pack_tarballs")
-            .fetch_all(live)
-            .await?;
+    copy_pack_trees(live, into).await?;
+    let packs = sqlx::query(
+        "SELECT issue_slug, tar_gz, digest, bytes, created_at, tree_digest FROM pack_tarballs",
+    )
+    .fetch_all(live)
+    .await?;
     for p in &packs {
         sqlx::query(
-            "INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at) \
-             VALUES ($1, $2, $3, $4, $5) ON CONFLICT (issue_slug) DO NOTHING",
+            "INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (issue_slug) DO NOTHING",
         )
         .bind(p.get::<String, _>("issue_slug"))
         .bind(p.get::<Vec<u8>, _>("tar_gz"))
         .bind(p.get::<String, _>("digest"))
         .bind(p.get::<i64, _>("bytes"))
         .bind(p.get::<String, _>("created_at"))
+        .bind(p.get::<Option<String>, _>("tree_digest"))
         .execute(into.pool())
         .await?;
     }
@@ -386,6 +389,71 @@ async fn copy_artifact_store(live: &sqlx::PgPool, into: &Db) -> Result<()> {
         .bind(s.get::<String, _>("body_md"))
         .bind(s.get::<Option<String>, _>("author"))
         .bind(s.get::<String, _>("created_at"))
+        .execute(into.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+/// Copy the stored trees `pack_tarballs` references, one tree's files at a time, and every digest
+/// alias, so the copied `pack_tarballs` rows keep their tree. The other tables that reference trees
+/// are not rebuilt, so their trees are not carried.
+async fn copy_pack_trees(live: &sqlx::PgPool, into: &Db) -> Result<()> {
+    use sqlx::Row as _;
+    let trees = sqlx::query(
+        "SELECT digest, file_count, total_bytes, delivered_bytes, tarball_digest, created_at \
+         FROM pack_trees WHERE digest IN (SELECT tree_digest FROM pack_tarballs) ORDER BY digest",
+    )
+    .fetch_all(live)
+    .await?;
+    for t in &trees {
+        let digest: String = t.get("digest");
+        sqlx::query(
+            "INSERT INTO pack_trees \
+                 (digest, file_count, total_bytes, delivered_bytes, tarball_digest, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (digest) DO NOTHING",
+        )
+        .bind(&digest)
+        .bind(t.get::<i32, _>("file_count"))
+        .bind(t.get::<i64, _>("total_bytes"))
+        .bind(t.get::<i64, _>("delivered_bytes"))
+        .bind(t.get::<String, _>("tarball_digest"))
+        .bind(t.get::<String, _>("created_at"))
+        .execute(into.pool())
+        .await?;
+        let files =
+            sqlx::query("SELECT path, sha256, content FROM pack_tree_files WHERE digest = $1")
+                .bind(&digest)
+                .fetch_all(live)
+                .await?;
+        for f in &files {
+            sqlx::query(
+                "INSERT INTO pack_tree_files (digest, path, sha256, content) \
+                 VALUES ($1, $2, $3, $4) ON CONFLICT (digest, path) DO NOTHING",
+            )
+            .bind(&digest)
+            .bind(f.get::<String, _>("path"))
+            .bind(f.get::<String, _>("sha256"))
+            .bind(f.get::<Vec<u8>, _>("content"))
+            .execute(into.pool())
+            .await?;
+        }
+    }
+    let aliases = sqlx::query(
+        "SELECT old_digest, tree_digest, unconvertible_reason, recorded_at FROM pack_digest_aliases",
+    )
+    .fetch_all(live)
+    .await?;
+    for a in &aliases {
+        sqlx::query(
+            "INSERT INTO pack_digest_aliases \
+                 (old_digest, tree_digest, unconvertible_reason, recorded_at) \
+             VALUES ($1, $2, $3, $4) ON CONFLICT (old_digest) DO NOTHING",
+        )
+        .bind(a.get::<String, _>("old_digest"))
+        .bind(a.get::<Option<String>, _>("tree_digest"))
+        .bind(a.get::<Option<String>, _>("unconvertible_reason"))
+        .bind(a.get::<String, _>("recorded_at"))
         .execute(into.pool())
         .await?;
     }
@@ -1306,7 +1374,8 @@ mod tests {
     }
 
     /// The rebuild swap must carry the pack store: `copy_artifact_store` moves `pack_tarballs`
-    /// and `pack_steering` verbatim into the rebuilt DB, alongside the artifact tables.
+    /// with the trees they reference, the digest aliases, and `pack_steering` verbatim into the
+    /// rebuilt DB, alongside the artifact tables.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn copy_artifact_store_carries_pack_tarballs_and_steering(pool: PgPool) -> Result<()> {
         let live_url = crate::test_ledger_url();
@@ -1331,10 +1400,48 @@ mod tests {
             None,
         )
         .await?;
+        let unreferenced =
+            crucible_contract::pack_tree::PackTree::from_pairs(&[("crucible.toml", b"draft")])?;
+        crate::playbooks::pack_trees::put_tree(&mut *live_pool.acquire().await?, &unreferenced)
+            .await?;
+        sqlx::query(
+            "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
+             VALUES ('sha256:old', $1, 'then')",
+        )
+        .bind(tree.digest().as_str())
+        .execute(&live_pool)
+        .await?;
 
         let into = db_with(pool);
         copy_artifact_store(&live_pool, &into).await?;
         live_pool.close().await;
+
+        let pointed: Option<String> =
+            sqlx::query_scalar("SELECT tree_digest FROM pack_tarballs WHERE issue_slug = $1")
+                .bind("owner_repo_7")
+                .fetch_one(into.pool())
+                .await?;
+        assert_eq!(pointed.as_deref(), Some(tree.digest().as_str()));
+        let files: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT digest, path, content FROM pack_tree_files ORDER BY digest, path",
+        )
+        .fetch_all(into.pool())
+        .await?;
+        assert_eq!(
+            files,
+            vec![(
+                tree.digest().to_string(),
+                "SCOPE.md".to_string(),
+                b"identity: v1:beef\n".to_vec()
+            )],
+            "the referenced tree is copied and the unreferenced one is not"
+        );
+        let alias: Option<String> = sqlx::query_scalar(
+            "SELECT tree_digest FROM pack_digest_aliases WHERE old_digest = 'sha256:old'",
+        )
+        .fetch_one(into.pool())
+        .await?;
+        assert_eq!(alias.as_deref(), Some(tree.digest().as_str()));
 
         let copied = crate::runs::blob_store::get_pack_tarball(into.pool(), "owner_repo_7")
             .await?

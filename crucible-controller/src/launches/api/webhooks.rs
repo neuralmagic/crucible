@@ -342,6 +342,7 @@ fn save_refusal(e: SaveError) -> Response {
         e @ SaveError::VerifierFixed => {
             invalid_fields(vec![field_error("verifier", e.to_string())])
         }
+        SaveError::Internal(e) => crate::launches::api::save_failed(e),
         other => AppError::from(anyhow::Error::new(other)).into_response(),
     }
 }
@@ -476,7 +477,9 @@ fn new_webhook<'a>(
     crate::launches::webhooks::NewWebhook {
         standing: crate::launches::standing::NewStanding {
             playbook: &authorized.launch.pack.id,
-            target_kind: "adopted",
+            target: crate::launches::standing::StandingTarget::Adopted(
+                authorized.launch.pack.revision(),
+            ),
             eligible_draft_version: None,
             params: &authorized.launch.params,
             schema_digest: &authorized.launch.pack.schema_digest,

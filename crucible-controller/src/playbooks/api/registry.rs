@@ -794,7 +794,14 @@ pub(crate) async fn launch_playbook(
         launcher_groups: Some(&saver.groups),
     };
     use crate::launches::store::AdoptPlaybookOutcome;
-    match crate::launches::store::adopt_playbook_launch(state.db.pool(), &key, &launch).await {
+    match crate::launches::store::adopt_playbook_launch(
+        state.db.pool(),
+        &key,
+        &launch,
+        pack.revision(),
+    )
+    .await
+    {
         Ok(AdoptPlaybookOutcome::Adopted) => {
             // The issue row the adopt just wrote is what every later dispatch reads its cluster
             // off, so the pin lands before the launch is enqueued.
@@ -813,6 +820,16 @@ pub(crate) async fn launch_playbook(
                 Json(ErrorBody::new(format!(
                     "playbook {id} was re-registered while the launch was being authorized \
                      (schema is now {current}); reload the form"
+                ))),
+            )
+                .into_response();
+        }
+        Ok(AdoptPlaybookOutcome::Repinned { rev }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorBody::new(format!(
+                    "playbook {id} was re-registered at revision {rev} while the launch was being \
+                     authorized; reload the form"
                 ))),
             )
                 .into_response();

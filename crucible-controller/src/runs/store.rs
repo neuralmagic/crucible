@@ -719,6 +719,7 @@ mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                 },
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
             .await?,
             AdoptPlaybookOutcome::Adopted
@@ -857,6 +858,7 @@ mod tests {
                 draft_version: None,
                 created_by: Some("wren"),
             },
+            crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
         )
         .await?;
         let playbook_run = format!("{}-1787528065", crate::model::sanitize_key(key));

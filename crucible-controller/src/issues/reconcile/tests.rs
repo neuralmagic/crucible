@@ -6542,6 +6542,10 @@ async fn adopt_launch_with_groups(
 ) {
     let params = serde_json::json!({"topic": "attention sinks", "depth": "deep"});
     let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+    let registered = crate::playbooks::registry::get(db.pool(), "survey")
+        .await
+        .expect("read the registry")
+        .expect("survey is registered");
     assert!(
         matches!(
             crate::launches::store::adopt_playbook_launch(
@@ -6562,6 +6566,7 @@ async fn adopt_launch_with_groups(
                     created_by: Some("wren"),
                     launcher_groups,
                 },
+                registered.revision()
             )
             .await
             .expect("adopt"),
@@ -6579,12 +6584,18 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
         crate::launches::model::CursorSpec::parse("$.scan.newest_created_at", Some("since"), None)
             .expect("cursor");
     let params = serde_json::json!({"topic": "attention sinks"});
+    let registered = crate::playbooks::registry::get(db.pool(), "survey")
+        .await
+        .expect("read the registry")
+        .expect("survey is registered");
     let scheduled = crate::launches::schedules::ScheduleStore::new(db.clone())
         .create(
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: "survey",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        registered.revision(),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:form",
@@ -6624,6 +6635,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             created_by: Some("wren"),
             launcher_groups: None,
         },
+        registered.revision(),
     )
     .await
     .expect("adopt");

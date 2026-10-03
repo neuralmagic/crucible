@@ -129,21 +129,10 @@ const SELECT: &str = const_format::concatcp!(
 
 /// Store a deferred one-shot. The values were validated against the pack's stored schema and the
 /// ceilings bounded by the admin caps at the endpoint, exactly as for an immediate launch.
-///
-/// `Ok(None)` when the playbook was deregistered between that authorization and this insert, which
-/// the endpoint reports as a 404 rather than letting the constraint violation surface as a 500.
-pub(crate) async fn create(pool: &PgPool, new: &NewOneShot<'_>) -> Result<Option<OneShot>> {
+pub(crate) async fn create(pool: &PgPool, new: &NewOneShot<'_>) -> Result<OneShot> {
     let id = uuid::Uuid::now_v7().to_string();
     let now = crate::clock::now_rfc3339();
     let mut tx = pool.begin().await.context("create one-shot: begin")?;
-    let registered: Option<String> = sqlx::query_scalar("SELECT id FROM playbooks WHERE id = $1")
-        .bind(new.standing.playbook)
-        .fetch_optional(&mut *tx)
-        .await
-        .context("create one-shot: registry")?;
-    if registered.is_none() {
-        return Ok(None);
-    }
     standing::insert(&mut tx, &id, Trigger::Deferred, &new.standing, &now).await?;
     sqlx::query(
         "INSERT INTO playbook_one_shots (id, dedupe_schedule, fire_at) VALUES ($1, $2, $3)",
@@ -155,7 +144,9 @@ pub(crate) async fn create(pool: &PgPool, new: &NewOneShot<'_>) -> Result<Option
     .await
     .context("create one-shot")?;
     tx.commit().await.context("create one-shot: commit")?;
-    get(pool, &id).await
+    get(pool, &id)
+        .await?
+        .context("the one-shot just stored is gone")
 }
 
 /// Every one-shot, soonest-due first among the pending ones.
@@ -390,7 +381,9 @@ mod tests {
             &NewOneShot {
                 standing: NewStanding {
                     playbook: "survey",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params(),
                     schema_digest: "sha256:schema",
@@ -411,7 +404,6 @@ mod tests {
         )
         .await
         .expect("create")
-        .expect("the playbook is registered")
     }
 
     #[test]
