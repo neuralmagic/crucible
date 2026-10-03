@@ -270,19 +270,7 @@ impl PackTree {
     /// 0755, owner 0, and mtime 0, in a gzip stream with no name or timestamp. The same tree
     /// always yields the same bytes.
     pub fn tarball(&self) -> std::io::Result<Vec<u8>> {
-        let gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
-        let mut builder = tar::Builder::new(gz);
-        for (path, bytes) in &self.0 {
-            let mut header = tar::Header::new_gnu();
-            header.set_entry_type(tar::EntryType::Regular);
-            header.set_size(bytes.len() as u64);
-            header.set_mode(0o755);
-            header.set_uid(0);
-            header.set_gid(0);
-            header.set_mtime(0);
-            builder.append_data(&mut header, path.as_str(), bytes.as_slice())?;
-        }
-        builder.into_inner()?.finish()
+        encode_tarball(&self.0)
     }
 
     /// Refuse a tree in which a file's path followed by `/` begins another file's path: no
@@ -305,6 +293,24 @@ impl PackTree {
         }
         Ok(())
     }
+}
+
+/// `files` as the gzipped tar [`PackTree::tarball`] describes. Unlike a tree, `files` may hold
+/// excluded paths, so per-run inputs delivered beside a pack use the same encoding.
+pub fn encode_tarball(files: &BTreeMap<PackFilePath, Vec<u8>>) -> std::io::Result<Vec<u8>> {
+    let gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    for (path, bytes) in files {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_mtime(0);
+        builder.append_data(&mut header, path.as_str(), bytes.as_slice())?;
+    }
+    builder.into_inner()?.finish()
 }
 
 /// A pack read from a directory or an archive: the tree, and the excluded paths it skipped.

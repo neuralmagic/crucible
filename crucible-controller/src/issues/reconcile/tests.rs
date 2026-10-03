@@ -6822,6 +6822,72 @@ async fn a_dequeued_playbook_key_dispatches_from_its_stored_row(pool: PgPool) ->
     Ok(())
 }
 
+/// Dispatch delivers only the tree stored under the launch's digest: when a stored file no longer
+/// hashes to it, the launch is refused with that reason, no pod is created, and it stays `new`.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_stored_tree_was_tampered_with_is_refused(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-9";
+    seed_registered_playbook(&db, "survey").await;
+    crate::playbooks::pack_migration::convert_pack_trees(db.pool()).await?;
+    adopt_launch(&db, key, 3.5).await;
+    let tree: String = sqlx::query_scalar(
+        "SELECT tree_digest FROM pack_tarballs WHERE issue_slug = $1 AND tree_digest IS NOT NULL",
+    )
+    .bind(crate::model::sanitize_key(key))
+    .fetch_one(db.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE pack_tree_files SET content = 'print(\"evil\")' \
+         WHERE digest = $1 AND path = 'workflow.star'",
+    )
+    .bind(&tree)
+    .execute(db.pool())
+    .await?;
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::Succeeded,
+        logs: String::new(),
+        created: created.clone(),
+    }));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+
+    let err = format!(
+        "{:#}",
+        res.expect_err("a tampered tree is never dispatched")
+    );
+    assert!(
+        err.contains(&format!(
+            "pack tree {tree} no longer matches its stored files"
+        )),
+        "{err}"
+    );
+    assert!(
+        created.lock().expect("lock").is_empty(),
+        "no pod was created"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::New);
+    let failed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE key = $1 AND reason = $2")
+            .bind(key)
+            .bind(crate::runs::launch::PLAYBOOK_DISPATCH_FAILED)
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(failed, 1, "the refusal is on the launch's event log");
+    Ok(())
+}
+
 /// With the lane built but switched off, a GitHub row stays where it is while a playbook launch
 /// still dispatches through the same reconcile.
 #[cfg(feature = "autoresearch")]

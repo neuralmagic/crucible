@@ -120,15 +120,7 @@ pub(super) async fn reconcile_awaiting(db: &Db, cfg: &ControllerCfg, issue: &Iss
         return Ok(());
     }
 
-    launch_approved_run(
-        db,
-        cfg,
-        issue,
-        &scope,
-        Status::AwaitingApproval,
-        pack.path(),
-    )
-    .await
+    launch_approved_run(db, cfg, issue, &scope, Status::AwaitingApproval, &pack).await
 }
 
 /// Launch the approved pack's loop run and advance `from` → `running` (`from` is
@@ -143,7 +135,7 @@ async fn launch_approved_run(
     issue: &Issue,
     scope: &crate::issues::model::Scope,
     from: Status,
-    pack_dir: &std::path::Path,
+    pack: &crate::playbooks::packs::MaterializedPack,
 ) -> Result<()> {
     // Mint the run id before the dispatch so the pod is stamped with it (and the completion edge maps
     // back). The primitive renders the pack's loop pod, stamps it controller-owned (managed-by +
@@ -171,7 +163,7 @@ async fn launch_approved_run(
         crate::runs::workpod::active_dispatcher(),
         &issue.key,
         &run_id,
-        pack_dir,
+        pack,
         &build_digests,
         // The NAME; the dispatch resolves it against the configured set and projects the JSON onto
         // the loop container as BROKER_CODEGEN_TOOLS_OVERLAY.
@@ -340,7 +332,7 @@ pub(super) async fn reconcile_building(db: &Db, cfg: &ControllerCfg, issue: &Iss
         crate::builds::lifecycle::BuildsProgress::AllReady => {
             // Every image is built + pinned — the block lifts. Launch the run exactly as a build-free
             // pack would, advancing `building` → `running`.
-            launch_approved_run(db, cfg, issue, &scope, Status::Building, pack.path()).await
+            launch_approved_run(db, cfg, issue, &scope, Status::Building, &pack).await
         }
         // Still dispatching/building (or transiently capped): stay `building`, re-driven next pass.
         crate::builds::lifecycle::BuildsProgress::Waiting => Ok(()),

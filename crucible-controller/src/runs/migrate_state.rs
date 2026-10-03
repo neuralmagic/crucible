@@ -836,15 +836,17 @@ mod tests {
                 .expect("uri");
         assert_eq!(s3.as_deref(), Some("s3://bucket/x/session.jsonl"));
 
-        // Materializing the migrated pack reconstructs the original STEER.md byte-for-byte:
-        // frozen prefix from the tarball, blocks re-injected from the rows.
+        // The STEER.md a run of the migrated pack receives is the original byte-for-byte: the
+        // frozen prefix from the stored tree, the blocks re-injected from the rows.
         let pack = crate::playbooks::packs::materialize_pack(&pool, "owner/repo#7")
             .await
             .expect("materialize")
             .expect("stored");
         assert_eq!(
-            std::fs::read_to_string(pack.path().join("STEER.md")).expect("STEER.md"),
-            STEER_FILE
+            crate::playbooks::packs::steer_md(&pool, "owner/repo#7", pack.path())
+                .await
+                .expect("steer"),
+            Some(STEER_FILE.as_bytes().to_vec())
         );
         let (frozen, _) = split_steer(STEER_FILE).expect("split");
         let migrated =
@@ -1039,8 +1041,10 @@ mod tests {
             .expect("materialize")
             .expect("stored");
         assert_eq!(
-            std::fs::read_to_string(materialized.path().join("STEER.md")).expect("STEER.md"),
-            STEER_FILE
+            crate::playbooks::packs::steer_md(&pool, "owner/repo#7", materialized.path())
+                .await
+                .expect("steer"),
+            Some(STEER_FILE.as_bytes().to_vec())
         );
     }
 

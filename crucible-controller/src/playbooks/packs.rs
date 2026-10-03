@@ -2,16 +2,17 @@
 //! (keyed by the sanitized issue key) names, beside the gzipped tarball older controllers read,
 //! and human steering lives beside it as `pack_steering` rows. Readers that need a working tree
 //! (the engine's PR push, `crucible deploy render`, `[build]` planning) call [`materialize_pack`],
-//! which writes the tree into a scratch [`tempfile::TempDir`] and appends the steering rows onto
-//! `STEER.md`, in the exact marker-wrapped shape `crucible/src/control.rs::append_steer` writes.
-//! Readers that need one file (`SCOPE.md`) read it alone via [`read_pack_file`].
+//! which writes exactly the stored tree into a scratch [`tempfile::TempDir`]. A run receives the
+//! steering rows beside that tree as [`steer_md`], in the exact marker-wrapped shape
+//! `crucible/src/control.rs::append_steer` writes. Readers that need one file (`SCOPE.md`) read
+//! it alone via [`read_pack_file`].
 
 #![allow(clippy::disallowed_macros)]
 
 use crate::runs::blob_store::StoredPack;
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{
-    OverBudget, PackTree, ReadPack, TreeError, check_delivery_budget, walk_dir,
+    OverBudget, PackTree, ReadPack, TreeDigest, TreeError, check_delivery_budget, walk_dir,
 };
 use sqlx::PgPool;
 use std::collections::BTreeMap;
@@ -22,11 +23,17 @@ use std::path::{Path, PathBuf};
 pub struct MaterializedPack {
     _guard: tempfile::TempDir,
     root: PathBuf,
+    digest: TreeDigest,
 }
 
 impl MaterializedPack {
     pub fn path(&self) -> &Path {
         &self.root
+    }
+
+    /// The digest of the tree written at [`Self::path`].
+    pub fn digest(&self) -> &TreeDigest {
+        &self.digest
     }
 }
 
@@ -155,9 +162,35 @@ pub async fn store_pack_tree(pool: &PgPool, key: &str, dir: &Path) -> Result<Sto
 /// Write `tree` into `dir` (created if missing), every file with mode 0755 as the pod's pack mount
 /// gives it.
 pub(crate) fn write_tree(tree: &PackTree, dir: &Path) -> Result<()> {
+    write_files(tree.files(), dir)
+}
+
+/// Write `tree` into `dir`, refused unless the directory then reads back as exactly `tree`
+/// (RFC-0002:C-PACK-BASE).
+pub(crate) fn write_checked_tree(tree: &PackTree, dir: &Path) -> Result<()> {
+    write_tree(tree, dir)?;
+    let written = walk_dir(dir)
+        .with_context(|| format!("reading back the pack at {}", dir.display()))?
+        .tree
+        .digest();
+    let expected = tree.digest();
+    if written != expected {
+        anyhow::bail!(
+            "the pack written at {} reads back as tree {written}, not the stored tree {expected}",
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
+/// Write `files` under `dir` (created if missing), each with mode 0755.
+pub(crate) fn write_files(
+    files: &BTreeMap<crucible_contract::pack_tree::PackFilePath, Vec<u8>>,
+    dir: &Path,
+) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    for (path, bytes) in tree.files() {
+    for (path, bytes) in files {
         let dest = dir.join(path.as_str());
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)
@@ -178,51 +211,57 @@ pub(crate) fn materialize_tree(tree: &PackTree) -> Result<MaterializedPack> {
     Ok(MaterializedPack {
         _guard: guard,
         root,
+        digest: tree.digest(),
     })
 }
 
-/// Write `key`'s stored pack into a scratch tree and append its steering rows onto `STEER.md`
-/// (ordered by seq, each stamped with the row's own recorded time, so the same pack and rows
-/// always materialize to the same bytes). `None` when no pack was ever stored.
+/// Write exactly `key`'s stored pack into a scratch tree. `None` when no pack was ever stored.
 pub(crate) async fn materialize_pack(pool: &PgPool, key: &str) -> Result<Option<MaterializedPack>> {
     let slug = crate::model::sanitize_key(key);
     let Some(tree) = crate::runs::blob_store::get_pack(pool, &slug).await? else {
         return Ok(None);
     };
-    let MaterializedPack {
-        _guard: guard,
-        root,
-    } = tokio::task::spawn_blocking(move || materialize_tree(&tree))
+    tokio::task::spawn_blocking(move || materialize_tree(&tree))
         .await
         .context("joining the pack materialization worker")?
-        .with_context(|| format!("writing the stored pack for {key}"))?;
+        .with_context(|| format!("writing the stored pack for {key}"))
+        .map(Some)
+}
+
+/// The `STEER.md` a run of `key` receives beside the pack written at `pack_dir`: the pack's own
+/// `STEER.md` with `key`'s steering rows appended, ordered by seq and each stamped with the row's
+/// recorded time, so the same pack and rows always give the same bytes. `None` when `key` has no
+/// steering rows.
+pub(crate) async fn steer_md(pool: &PgPool, key: &str, pack_dir: &Path) -> Result<Option<Vec<u8>>> {
+    let slug = crate::model::sanitize_key(key);
     let steering = crate::runs::blob_store::list_steering(pool, &slug).await?;
-    if !steering.is_empty() {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(root.join("STEER.md"))
-            .context("opening STEER.md for steering injection")?;
-        for s in &steering {
-            let ts: jiff::Timestamp = s
-                .created_at
-                .parse()
-                .with_context(|| format!("parsing steering timestamp {:?}", s.created_at))?;
-            let payload = format!(
+    if steering.is_empty() {
+        return Ok(None);
+    }
+    let mut out = match tokio::fs::read(pack_dir.join(STEER_MD)).await {
+        Ok(frozen) => frozen,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e).context("reading the pack's STEER.md"),
+    };
+    for s in &steering {
+        let ts: jiff::Timestamp = s
+            .created_at
+            .parse()
+            .with_context(|| format!("parsing steering timestamp {:?}", s.created_at))?;
+        out.extend_from_slice(
+            format!(
                 "<!-- steer @{} by control -->\n{}\n",
                 ts.as_second(),
                 s.body_md.trim()
-            );
-            f.write_all(payload.as_bytes())
-                .context("appending steering to STEER.md")?;
-        }
+            )
+            .as_bytes(),
+        );
     }
-    Ok(Some(MaterializedPack {
-        _guard: guard,
-        root,
-    }))
+    Ok(Some(out))
 }
+
+/// The pack-relative path a run reads steering from.
+pub(crate) const STEER_MD: &str = "STEER.md";
 
 /// [`materialize_pack`], falling back to an empty scratch tree when no pack is stored — the
 /// pre-tarball semantics of a missing `packs/<key>/` dir (`plan_builds` sees no manifest; a real
@@ -235,13 +274,7 @@ pub(crate) async fn materialize_pack_or_empty(
     if let Some(pack) = materialize_pack(pool, key).await? {
         return Ok(pack);
     }
-    let guard = tempfile::tempdir().context("pack materialization scratch dir")?;
-    let root = guard.path().join("pack");
-    std::fs::create_dir_all(&root).context("creating the empty pack tree")?;
-    Ok(MaterializedPack {
-        _guard: guard,
-        root,
-    })
+    materialize_tree(&PackTree::default())
 }
 
 /// Read one file (by pack-relative path) of `key`'s stored pack. `None` when no pack is stored or
@@ -408,13 +441,27 @@ mod tests {
         );
     }
 
+    /// Steering rows never enter the materialized tree; they are appended onto the pack's own
+    /// `STEER.md` in the copy a run receives beside it, in seq order and the same bytes each time.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn steering_rows_inject_onto_steer_md_in_order_and_deterministically(pool: sqlx::PgPool) {
+    async fn steering_rows_append_onto_steer_md_beside_the_tree(pool: sqlx::PgPool) {
         let tree = sample_tree();
         std::fs::write(tree.path().join("STEER.md"), "frozen guidance\n").unwrap();
         store_pack_tree(&pool, "owner/repo#7", tree.path())
             .await
             .expect("store");
+        let stored = walk_dir(tree.path()).expect("walk").tree;
+        let pack = materialize_pack(&pool, "owner/repo#7")
+            .await
+            .expect("materialize")
+            .expect("stored");
+        assert_eq!(
+            steer_md(&pool, "owner/repo#7", pack.path())
+                .await
+                .expect("steer"),
+            None,
+            "no rows, nothing beside the tree"
+        );
         crate::runs::blob_store::append_steering(
             &pool,
             "owner_repo_7",
@@ -427,26 +474,33 @@ mod tests {
             .await
             .expect("append");
 
-        let read_steer = |p: &MaterializedPack| {
-            std::fs::read_to_string(p.path().join("STEER.md")).expect("STEER.md")
-        };
-        let first = materialize_pack(&pool, "owner/repo#7")
+        let pack = materialize_pack(&pool, "owner/repo#7")
             .await
             .expect("materialize")
             .expect("stored");
-        let text = read_steer(&first);
+        assert_eq!(walk_dir(pack.path()).expect("walk").tree, stored);
+        assert_eq!(pack.digest(), &stored.digest());
+        let first = steer_md(&pool, "owner/repo#7", pack.path())
+            .await
+            .expect("steer")
+            .expect("rows");
+        let text = String::from_utf8(first.clone()).expect("text");
         assert!(text.starts_with("frozen guidance\n"), "{text}");
         assert_eq!(text.matches("by control -->").count(), 2);
         let dup = text.find("hoist the dup check").expect("first entry");
         let fail = text.find("pick fail-closed").expect("second entry");
         assert!(dup < fail, "seq order preserved");
 
-        // Same tarball + rows → the same bytes, so build watch digests stay stable.
-        let second = materialize_pack(&pool, "owner/repo#7")
+        let bare = materialize_tree(&PackTree::default()).expect("empty");
+        let second = steer_md(&pool, "owner/repo#7", bare.path())
             .await
-            .expect("materialize")
-            .expect("stored");
-        assert_eq!(text, read_steer(&second));
+            .expect("steer")
+            .expect("rows");
+        assert_eq!(
+            [b"frozen guidance\n".as_slice(), &second].concat(),
+            first,
+            "a pack without STEER.md receives the rows alone"
+        );
     }
 
     #[cfg(feature = "autoresearch")]

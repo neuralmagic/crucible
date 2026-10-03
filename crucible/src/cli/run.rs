@@ -304,6 +304,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     .clone()
                     .unwrap_or_else(|| format!("{domain}-pack")),
                 run_name: domain.to_string(),
+                inputs: Default::default(),
             }
         });
         let playbook = playbook_launch(&args)?;

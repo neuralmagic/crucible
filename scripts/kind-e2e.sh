@@ -12,7 +12,8 @@
 #      still running when it comes back
 #   B  legacy pack rows are converted to stored trees at startup: a foreign-encoded tarball
 #      converts to the same tree, a symlink pack is recorded unconvertible, and the draft
-#      still launches
+#      still launches; with its legacy bytes swapped for another pack's, it still delivers the
+#      stored tree
 #   M  a loop image labelled with another contract version parks the launch without a pod
 # Needs docker, kind, kubectl, jq, curl. Uses $DATABASE_URL and $PG_CONTAINER when set (the CI
 # postgres action), else starts its own Postgres. KEEP=1 leaves everything up; ARTIFACT_DIR
@@ -461,6 +462,27 @@ $(diff <(sql -c "SELECT path, sha256 FROM pack_tree_files WHERE digest = '$TREE'
     <(sql -c "SELECT path, sha256 FROM pack_tree_files WHERE digest = '$RETREE' ORDER BY path"))"
 pass "[B] a foreign encoding of the same files converted to the same tree"
 launch_and_check B draft-launch "$DRAFT"
+
+log "[B] pointing version $VERSION's legacy bytes at a different pack, keeping its tree"
+small_pack "$WORK/decoy" 'echo decoy'
+DECOY_HEX=$(COPYFILE_DISABLE=1 tar -C "$WORK/decoy" -czf - . | od -An -v -tx1 | tr -d ' \n')
+sql -v hex="$DECOY_HEX" -v draft="$DRAFT" -v version="$VERSION" <<'SQL'
+BEGIN;
+ALTER TABLE playbook_draft_versions DISABLE TRIGGER playbook_draft_versions_legacy_bytes;
+UPDATE playbook_draft_versions
+SET tar_gz = s.b, tar_digest = 'sha256:' || encode(sha256(s.b), 'hex'), tar_bytes = length(s.b)
+FROM (SELECT decode(:'hex', 'hex') AS b) s
+WHERE draft_id = :'draft' AND version = :'version';
+ALTER TABLE playbook_draft_versions ENABLE TRIGGER playbook_draft_versions_legacy_bytes;
+COMMIT;
+SQL
+DECOY_DIGEST=$(sql -c "SELECT tar_digest FROM playbook_draft_versions WHERE draft_id = '$DRAFT' AND version = $VERSION")
+[ "$(sql -c "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = '$DRAFT' AND version = $VERSION")" = "$TREE" ] ||
+    fail "[B] version $VERSION lost its tree when its bytes were rewritten"
+launch_and_check B-tree draft-launch "$DRAFT"
+[ "$(sql -c "SELECT count(*) FROM pack_tarballs WHERE tree_digest = '$TREE' AND digest = '$DECOY_DIGEST'")" = 1 ] ||
+    fail "[B] the launch did not carry the decoy bytes beside the tree"
+pass "[B] dispatch delivered the stored tree, not the launch's legacy bytes"
 
 
 # ---- scenario M ----------------------------------------------------------------------------

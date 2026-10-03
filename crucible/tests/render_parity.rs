@@ -162,6 +162,7 @@ fn deploy_render_pack_playbook_matches_render_yaml() {
             pack: Some(PackDelivery {
                 configmap_name: "crucible-run-42-pack".to_string(),
                 run_name: "roundup".to_string(),
+                inputs: Default::default(),
             }),
             clusters_file: None,
             harness: None,
@@ -392,6 +393,7 @@ fn a_delivered_pack_renders_under_its_run_name_not_its_directory() {
             pack: Some(PackDelivery {
                 configmap_name: "crucible-run-7-pack".to_string(),
                 run_name: "crucible-run-7".to_string(),
+                inputs: Default::default(),
             }),
             playbook: Some(PlaybookLaunch {
                 max_time: "30m".parse().expect("30m is a duration"),

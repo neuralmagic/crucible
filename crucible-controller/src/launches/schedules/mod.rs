@@ -185,15 +185,14 @@ impl ScheduleStore {
         Ok(())
     }
 
-    /// Write the stored cursor file of the schedule that fired `issue_key` into the launch's
-    /// materialized pack, where the pack's own `[[workspace.inject]]` picks it up. Returns the
-    /// path written, or `None` when the launch is not a firing of a file-cursor schedule with a
-    /// stored value, in which case the pack's own copy stands.
-    pub(crate) async fn stage_cursor_file(
+    /// The stored cursor file of the schedule that fired `issue_key`: the pack-relative path the
+    /// run receives it at, where the pack's own `[[workspace.inject]]` picks it up, and its body.
+    /// `None` when the launch is not a firing of a file-cursor schedule with a stored value, in
+    /// which case the pack's own copy stands.
+    pub(crate) async fn cursor_file(
         &self,
         issue_key: &str,
-        pack_dir: &std::path::Path,
-    ) -> Result<Option<std::path::PathBuf>> {
+    ) -> Result<Option<(crucible_contract::pack_tree::PackFilePath, Vec<u8>)>> {
         let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT s.cursor_path, s.cursor_value
              FROM playbook_launches pl
@@ -208,18 +207,12 @@ impl ScheduleStore {
             return Ok(None);
         };
         let path = crate::launches::model::PackPath::parse(&path)
-            .map_err(|e| anyhow::anyhow!("stored cursor path for {issue_key}: {e}"))?
-            .under(pack_dir);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        tokio::fs::write(&path, value.as_bytes())
-            .await
-            .with_context(|| format!("writing the cursor file {}", path.display()))?;
-        tracing::info!(issue_key, path = %path.display(), bytes = value.len(), "schedules: cursor file staged into the pack");
-        Ok(Some(path))
+            .map_err(|e| anyhow::anyhow!("stored cursor path for {issue_key}: {e}"))?;
+        let path = path
+            .as_str()
+            .parse()
+            .with_context(|| format!("stored cursor path for {issue_key}"))?;
+        Ok(Some((path, value.into_bytes())))
     }
 }
 
@@ -1017,6 +1010,83 @@ mod tests {
         let (recorded, digest) = launch_tree(&pool, &keys[0]).await;
         assert_eq!(recorded.as_deref(), Some(adopted_tree.as_str()));
         assert_eq!(digest, crucible_contract::content_digest(&first.tarball()?));
+        Ok(())
+    }
+
+    /// A launch reports the exposure of the pack it runs. While the registry row still holds the
+    /// adopted tree, that is the row's stored exposure. Once a repin moves the row on, every launch
+    /// of the old tree, including one fired after the repin, reports the exposure extracted from
+    /// the tree it copied, never the new row's.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_adopted_launch_fired_after_a_repin_reports_the_adopted_trees_exposure(
+        pool: PgPool,
+    ) -> Result<()> {
+        use crate::playbooks::exposure::Exposure;
+        use crate::testing::fixtures::{PLAYBOOK_PACK_MANIFEST, WORKFLOW_TOPIC_DEPTH};
+        let first = PackTree::from_pairs(&[
+            ("crucible.toml", PLAYBOOK_PACK_MANIFEST.as_bytes()),
+            ("workflow.star", WORKFLOW_TOPIC_DEPTH.as_bytes()),
+        ])?;
+        let set_exposure = |marker: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let stored = serde_json::json!({
+                    "version": 1,
+                    "outputs": [{"kind": marker, "count": 1}],
+                });
+                sqlx::query("UPDATE playbooks SET exposure = $1 WHERE id = 'survey'")
+                    .bind(&stored)
+                    .execute(&pool)
+                    .await
+                    .expect("set exposure");
+                Exposure::from_value(stored).expect("exposure")
+            }
+        };
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &first).await;
+        let registered_first = set_exposure("first-row").await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let db = Db::new(pool.clone());
+        let scheduled = ScheduleStore::new(db.clone())
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
+        let fire = |due: &'static str, at: &'static str| {
+            let (db, pool, id) = (db.clone(), pool.clone(), scheduled.id.clone());
+            async move {
+                set_due(&pool, &id, Some(due)).await;
+                let keys = fire_due(&db, ts(at), 1, 5, std::time::Duration::from_secs(3600))
+                    .await
+                    .expect("fire");
+                assert_eq!(keys.len(), 1);
+                keys[0].clone()
+            }
+        };
+
+        let before = fire("2026-08-23T12:00:00Z", "2026-08-23T12:01:00Z").await;
+        assert_eq!(
+            crate::launches::store::exposure_for_issue(&pool, &before).await?,
+            Some(registered_first)
+        );
+
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+        let registered_second = set_exposure("second-row").await;
+        let after = fire("2026-08-23T13:00:00Z", "2026-08-23T13:01:00Z").await;
+        let extracted = {
+            let pack = crate::playbooks::packs::materialize_tree(&first)?;
+            crate::playbooks::exposure::extract(pack.path(), None)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+        };
+        for key in [&before, &after] {
+            let reported = crate::launches::store::exposure_for_issue(&pool, key).await?;
+            assert_eq!(reported.as_ref(), Some(&extracted), "{key}");
+            assert_ne!(reported, Some(registered_second.clone()), "{key}");
+        }
         Ok(())
     }
 
@@ -2888,11 +2958,11 @@ mod tests {
     }
 
     /// A file cursor advances off the run's captured files, the event names the file by size and
-    /// digest rather than printing it, and the next firing finds the body staged into its pack at
-    /// the path the schedule named. A firing before any value landed stages nothing, so the
+    /// digest rather than printing it, and the next firing receives the body at the path the
+    /// schedule named. A firing before any value landed receives nothing, so the
     /// pack's own file stands.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_finished_run_advances_a_file_cursor_and_the_next_firing_is_staged_with_it(
+    async fn a_finished_run_advances_a_file_cursor_and_the_next_firing_receives_it(
         pool: PgPool,
     ) -> Result<()> {
         let db = Db::new(pool.clone());
@@ -2915,10 +2985,8 @@ mod tests {
             "a file cursor overlays no param"
         );
 
-        let pack = tempfile::tempdir()?;
         let store = ScheduleStore::new(db.clone());
-        assert_eq!(store.stage_cursor_file(&fired[0], pack.path()).await?, None);
-        assert!(!pack.path().join("state/cursor.json").exists());
+        assert_eq!(store.cursor_file(&fired[0]).await?, None);
 
         let body = br#"{"seen": [{"pr": 12345, "head_sha": "ab12"}]}"#;
         crate::runs::blob_store::put_run_files(
@@ -2950,10 +3018,10 @@ mod tests {
         );
 
         let key = refire(&db, &pool, &scheduled.id).await?;
-        let pack = tempfile::tempdir()?;
-        let written = store.stage_cursor_file(&key, pack.path()).await?;
-        assert_eq!(written, Some(pack.path().join("state/cursor.json")));
-        assert_eq!(std::fs::read(pack.path().join("state/cursor.json"))?, body);
+        assert_eq!(
+            store.cursor_file(&key).await?,
+            Some(("state/cursor.json".parse()?, body.to_vec()))
+        );
         Ok(())
     }
 
@@ -3017,9 +3085,9 @@ mod tests {
     }
 
     /// The cursor file is a scheduled firing's input. A launch of the same schedule that arrived
-    /// any other way is staged with nothing, exactly as it is passed no cursor param.
+    /// any other way receives nothing, exactly as it is passed no cursor param.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn only_a_scheduled_firing_is_staged_with_the_cursor_file(pool: PgPool) -> Result<()> {
+    async fn only_a_scheduled_firing_receives_the_cursor_file(pool: PgPool) -> Result<()> {
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         schedule_with_cursor(&pool, &file_cursor(), Some("{\"seen\": []}")).await;
@@ -3035,12 +3103,7 @@ mod tests {
             .bind(&fired[0])
             .execute(&pool)
             .await?;
-        let pack = tempfile::tempdir()?;
-        let written = ScheduleStore::new(db)
-            .stage_cursor_file(&fired[0], pack.path())
-            .await?;
-        assert_eq!(written, None);
-        assert!(std::fs::read_dir(pack.path())?.next().is_none());
+        assert_eq!(ScheduleStore::new(db).cursor_file(&fired[0]).await?, None);
         Ok(())
     }
 

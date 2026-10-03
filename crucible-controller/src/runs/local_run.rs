@@ -135,7 +135,8 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
     argv
 }
 
-/// Write the launch's stored pack into its own directory and spawn the engine on it. Returns as
+/// Write the launch's stored pack into its own directory, checked against the stored tree, write
+/// the run's inputs over it, and spawn the engine on it. Returns as
 /// soon as the child is running: a playbook run is minutes to hours, and the serial reconcile
 /// worker may not park on it. The caller records the run row, then hands the child to
 /// [`supervise`]. `None` is the concurrency cap declining the launch, the same bound a work-pod
@@ -166,13 +167,15 @@ pub async fn start(
         .with_context(|| format!("no stored pack for playbook launch {issue_key}"))?;
     let pack = dir.join("pack");
     let write_to = pack.clone();
-    tokio::task::spawn_blocking(move || crate::playbooks::packs::write_tree(&tree, &write_to))
-        .await
-        .context("joining the local pack write")?
-        .context("writing the launch's pack for a local run")?;
-    crate::launches::schedules::ScheduleStore::new(db.clone())
-        .stage_cursor_file(issue_key, &pack)
-        .await?;
+    tokio::task::spawn_blocking(move || {
+        crate::playbooks::packs::write_checked_tree(&tree, &write_to)
+    })
+    .await
+    .context("joining the local pack write")?
+    .context("writing the launch's pack for a local run")?;
+    let inputs = crate::runs::workpod::run_inputs(db, issue_key, &pack).await?;
+    crate::playbooks::packs::write_files(&inputs, &pack)
+        .context("writing the run's inputs over its pack")?;
 
     let bin = crate::runs::engine::resolve_bin();
     let argv = run_argv(&pack.join("crucible.toml"), &opts);

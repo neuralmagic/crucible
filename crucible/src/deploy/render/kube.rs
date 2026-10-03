@@ -4,7 +4,7 @@ use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureC
 use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, OTEL_COLLECTOR_PORT};
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
-use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, check_delivery_budget, walk_dir};
+use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::networking::v1 as networking;
@@ -162,6 +162,10 @@ pub struct PackDelivery {
     /// fixed directory name, so without this every run renders under the same name and shares
     /// its state subtree and claim.
     pub run_name: String,
+    /// Per-run files that are not pack content (steering, a schedule's cursor file). They ride
+    /// their own ConfigMap key and `pack-stage` writes them over the extracted pack, so the pack
+    /// key holds exactly the pack's tree.
+    pub inputs: BTreeMap<PackFilePath, Vec<u8>>,
 }
 
 /// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
@@ -195,8 +199,12 @@ const PACK_CM_VOLUME: &str = "pack-cm";
 /// manifest dir, so a bare read-only ConfigMap mount would break it; extracting the tarball here is
 /// what makes the whole tree writable while still frozen-inject honest (see `command_judge`'s re-copy).
 const PACK_WORKDIR_VOLUME: &str = "pack-workdir";
-/// The pack ConfigMap's one key: the gzipped tar `pack-stage` extracts into the domain dir.
-const PACK_TARBALL_KEY: &str = "pack.tar.gz";
+/// The pack ConfigMap key holding the pack's gzipped tar, which `pack-stage` extracts into the
+/// domain dir.
+pub const PACK_TARBALL_KEY: &str = "pack.tar.gz";
+/// The pack ConfigMap key holding [`PackDelivery::inputs`] as a gzipped tar, present only when
+/// there are inputs.
+pub const RUN_INPUTS_KEY: &str = "inputs.tar.gz";
 
 /// POSIX single-quote one argv element for the `/bin/sh -c` wrapper.
 fn sh_quote(s: &str) -> String {
@@ -364,23 +372,24 @@ pub fn render(
     // pack) keeps its exact three-doc [pod, rbac, netpol] layout, the controller extracts by `kind`,
     // never by index, so ordering is free here.
     if let Some(pack) = &opts.pack {
-        let cm = pack_configmap(
-            manifest_dir,
-            &pack.configmap_name,
-            &profile.cluster.loop_namespace,
-        )
-        .context("building the pack ConfigMap")?;
+        let cm = pack_configmap(manifest_dir, pack, &profile.cluster.loop_namespace)
+            .context("building the pack ConfigMap")?;
         let cm_yaml = serde_norway::to_string(&cm).context("serializing the pack ConfigMap")?;
         out.push_str(&format!("---\n{cm_yaml}"));
     }
     Ok(out)
 }
 
-/// The pack ConfigMap: one `binaryData` key holding the
-/// [`crucible_contract::pack_tree::PackTree::tarball`] of the pack at
-/// `manifest_dir`. Fails with [`RenderError::EmptyPackDir`] when the pack has no files and with
-/// [`RenderError::PackOverDeliveryBudget`] when the tarball is over [`DELIVERY_BUDGET_BYTES`].
-fn pack_configmap(manifest_dir: &Path, name: &str, namespace: &str) -> Result<core::ConfigMap> {
+/// The pack ConfigMap: a `binaryData` key holding the
+/// [`crucible_contract::pack_tree::PackTree::tarball`] of the pack at `manifest_dir`, and one
+/// holding the run's inputs when it has any. Fails with [`RenderError::EmptyPackDir`] when the
+/// pack has no files and with [`RenderError::PackOverDeliveryBudget`] when the two tarballs
+/// together are over [`DELIVERY_BUDGET_BYTES`].
+fn pack_configmap(
+    manifest_dir: &Path,
+    pack: &PackDelivery,
+    namespace: &str,
+) -> Result<core::ConfigMap> {
     let tree = walk_dir(manifest_dir)
         .with_context(|| format!("reading the pack at {}", manifest_dir.display()))?
         .tree;
@@ -390,24 +399,36 @@ fn pack_configmap(manifest_dir: &Path, name: &str, namespace: &str) -> Result<co
         }
         .into());
     }
-    let tarball = tree.tarball().context("encoding the pack tarball")?;
-    if let Err(over) = check_delivery_budget(&tarball) {
+    let mut binary_data = BTreeMap::from([(
+        PACK_TARBALL_KEY.to_string(),
+        tree.tarball().context("encoding the pack tarball")?,
+    )]);
+    if !pack.inputs.is_empty() {
+        binary_data.insert(
+            RUN_INPUTS_KEY.to_string(),
+            encode_tarball(&pack.inputs).context("encoding the run inputs")?,
+        );
+    }
+    let delivered = binary_data.values().map(Vec::len).sum::<usize>();
+    if delivered > DELIVERY_BUDGET_BYTES {
         return Err(RenderError::PackOverDeliveryBudget {
             path: manifest_dir.to_path_buf(),
-            bytes: over.bytes,
+            bytes: delivered,
         }
         .into());
     }
     Ok(core::ConfigMap {
         metadata: ObjectMeta {
-            name: Some(name.to_string()),
+            name: Some(pack.configmap_name.clone()),
             namespace: Some(namespace.to_string()),
             ..Default::default()
         },
-        binary_data: Some(BTreeMap::from([(
-            PACK_TARBALL_KEY.to_string(),
-            k8s_openapi::ByteString(tarball),
-        )])),
+        binary_data: Some(
+            binary_data
+                .into_iter()
+                .map(|(key, bytes)| (key, k8s_openapi::ByteString(bytes)))
+                .collect(),
+        ),
         immutable: Some(true),
         ..Default::default()
     })
@@ -667,16 +688,22 @@ impl Renderer<'_> {
     /// (`STEER.md`, `state/`, the workspace clone). Reuses the loop image (it has `/bin/sh`, `tar`,
     /// and `gzip`), no extra pull.
     fn init_containers(&self) -> Option<Vec<core::Container>> {
-        let _pack = self.opts.pack.as_ref()?;
+        let pack = self.opts.pack.as_ref()?;
         let domain_dir = self.domain_dir();
+        let mut script = format!(
+            "set -e\nmkdir -p {domain_dir}\ntar -xzf {PACK_SRC_DIR}/{PACK_TARBALL_KEY} -C {domain_dir}\n"
+        );
+        if !pack.inputs.is_empty() {
+            script.push_str(&format!(
+                "tar -xzf {PACK_SRC_DIR}/{RUN_INPUTS_KEY} -C {domain_dir}\n"
+            ));
+        }
         Some(vec![core::Container {
             name: "pack-stage".to_string(),
             image: Some(self.image.clone()),
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-            args: Some(vec![format!(
-                "set -e\nmkdir -p {domain_dir}\ntar -xzf {PACK_SRC_DIR}/{PACK_TARBALL_KEY} -C {domain_dir}\n"
-            )]),
+            args: Some(vec![script]),
             volume_mounts: Some(vec![
                 core::VolumeMount {
                     name: PACK_CM_VOLUME.to_string(),
@@ -2512,6 +2539,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
                     run_name: "alpha".to_string(),
+                    inputs: Default::default(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -2569,11 +2597,110 @@ mod tests {
         );
         // The main container mounts the writable emptyDir at the domain path (so STEER.md/state writes).
         assert!(docs[0].contains("mountPath: /opt/crucible/domains/llm-d_llm-d-router_1650"));
+        assert!(
+            !yaml.contains(RUN_INPUTS_KEY),
+            "a run without inputs has no inputs key or extraction"
+        );
+    }
+
+    /// A delivery under ConfigMap name `cm` carrying `inputs`.
+    fn delivery(inputs: BTreeMap<PackFilePath, Vec<u8>>) -> PackDelivery {
+        PackDelivery {
+            configmap_name: "cm".to_string(),
+            run_name: "run".to_string(),
+            inputs,
+        }
+    }
+
+    /// Per-run inputs ride their own key, the pack key stays the pack's own tarball, and
+    /// `pack-stage` extracts the inputs over the pack, excluded paths included.
+    #[test]
+    fn run_inputs_ride_beside_the_pack_and_stage_over_it() {
+        let (manifest, profile) = pack_manifest_and_profile();
+        let tmp = Scratch::new("inputs");
+        let dir = tmp.path().join("llm-d_llm-d-router_1650");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        let inputs = BTreeMap::from([
+            ("goal.md".parse().expect("path"), b"# steered\n".to_vec()),
+            ("state/cursor.json".parse().expect("path"), b"{}".to_vec()),
+        ]);
+
+        let mut cm = pack_configmap(&dir, &delivery(inputs.clone()), "ns").expect("configmap");
+        let mut data = cm.binary_data.take().expect("binary data");
+        assert_eq!(
+            data.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![RUN_INPUTS_KEY, PACK_TARBALL_KEY]
+        );
+        let pack = data.remove(PACK_TARBALL_KEY).expect("pack").0;
+        assert_eq!(
+            pack,
+            delivered_tarball(&dir),
+            "the pack key ignores the inputs"
+        );
+        let staged = data.remove(RUN_INPUTS_KEY).expect("inputs").0;
+        assert_eq!(
+            unpack_delivery(&staged),
+            vec![
+                ("goal.md".to_string(), 0o755, b"# steered\n".to_vec()),
+                ("state/cursor.json".to_string(), 0o755, b"{}".to_vec()),
+            ]
+        );
+
+        let out = tmp.path().join("domain");
+        std::fs::create_dir_all(&out).expect("mkdir domain");
+        for (key, bytes) in [(PACK_TARBALL_KEY, &pack), (RUN_INPUTS_KEY, &staged)] {
+            let path = tmp.path().join(key);
+            std::fs::write(&path, bytes).expect("write");
+            let status = std::process::Command::new("tar")
+                .arg("-xzf")
+                .arg(&path)
+                .arg("-C")
+                .arg(&out)
+                .status()
+                .expect("run tar");
+            assert!(status.success(), "tar -xzf {key} exits 0");
+        }
+        assert_eq!(
+            std::fs::read(out.join("goal.md")).expect("goal"),
+            b"# steered\n"
+        );
+        assert_eq!(
+            std::fs::read(out.join("state/cursor.json")).expect("cursor"),
+            b"{}"
+        );
+        assert_eq!(
+            std::fs::read(out.join("tools/measure.sh")).expect("measure"),
+            b"#!/bin/sh\necho 1\n"
+        );
+
+        let input =
+            RenderInput::from_manifest(&manifest, "llm-d_llm-d-router_1650").expect("render input");
+        let yaml = render(
+            input,
+            &dir,
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                pack: Some(delivery(inputs)),
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render");
+        let domain = "-C /opt/crucible/domains/llm-d_llm-d-router_1650\n";
+        let extract = |key: &str| {
+            yaml.find(&format!("tar -xzf /opt/crucible/pack-src/{key} {domain}"))
+                .unwrap_or_else(|| panic!("pack-stage extracts {key}: {yaml}"))
+        };
+        assert!(
+            extract(PACK_TARBALL_KEY) < extract(RUN_INPUTS_KEY),
+            "the inputs land over the pack"
+        );
     }
 
     /// The tarball the pack ConfigMap for `dir` delivers.
     fn delivered_tarball(dir: &Path) -> Vec<u8> {
-        let cm = pack_configmap(dir, "cm", "ns").expect("configmap");
+        let cm = pack_configmap(dir, &delivery(BTreeMap::new()), "ns").expect("configmap");
         cm.binary_data
             .expect("binary data")
             .remove(PACK_TARBALL_KEY)
@@ -2707,7 +2834,7 @@ mod tests {
             .collect();
         std::fs::write(dir.join("blob.bin"), noise).expect("blob");
 
-        let err = pack_configmap(&dir, "cm", "ns").expect_err("over budget");
+        let err = pack_configmap(&dir, &delivery(BTreeMap::new()), "ns").expect_err("over budget");
 
         match err.downcast_ref::<RenderError>() {
             Some(RenderError::PackOverDeliveryBudget { bytes, .. }) => {
@@ -2726,7 +2853,7 @@ mod tests {
         write_pack_dir(&dir);
         std::os::unix::fs::symlink("crucible.toml", dir.join("link.toml")).expect("symlink");
 
-        let err = pack_configmap(&dir, "cm", "ns").expect_err("symlink");
+        let err = pack_configmap(&dir, &delivery(BTreeMap::new()), "ns").expect_err("symlink");
 
         assert!(format!("{err:#}").contains("link.toml"), "{err:#}");
     }
@@ -4429,6 +4556,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "alpha-pack".to_string(),
                     run_name: "alpha".to_string(),
+                    inputs: Default::default(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -4466,6 +4594,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-7-pack".to_string(),
                     run_name: "crucible-run-7".to_string(),
+                    inputs: Default::default(),
                 }),
                 playbook,
                 ..RenderOpts::default()

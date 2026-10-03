@@ -426,19 +426,11 @@ pub(crate) async fn adopt_playbook_launch(
     Ok(outcome)
 }
 
-/// The exposure a run of `issue_key` executes under: the launch's own recomputed disclosure (a
-/// draft one-shot), else the registry revision's, else the frozen scope pack's. `None` is
-/// absent-legacy or an issue with neither a launch nor a scope.
+/// The exposure a run of `issue_key` executes under: the launch's ([`launch_exposure`]), else the
+/// frozen scope pack's. `None` is absent-legacy or an issue with neither a launch nor a scope.
 pub async fn exposure_for_issue(pool: &sqlx::PgPool, issue_key: &str) -> Result<Option<Exposure>> {
     if let Some(launch) = get_playbook_launch(pool, issue_key).await? {
-        if launch.exposure.is_some() {
-            return Ok(launch.exposure);
-        }
-        return Ok(
-            crate::playbooks::exposure::registered(pool, &launch.playbook)
-                .await?
-                .flatten(),
-        );
+        return launch_exposure(pool, issue_key, &launch).await;
     }
     Ok(
         crate::issues::store::latest_scope_for_issue(pool, issue_key)
@@ -446,6 +438,59 @@ pub async fn exposure_for_issue(pool: &sqlx::PgPool, issue_key: &str) -> Result<
             .and_then(|s| s.exposure),
     )
 }
+/// The exposure launch `issue_key` runs under: its own recorded disclosure (a draft launch), else
+/// that of the registered pack it copied. While the registry row still holds that pack, this is
+/// the row's stored exposure; once a repin or deregistration moved the row on, it is extracted
+/// from the launch's own pack, never read off a row the launch no longer runs.
+pub(crate) async fn launch_exposure(
+    pool: &PgPool,
+    issue_key: &str,
+    launch: &PlaybookLaunch,
+) -> Result<Option<Exposure>> {
+    use sqlx::Row as _;
+    if launch.exposure.is_some() {
+        return Ok(launch.exposure.clone());
+    }
+    let row = sqlx::query(
+        "SELECT p.exposure,
+                COALESCE(t.tree_digest = p.tree_digest, t.digest = p.tar_digest) AS registered
+         FROM pack_tarballs t LEFT JOIN playbooks p ON p.id = $2
+         WHERE t.issue_slug = $1",
+    )
+    .bind(crate::model::sanitize_key(issue_key))
+    .bind(&launch.playbook)
+    .fetch_optional(pool)
+    .await
+    .context("comparing a launch's pack with its registry row")?;
+    let Some(row) = row else {
+        return Ok(
+            crate::playbooks::exposure::registered(pool, &launch.playbook)
+                .await?
+                .flatten(),
+        );
+    };
+    if row.try_get::<Option<bool>, _>("registered")? == Some(true) {
+        return row
+            .try_get::<Option<serde_json::Value>, _>("exposure")?
+            .map(Exposure::from_value)
+            .transpose();
+    }
+    let pack = crate::playbooks::packs::materialize_pack(pool, issue_key)
+        .await?
+        .with_context(|| format!("no stored pack for launch {issue_key}"))?;
+    let extracted =
+        tokio::task::spawn_blocking(move || crate::playbooks::exposure::extract(pack.path(), None))
+            .await
+            .context("joining the launch exposure worker")?;
+    match extracted {
+        Ok(exposure) => Ok(Some(exposure)),
+        Err(crate::playbooks::exposure::ExtractError::Refused(message)) => Err(anyhow::anyhow!(
+            "extracting the exposure of launch {issue_key}'s pack: {message}"
+        )),
+        Err(crate::playbooks::exposure::ExtractError::Internal(e)) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

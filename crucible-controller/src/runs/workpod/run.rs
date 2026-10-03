@@ -9,7 +9,10 @@ use crate::playbooks::providers::{AgentSelection, ModelProvider};
 use crate::runs::workpod::spec::{self, TurnSpec as _};
 use crate::runs::workpod::*;
 use anyhow::{Context, Result, bail};
-use crucible::deploy::{DigestResolver, PackDelivery, PlaybookLaunch, RenderOpts, render_yaml};
+use crucible::deploy::{
+    DigestResolver, PACK_TARBALL_KEY, PackDelivery, PlaybookLaunch, RenderOpts, render_yaml,
+};
+use crucible_contract::pack_tree::{PackFilePath, TreeDigest};
 #[cfg(feature = "autoresearch")]
 use crucible_contract::{ArtifactKind, content_digest};
 #[cfg(feature = "autoresearch")]
@@ -39,6 +42,8 @@ use std::time::Duration;
 /// stamp the pod with what the controller knows about the run.
 struct RunPodRender {
     pack: std::path::PathBuf,
+    pack_digest: TreeDigest,
+    inputs: RunInputs,
     profile: std::path::PathBuf,
     pod_name: String,
     issue_key: String,
@@ -61,8 +66,10 @@ impl RunPodRender {
             &self.profile,
             &self.pod_name,
             &self.opts,
+            self.inputs,
             self.digests,
         )?;
+        check_delivered_tree(cm.as_ref(), &self.pack_digest)?;
         stamp_run_pod(
             &mut pod,
             &self.pod_name,
@@ -161,11 +168,13 @@ impl RunRenderOpts {
     fn render_opts(
         &self,
         pod_name: &str,
+        inputs: RunInputs,
         digests: Option<Arc<dyn DigestResolver>>,
     ) -> Result<RenderOpts> {
         let pack = Some(PackDelivery {
             configmap_name: format!("{pod_name}-pack"),
             run_name: pod_name.to_string(),
+            inputs,
         });
         let agent = self.agent();
         Ok(match self {
@@ -213,21 +222,62 @@ impl RunRenderOpts {
 /// runs it under `spawn_blocking`. `pod_name` is the run's pod: the render names the run after it,
 /// so its state is its own, and names the pack ConfigMap `<pod>-pack`, so the CM and
 /// the pod volume that references it never drift. `opts` carries the per-kind run knobs
-/// ([`RunRenderOpts`]).
+/// ([`RunRenderOpts`]), and `inputs` the per-run files delivered beside the pack.
 pub fn render_run_docs(
     pack_out: &Path,
     profile_path: &Path,
     pod_name: &str,
     opts: &RunRenderOpts,
+    inputs: RunInputs,
     digests: Option<Arc<dyn DigestResolver>>,
 ) -> Result<(Pod, Option<ConfigMap>)> {
     let manifest = pack_out.join("crucible.toml");
     let yaml = render_yaml(
         &manifest,
         profile_path,
-        &opts.render_opts(pod_name, digests)?,
+        &opts.render_opts(pod_name, inputs, digests)?,
     )?;
     extract_run_docs(&yaml)
+}
+
+/// Per-run files delivered beside a pack's tree, keyed by the pack-relative path a run reads them
+/// at.
+pub type RunInputs = BTreeMap<PackFilePath, Vec<u8>>;
+
+/// The per-run inputs a run of `issue_key` receives beside the pack written at `pack_dir`: its
+/// steering, as the `STEER.md` the run reads, and the cursor file of the schedule that fired it.
+pub(crate) async fn run_inputs(db: &Db, issue_key: &str, pack_dir: &Path) -> Result<RunInputs> {
+    let mut inputs = RunInputs::new();
+    if let Some(steer) = crate::playbooks::packs::steer_md(db.pool(), issue_key, pack_dir).await? {
+        inputs.insert(crate::playbooks::packs::STEER_MD.parse()?, steer);
+    }
+    if let Some((path, body)) = crate::launches::schedules::ScheduleStore::new(db.clone())
+        .cursor_file(issue_key)
+        .await?
+    {
+        inputs.insert(path, body);
+    }
+    Ok(inputs)
+}
+
+/// Refuse a render whose pack ConfigMap does not deliver exactly the tree stored under `expected`
+/// (RFC-0002:C-PACK-BASE).
+fn check_delivered_tree(cm: Option<&ConfigMap>, expected: &TreeDigest) -> Result<()> {
+    let tarball = cm
+        .and_then(|cm| cm.binary_data.as_ref())
+        .and_then(|data| data.get(PACK_TARBALL_KEY))
+        .context("the render produced no pack ConfigMap to deliver the pack in")?;
+    let delivered = crucible_contract::pack_tree::read_tar_gz(&tarball.0)
+        .context("reading back the rendered pack tarball")?
+        .tree
+        .digest();
+    if &delivered != expected {
+        bail!(
+            "the rendered pack delivers tree {delivered}, not the stored tree {expected} this \
+             launch runs; refusing to dispatch it"
+        );
+    }
+    Ok(())
 }
 
 /// Pull the `Pod` and (optional) `ConfigMap` documents out of a (possibly multi-doc) rendered
@@ -486,6 +536,9 @@ fn secrets_refused(db: &Db, reason: String) -> RunAdmission {
 /// leaves a row the startup sweep reconciles. The run's cost is booked exactly once by that session
 /// ingest — never by this primitive.
 ///
+/// The pack ConfigMap delivers exactly `pack`'s tree, refused unless it reads back to
+/// `pack`'s digest, with the run's steering and cursor file beside it ([`RunInputs`]).
+///
 /// The cap counts `issues` at `running` (`count_running`, one run per running issue — today's
 /// authoritative concurrent-run count), not the `work_pods` rows: gating on the existing count
 /// preserves the exact bound and handles pre-primitive runs (which carry no `work_pods` row) with no
@@ -494,7 +547,7 @@ fn secrets_refused(db: &Db, reason: String) -> RunAdmission {
 // `run` span and draws the async controller → crucible edge.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
-    skip(db, cfg, dispatcher, pack_out, build_digests),
+    skip(db, cfg, dispatcher, pack, build_digests),
     fields(otel.kind = "producer", %issue_key, %run_id)
 )]
 pub async fn dispatch_run(
@@ -503,7 +556,7 @@ pub async fn dispatch_run(
     dispatcher: Arc<dyn PodDispatcher>,
     issue_key: &str,
     run_id: &str,
-    pack_out: &Path,
+    pack: &crate::playbooks::packs::MaterializedPack,
     build_digests: &BTreeMap<String, String>,
     codegen_contract: Option<&str>,
     opts: RunRenderOpts,
@@ -551,11 +604,13 @@ pub async fn dispatch_run(
         None => None,
     };
 
+    let inputs = run_inputs(db, issue_key, pack.path()).await?;
+
     // Resolve the scope's bindings BEFORE anything is written: a refusal must leave no work-pod
     // row, no Secret, and no pod behind.
     let mints = match secrets {
         Some(ls) => {
-            let declared = crate::secrets::manifest::declared_secrets(pack_out)?;
+            let declared = crate::secrets::manifest::declared_secrets(pack.path())?;
             match crate::secrets::launch::resolve(
                 db.pool(),
                 &ls.scope,
@@ -698,7 +753,9 @@ pub async fn dispatch_run(
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
     let job = RunPodRender {
-        pack: pack_out.to_path_buf(),
+        pack: pack.path().to_path_buf(),
+        pack_digest: pack.digest().clone(),
+        inputs,
         profile,
         pod_name: pod_name.clone(),
         issue_key: issue_key.to_string(),

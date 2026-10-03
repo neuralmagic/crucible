@@ -125,12 +125,7 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         None => crate::runs::model::RunImage::default(),
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
-    let exposure = match launch.exposure.clone() {
-        Some(exposure) => Some(exposure),
-        None => crate::playbooks::exposure::registered(db.pool(), &launch.playbook)
-            .await?
-            .flatten(),
-    };
+    let exposure = crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await?;
     let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
     let launcher = match crate::authz::resolve::dispatch_principals(
         db.pool(),
@@ -352,16 +347,13 @@ async fn dispatch_pod(
     let pack = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key)
         .await?
         .with_context(|| format!("no stored pack for playbook launch {}", issue.key))?;
-    crate::launches::schedules::ScheduleStore::new(db.clone())
-        .stage_cursor_file(&issue.key, pack.path())
-        .await?;
     let admission = crate::runs::workpod::dispatch_run(
         db,
         cfg,
         crate::runs::workpod::active_dispatcher(),
         &issue.key,
         run_id,
-        pack.path(),
+        &pack,
         &std::collections::BTreeMap::new(),
         None,
         opts,
