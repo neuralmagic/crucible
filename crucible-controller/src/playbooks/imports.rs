@@ -9,7 +9,7 @@
 //! seeds a draft from the frozen tarball, which is how a human edits what an agent proposed.
 
 use crate::playbooks::drafts::{DraftError, DraftSeed, SavedVersion};
-use crate::playbooks::pack_trees::PackRef;
+use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
 use crate::playbooks::preview::PackPreview;
 use crate::playbooks::registry::{
@@ -212,7 +212,7 @@ pub async fn propose(
     let (repo, git_ref, path) = (source.repo, source.git_ref, source.path);
 
     let id = uuid::Uuid::now_v7().to_string();
-    let tar_digest = content_digest(&pack.tarball);
+    let tar_digest = content_digest(pack.tarball());
     let graph = preview
         .graph
         .as_ref()
@@ -234,8 +234,7 @@ pub async fn propose(
         .begin()
         .await
         .context("opening the pack import transaction")?;
-    let tree_digest =
-        crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree, &pack.tarball).await?;
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, pack.pack()).await?;
     let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO pack_imports (id, repo, git_ref, path, rev, tar_gz, tar_digest, tar_bytes,
                                      params_schema, schema_digest, graph, diagnostics,
@@ -252,9 +251,9 @@ pub async fn propose(
     .bind(git_ref)
     .bind(path)
     .bind(&rev)
-    .bind(&pack.tarball)
+    .bind(pack.tarball())
     .bind(&tar_digest)
-    .bind(i64::try_from(pack.tarball.len()).context("pack size")?)
+    .bind(i64::try_from(pack.tarball().len()).context("pack size")?)
     .bind(&preview.params_schema)
     .bind(&preview.schema_digest)
     .bind(&graph)
@@ -277,7 +276,7 @@ pub async fn propose(
     tx.commit().await.context("committing a pack import")?;
     Ok(Proposed {
         import,
-        ignored: pack.ignored,
+        ignored: pack.into_ignored(),
     })
 }
 
@@ -332,17 +331,15 @@ pub async fn compile(
 
 /// The frozen pack of import `id`, `None` when there is no such import.
 pub(crate) async fn pack(pool: &PgPool, id: &str) -> Result<Option<PackTree>> {
-    let row = sqlx::query(
-        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
-         FROM pack_imports WHERE id = $1",
-    )
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT {PACK_COLS} FROM pack_imports WHERE id = $1"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await
     .context("reading a pack import")?;
     let Some(row) = row else { return Ok(None) };
-    let pack = PackRef::from_row(&row)?.context("the import holds no pack")?;
-    crate::playbooks::pack_trees::load(pool, pack)
+    crate::playbooks::pack_trees::load_row(pool, &row)
         .await
         .with_context(|| format!("reading the frozen pack of import {id}"))
         .map(Some)

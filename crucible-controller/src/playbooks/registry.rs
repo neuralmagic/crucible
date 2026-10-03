@@ -14,7 +14,7 @@
 //! Everything the launch path needs is a function here — [`schema`], [`materialize`] — so no other
 //! module reaches into the table.
 
-use crate::playbooks::pack_trees::PackRef;
+use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::packs::{Deliverable, MaterializedPack};
 use anyhow::{Context, Result};
 use crucible::plan::starlark::declared_params;
@@ -537,7 +537,7 @@ pub(crate) fn fetch_pack(git: &PackGit, req: PackSource<'_>) -> Result<FetchedPa
 
     let root = pack_root(&checkout.path(), req.path)?;
     let pack = crate::playbooks::packs::deliverable(&root)?;
-    let scratch = crate::playbooks::packs::materialize_tree(&pack.tree)
+    let scratch = crate::playbooks::packs::materialize_tree(pack.tree())
         .context("writing the playbook pack to scratch")
         .map_err(RegisterError::Internal)?;
     Ok(FetchedPack {
@@ -755,7 +755,7 @@ pub async fn publish_draft(
             tree: std::mem::take(&mut req.tree),
             ignored: Vec::new(),
         })?;
-        let scratch = crate::playbooks::packs::materialize_tree(&pack.tree)
+        let scratch = crate::playbooks::packs::materialize_tree(pack.tree())
             .context("writing the draft pack to scratch")
             .map_err(RegisterError::Internal)?;
         let extracted = extract(scratch.path())?;
@@ -772,7 +772,7 @@ pub async fn publish_draft(
             id: req.id,
             owner: req.owner,
             description: req.description,
-            rev: content_digest(&pack.tarball),
+            rev: content_digest(pack.tarball()),
             source,
             pack,
             replaces: Some(req.replaces),
@@ -845,7 +845,7 @@ async fn store(
     } = extracted;
     let (exposure_json, exposure_digest) = exposure.stored().map_err(RegisterError::Internal)?;
     let core_rev = core_rev().map_err(RegisterError::Internal)?;
-    let tar_digest = content_digest(&row.pack.tarball);
+    let tar_digest = content_digest(row.pack.tarball());
     let now = crate::clock::now_rfc3339();
     let (repo, git_ref, path, source_draft, source_draft_version) = match &row.source {
         PlaybookSource::Git {
@@ -905,10 +905,9 @@ async fn store(
     {
         return Err(RegisterError::Conflict(msg));
     }
-    let tree_digest =
-        crate::playbooks::pack_trees::put_tree(&mut tx, &row.pack.tree, &row.pack.tarball)
-            .await
-            .map_err(RegisterError::Internal)?;
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, row.pack.pack())
+        .await
+        .map_err(RegisterError::Internal)?;
     sqlx::query(
         r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz, tar_digest,
                                   tar_bytes, params_schema, schema_digest, agent_backend,
@@ -938,10 +937,10 @@ async fn store(
     .bind(git_ref)
     .bind(&row.rev)
     .bind(path)
-    .bind(&row.pack.tarball)
+    .bind(row.pack.tarball())
     .bind(&tar_digest)
     .bind(
-        i64::try_from(row.pack.tarball.len())
+        i64::try_from(row.pack.tarball().len())
             .context("pack size")
             .map_err(RegisterError::Internal)?,
     )
@@ -984,7 +983,7 @@ async fn store(
         rev: row.rev,
         tar_digest,
         tree_digest,
-        ignored: row.pack.ignored,
+        ignored: row.pack.into_ignored(),
         schema_changed: prior.is_some_and(|p| p != schema_digest),
         schema_digest,
         exposure_changed,
@@ -1029,10 +1028,9 @@ pub async fn schema(pool: &PgPool, id: &str) -> Result<Option<serde_json::Value>
 
 /// A registered playbook's pack. `None` when the id is unknown.
 pub(crate) async fn pack(pool: &PgPool, id: &str) -> Result<Option<PackTree>> {
-    let row = sqlx::query(
-        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
-         FROM playbooks WHERE id = $1",
-    )
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT {PACK_COLS} FROM playbooks WHERE id = $1"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -1044,11 +1042,12 @@ pub(crate) async fn pack(pool: &PgPool, id: &str) -> Result<Option<PackTree>> {
 
 /// The pack a `playbooks` row names, `None` when there is no row.
 async fn load_row(pool: &PgPool, row: Option<&sqlx::postgres::PgRow>) -> Result<Option<PackTree>> {
-    let Some(row) = row else { return Ok(None) };
-    let pack = PackRef::from_row(row)?.context("the row holds no pack")?;
-    crate::playbooks::pack_trees::load(pool, pack)
-        .await
-        .map(Some)
+    match row {
+        Some(row) => crate::playbooks::pack_trees::load_row(pool, row)
+            .await
+            .map(Some),
+        None => Ok(None),
+    }
 }
 
 /// A registered playbook's pack, only when the registry still serves the revision the caller
@@ -1059,10 +1058,10 @@ pub(crate) async fn pack_at_rev(
     rev: &str,
     tar_digest: Option<&str>,
 ) -> Result<Option<PackTree>> {
-    let row = sqlx::query(
-        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
-         FROM playbooks WHERE id = $1 AND rev = $2 AND ($3::text IS NULL OR tar_digest = $3)",
-    )
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT {PACK_COLS} FROM playbooks
+         WHERE id = $1 AND rev = $2 AND ($3::text IS NULL OR tar_digest = $3)"
+    ))
     .bind(id)
     .bind(rev)
     .bind(tar_digest)
@@ -1088,28 +1087,42 @@ pub async fn files(
         .map_err(anyhow::Error::new)
 }
 
-/// Copy a registered pack's stored tarball into `slug`'s `pack_tarballs` row, so a launch runs the
-/// bytes it was authorized against even after the registry is re-pinned. `INSERT .. SELECT`: the
-/// blob never round-trips through the controller. `false` when the id is unknown.
-pub(crate) async fn copy_pack_to<'e>(
+/// Copy a registered pack into launch `key`'s `pack_tarballs` row, so the launch runs the pack it
+/// was authorized against even after the registry is re-pinned, and the registry row's exposure
+/// onto the launch row when it records none. One statement, so both come from the same registry
+/// revision, and the blob never round-trips through the controller. `false` when the id is
+/// unknown.
+pub(crate) async fn copy_pack_to_launch<'e>(
     ex: impl sqlx::PgExecutor<'e>,
     id: &str,
-    slug: &str,
+    key: &str,
 ) -> Result<bool> {
-    let res = sqlx::query(
-        r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
-           SELECT $2, tar_gz, tar_digest, tar_bytes, $3, tree_digest FROM playbooks WHERE id = $1
-           ON CONFLICT (issue_slug) DO UPDATE SET
-               tar_gz = excluded.tar_gz, digest = excluded.digest, bytes = excluded.bytes,
-               created_at = excluded.created_at, tree_digest = excluded.tree_digest"#,
+    let copied: i64 = sqlx::query_scalar(
+        r#"WITH p AS (
+               SELECT tar_gz, tar_digest, tar_bytes, tree_digest, exposure, exposure_digest
+               FROM playbooks WHERE id = $1
+           ), pack AS (
+               INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
+               SELECT $3, tar_gz, tar_digest, tar_bytes, $4, tree_digest FROM p
+               ON CONFLICT (issue_slug) DO UPDATE SET
+                   tar_gz = excluded.tar_gz, digest = excluded.digest, bytes = excluded.bytes,
+                   created_at = excluded.created_at, tree_digest = excluded.tree_digest
+               RETURNING 1
+           ), exposure AS (
+               UPDATE playbook_launches pl
+               SET exposure = p.exposure, exposure_digest = p.exposure_digest
+               FROM p WHERE pl.key = $2 AND pl.exposure IS NULL
+           )
+           SELECT count(*) FROM pack"#,
     )
     .bind(id)
-    .bind(slug)
+    .bind(key)
+    .bind(crate::model::sanitize_key(key))
     .bind(crate::clock::now_rfc3339())
-    .execute(ex)
+    .fetch_one(ex)
     .await
     .context("copying a registered pack to a launch")?;
-    Ok(res.rows_affected() > 0)
+    Ok(copied > 0)
 }
 
 /// Re-extract the params schema of every row whose stored `core_rev` is not this binary's pin, and

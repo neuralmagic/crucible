@@ -1120,8 +1120,7 @@ mod tests {
         crate::runs::blob_store::put_pack(
             &mut *live.pool().acquire().await?,
             "owner_repo_2",
-            &scope,
-            &scope.tarball()?,
+            &crate::playbooks::pack_trees::EncodedPack::new(scope)?,
         )
         .await?;
         crate::runs::blob_store::put_run_session(live.pool(), "run-1", b"{\"v\":1}\n").await?;
@@ -1387,12 +1386,12 @@ mod tests {
             "SCOPE.md",
             b"identity: v1:beef\n",
         )])?;
-        let tgz = tree.tarball()?;
+        let encoded = crate::playbooks::pack_trees::EncodedPack::new(tree.clone())?;
+        let tgz = encoded.tarball().to_vec();
         let digest = crate::runs::blob_store::put_pack(
             &mut *live_pool.acquire().await?,
             "owner_repo_7",
-            &tree,
-            &tgz,
+            &encoded,
         )
         .await?
         .digest;
@@ -1407,8 +1406,7 @@ mod tests {
             crucible_contract::pack_tree::PackTree::from_pairs(&[("crucible.toml", b"draft")])?;
         crate::playbooks::pack_trees::put_tree(
             &mut *live_pool.acquire().await?,
-            &unreferenced,
-            &unreferenced.tarball()?,
+            &crate::playbooks::pack_trees::EncodedPack::new(unreferenced)?,
         )
         .await?;
         sqlx::query(

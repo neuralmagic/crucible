@@ -10,7 +10,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use crate::playbooks::pack_trees::PackRef;
+use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
 use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
 use anyhow::{Context, Result};
@@ -694,7 +694,7 @@ pub async fn save_version(
     ) = compiled?;
 
     let core_rev = crate::playbooks::registry::core_rev().map_err(DraftError::Internal)?;
-    let tar_digest = content_digest(&pack.tarball);
+    let tar_digest = content_digest(pack.tarball());
     let now = crate::clock::now_rfc3339();
     let graph_json = graph
         .as_ref()
@@ -767,7 +767,7 @@ pub async fn save_version(
             saved_at,
         }));
     }
-    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, &pack.tree, &pack.tarball)
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, pack.pack())
         .await
         .map_err(DraftError::Internal)?;
     let version: i64 = sqlx::query_scalar(
@@ -780,10 +780,10 @@ pub async fn save_version(
            RETURNING version"#,
     )
     .bind(id)
-    .bind(&pack.tarball)
+    .bind(pack.tarball())
     .bind(&tar_digest)
     .bind(
-        i64::try_from(pack.tarball.len())
+        i64::try_from(pack.tarball().len())
             .context("pack size")
             .map_err(DraftError::Internal)?,
     )
@@ -1047,12 +1047,11 @@ async fn version_pack(
     id: &str,
     version: Option<i64>,
 ) -> Result<Option<(VersionHead, PackTree)>> {
-    let row = sqlx::query(
-        "SELECT version, created_by, created_at, diagnostics, tree_digest,
-                CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT version, created_by, created_at, diagnostics, {PACK_COLS}
          FROM playbook_draft_versions WHERE draft_id = $1 AND ($2::BIGINT IS NULL OR version = $2)
-         ORDER BY version DESC LIMIT 1",
-    )
+         ORDER BY version DESC LIMIT 1"
+    ))
     .bind(id)
     .bind(version)
     .fetch_optional(pool)
@@ -1070,7 +1069,7 @@ async fn version_pack(
         diagnostics: serde_json::from_value(diagnostics)
             .context("decoding stored draft diagnostics")?,
     };
-    let pack = load_version(pool, &row)
+    let pack = crate::playbooks::pack_trees::load_row(pool, &row)
         .await
         .with_context(|| format!("reading draft {id} version {version}"))?;
     Ok(Some((head, pack)))
@@ -1153,12 +1152,6 @@ pub async fn version_tree(
         .map(|(head, tree)| (head.version, tree)))
 }
 
-/// The pack a `playbook_draft_versions` row names.
-async fn load_version(pool: &PgPool, row: &sqlx::postgres::PgRow) -> Result<PackTree> {
-    let pack = PackRef::from_row(row)?.context("the version holds no pack")?;
-    crate::playbooks::pack_trees::load(pool, pack).await
-}
-
 /// Drop a draft and every version it holds.
 pub async fn delete(pool: &PgPool, id: &str) -> Result<bool> {
     let res = sqlx::query("DELETE FROM playbook_drafts WHERE id = $1")
@@ -1197,11 +1190,10 @@ pub(crate) async fn copy_draft_pack_to<'e>(
 
 /// The newest version of draft `id` that compiled, with its pack.
 pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, PackTree), DraftError> {
-    let row = sqlx::query(
-        r#"SELECT version, tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
-           FROM playbook_draft_versions
-           WHERE draft_id = $1 AND schema_digest IS NOT NULL ORDER BY version DESC LIMIT 1"#,
-    )
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT version, {PACK_COLS} FROM playbook_draft_versions
+         WHERE draft_id = $1 AND schema_digest IS NOT NULL ORDER BY version DESC LIMIT 1"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -1215,7 +1207,7 @@ pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, PackTree)
     let version: i64 = row
         .try_get("version")
         .map_err(|e| DraftError::Internal(e.into()))?;
-    let tree = load_version(pool, &row)
+    let tree = crate::playbooks::pack_trees::load_row(pool, &row)
         .await
         .with_context(|| format!("reading draft {id} version {version}"))
         .map_err(DraftError::Internal)?;

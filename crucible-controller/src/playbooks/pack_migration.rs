@@ -8,7 +8,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use crate::playbooks::pack_trees::put_tree;
+use crate::playbooks::pack_trees::{EncodedPack, put_tree};
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
 use crucible_contract::pack_tree::{TreeDigest, read_tar_gz};
@@ -125,17 +125,14 @@ async fn convert_column(pool: &PgPool, c: &Column, report: &mut ConversionReport
         let target = match known {
             Some(tree) => AliasTarget::Tree(tree.parse().map_err(anyhow::Error::msg)?),
             None => match tokio::task::spawn_blocking(move || {
-                read_tar_gz(&bytes).map(|read| {
-                    let tarball = read.tree.tarball();
-                    (read.tree, tarball)
-                })
+                read_tar_gz(&bytes).map(|read| EncodedPack::new(read.tree))
             })
             .await
             .context("joining the pack conversion worker")?
             {
-                Ok((tree, tarball)) => {
-                    let tarball = tarball.context("encoding the pack tarball")?;
-                    AliasTarget::Tree(put_tree(&mut tx, &tree, &tarball).await?)
+                Ok(pack) => {
+                    let pack = pack.context("encoding the pack tarball")?;
+                    AliasTarget::Tree(put_tree(&mut tx, &pack).await?)
                 }
                 Err(reason) => AliasTarget::Unconvertible(reason.to_string()),
             },
@@ -413,9 +410,12 @@ mod tests {
         seed_launch_pack(&pool, "a", &second).await;
 
         let mut tx = pool.begin().await.expect("tx");
-        let stale = put_tree(&mut tx, &pack(&[("a", b"1")]), &first)
-            .await
-            .expect("put");
+        let stale = put_tree(
+            &mut tx,
+            &EncodedPack::new(pack(&[("a", b"1")])).expect("encode"),
+        )
+        .await
+        .expect("put");
         let launch_packs = COLUMNS
             .iter()
             .find(|c| c.table == "pack_tarballs")

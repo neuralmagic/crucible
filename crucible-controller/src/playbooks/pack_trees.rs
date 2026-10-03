@@ -11,13 +11,32 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgConnection, PgExecutor, Row};
 use std::collections::BTreeMap;
 
-/// Store `tree` under its digest unless it is already stored, and return the digest. `tarball` is
-/// `tree.tarball()`, the bytes the caller writes to the legacy column.
-pub(crate) async fn put_tree(
-    conn: &mut PgConnection,
-    tree: &PackTree,
-    tarball: &[u8],
-) -> Result<TreeDigest> {
+/// A pack tree paired with its own tarball, `tree.tarball()`: the bytes a legacy column holds
+/// beside the tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EncodedPack {
+    tree: PackTree,
+    tarball: Vec<u8>,
+}
+
+impl EncodedPack {
+    pub(crate) fn new(tree: PackTree) -> std::io::Result<Self> {
+        let tarball = tree.tarball()?;
+        Ok(Self { tree, tarball })
+    }
+
+    pub(crate) fn tree(&self) -> &PackTree {
+        &self.tree
+    }
+
+    pub(crate) fn tarball(&self) -> &[u8] {
+        &self.tarball
+    }
+}
+
+/// Store `pack`'s tree under its digest unless it is already stored, and return the digest.
+pub(crate) async fn put_tree(conn: &mut PgConnection, pack: &EncodedPack) -> Result<TreeDigest> {
+    let (tree, tarball) = (pack.tree(), pack.tarball());
     let (digest, file_hashes) = tree.digest_with_file_hashes();
     let stored: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pack_trees WHERE digest = $1")
         .bind(digest.as_str())
@@ -60,6 +79,11 @@ pub(crate) async fn put_tree(
     }
     Ok(digest)
 }
+
+/// The columns [`PackRef::from_row`] reads, for a table with `tree_digest` and `tar_gz` columns.
+/// The legacy bytes are only fetched when the row has no tree.
+pub(crate) const PACK_COLS: &str =
+    "tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz";
 
 /// Where a row's pack is: the stored tree its tree column names, or the legacy bytes of a row
 /// whose tree column is NULL.
@@ -142,6 +166,12 @@ pub(crate) async fn load(ex: impl PgExecutor<'_>, pack: PackRef) -> Result<PackT
     }
 }
 
+/// The pack a row selected with [`PACK_COLS`] names.
+pub(crate) async fn load_row(ex: impl PgExecutor<'_>, row: &PgRow) -> Result<PackTree> {
+    let pack = PackRef::from_row(row)?.context("the row holds no pack")?;
+    load(ex, pack).await
+}
+
 /// Legacy pack bytes read as a tree, off the async runtime.
 async fn read_legacy(bytes: Vec<u8>) -> Result<PackTree> {
     let read =
@@ -161,14 +191,17 @@ mod tests {
         PackTree::from_pairs(files).expect("tree")
     }
 
+    fn encoded(tree: &PackTree) -> EncodedPack {
+        EncodedPack::new(tree.clone()).expect("encode")
+    }
+
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn storing_a_tree_twice_keeps_one_copy(pool: PgPool) {
         let tree = pack(&[("crucible.toml", b"m"), ("tools/run.sh", b"r")]);
         let mut conn = pool.acquire().await.expect("conn");
 
-        let tarball = tree.tarball().expect("encode");
-        let first = put_tree(&mut conn, &tree, &tarball).await.expect("put");
-        let second = put_tree(&mut conn, &tree, &tarball)
+        let first = put_tree(&mut conn, &encoded(&tree)).await.expect("put");
+        let second = put_tree(&mut conn, &encoded(&tree))
             .await
             .expect("put again");
 
@@ -230,9 +263,7 @@ mod tests {
     async fn a_tree_digest_survives_only_its_own_tarball(pool: PgPool) {
         let tree = pack(&[("a", b"1")]);
         let mut conn = pool.acquire().await.expect("conn");
-        let digest = put_tree(&mut conn, &tree, &tree.tarball().expect("encode"))
-            .await
-            .expect("put");
+        let digest = put_tree(&mut conn, &encoded(&tree)).await.expect("put");
         let pinned = Some(digest.to_string());
 
         seed_legacy_row(&pool, digest.as_str()).await;
@@ -262,12 +293,8 @@ mod tests {
         let tree = pack(&[("a", b"1")]);
         let other = pack(&[("a", b"2")]);
         let mut conn = pool.acquire().await.expect("conn");
-        let digest = put_tree(&mut conn, &tree, &tree.tarball().expect("encode"))
-            .await
-            .expect("put");
-        let other_digest = put_tree(&mut conn, &other, &other.tarball().expect("encode"))
-            .await
-            .expect("put");
+        let digest = put_tree(&mut conn, &encoded(&tree)).await.expect("put");
+        let other_digest = put_tree(&mut conn, &encoded(&other)).await.expect("put");
         for (bytes, aliased_to) in [("converted", &digest), ("elsewhere", &other_digest)] {
             sqlx::query(
                 "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
@@ -296,9 +323,7 @@ mod tests {
     async fn a_stored_tree_reads_back_whole_or_one_file(pool: PgPool) {
         let tree = pack(&[("crucible.toml", b"m"), ("tools/run.sh", b"r")]);
         let mut conn = pool.acquire().await.expect("conn");
-        let digest = put_tree(&mut conn, &tree, &tree.tarball().expect("encode"))
-            .await
-            .expect("put");
+        let digest = put_tree(&mut conn, &encoded(&tree)).await.expect("put");
 
         assert_eq!(
             get_tree(&pool, &digest).await.expect("get"),
@@ -329,9 +354,7 @@ mod tests {
         assert!(err.contains("is not stored"), "{err}");
 
         let empty = PackTree::default();
-        let empty_digest = put_tree(&mut conn, &empty, &empty.tarball().expect("encode"))
-            .await
-            .expect("put");
+        let empty_digest = put_tree(&mut conn, &encoded(&empty)).await.expect("put");
         assert_eq!(
             get_tree(&pool, &empty_digest).await.expect("get"),
             Some(empty)
@@ -342,9 +365,7 @@ mod tests {
     async fn a_tampered_tree_is_never_returned(pool: PgPool) {
         let tree = pack(&[("a", b"1")]);
         let mut conn = pool.acquire().await.expect("conn");
-        let digest = put_tree(&mut conn, &tree, &tree.tarball().expect("encode"))
-            .await
-            .expect("put");
+        let digest = put_tree(&mut conn, &encoded(&tree)).await.expect("put");
         sqlx::query("UPDATE pack_tree_files SET content = 'evil' WHERE digest = $1")
             .bind(digest.as_str())
             .execute(&pool)

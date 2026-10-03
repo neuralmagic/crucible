@@ -1363,6 +1363,50 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+/// A launch whose registry row moved on and whose own pack the engine refuses still serves its
+/// run graph, as a revision that stored no exposure.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_of_a_launch_whose_pack_is_refused_omits_outputs(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let doc = serde_json::json!({"version": 1, "outputs": []});
+    let tree = |file: &str| crucible_contract::pack_tree::PackTree::from_pairs(&[(file, b"x")]);
+    crate::testing::pin_playbook(db.pool(), tree("SCOPE.md")?, &doc).await;
+    crate::testing::launch_playbook(db.pool(), "survey-1").await;
+    sqlx::query("UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL")
+        .execute(db.pool())
+        .await?;
+    crate::testing::pin_playbook(db.pool(), tree("crucible.toml")?, &doc).await;
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: "run-survey".to_string(),
+            scope: None,
+            issue: Some("survey-1".to_string()),
+            identity_digest: None,
+            status: "running".to_string(),
+            pod: None,
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    crate::runs::task_results::upsert_run_plan(
+        db.pool(),
+        "run-survey",
+        1,
+        r#"[{"name":"measure","kind":"command","depends_on":[],"session":"","needs":"all","required":true}]"#,
+    )
+    .await?;
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-survey/graph").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["tasks"][0]["name"], "measure");
+    assert!(v.get("outputs").is_none(), "{v}");
+    Ok(())
+}
+
 #[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn get_run_returns_candidates_or_404(pool: PgPool) -> Result<()> {

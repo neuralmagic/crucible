@@ -338,8 +338,9 @@ async fn migrate_pack(
 
     let mut tx = pool.begin().await.context("begin pack import")?;
     if store_pack {
-        let tarball = pack.tarball().context("encoding the pack tarball")?;
-        crate::runs::blob_store::put_pack(&mut tx, slug, &pack, &tarball).await?;
+        let pack = crate::playbooks::pack_trees::EncodedPack::new(pack)
+            .context("encoding the pack tarball")?;
+        crate::runs::blob_store::put_pack(&mut tx, slug, &pack).await?;
     }
     if import_blocks {
         for (i, (block, created_at)) in blocks.iter().zip(&created_ats).enumerate() {
@@ -991,8 +992,7 @@ mod tests {
         crate::runs::blob_store::put_pack(
             &mut conn,
             "owner_repo_7",
-            &other,
-            &other.tarball().expect("tarball"),
+            &crate::playbooks::pack_trees::EncodedPack::new(other).expect("encode"),
         )
         .await
         .expect("seed");
@@ -1024,8 +1024,7 @@ mod tests {
         crate::runs::blob_store::put_pack(
             &mut conn,
             "owner_repo_7",
-            &stored,
-            &stored.tarball().expect("tarball"),
+            &crate::playbooks::pack_trees::EncodedPack::new(stored.clone()).expect("encode"),
         )
         .await
         .expect("seed the pack without its rows");

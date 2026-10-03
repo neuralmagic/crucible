@@ -185,7 +185,7 @@ pub async fn start(
         }
         RunRenderOpts::Loop { .. } => CEILING_SLACK,
     };
-    let exposure = crate::launches::store::exposure_for_issue(db.pool(), issue_key).await?;
+    let exposure = crate::launches::store::exposure_for_issue(db.pool(), issue_key).await??;
     let mut env = run_env(
         std::env::vars(),
         &cfg.local_secret_allowlist,

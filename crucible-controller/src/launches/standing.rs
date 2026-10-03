@@ -384,8 +384,8 @@ impl From<String> for FireError {
 
 /// Mint the launch for a locked core row on the trigger's transaction: the launch row, its
 /// dispatch and agent columns, and the adopted tarball copy. `exposure` is the disclosure the
-/// launch row records: a draft-head firing's recomputed one, absent for an adopted pack whose
-/// disclosure is the registry row's. Returns how the owner snapshot stands; an `Err` is what the
+/// launch row records: a draft-head firing's recomputed one, absent otherwise. An adopted pack's
+/// launch records none, since the registry row's need not be that pack's. Returns how the owner snapshot stands; an `Err` is what the
 /// trigger records as a firing failure.
 pub(crate) async fn fire(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -475,6 +475,13 @@ pub(crate) async fn fire(
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("{noun} adopted pack copy: {e}"))?;
+        sqlx::query(
+            "UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL WHERE key = $1",
+        )
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("{noun} adopted pack exposure: {e}"))?;
     }
     sqlx::query(
         "UPDATE playbook_standing_launches SET consecutive_failures = 0, updated_at = $2 WHERE id = $1",

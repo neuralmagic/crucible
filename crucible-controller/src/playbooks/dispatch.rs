@@ -344,6 +344,20 @@ const AGENT_TABLES: [(&str, &str); 3] = [
     ("playbook_draft_versions", "draft_id, version"),
 ];
 
+/// A backfilled row's key as text, for a log line.
+fn row_key(row: &sqlx::postgres::PgRow, table: &str) -> Result<String> {
+    use sqlx::Row as _;
+    Ok(if table == "playbook_draft_versions" {
+        format!(
+            "{}/{}",
+            row.try_get::<String, _>("draft_id")?,
+            row.try_get::<i64, _>("version")?
+        )
+    } else {
+        row.try_get::<String, _>("id")?
+    })
+}
+
 /// Read the `[agent]` substrate off every stored pack that has none recorded, and stamp it. Rows
 /// written before the columns existed carry no substrate, and refusing to launch them for that
 /// reason would be a lie about the pack. Runs once at startup, under the maintenance lock, beside
@@ -353,18 +367,26 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
     let mut filled = 0usize;
     for (table, key) in AGENT_TABLES {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {key}, tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
-             FROM {table} WHERE agent_backend IS NULL OR agent_requirements IS NULL"
+            "SELECT {key}, {PACK_COLS} FROM {table}
+             WHERE agent_backend IS NULL OR agent_requirements IS NULL",
+            PACK_COLS = crate::playbooks::pack_trees::PACK_COLS,
         )))
         .fetch_all(pool)
         .await
         .with_context(|| format!("listing {table} rows with no recorded agent"))?;
         for row in rows {
-            let Some(pack) = crate::playbooks::pack_trees::PackRef::from_row(&row)? else {
-                continue;
-            };
-            let Ok(tree) = crate::playbooks::pack_trees::load(pool, pack).await else {
-                continue;
+            let tree = match crate::playbooks::pack_trees::load_row(pool, &row).await {
+                Ok(tree) => tree,
+                Err(e) if e.downcast_ref::<sqlx::Error>().is_some() => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        table,
+                        key = %row_key(&row, table)?,
+                        error = %format!("{e:#}"),
+                        "pack agent backfill skipped a pack it cannot read"
+                    );
+                    continue;
+                }
             };
             let agent = tokio::task::spawn_blocking(move || {
                 let pack = crate::playbooks::packs::materialize_tree(&tree)?;
@@ -768,6 +790,63 @@ mod tests {
             0,
             "a stamped row is not re-read"
         );
+        Ok(())
+    }
+
+    /// A row whose stored tree no longer hashes to its digest is skipped, and the backfill still
+    /// stamps the rows it can read.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn the_backfill_skips_a_tampered_tree_and_fills_the_rest(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        let tree = crucible_contract::pack_tree::PackTree::from_pairs(&[
+            (
+                "crucible.toml",
+                b"[workflow]\ntype = \"playbook\"\nfile = \"w.star\"\n\n\
+                  [agent]\nbackend = \"openshell\"\n",
+            ),
+            ("w.star", b"params = {}\n"),
+        ])?;
+        let pack = crate::playbooks::pack_trees::EncodedPack::new(tree)?;
+        let digest =
+            crate::playbooks::pack_trees::put_tree(&mut *pool.acquire().await?, &pack).await?;
+        for (id, tree_digest) in [("legacy", None), ("tampered", Some(digest.as_str()))] {
+            sqlx::query(
+                r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz,
+                                          tar_digest, tar_bytes, params_schema, schema_digest,
+                                          core_rev, created_at, updated_at, tree_digest)
+                   VALUES ($1, 'stored before the columns', 'owner/repo', NULL, 'deadbeef', '',
+                           $2, 'sha256:tar', $3, '{}'::jsonb, 'sha256:form', 'deadbeef',
+                           '2026-08-22T00:00:00Z', '2026-08-22T00:00:00Z', $4)"#,
+            )
+            .bind(id)
+            .bind(pack.tarball())
+            .bind(i64::try_from(pack.tarball().len())?)
+            .bind(tree_digest)
+            .execute(&pool)
+            .await?;
+        }
+        sqlx::query(
+            "UPDATE pack_tree_files SET content = 'tampered' WHERE digest = $1 AND path = 'w.star'",
+        )
+        .bind(digest.as_str())
+        .execute(&pool)
+        .await?;
+
+        assert_eq!(backfill_pack_agents(&pool).await?, 1);
+        let agent = |id: &'static str| {
+            let pool = pool.clone();
+            async move {
+                crate::playbooks::registry::get(&pool, id)
+                    .await
+                    .expect("read")
+                    .expect("row")
+                    .agent
+                    .map(|a| a.backend)
+            }
+        };
+        assert_eq!(agent("legacy").await, Some("openshell".to_string()));
+        assert_eq!(agent("tampered").await, None);
         Ok(())
     }
 

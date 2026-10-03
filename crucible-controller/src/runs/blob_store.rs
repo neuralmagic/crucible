@@ -9,6 +9,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
+use crate::playbooks::pack_trees::{PACK_COLS, PackRef};
 use anyhow::{Context, Result, ensure};
 use crucible_contract::content_digest;
 use crucible_contract::pack_tree::{PackTree, TreeDigest};
@@ -408,19 +409,18 @@ pub struct StoredPack {
     pub tree: TreeDigest,
 }
 
-/// Store (or replace) one sanitized issue key's frozen pack: the tree, and its tarball
-/// (`tree.tarball()`) beside it.
-pub async fn put_pack(
+/// Store (or replace) one sanitized issue key's frozen pack: the tree, and its tarball beside it.
+pub(crate) async fn put_pack(
     conn: &mut sqlx::PgConnection,
     issue_slug: &str,
-    tree: &PackTree,
-    tarball: &[u8],
+    pack: &crate::playbooks::pack_trees::EncodedPack,
 ) -> Result<StoredPack> {
+    let tarball = pack.tarball();
     let digest = content_digest(tarball);
     let mut tx = sqlx::Connection::begin(&mut *conn)
         .await
         .context("opening the pack store transaction")?;
-    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, tree, tarball).await?;
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, pack).await?;
     sqlx::query(
         r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
            VALUES ($1, $2, $3, $4, $5, $6)
@@ -444,14 +444,12 @@ pub async fn put_pack(
     })
 }
 
-/// Read one stored pack back as its tree, or `None` if never stored. A row with no tree yet reads
-/// its legacy bytes, digest-verified first.
-pub async fn get_pack(pool: &PgPool, issue_slug: &str) -> Result<Option<PackTree>> {
-    use crate::playbooks::pack_trees::PackRef;
-    let row = sqlx::query(
-        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz, digest
-         FROM pack_tarballs WHERE issue_slug = $1",
-    )
+/// Where one stored pack is, or `None` if never stored. A row with no tree yet names its legacy
+/// bytes, digest-verified first.
+pub(crate) async fn pack_ref(pool: &PgPool, issue_slug: &str) -> Result<Option<PackRef>> {
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT {PACK_COLS}, digest FROM pack_tarballs WHERE issue_slug = $1"
+    ))
     .bind(issue_slug)
     .fetch_optional(pool)
     .await
@@ -467,6 +465,14 @@ pub async fn get_pack(pool: &PgPool, issue_slug: &str) -> Result<Option<PackTree
             "pack {issue_slug}: digest mismatch, stored {digest}, read {got}"
         );
     }
+    Ok(Some(pack))
+}
+
+/// Read one stored pack back as its tree, or `None` if never stored.
+pub async fn get_pack(pool: &PgPool, issue_slug: &str) -> Result<Option<PackTree>> {
+    let Some(pack) = pack_ref(pool, issue_slug).await? else {
+        return Ok(None);
+    };
     crate::playbooks::pack_trees::load(pool, pack)
         .await
         .with_context(|| format!("reading pack {issue_slug}"))
@@ -981,14 +987,16 @@ mod tests {
 
         let first = PackTree::from_pairs(&[("crucible.toml", b"m"), ("big", &payload(2048))])
             .expect("tree");
-        let tarball = first.tarball().expect("tarball");
-        let stored = put_pack(&mut conn, "owner_repo_7", &first, &tarball)
+        let encoded =
+            crate::playbooks::pack_trees::EncodedPack::new(first.clone()).expect("encode");
+        let tarball = encoded.tarball();
+        let stored = put_pack(&mut conn, "owner_repo_7", &encoded)
             .await
             .expect("put");
         assert_eq!(
             stored,
             StoredPack {
-                digest: content_digest(&tarball),
+                digest: content_digest(tarball),
                 tree: first.digest(),
             }
         );
@@ -1002,8 +1010,7 @@ mod tests {
         put_pack(
             &mut conn,
             "owner_repo_7",
-            &second,
-            &second.tarball().expect("tarball"),
+            &crate::playbooks::pack_trees::EncodedPack::new(second.clone()).expect("encode"),
         )
         .await
         .expect("replace");

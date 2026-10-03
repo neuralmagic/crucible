@@ -171,6 +171,78 @@ pub(crate) async fn call(
     )
 }
 
+/// Register (or repin) playbook `survey` to `tree`, with `exposure` as its stored disclosure.
+#[cfg(test)]
+pub(crate) async fn pin_playbook(
+    pool: &sqlx::PgPool,
+    tree: crucible_contract::pack_tree::PackTree,
+    exposure: &serde_json::Value,
+) {
+    let pack = crate::playbooks::pack_trees::EncodedPack::new(tree).expect("encode");
+    let digest =
+        crate::playbooks::pack_trees::put_tree(&mut pool.acquire().await.expect("conn"), &pack)
+            .await
+            .expect("put tree");
+    sqlx::query(
+        r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz, tar_digest,
+                                  tar_bytes, params_schema, schema_digest, core_rev, created_by,
+                                  created_at, updated_at, tree_digest, exposure)
+           VALUES ('survey', 'reads a paper', 'owner/packs', 'main', $1, '', $2, $1, $3,
+                   '{"type":"object"}'::jsonb, 'sha256:schema', 'core1', 'wren',
+                   '2026-08-23T00:00:00Z', '2026-08-23T00:00:00Z', $4, $5)
+           ON CONFLICT (id) DO UPDATE SET rev = excluded.rev, tar_gz = excluded.tar_gz,
+               tar_digest = excluded.tar_digest, tar_bytes = excluded.tar_bytes,
+               tree_digest = excluded.tree_digest, exposure = excluded.exposure"#,
+    )
+    .bind(crucible_contract::content_digest(pack.tarball()))
+    .bind(pack.tarball())
+    .bind(i64::try_from(pack.tarball().len()).expect("size"))
+    .bind(digest.as_str())
+    .bind(exposure)
+    .execute(pool)
+    .await
+    .expect("pin");
+}
+
+/// Launch the registered playbook [`pin_playbook`] stored, as `key`.
+#[cfg(test)]
+pub(crate) async fn launch_playbook(
+    pool: &sqlx::PgPool,
+    key: &str,
+) -> crate::launches::model::PlaybookLaunch {
+    let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+    let params = serde_json::json!({});
+    let mut tx = pool.begin().await.expect("tx");
+    let inserted = crate::launches::store::insert_playbook_launch_with(
+        &mut tx,
+        key,
+        &crate::launches::model::NewPlaybookLaunch {
+            playbook: "survey",
+            repo: "owner/repo",
+            title: "survey",
+            params: &params,
+            schema_digest: "sha256:schema",
+            max_cost: 1.0,
+            max_time: &max_time,
+            advance_dedupe: false,
+            dedupe_schedule: None,
+            origin: crate::model::LaunchOrigin::Manual,
+            draft_version: None,
+            created_by: Some("wren"),
+            launcher_groups: None,
+        },
+        &crate::playbooks::exposure::Extraction::Absent,
+    )
+    .await
+    .expect("insert launch");
+    assert!(inserted, "playbook survey is registered");
+    tx.commit().await.expect("commit");
+    crate::launches::store::get_playbook_launch(pool, key)
+        .await
+        .expect("read launch")
+        .expect("launch")
+}
+
 /// Register a Chat Completions provider at `url` and make it the platform's autoresearch default,
 /// so the ranker's calls land on a `wiremock` server serving canned verdicts.
 #[cfg(test)]

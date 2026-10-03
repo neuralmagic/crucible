@@ -125,7 +125,8 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         None => crate::runs::model::RunImage::default(),
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
-    let exposure = crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await?;
+    let exposure =
+        crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await??;
     let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
     let launcher = match crate::authz::resolve::dispatch_principals(
         db.pool(),

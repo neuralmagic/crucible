@@ -9,6 +9,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
+use crate::playbooks::pack_trees::EncodedPack;
 use crate::runs::blob_store::StoredPack;
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{
@@ -48,26 +49,40 @@ pub(crate) enum PackRefusal {
     Encode(#[from] std::io::Error),
 }
 
-/// A pack ready to store: its tree, the tarball a run receives, and the excluded paths the read
-/// skipped.
+/// A pack ready to store: its tree and the tarball a run receives, and the excluded paths the
+/// read skipped.
 #[derive(Debug, Clone)]
 pub(crate) struct Deliverable {
-    pub tree: PackTree,
-    pub tarball: Vec<u8>,
-    pub ignored: Vec<String>,
+    pack: EncodedPack,
+    ignored: Vec<String>,
 }
 
 impl Deliverable {
     /// Encode `read`, refused when its tarball is over the delivery budget
     /// (RFC-0002:C-PACK-BASE).
     pub(crate) fn new(read: ReadPack) -> Result<Self, PackRefusal> {
-        let tarball = read.tree.tarball()?;
-        check_delivery_budget(&tarball)?;
+        let pack = EncodedPack::new(read.tree)?;
+        check_delivery_budget(pack.tarball())?;
         Ok(Self {
-            tree: read.tree,
-            tarball,
+            pack,
             ignored: read.ignored,
         })
+    }
+
+    pub(crate) fn pack(&self) -> &EncodedPack {
+        &self.pack
+    }
+
+    pub(crate) fn tree(&self) -> &PackTree {
+        self.pack.tree()
+    }
+
+    pub(crate) fn tarball(&self) -> &[u8] {
+        self.pack.tarball()
+    }
+
+    pub(crate) fn into_ignored(self) -> Vec<String> {
+        self.ignored
     }
 }
 
@@ -121,13 +136,8 @@ fn append_dir(
 /// Store `pack` as `key`'s durable pack.
 pub(crate) async fn store_pack(pool: &PgPool, key: &str, pack: &Deliverable) -> Result<StoredPack> {
     let mut conn = pool.acquire().await.context("pack store connection")?;
-    crate::runs::blob_store::put_pack(
-        &mut conn,
-        &crate::model::sanitize_key(key),
-        &pack.tree,
-        &pack.tarball,
-    )
-    .await
+    crate::runs::blob_store::put_pack(&mut conn, &crate::model::sanitize_key(key), pack.pack())
+        .await
 }
 
 /// Store a pod-delivered pack tarball as `key`'s durable pack. The tarball is read as a pack
@@ -283,15 +293,7 @@ pub(crate) async fn materialize_pack_or_empty(
 pub(crate) async fn read_pack_file(pool: &PgPool, key: &str, name: &str) -> Result<Option<String>> {
     use crate::playbooks::pack_trees::PackRef;
     let slug = crate::model::sanitize_key(key);
-    let row = sqlx::query(
-        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
-         FROM pack_tarballs WHERE issue_slug = $1",
-    )
-    .bind(&slug)
-    .fetch_optional(pool)
-    .await
-    .context("reading a stored pack")?;
-    let bytes = match row.as_ref().map(PackRef::from_row).transpose()?.flatten() {
+    let bytes = match crate::runs::blob_store::pack_ref(pool, &slug).await? {
         None => return Ok(None),
         Some(PackRef::Tree(digest)) => {
             crate::playbooks::pack_trees::read_file(pool, &digest, name).await?
@@ -633,8 +635,11 @@ mod tests {
         let pack = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
         let delivered = deliverable(&pack).expect("within budget");
         let walked = walk_dir(&pack).expect("walk").tree;
-        assert_eq!(delivered.tarball, walked.tarball().expect("tarball"));
-        assert_eq!(delivered.tree, walked);
+        assert_eq!(
+            delivered.tarball(),
+            walked.tarball().expect("tarball").as_slice()
+        );
+        assert_eq!(delivered.tree(), &walked);
 
         std::os::unix::fs::symlink("crucible.toml", pack.join("link")).expect("symlink");
         assert!(matches!(
