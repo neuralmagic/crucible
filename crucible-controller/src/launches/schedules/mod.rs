@@ -1020,6 +1020,77 @@ mod tests {
         Ok(())
     }
 
+    /// A schedule saved before tree storage holds its adopted bytes in the old encoding, and
+    /// conversion keeps them. Firing it after a repin copies those bytes over the registry copy and
+    /// still records the adopted tree.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_converted_schedule_fires_its_adopted_tree_after_a_repin(pool: PgPool) -> Result<()> {
+        use std::io::{Read as _, Write as _};
+        let first = tree(b"v1");
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &first).await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let scheduled = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
+        let mut tar = Vec::new();
+        flate2::read::GzDecoder::new(&first.tarball()?[..]).read_to_end(&mut tar)?;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(&tar)?;
+        let legacy = gz.finish()?;
+        assert_ne!(
+            legacy,
+            first.tarball()?,
+            "an encoding other than the tree's own"
+        );
+        sqlx::query(
+            "UPDATE playbook_standing_launches
+             SET adopted_tar_gz = $2, adopted_tar_digest = $3, adopted_tar_bytes = $4,
+                 adopted_tree_digest = NULL
+             WHERE id = $1",
+        )
+        .bind(&scheduled.id)
+        .bind(&legacy)
+        .bind(crucible_contract::content_digest(&legacy))
+        .bind(i64::try_from(legacy.len())?)
+        .execute(&pool)
+        .await?;
+        crate::playbooks::pack_migration::convert_pack_trees(&pool).await?;
+        let converted: Option<String> = sqlx::query_scalar(
+            "SELECT adopted_tree_digest FROM playbook_standing_launches WHERE id = $1",
+        )
+        .bind(&scheduled.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(converted.as_deref(), Some(adopted_tree.as_str()));
+        set_due(&pool, &scheduled.id, Some("2026-08-23T12:00:00Z")).await;
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+
+        let keys = fire_due(
+            &Db::new(pool.clone()),
+            ts("2026-08-23T12:01:00Z"),
+            1,
+            5,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            launch_tree(&pool, &keys[0]).await,
+            (
+                Some(adopted_tree.to_string()),
+                crucible_contract::content_digest(&legacy)
+            )
+        );
+        Ok(())
+    }
+
     /// The endpoint authorizes against the registry row it read; a repin that lands before the
     /// save commits refuses the save instead of adopting a revision nobody validated, and a
     /// deregistration refuses it as gone. Nothing is written either way.

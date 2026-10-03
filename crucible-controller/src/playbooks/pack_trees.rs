@@ -159,4 +159,41 @@ mod tests {
             .bind(tree.tarball().expect("encode"));
         assert_eq!(update_and_read(&pool, own_tarball).await, pinned);
     }
+
+    /// Bytes that conversion recorded as an encoding of the tree keep the tree when written back,
+    /// and bytes aliased to a different tree do not.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn bytes_aliased_to_the_tree_keep_it(pool: PgPool) {
+        let tree = pack(&[("a", b"1")]);
+        let other = pack(&[("a", b"2")]);
+        let mut conn = pool.acquire().await.expect("conn");
+        let digest = put_tree(&mut conn, &tree, &tree.tarball().expect("encode"))
+            .await
+            .expect("put");
+        let other_digest = put_tree(&mut conn, &other, &other.tarball().expect("encode"))
+            .await
+            .expect("put");
+        for (bytes, aliased_to) in [("converted", &digest), ("elsewhere", &other_digest)] {
+            sqlx::query(
+                "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
+                 VALUES ($1, $2, 'then')",
+            )
+            .bind(crucible_contract::content_digest(bytes.as_bytes()))
+            .bind(aliased_to.as_str())
+            .execute(&pool)
+            .await
+            .expect("alias");
+        }
+        let pinned = Some(digest.to_string());
+
+        seed_legacy_row(&pool, digest.as_str()).await;
+        let converted = sqlx::query("UPDATE pack_tarballs SET tar_gz = 'converted'");
+        assert_eq!(update_and_read(&pool, converted).await, pinned);
+
+        seed_legacy_row(&pool, digest.as_str()).await;
+        let elsewhere =
+            sqlx::query("UPDATE pack_tarballs SET tar_gz = 'elsewhere', tree_digest = $1")
+                .bind(digest.as_str());
+        assert_eq!(update_and_read(&pool, elsewhere).await, None);
+    }
 }
