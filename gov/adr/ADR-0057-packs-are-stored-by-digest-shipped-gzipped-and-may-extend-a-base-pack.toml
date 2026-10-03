@@ -1,0 +1,187 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0057"
+title = "Packs are stored by digest, shipped gzipped, and may extend a base pack"
+status = "proposed"
+date = "2026-10-02"
+refs = [
+    "ADR-0009",
+    "ADR-0033",
+    "ADR-0048",
+    "RFC-0002:C-PLAYBOOK-COMPOSITE",
+    "RFC-0003:C-APPROVALS",
+    "RFC-0003:C-READ-SCOPING",
+    "RFC-0004:C-CONTRACT-VERSION",
+    "RFC-0004:C-LINKED-RENDER",
+]
+
+[content]
+context = """
+A playbook pack is stored as one gzipped tarball in a Postgres `bytea` column and delivered to the run pod as one ConfigMap. Three limits apply, and they disagree:
+
+- A draft holds at most 128 files of at most 512 KiB each (`crucible-controller/src/playbooks/drafts.rs:25`, `:28`, enforced at `:403-421`). A draft file path must be non-blank (`drafts.rs:410-412`) and pass `validate_path` (`drafts.rs:413`), the repository-subtree validator, which on its own accepts an empty path (`registry.rs:264-267`).
+- A stored tarball is at most 8 MiB gzipped (`MAX_PACK_TAR_BYTES`, `crucible-controller/src/playbooks/registry.rs:32`), checked on git registration (`registry.rs:472`), draft publication (`registry.rs:680`), and draft save (`drafts.rs:663`).
+- Delivery renders every pack file, except `state/`, `.git/` and `workspace/` (`crucible/src/deploy/render/kube.rs:479-511`), into one ConfigMap capped at 900 KiB of raw file bytes (`CONFIGMAP_MAX_BYTES`, `kube.rs:199`, guard at `:396-402`). The `pack-stage` init container copies the ConfigMap projection into an emptyDir at the domain path (`kube.rs:769-795`, volumes at `:1288-1315`), because the loop writes `STEER.md`, `state/` and the workspace into that directory. The projection sets mode 0755 on every file (`kube.rs:1305`), which is where gate scripts get their execute bit.
+
+The controller never checks the 900 KiB budget, so the effective cap is the ConfigMap, found at dispatch: a pack between roughly 900 KiB raw and 8 MiB gzipped registers, launches, and fails with `PackOverConfigMapBudget` (`kube.rs:43-50`). The comment at `kube.rs:197` says packs are capped well under the budget upstream and cites `#134`. The claim is wrong, since the 8 MiB gzip cap does not do that, and the reference is stale: #134 is an unrelated workflow-language change.
+
+The tarball is copied whole, not referenced. Registration stores it in `playbooks.tar_gz` (`crucible-controller/migrations/0006_playbooks.sql:20`), each draft version in `playbook_draft_versions.tar_gz` (`0012_playbook_drafts.sql:28`), each import in `pack_imports.tar_gz` (`0013_pack_imports.sql:15`), and each adopted standing launch in `adopted_tar_gz` (`0033_standing_launches.sql:17`). Every launch copies it again into `pack_tarballs` under the launch's slug (`0004_shared_state.sql:46-52`; `registry.rs:1003-1022`, `drafts.rs:1172-1190`, `crucible-controller/src/launches/standing.rs:400-420`), so a run executes the bytes it was authorized against after the registry moves. The tar is not deterministic: `tar_pack_tree` writes each entry with the default header mode, which records mtime and ownership (`crucible-controller/src/playbooks/packs.rs:31-36`, `:63`), so two saves of the same files produce different digests.
+
+Pinning is already by content. `content_digest` is SHA-256 over the gzip bytes (`crucible-contract/src/artifact.rs:19`); a published draft's `rev` is that digest (`registry.rs:715`); an import registers only at the commit it was fetched at (`crucible-controller/src/playbooks/imports.rs:363`); a changed exposure needs its new digest accepted (`registry.rs:82-84`). Approvals of imports, scopes, and graduations go through [[RFC-0003:C-APPROVALS]].
+
+Every reader of a pack works on a materialized tree in the controller. Draft save compiles the full tree through the linked engine (`drafts.rs:652-669`, `registry.rs:1-7`). Dispatch unpacks the launch's `pack_tarballs` row (`packs.rs:101-135`, called from `crucible-controller/src/runs/launch.rs:352` and `issues/reconcile/lifecycle.rs:103`) and the render walks that directory (`crucible-controller/src/runs/workpod/run.rs:217-229`). Scope approval extracts the exposure from the stored bytes (`issues/reconcile/scope.rs:406`, `:618`).
+
+The case that breaks this is a pack with a large shared core and per-variant overlays: one workflow, its tools and its prompts reused across several variants, each variant adding a small directory. Measured on one such pack (gzip level 6, the `flate2` default):
+
+| Tree | Files | Raw | Gzipped |
+|---|---|---|---|
+| Shared core | 87 | 782 KiB | 212 KiB |
+| One overlay, typical | 5 | 31 KiB | 10 KiB |
+| One overlay, largest | 15 | 76 KiB | 25 KiB |
+| Core + one overlay, typical | 92 | 813 KiB | 222 KiB |
+| Core + one overlay, largest | 102 | 858 KiB | 237 KiB |
+| Core + all seven overlays | 157 | 1051 KiB | 297 KiB |
+
+A single variant fits the ConfigMap with 42 to 87 KiB of raw headroom; the core alone does not exceed it. One tree holding every variant exceeds both the 128-file draft cap and the 900 KiB raw budget, while its gzipped size is a third of that budget. So the author ships one draft per variant, each a full copy of the core: per draft version, per launch, and per run ConfigMap. Every pack under `examples/` is under 34 KiB raw, so nothing else is near either limit.
+
+Composite domains ([[ADR-0009]], [[RFC-0002:C-PLAYBOOK-COMPOSITE]]) are the existing reuse mechanism, and they solve a different problem. A `[composite]` manifest names sibling domain directories (`crucible/src/manifest/mod.rs:1194-1215`, `:1267-1278`) and checks each out as its own workspace in one run. They combine repositories, not files, and a registered pack is one subtree that cannot reach a sibling.
+
+Kubernetes validates a ConfigMap's size as the sum of `data` value lengths and decoded `binaryData` lengths against 1 MiB (`ValidateConfigMap`, https://github.com/kubernetes/kubernetes/blob/master/pkg/apis/core/validation/validation.go), so a gzipped tarball in one `binaryData` key counts at its gzipped size."""
+decision = """
+Three changes. They land together because a base pack is a reference by digest, which needs storage addressed by digest, and because the composed tree has to stay deliverable.
+
+**Delivery: one gzipped key.** The render tars and gzips the materialized pack directory (same exclusions as today) into one `binaryData` key of the pack ConfigMap, and `pack-stage` extracts it into the domain emptyDir with `tar -xzf` (the loop image ships `tar` and `gzip`, `Containerfile.runtime:55`). The tar is deterministic (sorted entries, fixed mtime, zero owner, mode 0755 on every regular file to match today's projection), so the in-process and command-line renders stay byte-identical as [[RFC-0004:C-LINKED-RENDER]] requires. The 900 KiB budget then applies to gzipped bytes. The stored cap drops to the same budget, checked on the composed tree at save, registration, and publication, so a pack that registers can be delivered. Steering stays in the materialized tree as `STEER.md`, as `materialize_pack` writes it today.
+
+**Storage: blobs by digest.** Pack tarballs move to one table keyed by `content_digest`. `playbooks`, `playbook_draft_versions`, `pack_imports`, adopted standing launches, and `pack_tarballs` reference a digest instead of holding bytes; a launch inserts a reference, not a copy. `tar_pack_tree` writes the deterministic tar above, so an unchanged tree keeps its digest across saves. A blob is deleted when no row references it. Every digest column keeps one meaning: SHA-256 of gzip bytes.
+
+**Base packs.** A draft may name a base: a registered pack, pinned at its stored digest. The draft holds only its overlay, and the 128-file and 512 KiB caps apply to the overlay. The composed tree is the base tree with the overlay laid over it. An overlay path that exists in the base replaces it, and the editor lists every replaced path. The overlay may replace `crucible.toml` or inherit it. A base has no base of its own. The base is recorded on the draft version, and on the pack published from it, in a second digest column, `base_digest`, beside the overlay's `tar_digest`. A pack's identity is the pair, and a launch, a standing launch, and a draft-head schedule ([[ADR-0033]]) pin the pair. One function composes the pair into a tree, and draft save, registration, publication, exposure extraction, and dispatch materialization all call it, so every reader sees the same composed tree and delivery stays one key. Moving to a new base is a new draft version with a new pair; nothing follows a base automatically. A base is a registered pack, so it compiles on its own.
+
+The base is controller metadata, not a manifest key. The engine only ever sees a composed tree, and the manifest is unchanged. Naming a base is a read of that pack under [[RFC-0003:C-READ-SCOPING]].
+
+**Compatibility.** No pack-level version key. [[RFC-0004:C-CONTRACT-VERSION]] admits only an engine whose contract version equals the controller's (`versions_match`, `crucible-controller/src/runs/contract.rs:92-93`), and registration compiles through that same linked engine, so a pack that registers is one every admitted engine can run. `CONTRACT_VERSION` (`crucible-contract/src/lib.rs:30-36`) versions the controller/engine wire types, not pack content, and stays that way. Packs stored before the change keep their bytes and digests; they move into the blob table under their existing digest.
+
+**Specification.** Before implementation this needs normative text: a new [[RFC-0002]] clause for base composition (replacement by path, the pair as identity, refusal of a save or launch whose base digest is not stored or not readable), and an [[RFC-0003:C-APPROVALS]] amendment stating that an approval of a pack built on a base binds the pair.
+
+**Not now: OCI distribution.** Publishing packs as OCI artifacts is deferred. It becomes worth its cost when a measured pack's gzipped tree passes half the delivery budget, or when spokes ([[ADR-0048]]) should pull pack bytes instead of receiving them in a hub-rendered ConfigMap. The digest-addressed table and the pair identity carry over to it."""
+consequences = """
+- A pack with a shared core and per-variant overlays stores the core once per base version. A variant draft holds its overlay: 5 to 15 files instead of 92 to 102.
+- A launch stores a reference instead of a copy, so `pack_tarballs` grows by rows, not by pack size.
+- The pack ConfigMap shrinks to the gzipped size: about 222 KiB instead of 813 KiB for a typical variant, written to etcd once per run. A tree holding every variant (297 KiB gzipped) also fits.
+- Registration and draft save refuse a pack over the delivery budget, so `PackOverConfigMapBudget` stops being reachable from a registered pack. The `kube.rs:197` comment is corrected with the change.
+- The rendered pack ConfigMap changes shape from one key per file to one key, so the rendered fixtures are regenerated once. A run pod rendered before the change is unaffected; it reads its own ConfigMap.
+- `kubectl get configmap` no longer shows pack files as text. Reading a run's pack goes through the controller's pack view, as it does for drafts and registered packs.
+- Draft save, registration, publication, and dispatch read the base blob from Postgres and unpack it with the overlay: one more blob read and about 212 KiB of decompression per call for the measured core. No external dependency is added, so nothing new can block registration, scoping, or pod start.
+- A draft-head launch of a draft on a base pins the pair and materializes the same composed tree as a published launch; nothing is merged into a second ConfigMap.
+- Every comparison of pack identity compares the pair. A comparison that reads only `tar_digest` misses a base change. The exposure digest check (`registry.rs:82-84`) is unaffected because it digests the exposure extracted from the composed tree.
+- A base that is re-pinned or retired keeps its blob while any draft version, pack, or launch references its digest.
+- Overlay replacement can shadow a base gate script or tool. The editor and the approval request list replaced paths so a reviewer sees them.
+- Deterministic tar headers change the digest of a tree tarred before and after the change. A published draft republished with no edits gets a new `rev` once."""
+
+[[content.alternatives]]
+text = "Deliver one gzipped binaryData key, store tarballs once by digest, and let a draft extend a registered base pack"
+status = "accepted"
+pros = [
+    "Removes the per-variant copy of the core from drafts, launches, and run ConfigMaps.",
+    "The delivery budget measures gzipped bytes, so stored and delivered sizes use one unit.",
+    "No new store, credential, or delivery path.",
+    "The engine and the manifest are unchanged; composition is controller-side.",
+]
+cons = [
+    "Each run still writes its pack into etcd.",
+    "Every pack read pays a base unpack.",
+    "Replacement by path can shadow base files, which the reviewer has to see.",
+]
+
+[[content.alternatives]]
+text = "Publish packs as OCI artifacts, a layer per part, pinned by manifest digest, delivered by image volume or an init-container pull"
+status = "considered"
+pros = [
+    "Content-addressed layers deduplicate a shared core across variants in the registry and on the node.",
+    "Run pods pull directly, so pack bytes leave etcd and the hub-rendered ConfigMap.",
+    "Same mechanism as Helm charts, Flux `OCIRepository`, and Tekton Bundles.",
+]
+cons = [
+    "Adds a registry to registration, draft save, and dispatch: the controller compiles and materializes the full tree, so it pulls the base on every save and every dispatch, or keeps a cache.",
+    "`pack-stage` mounts only the pack ConfigMap and the workdir (`kube.rs:769-795`). The `quay-auth` mount goes only on the main container and only when `pull_authfile` is set (`kube.rs:1110-1111`), and `imagePullSecrets` names the engine image's secret (`kube.rs:727-729`), which may not read a pack repository.",
+    "How CRI-O lays out artifact layers in an image volume mount is unverified, and containerd does not mount artifacts yet (https://github.com/containerd/containerd/issues/11381), so two delivery paths would exist.",
+    "Pack contents (prompts, tools, gate scripts) would sit in an external registry, which then has to be private and access-reviewed.",
+    "At the measured sizes the gzipped tree is a third of the ConfigMap budget, so none of this is needed yet.",
+]
+
+[[content.alternatives]]
+text = "Ship one pack holding every variant, selected by a launch parameter"
+status = "rejected"
+pros = [
+    "No composition; works for a git-registered pack once delivery is gzipped (297 KiB).",
+]
+cons = [
+    "157 files is over the 128-file draft cap, and every save carries the whole tree.",
+    "One exposure and one approval cover every variant, so a change to one overlay re-approves all of them.",
+    "Every run carries every overlay.",
+]
+rejection_reason = "It stays available to git-registered packs, but it does not fit a draft and ties every variant to one approval."
+
+[[content.alternatives]]
+text = "Raise the draft file cap"
+status = "rejected"
+pros = ["One constant."]
+cons = [
+    "A draft is saved whole, so each save and each version still carries the core.",
+    "Does nothing about the per-launch and per-ConfigMap copies.",
+]
+rejection_reason = "Lets a draft hold every variant without removing any copy of the core."
+
+[[content.alternatives]]
+text = "Reuse the core through composite domains"
+status = "rejected"
+pros = ["Existing mechanism ([[ADR-0009]])."]
+cons = [
+    "A composite combines sibling domains as separate workspaces in one run; it does not merge files into one pack tree.",
+    "A registered pack is one subtree and cannot reach a sibling directory.",
+]
+rejection_reason = "Composites combine repositories for one run, not files across packs."
+
+[[content.alternatives]]
+text = "Fetch the pack from a git ref inside the run pod"
+status = "rejected"
+pros = [
+    "No new store; registered packs already come from git.",
+    "Imports already pin by commit.",
+]
+cons = [
+    "Drafts have no git ref.",
+    "Every run pod needs forge credentials and forge reachability.",
+    "A commit pins a repository, not a pack subtree.",
+]
+rejection_reason = "Drafts and draft-head launches ([[ADR-0033]]) have no ref to fetch, and it puts forge credentials and forge availability on every run start."
+
+[[content.alternatives]]
+text = "Store pack tarballs in S3 and have the pod download by key"
+status = "rejected"
+pros = ["A plain blob store with no size pressure."]
+cons = [
+    "Run pods carry no S3 credentials; each cluster needs a new one.",
+    "Adds a dependency to pod start for packs that fit a ConfigMap once gzipped.",
+]
+rejection_reason = "Adds a credential to every cluster to solve a size problem the measured packs do not have once gzipped."
+
+[[content.alternatives]]
+text = "Split a large pack across several ConfigMaps in a projected volume"
+status = "rejected"
+pros = ["No new dependency; extends the current path."]
+cons = [
+    "Object count per run grows with pack size and counts against namespace quota.",
+    "Does nothing about the copies in Postgres.",
+]
+rejection_reason = "Gzip into one key gives three times the headroom of the largest measured tree with one object."
+
+[[content.alternatives]]
+text = "Raise the Postgres tarball cap"
+status = "rejected"
+pros = ["One constant."]
+cons = [
+    "The stored cap is already 8 MiB against a 900 KiB delivery budget; raising it widens the gap between what registers and what runs.",
+    "Each launch still copies the whole tarball into `pack_tarballs`.",
+]
+rejection_reason = "Storage is not the binding limit; delivery and copies are."
