@@ -1450,9 +1450,11 @@ mod tests {
         .await?;
         assert_eq!(alias.as_deref(), Some(tree.digest().as_str()));
 
-        let copied = crate::runs::blob_store::get_pack_tarball(into.pool(), "owner_repo_7")
-            .await?
-            .expect("tarball copied");
+        let copied: Vec<u8> = sqlx::query_scalar(
+            "SELECT tar_gz FROM pack_tarballs WHERE issue_slug = 'owner_repo_7'",
+        )
+        .fetch_one(into.pool())
+        .await?;
         assert_eq!(copied, tgz);
         assert_eq!(crucible_contract::content_digest(&copied), digest);
         let steering = crate::runs::blob_store::list_steering(into.pool(), "owner_repo_7").await?;

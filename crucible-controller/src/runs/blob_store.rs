@@ -444,22 +444,33 @@ pub async fn put_pack(
     })
 }
 
-/// Read one pack tarball back, digest-verified, or `None` if never stored.
-pub async fn get_pack_tarball(pool: &PgPool, issue_slug: &str) -> Result<Option<Vec<u8>>> {
-    let row = sqlx::query("SELECT tar_gz, digest FROM pack_tarballs WHERE issue_slug = $1")
-        .bind(issue_slug)
-        .fetch_optional(pool)
-        .await
-        .context("reading pack tarball")?;
+/// Read one stored pack back as its tree, or `None` if never stored. A row with no tree yet reads
+/// its legacy bytes, digest-verified first.
+pub async fn get_pack(pool: &PgPool, issue_slug: &str) -> Result<Option<PackTree>> {
+    use crate::playbooks::pack_trees::PackRef;
+    let row = sqlx::query(
+        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz, digest
+         FROM pack_tarballs WHERE issue_slug = $1",
+    )
+    .bind(issue_slug)
+    .fetch_optional(pool)
+    .await
+    .context("reading a stored pack")?;
     let Some(row) = row else { return Ok(None) };
-    let tar_gz: Vec<u8> = row.get("tar_gz");
-    let digest: String = row.get("digest");
-    let got = content_digest(&tar_gz);
-    ensure!(
-        got == digest,
-        "pack {issue_slug}: digest mismatch, stored {digest}, read {got}"
-    );
-    Ok(Some(tar_gz))
+    let pack =
+        PackRef::from_row(&row)?.with_context(|| format!("pack {issue_slug} holds no pack"))?;
+    if let PackRef::Legacy(bytes) = &pack {
+        let digest: String = row.try_get("digest")?;
+        let got = content_digest(bytes);
+        ensure!(
+            got == digest,
+            "pack {issue_slug}: digest mismatch, stored {digest}, read {got}"
+        );
+    }
+    crate::playbooks::pack_trees::load(pool, pack)
+        .await
+        .with_context(|| format!("reading pack {issue_slug}"))
+        .map(Some)
 }
 
 /// Append one steering entry for an issue's pack. Returns the assigned seq (1-based).
@@ -953,7 +964,7 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_pack_roundtrips_and_replaces_with_its_tree(pool: sqlx::PgPool) {
         assert!(
-            get_pack_tarball(&pool, "owner_repo_7")
+            get_pack(&pool, "owner_repo_7")
                 .await
                 .expect("get")
                 .is_none()
@@ -982,8 +993,8 @@ mod tests {
             }
         );
         assert_eq!(
-            get_pack_tarball(&pool, "owner_repo_7").await.expect("get"),
-            Some(tarball)
+            get_pack(&pool, "owner_repo_7").await.expect("get"),
+            Some(first.clone())
         );
         assert_eq!(stored_tree().await, Some(first.digest().to_string()));
 
@@ -997,8 +1008,8 @@ mod tests {
         .await
         .expect("replace");
         assert_eq!(
-            get_pack_tarball(&pool, "owner_repo_7").await.expect("get"),
-            Some(second.tarball().expect("tarball"))
+            get_pack(&pool, "owner_repo_7").await.expect("get"),
+            Some(second.clone())
         );
         assert_eq!(stored_tree().await, Some(second.digest().to_string()));
     }

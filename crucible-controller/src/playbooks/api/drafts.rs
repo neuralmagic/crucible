@@ -16,9 +16,10 @@ use crate::playbooks::drafts::{
     StaleBase,
 };
 
+use anyhow::Context as _;
 use axum::extract::{Path, Query, State};
 
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderName, StatusCode, header};
 
 use axum::response::{IntoResponse, Response};
 
@@ -613,14 +614,16 @@ pub(crate) async fn get_playbook_draft_origin_files(
     }
 }
 
-/// `GET /api/playbook-drafts/{id}/tarball` — one save as the bytes it stored. The same pack the
-/// launch path materializes, handed to whoever wants it in their own editor or their own CI.
+/// `GET /api/playbook-drafts/{id}/tarball` — one save's pack as its tarball, with its `tree1:`
+/// digest in `X-Pack-Digest`. The same pack the launch path materializes, handed to whoever wants
+/// it in their own editor or their own CI.
 #[utoipa::path(
     get,
     path = "/api/playbook-drafts/{id}/tarball",
     params(("id" = String, Path, description = "Draft id"), VersionQuery),
     responses(
-        (status = 200, description = "The version's pack tarball", content_type = "application/gzip"),
+        (status = 200, description = "The version's pack tarball", content_type = "application/gzip",
+            headers(("X-Pack-Digest" = String, description = "The pack's tree1: digest"))),
         (status = 404, description = "No draft or no such version", body = ErrorBody)
     )
 )]
@@ -635,14 +638,21 @@ pub(crate) async fn get_playbook_draft_tarball(
     {
         return Ok(refused);
     }
-    let Some((version, tar_gz)) =
-        crate::playbooks::drafts::tarball(state.db.pool(), &id, query.version).await?
+    let Some((version, tree)) =
+        crate::playbooks::drafts::version_tree(state.db.pool(), &id, query.version).await?
     else {
         return Ok(not_found(format!("no draft {id:?} at that version")));
     };
+    let tarball = tree
+        .tarball()
+        .context("encoding the draft pack for download")?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                HeaderName::from_static(PACK_DIGEST_HEADER),
+                tree.digest().to_string(),
+            ),
             (
                 header::CONTENT_DISPOSITION,
                 format!(
@@ -651,10 +661,13 @@ pub(crate) async fn get_playbook_draft_tarball(
                 ),
             ),
         ],
-        tar_gz,
+        tarball,
     )
         .into_response())
 }
+
+/// The response header a pack download carries its `tree1:` digest in.
+pub(crate) const PACK_DIGEST_HEADER: &str = "x-pack-digest";
 
 /// A draft id is a validated slug, but the download names a file with it, so anything that is not
 /// one is flattened rather than trusted into a header.
@@ -1153,7 +1166,7 @@ pub(crate) async fn publish_playbook_draft(
     {
         return refused;
     }
-    let (version, tar_gz) =
+    let (version, tree) =
         match crate::playbooks::drafts::newest_compiling(state.db.pool(), &id).await {
             Ok(newest) => newest,
             Err(e) => return draft_refusal(e),
@@ -1166,7 +1179,7 @@ pub(crate) async fn publish_playbook_draft(
         description: draft.description,
         draft: id.clone(),
         version,
-        tar_gz,
+        tree,
         replaces,
         accept_exposure_digest: body
             .accept_exposure_digest

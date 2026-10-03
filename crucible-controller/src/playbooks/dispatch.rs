@@ -353,15 +353,21 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
     let mut filled = 0usize;
     for (table, key) in AGENT_TABLES {
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT {key}, tar_gz FROM {table} WHERE agent_backend IS NULL OR agent_requirements IS NULL"
+            "SELECT {key}, tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+             FROM {table} WHERE agent_backend IS NULL OR agent_requirements IS NULL"
         )))
         .fetch_all(pool)
         .await
         .with_context(|| format!("listing {table} rows with no recorded agent"))?;
         for row in rows {
-            let tar_gz: Vec<u8> = row.try_get("tar_gz")?;
+            let Some(pack) = crate::playbooks::pack_trees::PackRef::from_row(&row)? else {
+                continue;
+            };
+            let Ok(tree) = crate::playbooks::pack_trees::load(pool, pack).await else {
+                continue;
+            };
             let agent = tokio::task::spawn_blocking(move || {
-                let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)?;
+                let pack = crate::playbooks::packs::materialize_tree(&tree)?;
                 pack_agent(pack.path())
             })
             .await

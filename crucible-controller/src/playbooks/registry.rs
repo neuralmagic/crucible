@@ -14,12 +14,13 @@
 //! Everything the launch path needs is a function here — [`schema`], [`materialize`] — so no other
 //! module reaches into the table.
 
+use crate::playbooks::pack_trees::PackRef;
 use crate::playbooks::packs::{Deliverable, MaterializedPack};
 use anyhow::{Context, Result};
 use crucible::plan::starlark::declared_params;
 use crucible::plan::starlark::params::ParamType;
 use crucible_contract::content_digest;
-use crucible_contract::pack_tree::TreeDigest;
+use crucible_contract::pack_tree::{PackTree, ReadPack, TreeDigest};
 use serde::Deserialize;
 use sqlx::{PgPool, Row};
 use std::path::{Component, Path, PathBuf};
@@ -99,7 +100,7 @@ pub struct PublishDraft {
     pub description: String,
     pub draft: String,
     pub version: i64,
-    pub tar_gz: Vec<u8>,
+    pub tree: PackTree,
     /// Whether the caller was authorized against an existing row under `id` (a re-pin) or against
     /// none (a new playbook). A row that appeared or vanished since refuses the publish.
     pub replaces: bool,
@@ -536,8 +537,8 @@ pub(crate) fn fetch_pack(git: &PackGit, req: PackSource<'_>) -> Result<FetchedPa
 
     let root = pack_root(&checkout.path(), req.path)?;
     let pack = crate::playbooks::packs::deliverable(&root)?;
-    let scratch = crate::playbooks::packs::unpack_to_scratch(&pack.tarball)
-        .context("unpacking the playbook pack tarball")
+    let scratch = crate::playbooks::packs::materialize_tree(&pack.tree)
+        .context("writing the playbook pack to scratch")
         .map_err(RegisterError::Internal)?;
     Ok(FetchedPack {
         rev: checkout.rev,
@@ -749,11 +750,13 @@ pub async fn publish_draft(
     }
 
     let extracted = tokio::task::spawn_blocking(move || {
-        let read = crucible_contract::pack_tree::read_tar_gz(&req.tar_gz)
-            .map_err(|e| RegisterError::Invalid(e.to_string()))?;
-        let pack = Deliverable::new(read)?;
-        let scratch = crate::playbooks::packs::unpack_to_scratch(&pack.tarball)
-            .context("unpacking the draft pack")
+        let mut req = req;
+        let pack = Deliverable::new(ReadPack {
+            tree: std::mem::take(&mut req.tree),
+            ignored: Vec::new(),
+        })?;
+        let scratch = crate::playbooks::packs::materialize_tree(&pack.tree)
+            .context("writing the draft pack to scratch")
             .map_err(RegisterError::Internal)?;
         let extracted = extract(scratch.path())?;
         Ok::<_, RegisterError>((req, pack, extracted))
@@ -1024,56 +1027,63 @@ pub async fn schema(pool: &PgPool, id: &str) -> Result<Option<serde_json::Value>
         .context("decoding a playbook schema")
 }
 
-/// Unpack a registered playbook's pack into a scratch tree. `None` when the id is unknown.
-pub async fn materialize(pool: &PgPool, id: &str) -> Result<Option<MaterializedPack>> {
-    let row = sqlx::query("SELECT tar_gz FROM playbooks WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
+/// A registered playbook's pack. `None` when the id is unknown.
+pub(crate) async fn pack(pool: &PgPool, id: &str) -> Result<Option<PackTree>> {
+    let row = sqlx::query(
+        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+         FROM playbooks WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("reading a playbook pack")?;
+    load_row(pool, row.as_ref())
         .await
-        .context("reading a playbook tarball")?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let tar_gz: Vec<u8> = row.try_get("tar_gz")?;
-    crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-        .with_context(|| format!("unpacking the stored pack for playbook {id}"))
+        .with_context(|| format!("reading the stored pack for playbook {id}"))
+}
+
+/// The pack a `playbooks` row names, `None` when there is no row.
+async fn load_row(pool: &PgPool, row: Option<&sqlx::postgres::PgRow>) -> Result<Option<PackTree>> {
+    let Some(row) = row else { return Ok(None) };
+    let pack = PackRef::from_row(row)?.context("the row holds no pack")?;
+    crate::playbooks::pack_trees::load(pool, pack)
+        .await
         .map(Some)
 }
 
-/// Unpack only when the registry still serves the revision the caller inspected.
-pub(crate) async fn materialize_at_rev(
+/// A registered playbook's pack, only when the registry still serves the revision the caller
+/// inspected.
+pub(crate) async fn pack_at_rev(
     pool: &PgPool,
     id: &str,
     rev: &str,
     tar_digest: Option<&str>,
-) -> Result<Option<MaterializedPack>> {
+) -> Result<Option<PackTree>> {
     let row = sqlx::query(
-        "SELECT tar_gz FROM playbooks WHERE id = $1 AND rev = $2 \
-         AND ($3::text IS NULL OR tar_digest = $3)",
+        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+         FROM playbooks WHERE id = $1 AND rev = $2 AND ($3::text IS NULL OR tar_digest = $3)",
     )
     .bind(id)
     .bind(rev)
     .bind(tar_digest)
     .fetch_optional(pool)
     .await
-    .context("reading a playbook tarball at an expected revision")?;
-    let Some(row) = row else { return Ok(None) };
-    let tar_gz: Vec<u8> = row.try_get("tar_gz")?;
-    crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-        .with_context(|| format!("unpacking the stored pack for playbook {id} at {rev}"))
-        .map(Some)
+    .context("reading a playbook pack at an expected revision")?;
+    load_row(pool, row.as_ref())
+        .await
+        .with_context(|| format!("reading the stored pack for playbook {id} at {rev}"))
 }
 
-/// Read every UTF-8 file in a registered pack at its pinned revision. The same bounded pack bytes
-/// that launches and template drafts consume back this inspector view.
+/// Read every UTF-8 file in a registered pack at its pinned revision. The same pack that
+/// launches and template drafts consume backs this inspector view.
 pub async fn files(
     pool: &PgPool,
     id: &str,
 ) -> Result<Option<std::collections::BTreeMap<String, String>>> {
-    let Some(pack) = materialize(pool, id).await? else {
+    let Some(tree) = pack(pool, id).await? else {
         return Ok(None);
     };
-    crate::playbooks::packs::read_tree(pack.path())
+    crate::playbooks::packs::text_files(tree)
         .map(Some)
         .map_err(anyhow::Error::new)
 }
@@ -1107,18 +1117,20 @@ pub(crate) async fn copy_pack_to<'e>(
 /// a pin bump must not leave a registered playbook with no form to render.
 pub async fn rederive_stale(pool: &PgPool) -> Result<usize> {
     let core_rev = core_rev()?;
-    let rows = sqlx::query("SELECT id, tar_gz FROM playbooks WHERE core_rev <> $1 ORDER BY id")
-        .bind(&core_rev)
-        .fetch_all(pool)
-        .await
-        .context("listing playbooks registered against an older engine revision")?;
+    let ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM playbooks WHERE core_rev <> $1 ORDER BY id")
+            .bind(&core_rev)
+            .fetch_all(pool)
+            .await
+            .context("listing playbooks registered against an older engine revision")?;
     let mut updated = 0usize;
-    for row in rows {
-        let id: String = row.try_get("id")?;
-        let tar_gz: Vec<u8> = row.try_get("tar_gz")?;
+    for id in ids {
+        let tree = pack(pool, &id).await;
         let extracted = tokio::task::spawn_blocking(move || {
-            let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-                .context("unpacking a stored playbook pack")
+            let tree = tree
+                .and_then(|tree| tree.context("the playbook was deleted"))
+                .map_err(RegisterError::Internal)?;
+            let pack = crate::playbooks::packs::materialize_tree(&tree)
                 .map_err(RegisterError::Internal)?;
             let (schema, digest) = extract_params_schema(pack.path())?;
             let exposure =
@@ -1655,22 +1667,24 @@ mod tests {
         }
     }
 
-    /// The tarball of a playbook pack whose workflow is [`WORKFLOW_TOPIC`], as a draft stores it.
-    fn draft_tar_gz(dir: &Path) -> Vec<u8> {
+    /// A playbook pack whose workflow is [`WORKFLOW_TOPIC`], as a draft stores it.
+    fn draft_tree(dir: &Path) -> PackTree {
         std::fs::create_dir_all(dir).expect("mkdir");
         std::fs::write(dir.join("crucible.toml"), PLAYBOOK_REPO_MANIFEST).expect("manifest");
         std::fs::write(dir.join("workflow.star"), WORKFLOW_TOPIC).expect("source");
-        crate::playbooks::packs::tar_pack_tree(dir).expect("tar")
+        crucible_contract::pack_tree::walk_dir(dir)
+            .expect("walk")
+            .tree
     }
 
-    fn publication(id: &str, tar_gz: Vec<u8>, replaces: bool) -> PublishDraft {
+    fn publication(id: &str, tree: PackTree, replaces: bool) -> PublishDraft {
         PublishDraft {
             id: id.to_string(),
             owner: crate::authz::model::Principal::platform(),
             description: "a published draft".to_string(),
             draft: "studio".to_string(),
             version: 3,
-            tar_gz,
+            tree,
             replaces,
             accept_exposure_digest: None,
         }
@@ -1683,14 +1697,11 @@ mod tests {
     async fn a_published_draft_pins_its_bytes_and_hands_the_row_back_to_git(pool: PgPool) {
         let _g = crate::ENV_LOCK.lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
-        let tar_gz = draft_tar_gz(&dir.path().join("draft"));
+        let tree = draft_tree(&dir.path().join("draft"));
 
-        let published = publish_draft(&pool, publication("survey", tar_gz.clone(), false), None)
+        let published = publish_draft(&pool, publication("survey", tree.clone(), false), None)
             .await
             .expect("publish");
-        let tree = crucible_contract::pack_tree::read_tar_gz(&tar_gz)
-            .expect("read")
-            .tree;
         let tarball = tree.tarball().expect("tarball");
         assert_eq!(published.rev, content_digest(&tarball));
         assert_eq!(published.rev, published.tar_digest);
@@ -1720,16 +1731,16 @@ mod tests {
         assert_eq!(row.source.repo(), None);
         assert_eq!(row.source.launch_repo(), DRAFT_LAUNCH_REPO);
 
-        match publish_draft(&pool, publication("survey", tar_gz.clone(), false), None).await {
+        match publish_draft(&pool, publication("survey", tree.clone(), false), None).await {
             Err(RegisterError::Conflict(msg)) => assert!(msg.contains("registered"), "{msg}"),
             other => panic!("a row that appeared since authorization refuses: {other:?}"),
         }
-        match publish_draft(&pool, publication("fresh", tar_gz.clone(), true), None).await {
+        match publish_draft(&pool, publication("fresh", tree.clone(), true), None).await {
             Err(RegisterError::Conflict(msg)) => assert!(msg.contains("deleted"), "{msg}"),
             other => panic!("a row that vanished since authorization refuses: {other:?}"),
         }
         assert!(get(&pool, "fresh").await.expect("get").is_none());
-        publish_draft(&pool, publication("survey", tar_gz, true), None)
+        publish_draft(&pool, publication("survey", tree, true), None)
             .await
             .expect("a re-pin the caller was authorized for lands");
 
@@ -1766,24 +1777,17 @@ mod tests {
         assert!(neither.is_err(), "a row carries one source, never none");
     }
 
-    /// A draft is published with the same checks a git pin gets: a source the engine refuses and
-    /// bytes that are not a pack store nothing.
+    /// A draft is published with the same checks a git pin gets: a source the engine refuses
+    /// stores nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_draft_that_does_not_compile_or_is_not_a_pack_publishes_nothing(pool: PgPool) {
+    async fn a_draft_that_does_not_compile_publishes_nothing(pool: PgPool) {
         let dir = tempfile::tempdir().expect("tempdir");
-        match publish_draft(
-            &pool,
-            publication("broken", broken_pack_tar_gz(dir.path()), false),
-            None,
-        )
-        .await
-        {
+        let broken = crucible_contract::pack_tree::read_tar_gz(&broken_pack_tar_gz(dir.path()))
+            .expect("read")
+            .tree;
+        match publish_draft(&pool, publication("broken", broken, false), None).await {
             Err(RegisterError::Compile(_)) => {}
             other => panic!("expected a compile refusal, got {other:?}"),
-        }
-        match publish_draft(&pool, publication("garbage", vec![0; 64], false), None).await {
-            Err(RegisterError::Invalid(msg)) => assert!(msg.contains("pack archive"), "{msg}"),
-            other => panic!("expected a not-a-pack refusal, got {other:?}"),
         }
         assert!(list(&pool).await.expect("list").is_empty());
     }
@@ -1795,9 +1799,11 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let pack = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
         write_over_budget_blobs(&pack);
-        let tar_gz = crate::playbooks::packs::tar_pack_tree(&pack).expect("tar");
+        let tree = crucible_contract::pack_tree::walk_dir(&pack)
+            .expect("walk")
+            .tree;
 
-        match publish_draft(&pool, publication("heavy", tar_gz, false), None).await {
+        match publish_draft(&pool, publication("heavy", tree, false), None).await {
             Err(RegisterError::Invalid(msg)) => assert!(msg.contains("delivery budget"), "{msg}"),
             other => panic!("expected a delivery-budget refusal, got {other:?}"),
         }
@@ -1903,12 +1909,9 @@ mod tests {
             "re-registering identical content adds no tree"
         );
 
-        // The stored tarball is the pack the schema came from.
-        let pack = materialize(&pool, "survey")
-            .await
-            .expect("materialize")
-            .expect("row");
-        assert!(pack.path().join("workflow.star").is_file());
+        // The stored pack is the pack the schema came from.
+        let stored = pack(&pool, "survey").await.expect("read").expect("row");
+        assert_eq!(stored, expected);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

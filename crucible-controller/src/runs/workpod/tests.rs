@@ -874,7 +874,8 @@ fn parse_scope_report_logs_tolerates_a_missing_or_garbled_transcript() {
 }
 
 /// A gzip'd tar of a tiny pack tree, built with the same crates the engine emits with — the
-/// blob the pack-marker tests and the unpack tests share.
+/// blob the pack-marker tests share.
+#[cfg(feature = "autoresearch")]
 fn sample_pack_tgz() -> Vec<u8> {
     use std::io::Write as _;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -924,74 +925,6 @@ fn parse_scope_pack_logs_distinguishes_absent_error_and_garbled() {
     let (blob, err) = parse_scope_pack_logs(&logs);
     assert!(blob.is_none());
     assert!(err.is_some(), "a garbled payload names itself");
-}
-
-#[test]
-fn unpack_pack_tgz_lands_the_tree_and_replaces_a_stale_dir() {
-    let tgz = sample_pack_tgz();
-    let dest = tempfile::tempdir().expect("tempdir");
-    let out = dest.path().join("pack");
-    // A stale pack from a prior scope must not survive the unpack.
-    std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("stale.md"), "old pack leftovers").unwrap();
-
-    crate::playbooks::packs::unpack_pack_tgz(&tgz, &out).expect("unpacks");
-    assert_eq!(
-        std::fs::read_to_string(out.join("crucible.toml")).expect("manifest landed"),
-        "[repo]\nurl = \"x\"\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(out.join("prompts/goal.md")).expect("nested file landed"),
-        "fix the thing\n"
-    );
-    assert!(
-        !out.join("stale.md").exists(),
-        "the stale pack dir was replaced, not merged into"
-    );
-}
-
-/// Traversal entries reject the WHOLE pack — the blob came from an agent-authored pod, and a
-/// pack that half-unpacked outside the dir must never be trusted.
-#[test]
-fn unpack_pack_tgz_rejects_traversal_entries() {
-    use std::io::Write as _;
-    // `tar::Builder::append_data` itself refuses `..` paths, so a hostile archive has to be
-    // crafted at the raw-header level — exactly what a malicious pod could emit.
-    let evil_tgz = |path: &str| -> Vec<u8> {
-        let mut header = tar::Header::new_gnu();
-        let name = &mut header.as_gnu_mut().expect("gnu header").name;
-        name[..path.len()].copy_from_slice(path.as_bytes());
-        header.set_size(4);
-        header.set_mode(0o644);
-        header.set_cksum();
-        let mut builder = tar::Builder::new(Vec::new());
-        builder
-            .append(&header, "evil".as_bytes())
-            .expect("append evil entry");
-        let tar_bytes = builder.into_inner().unwrap();
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(&tar_bytes).unwrap();
-        enc.finish().unwrap()
-    };
-
-    let dest = tempfile::tempdir().expect("tempdir");
-    let out = dest.path().join("pack");
-    for path in [
-        "../escaped.md",
-        "nested/../../escaped.md",
-        "/tmp/escaped.md",
-    ] {
-        let err = crate::playbooks::packs::unpack_pack_tgz(&evil_tgz(path), &out)
-            .expect_err("traversal must reject");
-        assert!(
-            format!("{err:#}").contains("escapes"),
-            "the rejection names the escape for {path}: {err:#}"
-        );
-        assert!(
-            !dest.path().join("escaped.md").exists(),
-            "nothing landed outside the pack dir for {path}"
-        );
-    }
 }
 
 #[test]

@@ -1,16 +1,15 @@
-//! Pack storage over Postgres: the durable form of a frozen scope pack is the gzipped tarball in
-//! `pack_tarballs` (keyed by the sanitized issue key) and the stored tree it encodes, and human
-//! steering lives beside it as
-//! `pack_steering` rows. Readers that need a working tree — the engine's PR push, `crucible
-//! deploy render`, `[build]` planning — call [`materialize_pack`], which unpacks the tarball into
-//! a scratch [`tempfile::TempDir`] and injects the steering rows onto `STEER.md`, in the exact
-//! marker-wrapped shape `crucible/src/control.rs::append_steer` writes. Readers that need one
-//! file (`SCOPE.md`) scan the tarball in memory via [`read_pack_file`].
+//! Pack storage over Postgres: a frozen scope pack is the stored tree its `pack_tarballs` row
+//! (keyed by the sanitized issue key) names, beside the gzipped tarball older controllers read,
+//! and human steering lives beside it as `pack_steering` rows. Readers that need a working tree
+//! (the engine's PR push, `crucible deploy render`, `[build]` planning) call [`materialize_pack`],
+//! which writes the tree into a scratch [`tempfile::TempDir`] and appends the steering rows onto
+//! `STEER.md`, in the exact marker-wrapped shape `crucible/src/control.rs::append_steer` writes.
+//! Readers that need one file (`SCOPE.md`) read it alone via [`read_pack_file`].
 
 #![allow(clippy::disallowed_macros)]
 
 use crate::runs::blob_store::StoredPack;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{
     OverBudget, PackTree, ReadPack, TreeError, check_delivery_budget, walk_dir,
 };
@@ -18,7 +17,7 @@ use sqlx::PgPool;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// A pack tree unpacked to scratch. The tempdir guard lives inside, so the tree exists exactly as
+/// A pack tree written to scratch. The tempdir guard lives inside, so the tree exists exactly as
 /// long as this value — keep it alive for the duration of any subprocess reading [`Self::path`].
 pub struct MaterializedPack {
     _guard: tempfile::TempDir,
@@ -153,31 +152,50 @@ pub async fn store_pack_tree(pool: &PgPool, key: &str, dir: &Path) -> Result<Sto
     store_pack(pool, key, &pack).await
 }
 
-/// Unpack a stored tarball into a scratch tree, through the same traversal rejection every
-/// materialization runs. The tempdir guard rides the returned value.
-pub(crate) fn unpack_to_scratch(tar_gz: &[u8]) -> Result<MaterializedPack> {
+/// Write `tree` into `dir` (created if missing), every file with mode 0755 as the pod's pack mount
+/// gives it.
+pub(crate) fn write_tree(tree: &PackTree, dir: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    for (path, bytes) in tree.files() {
+        let dest = dir.join(path.as_str());
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        std::fs::write(&dest, bytes).with_context(|| format!("writing {path}"))?;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("setting the mode of {path}"))?;
+    }
+    Ok(())
+}
+
+/// Write `tree` into a scratch directory. The tempdir guard rides the returned value.
+pub(crate) fn materialize_tree(tree: &PackTree) -> Result<MaterializedPack> {
     let guard = tempfile::tempdir().context("pack materialization scratch dir")?;
     let root = guard.path().join("pack");
-    unpack_pack_tgz(tar_gz, &root)?;
+    write_tree(tree, &root)?;
     Ok(MaterializedPack {
         _guard: guard,
         root,
     })
 }
 
-/// Unpack `key`'s stored tarball into a scratch tree and append its steering rows onto `STEER.md`
-/// (ordered by seq, each stamped with the row's own recorded time — so the same tarball and rows
+/// Write `key`'s stored pack into a scratch tree and append its steering rows onto `STEER.md`
+/// (ordered by seq, each stamped with the row's own recorded time, so the same pack and rows
 /// always materialize to the same bytes). `None` when no pack was ever stored.
 pub(crate) async fn materialize_pack(pool: &PgPool, key: &str) -> Result<Option<MaterializedPack>> {
     let slug = crate::model::sanitize_key(key);
-    let Some(tar_gz) = crate::runs::blob_store::get_pack_tarball(pool, &slug).await? else {
+    let Some(tree) = crate::runs::blob_store::get_pack(pool, &slug).await? else {
         return Ok(None);
     };
     let MaterializedPack {
         _guard: guard,
         root,
-    } = unpack_to_scratch(&tar_gz)
-        .with_context(|| format!("unpacking the stored pack for {key}"))?;
+    } = tokio::task::spawn_blocking(move || materialize_tree(&tree))
+        .await
+        .context("joining the pack materialization worker")?
+        .with_context(|| format!("writing the stored pack for {key}"))?;
     let steering = crate::runs::blob_store::list_steering(pool, &slug).await?;
     if !steering.is_empty() {
         use std::io::Write as _;
@@ -226,29 +244,36 @@ pub(crate) async fn materialize_pack_or_empty(
     })
 }
 
-/// Read one file (by pack-relative path) straight out of `key`'s stored tarball, no disk touch.
-/// `None` when no pack is stored or the file isn't in it.
+/// Read one file (by pack-relative path) of `key`'s stored pack. `None` when no pack is stored or
+/// the file isn't in it.
 #[cfg(feature = "autoresearch")]
 pub(crate) async fn read_pack_file(pool: &PgPool, key: &str, name: &str) -> Result<Option<String>> {
-    use std::io::Read as _;
+    use crate::playbooks::pack_trees::PackRef;
     let slug = crate::model::sanitize_key(key);
-    let Some(tar_gz) = crate::runs::blob_store::get_pack_tarball(pool, &slug).await? else {
-        return Ok(None);
-    };
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tar_gz.as_slice()));
-    for entry in archive.entries().context("reading the pack tar")? {
-        let mut entry = entry.context("reading a pack tar entry")?;
-        let path = entry.path().context("decoding a pack tar entry path")?;
-        let rel = path.strip_prefix(".").unwrap_or(&path);
-        if rel == Path::new(name) {
-            let mut s = String::new();
-            entry
-                .read_to_string(&mut s)
-                .with_context(|| format!("reading {name} from the stored pack for {key}"))?;
-            return Ok(Some(s));
+    let row = sqlx::query(
+        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+         FROM pack_tarballs WHERE issue_slug = $1",
+    )
+    .bind(&slug)
+    .fetch_optional(pool)
+    .await
+    .context("reading a stored pack")?;
+    let bytes = match row.as_ref().map(PackRef::from_row).transpose()?.flatten() {
+        None => return Ok(None),
+        Some(PackRef::Tree(digest)) => {
+            crate::playbooks::pack_trees::read_file(pool, &digest, name).await?
         }
-    }
-    Ok(None)
+        Some(legacy) => {
+            let tree = crate::playbooks::pack_trees::load(pool, legacy).await?;
+            name.parse::<crucible_contract::pack_tree::PackFilePath>()
+                .ok()
+                .and_then(|path| tree.into_files().remove(&path))
+        }
+    };
+    bytes
+        .map(String::from_utf8)
+        .transpose()
+        .with_context(|| format!("{name} in the stored pack for {key} is not text"))
 }
 
 /// Why a pack tree could not be read back as text files.
@@ -260,14 +285,8 @@ pub enum ReadTreeError {
     NotAPack(#[from] TreeError),
 }
 
-/// Read a pack tree back as a `{path: content}` map. A non-UTF-8 file is refused rather than
-/// dropped: an editor that round-trips the whole map on every save would delete a file it
-/// cannot show.
-pub(crate) fn read_tree(root: &Path) -> Result<BTreeMap<String, String>, ReadTreeError> {
-    text_files(walk_dir(root)?.tree)
-}
-
-/// `tree` as a `{path: content}` map, refusing a file that is not UTF-8.
+/// `tree` as a `{path: content}` map. A non-UTF-8 file is refused rather than dropped: an editor
+/// that round-trips the whole map on every save would delete a file it cannot show.
 pub(crate) fn text_files(tree: PackTree) -> Result<BTreeMap<String, String>, ReadTreeError> {
     tree.into_files()
         .into_iter()
@@ -278,45 +297,6 @@ pub(crate) fn text_files(tree: PackTree) -> Result<BTreeMap<String, String>, Rea
                 .map_err(|_| ReadTreeError::NotText(path))
         })
         .collect()
-}
-
-/// Unpack a scope pack blob (gzip'd tar) into `dest`, replacing whatever was there — a stale pack
-/// from a prior scope must never mix with the incoming one. Every entry path is validated before
-/// it touches the filesystem: absolute paths and `..` components reject the whole pack (defense in
-/// depth on top of tar's own `unpack_in` guard) — the blob came out of an agent-authored pod.
-pub(crate) fn unpack_pack_tgz(tgz: &[u8], dest: &Path) -> Result<()> {
-    if dest.exists() {
-        std::fs::remove_dir_all(dest)
-            .with_context(|| format!("clearing the stale pack dir {}", dest.display()))?;
-    }
-    std::fs::create_dir_all(dest)
-        .with_context(|| format!("creating the pack dir {}", dest.display()))?;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
-    for entry in archive.entries().context("reading the pack tar")? {
-        let mut entry = entry.context("reading a pack tar entry")?;
-        let path = entry.path().context("decoding a pack tar entry path")?;
-        let escapes = path.is_absolute()
-            || path.components().any(|c| {
-                !matches!(
-                    c,
-                    std::path::Component::Normal(_) | std::path::Component::CurDir
-                )
-            });
-        if escapes {
-            bail!(
-                "pack tar entry {:?} escapes the pack dir; rejecting the whole pack",
-                path
-            );
-        }
-        let path = path.into_owned();
-        if !entry
-            .unpack_in(dest)
-            .with_context(|| format!("unpacking pack tar entry {path:?}"))?
-        {
-            bail!("pack tar entry {path:?} was refused by the unpacker; rejecting the whole pack");
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -494,7 +474,7 @@ mod tests {
             .expect_err("traversal refused");
         assert!(format!("{err:#}").contains("escapes"), "{err:#}");
         assert!(
-            crate::runs::blob_store::get_pack_tarball(&pool, "owner_repo_7")
+            crate::runs::blob_store::get_pack(&pool, "owner_repo_7")
                 .await
                 .expect("get")
                 .is_none(),
@@ -639,20 +619,34 @@ mod tests {
     }
 
     #[test]
-    fn read_tree_reads_what_the_digest_covers() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("state")).expect("mkdir");
-        std::fs::write(dir.path().join("crucible.toml"), "m").expect("write");
-        std::fs::write(dir.path().join("state/s"), "s").expect("write");
+    fn text_files_refuses_a_file_that_is_not_text() {
+        let text = PackTree::from_pairs(&[("crucible.toml", b"m")]).expect("tree");
         assert_eq!(
-            read_tree(dir.path()).expect("read"),
+            text_files(text).expect("text"),
             BTreeMap::from([("crucible.toml".to_string(), "m".to_string())])
         );
-
-        std::os::unix::fs::symlink("crucible.toml", dir.path().join("link")).expect("symlink");
+        let binary = PackTree::from_pairs(&[("blob", &[0xff, 0xfe])]).expect("tree");
         assert!(matches!(
-            read_tree(dir.path()),
-            Err(ReadTreeError::NotAPack(TreeError::Symlink { .. }))
+            text_files(binary),
+            Err(ReadTreeError::NotText(path)) if path == "blob"
         ));
+    }
+
+    /// A written tree holds exactly the tree's files, each mode 0755 as the pod's pack mount
+    /// gives it.
+    #[test]
+    fn a_written_tree_walks_back_to_itself_with_every_file_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = PackTree::from_pairs(&[("role.sh", b"#!/bin/sh\n"), ("inbox/a.md", b"a")])
+            .expect("tree");
+        let pack = materialize_tree(&tree).expect("materialize");
+        assert_eq!(walk_dir(pack.path()).expect("walk").tree, tree);
+        for f in ["role.sh", "inbox/a.md"] {
+            let mode = std::fs::metadata(pack.path().join(f))
+                .expect("stat")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o755, "{f}");
+        }
     }
 }

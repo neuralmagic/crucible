@@ -4542,7 +4542,7 @@ async fn pod_scope_survival_without_a_pack_blob_fails_loudly(pool: PgPool) -> Re
         "no pack, no `scoped` — the row stays put for a retry"
     );
     assert!(
-        crate::runs::blob_store::get_pack_tarball(db.pool(), "owner_repo_71")
+        crate::runs::blob_store::get_pack(db.pool(), "owner_repo_71")
             .await?
             .is_none(),
         "nothing pretended to be a pack in the store"

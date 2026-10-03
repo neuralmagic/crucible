@@ -6594,10 +6594,11 @@ async fn a_skeleton_draft_has_no_origin_to_rebase_onto(pool: PgPool) -> Result<(
     Ok(())
 }
 
-/// Any save downloads as the bytes it stored, named for the version it is.
+/// Any save downloads as its tree's tarball, named for the version it is, with the digest the
+/// version records.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn any_draft_version_downloads_as_a_tarball(pool: PgPool) -> Result<()> {
-    let (db, _d) = db_with(pool);
+async fn any_draft_version_downloads_as_its_tree(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
     let app = app_with_admins(db, vec!["wren".to_string()]);
     let (status, created) = {
         post_admin(
@@ -6632,15 +6633,28 @@ async fn any_draft_version_downloads_as_a_tarball(pool: PgPool) -> Result<()> {
             .and_then(|v| v.to_str().ok()),
         Some("attachment; filename=\"studio-v1.tar.gz\"")
     );
+    let digest = res
+        .headers()
+        .get("x-pack-digest")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .expect("body");
-    let pack =
-        crate::playbooks::packs::unpack_to_scratch(&bytes).expect("the download is a pack tarball");
+    let tree = crucible_contract::pack_tree::read_tar_gz(&bytes)
+        .expect("the download is a pack tarball")
+        .tree;
     assert!(
-        pack.path().join("crucible.toml").is_file(),
+        tree.files().keys().any(|p| p.as_str() == "crucible.toml"),
         "the download unpacks to the save's own files"
     );
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = 'studio' AND version = 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(digest, Some(tree.digest().to_string()));
+    assert_eq!(recorded, digest, "the download is the version's tree");
 
     let (status, _) = get_json_object(&app, "/api/playbook-drafts/studio/tarball?version=9").await;
     assert_eq!(status, StatusCode::NOT_FOUND);

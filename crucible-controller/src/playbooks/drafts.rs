@@ -10,7 +10,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use crate::playbooks::packs::MaterializedPack;
+use crate::playbooks::pack_trees::PackRef;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
 use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
 use anyhow::{Context, Result};
@@ -33,12 +33,12 @@ pub(crate) const MAX_DRAFT_FILE_BYTES: usize = 512 * 1024;
 pub(crate) const MAX_DRAFT_SAVE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The manifest a draft starts from when no template seeds it.
-const SKELETON_MANIFEST: &str =
+pub(crate) const SKELETON_MANIFEST: &str =
     "[agent]\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n";
 
 /// The workflow a draft starts from: the smallest graph that compiles, so the studio opens on a
 /// green preview rather than on a diagnostic.
-const SKELETON_WORKFLOW: &str = concat!(
+pub(crate) const SKELETON_WORKFLOW: &str = concat!(
     "params = {}\n",
     "\n",
     "hello = command(name = \"hello\", run = \"echo hello\")\n",
@@ -573,7 +573,7 @@ pub async fn create(
                     registered.rev
                 )));
             }
-            let pack = crate::playbooks::registry::materialize_at_rev(
+            let tree = crate::playbooks::registry::pack_at_rev(
                 pool,
                 template,
                 &registered.rev,
@@ -587,7 +587,7 @@ pub async fn create(
                 ))
             })?;
             (
-                crate::playbooks::packs::read_tree(pack.path())?,
+                crate::playbooks::packs::text_files(tree)?,
                 SeededOrigin {
                     playbook: Some(registered.id),
                     import_id: None,
@@ -973,7 +973,7 @@ pub async fn files(
     id: &str,
     version: Option<i64>,
 ) -> Result<Option<DraftFiles>, DraftError> {
-    let Some((head, pack)) = materialize(pool, id, version)
+    let Some((head, tree)) = version_pack(pool, id, version)
         .await
         .map_err(DraftError::Internal)?
     else {
@@ -984,7 +984,7 @@ pub async fn files(
         saved_by: head.saved_by,
         saved_at: head.saved_at,
         diagnostics: head.diagnostics,
-        files: crate::playbooks::packs::read_tree(pack.path())?,
+        files: crate::playbooks::packs::text_files(tree)?,
     }))
 }
 
@@ -995,17 +995,20 @@ pub async fn exposure_of(
     id: &str,
     version: i64,
 ) -> Result<Option<crate::playbooks::exposure::Extraction>, DraftError> {
-    let Some((_, pack)) = materialize(pool, id, Some(version))
+    let Some((_, tree)) = version_pack(pool, id, Some(version))
         .await
         .map_err(DraftError::Internal)?
     else {
         return Ok(None);
     };
-    let extraction =
-        tokio::task::spawn_blocking(move || crate::playbooks::exposure::extract(pack.path(), None))
-            .await
-            .context("joining the draft exposure worker")
-            .map_err(DraftError::Internal)?;
+    let extraction = tokio::task::spawn_blocking(move || {
+        let pack = crate::playbooks::packs::materialize_tree(&tree)
+            .map_err(crate::playbooks::exposure::ExtractError::Internal)?;
+        crate::playbooks::exposure::extract(pack.path(), None)
+    })
+    .await
+    .context("joining the draft exposure worker")
+    .map_err(DraftError::Internal)?;
     match extraction {
         Ok(exposure) => Ok(Some(crate::playbooks::exposure::Extraction::Declared(
             exposure,
@@ -1030,51 +1033,46 @@ pub struct DraftFiles {
     pub files: BTreeMap<String, String>,
 }
 
-/// Who saved a materialized version, and when.
-struct MaterializedHead {
+/// Who saved a stored version, and when.
+struct VersionHead {
     version: i64,
     saved_by: Option<String>,
     saved_at: String,
     diagnostics: Vec<Diagnostic>,
 }
 
-/// Unpack a stored version into a scratch tree.
-async fn materialize(
+/// A stored version's pack, the newest when `version` is `None`.
+async fn version_pack(
     pool: &PgPool,
     id: &str,
     version: Option<i64>,
-) -> Result<Option<(MaterializedHead, MaterializedPack)>> {
-    let row = match version {
-        Some(v) => sqlx::query(
-            "SELECT version, created_by, created_at, diagnostics, tar_gz \
-             FROM playbook_draft_versions WHERE draft_id = $1 AND version = $2",
-        )
-        .bind(id)
-        .bind(v),
-        None => sqlx::query(
-            "SELECT version, created_by, created_at, diagnostics, tar_gz \
-             FROM playbook_draft_versions WHERE draft_id = $1 ORDER BY version DESC LIMIT 1",
-        )
-        .bind(id),
-    }
+) -> Result<Option<(VersionHead, PackTree)>> {
+    let row = sqlx::query(
+        "SELECT version, created_by, created_at, diagnostics, tree_digest,
+                CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+         FROM playbook_draft_versions WHERE draft_id = $1 AND ($2::BIGINT IS NULL OR version = $2)
+         ORDER BY version DESC LIMIT 1",
+    )
+    .bind(id)
+    .bind(version)
     .fetch_optional(pool)
     .await
-    .context("reading a draft tarball")?;
+    .context("reading a draft version")?;
     let Some(row) = row else {
         return Ok(None);
     };
     let version: i64 = row.try_get("version")?;
     let diagnostics: serde_json::Value = row.try_get("diagnostics")?;
-    let head = MaterializedHead {
+    let head = VersionHead {
         version,
         saved_by: row.try_get("created_by")?,
         saved_at: row.try_get("created_at")?,
         diagnostics: serde_json::from_value(diagnostics)
             .context("decoding stored draft diagnostics")?,
     };
-    let tar_gz: Vec<u8> = row.try_get("tar_gz")?;
-    let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-        .with_context(|| format!("unpacking draft {id} version {version}"))?;
+    let pack = load_version(pool, &row)
+        .await
+        .with_context(|| format!("reading draft {id} version {version}"))?;
     Ok(Some((head, pack)))
 }
 
@@ -1105,7 +1103,7 @@ pub async fn origin_files(pool: &PgPool, id: &str) -> Result<Option<OriginFiles>
             let playbook = origin.playbook.ok_or_else(|| {
                 DraftError::Internal(anyhow::anyhow!("origin without a playbook"))
             })?;
-            let pack = crate::playbooks::registry::materialize(pool, &playbook)
+            let tree = crate::playbooks::registry::pack(pool, &playbook)
                 .await
                 .map_err(DraftError::Internal)?
                 .ok_or_else(|| {
@@ -1117,64 +1115,48 @@ pub async fn origin_files(pool: &PgPool, id: &str) -> Result<Option<OriginFiles>
                 kind: OriginKind::Playbook,
                 reference: playbook,
                 rev: origin.current_rev,
-                files: crate::playbooks::packs::read_tree(pack.path())?,
+                files: crate::playbooks::packs::text_files(tree)?,
             }))
         }
         OriginKind::Import => {
             let import = origin.import_id.ok_or_else(|| {
                 DraftError::Internal(anyhow::anyhow!("origin without an import id"))
             })?;
-            let tar_gz: Option<Vec<u8>> =
-                sqlx::query_scalar("SELECT tar_gz FROM pack_imports WHERE id = $1")
-                    .bind(&import)
-                    .fetch_optional(pool)
-                    .await
-                    .context("reading the import tarball a draft came from")
-                    .map_err(DraftError::Internal)?;
-            let tar_gz = tar_gz.ok_or_else(|| {
-                DraftError::NotFound(format!(
-                    "draft {id} came from import {import}, which no longer exists"
-                ))
-            })?;
-            let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-                .context("unpacking the import a draft came from")
-                .map_err(DraftError::Internal)?;
+            let tree = crate::playbooks::imports::pack(pool, &import)
+                .await
+                .context("reading the import a draft came from")
+                .map_err(DraftError::Internal)?
+                .ok_or_else(|| {
+                    DraftError::NotFound(format!(
+                        "draft {id} came from import {import}, which no longer exists"
+                    ))
+                })?;
             Ok(Some(OriginFiles {
                 kind: OriginKind::Import,
                 reference: import,
                 rev: origin.rev,
-                files: crate::playbooks::packs::read_tree(pack.path())?,
+                files: crate::playbooks::packs::text_files(tree)?,
             }))
         }
     }
 }
 
-/// One stored version's tarball, exactly the bytes the save stored. `None` when the draft or the
+/// One stored version's pack, the newest when `version` is `None`. `None` when the draft or the
 /// version is unknown.
-pub async fn tarball(
+pub async fn version_tree(
     pool: &PgPool,
     id: &str,
     version: Option<i64>,
-) -> Result<Option<(i64, Vec<u8>)>> {
-    let row = match version {
-        Some(v) => sqlx::query(
-            "SELECT version, tar_gz FROM playbook_draft_versions WHERE draft_id = $1 AND version = $2",
-        )
-        .bind(id)
-        .bind(v),
-        None => sqlx::query(
-            "SELECT version, tar_gz FROM playbook_draft_versions WHERE draft_id = $1 \
-             ORDER BY version DESC LIMIT 1",
-        )
-        .bind(id),
-    }
-    .fetch_optional(pool)
-    .await
-    .context("reading a draft tarball for download")?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    Ok(Some((row.try_get("version")?, row.try_get("tar_gz")?)))
+) -> Result<Option<(i64, PackTree)>> {
+    Ok(version_pack(pool, id, version)
+        .await?
+        .map(|(head, tree)| (head.version, tree)))
+}
+
+/// The pack a `playbook_draft_versions` row names.
+async fn load_version(pool: &PgPool, row: &sqlx::postgres::PgRow) -> Result<PackTree> {
+    let pack = PackRef::from_row(row)?.context("the version holds no pack")?;
+    crate::playbooks::pack_trees::load(pool, pack).await
 }
 
 /// Drop a draft and every version it holds.
@@ -1213,10 +1195,11 @@ pub(crate) async fn copy_draft_pack_to<'e>(
     Ok(res.rows_affected() > 0)
 }
 
-/// The newest version of draft `id` that compiled, with its tarball.
-pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, Vec<u8>), DraftError> {
+/// The newest version of draft `id` that compiled, with its pack.
+pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, PackTree), DraftError> {
     let row = sqlx::query(
-        r#"SELECT version, tar_gz FROM playbook_draft_versions
+        r#"SELECT version, tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+           FROM playbook_draft_versions
            WHERE draft_id = $1 AND schema_digest IS NOT NULL ORDER BY version DESC LIMIT 1"#,
     )
     .bind(id)
@@ -1232,10 +1215,11 @@ pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, Vec<u8>),
     let version: i64 = row
         .try_get("version")
         .map_err(|e| DraftError::Internal(e.into()))?;
-    let tar_gz: Vec<u8> = row
-        .try_get("tar_gz")
-        .map_err(|e| DraftError::Internal(e.into()))?;
-    Ok((version, tar_gz))
+    let tree = load_version(pool, &row)
+        .await
+        .with_context(|| format!("reading draft {id} version {version}"))
+        .map_err(DraftError::Internal)?;
+    Ok((version, tree))
 }
 
 /// The playbook a publish of `draft` writes: the one asked for, else the one it last published
@@ -1294,7 +1278,7 @@ pub async fn graduate(
         return Err(DraftError::Invalid(format!("repo {repo:?} is not a repo")));
     }
 
-    let (version, tar_gz) = newest_compiling(pool, id).await?;
+    let (version, tree) = newest_compiling(pool, id).await?;
 
     let title = format!("[pack] {id}");
     let body = format!(
@@ -1305,9 +1289,6 @@ pub async fn graduate(
     let (branch_repo, branch_path, branch_key) =
         (repo.to_string(), path.to_string(), format!("draft/{id}"));
     let pushed = tokio::task::spawn_blocking(move || {
-        let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-            .context("unpacking the draft for export")
-            .map_err(DraftError::Internal)?;
         let scratch = tempfile::tempdir()
             .context("draft export scratch dir")
             .map_err(DraftError::Internal)?;
@@ -1316,7 +1297,7 @@ pub async fn graduate(
         } else {
             scratch.path().join(&branch_path)
         };
-        copy_tree(pack.path(), &out).map_err(DraftError::Internal)?;
+        crate::playbooks::packs::write_tree(&tree, &out).map_err(DraftError::Internal)?;
         crate::runs::engine::open_draft_pr(
             &branch_repo,
             &branch_key,
@@ -1347,22 +1328,6 @@ pub async fn graduate(
     .context("storing the draft graduation")
     .map_err(DraftError::Internal)?;
     Ok(url)
-}
-
-/// Copy a tree of regular files, creating `to`.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
-    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
-        let entry = entry.context("reading a tree entry")?;
-        let target = to.join(entry.file_name());
-        if entry.path().is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)
-                .with_context(|| format!("copying {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2108,10 +2073,9 @@ mod tests {
         );
     }
 
-    /// A save's bytes come back as the bytes: the tarball a download serves is the one the version
-    /// stored, and it unpacks to that save's files.
+    /// Each version reads back as the tree its save stored, under the digest its row records.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn every_version_downloads_as_the_tarball_it_stored(pool: PgPool) {
+    async fn every_version_reads_back_as_the_tree_it_stored(pool: PgPool) {
         create(
             &pool,
             "studio",
@@ -2124,44 +2088,55 @@ mod tests {
         .expect("create");
         let mut second = skeleton();
         second.insert("skills/read/SKILL.md".to_string(), "read it\n".to_string());
-        save_version(&pool, "studio", second, None, Some(1))
+        save_version(&pool, "studio", second.clone(), None, Some(1))
             .await
             .expect("save");
+        let recorded = |version: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT tree_digest FROM playbook_draft_versions
+                     WHERE draft_id = 'studio' AND version = $1",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("tree column")
+            }
+        };
 
-        let (version, bytes) = tarball(&pool, "studio", None)
+        let (version, tree) = version_tree(&pool, "studio", None)
             .await
-            .expect("tarball")
+            .expect("read")
             .expect("a version");
         assert_eq!(version, 2);
-        let pack = crate::playbooks::packs::unpack_to_scratch(&bytes).expect("unpack");
-        let files = crate::playbooks::packs::read_tree(pack.path()).expect("read");
         assert_eq!(
-            files.get("skills/read/SKILL.md").map(String::as_str),
-            Some("read it\n")
+            crate::playbooks::packs::text_files(tree.clone()).expect("text"),
+            second
         );
+        assert_eq!(recorded(2).await, Some(tree.digest().to_string()));
 
-        let (version, first) = tarball(&pool, "studio", Some(1))
+        let (version, first) = version_tree(&pool, "studio", Some(1))
             .await
-            .expect("tarball")
+            .expect("read")
             .expect("a version");
         assert_eq!(version, 1);
-        let pack = crate::playbooks::packs::unpack_to_scratch(&first).expect("unpack");
-        assert!(
-            !crate::playbooks::packs::read_tree(pack.path())
-                .expect("read")
-                .contains_key("skills/read/SKILL.md"),
+        assert_eq!(
+            crate::playbooks::packs::text_files(first.clone()).expect("text"),
+            skeleton(),
             "version 1 is version 1"
         );
+        assert_eq!(recorded(1).await, Some(first.digest().to_string()));
         assert!(
-            tarball(&pool, "studio", Some(9))
+            version_tree(&pool, "studio", Some(9))
                 .await
-                .expect("tarball")
+                .expect("read")
                 .is_none()
         );
         assert!(
-            tarball(&pool, "nope", None)
+            version_tree(&pool, "nope", None)
                 .await
-                .expect("tarball")
+                .expect("read")
                 .is_none()
         );
     }

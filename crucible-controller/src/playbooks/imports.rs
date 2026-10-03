@@ -9,6 +9,7 @@
 //! seeds a draft from the frozen tarball, which is how a human edits what an agent proposed.
 
 use crate::playbooks::drafts::{DraftError, DraftSeed, SavedVersion};
+use crate::playbooks::pack_trees::PackRef;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
 use crate::playbooks::preview::PackPreview;
 use crate::playbooks::registry::{
@@ -17,7 +18,7 @@ use crate::playbooks::registry::{
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
-use crucible_contract::pack_tree::read_tar_gz;
+use crucible_contract::pack_tree::PackTree;
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 
@@ -311,12 +312,12 @@ pub async fn compile(
     id: &str,
     params: BTreeMap<String, String>,
 ) -> Result<PackPreview, ImportError> {
-    let tar_gz = tarball(pool, id)
+    let tree = pack(pool, id)
         .await?
         .ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
     let preview = tokio::task::spawn_blocking(move || {
-        let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-            .context("unpacking the frozen import tarball")
+        let pack = crate::playbooks::packs::materialize_tree(&tree)
+            .context("writing the frozen import to scratch")
             .map_err(RegisterError::Internal)?;
         crate::playbooks::preview::preview_pack(
             pack.path(),
@@ -329,15 +330,22 @@ pub async fn compile(
     Ok(preview?)
 }
 
-async fn tarball(pool: &PgPool, id: &str) -> Result<Option<Vec<u8>>> {
-    let row = sqlx::query("SELECT tar_gz FROM pack_imports WHERE id = $1")
-        .bind(id)
-        .fetch_optional(pool)
+/// The frozen pack of import `id`, `None` when there is no such import.
+pub(crate) async fn pack(pool: &PgPool, id: &str) -> Result<Option<PackTree>> {
+    let row = sqlx::query(
+        "SELECT tree_digest, CASE WHEN tree_digest IS NULL THEN tar_gz END AS tar_gz
+         FROM pack_imports WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .context("reading a pack import")?;
+    let Some(row) = row else { return Ok(None) };
+    let pack = PackRef::from_row(&row)?.context("the import holds no pack")?;
+    crate::playbooks::pack_trees::load(pool, pack)
         .await
-        .context("reading a pack import tarball")?;
-    row.map(|r| r.try_get("tar_gz"))
-        .transpose()
-        .map_err(Into::into)
+        .with_context(|| format!("reading the frozen pack of import {id}"))
+        .map(Some)
 }
 
 /// Register a pending import: the pack is re-fetched at the frozen rev through the one
@@ -448,14 +456,9 @@ pub async fn open_as_draft(
         .await?
         .ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
     import.ensure_pending()?;
-    let tar_gz = tarball(pool, id)
+    let tree = pack(pool, id)
         .await?
         .ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
-    let tree = tokio::task::spawn_blocking(move || read_tar_gz(&tar_gz))
-        .await
-        .context("joining the import read worker")?
-        .context("reading the frozen import tarball")?
-        .tree;
     let saved = crate::playbooks::drafts::create(
         pool,
         draft_id,
