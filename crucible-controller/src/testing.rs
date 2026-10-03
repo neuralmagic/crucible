@@ -405,6 +405,22 @@ pub mod fixtures {
         pack
     }
 
+    /// `len` bytes of text gzip cannot shrink much (a xorshift stream over 64 symbols), for packs
+    /// that must be over the delivery budget while each file stays under the draft per-file cap.
+    pub fn incompressible_text(len: usize, seed: u64) -> String {
+        const SYMBOLS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(SYMBOLS[(x >> 58) as usize])
+            })
+            .collect()
+    }
+
     /// The params schema the engine extracts from `source`, for asserting what a registration
     /// stored against what the pack declares.
     pub fn schema_of(source: &str) -> serde_json::Value {

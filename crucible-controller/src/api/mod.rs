@@ -87,6 +87,7 @@ pub(crate) mod tests;
         crate::playbooks::api::import::create_draft_from_git,
         crate::playbooks::api::drafts::create_playbook_draft,
         crate::playbooks::api::drafts::list_playbook_drafts,
+        crate::playbooks::api::drafts::get_playbook_limits,
         crate::playbooks::api::drafts::get_playbook_draft,
         crate::playbooks::api::drafts::get_playbook_draft_files,
         crate::playbooks::api::drafts::get_playbook_draft_preview,
@@ -264,6 +265,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::PublishDraftBody,
         crate::playbooks::api::drafts::PlaybookDraftDto,
         crate::playbooks::api::drafts::PlaybookDraftDetail,
+        crate::playbooks::api::drafts::PlaybookLimits,
         crate::playbooks::api::drafts::DraftVersionDto,
         crate::playbooks::api::drafts::DraftCompileDto,
         crate::playbooks::api::drafts::DraftFilesDto,
@@ -475,6 +477,7 @@ pub fn router(state: ApiState) -> Router {
             crate::playbooks::api::drafts::get_playbook_draft,
             crate::playbooks::api::drafts::delete_playbook_draft
         ))
+        .routes(routes!(crate::playbooks::api::drafts::get_playbook_limits))
         .routes(routes!(
             crate::playbooks::api::drafts::get_playbook_draft_files
         ))

@@ -22,10 +22,10 @@ use std::path::Path;
 
 /// How many files one draft may hold. A playbook pack is a manifest, a workflow source and a
 /// handful of skills; a save past this is not one.
-const MAX_DRAFT_FILES: usize = 128;
+pub(crate) const MAX_DRAFT_FILES: usize = 128;
 
 /// How large one draft file may be, before gzip.
-const MAX_DRAFT_FILE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_DRAFT_FILE_BYTES: usize = 512 * 1024;
 
 /// The manifest a draft starts from when no template seeds it.
 const SKELETON_MANIFEST: &str =
@@ -657,6 +657,11 @@ pub async fn save_version(
             .context("creating the draft tree")
             .map_err(DraftError::Internal)?;
         write_tree(&files, &root)?;
+        if let Some(reason) =
+            crate::playbooks::packs::over_delivery_budget(&root).map_err(DraftError::Internal)?
+        {
+            return Err(DraftError::Invalid(reason));
+        }
         let tar_gz = crate::playbooks::packs::tar_pack_tree(&root)
             .context("taring the draft tree")
             .map_err(DraftError::Internal)?;
@@ -1360,6 +1365,39 @@ mod tests {
     /// no `[agent]` compiles, and its agent task still cannot be spawned where a pod launch would
     /// put it. The save has to say so, anchored on the manifest, marked as the dispatch verdict
     /// rather than a compile failure.
+    /// A save whose files each fit the per-file cap, but whose delivered tarball is over the
+    /// delivery budget, is refused and stores no version.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_save_over_the_delivery_budget_stores_nothing(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("the skeleton compiles");
+        let before = versions(&pool, "studio").await.expect("versions").len();
+
+        let mut files = skeleton();
+        for seed in 1..=3 {
+            files.insert(
+                format!("blob{seed}.txt"),
+                crate::testing::fixtures::incompressible_text(500 * 1024, seed),
+            );
+        }
+        match save_version(&pool, "studio", files, None, None).await {
+            Err(DraftError::Invalid(msg)) => assert!(msg.contains("delivery budget"), "{msg}"),
+            other => panic!("expected a delivery-budget refusal, got {other:?}"),
+        }
+        assert_eq!(
+            versions(&pool, "studio").await.expect("versions").len(),
+            before
+        );
+    }
+
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_save_that_compiles_still_reports_what_cannot_be_spawned(pool: PgPool) {
         let pod = crate::playbooks::dispatch::DispatchCapability::new(

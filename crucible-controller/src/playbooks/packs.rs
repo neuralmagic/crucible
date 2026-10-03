@@ -26,6 +26,19 @@ impl MaterializedPack {
     }
 }
 
+/// Why the pack tree at `root` is over the run delivery budget, or `None` when it fits: its
+/// delivered tarball (the engine's [`crucible::deploy::pack_delivery_tarball`]) against
+/// [`crucible::deploy::PACK_DELIVERY_BUDGET_BYTES`].
+pub(crate) fn over_delivery_budget(root: &Path) -> Result<Option<String>> {
+    let budget = crucible::deploy::PACK_DELIVERY_BUDGET_BYTES;
+    let bytes = crucible::deploy::pack_delivery_tarball(root)
+        .context("sizing the pack's delivered tarball")?
+        .len();
+    Ok((bytes > budget).then(|| {
+        format!("the pack delivers {bytes} gzipped bytes to a run, over the {budget}-byte delivery budget")
+    }))
+}
+
 /// Gzip-tar a pack working tree (regular files + symlinks, relative paths, `.git` excluded — a
 /// pack is authored files, never a repo; the PR push `git init`s its own scratch copy).
 pub(crate) fn tar_pack_tree(tree: &Path) -> Result<Vec<u8>> {
@@ -423,5 +436,31 @@ mod tests {
                 .expect("read")
                 .is_none()
         );
+    }
+
+    /// A tree within the budget fits; one whose delivered tarball is over it is refused with the
+    /// size, and an empty tree (a draft not yet written) delivers nothing and fits.
+    #[test]
+    fn over_delivery_budget_names_an_oversize_tree() {
+        use crate::testing::fixtures::{WORKFLOW_TOPIC, incompressible_text, write_playbook_pack};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
+        assert_eq!(over_delivery_budget(&pack).expect("sized"), None);
+
+        for seed in 1..=3 {
+            std::fs::write(
+                pack.join(format!("blob{seed}.txt")),
+                incompressible_text(500 * 1024, seed),
+            )
+            .expect("blob");
+        }
+        let over = over_delivery_budget(&pack)
+            .expect("sized")
+            .expect("over the budget");
+        assert!(over.contains("delivery budget"), "{over}");
+
+        let empty = dir.path().join("empty");
+        std::fs::create_dir_all(&empty).expect("mkdir");
+        assert_eq!(over_delivery_budget(&empty).expect("sized"), None);
     }
 }

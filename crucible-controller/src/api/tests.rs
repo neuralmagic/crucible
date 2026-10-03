@@ -3248,6 +3248,31 @@ async fn artifact_manifest_lists_local_files_and_derives_for_s3(pool: PgPool) ->
     Ok(())
 }
 
+/// The limits a draft save is checked against are retrievable, with the delivery budget the
+/// engine's render enforces.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn playbook_limits_report_the_draft_caps_and_the_delivery_budget(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let res = app
+        .oneshot(HttpRequest::get("/api/playbook-limits").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+    let limits: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        limits,
+        serde_json::json!({
+            "max_draft_files": 128,
+            "max_draft_file_bytes": 512 * 1024,
+            "delivery_budget_bytes": crucible::deploy::PACK_DELIVERY_BUDGET_BYTES,
+        })
+    );
+    Ok(())
+}
+
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3339,6 +3364,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbooks/{id}/launch",
         "/api/playbook-drafts",
         "/api/playbook-drafts/from-git",
+        "/api/playbook-limits",
         "/api/playbook-drafts/{id}",
         "/api/playbook-drafts/{id}/files",
         "/api/playbook-drafts/{id}/preview",

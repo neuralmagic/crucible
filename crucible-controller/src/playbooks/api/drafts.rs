@@ -422,6 +422,32 @@ pub(crate) async fn list_playbook_drafts(
     ))
 }
 
+/// The limits a draft save and a pack are checked against.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PlaybookLimits {
+    /// The most files one draft version holds.
+    max_draft_files: usize,
+    /// The largest single draft file, in bytes.
+    max_draft_file_bytes: usize,
+    /// The most gzipped bytes a pack may deliver to a run. Save, registration, and publication
+    /// refuse a pack over it.
+    delivery_budget_bytes: usize,
+}
+
+/// `GET /api/playbook-limits` — the draft and delivery limits.
+#[utoipa::path(
+    get,
+    path = "/api/playbook-limits",
+    responses((status = 200, description = "Draft and delivery limits", body = PlaybookLimits))
+)]
+pub(crate) async fn get_playbook_limits() -> Json<PlaybookLimits> {
+    Json(PlaybookLimits {
+        max_draft_files: crate::playbooks::drafts::MAX_DRAFT_FILES,
+        max_draft_file_bytes: crate::playbooks::drafts::MAX_DRAFT_FILE_BYTES,
+        delivery_budget_bytes: crucible::deploy::PACK_DELIVERY_BUDGET_BYTES,
+    })
+}
+
 /// `GET /api/playbook-drafts/{id}` — one draft with its save history.
 #[utoipa::path(
     get,

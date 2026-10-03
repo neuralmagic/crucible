@@ -466,6 +466,11 @@ pub(crate) fn fetch_pack(git: &PackGit, req: PackSource<'_>) -> Result<FetchedPa
     }
 
     let root = pack_root(&checkout.path(), req.path)?;
+    if let Some(reason) =
+        crate::playbooks::packs::over_delivery_budget(&root).map_err(RegisterError::Internal)?
+    {
+        return Err(RegisterError::Invalid(reason));
+    }
     let tar_gz = crate::playbooks::packs::tar_pack_tree(&root)
         .context("taring the playbook pack tree")
         .map_err(RegisterError::Internal)?;
@@ -698,6 +703,11 @@ pub async fn publish_draft(
         let pack = crate::playbooks::packs::unpack_to_scratch(&req.tar_gz)
             .context("unpacking the draft pack")
             .map_err(RegisterError::Internal)?;
+        if let Some(reason) = crate::playbooks::packs::over_delivery_budget(pack.path())
+            .map_err(RegisterError::Internal)?
+        {
+            return Err(RegisterError::Invalid(reason));
+        }
         let extracted = extract(pack.path())?;
         Ok::<_, RegisterError>((req, extracted))
     })
@@ -1694,6 +1704,30 @@ mod tests {
         {
             Err(RegisterError::Invalid(msg)) => assert!(msg.contains("registry limit"), "{msg}"),
             other => panic!("expected a size refusal, got {other:?}"),
+        }
+        assert!(list(&pool).await.expect("list").is_empty());
+    }
+
+    /// A draft whose delivered tarball is over the delivery budget is refused at publication,
+    /// even though its stored tarball is under the registry bound.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_draft_over_the_delivery_budget_publishes_nothing(pool: PgPool) {
+        use crate::testing::fixtures::{incompressible_text, write_playbook_pack};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pack = write_playbook_pack(dir.path(), WORKFLOW_TOPIC);
+        for seed in 1..=3 {
+            std::fs::write(
+                pack.join(format!("blob{seed}.txt")),
+                incompressible_text(500 * 1024, seed),
+            )
+            .expect("blob");
+        }
+        let tar_gz = crate::playbooks::packs::tar_pack_tree(&pack).expect("tar");
+        assert!(tar_gz.len() <= MAX_PACK_TAR_BYTES, "under the stored bound");
+
+        match publish_draft(&pool, publication("heavy", tar_gz, false), None).await {
+            Err(RegisterError::Invalid(msg)) => assert!(msg.contains("delivery budget"), "{msg}"),
+            other => panic!("expected a delivery-budget refusal, got {other:?}"),
         }
         assert!(list(&pool).await.expect("list").is_empty());
     }
