@@ -567,6 +567,18 @@ impl Renderer<'_> {
         }
     }
 
+    /// The run-state claim mounted over the domain dir's `state/`, or None when this render
+    /// persists nothing.
+    fn state_mount(&self) -> Option<core::VolumeMount> {
+        self.state_pvc()?;
+        Some(core::VolumeMount {
+            name: "run-state".to_string(),
+            mount_path: format!("{}/state", self.domain_dir()),
+            sub_path: self.state_sub_path(),
+            ..Default::default()
+        })
+    }
+
     /// Generated when `state_pvc` is a template. No ownerReferences: a static render has no owner
     /// UID to point at, and the claim outliving the pod is the point.
     fn state_pvc_doc(&self) -> Option<core::PersistentVolumeClaim> {
@@ -685,8 +697,9 @@ impl Renderer<'_> {
 
     /// The pack-staging init-container, present only under pack delivery: extract the ConfigMap's pack
     /// tarball into the writable domain-dir emptyDir so the main container reads AND writes there
-    /// (`STEER.md`, `state/`, the workspace clone). Reuses the loop image (it has `/bin/sh`, `tar`,
-    /// and `gzip`), no extra pull.
+    /// (`STEER.md`, `state/`, the workspace clone). It mounts the run-state claim where the main
+    /// container does, so inputs under `state/` land where the run reads them. Reuses the loop
+    /// image (it has `/bin/sh`, `tar`, and `gzip`), no extra pull.
     fn init_containers(&self) -> Option<Vec<core::Container>> {
         let pack = self.opts.pack.as_ref()?;
         let domain_dir = self.domain_dir();
@@ -704,19 +717,24 @@ impl Renderer<'_> {
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
             args: Some(vec![script]),
-            volume_mounts: Some(vec![
-                core::VolumeMount {
-                    name: PACK_CM_VOLUME.to_string(),
-                    mount_path: PACK_SRC_DIR.to_string(),
-                    read_only: Some(true),
-                    ..Default::default()
-                },
-                core::VolumeMount {
-                    name: PACK_WORKDIR_VOLUME.to_string(),
-                    mount_path: domain_dir,
-                    ..Default::default()
-                },
-            ]),
+            volume_mounts: Some(
+                [
+                    core::VolumeMount {
+                        name: PACK_CM_VOLUME.to_string(),
+                        mount_path: PACK_SRC_DIR.to_string(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                    core::VolumeMount {
+                        name: PACK_WORKDIR_VOLUME.to_string(),
+                        mount_path: domain_dir,
+                        ..Default::default()
+                    },
+                ]
+                .into_iter()
+                .chain(self.state_mount())
+                .collect(),
+            ),
             ..Default::default()
         }])
     }
@@ -1066,14 +1084,7 @@ exit $rc
         }
         // Persistent run state: mounted OVER the domain dir's state/ subdir so session.jsonl and
         // the agent-session files outlive the pod (the wrapper's `--resume` reads them back).
-        if self.state_pvc().is_some() {
-            mounts.push(core::VolumeMount {
-                name: "run-state".to_string(),
-                mount_path: format!("{}/state", self.domain_dir()),
-                sub_path: self.state_sub_path(),
-                ..Default::default()
-            });
-        }
+        mounts.extend(self.state_mount());
         // Tier 2 ingest token (Tier 2 ingest): the projected `crucible-ingest`-audience token the loop
         // reads to POST its run-session. Mounted read-only, only when the drop-box URL is configured.
         if self.profile.cluster.ingest_url.is_some() {
@@ -2695,6 +2706,84 @@ mod tests {
         assert!(
             extract(PACK_TARBALL_KEY) < extract(RUN_INPUTS_KEY),
             "the inputs land over the pack"
+        );
+    }
+
+    /// Under a run-state claim, `pack-stage` mounts the claim where the main container does, so
+    /// an input under `state/` is extracted onto the claim the run reads rather than into the
+    /// emptyDir the claim hides.
+    #[test]
+    fn pack_stage_writes_state_inputs_onto_the_run_state_claim() {
+        let (manifest, mut profile) = pack_manifest_and_profile();
+        profile.cluster.state_pvc = Some(crate::deploy::profile::StatePvc::Existing(
+            "shared".to_string(),
+        ));
+        let tmp = Scratch::new("state-inputs");
+        let dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let yaml = render(
+            input,
+            &dir,
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                pack: Some(delivery(BTreeMap::from([(
+                    "state/cursor.json".parse().expect("path"),
+                    b"{}".to_vec(),
+                )]))),
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render");
+        let pod: core::Pod = serde_norway::from_str(
+            yaml.split("\n---\n")
+                .find(|d| d.contains("kind: Pod"))
+                .expect("a Pod doc"),
+        )
+        .expect("pod parses");
+        let spec = pod.spec.expect("pod spec");
+        let mounts = |c: &core::Container| {
+            c.volume_mounts
+                .iter()
+                .flatten()
+                .filter(|m| m.name == "run-state")
+                .map(|m| (m.mount_path.clone(), m.sub_path.clone()))
+                .collect::<Vec<_>>()
+        };
+        let claim = vec![(
+            "/opt/crucible/domains/alpha/state".to_string(),
+            Some("state/alpha".to_string()),
+        )];
+        let stage = spec
+            .init_containers
+            .iter()
+            .flatten()
+            .find(|c| c.name == "pack-stage")
+            .expect("pack-stage");
+        assert_eq!(mounts(stage), claim, "pack-stage writes onto the claim");
+        assert_eq!(
+            mounts(&spec.containers[0]),
+            claim,
+            "the run reads the claim"
+        );
+
+        profile.cluster.state_pvc = None;
+        let yaml = render(
+            RenderInput::from_manifest(&manifest, "alpha").expect("render input"),
+            &dir,
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                pack: Some(delivery(BTreeMap::new())),
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render");
+        assert!(
+            !yaml.contains("run-state"),
+            "no claim, no claim mount: {yaml}"
         );
     }
 
