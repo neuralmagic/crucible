@@ -258,6 +258,7 @@ start_controller() {
         "$CONTROLLER_BIN" autopilot >"$WORK/controller-$BOOT.log" 2>&1 &
     CONTROLLER_PID=$!
     wait_for 90 "controller health" curl -sf "$CONTROLLER_URL/healthz"
+    wait_for 180 "startup pack conversion" grep -q 'issues re-enqueued at startup' "$WORK/controller-$BOOT.log"
 }
 
 stop_controller() {
