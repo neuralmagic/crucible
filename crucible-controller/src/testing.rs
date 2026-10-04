@@ -194,7 +194,7 @@ pub(crate) async fn pin_playbook(
                tar_digest = excluded.tar_digest, tar_bytes = excluded.tar_bytes,
                tree_digest = excluded.tree_digest, exposure = excluded.exposure"#,
     )
-    .bind(crucible_contract::content_digest(pack.tarball()))
+    .bind(pack.tarball_digest())
     .bind(pack.tarball())
     .bind(i64::try_from(pack.tarball().len()).expect("size"))
     .bind(digest.as_str())

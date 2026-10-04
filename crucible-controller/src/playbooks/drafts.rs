@@ -14,7 +14,6 @@ use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
 use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
 use anyhow::{Context, Result};
-use crucible_contract::content_digest;
 use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
@@ -758,7 +757,6 @@ pub async fn save_version(
     ) = compiled?;
 
     let core_rev = crate::playbooks::registry::core_rev().map_err(DraftError::Internal)?;
-    let tar_digest = content_digest(pack.tarball());
     let now = crate::clock::now_rfc3339();
     let graph_json = graph
         .as_ref()
@@ -845,7 +843,7 @@ pub async fn save_version(
     )
     .bind(id)
     .bind(pack.tarball())
-    .bind(&tar_digest)
+    .bind(pack.tarball_digest())
     .bind(
         i64::try_from(pack.tarball().len())
             .context("pack size")
@@ -1391,6 +1389,7 @@ pub async fn graduate(
 #[cfg(test)]
 mod tests {
     use crate::playbooks::drafts::*;
+    use crucible_contract::content_digest;
 
     fn skeleton() -> BTreeMap<String, String> {
         BTreeMap::from([
@@ -2659,8 +2658,6 @@ mod tests {
             delivered = encoded.tarball().len();
             let start = std::time::Instant::now();
             let _ = encoded.tree().digest_with_file_hashes();
-            let _ = content_digest(encoded.tarball());
-            let _ = content_digest(encoded.tarball());
             let hashes = ms(start);
             let start = std::time::Instant::now();
             let compiled = compile_tree(&root);

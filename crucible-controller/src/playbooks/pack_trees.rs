@@ -18,12 +18,18 @@ use std::collections::{BTreeMap, HashSet};
 pub(crate) struct EncodedPack {
     tree: PackTree,
     tarball: Vec<u8>,
+    tarball_digest: String,
 }
 
 impl EncodedPack {
     pub(crate) fn new(tree: PackTree) -> std::io::Result<Self> {
         let tarball = tree.tarball()?;
-        Ok(Self { tree, tarball })
+        let tarball_digest = crucible_contract::content_digest(&tarball);
+        Ok(Self {
+            tree,
+            tarball,
+            tarball_digest,
+        })
     }
 
     pub(crate) fn tree(&self) -> &PackTree {
@@ -32,6 +38,11 @@ impl EncodedPack {
 
     pub(crate) fn tarball(&self) -> &[u8] {
         &self.tarball
+    }
+
+    /// `content_digest` of [`EncodedPack::tarball`].
+    pub(crate) fn tarball_digest(&self) -> &str {
+        &self.tarball_digest
     }
 }
 
@@ -61,7 +72,7 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, pack: &EncodedPack) -> Res
         .bind(i32::try_from(tree.files().len()).context("pack file count")?)
         .bind(i64::try_from(total).context("pack size")?)
         .bind(i64::try_from(pack.tarball().len()).context("pack delivered size")?)
-        .bind(crucible_contract::content_digest(pack.tarball()))
+        .bind(pack.tarball_digest())
         .bind(crate::clock::now_rfc3339())
         .execute(&mut *tx)
         .await

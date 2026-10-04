@@ -416,7 +416,7 @@ pub(crate) async fn put_pack(
     pack: &crate::playbooks::pack_trees::EncodedPack,
 ) -> Result<StoredPack> {
     let tarball = pack.tarball();
-    let digest = content_digest(tarball);
+    let digest = pack.tarball_digest().to_string();
     let mut tx = sqlx::Connection::begin(&mut *conn)
         .await
         .context("opening the pack store transaction")?;

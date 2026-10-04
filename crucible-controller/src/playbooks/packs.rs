@@ -82,6 +82,10 @@ impl Deliverable {
         self.pack.tarball()
     }
 
+    pub(crate) fn tarball_digest(&self) -> &str {
+        self.pack.tarball_digest()
+    }
+
     pub(crate) fn into_ignored(self) -> Vec<String> {
         self.ignored
     }

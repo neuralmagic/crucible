@@ -844,7 +844,7 @@ async fn store(
     } = extracted;
     let (exposure_json, exposure_digest) = exposure.stored().map_err(RegisterError::Internal)?;
     let core_rev = core_rev().map_err(RegisterError::Internal)?;
-    let tar_digest = content_digest(row.pack.tarball());
+    let tar_digest = row.pack.tarball_digest();
     let now = crate::clock::now_rfc3339();
     let (repo, git_ref, path, source_draft, source_draft_version) = match &row.source {
         PlaybookSource::Git {
@@ -937,7 +937,7 @@ async fn store(
     .bind(&row.rev)
     .bind(path)
     .bind(row.pack.tarball())
-    .bind(&tar_digest)
+    .bind(tar_digest)
     .bind(
         i64::try_from(row.pack.tarball().len())
             .context("pack size")

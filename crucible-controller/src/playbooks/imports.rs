@@ -17,7 +17,6 @@ use crate::playbooks::registry::{
 };
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result};
-use crucible_contract::content_digest;
 use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
@@ -224,7 +223,7 @@ pub async fn propose(
     let (repo, git_ref, path) = (source.repo, source.git_ref, source.path);
 
     let id = uuid::Uuid::now_v7().to_string();
-    let tar_digest = content_digest(pack.tarball());
+    let tar_digest = pack.tarball_digest();
     let graph = preview
         .graph
         .as_ref()
@@ -264,7 +263,7 @@ pub async fn propose(
     .bind(path)
     .bind(&rev)
     .bind(pack.tarball())
-    .bind(&tar_digest)
+    .bind(tar_digest)
     .bind(i64::try_from(pack.tarball().len()).context("pack size")?)
     .bind(&preview.params_schema)
     .bind(&preview.schema_digest)
