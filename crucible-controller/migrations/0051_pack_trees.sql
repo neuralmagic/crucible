@@ -43,10 +43,14 @@ ALTER TABLE pack_imports               ADD COLUMN tree_digest TEXT REFERENCES pa
 ALTER TABLE playbook_draft_versions    ADD COLUMN tree_digest TEXT REFERENCES pack_trees(digest);
 ALTER TABLE playbook_standing_launches ADD COLUMN adopted_tree_digest TEXT REFERENCES pack_trees(digest);
 ALTER TABLE pack_tarballs              ADD COLUMN tree_digest TEXT REFERENCES pack_trees(digest);
+-- The tree a scope froze. Build planning and dispatch read it, not whatever the issue's
+-- pack_tarballs row holds later. NULL for a scope frozen before trees, which reads that row.
+ALTER TABLE scopes                     ADD COLUMN tree_digest TEXT REFERENCES pack_trees(digest);
 
 -- A controller that predates tree storage rewrites legacy bytes without knowing the tree column.
--- When the bytes change, keep the tree only if the new bytes are that tree's own tarball; otherwise
--- clear it so startup conversion picks the row up again.
+-- When the bytes change, keep the tree if the new bytes are its tarball or an encoding of it that
+-- conversion recorded in pack_digest_aliases; otherwise clear it so startup conversion picks the
+-- row up again.
 CREATE FUNCTION pack_legacy_bytes_changed() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE
     bytes_digest TEXT;
@@ -55,8 +59,10 @@ BEGIN
     EXECUTE format('SELECT ''sha256:'' || encode(sha256(($1).%I), ''hex''), ($1).%I',
                    TG_ARGV[0], TG_ARGV[1])
         INTO bytes_digest, tree USING NEW;
-    IF tree IS NOT NULL AND NOT EXISTS (
-        SELECT 1 FROM pack_trees WHERE digest = tree AND tarball_digest = bytes_digest) THEN
+    IF tree IS NOT NULL
+       AND NOT EXISTS (SELECT 1 FROM pack_trees WHERE digest = tree AND tarball_digest = bytes_digest)
+       AND NOT EXISTS (SELECT 1 FROM pack_digest_aliases
+                       WHERE old_digest = bytes_digest AND tree_digest = tree) THEN
         NEW := jsonb_populate_record(NEW, jsonb_build_object(TG_ARGV[1], NULL));
     END IF;
     RETURN NEW;
