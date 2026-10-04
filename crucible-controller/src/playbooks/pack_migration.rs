@@ -170,7 +170,10 @@ async fn convert_column(pool: &PgPool, c: &Column, report: &mut ConversionReport
         let old = content_digest(&bytes);
         let mut tx = pool.begin().await?;
         let known: Option<String> = sqlx::query_scalar(
-            "SELECT tree_digest FROM pack_digest_aliases WHERE old_digest = $1 AND tree_digest IS NOT NULL",
+            "SELECT a.tree_digest FROM pack_digest_aliases a
+             JOIN pack_trees t ON t.digest = a.tree_digest
+             WHERE a.old_digest = $1
+             FOR KEY SHARE OF t",
         )
         .bind(&old)
         .fetch_optional(&mut *tx)
@@ -344,6 +347,44 @@ mod tests {
         .expect("count");
         assert_eq!(counts, (1, 2));
         assert_eq!(tree_of(&pool, "a").await, tree_of(&pool, "b").await);
+    }
+
+    /// Legacy bytes whose alias names a collected tree convert by storing that tree again.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn bytes_whose_aliased_tree_was_collected_store_it_again(pool: PgPool) {
+        let legacy = pack(&[("crucible.toml", b"m")]).tarball().expect("encode");
+        seed_launch_pack(&pool, "a", &legacy).await;
+        convert_pack_trees(&pool).await.expect("convert");
+        let tree = tree_of(&pool, "a").await.expect("pinned");
+        sqlx::query("DELETE FROM pack_tarballs")
+            .execute(&pool)
+            .await
+            .expect("drop the pin");
+        sqlx::query("UPDATE pack_trees SET created_at = '2000-01-01T00:00:00Z'")
+            .execute(&pool)
+            .await
+            .expect("age");
+        assert_eq!(
+            crate::playbooks::pack_trees::collect(&pool)
+                .await
+                .expect("collect"),
+            1
+        );
+
+        seed_launch_pack(&pool, "b", &legacy).await;
+        let report = convert_pack_trees(&pool).await.expect("convert again");
+
+        assert_eq!(report.converted, 1);
+        assert_eq!(tree_of(&pool, "b").await.as_deref(), Some(tree.as_str()));
+        let stored: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM pack_trees WHERE digest = $1),
+                    (SELECT count(*) FROM pack_tree_files WHERE digest = $1)",
+        )
+        .bind(&tree)
+        .fetch_one(&pool)
+        .await
+        .expect("stored");
+        assert_eq!(stored, (1, 1));
     }
 
     /// A tarball holding a symlink is recorded unconvertible with the reason, keeps no tree, and
