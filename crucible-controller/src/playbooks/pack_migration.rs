@@ -2,9 +2,10 @@
 //!
 //! Every row that holds a gzipped pack and no tree digest is read as a tree, the tree is stored,
 //! the row's old gzip digest is recorded as an alias, and the row is pointed at the tree. A
-//! tarball that cannot be a pack is recorded as unconvertible and never retried. Revision pins
-//! are not touched. Safe to run on every start: converted rows are skipped, and each step is
-//! idempotent.
+//! tarball that cannot be a pack is recorded as unconvertible and never retried. Then, in one
+//! transaction, the comparison pins are derived from what the rows held when they were pinned and
+//! a draft-sourced playbook's rev becomes its tree digest, the value its writer now mints. Safe to
+//! run on every start: converted rows are skipped, and each step is idempotent.
 
 #![allow(clippy::disallowed_macros)]
 
@@ -20,6 +21,8 @@ use sqlx::{PgConnection, PgPool, Row};
 pub struct ConversionReport {
     pub converted: usize,
     pub unconvertible: usize,
+    /// Pin columns derived and draft-sourced revs rewritten.
+    pub pinned: usize,
 }
 
 /// A legacy pack-byte column, its tree column, and a SQL expression naming one row as text.
@@ -81,17 +84,66 @@ pub async fn convert_pack_trees(pool: &PgPool) -> Result<ConversionReport> {
     for column in &COLUMNS {
         convert_column(pool, column, &mut report).await?;
     }
+    let mut tx = pool.begin().await?;
     sqlx::query(
         "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at)
          SELECT id, tree_digest, $1 FROM playbooks WHERE tree_digest IS NOT NULL
          ON CONFLICT DO NOTHING",
     )
     .bind(crate::clock::now_rfc3339())
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("recording each playbook's current tree as a revision")?;
+    for (what, statement) in PINS {
+        let updated = sqlx::query(statement)
+            .execute(&mut *tx)
+            .await
+            .with_context(|| format!("deriving {what}"))?
+            .rows_affected();
+        report.pinned += usize::try_from(updated).context("pinned row count")?;
+    }
+    tx.commit().await?;
     Ok(report)
 }
+
+/// Each unset pin, taken from the origin's tree when the stored rev is still the origin's rev or
+/// from the alias of a pre-tree rev; then each draft-sourced rev that is still a pre-tree digest.
+const PINS: [(&str, &str); 6] = [
+    (
+        "draft origin pins from the origin playbook",
+        "UPDATE playbook_drafts d SET origin_digest = p.tree_digest FROM playbooks p
+         WHERE d.origin_digest IS NULL AND d.origin_playbook = p.id AND d.origin_rev = p.rev
+           AND p.tree_digest IS NOT NULL",
+    ),
+    (
+        "draft origin pins from the origin import",
+        "UPDATE playbook_drafts d SET origin_digest = i.tree_digest FROM pack_imports i
+         WHERE d.origin_digest IS NULL AND d.origin_import = i.id AND i.tree_digest IS NOT NULL",
+    ),
+    (
+        "draft origin pins from a pre-tree rev",
+        "UPDATE playbook_drafts d SET origin_digest = a.tree_digest FROM pack_digest_aliases a
+         WHERE d.origin_digest IS NULL AND d.origin_rev = a.old_digest
+           AND a.tree_digest IS NOT NULL",
+    ),
+    (
+        "secret binding pins from the bound playbook",
+        "UPDATE secret_bindings b SET pack_digest = p.tree_digest FROM playbooks p
+         WHERE b.pack_digest IS NULL AND b.scope_kind = 'playbook' AND b.scope_id = p.id
+           AND b.pack_rev = p.rev AND p.tree_digest IS NOT NULL",
+    ),
+    (
+        "secret binding pins from a pre-tree rev",
+        "UPDATE secret_bindings b SET pack_digest = a.tree_digest FROM pack_digest_aliases a
+         WHERE b.pack_digest IS NULL AND b.pack_rev = a.old_digest AND a.tree_digest IS NOT NULL",
+    ),
+    (
+        "draft-sourced revs",
+        "UPDATE playbooks p SET rev = p.tree_digest FROM pack_digest_aliases a
+         WHERE p.source_draft IS NOT NULL AND p.rev = a.old_digest
+           AND a.tree_digest = p.tree_digest",
+    ),
+];
 
 async fn convert_column(pool: &PgPool, c: &Column, report: &mut ConversionReport) -> Result<()> {
     let mut rows = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -326,10 +378,11 @@ mod tests {
         );
     }
 
-    /// Every legacy column converts, the composite draft-version key included, and a revision
-    /// pin naming the old digest is left as it was.
+    /// Every legacy column converts, the composite draft-version key included. A git-sourced
+    /// rev, an adopted rev and an origin rev naming the old digest stay as they were, and the
+    /// draft's origin pin is taken from the old digest's alias.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn every_legacy_column_converts_and_pins_are_untouched(pool: PgPool) {
+    async fn every_legacy_column_converts_and_revs_other_than_draft_sources_stay(pool: PgPool) {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("crucible.toml"), "m").expect("write");
         let legacy = crate::playbooks::packs::tar_pack_tree(dir.path()).expect("tar");
@@ -370,7 +423,8 @@ mod tests {
             report,
             ConversionReport {
                 converted: 5,
-                unconvertible: 0
+                unconvertible: 0,
+                pinned: 1,
             }
         );
         let trees: Vec<Option<String>> = sqlx::query_scalar(
@@ -393,6 +447,12 @@ mod tests {
         .await
         .expect("pins");
         assert_eq!(pins, vec![old; 3]);
+        let origin: Option<String> =
+            sqlx::query_scalar("SELECT origin_digest FROM playbook_drafts WHERE id = 'd'")
+                .fetch_one(&pool)
+                .await
+                .expect("origin pin");
+        assert_eq!(origin.as_deref(), Some(tree.as_str()));
         let revisions: Vec<(String, String)> =
             sqlx::query_as("SELECT playbook_id, tree_digest FROM playbook_revisions")
                 .fetch_all(&pool)
@@ -457,5 +517,188 @@ mod tests {
             .expect("trigger");
             assert_eq!(trigger, 1, "{} has no legacy-bytes trigger", c.table);
         }
+    }
+
+    /// What an older controller left for a draft-sourced playbook converts in one pass: the rev
+    /// becomes the tree digest, and the secret binding and the draft forked at the old rev are
+    /// pinned to the tree, so the binding is not stale. A second pass, and a republish of the same
+    /// content, change none of it.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_draft_sourced_pin_survives_conversion_restarts_and_republish(pool: PgPool) {
+        use crate::playbooks::drafts::{DraftSeed, SKELETON_MANIFEST, SKELETON_WORKFLOW};
+        use crate::secrets::launch::{PackPin, Revision, Scope};
+        let platform = crate::authz::model::Principal::platform();
+        crate::playbooks::drafts::create(
+            &pool,
+            "studio",
+            "d",
+            DraftSeed::Skeleton,
+            None,
+            &platform,
+        )
+        .await
+        .expect("draft");
+        let tree = pack(&[
+            ("crucible.toml", SKELETON_MANIFEST.as_bytes()),
+            ("workflow.star", SKELETON_WORKFLOW.as_bytes()),
+        ]);
+        let publication = || crate::playbooks::registry::PublishDraft {
+            id: "survey".to_string(),
+            owner: platform.clone(),
+            description: "published".to_string(),
+            draft: "studio".to_string(),
+            version: 1,
+            tree: tree.clone(),
+            replaces: false,
+            accept_exposure_digest: None,
+        };
+        crate::playbooks::registry::publish_draft(&pool, publication(), None)
+            .await
+            .expect("publish");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("crucible.toml"), SKELETON_MANIFEST).expect("write");
+        std::fs::write(dir.path().join("workflow.star"), SKELETON_WORKFLOW).expect("write");
+        let legacy = crate::playbooks::packs::tar_pack_tree(dir.path()).expect("tar");
+        let old = content_digest(&legacy);
+        sqlx::query(
+            "UPDATE playbooks SET rev = $2, tar_gz = $1, tar_digest = $2, tree_digest = NULL
+             WHERE id = 'survey'",
+        )
+        .bind(&legacy)
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .expect("the row an older controller published");
+        sqlx::query(
+            "INSERT INTO playbook_drafts (id, description, origin_playbook, origin_rev, created_at,
+                                          updated_at)
+             VALUES ('fork', 'd', 'survey', $1, 'now', 'now')",
+        )
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .expect("a draft forked at the old rev");
+        let owner = crate::authz::model::Principal::parse("user:alice").expect("owner");
+        let name = crate::secrets::SecretName::parse("pr_token").expect("name");
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::secrets::store::insert(
+            &mut conn,
+            &crate::secrets::store::NewSecret {
+                id: "secret-1",
+                name: &name,
+                owner: &owner,
+                kind: crate::secrets::SecretKind::Opaque,
+                visibility: crate::secrets::Visibility::BrokerOnly,
+                consumer: crate::secrets::ConsumerClass::Run,
+                mode: crate::secrets::SecretMode::Managed,
+                vault_path: "user:alice/pr",
+                current_version: Some(1),
+                created_by: Some("alice"),
+            },
+        )
+        .await
+        .expect("register");
+        let bound = crate::secrets::store::insert_binding(
+            &mut conn,
+            &crate::secrets::store::NewBinding {
+                id: "binding-1",
+                secret_id: "secret-1",
+                scope_kind: crate::secrets::ScopeKind::Playbook,
+                scope_id: "survey",
+                projection_kind: crate::secrets::ProjectionKind::Env,
+                projection: "PR_TOKEN",
+                declared_name: &name,
+                pack_rev: Some(&old),
+                schema_digest: None,
+                created_by: Some("alice"),
+            },
+        )
+        .await
+        .expect("bind");
+        assert_eq!(bound.pack_digest, None, "the row had no tree to pin");
+
+        let launch_check = || async {
+            let row = crate::playbooks::registry::get(&pool, "survey")
+                .await
+                .expect("read")
+                .expect("row");
+            let tree = row.tree_digest.as_ref().map(|t| t.to_string());
+            crate::secrets::launch::resolve(
+                &pool,
+                &Scope::playbook("survey"),
+                &[crate::secrets::manifest::DeclaredSecret {
+                    name: name.clone(),
+                    kind: crate::secrets::SecretKind::Opaque,
+                    projection: None,
+                }],
+                &crate::authz::model::Principals::new(Some("alice"), &[]),
+                Revision::Published(Some(PackPin {
+                    rev: &row.rev,
+                    tree: tree.as_deref(),
+                })),
+                None,
+            )
+            .await
+            .expect("resolve")
+            .map(|mints| mints.len())
+        };
+        let pins = || async {
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, Option<String>)>(
+                "SELECT p.rev, p.tree_digest, b.pack_digest, d.origin_digest
+                 FROM playbooks p, secret_bindings b, playbook_drafts d
+                 WHERE p.id = 'survey' AND d.id = 'fork'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pins")
+        };
+
+        let report = convert_pack_trees(&pool).await.expect("convert");
+        assert_eq!(report.pinned, 3, "{report:?}");
+        let digest = tree.digest().to_string();
+        let converted = pins().await;
+        assert_eq!(
+            converted,
+            (
+                digest.clone(),
+                Some(digest.clone()),
+                Some(digest.clone()),
+                Some(digest.clone())
+            )
+        );
+        assert_eq!(launch_check().await, Ok(1));
+        let fork = crate::playbooks::drafts::get(&pool, "fork")
+            .await
+            .expect("read")
+            .expect("fork")
+            .origin
+            .expect("origin");
+        assert!(!fork.moved(), "the old rev and the tree name the same pack");
+
+        assert_eq!(
+            convert_pack_trees(&pool).await.expect("restart"),
+            ConversionReport::default()
+        );
+        assert_eq!(pins().await, converted);
+        assert_eq!(launch_check().await, Ok(1));
+
+        let republished = crate::playbooks::registry::publish_draft(
+            &pool,
+            crate::playbooks::registry::PublishDraft {
+                replaces: true,
+                ..publication()
+            },
+            None,
+        )
+        .await
+        .expect("republish");
+        assert_eq!(republished.rev, digest);
+        assert_eq!(pins().await, converted);
+        assert_eq!(launch_check().await, Ok(1));
+        assert_eq!(
+            convert_pack_trees(&pool).await.expect("restart"),
+            ConversionReport::default()
+        );
     }
 }

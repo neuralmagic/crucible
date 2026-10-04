@@ -6,12 +6,12 @@
 //! authorization tests need no Vault at all, because every refusal they assert happens before the
 //! registry would reach for one.
 
-use super::*;
 use crate::api::{openapi_spec, router};
 use crate::client::Db;
 use crate::daemon::queue::Override;
 use crate::daemon::queue::OverrideSink;
 use crate::identity::auth::AuthPath;
+use crate::secrets::api::*;
 use crate::secrets::store;
 use crate::secrets::vault::dev::{DevVault, uniq};
 use crate::testing::call;
@@ -1893,4 +1893,111 @@ fn the_preview_gate_lists_declared_secrets_and_warns_on_profile_overlap() {
         PackSecretsDto::new(&declared, &[]).warnings.is_empty(),
         "no profile, no warning"
     );
+}
+
+/// A playbook binding's `pack_rev` that a newer tree superseded is refused, naming the tree, for
+/// a binder who may read the playbook and when the playbook held that tree. A binder who may not
+/// read it is answered as for an unknown rev. A binding at the playbook's current rev pins its
+/// tree.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_superseded_pack_rev_is_refused_only_to_a_reader(pool: PgPool) {
+    let app = app(pool.clone(), None);
+    let tree = crucible_contract::pack_tree::PackTree::from_pairs(&[("crucible.toml", b"m")])
+        .expect("tree");
+    let pack = crate::playbooks::pack_trees::EncodedPack::new(tree).expect("encode");
+    let digest =
+        crate::playbooks::pack_trees::put_tree(&mut pool.acquire().await.expect("conn"), &pack)
+            .await
+            .expect("put");
+    for statement in [
+        "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, tar_digest, tar_bytes, \
+         params_schema, schema_digest, core_rev, created_at, updated_at, tree_digest, owner) \
+         VALUES ('survey', 'd', 'o/r', 'aaa', '', 'x', 'sha256:x', 1, '{}'::jsonb, 's', 'c', \
+         'now', 'now', $1, 'user:alice')",
+        "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at) \
+         VALUES ('survey', $1, 'now')",
+        "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at) \
+         VALUES ('sha256:old', $1, 'then')",
+    ] {
+        sqlx::query(statement)
+            .bind(digest.as_str())
+            .execute(&pool)
+            .await
+            .expect(statement);
+    }
+    let register = |user: &'static str| {
+        let app = app.clone();
+        async move {
+            let (status, created) = call(
+                &app,
+                as_user(
+                    "POST",
+                    "/api/secrets",
+                    user,
+                    &[],
+                    Some(json!({"name": "pr-token", "kind": "opaque", "mint": "github-app"})),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{created}");
+            created["id"].as_str().expect("an id").to_string()
+        }
+    };
+    let bind = |user: &'static str, id: String, declared: &'static str, rev: &'static str| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                as_user(
+                    "POST",
+                    &format!("/api/secrets/{id}/bindings"),
+                    user,
+                    &[],
+                    Some(json!({
+                        "scope_kind": "playbook",
+                        "scope_id": "survey",
+                        "declared_name": declared,
+                        "projection_kind": "env",
+                        "projection": declared.to_uppercase(),
+                        "pack_rev": rev,
+                    })),
+                ),
+            )
+            .await
+        }
+    };
+
+    let alices = register("alice").await;
+    let (status, refused) = bind("alice", alices.clone(), "one", "sha256:old").await;
+    assert_eq!(status, StatusCode::CONFLICT, "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .expect("error")
+            .contains(&format!("superseded by {digest}")),
+        "{refused}"
+    );
+    let (status, unknown) = bind("alice", alices.clone(), "one", "sha256:never").await;
+    assert_eq!(status, StatusCode::CREATED, "{unknown}");
+    let (status, current) = bind("alice", alices, "two", "aaa").await;
+    assert_eq!(status, StatusCode::CREATED, "{current}");
+    let pins: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT declared_name, pack_digest FROM secret_bindings ORDER BY declared_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("pins");
+    assert_eq!(
+        pins,
+        vec![
+            ("one".to_string(), None),
+            ("two".to_string(), Some(digest.to_string()))
+        ]
+    );
+
+    let bobs = register("bob").await;
+    let (status, outsider) = bind("bob", bobs, "three", "sha256:old").await;
+    assert_eq!(status, StatusCode::CREATED, "{outsider}");
+    assert_eq!(outsider["pack_rev"], "sha256:old");
+    assert!(!outsider.to_string().contains("tree1:"), "{outsider}");
 }

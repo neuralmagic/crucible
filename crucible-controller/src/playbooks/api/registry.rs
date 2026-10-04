@@ -39,9 +39,10 @@ pub(crate) struct RegisterPlaybookBody {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct RegisterAck {
     pub(crate) id: String,
-    /// The commit the pack is pinned at, or the tarball digest of a draft-sourced pack.
+    /// The commit the pack is pinned at, or the tree digest of a draft-sourced pack.
     pub(crate) rev: String,
-    pub(crate) tar_digest: String,
+    /// The `tree1:` digest of the stored pack.
+    pub(crate) tree_digest: String,
     pub(crate) schema_digest: String,
     /// True when re-registering an existing id changed the launch form.
     pub(crate) schema_changed: bool,
@@ -58,7 +59,7 @@ impl From<crate::playbooks::registry::Registered> for RegisterAck {
         RegisterAck {
             id: r.id,
             rev: r.rev,
-            tar_digest: r.tar_digest,
+            tree_digest: r.tree_digest.to_string(),
             schema_digest: r.schema_digest,
             schema_changed: r.schema_changed,
             exposure_digest: r.exposure_digest,
@@ -267,9 +268,11 @@ pub struct PlaybookDto {
     pub id: String,
     pub description: String,
     pub source: PlaybookSourceDto,
-    /// The git commit, or the tarball digest of a draft-sourced pack.
+    /// The git commit, or the tree digest of a draft-sourced pack.
     pub rev: String,
-    pub tar_digest: String,
+    /// The `tree1:` digest of the stored pack; null until startup conversion reaches a row an
+    /// older controller wrote.
+    pub tree_digest: Option<String>,
     pub schema_digest: String,
     /// The engine pin the stored schema was extracted with.
     pub core_rev: String,
@@ -331,7 +334,7 @@ impl PlaybookDto {
             description: r.description,
             source: r.source.into(),
             rev: r.rev,
-            tar_digest: r.tar_digest,
+            tree_digest: r.tree_digest.map(|t| t.to_string()),
             exposure_digest: r.exposure_digest,
             schema_digest: r.schema_digest,
             core_rev: r.core_rev,

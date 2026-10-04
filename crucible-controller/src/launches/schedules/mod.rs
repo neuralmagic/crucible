@@ -250,6 +250,7 @@ pub(crate) struct Schedule {
     pub adopted_repo: Option<String>,
     pub adopted_path: Option<String>,
     pub adopted_rev: Option<String>,
+    pub adopted_tree_digest: Option<String>,
     pub eligible_draft_version: Option<i64>,
     pub params: serde_json::Value,
     pub schema_digest: String,
@@ -311,6 +312,7 @@ impl From<ScheduleRow> for Schedule {
             adopted_repo: c.adopted_repo,
             adopted_path: c.adopted_path,
             adopted_rev: c.adopted_rev,
+            adopted_tree_digest: c.adopted_tree_digest,
             eligible_draft_version: c.eligible_draft_version,
             params: c.params,
             schema_digest: c.schema_digest,
@@ -1172,7 +1174,7 @@ mod tests {
         let new = adopted(PackRevision::Tree(&authorized), &params, &max_time, &spec);
         let store = ScheduleStore::new(Db::new(pool.clone()));
         let kept = store.create(&new, Timestamp::now()).await?;
-        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+        let repinned = pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
 
         let refused = store
             .create(&new, Timestamp::now())
@@ -1182,7 +1184,7 @@ mod tests {
             refused.downcast_ref::<Unadoptable>(),
             Some(&Unadoptable::Repinned {
                 playbook: "survey".to_string(),
-                rev: "def456".to_string()
+                rev: format!("revision def456 (tree {repinned})")
             })
         );
         let refused = store

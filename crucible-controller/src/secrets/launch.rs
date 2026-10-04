@@ -166,22 +166,43 @@ pub enum Refusal {
 pub enum Revision<'a> {
     /// A registered playbook at the revision it is pinned to. `None` is a scope with no pack
     /// revision to compare against, which pins nothing.
-    Published(Option<&'a str>),
+    Published(Option<PackPin<'a>>),
     /// A draft test-fire.
     Draft,
+}
+
+/// A registered playbook's revision: its source rev, and its tree when one is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackPin<'a> {
+    pub rev: &'a str,
+    pub tree: Option<&'a str>,
 }
 
 /// The owned form of [`Revision`], for the dispatch struct that carries it across an await.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnedRevision {
-    Published(Option<String>),
+    Published {
+        rev: Option<String>,
+        tree: Option<String>,
+    },
     Draft,
 }
 
 impl OwnedRevision {
+    /// A scope with no pack revision to compare against.
+    pub const UNPINNED: OwnedRevision = OwnedRevision::Published {
+        rev: None,
+        tree: None,
+    };
+
     pub fn as_revision(&self) -> Revision<'_> {
         match self {
-            OwnedRevision::Published(rev) => Revision::Published(rev.as_deref()),
+            OwnedRevision::Published { rev, tree } => {
+                Revision::Published(rev.as_deref().map(|rev| PackPin {
+                    rev,
+                    tree: tree.as_deref(),
+                }))
+            }
             OwnedRevision::Draft => Revision::Draft,
         }
     }
@@ -299,8 +320,12 @@ fn check_one(
         });
     }
     match (binding.pack_rev.as_deref(), revision) {
-        (Some(bound), Revision::Published(Some(current))) if bound != current => {
-            Some(Refusal::Stale {
+        (Some(bound_rev), Revision::Published(Some(current))) => {
+            let (bound, current) = match (binding.pack_digest.as_deref(), current.tree) {
+                (Some(bound), Some(tree)) => (bound, tree),
+                _ => (bound_rev, current.rev),
+            };
+            (bound != current).then(|| Refusal::Stale {
                 name: secret.name.clone(),
                 scope: scope.clone(),
                 bound: bound.to_string(),
@@ -356,8 +381,8 @@ fn check_disclosed(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::authz::model::Principal;
+    use crate::secrets::launch::*;
     use crate::secrets::store::{NewBinding, NewSecret};
     use crate::secrets::{ConsumerClass, ProjectionKind, SecretKind, SecretMode, Visibility};
 
@@ -793,7 +818,10 @@ mod tests {
             &scope,
             &want,
             &launcher,
-            Revision::Published(Some("rev-2")),
+            Revision::Published(Some(PackPin {
+                rev: "rev-2",
+                tree: None,
+            })),
             None,
         )
         .await
@@ -809,7 +837,10 @@ mod tests {
             &scope,
             &want,
             &launcher,
-            Revision::Published(Some("rev-1")),
+            Revision::Published(Some(PackPin {
+                rev: "rev-1",
+                tree: None,
+            })),
             None,
         )
         .await

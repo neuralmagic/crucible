@@ -18,7 +18,7 @@ use crate::playbooks::registry::{
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
-use crucible_contract::pack_tree::PackTree;
+use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
 
@@ -80,7 +80,8 @@ pub struct PackImport {
     pub path: String,
     /// The commit everything below was taken at.
     pub rev: String,
-    pub tar_digest: String,
+    /// The stored tree; `None` until startup conversion reaches a row an older controller wrote.
+    pub tree_digest: Option<TreeDigest>,
     pub params_schema: Option<serde_json::Value>,
     pub schema_digest: Option<String>,
     pub graph: Option<WorkflowGraphDto>,
@@ -104,7 +105,7 @@ pub struct PackImport {
     pub resolved_at: Option<String>,
 }
 
-const COLUMNS: &str = "id, repo, git_ref, path, rev, tar_digest, params_schema, schema_digest, \
+const COLUMNS: &str = "id, repo, git_ref, path, rev, tree_digest, params_schema, schema_digest, \
                        graph, diagnostics, agent_backend, agent_sandbox_image, agent_requirements, declared_secrets, \
                        exposure, exposure_digest, core_rev, status, playbook, draft_id, owner, proposed_by, created_at, resolved_by, \
                        resolved_at";
@@ -120,7 +121,11 @@ impl PackImport {
             git_ref: row.try_get("git_ref")?,
             path: row.try_get("path")?,
             rev: row.try_get("rev")?,
-            tar_digest: row.try_get("tar_digest")?,
+            tree_digest: row
+                .try_get::<Option<String>, _>("tree_digest")?
+                .map(TreeDigest::try_from)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
             params_schema: row.try_get("params_schema")?,
             schema_digest: row.try_get("schema_digest")?,
             graph: graph

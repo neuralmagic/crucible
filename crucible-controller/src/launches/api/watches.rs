@@ -27,6 +27,9 @@ dto! {
         pub adopted_repo: Option<String>,
         pub adopted_path: Option<String>,
         pub adopted_rev: Option<String>,
+        /// The `tree1:` digest of the adopted pack; null for a row adopted before trees were
+        /// recorded.
+        pub adopted_tree_digest: Option<String>,
         /// The values every launch carries, besides the item's key.
         #[schema(value_type = Object)]
         pub params: serde_json::Value,
@@ -371,12 +374,15 @@ pub(crate) async fn create_watch(
         Err(e) => return crate::launches::api::save_failed(e),
     };
     let audit_reason = format!(
-        "playbook {} watching {} {:?} from {} as revision {}",
+        "playbook {} watching {} {:?} from {} as {}",
         stored.playbook,
         stored.tracker,
         stored.query,
         stored.watermark,
-        stored.adopted_rev.as_deref().unwrap_or("?")
+        crate::launches::standing::adopted_label(
+            stored.adopted_rev.as_deref().unwrap_or("?"),
+            stored.adopted_tree_digest.as_deref()
+        )
     );
     if let Err(e) = state
         .audit_required(
@@ -574,8 +580,15 @@ pub(crate) async fn update_watch(
         Err(e) => return AppError::from(e).into_response(),
     }
     let audit_reason = format!(
-        "playbook {} rewatching {} {:?} from {}",
-        stored.playbook, stored.tracker, stored.query, stored.watermark
+        "playbook {} rewatching {} {:?} from {} as {}",
+        stored.playbook,
+        stored.tracker,
+        stored.query,
+        stored.watermark,
+        crate::launches::standing::adopted_label(
+            stored.adopted_rev.as_deref().unwrap_or("?"),
+            stored.adopted_tree_digest.as_deref()
+        )
     );
     if let Err(e) = state
         .audit_required(

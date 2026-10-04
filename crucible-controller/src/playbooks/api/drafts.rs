@@ -76,6 +76,10 @@ pub struct DraftOriginDto {
     pub rev: Option<String>,
     /// The rev that pack serves now.
     pub current_rev: Option<String>,
+    /// The `tree1:` digest the draft was seeded from.
+    pub digest: Option<String>,
+    /// The `tree1:` digest that pack serves now.
+    pub current_digest: Option<String>,
     pub moved: bool,
 }
 
@@ -90,6 +94,8 @@ impl From<DraftOrigin> for DraftOriginDto {
             path: o.path,
             rev: o.rev,
             current_rev: o.current_rev,
+            digest: o.digest,
+            current_digest: o.current_digest,
             moved,
         }
     }
@@ -167,7 +173,9 @@ dto! {
     /// One save in a draft's history.
     pub struct DraftVersionDto: From<v: DraftVersionRow> {
         pub version: i64,
-        pub tar_digest: String,
+        /// The save's `tree1:` digest; null until startup conversion reaches a row an older
+        /// controller wrote.
+        pub tree_digest: Option<String> = v.tree_digest.as_ref().map(|t| t.to_string()),
         /// Null when this save did not compile.
         pub schema_digest: Option<String>,
         pub diagnostics: i64 = v.diagnostics.len() as i64,
@@ -257,7 +265,7 @@ pub(crate) struct CreateDraftBody {
     /// Revision rendered by the inspector; cloning refuses if the registry moved meanwhile.
     #[serde(default)]
     template_rev: Option<String>,
-    /// Pack digest rendered by the inspector; protects same-revision repoints.
+    /// Tree digest rendered by the inspector; protects same-revision repoints.
     #[serde(default)]
     template_digest: Option<String>,
 }

@@ -78,8 +78,8 @@ pub(crate) enum Unadoptable {
     #[error("playbook {playbook:?} was deregistered while the save was being authorized")]
     Gone { playbook: String },
     #[error(
-        "playbook {playbook:?} was re-registered at revision {rev} while the save was being \
-         authorized; reload the form"
+        "playbook {playbook:?} was re-registered at {rev} while the save was being authorized; \
+         reload the form"
     )]
     Repinned { playbook: String, rev: String },
 }
@@ -100,7 +100,7 @@ async fn lock_adopted(
     if !locked.holds(pinned) {
         return Err(Unadoptable::Repinned {
             playbook,
-            rev: locked.rev,
+            rev: adopted_label(&locked.rev, locked.tree_digest.as_deref()),
         }
         .into());
     }
@@ -117,6 +117,9 @@ pub(crate) struct Standing {
     pub adopted_repo: Option<String>,
     pub adopted_path: Option<String>,
     pub adopted_rev: Option<String>,
+    /// The adopted bytes' digest, and the adopted tree once one is recorded.
+    pub adopted_tar_digest: Option<String>,
+    pub adopted_tree_digest: Option<String>,
     pub eligible_draft_version: Option<i64>,
     pub params: serde_json::Value,
     pub schema_digest: String,
@@ -145,11 +148,34 @@ pub(crate) struct Standing {
     pub updated_at: String,
 }
 
+impl Standing {
+    /// Whether this row adopted the revision `pack` holds: the same tree, or the same bytes when
+    /// this row recorded no tree.
+    pub(crate) fn adopts(&self, pack: &crate::playbooks::registry::PlaybookRow) -> bool {
+        match (
+            self.adopted_tree_digest.as_deref(),
+            pack.tree_digest.as_ref(),
+        ) {
+            (Some(adopted), Some(tree)) => adopted == tree.as_str(),
+            (Some(_), None) => false,
+            (None, _) => self.adopted_tar_digest.as_deref() == Some(pack.tar_digest.as_str()),
+        }
+    }
+}
+
+/// How an audit line names an adopted revision: the rev, and the tree when it is not the rev.
+pub(crate) fn adopted_label(rev: &str, tree: Option<&str>) -> String {
+    match tree {
+        Some(tree) if tree != rev => format!("revision {rev} (tree {tree})"),
+        _ => format!("revision {rev}"),
+    }
+}
+
 /// The [`Standing`] projection, qualified as `c` so a sidecar read can join its own table beside
 /// it: `SELECT {COLUMNS}, s.cron_expr FROM playbook_standing_launches c JOIN playbook_schedules s
 /// USING (id)`.
 pub(crate) const COLUMNS: &str = "c.id, c.playbook, c.target_kind, c.adopted_repo, c.adopted_path, \
-    c.adopted_rev, c.eligible_draft_version, c.params, c.schema_digest, c.max_cost, c.max_time, \
+    c.adopted_rev, c.adopted_tar_digest, c.adopted_tree_digest, c.eligible_draft_version, c.params, c.schema_digest, c.max_cost, c.max_time, \
     c.advance_dedupe, c.enabled, c.consecutive_failures, c.created_by, c.owner_principal, \
     c.owner_groups, c.owner_groups_at, c.owner_signin_required, c.owner_refresh_error, \
     c.owner_refresh_at, c.dispatch_target, c.agent_provider, c.agent_model, c.created_at, \
@@ -302,9 +328,7 @@ pub(crate) struct Authorized {
     /// The draft version a draft-head firing freezes.
     pub draft_version: Option<i64>,
     pub adopted_tar_gz: Option<Vec<u8>>,
-    pub adopted_tar_digest: Option<String>,
     pub adopted_tar_bytes: Option<i64>,
-    pub adopted_tree_digest: Option<String>,
 }
 
 /// Lock the core row for the firing the trigger just claimed.
@@ -319,7 +343,7 @@ pub(crate) async fn authorized(
                COALESCE(p.description, d.description) AS description,
                COALESCE(c.adopted_params_schema, dv.params_schema) AS params_schema,
                dv.version AS draft_version,
-               c.adopted_tar_gz, c.adopted_tar_digest, c.adopted_tar_bytes, c.adopted_tree_digest
+               c.adopted_tar_gz, c.adopted_tar_bytes
         FROM playbook_standing_launches c
         LEFT JOIN playbooks p ON p.id = c.playbook AND c.target_kind = 'adopted'
         LEFT JOIN playbook_drafts d ON d.id = c.playbook AND c.target_kind = 'draft_head'
@@ -455,7 +479,7 @@ pub(crate) async fn fire(
     if core.target_kind == "adopted" {
         let (Some(tar_gz), Some(digest), Some(bytes)) = (
             row.adopted_tar_gz.as_ref(),
-            row.adopted_tar_digest.as_ref(),
+            core.adopted_tar_digest.as_ref(),
             row.adopted_tar_bytes,
         ) else {
             return Err(format!("{noun} has no adopted pack").into());
@@ -471,7 +495,7 @@ pub(crate) async fn fire(
         .bind(digest)
         .bind(bytes)
         .bind(crate::clock::now_rfc3339())
-        .bind(row.adopted_tree_digest.as_deref())
+        .bind(core.adopted_tree_digest.as_deref())
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("{noun} adopted pack copy: {e}"))?;

@@ -46,6 +46,10 @@ ALTER TABLE pack_tarballs              ADD COLUMN tree_digest TEXT REFERENCES pa
 -- The tree a scope froze. Build planning and dispatch read it, not whatever the issue's
 -- pack_tarballs row holds later. NULL for a scope frozen before trees, which reads that row.
 ALTER TABLE scopes                     ADD COLUMN tree_digest TEXT REFERENCES pack_trees(digest);
+-- The tree a draft was seeded from and the tree a secret binding was reviewed against. Comparison
+-- pins only, so no foreign key; NULL compares by the rev beside it.
+ALTER TABLE playbook_drafts            ADD COLUMN origin_digest TEXT;
+ALTER TABLE secret_bindings            ADD COLUMN pack_digest TEXT;
 
 -- A controller that predates tree storage rewrites legacy bytes without knowing the tree column.
 -- When the bytes change, keep the tree if the new bytes are its tarball or an encoding of it that

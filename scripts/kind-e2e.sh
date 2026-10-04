@@ -604,11 +604,14 @@ expect_playbook_files() {
 }
 
 # clone_template <label> <draft> <playbook> <tree>: a draft templated from the playbook at the
-# revision and bytes digest it serves stores that tree as its version 1.
+# revision and tree digest it serves stores that tree as its version 1. A row with no tree yet is
+# templated by its revision alone.
 clone_template() {
     local rev digest
-    read -r rev digest <<<"$(sql -F ' ' -c "SELECT rev, tar_digest FROM playbooks WHERE id = '$3'")"
-    api POST /api/playbook-drafts "{\"id\":\"$2\",\"description\":\"kind e2e\",\"template\":\"$3\",\"template_rev\":\"$rev\",\"template_digest\":\"$digest\"}"
+    read -r rev digest <<<"$(sql -F ' ' -c "SELECT rev, tree_digest FROM playbooks WHERE id = '$3'")"
+    api POST /api/playbook-drafts "$(jq -nc --arg id "$2" --arg t "$3" --arg rev "$rev" --arg d "$digest" \
+        '{id: $id, description: "kind e2e", template: $t, template_rev: $rev}
+         + (if $d == "" then {} else {template_digest: $d} end)')"
     [ "$HTTP" = 201 ] || fail "[$1] templating $2 from $3: $HTTP $(cat "$WORK/api.json")"
     [ "$(draft_tree "$2" 1)" = "$4" ] || fail "[$1] the draft templated from $3 holds '$(draft_tree "$2" 1)', not $4"
     pass "[$1] a draft templated from $3 holds $4"
@@ -646,7 +649,9 @@ crux draft-publish "$DRAFT" --playbook "$DRAFT-pub" --json >"$WORK/publish-P.jso
 [ "$(playbook_tree "$DRAFT-pub")" = "$TREE" ] || fail "[P] the registry row holds tree '$(playbook_tree "$DRAFT-pub")'"
 [ "$(sql -c "SELECT count(*) FROM playbook_revisions WHERE playbook_id = '$DRAFT-pub' AND tree_digest = '$TREE'")" = 1 ] ||
     fail "[P] the published tree is not recorded as a revision"
-pass "[P] the registry row and its revision hold the draft's tree"
+[ "$(sql -c "SELECT rev FROM playbooks WHERE id = '$DRAFT-pub'")" = "$TREE" ] ||
+    fail "[P] the published row's rev is $(sql -c "SELECT rev FROM playbooks WHERE id = '$DRAFT-pub'"), not its tree"
+pass "[P] the registry row and its revision hold the draft's tree, and its rev is that tree"
 launch_and_check P launch "$DRAFT-pub"
 [ "$LAUNCH_TREE" = "$TREE" ] || fail "[P] the launch ran tree $LAUNCH_TREE, not the registered $TREE"
 read -r launched registered <<<"$(sql -F ' ' -c "SELECT l.exposure_digest, p.exposure_digest FROM playbook_launches l JOIN playbooks p ON p.id = l.playbook WHERE l.key = '$KEY'")"

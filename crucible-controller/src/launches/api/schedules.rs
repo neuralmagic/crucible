@@ -33,6 +33,9 @@ dto! {
         pub adopted_repo: Option<String>,
         pub adopted_path: Option<String>,
         pub adopted_rev: Option<String>,
+        /// The `tree1:` digest of the adopted pack; null for a draft head, or for a row adopted
+        /// before trees were recorded.
+        pub adopted_tree_digest: Option<String>,
         pub eligible_draft_version: Option<i64>,
         /// The values every firing launches.
         #[schema(value_type = Object)]
@@ -480,7 +483,10 @@ pub(crate) async fn create_schedule(
         stored
             .adopted_rev
             .as_deref()
-            .map(|rev| format!("revision {rev}"))
+            .map(|rev| crate::launches::standing::adopted_label(
+                rev,
+                stored.adopted_tree_digest.as_deref()
+            ))
             .unwrap_or_else(|| format!(
                 "draft version {}",
                 stored.eligible_draft_version.unwrap_or_default()
@@ -708,9 +714,18 @@ pub(crate) async fn update_schedule(
         stored.tz,
         prior
             .as_ref()
-            .and_then(|s| s.adopted_rev.as_deref())
-            .unwrap_or("draft head"),
-        stored.adopted_rev.as_deref().unwrap_or("draft head")
+            .and_then(|s| s.adopted_rev.as_deref().map(|rev| {
+                crate::launches::standing::adopted_label(rev, s.adopted_tree_digest.as_deref())
+            }))
+            .unwrap_or_else(|| "draft head".to_string()),
+        stored
+            .adopted_rev
+            .as_deref()
+            .map(|rev| crate::launches::standing::adopted_label(
+                rev,
+                stored.adopted_tree_digest.as_deref()
+            ))
+            .unwrap_or_else(|| "draft head".to_string())
     );
     if let Err(e) = state
         .audit_required(

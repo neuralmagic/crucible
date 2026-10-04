@@ -46,6 +46,9 @@ pub struct WebhookDto {
     pub adopted_repo: Option<String>,
     pub adopted_path: Option<String>,
     pub adopted_rev: Option<String>,
+    /// The `tree1:` digest of the adopted pack; null for a row adopted before trees were
+    /// recorded.
+    pub adopted_tree_digest: Option<String>,
     /// The fixed values every launch carries.
     #[schema(value_type = BTreeMap<String, String>)]
     pub params: serde_json::Value,
@@ -96,6 +99,7 @@ impl From<Webhook> for WebhookDto {
             adopted_repo: c.adopted_repo,
             adopted_path: c.adopted_path,
             adopted_rev: c.adopted_rev,
+            adopted_tree_digest: c.adopted_tree_digest,
             params: c.params,
             derive: w.derive,
             filter: w.filter,
@@ -609,10 +613,13 @@ pub(crate) async fn create_webhook(
     };
     let webhook = created.webhook;
     let reason = format!(
-        "playbook {} on {} deliveries as revision {}",
+        "playbook {} on {} deliveries as {}",
         webhook.core.playbook,
         webhook.verifier.as_str(),
-        webhook.core.adopted_rev.as_deref().unwrap_or("?")
+        crate::launches::standing::adopted_label(
+            webhook.core.adopted_rev.as_deref().unwrap_or("?"),
+            webhook.core.adopted_tree_digest.as_deref()
+        )
     );
     if let Err(refusal) = audit(
         &state,
@@ -797,7 +804,7 @@ pub(crate) async fn update_webhook(
         Err(refusal) => return refusal,
     };
     let firing_changed = prior.core.playbook != authorized.launch.pack.id
-        || prior.core.adopted_rev.as_deref() != Some(authorized.launch.pack.rev.as_str())
+        || !prior.core.adopts(&authorized.launch.pack)
         || prior.core.params != authorized.launch.params
         || prior.core.dispatch_target.as_deref() != Some(saver.dispatch_target.as_str())
         || prior.core.agent_provider != saver.provider
@@ -845,9 +852,13 @@ pub(crate) async fn update_webhook(
         return AppError::from(e).into_response();
     }
     let reason = format!(
-        "playbook {} on {} deliveries",
+        "playbook {} on {} deliveries as {}",
         webhook.core.playbook,
-        webhook.verifier.as_str()
+        webhook.verifier.as_str(),
+        crate::launches::standing::adopted_label(
+            webhook.core.adopted_rev.as_deref().unwrap_or("?"),
+            webhook.core.adopted_tree_digest.as_deref()
+        )
     );
     if let Err(refusal) = audit(
         &state,

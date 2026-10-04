@@ -154,7 +154,9 @@ pub struct PackImportDto {
     pub path: String,
     /// The commit everything below was taken at; the preview is this pack even after the ref moves.
     pub rev: String,
-    pub tar_digest: String,
+    /// The `tree1:` digest of the frozen pack; null until startup conversion reaches a row an
+    /// older controller wrote.
+    pub tree_digest: Option<String>,
     /// The engine's params JSON Schema; null when the source did not compile.
     pub params_schema: Option<serde_json::Value>,
     pub schema_digest: Option<String>,
@@ -204,7 +206,7 @@ impl PackImportDto {
             git_ref: i.git_ref,
             path: i.path,
             rev: i.rev,
-            tar_digest: i.tar_digest,
+            tree_digest: i.tree_digest.map(|t| t.to_string()),
             params_schema: i.params_schema,
             schema_digest: i.schema_digest,
             graph: i.graph,

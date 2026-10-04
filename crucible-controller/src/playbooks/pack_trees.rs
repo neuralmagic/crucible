@@ -156,6 +156,72 @@ pub(crate) async fn read_file(
         .with_context(|| format!("reading {path} of pack tree {digest}"))
 }
 
+/// What a digest a caller supplied names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resolved {
+    Current(TreeDigest),
+    Superseded { replacement: TreeDigest },
+    Unconvertible { reason: String },
+    Unknown,
+}
+
+/// Resolve a digest a caller supplied: a stored tree, a pre-tree digest and what it became, or
+/// nothing this controller knows. The caller decides what each answer may disclose.
+pub(crate) async fn resolve_supplied(ex: impl PgExecutor<'_>, supplied: &str) -> Result<Resolved> {
+    if let Ok(digest) = supplied.parse::<TreeDigest>() {
+        let stored: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pack_trees WHERE digest = $1")
+            .bind(digest.as_str())
+            .fetch_optional(ex)
+            .await
+            .context("resolving a pack digest")?;
+        return Ok(match stored {
+            Some(_) => Resolved::Current(digest),
+            None => Resolved::Unknown,
+        });
+    }
+    let alias = sqlx::query(
+        "SELECT tree_digest, unconvertible_reason FROM pack_digest_aliases WHERE old_digest = $1",
+    )
+    .bind(supplied)
+    .fetch_optional(ex)
+    .await
+    .context("resolving a pre-tree pack digest")?;
+    let Some(alias) = alias else {
+        return Ok(Resolved::Unknown);
+    };
+    let tree: Option<String> = alias.try_get("tree_digest")?;
+    let reason: Option<String> = alias.try_get("unconvertible_reason")?;
+    Ok(match (tree, reason) {
+        (Some(tree), _) => Resolved::Superseded {
+            replacement: tree.parse().map_err(anyhow::Error::msg)?,
+        },
+        (None, Some(reason)) => Resolved::Unconvertible { reason },
+        (None, None) => Resolved::Unknown,
+    })
+}
+
+/// The tree that superseded `supplied`, when `supplied` is a pre-tree digest whose tree playbook
+/// `playbook` has held. `None` for anything else, which the caller answers as an unknown digest.
+/// Only for a caller who may read `playbook`.
+pub(crate) async fn superseded_in(
+    pool: &sqlx::PgPool,
+    playbook: &str,
+    supplied: &str,
+) -> Result<Option<TreeDigest>> {
+    let Resolved::Superseded { replacement } = resolve_supplied(pool, supplied).await? else {
+        return Ok(None);
+    };
+    let held: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM playbook_revisions WHERE playbook_id = $1 AND tree_digest = $2",
+    )
+    .bind(playbook)
+    .bind(replacement.as_str())
+    .fetch_optional(pool)
+    .await
+    .context("checking a playbook's revisions")?;
+    Ok(held.map(|_| replacement))
+}
+
 /// The pack `pack` names: its stored tree, or its legacy bytes read as a tree.
 pub(crate) async fn load(ex: impl PgExecutor<'_>, pack: PackRef) -> Result<PackTree> {
     match pack {
@@ -495,5 +561,91 @@ mod tests {
                 "converted {converted}"
             );
         }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_supplied_digest_resolves_to_what_it_names(pool: PgPool) {
+        let mut conn = pool.acquire().await.expect("conn");
+        let digest = put_tree(&mut conn, &encoded(&pack(&[("a", b"1")])))
+            .await
+            .expect("put");
+        sqlx::query(
+            "INSERT INTO pack_digest_aliases (old_digest, tree_digest, unconvertible_reason, recorded_at)
+             VALUES ('sha256:old', $1, NULL, 'now'), ('sha256:broken', NULL, 'a symlink', 'now')",
+        )
+        .bind(digest.as_str())
+        .execute(&pool)
+        .await
+        .expect("aliases");
+        let missing = pack(&[("b", b"2")]).digest();
+
+        assert_eq!(
+            resolve_supplied(&pool, digest.as_str())
+                .await
+                .expect("current"),
+            Resolved::Current(digest.clone())
+        );
+        assert_eq!(
+            resolve_supplied(&pool, "sha256:old").await.expect("old"),
+            Resolved::Superseded {
+                replacement: digest.clone()
+            }
+        );
+        assert_eq!(
+            resolve_supplied(&pool, "sha256:broken")
+                .await
+                .expect("broken"),
+            Resolved::Unconvertible {
+                reason: "a symlink".to_string()
+            }
+        );
+        for unknown in [missing.as_str(), "sha256:never", "abc123"] {
+            assert_eq!(
+                resolve_supplied(&pool, unknown).await.expect("unknown"),
+                Resolved::Unknown,
+                "{unknown}"
+            );
+        }
+
+        assert_eq!(
+            superseded_in(&pool, "p", "sha256:old")
+                .await
+                .expect("none held"),
+            None,
+            "a playbook that never held the replacement learns nothing"
+        );
+        sqlx::query(
+            "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, tar_digest, \
+             tar_bytes, params_schema, schema_digest, core_rev, created_at, updated_at) \
+             VALUES ('p', 'd', 'o/r', 'aaa', '', 'x', 'sha256:x', 1, '{}'::jsonb, 's', 'c', \
+             'now', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect("playbook");
+        sqlx::query(
+            "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at) \
+             VALUES ('p', $1, 'now')",
+        )
+        .bind(digest.as_str())
+        .execute(&pool)
+        .await
+        .expect("revision");
+        assert_eq!(
+            superseded_in(&pool, "p", "sha256:old").await.expect("held"),
+            Some(digest.clone())
+        );
+        assert_eq!(
+            superseded_in(&pool, "p", digest.as_str())
+                .await
+                .expect("current"),
+            None
+        );
+        assert_eq!(
+            superseded_in(&pool, "p", "sha256:broken")
+                .await
+                .expect("broken"),
+            None
+        );
     }
 }

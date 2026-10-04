@@ -4602,7 +4602,7 @@ fn repo_secrets(launcher: crate::authz::model::Principals) -> crate::runs::workp
     crate::runs::workpod::LaunchSecrets {
         scope: crate::secrets::launch::Scope::repo("owner/repo"),
         launcher,
-        revision: crate::secrets::launch::OwnedRevision::Published(None),
+        revision: crate::secrets::launch::OwnedRevision::UNPINNED,
         provider: Some(std::sync::Arc::new(
             crate::secrets::provider::MapProvider::new([(
                 "pr_token".to_string(),

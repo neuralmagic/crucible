@@ -15,7 +15,7 @@ use crate::playbooks::plan_graph::WorkflowGraphDto;
 use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
 use anyhow::{Context, Result};
 use crucible_contract::content_digest;
-use crucible_contract::pack_tree::PackTree;
+use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
@@ -241,10 +241,10 @@ impl OriginKind {
     }
 }
 
-/// A draft's origin, resolved against where that pack lives now. `rev` is what the draft was
-/// seeded from and `current_rev` is what the origin serves today: a registry re-pin moves them
-/// apart, which is what the studio offers a rebase against. An import's bytes are frozen, so its
-/// two revs are the same one.
+/// A draft's origin, resolved against where that pack lives now. `rev` and `digest` are what the
+/// draft was seeded from and `current_rev` and `current_digest` are what the origin serves today:
+/// a registry re-pin moves them apart, which is what the studio offers a rebase against. An
+/// import's bytes are frozen, so its two pins are the same one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftOrigin {
     pub kind: OriginKind,
@@ -254,21 +254,26 @@ pub struct DraftOrigin {
     pub path: Option<String>,
     pub rev: Option<String>,
     pub current_rev: Option<String>,
+    pub digest: Option<String>,
+    pub current_digest: Option<String>,
 }
 
 impl DraftOrigin {
-    /// Whether the origin pack re-pinned under the draft.
+    /// Whether the origin pack re-pinned under the draft: a different tree, or a different rev
+    /// when either side has no tree recorded.
     pub fn moved(&self) -> bool {
-        match (self.rev.as_deref(), self.current_rev.as_deref()) {
-            (Some(seeded), Some(current)) => seeded != current,
-            _ => false,
-        }
+        let pins = match (self.digest.as_deref(), self.current_digest.as_deref()) {
+            (Some(seeded), Some(current)) => Some((seeded, current)),
+            _ => self.rev.as_deref().zip(self.current_rev.as_deref()),
+        };
+        pins.is_some_and(|(seeded, current)| seeded != current)
     }
 
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Option<Self>> {
         let playbook: Option<String> = row.try_get("origin_playbook")?;
         let import_id: Option<String> = row.try_get("origin_import")?;
         let rev: Option<String> = row.try_get("origin_rev")?;
+        let digest: Option<String> = row.try_get("origin_digest")?;
         if let Some(playbook) = playbook {
             return Ok(Some(DraftOrigin {
                 kind: OriginKind::Playbook,
@@ -278,6 +283,8 @@ impl DraftOrigin {
                 path: row.try_get("origin_playbook_path")?,
                 rev,
                 current_rev: row.try_get("origin_current_rev")?,
+                digest,
+                current_digest: row.try_get("origin_current_digest")?,
             }));
         }
         let Some(import_id) = import_id else {
@@ -291,16 +298,19 @@ impl DraftOrigin {
             path: row.try_get("origin_import_path")?,
             current_rev: rev.clone(),
             rev,
+            current_digest: digest.clone(),
+            digest,
         }))
     }
 }
 
 /// Every draft column the studio reads, joined to whatever its origin is now.
 const DRAFT_COLUMNS: &str = "d.id, d.description, d.origin_playbook, d.origin_rev, \
-                             d.origin_import, d.graduation_repo, d.graduation_path, \
-                             d.graduation_pr_url, d.retired_at, d.owner, d.created_by, d.created_at, \
-                             d.updated_at, p.repo AS origin_playbook_repo, \
-                             p.path AS origin_playbook_path, p.rev AS origin_current_rev, \
+                             d.origin_digest, d.origin_import, d.graduation_repo, \
+                             d.graduation_path, d.graduation_pr_url, d.retired_at, d.owner, \
+                             d.created_by, d.created_at, d.updated_at, \
+                             p.repo AS origin_playbook_repo, p.path AS origin_playbook_path, \
+                             p.rev AS origin_current_rev, p.tree_digest AS origin_current_digest, \
                              i.repo AS origin_import_repo, i.path AS origin_import_path, \
                              sp.id AS published_playbook";
 
@@ -346,11 +356,12 @@ impl DraftRow {
     }
 }
 
-/// One stored save, without its tarball.
+/// One stored save, without its files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftVersionRow {
     pub version: i64,
-    pub tar_digest: String,
+    /// The stored tree; `None` until startup conversion reaches a row an older controller wrote.
+    pub tree_digest: Option<TreeDigest>,
     pub schema_digest: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
     pub core_rev: String,
@@ -363,7 +374,11 @@ impl DraftVersionRow {
         let diagnostics: serde_json::Value = row.try_get("diagnostics")?;
         Ok(DraftVersionRow {
             version: row.try_get("version")?,
-            tar_digest: row.try_get("tar_digest")?,
+            tree_digest: row
+                .try_get::<Option<String>, _>("tree_digest")?
+                .map(TreeDigest::try_from)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
             schema_digest: row.try_get("schema_digest")?,
             diagnostics: serde_json::from_value(diagnostics)
                 .context("decoding stored draft diagnostics")?,
@@ -514,6 +529,27 @@ struct SeededOrigin {
     playbook: Option<String>,
     import_id: Option<String>,
     rev: Option<String>,
+    digest: Option<String>,
+}
+
+/// The refusal for a template pin `supplied` that the registry no longer serves: superseded,
+/// naming its replacement, when it is a pre-tree digest of a tree `template` has held, and
+/// `otherwise` for anything else, so an unknown pin and a superseded one the template never held
+/// read alike. The caller may read `template`.
+async fn superseded_or(
+    pool: &PgPool,
+    template: &str,
+    supplied: &str,
+    otherwise: impl FnOnce() -> String,
+) -> DraftError {
+    match crate::playbooks::pack_trees::superseded_in(pool, template, supplied).await {
+        Ok(Some(replacement)) => DraftError::Conflict(format!(
+            "playbook {template:?} revision {supplied} is superseded by {replacement}; reload \
+             before cloning"
+        )),
+        Ok(None) => DraftError::Conflict(otherwise()),
+        Err(e) => DraftError::Internal(e),
+    }
 }
 
 /// Whether a draft can be created under `id`: a valid slug, a description, and an id the registry
@@ -566,49 +602,63 @@ pub async fn create(
                 .await
                 .map_err(DraftError::Internal)?
                 .ok_or_else(|| DraftError::NotFound(format!("no playbook {template:?}")))?;
-            if expected_rev.is_some_and(|rev| rev != registered.rev) {
-                return Err(DraftError::Conflict(format!(
-                    "playbook {template:?} moved from inspected revision {} to {}; reload before cloning",
-                    expected_rev.unwrap_or_default(),
-                    registered.rev
-                )));
+            if let Some(rev) = expected_rev
+                && rev != registered.rev
+            {
+                return Err(superseded_or(pool, template, rev, || {
+                    format!(
+                        "playbook {template:?} moved from inspected revision {rev} to {}; \
+                         reload before cloning",
+                        registered.rev
+                    )
+                })
+                .await);
             }
+            let pinned = expected_digest
+                .map(str::to_string)
+                .or_else(|| registered.tree_digest.map(|t| t.to_string()));
             let tree = crate::playbooks::registry::pack_at_rev(
                 pool,
                 template,
                 &registered.rev,
-                expected_digest,
+                pinned.as_deref(),
             )
             .await
-            .map_err(DraftError::Internal)?
-            .ok_or_else(|| {
-                DraftError::Conflict(format!(
-                    "playbook {template:?} moved while cloning; reload before retrying"
-                ))
-            })?;
+            .map_err(DraftError::Internal)?;
+            let Some(tree) = tree else {
+                let moved =
+                    || format!("playbook {template:?} moved while cloning; reload before retrying");
+                return Err(match expected_digest {
+                    Some(digest) => superseded_or(pool, template, digest, moved).await,
+                    None => DraftError::Conflict(moved()),
+                });
+            };
             (
                 crate::playbooks::packs::text_files(tree)?,
                 SeededOrigin {
                     playbook: Some(registered.id),
                     import_id: None,
                     rev: Some(registered.rev),
+                    digest: pinned,
                 },
             )
         }
         DraftSeed::Import { id: import, tree } => {
-            let rev: Option<String> =
-                sqlx::query_scalar("SELECT rev FROM pack_imports WHERE id = $1")
+            let pins: Option<(String, Option<String>)> =
+                sqlx::query_as("SELECT rev, tree_digest FROM pack_imports WHERE id = $1")
                     .bind(import)
                     .fetch_optional(pool)
                     .await
                     .context("reading the rev a draft is seeded at")
                     .map_err(DraftError::Internal)?;
+            let (rev, digest) = pins.unzip();
             (
                 crate::playbooks::packs::text_files(tree.clone())?,
                 SeededOrigin {
                     playbook: None,
                     import_id: Some(import.to_string()),
                     rev,
+                    digest: digest.flatten(),
                 },
             )
         }
@@ -624,8 +674,8 @@ pub async fn create(
     let now = crate::clock::now_rfc3339();
     let inserted = sqlx::query(
         r#"INSERT INTO playbook_drafts (id, description, origin_playbook, origin_import, origin_rev,
-                                        created_by, created_at, updated_at, owner)
-           VALUES ($1, $2, $3, $6, $7, $4, $5, $5, $8) ON CONFLICT (id) DO NOTHING"#,
+                                        created_by, created_at, updated_at, owner, origin_digest)
+           VALUES ($1, $2, $3, $6, $7, $4, $5, $5, $8, $9) ON CONFLICT (id) DO NOTHING"#,
     )
     .bind(id)
     .bind(description.trim())
@@ -635,6 +685,7 @@ pub async fn create(
     .bind(&origin.import_id)
     .bind(&origin.rev)
     .bind(owner.to_string())
+    .bind(&origin.digest)
     .execute(pool)
     .await
     .context("creating a playbook draft")
@@ -888,7 +939,7 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<DraftRow>> {
 /// A draft's save history, newest first.
 pub async fn versions(pool: &PgPool, id: &str) -> Result<Vec<DraftVersionRow>> {
     let rows = sqlx::query(
-        r#"SELECT version, tar_digest, schema_digest, diagnostics, core_rev, created_by, created_at
+        r#"SELECT version, tree_digest, schema_digest, diagnostics, core_rev, created_by, created_at
            FROM playbook_draft_versions WHERE draft_id = $1 ORDER BY version DESC"#,
     )
     .bind(id)
@@ -1602,8 +1653,8 @@ mod tests {
             vec![3, 2, 1]
         );
         assert_ne!(
-            history[0].tar_digest, history[1].tar_digest,
-            "an edited file is different bytes"
+            history[0].tree_digest, history[1].tree_digest,
+            "an edited file is a different tree"
         );
 
         assert_eq!(
@@ -2246,5 +2297,152 @@ mod tests {
             Some("workflow.star")
         );
         assert!(refused.diagnostics[0].line.is_some());
+    }
+
+    /// The origin pin is the tree. A registry repoint that keeps the rev but changes the tree
+    /// moves the origin, a template pin naming the old tree is refused, and a pre-tree digest is
+    /// refused as superseded only when the template has held its replacement. A superseded digest
+    /// whose tree the template never held reads exactly as an unknown one.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_same_rev_repoint_to_another_tree_moves_the_origin(pool: PgPool) {
+        let tree = |marker: &str| {
+            PackTree::from_pairs(&[
+                ("crucible.toml", SKELETON_MANIFEST.as_bytes()),
+                (
+                    "workflow.star",
+                    format!("params = {{}}\n# {marker}\n").as_bytes(),
+                ),
+            ])
+            .expect("tree")
+        };
+        let (first, second, elsewhere) = (tree("first"), tree("second"), tree("elsewhere"));
+        let mut conn = pool.acquire().await.expect("conn");
+        let mut stored = Vec::new();
+        for t in [&first, &second, &elsewhere] {
+            let pack = crate::playbooks::pack_trees::EncodedPack::new(t.clone()).expect("encode");
+            crate::playbooks::pack_trees::put_tree(&mut conn, &pack)
+                .await
+                .expect("put");
+            stored.push(pack);
+        }
+        let pin = |pack: &crate::playbooks::pack_trees::EncodedPack| {
+            let pool = pool.clone();
+            let (tarball, digest) = (pack.tarball().to_vec(), pack.tree().digest().to_string());
+            async move {
+                sqlx::query(
+                    "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, \
+                     tar_digest, tar_bytes, params_schema, schema_digest, core_rev, created_at, \
+                     updated_at, tree_digest) \
+                     VALUES ('survey', 'd', 'o/r', 'aaa', '', $1, $2, 1, '{}'::jsonb, 's', \
+                     'pin', 'now', 'now', $3) \
+                     ON CONFLICT (id) DO UPDATE SET tar_gz = excluded.tar_gz, \
+                     tar_digest = excluded.tar_digest, tree_digest = excluded.tree_digest",
+                )
+                .bind(&tarball)
+                .bind(content_digest(&tarball))
+                .bind(&digest)
+                .execute(&pool)
+                .await
+                .expect("pin");
+                sqlx::query(
+                    "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at) \
+                     VALUES ('survey', $1, 'now') ON CONFLICT DO NOTHING",
+                )
+                .bind(&digest)
+                .execute(&pool)
+                .await
+                .expect("revision");
+            }
+        };
+        fn template(expected_digest: Option<&str>) -> DraftSeed<'_> {
+            DraftSeed::Template {
+                id: "survey",
+                expected_rev: Some("aaa"),
+                expected_digest,
+            }
+        }
+        async fn refuse(pool: &PgPool, seed: DraftSeed<'_>) -> String {
+            match create(
+                pool,
+                "again",
+                "d",
+                seed,
+                None,
+                &crate::authz::model::Principal::platform(),
+            )
+            .await
+            {
+                Err(DraftError::Conflict(msg)) => msg,
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
+        pin(&stored[0]).await;
+        let first_digest = first.digest().to_string();
+        create(
+            &pool,
+            "fork",
+            "d",
+            template(Some(&first_digest)),
+            None,
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("fork");
+        let origin = || async {
+            get(&pool, "fork")
+                .await
+                .expect("read")
+                .expect("draft")
+                .origin
+                .expect("origin")
+        };
+        let seeded = origin().await;
+        assert_eq!(seeded.digest.as_deref(), Some(first_digest.as_str()));
+        assert!(!seeded.moved());
+
+        pin(&stored[1]).await;
+        let repointed = origin().await;
+        assert_eq!(repointed.rev, repointed.current_rev, "the rev did not move");
+        assert_eq!(repointed.current_digest, Some(second.digest().to_string()));
+        assert!(repointed.moved(), "the tree did");
+
+        let unknown = refuse(&pool, template(Some("sha256:never"))).await;
+        assert!(unknown.contains("moved while cloning"), "{unknown}");
+        assert_eq!(refuse(&pool, template(Some(&first_digest))).await, unknown);
+
+        for (old, tree) in [("sha256:old", &second), ("sha256:foreign", &elsewhere)] {
+            sqlx::query(
+                "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
+                 VALUES ($1, $2, 'then')",
+            )
+            .bind(old)
+            .bind(tree.digest().as_str())
+            .execute(&pool)
+            .await
+            .expect("alias");
+        }
+        let superseded = refuse(&pool, template(Some("sha256:old"))).await;
+        assert!(
+            superseded.contains(&format!("superseded by {}", second.digest())),
+            "{superseded}"
+        );
+        assert_eq!(
+            refuse(&pool, template(Some("sha256:foreign"))).await,
+            unknown,
+            "a tree the template never held is not named"
+        );
+        let stale_rev = refuse(
+            &pool,
+            DraftSeed::Template {
+                id: "survey",
+                expected_rev: Some("sha256:old"),
+                expected_digest: None,
+            },
+        )
+        .await;
+        assert!(
+            stale_rev.contains(&format!("superseded by {}", second.digest())),
+            "{stale_rev}"
+        );
     }
 }

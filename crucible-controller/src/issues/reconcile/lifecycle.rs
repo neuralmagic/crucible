@@ -183,7 +183,7 @@ async fn launch_approved_run(
         Some(&crate::runs::workpod::LaunchSecrets {
             scope: crate::secrets::launch::Scope::repo(&issue.repo),
             launcher: crate::authz::model::Principals::default(),
-            revision: crate::secrets::launch::OwnedRevision::Published(None),
+            revision: crate::secrets::launch::OwnedRevision::UNPINNED,
             provider: cfg.secret_provider.clone(),
             inference_provider: dispatch.map(|d| d.provider),
             exposure: scope.exposure.clone(),

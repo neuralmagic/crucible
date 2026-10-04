@@ -172,8 +172,7 @@ pub const DRAFT_LAUNCH_REPO: &str = "(draft)";
 pub struct Registered {
     pub id: String,
     pub rev: String,
-    pub tar_digest: String,
-    /// The stored tree the pack's bytes encode.
+    /// The stored tree.
     pub tree_digest: TreeDigest,
     /// Excluded paths the pack's read skipped.
     pub ignored: Vec<String>,
@@ -729,8 +728,8 @@ pub async fn register(
 }
 
 /// Store a draft version under `req.id`: the same extraction and transaction as [`register`], with
-/// the draft's tarball in place of a git fetch. The stored bytes are the tarball of the tree the
-/// draft's bytes read as, and the row pins their digest as its `rev`.
+/// the draft's tree in place of a git fetch. A draft has no commit, so the tree digest is the
+/// row's `rev`.
 pub async fn publish_draft(
     pool: &PgPool,
     req: PublishDraft,
@@ -772,7 +771,7 @@ pub async fn publish_draft(
             id: req.id,
             owner: req.owner,
             description: req.description,
-            rev: content_digest(pack.tarball()),
+            rev: pack.tree().digest().to_string(),
             source,
             pack,
             replaces: Some(req.replaces),
@@ -981,7 +980,6 @@ async fn store(
     Ok(Registered {
         id: row.id,
         rev: row.rev,
-        tar_digest,
         tree_digest,
         ignored: row.pack.into_ignored(),
         schema_changed: prior.is_some_and(|p| p != schema_digest),
@@ -1051,20 +1049,20 @@ async fn load_row(pool: &PgPool, row: Option<&sqlx::postgres::PgRow>) -> Result<
 }
 
 /// A registered playbook's pack, only when the registry still serves the revision the caller
-/// inspected.
+/// inspected: the same rev and, when the caller names one, the same tree.
 pub(crate) async fn pack_at_rev(
     pool: &PgPool,
     id: &str,
     rev: &str,
-    tar_digest: Option<&str>,
+    tree_digest: Option<&str>,
 ) -> Result<Option<PackTree>> {
     let row = sqlx::query(const_format::formatcp!(
         "SELECT {PACK_COLS} FROM playbooks
-         WHERE id = $1 AND rev = $2 AND ($3::text IS NULL OR tar_digest = $3)"
+         WHERE id = $1 AND rev = $2 AND ($3::text IS NULL OR tree_digest = $3)"
     ))
     .bind(id)
     .bind(rev)
-    .bind(tar_digest)
+    .bind(tree_digest)
     .fetch_optional(pool)
     .await
     .context("reading a playbook pack at an expected revision")?;
@@ -1703,7 +1701,7 @@ mod tests {
         }
     }
 
-    /// A published draft is a registry row with a draft source and its bytes' digest as the pin,
+    /// A published draft is a registry row with a draft source and its tree digest as the rev,
     /// guarded against a row appearing or vanishing after the caller was authorized, and a git
     /// registration of the same id takes the row back to a git source.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -1716,8 +1714,7 @@ mod tests {
             .await
             .expect("publish");
         let tarball = tree.tarball().expect("tarball");
-        assert_eq!(published.rev, content_digest(&tarball));
-        assert_eq!(published.rev, published.tar_digest);
+        assert_eq!(published.rev, tree.digest().to_string());
         assert_eq!(published.tree_digest, tree.digest());
         let stored: (Option<String>, Vec<u8>) =
             sqlx::query_as("SELECT tree_digest, tar_gz FROM playbooks WHERE id = 'survey'")
@@ -1884,7 +1881,11 @@ mod tests {
         let row = get(&pool, "survey").await.expect("get").expect("row");
         assert_eq!(row.core_rev, core_rev().expect("engine revision"));
         assert_eq!(row.created_by.as_deref(), Some("wren"));
-        assert_eq!(row.tar_digest, second.tar_digest, "the last pin is stored");
+        assert_eq!(
+            row.tree_digest,
+            Some(second.tree_digest.clone()),
+            "the last pin is stored"
+        );
 
         let expected = crucible_contract::pack_tree::PackTree::from_pairs(&[
             ("crucible.toml", PLAYBOOK_REPO_MANIFEST.as_bytes()),
@@ -2031,7 +2032,7 @@ mod tests {
             .expect("re-register");
 
         assert_ne!(second.rev, first.rev, "the pin moved");
-        assert_ne!(second.tar_digest, first.tar_digest, "the pack changed");
+        assert_ne!(second.tree_digest, first.tree_digest, "the pack changed");
         assert_ne!(second.schema_digest, first.schema_digest);
         assert!(second.schema_changed, "the form changed with the pack");
         assert_eq!(

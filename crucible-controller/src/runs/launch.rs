@@ -56,9 +56,13 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         None => {
             let pack = crate::playbooks::registry::get(db.pool(), &launch.playbook).await?;
             (
-                crate::secrets::launch::OwnedRevision::Published(
-                    pack.as_ref().map(|p| p.rev.clone()),
-                ),
+                crate::secrets::launch::OwnedRevision::Published {
+                    rev: pack.as_ref().map(|p| p.rev.clone()),
+                    tree: pack
+                        .as_ref()
+                        .and_then(|p| p.tree_digest.as_ref())
+                        .map(|t| t.to_string()),
+                },
                 pack.and_then(|p| p.agent),
             )
         }

@@ -16,6 +16,7 @@ import {
 } from '../ui';
 import type { StatusTone } from '../ui';
 import { scheduleView, signinNeededCount, type ScheduleDto, type ScheduleState } from './schedulesView';
+import { shortRev } from './draftStudio';
 
 const EMPTY: ScheduleDto[] = [];
 
@@ -53,7 +54,7 @@ const columns = helper.columns([
     cell: ({ row }) =>
       row.original.target_kind === 'draft_head'
         ? `draft head · v${row.original.eligible_draft_version ?? '—'}`
-        : `adopted · ${(row.original.adopted_rev ?? '').slice(0, 7)}`,
+        : `adopted · ${shortRev(row.original.adopted_rev)}`,
   }),
   helper.display({
     id: 'recurrence',
