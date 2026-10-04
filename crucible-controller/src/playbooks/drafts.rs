@@ -1181,14 +1181,22 @@ pub async fn origin_files(pool: &PgPool, id: &str) -> Result<Option<OriginFiles>
             let import = origin.import_id.ok_or_else(|| {
                 DraftError::Internal(anyhow::anyhow!("origin without an import id"))
             })?;
-            let tree = crate::playbooks::imports::pack(pool, &import)
+            let row = sqlx::query(const_format::formatcp!(
+                "SELECT {} FROM pack_imports WHERE id = $1",
+                crate::playbooks::pack_trees::PACK_COLS
+            ))
+            .bind(&import)
+            .fetch_optional(pool)
+            .await
+            .context("reading the import a draft came from")?
+            .ok_or_else(|| {
+                DraftError::NotFound(format!(
+                    "draft {id} came from import {import}, which no longer exists"
+                ))
+            })?;
+            let tree = crate::playbooks::pack_trees::load_row(pool, &row)
                 .await
-                .context("reading the import a draft came from")?
-                .ok_or_else(|| {
-                    DraftError::NotFound(format!(
-                        "draft {id} came from import {import}, which no longer exists"
-                    ))
-                })?;
+                .with_context(|| format!("reading the frozen pack of import {import}"))?;
             Ok(Some(OriginFiles {
                 kind: OriginKind::Import,
                 reference: import,
