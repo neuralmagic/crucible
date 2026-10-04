@@ -38,11 +38,12 @@ impl EncodedPack {
 pub(crate) async fn put_tree(conn: &mut PgConnection, pack: &EncodedPack) -> Result<TreeDigest> {
     let (tree, tarball) = (pack.tree(), pack.tarball());
     let (digest, file_hashes) = tree.digest_with_file_hashes();
-    let stored: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pack_trees WHERE digest = $1")
-        .bind(digest.as_str())
-        .fetch_optional(&mut *conn)
-        .await
-        .context("looking up a pack tree")?;
+    let stored: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM pack_trees WHERE digest = $1 FOR KEY SHARE")
+            .bind(digest.as_str())
+            .fetch_optional(&mut *conn)
+            .await
+            .context("looking up a pack tree")?;
     if stored.is_some() {
         return Ok(digest);
     }
@@ -78,6 +79,45 @@ pub(crate) async fn put_tree(conn: &mut PgConnection, pack: &EncodedPack) -> Res
         .context("storing pack files")?;
     }
     Ok(digest)
+}
+
+/// Every `(table, column)` that pins a stored tree. Aliases and draft or binding provenance name
+/// trees without keeping them.
+const TREE_PINS: [(&str, &str); 7] = [
+    ("playbooks", "tree_digest"),
+    ("playbook_revisions", "tree_digest"),
+    ("pack_imports", "tree_digest"),
+    ("playbook_draft_versions", "tree_digest"),
+    ("playbook_standing_launches", "adopted_tree_digest"),
+    ("pack_tarballs", "tree_digest"),
+    ("scopes", "tree_digest"),
+];
+
+/// How old an unpinned tree must be before [`collect`] deletes it.
+const COLLECT_AFTER: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
+
+/// Delete every tree older than [`COLLECT_AFTER`] that no [`TREE_PINS`] column names, and return
+/// how many went. A row that pins one of them while this runs makes the foreign key refuse the
+/// delete, which is an error with nothing deleted.
+pub async fn collect(pool: &sqlx::PgPool) -> Result<u64> {
+    let cutoff = jiff::Timestamp::now()
+        .checked_sub(COLLECT_AFTER)
+        .context("computing the pack tree cutoff")?;
+    let unpinned: String = TREE_PINS
+        .iter()
+        .map(|(table, column)| {
+            format!(" AND NOT EXISTS (SELECT 1 FROM {table} WHERE {column} = t.digest)")
+        })
+        .collect();
+    let deleted = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DELETE FROM pack_trees t WHERE t.created_at < $1{unpinned}"
+    )))
+    .bind(crate::clock::stamp(cutoff))
+    .execute(pool)
+    .await
+    .context("deleting unpinned pack trees")?
+    .rows_affected();
+    Ok(deleted)
 }
 
 /// The columns [`PackRef::from_row`] reads, for a table with `tree_digest` and `tar_gz` columns.
@@ -647,5 +687,219 @@ mod tests {
                 .expect("broken"),
             None
         );
+    }
+
+    async fn age_every_tree(pool: &PgPool) {
+        sqlx::query("UPDATE pack_trees SET created_at = '2000-01-01T00:00:00Z'")
+            .execute(pool)
+            .await
+            .expect("age");
+    }
+
+    async fn stored(pool: &PgPool, digest: &str) -> (bool, i64) {
+        sqlx::query_as(
+            "SELECT EXISTS (SELECT 1 FROM pack_trees WHERE digest = $1),
+                    (SELECT count(*) FROM pack_tree_files WHERE digest = $1)",
+        )
+        .bind(digest)
+        .fetch_one(pool)
+        .await
+        .expect("stored")
+    }
+
+    async fn skeleton_draft(pool: &PgPool, id: &str) -> String {
+        crate::playbooks::drafts::create(
+            pool,
+            id,
+            "d",
+            crate::playbooks::drafts::DraftSeed::Skeleton,
+            None,
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("draft");
+        sqlx::query_scalar(
+            "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = $1 AND version = 1",
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("draft tree")
+    }
+
+    /// Every foreign key into `pack_trees` other than its own files is a pin collection honors.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn collection_honors_every_foreign_key_into_pack_trees(pool: PgPool) {
+        let mut keys: Vec<(String, String)> = sqlx::query_as(
+            "SELECT cl.relname::TEXT, a.attname::TEXT FROM pg_constraint c
+             JOIN pg_class cl ON cl.oid = c.conrelid
+             JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+             WHERE c.contype = 'f' AND c.confrelid = 'pack_trees'::regclass
+               AND cl.relname <> 'pack_tree_files'",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("foreign keys");
+        keys.sort();
+        let mut pins: Vec<(String, String)> = TREE_PINS
+            .iter()
+            .map(|(t, c)| (t.to_string(), c.to_string()))
+            .collect();
+        pins.sort();
+        assert_eq!(keys, pins);
+    }
+
+    /// Deleting a draft leaves its tree while another draft holds the same tree, and the tree and
+    /// its files go once the last draft holding it is deleted.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_deleted_drafts_tree_goes_only_when_nothing_else_pins_it(pool: PgPool) {
+        let first = skeleton_draft(&pool, "first").await;
+        let second = skeleton_draft(&pool, "second").await;
+        assert_eq!(first, second);
+        let (_, files) = stored(&pool, &first).await;
+        assert!(files > 0);
+        age_every_tree(&pool).await;
+
+        assert!(
+            crate::playbooks::drafts::delete(&pool, "first")
+                .await
+                .expect("delete")
+        );
+        assert_eq!(collect(&pool).await.expect("collect"), 0);
+        assert_eq!(stored(&pool, &first).await, (true, files));
+
+        assert!(
+            crate::playbooks::drafts::delete(&pool, "second")
+                .await
+                .expect("delete")
+        );
+        assert_eq!(collect(&pool).await.expect("collect"), 1);
+        assert_eq!(stored(&pool, &first).await, (false, 0));
+        assert_eq!(collect(&pool).await.expect("again"), 0);
+    }
+
+    /// A launch's frozen copy of a draft version pins its tree after the draft is gone, and an
+    /// alias naming the tree does not.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_tree_a_launch_pins_survives_its_draft(pool: PgPool) {
+        let digest = skeleton_draft(&pool, "studio").await;
+        assert!(
+            crate::playbooks::drafts::copy_draft_pack_to(&pool, "studio", 1, "launch_1")
+                .await
+                .expect("copy")
+        );
+        sqlx::query(
+            "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
+             VALUES ('sha256:old', $1, 'then')",
+        )
+        .bind(&digest)
+        .execute(&pool)
+        .await
+        .expect("alias");
+        assert!(
+            crate::playbooks::drafts::delete(&pool, "studio")
+                .await
+                .expect("delete")
+        );
+        age_every_tree(&pool).await;
+
+        assert_eq!(collect(&pool).await.expect("collect"), 0);
+        assert!(stored(&pool, &digest).await.0);
+
+        sqlx::query("DELETE FROM pack_tarballs WHERE issue_slug = 'launch_1'")
+            .execute(&pool)
+            .await
+            .expect("drop the launch copy");
+        assert_eq!(collect(&pool).await.expect("collect"), 1);
+        assert!(!stored(&pool, &digest).await.0);
+    }
+
+    /// An unpinned tree younger than the cutoff survives collection.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_fresh_unpinned_tree_survives(pool: PgPool) {
+        let mut conn = pool.acquire().await.expect("conn");
+        let fresh = put_tree(&mut conn, &encoded(&pack(&[("a", b"1")])))
+            .await
+            .expect("put");
+        let stamp = |ago: jiff::SignedDuration| {
+            crate::clock::stamp(jiff::Timestamp::now().checked_sub(ago).expect("past"))
+        };
+        sqlx::query("UPDATE pack_trees SET created_at = $1 WHERE digest = $2")
+            .bind(stamp(COLLECT_AFTER - jiff::SignedDuration::from_mins(5)))
+            .bind(fresh.as_str())
+            .execute(&pool)
+            .await
+            .expect("inside the cutoff");
+
+        assert_eq!(collect(&pool).await.expect("collect"), 0);
+        assert!(stored(&pool, fresh.as_str()).await.0);
+
+        sqlx::query("UPDATE pack_trees SET created_at = $1 WHERE digest = $2")
+            .bind(stamp(COLLECT_AFTER + jiff::SignedDuration::from_mins(5)))
+            .bind(fresh.as_str())
+            .execute(&pool)
+            .await
+            .expect("past the cutoff");
+        assert_eq!(collect(&pool).await.expect("collect"), 1);
+    }
+
+    /// A writer that reuses an old unpinned tree holds it against collection: a collection that
+    /// starts meanwhile waits, then fails on the foreign key once the writer pins the tree, and
+    /// the tree and its files stay.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_tree_pinned_while_collecting_fails_the_collection(pool: PgPool) {
+        let tree = pack(&[("a", b"1")]);
+        let digest = put_tree(&mut pool.acquire().await.expect("conn"), &encoded(&tree))
+            .await
+            .expect("put");
+        age_every_tree(&pool).await;
+
+        let mut writer = pool.begin().await.expect("begin");
+        assert_eq!(
+            put_tree(&mut writer, &encoded(&tree)).await.expect("reuse"),
+            digest
+        );
+        let collecting = tokio::spawn({
+            let pool = pool.clone();
+            async move { collect(&pool).await }
+        });
+        let mut waited = 0;
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND query LIKE 'DELETE FROM pack_trees%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("waiting");
+            if waiting > 0 {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 500, "collection never waited on the writer");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        sqlx::query(
+            "INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
+             VALUES ('launch_1', $1, $2, 1, 'now', $3)",
+        )
+        .bind(tree.tarball().expect("encode"))
+        .bind(crucible_contract::content_digest(
+            &tree.tarball().expect("encode"),
+        ))
+        .bind(digest.as_str())
+        .execute(&mut *writer)
+        .await
+        .expect("pin");
+        writer.commit().await.expect("commit");
+
+        let err = collecting
+            .await
+            .expect("join")
+            .expect_err("the pin wins")
+            .to_string();
+        assert!(err.contains("deleting unpinned pack trees"), "{err}");
+        assert_eq!(stored(&pool, digest.as_str()).await, (true, 1));
     }
 }
