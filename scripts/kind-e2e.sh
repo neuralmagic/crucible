@@ -60,6 +60,7 @@ mkdir -p "$ROOT/target"
 WORK=$(mktemp -d "$ROOT/target/kind-e2e.XXXXXX")
 ARTIFACT_DIR="${ARTIFACT_DIR:-$WORK/artifacts}"
 OWN_PG=""
+PG=""
 CONTROLLER_PID=""
 CONTROLLER_ENV=()
 BG_PIDS=()
@@ -80,7 +81,9 @@ collect() {
     kubectl -n "$NS" get all,cm,pvc -o yaml >"$ARTIFACT_DIR/objects.yaml" 2>&1 || true
     kind export logs --name "$CLUSTER" "$ARTIFACT_DIR/kind" >/dev/null 2>&1 || true
     docker logs "$REG" >"$ARTIFACT_DIR/registry.log" 2>&1 || true
-    sql -c "SELECT key, status, parked_reason FROM issues" </dev/null >"$ARTIFACT_DIR/issues.txt" 2>&1 || true
+    if [ -n "$PG" ]; then
+        sql -c "SELECT key, status, parked_reason FROM issues" </dev/null >"$ARTIFACT_DIR/issues.txt" 2>&1 || true
+    fi
     echo "artifacts: $ARTIFACT_DIR" >&2
 }
 
