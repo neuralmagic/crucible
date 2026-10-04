@@ -63,7 +63,21 @@ pub enum DraftError {
     #[error("{0}")]
     Push(String),
     #[error(transparent)]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
+}
+
+/// An [`Unconvertible`](crate::playbooks::pack_trees::Unconvertible) pack is refused as invalid,
+/// naming its reason; anything else is internal.
+impl From<anyhow::Error> for DraftError {
+    fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
+            .is_some()
+        {
+            DraftError::Invalid(format!("{e:#}"))
+        } else {
+            DraftError::Internal(e)
+        }
+    }
 }
 
 impl From<crate::playbooks::packs::ReadTreeError> for DraftError {
@@ -119,7 +133,7 @@ impl From<RegisterError> for DraftError {
             RegisterError::RevMoved(rev) => DraftError::Conflict(format!("the ref moved to {rev}")),
             RegisterError::Conflict(m) => DraftError::Conflict(m),
             e @ RegisterError::ExposureChanged { .. } => DraftError::Conflict(e.to_string()),
-            RegisterError::Internal(e) => DraftError::Internal(e),
+            RegisterError::Internal(e) => DraftError::from(e),
         }
     }
 }
@@ -623,8 +637,7 @@ pub async fn create(
                 &registered.rev,
                 pinned.as_deref(),
             )
-            .await
-            .map_err(DraftError::Internal)?;
+            .await?;
             let Some(tree) = tree else {
                 let moved =
                     || format!("playbook {template:?} moved while cloning; reload before retrying");
@@ -1046,10 +1059,7 @@ pub async fn exposure_of(
     id: &str,
     version: i64,
 ) -> Result<Option<crate::playbooks::exposure::Extraction>, DraftError> {
-    let Some((_, tree)) = version_pack(pool, id, Some(version))
-        .await
-        .map_err(DraftError::Internal)?
-    else {
+    let Some((_, tree)) = version_pack(pool, id, Some(version)).await? else {
         return Ok(None);
     };
     let extraction = tokio::task::spawn_blocking(move || {
@@ -1154,8 +1164,7 @@ pub async fn origin_files(pool: &PgPool, id: &str) -> Result<Option<OriginFiles>
                 DraftError::Internal(anyhow::anyhow!("origin without a playbook"))
             })?;
             let tree = crate::playbooks::registry::pack(pool, &playbook)
-                .await
-                .map_err(DraftError::Internal)?
+                .await?
                 .ok_or_else(|| {
                     DraftError::NotFound(format!(
                         "draft {id} came from playbook {playbook}, which is no longer registered"
@@ -1174,8 +1183,7 @@ pub async fn origin_files(pool: &PgPool, id: &str) -> Result<Option<OriginFiles>
             })?;
             let tree = crate::playbooks::imports::pack(pool, &import)
                 .await
-                .context("reading the import a draft came from")
-                .map_err(DraftError::Internal)?
+                .context("reading the import a draft came from")?
                 .ok_or_else(|| {
                     DraftError::NotFound(format!(
                         "draft {id} came from import {import}, which no longer exists"
@@ -1260,8 +1268,7 @@ pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, PackTree)
         .map_err(|e| DraftError::Internal(e.into()))?;
     let tree = crate::playbooks::pack_trees::load_row(pool, &row)
         .await
-        .with_context(|| format!("reading draft {id} version {version}"))
-        .map_err(DraftError::Internal)?;
+        .with_context(|| format!("reading draft {id} version {version}"))?;
     Ok((version, tree))
 }
 

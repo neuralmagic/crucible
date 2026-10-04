@@ -326,6 +326,80 @@ pub(crate) async fn register_inference_key(
     Ok(())
 }
 
+/// Why [`symlink_pack`] cannot be a tree.
+#[cfg(test)]
+pub(crate) const SYMLINK_REASON: &str = "link is a symbolic link; a pack holds regular files only";
+
+/// A gzipped tarball an older controller could have stored: a compiling draft skeleton beside a
+/// symlink, so conversion records it unconvertible.
+#[cfg(test)]
+pub(crate) fn symlink_pack() -> Vec<u8> {
+    use crate::playbooks::drafts::{SKELETON_MANIFEST, SKELETON_WORKFLOW};
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    for (path, body) in [
+        ("crucible.toml", SKELETON_MANIFEST),
+        ("workflow.star", SKELETON_WORKFLOW),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, path, body.as_bytes())
+            .expect("file");
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    builder
+        .append_link(&mut header, "link", "crucible.toml")
+        .expect("link");
+    builder.into_inner().expect("tar").finish().expect("gzip")
+}
+
+/// Write [`symlink_pack`] into the legacy pack columns of every `table` row matching `filter`,
+/// then run startup conversion, which records those bytes unconvertible and leaves the rows
+/// without a tree.
+#[cfg(test)]
+pub(crate) async fn make_unconvertible(pool: &sqlx::PgPool, table: &str, filter: &str) {
+    let tgz = symlink_pack();
+    let digest = crucible_contract::content_digest(&tgz);
+    let (bytes_col, digest_col, size_col, tree_col) = match table {
+        "playbook_standing_launches" => (
+            "adopted_tar_gz",
+            "adopted_tar_digest",
+            "adopted_tar_bytes",
+            "adopted_tree_digest",
+        ),
+        "pack_tarballs" => ("tar_gz", "digest", "bytes", "tree_digest"),
+        _ => ("tar_gz", "tar_digest", "tar_bytes", "tree_digest"),
+    };
+    let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table} SET {bytes_col} = $1, {digest_col} = $2, {size_col} = $3 WHERE {filter}"
+    )))
+    .bind(&tgz)
+    .bind(&digest)
+    .bind(i64::try_from(tgz.len()).expect("size"))
+    .execute(pool)
+    .await
+    .expect("write legacy bytes")
+    .rows_affected();
+    assert!(updated > 0, "no {table} row matches {filter}");
+    crate::playbooks::pack_migration::convert_pack_trees(pool)
+        .await
+        .expect("convert");
+    let (treeless, reason): (i64, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT (SELECT count(*) FROM {table} WHERE {filter} AND {tree_col} IS NULL),
+                (SELECT unconvertible_reason FROM pack_digest_aliases WHERE old_digest = $1)"
+    )))
+    .bind(&digest)
+    .fetch_one(pool)
+    .await
+    .expect("read conversion");
+    assert_eq!(treeless, i64::try_from(updated).expect("count"));
+    assert_eq!(reason.as_deref(), Some(SYMLINK_REASON));
+}
+
 /// Real engine inputs for tests that render through the linked `crucible` library: a deploy
 /// profile, the smallest loop and playbook packs that render, and workflow sources that compile.
 #[cfg(test)]

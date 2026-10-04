@@ -262,13 +262,45 @@ pub(crate) async fn superseded_in(
     Ok(held.map(|_| replacement))
 }
 
-/// The pack `pack` names: its stored tree, or its legacy bytes read as a tree.
+/// Legacy pack bytes that cannot be a tree, refused wherever they would be compiled, delivered,
+/// launched, or used as a base.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("pack {digest} is unconvertible: {reason}")]
+pub(crate) struct Unconvertible {
+    pub(crate) digest: String,
+    pub(crate) reason: String,
+}
+
+/// The refusal for legacy bytes that conversion recorded as unconvertible, `None` for any others.
+pub(crate) async fn unconvertible(
+    ex: impl PgExecutor<'_>,
+    tar_gz: &[u8],
+) -> Result<Option<Unconvertible>> {
+    let digest = crucible_contract::content_digest(tar_gz);
+    let reason: Option<String> = sqlx::query_scalar(
+        "SELECT unconvertible_reason FROM pack_digest_aliases
+         WHERE old_digest = $1 AND unconvertible_reason IS NOT NULL",
+    )
+    .bind(&digest)
+    .fetch_optional(ex)
+    .await
+    .context("looking up an unconvertible pack")?;
+    Ok(reason.map(|reason| Unconvertible { digest, reason }))
+}
+
+/// The pack `pack` names: its stored tree, or its legacy bytes read as a tree. Legacy bytes that
+/// cannot be a tree are an [`Unconvertible`] error.
 pub(crate) async fn load(ex: impl PgExecutor<'_>, pack: PackRef) -> Result<PackTree> {
     match pack {
         PackRef::Tree(digest) => get_tree(ex, &digest)
             .await?
             .with_context(|| format!("pack tree {digest} is not stored")),
-        PackRef::Legacy(bytes) => read_legacy(bytes).await,
+        PackRef::Legacy(bytes) => {
+            if let Some(refusal) = unconvertible(ex, &bytes).await? {
+                return Err(refusal.into());
+            }
+            read_legacy(bytes).await
+        }
     }
 }
 
@@ -280,11 +312,14 @@ pub(crate) async fn load_row(ex: impl PgExecutor<'_>, row: &PgRow) -> Result<Pac
 
 /// Legacy pack bytes read as a tree, off the async runtime.
 async fn read_legacy(bytes: Vec<u8>) -> Result<PackTree> {
-    let read =
-        tokio::task::spawn_blocking(move || crucible_contract::pack_tree::read_tar_gz(&bytes))
-            .await
-            .context("joining the legacy pack read worker")?
-            .context("reading legacy pack bytes")?;
+    let read = tokio::task::spawn_blocking(move || {
+        crucible_contract::pack_tree::read_tar_gz(&bytes).map_err(|e| Unconvertible {
+            digest: crucible_contract::content_digest(&bytes),
+            reason: e.to_string(),
+        })
+    })
+    .await
+    .context("joining the legacy pack read worker")??;
     Ok(read.tree)
 }
 
@@ -599,6 +634,42 @@ mod tests {
                     .expect("read"),
                 Some(SKELETON_WORKFLOW.to_string()),
                 "converted {converted}"
+            );
+        }
+    }
+
+    /// Legacy bytes that cannot be a tree load as an [`Unconvertible`] refusal naming the reason,
+    /// whether conversion recorded them or a standby wrote them since.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn unconvertible_legacy_bytes_load_as_a_refusal(pool: PgPool) {
+        let tgz = crate::testing::symlink_pack();
+        let expected = Unconvertible {
+            digest: crucible_contract::content_digest(&tgz),
+            reason: crate::testing::SYMLINK_REASON.to_string(),
+        };
+        for recorded in [false, true] {
+            if recorded {
+                sqlx::query(
+                    "INSERT INTO pack_digest_aliases (old_digest, unconvertible_reason, recorded_at)
+                     VALUES ($1, $2, 'now')",
+                )
+                .bind(&expected.digest)
+                .bind(&expected.reason)
+                .execute(&pool)
+                .await
+                .expect("alias");
+            }
+            assert_eq!(
+                unconvertible(&pool, &tgz).await.expect("lookup"),
+                recorded.then(|| expected.clone())
+            );
+            let err = load(&pool, PackRef::Legacy(tgz.clone()))
+                .await
+                .expect_err("refused");
+            assert_eq!(
+                err.downcast_ref::<Unconvertible>(),
+                Some(&expected),
+                "recorded {recorded}"
             );
         }
     }

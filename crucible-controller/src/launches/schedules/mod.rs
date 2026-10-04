@@ -2594,6 +2594,132 @@ mod tests {
         Ok(())
     }
 
+    /// A schedule whose adopted pack is unconvertible refuses every firing naming the reason,
+    /// launches nothing, and is auto-disabled at the threshold like any other failing firing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_unconvertible_adopted_pack_fails_each_firing_until_disabled(
+        pool: PgPool,
+    ) -> Result<()> {
+        let db = Db::new(pool.clone());
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_due_at(&pool, "* * * * *", Some("2026-08-23T12:00:00Z")).await;
+        crate::testing::make_unconvertible(
+            &pool,
+            "playbook_standing_launches",
+            &format!("id = '{}'", scheduled.id),
+        )
+        .await;
+
+        for (attempt, now) in [
+            (1, "2026-08-23T12:00:30Z"),
+            (2, "2026-08-23T12:01:30Z"),
+            (3, "2026-08-23T12:02:30Z"),
+        ] {
+            let fired = fire_due(&db, ts(now), 8, 3, std::time::Duration::from_secs(3600)).await?;
+            assert!(fired.is_empty(), "attempt {attempt}: {fired:?}");
+            let row = ScheduleStore::new(Db::new(pool.clone()))
+                .get(&scheduled.id)
+                .await?
+                .expect("row");
+            assert_eq!(row.consecutive_failures, attempt);
+            assert_eq!(row.enabled, attempt < 3, "attempt {attempt}");
+        }
+
+        let events = events_for(&pool, &Trigger::Schedule.event_key(&scheduled.id)).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let reason = events[0].2.clone().expect("reason");
+        assert!(
+            reason.starts_with("auto-disabled after 3 consecutive firing failures")
+                && reason.contains(crate::testing::SYMLINK_REASON),
+            "{reason}"
+        );
+        let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launched, 0);
+        Ok(())
+    }
+
+    /// A draft-head firing whose newest compiling version is unconvertible is refused naming the
+    /// reason, launches nothing, and counts toward auto-disable.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_unconvertible_draft_head_fails_its_firing(pool: PgPool) -> Result<()> {
+        let saved = crate::playbooks::drafts::create(
+            &pool,
+            "studio",
+            "iterative pack",
+            crate::playbooks::drafts::DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("draft");
+        let schema_digest = saved.schema_digest.clone().expect("the skeleton compiles");
+        let max_time = MaxTime::parse("30m").expect("duration");
+        let spec = CronSpec::parse("0 * * * *", "UTC").expect("expr");
+        let schedule = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &NewSchedule {
+                    standing: NewStanding {
+                        playbook: "studio",
+                        target: crate::launches::standing::StandingTarget::DraftHead,
+                        eligible_draft_version: Some(saved.version),
+                        params: &serde_json::json!({}),
+                        schema_digest: &schema_digest,
+                        max_cost: 1.0,
+                        max_time: &max_time,
+                        advance_dedupe: false,
+                        enabled: true,
+                        created_by: Some("wren"),
+                        owner_principal: None,
+                        owner_groups: None,
+                        dispatch_target: None,
+                        agent_provider: None,
+                        agent_model: None,
+                    },
+                    cursor: None,
+                    spec: &spec,
+                },
+                ts("2026-08-23T11:00:00Z"),
+            )
+            .await?;
+        set_due(&pool, &schedule.id, Some("2026-08-23T12:00:00Z")).await;
+        crate::testing::make_unconvertible(&pool, "playbook_draft_versions", "draft_id = 'studio'")
+            .await;
+
+        let db = Db::new(pool.clone());
+        let fired = fire_due(
+            &db,
+            ts("2026-08-23T12:01:00Z"),
+            1,
+            1,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+
+        assert!(fired.is_empty(), "{fired:?}");
+        let row = ScheduleStore::new(Db::new(pool.clone()))
+            .get(&schedule.id)
+            .await?
+            .expect("row");
+        assert_eq!(row.consecutive_failures, 1);
+        assert!(
+            !row.enabled,
+            "a threshold of one disables on the first failure"
+        );
+        let events = events_for(&pool, &Trigger::Schedule.event_key(&schedule.id)).await;
+        let reason = events
+            .last()
+            .and_then(|e| e.2.clone())
+            .expect("the disable names the failure");
+        assert!(reason.contains(crate::testing::SYMLINK_REASON), "{reason}");
+        let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launched, 0);
+        Ok(())
+    }
+
     /// A firing that cannot launch leaves no half-written launch, counts against the schedule, and
     /// at the threshold takes it out of the rotation with the transition on the event log.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

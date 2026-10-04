@@ -18,7 +18,30 @@ use anyhow::{Context, Result};
 /// dispatch state back off these events, so the text is a shared constant rather than a literal.
 pub(crate) const PLAYBOOK_DISPATCH_FAILED: &str = "playbook dispatch failed";
 
+/// Dispatch `issue`'s playbook launch, parking it when its pack is unconvertible.
 pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
+    let Err(e) = start(db, cfg, issue).await else {
+        return Ok(());
+    };
+    let Some(refusal) = e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>() else {
+        return Err(e);
+    };
+    crate::issues::transitions::park(
+        db.pool(),
+        db.events(),
+        &issue.key,
+        Status::New,
+        &ParkReason::PackUnconvertible {
+            digest: refusal.digest.clone(),
+            reason: refusal.reason.clone(),
+        },
+        ParkedBy::Machine,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let day = crate::clock::today_utc();
     if db
         .decline_if_over_ceiling(&day, cfg.effective().daily_cost_ceiling)

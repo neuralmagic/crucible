@@ -50,13 +50,20 @@ pub enum ImportError {
     #[error(transparent)]
     Draft(DraftError),
     #[error(transparent)]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
+}
+
+/// Classified as [`DraftError`] classifies it: an unconvertible pack is a refusal.
+impl From<anyhow::Error> for ImportError {
+    fn from(e: anyhow::Error) -> Self {
+        DraftError::from(e).into()
+    }
 }
 
 impl From<RegisterError> for ImportError {
     fn from(e: RegisterError) -> Self {
         match e {
-            RegisterError::Internal(e) => ImportError::Internal(e),
+            RegisterError::Internal(e) => ImportError::from(e),
             other => ImportError::Register(other),
         }
     }

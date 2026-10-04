@@ -7003,6 +7003,52 @@ async fn a_launch_whose_stored_tree_was_tampered_with_is_refused(pool: PgPool) -
     Ok(())
 }
 
+/// A launch whose pack conversion recorded as unconvertible is parked naming the reason, with no
+/// pod, on its first dispatch rather than retried.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_pack_is_unconvertible_parks_naming_the_reason(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
+    seed_registered_playbook(&db, "survey").await;
+    crate::testing::make_unconvertible(db.pool(), "playbooks", "id = 'survey'").await;
+    adopt_launch(&db, key, 3.5).await;
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::Succeeded,
+        logs: String::new(),
+        created: created.clone(),
+    }));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+
+    res?;
+    assert!(
+        created.lock().expect("lock").is_empty(),
+        "no pod was created"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    let reason = issue.parked_reason.expect("parked reason");
+    assert!(reason.contains(crate::testing::SYMLINK_REASON), "{reason}");
+    assert!(
+        matches!(
+            ParkReason::parse(&reason),
+            ParkReason::PackUnconvertible { reason, .. } if reason == crate::testing::SYMLINK_REASON
+        ),
+        "{reason}"
+    );
+    Ok(())
+}
+
 /// With the lane built but switched off, a GitHub row stays where it is while a playbook launch
 /// still dispatches through the same reconcile.
 #[cfg(feature = "autoresearch")]

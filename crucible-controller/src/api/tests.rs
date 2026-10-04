@@ -6541,6 +6541,48 @@ async fn a_pending_import_opens_as_a_draft(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Opening a pending import whose frozen pack is unconvertible as a draft is refused naming the
+/// reason, and leaves the import unopened.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn opening_an_unconvertible_import_as_a_draft_is_refused_naming_the_reason(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let repo = import_fixture(dir.path(), IMPORT_WORKFLOW);
+    let app = app_with_roles(
+        db,
+        Arc::new(Recorder::default()),
+        vec!["wren".to_string()],
+        vec!["dana".to_string()],
+    );
+    let (status, import) = post_json_as(
+        &app,
+        "/api/playbooks/imports",
+        "dana",
+        serde_json::json!({"repo": &repo, "git_ref": "main", "path": "packs/survey"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{import}");
+    let id = import["id"].as_str().unwrap_or_default().to_string();
+    crate::testing::make_unconvertible(&pool, "pack_imports", &format!("id = '{id}'")).await;
+
+    let (status, body) = post_json_as(
+        &app,
+        &format!("/api/playbooks/imports/{id}/draft"),
+        "dana",
+        serde_json::json!({"id": "survey-draft", "description": "an agent's proposal, edited"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(crate::testing::SYMLINK_REASON), "{body}");
+    let (status, row) = get_json_object(&app, &format!("/api/playbooks/imports/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["draft_id"], serde_json::Value::Null);
+    Ok(())
+}
+
 /// The one-motion entry: a repo, a ref and a path go in, a draft comes out, and the pending import
 /// it minted is what says where those bytes came from. The draft's origin names that import, and
 /// its rebase source is the frozen pack.
@@ -8922,6 +8964,67 @@ async fn a_draft_seeds_from_a_registered_pack(pool: PgPool) -> Result<()> {
         draft["origin"]["repo"].is_string(),
         "graduation pre-fills its target from here: {draft}"
     );
+    Ok(())
+}
+
+/// Cloning a template whose registered pack is unconvertible is refused naming the reason, and
+/// creates no draft.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn cloning_an_unconvertible_template_is_refused_naming_the_reason(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    crate::testing::make_unconvertible(&pool, "playbooks", "id = 'survey'").await;
+
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "forked", "template": "survey"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(crate::testing::SYMLINK_REASON), "{body}");
+    let (status, _) = get_json_object(&app, "/api/playbook-drafts/studio").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A draft launch recomputes its exposure from the version it launches; an unconvertible version
+/// is refused naming the reason, and no launch is recorded.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn launching_an_unconvertible_draft_version_is_refused_naming_the_reason(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    crate::testing::make_unconvertible(&pool, "playbook_draft_versions", "draft_id = 'studio'")
+        .await;
+
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/launch",
+        serde_json::json!({"params": {}, "max_cost": 1.0, "max_time": "30m"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(crate::testing::SYMLINK_REASON), "{body}");
+    let launches: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(launches, 0);
     Ok(())
 }
 

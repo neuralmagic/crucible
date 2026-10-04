@@ -439,6 +439,14 @@ pub(crate) async fn fire(
         )
         .into());
     };
+    if core.adopted_tree_digest.is_none()
+        && let Some(tar_gz) = row.adopted_tar_gz.as_deref()
+        && let Some(refusal) = crate::playbooks::pack_trees::unconvertible(&mut **tx, tar_gz)
+            .await
+            .map_err(|e| format!("{noun} adopted pack: {e:#}"))?
+    {
+        return Err(format!("{noun} adopted {refusal}").into());
+    }
     let max_time =
         MaxTime::parse(&core.max_time).map_err(|e| format!("{noun} stored max_time: {e}"))?;
     let params = overlaid_params(core, schema, firing.overlay)?;
