@@ -2043,6 +2043,7 @@ dependencies = [
  "async-trait",
  "axum",
  "clap",
+ "crucible-contract",
  "reqwest 0.13.4",
  "rmcp 1.8.0",
  "serde",

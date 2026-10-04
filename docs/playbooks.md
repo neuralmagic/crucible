@@ -357,7 +357,7 @@ it:
 
 ```sh
 crux draft-create haiku --description "a haiku, reviewed"
-crux draft-push haiku ./haiku --base 1
+crux draft-push haiku ./haiku --base-version 1
 crux draft-launch haiku --max-cost 1 --max-time 5m
 ```
 

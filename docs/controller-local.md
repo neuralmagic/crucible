@@ -23,7 +23,7 @@ setup:
 ```sh
 crux whoami
 crux draft-create notes --description "release notes"
-crux draft-push notes examples/playbook --base 1
+crux draft-push notes examples/playbook --base-version 1
 crux draft-launch notes --max-cost 1 --max-time 5m
 ```
 

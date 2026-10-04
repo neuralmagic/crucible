@@ -823,6 +823,15 @@ pub fn draft_pulled(id: &str, version: i64, dir: &std::path::Path, files: &[Stri
     out
 }
 
+/// What a pack directory reads as on this machine: its `tree1:` digest and the paths a save skips.
+pub fn local_pack(digest: &crucible_contract::pack_tree::TreeDigest, ignored: &[String]) -> String {
+    let mut out = format!("local tree: {digest}\n");
+    if !ignored.is_empty() {
+        out.push_str(&format!("ignored: {}\n", ignored.join(", ")));
+    }
+    out
+}
+
 /// A save that landed: the new version, its diagnostics, and the studio page a human opens on it.
 pub fn draft_created(id: &str, saved: &dto::DraftCompile, studio_url: &str) -> String {
     let mut out = format!("created draft {id} at version {}\n", saved.version);
@@ -1382,8 +1391,8 @@ fn credential_line(credential: &Credential) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::config::Auth;
+    use crate::render::*;
 
     fn log_of(text: Option<&str>, location: Option<&str>) -> dto::RunLog {
         dto::RunLog {
@@ -2759,7 +2768,7 @@ mod tests {
             {"run_id": "owner_repo_7-1720000000", "status": "finished"}
         ]))
         .unwrap();
-        let out = super::runs(&rows);
+        let out = crate::render::runs(&rows);
         let lines: Vec<Vec<&str>> = out
             .lines()
             .skip(1)

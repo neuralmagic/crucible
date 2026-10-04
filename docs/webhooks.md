@@ -275,7 +275,7 @@ EOF
 printf '#!/bin/sh\necho "$CRUCIBLE_INPUTS"\n' > announce.sh && chmod +x announce.sh
 
 crux draft-create image-pushed --description "Record which image a registry push named"
-crux draft-push image-pushed /tmp/image-pushed --base 1
+crux draft-push image-pushed /tmp/image-pushed --base-version 1
 crux draft-publish image-pushed --playbook on-image-push
 ```
 
