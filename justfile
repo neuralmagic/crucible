@@ -164,8 +164,8 @@ forge-capture-e2e:
 
 # End-to-end proof of the pod executor on a throwaway kind cluster: the controller from this
 # checkout launches command-only drafts and playbooks as pods, across restarts and contract
-# mismatches (scenarios in the script header). Needs docker, kind, kubectl, jq. KEEP=1 leaves the
-# cluster, registry, and Postgres up.
+# mismatches (scenarios in the script header). Needs docker, kind, kubectl, jq, curl, git, shasum.
+# KEEP=1 leaves the cluster, registry, and Postgres up.
 kind-e2e:
     scripts/kind-e2e.sh
 

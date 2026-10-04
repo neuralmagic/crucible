@@ -34,6 +34,8 @@
 #      state/ (also over a state PVC), and a draft-head schedule fires the newest compiled tree
 #   X  a registry row re-registered or deleted between authorization and save refuses a launch,
 #      schedule, webhook, or one-shot with 409 or 404, and stores nothing
+#   Q  an approved direct autoresearch pack plans and delivers the tree its scope froze, not one
+#      written to its pack row afterwards (needs the controller built with the autoresearch lane)
 #   O  the local executor runs a stored tree with its steering beside it, and parks a tampered tree
 #   G  migrate-state stores a legacy pack dir as a tree with its steering split into rows
 #   M  a loop image labelled with another contract version parks the launch without a pod
@@ -122,8 +124,13 @@ case "$NODE_ARCH" in x86_64 | amd64) NODE_ARCH=amd64 ;; aarch64 | arm64) NODE_AR
 if [ "${SKIP_BUILD:-0}" != 1 ]; then
     log "building the controller, crux, and crucible for the host"
     (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible -p crucible-controller -p crux --bins)
+    log "building the controller with the autoresearch lane"
+    (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible-controller --features autoresearch \
+        --bin crucible-controller --target-dir "$ROOT/target/autoresearch")
 fi
 BIN="$ROOT/target/debug"
+AUTORESEARCH_CONTROLLER="$ROOT/target/autoresearch/debug/crucible-controller"
+CONTROLLER_BIN="$BIN/crucible-controller"
 
 mkdir -p "$WORK/image"
 HOST_ARCH=$(uname -m)
@@ -208,7 +215,7 @@ HOOKS_URL="http://127.0.0.1:$HOOKPORT"
 unset CONTROLLER_API_TOKEN
 
 BOOT=0
-# start_controller [profile]: boot the controller and wait for it to answer. CONTROLLER_ENV holds
+# start_controller [profile]: boot CONTROLLER_BIN and wait for it to answer. CONTROLLER_ENV holds
 # extra VAR=value settings for this boot.
 start_controller() {
     BOOT=$((BOOT + 1))
@@ -227,7 +234,7 @@ start_controller() {
         CRUCIBLE_BIN="$BIN/crucible" FORGE_INSECURE_REGISTRIES="localhost:$REGPORT" \
         RUST_LOG="${RUST_LOG:-info}" NO_COLOR=1 \
         ${CONTROLLER_ENV[@]+"${CONTROLLER_ENV[@]}"} \
-        "$BIN/crucible-controller" autopilot >"$WORK/controller-$BOOT.log" 2>&1 &
+        "$CONTROLLER_BIN" autopilot >"$WORK/controller-$BOOT.log" 2>&1 &
     CONTROLLER_PID=$!
     wait_for 90 "controller health" curl -sf "$CONTROLLER_URL/healthz"
 }
@@ -468,11 +475,11 @@ no_run_objects() {
         [ "$(kubectl -n "$NS" get configmaps -o json | jq '[.items[] | select(.binaryData["pack.tar.gz"])] | length')" = 0 ]
 }
 
-# delivered <label> <key> <none|inputs|legacy> [watch label]: assert, from the watch streams, how
-# the launch's pack reached its pod. The pack key is the tarball of the tree on the launch's pack
-# row, or for legacy a launch whose row holds no tree; inputs adds the run's own inputs key, which
-# pack-stage extracts over the pack. Writes delivered-<label>.tar.gz (and inputs-<label>.tar.gz),
-# and the launch's tree to LAUNCH_TREE.
+# delivered <label> <key> <none|inputs|legacy> [watch label] [tree]: assert, from the watch
+# streams, how the launch's pack reached its pod. The pack key is the tarball of the given tree,
+# else of the tree on the launch's pack row, or for legacy a launch whose row holds no tree; inputs
+# adds the run's own inputs key, which pack-stage extracts over the pack. Writes
+# delivered-<label>.tar.gz (and inputs-<label>.tar.gz), and the tree to LAUNCH_TREE.
 delivered() {
     local label="$1" key="$2" mode="$3" watch="${4:-$1}" pod cm args want=pack.tar.gz
     [ "$mode" = inputs ] && want=inputs.tar.gz,pack.tar.gz
@@ -497,7 +504,7 @@ delivered() {
     jq -r '.binaryData["pack.tar.gz"]' <<<"$cm" | base64 -d >"$WORK/delivered-$label.tar.gz"
     [ "$mode" = inputs ] && jq -r '.binaryData["inputs.tar.gz"]' <<<"$cm" | base64 -d >"$WORK/inputs-$label.tar.gz"
 
-    LAUNCH_TREE=$(launch_tree "$key")
+    LAUNCH_TREE=${5:-$(launch_tree "$key")}
     if [ "$mode" = legacy ]; then
         [ -z "$LAUNCH_TREE" ] || fail "[$label] the launch's pack row holds tree $LAUNCH_TREE"
         return
@@ -506,6 +513,11 @@ delivered() {
     [ "sha256:$(sha256 "$WORK/delivered-$label.tar.gz")" = "$(tree_tarball "$LAUNCH_TREE")" ] ||
         fail "[$label] the pack key is not the tarball of the launch's tree $LAUNCH_TREE"
     pass "[$label] the pack key is the tarball of the launch's tree"
+}
+
+# staged <watch label> <key>: the watch saw the launch's pack-stage exit 0.
+staged() {
+    [ "$(jq -s --arg key "$(label "$2")" '[.[] | .object | select(.metadata.labels["crucible.dev/issue-key"] == $key) | .status.initContainerStatuses[]? | select(.name == "pack-stage" and .state.terminated.exitCode == 0)] | length' "$WORK/pods-$1.json")" -gt 0 ]
 }
 
 # check_delivery <label> <key>: the delivery pack reached the pod as one gzipped key.
@@ -1194,8 +1206,51 @@ expect_bg X gone 404 'was deregistered while the save was being authorized'
     fail "[X] the refused schedule was stored"
 pass "[X] a schedule authorized before its playbook was deleted is refused with 404"
 
+# ---- scenario Q ----------------------------------------------------------------------------
+stop_controller
+CONTROLLER_BIN="$AUTORESEARCH_CONTROLLER"
+CONTROLLER_ENV=(CONTROLLER_AUTORESEARCH=true CONTROLLER_DAILY_COST_CEILING_USD=0)
+start_controller
+log "[Q] launching a direct autoresearch pack while a zero daily ceiling holds its run"
+QREPO="$WORK/qrepo"
+mkdir -p "$QREPO"
+cp -R "$FIX/packs/scope" "$QREPO/pack"
+git -C "$QREPO" init -q
+git_commit "$QREPO" scope
+api POST /api/packs/launch "{\"repo\":\"file://$QREPO\",\"path\":\"pack\",\"justification\":\"kind e2e\"}"
+expect_http Q 201 '"status":"awaiting-approval"'
+SCOPE_KEY=$(jq -r .key "$WORK/api.json")
+SCOPE_TREE=$(sql -c "SELECT tree_digest FROM scopes WHERE issue = '$SCOPE_KEY'")
+is_tree "$SCOPE_TREE" && [ "$SCOPE_TREE" = "$(launch_tree "$SCOPE_KEY")" ] ||
+    fail "[Q] the scope froze '$SCOPE_TREE'; its pack row holds '$(launch_tree "$SCOPE_KEY")'"
+pass "[Q] the approved scope froze the tree its launch stored"
+
+log "[Q] writing a tree that declares a build to the scope's pack row"
+cp -R "$FIX/packs/scope" "$WORK/scopedecoy"
+printf '\n[build.sandbox]\nbackend = "cluster"\nimage = "ghcr.io/org/sandbox"\ntimeout = "30m"\n[build.sandbox.cluster]\ncontainerfile = "Containerfile"\n' >>"$WORK/scopedecoy/crucible.toml"
+echo 'FROM scratch' >"$WORK/scopedecoy/Containerfile"
+new_draft "$DRAFT-scopedecoy" "$WORK/scopedecoy"
+SCOPE_DECOY=$(draft_tree "$DRAFT-scopedecoy" 2)
+is_tree "$SCOPE_DECOY" && [ "$SCOPE_DECOY" != "$SCOPE_TREE" ] || fail "[Q] the decoy saved as tree '$SCOPE_DECOY'"
+sql -c "UPDATE pack_tarballs SET tree_digest = '$SCOPE_DECOY' WHERE issue_slug = '$(slug "$SCOPE_KEY")'"
+[ "$(sql -c "SELECT status FROM issues WHERE key = '$SCOPE_KEY'")" = awaiting-approval ] ||
+    fail "[Q] the scope moved while the ceiling held it: $(sql -c "SELECT status FROM issues WHERE key = '$SCOPE_KEY'")"
+watch_start Q
+api PUT /api/config/overrides '{"daily_cost_ceiling":100,"justification":"kind e2e"}'
+[ "$HTTP" = 200 ] || fail "[Q] raising the daily ceiling: $HTTP $(cat "$WORK/api.json")"
+crux reconcile >/dev/null
+wait_for 120 "the scope's run pod to stage its pack" staged Q "$SCOPE_KEY"
+watch_stop
+delivered Q "$SCOPE_KEY" none Q "$SCOPE_TREE"
+[ "$(sql -c "SELECT count(*) FROM events WHERE key = '$SCOPE_KEY' AND to_status = 'building'")" = 0 ] ||
+    fail "[Q] the scope planned the decoy's build"
+[ "$(sql -c "SELECT count(*) FROM events WHERE key = '$SCOPE_KEY' AND from_status = 'awaiting-approval' AND to_status = 'running'")" = 1 ] ||
+    fail "[Q] the scope did not launch its run: $(sql -c "SELECT from_status, to_status, reason FROM events WHERE key = '$SCOPE_KEY'")"
+pass "[Q] the scope planned and delivered its frozen tree, not the tree written to its pack row"
+
 # ---- scenario O ----------------------------------------------------------------------------
 stop_controller
+CONTROLLER_BIN="$BIN/crucible-controller"
 CONTROLLER_ENV=(CONTROLLER_PLAYBOOK_EXECUTOR=local CONTROLLER_MAX_CONCURRENT_PODS=1)
 start_controller
 log "[O] running stored trees with the local executor"

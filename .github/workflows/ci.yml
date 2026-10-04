@@ -326,7 +326,7 @@ jobs:
   # The controller dispatching real pods on a throwaway kind cluster (scripts/kind-e2e.sh). Not in
   # the required check until it has a flake-free record.
   kind-e2e:
-    timeout-minutes: 30
+    timeout-minutes: 45
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
