@@ -2,8 +2,8 @@ use crate::manifest;
 use crate::manifest::AgentBackend;
 use anyhow::{Context, Result};
 use base64::Engine as _;
+use crucible_contract::pack_tree::{PackTree, walk_dir};
 use crucible_contract::scope::ScopeReport;
-use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 /// A pack that cannot be written or shipped. The two cap arms are the reason the marker
@@ -19,13 +19,13 @@ pub enum PackError {
         "pack tar is {bytes} bytes, over the {PACK_TAR_CAP_BYTES}-byte cap — refusing to emit a \
          pack that can't ride the pod logs whole"
     )]
-    TarOverCap { bytes: usize },
+    TarOverCap { bytes: u64 },
     #[error(
         "pack payload is {encoded} bytes encoded ({tarred} bytes tarred), over the \
          {PACK_PAYLOAD_CAP_BYTES}-byte cap — refusing to emit a pack that can't ride the pod \
          logs whole"
     )]
-    PayloadOverCap { encoded: usize, tarred: usize },
+    PayloadOverCap { encoded: usize, tarred: u64 },
 }
 
 /// The prefix of the single-line pack marker a SURVIVING `--marker` scope turn emits before the
@@ -37,12 +37,10 @@ pub enum PackError {
 /// Shares the controller's scraper literal via `crucible-contract`.
 pub use crucible_contract::SCOPE_PACK_MARKER;
 
-/// Sanity cap on the pack tar (uncompressed bytes), anything bigger is a drafted pack gone wrong
-/// (a vendored dependency tree, a stray dataset). The budget that actually matters is
-/// [`PACK_PAYLOAD_CAP_BYTES`] on the emitted marker payload: a text-heavy pack many times the old
-/// 4 MiB tar bound still compresses under the log budget, so the raw-tar bound is deliberately
-/// loose. Over either cap the emit refuses with an explicit error, never a silently truncated pack.
-pub(super) const PACK_TAR_CAP_BYTES: usize = 64 * 1024 * 1024;
+/// Cap on the pack tar (uncompressed bytes): the most the controller gunzips from a pack archive.
+/// The budget that usually binds is [`PACK_PAYLOAD_CAP_BYTES`] on the emitted marker payload; over
+/// either cap the emit refuses with an explicit error, never a silently truncated pack.
+pub(super) const PACK_TAR_CAP_BYTES: u64 = crucible_contract::pack_tree::MAX_EXPANDED_BYTES;
 
 /// Cap on the emitted pack marker payload (base64(gzip(tar)) bytes), the thing that must ride one
 /// pod-log line under the kubelet's 10 MiB log-rotation budget with headroom for the rest of the
@@ -381,80 +379,49 @@ pub(super) fn scratch_dir(prefix: &str) -> PathBuf {
     dir
 }
 
-/// Tar the pack directory (entries relative to the dir), refusing over [`PACK_TAR_CAP_BYTES`],
-/// the marker line must fit the pod-log budget, and a partial pack must never leave this process.
-///
-/// `.git` subtrees are EXCLUDED: the run phase builds its workspace by cloning `[repo]` from the
-/// manifest (`run::manifest_setup`), so a checkout's object store inside the pack is dead weight,
-/// and its packfiles are already compressed, which is exactly what blew the encoded-payload budget
-/// on the first live checkpoint build (12.6 MiB pack, 7.4 MiB encoded, mostly git objects).
-pub(super) fn tar_pack_dir(dir: &Path) -> Result<Vec<u8>> {
-    let mut builder = tar::Builder::new(Vec::new());
-    append_dir_filtered(&mut builder, dir, Path::new(""))
-        .with_context(|| format!("tarring the pack dir {}", dir.display()))?;
-    let tar = builder
-        .into_inner()
-        .context("finishing the pack tar stream")?;
-    if tar.len() > PACK_TAR_CAP_BYTES {
-        return Err(PackError::TarOverCap { bytes: tar.len() }.into());
-    }
-    Ok(tar)
+/// The pack directory as a tree: `state/`, `workspace/` and `.git` subtrees are skipped at any
+/// depth, and a symlink or other non-regular file is refused.
+pub(super) fn read_pack(dir: &Path) -> Result<PackTree> {
+    Ok(walk_dir(dir)
+        .with_context(|| format!("reading the pack dir {}", dir.display()))?
+        .tree)
 }
 
-/// Recursively append `dir`'s entries under `prefix` (both relative to the pack root), skipping
-/// any directory named `.git`. Empty directories are dropped (a pack never depends on one) and a
-/// symlink is appended as the file it points at, pack content is plain files by construction.
-fn append_dir_filtered(
-    builder: &mut tar::Builder<Vec<u8>>,
-    dir: &Path,
-    prefix: &Path,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let rel = prefix.join(&name);
-        if path.is_dir() {
-            if name == ".git" {
-                continue;
-            }
-            append_dir_filtered(builder, &path, &rel)?;
-        } else {
-            builder
-                .append_path_with_name(&path, &rel)
-                .with_context(|| format!("tarring {}", path.display()))?;
-        }
-    }
-    Ok(())
+/// The gzipped tar of the pack dir, the same encoding a run receives, refused when it expands past
+/// [`PACK_TAR_CAP_BYTES`]: the controller would refuse that archive, so a partial pack must never
+/// leave this process.
+pub(super) fn pack_gz(dir: &Path) -> Result<Vec<u8>> {
+    pack_gz_and_expanded(dir).map(|(gz, _)| gz)
 }
 
-/// The pack marker's payload for a surviving pack: base64(gzip(tar of the pack dir)), refused over
+fn pack_gz_and_expanded(dir: &Path) -> Result<(Vec<u8>, u64)> {
+    let gz = read_pack(dir)?
+        .tarball()
+        .context("encoding the pack tarball")?;
+    let expanded = std::io::copy(
+        &mut flate2::read::GzDecoder::new(gz.as_slice()),
+        &mut std::io::sink(),
+    )
+    .context("sizing the pack tarball")?;
+    if expanded > PACK_TAR_CAP_BYTES {
+        return Err(PackError::TarOverCap { bytes: expanded }.into());
+    }
+    Ok((gz, expanded))
+}
+
+/// The pack marker's payload for a surviving pack: base64 of [`pack_gz`], refused over
 /// [`PACK_PAYLOAD_CAP_BYTES`], the encoded line is what must survive the pod-log budget whole.
 pub(super) fn pack_marker_payload(dir: &Path) -> Result<String> {
-    let tar = tar_pack_dir(dir)?;
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&tar).context("gzipping the pack tar")?;
-    let gz = enc.finish().context("finishing the pack gzip stream")?;
+    let (gz, tarred) = pack_gz_and_expanded(dir)?;
     let payload = base64::engine::general_purpose::STANDARD.encode(gz);
     if payload.len() > PACK_PAYLOAD_CAP_BYTES {
         return Err(PackError::PayloadOverCap {
             encoded: payload.len(),
-            tarred: tar.len(),
+            tarred,
         }
         .into());
     }
     Ok(payload)
-}
-
-/// The raw gzipped tar of the pack dir, the Tier 2 `scope-pack` artifact body (uploaded to the
-/// ingest drop-box). No base64, no line-length cap: the drop-box takes the compressed bytes directly
-/// and enforces its own 16 MiB HTTP cap, so this doesn't fight the pod-log budget the way
-/// [`pack_marker_payload`] must.
-pub(super) fn pack_gz(dir: &Path) -> Result<Vec<u8>> {
-    let tar = tar_pack_dir(dir)?;
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&tar).context("gzipping the pack tar")?;
-    enc.finish().context("finishing the pack gzip stream")
 }
 
 /// The full `CRUCIBLE_SCOPE_PACK: …` marker line for a report, or `None` when the pipeline didn't
@@ -476,7 +443,7 @@ pub(super) fn pack_marker_line(report: &ScopeReport, pack: &Path) -> Option<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::scope::pack::{CONTROLS_DIR, strip_controls_and_selftest};
 
     #[test]
     fn de_prescribing_strips_control_injects_in_both_authoring_forms() {
