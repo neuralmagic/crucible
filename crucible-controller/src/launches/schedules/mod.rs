@@ -286,6 +286,16 @@ pub(crate) struct Schedule {
     pub updated_at: String,
 }
 
+impl Schedule {
+    /// How an audit line names what this schedule adopted.
+    pub(crate) fn adopted_label(&self) -> String {
+        crate::launches::standing::adopted_label(
+            self.adopted_rev.as_deref(),
+            self.adopted_tree_digest.as_deref(),
+        )
+    }
+}
+
 /// The column set every read projects: the core row beside the sidecar.
 #[derive(sqlx::FromRow)]
 struct ScheduleRow {

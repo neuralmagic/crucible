@@ -452,6 +452,36 @@ pub async fn exposure_for_issue(
     .and_then(|s| s.exposure)))
 }
 
+/// The revision registered launch `issue_key` runs: the pack its `pack_tarballs` row froze, with
+/// the registry's source rev only while the registry row still holds that pack. A launch with no
+/// frozen pack runs the registry row as it stands.
+pub(crate) async fn launch_revision(
+    pool: &PgPool,
+    issue_key: &str,
+    playbook: &str,
+) -> Result<crate::secrets::launch::OwnedRevision> {
+    let frozen: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT CASE WHEN COALESCE(t.tree_digest = p.tree_digest, t.digest = p.tar_digest)
+                     THEN p.rev END,
+                COALESCE(t.tree_digest, t.digest)
+         FROM pack_tarballs t LEFT JOIN playbooks p ON p.id = $2
+         WHERE t.issue_slug = $1",
+    )
+    .bind(crate::model::sanitize_key(issue_key))
+    .bind(playbook)
+    .fetch_optional(pool)
+    .await
+    .context("reading the pack a launch froze")?;
+    let (rev, pack) = match frozen {
+        Some(frozen) => frozen,
+        None => crate::playbooks::registry::get(pool, playbook)
+            .await?
+            .map(|p| (Some(p.rev), p.tree_digest.map(|t| t.to_string())))
+            .unwrap_or_default(),
+    };
+    Ok(crate::secrets::launch::OwnedRevision::Published { rev, pack })
+}
+
 /// The exposure launch `issue_key` runs under: the one its row records, else the registry row's
 /// while that row still holds the launch's pack, else the one extracted from the launch's own
 /// pack, which is then recorded on the launch row.

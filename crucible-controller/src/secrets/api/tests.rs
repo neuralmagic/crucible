@@ -2001,3 +2001,99 @@ async fn a_superseded_pack_rev_is_refused_only_to_a_reader(pool: PgPool) {
     assert_eq!(outsider["pack_rev"], "sha256:old");
     assert!(!outsider.to_string().contains("tree1:"), "{outsider}");
 }
+
+/// A binder who may not read the playbook binds at a pre-tree rev and is answered as for any
+/// rev, but the binding pins the tree that rev became, the pin startup conversion would derive:
+/// a restart changes neither the pin nor the launch's answer.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn an_outsiders_pre_tree_binding_pins_what_conversion_would(pool: PgPool) {
+    let app = app(pool.clone(), None);
+    let tree = crucible_contract::pack_tree::PackTree::from_pairs(&[("crucible.toml", b"m")])
+        .expect("tree");
+    let pack = crate::playbooks::pack_trees::EncodedPack::new(tree).expect("encode");
+    let digest =
+        crate::playbooks::pack_trees::put_tree(&mut pool.acquire().await.expect("conn"), &pack)
+            .await
+            .expect("put");
+    for statement in [
+        "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, tar_digest, tar_bytes, \
+         params_schema, schema_digest, core_rev, created_at, updated_at, tree_digest, owner) \
+         VALUES ('survey', 'd', 'o/r', $1, '', 'x', 'sha256:x', 1, '{}'::jsonb, 's', 'c', \
+         'now', 'now', $1, 'user:alice')",
+        "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at) \
+         VALUES ('survey', $1, 'now')",
+        "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at) \
+         VALUES ('sha256:old', $1, 'then')",
+    ] {
+        sqlx::query(statement)
+            .bind(digest.as_str())
+            .execute(&pool)
+            .await
+            .expect(statement);
+    }
+    let (status, created) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "bob",
+            &[],
+            Some(json!({"name": "pr-token", "kind": "opaque", "mint": "github-app"})),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["id"].as_str().expect("an id");
+    let (status, bound) = call(
+        &app,
+        as_user(
+            "POST",
+            &format!("/api/secrets/{id}/bindings"),
+            "bob",
+            &[],
+            Some(json!({
+                "scope_kind": "playbook",
+                "scope_id": "survey",
+                "projection_kind": "env",
+                "projection": "PR_TOKEN",
+                "pack_rev": "sha256:old",
+            })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{bound}");
+
+    let pin = || async {
+        sqlx::query_scalar::<_, Option<String>>("SELECT pack_digest FROM secret_bindings")
+            .fetch_one(&pool)
+            .await
+            .expect("pin")
+    };
+    let launch = || async {
+        crate::secrets::launch::resolve(
+            &pool,
+            &crate::secrets::launch::Scope::playbook("survey"),
+            &[],
+            &crate::authz::model::Principals::new(Some("bob"), &[]),
+            crate::secrets::launch::Revision::Published(Some(
+                crate::secrets::launch::PackPin::Registered {
+                    rev: digest.as_str(),
+                    tree: Some(digest.as_str()),
+                },
+            )),
+            None,
+        )
+        .await
+        .expect("resolve")
+        .map(|mints| mints.len())
+    };
+    assert_eq!(pin().await, Some(digest.to_string()));
+    assert_eq!(launch().await, Ok(1));
+
+    let report = crate::playbooks::pack_migration::convert_pack_trees(&pool)
+        .await
+        .expect("restart");
+    assert_eq!(report.pinned, 0, "{report:?}");
+    assert_eq!(pin().await, Some(digest.to_string()));
+    assert_eq!(launch().await, Ok(1));
+}

@@ -475,22 +475,11 @@ pub(crate) async fn create_schedule(
 
     let audit_key = format!("schedule:{}", stored.id);
     let audit_reason = format!(
-        "playbook {} scheduled on {:?} ({}) as {} {}",
+        "playbook {} scheduled on {:?} ({}) as {}",
         stored.playbook,
         stored.cron_expr,
         stored.tz,
-        stored.target_kind,
-        stored
-            .adopted_rev
-            .as_deref()
-            .map(|rev| crate::launches::standing::adopted_label(
-                rev,
-                stored.adopted_tree_digest.as_deref()
-            ))
-            .unwrap_or_else(|| format!(
-                "draft version {}",
-                stored.eligible_draft_version.unwrap_or_default()
-            ))
+        stored.adopted_label()
     );
     if let Err(e) = state
         .audit_required(
@@ -714,18 +703,8 @@ pub(crate) async fn update_schedule(
         stored.tz,
         prior
             .as_ref()
-            .and_then(|s| s.adopted_rev.as_deref().map(|rev| {
-                crate::launches::standing::adopted_label(rev, s.adopted_tree_digest.as_deref())
-            }))
-            .unwrap_or_else(|| "draft head".to_string()),
-        stored
-            .adopted_rev
-            .as_deref()
-            .map(|rev| crate::launches::standing::adopted_label(
-                rev,
-                stored.adopted_tree_digest.as_deref()
-            ))
-            .unwrap_or_else(|| "draft head".to_string())
+            .map_or_else(|| "draft head".to_string(), Schedule::adopted_label),
+        stored.adopted_label()
     );
     if let Err(e) = state
         .audit_required(

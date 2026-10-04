@@ -100,7 +100,7 @@ async fn lock_adopted(
     if !locked.holds(pinned) {
         return Err(Unadoptable::Repinned {
             playbook,
-            rev: adopted_label(&locked.rev, locked.tree_digest.as_deref()),
+            rev: adopted_label(Some(&locked.rev), locked.tree_digest.as_deref()),
         }
         .into());
     }
@@ -149,6 +149,14 @@ pub(crate) struct Standing {
 }
 
 impl Standing {
+    /// How an audit line names what this row adopted.
+    pub(crate) fn adopted_label(&self) -> String {
+        adopted_label(
+            self.adopted_rev.as_deref(),
+            self.adopted_tree_digest.as_deref(),
+        )
+    }
+
     /// Whether this row adopted the revision `pack` holds: the same tree, or the same bytes when
     /// this row recorded no tree.
     pub(crate) fn adopts(&self, pack: &crate::playbooks::registry::PlaybookRow) -> bool {
@@ -163,11 +171,13 @@ impl Standing {
     }
 }
 
-/// How an audit line names an adopted revision: the rev, and the tree when it is not the rev.
-pub(crate) fn adopted_label(rev: &str, tree: Option<&str>) -> String {
-    match tree {
-        Some(tree) if tree != rev => format!("revision {rev} (tree {tree})"),
-        _ => format!("revision {rev}"),
+/// How an audit line names what a standing row adopted: the rev, and the tree when it is not the
+/// rev. A row with no adopted rev follows its draft head.
+pub(crate) fn adopted_label(rev: Option<&str>, tree: Option<&str>) -> String {
+    match (rev, tree) {
+        (None, _) => "draft head".to_string(),
+        (Some(rev), Some(tree)) if tree != rev => format!("revision {rev} (tree {tree})"),
+        (Some(rev), _) => format!("revision {rev}"),
     }
 }
 

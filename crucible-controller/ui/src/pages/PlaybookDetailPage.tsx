@@ -15,6 +15,7 @@ import {
   SectionBody,
   SectionHeader,
 } from '../ui';
+import { shortRev } from './draftStudio';
 import { FormActions, FormError, FormGrid, TextField } from './formControls';
 import { sourceLabel } from './playbookSource';
 import { SharesSection } from './SharesSection';
@@ -121,7 +122,7 @@ export function PlaybookDetailPage() {
       <SharesSection path="/api/playbooks/{id}" id={playbook.id} />
 
       <Section>
-        <SectionHeader title="Edit a copy" note={`seeded from ${playbook.rev.slice(0, 7)}`} />
+        <SectionHeader title="Edit a copy" note={`seeded from ${shortRev(playbook.rev)}`} />
         <SectionBody>
           <FormGrid>
             <TextField

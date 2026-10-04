@@ -616,10 +616,7 @@ pub(crate) async fn create_webhook(
         "playbook {} on {} deliveries as {}",
         webhook.core.playbook,
         webhook.verifier.as_str(),
-        crate::launches::standing::adopted_label(
-            webhook.core.adopted_rev.as_deref().unwrap_or("?"),
-            webhook.core.adopted_tree_digest.as_deref()
-        )
+        webhook.core.adopted_label()
     );
     if let Err(refusal) = audit(
         &state,
@@ -855,10 +852,7 @@ pub(crate) async fn update_webhook(
         "playbook {} on {} deliveries as {}",
         webhook.core.playbook,
         webhook.verifier.as_str(),
-        crate::launches::standing::adopted_label(
-            webhook.core.adopted_rev.as_deref().unwrap_or("?"),
-            webhook.core.adopted_tree_digest.as_deref()
-        )
+        webhook.core.adopted_label()
     );
     if let Err(refusal) = audit(
         &state,

@@ -379,10 +379,7 @@ pub(crate) async fn create_watch(
         stored.tracker,
         stored.query,
         stored.watermark,
-        crate::launches::standing::adopted_label(
-            stored.adopted_rev.as_deref().unwrap_or("?"),
-            stored.adopted_tree_digest.as_deref()
-        )
+        stored.adopted_label()
     );
     if let Err(e) = state
         .audit_required(
@@ -585,10 +582,7 @@ pub(crate) async fn update_watch(
         stored.tracker,
         stored.query,
         stored.watermark,
-        crate::launches::standing::adopted_label(
-            stored.adopted_rev.as_deref().unwrap_or("?"),
-            stored.adopted_tree_digest.as_deref()
-        )
+        stored.adopted_label()
     );
     if let Err(e) = state
         .audit_required(

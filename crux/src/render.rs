@@ -2456,10 +2456,6 @@ mod tests {
         )
         .expect("the old shape parses");
         assert_eq!(old.tree_digest.as_deref(), Some("sha256:aa"));
-        let ack: dto::PublishAck =
-            serde_json::from_str(r#"{"id":"p","rev":"sha256:aa","tar_digest":"sha256:aa"}"#)
-                .expect("the old ack parses");
-        assert_eq!(ack.tree_digest.as_deref(), Some("sha256:aa"));
     }
 
     #[test]

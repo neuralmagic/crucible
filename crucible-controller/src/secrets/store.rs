@@ -93,8 +93,9 @@ pub struct BindingRow {
     #[sqlx(try_from = "String")]
     pub declared_name: SecretName,
     pub pack_rev: Option<String>,
-    /// The tree the bound playbook held at `pack_rev` when the binding was made, `None` when the
-    /// binding names no revision or one the playbook no longer held.
+    /// The tree the bound playbook held at `pack_rev` when the binding was made, or the tree a
+    /// pre-tree `pack_rev` became; `None` when the binding names no revision or one neither
+    /// names.
     pub pack_digest: Option<String>,
     pub schema_digest: Option<String>,
     pub created_by: Option<String>,
@@ -306,8 +307,9 @@ pub async fn delete(conn: &mut PgConnection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Store a binding. A playbook binding whose `pack_rev` is the playbook's current rev also pins
-/// the playbook's current tree.
+/// Store a binding. A playbook binding pins the playbook's current tree when `pack_rev` is the
+/// playbook's current rev, else the tree a pre-tree `pack_rev` became: the pin startup conversion
+/// derives.
 pub async fn insert_binding(
     conn: &mut PgConnection,
     new: &NewBinding<'_>,
@@ -317,8 +319,11 @@ pub async fn insert_binding(
                                         projection, declared_name, pack_rev, schema_digest,
                                         created_by, created_at, pack_digest)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                   (SELECT tree_digest FROM playbooks
-                    WHERE $3 = 'playbook' AND id = $4 AND rev = $8))
+                   COALESCE(
+                       (SELECT tree_digest FROM playbooks
+                        WHERE $3 = 'playbook' AND id = $4 AND rev = $8),
+                       (SELECT tree_digest FROM pack_digest_aliases
+                        WHERE $3 = 'playbook' AND old_digest = $8)))
            RETURNING {BINDING_COLUMNS}"#
     ))
     .bind(new.id)

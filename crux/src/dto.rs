@@ -680,9 +680,6 @@ impl PlaybookSource {
 pub struct PublishAck {
     pub id: String,
     pub rev: String,
-    /// As [`PackImport::tree_digest`].
-    #[serde(default, alias = "tar_digest")]
-    pub tree_digest: Option<String>,
     #[serde(default)]
     pub schema_changed: bool,
     #[serde(default)]
@@ -754,9 +751,6 @@ pub struct Playbook {
     pub source: PlaybookSource,
     #[serde(default)]
     pub rev: String,
-    /// As [`PackImport::tree_digest`].
-    #[serde(default, alias = "tar_digest")]
-    pub tree_digest: Option<String>,
     #[serde(default)]
     pub created_by: Option<String>,
 }

@@ -1162,7 +1162,8 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         Ok(report) => tracing::info!(
             converted = report.converted,
             unconvertible = report.unconvertible,
-            "autopilot: legacy packs converted to stored trees"
+            pinned = report.pinned,
+            "autopilot: legacy packs converted to stored trees and pins derived"
         ),
         Err(e) => tracing::warn!(
             error = %format!("{e:#}"),

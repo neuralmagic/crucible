@@ -135,7 +135,8 @@ const PINS: [(&str, &str); 6] = [
     (
         "secret binding pins from a pre-tree rev",
         "UPDATE secret_bindings b SET pack_digest = a.tree_digest FROM pack_digest_aliases a
-         WHERE b.pack_digest IS NULL AND b.pack_rev = a.old_digest AND a.tree_digest IS NOT NULL",
+         WHERE b.pack_digest IS NULL AND b.scope_kind = 'playbook' AND b.pack_rev = a.old_digest
+           AND a.tree_digest IS NOT NULL",
     ),
     (
         "draft-sourced revs",
@@ -633,7 +634,7 @@ mod tests {
                     projection: None,
                 }],
                 &crate::authz::model::Principals::new(Some("alice"), &[]),
-                Revision::Published(Some(PackPin {
+                Revision::Published(Some(PackPin::Registered {
                     rev: &row.rev,
                     tree: tree.as_deref(),
                 })),
