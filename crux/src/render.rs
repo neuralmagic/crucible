@@ -768,6 +768,7 @@ pub fn pack_import(i: &dto::PackImport, preview_url: &str) -> String {
     ));
     line(&mut out, "path", Some(&i.path));
     out.push_str(&format!("rev: {}\n", i.rev));
+    line(&mut out, "tree", i.tree_digest.as_deref());
     out.push_str(&format!(
         "schema: {}\n",
         i.schema_digest
@@ -860,7 +861,7 @@ pub fn draft_published(id: &str, ack: &dto::PublishAck) -> String {
     let mut out = format!(
         "published draft {id} as playbook {} @ {}\n",
         ack.id,
-        ack.rev.chars().take(19).collect::<String>()
+        short_rev(&ack.rev)
     );
     if ack.schema_changed {
         out.push_str("the launch form changed.\n");
@@ -1022,6 +1023,16 @@ pub fn secret_bound(b: &dto::SecretBinding) -> String {
     )
 }
 
+/// A rev or digest cut to what a reader compares by eye: a `sha256:` or `tree1:` prefix and 12
+/// characters after it, or the first 12 of a git commit.
+fn short_rev(rev: &str) -> String {
+    let short = |value: &str| value.chars().take(12).collect::<String>();
+    match rev.split_once(':') {
+        Some((prefix, value)) => format!("{prefix}:{}", short(value)),
+        None => short(rev),
+    }
+}
+
 pub fn playbooks(list: &[dto::Playbook]) -> String {
     if list.is_empty() {
         return "no playbooks registered\n".to_string();
@@ -1032,7 +1043,7 @@ pub fn playbooks(list: &[dto::Playbook]) -> String {
             vec![
                 p.id.clone(),
                 p.source.label(),
-                p.rev.chars().take(8).collect(),
+                short_rev(&p.rev),
                 or_dash(p.created_by.as_deref()),
                 truncate(&p.description, TITLE_MAX),
             ]
@@ -2429,12 +2440,26 @@ mod tests {
         serde_json::from_str(
             r#"{"id":"0192f4a1-8c3e-7000-9abc-1234567890ab","repo":"owner/packs",
                "git_ref":"main","path":"packs/calibrate","rev":"9f1c2b3",
-               "tar_digest":"sha256:aa","params_schema":null,"schema_digest":"sha256:bb",
+               "tree_digest":"tree1:aa","params_schema":null,"schema_digest":"sha256:bb",
                "graph":null,"diagnostics":[],"core_rev":"c0ffee","status":"pending",
                "playbook":null,"draft_id":null,"proposed_by":"agent-7",
                "created_at":"2026-08-23T09:00:00Z","resolved_by":null,"resolved_at":null}"#,
         )
         .expect("the import fixture parses")
+    }
+
+    /// A controller from before tree storage names the digest `tar_digest`; it still lands.
+    #[test]
+    fn a_digest_under_its_old_name_still_reads() {
+        let old: dto::PackImport = serde_json::from_str(
+            r#"{"id":"i","repo":"owner/packs","rev":"9f1c2b3","tar_digest":"sha256:aa"}"#,
+        )
+        .expect("the old shape parses");
+        assert_eq!(old.tree_digest.as_deref(), Some("sha256:aa"));
+        let ack: dto::PublishAck =
+            serde_json::from_str(r#"{"id":"p","rev":"sha256:aa","tar_digest":"sha256:aa"}"#)
+                .expect("the old ack parses");
+        assert_eq!(ack.tree_digest.as_deref(), Some("sha256:aa"));
     }
 
     #[test]
@@ -2447,6 +2472,7 @@ mod tests {
         assert!(out.contains("repo: owner/packs @ main\n"), "{out}");
         assert!(out.contains("path: packs/calibrate\n"), "{out}");
         assert!(out.contains("rev: 9f1c2b3\n"), "{out}");
+        assert!(out.contains("tree: tree1:aa\n"), "{out}");
         assert!(out.contains("schema: sha256:bb\n"), "{out}");
         assert!(out.contains("diagnostics: none\n"), "{out}");
         assert!(out.contains("proposed_by: agent-7\n"), "{out}");
@@ -2606,7 +2632,7 @@ mod tests {
             r#"[{"id":"survey","description":"reads a paper","rev":"7c2c1a563813ce95",
                  "source":{"kind":"git","repo":"owner/packs","git_ref":null,"path":"packs/survey"},
                  "created_by":"wren"},
-                {"id":"mlr-pack","description":"mlr sweep","rev":"sha256:beefcafe",
+                {"id":"mlr-pack","description":"mlr sweep","rev":"tree1:beefcafe0123456789",
                  "source":{"kind":"draft","draft":"studio","version":3},
                  "created_by":"reed"}]"#,
         )
@@ -2614,6 +2640,14 @@ mod tests {
         let out = playbooks(&list);
         assert!(out.contains("owner/packs/packs/survey"), "{out}");
         assert!(out.contains("draft studio v3"), "{out}");
+        assert!(
+            out.contains("7c2c1a563813 "),
+            "a commit keeps 12 characters: {out}"
+        );
+        assert!(
+            out.contains("tree1:beefcafe0123 "),
+            "a digest keeps its prefix and 12 characters: {out}"
+        );
     }
 
     /// A publish lands a playbook at once; what the agent needs back is its id, its pin, and that
@@ -2621,14 +2655,14 @@ mod tests {
     #[test]
     fn a_publish_names_the_playbook_and_keeps_the_draft_live() {
         let ack: dto::PublishAck = serde_json::from_str(
-            r#"{"id":"mlr-pack","rev":"sha256:0123456789abcdef0123","tar_digest":"sha256:0123",
+            r#"{"id":"mlr-pack","rev":"tree1:0123456789abcdef0123","tree_digest":"tree1:0123456789abcdef0123",
                "schema_digest":"sha256:form","schema_changed":true,"exposure_digest":null,
                "exposure_changed":false}"#,
         )
         .expect("the publish fixture parses");
         let out = draft_published("studio", &ack);
         assert!(
-            out.starts_with("published draft studio as playbook mlr-pack @ sha256:0123456789ab\n"),
+            out.starts_with("published draft studio as playbook mlr-pack @ tree1:0123456789ab\n"),
             "{out}"
         );
         assert!(out.contains("the launch form changed.\n"), "{out}");
