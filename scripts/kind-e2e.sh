@@ -7,7 +7,8 @@
 #      and its ConfigMap are collected afterwards; the save recorded the tree the launch runs and
 #      the tarball download names it in X-Pack-Digest
 #   P  the draft published to the registry launches with the same delivery; the registry row and
-#      its revision hold the draft's tree, and the launch records the registry row's exposure
+#      its revision hold the draft's tree, the launch records the registry row's exposure, and the
+#      registry inspector and a template clone read that tree
 #   F  a failing task parks its launch with the task's error
 #   C  a pack over the delivery budget is refused at save
 #   R  runs survive a controller restart: one finishes while the controller is down, one is
@@ -19,7 +20,8 @@
 #   D  the download, the draft's files, and launch adoption read the stored tree: a save or a
 #      delete that lands while a launch waits on the version row refuses the launch
 #   L  a version whose bytes change on a live controller loses its tree; it is read, downloaded,
-#      and delivered from its legacy bytes, and converts to the downloaded tree at the next boot
+#      and delivered from its legacy bytes, and converts to the downloaded tree at the next boot; a
+#      registry row whose bytes change is inspected, templated, and launched from them alike
 #   T  a stored tree whose files were tampered with refuses its draft launch and parks its
 #      registered launch without a pod; the startup agent backfill skips it and fills the rest
 #   E  a restart re-derives a stale registry row from its tree, not its bytes
@@ -31,11 +33,13 @@
 #   S  steering rows reach the run as STEER.md in a per-run inputs key beside the untouched pack,
 #      count against the delivery budget, and satisfy an inject the pack does not ship
 #   K  a schedule's cursor file reaches the run in the inputs key, at the pack root or under
-#      state/ (also over a state PVC), and a draft-head schedule fires the newest compiled tree
+#      state/ (also over a state PVC), and a draft-head schedule fires the newest compiled tree,
+#      not a newer save that does not compile
 #   X  a registry row re-registered or deleted between authorization and save refuses a launch,
-#      schedule, webhook, or one-shot with 409 or 404, and stores nothing
+#      schedule, schedule edit, webhook, or one-shot with 409 or 404, and stores nothing
 #   Q  an approved direct autoresearch pack plans and delivers the tree its scope froze, not one
-#      written to its pack row afterwards (needs the controller built with the autoresearch lane)
+#      written to its pack row afterwards, and its approval evidence reads SCOPE.md from the
+#      stored tree (needs the controller built with the autoresearch lane)
 #   O  the local executor runs a stored tree with its steering beside it, and parks a tampered tree
 #   G  migrate-state stores a legacy pack dir as a tree with its steering split into rows
 #   M  a loop image labelled with another contract version parks the launch without a pod
@@ -152,7 +156,7 @@ else
         -v "kind-e2e-target-$NODE_ARCH":/ctarget \
         -v "$WORK/image":/out \
         -e CARGO_TARGET_DIR=/ctarget -e SQLX_OFFLINE=true \
-        rust:1-bookworm sh -c 'cargo build --locked -q -p crucible --bin crucible && cp /ctarget/debug/crucible /out/'
+        rust:1-bookworm sh -c 'cargo build --locked -q -p crucible --bin crucible && cp /ctarget/debug/crucible /out/ && strip /out/crucible'
     LOOP_BASE="${LOOP_BASE:-debian:bookworm-slim}"
 fi
 CONTRACT_VERSION=$("$BIN/crucible" --contract-version)
@@ -587,6 +591,29 @@ check_download() {
 # draft_files <draft>: the paths `crux draft-files` serves for the newest save.
 draft_files() { crux draft-files "$1" --json | jq -r '.files | keys[]' | LC_ALL=C sort; }
 
+# expect_playbook_files <label> <playbook> <dir>: the registry inspector serves the files of the
+# pack in dir, check.sh byte for byte.
+expect_playbook_files() {
+    api GET "/api/playbooks/$2"
+    [ "$HTTP" = 200 ] || fail "[$1] inspecting $2: $HTTP $(cat "$WORK/api.json")"
+    [ "$(jq -r '.files | keys[]' "$WORK/api.json" | LC_ALL=C sort)" = "$(cd "$3" && find . -type f | sed 's|^\./||' | LC_ALL=C sort)" ] ||
+        fail "[$1] $2 serves files $(jq -c '.files | keys' "$WORK/api.json"), not those of $3"
+    [ "$(jq -r '.files["check.sh"]' "$WORK/api.json")" = "$(cat "$3/check.sh")" ] ||
+        fail "[$1] $2 serves a check.sh that is not the one in $3"
+    pass "[$1] the registry inspector serves $2 as the pack in $(basename "$3")"
+}
+
+# clone_template <label> <draft> <playbook> <tree>: a draft templated from the playbook at the
+# revision and bytes digest it serves stores that tree as its version 1.
+clone_template() {
+    local rev digest
+    read -r rev digest <<<"$(sql -F ' ' -c "SELECT rev, tar_digest FROM playbooks WHERE id = '$3'")"
+    api POST /api/playbook-drafts "{\"id\":\"$2\",\"description\":\"kind e2e\",\"template\":\"$3\",\"template_rev\":\"$rev\",\"template_digest\":\"$digest\"}"
+    [ "$HTTP" = 201 ] || fail "[$1] templating $2 from $3: $HTTP $(cat "$WORK/api.json")"
+    [ "$(draft_tree "$2" 1)" = "$4" ] || fail "[$1] the draft templated from $3 holds '$(draft_tree "$2" 1)', not $4"
+    pass "[$1] a draft templated from $3 holds $4"
+}
+
 # insert_steering <key> <seq> <body>: record a steering row for a launch, stamped 2026-10-01Z.
 insert_steering() {
     { printf '%s\n' "\\set body '$3'"; cat; } <<'SQL' | sql -v slug="$(slug "$1")" -v seq="$2"
@@ -626,6 +653,8 @@ read -r launched registered <<<"$(sql -F ' ' -c "SELECT l.exposure_digest, p.exp
 [ -n "$registered" ] && [ "$launched" = "$registered" ] ||
     fail "[P] the launch recorded exposure '$launched'; the registry row holds '$registered'"
 pass "[P] the launch recorded the registry row's exposure"
+expect_playbook_files P "$DRAFT-pub" "$PACK"
+clone_template P e2e-clone "$DRAFT-pub" "$TREE"
 
 # ---- scenario F ----------------------------------------------------------------------------
 small_pack "$WORK/fail" 'echo "deliberate failure" >&2
@@ -811,6 +840,28 @@ launch_delivered L legacy draft-launch "$DRAFT"
 LEGACY_KEY="$KEY"
 pass "[L] the run received the legacy bytes' tree"
 
+log "[L] rewriting a registered playbook's bytes to the same pack on the live controller"
+small_pack "$WORK/lreg" "$OK_JSON"
+new_draft "$DRAFT-lreg" "$WORK/lreg"
+crux draft-publish "$DRAFT-lreg" --playbook "$DRAFT-lregpub" --json >"$WORK/publish-L.json"
+sql_tarball "$WORK/legacy" -v id="$DRAFT-lregpub" <<'SQL'
+UPDATE playbooks
+SET tar_gz = s.b, tar_digest = 'sha256:' || encode(sha256(s.b), 'hex'), tar_bytes = length(s.b)
+FROM (SELECT decode(:'hex', 'hex') AS b) s
+WHERE id = :'id';
+SQL
+[ -z "$(playbook_tree "$DRAFT-lregpub")" ] || fail "[L] new registry bytes that are no encoding of the tree kept it"
+expect_playbook_files L-reg "$DRAFT-lregpub" "$WORK/legacy"
+clone_template L-reg e2e-lclone "$DRAFT-lregpub" "$LEGACY_TREE"
+launch_delivered L-reg legacy launch "$DRAFT-lregpub"
+[ "$(listing "$WORK/delivered-L-reg.tar.gz" | tr '\n' ' ')" = "$LEGACY_FILES" ] ||
+    fail "[L] the registered launch received $(listing "$WORK/delivered-L-reg.tar.gz" | tr '\n' ' ')"
+LEGACY_REG_KEY="$KEY"
+read -r launched registered <<<"$(sql -F ' ' -c "SELECT l.exposure_digest, p.exposure_digest FROM playbook_launches l JOIN playbooks p ON p.id = l.playbook WHERE l.key = '$KEY'")"
+[ -n "$registered" ] && [ "$launched" = "$registered" ] ||
+    fail "[L] the legacy launch recorded exposure '$launched'; the registry row holds '$registered'"
+pass "[L] a registry row's legacy bytes are inspected, templated, and launched, pinned by their digest"
+
 # ---- scenario T ----------------------------------------------------------------------------
 log "[T] tampering with a published tree"
 small_pack "$WORK/tamper" "echo tamper-$ID
@@ -950,6 +1001,8 @@ pass "[W] the foreign encoding converted to v1's tree and is recorded as its ali
 [ "$(draft_tree "$DRAFT" "$VERSION")" = "$LEGACY_TREE" ] ||
     fail "[L] version $VERSION converted to '$(draft_tree "$DRAFT" "$VERSION")', not the downloaded $LEGACY_TREE"
 [ "$(launch_tree "$LEGACY_KEY")" = "$LEGACY_TREE" ] || fail "[L] the legacy launch's pack row converted to '$(launch_tree "$LEGACY_KEY")'"
+[ "$(playbook_tree "$DRAFT-lregpub")" = "$LEGACY_TREE" ] && [ "$(launch_tree "$LEGACY_REG_KEY")" = "$LEGACY_TREE" ] ||
+    fail "[L] the legacy registry row and its launch converted to '$(playbook_tree "$DRAFT-lregpub")' and '$(launch_tree "$LEGACY_REG_KEY")'"
 pass "[L] the legacy bytes converted to the tree their download named"
 read -r core schema <<<"$(sql -F ' ' -c "SELECT core_rev, schema_digest FROM playbooks WHERE id = '$DRAFT-pub'")"
 [ "$core" != stale ] && [ "$schema" = "$PUB_SCHEMA" ] ||
@@ -1138,9 +1191,17 @@ crux draft-push "$DRAFT-cursor" "$WORK/cursor" --base-version 2 --json >"$WORK/p
 [ "$(jq -r .version "$WORK/push-K-dh.json")" = 3 ] || fail "[K] draft-push: $(cat "$WORK/push-K-dh.json")"
 api POST /api/schedules "{\"playbook\":\"$DRAFT-cursor\",\"target_kind\":\"draft_head\",\"cron_expr\":\"0 0 1 1 *\",\"max_cost\":1,\"max_time\":\"5m\",\"cursor\":{\"from\":\"check/out.txt\",\"path\":\"cursor.json\"}}"
 expect_http K 201 '"target_kind":"draft_head"'
-fired K-head "$DRAFT-cursor" "$(jq -r .id "$WORK/api.json")" inputs
+HEAD_SCHEDULE=$(jq -r .id "$WORK/api.json")
+mkdir -p "$WORK/broken"
+cp -R "$WORK/cursor/." "$WORK/broken/"
+echo 'this is not starlark (' >"$WORK/broken/workflow.star"
+crux draft-push "$DRAFT-cursor" "$WORK/broken" --base-version 3 --json >"$WORK/push-K-broken.json"
+[ "$(jq -r .version "$WORK/push-K-broken.json")" = 4 ] || fail "[K] draft-push: $(cat "$WORK/push-K-broken.json")"
+[ "$(sql -c "SELECT schema_digest IS NULL FROM playbook_draft_versions WHERE draft_id = '$DRAFT-cursor' AND version = 4")" = t ] ||
+    fail "[K] version 4 compiled"
+fired K-head "$DRAFT-cursor" "$HEAD_SCHEDULE" inputs
 [ "$LAUNCH_TREE" = "$(draft_tree "$DRAFT-cursor" 3)" ] || fail "[K] the draft-head firing ran $LAUNCH_TREE, not version 3's tree"
-pass "[K] the draft-head firing ran the newest compiled tree"
+pass "[K] the draft-head firing ran the newest compiled tree, not the newer save that does not compile"
 
 stop_controller
 log "[K] firing the state/ cursor schedule over a run-state claim"
@@ -1172,8 +1233,8 @@ X_SOURCE="\"repo\":\"file://$XREPO\",\"path\":\"pack\""
 api POST /api/playbooks "{\"id\":\"e2e-x\",\"description\":\"kind e2e\",$X_SOURCE}"
 expect_http X 201 '"id":"e2e-x"'
 ONE_SHOT_AT=$(date -u -v+1d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -d '+1 day' +%Y-%m-%dT%H:%M:%SZ)
-# x_race <name> <path> <body>: re-register e2e-x at a new commit while a save authorized against
-# the old revision waits behind it on the registry row; the save is refused with 409.
+# x_race <name> <path> <body> [method]: re-register e2e-x at a new commit while a save authorized
+# against the old revision waits behind it on the registry row; the save is refused with 409.
 x_race() {
     X_COMMITS=$((X_COMMITS + 1))
     printf 'echo x-%s\n' "$X_COMMITS" >>"$XREPO/pack/check.sh"
@@ -1181,21 +1242,29 @@ x_race() {
     hold_lock "SELECT 1 FROM playbooks WHERE id = 'e2e-x' FOR UPDATE"
     api_bg "register-$1" POST /api/playbooks "{\"id\":\"e2e-x\",\"description\":\"kind e2e\",$X_SOURCE}"
     wait_for 60 "the re-registration to wait on the row" lock_waiters 1
-    api_bg "$1" POST "$2" "$3"
+    api_bg "$1" "${4:-POST}" "$2" "$3"
     wait_for 60 "the $1 save to wait behind it" lock_waiters 2
     release_lock
     api_wait
     expect_bg X "register-$1" 201 '"id":"e2e-x"'
     expect_bg X "$1" 409 'was re-registered at revision'
 }
+api POST /api/schedules '{"playbook":"e2e-x","cron_expr":"0 0 1 1 *","max_cost":1,"max_time":"5m"}'
+expect_http X 201 '"playbook":"e2e-x"'
+X_SCHEDULE=$(jq -r .id "$WORK/api.json")
+X_ADOPTED=$(sql -c "SELECT adopted_tree_digest FROM playbook_standing_launches WHERE id = '$X_SCHEDULE'")
+[ "$X_ADOPTED" = "$(playbook_tree e2e-x)" ] || fail "[X] the schedule adopted '$X_ADOPTED'"
 X_COMMITS=0
+x_race schedule-edit "/api/schedules/$X_SCHEDULE" '{"playbook":"e2e-x","cron_expr":"0 0 2 1 *","max_cost":1,"max_time":"5m"}' PUT
 x_race launch /api/playbooks/e2e-x/launch '{"max_cost":1,"max_time":"5m"}'
 x_race schedule /api/schedules '{"playbook":"e2e-x","cron_expr":"0 0 1 1 *","max_cost":1,"max_time":"5m"}'
 x_race webhook /api/webhooks '{"playbook":"e2e-x","verifier":"path_token","dedupe":"string(body.n)","max_launches_per_hour":1,"max_cost":1,"max_time":"5m"}'
 x_race one-shot /api/one-shots "{\"playbook\":\"e2e-x\",\"max_cost\":1,\"max_time\":\"5m\",\"fire_at\":\"$ONE_SHOT_AT\"}"
-[ "$(sql -c "SELECT (SELECT count(*) FROM playbook_launches WHERE playbook = 'e2e-x') + (SELECT count(*) FROM playbook_standing_launches WHERE playbook = 'e2e-x')")" = 0 ] ||
-    fail "[X] a refused save stored a launch or a standing launch"
-pass "[X] a launch, schedule, webhook, and one-shot authorized before a re-registration are refused with 409"
+[ "$(sql -c "SELECT count(*) FROM playbook_launches WHERE playbook = 'e2e-x'")" = 0 ] ||
+    fail "[X] a refused launch was stored"
+[ "$(sql -F ' ' -c "SELECT id, cron_expr, adopted_tree_digest FROM playbook_standing_launches s LEFT JOIN playbook_schedules USING (id) WHERE s.playbook = 'e2e-x'")" = "$X_SCHEDULE 0 0 1 1 * $X_ADOPTED" ] ||
+    fail "[X] a refused save stored or changed a standing launch: $(sql -c "SELECT * FROM playbook_standing_launches WHERE playbook = 'e2e-x'")"
+pass "[X] a schedule edit, launch, schedule, webhook, and one-shot authorized before a re-registration are refused with 409"
 
 api POST /api/playbooks "{\"id\":\"e2e-xgone\",\"description\":\"kind e2e\",$X_SOURCE}"
 expect_http X 201 '"id":"e2e-xgone"'
@@ -1227,6 +1296,10 @@ SCOPE_TREE=$(sql -c "SELECT tree_digest FROM scopes WHERE issue = '$SCOPE_KEY'")
 is_tree "$SCOPE_TREE" && [ "$SCOPE_TREE" = "$(launch_tree "$SCOPE_KEY")" ] ||
     fail "[Q] the scope froze '$SCOPE_TREE'; its pack row holds '$(launch_tree "$SCOPE_KEY")'"
 pass "[Q] the approved scope froze the tree its launch stored"
+api GET "/api/approvals/$(sql -c "SELECT id FROM scopes WHERE issue = '$SCOPE_KEY'")/evidence"
+[ "$HTTP" = 200 ] && [ "$(jq -c '[.rounds[] | [.round, .kind, .outcome.result]]' "$WORK/api.json")" = '[[1,"propose","passed"]]' ] ||
+    fail "[Q] the approval evidence: $HTTP $(cat "$WORK/api.json")"
+pass "[Q] the approval evidence reads SCOPE.md from the stored tree"
 
 log "[Q] writing a tree that declares a build to the scope's pack row"
 cp -R "$FIX/packs/scope" "$WORK/scopedecoy"
@@ -1272,6 +1345,8 @@ BLOCK="$KEY"
 wait_for 60 "the local blocker to run" is_running "$BLOCK"
 launch O draft-launch "$DRAFT-lsteer"
 LOCAL_KEY="$KEY"
+[ "$(crux playbook-run "$LOCAL_KEY" | jq -r '.launch.status + " " + (.runs | length | tostring)')" = "new 0" ] ||
+    fail "[O] $LOCAL_KEY dispatched while the blocker held the only slot"
 insert_steering "$LOCAL_KEY" 1 kind-steer-marker
 settle O-block "$BLOCK"
 expect_finished O-block
