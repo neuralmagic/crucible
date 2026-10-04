@@ -1629,6 +1629,68 @@ mod tests {
         assert_eq!(trees, 1);
     }
 
+    /// Each save that changes one file of a pack stores exactly one new blob and one new tree,
+    /// and every version reads back as the file map it saved.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_save_that_changes_one_file_stores_one_new_blob(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("create");
+        let counts = || async {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT (SELECT count(*) FROM pack_blobs), (SELECT count(*) FROM pack_trees)",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("counts")
+        };
+        let mut files = skeleton();
+        for n in 0..8 {
+            files.insert(format!("docs/{n}.md"), format!("doc {n}\n"));
+        }
+        save_version(&pool, "studio", files.clone(), None, None)
+            .await
+            .expect("save");
+        let mut saved = vec![files.clone()];
+        let (mut blobs, mut trees) = counts().await;
+
+        for round in 0..5 {
+            files.insert(format!("docs/{}.md", round % 8), format!("edit {round}\n"));
+            save_version(&pool, "studio", files.clone(), None, None)
+                .await
+                .expect("save");
+            saved.push(files.clone());
+            assert_eq!(counts().await, (blobs + 1, trees + 1), "round {round}");
+            (blobs, trees) = counts().await;
+        }
+
+        for (i, expected) in saved.iter().enumerate() {
+            let version = i64::try_from(i).expect("version") + 2;
+            let (_, tree) = version_tree(&pool, "studio", Some(version))
+                .await
+                .expect("read")
+                .expect("stored");
+            let read: BTreeMap<String, String> = tree
+                .into_files()
+                .into_iter()
+                .map(|(path, bytes)| {
+                    (
+                        path.as_str().to_string(),
+                        String::from_utf8(bytes).expect("utf8"),
+                    )
+                })
+                .collect();
+            assert_eq!(&read, expected, "version {version}");
+        }
+    }
+
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn saves_version_and_round_trip_the_file_map(pool: PgPool) {
         let (first, second, third) = {

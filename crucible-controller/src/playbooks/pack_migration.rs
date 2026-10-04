@@ -367,7 +367,8 @@ mod tests {
         assert_eq!(
             crate::playbooks::pack_trees::collect(&pool)
                 .await
-                .expect("collect"),
+                .expect("collect")
+                .trees,
             1
         );
 

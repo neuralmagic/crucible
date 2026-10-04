@@ -421,20 +421,30 @@ async fn copy_pack_trees(live: &sqlx::PgPool, into: &Db) -> Result<()> {
         .bind(t.get::<String, _>("created_at"))
         .execute(into.pool())
         .await?;
-        let files =
-            sqlx::query("SELECT path, sha256, content FROM pack_tree_files WHERE digest = $1")
-                .bind(&digest)
-                .fetch_all(live)
-                .await?;
+        let files = sqlx::query(
+            "SELECT f.path, f.sha256, b.content FROM pack_tree_files f \
+             JOIN pack_blobs b ON b.sha256 = f.sha256 WHERE f.digest = $1",
+        )
+        .bind(&digest)
+        .fetch_all(live)
+        .await?;
         for f in &files {
+            let sha256: String = f.get("sha256");
             sqlx::query(
-                "INSERT INTO pack_tree_files (digest, path, sha256, content) \
-                 VALUES ($1, $2, $3, $4) ON CONFLICT (digest, path) DO NOTHING",
+                "INSERT INTO pack_blobs (sha256, content) VALUES ($1, $2) \
+                 ON CONFLICT (sha256) DO NOTHING",
+            )
+            .bind(&sha256)
+            .bind(f.get::<Vec<u8>, _>("content"))
+            .execute(into.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO pack_tree_files (digest, path, sha256) \
+                 VALUES ($1, $2, $3) ON CONFLICT (digest, path) DO NOTHING",
             )
             .bind(&digest)
             .bind(f.get::<String, _>("path"))
-            .bind(f.get::<String, _>("sha256"))
-            .bind(f.get::<Vec<u8>, _>("content"))
+            .bind(&sha256)
             .execute(into.pool())
             .await?;
         }
@@ -1428,7 +1438,8 @@ mod tests {
                 .await?;
         assert_eq!(pointed.as_deref(), Some(tree.digest().as_str()));
         let files: Vec<(String, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT digest, path, content FROM pack_tree_files ORDER BY digest, path",
+            "SELECT f.digest, f.path, b.content FROM pack_tree_files f \
+             JOIN pack_blobs b ON b.sha256 = f.sha256 ORDER BY f.digest, f.path",
         )
         .fetch_all(into.pool())
         .await?;
@@ -1441,6 +1452,10 @@ mod tests {
             )],
             "the referenced tree is copied and the unreferenced one is not"
         );
+        let blobs: i64 = sqlx::query_scalar("SELECT count(*) FROM pack_blobs")
+            .fetch_one(into.pool())
+            .await?;
+        assert_eq!(blobs, 1, "only the referenced tree's blobs are copied");
         let alias: Option<String> = sqlx::query_scalar(
             "SELECT tree_digest FROM pack_digest_aliases WHERE old_digest = 'sha256:old'",
         )

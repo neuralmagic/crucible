@@ -12,13 +12,19 @@ CREATE TABLE pack_trees (
     created_at      TEXT   NOT NULL
 );
 
+-- File contents by sha256, shared by every tree that holds the same bytes.
+CREATE TABLE pack_blobs (
+    sha256  TEXT  PRIMARY KEY CHECK (sha256 ~ '^[0-9a-f]{64}$'),
+    content BYTEA NOT NULL
+);
+
 CREATE TABLE pack_tree_files (
-    digest  TEXT  NOT NULL REFERENCES pack_trees(digest) ON DELETE CASCADE,
-    path    TEXT  NOT NULL,
-    sha256  TEXT  NOT NULL,
-    content BYTEA NOT NULL,
+    digest TEXT NOT NULL REFERENCES pack_trees(digest) ON DELETE CASCADE,
+    path   TEXT NOT NULL,
+    sha256 TEXT NOT NULL REFERENCES pack_blobs(sha256) ON DELETE RESTRICT,
     PRIMARY KEY (digest, path)
 );
+CREATE INDEX pack_tree_files_sha256 ON pack_tree_files (sha256);
 
 -- A pre-tree digest and the tree it became, or why it could not become one. No foreign key on
 -- tree_digest: the alias outlives its tree so a stale pin is still answered as superseded.

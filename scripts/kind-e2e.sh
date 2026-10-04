@@ -398,7 +398,9 @@ label() {
 
 is_tree() { [[ "$1" =~ ^tree1:[0-9a-f]{64}$ ]]; }
 tree_paths() { sql -c "SELECT path FROM pack_tree_files WHERE digest = '$1' ORDER BY path COLLATE \"C\""; }
-tree_file() { sql -c "SELECT convert_from(content, 'UTF8') FROM pack_tree_files WHERE digest = '$1' AND path = '$2'"; }
+tree_file() { sql -c "SELECT convert_from(b.content, 'UTF8') FROM pack_tree_files f JOIN pack_blobs b USING (sha256) WHERE f.digest = '$1' AND f.path = '$2'"; }
+# tamper_file <tree> <path>: overwrite the stored bytes of one file of a tree.
+tamper_file() { sql -c "UPDATE pack_blobs SET content = 'tampered' WHERE sha256 = (SELECT sha256 FROM pack_tree_files WHERE digest = '$1' AND path = '$2')"; }
 tree_tarball() { sql -c "SELECT tarball_digest FROM pack_trees WHERE digest = '$1'"; }
 draft_tree() { sql -c "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = '$1' AND version = $2"; }
 playbook_tree() { sql -c "SELECT tree_digest FROM playbooks WHERE id = '$1'"; }
@@ -997,7 +999,7 @@ new_draft "$DRAFT-tamper" "$WORK/tamper"
 crux draft-publish "$DRAFT-tamper" --playbook "$DRAFT-tpub" --json >"$WORK/publish-T.json"
 TAMPER_TREE=$(playbook_tree "$DRAFT-tpub")
 [ "$TAMPER_TREE" = "$(draft_tree "$DRAFT-tamper" 2)" ] || fail "[T] the published row does not hold the draft's tree"
-sql -c "UPDATE pack_tree_files SET content = 'tampered' WHERE digest = '$TAMPER_TREE' AND path = 'check.sh'"
+tamper_file "$TAMPER_TREE" check.sh
 if crux draft-launch "$DRAFT-tamper" --max-cost 1 --max-time 5m >"$WORK/launch-T-draft.log" 2>&1; then
     fail "[T] a draft whose stored tree was tampered with launched"
 fi
@@ -1520,7 +1522,7 @@ $OK_JSON"
 new_draft "$DRAFT-ltamper" "$WORK/localtamper"
 crux draft-publish "$DRAFT-ltamper" --playbook "$DRAFT-ltpub" --json >"$WORK/publish-O.json"
 LOCAL_TAMPER=$(playbook_tree "$DRAFT-ltpub")
-sql -c "UPDATE pack_tree_files SET content = 'tampered' WHERE digest = '$LOCAL_TAMPER' AND path = 'check.sh'"
+tamper_file "$LOCAL_TAMPER" check.sh
 launch O-tamper launch "$DRAFT-ltpub"
 settle O-tamper "$KEY"
 watch_stop

@@ -1171,11 +1171,15 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         ),
     }
     match crucible_controller::playbooks::pack_trees::collect(db.pool()).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "autopilot: unpinned pack trees collected"),
+        Ok(collected) if collected == Default::default() => {}
+        Ok(collected) => tracing::info!(
+            count = collected.trees,
+            blobs = collected.blobs,
+            "autopilot: unpinned pack trees collected"
+        ),
         Err(e) => tracing::warn!(
             error = %format!("{e:#}"),
-            "autopilot: pack tree collection failed; unpinned trees stay until the next start"
+            "autopilot: pack tree collection failed; unpinned trees and blobs stay until the next start"
         ),
     }
     // Re-extract the params schema of every registered playbook whose stored engine pin is not

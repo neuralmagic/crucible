@@ -1,5 +1,6 @@
 //! Pack trees stored once by `tree1:` digest (RFC-0002:C-PACK-BASE, ADR-0059): `pack_trees` holds
-//! one row per tree and `pack_tree_files` its files. Until every legacy pack-byte column is
+//! one row per tree, `pack_tree_files` its paths, and `pack_blobs` each distinct file content once
+//! by sha256, shared across trees. Until every legacy pack-byte column is
 //! converted, [`load`] reads a row's tree when it has one and its legacy tarball when it does not,
 //! so a row a standby wrote, or one conversion has not reached, still reads.
 
@@ -8,8 +9,8 @@
 use anyhow::{Context, Result, bail};
 use crucible_contract::pack_tree::{PackFilePath, PackTree, TreeDigest};
 use sqlx::postgres::PgRow;
-use sqlx::{PgConnection, PgExecutor, Row};
-use std::collections::BTreeMap;
+use sqlx::{Connection, PgConnection, PgExecutor, Row};
+use std::collections::{BTreeMap, HashSet};
 
 /// A pack tree paired with its own tarball, `tree.tarball()`: the bytes a legacy column holds
 /// beside the tree.
@@ -34,51 +35,93 @@ impl EncodedPack {
     }
 }
 
-/// Store `pack`'s tree under its digest unless it is already stored, and return the digest.
+/// Store `pack`'s tree under its digest unless it is already stored, and return the digest. Only
+/// file contents no stored tree already holds are sent and stored.
 pub(crate) async fn put_tree(conn: &mut PgConnection, pack: &EncodedPack) -> Result<TreeDigest> {
-    let (tree, tarball) = (pack.tree(), pack.tarball());
+    let tree = pack.tree();
     let (digest, file_hashes) = tree.digest_with_file_hashes();
+    let mut tx = conn
+        .begin()
+        .await
+        .context("opening the pack tree transaction")?;
     let stored: Option<i32> =
         sqlx::query_scalar("SELECT 1 FROM pack_trees WHERE digest = $1 FOR KEY SHARE")
             .bind(digest.as_str())
-            .fetch_optional(&mut *conn)
+            .fetch_optional(&mut *tx)
             .await
             .context("looking up a pack tree")?;
-    if stored.is_some() {
-        return Ok(digest);
-    }
-    let total: usize = tree.files().values().map(Vec::len).sum();
-    let inserted = sqlx::query(
-        "INSERT INTO pack_trees
-             (digest, file_count, total_bytes, delivered_bytes, tarball_digest, created_at)
-         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (digest) DO NOTHING",
-    )
-    .bind(digest.as_str())
-    .bind(i32::try_from(tree.files().len()).context("pack file count")?)
-    .bind(i64::try_from(total).context("pack size")?)
-    .bind(i64::try_from(tarball.len()).context("pack delivered size")?)
-    .bind(crucible_contract::content_digest(tarball))
-    .bind(crate::clock::now_rfc3339())
-    .execute(&mut *conn)
-    .await
-    .context("storing a pack tree")?
-    .rows_affected();
-    if inserted == 1 {
-        let paths: Vec<&str> = tree.files().keys().map(|p| p.as_str()).collect();
-        let contents: Vec<&[u8]> = tree.files().values().map(Vec::as_slice).collect();
-        sqlx::query(
-            "INSERT INTO pack_tree_files (digest, path, sha256, content)
-             SELECT $1, * FROM UNNEST($2::TEXT[], $3::TEXT[], $4::BYTEA[])",
+    if stored.is_none() {
+        let total: usize = tree.files().values().map(Vec::len).sum();
+        let inserted = sqlx::query(
+            "INSERT INTO pack_trees
+                 (digest, file_count, total_bytes, delivered_bytes, tarball_digest, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (digest) DO NOTHING",
         )
         .bind(digest.as_str())
-        .bind(&paths)
-        .bind(&file_hashes)
+        .bind(i32::try_from(tree.files().len()).context("pack file count")?)
+        .bind(i64::try_from(total).context("pack size")?)
+        .bind(i64::try_from(pack.tarball().len()).context("pack delivered size")?)
+        .bind(crucible_contract::content_digest(pack.tarball()))
+        .bind(crate::clock::now_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .context("storing a pack tree")?
+        .rows_affected();
+        if inserted == 1 {
+            put_files(&mut tx, &digest, tree, &file_hashes).await?;
+        }
+    }
+    tx.commit().await.context("committing a pack tree")?;
+    Ok(digest)
+}
+
+/// Store the path rows of a new tree and every blob they name that is not stored yet. Blobs
+/// already stored are locked so collection cannot delete them before the path rows land.
+async fn put_files(
+    conn: &mut PgConnection,
+    digest: &TreeDigest,
+    tree: &PackTree,
+    file_hashes: &[String],
+) -> Result<()> {
+    let present: HashSet<String> = sqlx::query_scalar(
+        "SELECT sha256 FROM pack_blobs WHERE sha256 = ANY($1) ORDER BY sha256 FOR KEY SHARE",
+    )
+    .bind(file_hashes)
+    .fetch_all(&mut *conn)
+    .await
+    .context("locking stored pack blobs")?
+    .into_iter()
+    .collect();
+    let missing: BTreeMap<&str, &[u8]> = file_hashes
+        .iter()
+        .zip(tree.files().values())
+        .filter(|(sha, _)| !present.contains(sha.as_str()))
+        .map(|(sha, content)| (sha.as_str(), content.as_slice()))
+        .collect();
+    if !missing.is_empty() {
+        let (shas, contents): (Vec<&str>, Vec<&[u8]>) = missing.into_iter().unzip();
+        sqlx::query(
+            "INSERT INTO pack_blobs (sha256, content)
+             SELECT * FROM UNNEST($1::TEXT[], $2::BYTEA[]) ON CONFLICT (sha256) DO NOTHING",
+        )
+        .bind(&shas)
         .bind(&contents)
         .execute(&mut *conn)
         .await
-        .context("storing pack files")?;
+        .context("storing pack blobs")?;
     }
-    Ok(digest)
+    let paths: Vec<&str> = tree.files().keys().map(|p| p.as_str()).collect();
+    sqlx::query(
+        "INSERT INTO pack_tree_files (digest, path, sha256)
+         SELECT $1, * FROM UNNEST($2::TEXT[], $3::TEXT[])",
+    )
+    .bind(digest.as_str())
+    .bind(&paths)
+    .bind(file_hashes)
+    .execute(&mut *conn)
+    .await
+    .context("storing pack files")?;
+    Ok(())
 }
 
 /// Every `(table, column)` that pins a stored tree. Aliases and draft or binding provenance name
@@ -96,10 +139,18 @@ const TREE_PINS: [(&str, &str); 7] = [
 /// How old an unpinned tree must be before [`collect`] deletes it.
 const COLLECT_AFTER: jiff::SignedDuration = jiff::SignedDuration::from_hours(24);
 
-/// Delete every tree older than [`COLLECT_AFTER`] that no [`TREE_PINS`] column names, and return
-/// how many went. A row that pins one of them while this runs makes the foreign key refuse the
-/// delete, which is an error with nothing deleted.
-pub async fn collect(pool: &sqlx::PgPool) -> Result<u64> {
+/// What one [`collect`] deleted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Collected {
+    pub trees: u64,
+    pub blobs: u64,
+}
+
+/// Delete every tree older than [`COLLECT_AFTER`] that no [`TREE_PINS`] column names, then every
+/// blob no remaining tree holds. A row that pins one of those trees, or a writer that takes one of
+/// those blobs, while this runs makes a foreign key refuse the delete, which is an error with
+/// nothing deleted.
+pub async fn collect(pool: &sqlx::PgPool) -> Result<Collected> {
     let cutoff = jiff::Timestamp::now()
         .checked_sub(COLLECT_AFTER)
         .context("computing the pack tree cutoff")?;
@@ -109,15 +160,30 @@ pub async fn collect(pool: &sqlx::PgPool) -> Result<u64> {
             format!(" AND NOT EXISTS (SELECT 1 FROM {table} WHERE {column} = t.digest)")
         })
         .collect();
-    let deleted = sqlx::query(sqlx::AssertSqlSafe(format!(
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the pack tree collection")?;
+    let trees = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM pack_trees t WHERE t.created_at < $1{unpinned}"
     )))
     .bind(crate::clock::stamp(cutoff))
-    .execute(pool)
+    .execute(&mut *tx)
     .await
     .context("deleting unpinned pack trees")?
     .rows_affected();
-    Ok(deleted)
+    let blobs = sqlx::query(
+        "DELETE FROM pack_blobs b
+         WHERE NOT EXISTS (SELECT 1 FROM pack_tree_files f WHERE f.sha256 = b.sha256)",
+    )
+    .execute(&mut *tx)
+    .await
+    .context("deleting unreferenced pack blobs")?
+    .rows_affected();
+    tx.commit()
+        .await
+        .context("committing the pack tree collection")?;
+    Ok(Collected { trees, blobs })
 }
 
 /// The columns [`PackRef::from_row`] reads, for a table with `tree_digest` and `tar_gz` columns.
@@ -153,8 +219,9 @@ pub(crate) async fn get_tree(
     digest: &TreeDigest,
 ) -> Result<Option<PackTree>> {
     let rows = sqlx::query(
-        "SELECT f.path, f.content FROM pack_trees t
+        "SELECT f.path, b.content FROM pack_trees t
          LEFT JOIN pack_tree_files f ON f.digest = t.digest
+         LEFT JOIN pack_blobs b ON b.sha256 = f.sha256
          WHERE t.digest = $1",
     )
     .bind(digest.as_str())
@@ -188,12 +255,15 @@ pub(crate) async fn read_file(
     digest: &TreeDigest,
     path: &str,
 ) -> Result<Option<Vec<u8>>> {
-    sqlx::query_scalar("SELECT content FROM pack_tree_files WHERE digest = $1 AND path = $2")
-        .bind(digest.as_str())
-        .bind(path)
-        .fetch_optional(ex)
-        .await
-        .with_context(|| format!("reading {path} of pack tree {digest}"))
+    sqlx::query_scalar(
+        "SELECT b.content FROM pack_tree_files f JOIN pack_blobs b ON b.sha256 = f.sha256
+         WHERE f.digest = $1 AND f.path = $2",
+    )
+    .bind(digest.as_str())
+    .bind(path)
+    .fetch_optional(ex)
+    .await
+    .with_context(|| format!("reading {path} of pack tree {digest}"))
 }
 
 /// What a digest a caller supplied names.
@@ -356,7 +426,8 @@ mod tests {
         .expect("count");
         assert_eq!(counts, (1, 2));
         let stored: Vec<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT path, content FROM pack_tree_files WHERE digest = $1 ORDER BY path",
+            "SELECT f.path, b.content FROM pack_tree_files f JOIN pack_blobs b USING (sha256)
+             WHERE f.digest = $1 ORDER BY f.path",
         )
         .bind(first.as_str())
         .fetch_all(&pool)
@@ -507,11 +578,14 @@ mod tests {
         let tree = pack(&[("a", b"1")]);
         let mut conn = pool.acquire().await.expect("conn");
         let digest = put_tree(&mut conn, &encoded(&tree)).await.expect("put");
-        sqlx::query("UPDATE pack_tree_files SET content = 'evil' WHERE digest = $1")
-            .bind(digest.as_str())
-            .execute(&pool)
-            .await
-            .expect("tamper");
+        sqlx::query(
+            "UPDATE pack_blobs SET content = 'evil'
+             WHERE sha256 IN (SELECT sha256 FROM pack_tree_files WHERE digest = $1)",
+        )
+        .bind(digest.as_str())
+        .execute(&pool)
+        .await
+        .expect("tamper");
 
         let err = get_tree(&pool, &digest)
             .await
@@ -836,7 +910,7 @@ mod tests {
                 .await
                 .expect("delete")
         );
-        assert_eq!(collect(&pool).await.expect("collect"), 0);
+        assert_eq!(collect(&pool).await.expect("collect").trees, 0);
         assert_eq!(stored(&pool, &first).await, (true, files));
 
         assert!(
@@ -844,9 +918,9 @@ mod tests {
                 .await
                 .expect("delete")
         );
-        assert_eq!(collect(&pool).await.expect("collect"), 1);
+        assert_eq!(collect(&pool).await.expect("collect").trees, 1);
         assert_eq!(stored(&pool, &first).await, (false, 0));
-        assert_eq!(collect(&pool).await.expect("again"), 0);
+        assert_eq!(collect(&pool).await.expect("again").trees, 0);
     }
 
     /// A launch's frozen copy of a draft version pins its tree after the draft is gone, and an
@@ -874,14 +948,14 @@ mod tests {
         );
         age_every_tree(&pool).await;
 
-        assert_eq!(collect(&pool).await.expect("collect"), 0);
+        assert_eq!(collect(&pool).await.expect("collect").trees, 0);
         assert!(stored(&pool, &digest).await.0);
 
         sqlx::query("DELETE FROM pack_tarballs WHERE issue_slug = 'launch_1'")
             .execute(&pool)
             .await
             .expect("drop the launch copy");
-        assert_eq!(collect(&pool).await.expect("collect"), 1);
+        assert_eq!(collect(&pool).await.expect("collect").trees, 1);
         assert!(!stored(&pool, &digest).await.0);
     }
 
@@ -902,7 +976,7 @@ mod tests {
             .await
             .expect("inside the cutoff");
 
-        assert_eq!(collect(&pool).await.expect("collect"), 0);
+        assert_eq!(collect(&pool).await.expect("collect").trees, 0);
         assert!(stored(&pool, fresh.as_str()).await.0);
 
         sqlx::query("UPDATE pack_trees SET created_at = $1 WHERE digest = $2")
@@ -911,7 +985,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("past the cutoff");
-        assert_eq!(collect(&pool).await.expect("collect"), 1);
+        assert_eq!(collect(&pool).await.expect("collect").trees, 1);
     }
 
     /// A writer that reuses an old unpinned tree holds it against collection: a collection that
@@ -972,5 +1046,166 @@ mod tests {
             .to_string();
         assert!(err.contains("deleting unpinned pack trees"), "{err}");
         assert_eq!(stored(&pool, digest.as_str()).await, (true, 1));
+    }
+
+    async fn blob_count(pool: &PgPool) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM pack_blobs")
+            .fetch_one(pool)
+            .await
+            .expect("blobs")
+    }
+
+    async fn blob_stored(pool: &PgPool, content: &[u8]) -> bool {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pack_blobs WHERE sha256 = $1)")
+            .bind(crucible_contract::artifact::sha256_hex(content))
+            .fetch_one(pool)
+            .await
+            .expect("blob")
+    }
+
+    /// Trees that share a file store its bytes once, and a tree holding the same bytes at two
+    /// paths stores them once too. Each tree still reads back whole.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn trees_sharing_a_file_store_one_blob(pool: PgPool) {
+        let first = pack(&[("crucible.toml", b"m"), ("lib.star", b"shared")]);
+        let second = pack(&[("crucible.toml", b"n"), ("lib.star", b"shared")]);
+        let doubled = pack(&[("a.star", b"shared"), ("b.star", b"shared")]);
+        let mut conn = pool.acquire().await.expect("conn");
+
+        let mut digests = Vec::new();
+        for tree in [&first, &second, &doubled] {
+            digests.push(put_tree(&mut conn, &encoded(tree)).await.expect("put"));
+        }
+
+        assert_eq!(blob_count(&pool).await, 3, "m, n and shared");
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM pack_tree_files")
+            .fetch_one(&pool)
+            .await
+            .expect("rows");
+        assert_eq!(rows, 6);
+        for (digest, tree) in digests.iter().zip([first, second, doubled]) {
+            assert_eq!(get_tree(&pool, digest).await.expect("get"), Some(tree));
+        }
+        assert_eq!(
+            read_file(&pool, &digests[2], "b.star").await.expect("read"),
+            Some(b"shared".to_vec())
+        );
+    }
+
+    /// Tampering with a blob two trees share fails both trees' digest checks.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_tampered_shared_blob_fails_every_tree_holding_it(pool: PgPool) {
+        let mut conn = pool.acquire().await.expect("conn");
+        let first = put_tree(&mut conn, &encoded(&pack(&[("a", b"1"), ("s", b"x")])))
+            .await
+            .expect("put");
+        let second = put_tree(&mut conn, &encoded(&pack(&[("b", b"2"), ("s", b"x")])))
+            .await
+            .expect("put");
+        sqlx::query("UPDATE pack_blobs SET content = 'evil' WHERE sha256 = $1")
+            .bind(crucible_contract::artifact::sha256_hex(b"x"))
+            .execute(&pool)
+            .await
+            .expect("tamper");
+
+        for digest in [first, second] {
+            let err = load(&pool, PackRef::Tree(digest.clone()))
+                .await
+                .expect_err("tampered")
+                .to_string();
+            assert!(err.contains("no longer matches"), "{digest}: {err}");
+        }
+    }
+
+    /// Collection deletes an unpinned tree and then the blobs only it held, keeps the blobs a
+    /// surviving tree holds, and the surviving tree reads back the same before and after.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn collection_deletes_blobs_only_a_collected_tree_held(pool: PgPool) {
+        let kept = pack(&[("crucible.toml", b"kept"), ("lib.star", b"shared")]);
+        let dropped = pack(&[("crucible.toml", b"dropped"), ("lib.star", b"shared")]);
+        let mut conn = pool.acquire().await.expect("conn");
+        let kept_digest = put_tree(&mut conn, &encoded(&kept)).await.expect("put");
+        let dropped_digest = put_tree(&mut conn, &encoded(&dropped)).await.expect("put");
+        seed_legacy_row(&pool, kept_digest.as_str()).await;
+        age_every_tree(&pool).await;
+        let before = get_tree(&pool, &kept_digest).await.expect("before");
+        assert_eq!(blob_count(&pool).await, 3);
+
+        assert_eq!(
+            collect(&pool).await.expect("collect"),
+            Collected { trees: 1, blobs: 1 }
+        );
+
+        assert_eq!(stored(&pool, dropped_digest.as_str()).await, (false, 0));
+        assert!(!blob_stored(&pool, b"dropped").await);
+        assert!(blob_stored(&pool, b"shared").await);
+        assert!(blob_stored(&pool, b"kept").await);
+        assert_eq!(get_tree(&pool, &kept_digest).await.expect("after"), before);
+        assert_eq!(before, Some(kept));
+        assert_eq!(collect(&pool).await.expect("again"), Collected::default());
+    }
+
+    /// The foreign key refuses to delete a blob while a tree holds it.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_blob_a_tree_holds_cannot_be_deleted(pool: PgPool) {
+        let mut conn = pool.acquire().await.expect("conn");
+        put_tree(&mut conn, &encoded(&pack(&[("a", b"1")])))
+            .await
+            .expect("put");
+        let err = sqlx::query("DELETE FROM pack_blobs")
+            .execute(&pool)
+            .await
+            .expect_err("restricted")
+            .to_string();
+        assert!(err.contains("pack_tree_files"), "{err}");
+    }
+
+    /// A writer that reuses a blob only a collectable tree holds keeps it: collection waits on
+    /// the writer's lock, then fails on the foreign key once the writer's tree names the blob,
+    /// and the collectable tree, the blob and the writer's tree all stay.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_blob_taken_while_collecting_fails_the_collection(pool: PgPool) {
+        let old = pack(&[("a", b"old"), ("lib", b"shared")]);
+        let new = pack(&[("a", b"new"), ("lib", b"shared")]);
+        let old_digest = put_tree(&mut pool.acquire().await.expect("conn"), &encoded(&old))
+            .await
+            .expect("put");
+        age_every_tree(&pool).await;
+
+        let mut writer = pool.begin().await.expect("begin");
+        let new_digest = put_tree(&mut writer, &encoded(&new)).await.expect("put");
+        let collecting = tokio::spawn({
+            let pool = pool.clone();
+            async move { collect(&pool).await }
+        });
+        let mut waited = 0;
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND query LIKE 'DELETE FROM pack_blobs%'",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("waiting");
+            if waiting > 0 {
+                break;
+            }
+            waited += 1;
+            assert!(waited < 500, "collection never waited on the writer");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        writer.commit().await.expect("commit");
+
+        let err = collecting
+            .await
+            .expect("join")
+            .expect_err("the writer wins");
+        assert!(
+            format!("{err:#}").contains("deleting unreferenced pack blobs"),
+            "{err:#}"
+        );
+        assert_eq!(get_tree(&pool, &old_digest).await.expect("old"), Some(old));
+        assert_eq!(get_tree(&pool, &new_digest).await.expect("new"), Some(new));
     }
 }

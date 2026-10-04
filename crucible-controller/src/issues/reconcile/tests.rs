@@ -6959,8 +6959,8 @@ async fn a_launch_whose_stored_tree_was_tampered_with_is_refused(pool: PgPool) -
     .fetch_one(db.pool())
     .await?;
     sqlx::query(
-        "UPDATE pack_tree_files SET content = 'print(\"evil\")' \
-         WHERE digest = $1 AND path = 'workflow.star'",
+        "UPDATE pack_blobs SET content = 'print(\"evil\")' WHERE sha256 = \
+         (SELECT sha256 FROM pack_tree_files WHERE digest = $1 AND path = 'workflow.star')",
     )
     .bind(&tree)
     .execute(db.pool())

@@ -827,7 +827,8 @@ mod tests {
             .await?;
         }
         sqlx::query(
-            "UPDATE pack_tree_files SET content = 'tampered' WHERE digest = $1 AND path = 'w.star'",
+            "UPDATE pack_blobs SET content = 'tampered' WHERE sha256 = \
+             (SELECT sha256 FROM pack_tree_files WHERE digest = $1 AND path = 'w.star')",
         )
         .bind(digest.as_str())
         .execute(&pool)
