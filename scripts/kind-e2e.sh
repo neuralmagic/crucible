@@ -5,7 +5,9 @@
 #   A  a command-only draft launch completes; its pack arrives as one gzipped ConfigMap key
 #      that pack-stage extracts, though the raw tar is over the ConfigMap size limit; the pod
 #      and its ConfigMap are collected afterwards; the save recorded the tree the launch runs and
-#      the tarball download names it in X-Pack-Digest
+#      the tarball download names it in X-Pack-Digest; the API and its OpenAPI spec name the digest
+#      tree_digest; crux's push and pull skip state/, workspace/ and .git at any depth, refuse a
+#      symlink, and print the local tree and the skipped paths
 #   P  the draft published to the registry launches with the same delivery; the registry row and
 #      its revision hold the draft's tree, the launch records the registry row's exposure, and the
 #      registry inspector and a template clone read that tree
@@ -26,7 +28,8 @@
 #      registered launch without a pod; the startup agent backfill skips it and fills the rest
 #   E  a restart re-derives a stale registry row from its tree, not its bytes
 #   I  a git pack is proposed, compiled, registered, opened as a draft, and registered directly,
-#      each holding the same tree with state/ ignored; an over-budget repo is refused
+#      each holding the same tree with state/ ignored, named tree_digest through the API and crux;
+#      an over-budget repo is refused
 #   W  a webhook adopted from a converted foreign encoding fires its adopted tree after the
 #      playbook is re-registered, keeps the encoding's bytes, and records and serves that tree's
 #      exposure; a one-shot against the new revision runs the new tree
@@ -41,6 +44,14 @@
 #      written to its pack row afterwards, and its approval evidence reads SCOPE.md from the
 #      stored tree (needs the controller built with the autoresearch lane)
 #   O  the local executor runs a stored tree with its steering beside it, and parks a tampered tree
+#   V  conversion makes a draft-sourced rev its tree and pins a secret binding and a fork to it, so
+#      neither is stale or moved across restarts and an identical republish, while new content
+#      stales and moves them; a launch is checked against the tree it froze; a pre-tree digest is
+#      refused naming its replacement only to a reader of a playbook that held it; a same-rev
+#      tree change makes a webhook edit a new firing; unconvertible packs are refused naming the
+#      reason at draft launch, template clone, open-as-draft, standing fire, and dispatch; an
+#      unpinned old tree is collected at startup and its legacy bytes store it again; the engine's
+#      scope pack is the controller's canonical tarball of the walked tree
 #   G  migrate-state stores a legacy pack dir as a tree with its steering split into rows
 #   M  a loop image labelled with another contract version parks the launch without a pod
 #   Z  db rebuild carries the trees and aliases the pack rows reference
@@ -131,12 +142,15 @@ case "$NODE_ARCH" in x86_64 | amd64) NODE_ARCH=amd64 ;; aarch64 | arm64) NODE_AR
 if [ "${SKIP_BUILD:-0}" != 1 ]; then
     log "building the controller, crux, and crucible for the host"
     (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible -p crucible-controller -p crux --bins)
-    log "building the controller with the autoresearch lane"
+    log "building the controller and the engine with the autoresearch lane"
     (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible-controller --features autoresearch \
         --bin crucible-controller --target-dir "$ROOT/target/autoresearch")
+    (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible --features autoresearch \
+        --bin crucible --target-dir "$ROOT/target/autoresearch")
 fi
 BIN="$ROOT/target/debug"
 AUTORESEARCH_CONTROLLER="$ROOT/target/autoresearch/debug/crucible-controller"
+AUTORESEARCH_ENGINE="$ROOT/target/autoresearch/debug/crucible"
 CONTROLLER_BIN="$BIN/crucible-controller"
 
 mkdir -p "$WORK/image"
@@ -155,7 +169,7 @@ else
         -v kind-e2e-cargo:/usr/local/cargo/registry \
         -v "kind-e2e-target-$NODE_ARCH":/ctarget \
         -v "$WORK/image":/out \
-        -e CARGO_TARGET_DIR=/ctarget -e SQLX_OFFLINE=true \
+        -e CARGO_TARGET_DIR=/ctarget -e SQLX_OFFLINE=true -e CARGO_PROFILE_DEV_DEBUG=0 \
         rust:1-bookworm sh -c 'cargo build --locked -q -p crucible --bin crucible && cp /ctarget/debug/crucible /out/ && strip /out/crucible'
     LOOP_BASE="${LOOP_BASE:-debian:bookworm-slim}"
 fi
@@ -255,16 +269,33 @@ stop_controller() {
 crux() { "$BIN/crux" "$@"; }
 
 # api_call <out> <method> <path> [json body]: call the controller API, writing the response body
-# to <out> and printing the status.
+# to <out> and printing the status. AS_USER, when set, is asserted as the caller's login.
 api_call() {
-    local out="$1" method="$2" path="$3" data=()
+    local out="$1" method="$2" path="$3" data=() who=()
     [ $# -ge 4 ] && data=(--data "$4")
+    [ -n "${AS_USER:-}" ] && who=(-H "x-auth-request-user: $AS_USER")
     curl -s -o "$out" -w '%{http_code}' -X "$method" -H 'content-type: application/json' \
-        ${data[@]+"${data[@]}"} "$CONTROLLER_URL$path"
+        ${who[@]+"${who[@]}"} ${data[@]+"${data[@]}"} "$CONTROLLER_URL$path"
 }
 
 # api <method> <path> [json body]: the status lands in HTTP and the body in $WORK/api.json.
 api() { HTTP=$(api_call "$WORK/api.json" "$@"); }
+
+# as <login> <method> <path> [json body]: api as that login. Only a boot without
+# CONTROLLER_DEV_IDENTITY takes the asserted login.
+as() {
+    local AS_USER="$1"
+    shift
+    api "$@"
+}
+
+# expect_tree_digest <label> <jq path> <tree>: the object at the path in the last api body names
+# the tree as tree_digest and carries no tar_digest.
+expect_tree_digest() {
+    local got
+    got=$(jq -c "$2 | [.tree_digest, has(\"tar_digest\")]" "$WORK/api.json")
+    [ "$got" = "[\"$3\",false]" ] || fail "[$1] $2 holds [tree_digest, has tar_digest] = $got, not $3 alone"
+}
 
 # expect_http <label> <status> <body fragment>: the last api call answered so.
 expect_http() {
@@ -330,6 +361,22 @@ conversion_report() {
     echo "$(sed -E 's/.*converted=([0-9]+).*/\1/' <<<"$line") $(sed -E 's/.*unconvertible=([0-9]+).*/\1/' <<<"$line")"
 }
 
+# pinned_report <boot>: how many pins the boot's conversion derived, "none" if silent.
+pinned_report() {
+    local line
+    line=$(grep 'legacy packs converted to stored trees' "$WORK/controller-$1.log" || true)
+    [ -z "$line" ] && { echo none; return; }
+    sed -E 's/.*pinned=([0-9]+).*/\1/' <<<"$line"
+}
+
+# collected_report <boot>: how many unpinned trees the boot collected, "none" if silent.
+collected_report() {
+    local line
+    line=$(grep 'unpinned pack trees collected' "$WORK/controller-$1.log" || true)
+    [ -z "$line" ] && { echo none; return; }
+    sed -E 's/.*count=([0-9]+).*/\1/' <<<"$line"
+}
+
 # ---- pack and tree helpers -----------------------------------------------------------------
 sha256() { shasum -a 256 "$1" | cut -d' ' -f1; }
 
@@ -357,13 +404,34 @@ playbook_tree() { sql -c "SELECT tree_digest FROM playbooks WHERE id = '$1'"; }
 launch_tree() { sql -c "SELECT tree_digest FROM pack_tarballs WHERE issue_slug = '$(slug "$1")'"; }
 listing() { tar -tzf "$1" | LC_ALL=C sort; }
 
-# sql_tarball <dir> [psql args...]: run the SQL on stdin with the directory gzip-tarred by the host
-# tar, as hex, in the psql variable hex. The bytes go over stdin, not the command line.
-sql_tarball() {
-    local dir="$1" hex
+# sql_file <file> [psql args...]: run the SQL on stdin with the file's bytes, as hex, in the psql
+# variable hex. The bytes go over stdin, not the command line.
+sql_file() {
+    local hex
+    hex=$(od -An -v -tx1 <"$1" | tr -d ' \n')
     shift
-    hex=$( (cd "$dir" && COPYFILE_DISABLE=1 tar -czf - .) | od -An -v -tx1 | tr -d ' \n')
     { printf '%s\n' "\\set hex '$hex'"; cat; } | sql "$@"
+}
+
+# host_tarball <dir> <file>: the directory gzip-tarred by the host tar.
+host_tarball() { (cd "$1" && COPYFILE_DISABLE=1 tar -czf - .) >"$2"; }
+
+# sql_tarball <dir> [psql args...]: sql_file with the directory gzip-tarred by the host tar.
+sql_tarball() {
+    local dir="$1"
+    shift
+    host_tarball "$dir" "$WORK/sql-tarball.tar.gz"
+    sql_file "$WORK/sql-tarball.tar.gz" "$@"
+}
+
+# seed_pack_row <slug> <file>: store the gzipped tarball as a launch pack row with no tree, as a
+# controller from before tree storage wrote it.
+seed_pack_row() {
+    sql_file "$2" -v slug="$1" <<'SQL'
+INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at)
+SELECT :'slug', b, 'sha256:' || encode(sha256(b), 'hex'), length(b), now()::TEXT
+FROM (SELECT decode(:'hex', 'hex') AS b) s;
+SQL
 }
 
 # newest_launch <playbook> <origin>: the newest launch key of that origin, empty when none.
@@ -641,6 +709,56 @@ launch_and_check A draft-launch "$DRAFT"
 [ "$LAUNCH_TREE" = "$TREE" ] || fail "[A] the launch ran tree $LAUNCH_TREE, not the saved $TREE"
 wait_for 90 "the run's pod and pack ConfigMap to be collected" no_run_objects
 pass "[A] pod and pack ConfigMap collected"
+[ "$(jq -c '[.local_tree_digest, .ignored]' "$WORK/push-$DRAFT.json")" = "[\"$TREE\",[]]" ] ||
+    fail "[A] the push reported $(jq -c '[.local_tree_digest, .ignored]' "$WORK/push-$DRAFT.json"), not the saved $TREE"
+pass "[A] the push reported the saved tree as the directory's local digest"
+api GET "/api/playbook-drafts/$DRAFT"
+expect_tree_digest A ".versions[] | select(.version == $VERSION)" "$TREE"
+curl -sf "$CONTROLLER_URL/api/openapi.json" >"$WORK/openapi.json" || fail "[A] the OpenAPI spec is not served"
+if ! { grep -q '"tree_digest"' "$WORK/openapi.json" && grep -q '"adopted_tree_digest"' "$WORK/openapi.json"; }; then
+    fail "[A] the OpenAPI spec names no tree_digest"
+fi
+grep -q 'tar_digest' "$WORK/openapi.json" && fail "[A] the OpenAPI spec still names tar_digest"
+pass "[A] the draft API and the OpenAPI spec name the pack digest tree_digest, never tar_digest"
+
+log "[A] pushing and pulling a pack dir through crux's walker"
+WALK="$WORK/walk"
+small_pack "$WALK" "$OK_JSON"
+mkdir -p "$WALK/state" "$WALK/workspace" "$WALK/.git" "$WALK/sub/state"
+for f in state/cursor workspace/main.go .git/HEAD sub/state/x; do printf '\377\376' >"$WALK/$f"; done
+echo kept >"$WALK/sub/kept.txt"
+crux draft-create "$DRAFT-walk" --description "kind e2e" >/dev/null
+if crux draft-push "$DRAFT-walk" "$WALK" --base 1 >/dev/null 2>&1; then
+    fail "[A] draft-push still takes --base"
+fi
+ln -s check.sh "$WALK/link"
+if crux draft-push "$DRAFT-walk" "$WALK" --base-version 1 >"$WORK/push-walk-link.log" 2>&1; then
+    fail "[A] a pack dir holding a symlink was pushed"
+fi
+grep -q 'link is a symbolic link' "$WORK/push-walk-link.log" ||
+    fail "[A] the symlink refusal does not name it: $(cat "$WORK/push-walk-link.log")"
+rm "$WALK/link"
+ln -s /etc/passwd "$WALK/workspace/link"
+crux draft-push "$DRAFT-walk" "$WALK" --base-version 1 >"$WORK/push-walk.txt"
+WALK_TREE=$(draft_tree "$DRAFT-walk" 2)
+is_tree "$WALK_TREE" || fail "[A] the walked push saved tree '$WALK_TREE': $(cat "$WORK/push-walk.txt")"
+if ! { grep -qx "local tree: $WALK_TREE" "$WORK/push-walk.txt" &&
+    grep -qx 'ignored: .git, state, sub/state, workspace' "$WORK/push-walk.txt"; }; then
+    fail "[A] the push printed: $(cat "$WORK/push-walk.txt")"
+fi
+[ "$(tree_paths "$WALK_TREE" | tr '\n' ' ')" = "check.sh crucible.toml sub/kept.txt workflow.star " ] ||
+    fail "[A] the walked push saved $(tree_paths "$WALK_TREE" | tr '\n' ' ')"
+pass "[A] draft-push skipped state/, workspace/ and .git at any depth, refused a symlink, and printed the local tree the save stored"
+mkdir -p "$WORK/pulled/state"
+echo local >"$WORK/pulled/state/cursor"
+crux draft-pull "$DRAFT-walk" "$WORK/pulled" >"$WORK/pull-walk.txt"
+if ! { grep -qx "local tree: $WALK_TREE" "$WORK/pull-walk.txt" && grep -qx 'ignored: state' "$WORK/pull-walk.txt"; }; then
+    fail "[A] the pull printed: $(cat "$WORK/pull-walk.txt")"
+fi
+crux draft-pull "$DRAFT-walk" "$WORK/pulled" --json >"$WORK/pull-walk.json"
+[ "$(jq -c '[.local_tree_digest, .ignored]' "$WORK/pull-walk.json")" = "[\"$WALK_TREE\",[\"state\"]]" ] ||
+    fail "[A] the pull reported $(jq -c '[.local_tree_digest, .ignored]' "$WORK/pull-walk.json")"
+pass "[A] draft-pull printed the pulled dir's local tree and the paths a push would skip"
 
 # ---- scenario P ----------------------------------------------------------------------------
 log "[P] publishing $DRAFT as playbook $DRAFT-pub"
@@ -659,6 +777,11 @@ read -r launched registered <<<"$(sql -F ' ' -c "SELECT l.exposure_digest, p.exp
     fail "[P] the launch recorded exposure '$launched'; the registry row holds '$registered'"
 pass "[P] the launch recorded the registry row's exposure"
 expect_playbook_files P "$DRAFT-pub" "$PACK"
+expect_tree_digest P . "$TREE"
+api GET /api/playbooks
+expect_tree_digest P ".[] | select(.id == \"$DRAFT-pub\")" "$TREE"
+[ "$(jq '[.[] | has("tar_digest")] | any' "$WORK/api.json")" = false ] || fail "[P] the registry list still carries tar_digest"
+pass "[P] the registry inspector and list name the registered tree_digest"
 clone_template P e2e-clone "$DRAFT-pub" "$TREE"
 
 # ---- scenario F ----------------------------------------------------------------------------
@@ -721,12 +844,10 @@ ln -s crucible.toml "$WORK/symlink/link"
 mkdir -p "$WORK/bomb"
 head -c 70000000 /dev/zero >"$WORK/bomb/zeros"
 for seed in symlink bomb; do
-    sql_tarball "$WORK/$seed" -v slug="kind_e2e_$seed" <<'SQL'
-INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at)
-SELECT :'slug', b, 'sha256:' || encode(sha256(b), 'hex'), length(b), now()::TEXT
-FROM (SELECT decode(:'hex', 'hex') AS b) s;
-SQL
+    host_tarball "$WORK/$seed" "$WORK/$seed.tar.gz"
+    seed_pack_row "kind_e2e_$seed" "$WORK/$seed.tar.gz"
 done
+rm "$WORK/bomb.tar.gz"
 rm -rf "$WORK/bomb"
 
 start_controller
@@ -906,6 +1027,12 @@ expect_http I 201 '"ignored_paths":["state"]'
 IMPORT=$(jq -r .id "$WORK/api.json")
 IMPORT_TREE=$(sql -c "SELECT tree_digest FROM pack_imports WHERE id = '$IMPORT'")
 is_tree "$IMPORT_TREE" || fail "[I] the import recorded tree '$IMPORT_TREE'"
+expect_tree_digest I . "$IMPORT_TREE"
+crux playbook-import "file://$REPO" --path pack >"$WORK/import-I.txt"
+grep -qx "tree: $IMPORT_TREE" "$WORK/import-I.txt" || fail "[I] crux printed the import as: $(cat "$WORK/import-I.txt")"
+crux playbook-import "file://$REPO" --path pack --json >"$WORK/api.json"
+expect_tree_digest I . "$IMPORT_TREE"
+pass "[I] the import API and crux name the frozen tree_digest"
 [ "$(tree_paths "$IMPORT_TREE" | tr '\n' ' ')" = "$IMPORT_FILES" ] ||
     fail "[I] the import stored $(tree_paths "$IMPORT_TREE" | tr '\n' ' ')"
 api GET "/api/playbooks/imports/$IMPORT"
@@ -928,6 +1055,7 @@ api POST "/api/playbooks/imports/$IMPORT/compile" '{}'
 expect_http I 200 '"schema_digest":"sha256:'
 api POST "/api/playbooks/imports/$IMPORT/register" '{"id":"e2e-imp-pub","description":"kind e2e"}'
 expect_http I 201 '"ignored_paths":["state"]'
+expect_tree_digest I . "$IMPORT_TREE"
 [ "$(playbook_tree e2e-imp-pub)" = "$IMPORT_TREE" ] || fail "[I] the registered import holds '$(playbook_tree e2e-imp-pub)'"
 pass "[I] the compiled import registered its tree"
 
@@ -940,6 +1068,13 @@ expect_http I 201 '"ignored_paths":["state"]'
 pass "[I] a draft from git and a git registration hold the same tree"
 launch_delivered I none launch e2e-git
 [ "$LAUNCH_TREE" = "$IMPORT_TREE" ] || fail "[I] the launch ran $LAUNCH_TREE"
+crux playbooks >"$WORK/playbooks-I.txt"
+GIT_REV=$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-git'")
+if ! { grep -E "^$DRAFT-pub " "$WORK/playbooks-I.txt" | grep -qF " ${TREE:0:18} " &&
+    grep -E "^e2e-git " "$WORK/playbooks-I.txt" | grep -qF " ${GIT_REV:0:12} "; }; then
+    fail "[I] crux playbooks does not shorten a tree rev to its prefix and 12 characters, or a commit to 12: $(cat "$WORK/playbooks-I.txt")"
+fi
+pass "[I] crux playbooks shows a draft-sourced rev as tree1: and 12 characters"
 
 HEAVY="$WORK/heavy"
 cp -R "$OVER" "$HEAVY"
@@ -1028,6 +1163,12 @@ WEBHOOK=$(jq -r .webhook.id "$WORK/webhook-created-W.json")
 WEBHOOK_TOKEN=$(jq -r .secret "$WORK/webhook-created-W.json")
 [ "$(sql -F ' ' -c "SELECT adopted_tree_digest, adopted_tar_digest FROM playbook_standing_launches WHERE id = '$WEBHOOK'")" = "$W_TREE $W_FOREIGN" ] ||
     fail "[W] the webhook adopted $(sql -F ' ' -c "SELECT adopted_tree_digest, adopted_tar_digest FROM playbook_standing_launches WHERE id = '$WEBHOOK'")"
+[ "$(jq -r .webhook.adopted_tree_digest "$WORK/webhook-created-W.json")" = "$W_TREE" ] ||
+    fail "[W] the webhook names adopted tree $(jq -r .webhook.adopted_tree_digest "$WORK/webhook-created-W.json")"
+W_REV=$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-hook'")
+sql -c "SELECT reason FROM events WHERE key LIKE '%$WEBHOOK'" | grep -qF "deliveries as revision $W_REV (tree $W_TREE)" ||
+    fail "[W] the webhook's audit names: $(sql -c "SELECT reason FROM events WHERE key LIKE '%$WEBHOOK'")"
+pass "[W] the webhook and its audit name the adopted tree beside the commit"
 
 small_pack "$WREPO/pack" "test \"\$(cat marker.txt)\" = v2
 $OK_JSON" '["check.sh", "marker.txt"]'
@@ -1171,6 +1312,9 @@ expect_http K 422 '"field":"cursor.path"'
 pass "[K] a cursor path that is not a pack path is refused at save"
 
 schedule k-cursor cursor.json
+[ "$(jq -r .adopted_tree_digest "$WORK/api.json")" = "$(playbook_tree k-cursor)" ] ||
+    fail "[K] the schedule names adopted tree $(jq -r .adopted_tree_digest "$WORK/api.json")"
+pass "[K] the schedule names the adopted tree_digest"
 fired K k-cursor "$SCHEDULE" inputs
 [ "$LAUNCH_TREE" = "$(playbook_tree k-cursor)" ] || fail "[K] the firing ran $LAUNCH_TREE, not the registered tree"
 [ "$(listing "$WORK/inputs-K.tar.gz")" = cursor.json ] && [ "$(tar -xzOf "$WORK/inputs-K.tar.gz" cursor.json)" = '{"n":7}' ] ||
@@ -1197,6 +1341,7 @@ crux draft-push "$DRAFT-cursor" "$WORK/cursor" --base-version 2 --json >"$WORK/p
 api POST /api/schedules "{\"playbook\":\"$DRAFT-cursor\",\"target_kind\":\"draft_head\",\"cron_expr\":\"0 0 1 1 *\",\"max_cost\":1,\"max_time\":\"5m\",\"cursor\":{\"from\":\"check/out.txt\",\"path\":\"cursor.json\"}}"
 expect_http K 201 '"target_kind":"draft_head"'
 HEAD_SCHEDULE=$(jq -r .id "$WORK/api.json")
+[ "$(jq -r .adopted_tree_digest "$WORK/api.json")" = null ] || fail "[K] the draft-head schedule adopted a tree"
 mkdir -p "$WORK/broken"
 cp -R "$WORK/cursor/." "$WORK/broken/"
 echo 'this is not starlark (' >"$WORK/broken/workflow.star"
@@ -1259,6 +1404,10 @@ expect_http X 201 '"playbook":"e2e-x"'
 X_SCHEDULE=$(jq -r .id "$WORK/api.json")
 X_ADOPTED=$(sql -c "SELECT adopted_tree_digest FROM playbook_standing_launches WHERE id = '$X_SCHEDULE'")
 [ "$X_ADOPTED" = "$(playbook_tree e2e-x)" ] || fail "[X] the schedule adopted '$X_ADOPTED'"
+X_REV=$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-x'")
+sql -c "SELECT reason FROM events WHERE key = 'schedule:$X_SCHEDULE'" | grep -qF "as revision $X_REV (tree $X_ADOPTED)" ||
+    fail "[X] the schedule's audit names: $(sql -c "SELECT reason FROM events WHERE key = 'schedule:$X_SCHEDULE'")"
+pass "[X] the schedule's audit names the adopted tree beside the commit"
 X_COMMITS=0
 x_race schedule-edit "/api/schedules/$X_SCHEDULE" '{"playbook":"e2e-x","cron_expr":"0 0 2 1 *","max_cost":1,"max_time":"5m"}' PUT
 x_race launch /api/playbooks/e2e-x/launch '{"max_cost":1,"max_time":"5m"}'
@@ -1270,6 +1419,14 @@ x_race one-shot /api/one-shots "{\"playbook\":\"e2e-x\",\"max_cost\":1,\"max_tim
 [ "$(sql -F ' ' -c "SELECT id, cron_expr, adopted_tree_digest FROM playbook_standing_launches s LEFT JOIN playbook_schedules USING (id) WHERE s.playbook = 'e2e-x'")" = "$X_SCHEDULE 0 0 1 1 * $X_ADOPTED" ] ||
     fail "[X] a refused save stored or changed a standing launch: $(sql -c "SELECT * FROM playbook_standing_launches WHERE playbook = 'e2e-x'")"
 pass "[X] a schedule edit, launch, schedule, webhook, and one-shot authorized before a re-registration are refused with 409"
+X_TREE=$(playbook_tree e2e-x)
+X_REV2=$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-x'")
+api PUT "/api/schedules/$X_SCHEDULE" '{"playbook":"e2e-x","cron_expr":"0 0 3 1 *","max_cost":1,"max_time":"5m"}'
+expect_http X 200 "\"adopted_tree_digest\":\"$X_TREE\""
+sql -c "SELECT reason FROM events WHERE key = 'schedule:$X_SCHEDULE'" |
+    grep -qF "from revision $X_REV (tree $X_ADOPTED) to revision $X_REV2 (tree $X_TREE)" ||
+    fail "[X] the schedule edit's audit names: $(sql -c "SELECT reason FROM events WHERE key = 'schedule:$X_SCHEDULE'")"
+pass "[X] a schedule edit adopts the current tree, and its audit names both trees beside their commits"
 
 api POST /api/playbooks "{\"id\":\"e2e-xgone\",\"description\":\"kind e2e\",$X_SOURCE}"
 expect_http X 201 '"id":"e2e-xgone"'
@@ -1375,6 +1532,457 @@ LOCAL_PACK=$(ls -d "$WORK/scratch/local-runs/$(slug "$LOCAL_KEY")"-*/pack)
 $STEER_STAMP
 kind-steer-marker" ] || fail "[O] the local run's STEER.md is: $(cat "$LOCAL_PACK/STEER.md")"
 pass "[O] the local executor ran the stored tree with its steering and parked the tampered one"
+
+# ---- scenario V ----------------------------------------------------------------------------
+log "[V] pinning a binding and a fork to a draft-sourced playbook, and readying unconvertible rows"
+small_pack "$WORK/vpin" "$OK_JSON"
+new_draft "$DRAFT-vpin" "$WORK/vpin"
+crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V.json"
+V_TREE=$(playbook_tree e2e-vpub)
+is_tree "$V_TREE" || fail "[V] e2e-vpub registered with tree '$V_TREE'"
+api POST /api/secrets '{"name":"vpin_token","kind":"opaque","mint":"github-app"}'
+expect_http V 201 '"name":"vpin_token"'
+V_SECRET=$(jq -r .id "$WORK/api.json")
+
+# bind_vpin <pack_rev>: bind vpin_token to e2e-vpub, reviewed against that revision.
+bind_vpin() {
+    api POST "/api/secrets/$V_SECRET/bindings" "{\"scope_kind\":\"playbook\",\"scope_id\":\"e2e-vpub\",\"projection_kind\":\"env\",\"projection\":\"VPIN_TOKEN\",\"pack_rev\":\"$1\"}"
+}
+
+# v_pins: e2e-vpub's rev and tree, the binding's rev and tree, and the fork's rev and tree.
+v_pins() {
+    sql -F ' ' -c "SELECT p.rev, p.tree_digest, b.pack_rev, b.pack_digest, d.origin_rev, d.origin_digest
+                   FROM playbooks p, secret_bindings b, playbook_drafts d
+                   WHERE p.id = 'e2e-vpub' AND b.id = '$V_BINDING' AND d.id = 'e2e-vfork'"
+}
+
+# expect_released <label> <playbook>: a launch of the playbook resolves its binding, which the
+# local executor refuses to run without: the binding was not stale.
+expect_released() {
+    launch "$1" launch "$2"
+    settle "$1" "$KEY"
+    expect_parked "$1" "this launch resolved 1 binding(s)"
+}
+
+bind_vpin "$V_TREE"
+expect_http V 201 '"scope_id":"e2e-vpub"'
+V_BINDING=$(jq -r .id "$WORK/api.json")
+[ "$(sql -c "SELECT pack_digest FROM secret_bindings WHERE id = '$V_BINDING'")" = "$V_TREE" ] ||
+    fail "[V] the binding pinned '$(sql -c "SELECT pack_digest FROM secret_bindings WHERE id = '$V_BINDING'")'"
+clone_template V e2e-vfork e2e-vpub "$V_TREE"
+[ "$(sql -c "SELECT origin_digest FROM playbook_drafts WHERE id = 'e2e-vfork'")" = "$V_TREE" ] ||
+    fail "[V] the fork pinned origin '$(sql -c "SELECT origin_digest FROM playbook_drafts WHERE id = 'e2e-vfork'")'"
+pass "[V] the binding and the fork pin e2e-vpub's tree"
+
+VREPO="$WORK/vrepo"
+small_pack "$VREPO/pack" "echo vgit-$ID
+$OK_JSON"
+git -C "$VREPO" init -q
+git_commit "$VREPO" pack
+api POST /api/playbooks "{\"id\":\"e2e-vgit\",\"description\":\"kind e2e\",\"repo\":\"file://$VREPO\",\"path\":\"pack\"}"
+expect_http V 201 '"id":"e2e-vgit"'
+
+small_pack "$WORK/vuncv" "echo uncv-$ID
+$OK_JSON"
+new_draft "$DRAFT-vuncv" "$WORK/vuncv"
+crux draft-publish "$DRAFT-vuncv" --playbook e2e-vuncvpub --json >"$WORK/publish-V-uncv.json"
+api POST /api/schedules '{"playbook":"e2e-vuncvpub","cron_expr":"0 0 1 1 *","max_cost":1,"max_time":"5m"}'
+expect_http V 201 '"playbook":"e2e-vuncvpub"'
+V_SCHEDULE=$(jq -r .id "$WORK/api.json")
+api PUT /api/config/overrides '{"allow_draft_head_schedules":true,"justification":"kind e2e"}'
+[ "$HTTP" = 200 ] || fail "[V] enabling draft-head schedules: $HTTP $(cat "$WORK/api.json")"
+api POST /api/schedules "{\"playbook\":\"$DRAFT-vuncv\",\"target_kind\":\"draft_head\",\"cron_expr\":\"0 0 1 1 *\",\"max_cost\":1,\"max_time\":\"5m\"}"
+expect_http V 201 '"target_kind":"draft_head"'
+V_HEAD_SCHEDULE=$(jq -r .id "$WORK/api.json")
+api POST /api/playbooks/imports "{\"repo\":\"file://$VREPO\",\"path\":\"pack\"}"
+expect_http V 201 '"status"'
+V_IMPORT=$(jq -r .id "$WORK/api.json")
+VWREPO="$WORK/vwrepo"
+small_pack "$VWREPO/pack" "echo watch-$ID
+$OK_JSON"
+printf 'params = {"key": {"type": "string", "required": True}}\n\n%s\n' "$(cat "$FIX/packs/deliver/workflow.star")" >"$VWREPO/pack/workflow.star"
+git -C "$VWREPO" init -q
+git_commit "$VWREPO" watch
+api POST /api/playbooks "{\"id\":\"e2e-vwatch\",\"description\":\"kind e2e\",\"repo\":\"file://$VWREPO\",\"path\":\"pack\"}"
+expect_http V 201 '"id":"e2e-vwatch"'
+small_pack "$WORK/vdisp" "$OK_JSON"
+new_draft "$DRAFT-vdisp" "$WORK/vdisp"
+
+log "[V] encoding scope packs with the engine"
+VCODE="$WORK/vcode"
+mkdir -p "$VCODE"
+echo code >"$VCODE/README"
+git -C "$VCODE" init -q
+git_commit "$VCODE" code
+
+# scope_pack <dir>: an autoresearch pack the engine's scope pipeline freezes with no agent turn.
+scope_pack() {
+    mkdir -p "$1"
+    cp "$FIX/packs/scope/workflow.star" "$1/"
+    cat >"$1/crucible.toml" <<TOML
+[repo]
+path = "$VCODE"
+
+[workspace]
+inject = ["measure.sh"]
+
+[agent]
+backend = "openshell"
+goal = "Freeze the pack."
+sandbox_image = "ghcr.io/org/sandbox:latest"
+
+[judge]
+measure_cmd = "./measure.sh"
+direction = "higher"
+objective = "score"
+
+[workflow]
+type = "autoresearch"
+file = "workflow.star"
+TOML
+    printf '#!/bin/sh\necho %s\n' "'{\"valid\": true, \"score\": 1, \"pass\": true}'" >"$1/measure.sh"
+    chmod +x "$1/measure.sh"
+}
+
+# scope_marker <dir>: the pack marker payload a surviving scope of the dir emits.
+scope_marker() {
+    "$AUTORESEARCH_ENGINE" scope --pack "$1" --json --marker >"$1.out" 2>"$1.err" ||
+        fail "[V] the scope of $1 did not survive: $(grep CRUCIBLE_SCOPE_REPORT "$1.out")"
+    sed -n 's/^CRUCIBLE_SCOPE_PACK: //p' "$1.out"
+}
+
+scope_pack "$WORK/vscope"
+mkdir -p "$WORK/vscope/state" "$WORK/vscope/workspace" "$WORK/vscope/.git" "$WORK/vscope/sub/state"
+for f in state/cursor workspace/main.go .git/HEAD sub/state/x; do echo junk >"$WORK/vscope/$f"; done
+ln -s /etc/passwd "$WORK/vscope/state/link"
+echo kept >"$WORK/vscope/sub/kept.txt"
+scope_marker "$WORK/vscope" | base64 -d >"$WORK/vscope.tar.gz"
+V_SCOPE_FILES="SCOPE.md WORKFLOW.png crucible.toml measure.sh sub/kept.txt workflow.star "
+[ "$(tar -tzf "$WORK/vscope.tar.gz" | tr '\n' ' ')" = "$V_SCOPE_FILES" ] ||
+    fail "[V] the engine's scope pack lists $(tar -tzf "$WORK/vscope.tar.gz" | tr '\n' ' ')"
+pass "[V] the engine's scope pack skips state/, workspace/ and .git at any depth and lists its entries in order"
+scope_pack "$WORK/vscopelink"
+ln -s crucible.toml "$WORK/vscopelink/link"
+scope_marker "$WORK/vscopelink" >"$WORK/vscopelink.marker"
+jq -r .error "$WORK/vscopelink.marker" | grep -q 'link is a symbolic link' ||
+    fail "[V] a scope pack holding a symlink emitted: $(cut -c1-300 "$WORK/vscopelink.marker")"
+scope_pack "$WORK/vscopebig"
+head -c 70000000 /dev/zero >"$WORK/vscopebig/zeros"
+scope_marker "$WORK/vscopebig" >"$WORK/vscopebig.marker"
+rm "$WORK/vscopebig/zeros"
+jq -r .error "$WORK/vscopebig.marker" | grep -Eq "pack tar is [0-9]+ bytes, over the controller's 67108864-byte expanded cap" ||
+    fail "[V] an oversize scope pack emitted: $(cut -c1-300 "$WORK/vscopebig.marker")"
+pass "[V] the engine refuses a scope pack holding a symlink, or past the controller's expanded cap, naming why"
+
+stop_controller
+log "[V] rewriting e2e-vpub, its binding, and its fork as a controller from before trees left them"
+host_tarball "$WORK/vpin" "$WORK/vpin.tar.gz"
+sql_file "$WORK/vpin.tar.gz" <<'SQL'
+UPDATE playbooks
+SET tar_gz = s.b, tar_digest = 'sha256:' || encode(sha256(s.b), 'hex'), tar_bytes = length(s.b),
+    rev = 'sha256:' || encode(sha256(s.b), 'hex'), tree_digest = NULL
+FROM (SELECT decode(:'hex', 'hex') AS b) s
+WHERE id = 'e2e-vpub';
+SQL
+V_OLD="sha256:$(sha256 "$WORK/vpin.tar.gz")"
+sql -c "UPDATE secret_bindings SET pack_rev = '$V_OLD', pack_digest = NULL WHERE id = '$V_BINDING'"
+sql -c "UPDATE playbook_drafts SET origin_rev = '$V_OLD', origin_digest = NULL WHERE id = 'e2e-vfork'"
+[ "$(v_pins)" = "$V_OLD  $V_OLD  $V_OLD " ] || fail "[V] the pre-tree rows read $(v_pins)"
+mkdir -p "$WORK/vsym" "$WORK/vgc"
+echo m >"$WORK/vsym/crucible.toml"
+ln -s crucible.toml "$WORK/vsym/link"
+host_tarball "$WORK/vsym" "$WORK/vsym.tar.gz"
+seed_pack_row kind_e2e_vsym "$WORK/vsym.tar.gz"
+echo "collected $ID" >"$WORK/vgc/crucible.toml"
+host_tarball "$WORK/vgc" "$WORK/vgc.tar.gz"
+seed_pack_row kind_e2e_vgc "$WORK/vgc.tar.gz"
+seed_pack_row kind_e2e_vscope "$WORK/vscope.tar.gz"
+
+CONTROLLER_ENV=(CONTROLLER_PLAYBOOK_EXECUTOR=local CONTROLLER_MAX_CONCURRENT_PODS=1 CONTROLLER_SCHEDULE_AUTO_DISABLE_FAILURES=1
+    JIRA_BASE_URL=http://127.0.0.1:9 JIRA_EMAIL=e2e@example.com JIRA_API_TOKEN=e2e)
+start_controller
+read -r converted unconvertible <<<"$(conversion_report "$BOOT")"
+[ "$converted $unconvertible $(pinned_report "$BOOT")" = "3 1 3" ] ||
+    fail "[V] boot $BOOT reported converted/unconvertible/pinned '$converted $unconvertible $(pinned_report "$BOOT")'; expected 3 1 3"
+[ "$(v_pins)" = "$V_TREE $V_TREE $V_OLD $V_TREE $V_OLD $V_TREE" ] ||
+    fail "[V] conversion left the pins at $(v_pins)"
+[ "$(sql -c "SELECT tree_digest FROM pack_digest_aliases WHERE old_digest = '$V_OLD'")" = "$V_TREE" ] ||
+    fail "[V] the old rev is not an alias of $V_TREE"
+pass "[V] conversion made the draft-sourced rev its tree and pinned the binding and the fork to it, in one boot"
+api GET /api/playbook-drafts/e2e-vfork
+[ "$(jq -c '.origin | [.rev, .current_rev, .digest, .current_digest, .moved]' "$WORK/api.json")" = "[\"$V_OLD\",\"$V_TREE\",\"$V_TREE\",\"$V_TREE\",false]" ] ||
+    fail "[V] the fork's origin reads $(jq -c .origin "$WORK/api.json")"
+pass "[V] the fork whose rev names the old bytes has not moved: its origin digest is the current tree"
+expect_released V-pin e2e-vpub
+
+V_SCOPE_TREE=$(launch_tree kind_e2e_vscope)
+is_tree "$V_SCOPE_TREE" && [ "$(tree_tarball "$V_SCOPE_TREE")" = "sha256:$(sha256 "$WORK/vscope.tar.gz")" ] ||
+    fail "[V] the engine's scope pack converted to '$V_SCOPE_TREE', whose tarball is $(tree_tarball "$V_SCOPE_TREE"), not the engine's bytes"
+[ "$(tree_paths "$V_SCOPE_TREE" | tr '\n' ' ')" = "$V_SCOPE_FILES" ] ||
+    fail "[V] the engine's scope pack stored $(tree_paths "$V_SCOPE_TREE" | tr '\n' ' ')"
+pass "[V] the controller reads the engine's scope pack back as a tree whose canonical tarball is the engine's bytes"
+
+log "[V] supplying the pre-tree digest as a template pin and as a binding's revision"
+V_UNKNOWN="sha256:$(printf '0%.0s' $(seq 1 64))"
+# template_v <label> <draft> <playbook> <json pins>: template a draft from the playbook at the
+# pins; the answer lands in template-<label>.json and .code.
+template_v() {
+    api POST /api/playbook-drafts "$(jq -nc --arg id "$2" --arg t "$3" --argjson pins "$4" \
+        '{id: $id, description: "kind e2e", template: $t} + $pins')"
+    cp "$WORK/api.json" "$WORK/template-$1.json"
+    echo "$HTTP" >"$WORK/template-$1.code"
+}
+template_v sup-rev e2e-vsup e2e-vpub "{\"template_rev\":\"$V_OLD\"}"
+expect_http V 409 "revision $V_OLD is superseded by $V_TREE"
+template_v sup-digest e2e-vsup e2e-vpub "{\"template_rev\":\"$V_TREE\",\"template_digest\":\"$V_OLD\"}"
+expect_http V 409 "revision $V_OLD is superseded by $V_TREE"
+template_v unknown e2e-vsup e2e-vpub "{\"template_rev\":\"$V_TREE\",\"template_digest\":\"$V_UNKNOWN\"}"
+expect_http V 409 'moved while cloning'
+V_GIT_REV=$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-vgit'")
+template_v other-old e2e-vsup e2e-vgit "{\"template_rev\":\"$V_GIT_REV\",\"template_digest\":\"$V_OLD\"}"
+template_v other-unknown e2e-vsup e2e-vgit "{\"template_rev\":\"$V_GIT_REV\",\"template_digest\":\"$V_UNKNOWN\"}"
+{ [ "$(cat "$WORK/template-other-old.code")" = 409 ] && cmp -s "$WORK/template-other-old.json" "$WORK/template-other-unknown.json"; } ||
+    fail "[V] a playbook that never held $V_TREE answered the old digest $(cat "$WORK/template-other-old.code") $(cat "$WORK/template-other-old.json"), the unknown one $(cat "$WORK/template-other-unknown.json")"
+[ -z "$(sql -c "SELECT id FROM playbook_drafts WHERE id = 'e2e-vsup'")" ] || fail "[V] a refused template created e2e-vsup"
+bind_vpin "$V_OLD"
+expect_http V 409 "pack revision $V_OLD is superseded by $V_TREE"
+pass "[V] a reader supplying the pre-tree digest is told its replacement; a playbook that never held it answers as for an unknown digest"
+
+log "[V] watching a tracker query from a git-sourced playbook"
+VW_TREE=$(playbook_tree e2e-vwatch)
+VW_REV=$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-vwatch'")
+VW_BODY='{"playbook":"e2e-vwatch","tracker":"jira","query":"project = E2E","key_param":"key","max_cost":1,"max_time":"5m","enabled":false}'
+api POST /api/watches "$VW_BODY"
+expect_http V 201 "\"adopted_tree_digest\":\"$VW_TREE\""
+VW_ID=$(jq -r .id "$WORK/api.json")
+api PUT "/api/watches/$VW_ID" "$VW_BODY"
+expect_http V 200 "\"adopted_tree_digest\":\"$VW_TREE\""
+[ "$(sql -c "SELECT reason FROM events WHERE key LIKE '%$VW_ID'" | grep -cF "as revision $VW_REV (tree $VW_TREE)")" = 2 ] ||
+    fail "[V] the watch's audits name: $(sql -c "SELECT reason FROM events WHERE key LIKE '%$VW_ID'")"
+pass "[V] a watch names its adopted tree_digest, and its create and edit audits name the tree beside the commit"
+
+log "[V] refusing unconvertible packs naming the reason"
+V_SYM_DIGEST="sha256:$(sha256 "$WORK/vsym.tar.gz")"
+V_SYM_REASON=$(sql -c "SELECT unconvertible_reason FROM pack_digest_aliases WHERE old_digest = '$V_SYM_DIGEST' AND tree_digest IS NULL")
+grep -q 'symbolic link' <<<"$V_SYM_REASON" || fail "[V] the symlink pack is recorded unconvertible as '$V_SYM_REASON'"
+sql -v draft="$DRAFT-vuncv" -v import="$V_IMPORT" -v schedule="$V_SCHEDULE" <<'SQL'
+CREATE TEMP VIEW sym AS SELECT tar_gz, digest, bytes FROM pack_tarballs WHERE issue_slug = 'kind_e2e_vsym';
+UPDATE playbook_draft_versions SET tar_gz = sym.tar_gz, tar_digest = sym.digest, tar_bytes = sym.bytes
+FROM sym WHERE draft_id = :'draft' AND version = 2;
+UPDATE playbooks SET tar_gz = sym.tar_gz, tar_digest = sym.digest, tar_bytes = sym.bytes
+FROM sym WHERE id = 'e2e-vuncvpub';
+UPDATE pack_imports SET tar_gz = sym.tar_gz, tar_digest = sym.digest, tar_bytes = sym.bytes
+FROM sym WHERE id = :'import';
+UPDATE playbook_standing_launches
+SET adopted_tar_gz = sym.tar_gz, adopted_tar_digest = sym.digest, adopted_tar_bytes = sym.bytes
+FROM sym WHERE id = :'schedule';
+SQL
+[ "$(sql -c "SELECT count(*) FROM playbook_draft_versions WHERE draft_id = '$DRAFT-vuncv' AND version = 2 AND tree_digest IS NULL")
+$(sql -c "SELECT count(*) FROM playbooks WHERE id = 'e2e-vuncvpub' AND tree_digest IS NULL")
+$(sql -c "SELECT count(*) FROM pack_imports WHERE id = '$V_IMPORT' AND tree_digest IS NULL")
+$(sql -c "SELECT count(*) FROM playbook_standing_launches WHERE id = '$V_SCHEDULE' AND adopted_tree_digest IS NULL")" = "1
+1
+1
+1" ] || fail "[V] a row kept its tree when its bytes became the symlink pack"
+if crux draft-launch "$DRAFT-vuncv" --max-cost 1 --max-time 5m >"$WORK/launch-V-uncv.log" 2>&1; then
+    fail "[V] an unconvertible draft version launched"
+fi
+grep -qF "$V_SYM_REASON" "$WORK/launch-V-uncv.log" || fail "[V] the draft launch refusal: $(cat "$WORK/launch-V-uncv.log")"
+api POST /api/playbook-drafts '{"id":"e2e-vuncvclone","description":"kind e2e","template":"e2e-vuncvpub"}'
+expect_http V 422 "$V_SYM_REASON"
+api POST "/api/playbooks/imports/$V_IMPORT/draft" '{"id":"e2e-vuncvopen","description":"kind e2e"}'
+expect_http V 422 "$V_SYM_REASON"
+[ "$(sql -c "SELECT count(*) FROM playbook_drafts WHERE id IN ('e2e-vuncvclone', 'e2e-vuncvopen')")" = 0 ] ||
+    fail "[V] a refused clone or open left a draft"
+pass "[V] a draft launch, a template clone, and opening an import as a draft refuse the unconvertible pack naming the reason"
+
+# disabled_for <schedule>: the schedule is disabled.
+disabled_for() { [ "$(sql -c "SELECT enabled FROM playbook_standing_launches WHERE id = '$1'")" = f ]; }
+sql -c "UPDATE playbook_schedules SET next_due_at = '2000-01-01T00:00:00Z' WHERE id IN ('$V_SCHEDULE', '$V_HEAD_SCHEDULE')"
+for schedule in "$V_SCHEDULE" "$V_HEAD_SCHEDULE"; do
+    wait_for 60 "schedule $schedule to fail its firing" disabled_for "$schedule"
+    sql -c "SELECT reason FROM events WHERE key = 'schedule:$schedule' AND reason LIKE 'auto-disabled after 1 consecutive%'" |
+        grep -qF "$V_SYM_REASON" ||
+        fail "[V] schedule $schedule was disabled for: $(sql -c "SELECT reason FROM events WHERE key = 'schedule:$schedule'")"
+done
+[ "$(sql -c "SELECT count(*) FROM playbook_launches WHERE playbook IN ('e2e-vuncvpub', '$DRAFT-vuncv')")" = 0 ] ||
+    fail "[V] a refused firing launched"
+pass "[V] an adopted and a draft-head schedule fail their firing naming the reason and count toward auto-disable"
+
+# hold_dispatch / release_dispatch: a zero daily ceiling keeps every new launch from dispatching.
+hold_dispatch() {
+    api PUT /api/config/overrides '{"daily_cost_ceiling":0,"justification":"kind e2e"}'
+    [ "$HTTP" = 200 ] || fail "[V] zeroing the daily ceiling: $HTTP $(cat "$WORK/api.json")"
+}
+release_dispatch() {
+    api PUT /api/config/overrides '{"daily_cost_ceiling":100,"justification":"kind e2e"}'
+    [ "$HTTP" = 200 ] || fail "[V] raising the daily ceiling: $HTTP $(cat "$WORK/api.json")"
+    crux reconcile >/dev/null
+}
+# held <key>: the launch is still new, with no run.
+held() {
+    crux reconcile >/dev/null
+    [ "$(crux playbook-run "$1" | jq -r '.launch.status + " " + (.runs | length | tostring)')" = "new 0" ] ||
+        fail "[V] $1 dispatched while the ceiling held it"
+}
+
+hold_dispatch
+launch V-disp draft-launch "$DRAFT-vdisp"
+V_DISP="$KEY"
+held "$V_DISP"
+sql -v slug="$(slug "$V_DISP")" <<'SQL'
+UPDATE pack_tarballs SET tar_gz = s.tar_gz, digest = s.digest, bytes = s.bytes
+FROM (SELECT tar_gz, digest, bytes FROM pack_tarballs WHERE issue_slug = 'kind_e2e_vsym') s
+WHERE issue_slug = :'slug';
+SQL
+[ -z "$(launch_tree "$V_DISP")" ] || fail "[V] the queued launch kept its tree"
+release_dispatch
+settle V-disp "$V_DISP"
+expect_parked V-disp "pack $V_SYM_DIGEST is unconvertible: $V_SYM_REASON"
+[ "$(jq '.runs | length' "$WORK/run-V-disp.json")" = 0 ] || fail "[V] the unconvertible launch recorded a run"
+
+log "[V] unpinning one old tree and keeping a pinned and a fresh one"
+V_GC_TREE=$(launch_tree kind_e2e_vgc)
+is_tree "$V_GC_TREE" || fail "[V] the collectable pack converted to '$V_GC_TREE'"
+sql -c "DELETE FROM pack_tarballs WHERE issue_slug = 'kind_e2e_vgc'"
+small_pack "$WORK/vfresh" "echo fresh-$ID
+$OK_JSON"
+new_draft "$DRAFT-vfresh" "$WORK/vfresh"
+V_FRESH_TREE=$(draft_tree "$DRAFT-vfresh" 2)
+crux draft-delete "$DRAFT-vfresh" >/dev/null
+sql -c "UPDATE pack_trees SET created_at = '2000-01-01T00:00:00Z' WHERE digest IN ('$V_GC_TREE', '$V_TREE')"
+V_PINS=$(v_pins)
+
+stop_controller
+start_controller
+[ "$(conversion_report "$BOOT")" = none ] || fail "[V] boot $BOOT converted again: $(conversion_report "$BOOT")"
+[ "$(v_pins)" = "$V_PINS" ] || fail "[V] a restart moved the pins to $(v_pins)"
+[ "$(collected_report "$BOOT")" = 1 ] || fail "[V] boot $BOOT collected '$(collected_report "$BOOT")' trees, not the one unpinned old tree"
+[ "$(sql -F ' ' -c "SELECT (SELECT count(*) FROM pack_trees WHERE digest = '$V_GC_TREE'), (SELECT count(*) FROM pack_tree_files WHERE digest = '$V_GC_TREE')")" = "0 0" ] ||
+    fail "[V] the unpinned old tree is still stored"
+for kept in "$V_TREE" "$V_FRESH_TREE"; do
+    [ -n "$(tree_tarball "$kept")" ] && [ -n "$(tree_paths "$kept")" ] || fail "[V] collection removed $kept"
+done
+pass "[V] a restart collected the unpinned old tree and kept the pinned one and the fresh one; the pins held"
+
+expect_released V-restart e2e-vpub
+crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V-same.json"
+[ "$(jq -r .rev "$WORK/publish-V-same.json")" = "$V_TREE" ] && [ "$(v_pins)" = "$V_PINS" ] ||
+    fail "[V] the identical republish moved the pins to $(v_pins)"
+expect_released V-same e2e-vpub
+pass "[V] the binding is not stale after a restart and an identical republish"
+
+echo '# version 3' >>"$WORK/vpin/check.sh"
+crux draft-push "$DRAFT-vpin" "$WORK/vpin" --base-version 2 --json >"$WORK/push-V3.json"
+crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V3.json"
+V_TREE2=$(playbook_tree e2e-vpub)
+[ "$V_TREE2" != "$V_TREE" ] && [ "$(jq -r .rev "$WORK/publish-V3.json")" = "$V_TREE2" ] || fail "[V] the republish registered '$V_TREE2'"
+launch V-stale launch e2e-vpub
+settle V-stale "$KEY"
+expect_parked V-stale "against pack revision $V_TREE, which the pin bump to $V_TREE2 moved"
+api GET /api/playbook-drafts/e2e-vfork
+[ "$(jq -c '.origin | [.digest, .current_digest, .moved]' "$WORK/api.json")" = "[\"$V_TREE\",\"$V_TREE2\",true]" ] ||
+    fail "[V] the fork's origin reads $(jq -c .origin "$WORK/api.json")"
+pass "[V] a republish of new content stales the binding and moves the fork"
+
+log "[V] republishing between a launch and its dispatch"
+api DELETE "/api/secrets/$V_SECRET/bindings/$V_BINDING"
+[ "$HTTP" = 200 ] || [ "$HTTP" = 204 ] || fail "[V] unbinding: $HTTP $(cat "$WORK/api.json")"
+bind_vpin "$V_TREE2"
+expect_http V 201 '"scope_id":"e2e-vpub"'
+V_BINDING=$(jq -r .id "$WORK/api.json")
+hold_dispatch
+launch V-frozen launch e2e-vpub
+V_FROZEN="$KEY"
+held "$V_FROZEN"
+[ "$(launch_tree "$V_FROZEN")" = "$V_TREE2" ] || fail "[V] the queued launch froze $(launch_tree "$V_FROZEN")"
+echo '# version 4' >>"$WORK/vpin/check.sh"
+crux draft-push "$DRAFT-vpin" "$WORK/vpin" --base-version 3 --json >"$WORK/push-V4.json"
+crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V4.json"
+V_TREE3=$(playbook_tree e2e-vpub)
+[ "$V_TREE3" != "$V_TREE2" ] || fail "[V] the second republish kept $V_TREE2"
+held "$V_FROZEN"
+release_dispatch
+settle V-frozen "$V_FROZEN"
+expect_parked V-frozen "this launch resolved 1 binding(s)"
+launch V-repinned launch e2e-vpub
+settle V-repinned "$KEY"
+expect_parked V-repinned "against pack revision $V_TREE2, which the pin bump to $V_TREE3 moved"
+pass "[V] a launch is checked against the tree it froze, not the registry's newer one"
+
+stop_controller
+log "[V] storing the collected tree's legacy bytes again"
+seed_pack_row kind_e2e_vgc2 "$WORK/vgc.tar.gz"
+log "[V] booting without a dev identity, so callers assert their login"
+VHREPO="$WORK/vhrepo"
+small_pack "$VHREPO/pack" "echo vhook-$ID
+$OK_JSON"
+cp -R "$VHREPO/pack" "$VHREPO/pack2"
+echo '# the same commit, another tree' >>"$VHREPO/pack2/check.sh"
+git -C "$VHREPO" init -q
+git_commit "$VHREPO" hook
+VH_SOURCE="\"repo\":\"file://$VHREPO\",\"path\":\"pack\""
+CONTROLLER_ENV=(CONTROLLER_DEV_IDENTITY=)
+start_controller
+read -r converted unconvertible <<<"$(conversion_report "$BOOT")"
+[ "$converted $unconvertible" = "1 0" ] || fail "[V] boot $BOOT reported '$converted $unconvertible' storing the collected bytes again"
+grep -q 'pack tree conversion failed' "$WORK/controller-$BOOT.log" && fail "[V] conversion failed on bytes whose tree was collected"
+[ "$(launch_tree kind_e2e_vgc2)" = "$V_GC_TREE" ] && [ "$(tree_paths "$V_GC_TREE")" = crucible.toml ] ||
+    fail "[V] the collected tree's bytes converted to '$(launch_tree kind_e2e_vgc2)' holding '$(tree_paths "$V_GC_TREE")'"
+pass "[V] legacy bytes whose aliased tree was collected store that tree again"
+
+as e2e POST /api/playbooks "{\"id\":\"e2e-vhook\",\"description\":\"kind e2e\",$VH_SOURCE}"
+expect_http V 201 '"id":"e2e-vhook"'
+VH_TREE=$(playbook_tree e2e-vhook)
+VH_REV=$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-vhook'")
+as e2e PUT /api/playbooks/e2e-vhook/shares/user:outsider '{"role":"launcher"}'
+[ "$HTTP" = 200 ] || [ "$HTTP" = 201 ] || [ "$HTTP" = 204 ] || fail "[V] sharing e2e-vhook: $HTTP $(cat "$WORK/api.json")"
+VH_BODY='{"playbook":"e2e-vhook","verifier":"path_token","dedupe":"string(body.n)","max_launches_per_hour":1,"max_cost":1,"max_time":"5m"}'
+as outsider POST /api/webhooks "$VH_BODY"
+expect_http V 201 '"playbook":"e2e-vhook"'
+VH_HOOK=$(jq -r .webhook.id "$WORK/api.json")
+as e2e PUT /api/playbooks/e2e-vhook/shares/user:outsider '{"role":"viewer"}'
+[ "$HTTP" = 200 ] || [ "$HTTP" = 201 ] || [ "$HTTP" = 204 ] || fail "[V] narrowing the share: $HTTP $(cat "$WORK/api.json")"
+as outsider PUT "/api/webhooks/$VH_HOOK" "$VH_BODY"
+[ "$HTTP" = 200 ] || fail "[V] an unchanged webhook edit by a viewer: $HTTP $(cat "$WORK/api.json")"
+as e2e POST /api/playbook-drafts "{\"id\":\"e2e-vhfork\",\"description\":\"kind e2e\",\"template\":\"e2e-vhook\",\"template_rev\":\"$VH_REV\",\"template_digest\":\"$VH_TREE\"}"
+expect_http V 201 '"version":1'
+as e2e POST /api/playbooks "{\"id\":\"e2e-vhook\",\"description\":\"kind e2e\",\"repo\":\"file://$VHREPO\",\"path\":\"pack2\"}"
+expect_http V 201 '"id":"e2e-vhook"'
+VH_TREE2=$(playbook_tree e2e-vhook)
+[ "$(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-vhook'")" = "$VH_REV" ] && [ "$VH_TREE2" != "$VH_TREE" ] ||
+    fail "[V] re-registering at the same commit holds rev $(sql -c "SELECT rev FROM playbooks WHERE id = 'e2e-vhook'") and tree $VH_TREE2"
+as outsider PUT "/api/webhooks/$VH_HOOK" "$VH_BODY"
+[ "$HTTP" = 403 ] || [ "$HTTP" = 404 ] || fail "[V] a viewer re-adopted a new tree at the same rev: $HTTP $(cat "$WORK/api.json")"
+[ "$(sql -c "SELECT adopted_tree_digest FROM playbook_standing_launches WHERE id = '$VH_HOOK'")" = "$VH_TREE" ] ||
+    fail "[V] the refused edit changed the adopted tree"
+as e2e PUT "/api/webhooks/$VH_HOOK" "$VH_BODY"
+[ "$HTTP" = 200 ] && [ "$(jq -r .adopted_tree_digest "$WORK/api.json")" = "$VH_TREE2" ] ||
+    fail "[V] the owner's edit: $HTTP $(cat "$WORK/api.json")"
+sql -c "SELECT reason FROM events WHERE key LIKE '%$VH_HOOK'" | grep -qF "deliveries as revision $VH_REV (tree $VH_TREE2)" ||
+    fail "[V] the webhook edit's audit names: $(sql -c "SELECT reason FROM events WHERE key LIKE '%$VH_HOOK'")"
+pass "[V] a same-rev tree change makes a webhook edit a new firing, decided against the playbook again"
+as e2e GET /api/playbook-drafts/e2e-vhfork
+[ "$(jq -c '.origin | [.rev == .current_rev, .digest, .current_digest, .moved]' "$WORK/api.json")" = "[true,\"$VH_TREE\",\"$VH_TREE2\",true]" ] ||
+    fail "[V] the fork of the same-rev repoint reads $(jq -c .origin "$WORK/api.json")"
+pass "[V] a fork moves when its origin's tree changes under the same rev"
+
+for who in outsider e2e; do
+    for pin in old unknown; do
+        digest="$V_OLD"
+        [ "$pin" = unknown ] && digest="$V_UNKNOWN"
+        as "$who" POST /api/playbook-drafts "{\"id\":\"e2e-vsup\",\"description\":\"kind e2e\",\"template\":\"e2e-vpub\",\"template_digest\":\"$digest\"}"
+        cp "$WORK/api.json" "$WORK/template-$who-$pin.json"
+        echo "$HTTP" >"$WORK/template-$who-$pin.code"
+    done
+done
+cmp -s "$WORK/template-outsider-old.json" "$WORK/template-outsider-unknown.json" &&
+    [ "$(cat "$WORK/template-outsider-old.code")" = "$(cat "$WORK/template-outsider-unknown.code")" ] ||
+    fail "[V] a non-reader told the old digest $(cat "$WORK/template-outsider-old.code") $(cat "$WORK/template-outsider-old.json") apart from an unknown one $(cat "$WORK/template-outsider-unknown.code") $(cat "$WORK/template-outsider-unknown.json")"
+{ grep -qF "superseded by $V_TREE" "$WORK/template-e2e-old.json" && ! grep -q superseded "$WORK/template-e2e-unknown.json"; } ||
+    fail "[V] the reader got $(cat "$WORK/template-e2e-old.json") and $(cat "$WORK/template-e2e-unknown.json")"
+grep -q "$V_TREE" "$WORK/template-outsider-old.json" && fail "[V] the non-reader's answer names $V_TREE"
+pass "[V] a non-reader's answer for the pre-tree digest is byte-identical to the unknown digest's; a reader's names the replacement"
 
 # ---- scenario G ----------------------------------------------------------------------------
 stop_controller
