@@ -273,6 +273,11 @@ impl PackTree {
         encode_tarball(&self.0)
     }
 
+    /// [`PackTree::tarball`] and the length of the tar inside it, the size it gunzips to.
+    pub fn tarball_and_expanded_len(&self) -> std::io::Result<(Vec<u8>, u64)> {
+        encode_counted(&self.0)
+    }
+
     /// Refuse a tree in which a file's path followed by `/` begins another file's path: no
     /// filesystem can hold both.
     fn check_prefix_collisions(&self) -> Result<(), TreeError> {
@@ -298,8 +303,15 @@ impl PackTree {
 /// `files` as the gzipped tar [`PackTree::tarball`] describes. Unlike a tree, `files` may hold
 /// excluded paths, so per-run inputs delivered beside a pack use the same encoding.
 pub fn encode_tarball(files: &BTreeMap<PackFilePath, Vec<u8>>) -> std::io::Result<Vec<u8>> {
+    encode_counted(files).map(|(gz, _)| gz)
+}
+
+fn encode_counted(files: &BTreeMap<PackFilePath, Vec<u8>>) -> std::io::Result<(Vec<u8>, u64)> {
     let gz = flate2::GzBuilder::new().write(Vec::new(), flate2::Compression::default());
-    let mut builder = tar::Builder::new(gz);
+    let mut builder = tar::Builder::new(Counted {
+        inner: gz,
+        written: 0,
+    });
     for (path, bytes) in files {
         let mut header = tar::Header::new_gnu();
         header.set_entry_type(tar::EntryType::Regular);
@@ -310,7 +322,26 @@ pub fn encode_tarball(files: &BTreeMap<PackFilePath, Vec<u8>>) -> std::io::Resul
         header.set_mtime(0);
         builder.append_data(&mut header, path.as_str(), bytes.as_slice())?;
     }
-    builder.into_inner()?.finish()
+    let tar = builder.into_inner()?;
+    Ok((tar.inner.finish()?, tar.written))
+}
+
+/// A writer that counts the bytes it passes on.
+struct Counted<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for Counted<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// A pack read from a directory or an archive: the tree, and the excluded paths it skipped.
@@ -824,6 +855,35 @@ mod tests {
 
         let err = read_tar_gz(&tgz).expect_err("escapes").to_string();
         assert!(err.contains("escapes"), "{err}");
+    }
+
+    #[test]
+    fn the_expanded_len_is_what_the_tarball_gunzips_to() {
+        let long = format!("{}/workflow.star", "d".repeat(120));
+        let packs = [
+            tree(&[]),
+            tree(&[("workflow.star", b"hello\n")]),
+            tree(&[
+                ("big", &[7u8; 5000]),
+                ("exact", &[1u8; 512]),
+                (long.as_str(), b"x"),
+            ]),
+        ];
+        for pack in packs {
+            let (tarball, len) = pack.tarball_and_expanded_len().expect("tarball");
+            assert_eq!(tarball, pack.tarball().expect("tarball"));
+            let expanded = std::io::copy(
+                &mut flate2::read::GzDecoder::new(&tarball[..]),
+                &mut std::io::sink(),
+            )
+            .expect("gunzip");
+            assert_eq!(
+                len,
+                expanded,
+                "{:?}",
+                pack.files().keys().collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

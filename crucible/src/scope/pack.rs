@@ -16,8 +16,7 @@ pub enum PackError {
     )]
     OutDirNotEmpty { path: std::path::PathBuf },
     #[error(
-        "pack tar is {bytes} bytes, over the {PACK_TAR_CAP_BYTES}-byte cap — refusing to emit a \
-         pack that can't ride the pod logs whole"
+        "pack tar is {bytes} bytes, over the controller's {PACK_TAR_CAP_BYTES}-byte expanded cap"
     )]
     TarOverCap { bytes: u64 },
     #[error(
@@ -395,14 +394,9 @@ pub(super) fn pack_gz(dir: &Path) -> Result<Vec<u8>> {
 }
 
 fn pack_gz_and_expanded(dir: &Path) -> Result<(Vec<u8>, u64)> {
-    let gz = read_pack(dir)?
-        .tarball()
+    let (gz, expanded) = read_pack(dir)?
+        .tarball_and_expanded_len()
         .context("encoding the pack tarball")?;
-    let expanded = std::io::copy(
-        &mut flate2::read::GzDecoder::new(gz.as_slice()),
-        &mut std::io::sink(),
-    )
-    .context("sizing the pack tarball")?;
     if expanded > PACK_TAR_CAP_BYTES {
         return Err(PackError::TarOverCap { bytes: expanded }.into());
     }
