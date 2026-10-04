@@ -56,7 +56,13 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
                  publishes every completed turn unscored"
             );
         }
-        manifest::ensure_injects_resolve(&manifest, manifest_dir)?;
+        let staged: Vec<&str> = opts
+            .pack
+            .iter()
+            .flat_map(|pack| pack.inputs.keys())
+            .map(|path| path.as_str())
+            .collect();
+        manifest::ensure_injects_resolve(&manifest, manifest_dir, &staged)?;
         let name = match &opts.pack {
             Some(pack) => pack.run_name.as_str(),
             None => manifest_dir

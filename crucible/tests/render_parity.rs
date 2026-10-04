@@ -411,3 +411,49 @@ fn a_delivered_pack_renders_under_its_run_name_not_its_directory() {
     );
     assert!(!yaml.contains("state/pack"), "{yaml}");
 }
+
+/// A delivered pack may inject a file only its run inputs carry (steering, a cursor under
+/// `state/`): the render resolves the inject against the inputs, and still refuses one that
+/// neither the pack nor the inputs provide.
+#[test]
+fn an_inject_resolves_through_the_run_inputs() {
+    let tmp = scratch("inputs-inject");
+    let pack = tmp.path().join("pack");
+    std::fs::create_dir_all(&pack).expect("mkdir pack");
+    write_playbook_pack(&pack);
+    let manifest = pack.join("crucible.toml");
+    let declared = std::fs::read_to_string(&manifest).expect("manifest");
+    std::fs::write(
+        &manifest,
+        format!("{declared}[workspace]\ninject = [\"STEER.md\", \"state/cursor.json\"]\n"),
+    )
+    .expect("manifest");
+    let render_with = |inputs: &[&str]| {
+        render_yaml(
+            &manifest,
+            &delta_profile(),
+            &RenderOpts {
+                pack: Some(PackDelivery {
+                    configmap_name: "crucible-run-7-pack".to_string(),
+                    run_name: "crucible-run-7".to_string(),
+                    inputs: inputs
+                        .iter()
+                        .map(|path| (path.parse().expect("pack path"), b"x".to_vec()))
+                        .collect(),
+                }),
+                playbook: Some(PlaybookLaunch {
+                    max_time: "30m".parse().expect("30m is a duration"),
+                    max_cost: 1.0,
+                    params: BTreeMap::from([("topic".to_string(), "t".to_string())]),
+                }),
+                ..RenderOpts::default()
+            },
+        )
+    };
+
+    let yaml = render_with(&["STEER.md", "state/cursor.json"]).expect("render");
+    assert!(yaml.contains("inputs.tar.gz"), "{yaml}");
+    let err = render_with(&["STEER.md"]).expect_err("an inject nothing provides");
+    assert!(format!("{err:#}").contains("state/cursor.json"), "{err:#}");
+    assert!(!format!("{err:#}").contains("STEER.md ->"), "{err:#}");
+}
