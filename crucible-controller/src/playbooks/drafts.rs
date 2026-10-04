@@ -2460,4 +2460,197 @@ mod tests {
             "{stale_rev}"
         );
     }
+
+    /// Text shaped like a pack's docs: headings over lines drawn from a pool of 512 sentences, so
+    /// gzip finds the repeated phrasing it finds in written prose (about 7x).
+    fn pack_prose(len: usize, seed: u64) -> String {
+        const WORDS: [&str; 48] = [
+            "the", "pack", "run", "agent", "tree", "file", "step", "build", "image", "draft",
+            "save", "check", "result", "error", "test", "cluster", "pod", "turn", "score",
+            "launch", "workflow", "manifest", "with", "from", "into", "when", "each", "every",
+            "before", "after", "returns", "stores", "reads", "writes", "compiles", "refuses", "a",
+            "an", "of", "to", "is", "and", "or", "not", "this", "that", "its", "once",
+        ];
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move |bound: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            usize::try_from(x % bound).expect("bounded")
+        };
+        let sentences: Vec<String> = (0..512)
+            .map(|_| {
+                let words: Vec<&str> = (0..5 + next(6)).map(|_| WORDS[next(48)]).collect();
+                format!("{}.", words.join(" "))
+            })
+            .collect();
+        let mut out = String::with_capacity(len + 256);
+        let mut line = 0;
+        while out.len() < len {
+            if line % 24 == 0 {
+                out.push_str(&format!("\n## Section {}\n\n", next(1000)));
+            }
+            out.push_str(&sentences[next(512)]);
+            out.push(' ');
+            out.push_str(&sentences[next(512)]);
+            out.push('\n');
+            line += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn percentile(samples: &[f64], p: f64) -> f64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let rank = (p * sorted.len() as f64).ceil() as usize;
+        sorted[rank.clamp(1, sorted.len()) - 1]
+    }
+
+    async fn relation_bytes(pool: &PgPool) -> Vec<(&'static str, i64)> {
+        let mut sizes = Vec::new();
+        for table in [
+            "pack_trees",
+            "pack_tree_files",
+            "pack_blobs",
+            "playbook_draft_versions",
+        ] {
+            let bytes: Option<i64> =
+                sqlx::query_scalar("SELECT pg_total_relation_size(to_regclass($1))")
+                    .bind(table)
+                    .fetch_one(pool)
+                    .await
+                    .expect("relation size");
+            if let Some(bytes) = bytes {
+                sizes.push((table, bytes));
+            }
+        }
+        sizes
+    }
+
+    /// The draft save path on a large pack: 40 files of 125 KB of prose saved 20 times, one file
+    /// changed per save, with each phase timed on the same input and the tables' growth.
+    ///
+    /// `cargo nextest run --release -p crucible-controller --run-ignored only --no-capture
+    /// large_pack_save_profile`
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    #[ignore = "a measurement, not a check"]
+    async fn large_pack_save_profile(pool: PgPool) {
+        const FILES: u64 = 40;
+        const FILE_BYTES: usize = 125 * 1024;
+        const SAVES: u64 = 20;
+
+        create(
+            &pool,
+            "studio",
+            "a large drafted pack",
+            DraftSeed::Skeleton,
+            None,
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("the skeleton compiles");
+        let mut files = skeleton();
+        for n in 0..FILES {
+            files.insert(format!("docs/{n:02}.md"), pack_prose(FILE_BYTES, n));
+        }
+        let raw: usize = files.values().map(String::len).sum();
+        let before = relation_bytes(&pool).await;
+
+        let phases = [
+            "json decode",
+            "write_tree",
+            "walk_dir",
+            "tarball encode",
+            "hashes",
+            "compile",
+            "save_version",
+            "db + rest",
+        ];
+        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); phases.len()];
+        let ms = |since: std::time::Instant| since.elapsed().as_secs_f64() * 1000.0;
+        let mut delivered = 0;
+        for save in 0..SAVES {
+            let changed = format!("docs/{:02}.md", save % FILES);
+            files.insert(changed, pack_prose(FILE_BYTES, 1000 + save));
+
+            let body = serde_json::to_vec(&serde_json::json!({ "files": &files })).expect("json");
+            let start = std::time::Instant::now();
+            let decoded: BTreeMap<String, BTreeMap<String, String>> =
+                serde_json::from_slice(&body).expect("decode");
+            let decode = ms(start);
+            assert_eq!(decoded.get("files"), Some(&files));
+
+            let scratch = tempfile::tempdir().expect("tempdir");
+            let root = scratch.path().join("pack");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            let start = std::time::Instant::now();
+            write_tree(&files, &root).expect("write_tree");
+            let write = ms(start);
+            let start = std::time::Instant::now();
+            let walked = crucible_contract::pack_tree::walk_dir(&root).expect("walk");
+            let walk = ms(start);
+            let start = std::time::Instant::now();
+            let encoded =
+                crate::playbooks::pack_trees::EncodedPack::new(walked.tree).expect("encode");
+            let encode = ms(start);
+            delivered = encoded.tarball().len();
+            let start = std::time::Instant::now();
+            let _ = encoded.tree().digest_with_file_hashes();
+            let _ = content_digest(encoded.tarball());
+            let _ = content_digest(encoded.tarball());
+            let hashes = ms(start);
+            let start = std::time::Instant::now();
+            let compiled = compile_tree(&root);
+            let compile = ms(start);
+            assert!(
+                compiled.diagnostics.is_empty(),
+                "{:?}",
+                compiled.diagnostics
+            );
+
+            let start = std::time::Instant::now();
+            save_version(&pool, "studio", files.clone(), None, None)
+                .await
+                .expect("save");
+            let total = ms(start);
+            let rest = total - write - walk - encode - hashes - compile;
+            for (i, value) in [decode, write, walk, encode, hashes, compile, total, rest]
+                .into_iter()
+                .enumerate()
+            {
+                samples[i].push(value);
+            }
+            println!("save {:>2}: {total:>7.1} ms", save + 1);
+        }
+
+        let after = relation_bytes(&pool).await;
+        println!(
+            "\npack: {FILES} files, {raw} raw bytes, {delivered} gzipped ({:.2}x); {SAVES} saves",
+            raw as f64 / delivered as f64
+        );
+        println!(
+            "{:<16} {:>9} {:>9} {:>9}",
+            "phase (ms)", "p50", "p95", "first"
+        );
+        for (phase, values) in phases.iter().zip(&samples) {
+            println!(
+                "{phase:<16} {:>9.1} {:>9.1} {:>9.1}",
+                percentile(values, 0.5),
+                percentile(values, 0.95),
+                values[0]
+            );
+        }
+        println!(
+            "\n{:<24} {:>12} {:>12} {:>12} {:>12}",
+            "relation", "before", "after", "growth", "per save"
+        );
+        for ((table, from), (_, to)) in before.iter().zip(&after) {
+            println!(
+                "{table:<24} {from:>12} {to:>12} {:>12} {:>12}",
+                to - from,
+                (to - from) / i64::try_from(SAVES).expect("saves")
+            );
+        }
+    }
 }
