@@ -48,6 +48,7 @@ added = [
     "otherwise, resolved by the compiler to the answers no other task lists",
     "typed emits: a field may declare its JSON type or labels, checked at run time at the producer and at compile time against over, score readers, and output-decided routes (C-WORKFLOW)",
     "schema_file(): a field may declare a JSON Schema (2020-12) read from the pack; its content is compiled into the plan and consumers read its top-level type (C-WORKFLOW)",
+    "repair = N on agent tasks: a passing turn whose output breaks its declaration resumes the same conversation with the masked notes, within the attempt's deadline and the run's budget (C-WORKFLOW)",
 ]
 changed = [
     "DSL grammar admits dictionaries, conditionals, comprehensions, iteration, user-defined functions, load() and the pure standard library",
