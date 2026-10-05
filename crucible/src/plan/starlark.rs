@@ -1458,10 +1458,24 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
         });
         let Some(asked) = asked else { continue };
         let listed_here = listed.get(&(when.task.clone(), when.question.clone()));
+        let possible = tasks
+            .iter()
+            .find(|route| route.name == when.task)
+            .and_then(|route| {
+                crate::plan::ir::typed_answers(route, &when.question, |name| {
+                    tasks.iter().find(|task| &task.name == name)
+                })
+            })
+            .map(|(_, _, possible)| possible);
         let rest: Vec<Label> = asked
             .labels()
             .into_iter()
             .chain([Label::uncertain()])
+            .filter(|label| {
+                possible
+                    .as_ref()
+                    .is_none_or(|possible| possible.contains(label))
+            })
             .filter(|label| !listed_here.is_some_and(|l| l.contains(label)))
             .filter(|label| !asked.drop.contains(label))
             .collect();
@@ -1494,7 +1508,14 @@ fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
         None | Some(Value::None) => Ok(None),
         Some(Value::Output(output)) => match output.ty {
             None => Ok(Some(output.reference)),
-            Some(declared) if declared.is_list() => Ok(Some(output.reference)),
+            Some(declared) if declared.is_list() => match declared.item_refusal() {
+                None => Ok(Some(output.reference)),
+                Some(why) => Err(CompileError::OverItemsNotStrings {
+                    reference: output.reference.to_string(),
+                    declared,
+                    why,
+                }),
+            },
             Some(declared) => Err(CompileError::OverNotAList {
                 reference: output.reference.to_string(),
                 declared,
@@ -3927,7 +3948,7 @@ workflow(type = "playbook", tasks = [plan, lane])
 
         std::fs::write(
             pack.join("crucible/schemas/lanes.json"),
-            r#"{"type": "array", "items": {"type": "integer"}}"#,
+            r#"{"type": "array", "items": {"type": "string"}, "minItems": 2}"#,
         )
         .unwrap();
         let edited = compile_schema_pack(&pack, SCHEMA_TYPED).unwrap_or_else(|e| panic!("{e}"));
@@ -4223,7 +4244,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
         };
         for ok in [
             r#"{"area": ["scheduler", "frontend"], "urgent": "boolean"}"#,
-            r#"{"area": ["frontend", "uncertain"], "urgent": ["yes", "no"]}"#,
+            r#"{"area": ["scheduler", "uncertain"], "urgent": ["yes", "no"]}"#,
             r#"["area", "urgent"]"#,
         ] {
             let pack = temp_pack("typed-route-ok");
@@ -4241,17 +4262,167 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
                 "which declares it string; \"area\" answers labels from",
             ),
             (
-                r#"{"area": ["scheduler"], "urgent": "string"}"#,
+                r#"{"area": ["scheduler", "frontend"], "urgent": "string"}"#,
                 "which declares it string; \"urgent\" answers \"boolean\" or labels from yes|no|uncertain",
             ),
             (
-                r#"{"area": ["scheduler"]}"#,
+                r#"{"area": ["scheduler", "frontend"]}"#,
                 "reads question \"urgent\" from \"classify\", which declares emits without it",
+            ),
+            (
+                r#"{"area": ["frontend", "uncertain"], "urgent": "boolean"}"#,
+                "task \"fix\": gate.area can never be answered \"scheduler\"; \"gate\" reads it from \"classify\", which declares it one of frontend|uncertain, so it answers only frontend, uncertain",
             ),
         ] {
             let err = typed_error("typed-route-bad", &routed(bad));
             assert!(err.contains(needle), "{bad}: {err}");
         }
+    }
+
+    /// A pack with `schemas/<name>.json` for each schema given, compiled from `source`.
+    fn compile_with_schemas(
+        tag: &str,
+        schemas: &[(&str, &str)],
+        source: &str,
+    ) -> std::result::Result<CompiledWorkflow, String> {
+        let pack = temp_pack(tag);
+        std::fs::create_dir_all(pack.join("schemas")).unwrap();
+        for (name, document) in schemas {
+            std::fs::write(pack.join(format!("schemas/{name}.json")), document).unwrap();
+        }
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .map_err(|error| crate::errors::report(&error));
+        let _ = std::fs::remove_dir_all(&pack);
+        compiled
+    }
+
+    #[test]
+    fn over_a_schema_field_needs_string_items_at_the_over_argument() {
+        let source = "discover = command(name = \"discover\", run = \"./d.sh\", emits = {\"lanes\": schema_file(\"schemas/lanes.json\")})\n\
+                      audit = command(name = \"audit\", run = \"./a.sh\", depends_on = [discover], over = discover.lanes, max_fanout = 4)\n\
+                      workflow(type = \"playbook\", tasks = [discover, audit])\n";
+        for ok in [
+            r#"{"type": "array", "items": {"type": "string"}}"#,
+            r#"{"type": "array", "items": {"enum": ["a", "b"]}}"#,
+            r##"{"type": "array", "$defs": {"lane": {"const": "x"}}, "items": {"$ref": "#/$defs/lane"}}"##,
+        ] {
+            compile_with_schemas("over-items-ok", &[("lanes", ok)], source)
+                .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for (bad, needle) in [
+            (
+                r#"{"type": "array"}"#,
+                "argument \"over\" maps over discover.lanes, which is declared schema (list), but it declares no `items`, so an item may be anything; a mapped instance is named by its item, so `over` needs a list of strings",
+            ),
+            (
+                r#"{"type": "array", "items": {"type": "integer"}}"#,
+                "but its `items` is {\"type\":\"integer\"}, which does not make every item a string",
+            ),
+        ] {
+            let err =
+                compile_with_schemas("over-items-bad", &[("lanes", bad)], source).unwrap_err();
+            assert!(err.contains(needle), "{bad}: {err}");
+            assert!(
+                err.contains(&column_of(source, "audit = command", "over = ")),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_reads_a_schema_typed_source_by_its_enum() {
+        let source = "classify = command(name = \"classify\", run = \"./c.sh\", emits = {\"area\": schema_file(\"schemas/area.json\"), \"urgent\": schema_file(\"schemas/urgent.json\")})\n\
+gate = route(name = \"gate\", depends_on = [classify], source = classify, questions = {\"area\": choice(ask = \"Which?\", options = {\"scheduler\": None, \"frontend\": None}), \"urgent\": noul(ask = \"Now?\")})\n\
+fix = command(name = \"fix\", run = \"./f.sh\", depends_on = [gate], when = gate.area, answers = \"scheduler\")\n\
+rest = command(name = \"rest\", run = \"./r.sh\", depends_on = [gate], when = gate.area, otherwise = True)\n\
+now = command(name = \"now\", run = \"./n.sh\", depends_on = [gate], when = gate.urgent, answers = \"yes\")\n\
+later = command(name = \"later\", run = \"./l.sh\", depends_on = [gate], when = gate.urgent, otherwise = True)\n\
+workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n";
+        let compiled = compile_with_schemas(
+            "route-schema-ok",
+            &[
+                (
+                    "area",
+                    r#"{"type": "string", "enum": ["scheduler", "frontend"]}"#,
+                ),
+                ("urgent", r#"{"type": "boolean"}"#),
+            ],
+            source,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let when = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .and_then(|t| t.when.as_ref())
+                .map(|w| w.is.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            when("rest"),
+            ["frontend"],
+            "otherwise covers only the answers the source can give"
+        );
+        assert_eq!(when("later"), ["no"]);
+
+        for (area, urgent, needle) in [
+            (
+                r#"{"type": "string", "enum": ["scheduler", "backend"]}"#,
+                r#"{"type": "boolean"}"#,
+                "reads question \"area\" from \"classify\", which declares it schema (string); \"area\" answers labels from frontend|scheduler|uncertain",
+            ),
+            (
+                r#"{"type": "string"}"#,
+                r#"{"type": "boolean"}"#,
+                "reads question \"area\" from \"classify\", which declares it schema (string)",
+            ),
+            (
+                r#"{"enum": ["scheduler", "frontend"]}"#,
+                r#"{"type": "string"}"#,
+                "reads question \"urgent\" from \"classify\", which declares it schema (string); \"urgent\" answers \"boolean\" or labels from yes|no|uncertain",
+            ),
+            (
+                r#"{"const": "frontend"}"#,
+                r#"{"type": "boolean"}"#,
+                "task \"fix\": gate.area can never be answered \"scheduler\"; \"gate\" reads it from \"classify\", which declares it schema with no single top-level type, so it answers only frontend",
+            ),
+        ] {
+            let err = compile_with_schemas(
+                "route-schema-bad",
+                &[("area", area), ("urgent", urgent)],
+                source,
+            )
+            .unwrap_err();
+            assert!(err.contains(needle), "{area} / {urgent}: {err}");
+            assert!(err.contains("workflow.star:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_score_schema_whose_enum_names_a_non_number_is_refused() {
+        let source = "m = command(name = \"m\", run = \"true\", emits = {\"score\": schema_file(\"schemas/score.json\")})\n\
+                      p = top_k(name = \"p\", k = 1, direction = \"lower\", depends_on = [m])\n\
+                      workflow(type = \"custom\", tasks = [m, p], result = p)\n";
+        compile_with_schemas(
+            "score-enum-ok",
+            &[("score", r#"{"type": "number", "enum": [1, 2.5]}"#)],
+            source,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let err = compile_with_schemas(
+            "score-enum-bad",
+            &[("score", r#"{"type": "number", "enum": [1, "high"]}"#)],
+            source,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(
+                "task \"p\" reads a numeric `score` from \"m\", which declares it schema (number)"
+            ),
+            "{err}"
+        );
     }
 
     #[test]

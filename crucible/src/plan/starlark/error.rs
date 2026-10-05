@@ -483,6 +483,15 @@ pub enum CompileError {
         reference: String,
         declared: crucible_contract::emits::FieldType,
     },
+    #[error(
+        "argument \"over\" maps over {reference}, which is declared {declared}, but {why}; a mapped \
+         instance is named by its item, so `over` needs a list of strings"
+    )]
+    OverItemsNotStrings {
+        reference: String,
+        declared: crucible_contract::emits::FieldType,
+        why: String,
+    },
 
     #[error("argument {argument:?}: {error}")]
     InvalidIdentifier {
@@ -508,7 +517,10 @@ pub enum CompileError {
     OtherwiseWithoutWhen,
     #[error("a task takes \"answers\" or \"otherwise\", not both")]
     OtherwiseWithAnswers,
-    #[error("unreachable otherwise on {task:?}: every answer of {asked} is listed or dropped")]
+    #[error(
+        "unreachable otherwise on {task:?}: every answer of {asked} is listed, dropped, or one its \
+         source can never give"
+    )]
     UnreachableOtherwise { task: String, asked: String },
     #[error(
         "{asked} cannot answer {label:?}{} (it answers: {declared})",

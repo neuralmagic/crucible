@@ -869,6 +869,19 @@ pub enum PlanError {
         producer: String,
         declared: FieldType,
     },
+    #[error(
+        "task {task:?} maps over {reference}, which {producer:?} declares {declared}, but {why}; a \
+         mapped instance is named by its item, so `over` needs a list of strings"
+    )]
+    OverItemsNotStrings {
+        task: String,
+        reference: String,
+        producer: String,
+        declared: Box<FieldType>,
+        why: String,
+    },
+    #[error("{0}")]
+    WhenNeverAnswered(Box<NeverAnswered>),
     #[error("route task {task:?} declares `over`; routing each element of a list is not supported")]
     RouteWithOver { task: String },
     #[error("task {task:?}: when names {route:?}, which is not one of its dependencies")]
@@ -1013,17 +1026,59 @@ pub enum PlanError {
     },
 }
 
+/// A `when` naming a label its route can never give, because the route's source bounds that
+/// question's field to other answers.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error(
+    "task {task:?}: {route}.{question} can never be answered {label:?}; {route:?} reads it from \
+     {source_task:?}, which declares it {declared}, so it answers only {}",
+    .possible.join(", ")
+)]
+pub struct NeverAnswered {
+    pub task: String,
+    pub route: String,
+    pub question: String,
+    pub label: String,
+    pub source_task: String,
+    pub declared: FieldType,
+    pub possible: Vec<String>,
+}
+
 /// Whether every value of `declared` is an answer an output-decided route accepts for
-/// `question`: one of its labels or `uncertain`, or, for a noul, a boolean.
+/// `question`: one of its labels or `uncertain`, where a boolean answers `yes` or `no`.
 fn answers(question: &Question, declared: &FieldType) -> bool {
-    match (declared, &question.kind) {
-        (FieldType::Boolean, QuestionKind::Noul) => true,
-        (FieldType::OneOf(labels), _) => labels.iter().all(|l| question.resolves_to(l)),
-        (FieldType::Schema(schema), QuestionKind::Noul) => {
-            schema.coarse() == Some(FieldType::Boolean)
-        }
-        _ => false,
-    }
+    declared
+        .route_answers()
+        .is_some_and(|labels| labels.iter().all(|l| question.resolves_to(l)))
+}
+
+/// The answers a route can give `question` when it reads them from a dependency whose emits type
+/// that field with finitely many values the question accepts, with the source task and the type.
+/// `None` for a route a model decides, or one whose source leaves the field untyped, where any
+/// label of the question may arrive, and for a source the route cannot read at all, which
+/// validation refuses on its own.
+pub(crate) fn typed_answers<'a>(
+    route: &Task,
+    question: &QuestionId,
+    find: impl Fn(&TaskName) -> Option<&'a Task>,
+) -> Option<(&'a TaskName, &'a FieldType, BTreeSet<Label>)> {
+    let TaskKind::Route {
+        questions,
+        decider: Decider::Output { task: source },
+    } = &route.task
+    else {
+        return None;
+    };
+    let asked = questions.get(question)?;
+    let source = find(source)?;
+    let Declared::Typed(declared) = source.emits.field(question.as_str()) else {
+        return None;
+    };
+    let possible = declared.route_answers()?;
+    possible
+        .iter()
+        .all(|label| asked.resolves_to(label))
+        .then_some((&source.name, declared, possible))
 }
 
 fn answerable_types(question: &Question) -> String {
@@ -1365,8 +1420,25 @@ impl Plan {
                         question: question(),
                     });
                 }
+                let typed = typed_answers(target, &when.question, |name| {
+                    index.get(name).map(|&i| &self.tasks[i])
+                });
                 let mut listed = BTreeSet::new();
                 for label in &when.is {
+                    if let Some((source, declared, possible)) = &typed
+                        && asked.resolves_to(label)
+                        && !possible.contains(label)
+                    {
+                        return Err(PlanError::WhenNeverAnswered(Box::new(NeverAnswered {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                            label: label.to_string(),
+                            source_task: source.0.clone(),
+                            declared: (*declared).clone(),
+                            possible: possible.iter().map(ToString::to_string).collect(),
+                        })));
+                    }
                     if !asked.resolves_to(label) {
                         return Err(PlanError::WhenUnknownLabel {
                             task: task(),
@@ -1543,7 +1615,17 @@ impl Plan {
                     let producer = &self.tasks[index[&reference.task]];
                     match producer.emits.field(&reference.field.0) {
                         Declared::Unchecked | Declared::Untyped => {}
-                        Declared::Typed(declared) if declared.is_list() => {}
+                        Declared::Typed(declared) if declared.is_list() => {
+                            if let Some(why) = declared.item_refusal() {
+                                return Err(PlanError::OverItemsNotStrings {
+                                    task: task(),
+                                    reference: reference.to_string(),
+                                    producer: reference.task.0.clone(),
+                                    declared: Box::new(declared.clone()),
+                                    why,
+                                });
+                            }
+                        }
                         Declared::Omitted => {
                             return Err(PlanError::OverFieldOmitted {
                                 task: task(),
@@ -1627,16 +1709,26 @@ impl Plan {
             }
         }
         for ((route, question), listed) in &handled {
-            let TaskKind::Route { questions, .. } = &self.tasks[index[route]].task else {
+            let route_task = &self.tasks[index[route]];
+            let TaskKind::Route { questions, .. } = &route_task.task else {
                 continue;
             };
             let Some(asked) = questions.get(question) else {
                 continue;
             };
+            let possible = typed_answers(route_task, question, |name| {
+                index.get(name).map(|&i| &self.tasks[i])
+            })
+            .map(|(_, _, possible)| possible);
             let unrouted: Vec<String> = asked
                 .labels()
                 .into_iter()
                 .chain([Label::uncertain()])
+                .filter(|l| {
+                    possible
+                        .as_ref()
+                        .is_none_or(|possible| possible.contains(l))
+                })
                 .filter(|l| !listed.contains(l) && !asked.drop.contains(l))
                 .map(|l| l.to_string())
                 .collect();
@@ -3190,7 +3282,12 @@ emits = ["lines"]
             plan(vec![classify, noul_route("gate", "classify")]).validate()
         };
         routed(schema(serde_json::json!({"type": "boolean"}))).unwrap();
-        let unanswerable = schema(serde_json::json!({"enum": ["yes", "no"]}));
+        routed(schema(
+            serde_json::json!({"enum": ["yes", "no", "uncertain"]}),
+        ))
+        .unwrap();
+        routed(schema(serde_json::json!({"enum": [true, false]}))).unwrap();
+        let unanswerable = schema(serde_json::json!({"enum": ["yes", "maybe"]}));
         assert_eq!(
             routed(unanswerable.clone()).unwrap_err(),
             PlanError::RouteSourceUnanswerable {
@@ -3200,6 +3297,182 @@ emits = ["lines"]
                 declared: Box::new(unanswerable),
                 expected: "\"boolean\" or labels from yes|no|uncertain".into(),
             }
+        );
+    }
+
+    #[test]
+    fn over_a_schema_field_needs_items_that_are_provably_strings() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let over = |document: serde_json::Value| {
+            let mut discover = agent("discover", &[]);
+            discover.emits = typed(&[("targets", schema(document))]);
+            let mut audit = agent("audit", &["discover"]);
+            audit.over = Some(targets.clone());
+            audit.max_fanout = Some(4);
+            plan(vec![discover, audit]).validate()
+        };
+        for ok in [
+            serde_json::json!({"type": "array", "items": {"type": "string"}}),
+            serde_json::json!({"type": "array", "items": {"enum": ["a", "b"]}}),
+            serde_json::json!({"type": "array", "items": {"const": "only"}}),
+            serde_json::json!({
+                "type": "array",
+                "$defs": {"lane": {"type": "string", "minLength": 1}},
+                "items": {"$ref": "#/$defs/lane"}
+            }),
+            serde_json::json!({"type": "array", "items": {"anyOf": [{"const": "a"}, {"type": "string"}]}}),
+            serde_json::json!({"type": "array", "prefixItems": [{"const": "x"}], "items": false}),
+        ] {
+            over(ok.clone()).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for (bad, why) in [
+            (
+                serde_json::json!({"type": "array"}),
+                "it declares no `items`, so an item may be anything",
+            ),
+            (
+                serde_json::json!({"type": "array", "items": {"type": "integer"}}),
+                "its `items` is {\"type\":\"integer\"}, which does not make every item a string",
+            ),
+            (
+                serde_json::json!({"type": "array", "items": {"enum": ["a", 1]}}),
+                "its `items` is {\"enum\":[\"a\",1]}, which does not make every item a string",
+            ),
+            (
+                serde_json::json!({"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "null"}]}}),
+                "which does not make every item a string",
+            ),
+            (
+                serde_json::json!({"type": "array", "prefixItems": [{"type": "integer"}], "items": {"type": "string"}}),
+                "its `prefixItems[0]` is {\"type\":\"integer\"}",
+            ),
+            (
+                serde_json::json!({"type": "array", "prefixItems": [{"type": "string"}]}),
+                "an item past its `prefixItems` may be anything",
+            ),
+        ] {
+            match over(bad.clone()).unwrap_err() {
+                PlanError::OverItemsNotStrings {
+                    task,
+                    reference,
+                    why: got,
+                    ..
+                } => {
+                    assert_eq!(
+                        (task.as_str(), reference.as_str()),
+                        ("audit", "discover.targets")
+                    );
+                    assert!(got.contains(why), "{bad}: {got}");
+                }
+                other => panic!("{bad}: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_toml_plan_gets_the_same_exact_checks() {
+        let toml = |items: &str| {
+            format!(
+                "version = 1\n[budget]\nusd = 1.0\n\
+                 [[task]]\nname = \"discover\"\nkind = \"command\"\ncommand = \"true\"\n\
+                 emits = {{ lanes = {{ schema = '{{\"type\":\"array\",\"items\":{items}}}' }} }}\n\
+                 [[task]]\nname = \"audit\"\nkind = \"command\"\ncommand = \"true\"\n\
+                 depends_on = [\"discover\"]\nover = {{ task = \"discover\", field = \"lanes\" }}\nmax_fanout = 4\n"
+            )
+        };
+        Plan::from_toml_str(&toml(r#"{"type":"string"}"#))
+            .unwrap()
+            .validate()
+            .unwrap();
+        let err = Plan::from_toml_str(&toml(r#"{"type":"number"}"#))
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(err, PlanError::OverItemsNotStrings { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_numeric_schema_whose_enum_holds_a_non_number_is_no_score() {
+        let scored = |document: serde_json::Value| {
+            let mut e = agent("e", &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: Some(0.5),
+                direction: Some(Direction::Higher),
+            };
+            e.emits = typed(&[("score", schema(document))]);
+            plan(vec![e]).validate()
+        };
+        scored(serde_json::json!({"type": "number", "enum": [0, 0.5, 1]})).unwrap();
+        assert!(matches!(
+            scored(serde_json::json!({"type": "number", "enum": [0, "high"]})).unwrap_err(),
+            PlanError::ScoreNotNumeric { .. }
+        ));
+    }
+
+    #[test]
+    fn a_when_label_a_typed_source_can_never_give_is_refused() {
+        let with = |ty: FieldType, is: &[&str], rest: &[&str]| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[("area", ty)]);
+            plan(vec![
+                classify,
+                output_route("gate", "classify", &[]),
+                on(agent("fix", &["gate"]), "gate", "area", is),
+                on(agent("rest", &["gate"]), "gate", "area", rest),
+            ])
+            .validate()
+        };
+        let enum_of = |labels: &[&str]| schema(serde_json::json!({"enum": labels}));
+        for ty in [
+            one_of(&["scheduler", "frontend"]),
+            enum_of(&["scheduler", "frontend"]),
+        ] {
+            with(ty.clone(), &["scheduler"], &["frontend"]).unwrap_or_else(|e| {
+                panic!("{ty}: labels the source cannot give need no task: {e}")
+            });
+            assert_eq!(
+                with(ty.clone(), &["scheduler"], &["frontend", "uncertain"]).unwrap_err(),
+                PlanError::WhenNeverAnswered(Box::new(NeverAnswered {
+                    task: "rest".into(),
+                    route: "gate".into(),
+                    question: "area".into(),
+                    label: "uncertain".into(),
+                    source_task: "classify".into(),
+                    declared: ty.clone(),
+                    possible: vec!["frontend".into(), "scheduler".into()],
+                })),
+                "{ty}"
+            );
+            assert!(
+                matches!(
+                    with(ty.clone(), &["scheduler"], &[]).unwrap_err(),
+                    PlanError::WhenWithoutLabels { .. }
+                ),
+                "{ty}"
+            );
+        }
+        let untyped = with(FieldType::String, &["scheduler"], &["frontend"]);
+        assert!(
+            matches!(untyped, Err(PlanError::RouteSourceUnanswerable { .. })),
+            "{untyped:?}"
+        );
+        let message = with(
+            enum_of(&["scheduler", "frontend"]),
+            &["scheduler"],
+            &["frontend", "uncertain"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("gate.area can never be answered \"uncertain\""),
+            "{message}"
         );
     }
 

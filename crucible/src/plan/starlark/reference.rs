@@ -106,8 +106,11 @@ fn task_knobs() -> Vec<Kwarg> {
              answer. A `link` is one http(s) url and `links` a list of them, each naming a result \
              the task produced outside the run (a pull request, a pushed branch, an issue), \
              which the run and task views then link out to. A `schema_file(...)` promises a value \
-             its JSON Schema admits; consumers read the schema's top-level `type`, so `over` \
-             needs `\"array\"` and a score `\"number\"` or `\"integer\"`.",
+             its JSON Schema admits, and is checked against each consumer exactly: `over` needs \
+             `\"type\": \"array\"` with string items (by `type`, `const` or `enum`), a score a \
+             numeric `type` with no non-number in its `enum`, and a route a `const`, `enum` or \
+             boolean whose every value it can answer. A `when` label such a source can never give \
+             is refused.",
         ),
         Kwarg::new(
             "emits_files",
