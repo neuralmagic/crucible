@@ -189,6 +189,32 @@ them. On the wire a schema is its JSON text (`{ schema = "..." }` in the TOML,
 `{ path = "RESULT.json", schema = "..." }` for a file), since TOML cannot hold the nulls schemas
 often carry.
 
+### Repair
+
+An agent task can fix its own output instead of failing on it:
+
+```python
+plan = agent(
+    name = "plan",
+    prompt = prompt_file("prompts/plan.md"),
+    emits = {"lanes": schema_file("crucible/schemas/lanes.json")},
+    emits_files = {"RESULT.json": schema_file("crucible/schemas/result.json")},
+    repair = 2,
+)
+```
+
+When a turn passes but its output misses a declared field or file, or breaks a type or schema,
+the engine resumes the same conversation with the validation notes (masked as above) and asks for
+the output and files to be fixed in place, then checks again, up to `repair` times (at most 3).
+Repairs run within the attempt's `timeout`, cost what they cost against the run's budget, and do
+not start once the attempt has spent what the run had left. They are not retries: `attempts`
+stays 1, and when repairs run out the task fails with the note it would have failed with anyway.
+Each mapped instance repairs on its own. A task with no `session` gets a conversation for the
+attempt; one in a session continues it. `command` and `evaluate` refuse `repair`.
+
+Each repair is recorded on the task's `task_result` event under `repairs`, as
+`{label, round, of, cost_usd, notes}` with labels like `audit[RHAI-1] repair 1/2`.
+
 ## Execution semantics
 
 How the executor walks a graph, what one task goes through and how the plan as a whole

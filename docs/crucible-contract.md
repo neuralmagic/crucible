@@ -357,6 +357,9 @@ one is an unknown-name error where it was written, and a did-you-mean never offe
 - `prompt_file(path)` reads a regular UTF-8 file below the pack directory and embeds its contents
   in the generated manifest. Absolute paths, `..`, symlinks, non-files, and oversized inputs are
   rejected.
+- `agent(..., repair = N)` and `skill(..., repair = N)` resume the task's conversation up to N
+  times (at most 3) to fix a passing turn whose output breaks its declared fields or files. See
+  [Work graphs](./work-graphs.md#repair).
 - `schema_file(path)` reads a JSON Schema (draft 2020-12) below the pack directory, under the same
   path policy, and embeds its content as a field type in `emits` or a file's schema in
   `emits_files`. A file that is not a valid 2020-12 schema, or references a remote `$ref`, is
@@ -780,7 +783,9 @@ renders these rather than reading urls out of `output`.
 
 A `plan_admitted` task carries `emits_files` (contract 1.14.0): each declared path, as a string,
 or `{path, schema}` when the declaration gave a schema. A field typed by a schema carries
-`{"schema": "<JSON Schema text>"}` as its `type`.
+`{"schema": "<JSON Schema text>"}` as its `type`. A `task_result` event carries `repairs` (contract 1.14.0), one
+`{label, round, of, cost_usd, notes}` per repair turn an agent task took, omitted when there were
+none; their cost is already part of `cost_usd`.
 
 A `task_result` event carries an additive `agent` object (contract 1.13.0) on an `agent` task and
 on the loop's candidate turn, omitted on every task that runs no agent: `harness`, `model` and
