@@ -161,6 +161,34 @@ A field declared without a type (list form) or a task with no `emits` stays unch
 time. The generated TOML carries the types as a table (`emits = { score = "number" }`) and the
 `plan_admitted` event lists each field with its type.
 
+### Schema types
+
+`schema_file(path)` reads a JSON Schema (draft 2020-12) from the pack and stands in for a type,
+in `emits` and in a dict form of `emits_files`:
+
+```python
+plan = command(
+    name = "plan",
+    run = "./plan.sh",
+    emits = {"lanes": schema_file("crucible/schemas/lanes.json"), "tickets": "integer"},
+    emits_files = {"RESULT.json": schema_file("crucible/schemas/result.json"), "REPORT.md": None},
+)
+```
+
+The schema's content is compiled into the plan, so editing it changes the plan digest. A file
+that is not a valid 2020-12 schema, declares another `$schema`, or references a remote `$ref` is
+a compile error at the call; nothing is fetched. At runtime a passing output whose field the
+schema rejects, or a declared file that is not JSON or does not match, fails the producing task
+like a wrong type, with a note giving the first three errors as instance path and message:
+`output field "lanes" does not match its schema: /1: value is not of type "string"`. Notes never
+repeat the refused value.
+
+Consumers see the schema's top-level `type`: `over` needs `"array"`, a score `"number"` or
+`"integer"`, a `noul` route `"boolean"`. A schema with no single top-level type satisfies none of
+them. On the wire a schema is its JSON text (`{ schema = "..." }` in the TOML,
+`{ path = "RESULT.json", schema = "..." }` for a file), since TOML cannot hold the nulls schemas
+often carry.
+
 ## Execution semantics
 
 How the executor walks a graph, what one task goes through and how the plan as a whole
