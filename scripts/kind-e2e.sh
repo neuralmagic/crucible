@@ -11,6 +11,9 @@
 #   P  the draft published to the registry launches with the same delivery; the registry row and
 #      its revision hold the draft's tree, the launch records the registry row's exposure, and the
 #      registry inspector and a template clone read that tree
+#   U  a save stores only the file contents not already stored: an identical pack in another draft
+#      adds no blob, a save with one file changed adds one, and drafts share the blobs they have
+#      in common; collecting a deleted draft's tree deletes only the blob no other tree holds
 #   F  a failing task parks its launch with the task's error
 #   C  a pack over the delivery budget is refused at save
 #   R  runs survive a controller restart: one finishes while the controller is down, one is
@@ -786,6 +789,38 @@ expect_tree_digest P ".[] | select(.id == \"$DRAFT-pub\")" "$TREE"
 [ "$(jq '[.[] | has("tar_digest")] | any' "$WORK/api.json")" = false ] || fail "[P] the registry list still carries tar_digest"
 pass "[P] the registry inspector and list name the registered tree_digest"
 clone_template P e2e-clone "$DRAFT-pub" "$TREE"
+
+# ---- scenario U ----------------------------------------------------------------------------
+log "[U] saving drafts that share most of the delivery pack's files"
+blob_count() { sql -c "SELECT count(*) FROM pack_blobs"; }
+path_blob() { sql -c "SELECT sha256 FROM pack_tree_files WHERE digest = '$1' AND path = '$2'"; }
+U_PACK="$WORK/blobs"
+cp -R "$PACK" "$U_PACK"
+U_BEFORE=$(blob_count)
+new_draft "$DRAFT-blobs" "$U_PACK"
+[ "$(draft_tree "$DRAFT-blobs" 2)" = "$TREE" ] || fail "[U] a copy of the delivery pack saved tree $(draft_tree "$DRAFT-blobs" 2), not $TREE"
+[ "$(blob_count)" = "$U_BEFORE" ] || fail "[U] saving an identical pack in another draft added $(($(blob_count) - U_BEFORE)) blobs"
+echo "edited $ID" >>"$U_PACK/bulk/a.txt"
+U_BEFORE=$(blob_count)
+crux draft-push "$DRAFT-blobs" "$U_PACK" --base-version 2 --json >"$WORK/push-U3.json"
+[ "$(jq -r .version "$WORK/push-U3.json")" = 3 ] || fail "[U] draft-push: $(cat "$WORK/push-U3.json")"
+U_TREE=$(draft_tree "$DRAFT-blobs" 3)
+[ "$(blob_count)" = $((U_BEFORE + 1)) ] || fail "[U] a save with one file changed added $(($(blob_count) - U_BEFORE)) blobs, not 1"
+U_OWN="$WORK/blobs-own"
+cp -R "$PACK" "$U_OWN"
+echo "own $ID" >>"$U_OWN/bulk/b.txt"
+U_BEFORE=$(blob_count)
+new_draft "$DRAFT-blobs-own" "$U_OWN"
+U_OWN_TREE=$(draft_tree "$DRAFT-blobs-own" 2)
+[ "$(blob_count)" = $((U_BEFORE + 1)) ] || fail "[U] a draft with one file of its own added $(($(blob_count) - U_BEFORE)) blobs, not 1"
+for path in bulk/c.txt check.sh nested/deep/marker.txt; do
+    [ "$(path_blob "$U_TREE" "$path")" = "$(path_blob "$U_OWN_TREE" "$path")" ] &&
+        [ "$(path_blob "$U_TREE" "$path")" = "$(path_blob "$TREE" "$path")" ] || fail "[U] the drafts do not share the blob of $path"
+done
+[ "$(path_blob "$U_TREE" bulk/b.txt)" = "$(path_blob "$TREE" bulk/b.txt)" ] || fail "[U] the edit of bulk/a.txt moved bulk/b.txt's blob"
+[ "$(path_blob "$U_OWN_TREE" bulk/b.txt)" != "$(path_blob "$TREE" bulk/b.txt)" ] || fail "[U] the edited bulk/b.txt reuses the original blob"
+crux draft-delete "$DRAFT-blobs-own" >/dev/null
+pass "[U] saves stored only new file contents: an identical draft added no blob, one changed file added one, and the drafts share the rest"
 
 # ---- scenario F ----------------------------------------------------------------------------
 small_pack "$WORK/fail" 'echo "deliberate failure" >&2
@@ -1853,30 +1888,37 @@ $OK_JSON"
 new_draft "$DRAFT-vfresh" "$WORK/vfresh"
 V_FRESH_TREE=$(draft_tree "$DRAFT-vfresh" 2)
 crux draft-delete "$DRAFT-vfresh" >/dev/null
-sql -c "UPDATE pack_trees SET created_at = '2000-01-01T00:00:00Z' WHERE digest IN ('$V_GC_TREE', '$V_TREE')"
+sql -c "UPDATE pack_trees SET created_at = '2000-01-01T00:00:00Z' WHERE digest IN ('$V_GC_TREE', '$V_TREE', '$U_OWN_TREE')"
 V_PINS=$(v_pins)
-V_GC_ONLY=$(sql -c "SELECT DISTINCT sha256 FROM pack_tree_files WHERE digest = '$V_GC_TREE'
-    AND sha256 NOT IN (SELECT sha256 FROM pack_tree_files WHERE digest <> '$V_GC_TREE') ORDER BY 1")
-[ -n "$V_GC_ONLY" ] || fail "[V] the collectable tree holds no blob of its own"
-V_KEPT_BLOBS=$(sql -c "SELECT count(DISTINCT sha256) FROM pack_tree_files WHERE digest IN ('$V_TREE', '$V_FRESH_TREE')")
+V_GC_ONLY=$(sql -c "SELECT DISTINCT sha256 FROM pack_tree_files WHERE digest IN ('$V_GC_TREE', '$U_OWN_TREE')
+    AND sha256 NOT IN (SELECT sha256 FROM pack_tree_files WHERE digest NOT IN ('$V_GC_TREE', '$U_OWN_TREE')) ORDER BY 1")
+[ -n "$V_GC_ONLY" ] || fail "[V] the collectable trees hold no blob of their own"
+grep -qx "$(path_blob "$U_OWN_TREE" bulk/b.txt)" <<<"$V_GC_ONLY" ||
+    fail "[V] the deleted draft's own blob is held by another tree"
+V_KEPT_BLOBS=$(sql -c "SELECT count(DISTINCT sha256) FROM pack_tree_files WHERE digest IN ('$V_TREE', '$V_FRESH_TREE', '$U_TREE')")
 
 stop_controller
 start_controller
 [ "$(conversion_report "$BOOT")" = none ] || fail "[V] boot $BOOT converted again: $(conversion_report "$BOOT")"
 [ "$(v_pins)" = "$V_PINS" ] || fail "[V] a restart moved the pins to $(v_pins)"
-[ "$(collected_report "$BOOT")" = "1 $(wc -l <<<"$V_GC_ONLY" | tr -d ' ')" ] ||
-    fail "[V] boot $BOOT collected '$(collected_report "$BOOT")' trees and blobs, not the one unpinned old tree and the blobs only it held"
+[ "$(collected_report "$BOOT")" = "2 $(wc -l <<<"$V_GC_ONLY" | tr -d ' ')" ] ||
+    fail "[V] boot $BOOT collected '$(collected_report "$BOOT")' trees and blobs, not the two unpinned old trees and the blobs only they held"
 for sha in $V_GC_ONLY; do
     [ "$(sql -c "SELECT count(*) FROM pack_blobs WHERE sha256 = '$sha'")" = 0 ] || fail "[V] blob $sha only the collected tree held is still stored"
 done
-[ "$(sql -c "SELECT count(*) FROM pack_blobs WHERE sha256 IN (SELECT sha256 FROM pack_tree_files WHERE digest IN ('$V_TREE', '$V_FRESH_TREE'))")" = "$V_KEPT_BLOBS" ] ||
+[ "$(sql -c "SELECT count(*) FROM pack_blobs WHERE sha256 IN (SELECT sha256 FROM pack_tree_files WHERE digest IN ('$V_TREE', '$V_FRESH_TREE', '$U_TREE'))")" = "$V_KEPT_BLOBS" ] ||
     fail "[V] collection deleted a blob a kept tree holds"
-[ "$(sql -F ' ' -c "SELECT (SELECT count(*) FROM pack_trees WHERE digest = '$V_GC_TREE'), (SELECT count(*) FROM pack_tree_files WHERE digest = '$V_GC_TREE')")" = "0 0" ] ||
-    fail "[V] the unpinned old tree is still stored"
-for kept in "$V_TREE" "$V_FRESH_TREE"; do
+for gone in "$V_GC_TREE" "$U_OWN_TREE"; do
+    [ "$(sql -F ' ' -c "SELECT (SELECT count(*) FROM pack_trees WHERE digest = '$gone'), (SELECT count(*) FROM pack_tree_files WHERE digest = '$gone')")" = "0 0" ] ||
+        fail "[V] the unpinned old tree $gone is still stored"
+done
+for kept in "$V_TREE" "$V_FRESH_TREE" "$U_TREE"; do
     [ -n "$(tree_tarball "$kept")" ] && [ -n "$(tree_paths "$kept")" ] || fail "[V] collection removed $kept"
 done
-pass "[V] a restart collected the unpinned old tree and the blobs only it held, and kept the pinned and fresh trees and their blobs; the pins held"
+pass "[V] a restart collected the unpinned old trees and the blobs only they held, and kept the pinned and fresh trees and their blobs; the pins held"
+launch_and_check V-blobs draft-launch "$DRAFT-blobs"
+[ "$LAUNCH_TREE" = "$U_TREE" ] || fail "[V] the launch ran tree $LAUNCH_TREE, not $U_TREE"
+pass "[V] a draft sharing blobs with a collected tree still delivers"
 
 expect_released V-restart e2e-vpub
 crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V-same.json"
