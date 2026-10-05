@@ -30,7 +30,7 @@ decision = """
 
 **Wire.** A schema is carried as its JSON text: `{"schema": "<text>"}` for a field type, `{"path": ..., "schema": "<text>"}` for a declared file. A declared file without a schema stays a bare path string. The text is the document `serde_json` re-serializes, so the plan pins the content and an edit to the schema file changes the digest.
 
-**Consumers.** A schema satisfies a consumer through its top-level `type` alone: `array` as a list, `number` or `integer` as a number, `boolean` for a noul. A schema with no single top-level type satisfies none of them.
+**Consumers.** A schema satisfies each built-in consumer exactly, read without evaluating it: `over` needs `type: array` with items that are provably strings (by `type`, `const`, or `enum`, through local `$ref`, `allOf`, or every `anyOf`/`oneOf` branch), since the runtime names an instance by its item; a score needs a numeric `type` and no non-number in its `const` or `enum`; a route needs every value the schema bounds (`const`, `enum`, or `type: boolean`) to be an answer the question accepts. A `when` label such a source can never give is refused. A schema with no single top-level type satisfies none of them.
 
 **Notes.** A refusal gives the first three errors as instance path and message, masked so the note does not repeat the refused value; the note is persisted and served and the output is not.
 
@@ -39,7 +39,7 @@ consequences = """
 - A producer's output and declared JSON files can be held to a shape, and a mismatch fails at the producer with a note naming where.
 - Plans that use schemas are larger by the schema text, and `plan_admitted` carries it per task. `schema_file()` is bounded at 64 KiB per file and shares the embed budget with prompts.
 - The schema text in TOML and JSON is a string, so a reader of the generated manifest or the event parses it a second time to see the document.
-- Consumers know only the top-level type. A schema that promises a list of objects passes `over` as a list; nothing at compile time checks that a mapped task reads the item's fields correctly.
+- The compile-time reading is syntactic: it proves what `type`, `const`, `enum`, local `$ref`, `allOf`, `anyOf` and `oneOf` say and refuses anything it cannot prove, so a schema that constrains its values another way (`pattern`, `not`, `if`/`then`) must also state them in one of those keywords to satisfy a consumer. It does not check that a mapped item's string is a usable key (non-empty, no brackets, unique); the runtime still refuses those.
 - Validation compiles the schema per check. It runs once per passing attempt per typed field or file, which is cheap next to the task itself.
 - `format` is an annotation under 2020-12 and is not asserted, as the crate defaults.
 - An older engine cannot run a plan that uses schemas. [[RFC-0004:C-CONTRACT-VERSION]] already keeps dispatch images in step with the controller."""
@@ -89,4 +89,4 @@ text = "Derive consumer compatibility by checking the schema against a canonical
 status = "rejected"
 pros = ["Could check item shapes for over."]
 cons = ["Schema subsumption is undecidable in general and the crate offers no such check."]
-rejection_reason = "The top-level type is what consumers rely on today; deeper checks have no library to stand on."
+rejection_reason = "Schema subsumption has no library to stand on; the keyword reading each consumer needs is small and exact."
