@@ -46,6 +46,7 @@ pub(crate) fn plan_admitted_event(
                         ty: ty.cloned(),
                     })
                     .collect(),
+                emits_files: t.emits_files.clone(),
                 timeout: t
                     .timeout
                     .as_ref()
@@ -253,6 +254,52 @@ mod tests {
             line.contains(r#""emits":[{"field":"score","type":"number"},{"field":"tier","type":["high","low"]}]"#),
             "{line}"
         );
+    }
+
+    #[test]
+    fn the_admitted_plan_carries_each_schema_and_each_declared_file() {
+        use crucible_contract::emits::{DeclaredFile, EmitWire, FieldType, JsonSchema};
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "plan"
+            kind = "command"
+            command = "true"
+            emits = { lanes = { schema = '{"type":"array","items":{"type":"string"}}' } }
+            emits_files = ["REPORT.md", { path = "RESULT.json", schema = '{"type":"object"}' }]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let event = crate::plan::events::plan_admitted_event(&plan, None);
+        let SessionEvent::PlanAdmitted { tasks, .. } = &event else {
+            panic!("not a plan_admitted event");
+        };
+        let lanes = JsonSchema::parse(r#"{"type":"array","items":{"type":"string"}}"#).unwrap();
+        assert_eq!(
+            tasks[0].emits,
+            [EmitWire {
+                field: "lanes".into(),
+                ty: Some(FieldType::Schema(lanes)),
+            }]
+        );
+        assert_eq!(
+            tasks[0].emits_files,
+            [
+                DeclaredFile::from("REPORT.md"),
+                DeclaredFile {
+                    path: "RESULT.json".into(),
+                    schema: Some(JsonSchema::parse(r#"{"type":"object"}"#).unwrap()),
+                },
+            ]
+        );
+        let line = crucible_contract::encode(&event);
+        let back = crucible_contract::decode(&line).expect("decodes");
+        assert_eq!(crucible_contract::encode(&back), line);
     }
 
     /// The urls a reader renders come off the declared `link`/`links` fields alone, parsed by the

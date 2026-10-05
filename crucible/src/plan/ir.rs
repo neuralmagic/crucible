@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use crucible_contract::decision::{
     Label, Question, QuestionError, QuestionId, QuestionKind, UNCERTAIN,
 };
-use crucible_contract::emits::{FieldType, FieldTypeError};
+use crucible_contract::emits::{DeclaredFile, FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
 
 /// The reserved input a task that declares a history depth receives its launch series' earlier
@@ -471,11 +471,12 @@ pub struct Task {
     /// routes, `over`) at validation. Empty = undeclared.
     #[serde(default, skip_serializing_if = "Emits::is_empty")]
     pub emits: Emits,
-    /// Workspace-relative paths this task's output includes as files. A declared file is part
-    /// of the task's output, not part of the workspace state that isolation discards, so a
-    /// dependent receives it either way.
+    /// Workspace-relative paths this task's output includes as files, each with the schema its
+    /// JSON content must satisfy when one is declared. A declared file is part of the task's
+    /// output, not part of the workspace state that isolation discards, so a dependent receives
+    /// it either way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub emits_files: Vec<String>,
+    pub emits_files: Vec<DeclaredFile>,
     /// An upstream list this task runs once per element of. The task is one node in the graph
     /// however many elements arrive, so the graph stays renderable before any spend; only the
     /// number of instances is decided at run time.
@@ -1000,6 +1001,9 @@ fn answers(question: &Question, declared: &FieldType) -> bool {
     match (declared, &question.kind) {
         (FieldType::Boolean, QuestionKind::Noul) => true,
         (FieldType::OneOf(labels), _) => labels.iter().all(|l| question.resolves_to(l)),
+        (FieldType::Schema(schema), QuestionKind::Noul) => {
+            schema.coarse() == Some(FieldType::Boolean)
+        }
         _ => false,
     }
 }
@@ -1520,9 +1524,8 @@ impl Plan {
                     }
                     let producer = &self.tasks[index[&reference.task]];
                     match producer.emits.field(&reference.field.0) {
-                        Declared::Unchecked
-                        | Declared::Untyped
-                        | Declared::Typed(FieldType::List) => {}
+                        Declared::Unchecked | Declared::Untyped => {}
+                        Declared::Typed(declared) if declared.is_list() => {}
                         Declared::Omitted => {
                             return Err(PlanError::OverFieldOmitted {
                                 task: task(),
@@ -1752,7 +1755,7 @@ impl Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::ir::*;
 
     fn agent(name: &str, deps: &[&str]) -> Task {
         Task {
@@ -3086,6 +3089,123 @@ emits = ["lines"]
                 }
             );
         }
+    }
+
+    fn schema(document: serde_json::Value) -> FieldType {
+        FieldType::Schema(crucible_contract::emits::JsonSchema::new(document).unwrap())
+    }
+
+    #[test]
+    fn a_schema_field_satisfies_a_consumer_through_its_top_level_type() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let over = |ty: FieldType| {
+            let mut discover = agent("discover", &[]);
+            discover.emits = typed(&[("targets", ty)]);
+            let mut audit = agent("audit", &["discover"]);
+            audit.over = Some(targets.clone());
+            audit.max_fanout = Some(4);
+            plan(vec![discover, audit]).validate()
+        };
+        over(schema(
+            serde_json::json!({"type": "array", "items": {"type": "string"}}),
+        ))
+        .unwrap();
+        for bad in [
+            schema(serde_json::json!({"type": "object"})),
+            schema(serde_json::json!({"items": {"type": "string"}})),
+            schema(serde_json::json!({"type": ["array", "null"]})),
+        ] {
+            assert_eq!(
+                over(bad.clone()).unwrap_err(),
+                PlanError::OverNotAList {
+                    task: "audit".into(),
+                    reference: "discover.targets".into(),
+                    producer: "discover".into(),
+                    declared: bad,
+                }
+            );
+        }
+
+        let scored = |ty: FieldType| {
+            let mut e = agent("e", &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: Some(0.5),
+                direction: Some(Direction::Higher),
+            };
+            e.emits = typed(&[("score", ty)]);
+            plan(vec![e]).validate()
+        };
+        scored(schema(serde_json::json!({"type": "number", "minimum": 0}))).unwrap();
+        scored(schema(serde_json::json!({"type": "integer"}))).unwrap();
+        let unscored = schema(serde_json::json!({"minimum": 0}));
+        assert_eq!(
+            scored(unscored.clone()).unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "e".into(),
+                source_task: "e".into(),
+                declared: unscored,
+            }
+        );
+
+        let routed = |ty: FieldType| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[("urgent", ty)]);
+            plan(vec![classify, noul_route("gate", "classify")]).validate()
+        };
+        routed(schema(serde_json::json!({"type": "boolean"}))).unwrap();
+        let unanswerable = schema(serde_json::json!({"enum": ["yes", "no"]}));
+        assert_eq!(
+            routed(unanswerable.clone()).unwrap_err(),
+            PlanError::RouteSourceUnanswerable {
+                task: "gate".into(),
+                source_task: "classify".into(),
+                question: "urgent".into(),
+                declared: Box::new(unanswerable),
+                expected: "\"boolean\" or labels from yes|no|uncertain".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_task_with_schema_types_round_trips_through_json_and_toml() {
+        let mut t = agent("probe", &[]);
+        t.emits = typed(&[(
+            "lanes",
+            schema(serde_json::json!({"type": "array", "items": {"default": null}})),
+        )]);
+        t.emits_files = vec![
+            "REPORT.md".into(),
+            DeclaredFile {
+                path: "RESULT.json".into(),
+                schema: Some(
+                    crucible_contract::emits::JsonSchema::new(
+                        serde_json::json!({"type": "object", "properties": {"x": {"const": null}}}),
+                    )
+                    .unwrap(),
+                ),
+            },
+        ];
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.emits, t.emits);
+        assert_eq!(back.emits_files, t.emits_files);
+        let toml = toml::to_string(&t).unwrap();
+        let back: Task = toml::from_str(&toml).unwrap();
+        assert_eq!(back.emits, t.emits);
+        assert_eq!(back.emits_files, t.emits_files);
+
+        let untyped = agent("plain", &[]);
+        let mut listed = untyped.clone();
+        listed.emits_files = vec!["A.md".into(), "B.md".into()];
+        assert!(
+            serde_json::to_string(&listed)
+                .unwrap()
+                .contains(r#""emits_files":["A.md","B.md"]"#)
+        );
     }
 
     #[test]

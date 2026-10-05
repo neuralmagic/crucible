@@ -2251,6 +2251,14 @@ fn emits_violation(emits: &crate::plan::ir::Emits, value: &Value) -> Option<Stri
         if let Some(why) = ty.link_refusal(found) {
             return Some(format!("output field {:?} declared {ty}: {why}", field.0));
         }
+        if let crucible_contract::emits::FieldType::Schema(schema) = ty
+            && let Some(why) = schema.refusal(found)
+        {
+            return Some(format!(
+                "output field {:?} does not match its schema: {why}",
+                field.0
+            ));
+        }
         Some(match (ty, found) {
             (crucible_contract::emits::FieldType::OneOf(_), Value::String(label)) => {
                 format!("output field {:?} is {label:?}, declared {ty}", field.0)
@@ -4150,6 +4158,17 @@ mod tests {
                 json!("https://github.com/o/r/pull/1"),
                 "declared links: string is not a list",
             ),
+            (
+                FieldType::Schema(
+                    crucible_contract::emits::JsonSchema::new(
+                        json!({"type": "array", "items": {"type": "string"}}),
+                    )
+                    .unwrap(),
+                ),
+                json!(["a", "b"]),
+                json!(["a", 2]),
+                "does not match its schema: /1: value is not of type \"string\"",
+            ),
         ];
         for (ty, good, bad, note) in cases {
             let plan = valid(
@@ -5082,7 +5101,7 @@ mod tests {
     #[test]
     fn only_passing_instances_stage_their_files_downstream() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let mut consumer = task("roundup", &["audit"], "any", true);
         consumer.join = Join::Passed;
         let plan = valid(
@@ -5862,7 +5881,7 @@ mod tests {
     #[test]
     fn a_failed_producers_files_reach_a_settled_dependent_and_not_a_settled_descendant() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let plan = valid(
             vec![
                 probe,
@@ -5896,7 +5915,7 @@ mod tests {
     #[test]
     fn the_files_flag_is_false_without_a_set_staged_for_this_consumer() {
         let mut hoard = task("hoard", &[], "any", false);
-        hoard.emits_files = vec!["evidence/hoard.json".to_string()];
+        hoard.emits_files = vec!["evidence/hoard.json".into()];
         let plan = valid(
             vec![
                 task("quiet", &[], "any", false),
@@ -5931,7 +5950,7 @@ mod tests {
     #[test]
     fn a_mapped_producers_files_flag_is_per_instance() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let plan = valid(
             vec![
                 task("discover", &[], "any", true),
@@ -6103,7 +6122,7 @@ mod tests {
     #[test]
     fn a_failed_mapped_grandparents_instances_reach_no_settled_descendant() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let plan = valid(
             vec![
                 task("discover", &[], "any", true),
@@ -6138,7 +6157,7 @@ mod tests {
     #[test]
     fn a_passed_join_is_staged_nothing_from_a_failed_direct_dependency() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let mut roundup = task("roundup", &["probe", "other"], "any", true);
         roundup.join = Join::Passed;
         let plan = valid(vec![probe, task("other", &[], "any", false), roundup], 10.0);
@@ -6319,11 +6338,11 @@ mod tests {
     #[test]
     fn an_epilogue_is_staged_with_failed_and_passing_main_graph_evidence() {
         let mut build = task("build", &[], "any", true);
-        build.emits_files = vec!["evidence/build.json".to_string()];
+        build.emits_files = vec!["evidence/build.json".into()];
         let mut probe = task("probe", &["build"], "any", true);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let mut deliver = task("deliver", &["probe"], "any", true);
-        deliver.emits_files = vec!["DELIVER.md".to_string()];
+        deliver.emits_files = vec!["DELIVER.md".into()];
         let plan = valid(
             vec![build, probe, deliver, epilogue("report", &[], true)],
             10.0,
@@ -6356,7 +6375,7 @@ mod tests {
     #[test]
     fn an_epilogue_reports_no_files_for_a_failure_without_a_captured_set() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let plan = valid(vec![probe, epilogue("report", &[], true)], 10.0);
         let mut r = ScriptRunner::new();
         r.on(
@@ -6376,9 +6395,9 @@ mod tests {
     #[test]
     fn an_epilogue_is_not_staged_with_a_skipped_or_transport_failed_set() {
         let mut quiet = task("quiet", &[], "any", false);
-        quiet.emits_files = vec!["evidence/quiet.json".to_string()];
+        quiet.emits_files = vec!["evidence/quiet.json".into()];
         let mut flaky = task("flaky", &[], "any", false);
-        flaky.emits_files = vec!["evidence/flaky.json".to_string()];
+        flaky.emits_files = vec!["evidence/flaky.json".into()];
         let plan = valid(vec![quiet, flaky, epilogue("report", &[], true)], 10.0);
         let mut r = ScriptRunner::new();
         r.captured.insert("quiet".to_string());
@@ -6414,7 +6433,7 @@ mod tests {
     #[test]
     fn an_epilogue_is_staged_with_each_mapped_instances_set() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let plan = valid(
             vec![
                 task("discover", &[], "any", true),
@@ -6447,9 +6466,9 @@ mod tests {
     #[test]
     fn a_main_graph_task_is_not_staged_with_unrelated_failure_evidence() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let mut other = task("other", &[], "any", true);
-        other.emits_files = vec!["evidence/other.json".to_string()];
+        other.emits_files = vec!["evidence/other.json".into()];
         let plan = valid(
             vec![
                 probe,
@@ -6909,7 +6928,7 @@ mod tests {
         );
         let mut plan_tasks = plan.plan().tasks.clone();
         for t in &mut plan_tasks {
-            t.emits_files = vec![format!("{}.json", t.name)];
+            t.emits_files = vec![format!("{}.json", t.name).into()];
         }
         let plan = valid(plan_tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -7202,7 +7221,7 @@ mod tests {
     fn the_reviewers_captured_evidence_is_staged_into_every_target() {
         let mut tasks = fix_chain(Join::All).plan().tasks.clone();
         for t in &mut tasks {
-            t.emits_files = vec![format!("{}.json", t.name)];
+            t.emits_files = vec![format!("{}.json", t.name).into()];
         }
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();

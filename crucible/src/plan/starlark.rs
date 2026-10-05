@@ -40,7 +40,7 @@ use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 use crucible_contract::decision::{
     ChoiceOption, IdentError, Label, NOUL_YES, Question, QuestionId, QuestionKind, UNCERTAIN,
 };
-use crucible_contract::emits::FieldType;
+use crucible_contract::emits::{DeclaredFile, FieldType};
 
 type Result<T> = std::result::Result<T, CompileError>;
 
@@ -1205,7 +1205,7 @@ fn check_fanout(task: &Task) -> Result<()> {
 
 /// The paths a task promises as output. Shape is checked here, where the author wrote them: an
 /// absolute path or a `..` cannot be a workspace-relative output whatever the filesystem says.
-fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>> {
+fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<DeclaredFile>> {
     let Some(value) = named.remove("emits_files") else {
         return Ok(Vec::new());
     };
@@ -1219,7 +1219,7 @@ fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>
         };
         let relative = safe_relative_path(&path)
             .map_err(|_| CompileError::EmitsFileNotRelative { path: path.clone() })?;
-        paths.push(relative.display().to_string());
+        paths.push(DeclaredFile::from(relative.display().to_string()));
     }
     Ok(paths)
 }
@@ -1423,7 +1423,8 @@ fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     match named.remove("over") {
         None | Some(Value::None) => Ok(None),
         Some(Value::Output(output)) => match output.ty {
-            None | Some(FieldType::List) => Ok(Some(output.reference)),
+            None => Ok(Some(output.reference)),
+            Some(declared) if declared.is_list() => Ok(Some(output.reference)),
             Some(declared) => Err(CompileError::OverNotAList {
                 reference: output.reference.to_string(),
                 declared,
@@ -4521,7 +4522,7 @@ workflow(type = "playbook", tasks = [discover, audit])
             .iter()
             .find(|t| t.name.0 == "analyze")
             .expect("analyze");
-        assert_eq!(analyze.emits_files, ["SPEC.md"]);
+        assert_eq!(analyze.emits_files, [DeclaredFile::from("SPEC.md")]);
         let TaskKind::Agent { prompt, .. } = &analyze.task else {
             panic!("a skill is an agent task")
         };
@@ -5845,7 +5846,7 @@ workflow(type = "playbook", tasks = [a])
         assert_eq!(prompt.matches(EXTERNAL_OPEN).count(), 1, "{prompt}");
 
         // It is an ordinary agent task in every other respect.
-        assert_eq!(task.emits_files, ["SPEC.md"]);
+        assert_eq!(task.emits_files, [DeclaredFile::from("SPEC.md")]);
         assert_eq!(
             compiled.prompt_files,
             [PathBuf::from("skills/analyze/SKILL.md")]
@@ -6258,7 +6259,10 @@ workflow(reviews + [gate("gate", reviews)])
         let pack = temp_pack("declared-path");
         let source = "a = agent(name = \"a\", prompt = \"p\", emits_files = [\"./A.md\"])\nworkflow(type = \"playbook\", tasks = [a])\n";
         let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
-        assert_eq!(compiled.workflow.tasks[0].emits_files, ["A.md"]);
+        assert_eq!(
+            compiled.workflow.tasks[0].emits_files,
+            [DeclaredFile::from("A.md")]
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 

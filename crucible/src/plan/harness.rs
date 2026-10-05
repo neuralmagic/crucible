@@ -21,6 +21,7 @@ use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
 use crate::plan::turn_log::{Heartbeat, TurnLog};
 use crucible_contract::TransportCause;
+use crucible_contract::emits::DeclaredFile;
 use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,14 +151,14 @@ fn fingerprint(path: &Path) -> Fingerprint {
 struct PriorContents(BTreeMap<String, Fingerprint>);
 
 impl PriorContents {
-    fn of(workspace: &Path, declared: &[String]) -> Self {
+    fn of(workspace: &Path, declared: &[DeclaredFile]) -> Self {
         PriorContents(
             declared
                 .iter()
-                .map(|path| {
-                    let held = confined(workspace, path)
+                .map(|file| {
+                    let held = confined(workspace, &file.path)
                         .map_or(Fingerprint::Unreadable, |resolved| fingerprint(&resolved));
-                    (path.clone(), held)
+                    (file.path.clone(), held)
                 })
                 .collect(),
         )
@@ -252,7 +253,7 @@ impl TaskRunner for HarnessRunner {
             .flat_map(|producer| {
                 producer.emits_files.iter().map(|declared| StagedInput {
                     producer: producer.name.0.clone(),
-                    declared: declared.clone(),
+                    declared: declared.path.clone(),
                 })
             })
             .collect();
@@ -492,8 +493,9 @@ fn run_task(cx: &Dispatch<'_>, task: &Task, job: Job<'_>, pending: Option<&str>)
 /// Take a settled attempt's declared files, or withhold the whole set.
 ///
 /// A declared file that is absent after an otherwise-passing attempt is output drift, and it
-/// fails at the task that promised it rather than as a mystery in whatever depended on it. It is
-/// not retried: a task that ran and did not produce what it promised will not produce it twice.
+/// fails at the task that promised it rather than as a mystery in whatever depended on it. So is
+/// a declared file whose captured content its schema does not admit. Neither is retried: a task
+/// that ran and did not produce what it promised will not produce it twice.
 ///
 /// A failing attempt's set is captured too, for a consumer joining `settled`, and it is captured
 /// before [`TaskRunner::settled`] discards the workspace. On that path a declared path counts
@@ -527,7 +529,8 @@ fn capture_declared(
     let _ = std::fs::remove_dir_all(&staging);
     let mut charged = 0u64;
     let taken = (|| -> Result<(), String> {
-        for declared in &task.emits_files {
+        for file in &task.emits_files {
+            let declared = &file.path;
             let from = confined(workspace, declared)?;
             let size = match std::fs::metadata(&from) {
                 Ok(metadata) if metadata.is_file() => metadata.len(),
@@ -564,6 +567,13 @@ fn capture_declared(
             std::fs::copy(&from, &to)
                 .map_err(|error| format!("capturing {declared:?}: {error}"))?;
             engine_mode(&to);
+            if !failing && file.schema.is_some() {
+                let bytes = std::fs::read(&to)
+                    .map_err(|error| format!("reading captured {declared:?}: {error}"))?;
+                if let Some(why) = file.refusal(&bytes) {
+                    return Err(why);
+                }
+            }
         }
         Ok(())
     })();
@@ -1299,7 +1309,7 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: crate::plan::ir::Emits::default(),
-            emits_files: files.iter().map(|f| (*f).to_string()).collect(),
+            emits_files: files.iter().map(|f| DeclaredFile::from(*f)).collect(),
             over: None,
             max_fanout: None,
             when: None,

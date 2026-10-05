@@ -160,6 +160,10 @@ pub struct PlanTaskWire {
     /// Empty when the task declares none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<crate::emits::EmitWire>,
+    /// The files the task's output includes, each with its schema when the declaration gave one.
+    /// Empty when the task declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits_files: Vec<crate::emits::DeclaredFile>,
     /// How long one attempt may run (`90s`, `10m`, `2h`), empty when the task declares no limit
     /// and only the run's wall-clock ceiling bounds it.
     #[serde(default)]
@@ -903,6 +907,26 @@ mod tests {
                         field: "note".into(),
                         ty: None,
                     },
+                    crate::emits::EmitWire {
+                        field: "lanes".into(),
+                        ty: Some(crate::emits::FieldType::Schema(
+                            crate::emits::JsonSchema::new(serde_json::json!({
+                                "type": "array",
+                                "items": {"type": "string", "default": null}
+                            }))
+                            .expect("a valid schema"),
+                        )),
+                    },
+                ],
+                emits_files: vec![
+                    "REPORT.md".into(),
+                    crate::emits::DeclaredFile {
+                        path: "RESULT.json".into(),
+                        schema: Some(
+                            crate::emits::JsonSchema::new(serde_json::json!({"type": "object"}))
+                                .expect("a valid schema"),
+                        ),
+                    },
                 ],
                 timeout: "10m".into(),
                 history_depth: 5,
@@ -972,6 +996,7 @@ mod tests {
             revise,
             max_rounds: 0,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             timeout: String::new(),
             history_depth: 0,
         };

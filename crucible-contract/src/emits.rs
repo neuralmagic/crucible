@@ -6,7 +6,7 @@
 
 use std::collections::BTreeSet;
 
-use serde::de::{self, Deserializer, SeqAccess, Visitor};
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -17,7 +17,8 @@ use crate::link::ExternalLink;
 /// The JSON type one declared output field holds.
 ///
 /// Written as its token (`"string"`, `"integer"`, `"number"`, `"boolean"`, `"list"`, `"object"`,
-/// `"link"`, `"links"`) or as a list of labels, which declares a string that is one of them.
+/// `"link"`, `"links"`), as a list of labels, which declares a string that is one of them, or as
+/// `{"schema": "<JSON Schema text>"}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FieldType {
     String,
@@ -34,6 +35,8 @@ pub enum FieldType {
     Links,
     /// A string equal to one of these labels.
     OneOf(Vec<Label>),
+    /// A value this JSON Schema admits.
+    Schema(JsonSchema),
 }
 
 /// Why a declared field type is not one.
@@ -87,7 +90,20 @@ impl FieldType {
 
     /// True for a type every value of which is a JSON number.
     pub fn is_numeric(&self) -> bool {
-        matches!(self, FieldType::Integer | FieldType::Number)
+        match self {
+            FieldType::Integer | FieldType::Number => true,
+            FieldType::Schema(schema) => schema.coarse().is_some_and(|ty| ty.is_numeric()),
+            _ => false,
+        }
+    }
+
+    /// True for a type every value of which is a JSON array.
+    pub fn is_list(&self) -> bool {
+        match self {
+            FieldType::List => true,
+            FieldType::Schema(schema) => schema.coarse() == Some(FieldType::List),
+            _ => false,
+        }
     }
 
     pub fn validate(&self) -> Result<(), FieldTypeError> {
@@ -121,6 +137,7 @@ impl FieldType {
             }
             (FieldType::OneOf(labels), Value::String(s)) => labels.iter().any(|l| l.as_str() == s),
             (FieldType::Link | FieldType::Links, _) => self.link_refusal(value).is_none(),
+            (FieldType::Schema(schema), value) => schema.admits(value),
             _ => false,
         }
     }
@@ -163,6 +180,241 @@ impl FieldType {
     }
 }
 
+/// The JSON Schema (draft 2020-12) a declared value must satisfy. [`JsonSchema::new`] is the only
+/// constructor, so a held schema is a valid 2020-12 document that compiles without fetching
+/// anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JsonSchema(Box<Value>);
+
+/// Why a document is not a usable [`JsonSchema`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaError {
+    NotJson { error: String },
+    OtherDialect { declared: String },
+    Invalid { error: String },
+}
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SchemaError::NotJson { error } => write!(f, "the schema is not JSON: {error}"),
+            SchemaError::OtherDialect { declared } => write!(
+                f,
+                "the schema declares $schema {declared:?}; only {DRAFT_2020_12:?} is accepted, \
+                 or no $schema at all"
+            ),
+            SchemaError::Invalid { error } => {
+                write!(f, "the schema is not a valid 2020-12 JSON Schema: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchemaError {}
+
+/// The only `$schema` a [`JsonSchema`] may declare.
+pub const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
+
+/// How many validation errors a refusal names before it stops.
+pub const MAX_SCHEMA_ERRORS: usize = 3;
+
+impl JsonSchema {
+    pub fn new(document: Value) -> Result<JsonSchema, SchemaError> {
+        if let Some(declared) = document.get("$schema").and_then(Value::as_str)
+            && declared != DRAFT_2020_12
+        {
+            return Err(SchemaError::OtherDialect {
+                declared: declared.to_owned(),
+            });
+        }
+        jsonschema::draft202012::new(&document).map_err(|error| SchemaError::Invalid {
+            error: error.to_string(),
+        })?;
+        Ok(JsonSchema(Box::new(document)))
+    }
+
+    pub fn parse(text: &str) -> Result<JsonSchema, SchemaError> {
+        let document = serde_json::from_str(text).map_err(|error| SchemaError::NotJson {
+            error: error.to_string(),
+        })?;
+        JsonSchema::new(document)
+    }
+
+    /// The scalar type its top-level `type` names, which is what a consumer of the field may
+    /// rely on. `None` when `type` is absent, a list, or `"null"`.
+    pub fn coarse(&self) -> Option<FieldType> {
+        match self.0.get("type").and_then(Value::as_str)? {
+            "string" => Some(FieldType::String),
+            "integer" => Some(FieldType::Integer),
+            "number" => Some(FieldType::Number),
+            "boolean" => Some(FieldType::Boolean),
+            "array" => Some(FieldType::List),
+            "object" => Some(FieldType::Object),
+            _ => None,
+        }
+    }
+
+    pub fn admits(&self, value: &Value) -> bool {
+        self.refusal(value).is_none()
+    }
+
+    /// Why `value` does not satisfy the schema: the first [`MAX_SCHEMA_ERRORS`] errors, each as
+    /// its instance path and message. `None` when it does.
+    ///
+    /// This becomes a task's fail note, which is persisted and served, so messages are masked and
+    /// never repeat the value they refused.
+    pub fn refusal(&self, value: &Value) -> Option<String> {
+        let validator = match jsonschema::draft202012::new(&self.0) {
+            Ok(validator) => validator,
+            Err(error) => return Some(format!("the schema does not compile: {error}")),
+        };
+        let mut errors = validator.iter_errors(value);
+        let shown: Vec<String> = errors
+            .by_ref()
+            .take(MAX_SCHEMA_ERRORS)
+            .map(|error| {
+                let at = error.instance_path().as_str();
+                let at = if at.is_empty() { "/" } else { at };
+                format!("{at}: {}", error.masked())
+            })
+            .collect();
+        if shown.is_empty() {
+            return None;
+        }
+        let more = if errors.next().is_some() {
+            "; and more"
+        } else {
+            ""
+        };
+        Some(format!("{}{more}", shown.join("; ")))
+    }
+}
+
+impl std::fmt::Display for JsonSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.coarse() {
+            Some(ty) => write!(f, "schema ({ty})"),
+            None => f.write_str("schema with no single top-level type"),
+        }
+    }
+}
+
+/// On the wire a schema is its JSON text, so a document holding `null` survives TOML.
+impl Serialize for JsonSchema {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for JsonSchema {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        JsonSchema::parse(&text).map_err(de::Error::custom)
+    }
+}
+
+/// One path a task declares in `emits_files`, with the schema its JSON content must satisfy when
+/// the declaration gave one.
+///
+/// Written as the bare path, or as `{"path": ..., "schema": "<JSON Schema text>"}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredFile {
+    pub path: String,
+    pub schema: Option<JsonSchema>,
+}
+
+impl From<&str> for DeclaredFile {
+    fn from(path: &str) -> Self {
+        DeclaredFile {
+            path: path.to_owned(),
+            schema: None,
+        }
+    }
+}
+
+impl From<String> for DeclaredFile {
+    fn from(path: String) -> Self {
+        DeclaredFile { path, schema: None }
+    }
+}
+
+impl DeclaredFile {
+    /// Why `bytes`, this file's content after a passing attempt, break its declaration. `None`
+    /// for a file with no schema and for content the schema admits.
+    pub fn refusal(&self, bytes: &[u8]) -> Option<String> {
+        let schema = self.schema.as_ref()?;
+        let value: Value = match serde_json::from_slice(bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                return Some(format!(
+                    "declared file {:?} is not JSON: {error}",
+                    self.path
+                ));
+            }
+        };
+        schema.refusal(&value).map(|why| {
+            format!(
+                "declared file {:?} does not match its schema: {why}",
+                self.path
+            )
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct TypedFileRef<'a> {
+    path: &'a str,
+    schema: &'a JsonSchema,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypedFileRepr {
+    path: String,
+    schema: JsonSchema,
+}
+
+impl Serialize for DeclaredFile {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.schema {
+            None => serializer.serialize_str(&self.path),
+            Some(schema) => TypedFileRef {
+                path: &self.path,
+                schema,
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for DeclaredFile {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DeclaredFileVisitor;
+
+        impl<'de> Visitor<'de> for DeclaredFileVisitor {
+            type Value = DeclaredFile;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a workspace-relative path, or a table of path and schema")
+            }
+
+            fn visit_str<E: de::Error>(self, path: &str) -> Result<DeclaredFile, E> {
+                Ok(DeclaredFile::from(path))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<DeclaredFile, A::Error> {
+                let repr = TypedFileRepr::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(DeclaredFile {
+                    path: repr.path,
+                    schema: Some(repr.schema),
+                })
+            }
+        }
+
+        deserializer.deserialize_any(DeclaredFileVisitor)
+    }
+}
+
 /// The JSON type of a value, in the tokens [`FieldType`] uses, for saying what arrived instead.
 pub fn value_type(value: &Value) -> &'static str {
     match value {
@@ -183,6 +435,7 @@ impl std::fmt::Display for FieldType {
                 let labels: Vec<&str> = labels.iter().map(Label::as_str).collect();
                 write!(f, "one of {}", labels.join("|"))
             }
+            FieldType::Schema(schema) => write!(f, "{schema}"),
             scalar => f.write_str(scalar.token().unwrap_or_default()),
         }
     }
@@ -198,6 +451,7 @@ impl Serialize for FieldType {
                 }
                 seq.end()
             }
+            FieldType::Schema(schema) => SchemaRef { schema }.serialize(serializer),
             scalar => serializer.serialize_str(scalar.token().unwrap_or_default()),
         }
     }
@@ -213,7 +467,7 @@ impl<'de> Deserialize<'de> for FieldType {
             fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 f.write_str(
                     "a field type: \"string\", \"integer\", \"number\", \"boolean\", \"list\", \
-                     \"object\", \"link\", \"links\", or a list of labels",
+                     \"object\", \"link\", \"links\", a list of labels, or a schema table",
                 )
             }
 
@@ -231,10 +485,26 @@ impl<'de> Deserialize<'de> for FieldType {
                 ty.validate().map_err(de::Error::custom)?;
                 Ok(ty)
             }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<FieldType, A::Error> {
+                let repr = SchemaRepr::deserialize(de::value::MapAccessDeserializer::new(map))?;
+                Ok(FieldType::Schema(repr.schema))
+            }
         }
 
         deserializer.deserialize_any(FieldTypeVisitor)
     }
+}
+
+#[derive(Serialize)]
+struct SchemaRef<'a> {
+    schema: &'a JsonSchema,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SchemaRepr {
+    schema: JsonSchema,
 }
 
 /// One declared output field on the wire: its name, and its type when the declaration gave one.
@@ -248,7 +518,10 @@ pub struct EmitWire {
 #[cfg(test)]
 mod tests {
     use crate::decision::Label;
-    use crate::emits::{EmitWire, FieldType, FieldTypeError, value_type};
+    use crate::emits::{
+        DRAFT_2020_12, DeclaredFile, EmitWire, FieldType, FieldTypeError, JsonSchema,
+        MAX_SCHEMA_ERRORS, SchemaError, value_type,
+    };
     use crate::link::{LinkKind, LinkProvider};
     use serde_json::json;
 
@@ -505,5 +778,225 @@ mod tests {
         let text = serde_json::to_string(&typed).unwrap();
         assert_eq!(text, r#"{"field":"severity","type":["high","low"]}"#);
         assert_eq!(serde_json::from_str::<EmitWire>(&text).unwrap(), typed);
+    }
+
+    fn schema(document: serde_json::Value) -> JsonSchema {
+        JsonSchema::new(document).unwrap()
+    }
+
+    fn lanes() -> JsonSchema {
+        schema(json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["name", "width"],
+                "properties": {
+                    "name": {"type": "string"},
+                    "width": {"type": "integer", "minimum": 1}
+                }
+            }
+        }))
+    }
+
+    #[test]
+    fn a_schema_field_admits_exactly_what_its_schema_admits() {
+        let ty = FieldType::Schema(lanes());
+        assert!(ty.admits(&json!([])));
+        assert!(ty.admits(&json!([{"name": "a", "width": 2}])));
+        assert!(!ty.admits(&json!([{"name": "a", "width": 0}])));
+        assert!(!ty.admits(&json!([{"name": "a"}])));
+        assert!(!ty.admits(&json!({"name": "a", "width": 2})));
+        assert!(!ty.admits(&json!(null)));
+    }
+
+    #[test]
+    fn a_schema_refusal_names_each_instance_path_and_its_error() {
+        let why = lanes()
+            .refusal(&json!([{"name": "a", "width": 2}, {"name": 7, "width": 0}]))
+            .unwrap();
+        assert!(why.contains("/1/name: "), "{why}");
+        assert!(why.contains("/1/width: "), "{why}");
+        assert!(!why.contains("/0"), "{why}");
+        let root = lanes().refusal(&json!("x")).unwrap();
+        assert!(root.starts_with("/: "), "{root}");
+        assert_eq!(lanes().refusal(&json!([{"name": "a", "width": 1}])), None);
+    }
+
+    #[test]
+    fn a_schema_refusal_stops_after_a_few_errors() {
+        let many: Vec<_> = (0..10).map(|_| json!({"name": 1, "width": 0})).collect();
+        let why = lanes().refusal(&json!(many)).unwrap();
+        assert_eq!(why.matches(": ").count(), MAX_SCHEMA_ERRORS, "{why}");
+        assert!(why.ends_with("; and more"), "{why}");
+    }
+
+    /// The note this produces is persisted and served, and `output` is not.
+    #[test]
+    fn a_schema_refusal_does_not_repeat_the_value_it_refused() {
+        let why = schema(json!({"type": "object", "properties": {"token": {"type": "integer"}}}))
+            .refusal(&json!({"token": "hunter2"}))
+            .unwrap();
+        assert!(why.contains("/token"), "{why}");
+        assert!(!why.contains("hunter2"), "{why}");
+        let why = schema(json!({"enum": ["a", "b"]}))
+            .refusal(&json!("hunter2"))
+            .unwrap();
+        assert!(!why.contains("hunter2"), "{why}");
+    }
+
+    #[test]
+    fn a_schema_takes_its_coarse_type_from_its_top_level_type() {
+        for (ty, coarse) in [
+            ("string", Some(FieldType::String)),
+            ("integer", Some(FieldType::Integer)),
+            ("number", Some(FieldType::Number)),
+            ("boolean", Some(FieldType::Boolean)),
+            ("array", Some(FieldType::List)),
+            ("object", Some(FieldType::Object)),
+            ("null", None),
+        ] {
+            assert_eq!(schema(json!({"type": ty})).coarse(), coarse, "{ty}");
+        }
+        assert_eq!(schema(json!({"type": ["string", "null"]})).coarse(), None);
+        assert_eq!(schema(json!({"minimum": 1})).coarse(), None);
+        assert_eq!(schema(json!(true)).coarse(), None);
+
+        assert!(FieldType::Schema(schema(json!({"type": "integer"}))).is_numeric());
+        assert!(FieldType::Schema(schema(json!({"type": "number"}))).is_numeric());
+        assert!(!FieldType::Schema(schema(json!({"minimum": 0}))).is_numeric());
+        assert!(FieldType::Schema(lanes()).is_list());
+        assert!(!FieldType::Schema(schema(json!({"items": {}}))).is_list());
+        assert!(FieldType::List.is_list());
+        assert!(!FieldType::Object.is_list());
+    }
+
+    #[test]
+    fn a_schema_displays_its_coarse_type() {
+        assert_eq!(FieldType::Schema(lanes()).to_string(), "schema (list)");
+        assert_eq!(
+            FieldType::Schema(schema(json!({}))).to_string(),
+            "schema with no single top-level type"
+        );
+    }
+
+    #[test]
+    fn only_a_valid_2020_12_schema_is_a_schema() {
+        assert!(matches!(
+            JsonSchema::new(json!({"type": "lane"})),
+            Err(SchemaError::Invalid { .. })
+        ));
+        assert!(matches!(
+            JsonSchema::new(json!({"minLength": -1})),
+            Err(SchemaError::Invalid { .. })
+        ));
+        assert_eq!(
+            JsonSchema::new(json!({"$schema": "http://json-schema.org/draft-07/schema#"})),
+            Err(SchemaError::OtherDialect {
+                declared: "http://json-schema.org/draft-07/schema#".into()
+            })
+        );
+        assert!(JsonSchema::new(json!({"$schema": DRAFT_2020_12, "type": "string"})).is_ok());
+        assert!(matches!(
+            JsonSchema::parse("{\"type\": "),
+            Err(SchemaError::NotJson { .. })
+        ));
+    }
+
+    #[test]
+    fn a_remote_ref_is_refused_rather_than_fetched() {
+        let refused = JsonSchema::new(json!({"$ref": "https://example.com/lanes.json"}));
+        assert!(
+            matches!(refused, Err(SchemaError::Invalid { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            JsonSchema::new(json!({
+                "$defs": {"lane": {"type": "string"}},
+                "type": "array",
+                "items": {"$ref": "#/$defs/lane"}
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_schema_type_round_trips_as_a_table_holding_its_text() {
+        let ty = FieldType::Schema(schema(json!({"type": "array", "default": null})));
+        let text = serde_json::to_string(&ty).unwrap();
+        assert_eq!(
+            text,
+            r#"{"schema":"{\"default\":null,\"type\":\"array\"}"}"#
+        );
+        assert_eq!(serde_json::from_str::<FieldType>(&text).unwrap(), ty);
+
+        let wire = EmitWire {
+            field: "lanes".into(),
+            ty: Some(ty),
+        };
+        let text = serde_json::to_string(&wire).unwrap();
+        assert_eq!(serde_json::from_str::<EmitWire>(&text).unwrap(), wire);
+    }
+
+    #[test]
+    fn a_malformed_schema_type_does_not_decode() {
+        for (text, needle) in [
+            (
+                r#"{"schema": "{\"type\": \"lane\"}"}"#,
+                "not a valid 2020-12",
+            ),
+            (r#"{"schema": "{"}"#, "not JSON"),
+            (r#"{"schema": {"type": "array"}}"#, "string"),
+            (r#"{"schema": "{}", "extra": 1}"#, "unknown field"),
+            (r#"{}"#, "missing field"),
+        ] {
+            let err = serde_json::from_str::<FieldType>(text)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(needle), "{text}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_declared_file_is_a_bare_path_until_it_carries_a_schema() {
+        let bare = DeclaredFile::from("REPORT.md");
+        assert_eq!(serde_json::to_string(&bare).unwrap(), r#""REPORT.md""#);
+        assert_eq!(
+            serde_json::from_str::<DeclaredFile>(r#""REPORT.md""#).unwrap(),
+            bare
+        );
+        let typed = DeclaredFile {
+            path: "RESULT.json".into(),
+            schema: Some(schema(json!({"type": "object"}))),
+        };
+        let text = serde_json::to_string(&typed).unwrap();
+        assert_eq!(
+            text,
+            r#"{"path":"RESULT.json","schema":"{\"type\":\"object\"}"}"#
+        );
+        assert_eq!(serde_json::from_str::<DeclaredFile>(&text).unwrap(), typed);
+        for bad in [
+            r#"{"path": "a.json"}"#,
+            r#"{"path": "a.json", "schema": "{}", "other": 1}"#,
+            r#"7"#,
+        ] {
+            assert!(serde_json::from_str::<DeclaredFile>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_declared_file_refuses_content_that_is_not_json_or_breaks_its_schema() {
+        let typed = DeclaredFile {
+            path: "RESULT.json".into(),
+            schema: Some(schema(json!({"type": "object", "required": ["ok"]}))),
+        };
+        assert_eq!(typed.refusal(br#"{"ok": true}"#), None);
+        let why = typed.refusal(b"not json").unwrap();
+        assert!(why.contains("\"RESULT.json\" is not JSON"), "{why}");
+        let why = typed.refusal(br#"{"other": 1}"#).unwrap();
+        assert!(
+            why.contains("\"RESULT.json\" does not match its schema: /: "),
+            "{why}"
+        );
+        assert_eq!(DeclaredFile::from("REPORT.md").refusal(b"anything"), None);
     }
 }
