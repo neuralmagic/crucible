@@ -81,6 +81,8 @@ impl QueueConfig {
 /// a single worker, but the set generalizes cleanly if workers are later sharded).
 struct QueueState {
     order: VecDeque<String>,
+    /// How many keys at the front of `order` were added urgent. They run FIFO among themselves.
+    urgent: usize,
     dirty: HashSet<String>,
     processing: HashSet<String>,
 }
@@ -114,22 +116,29 @@ impl Inner {
         self.notify.notify_one();
     }
 
-    /// Add operator-directed work ahead of the ordinary discovery/startup backlog. If the key is
-    /// already queued, promote that existing entry instead of letting FIFO dedup hide the human
-    /// override behind every older key. An in-flight key keeps the normal dirty-bit follow-up
-    /// semantics: it cannot be interrupted safely, so it reruns immediately after completion.
+    /// Add operator-directed work ahead of the ordinary discovery/startup backlog, behind any
+    /// urgent key already waiting. If the key is already queued, promote that existing entry
+    /// instead of letting FIFO dedup hide the human override behind every older key. An in-flight
+    /// key keeps the normal dirty-bit follow-up semantics: it cannot be interrupted safely, so it
+    /// reruns immediately after completion.
     fn add_urgent(&self, key: String) {
         let mut st = self.state();
         if st.processing.contains(&key) {
             st.dirty.insert(key);
             return;
         }
-        if st.dirty.insert(key.clone()) {
-            st.order.push_front(key);
-        } else if let Some(position) = st.order.iter().position(|queued| queued == &key) {
-            st.order.remove(position);
-            st.order.push_front(key);
+        if !st.dirty.insert(key.clone()) {
+            match st.order.iter().position(|queued| queued == &key) {
+                Some(position) if position < st.urgent => return,
+                Some(position) => {
+                    st.order.remove(position);
+                }
+                None => return,
+            }
         }
+        let at = st.urgent;
+        st.order.insert(at, key);
+        st.urgent += 1;
         drop(st);
         self.notify.notify_one();
     }
@@ -143,6 +152,7 @@ impl Inner {
             {
                 let mut st = self.state();
                 if let Some(key) = st.order.pop_front() {
+                    st.urgent = st.urgent.saturating_sub(1);
                     st.dirty.remove(&key);
                     st.processing.insert(key.clone());
                     return Some(key);
@@ -200,6 +210,7 @@ impl WorkQueue {
             inner: Arc::new(Inner {
                 state: Mutex::new(QueueState {
                     order: VecDeque::new(),
+                    urgent: 0,
                     dirty: HashSet::new(),
                     processing: HashSet::new(),
                 }),
@@ -352,8 +363,23 @@ pub trait DiscoverySource: Send + Sync {
     fn poll(&self, enqueue: Arc<dyn Enqueue>) -> BoxFuture<anyhow::Result<()>>;
 }
 
-/// Signals that work is waiting for a source outside the discovery cadence.
-pub type WakeStream = Pin<Box<dyn futures_util::Stream<Item = ()> + Send>>;
+/// A source whose work has a due time. The launch loop asks it for the earliest one and runs a
+/// pass once that time has come. `held` names the rows an earlier pass deferred; both calls leave
+/// them out.
+pub trait DueSource: Send + Sync {
+    fn next_due(&self, held: Vec<String>) -> BoxFuture<anyhow::Result<Option<jiff::Timestamp>>>;
+    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>)
+    -> BoxFuture<anyhow::Result<Pass>>;
+}
+
+/// What one [`DueSource::pass`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Pass {
+    /// Rows the pass claimed, whatever became of them.
+    pub claimed: usize,
+    /// Rows still due that the pass deferred or skipped.
+    pub held: Vec<String>,
+}
 
 /// A monotonically increasing counter plus a `Notify`. [`WorkQueue::run`](crate::daemon::queue::WorkQueue::run)
 /// calls [`mark`](TestSyncMarker::mark) once per processed item (success, backoff-requeue, or
@@ -485,6 +511,70 @@ mod tests {
         queue.shut_down();
         handle.await.expect("worker joined");
         assert_eq!(*seen.lock().expect("lock"), vec!["human", "old-a", "old-b"]);
+    }
+
+    #[tokio::test]
+    async fn urgent_keys_run_first_in_the_order_they_arrived() {
+        let queue = WorkQueue::new();
+        let seen: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+        let seen_cl = seen.clone();
+        let sync = Arc::new(TestSyncMarker::new());
+
+        queue.reenqueue_startup(vec!["old-a".into(), "old-b".into()]);
+        queue.enqueue_urgent(IssueKey("launch-1".into()));
+        queue.enqueue_urgent(IssueKey("launch-2".into()));
+        // Already urgent: keeps its place instead of jumping ahead of launch-2.
+        queue.enqueue_urgent(IssueKey("launch-1".into()));
+        // A backlog key promoted now lands behind the urgent keys already waiting.
+        queue.enqueue_urgent(IssueKey("old-b".into()));
+        queue.enqueue_urgent(IssueKey("launch-3".into()));
+        queue.enqueue(IssueKey("new-plain".into()));
+
+        let reconcile: ReconcileFn = Arc::new(move |key: IssueKey| {
+            let seen = seen_cl.clone();
+            Box::pin(async move {
+                seen.lock().expect("lock").push(key.0);
+                Ok(())
+            })
+        });
+        let q = queue.clone();
+        let sync_cl = sync.clone();
+        let handle = tokio::spawn(async move {
+            q.run(
+                reconcile,
+                noop_park(),
+                QueueConfig::default(),
+                Some(sync_cl),
+            )
+            .await;
+        });
+
+        sync.wait_for_count(6).await;
+        queue.shut_down();
+        handle.await.expect("worker joined");
+        assert_eq!(
+            *seen.lock().expect("lock"),
+            vec![
+                "launch-1",
+                "launch-2",
+                "old-b",
+                "launch-3",
+                "old-a",
+                "new-plain"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_urgent_count_drains_so_later_urgent_keys_still_go_first() {
+        let queue = WorkQueue::new();
+        queue.enqueue_urgent(IssueKey("u1".into()));
+        assert_eq!(queue.inner.get_next().await.as_deref(), Some("u1"));
+        queue.inner.done("u1");
+        queue.enqueue(IssueKey("plain".into()));
+        queue.enqueue_urgent(IssueKey("u2".into()));
+        assert_eq!(queue.inner.get_next().await.as_deref(), Some("u2"));
+        assert_eq!(queue.inner.get_next().await.as_deref(), Some("plain"));
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@
 //! ```
 
 use crate::client::Db;
+use crate::daemon::queue::{BoxFuture, DiscoverySource, Enqueue};
 use crate::launches::standing::{
     Claim, Claimed, Failed, FailureCause, FireError, LaunchTrigger, Recorded, SweepCfg,
     TriggerFuture,
@@ -17,8 +18,9 @@ use crate::launches::webhooks::transform::{Input, Transform};
 use crate::model::Trigger;
 use anyhow::{Context, Result};
 use jiff::{SignedDuration, Timestamp};
+use std::sync::Arc;
 
-/// Deliveries one sweep settles per webhook; a deeper backlog drains on later ticks.
+/// Deliveries one sweep settles per webhook; a deeper backlog drains on later passes.
 const SETTLE_CAP: i64 = 32;
 
 const RATE_WINDOW: SignedDuration = SignedDuration::from_secs(3600);
@@ -78,6 +80,24 @@ async fn settle_as(
     .await
     .context("settle a webhook delivery")?;
     Ok(())
+}
+
+/// Runs [`housekeep`] on the discovery cadence.
+pub struct WebhookHousekeeping {
+    db: Db,
+}
+
+impl WebhookHousekeeping {
+    pub fn new(db: Db) -> Self {
+        WebhookHousekeeping { db }
+    }
+}
+
+impl DiscoverySource for WebhookHousekeeping {
+    fn poll(&self, _enqueue: Arc<dyn Enqueue>) -> BoxFuture<Result<()>> {
+        let db = self.db.clone();
+        Box::pin(async move { housekeep(&db, Timestamp::now()).await })
+    }
 }
 
 /// Settle every pending delivery of every disabled webhook failed, and prune settled deliveries
@@ -258,21 +278,22 @@ impl LaunchTrigger for WebhookTrigger {
         &'a self,
         db: &'a Db,
         _cfg: SweepCfg,
-        now: Timestamp,
+        _now: Timestamp,
+        held: &'a [String],
     ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
         Box::pin(async move {
-            housekeep(db, now).await?;
             let pending: Vec<(String, String)> = sqlx::query_as(
                 "SELECT webhook_id, id FROM (
                      SELECT d.webhook_id, d.id,
                             row_number() OVER (PARTITION BY d.webhook_id ORDER BY d.id) AS n
                      FROM playbook_webhook_deliveries d
                      JOIN playbook_standing_launches c ON c.id = d.webhook_id
-                     WHERE d.outcome IS NULL AND c.enabled
+                     WHERE d.outcome IS NULL AND c.enabled AND d.webhook_id <> ALL($2)
                  ) ranked
                  WHERE n <= $1 ORDER BY webhook_id, id",
             )
             .bind(SETTLE_CAP)
+            .bind(held)
             .fetch_all(db.pool())
             .await
             .context("pending webhook deliveries")?;
@@ -286,6 +307,25 @@ impl LaunchTrigger for WebhookTrigger {
                     claim
                 })
                 .collect())
+        })
+    }
+
+    fn next_due<'a>(
+        &'a self,
+        db: &'a Db,
+        held: &'a [String],
+    ) -> TriggerFuture<'a, Result<Option<Timestamp>>> {
+        Box::pin(async move {
+            let earliest: Option<String> = sqlx::query_scalar(
+                "SELECT MIN(d.received_at) FROM playbook_webhook_deliveries d
+                 JOIN playbook_standing_launches c ON c.id = d.webhook_id
+                 WHERE d.outcome IS NULL AND c.enabled AND d.webhook_id <> ALL($1)",
+            )
+            .bind(held)
+            .fetch_one(db.pool())
+            .await
+            .context("the oldest pending delivery")?;
+            crate::launches::standing::due_at(earliest)
         })
     }
 
@@ -379,12 +419,12 @@ impl LaunchTrigger for WebhookTrigger {
 #[cfg(test)]
 mod tests {
     use crate::client::Db;
-    use crate::launches::standing::{self, NewStanding, SweepCfg};
+    use crate::launches::standing::{self, LaunchTrigger, NewStanding, SweepCfg};
     use crate::launches::webhooks::trigger::WebhookTrigger;
     use crate::launches::webhooks::verify::{Verifier, VerifierKind};
     use crate::launches::webhooks::{self as store, NewWebhook};
     use crate::model::MaxTime;
-    use jiff::Timestamp;
+    use jiff::{SignedDuration, Timestamp};
     use serde_json::json;
     use sqlx::{PgPool, Row};
 
@@ -491,6 +531,18 @@ mod tests {
         }
     }
 
+    async fn housekeep(pool: &PgPool) {
+        use crate::daemon::queue::{DiscoverySource, Enqueue, IssueKey};
+        struct NoQueue;
+        impl Enqueue for NoQueue {
+            fn enqueue(&self, _: IssueKey) {}
+        }
+        crate::launches::webhooks::trigger::WebhookHousekeeping::new(Db::new(pool.clone()))
+            .poll(std::sync::Arc::new(NoQueue))
+            .await
+            .expect("housekeep");
+    }
+
     async fn sweep(pool: &PgPool) -> Vec<String> {
         standing::sweep(
             &Db::new(pool.clone()),
@@ -499,9 +551,11 @@ mod tests {
             Timestamp::now(),
             None,
             None,
+            &[],
         )
         .await
         .expect("sweep")
+        .fired
     }
 
     async fn outcomes(pool: &PgPool) -> Vec<(String, Option<String>, Option<String>)> {
@@ -538,49 +592,96 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_recorded_delivery_wakes_the_listener_before_the_next_tick(pool: PgPool) {
-        use futures_util::StreamExt;
-        let wait = std::time::Duration::from_secs(10);
+    async fn housekeeping_settles_a_disabled_webhook_and_prunes_past_retention(pool: PgPool) {
         register(&pool).await;
-        let id = webhook(&pool, 10, "body.docker_url").await;
-        let mut wakes = crate::launches::announce::wakes(pool.clone(), &[store::DELIVERY_CHANNEL]);
-        tokio::time::timeout(wait, wakes.next())
+        let kept = webhook(&pool, 10, "body.docker_url").await;
+        let old = deliver(&pool, &kept, &push("latest", "sha256:a")).await;
+        sqlx::query(
+            "UPDATE playbook_webhook_deliveries
+             SET outcome = 'filtered', settled_at = '2020-01-01T00:00:00Z' WHERE id = $1",
+        )
+        .bind(&old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let disabled = webhook(&pool, 10, "body.docker_url").await;
+        let stuck = deliver(&pool, &disabled, &push("latest", "sha256:b")).await;
+        sqlx::query("UPDATE playbook_standing_launches SET enabled = false WHERE id = $1")
+            .bind(&disabled)
+            .execute(&pool)
             .await
-            .expect("a wake once listening")
-            .expect("the stream stays open");
+            .unwrap();
 
-        deliver(&pool, &id, &push("latest", "sha256:a")).await;
-        tokio::time::timeout(wait, wakes.next())
-            .await
-            .expect("a wake for the delivery")
-            .expect("the stream stays open");
+        housekeep(&pool).await;
 
-        assert_eq!(sweep(&pool).await.len(), 1);
+        let outcome: Option<String> =
+            sqlx::query_scalar("SELECT outcome FROM playbook_webhook_deliveries WHERE id = $1")
+                .bind(&stuck)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(outcome.as_deref(), Some("failed"));
+        let pruned: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM playbook_webhook_deliveries WHERE id = $1")
+                .bind(&old)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pruned, 0, "a delivery settled past retention is pruned");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_minted_launch_wakes_the_launch_listener(pool: PgPool) {
-        use futures_util::StreamExt;
-        let wait = std::time::Duration::from_secs(10);
+    async fn a_pending_delivery_is_due_until_it_settles(pool: PgPool) {
+        let db = Db::new(pool.clone());
         register(&pool).await;
         let id = webhook(&pool, 10, "body.docker_url").await;
-        let mut wakes = crate::launches::announce::wakes(
-            pool.clone(),
-            &[crate::launches::store::LAUNCH_CHANNEL],
-        );
-        tokio::time::timeout(wait, wakes.next())
-            .await
-            .expect("a wake once listening")
-            .expect("the stream stays open");
+        assert_eq!(WebhookTrigger.next_due(&db, &[]).await.unwrap(), None);
 
+        let before = Timestamp::now() - SignedDuration::from_secs(1);
+        deliver(&pool, &id, &push("latest", "sha256:a")).await;
+        let due = WebhookTrigger
+            .next_due(&db, &[])
+            .await
+            .unwrap()
+            .expect("a pending delivery is due");
+        assert!(due >= before && due <= Timestamp::now(), "due at receipt");
+        assert_eq!(
+            WebhookTrigger
+                .next_due(&db, std::slice::from_ref(&id))
+                .await
+                .unwrap(),
+            None,
+            "a held webhook's deliveries are left out"
+        );
+        assert!(
+            standing::sweep(
+                &db,
+                &WebhookTrigger,
+                cfg(),
+                Timestamp::now(),
+                None,
+                None,
+                &[id]
+            )
+            .await
+            .unwrap()
+            .fired
+            .is_empty(),
+            "a held webhook does not fire"
+        );
+
+        assert_eq!(sweep(&pool).await.len(), 1);
+        assert_eq!(WebhookTrigger.next_due(&db, &[]).await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_minted_launch_is_pending_until_it_dispatches(pool: PgPool) {
+        register(&pool).await;
+        let id = webhook(&pool, 10, "body.docker_url").await;
         deliver(&pool, &id, &push("latest", "sha256:a")).await;
         assert_eq!(sweep(&pool).await.len(), 1);
-        tokio::time::timeout(wait, wakes.next())
-            .await
-            .expect("a wake for the minted launch")
-            .expect("the stream stays open");
         assert_eq!(
-            crate::launches::pending::pending_launch_keys(&pool)
+            crate::launches::pending::pending_launch_keys(&pool, &[])
                 .await
                 .expect("pending"),
             vec![
@@ -716,6 +817,7 @@ mod tests {
             .execute(&pool)
             .await
             .expect("age");
+        housekeep(&pool).await;
         deliver(&pool, &id, &push("latest", "sha256:a")).await;
 
         sweep(&pool).await;

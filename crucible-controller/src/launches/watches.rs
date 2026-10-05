@@ -390,6 +390,7 @@ impl LaunchTrigger for WatchTrigger {
         db: &'a Db,
         cfg: SweepCfg,
         now: Timestamp,
+        _held: &'a [String],
     ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
         let db = db.clone();
         Box::pin(async move {
@@ -522,8 +523,10 @@ pub(crate) async fn sweep(
         now,
         refresh,
         None,
+        &[],
     )
     .await
+    .map(|swept| swept.fired)
 }
 
 #[cfg(test)]

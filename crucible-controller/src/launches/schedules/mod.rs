@@ -29,7 +29,7 @@ use cron::CronSpec;
 use jiff::Timestamp;
 
 /// How many due schedules one sweep fires. A deeper backlog is a controller that was down for a
-/// while; the rest fire on the next discovery tick rather than holding the loop.
+/// while; the rest fire on the next pass rather than holding the loop.
 const FIRE_CAP: i64 = 32;
 
 /// How far the missed-window count walks before it stops counting. Bounds the walk for a
@@ -538,21 +538,36 @@ impl ScheduleStore {
         standing::expire_stale_owner_parks(self.db.pool(), Trigger::Schedule, schedule_id).await
     }
 
-    async fn due_rows(&self, now: Timestamp) -> Result<Vec<DueRow>> {
+    async fn due_rows(&self, now: Timestamp, held: &[String]) -> Result<Vec<DueRow>> {
         sqlx::query_as::<_, DueRow>(
             r#"
             SELECT s.id, s.cron_expr, s.tz, s.cursor_param, s.cursor_value
             FROM playbook_schedules s
             JOIN playbook_standing_launches c USING (id)
             WHERE c.enabled AND s.next_due_at IS NOT NULL AND s.next_due_at <= $1
+              AND s.id <> ALL($3)
             ORDER BY s.next_due_at, s.id LIMIT $2
             "#,
         )
         .bind(stamp(now))
         .bind(FIRE_CAP)
+        .bind(held)
         .fetch_all(self.db.pool())
         .await
         .context("the due schedules")
+    }
+
+    async fn next_due(&self, held: &[String]) -> Result<Option<Timestamp>> {
+        let earliest: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(s.next_due_at) FROM playbook_schedules s
+             JOIN playbook_standing_launches c USING (id)
+             WHERE c.enabled AND s.next_due_at IS NOT NULL AND s.id <> ALL($1)",
+        )
+        .bind(held)
+        .fetch_one(self.db.pool())
+        .await
+        .context("the next due schedule")?;
+        standing::due_at(earliest)
     }
 
     async fn claim_due(
@@ -718,6 +733,7 @@ impl LaunchTrigger for ScheduleTrigger {
         _db: &'a Db,
         _cfg: SweepCfg,
         now: Timestamp,
+        held: &'a [String],
     ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
         let store = self.store.clone();
         let config = self.config.clone();
@@ -738,7 +754,7 @@ impl LaunchTrigger for ScheduleTrigger {
                     )
                     .await?;
             }
-            let rows = store.due_rows(now).await?;
+            let rows = store.due_rows(now, held).await?;
             Ok(rows
                 .into_iter()
                 .map(|row| {
@@ -754,6 +770,14 @@ impl LaunchTrigger for ScheduleTrigger {
                 })
                 .collect())
         })
+    }
+
+    fn next_due<'a>(
+        &'a self,
+        _db: &'a Db,
+        held: &'a [String],
+    ) -> TriggerFuture<'a, Result<Option<Timestamp>>> {
+        Box::pin(async move { self.store.next_due(held).await })
     }
 
     fn claim<'a, 'c>(
@@ -822,8 +846,10 @@ pub(crate) async fn fire_due_refreshing(
         now,
         refresh,
         None,
+        &[],
     )
-    .await?;
+    .await?
+    .fired;
     keys.truncate(cap);
     Ok(keys)
 }
@@ -3289,6 +3315,81 @@ mod tests {
         assert_eq!(repointed.cursor.as_ref(), Some(&moved));
         assert_eq!(repointed.cursor_value, None);
         assert_eq!(repointed.cursor_updated_at, None);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn next_due_is_the_earliest_window_of_an_enabled_unheld_schedule(
+        pool: PgPool,
+    ) -> Result<()> {
+        use crate::launches::standing::LaunchTrigger;
+        let db = Db::new(pool.clone());
+        let trigger = ScheduleTrigger::unpoliced(db.clone());
+        let at = |s: &str| Some(s.parse::<Timestamp>().expect("stamp"));
+        register_row(&pool, "survey").await;
+        assert_eq!(trigger.next_due(&db, &[]).await?, None);
+
+        let parked = schedule_due_at(&pool, "0 * * * *", None).await;
+        assert_eq!(
+            trigger.next_due(&db, &[]).await?,
+            None,
+            "a schedule with no next window is not due"
+        );
+        let later = schedule_due_at(&pool, "0 * * * *", Some("2031-01-02T00:00:00Z")).await;
+        let earlier = schedule_due_at(&pool, "0 * * * *", Some("2031-01-01T00:00:00Z")).await;
+        assert_eq!(
+            trigger.next_due(&db, &[]).await?,
+            at("2031-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            trigger
+                .next_due(&db, &[earlier.id.clone(), parked.id.clone()])
+                .await?,
+            at("2031-01-02T00:00:00Z"),
+            "a held schedule is left out"
+        );
+
+        standing::set_enabled(&pool, &later.id, false).await?;
+        assert_eq!(
+            trigger
+                .next_due(&db, std::slice::from_ref(&earlier.id))
+                .await?,
+            None,
+            "a disabled standing launch is not due"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_held_schedule_is_left_out_of_the_sweep(pool: PgPool) -> Result<()> {
+        let db = Db::new(pool.clone());
+        register_row(&pool, "survey").await;
+        let held = schedule_due_at(&pool, "0 * * * *", Some("2020-01-01T00:00:00Z")).await;
+        let free = schedule_due_at(&pool, "0 * * * *", Some("2020-01-01T00:00:00Z")).await;
+
+        let swept = standing::sweep(
+            &db,
+            &ScheduleTrigger::unpoliced(db.clone()),
+            ScheduleTrigger::sweep_cfg(5, std::time::Duration::from_secs(3600)),
+            Timestamp::now(),
+            None,
+            None,
+            std::slice::from_ref(&held.id),
+        )
+        .await?;
+        assert_eq!(swept.claimed, 1);
+        assert_eq!(swept.fired.len(), 1);
+        let store = ScheduleStore::new(db.clone());
+        assert_eq!(
+            store.get(&held.id).await?.unwrap().next_due_at.as_deref(),
+            Some("2020-01-01T00:00:00Z"),
+            "the held schedule was not claimed"
+        );
+        assert_ne!(
+            store.get(&free.id).await?.unwrap().next_due_at.as_deref(),
+            Some("2020-01-01T00:00:00Z"),
+            "the free schedule advanced"
+        );
         Ok(())
     }
 }

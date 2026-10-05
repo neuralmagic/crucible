@@ -985,6 +985,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         })),
         verify_interval,
         reconcile_now: Some(reconcile_now.clone()),
+        launch_probe: crucible_controller::daemon::launch_loop::PROBE_INTERVAL,
     };
 
     // Ctrl-C flips the STOP flag; a poller translates it into the daemon's `Notify`-based shutdown

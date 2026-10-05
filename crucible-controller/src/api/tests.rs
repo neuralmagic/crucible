@@ -13095,9 +13095,11 @@ async fn sweep_webhooks(db: &Db) -> Vec<String> {
         jiff::Timestamp::now(),
         None,
         None,
+        &[],
     )
     .await
     .expect("sweep")
+    .fired
 }
 
 async fn delivery_outcomes(app: &Router, id: &str) -> Vec<String> {
