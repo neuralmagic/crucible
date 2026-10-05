@@ -11,7 +11,7 @@ use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::decision::Label;
+use crate::decision::{Label, NOUL_NO, NOUL_YES};
 use crate::link::ExternalLink;
 
 /// The JSON type one declared output field holds.
@@ -88,12 +88,49 @@ impl FieldType {
             .map(|(name, _)| *name)
     }
 
-    /// True for a type every value of which is a JSON number.
+    /// True for a type every value of which is a JSON number. A schema qualifies through its
+    /// top-level `type`, unless its `const` or `enum` names a value that is not a number.
     pub fn is_numeric(&self) -> bool {
         match self {
             FieldType::Integer | FieldType::Number => true,
-            FieldType::Schema(schema) => schema.coarse().is_some_and(|ty| ty.is_numeric()),
+            FieldType::Schema(schema) => {
+                schema.coarse().is_some_and(|ty| ty.is_numeric())
+                    && schema
+                        .finite_values()
+                        .is_none_or(|values| values.iter().all(Value::is_number))
+            }
             _ => false,
+        }
+    }
+
+    /// Why a list of this type may hold an item that cannot name a mapped instance, which has to
+    /// be a string. `None` for a schema whose items are provably strings, and for every other
+    /// type, which says nothing about its items.
+    pub fn item_refusal(&self) -> Option<String> {
+        match self {
+            FieldType::Schema(schema) => schema.item_refusal(),
+            _ => None,
+        }
+    }
+
+    /// The answers an output-decided route reads off a value of this type when there are finitely
+    /// many: a label list's labels, and `yes`/`no` for a boolean. `None` when a value may be a
+    /// string outside any set, or something that is not a label at all.
+    pub fn route_answers(&self) -> Option<BTreeSet<Label>> {
+        match self {
+            FieldType::OneOf(labels) => Some(labels.iter().cloned().collect()),
+            FieldType::Boolean => Some(noul_answers()),
+            FieldType::Schema(schema) => schema
+                .finite_values()?
+                .iter()
+                .map(|value| match value {
+                    Value::String(label) => Label::new(label.as_str()).ok(),
+                    Value::Bool(true) => Label::new(NOUL_YES).ok(),
+                    Value::Bool(false) => Label::new(NOUL_NO).ok(),
+                    _ => None,
+                })
+                .collect(),
+            _ => None,
         }
     }
 
@@ -177,6 +214,109 @@ impl FieldType {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+}
+
+fn noul_answers() -> BTreeSet<Label> {
+    [NOUL_YES, NOUL_NO]
+        .into_iter()
+        .filter_map(|label| Label::new(label).ok())
+        .collect()
+}
+
+/// How many local `$ref` hops a compile-time reading of a schema follows before it stops proving
+/// anything.
+const MAX_REF_HOPS: usize = 16;
+
+/// The schema a local `$ref` (`#` or `#/json/pointer`) names, if it names one in `root`.
+fn local_ref<'a>(root: &'a Value, schema: &Value) -> Option<&'a Value> {
+    let pointer = schema.get("$ref")?.as_str()?.strip_prefix('#')?;
+    root.pointer(pointer)
+}
+
+fn subschemas<'a>(schema: &'a Value, keyword: &str) -> &'a [Value] {
+    schema
+        .get(keyword)
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// The finitely many values every instance of `schema` is one of, read off `const`, `enum`, or
+/// `type: "boolean"`, through local `$ref`s and `allOf`. An upper bound: `None` when the schema
+/// does not bound them.
+fn finite_values(root: &Value, schema: &Value, hops: usize) -> Option<Vec<Value>> {
+    if hops > MAX_REF_HOPS {
+        return None;
+    }
+    if let Some(value) = schema.get("const") {
+        return Some(vec![value.clone()]);
+    }
+    if let Some(Value::Array(values)) = schema.get("enum") {
+        return Some(values.clone());
+    }
+    if schema.get("type").and_then(Value::as_str) == Some("boolean") {
+        return Some(vec![Value::Bool(true), Value::Bool(false)]);
+    }
+    if let Some(target) = local_ref(root, schema)
+        && let Some(values) = finite_values(root, target, hops + 1)
+    {
+        return Some(values);
+    }
+    subschemas(schema, "allOf")
+        .iter()
+        .find_map(|member| finite_values(root, member, hops + 1))
+}
+
+/// Whether every instance of `schema` is a string: its `type` is `"string"`, its `const` or `enum`
+/// holds only strings, a local `$ref` or an `allOf` member says so, or every branch of its
+/// `anyOf`/`oneOf` does.
+fn provably_strings(root: &Value, schema: &Value, hops: usize) -> bool {
+    if hops > MAX_REF_HOPS {
+        return false;
+    }
+    let typed_string = match schema.get("type") {
+        Some(Value::String(ty)) => ty == "string",
+        Some(Value::Array(types)) => !types.is_empty() && types.iter().all(|t| t == "string"),
+        _ => false,
+    };
+    if typed_string {
+        return true;
+    }
+    let bounded = schema
+        .get("const")
+        .map(|value| vec![value.clone()])
+        .or_else(|| schema.get("enum").and_then(Value::as_array).cloned());
+    if let Some(values) = bounded
+        && !values.is_empty()
+        && values.iter().all(Value::is_string)
+    {
+        return true;
+    }
+    if local_ref(root, schema).is_some_and(|target| provably_strings(root, target, hops + 1)) {
+        return true;
+    }
+    if subschemas(schema, "allOf")
+        .iter()
+        .any(|member| provably_strings(root, member, hops + 1))
+    {
+        return true;
+    }
+    ["anyOf", "oneOf"].into_iter().any(|keyword| {
+        let branches = subschemas(schema, keyword);
+        !branches.is_empty()
+            && branches
+                .iter()
+                .all(|branch| provably_strings(root, branch, hops + 1))
+    })
+}
+
+/// A subschema as a refusal quotes it: its JSON, cut short past a few dozen characters.
+fn quoted(schema: &Value) -> String {
+    const SHOWN: usize = 80;
+    let text = schema.to_string();
+    match text.char_indices().nth(SHOWN) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
     }
 }
 
@@ -275,6 +415,39 @@ impl JsonSchema {
 
     pub fn admits(&self, value: &Value) -> bool {
         self.refusal(value).is_none()
+    }
+
+    /// The finitely many values every instance is one of, when the schema bounds them with
+    /// `const`, `enum`, or `type: "boolean"`.
+    pub fn finite_values(&self) -> Option<Vec<Value>> {
+        finite_values(&self.0, &self.0, 0)
+    }
+
+    /// Why an item of the array this schema admits may not be a string; `None` when every item,
+    /// `prefixItems` included, provably is one.
+    pub fn item_refusal(&self) -> Option<String> {
+        let root = self.0.as_ref();
+        for (at, prefix) in subschemas(root, "prefixItems").iter().enumerate() {
+            if !provably_strings(root, prefix, 0) {
+                return Some(format!(
+                    "its `prefixItems[{at}]` is {}, which does not make every item a string",
+                    quoted(prefix)
+                ));
+            }
+        }
+        match root.get("items") {
+            None if root.get("prefixItems").is_some() => Some(
+                "it declares no `items`, so an item past its `prefixItems` may be anything"
+                    .to_owned(),
+            ),
+            None => Some("it declares no `items`, so an item may be anything".to_owned()),
+            Some(Value::Bool(false)) => None,
+            Some(items) if provably_strings(root, items, 0) => None,
+            Some(items) => Some(format!(
+                "its `items` is {}, which does not make every item a string",
+                quoted(items)
+            )),
+        }
     }
 
     /// Why `value` does not satisfy the schema: the first [`MAX_SCHEMA_ERRORS`] errors, each as
@@ -1030,5 +1203,140 @@ mod tests {
             "{why}"
         );
         assert_eq!(DeclaredFile::from("REPORT.md").refusal(b"anything"), None);
+    }
+
+    #[test]
+    fn finite_values_read_const_enum_boolean_refs_and_all_of() {
+        assert_eq!(
+            schema(json!({"const": "a"})).finite_values(),
+            Some(vec![json!("a")])
+        );
+        assert_eq!(
+            schema(json!({"type": "string", "enum": ["a", "b"]})).finite_values(),
+            Some(vec![json!("a"), json!("b")])
+        );
+        assert_eq!(
+            schema(json!({"type": "boolean"})).finite_values(),
+            Some(vec![json!(true), json!(false)])
+        );
+        assert_eq!(
+            schema(json!({"$defs": {"t": {"enum": [1, 2]}}, "$ref": "#/$defs/t"})).finite_values(),
+            Some(vec![json!(1), json!(2)])
+        );
+        assert_eq!(
+            schema(json!({"allOf": [{"type": "string"}, {"const": "x"}]})).finite_values(),
+            Some(vec![json!("x")])
+        );
+        assert_eq!(schema(json!({"type": "string"})).finite_values(), None);
+        assert_eq!(
+            schema(json!({"anyOf": [{"const": 1}, {"const": 2}]})).finite_values(),
+            None
+        );
+    }
+
+    #[test]
+    fn items_are_proven_strings_or_the_refusal_says_what_was_found() {
+        for ok in [
+            json!({"type": "array", "items": {"type": "string"}}),
+            json!({"type": "array", "items": {"type": ["string"]}}),
+            json!({"type": "array", "items": {"enum": ["a", "b"]}}),
+            json!({"type": "array", "items": {"const": "a"}}),
+            json!({"type": "array", "items": {"allOf": [{"minLength": 1}, {"type": "string"}]}}),
+            json!({"type": "array", "items": {"oneOf": [{"const": "a"}, {"enum": ["b"]}]}}),
+            json!({"type": "array", "$defs": {"l": {"$ref": "#/$defs/m"}, "m": {"type": "string"}}, "items": {"$ref": "#/$defs/l"}}),
+            json!({"type": "array", "prefixItems": [{"const": "head"}], "items": {"type": "string"}}),
+            json!({"type": "array", "items": false}),
+        ] {
+            assert_eq!(schema(ok.clone()).item_refusal(), None, "{ok}");
+        }
+        for (bad, why) in [
+            (
+                json!({"type": "array"}),
+                "it declares no `items`, so an item may be anything",
+            ),
+            (
+                json!({"type": "array", "items": true}),
+                "its `items` is true, which does not make every item a string",
+            ),
+            (
+                json!({"type": "array", "items": {}}),
+                "its `items` is {}, which",
+            ),
+            (
+                json!({"type": "array", "items": {"type": ["string", "null"]}}),
+                "does not make every item a string",
+            ),
+            (
+                json!({"type": "array", "items": {"enum": []}}),
+                "does not make every item a string",
+            ),
+            (
+                json!({"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "integer"}]}}),
+                "does not make every item a string",
+            ),
+            (
+                json!({"type": "array", "prefixItems": [{"type": "integer"}], "items": {"type": "string"}}),
+                "its `prefixItems[0]` is {\"type\":\"integer\"}",
+            ),
+        ] {
+            let got = schema(bad.clone())
+                .item_refusal()
+                .unwrap_or_else(|| panic!("{bad} passed"));
+            assert!(got.contains(why), "{bad}: {got}");
+        }
+        assert_eq!(
+            FieldType::List.item_refusal(),
+            None,
+            "a plain list says nothing about its items"
+        );
+    }
+
+    #[test]
+    fn an_items_refusal_cuts_a_long_schema_short() {
+        let long: Vec<i32> = (0..100).collect();
+        let why = schema(json!({"type": "array", "items": {"enum": long}}))
+            .item_refusal()
+            .unwrap();
+        assert!(why.contains('…'), "{why}");
+        assert!(why.len() < 200, "{why}");
+    }
+
+    #[test]
+    fn route_answers_are_the_labels_a_value_can_be() {
+        let set = |names: &[&str]| -> Option<std::collections::BTreeSet<Label>> {
+            Some(names.iter().map(|n| Label::new(*n).unwrap()).collect())
+        };
+        assert_eq!(labels(&["a", "b"]).route_answers(), set(&["a", "b"]));
+        assert_eq!(FieldType::Boolean.route_answers(), set(&["no", "yes"]));
+        assert_eq!(
+            FieldType::Schema(schema(json!({"type": "boolean"}))).route_answers(),
+            set(&["no", "yes"])
+        );
+        assert_eq!(
+            FieldType::Schema(schema(json!({"enum": ["a", true]}))).route_answers(),
+            set(&["a", "yes"])
+        );
+        assert_eq!(
+            FieldType::Schema(schema(json!({"const": "a"}))).route_answers(),
+            set(&["a"])
+        );
+        for none in [
+            FieldType::String,
+            FieldType::Integer,
+            FieldType::Schema(schema(json!({"type": "string"}))),
+            FieldType::Schema(schema(json!({"enum": ["a", 1]}))),
+            FieldType::Schema(schema(json!({"enum": ["not a label"]}))),
+        ] {
+            assert_eq!(none.route_answers(), None, "{none}");
+        }
+    }
+
+    #[test]
+    fn a_numeric_schema_must_not_enumerate_a_non_number() {
+        assert!(FieldType::Schema(schema(json!({"type": "integer", "enum": [1, 2]}))).is_numeric());
+        assert!(
+            !FieldType::Schema(schema(json!({"type": "number", "enum": [1, "x"]}))).is_numeric()
+        );
+        assert!(!FieldType::Schema(schema(json!({"type": "number", "const": "x"}))).is_numeric());
     }
 }
