@@ -356,6 +356,8 @@ fn real_git_path() -> String {
 struct FakePodDispatcher {
     pool: sqlx::PgPool,
     deliver: bool,
+    /// Pods run until the test completes them: the session is written then, not at create.
+    held: bool,
     tx: tokio::sync::mpsc::UnboundedSender<IssueKey>,
     /// The session log every created pod "produces".
     session: &'static str,
@@ -391,12 +393,14 @@ impl PodDispatcher for FakePodDispatcher {
         let issue_key = pod_annotation(&pod, crucible_controller::daemon::ISSUE_KEY_ANNOTATION)
             .expect("stamped issue-key annotation")
             .to_string();
-        crucible_controller::runs::blob_store::put_run_session(
-            &self.pool,
-            &run_id,
-            self.session.as_bytes(),
-        )
-        .await?;
+        if !self.held {
+            crucible_controller::runs::blob_store::put_run_session(
+                &self.pool,
+                &run_id,
+                self.session.as_bytes(),
+            )
+            .await?;
+        }
         self.launches.lock().expect("launches").push(run_id);
         self.keys.lock().expect("keys").push(issue_key.clone());
         if self.deliver {
@@ -784,6 +788,7 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
     let launcher = Arc::new(FakePodDispatcher {
         pool: db.pool().clone(),
         deliver: true,
+        held: false,
         tx,
         session: SESSION_LOG,
         launches: Mutex::new(Vec::new()),
@@ -1063,6 +1068,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
     let launcher1 = Arc::new(FakePodDispatcher {
         pool: db.pool().clone(),
         deliver: false,
+        held: false,
         tx: tx1,
         session: SESSION_LOG,
         launches: Mutex::new(Vec::new()),
@@ -1108,6 +1114,7 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
     let launcher2 = Arc::new(FakePodDispatcher {
         pool: db.pool().clone(),
         deliver: false,
+        held: false,
         tx: tx2,
         session: SESSION_LOG,
         launches: Mutex::new(Vec::new()),
@@ -1375,6 +1382,7 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
     let launcher = Arc::new(FakePodDispatcher {
         pool: db.pool().clone(),
         deliver: true,
+        held: false,
         tx,
         session: PLAYBOOK_SESSION_LOG,
         launches: Mutex::new(Vec::new()),
@@ -1610,30 +1618,50 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
 }
 
 /// A running assembled daemon with its discovery tick an hour away, the fake cluster behind it, a
-/// registered `survey` playbook, and an API to drive it.
+/// registered `survey` playbook, an API to drive it, and the webhook delivery surface.
 struct LaunchRig {
     _root: tempfile::TempDir,
     _launcher_guard: DispatcherGuard,
     db: Db,
     app: axum::Router,
+    hooks: axum::Router,
     launcher: Arc<FakePodDispatcher>,
     shutdown: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<()>>,
 }
 
-/// `standby` gives the API a queue of its own that no worker drains, as on the replica that is
-/// not the leader; otherwise the API shares the daemon's queue.
-async fn launch_rig(standby: bool) -> Result<LaunchRig> {
+struct RigOpts {
+    /// Give the API a queue of its own that no worker drains, as on the replica that is not the
+    /// leader; otherwise the API shares the daemon's queue.
+    standby: bool,
+    /// Complete every pod as soon as it is created; otherwise the test completes them.
+    deliver: bool,
+    max_concurrent_pods: u32,
+}
+
+impl Default for RigOpts {
+    fn default() -> Self {
+        RigOpts {
+            standby: false,
+            deliver: true,
+            max_concurrent_pods: 2,
+        }
+    }
+}
+
+async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
     let root = tempfile::tempdir()?;
     let state_dir = root.path().join("state");
     let mut cfg = test_cfg(&state_dir, Vec::new());
     cfg.admins = vec!["wren".to_string()];
+    cfg.profile.max_concurrent_pods = opts.max_concurrent_pods;
     let db = Db::open(cfg.db_url()).await?;
 
     let (tx, completions) = channel_completions();
     let launcher = Arc::new(FakePodDispatcher {
         pool: db.pool().clone(),
-        deliver: true,
+        deliver: opts.deliver,
+        held: !opts.deliver,
         tx,
         session: PLAYBOOK_SESSION_LOG,
         launches: Mutex::new(Vec::new()),
@@ -1643,7 +1671,7 @@ async fn launch_rig(standby: bool) -> Result<LaunchRig> {
     crucible_controller::install_dispatcher(launcher.clone());
 
     let queue = WorkQueue::new();
-    let api_queue = if standby {
+    let api_queue = if opts.standby {
         WorkQueue::new()
     } else {
         queue.clone()
@@ -1677,6 +1705,9 @@ async fn launch_rig(standby: bool) -> Result<LaunchRig> {
             .expect("the shipped default policy set loads"),
         &cfg,
     ));
+    let hooks = crucible_controller::launches::webhooks::receive::router(
+        crucible_controller::launches::webhooks::receive::HooksState::new(db.pool().clone(), None),
+    );
 
     let repo = write_playbook_repo(root.path());
     let (status, registered) = api(
@@ -1707,6 +1738,7 @@ async fn launch_rig(standby: bool) -> Result<LaunchRig> {
         _launcher_guard: DispatcherGuard,
         db,
         app,
+        hooks,
         launcher,
         shutdown,
         handle,
@@ -1714,19 +1746,72 @@ async fn launch_rig(standby: bool) -> Result<LaunchRig> {
 }
 
 impl LaunchRig {
-    /// The first key the fake cluster was asked to run, within `within`.
-    async fn first_dispatch(&self, within: Duration) -> String {
+    /// The `n`th key (from 0) the fake cluster was asked to run, within `within`.
+    async fn dispatched(&self, n: usize, within: Duration) -> String {
         let deadline = tokio::time::Instant::now() + within;
         loop {
-            if let Some(key) = self.launcher.keys.lock().expect("keys").first().cloned() {
+            if let Some(key) = self.launcher.keys.lock().expect("keys").get(n).cloned() {
                 return key;
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "nothing dispatched within {within:?}"
+                "dispatch {n} did not happen within {within:?}"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    async fn launch(&self, topic: &str) {
+        let (status, launch) = api(
+            &self.app,
+            "POST",
+            "/api/playbooks/survey/launch",
+            Some(serde_json::json!({
+                "params": {"topic": topic, "depth": "deep"},
+                "max_cost": 3.5,
+                "max_time": "30m",
+            })),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::CREATED, "{launch}");
+    }
+
+    /// The pod for `key` finishes its session, and the cluster watch reports it.
+    async fn complete(&self, key: &str) {
+        let n = self
+            .launcher
+            .keys
+            .lock()
+            .expect("keys")
+            .iter()
+            .position(|k| k == key)
+            .expect("the key was dispatched");
+        let run_id = self.launcher.launches.lock().expect("launches")[n].clone();
+        crucible_controller::runs::blob_store::put_run_session(
+            self.db.pool(),
+            &run_id,
+            self.launcher.session.as_bytes(),
+        )
+        .await
+        .expect("session");
+        self.launcher
+            .tx
+            .send(IssueKey(key.to_string()))
+            .expect("the completion stream is open");
+    }
+
+    async fn deliver(&self, path: &str, body: serde_json::Value) -> http::StatusCode {
+        use tower::ServiceExt;
+        let req = http::Request::post(path)
+            .header(http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request");
+        self.hooks
+            .clone()
+            .oneshot(req)
+            .await
+            .expect("response")
+            .status()
     }
 
     async fn stop(self) -> usize {
@@ -1741,22 +1826,15 @@ impl LaunchRig {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_the_standby_accepts_dispatches_on_the_leader() -> Result<()> {
     let _g = E2E_LOCK.lock().await;
-    let rig = launch_rig(true).await?;
+    let rig = launch_rig(RigOpts {
+        standby: true,
+        ..RigOpts::default()
+    })
+    .await?;
 
-    let (status, launch) = api(
-        &rig.app,
-        "POST",
-        "/api/playbooks/survey/launch",
-        Some(serde_json::json!({
-            "params": {"topic": "standby topic", "depth": "deep"},
-            "max_cost": 3.5,
-            "max_time": "30m",
-        })),
-    )
-    .await;
-    assert_eq!(status, http::StatusCode::CREATED, "{launch}");
+    rig.launch("standby topic").await;
 
-    let key = rig.first_dispatch(Duration::from_secs(10)).await;
+    let key = rig.dispatched(0, Duration::from_secs(10)).await;
     wait_for_status(&rig.db, &key, Status::Done).await;
     assert_eq!(rig.stop().await, 1);
     Ok(())
@@ -1767,7 +1845,7 @@ async fn a_launch_the_standby_accepts_dispatches_on_the_leader() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_one_shot_launches_at_its_instant_without_a_discovery_tick() -> Result<()> {
     let _g = E2E_LOCK.lock().await;
-    let rig = launch_rig(false).await?;
+    let rig = launch_rig(RigOpts::default()).await?;
 
     let fire_at = jiff::Timestamp::now() + jiff::SignedDuration::from_secs(2);
     let (status, one_shot) = api(
@@ -1785,7 +1863,7 @@ async fn a_one_shot_launches_at_its_instant_without_a_discovery_tick() -> Result
     .await;
     assert_eq!(status, http::StatusCode::CREATED, "{one_shot}");
 
-    let key = rig.first_dispatch(Duration::from_secs(10)).await;
+    let key = rig.dispatched(0, Duration::from_secs(10)).await;
     let dispatched = jiff::Timestamp::now();
     assert!(
         dispatched >= fire_at - jiff::SignedDuration::from_secs(1),
@@ -1793,5 +1871,101 @@ async fn a_one_shot_launches_at_its_instant_without_a_discovery_tick() -> Result
     );
     wait_for_status(&rig.db, &key, Status::Done).await;
     assert_eq!(rig.stop().await, 1);
+    Ok(())
+}
+
+/// A webhook delivery, posted to either replica, launches through the leader's launch loop with
+/// the discovery tick an hour away, and the delivery settles `launched`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_webhook_delivery_launches_without_a_discovery_tick() -> Result<()> {
+    let _g = E2E_LOCK.lock().await;
+    for standby in [false, true] {
+        let rig = launch_rig(RigOpts {
+            standby,
+            ..RigOpts::default()
+        })
+        .await?;
+
+        let (status, created) = api(
+            &rig.app,
+            "POST",
+            "/api/webhooks",
+            Some(serde_json::json!({
+                "playbook": "survey",
+                "verifier": "path_token",
+                "dedupe": "body.topic",
+                "derive": {"topic": "body.topic"},
+                "params": {"depth": "deep"},
+                "max_launches_per_hour": 5,
+                "max_cost": 3.0,
+                "max_time": "30m",
+            })),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::CREATED, "{created}");
+        let id = created["webhook"]["id"].as_str().expect("id");
+        let secret = created["secret"].as_str().expect("secret");
+
+        assert_eq!(
+            rig.deliver(
+                &format!("/hooks/{id}/{secret}"),
+                serde_json::json!({"topic": "hooked"}),
+            )
+            .await,
+            http::StatusCode::ACCEPTED
+        );
+
+        let key = rig.dispatched(0, Duration::from_secs(10)).await;
+        wait_for_status(&rig.db, &key, Status::Done).await;
+        let (status, deliveries) = api(
+            &rig.app,
+            "GET",
+            &format!("/api/webhooks/{id}/deliveries"),
+            None,
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::OK, "{deliveries}");
+        let outcomes: Vec<&str> = deliveries
+            .as_array()
+            .expect("array")
+            .iter()
+            .map(|d| d["outcome"].as_str().expect("outcome"))
+            .collect();
+        assert_eq!(outcomes, vec!["launched"], "standby: {standby}");
+        assert_eq!(rig.stop().await, 1, "standby: {standby}");
+    }
+    Ok(())
+}
+
+/// A launch the concurrency cap turned away dispatches as soon as the running pod completes,
+/// not a discovery interval later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_capped_launch_dispatches_when_a_slot_frees() -> Result<()> {
+    let _g = E2E_LOCK.lock().await;
+    let rig = launch_rig(RigOpts {
+        deliver: false,
+        max_concurrent_pods: 1,
+        ..RigOpts::default()
+    })
+    .await?;
+
+    rig.launch("first").await;
+    let first = rig.dispatched(0, Duration::from_secs(10)).await;
+    wait_for_status(&rig.db, &first, Status::Running).await;
+    rig.launch("second").await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        rig.launcher.keys.lock().expect("keys").len(),
+        1,
+        "the cap holds the second launch back"
+    );
+
+    rig.complete(&first).await;
+    let second = rig.dispatched(1, Duration::from_secs(5)).await;
+    assert_ne!(first, second);
+    wait_for_status(&rig.db, &first, Status::Done).await;
+    rig.complete(&second).await;
+    wait_for_status(&rig.db, &second, Status::Done).await;
+    assert_eq!(rig.stop().await, 2);
     Ok(())
 }

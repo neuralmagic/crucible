@@ -10,8 +10,6 @@
 //!        └────────▶ sleep min(until due, probe interval), or until woken ──────┘
 //! ```
 
-#![allow(clippy::disallowed_macros)]
-
 use crate::daemon::queue::{DueSource, Enqueue};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,7 +28,8 @@ pub struct LaunchLoopCfg {
     pub hold: Arc<dyn Fn() -> Duration + Send + Sync>,
 }
 
-/// Run the launch loop until the task is cancelled. `wake` forces an early probe.
+/// Run the launch loop until the task is cancelled. `wake` forces an early probe and releases
+/// every held row.
 pub async fn run(
     source: Arc<dyn DueSource>,
     enqueue: Arc<dyn Enqueue>,
@@ -73,7 +72,7 @@ pub async fn run(
         };
         tokio::select! {
             _ = tokio::time::sleep(sleep) => {}
-            _ = wake.notified() => {}
+            _ = wake.notified() => held.clear(),
         }
     }
 }
@@ -178,7 +177,7 @@ mod tests {
     const PAST: Option<SignedDuration> = Some(SignedDuration::from_secs(-1));
     const LONG: Duration = Duration::from_secs(3600);
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_due_row_passes_at_once_and_a_claiming_pass_repeats_until_idle() {
         let claimed = |n| Pass {
             claimed: n,
@@ -196,35 +195,34 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn nothing_due_sleeps_the_probe_interval_between_probes() {
         let script = Script::new(vec![None], Vec::new());
         let (handle, _) = spawn(&script, Duration::from_millis(20), LONG);
         tokio::time::sleep(Duration::from_millis(150)).await;
         handle.abort();
-        let probes = script.probes().len();
-        assert!((3..=10).contains(&probes), "{probes} probes in 150ms");
+        assert_eq!(script.probes().len(), 8, "probes at 0, 20, ..., 140ms");
         assert!(script.passes().is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_future_due_time_is_met_before_the_probe_interval() {
         let script = Script::new(
             vec![Some(SignedDuration::from_millis(200)), PAST, None],
             Vec::new(),
         );
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let (handle, _) = spawn(&script, LONG, LONG);
         script.wait_for_passes(1).await;
         handle.abort();
         let waited = started.elapsed();
         assert!(
-            waited >= Duration::from_millis(150) && waited < Duration::from_secs(2),
+            waited >= Duration::from_millis(190) && waited <= Duration::from_millis(201),
             "passed after {waited:?}"
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_deferred_row_is_held_out_of_probes_and_passes_until_its_hold_ends() {
         let script = Script::new(
             vec![PAST],
@@ -248,17 +246,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_pass_that_claims_nothing_waits_the_probe_interval_instead_of_spinning() {
         let script = Script::new(vec![PAST], Vec::new());
         let (handle, _) = spawn(&script, Duration::from_millis(50), LONG);
         tokio::time::sleep(Duration::from_millis(220)).await;
         handle.abort();
-        let passes = script.passes().len();
-        assert!((3..=6).contains(&passes), "{passes} passes in 220ms");
+        assert_eq!(script.passes().len(), 5, "passes at 0, 50, ..., 200ms");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_wake_probes_before_the_interval_runs_out() {
         let script = Script::new(vec![None, PAST, None], Vec::new());
         let (handle, wake) = spawn(&script, LONG, LONG);
@@ -267,5 +264,23 @@ mod tests {
         wake.notify_one();
         script.wait_for_passes(1).await;
         handle.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_wake_releases_the_held_rows() {
+        let script = Script::new(
+            vec![PAST],
+            vec![Pass {
+                claimed: 0,
+                held: vec!["standing-a".into()],
+            }],
+        );
+        let (handle, wake) = spawn(&script, LONG, LONG);
+        script.wait_for_passes(1).await;
+        wake.notify_one();
+        script.wait_for_passes(2).await;
+        handle.abort();
+        assert_eq!(script.probes()[1], Vec::<String>::new());
+        assert_eq!(script.passes()[1], Vec::<String>::new());
     }
 }

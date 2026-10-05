@@ -631,6 +631,30 @@ pub async fn run_led(
 
     queue.reenqueue_startup(non_terminal_keys);
 
+    // A pod completion wakes the launch loop once its reconcile has freed the slot.
+    let launch_wake = Arc::new(tokio::sync::Notify::new());
+    let completed: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
+    let reconcile: ReconcileFn = {
+        let completed = completed.clone();
+        let wake = launch_wake.clone();
+        Arc::new(move |key: IssueKey| {
+            let completed = completed.clone();
+            let wake = wake.clone();
+            let reconciled = reconcile(key.clone());
+            Box::pin(async move {
+                let result = reconciled.await;
+                if completed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key.0)
+                {
+                    wake.notify_one();
+                }
+                result
+            })
+        })
+    };
+
     let worker_queue = queue.clone();
     let worker = tokio::spawn(async move {
         worker_queue.run(reconcile, park, cfg.queue, sync).await;
@@ -642,10 +666,13 @@ pub async fn run_led(
         use futures_util::StreamExt;
         let mut completions = completions;
         while let Some(key) = completions.next().await {
+            completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.0.clone());
             completion_queue.enqueue(key);
         }
     });
-    let launch_wake = Arc::new(tokio::sync::Notify::new());
     if let Some(launches) = launches {
         let hold = match cfg.discovery_interval_fn.clone() {
             Some(f) => f,

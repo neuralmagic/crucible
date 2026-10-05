@@ -1429,8 +1429,14 @@ impl DueSource for TriggerSweep {
         Box::pin(async move {
             let mut earliest: Option<Timestamp> = None;
             for trigger in &triggers {
-                if let Some(due) = trigger.next_due(&db, &held).await? {
-                    earliest = Some(earliest.map_or(due, |e| e.min(due)));
+                match trigger.next_due(&db, &held).await {
+                    Ok(Some(due)) => earliest = Some(earliest.map_or(due, |e| e.min(due))),
+                    Ok(None) => {}
+                    Err(e) => tracing::error!(
+                        trigger = trigger.trigger().as_str(),
+                        error = format!("{e:#}"),
+                        "standing: due probe failed"
+                    ),
                 }
             }
             Ok(earliest)
@@ -1768,5 +1774,93 @@ mod tests {
             "a refusal the overlay did not cause alone is the row's, not the sender's"
         );
         assert_eq!(core_state(&pool).await.0, 1);
+    }
+
+    /// A trigger with a fixed due-time probe and nothing to claim.
+    struct Probe(Option<Result<Timestamp, &'static str>>);
+
+    impl LaunchTrigger for Probe {
+        fn trigger(&self) -> Trigger {
+            Trigger::Schedule
+        }
+
+        fn due<'a>(
+            &'a self,
+            _db: &'a Db,
+            _cfg: SweepCfg,
+            _now: Timestamp,
+            _held: &'a [String],
+        ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn next_due<'a>(
+            &'a self,
+            _db: &'a Db,
+            _held: &'a [String],
+        ) -> TriggerFuture<'a, Result<Option<Timestamp>>> {
+            let answer = self.0.map(|r| r.map_err(anyhow::Error::msg)).transpose();
+            Box::pin(async move { answer })
+        }
+
+        fn claim<'a, 'c>(
+            &'a self,
+            _tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+            _claim: &'a mut Claim,
+            _now: Timestamp,
+        ) -> TriggerFuture<'a, Result<Claimed>> {
+            Box::pin(async { Ok(Claimed::Lost) })
+        }
+
+        fn settle<'a, 'c>(
+            &'a self,
+            _tx: &'a mut sqlx::Transaction<'c, sqlx::Postgres>,
+            _claim: &'a Claim,
+            _key: &'a str,
+            _now: Timestamp,
+        ) -> TriggerFuture<'a, Result<Vec<Recorded>>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn fail<'a>(
+            &'a self,
+            _db: &'a Db,
+            _claim: &'a Claim,
+            _error: &'a FireError,
+            _now: Timestamp,
+        ) -> TriggerFuture<'a, Result<Failed>> {
+            Box::pin(async {
+                Ok(Failed {
+                    counts: false,
+                    force_disable: false,
+                    announced: false,
+                })
+            })
+        }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_failed_probe_leaves_the_other_triggers_due_times(pool: PgPool) {
+        let early: Timestamp = "2026-10-01T00:00:00Z".parse().expect("timestamp");
+        let late: Timestamp = "2026-10-02T00:00:00Z".parse().expect("timestamp");
+        let sweep = standing::TriggerSweep::new(
+            Db::new(pool),
+            vec![
+                std::sync::Arc::new(Probe(Some(Ok(late)))),
+                std::sync::Arc::new(Probe(Some(Err("the probe query failed")))),
+                std::sync::Arc::new(Probe(None)),
+                std::sync::Arc::new(Probe(Some(Ok(early)))),
+            ],
+            5,
+            std::time::Duration::from_secs(3600),
+            None,
+            None,
+        );
+
+        let due = crate::daemon::queue::DueSource::next_due(&sweep, Vec::new())
+            .await
+            .expect("the sweep's probe");
+
+        assert_eq!(due, Some(early));
     }
 }
