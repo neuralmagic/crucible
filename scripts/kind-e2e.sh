@@ -370,12 +370,12 @@ pinned_report() {
     sed -E 's/.*pinned=([0-9]+).*/\1/' <<<"$line"
 }
 
-# collected_report <boot>: how many unpinned trees the boot collected, "none" if silent.
+# collected_report <boot>: how many unpinned trees and blobs the boot collected, "none" if silent.
 collected_report() {
     local line
     line=$(grep 'unpinned pack trees collected' "$WORK/controller-$1.log" || true)
     [ -z "$line" ] && { echo none; return; }
-    sed -E 's/.*count=([0-9]+).*/\1/' <<<"$line"
+    echo "$(sed -E 's/.*count=([0-9]+).*/\1/' <<<"$line") $(sed -E 's/.*blobs=([0-9]+).*/\1/' <<<"$line")"
 }
 
 # ---- pack and tree helpers -----------------------------------------------------------------
@@ -1855,18 +1855,28 @@ V_FRESH_TREE=$(draft_tree "$DRAFT-vfresh" 2)
 crux draft-delete "$DRAFT-vfresh" >/dev/null
 sql -c "UPDATE pack_trees SET created_at = '2000-01-01T00:00:00Z' WHERE digest IN ('$V_GC_TREE', '$V_TREE')"
 V_PINS=$(v_pins)
+V_GC_ONLY=$(sql -c "SELECT DISTINCT sha256 FROM pack_tree_files WHERE digest = '$V_GC_TREE'
+    AND sha256 NOT IN (SELECT sha256 FROM pack_tree_files WHERE digest <> '$V_GC_TREE') ORDER BY 1")
+[ -n "$V_GC_ONLY" ] || fail "[V] the collectable tree holds no blob of its own"
+V_KEPT_BLOBS=$(sql -c "SELECT count(DISTINCT sha256) FROM pack_tree_files WHERE digest IN ('$V_TREE', '$V_FRESH_TREE')")
 
 stop_controller
 start_controller
 [ "$(conversion_report "$BOOT")" = none ] || fail "[V] boot $BOOT converted again: $(conversion_report "$BOOT")"
 [ "$(v_pins)" = "$V_PINS" ] || fail "[V] a restart moved the pins to $(v_pins)"
-[ "$(collected_report "$BOOT")" = 1 ] || fail "[V] boot $BOOT collected '$(collected_report "$BOOT")' trees, not the one unpinned old tree"
+[ "$(collected_report "$BOOT")" = "1 $(wc -l <<<"$V_GC_ONLY" | tr -d ' ')" ] ||
+    fail "[V] boot $BOOT collected '$(collected_report "$BOOT")' trees and blobs, not the one unpinned old tree and the blobs only it held"
+for sha in $V_GC_ONLY; do
+    [ "$(sql -c "SELECT count(*) FROM pack_blobs WHERE sha256 = '$sha'")" = 0 ] || fail "[V] blob $sha only the collected tree held is still stored"
+done
+[ "$(sql -c "SELECT count(*) FROM pack_blobs WHERE sha256 IN (SELECT sha256 FROM pack_tree_files WHERE digest IN ('$V_TREE', '$V_FRESH_TREE'))")" = "$V_KEPT_BLOBS" ] ||
+    fail "[V] collection deleted a blob a kept tree holds"
 [ "$(sql -F ' ' -c "SELECT (SELECT count(*) FROM pack_trees WHERE digest = '$V_GC_TREE'), (SELECT count(*) FROM pack_tree_files WHERE digest = '$V_GC_TREE')")" = "0 0" ] ||
     fail "[V] the unpinned old tree is still stored"
 for kept in "$V_TREE" "$V_FRESH_TREE"; do
     [ -n "$(tree_tarball "$kept")" ] && [ -n "$(tree_paths "$kept")" ] || fail "[V] collection removed $kept"
 done
-pass "[V] a restart collected the unpinned old tree and kept the pinned one and the fresh one; the pins held"
+pass "[V] a restart collected the unpinned old tree and the blobs only it held, and kept the pinned and fresh trees and their blobs; the pins held"
 
 expect_released V-restart e2e-vpub
 crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V-same.json"

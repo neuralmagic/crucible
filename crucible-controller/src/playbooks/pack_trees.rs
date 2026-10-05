@@ -162,6 +162,20 @@ pub struct Collected {
 /// those blobs, while this runs makes a foreign key refuse the delete, which is an error with
 /// nothing deleted.
 pub async fn collect(pool: &sqlx::PgPool) -> Result<Collected> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the pack tree collection")?;
+    let collected = collect_in(&mut tx).await?;
+    tx.commit()
+        .await
+        .context("committing the pack tree collection")?;
+    Ok(collected)
+}
+
+/// [`collect`] inside the caller's transaction. Blobs are locked in sha256 order, as
+/// [`put_files`] locks them.
+async fn collect_in(conn: &mut PgConnection) -> Result<Collected> {
     let cutoff = jiff::Timestamp::now()
         .checked_sub(COLLECT_AFTER)
         .context("computing the pack tree cutoff")?;
@@ -171,29 +185,24 @@ pub async fn collect(pool: &sqlx::PgPool) -> Result<Collected> {
             format!(" AND NOT EXISTS (SELECT 1 FROM {table} WHERE {column} = t.digest)")
         })
         .collect();
-    let mut tx = pool
-        .begin()
-        .await
-        .context("opening the pack tree collection")?;
     let trees = sqlx::query(sqlx::AssertSqlSafe(format!(
         "DELETE FROM pack_trees t WHERE t.created_at < $1{unpinned}"
     )))
     .bind(crate::clock::stamp(cutoff))
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await
     .context("deleting unpinned pack trees")?
     .rows_affected();
     let blobs = sqlx::query(
-        "DELETE FROM pack_blobs b
-         WHERE NOT EXISTS (SELECT 1 FROM pack_tree_files f WHERE f.sha256 = b.sha256)",
+        "DELETE FROM pack_blobs WHERE sha256 IN (
+             SELECT sha256 FROM pack_blobs b
+             WHERE NOT EXISTS (SELECT 1 FROM pack_tree_files f WHERE f.sha256 = b.sha256)
+             ORDER BY sha256 FOR UPDATE)",
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await
     .context("deleting unreferenced pack blobs")?
     .rows_affected();
-    tx.commit()
-        .await
-        .context("committing the pack tree collection")?;
     Ok(Collected { trees, blobs })
 }
 
@@ -266,15 +275,22 @@ pub(crate) async fn read_file(
     digest: &TreeDigest,
     path: &str,
 ) -> Result<Option<Vec<u8>>> {
-    sqlx::query_scalar(
-        "SELECT b.content FROM pack_tree_files f JOIN pack_blobs b ON b.sha256 = f.sha256
+    let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+        "SELECT f.sha256, b.content FROM pack_tree_files f JOIN pack_blobs b ON b.sha256 = f.sha256
          WHERE f.digest = $1 AND f.path = $2",
     )
     .bind(digest.as_str())
     .bind(path)
     .fetch_optional(ex)
     .await
-    .with_context(|| format!("reading {path} of pack tree {digest}"))
+    .with_context(|| format!("reading {path} of pack tree {digest}"))?;
+    let Some((sha256, content)) = row else {
+        return Ok(None);
+    };
+    if crucible_contract::artifact::sha256_hex(&content) != sha256 {
+        bail!("{path} of pack tree {digest} no longer matches its stored hash");
+    }
+    Ok(Some(content))
 }
 
 /// What a digest a caller supplied names.
@@ -845,6 +861,26 @@ mod tests {
         );
     }
 
+    /// Wait until a statement starting with `prefix` waits on a lock.
+    async fn wait_on_lock(pool: &PgPool, prefix: &str) {
+        for _ in 0..500 {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'
+                   AND starts_with(query, $1))",
+            )
+            .bind(prefix)
+            .fetch_one(pool)
+            .await
+            .expect("waiting");
+            if waiting {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("no statement starting with {prefix} waited on a lock");
+    }
+
     async fn age_every_tree(pool: &PgPool) {
         sqlx::query("UPDATE pack_trees SET created_at = '2000-01-01T00:00:00Z'")
             .execute(pool)
@@ -1019,23 +1055,7 @@ mod tests {
             let pool = pool.clone();
             async move { collect(&pool).await }
         });
-        let mut waited = 0;
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity
-                 WHERE datname = current_database() AND wait_event_type = 'Lock'
-                   AND query LIKE 'DELETE FROM pack_trees%'",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("waiting");
-            if waiting > 0 {
-                break;
-            }
-            waited += 1;
-            assert!(waited < 500, "collection never waited on the writer");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_on_lock(&pool, "DELETE FROM pack_trees").await;
         sqlx::query(
             "INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
              VALUES ('launch_1', $1, $2, 1, 'now', $3)",
@@ -1125,6 +1145,11 @@ mod tests {
                 .expect_err("tampered")
                 .to_string();
             assert!(err.contains("no longer matches"), "{digest}: {err}");
+            let err = read_file(&pool, &digest, "s")
+                .await
+                .expect_err("tampered")
+                .to_string();
+            assert!(err.contains("no longer matches"), "{digest}: {err}");
         }
     }
 
@@ -1189,23 +1214,7 @@ mod tests {
             let pool = pool.clone();
             async move { collect(&pool).await }
         });
-        let mut waited = 0;
-        loop {
-            let waiting: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM pg_stat_activity
-                 WHERE datname = current_database() AND wait_event_type = 'Lock'
-                   AND query LIKE 'DELETE FROM pack_blobs%'",
-            )
-            .fetch_one(&pool)
-            .await
-            .expect("waiting");
-            if waiting > 0 {
-                break;
-            }
-            waited += 1;
-            assert!(waited < 500, "collection never waited on the writer");
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        wait_on_lock(&pool, "DELETE FROM pack_blobs").await;
         writer.commit().await.expect("commit");
 
         let err = collecting
@@ -1217,6 +1226,99 @@ mod tests {
             "{err:#}"
         );
         assert_eq!(get_tree(&pool, &old_digest).await.expect("old"), Some(old));
+        assert_eq!(get_tree(&pool, &new_digest).await.expect("new"), Some(new));
+    }
+
+    /// A writer that reuses many orphaned blobs and has locked only the lowest by sha256, and a
+    /// collection that starts meanwhile: collection waits on that lock before locking any other,
+    /// so the writer locks the rest and stores its tree, and collection fails on the foreign key
+    /// instead of deadlocking. The blobs are stored highest first, so a collection locking in heap
+    /// or hash order would take a higher one before waiting.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_writer_and_a_collection_lock_blobs_in_one_order(pool: PgPool) {
+        let mut contents: Vec<(String, String)> = (0..16)
+            .map(|i| {
+                let content = format!("blob-{i}");
+                (
+                    crucible_contract::artifact::sha256_hex(content.as_bytes()),
+                    content,
+                )
+            })
+            .collect();
+        contents.sort();
+        let mut conn = pool.acquire().await.expect("conn");
+        for (_, content) in contents.iter().rev() {
+            put_tree(&mut conn, &encoded(&pack(&[("old", content.as_bytes())])))
+                .await
+                .expect("put");
+        }
+        age_every_tree(&pool).await;
+        let paths: Vec<String> = (0..contents.len()).map(|i| format!("f{i}")).collect();
+        let pairs: Vec<(&str, &[u8])> = paths
+            .iter()
+            .zip(&contents)
+            .map(|(path, (_, content))| (path.as_str(), content.as_bytes()))
+            .collect();
+        let new = pack(&pairs);
+
+        let mut writer = pool.begin().await.expect("begin");
+        sqlx::query("SELECT 1 FROM pack_blobs WHERE sha256 = $1 FOR KEY SHARE")
+            .bind(&contents[0].0)
+            .execute(&mut *writer)
+            .await
+            .expect("lock");
+        let collecting = tokio::spawn({
+            let pool = pool.clone();
+            async move { collect(&pool).await }
+        });
+        wait_on_lock(&pool, "DELETE FROM pack_blobs").await;
+        let new_digest = put_tree(&mut writer, &encoded(&new)).await.expect("put");
+        writer.commit().await.expect("commit");
+
+        let err = collecting
+            .await
+            .expect("join")
+            .expect_err("the writer wins");
+        let err = format!("{err:#}");
+        assert!(err.contains("deleting unreferenced pack blobs"), "{err}");
+        assert!(err.contains("foreign key"), "{err}");
+        assert_eq!(get_tree(&pool, &new_digest).await.expect("new"), Some(new));
+        assert_eq!(blob_count(&pool).await, 16);
+    }
+
+    /// A collection that deleted an orphaned blob, uncommitted, and a writer reusing it: the
+    /// writer waits, finds the blob gone once collection commits, stores it again, and its tree
+    /// reads back whole.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_blob_collected_while_a_writer_reuses_it_is_stored_again(pool: PgPool) {
+        put_tree(
+            &mut pool.acquire().await.expect("conn"),
+            &encoded(&pack(&[("a", b"old"), ("lib", b"shared")])),
+        )
+        .await
+        .expect("put");
+        age_every_tree(&pool).await;
+        let new = pack(&[("a", b"new"), ("lib", b"shared")]);
+
+        let mut collector = pool.begin().await.expect("begin");
+        assert_eq!(
+            collect_in(&mut collector).await.expect("collect"),
+            Collected { trees: 1, blobs: 2 }
+        );
+        let writing = tokio::spawn({
+            let pool = pool.clone();
+            let new = new.clone();
+            async move {
+                let mut conn = pool.acquire().await.expect("conn");
+                put_tree(&mut conn, &encoded(&new)).await
+            }
+        });
+        wait_on_lock(&pool, "SELECT sha256 FROM pack_blobs").await;
+        collector.commit().await.expect("commit");
+
+        let new_digest = writing.await.expect("join").expect("the writer stores it");
+        assert!(blob_stored(&pool, b"shared").await);
+        assert!(!blob_stored(&pool, b"old").await);
         assert_eq!(get_tree(&pool, &new_digest).await.expect("new"), Some(new));
     }
 }
