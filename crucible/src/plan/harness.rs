@@ -3635,6 +3635,125 @@ workflow(type = "playbook", tasks = [probe, report])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Real command tasks against real schemas: a matching output feeds its consumer and its file
+    /// is captured, and a field or file the schema rejects fails at the producer, once, naming
+    /// where the value went wrong.
+    #[test]
+    fn a_schema_typed_output_and_file_fail_at_the_producer_when_they_do_not_match() {
+        let dir = playbook_pack(
+            "schema-typed",
+            r#"
+good = command(
+    name = "good",
+    run = "printf '{\"ok\": true}' > RESULT.json && printf 'notes' > NOTES.md && printf '{\"lanes\": [\"a\", \"b\"]}\n'",
+    emits = {"lanes": schema_file("schemas/lanes.json")},
+    emits_files = {"RESULT.json": schema_file("schemas/result.json"), "NOTES.md": None},
+)
+lane = command(
+    name = "lane",
+    run = "printf '{\"done\": true}\n'",
+    depends_on = [good],
+    over = good.lanes,
+    max_fanout = 4,
+)
+bad_field = command(
+    name = "bad_field",
+    run = "printf '{\"lanes\": [\"a\", 7]}\n'",
+    emits = {"lanes": schema_file("schemas/lanes.json")},
+    required = False,
+)
+after = command(name = "after", run = "printf '{}\n'", depends_on = [bad_field], required = False)
+bad_file = command(
+    name = "bad_file",
+    run = "printf '{\"ok\": \"yes\"}' > BAD.json && printf '{}\n'",
+    emits_files = {"BAD.json": schema_file("schemas/result.json")},
+    required = False,
+)
+not_json = command(
+    name = "not_json",
+    run = "printf 'ok' > PLAIN.json && printf '{}\n'",
+    emits_files = {"PLAIN.json": schema_file("schemas/result.json")},
+    required = False,
+)
+workflow(type = "playbook", tasks = [good, lane, bad_field, after, bad_file, not_json])
+"#,
+        );
+        std::fs::create_dir_all(dir.join("schemas")).unwrap();
+        std::fs::write(
+            dir.join("schemas/lanes.json"),
+            r#"{"type": "array", "items": {"type": "string"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("schemas/result.json"),
+            r#"{"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}"#,
+        )
+        .unwrap();
+        let out = run_playbook(&dir);
+        let result = |name: &str| &out.results[&name.into()];
+
+        assert_eq!(
+            result("good").status,
+            TaskStatus::Pass,
+            "{:?}",
+            result("good").note
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/good/RESULT.json")).unwrap(),
+            "{\"ok\": true}"
+        );
+        let lanes: Vec<_> = out
+            .results
+            .iter()
+            .filter(|(name, _)| name.0.starts_with("lane["))
+            .collect();
+        assert_eq!(lanes.len(), 2, "{:?}", out.results.keys());
+        assert!(lanes.iter().all(|(_, r)| r.status == TaskStatus::Pass));
+
+        let bad_field = result("bad_field");
+        assert_eq!(bad_field.status, TaskStatus::Fail);
+        assert_eq!(
+            bad_field.attempts, 1,
+            "a schema mismatch must not be retried"
+        );
+        assert_eq!(
+            bad_field.note.as_deref(),
+            Some(
+                "output field \"lanes\" does not match its schema: /1: value is not of type \"string\""
+            )
+        );
+        assert_eq!(result("after").status, TaskStatus::Blocked);
+
+        let bad_file = result("bad_file");
+        assert_eq!(bad_file.status, TaskStatus::Fail);
+        assert_eq!(
+            bad_file.attempts, 1,
+            "a schema mismatch must not be retried"
+        );
+        assert_eq!(
+            bad_file.note.as_deref(),
+            Some(
+                "declared file \"BAD.json\" does not match its schema: /ok: value is not of type \"boolean\""
+            )
+        );
+        assert!(
+            !dir.join("state/files/bad_file").exists(),
+            "a file its schema rejects was published"
+        );
+
+        let not_json = result("not_json");
+        assert_eq!(not_json.status, TaskStatus::Fail);
+        assert!(
+            not_json
+                .note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("declared file \"PLAIN.json\" is not JSON: ")),
+            "{:?}",
+            not_json.note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A staged set is complete or absent. A failing producer that delivered one of two declared
     /// paths publishes neither, refunds what it charged, says why beside its own failure note,
     /// and stays failed rather than becoming a different failure.

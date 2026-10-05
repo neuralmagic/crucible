@@ -8,7 +8,8 @@ use starlark_syntax::codemap::FileSpan;
 
 pub(crate) const MAX_SOURCE_BYTES: usize = 256 * 1024;
 pub(crate) const MAX_PROMPT_BYTES: usize = 256 * 1024;
-pub(crate) const MAX_TOTAL_PROMPT_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_TOTAL_EMBED_BYTES: usize = 1024 * 1024;
 pub(crate) const MAX_TASKS: usize = 128;
 /// Tasks a source may build before `workflow(...)` picks the ones that ship. Loops and
 /// comprehensions can construct far more than they include; these live on the Rust heap, which
@@ -95,10 +96,20 @@ pub enum CompileError {
     #[error("serializing the compiled workflow")]
     Json(#[from] serde_json::Error),
 
-    #[error("prompt_file({raw:?}) is {bytes} bytes; maximum is {MAX_PROMPT_BYTES}")]
-    PromptTooLarge { raw: String, bytes: usize },
-    #[error("workflow embeds more than {MAX_TOTAL_PROMPT_BYTES} bytes of prompt files")]
-    PromptBudgetSpent,
+    #[error("{call}({raw:?}) is {bytes} bytes; maximum is {max}")]
+    EmbedTooLarge {
+        call: &'static str,
+        raw: String,
+        bytes: u64,
+        max: usize,
+    },
+    #[error("workflow embeds more than {MAX_TOTAL_EMBED_BYTES} bytes of prompt and schema files")]
+    EmbedBudgetSpent,
+    #[error("schema_file({raw:?}): {error}")]
+    InvalidSchema {
+        raw: String,
+        error: crucible_contract::emits::SchemaError,
+    },
 
     #[error(
         "an argument nests {depth} levels deep; maximum is {MAX_NESTING_DEPTH}. A loop can build \
@@ -361,7 +372,10 @@ pub enum CompileError {
     SkillArgNotRenderable { task: String, key: String },
     #[error("a dictionary key must be a string")]
     DictKeyNotString,
-    #[error("\"emits_files\" must be a list of workspace-relative path strings")]
+    #[error(
+        "\"emits_files\" must be a list of workspace-relative path strings, or a dict from path \
+         to schema_file(...) or None"
+    )]
     EmitsFilesNotList,
     #[error(
         "emits_files entry {path:?} is not workspace-relative; a declared output cannot be an \
@@ -429,7 +443,8 @@ pub enum CompileError {
     EmitsNotList,
     #[error(
         "emits field {field:?} has unknown type {got:?}{}; use \"string\", \"integer\", \
-         \"number\", \"boolean\", \"list\", \"object\", or a list of labels",
+         \"number\", \"boolean\", \"list\", \"object\", \"link\", \"links\", a list of \
+         labels, or schema_file(...)",
         diag::hint(.suggestion.as_deref())
     )]
     UnknownFieldType {
@@ -437,7 +452,10 @@ pub enum CompileError {
         got: String,
         suggestion: Option<String>,
     },
-    #[error("emits field {field:?} must map to a type name or a list of label strings")]
+    #[error(
+        "emits field {field:?} must map to a type name, a list of label strings, or \
+         schema_file(...)"
+    )]
     FieldTypeWrongShape { field: String },
     #[error("emits field {field:?}: {error}")]
     InvalidFieldLabel {

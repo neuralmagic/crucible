@@ -49,6 +49,9 @@ pub fn compile_workflow(
     for prompt_file in &compiled.prompt_files {
         eprintln!("embedded prompt: {}", prompt_file.display());
     }
+    for schema_file in &compiled.schema_files {
+        eprintln!("embedded schema: {}", schema_file.display());
+    }
     print!("{}", compiled.canonical_json);
     Ok(())
 }

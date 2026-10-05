@@ -105,13 +105,17 @@ fn task_knobs() -> Vec<Kwarg> {
              `top_k` or grade score a number, and a `route(source = ...)` question labels it can \
              answer. A `link` is one http(s) url and `links` a list of them, each naming a result \
              the task produced outside the run (a pull request, a pushed branch, an issue), \
-             which the run and task views then link out to.",
+             which the run and task views then link out to. A `schema_file(...)` promises a value \
+             its JSON Schema admits; consumers read the schema's top-level `type`, so `over` \
+             needs `\"array\"` and a score `\"number\"` or `\"integer\"`.",
         ),
         Kwarg::new(
             "emits_files",
-            "list[str]",
+            "list[str] | dict[str, schema | None]",
             "Workspace files the task produces. A dependent is staged with the declared files of \
-             every dependency that passed.",
+             every dependency that passed. The dict form maps a path to `schema_file(...)` or \
+             `None`; a file with a schema must hold JSON the schema admits when the task passes, \
+             or the task fails.",
         ),
         Kwarg::new(
             "over",
@@ -381,6 +385,17 @@ pub fn functions() -> Vec<Function> {
             lane: Lane::Common,
             purpose: "Embed a UTF-8 file below the pack directory. Absolute paths, `..`, \
                       symlinks, non-files, and oversized inputs are refused.",
+            positional: Some("path"),
+            kwargs: vec![],
+        },
+        Function {
+            name: "schema_file",
+            lane: Lane::Common,
+            purpose: "Read a JSON Schema (draft 2020-12) below the pack directory, for a field \
+                      type in `emits` or a file in `emits_files`. Its content, not its path, is \
+                      compiled into the plan. Paths are confined as for `prompt_file`; a file \
+                      that is not a valid 2020-12 schema, declares another `$schema`, or \
+                      references a remote `$ref` is refused.",
             positional: Some("path"),
             kwargs: vec![],
         },
@@ -739,8 +754,8 @@ pub fn markdown() -> String {
     );
     out.push_str(&dialect_sentence());
     out.push_str(
-        "\n\n`prompt_file()` and `load()` are the only file access, both confined below the pack \
-         directory, and a loaded module cannot re-export what it loaded. The surface has no \
+        "\n\n`prompt_file()`, `schema_file()`, and `load()` are the only file access, all confined \
+         below the pack directory, and a loaded module cannot re-export what it loaded. The surface has no \
          processes, network access, clock, or randomness.\n\n\
          For what the engine does with the compiled graph, see [Work graphs](./work-graphs.md); \
          for the normative rules, see the [implementation contract](./crucible-contract.md).\n\n",
