@@ -800,7 +800,7 @@ U_BEFORE=$(blob_count)
 new_draft "$DRAFT-blobs" "$U_PACK"
 [ "$(draft_tree "$DRAFT-blobs" 2)" = "$TREE" ] || fail "[U] a copy of the delivery pack saved tree $(draft_tree "$DRAFT-blobs" 2), not $TREE"
 [ "$(blob_count)" = "$U_BEFORE" ] || fail "[U] saving an identical pack in another draft added $(($(blob_count) - U_BEFORE)) blobs"
-echo "edited $ID" >>"$U_PACK/bulk/a.txt"
+head -c 512000 <(yes "edited filler $ID") >"$U_PACK/bulk/a.txt"
 U_BEFORE=$(blob_count)
 crux draft-push "$DRAFT-blobs" "$U_PACK" --base-version 2 --json >"$WORK/push-U3.json"
 [ "$(jq -r .version "$WORK/push-U3.json")" = 3 ] || fail "[U] draft-push: $(cat "$WORK/push-U3.json")"
@@ -808,7 +808,7 @@ U_TREE=$(draft_tree "$DRAFT-blobs" 3)
 [ "$(blob_count)" = $((U_BEFORE + 1)) ] || fail "[U] a save with one file changed added $(($(blob_count) - U_BEFORE)) blobs, not 1"
 U_OWN="$WORK/blobs-own"
 cp -R "$PACK" "$U_OWN"
-echo "own $ID" >>"$U_OWN/bulk/b.txt"
+head -c 512000 <(yes "own filler $ID") >"$U_OWN/bulk/b.txt"
 U_BEFORE=$(blob_count)
 new_draft "$DRAFT-blobs-own" "$U_OWN"
 U_OWN_TREE=$(draft_tree "$DRAFT-blobs-own" 2)
