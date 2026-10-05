@@ -212,6 +212,25 @@ impl std::fmt::Display for SchemaError {
 
 impl std::error::Error for SchemaError {}
 
+/// `value` with every object's keys in sorted order, so its text is the same whether or not
+/// serde_json preserves insertion order.
+fn sorted_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key, sorted_keys(value)))
+                    .collect(),
+            )
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sorted_keys).collect()),
+        other => other,
+    }
+}
+
 /// The only `$schema` a [`JsonSchema`] may declare.
 pub const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 
@@ -230,7 +249,7 @@ impl JsonSchema {
         jsonschema::draft202012::new(&document).map_err(|error| SchemaError::Invalid {
             error: error.to_string(),
         })?;
-        Ok(JsonSchema(Box::new(document)))
+        Ok(JsonSchema(Box::new(sorted_keys(document))))
     }
 
     pub fn parse(text: &str) -> Result<JsonSchema, SchemaError> {
@@ -916,6 +935,19 @@ mod tests {
                 "items": {"$ref": "#/$defs/lane"}
             }))
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_schema_is_pinned_with_sorted_keys_at_every_depth() {
+        let ty = FieldType::Schema(schema(json!({
+            "type": "object",
+            "properties": {"z": {"type": "string"}, "a": {"type": "integer"}},
+            "required": ["z", "a"]
+        })));
+        assert_eq!(
+            serde_json::to_string(&ty).unwrap(),
+            r#"{"schema":"{\"properties\":{\"a\":{\"type\":\"integer\"},\"z\":{\"type\":\"string\"}},\"required\":[\"z\",\"a\"],\"type\":\"object\"}"}"#
         );
     }
 

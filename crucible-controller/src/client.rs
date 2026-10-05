@@ -439,7 +439,8 @@ mod tests {
             (
                 "0052_pending_launch_index.sql",
                 "05a467cb170a352052d43e0a52204852063256ed0acab42bef305dc739560829",
-            ),            (
+            ),
+            (
                 "0053_task_repairs.sql",
                 "4f2444a5c159ac1f47d4bc0972d44e7d17b2cdcdf0e5e60e3aa025ed92a3f726",
             ),
