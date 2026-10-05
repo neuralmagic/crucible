@@ -33,6 +33,9 @@ dto! {
         pub adopted_repo: Option<String>,
         pub adopted_path: Option<String>,
         pub adopted_rev: Option<String>,
+        /// The `tree1:` digest of the adopted pack; null for a draft head, or for a row adopted
+        /// before trees were recorded.
+        pub adopted_tree_digest: Option<String>,
         pub eligible_draft_version: Option<i64>,
         /// The values every firing launches.
         #[schema(value_type = Object)]
@@ -335,6 +338,7 @@ async fn authorize_schedule(
         },
         rev: format!("draft-v{version}"),
         tar_digest: String::new(),
+        tree_digest: None,
         schema_digest,
         agent: latest.agent,
         core_rev: crate::playbooks::registry::core_rev().unwrap_or_default(),
@@ -438,7 +442,12 @@ pub(crate) async fn create_schedule(
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: &authorized.pack.id,
-                    target_kind: &body.target_kind,
+                    target: match draft_version {
+                        Some(_) => crate::launches::standing::StandingTarget::DraftHead,
+                        None => crate::launches::standing::StandingTarget::Adopted(
+                            authorized.pack.revision(),
+                        ),
+                    },
                     eligible_draft_version: draft_version,
                     params: &authorized.params,
                     schema_digest: &authorized.pack.schema_digest,
@@ -461,24 +470,16 @@ pub(crate) async fn create_schedule(
         .await;
     let stored = match stored {
         Ok(s) => s,
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return crate::launches::api::save_failed(e),
     };
 
     let audit_key = format!("schedule:{}", stored.id);
     let audit_reason = format!(
-        "playbook {} scheduled on {:?} ({}) as {} {}",
+        "playbook {} scheduled on {:?} ({}) as {}",
         stored.playbook,
         stored.cron_expr,
         stored.tz,
-        stored.target_kind,
-        stored
-            .adopted_rev
-            .as_deref()
-            .map(|rev| format!("revision {rev}"))
-            .unwrap_or_else(|| format!(
-                "draft version {}",
-                stored.eligible_draft_version.unwrap_or_default()
-            ))
+        stored.adopted_label()
     );
     if let Err(e) = state
         .audit_required(
@@ -653,7 +654,12 @@ pub(crate) async fn update_schedule(
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: &authorized.pack.id,
-                    target_kind: &body.target_kind,
+                    target: match draft_version {
+                        Some(_) => crate::launches::standing::StandingTarget::DraftHead,
+                        None => crate::launches::standing::StandingTarget::Adopted(
+                            authorized.pack.revision(),
+                        ),
+                    },
                     eligible_draft_version: draft_version,
                     params: &authorized.params,
                     schema_digest: &authorized.pack.schema_digest,
@@ -677,7 +683,7 @@ pub(crate) async fn update_schedule(
     let stored = match stored {
         Ok(Some(s)) => s,
         Ok(None) => return not_found(format!("no schedule {id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Err(e) => return crate::launches::api::save_failed(e),
     };
     // The re-save re-owned the row, so the firings that parked under the old snapshot will never
     // launch.
@@ -697,9 +703,8 @@ pub(crate) async fn update_schedule(
         stored.tz,
         prior
             .as_ref()
-            .and_then(|s| s.adopted_rev.as_deref())
-            .unwrap_or("draft head"),
-        stored.adopted_rev.as_deref().unwrap_or("draft head")
+            .map_or_else(|| "draft head".to_string(), Schedule::adopted_label),
+        stored.adopted_label()
     );
     if let Err(e) = state
         .audit_required(

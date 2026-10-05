@@ -1181,7 +1181,10 @@ mod tests {
                 path: "examples/paper".to_string(),
             },
             rev: "7c2c1a563813ce952dd4039745730397cf2295c2".to_string(),
-            tar_digest: "sha256:beef".to_string(),
+            tree_digest: Some(
+                "tree1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ),
             schema_digest: "sha256:cafe".to_string(),
             core_rev: "7c2c1a563813ce952dd4039745730397cf2295c2".to_string(),
             dispatch: crate::playbooks::api::registry::PackDispatchDto::new(
@@ -1212,7 +1215,14 @@ mod tests {
             })
         );
         assert_eq!(v["rev"], "7c2c1a563813ce952dd4039745730397cf2295c2");
-        assert_eq!(v["tar_digest"], "sha256:beef");
+        assert_eq!(
+            v["tree_digest"],
+            "tree1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(
+            v.get("tar_digest").is_none(),
+            "the bytes digest is not on the wire"
+        );
         assert_eq!(v["schema_digest"], "sha256:cafe");
         assert_eq!(v["core_rev"], "7c2c1a563813ce952dd4039745730397cf2295c2");
         assert_eq!(v["dispatch"]["backend"], "openshell");

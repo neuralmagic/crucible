@@ -20,6 +20,7 @@ pub mod link;
 pub mod markers;
 pub mod mcp;
 pub mod outputs;
+pub mod pack_tree;
 pub mod refine;
 pub mod report;
 pub mod scope;

@@ -2,8 +2,8 @@
 //! and loads it into the shared-state tables — drop-box evidence into artifact chunks (digests
 //! re-verified against the `pod_artifacts` pointers), run session logs (dispatched, adopted,
 //! external) into run-session artifacts with `runs.session_uri` repointed at the `db://` scheme,
-//! pack working trees re-tarred deterministically into `pack_tarballs` (trailing `STEER.md`
-//! steering appends split into `pack_steering` so the frozen pack stays frozen),
+//! pack working trees stored as pack trees in `pack_tarballs` (trailing `STEER.md` steering
+//! appends split into `pack_steering` so the frozen pack stays frozen),
 //! `controller-events.jsonl` into the `events` table, and `autopilot.json` into its row.
 //!
 //! Idempotent: every category short-circuits on a digest/content match, and event lines dedupe on
@@ -16,6 +16,7 @@
 #![allow(clippy::disallowed_macros)]
 
 use anyhow::{Context, Result, bail, ensure};
+use crucible_contract::pack_tree::{PackTree, TreeDigest, read_tar_gz, walk_dir};
 use crucible_contract::{ArtifactKind, content_digest};
 use serde::Deserialize;
 use sqlx::PgPool;
@@ -305,20 +306,14 @@ async fn migrate_pack(
             ))
         })
         .collect::<Result<_>>()?;
-    let tar_gz = deterministic_pack_tar(tree, steer_override.as_deref())?;
-    let digest = content_digest(&tar_gz);
-    let existing: Option<String> =
-        sqlx::query_scalar("SELECT digest FROM pack_tarballs WHERE issue_slug = $1")
-            .bind(slug)
-            .fetch_optional(pool)
-            .await
-            .context("looking up the stored pack tarball")?;
-    let store_tarball = match existing {
+    let pack = pack_tree_of(tree, steer_override.as_deref())?;
+    let digest = pack.digest();
+    let store_pack = match stored_tree(pool, slug).await? {
         Some(d) if d == digest => {
             packs.skipped += 1;
             false
         }
-        Some(d) => bail!("stored tarball digest {d} differs from the re-tarred tree ({digest})"),
+        Some(d) => bail!("stored pack tree {d} differs from the tree on disk ({digest})"),
         None => true,
     };
     let import_blocks = if blocks.is_empty() {
@@ -337,13 +332,15 @@ async fn migrate_pack(
             false
         }
     };
-    if !store_tarball && !import_blocks {
+    if !store_pack && !import_blocks {
         return Ok(());
     }
 
     let mut tx = pool.begin().await.context("begin pack import")?;
-    if store_tarball {
-        crate::runs::blob_store::put_pack_tarball(&mut *tx, slug, &tar_gz).await?;
+    if store_pack {
+        let pack = crate::playbooks::pack_trees::EncodedPack::new(pack)
+            .context("encoding the pack tarball")?;
+        crate::runs::blob_store::put_pack(&mut tx, slug, &pack).await?;
     }
     if import_blocks {
         for (i, (block, created_at)) in blocks.iter().zip(&created_ats).enumerate() {
@@ -361,7 +358,7 @@ async fn migrate_pack(
         }
     }
     tx.commit().await.context("commit pack import")?;
-    if store_tarball {
+    if store_pack {
         packs.migrated += 1;
     }
     if import_blocks {
@@ -416,57 +413,43 @@ fn steer_marker_epoch(line: &str) -> Result<Option<i64>> {
         .with_context(|| format!("steer marker epoch {middle:?} does not parse"))
 }
 
-/// Gzip-tar a pack tree deterministically: entries sorted by name at every level, mtimes and
-/// uid/gid zeroed, `.git` excluded, symlinks followed. `steer_override` replaces the root
-/// `STEER.md`'s bytes (the frozen prefix, once the steering blocks are split into rows).
-fn deterministic_pack_tar(tree: &Path, steer_override: Option<&str>) -> Result<Vec<u8>> {
-    let enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    let mut builder = tar::Builder::new(enc);
-    add_dir(&mut builder, tree, Path::new(""), steer_override)?;
-    let enc = builder.into_inner().context("finishing the pack tar")?;
-    enc.finish().context("gzipping the pack tar")
+/// The pack at `dir`, with `steer_override` in place of the root `STEER.md`'s bytes (the frozen
+/// prefix, once the steering blocks are split into rows).
+fn pack_tree_of(dir: &Path, steer_override: Option<&str>) -> Result<PackTree> {
+    let mut files = walk_dir(dir)
+        .with_context(|| format!("reading the pack at {}", dir.display()))?
+        .tree
+        .into_files();
+    if let Some(steer) = steer_override {
+        files.insert(
+            "STEER.md".parse().map_err(anyhow::Error::new)?,
+            steer.as_bytes().to_vec(),
+        );
+    }
+    PackTree::new(files).map_err(anyhow::Error::new)
 }
 
-fn add_dir(
-    builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>,
-    dir: &Path,
-    rel: &Path,
-    steer_override: Option<&str>,
-) -> Result<()> {
-    for entry in sorted_entries(dir)? {
-        let name = entry.file_name();
-        let at_root = rel.as_os_str().is_empty();
-        if at_root && name == ".git" {
-            continue;
-        }
-        let path = entry.path();
-        let entry_rel = rel.join(&name);
-        if path.is_dir() {
-            add_dir(builder, &path, &entry_rel, steer_override)?;
-            continue;
-        }
-        let data = match steer_override {
-            Some(s) if at_root && name == "STEER.md" => s.as_bytes().to_vec(),
-            _ => std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?,
-        };
-        let mode = std::fs::metadata(&path)
-            .with_context(|| format!("stat {}", path.display()))?
-            .permissions();
-        #[cfg(unix)]
-        let mode = std::os::unix::fs::PermissionsExt::mode(&mode) & 0o7777;
-        #[cfg(not(unix))]
-        let mode = if mode.readonly() { 0o444 } else { 0o644 };
-        let mut header = tar::Header::new_gnu();
-        header.set_size(data.len() as u64);
-        header.set_mode(mode);
-        header.set_mtime(0);
-        header.set_uid(0);
-        header.set_gid(0);
-        builder
-            .append_data(&mut header, &entry_rel, data.as_slice())
-            .with_context(|| format!("taring pack entry {}", entry_rel.display()))?;
+/// The tree `slug`'s stored pack holds: its tree column, or the tree its legacy bytes read as
+/// when the column is not filled yet. `None` when nothing is stored.
+async fn stored_tree(pool: &PgPool, slug: &str) -> Result<Option<TreeDigest>> {
+    let row: Option<(Option<String>, Vec<u8>)> =
+        sqlx::query_as("SELECT tree_digest, tar_gz FROM pack_tarballs WHERE issue_slug = $1")
+            .bind(slug)
+            .fetch_optional(pool)
+            .await
+            .context("looking up the stored pack")?;
+    let Some((tree, tar_gz)) = row else {
+        return Ok(None);
+    };
+    match tree {
+        Some(tree) => Ok(Some(tree.parse().map_err(anyhow::Error::msg)?)),
+        None => Ok(Some(
+            read_tar_gz(&tar_gz)
+                .context("reading the stored pack tarball")?
+                .tree
+                .digest(),
+        )),
     }
-    Ok(())
 }
 
 // --- controller-events.jsonl ------------------------------------------------------------------
@@ -615,7 +598,7 @@ async fn migrate_autopilot(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::migrate_state::*;
 
     // --- pure parsing + tar determinism (no DB) ------------------------------------------------
 
@@ -680,32 +663,20 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_tar_is_stable_across_mtime_churn() {
-        let tree = sample_pack_tree();
-        let first = deterministic_pack_tar(tree.path(), None).expect("tar");
-        // Rewriting a file bumps its mtime; the tar bytes must not care.
-        std::fs::write(tree.path().join("SCOPE.md"), "identity: v1:beef\n").unwrap();
-        let second = deterministic_pack_tar(tree.path(), None).expect("tar");
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn deterministic_tar_replaces_steer_and_excludes_git() {
+    fn the_pack_tree_replaces_steer_and_excludes_git() {
         let tree = sample_pack_tree();
         std::fs::write(tree.path().join("STEER.md"), "frozen\nappended junk\n").unwrap();
-        let tar_gz = deterministic_pack_tar(tree.path(), Some("frozen\n")).expect("tar");
-        let scratch = tempfile::tempdir().expect("scratch");
-        let out = scratch.path().join("pack");
-        crate::playbooks::packs::unpack_pack_tgz(&tar_gz, &out).expect("unpack");
+        let pack = pack_tree_of(tree.path(), Some("frozen\n")).expect("tree");
         assert_eq!(
-            std::fs::read_to_string(out.join("STEER.md")).expect("STEER.md"),
-            "frozen\n"
+            pack,
+            PackTree::from_pairs(&[
+                ("SCOPE.md", b"identity: v1:beef\n"),
+                ("STEER.md", b"frozen\n"),
+                ("crucible.toml", b"[repo]\nurl = \"x\"\n"),
+                ("gates/judge.py", b"print(1)\n"),
+            ])
+            .expect("expected tree")
         );
-        assert_eq!(
-            std::fs::read_to_string(out.join("gates").join("judge.py")).expect("nested"),
-            "print(1)\n"
-        );
-        assert!(!out.join(".git").exists());
     }
 
     #[test]
@@ -866,15 +837,34 @@ mod tests {
                 .expect("uri");
         assert_eq!(s3.as_deref(), Some("s3://bucket/x/session.jsonl"));
 
-        // Materializing the migrated pack reconstructs the original STEER.md byte-for-byte:
-        // frozen prefix from the tarball, blocks re-injected from the rows.
+        // The STEER.md a run of the migrated pack receives is the original byte-for-byte: the
+        // frozen prefix from the stored tree, the blocks re-injected from the rows.
         let pack = crate::playbooks::packs::materialize_pack(&pool, "owner/repo#7")
             .await
             .expect("materialize")
             .expect("stored");
         assert_eq!(
-            std::fs::read_to_string(pack.path().join("STEER.md")).expect("STEER.md"),
-            STEER_FILE
+            crate::playbooks::packs::steer_md(&pool, "owner/repo#7", pack.path())
+                .await
+                .expect("steer"),
+            Some(STEER_FILE.as_bytes().to_vec())
+        );
+        let (frozen, _) = split_steer(STEER_FILE).expect("split");
+        let migrated =
+            pack_tree_of(&state.path().join("packs/owner_repo_7"), Some(&frozen)).expect("tree");
+        let row: (Option<String>, Vec<u8>) = sqlx::query_as(
+            "SELECT tree_digest, tar_gz FROM pack_tarballs WHERE issue_slug = 'owner_repo_7'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("pack row");
+        assert_eq!(
+            row,
+            (
+                Some(migrated.digest().to_string()),
+                migrated.tarball().expect("tarball")
+            ),
+            "the tree column names the tree the stored bytes encode"
         );
 
         let events = crate::event_log::EventLog::new(pool.clone())
@@ -997,9 +987,15 @@ mod tests {
         let pack = state.path().join("packs").join("owner_repo_7");
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
-        crate::runs::blob_store::put_pack_tarball(&pool, "owner_repo_7", b"some other tarball")
-            .await
-            .expect("seed");
+        let other = PackTree::from_pairs(&[("crucible.toml", b"other")]).expect("tree");
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::runs::blob_store::put_pack(
+            &mut conn,
+            "owner_repo_7",
+            &crate::playbooks::pack_trees::EncodedPack::new(other).expect("encode"),
+        )
+        .await
+        .expect("seed");
 
         let report = migrate_state(&pool, state.path(), false)
             .await
@@ -1023,24 +1019,31 @@ mod tests {
         std::fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
         std::fs::write(pack.join("STEER.md"), STEER_FILE).unwrap();
         let (frozen, _) = split_steer(STEER_FILE).expect("split");
-        let tar_gz = deterministic_pack_tar(&pack, Some(&frozen)).expect("tar");
-        crate::runs::blob_store::put_pack_tarball(&pool, "owner_repo_7", &tar_gz)
-            .await
-            .expect("seed the tarball without its rows");
+        let stored = pack_tree_of(&pack, Some(&frozen)).expect("tree");
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::runs::blob_store::put_pack(
+            &mut conn,
+            "owner_repo_7",
+            &crate::playbooks::pack_trees::EncodedPack::new(stored.clone()).expect("encode"),
+        )
+        .await
+        .expect("seed the pack without its rows");
 
         let report = migrate_state(&pool, state.path(), false)
             .await
             .expect("migrate");
         assert!(report.failures().is_empty(), "{:?}", report.failures());
-        assert_eq!(report.packs.skipped, 1, "digest matched");
+        assert_eq!(report.packs.skipped, 1, "the tree matched");
         assert_eq!(report.steering.migrated, 2, "the missing rows imported");
         let materialized = crate::playbooks::packs::materialize_pack(&pool, "owner/repo#7")
             .await
             .expect("materialize")
             .expect("stored");
         assert_eq!(
-            std::fs::read_to_string(materialized.path().join("STEER.md")).expect("STEER.md"),
-            STEER_FILE
+            crate::playbooks::packs::steer_md(&pool, "owner/repo#7", materialized.path())
+                .await
+                .expect("steer"),
+            Some(STEER_FILE.as_bytes().to_vec())
         );
     }
 

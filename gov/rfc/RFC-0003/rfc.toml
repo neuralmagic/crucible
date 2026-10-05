@@ -45,5 +45,12 @@ clauses = [
 version = "0.1.0"
 date = "2026-09-13"
 notes = "Initial draft"
-added = ["C-ACT-AS, acting as a team narrows the subject to that team principal", "C-WEBHOOK-DELIVERY, C-WEBHOOK-SETTLEMENT, C-WEBHOOK-LIFECYCLE, webhook triggers"]
-changed = ["C-PRINCIPALS and C-TEAM-UX defer to C-ACT-AS", "C-OWNERSHIP, C-HIERARCHY, C-DECISION, and C-ENFORCEMENT name webhooks and their deliveries"]
+added = [
+    "C-ACT-AS, acting as a team narrows the subject to that team principal",
+    "C-WEBHOOK-DELIVERY, C-WEBHOOK-SETTLEMENT, C-WEBHOOK-LIFECYCLE, webhook triggers",
+]
+changed = [
+    "C-PRINCIPALS and C-TEAM-UX defer to C-ACT-AS",
+    "C-OWNERSHIP, C-HIERARCHY, C-DECISION, and C-ENFORCEMENT name webhooks and their deliveries",
+    "C-APPROVALS: a draft graduation binds the pack's digest, which for a pack saved on a base covers the flattened tree",
+]

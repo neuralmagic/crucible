@@ -48,22 +48,6 @@ fn forge_root(dir: &Path) -> PathBuf {
     dir.join("forge")
 }
 
-/// Mark every file in an unpacked pack 0755, matching the pod's pack mount.
-fn grant_pack_exec(dir: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = entry?.path();
-        let meta = std::fs::symlink_metadata(&path)?;
-        if meta.is_dir() {
-            grant_pack_exec(&path)?;
-        } else if meta.is_file() {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-                .with_context(|| format!("marking {} executable", path.display()))?;
-        }
-    }
-    Ok(())
-}
-
 /// Host variables every local run inherits.
 const HOST_ENV: [&str; 4] = ["PATH", "HOME", "USER", "OPENSHELL_PODMAN_SOCKET"];
 
@@ -151,7 +135,8 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
     argv
 }
 
-/// Unpack the launch's stored pack into its own directory and spawn the engine on it. Returns as
+/// Write the launch's stored pack into its own directory, checked against the stored tree, write
+/// the run's inputs over it, and spawn the engine on it. Returns as
 /// soon as the child is running: a playbook run is minutes to hours, and the serial reconcile
 /// worker may not park on it. The caller records the run row, then hands the child to
 /// [`supervise`]. `None` is the concurrency cap declining the launch, the same bound a work-pod
@@ -177,21 +162,20 @@ pub async fn start(
             .with_context(|| format!("clearing the local run dir {}", dir.display()))?;
     }
     let slug = crate::model::sanitize_key(issue_key);
-    let tar_gz = crate::runs::blob_store::get_pack_tarball(db.pool(), &slug)
+    let tree = crate::runs::blob_store::get_pack(db.pool(), &slug)
         .await?
         .with_context(|| format!("no stored pack for playbook launch {issue_key}"))?;
     let pack = dir.join("pack");
-    let unpack_to = pack.clone();
+    let write_to = pack.clone();
     tokio::task::spawn_blocking(move || {
-        crate::playbooks::packs::unpack_pack_tgz(&tar_gz, &unpack_to)?;
-        grant_pack_exec(&unpack_to)
+        crate::playbooks::packs::write_checked_tree(&tree, &write_to)
     })
     .await
-    .context("joining the local pack unpack")?
-    .context("unpacking the launch's pack for a local run")?;
-    crate::launches::schedules::ScheduleStore::new(db.clone())
-        .stage_cursor_file(issue_key, &pack)
-        .await?;
+    .context("joining the local pack write")?
+    .context("writing the launch's pack for a local run")?;
+    let inputs = crate::runs::workpod::run_inputs(db, issue_key, &pack).await?;
+    crate::playbooks::packs::write_files(&inputs, &pack)
+        .context("writing the run's inputs over its pack")?;
 
     let bin = crate::runs::engine::resolve_bin();
     let argv = run_argv(&pack.join("crucible.toml"), &opts);
@@ -201,7 +185,7 @@ pub async fn start(
         }
         RunRenderOpts::Loop { .. } => CEILING_SLACK,
     };
-    let exposure = crate::launches::store::exposure_for_issue(db.pool(), issue_key).await?;
+    let exposure = crate::launches::store::exposure_for_issue(db.pool(), issue_key).await??;
     let mut env = run_env(
         std::env::vars(),
         &cfg.local_secret_allowlist,
@@ -403,24 +387,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn every_unpacked_pack_file_is_executable_like_the_pod_mount() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::create_dir_all(dir.path().join("inbox")).expect("mkdir");
-        std::fs::write(dir.path().join("role.sh"), "#!/bin/sh\n").expect("write");
-        std::fs::write(dir.path().join("inbox/a.md"), "a").expect("write");
-        std::os::unix::fs::symlink("role.sh", dir.path().join("alias.sh")).expect("symlink");
-        grant_pack_exec(dir.path()).expect("grant");
-        for f in ["role.sh", "inbox/a.md"] {
-            let mode = std::fs::metadata(dir.path().join(f))
-                .expect("stat")
-                .permissions()
-                .mode();
-            assert_eq!(mode & 0o777, 0o755, "{f}");
-        }
-    }
-
     /// Local mode has no registry, so the subprocess starts from nothing: the host variables,
     /// the run's own `CRUCIBLE_*` set, and whatever an operator named. Everything else the
     /// controller holds — its database URL, its Vault login, its tokens — stays with the controller.

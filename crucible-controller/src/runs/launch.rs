@@ -18,7 +18,30 @@ use anyhow::{Context, Result};
 /// dispatch state back off these events, so the text is a shared constant rather than a literal.
 pub(crate) const PLAYBOOK_DISPATCH_FAILED: &str = "playbook dispatch failed";
 
+/// Dispatch `issue`'s playbook launch, parking it when its pack is unconvertible.
 pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
+    let Err(e) = start(db, cfg, issue).await else {
+        return Ok(());
+    };
+    let Some(refusal) = e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>() else {
+        return Err(e);
+    };
+    crate::issues::transitions::park(
+        db.pool(),
+        db.events(),
+        &issue.key,
+        Status::New,
+        &ParkReason::PackUnconvertible {
+            digest: refusal.digest.clone(),
+            reason: refusal.reason.clone(),
+        },
+        ParkedBy::Machine,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let day = crate::clock::today_utc();
     if db
         .decline_if_over_ceiling(&day, cfg.effective().daily_cost_ceiling)
@@ -56,9 +79,8 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         None => {
             let pack = crate::playbooks::registry::get(db.pool(), &launch.playbook).await?;
             (
-                crate::secrets::launch::OwnedRevision::Published(
-                    pack.as_ref().map(|p| p.rev.clone()),
-                ),
+                crate::launches::store::launch_revision(db.pool(), &issue.key, &launch.playbook)
+                    .await?,
                 pack.and_then(|p| p.agent),
             )
         }
@@ -125,12 +147,8 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         None => crate::runs::model::RunImage::default(),
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
-    let exposure = match launch.exposure.clone() {
-        Some(exposure) => Some(exposure),
-        None => crate::playbooks::exposure::registered(db.pool(), &launch.playbook)
-            .await?
-            .flatten(),
-    };
+    let exposure =
+        crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await??;
     let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
     let launcher = match crate::authz::resolve::dispatch_principals(
         db.pool(),
@@ -352,16 +370,13 @@ async fn dispatch_pod(
     let pack = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key)
         .await?
         .with_context(|| format!("no stored pack for playbook launch {}", issue.key))?;
-    crate::launches::schedules::ScheduleStore::new(db.clone())
-        .stage_cursor_file(&issue.key, pack.path())
-        .await?;
     let admission = crate::runs::workpod::dispatch_run(
         db,
         cfg,
         crate::runs::workpod::active_dispatcher(),
         &issue.key,
         run_id,
-        pack.path(),
+        &pack,
         &std::collections::BTreeMap::new(),
         None,
         opts,

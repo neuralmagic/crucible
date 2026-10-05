@@ -233,7 +233,7 @@ mod tests {
         // The surviving trees were tarred into the durable pack store, keyed by sanitized key.
         for slug in ["owner_repo_1", "owner_repo_2"] {
             assert!(
-                crate::runs::blob_store::get_pack_tarball(db.pool(), slug)
+                crate::runs::blob_store::get_pack(db.pool(), slug)
                     .await?
                     .is_some(),
                 "pack tarball stored for {slug}"

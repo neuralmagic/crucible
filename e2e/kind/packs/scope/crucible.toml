@@ -1,0 +1,19 @@
+[repo]
+url = "https://github.com/owner/repo"
+
+[agent]
+backend = "openshell"
+goal = "Prove the frozen tree reaches the run."
+sandbox_image = "ghcr.io/org/sandbox:latest"
+
+[judge]
+measure_cmd = "./measure.sh"
+direction = "higher"
+objective = "score"
+
+[deploy]
+deploy_name = "kind-e2e-scope"
+
+[workflow]
+type = "autoresearch"
+file = "workflow.star"

@@ -331,6 +331,9 @@ pub struct Scope {
     /// The exposure digest the recorded approval bound to. Differs from `exposure_digest` only if
     /// the pack was re-frozen after the approval landed.
     pub approved_exposure_digest: Option<String>,
+    /// The stored pack tree this scope froze. `None` for a scope frozen before scopes recorded
+    /// one, whose pack is the issue's stored pack.
+    pub tree_digest: Option<crucible_contract::pack_tree::TreeDigest>,
 }
 
 impl Scope {
@@ -383,6 +386,7 @@ pub(crate) struct NewDirectPack<'a> {
     pub repo: &'a str,
     pub git_ref: &'a str,
     pub pack_digest: &'a str,
+    pub tree: &'a crucible_contract::pack_tree::TreeDigest,
     pub created_by: &'a str,
 }
 

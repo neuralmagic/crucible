@@ -1,0 +1,11 @@
+[workspace]
+inject = ["check.sh", "nested", "bulk"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Prove the pack arrived whole."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

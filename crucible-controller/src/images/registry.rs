@@ -88,12 +88,10 @@ impl LiveRegistryReader {
     }
 
     fn client(&self) -> oci_client::Client {
-        use oci_client::client::{ClientConfig, linux_amd64_resolver};
-        oci_client::Client::new(ClientConfig {
-            platform_resolver: Some(Box::new(linux_amd64_resolver)),
+        oci_client::Client::new(oci_client::client::ClientConfig {
             connect_timeout: Some(READ_TIMEOUT),
             read_timeout: Some(READ_TIMEOUT),
-            ..ClientConfig::default()
+            ..forge::oci::client_config()
         })
     }
 

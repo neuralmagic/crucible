@@ -323,6 +323,62 @@ jobs:
         if: always() && env.PG_CONTAINER != ''
         run: docker rm -f "$PG_CONTAINER" || true
 
+  # The controller dispatching real pods on a throwaway kind cluster (scripts/kind-e2e.sh). Not in
+  # the required check until it has a flake-free record.
+  kind-e2e:
+    timeout-minutes: 45
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) && fromJSON('["self-hosted", "beefy", "rust"]') || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          cache: ${{ runner.environment == 'github-hosted' }}
+
+      - name: Enable sccache + mold
+        if: runner.environment == 'self-hosted'
+        run: |
+          {
+            echo "SCCACHE_BUCKET=llm-d-sccache-783952637884"
+            echo "SCCACHE_REGION=us-east-1"
+            echo "SCCACHE_S3_KEY_PREFIX=crucible"
+            echo "RUSTC_WRAPPER=sccache"
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold"
+          } >> "$GITHUB_ENV"
+
+      - name: Install kind and kubectl
+        run: |
+          bin="$RUNNER_TEMP/bin"
+          mkdir -p "$bin"
+          curl -fsSLo "$bin/kind" https://github.com/kubernetes-sigs/kind/releases/download/v0.31.0/kind-linux-amd64
+          echo "eb244cbafcc157dff60cf68693c14c9a75c4e6e6fedaf9cd71c58117cb93e3fa  $bin/kind" | sha256sum -c -
+          curl -fsSLo "$bin/kubectl" https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl
+          echo "7721f265e18709862655affba5343e85e1980639395d5754473dafaadcaa69e3  $bin/kubectl" | sha256sum -c -
+          chmod +x "$bin/kind" "$bin/kubectl"
+          echo "$bin" >> "$GITHUB_PATH"
+
+      - name: Start Postgres
+        uses: ./.github/actions/postgres
+
+      - name: Kind e2e
+        env:
+          ARTIFACT_DIR: ${{ runner.temp }}/kind-e2e
+        run: scripts/kind-e2e.sh
+
+      - name: Upload e2e logs
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.0
+        with:
+          name: kind-e2e-logs
+          path: ${{ runner.temp }}/kind-e2e
+          if-no-files-found: ignore
+
+      - name: Stop Postgres
+        if: always() && env.PG_CONTAINER != ''
+        run: docker rm -f "$PG_CONTAINER" || true
+
   # The required check: green only when every job above is.
   build-and-test:
     needs: [lint, test-all-features, test-default-features]

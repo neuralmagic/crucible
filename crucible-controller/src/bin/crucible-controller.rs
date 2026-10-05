@@ -1155,6 +1155,33 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         return Ok(());
     };
 
+    // Convert legacy pack bytes to stored trees before anything below reads a pack. A failure
+    // leaves rows on their legacy bytes, which every reader still falls back to.
+    match crucible_controller::playbooks::pack_migration::convert_pack_trees(db.pool()).await {
+        Ok(report) if report == Default::default() => {}
+        Ok(report) => tracing::info!(
+            converted = report.converted,
+            unconvertible = report.unconvertible,
+            pinned = report.pinned,
+            "autopilot: legacy packs converted to stored trees and pins derived"
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "autopilot: pack tree conversion failed; unconverted packs read their legacy bytes"
+        ),
+    }
+    match crucible_controller::playbooks::pack_trees::collect(db.pool()).await {
+        Ok(collected) if collected == Default::default() => {}
+        Ok(collected) => tracing::info!(
+            count = collected.trees,
+            blobs = collected.blobs,
+            "autopilot: unpinned pack trees collected"
+        ),
+        Err(e) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "autopilot: pack tree collection failed; unpinned trees and blobs stay until the next start"
+        ),
+    }
     // Re-extract the params schema of every registered playbook whose stored engine pin is not
     // this binary's. Startup, not a discovery tick: the trigger is a new binary. The maintenance
     // advisory lock above is what keeps it single-writer.

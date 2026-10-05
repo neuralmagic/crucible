@@ -166,22 +166,49 @@ pub enum Refusal {
 pub enum Revision<'a> {
     /// A registered playbook at the revision it is pinned to. `None` is a scope with no pack
     /// revision to compare against, which pins nothing.
-    Published(Option<&'a str>),
+    Published(Option<PackPin<'a>>),
     /// A draft test-fire.
     Draft,
+}
+
+/// The pack a registered launch runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackPin<'a> {
+    /// The registry row still holds the launch's pack: its source rev, and its tree when one is
+    /// recorded.
+    Registered { rev: &'a str, tree: Option<&'a str> },
+    /// The registry moved off the launch's pack, so only the pack's own digest names it.
+    Unregistered(&'a str),
 }
 
 /// The owned form of [`Revision`], for the dispatch struct that carries it across an await.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnedRevision {
-    Published(Option<String>),
+    /// `rev` is the registry's source rev while the registry row holds the launch's pack; `pack`
+    /// is the pack's tree, or its gzip digest when it has none. Both `None` pins nothing.
+    Published {
+        rev: Option<String>,
+        pack: Option<String>,
+    },
     Draft,
 }
 
 impl OwnedRevision {
+    /// A scope with no pack revision to compare against.
+    pub const UNPINNED: OwnedRevision = OwnedRevision::Published {
+        rev: None,
+        pack: None,
+    };
+
     pub fn as_revision(&self) -> Revision<'_> {
         match self {
-            OwnedRevision::Published(rev) => Revision::Published(rev.as_deref()),
+            OwnedRevision::Published { rev, pack } => Revision::Published(match rev {
+                Some(rev) => Some(PackPin::Registered {
+                    rev,
+                    tree: pack.as_deref(),
+                }),
+                None => pack.as_deref().map(PackPin::Unregistered),
+            }),
             OwnedRevision::Draft => Revision::Draft,
         }
     }
@@ -299,8 +326,19 @@ fn check_one(
         });
     }
     match (binding.pack_rev.as_deref(), revision) {
-        (Some(bound), Revision::Published(Some(current))) if bound != current => {
-            Some(Refusal::Stale {
+        (Some(bound_rev), Revision::Published(Some(current))) => {
+            let (bound, current) = match (binding.pack_digest.as_deref(), current) {
+                (
+                    Some(bound),
+                    PackPin::Registered {
+                        tree: Some(tree), ..
+                    }
+                    | PackPin::Unregistered(tree),
+                ) => (bound, tree),
+                (_, PackPin::Registered { rev, .. }) => (bound_rev, rev),
+                (None, PackPin::Unregistered(pack)) => (bound_rev, pack),
+            };
+            (bound != current).then(|| Refusal::Stale {
                 name: secret.name.clone(),
                 scope: scope.clone(),
                 bound: bound.to_string(),
@@ -356,8 +394,8 @@ fn check_disclosed(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::authz::model::Principal;
+    use crate::secrets::launch::*;
     use crate::secrets::store::{NewBinding, NewSecret};
     use crate::secrets::{ConsumerClass, ProjectionKind, SecretKind, SecretMode, Visibility};
 
@@ -793,7 +831,10 @@ mod tests {
             &scope,
             &want,
             &launcher,
-            Revision::Published(Some("rev-2")),
+            Revision::Published(Some(PackPin::Registered {
+                rev: "rev-2",
+                tree: None,
+            })),
             None,
         )
         .await
@@ -809,12 +850,177 @@ mod tests {
             &scope,
             &want,
             &launcher,
-            Revision::Published(Some("rev-1")),
+            Revision::Published(Some(PackPin::Registered {
+                rev: "rev-1",
+                tree: None,
+            })),
             None,
         )
         .await
         .expect("resolve")
         .expect("no refusal");
+    }
+
+    /// A registered launch is checked against the pack it froze, not the registry row: a binding
+    /// reviewed against that pack still releases after a repin, and a binding reviewed against
+    /// the repinned tree does not release to a run of the frozen one.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_launch_is_checked_against_the_pack_it_froze(pool: sqlx::PgPool) {
+        use crucible_contract::pack_tree::PackTree;
+        let tree = |body: &'static [u8]| PackTree::from_pairs(&[("crucible.toml", body)]);
+        let registered = || async {
+            crate::playbooks::registry::get(&pool, "survey")
+                .await
+                .expect("read")
+                .expect("row")
+        };
+        let scope = Scope::playbook("survey");
+        let launcher = Principals::new(Some("alice"), &[]);
+        crate::testing::pin_playbook(
+            &pool,
+            tree(b"a").expect("tree"),
+            &serde_json::json!({"version": 1, "outputs": []}),
+        )
+        .await;
+        let first = registered().await;
+        let frozen = first.tree_digest.as_ref().expect("tree").to_string();
+        crate::testing::launch_playbook(&pool, "survey-1").await;
+        bind(
+            &pool,
+            "user:alice",
+            "pr_token",
+            &scope,
+            "pr_token",
+            Some(&first.rev),
+        )
+        .await;
+        crate::testing::pin_playbook(
+            &pool,
+            tree(b"b").expect("tree"),
+            &serde_json::json!({"version": 1, "outputs": []}),
+        )
+        .await;
+        let repinned = registered().await;
+
+        let revision = crate::launches::store::launch_revision(&pool, "survey-1", "survey")
+            .await
+            .expect("revision");
+        assert_eq!(
+            revision,
+            OwnedRevision::Published {
+                rev: None,
+                pack: Some(frozen.clone()),
+            }
+        );
+        let check = || async {
+            resolve(&pool, &scope, &[], &launcher, revision.as_revision(), None)
+                .await
+                .expect("resolve")
+        };
+        assert_eq!(check().await.expect("released").len(), 1);
+
+        sqlx::query("DELETE FROM secret_bindings")
+            .execute(&pool)
+            .await
+            .expect("unbind");
+        bind(
+            &pool,
+            "user:alice",
+            "pr_token_2",
+            &scope,
+            "pr_token",
+            Some(&repinned.rev),
+        )
+        .await;
+        let refusal = check().await.expect_err("refused");
+        let Refusal::Stale { bound, current, .. } = &refusal else {
+            panic!("expected a stale refusal, got {refusal:?}");
+        };
+        let repinned_tree = repinned.tree_digest.as_ref().expect("tree").to_string();
+        assert_eq!((bound, current), (&repinned_tree, &frozen));
+
+        crate::testing::launch_playbook(&pool, "survey-2").await;
+        let current = crate::launches::store::launch_revision(&pool, "survey-2", "survey")
+            .await
+            .expect("revision");
+        assert_eq!(
+            current,
+            OwnedRevision::Published {
+                rev: Some(repinned.rev.clone()),
+                pack: Some(repinned_tree),
+            }
+        );
+        resolve(&pool, &scope, &[], &launcher, current.as_revision(), None)
+            .await
+            .expect("resolve")
+            .expect("a launch of the reviewed tree releases");
+    }
+
+    /// A frozen pack with no tree is named by its gzip digest, which a binding at a pre-tree rev
+    /// matches and any other binding does not.
+    #[test]
+    fn an_unregistered_pack_without_a_tree_compares_by_its_digest() {
+        let binding = |rev: &str, digest: Option<&str>| BindingRow {
+            id: "b".to_string(),
+            secret_id: "s".to_string(),
+            scope_kind: ScopeKind::Playbook,
+            scope_id: "survey".to_string(),
+            projection_kind: ProjectionKind::Env,
+            projection: "PR_TOKEN".to_string(),
+            declared_name: SecretName::parse("pr_token").expect("name"),
+            pack_rev: Some(rev.to_string()),
+            pack_digest: digest.map(str::to_string),
+            schema_digest: None,
+            created_by: None,
+            created_at: "now".to_string(),
+        };
+        let secret = SecretRow {
+            id: "s".to_string(),
+            name: SecretName::parse("pr_token").expect("name"),
+            owner: Principal::parse("user:alice").expect("owner"),
+            kind: SecretKind::Opaque,
+            visibility: Visibility::BrokerOnly,
+            consumer: ConsumerClass::Run,
+            mode: SecretMode::Managed,
+            vault_path: "user:alice/pr".to_string(),
+            current_version: Some(1),
+            created_by: None,
+            created_at: "now".to_string(),
+            updated_at: "now".to_string(),
+        };
+        let launcher = Principals::new(Some("alice"), &[]);
+        let scope = Scope::playbook("survey");
+        let revision = Revision::Published(Some(PackPin::Unregistered("sha256:old")));
+        assert_eq!(
+            check_one(
+                &scope,
+                &binding("sha256:old", None),
+                &secret,
+                &launcher,
+                revision
+            ),
+            None
+        );
+        assert!(matches!(
+            check_one(
+                &scope,
+                &binding("sha256:old", Some("tree1:t")),
+                &secret,
+                &launcher,
+                revision
+            ),
+            Some(Refusal::Stale { .. })
+        ));
+        assert!(matches!(
+            check_one(
+                &scope,
+                &binding("abc123", None),
+                &secret,
+                &launcher,
+                revision
+            ),
+            Some(Refusal::Stale { .. })
+        ));
     }
 
     /// A draft test-fire is how a pack that needs a credential gets iterated on at all, so an

@@ -1,0 +1,11 @@
+# Minimal loop image for the kind e2e: the engine plus what a command-only playbook pod runs.
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+ARG CONTRACT_VERSION=unset--pass-build-arg-CONTRACT_VERSION-from-crucible-binary
+ARG CONTRACT_LABEL=${CONTRACT_VERSION}
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY crucible /usr/local/bin/crucible
+RUN test "$(crucible --contract-version)" = "${CONTRACT_VERSION}"
+LABEL io.crucible.contract-version="${CONTRACT_LABEL}"

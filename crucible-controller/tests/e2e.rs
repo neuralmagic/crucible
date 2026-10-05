@@ -1207,6 +1207,7 @@ async fn kube_dispatcher_creates_a_stamped_run_pod_live() -> Result<()> {
                     pr_repo: None,
                     agent: crucible_controller::playbooks::providers::AgentSelection::default(),
                 },
+                Default::default(),
                 Some(std::sync::Arc::new(crucible::deploy::RegistryDigests)),
             )?;
             crucible_controller::stamp_run_pod(

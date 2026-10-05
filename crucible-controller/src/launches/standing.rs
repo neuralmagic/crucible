@@ -18,6 +18,7 @@ use crate::model::LaunchOrigin;
 use crate::model::MaxTime;
 use crate::model::Trigger;
 use crate::model::{ParkReason, ParkedBy, Status};
+use crate::playbooks::registry::PackRevision;
 use anyhow::{Context, Result};
 use jiff::Timestamp;
 use sqlx::PgPool;
@@ -29,7 +30,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub(crate) struct NewStanding<'a> {
     pub playbook: &'a str,
-    pub target_kind: &'a str,
+    pub target: StandingTarget<'a>,
     pub eligible_draft_version: Option<i64>,
     /// The validated `{name: value}` object every firing launches.
     pub params: &'a serde_json::Value,
@@ -51,6 +52,61 @@ pub(crate) struct NewStanding<'a> {
     pub agent_model: Option<&'a str>,
 }
 
+/// What a standing launch fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandingTarget<'a> {
+    /// The registered pack at the revision the endpoint authorized. The save copies that revision
+    /// and refuses when the registry row no longer holds it.
+    Adopted(PackRevision<'a>),
+    /// The draft's latest saved version that compiles, resolved at each firing.
+    DraftHead,
+}
+
+impl StandingTarget<'_> {
+    /// The stored `target_kind`.
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            StandingTarget::Adopted(_) => "adopted",
+            StandingTarget::DraftHead => "draft_head",
+        }
+    }
+}
+
+/// Why a save could not adopt the revision its endpoint authorized.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum Unadoptable {
+    #[error("playbook {playbook:?} was deregistered while the save was being authorized")]
+    Gone { playbook: String },
+    #[error(
+        "playbook {playbook:?} was re-registered at {rev} while the save was being authorized; \
+         reload the form"
+    )]
+    Repinned { playbook: String, rev: String },
+}
+
+/// Hold the registry row an adopted save copies `FOR SHARE` and check it still holds the revision
+/// the endpoint authorized. A draft-head save copies nothing.
+async fn lock_adopted(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    new: &NewStanding<'_>,
+) -> Result<()> {
+    let StandingTarget::Adopted(pinned) = new.target else {
+        return Ok(());
+    };
+    let playbook = new.playbook.to_string();
+    let Some(locked) = crate::playbooks::registry::lock_revision(tx, new.playbook).await? else {
+        return Err(Unadoptable::Gone { playbook }.into());
+    };
+    if !locked.holds(pinned) {
+        return Err(Unadoptable::Repinned {
+            playbook,
+            rev: adopted_label(Some(&locked.rev), locked.tree_digest.as_deref()),
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// One `playbook_standing_launches` row. Sidecar reads `#[sqlx(flatten)]` this into their own
 /// row type, so the column list below is the one place it is spelled.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
@@ -61,6 +117,9 @@ pub(crate) struct Standing {
     pub adopted_repo: Option<String>,
     pub adopted_path: Option<String>,
     pub adopted_rev: Option<String>,
+    /// The adopted bytes' digest, and the adopted tree once one is recorded.
+    pub adopted_tar_digest: Option<String>,
+    pub adopted_tree_digest: Option<String>,
     pub eligible_draft_version: Option<i64>,
     pub params: serde_json::Value,
     pub schema_digest: String,
@@ -89,18 +148,51 @@ pub(crate) struct Standing {
     pub updated_at: String,
 }
 
+impl Standing {
+    /// How an audit line names what this row adopted.
+    pub(crate) fn adopted_label(&self) -> String {
+        adopted_label(
+            self.adopted_rev.as_deref(),
+            self.adopted_tree_digest.as_deref(),
+        )
+    }
+
+    /// Whether this row adopted the revision `pack` holds: the same tree, or the same bytes when
+    /// this row recorded no tree.
+    pub(crate) fn adopts(&self, pack: &crate::playbooks::registry::PlaybookRow) -> bool {
+        match (
+            self.adopted_tree_digest.as_deref(),
+            pack.tree_digest.as_ref(),
+        ) {
+            (Some(adopted), Some(tree)) => adopted == tree.as_str(),
+            (Some(_), None) => false,
+            (None, _) => self.adopted_tar_digest.as_deref() == Some(pack.tar_digest.as_str()),
+        }
+    }
+}
+
+/// How an audit line names what a standing row adopted: the rev, and the tree when it is not the
+/// rev. A row with no adopted rev follows its draft head.
+pub(crate) fn adopted_label(rev: Option<&str>, tree: Option<&str>) -> String {
+    match (rev, tree) {
+        (None, _) => "draft head".to_string(),
+        (Some(rev), Some(tree)) if tree != rev => format!("revision {rev} (tree {tree})"),
+        (Some(rev), _) => format!("revision {rev}"),
+    }
+}
+
 /// The [`Standing`] projection, qualified as `c` so a sidecar read can join its own table beside
 /// it: `SELECT {COLUMNS}, s.cron_expr FROM playbook_standing_launches c JOIN playbook_schedules s
 /// USING (id)`.
 pub(crate) const COLUMNS: &str = "c.id, c.playbook, c.target_kind, c.adopted_repo, c.adopted_path, \
-    c.adopted_rev, c.eligible_draft_version, c.params, c.schema_digest, c.max_cost, c.max_time, \
+    c.adopted_rev, c.adopted_tar_digest, c.adopted_tree_digest, c.eligible_draft_version, c.params, c.schema_digest, c.max_cost, c.max_time, \
     c.advance_dedupe, c.enabled, c.consecutive_failures, c.created_by, c.owner_principal, \
     c.owner_groups, c.owner_groups_at, c.owner_signin_required, c.owner_refresh_error, \
     c.owner_refresh_at, c.dispatch_target, c.agent_provider, c.agent_model, c.created_at, \
     c.updated_at";
 
-/// Store the core row under `id`. The adopted snapshot is copied from the registry in the same
-/// statement, so a later repin cannot move an existing recurrence.
+/// Store the core row under `id`. The adopted snapshot is copied from the registry row held by
+/// [`lock_adopted`], so it is the authorized revision and a later repin cannot move it.
 pub(crate) async fn insert(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     id: &str,
@@ -108,6 +200,7 @@ pub(crate) async fn insert(
     new: &NewStanding<'_>,
     now: &str,
 ) -> Result<()> {
+    lock_adopted(tx, new).await?;
     sqlx::query(
         r#"
         INSERT INTO playbook_standing_launches (
@@ -116,22 +209,19 @@ pub(crate) async fn insert(
             owner_groups, owner_groups_at, dispatch_target, agent_provider, agent_model,
             created_at, updated_at,
             adopted_repo, adopted_path, adopted_rev, adopted_tar_gz, adopted_tar_digest,
-            adopted_tar_bytes, adopted_params_schema)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                CASE WHEN $13::text IS NULL THEN NULL ELSE $18 END, $15, $16, $17, $18, $18,
-                (SELECT repo FROM playbooks WHERE id = $3),
-                (SELECT path FROM playbooks WHERE id = $3),
-                (SELECT rev FROM playbooks WHERE id = $3),
-                (SELECT tar_gz FROM playbooks WHERE id = $3),
-                (SELECT tar_digest FROM playbooks WHERE id = $3),
-                (SELECT tar_bytes FROM playbooks WHERE id = $3),
-                (SELECT params_schema FROM playbooks WHERE id = $3))
+            adopted_tar_bytes, adopted_params_schema, adopted_tree_digest)
+        SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+               CASE WHEN $13::text IS NULL THEN NULL ELSE $18 END, $15, $16, $17, $18, $18,
+               p.repo, p.path, p.rev, p.tar_gz, p.tar_digest, p.tar_bytes, p.params_schema,
+               p.tree_digest
+        FROM (VALUES (1)) one
+        LEFT JOIN playbooks p ON p.id = $3 AND $4 = 'adopted'
         "#,
     )
     .bind(id)
     .bind(trigger.as_str())
     .bind(new.playbook)
-    .bind(new.target_kind)
+    .bind(new.target.kind())
     .bind(new.eligible_draft_version)
     .bind(new.params)
     .bind(new.schema_digest)
@@ -161,9 +251,10 @@ pub(crate) async fn replace(
     new: &NewStanding<'_>,
     now: &str,
 ) -> Result<bool> {
+    lock_adopted(tx, new).await?;
     let updated = sqlx::query(
         r#"
-        UPDATE playbook_standing_launches
+        UPDATE playbook_standing_launches c
         SET playbook = $2, target_kind = $3, eligible_draft_version = $4, params = $5,
             schema_digest = $6, max_cost = $7, max_time = $8, advance_dedupe = $9, enabled = $10,
             created_by = $11, owner_principal = $12, owner_groups = $13,
@@ -171,19 +262,18 @@ pub(crate) async fn replace(
             owner_signin_required = false, owner_refresh_error = NULL,
             dispatch_target = $14, agent_provider = $15, agent_model = $16,
             consecutive_failures = 0, updated_at = $17,
-            adopted_repo = (SELECT repo FROM playbooks WHERE id = $2),
-            adopted_path = (SELECT path FROM playbooks WHERE id = $2),
-            adopted_rev = (SELECT rev FROM playbooks WHERE id = $2),
-            adopted_tar_gz = (SELECT tar_gz FROM playbooks WHERE id = $2),
-            adopted_tar_digest = (SELECT tar_digest FROM playbooks WHERE id = $2),
-            adopted_tar_bytes = (SELECT tar_bytes FROM playbooks WHERE id = $2),
-            adopted_params_schema = (SELECT params_schema FROM playbooks WHERE id = $2)
-        WHERE id = $1
+            adopted_repo = p.repo, adopted_path = p.path, adopted_rev = p.rev,
+            adopted_tar_gz = p.tar_gz, adopted_tar_digest = p.tar_digest,
+            adopted_tar_bytes = p.tar_bytes, adopted_params_schema = p.params_schema,
+            adopted_tree_digest = p.tree_digest
+        FROM (VALUES (1)) one
+        LEFT JOIN playbooks p ON p.id = $2 AND $3 = 'adopted'
+        WHERE c.id = $1
         "#,
     )
     .bind(id)
     .bind(new.playbook)
-    .bind(new.target_kind)
+    .bind(new.target.kind())
     .bind(new.eligible_draft_version)
     .bind(new.params)
     .bind(new.schema_digest)
@@ -248,7 +338,6 @@ pub(crate) struct Authorized {
     /// The draft version a draft-head firing freezes.
     pub draft_version: Option<i64>,
     pub adopted_tar_gz: Option<Vec<u8>>,
-    pub adopted_tar_digest: Option<String>,
     pub adopted_tar_bytes: Option<i64>,
 }
 
@@ -264,7 +353,7 @@ pub(crate) async fn authorized(
                COALESCE(p.description, d.description) AS description,
                COALESCE(c.adopted_params_schema, dv.params_schema) AS params_schema,
                dv.version AS draft_version,
-               c.adopted_tar_gz, c.adopted_tar_digest, c.adopted_tar_bytes
+               c.adopted_tar_gz, c.adopted_tar_bytes
         FROM playbook_standing_launches c
         LEFT JOIN playbooks p ON p.id = c.playbook AND c.target_kind = 'adopted'
         LEFT JOIN playbook_drafts d ON d.id = c.playbook AND c.target_kind = 'draft_head'
@@ -329,8 +418,8 @@ impl From<String> for FireError {
 
 /// Mint the launch for a locked core row on the trigger's transaction: the launch row, its
 /// dispatch and agent columns, and the adopted tarball copy. `exposure` is the disclosure the
-/// launch row records: a draft-head firing's recomputed one, absent for an adopted pack whose
-/// disclosure is the registry row's. Returns how the owner snapshot stands; an `Err` is what the
+/// launch row records: a draft-head firing's recomputed one, absent otherwise. An adopted pack's
+/// launch records none, since the registry row's need not be that pack's. Returns how the owner snapshot stands; an `Err` is what the
 /// trigger records as a firing failure.
 pub(crate) async fn fire(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -350,6 +439,14 @@ pub(crate) async fn fire(
         )
         .into());
     };
+    if core.adopted_tree_digest.is_none()
+        && let Some(tar_gz) = row.adopted_tar_gz.as_deref()
+        && let Some(refusal) = crate::playbooks::pack_trees::unconvertible(&mut **tx, tar_gz)
+            .await
+            .map_err(|e| format!("{noun} adopted pack: {e:#}"))?
+    {
+        return Err(format!("{noun} adopted {refusal}").into());
+    }
     let max_time =
         MaxTime::parse(&core.max_time).map_err(|e| format!("{noun} stored max_time: {e}"))?;
     let params = overlaid_params(core, schema, firing.overlay)?;
@@ -400,14 +497,15 @@ pub(crate) async fn fire(
     if core.target_kind == "adopted" {
         let (Some(tar_gz), Some(digest), Some(bytes)) = (
             row.adopted_tar_gz.as_ref(),
-            row.adopted_tar_digest.as_ref(),
+            core.adopted_tar_digest.as_ref(),
             row.adopted_tar_bytes,
         ) else {
             return Err(format!("{noun} has no adopted pack").into());
         };
         let slug = crate::model::sanitize_key(key);
         sqlx::query(
-            r#"UPDATE pack_tarballs SET tar_gz = $2, digest = $3, bytes = $4, created_at = $5
+            r#"UPDATE pack_tarballs SET tar_gz = $2, digest = $3, bytes = $4, created_at = $5,
+                                        tree_digest = $6
                WHERE issue_slug = $1"#,
         )
         .bind(&slug)
@@ -415,9 +513,17 @@ pub(crate) async fn fire(
         .bind(digest)
         .bind(bytes)
         .bind(crate::clock::now_rfc3339())
+        .bind(core.adopted_tree_digest.as_deref())
         .execute(&mut **tx)
         .await
         .map_err(|e| format!("{noun} adopted pack copy: {e}"))?;
+        sqlx::query(
+            "UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL WHERE key = $1",
+        )
+        .bind(key)
+        .execute(&mut **tx)
+        .await
+        .map_err(|e| format!("{noun} adopted pack exposure: {e}"))?;
     }
     sqlx::query(
         "UPDATE playbook_standing_launches SET consecutive_failures = 0, updated_at = $2 WHERE id = $1",
@@ -1423,7 +1529,9 @@ mod tests {
             Trigger::Watch,
             &NewStanding {
                 playbook: "backport",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params,
                 schema_digest: "sha256:schema",

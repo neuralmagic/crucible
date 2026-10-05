@@ -154,7 +154,9 @@ pub struct PackImportDto {
     pub path: String,
     /// The commit everything below was taken at; the preview is this pack even after the ref moves.
     pub rev: String,
-    pub tar_digest: String,
+    /// The `tree1:` digest of the frozen pack; null until startup conversion reaches a row an
+    /// older controller wrote.
+    pub tree_digest: Option<String>,
     /// The engine's params JSON Schema; null when the source did not compile.
     pub params_schema: Option<serde_json::Value>,
     pub schema_digest: Option<String>,
@@ -183,6 +185,10 @@ pub struct PackImportDto {
     pub created_at: String,
     pub resolved_by: Option<String>,
     pub resolved_at: Option<String>,
+    /// Paths under an excluded segment (`state`, `.git`, `workspace`) the fetch did not store.
+    /// Present only on the response to the proposal that fetched them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ignored_paths: Option<Vec<String>>,
 }
 
 impl PackImportDto {
@@ -200,7 +206,7 @@ impl PackImportDto {
             git_ref: i.git_ref,
             path: i.path,
             rev: i.rev,
-            tar_digest: i.tar_digest,
+            tree_digest: i.tree_digest.map(|t| t.to_string()),
             params_schema: i.params_schema,
             schema_digest: i.schema_digest,
             graph: i.graph,
@@ -217,6 +223,7 @@ impl PackImportDto {
             created_at: i.created_at,
             resolved_by: i.resolved_by,
             resolved_at: i.resolved_at,
+            ignored_paths: None,
         }
     }
 }
@@ -286,7 +293,7 @@ pub(crate) async fn propose_pack_import(
         Ok(g) => g,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let import = match crate::playbooks::imports::propose(
+    let proposed = match crate::playbooks::imports::propose(
         state.db.pool(),
         &git,
         crate::playbooks::registry::PackSource {
@@ -300,9 +307,10 @@ pub(crate) async fn propose_pack_import(
     )
     .await
     {
-        Ok(i) => i,
+        Ok(p) => p,
         Err(e) => return import_error(e),
     };
+    let import = proposed.import;
 
     state
         .audit(
@@ -327,12 +335,10 @@ pub(crate) async fn propose_pack_import(
     };
     (
         StatusCode::CREATED,
-        Json(PackImportDto::from_row(
-            import,
-            &state.dispatch,
-            &state.profile_secret_env,
-            &catalog,
-        )),
+        Json(PackImportDto {
+            ignored_paths: Some(proposed.ignored),
+            ..PackImportDto::from_row(import, &state.dispatch, &state.profile_secret_env, &catalog)
+        }),
     )
         .into_response()
 }
@@ -534,19 +540,7 @@ pub(crate) async fn register_pack_import(
             "register_pack_import",
         )
         .await;
-    (
-        StatusCode::CREATED,
-        Json(RegisterAck {
-            id: registered.id,
-            rev: registered.rev,
-            tar_digest: registered.tar_digest,
-            schema_digest: registered.schema_digest,
-            schema_changed: registered.schema_changed,
-            exposure_digest: registered.exposure_digest,
-            exposure_changed: registered.exposure_changed,
-        }),
-    )
-        .into_response()
+    (StatusCode::CREATED, Json(RegisterAck::from(registered))).into_response()
 }
 
 /// `POST /api/playbooks/imports/{id}/discard` — refuse a proposal. The row stays for the audit
@@ -632,6 +626,8 @@ pub struct DraftFromGitDto {
     /// The commit the fetch resolved to; the draft's origin rev.
     pub rev: String,
     pub draft: DraftCompileDto,
+    /// Paths under an excluded segment (`state`, `.git`, `workspace`) the fetch did not store.
+    pub ignored_paths: Vec<String>,
 }
 
 /// `POST /api/playbook-drafts/from-git` — fetch a pack at a ref and open it as a draft in one
@@ -689,7 +685,7 @@ pub(crate) async fn create_draft_from_git(
         Ok(g) => g,
         Err(e) => return AppError::from(e).into_response(),
     };
-    let (import, saved) = match crate::playbooks::imports::propose_as_draft(
+    let (proposed, saved) = match crate::playbooks::imports::propose_as_draft(
         state.db.pool(),
         &git,
         crate::playbooks::registry::PackSource {
@@ -708,6 +704,7 @@ pub(crate) async fn create_draft_from_git(
         Ok(v) => v,
         Err(e) => return import_error(e),
     };
+    let import = proposed.import;
 
     state
         .audit(
@@ -738,6 +735,7 @@ pub(crate) async fn create_draft_from_git(
             path: import.path,
             rev: import.rev,
             draft: DraftCompileDto::from_saved(saved, &state.dispatch, &catalog),
+            ignored_paths: proposed.ignored,
         }),
     )
         .into_response()
