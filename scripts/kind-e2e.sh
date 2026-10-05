@@ -1916,9 +1916,15 @@ for kept in "$V_TREE" "$V_FRESH_TREE" "$U_TREE"; do
     [ -n "$(tree_tarball "$kept")" ] && [ -n "$(tree_paths "$kept")" ] || fail "[V] collection removed $kept"
 done
 pass "[V] a restart collected the unpinned old trees and the blobs only they held, and kept the pinned and fresh trees and their blobs; the pins held"
-launch_and_check V-blobs draft-launch "$DRAFT-blobs"
-[ "$LAUNCH_TREE" = "$U_TREE" ] || fail "[V] the launch ran tree $LAUNCH_TREE, not $U_TREE"
-pass "[V] a draft sharing blobs with a collected tree still delivers"
+launch V-blobs draft-launch "$DRAFT-blobs"
+settle V-blobs "$KEY"
+expect_finished V-blobs
+[ "$(launch_tree "$KEY")" = "$U_TREE" ] || fail "[V] the launch ran tree $(launch_tree "$KEY"), not $U_TREE"
+V_BLOBS_PACK=$(ls -d "$WORK/scratch/local-runs/$(slug "$KEY")"-*/pack)
+for f in $(cd "$U_PACK" && find . -type f); do
+    cmp -s "$U_PACK/$f" "$V_BLOBS_PACK/$f" || fail "[V] the run's $f differs from the saved draft's"
+done
+pass "[V] a draft sharing blobs with a collected tree still delivers its saved files"
 
 expect_released V-restart e2e-vpub
 crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V-same.json"
