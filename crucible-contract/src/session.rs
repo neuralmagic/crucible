@@ -324,6 +324,21 @@ pub struct TaskRepair {
     pub notes: Vec<String>,
 }
 
+impl TaskRepair {
+    /// Every repair in a stored or logged array that this build can read, in order. An entry it
+    /// cannot read drops out rather than costing the reader the attempt it rode in on.
+    pub fn decode_all(raw: &serde_json::Value) -> Vec<TaskRepair> {
+        raw.as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 /// Why the executor never dispatched a task. `task` names the required task whose failure
 /// short-circuited the plan and is absent for every other reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

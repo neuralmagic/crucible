@@ -138,6 +138,9 @@ struct TaskResultWire {
     /// is: one unreadable object must not cost the reader the attempt it rode in on.
     #[serde(default)]
     agent: serde_json::Value,
+    /// The repair turns the attempt took, decoded entry by entry for the same reason.
+    #[serde(default)]
+    repairs: serde_json::Value,
     #[serde(default)]
     blocked: Option<TaskBlocked>,
 }
@@ -445,6 +448,7 @@ fn parse_session(content: &str) -> ParsedRun {
                     output,
                     links,
                     agent,
+                    repairs,
                     blocked,
                 } = *wire;
                 if task.is_empty() {
@@ -468,6 +472,7 @@ fn parse_session(content: &str) -> ParsedRun {
                     blocked,
                     links: crucible_contract::decode_links(&links),
                     agent: serde_json::from_value(agent).ok(),
+                    repairs: crucible_contract::session::TaskRepair::decode_all(&repairs),
                 });
             }
             Ev::Shutdown { outcome, reason } => {
@@ -1144,7 +1149,7 @@ mod tests {
             r#"{"v":1,"kind":"plan_admitted","plan_version":1,"reason":"","budget_usd":5.0,"tasks":[{"name":"propose","kind":"agent","depends_on":[],"session":"solver","needs":"all","required":true},{"name":"measure","kind":"command","depends_on":["propose"],"session":"","needs":"all","required":true}]}"#,
             r#"{"v":1,"kind":"task_result","task":"propose","status":"pass","plan_version":1,"task_kind":"agent","iter":0,"attempts":1,"cost_usd":0.75,"note":"","secs":12.0}"#,
             r#"{"v":1,"kind":"task_result","task":"measure","status":"pass","plan_version":1,"task_kind":"command","iter":0,"attempts":1,"cost_usd":0.0,"note":"","secs":30.0}"#,
-            r##"{"v":1,"kind":"task_result","task":"propose","status":"pass","plan_version":1,"task_kind":"agent","iter":1,"attempts":1,"cost_usd":0.5,"note":"","secs":9.0,"links":[{"url":"https://github.com/neuralmagic/crucible/pull/7","provider":"github","kind":"pull_request","label":"#7"}],"agent":{"harness":"claude","model":"glm-5.3","effort":"low"}}"##,
+            r##"{"v":1,"kind":"task_result","task":"propose","status":"pass","plan_version":1,"task_kind":"agent","iter":1,"attempts":1,"cost_usd":0.5,"note":"","secs":9.0,"links":[{"url":"https://github.com/neuralmagic/crucible/pull/7","provider":"github","kind":"pull_request","label":"#7"}],"agent":{"harness":"claude","model":"glm-5.3","effort":"low"},"repairs":[{"label":"propose repair 1/2","round":1,"of":2,"cost_usd":0.25,"notes":["output missing declared field \"lanes\""]},{"label":3}]}"##,
             r#"{"v":1,"kind":"task_result","task":"measure","status":"transport","plan_version":1,"task_kind":"command","iter":1,"attempts":1,"cost_usd":0.0,"note":"rig unreachable","secs":1.0}"#,
             r#"{"v":1,"kind":"task_result","task":"measure","status":"fail","plan_version":1,"task_kind":"command","iter":1,"attempts":2,"cost_usd":0.0,"note":"regressed","secs":28.0}"#,
             r#"{"v":1,"kind":"task_result","task":"report","status":"blocked","plan_version":1,"task_kind":"command","iter":1,"attempts":0,"cost_usd":0.0,"note":"required task measure failed","blocked":{"reason":"required_task_failed","task":"measure"},"secs":0.0}"#,
@@ -1228,6 +1233,16 @@ mod tests {
             "what the attempt ran on rides the event into the row"
         );
         assert_eq!(results[0].agent, None, "a command task names no agent");
+        assert_eq!(
+            results[3]
+                .repairs
+                .iter()
+                .map(|r| (r.label.as_str(), r.round, r.of, r.cost_usd))
+                .collect::<Vec<_>>(),
+            vec![("propose repair 1/2", 1, 2, 0.25)],
+            "the repairs ride the event into the row, and an unreadable one drops out alone"
+        );
+        assert!(results[0].repairs.is_empty());
         assert_eq!(
             results[4].blocked,
             Some(TaskBlocked {

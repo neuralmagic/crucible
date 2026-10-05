@@ -1231,6 +1231,7 @@ async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> 
             blocked: None,
             links,
             agent: None,
+            repairs: Vec::new(),
         },
     )
     .await?;
@@ -1281,6 +1282,7 @@ async fn run_graph_serves_what_each_agent_task_ran_on(pool: PgPool) -> Result<()
                 blocked: None,
                 links: Vec::new(),
                 agent,
+                repairs: Vec::new(),
             },
         )
         .await?;
@@ -1328,6 +1330,7 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
                 blocked: None,
                 links: Vec::new(),
                 agent: None,
+                repairs: Vec::new(),
             },
         )
         .await?;
@@ -9929,6 +9932,7 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
                 blocked: None,
                 links: Vec::new(),
                 agent: None,
+                repairs: Vec::new(),
             },
         )
         .await?;

@@ -424,6 +424,21 @@ dto! {
         pub links: Vec<ExternalLinkDto> = r.links.into_iter().map(ExternalLinkDto::from).collect(),
         /// What the attempts ran on, resolved; null for a command task.
         pub agent: Option<TaskAgentDto> = r.agent.map(TaskAgentDto::from),
+        /// The repair turns the attempt took, in order; their cost is part of `cost_usd`.
+        pub repairs: Vec<TaskRepairDto> = r.repairs.into_iter().map(TaskRepairDto::from).collect(),
+    }
+}
+
+dto! {
+    /// One repair turn: the agent's session resumed with the masked validation notes its previous
+    /// turn earned.
+    pub struct TaskRepairDto: From<r: crucible_contract::session::TaskRepair> {
+        /// `<task> repair <round>/<of>`.
+        pub label: String,
+        pub round: u32,
+        pub of: u32,
+        pub cost_usd: f64,
+        pub notes: Vec<String>,
     }
 }
 

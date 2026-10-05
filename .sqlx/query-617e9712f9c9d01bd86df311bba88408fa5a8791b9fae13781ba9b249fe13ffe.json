@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT iter AS \"iter!: i64\", task AS \"task!\", status AS \"status!\", note AS \"note!\",\n               cost_usd, secs, blocked, links AS \"links!\", agent\n        FROM run_task_results WHERE run_id = $1 ORDER BY iter, task\n        ",
+  "query": "\n        SELECT iter AS \"iter!: i64\", task AS \"task!\", status AS \"status!\", note AS \"note!\",\n               cost_usd, secs, blocked, links AS \"links!\", agent, repairs AS \"repairs!\"\n        FROM run_task_results WHERE run_id = $1 ORDER BY iter, task\n        ",
   "describe": {
     "columns": [
       {
@@ -101,6 +101,17 @@
             "name": "agent"
           }
         }
+      },
+      {
+        "ordinal": 9,
+        "name": "repairs!",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "repairs"
+          }
+        }
       }
     ],
     "parameters": {
@@ -117,8 +128,9 @@
       true,
       true,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "dba5ebb43b1c544a5fe370a96b12ae90e9822ee3c020ed01df754dce312ad354"
+  "hash": "617e9712f9c9d01bd86df311bba88408fa5a8791b9fae13781ba9b249fe13ffe"
 }

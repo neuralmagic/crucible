@@ -128,8 +128,8 @@ const RUN_GRAPH = {
   ],
   fanout: [{ task: 'summarize', items: 3 }],
   results: [
-    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [] },
-    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [] },
+    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [], repairs: [] },
+    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [], repairs: [] },
     {
       iter: 1,
       task: 'summarize[paged-attention]',
@@ -190,6 +190,7 @@ const RETRY_GRAPH = {
     cost_usd: 0.01,
     secs: 3,
     links: [],
+    repairs: [],
   })),
 };
 
@@ -207,10 +208,10 @@ const TRIAGE_GRAPH = {
   ],
   fanout: [{ task: 'triage', items: 20 }],
   results: [
-    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
-    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
-    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'high' } },
-    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [], agent: null },
+    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'high' } },
+    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [], repairs: [], agent: null },
   ],
 };
 
