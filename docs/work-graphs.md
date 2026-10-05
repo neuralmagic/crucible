@@ -183,9 +183,22 @@ like a wrong type, with a note giving the first three errors as instance path an
 `output field "lanes" does not match its schema: /1: value is not of type "string"`. Notes never
 repeat the refused value.
 
-Consumers see the schema's top-level `type`: `over` needs `"array"`, a score `"number"` or
-`"integer"`, a `noul` route `"boolean"`. A schema with no single top-level type satisfies none of
-them. On the wire a schema is its JSON text (`{ schema = "..." }` in the TOML,
+Each consumer checks the schema exactly, reading `type`, `const`, `enum`, local `$ref`, `allOf`,
+and every branch of `anyOf`/`oneOf`, and refusing what it cannot prove:
+
+- `over` needs `"type": "array"` whose `items` (and any `prefixItems`) are provably strings:
+  `"type": "string"`, or a `const`/`enum` of strings. A mapped instance is named by its item, so
+  `{"type": "array"}` with no `items`, or `"items": {"type": "integer"}`, is a compile error at the
+  `over` argument.
+- A score needs a numeric `type`, and its `const`/`enum` must hold numbers only.
+- A `route(source = ...)` question needs every value the schema bounds (`const`, `enum`, or
+  `"type": "boolean"`, which answers `yes`/`no`) to be a label the question accepts. A schema that
+  bounds nothing is refused, as `"string"` is.
+
+When a route's source bounds a question to finitely many answers, by a label list, `"boolean"`, or
+a schema, a `when` naming a label the source can never give is a compile error ("can never be
+answered"), such a label needs no task, and `otherwise` covers only the labels it can give. A schema
+with no single top-level type satisfies no consumer. On the wire a schema is its JSON text (`{ schema = "..." }` in the TOML,
 `{ path = "RESULT.json", schema = "..." }` for a file), since TOML cannot hold the nulls schemas
 often carry.
 
