@@ -1,0 +1,92 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0060"
+title = "Schema-typed emits carry the schema text in the plan"
+status = "proposed"
+date = "2026-10-05"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0002:C-TASK-FILES",
+    "RFC-0004:C-CONTRACT-VERSION",
+    "ADR-0058",
+]
+
+[content]
+context = """
+Typed emits ([[RFC-0001:C-WORKFLOW]]) promise a field's JSON type or a label set, and nothing about the shape inside a list or object. A declared file ([[RFC-0002:C-TASK-FILES]]) promises only that it exists. A task handing structured data downstream (a planner's lane list, a probe's RESULT.json) cannot say what that data looks like, so a malformed result fails in whichever consumer reads it.
+
+Constraints:
+
+- The generated `[workflow]` TOML is the runtime authority, and the compiled plan's bytes are its digest. Resume refuses a changed digest, and an approval pins the plan it saw. Whatever the schema check enforces has to be in those bytes, not behind a path.
+- TOML has no null. JSON Schemas carry null routinely: `"default": null`, `"const": null`, `"enum": [..., null]`.
+- `Task` does not deny unknown fields ([[ADR-0058]]), so a plan file or `[[workflow.task]]` table read by an older engine drops a field it does not know and runs without it.
+- Consumer checks (`over` needs a list, score readers a number, a noul route a boolean) match on the coarse field type.
+- The controller already validates launch params with the `jsonschema` crate, built without default features."""
+decision = """
+**Field type.** `FieldType::Schema(JsonSchema)` joins the field types. `JsonSchema::new` is its only constructor and refuses a `$schema` other than 2020-12 and any document the `jsonschema` crate will not compile. The crate is built without default features, so a remote `$ref` fails compilation rather than being fetched. Validation lives in the contract crate, so the engine and the controller judge the same documents.
+
+**DSL.** `schema_file("path")` reads the schema from the pack under `load()`'s confinement, bounded and charged to the prompt budget, and is accepted as a type in the dict form of `emits` and as a value in a new dict form of `emits_files` (`{"RESULT.json": schema_file(...), "REPORT.md": None}`). The list form of `emits_files` stays.
+
+**Wire.** A schema is carried as its JSON text: `{"schema": "<text>"}` for a field type, `{"path": ..., "schema": "<text>"}` for a declared file. A declared file without a schema stays a bare path string. The text is the document `serde_json` re-serializes, so the plan pins the content and an edit to the schema file changes the digest.
+
+**Consumers.** A schema satisfies a consumer through its top-level `type` alone: `array` as a list, `number` or `integer` as a number, `boolean` for a noul. A schema with no single top-level type satisfies none of them.
+
+**Notes.** A refusal gives the first three errors as instance path and message, masked so the note does not repeat the refused value; the note is persisted and served and the output is not.
+
+**Compatibility.** Every existing plan serializes byte-identical. An older engine refuses a schema field type (an unknown map form of `FieldType`) and a schema-typed file (a table where `Vec<String>` expects a string) instead of dropping either. The contract version moves to 1.14.0 because `plan_admitted` gains `emits_files` and both wire forms gain a variant ([[RFC-0004:C-CONTRACT-VERSION]])."""
+consequences = """
+- A producer's output and declared JSON files can be held to a shape, and a mismatch fails at the producer with a note naming where.
+- Plans that use schemas are larger by the schema text, and `plan_admitted` carries it per task. `schema_file()` is bounded at 64 KiB per file and shares the embed budget with prompts.
+- The schema text in TOML and JSON is a string, so a reader of the generated manifest or the event parses it a second time to see the document.
+- Consumers know only the top-level type. A schema that promises a list of objects passes `over` as a list; nothing at compile time checks that a mapped task reads the item's fields correctly.
+- Validation compiles the schema per check. It runs once per passing attempt per typed field or file, which is cheap next to the task itself.
+- `format` is an annotation under 2020-12 and is not asserted, as the crate defaults.
+- An older engine cannot run a plan that uses schemas. [[RFC-0004:C-CONTRACT-VERSION]] already keeps dispatch images in step with the controller."""
+
+[[content.alternatives]]
+text = "Carry the schema as its JSON text, and make schema-typed files a table entry in emits_files"
+status = "accepted"
+pros = [
+    "Any valid schema survives the TOML authority, nulls included.",
+    "Existing plans keep their bytes; an older engine refuses a schema it cannot enforce.",
+    "One argument names each declared file once.",
+]
+cons = [
+    "Readers parse the schema text a second time.",
+    "`emits_files` entries are no longer all strings, so every reader of the compiled plan has to take the table form.",
+]
+
+[[content.alternatives]]
+text = "Carry the schema as a nested JSON object, and refuse a schema holding null"
+status = "rejected"
+pros = ["Readable in the TOML and in the event without a second parse."]
+cons = ["Refuses common schemas, including what generators such as pydantic emit for optional fields."]
+rejection_reason = "An arbitrary hole in which valid schemas are accepted is worse than a string field."
+
+[[content.alternatives]]
+text = "Pin the schema by path and digest, and read the file at run time"
+status = "rejected"
+pros = ["Small plans."]
+cons = [
+    "The schema is not in the hashed plan, so what was approved is not what is enforced unless every reader re-checks the digest.",
+    "Runs would need the pack tree to validate output; resume and the controller would need it too.",
+]
+rejection_reason = "The plan is the authority; enforcement must not depend on a file beside it."
+
+[[content.alternatives]]
+text = "A parallel files_schema task field keyed by path"
+status = "rejected"
+pros = ["emits_files keeps one type."]
+cons = [
+    "An older engine drops the unknown field from a plan file and runs without validating.",
+    "Two arguments keyed by the same paths need their own consistency checks.",
+]
+rejection_reason = "Silent downgrade on the plan-file path, and duplicated keys."
+
+[[content.alternatives]]
+text = "Derive consumer compatibility by checking the schema against a canonical schema for each consumer"
+status = "rejected"
+pros = ["Could check item shapes for over."]
+cons = ["Schema subsumption is undecidable in general and the crate offers no such check."]
+rejection_reason = "The top-level type is what consumers rely on today; deeper checks have no library to stand on."
