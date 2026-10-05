@@ -8,7 +8,7 @@
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
-use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
+use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
@@ -223,6 +223,17 @@ fn agent_knobs() -> Vec<Kwarg> {
             "session",
             "session | str",
             "Join a durable conversation. A task in a session cannot be isolated.",
+        ),
+        Kwarg::new(
+            "repair",
+            "int",
+            format!(
+                "Repair turns, up to {MAX_REPAIR_CEILING}. When a passing turn's output misses \
+                 a declared field or file, or breaks its type or schema, the same session is \
+                 resumed with the masked validation notes and asked to fix it in place, then \
+                 checked again. Repairs share the attempt's timeout and cost. Default 0; \
+                 refused on `command` and `evaluate`."
+            ),
         ),
     ]
 }

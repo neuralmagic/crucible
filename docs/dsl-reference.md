@@ -25,6 +25,7 @@ An agent turn driven by a prompt.
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
 | `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
+| `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
@@ -57,6 +58,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `effort` | `str` | Reasoning effort, overriding `[agent]`. |
 | `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
+| `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |

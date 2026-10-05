@@ -1306,6 +1306,7 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
             &crate::plan::events::task_result_event(1, 0, t, &r, None),

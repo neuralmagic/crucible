@@ -2,7 +2,7 @@
 
 use crate::errors::FileError;
 use crate::plan::diag;
-use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
+use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 use crate::plan::workflow::WorkflowError;
 use starlark_syntax::codemap::FileSpan;
 
@@ -428,6 +428,15 @@ pub enum CompileError {
     HistoryOutOfRange { got: i32 },
     #[error("max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { got: i32 },
+    #[error(
+        "\"repair\" applies to agent and skill tasks; a {kind} task is deterministic, so running \
+         it again would produce the same output"
+    )]
+    RepairOnDeterministicTask { kind: &'static str },
+    #[error("\"repair\" must be an integer")]
+    RepairNotInteger,
+    #[error("repair = {got} is outside 0..={MAX_REPAIR_CEILING}")]
+    RepairOutOfRange { got: i32 },
     #[error(
         "revise = {targets:?} without max_rounds; a revise loop states how many rounds it may \
          take before it runs, not after"

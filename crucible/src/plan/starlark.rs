@@ -26,8 +26,9 @@ use crate::duration::TaskTimeout;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
-    Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
-    OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
+    Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_REPAIR_CEILING,
+    MAX_ROUNDS_CEILING, OutputField, OutputRef, ReportDestination, Revise, SlackDestination, Stage,
+    Task, TaskKind, TaskName, When,
 };
 use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
@@ -583,6 +584,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "repair",
         ],
         "skill" => &[
             "name",
@@ -610,6 +612,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "repair",
         ],
         "command" => &[
             "name",
@@ -875,6 +878,7 @@ fn constructor(
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -915,6 +919,7 @@ fn constructor(
                 timeout: None,
                 when: None,
                 history: None,
+                repair: 0,
             }
         }
         "route" => {
@@ -948,6 +953,7 @@ fn constructor(
                 when: take_when(&mut named, state, &name)?,
                 name,
                 history: None,
+                repair: 0,
             }
         }
         "propose" => {
@@ -1180,6 +1186,7 @@ fn dsl_task(
     session: Option<String>,
 ) -> Result<Task> {
     let when = take_when(named, state, &name)?;
+    let repair = take_repair(named, &kind)?;
     let task = Task {
         name,
         task: kind,
@@ -1198,6 +1205,7 @@ fn dsl_task(
         revise: take_revise(named)?,
         timeout: take_timeout(named)?,
         history: take_optional_history(named)?,
+        repair,
     };
     check_fanout(&task)?;
     if task.join == Join::Settled && task.depends_on.is_empty() {
@@ -1505,6 +1513,25 @@ fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u3
     }
 }
 
+/// `repair = N` on an agent task. A command or evaluate task naming it gets its own refusal
+/// rather than an unknown-argument one, since the argument exists and is refused on purpose.
+fn take_repair(named: &mut BTreeMap<String, Value>, kind: &TaskKind) -> Result<u32> {
+    let Some(value) = named.remove("repair") else {
+        return Ok(0);
+    };
+    if !matches!(kind, TaskKind::Agent { .. }) {
+        return Err(CompileError::RepairOnDeterministicTask { kind: kind.label() });
+    }
+    match value {
+        Value::None => Ok(0),
+        Value::Int(n) => match u32::try_from(n) {
+            Ok(rounds) if rounds <= MAX_REPAIR_CEILING => Ok(rounds),
+            _ => Err(CompileError::RepairOutOfRange { got: n }),
+        },
+        _ => Err(CompileError::RepairNotInteger),
+    }
+}
+
 fn take_optional_history(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
     match named.remove("history") {
         None | Some(Value::None) => Ok(None),
@@ -1595,6 +1622,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         revise: None,
         timeout: None,
         history: None,
+        repair: 0,
     }
 }
 
@@ -4044,6 +4072,53 @@ workflow(type = "playbook", tasks = [plan, lane])
     }
 
     #[test]
+    fn repair_compiles_on_agent_and_skill_tasks_only() {
+        let pack = temp_pack("repair");
+        std::fs::create_dir_all(pack.join("skills/fix")).unwrap();
+        std::fs::write(pack.join("skills/fix/SKILL.md"), "Fix it.\n").unwrap();
+        let compile = |source: &str| {
+            compile_source(source, &pack.join("workflow.star"), &pack)
+                .map_err(|error| crate::errors::report(&error))
+        };
+        let compiled = compile(
+            "a = agent(name = \"a\", prompt = \"p\", repair = 2)\n\
+             s = skill(name = \"s\", skill = \"skills/fix\", repair = 3)\n\
+             b = agent(name = \"b\", prompt = \"p\")\n\
+             workflow(type = \"playbook\", tasks = [a, s, b])\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let repair: Vec<u32> = compiled.workflow.tasks.iter().map(|t| t.repair).collect();
+        assert_eq!(repair, [2, 3, 0]);
+        for (source, needle) in [
+            (
+                "c = command(name = \"c\", run = \"true\", repair = 1)\nworkflow(type = \"playbook\", tasks = [c])\n",
+                "\"repair\" applies to agent and skill tasks; a command task is deterministic",
+            ),
+            (
+                "e = evaluate(name = \"e\", run = \"true\", repair = 1)\nworkflow(type = \"playbook\", tasks = [e])\n",
+                "a evaluate task is deterministic",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", repair = 4)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "repair = 4 is outside 0..=3",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", repair = -1)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "repair = -1 is outside 0..=3",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", repair = \"2\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "\"repair\" must be an integer",
+            ),
+        ] {
+            let err = compile(source).unwrap_err();
+            assert!(err.contains(needle), "{source}: {err}");
+            assert!(err.contains("workflow.star:1:"), "{source}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
     fn a_malformed_dict_emits_is_an_error_at_the_emits_argument() {
         for (replacement, needle) in [
             (
@@ -4248,11 +4323,11 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3, repair = 1{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
@@ -4264,11 +4339,11 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3, repair = 1{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",

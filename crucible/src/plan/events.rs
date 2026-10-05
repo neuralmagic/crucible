@@ -107,6 +107,7 @@ pub(crate) fn task_result_event(
         trace_id,
         span_id,
         agent: args.and_then(|args| crate::plan::harness::resolved_agent(args, task)),
+        repairs: r.repairs.clone(),
     }
 }
 
@@ -335,6 +336,7 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         };
         let SessionEvent::TaskResult { links, .. } =
             crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None)
@@ -358,6 +360,42 @@ mod tests {
             panic!("not a task_result event");
         };
         assert!(links.is_empty(), "no output, no links");
+    }
+
+    #[test]
+    fn a_task_result_carries_its_repair_turns() {
+        let plan = Plan::from_toml_str(
+            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"plan\"\nkind = \"agent\"\nprompt = \"p\"\nrepair = 2\n",
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let repair = crucible_contract::session::TaskRepair {
+            label: "plan repair 1/2".into(),
+            round: 1,
+            of: 2,
+            cost_usd: 0.25,
+            notes: vec!["output missing declared field \"lanes\"".into()],
+        };
+        let result = crate::plan::exec::TaskResult {
+            status: crate::plan::exec::TaskStatus::Pass,
+            attempts: 1,
+            cost_usd: 0.75,
+            output: Some(serde_json::json!({"lanes": []})),
+            note: None,
+            fanout: None,
+            blocked: None,
+            transport: None,
+            repairs: vec![repair.clone()],
+        };
+        let event =
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None);
+        let SessionEvent::TaskResult { repairs, .. } = &event else {
+            panic!("not a task_result event");
+        };
+        assert_eq!(repairs, &[repair]);
+        let line = crucible_contract::encode(&event);
+        assert!(line.contains(r#""label":"plan repair 1/2""#), "{line}");
     }
 
     #[test]
@@ -428,6 +466,7 @@ mod tests {
                 Attempt {
                     outcome,
                     cost_usd: 0.25,
+                    repairs: Vec::new(),
                 }
             }
         }

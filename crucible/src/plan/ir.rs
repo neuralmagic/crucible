@@ -499,6 +499,14 @@ pub struct Task {
     /// How many earlier runs of the launch series this task reads under [`HISTORY_INPUT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<u32>,
+    /// How many times an agent task's session is resumed to fix a passing attempt whose output
+    /// breaks its declared emits or files, within the attempt's deadline. Zero for none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repair: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `tasks` run again with the
@@ -552,6 +560,9 @@ impl From<Revise> for ReviseRepr {
 
 /// The most rounds one revise loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
 pub const MAX_ROUNDS_CEILING: u32 = 5;
+
+/// The most repair turns one agent attempt may take.
+pub const MAX_REPAIR_CEILING: u32 = 3;
 
 /// Executor-enforced accounting limit; overruns fail the plan.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -925,6 +936,13 @@ pub enum PlanError {
     ReviseTargetUnreachable { task: String, target: String },
     #[error("task {task:?}: max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { task: String, got: u32 },
+    #[error("task {task:?}: repair = {got} is outside 0..={MAX_REPAIR_CEILING}")]
+    RepairOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} is a {kind} task and declares repair; only an agent task's session can be \
+         resumed to fix its output, and a {kind} task would produce the same output again"
+    )]
+    RepairOnUnsupportedTask { task: String, kind: &'static str },
     #[error(
         "task {task:?}'s revise loop includes {member:?}, a {kind} task; only agent, command, and \
          evaluate tasks take part in a revise loop"
@@ -1558,6 +1576,18 @@ impl Plan {
                     }
                 }
             }
+            if t.repair > MAX_REPAIR_CEILING {
+                return Err(PlanError::RepairOutOfRange {
+                    task: task(),
+                    got: t.repair,
+                });
+            }
+            if t.repair > 0 && !matches!(t.task, TaskKind::Agent { .. }) {
+                return Err(PlanError::RepairOnUnsupportedTask {
+                    task: task(),
+                    kind: t.task.label(),
+                });
+            }
             if let Some(revise) = &t.revise {
                 if t.when.is_some() {
                     return Err(PlanError::WhenOnReviewer { task: task() });
@@ -1782,6 +1812,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -2421,6 +2452,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -2571,6 +2603,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -3766,6 +3799,45 @@ emits = ["lines"]
                 member: "fold".into(),
                 kind: "top_k"
             }
+        );
+    }
+
+    #[test]
+    fn repair_is_bounded_and_belongs_to_agent_tasks() {
+        for ok in [0, 1, MAX_REPAIR_CEILING] {
+            let mut t = agent("plan", &[]);
+            t.repair = ok;
+            plan(vec![t]).validate().unwrap();
+        }
+        let mut t = agent("plan", &[]);
+        t.repair = MAX_REPAIR_CEILING + 1;
+        assert_eq!(
+            refused(vec![t]),
+            PlanError::RepairOutOfRange {
+                task: "plan".into(),
+                got: MAX_REPAIR_CEILING + 1,
+            }
+        );
+        let mut t = agent("probe", &[]);
+        t.task = TaskKind::Command {
+            command: "./probe.sh".into(),
+        };
+        t.repair = 1;
+        assert_eq!(
+            refused(vec![t]),
+            PlanError::RepairOnUnsupportedTask {
+                task: "probe".into(),
+                kind: "command",
+            }
+        );
+        let mut t = agent("plan", &[]);
+        t.repair = 2;
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains(r#""repair":2"#), "{json}");
+        assert!(
+            !serde_json::to_string(&agent("plain", &[]))
+                .unwrap()
+                .contains("repair")
         );
     }
 

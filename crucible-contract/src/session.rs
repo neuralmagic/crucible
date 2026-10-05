@@ -310,6 +310,20 @@ pub struct TaskAgent {
     pub effort: String,
 }
 
+/// One repair turn of an agent attempt: the session was resumed with `notes`, the masked
+/// validation notes its previous turn earned, and asked to fix its output in place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRepair {
+    /// `<task> repair <round>/<of>`, the sub-attempt as a reader names it.
+    pub label: String,
+    pub round: u32,
+    pub of: u32,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
 /// Why the executor never dispatched a task. `task` names the required task whose failure
 /// short-circuited the plan and is absent for every other reason.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -496,6 +510,9 @@ pub enum SessionEvent {
         /// What the attempts ran on, resolved. Present exactly when the task runs an agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<TaskAgent>,
+        /// The repair turns the attempts took, in order. Their cost is part of `cost_usd`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        repairs: Vec<TaskRepair>,
         #[serde(default)]
         note: String,
         /// Present exactly when `status` is `blocked`; `note` is its rendered form.
@@ -1068,6 +1085,13 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             agent: None,
+            repairs: vec![TaskRepair {
+                label: "measure-a repair 1/2".into(),
+                round: 1,
+                of: 2,
+                cost_usd: 0.1,
+                notes: vec!["output missing declared field \"score\"".into()],
+            }],
         });
         // A minimal line (old writers, other contexts) still decodes: every field but
         // task/status defaults.
@@ -1119,6 +1143,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             agent: None,
+            repairs: Vec::new(),
         };
         assert_eq!(
             encode(&ev),
@@ -1175,6 +1200,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             agent: None,
+            repairs: Vec::new(),
         };
         assert_eq!(
             encode(&ev),
@@ -1223,6 +1249,7 @@ mod tests {
                 model: "glm-5.3".into(),
                 effort: "low".into(),
             }),
+            repairs: Vec::new(),
         };
         assert!(
             encode(&ev)
