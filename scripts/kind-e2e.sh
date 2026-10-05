@@ -62,6 +62,11 @@
 #      leader killed, the peer takes the lease and fires a one-shot on time, once
 #   M  a loop image labelled with another contract version parks the launch without a pod
 #   Z  db rebuild carries the trees and aliases the pack rows reference
+#   Y  examples/schema-repair through the controller: the draft's compiled graph and the run's
+#      admitted plan parse with schema-typed fields and files, the agent whose first turn breaks
+#      its file's schema passes after one repair turn, the mapped instance that never fixes its
+#      file fails with a note that does not repeat the refused value, and the run's spend and the
+#      task results count the repair turns
 # Needs docker, kind, kubectl, jq, curl, git, shasum, openssl. Uses $DATABASE_URL and $PG_CONTAINER when
 # set (the CI postgres action), else starts its own Postgres. KEEP=1 leaves everything up;
 # ARTIFACT_DIR collects logs on failure.
@@ -185,6 +190,7 @@ else
     LOOP_BASE="${LOOP_BASE:-debian:bookworm-slim}"
 fi
 CONTRACT_VERSION=$("$BIN/crucible" --contract-version)
+cp "$ROOT/tools/fake-agent.py" "$WORK/image/fake-agent.py"
 
 # ---- cluster and registry ------------------------------------------------------------------
 log "creating kind cluster $CLUSTER"
@@ -2263,6 +2269,51 @@ watch_stop
 stop_peer
 DISCOVERY_SECS=5
 pass "[N] latency to pod creation: standby launch ${N_LAT_STANDBY}s, one-shot ${N_LAT_ONCE}s, schedule ${N_LAT_CRON}s, webhook${N_LAT_HOOK}, failover one-shot ${N_LAT_FAILOVER}s (lease handover ${N_HANDOVER}s, leading ${N_READY}s after the kill), bound ${N_BOUND}s against the 300s discovery tick"
+
+# ---- scenario Y ----------------------------------------------------------------------------
+CONTROLLER_ENV=()
+start_controller
+log "[Y] saving examples/schema-repair and reading its compiled graph"
+new_draft schema-repair "$ROOT/examples/schema-repair"
+api GET /api/playbook-drafts/schema-repair/preview
+[ "$HTTP" = 200 ] || fail "[Y] the draft preview answered $HTTP: $(cat "$WORK/api.json")"
+[ "$(jq -c '[.graph.nodes[] | {(.name): .emits_files}] | add' "$WORK/api.json")" = \
+    '{"probe":["PROBE.json"],"plan":["PLAN.json"],"audit":["AUDIT.json"]}' ] ||
+    fail "[Y] the compiled graph's declared files: $(jq -c '{graph, diagnostics}' "$WORK/api.json")"
+pass "[Y] the controller reduced a plan with schema-typed fields and files to its graph"
+
+launch Y draft-launch schema-repair
+settle Y "$KEY"
+expect_finished Y
+RUN=$(jq -r '.runs[0].run_id' "$WORK/run-Y.json")
+sql -c "SELECT graph_json FROM run_plans WHERE run_id = '$RUN'" >"$WORK/plan-Y.json"
+jq -e '.[] | select(.name == "plan")
+    | (.emits[0].type.schema | contains("\"items\""))
+      and (.emits_files[] | select(.path == "PLAN.json") | .schema | contains("\"required\""))' \
+    "$WORK/plan-Y.json" >/dev/null || fail "[Y] the admitted plan does not carry the schema text: $(cat "$WORK/plan-Y.json")"
+api GET "/api/runs/$RUN/graph"
+[ "$HTTP" = 200 ] || fail "[Y] the run graph answered $HTTP: $(cat "$WORK/api.json")"
+pass "[Y] the admitted plan carries each schema's text and the run graph decodes it"
+
+y_result() { jq -c --arg t "$1" '.results[] | select(.task == $t) | '"$2" "$WORK/api.json"; }
+[ "$(y_result plan '[.status, .cost_usd, (.repairs | map([.label, .round, .of, .cost_usd]))]')" = \
+    '["pass",0.375,[["plan repair 1/1",1,1,0.125]]]' ] ||
+    fail "[Y] plan: $(y_result plan .)"
+[ "$(y_result plan '.repairs[0].notes')" = \
+    '["declared file \"PLAN.json\" does not match its schema: /ok: value is not of type \"boolean\""]' ] ||
+    fail "[Y] plan's repair notes: $(y_result plan .repairs)"
+pass "[Y] the agent passed after one repair turn, recorded with its cost and notes"
+[ "$(y_result 'audit[a]' '[.status, .repairs]')" = '["pass",[]]' ] || fail "[Y] audit[a]: $(y_result 'audit[a]' .)"
+[ "$(y_result 'audit[b]' '[.status, .note, (.repairs | length)]')" = \
+    '["fail","declared file \"AUDIT.json\" does not match its schema: /ok: value is not of type \"boolean\"",1]' ] ||
+    fail "[Y] audit[b]: $(y_result 'audit[b]' .)"
+grep -q hunter2 "$WORK/api.json" && fail "[Y] a task result repeats the refused value"
+pass "[Y] the instance that never fixed its file failed after its repair, with a masked note"
+api GET "/api/runs/$RUN"
+[ "$(jq -r '.run.cost_usd' "$WORK/api.json")" = 0.5625 ] ||
+    fail "[Y] the run spent $(jq -r '.run.cost_usd' "$WORK/api.json"), not 0.5625 with its repairs"
+pass "[Y] the run's spend includes the repair turns"
+stop_controller
 
 # ---- scenario M ----------------------------------------------------------------------------
 CONTROLLER_ENV=()
