@@ -3,7 +3,7 @@
 [govctl]
 id = "ADR-0056"
 title = "Launch triggers wake the launch loop at their due time, off the discovery tick"
-status = "proposed"
+status = "accepted"
 date = "2026-09-30"
 refs = [
     "ADR-0037",
@@ -31,7 +31,7 @@ The one-shot, schedule, and webhook triggers move out of the discovery source in
 
 **Probe instead of notify.** The launch loop asks Postgres for the earliest due time across four sources: the three trigger tables, limited to enabled standing launches, and undispatched launches, due from their `updated_at`. A partial index on the last makes all four index lookups. It runs a pass when that time has arrived. Otherwise it sleeps until that time or for a short probe interval (2 s), whichever is sooner. A row written on any replica is seen within one probe interval, and a known due time is met on the dot. No SQL trigger or LISTEN connection is involved, so a reconnect cannot lose a wake. This replaces the [[ADR-0055]] delivery channel and the launch channel, whose notifies and listener are removed.
 
-**Rows that stay due.** After a pass, a row it deferred (owner refresh) or skipped (an earlier failure on the same standing launch) is still due. The loop keeps those ids in memory with a retry time one discovery interval out, and excludes them from the probe until then. A trigger that hit its 32-row cap gets another pass straight away. An undispatched launch the pass enqueued is held the same way, so one waiting on the concurrent-pod cap, which stays `new`, is re-enqueued once per discovery interval rather than on every probe. A freed slot still re-drives it at once.
+**Rows that stay due.** After a pass, a row it deferred (owner refresh) or skipped (an earlier failure on the same standing launch) is still due. The loop keeps those ids in memory with a retry time one discovery interval out, and excludes them from the probe until then. A trigger that hit its 32-row cap gets another pass straight away. An undispatched launch the pass enqueued is held the same way, so one that stays `new` (waiting on the concurrent-pod cap, or deferred on an unreachable issuer) is re-enqueued once per discovery interval rather than on every probe. A freed slot still re-drives it at once.
 
 **Webhook housekeeping.** Settling a disabled webhook's pending deliveries and pruning deliveries past retention ran inside the webhook sweep. A pass now runs only when something is due, so both move to a discovery source of their own.
 
