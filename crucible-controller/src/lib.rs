@@ -26,6 +26,7 @@ pub mod client;
 pub(crate) mod clock;
 pub mod config;
 pub mod daemon;
+pub mod decisions;
 pub(crate) mod dto;
 #[cfg(feature = "embedded-db")]
 pub mod embedded_db;
