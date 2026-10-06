@@ -177,6 +177,7 @@ const DEFAULT_SCHEDULE_OWNER_TTL_SECS: u64 = 7 * 24 * 3600;
 /// The default playbook wall-clock cap, in hours. Spelled once: clap renders it into
 /// `--playbook-max-time-cap`'s default and [`PlaybookCaps::default`] builds the same value.
 const DEFAULT_PLAYBOOK_MAX_TIME_HOURS: u64 = 4;
+const DEFAULT_LOOP_RUN_MAX_AGE_HOURS: u64 = 24;
 
 /// The admin bounds a playbook launcher's ceilings are checked against.
 #[derive(Debug, Clone)]
@@ -678,6 +679,15 @@ pub struct ControllerCfg {
         default_value_t = crate::model::MaxTime::hours(DEFAULT_PLAYBOOK_MAX_TIME_HOURS)
     )]
     pub playbook_max_time_cap: crate::model::MaxTime,
+    /// How long a loop run's pod may stay non-terminal before the controller deletes it and fails
+    /// the run. A playbook run's bound is its own `max_time` plus a fixed startup margin.
+    #[arg(
+        long = "loop-run-max-age",
+        env = "CONTROLLER_LOOP_RUN_MAX_AGE",
+        value_parser = crate::model::MaxTime::parse,
+        default_value_t = crate::model::MaxTime::hours(DEFAULT_LOOP_RUN_MAX_AGE_HOURS)
+    )]
+    pub loop_run_max_age: crate::model::MaxTime,
     /// How a playbook launch's engine runs: `pod` (a controller-owned work pod, the default) or
     /// `local` (a supervised subprocess on this machine). Production stays `pod` unless a
     /// deployment opts in; the laptop flow is the reason `local` exists.
