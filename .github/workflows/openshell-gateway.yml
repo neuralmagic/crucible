@@ -161,9 +161,9 @@ jobs:
         run: |
           cargo build --release --locked -p openshell-supervisor --bin openshell-supervisor
           tasks/scripts/verify-glibc-symbols.sh 2.39 target/release/openshell-supervisor
-          # Stage where upstream's Dockerfile.supervisor expects the binary.
-          mkdir -p deploy/docker/.build/prebuilt-binaries/amd64
-          cp target/release/openshell-supervisor deploy/docker/.build/prebuilt-binaries/amd64/
+          mkdir -p ../dist/supervisor
+          cp target/release/openshell-supervisor ../dist/supervisor/
+          cp ../Containerfile.openshell-supervisor ../dist/supervisor/
 
       - name: Build sandbox runtime (musl static)
         if: steps.exists.outputs.skip != 'true'
@@ -222,22 +222,36 @@ jobs:
           push: true
           tags: ghcr.io/neuralmagic/openshell-gateway:sha-${{ steps.rev.outputs.rev }}
 
-      - name: Build and push the supervisor image
+      - name: Build the supervisor image
         if: steps.exists.outputs.skip != 'true'
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
-          context: openshell-src
-          file: openshell-src/deploy/docker/Dockerfile.supervisor
+          context: dist/supervisor
+          file: dist/supervisor/Containerfile.openshell-supervisor
           platforms: linux/amd64
-          push: true
+          load: true
           tags: ghcr.io/neuralmagic/openshell-supervisor:sha-${{ steps.rev.outputs.rev }}
 
-      - name: Build and push the sandbox runtime image
+      - name: Run the supervisor image before pushing it
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          image='ghcr.io/neuralmagic/openshell-supervisor:sha-${{ steps.rev.outputs.rev }}'
+          docker run --rm "$image" --version | grep -q '^openshell-supervisor '
+          docker push "$image"
+
+      - name: Build the sandbox runtime image
         if: steps.exists.outputs.skip != 'true'
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: openshell-src
           file: openshell-src/deploy/docker/Dockerfile.sandbox
           platforms: linux/amd64
-          push: true
+          load: true
           tags: ghcr.io/neuralmagic/openshell-sandbox:sha-${{ steps.rev.outputs.rev }}
+
+      - name: Run the sandbox runtime image before pushing it
+        if: steps.exists.outputs.skip != 'true'
+        run: |
+          image='ghcr.io/neuralmagic/openshell-sandbox:sha-${{ steps.rev.outputs.rev }}'
+          docker run --rm "$image" --version | grep -q '^openshell-sandbox '
+          docker push "$image"
