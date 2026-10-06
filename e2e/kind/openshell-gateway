@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stand-in for openshell-gateway: generate-certs writes placeholder material, anything else fails,
+# so an in-pod boot gets as far as publishing its client-TLS Secret and no further.
+set -eu
+[ "${1:-}" = generate-certs ] || { echo "openshell-gateway stand-in: only generate-certs" >&2; exit 1; }
+shift
+out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --output-dir) out="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+[ -n "$out" ] || { echo "openshell-gateway stand-in: generate-certs needs --output-dir" >&2; exit 2; }
+mkdir -p "$out/client"
+for f in ca.crt client/tls.crt client/tls.key; do echo "kind e2e $f" >"$out/$f"; done

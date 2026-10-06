@@ -15,6 +15,10 @@
 #      adds no blob, a save with one file changed adds one, and drafts share the blobs they have
 #      in common; collecting a deleted draft's tree deletes only the blob no other tree holds
 #   F  a failing task parks its launch with the task's error
+#   H  with only the rendered sandbox Role (secrets create, no get or patch), a controller-
+#      dispatched run pod and a rendered turn pod each boot the gateway (a stand-in that only
+#      generates certs) far enough to create their client-TLS Secret, named for the pod and the
+#      boot and owned by the pod, which collects it
 #   C  a pack over the delivery budget is refused at save
 #   R  runs survive a controller restart: one finishes while the controller is down, one is
 #      still running when it comes back
@@ -176,7 +180,7 @@ if [ -n "${CRUCIBLE_LINUX_BIN:-}" ]; then
     cp "$CRUCIBLE_LINUX_BIN" "$WORK/image/crucible"
     LOOP_BASE="${LOOP_BASE:-ubuntu:24.04}"
 elif [ "$(uname -s)" = Linux ] && [ "$HOST_ARCH" = "$NODE_ARCH" ]; then
-    cp "$BIN/crucible" "$WORK/image/crucible"
+    cp "$AUTORESEARCH_ENGINE" "$WORK/image/crucible"
     LOOP_BASE="${LOOP_BASE:-ubuntu:24.04}"
 else
     log "building crucible for linux/$NODE_ARCH in rust:1-bookworm"
@@ -186,11 +190,12 @@ else
         -v "kind-e2e-target-$NODE_ARCH":/ctarget \
         -v "$WORK/image":/out \
         -e CARGO_TARGET_DIR=/ctarget -e SQLX_OFFLINE=true -e CARGO_PROFILE_DEV_DEBUG=0 \
-        rust:1-bookworm sh -c 'cargo build --locked -q -p crucible --bin crucible && cp /ctarget/debug/crucible /out/ && strip /out/crucible'
+        rust:1-bookworm sh -c 'cargo build --locked -q -p crucible --features autoresearch --bin crucible && cp /ctarget/debug/crucible /out/ && strip /out/crucible'
     LOOP_BASE="${LOOP_BASE:-debian:bookworm-slim}"
 fi
 CONTRACT_VERSION=$("$BIN/crucible" --contract-version)
 cp "$ROOT/tools/fake-agent.py" "$WORK/image/fake-agent.py"
+cp "$FIX/openshell-gateway" "$WORK/image/openshell-gateway"
 
 # ---- cluster and registry ------------------------------------------------------------------
 log "creating kind cluster $CLUSTER"
@@ -208,7 +213,28 @@ done
 
 kubectl create namespace "$NS" >/dev/null
 kubectl -n "$NS" create serviceaccount crucible-loop >/dev/null
-kubectl -n "$NS" create configmap crucible-e2e-kubeconfig --from-literal=kubeconfig= >/dev/null
+# The loop pod's kubeconfig: the API server through the projected token and CA it mounts.
+cat >"$WORK/pod-kubeconfig" <<KUBECONFIG
+apiVersion: v1
+kind: Config
+clusters:
+  - name: in-cluster
+    cluster:
+      server: https://kubernetes.default.svc
+      certificate-authority: /var/run/kube/ca.crt
+users:
+  - name: loop
+    user:
+      tokenFile: /var/run/kube/token
+contexts:
+  - name: in-cluster
+    context:
+      cluster: in-cluster
+      user: loop
+      namespace: $NS
+current-context: in-cluster
+KUBECONFIG
+kubectl -n "$NS" create configmap crucible-e2e-kubeconfig --from-file=kubeconfig="$WORK/pod-kubeconfig" >/dev/null
 
 # ---- loop images ---------------------------------------------------------------------------
 # push_loop_image <tag> <contract label>: build the loop image and push it to the registry.
@@ -870,6 +896,90 @@ settle F "$KEY"
 expect_parked F "deliberate failure"
 [ "$(jq -r '.runs[0].status' "$WORK/run-F.json")" = error ] ||
     fail "[F] run status is $(jq -c '.runs[0].status' "$WORK/run-F.json")"
+
+# ---- scenario H ----------------------------------------------------------------------------
+SA_REF="system:serviceaccount:$NS:crucible-loop"
+TLS_PREFIX=crucible-openshell-client-tls-
+
+# tls_secrets: the client-TLS Secrets in the namespace, as one JSON array.
+tls_secrets() {
+    kubectl -n "$NS" get secrets -o json | jq -c --arg p "$TLS_PREFIX" '[.items[] | select(.metadata.name | startswith($p))]'
+}
+
+# tls_secret_count <n>: exactly n client-TLS Secrets exist.
+tls_secret_count() { [ "$(tls_secrets | jq length)" = "$1" ]; }
+
+# tls_secret_published: at least one client-TLS Secret exists.
+tls_secret_published() { [ "$(tls_secrets | jq length)" -gt 0 ]; }
+
+# expect_pod_secrets <label> <pod>: every client-TLS Secret is named for the pod and a distinct
+# boot (each transport retry boots again), owned by the live pod, and carries the mTLS keys the
+# driver mounts.
+expect_pod_secrets() {
+    local s uid
+    s=$(tls_secrets)
+    jq -e --arg n "$TLS_PREFIX$2-" 'all(.[]; .metadata.name | startswith($n) and (ltrimstr($n) | test("^[0-9a-f]{12}$")))' <<<"$s" >/dev/null ||
+        fail "[$1] a Secret is not named for pod $2 and one boot: $(jq -c 'map(.metadata.name)' <<<"$s")"
+    uid=$(kubectl -n "$NS" get pod "$2" -o jsonpath='{.metadata.uid}')
+    jq -e --arg pod "$2" --arg uid "$uid" 'all(.[]; [.metadata.ownerReferences[] | [.kind, .name, .uid]] == [["Pod", $pod, $uid]])' <<<"$s" >/dev/null ||
+        fail "[$1] a Secret is not owned by pod $2 ($uid): $(jq -c 'map(.metadata.ownerReferences)' <<<"$s")"
+    jq -e 'all(.[]; (.data | keys) == ["ca.crt", "tls.crt", "tls.key"])' <<<"$s" >/dev/null ||
+        fail "[$1] a Secret carries other keys: $(jq -c 'map(.data | keys)' <<<"$s")"
+    pass "[$1] pod $2 published $(jq -r 'map(.metadata.name) | join(", ")' <<<"$s"), owned by the pod"
+}
+
+log "[H] granting the loop SA the rendered sandbox Role and nothing else"
+GW_PACK="$WORK/gateway"
+cp -R "$FIX/packs/gateway" "$GW_PACK"
+"$BIN/crucible" deploy render --manifest "$GW_PACK/crucible.toml" --profile "$WORK/profile.toml" \
+    --no-pin --playbook --max-cost 1 --max-time 5m >"$WORK/render-H.yaml"
+kubectl create --dry-run=client -o json -f "$WORK/render-H.yaml" |
+    jq -s '{apiVersion: "v1", kind: "List", items: [.[] | if .kind == "List" then .items[] else . end
+        | select((.kind == "Role" or .kind == "RoleBinding") and .metadata.name == "crucible-loop-sandbox")]}' |
+    kubectl apply -f - >/dev/null
+for verb in get patch update; do
+    [ "$(kubectl auth can-i "$verb" secrets -n "$NS" --as "$SA_REF" 2>/dev/null)" = no ] ||
+        fail "[H] the loop SA can $verb secrets"
+done
+[ "$(kubectl auth can-i create secrets -n "$NS" --as "$SA_REF")" = yes ] || fail "[H] the loop SA cannot create secrets"
+pass "[H] the loop SA may create Secrets and may not get, patch, or update them"
+
+log "[H] a controller-dispatched run pod boots the gateway"
+new_draft "$DRAFT-gateway" "$GW_PACK"
+watch_start H
+launch H draft-launch "$DRAFT-gateway"
+wait_for 120 "the run pod's gateway to publish its client-TLS Secret" tls_secret_published
+H_POD=$(tls_secrets | jq -r '.[0].metadata.ownerReferences[0].name')
+[ "$(kubectl -n "$NS" get pod "$H_POD" -o jsonpath='{.metadata.labels.crucible\.dev/issue-key}')" = "$(label "$KEY")" ] ||
+    fail "[H] the Secret's owner $H_POD is not the launch's pod"
+expect_pod_secrets H "$H_POD"
+settle H "$KEY"
+watch_stop
+reason=$(jq -r '.launch.parked_reason // empty' "$WORK/run-H.json")
+[ "$STATUS" = parked ] && grep -q 'gateway' <<<"$reason" || fail "[H] expected a park at the gateway, got '$STATUS': $reason"
+grep -qi -e forbidden -e 'publishing Secret' <<<"$reason" && fail "[H] the publish was refused: $reason"
+pass "[H] the run got past the publish and stopped at the stand-in gateway"
+wait_for 90 "the run pod to be collected" no_run_objects
+wait_for 90 "the run pod's Secret to be collected with it" tls_secret_count 0
+pass "[H] the Secret was collected with its pod"
+
+log "[H] a rendered turn pod boots the gateway"
+kubectl -n "$NS" run crucible-e2e-gitd --image "$LOOP_IMAGE" --port 9418 --restart Never --command -- sh -c \
+    'mkdir -p /srv/code && cd /srv/code && git init -q && git -c user.name=e2e -c user.email=e2e@example.com commit -q --allow-empty -m init && exec git daemon --base-path=/srv --export-all --reuseaddr /srv' >/dev/null
+kubectl -n "$NS" expose pod crucible-e2e-gitd --port 9418 >/dev/null
+kubectl -n "$NS" wait --for=condition=Ready pod/crucible-e2e-gitd --timeout=120s >/dev/null
+echo "Boot the gateway." >"$WORK/goal-H.txt"
+H_TURN=crucible-turn-e2e-tls
+"$BIN/crucible" deploy render-turn --profile "$WORK/profile.toml" --name "$H_TURN" --issue e2e/tls#1 \
+    --turn-kind scope --goal-file "$WORK/goal-H.txt" --repo-url "git://crucible-e2e-gitd.$NS.svc:9418/code" \
+    --sandbox-image ghcr.io/org/sandbox:latest --no-pin >"$WORK/turn-H.yaml"
+kubectl apply -f "$WORK/turn-H.yaml" >/dev/null
+wait_for 120 "the turn pod's gateway to publish its client-TLS Secret" tls_secret_published
+expect_pod_secrets H-turn "$H_TURN"
+kubectl -n "$NS" delete pod "$H_TURN" crucible-e2e-gitd --wait=true >/dev/null
+kubectl -n "$NS" delete service crucible-e2e-gitd >/dev/null
+wait_for 90 "the turn pod's Secret to be collected with it" tls_secret_count 0
+pass "[H] the turn pod's Secret was collected with it"
 
 # ---- scenario C ----------------------------------------------------------------------------
 log "[C] saving a pack over the delivery budget"
