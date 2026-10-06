@@ -65,6 +65,10 @@ pub const CODEX_ENDPOINTS: &[&str] = &[
     "ab.chatgpt.com:443:full",
 ];
 
+/// Claude Code's own log intake: `claude` posts its client logs here whatever backend serves the
+/// model.
+pub const CLAUDE_ENDPOINTS: &[&str] = &["http-intake.logs.us5.datadoghq.com:443:read-write"];
+
 /// The one OpenAI host a key-authenticated harness (opencode, pi) reaches when no custom base URL
 /// redirects it; a custom endpoint's host is added per turn from `OPENAI_BASE_URL` instead.
 pub const OPENAI_API_ENDPOINTS: &[&str] = &["api.openai.com:443:full"];
@@ -77,7 +81,8 @@ pub fn default_endpoints(harness: Harness) -> Vec<&'static str> {
     match harness {
         Harness::Codex => out.extend_from_slice(CODEX_ENDPOINTS),
         Harness::OpenCode | Harness::Pi => out.extend_from_slice(OPENAI_API_ENDPOINTS),
-        Harness::Claude | Harness::Hermes => {}
+        Harness::Claude => out.extend_from_slice(CLAUDE_ENDPOINTS),
+        Harness::Hermes => {}
     }
     out
 }
