@@ -1,0 +1,10 @@
+# produces: ghcr.io/neuralmagic/openshell-supervisor:sha-<rev>
+# The OpenShell sandbox supervisor built from the fork rev pinned in Cargo.lock. The binary is a
+# plain cargo build that links libgcc_s dynamically, so the base carries libgcc (distroless/cc),
+# unlike upstream's base-nossl image whose binary comes from a static-libgcc Nix toolchain.
+#
+# Built and pushed by .github/workflows/openshell-gateway.yml with the staged binary directory as
+# the build context.
+FROM gcr.io/distroless/cc-debian13@sha256:159783207c2cd44c2aa5715961d13c8612368ac9bd450f887e3f08fc8ea461e3
+COPY --chmod=0555 openshell-supervisor /openshell-supervisor
+ENTRYPOINT ["/openshell-supervisor"]
