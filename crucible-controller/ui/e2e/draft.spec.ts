@@ -576,8 +576,8 @@ test.describe('draft authoring studio', () => {
         status: 201,
         json: {
           id: 'mlr-pack',
-          rev: 'sha256:0123456789abcdef0123',
-          tar_digest: 'sha256:0123456789abcdef0123',
+          rev: 'tree1:0123456789abcdef0123',
+          tree_digest: 'tree1:0123456789abcdef0123',
           schema_digest: 'sha256:form',
           schema_changed: false,
           exposure_digest: null,

@@ -115,24 +115,84 @@ const RUNS = [
 ];
 
 /** A run's admitted work graph: a fanned-out task whose instances land in the results without ever
- * being declared, one of them failed, plus a task nothing has reported on yet. */
+ * being declared, one of them failed, plus a task nothing has reported on yet. `read` emitted
+ * three papers and only two instances started. Both instances and the reducer reported what they
+ * opened outside the run. */
 const RUN_GRAPH = {
   plan_version: 3,
   tasks: [
-    { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true },
-    { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'all', required: true },
-    { name: 'rank', kind: 'top_k', depends_on: ['summarize'], session: '', needs: 'all', required: true },
-    { name: 'file', kind: 'command', depends_on: ['rank'], session: '', needs: 'all', required: true },
+    { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true, over: '', max_fanout: 0 },
+    { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'all', required: true, over: 'read.papers', max_fanout: 8 },
+    { name: 'rank', kind: 'top_k', depends_on: ['summarize'], session: '', needs: 'all', required: true, over: '', max_fanout: 0 },
+    { name: 'file', kind: 'command', depends_on: ['rank'], session: '', needs: 'all', required: true, over: '', max_fanout: 0 },
   ],
+  fanout: [{ task: 'summarize', items: 3 }],
   results: [
-    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31 },
-    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240 },
-    { iter: 1, task: 'summarize[paged-attention]', status: 'pass', note: 'one entry per citation', cost_usd: 0.2, secs: 18 },
-    { iter: 1, task: 'summarize[flashinfer]', status: 'fail', note: 'exit 1: no citations parsed\n  at summarize.sh:14', cost_usd: 0.05, secs: 6 },
-    { iter: 1, task: 'rank', status: 'pass', note: 'kept 1 of 2', cost_usd: null, secs: 2 },
+    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [], repairs: [] },
+    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [], repairs: [] },
+    {
+      iter: 1,
+      task: 'summarize[paged-attention]',
+      status: 'pass',
+      note: 'one entry per citation',
+      cost_usd: 0.2,
+      secs: 18,
+      links: [
+        { url: 'https://github.com/neuralmagic/crucible/pull/418', provider: 'github', kind: 'pull_request', label: '#418' },
+        { url: 'https://github.com/neuralmagic/crucible/tree/paged-attention', provider: 'github', kind: 'branch', label: 'paged-attention' },
+      ],
+    },
+    {
+      iter: 1,
+      task: 'summarize[flashinfer]',
+      status: 'fail',
+      note: 'exit 1: no citations parsed\n  at summarize.sh:14',
+      cost_usd: 0.05,
+      secs: 6,
+      links: [
+        { url: 'https://gitlab.com/vllm/kernels/-/merge_requests/9', provider: 'gitlab', kind: 'merge_request', label: '!9' },
+      ],
+    },
+    {
+      iter: 1,
+      task: 'rank',
+      status: 'pass',
+      note: 'kept 1 of 2',
+      cost_usd: null,
+      secs: 2,
+      links: [
+        { url: 'https://github.com/neuralmagic/crucible/pull/412', provider: 'github', kind: 'pull_request', label: '#412' },
+        { url: 'https://github.com/neuralmagic/crucible/tree/survey-412', provider: 'github', kind: 'branch', label: 'survey-412' },
+        { url: 'https://crucible.atlassian.net/browse/INFERENG-77', provider: 'jira', kind: 'issue', label: 'INFERENG-77' },
+      ],
+    },
   ],
 };
 
+
+/** A run that flapped: one task retried across nine iterations, passing five times, failing once
+ * and passing three more. The long stretches are what the grid melds. */
+export const RETRY_RUN = 'RUN-0901';
+
+const RETRY_STATUSES = ['pass', 'pass', 'pass', 'pass', 'pass', 'fail', 'pass', 'pass', 'pass'];
+
+const RETRY_GRAPH = {
+  plan_version: 1,
+  tasks: [
+    { name: 'probe', kind: 'command', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
+  ],
+  fanout: [],
+  results: RETRY_STATUSES.map((status, iter) => ({
+    iter,
+    task: 'probe',
+    status,
+    note: status === 'fail' ? 'exit 7: the endpoint refused' : '',
+    cost_usd: 0.01,
+    secs: 3,
+    links: [],
+    repairs: [],
+  })),
+};
 
 /** The triage run this machine actually ran, as the endpoints answer for it: the plan it admitted,
  * what each task reported, and the evidence `triage[1027]` left behind — its payload and the
@@ -142,15 +202,16 @@ export const TRIAGE_RUN = 'playbook_triage-local_01a030fe-2592-7902-a02c-3e3b8d9
 const TRIAGE_GRAPH = {
   plan_version: 1,
   tasks: [
-    { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true },
-    { name: 'triage', kind: 'agent', depends_on: ['scan'], session: '', needs: 'any', required: false },
-    { name: 'roundup', kind: 'command', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true },
+    { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
+    { name: 'triage', kind: 'agent', depends_on: ['scan'], session: '', needs: 'any', required: false, over: 'scan.issues', max_fanout: 0 },
+    { name: 'roundup', kind: 'command', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
   ],
+  fanout: [{ task: 'triage', items: 20 }],
   results: [
-    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0 },
-    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0 },
-    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0 },
-    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0 },
+    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'high' } },
+    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [], repairs: [], agent: null },
   ],
 };
 
@@ -381,7 +442,7 @@ export const PACK_IMPORT = {
   git_ref: null,
   path: 'packs/survey',
   rev: '4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f8',
-  tar_digest: 'sha256:5555',
+  tree_digest: 'tree1:5555555555555555555555555555555555555555555555555555555555555555',
   params_schema: PREVIEW_SCHEMA,
   schema_digest: 'sha256:3333',
   graph: PREVIEW_GRAPH,
@@ -570,7 +631,23 @@ export const ROUTES: Record<string, Json> = {
     files: [],
     running: false,
   },
-  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38 }, candidates: [] },
+  '/api/runs/RUN-0412/tasks/rank/evidence': {
+    run_id: 'RUN-0412',
+    task: 'rank',
+    status: 'pass',
+    iter: 1,
+    note: 'kept 1 of 2',
+    attempts: 1,
+    cost_usd: null,
+    secs: 2,
+    payload: null,
+    files: [],
+    running: false,
+  },
+  [`/api/runs/${RETRY_RUN}`]: { run: { ...RUNS[0], run_id: RETRY_RUN }, candidates: [] },
+  [`/api/runs/${RETRY_RUN}/iterations`]: [],
+  [`/api/runs/${RETRY_RUN}/graph`]: RETRY_GRAPH,
+  [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38, agent_provider: 'pricetag-glm', agent_model: 'glm-5.3' }, candidates: [] },
   [`/api/runs/${TRIAGE_RUN}/iterations`]: [],
   [`/api/runs/${TRIAGE_RUN}/graph`]: TRIAGE_GRAPH,
   [`/api/runs/${TRIAGE_RUN}/log`]: TRIAGE_LOG,
@@ -612,7 +689,7 @@ export const ROUTES: Record<string, Json> = {
       description: 'Survey a topic across the tracked repos and file what it finds.',
       source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/survey' },
       rev: '9f2c1a4c0b3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f',
-      tar_digest: 'sha256:1111',
+      tree_digest: 'tree1:1111111111111111111111111111111111111111111111111111111111111111',
       schema_digest: 'sha256:2222',
       core_rev: '7c2c1a5',
       dispatch: DISPATCHABLE,
@@ -627,7 +704,7 @@ export const ROUTES: Record<string, Json> = {
       description: 'Triage the inbox and park what cannot move.',
       source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/triage' },
       rev: '0a1b2c3d4e5f60718293a4b5c6d7e8f901234567',
-      tar_digest: 'sha256:3333',
+      tree_digest: 'tree1:3333333333333333333333333333333333333333333333333333333333333333',
       schema_digest: 'sha256:4444',
       core_rev: '7c2c1a5',
       dispatch: DISPATCHABLE,
@@ -720,7 +797,7 @@ export const ROUTES: Record<string, Json> = {
     versions: [
       {
         version: 1,
-        tar_digest: 'sha256:4444',
+        tree_digest: 'tree1:4444444444444444444444444444444444444444444444444444444444444444',
         schema_digest: 'sha256:3333',
         diagnostics: 0,
         core_rev: '7c2c1a5',
@@ -1020,6 +1097,23 @@ export const ROUTES: Record<string, Json> = {
 };
 
 function fallback(path: string): Json {
+  // Evidence is answered for every task of a run, so a task with no fixture of its own gets the
+  // shape the endpoint always serves rather than an empty object the page cannot read.
+  if (path.endsWith('/evidence')) {
+    return {
+      run_id: '',
+      task: path.split('/').at(-2) ?? '',
+      status: null,
+      iter: null,
+      note: null,
+      attempts: null,
+      cost_usd: null,
+      secs: null,
+      payload: null,
+      files: [],
+      running: false,
+    };
+  }
   return path.endsWith('s') ? [] : {};
 }
 

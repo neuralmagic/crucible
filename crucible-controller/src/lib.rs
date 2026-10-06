@@ -204,7 +204,10 @@ pub async fn serve(
     // state moves into the human router.
     let mcp_router = mcp::router(
         api::router(state.clone()),
-        db.pool().clone(),
+        identity::auth::KeyGuard {
+            pool: db.pool().clone(),
+            refresh: guard.refresh.clone(),
+        },
         state.public_url.clone().unwrap_or_default(),
     );
 

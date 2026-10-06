@@ -110,7 +110,7 @@ pub fn ensure_running(
 
 /// A fresh random bearer token: 24 bytes of OS entropy, hex-encoded. Read from `/dev/urandom`
 /// directly so no rand crate is pulled in for one token per run (linux pods + macOS both have it).
-fn mint_token() -> Result<String> {
+pub(crate) fn mint_token() -> Result<String> {
     use std::io::Read;
     let mut bytes = [0u8; 24];
     std::fs::File::open("/dev/urandom")
@@ -129,7 +129,7 @@ fn probe_addr(bind: &str) -> String {
 }
 
 /// True if a TCP connection to `addr` succeeds within a short timeout.
-fn port_open(addr: &str) -> bool {
+pub(crate) fn port_open(addr: &str) -> bool {
     addr.parse::<SocketAddr>()
         .ok()
         .and_then(|sa| TcpStream::connect_timeout(&sa, Duration::from_millis(300)).ok())

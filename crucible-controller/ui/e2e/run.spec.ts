@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { stubApi, TRIAGE_RUN } from './api';
+import { RETRY_RUN, stubApi, TRIAGE_RUN } from './api';
 
 const RUN = '/runs/RUN-0412';
 
@@ -21,8 +21,9 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph).toBeVisible();
-    // Instances hang off their mapped task and become the producers for its downstream edge.
-    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(6);
+    // Instances hang off their mapped task and become the producers for its downstream edge; the
+    // seventh edge reaches the marker for a revision that stored no exposure.
+    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(7);
 
     const read = graph.locator('[data-task="read"]');
     await expect(read).toContainText('pass');
@@ -35,6 +36,66 @@ test.describe('the run task graph', () => {
     await expect(failed).toContainText('fail');
     await expect(graph.locator('[data-task="summarize[paged-attention]"]')).toContainText('pass');
     await expect(page.getByText('red = failed')).toBeVisible();
+  });
+
+  /// A mapped task is the fan-out, not the work: it says MAP, and the instances under it say what
+  /// they actually run.
+  test('badges a mapped task as a map and its instances as what they run', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    const deck = graph.locator('[data-task="summarize"]');
+    await expect(deck).toContainText('MAP');
+    await expect(deck).toContainText('over read.papers ≤8');
+    await expect(graph.locator('[data-task="summarize[flashinfer]"]')).toContainText('CMD');
+    await expect(graph.locator('[data-task="read"]')).toContainText('AGENT');
+    await expect(page.getByText('MAP = mapped over a producer field')).toBeVisible();
+  });
+
+  /// The case the badge exists for: a mapped agent task whose deck runs nothing itself.
+  test('badges a mapped agent task as a map, not as an agent', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-task="triage"]')).toContainText('MAP');
+    await expect(graph.locator('[data-task="triage[1027]"]')).toContainText('AGENT');
+    await expect(graph.locator('[data-task="scan"]')).toContainText('AGENT');
+  });
+
+  /// A mapped task says what the run made of it: three papers went in, two instances started, one
+  /// of those failed. The run is still going, so what it has not reached is pending, not missed.
+  test('counts a mapped task against the items it was spread over', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-fanout="summarize"]')).toHaveText(
+      '1 of 3 passed · 1 fail · 1 pending',
+    );
+    await expect(graph.locator('[data-task="file"]')).toContainText('pending');
+
+    await graph.locator('[data-task="summarize"]').click();
+    const panel = page.getByRole('complementary', { name: 'Task summarize' });
+    const value = (label: string) =>
+      panel.locator('dt', { hasText: new RegExp(`^${label}$`) }).locator('+ dd');
+    await expect(value('items')).toHaveText('3');
+    await expect(value('started')).toHaveText('2');
+    await expect(value('passed')).toHaveText('1');
+    await expect(value('fail')).toHaveText('1');
+  });
+
+  /// The case the panel exists for: twenty tickets were handed to `triage` and only two needed an
+  /// agent, which the result rows alone cannot show.
+  test('shows a fan-out most of whose items never started', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-fanout="triage"]')).toHaveText(
+      '2 of 20 passed · 18 never started',
+    );
   });
 
   /// Clicking a task opens what only a run knows about it, its result payload included.
@@ -165,6 +226,58 @@ test.describe('the run task grid', () => {
     await expect(page.getByText('fail 2', { exact: true })).toBeVisible();
   });
 
+  /// What an agent instance actually ran with, beside the attempt it ran. The mapped parent runs
+  /// nothing itself, so it reports a value only where its instances agreed on one, and a command
+  /// task reports none at all.
+  test('names the provider, model and effort each agent task ran with', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+
+    const grid = page.getByTestId('run-grid');
+    const cell = (task: string, col: string) =>
+      grid.locator(`[data-task-agent="${task}"][data-col="${col}"]`);
+
+    await expect(cell('scan', 'provider')).toHaveText('pricetag-glm');
+    await expect(cell('scan', 'model')).toHaveText('glm-5.3');
+    await expect(cell('scan', 'effort')).toHaveText('low');
+
+    await expect(cell('triage[952]', 'model')).toHaveText('glm-5.3');
+    await expect(cell('triage[952]', 'effort')).toHaveText('high');
+
+    await expect(cell('triage', 'model')).toHaveText('glm-5.3');
+    await expect(cell('triage', 'effort')).toHaveText('\u2014');
+
+    for (const col of ['provider', 'model', 'effort']) {
+      await expect(cell('roundup', col)).toHaveText('');
+    }
+  });
+
+  /// A task that reported the same status nine iterations running is drawn as three blocks, not
+  /// nine squares: the stretches carry their length and the failure keeps its own column.
+  test('melds a run of attempts that ended the same way', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${RETRY_RUN}`);
+
+    const row = page.getByTestId('run-grid').locator('[data-task="probe"]');
+    await expect(row).toHaveCount(3);
+    await expect(row).toHaveText(['5', '', '3']);
+    await expect(row.nth(0)).toHaveAttribute('data-status', 'pass');
+    await expect(row.nth(0)).toHaveAttribute('data-iter', '0');
+    await expect(row.nth(1)).toHaveAttribute('data-status', 'fail');
+    await expect(row.nth(1)).toHaveAttribute('data-span', '1');
+    await expect(row.nth(2)).toHaveAttribute('data-iter', '6');
+    await expect(row.nth(2)).toHaveAttribute('data-span', '3');
+  });
+
+  /// Picking a melded block opens the first attempt under it, not the last.
+  test('opens the first attempt of a melded block', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${RETRY_RUN}`);
+
+    await page.getByTestId('run-grid').locator('[data-task="probe"]').nth(2).click();
+    await expect(page.getByText('iter 6', { exact: true })).toBeVisible();
+  });
+
   /// Picking a cell reads that task's evidence without leaving the grid.
   test('opens a picked attempt and its evidence', async ({ page }) => {
     await stubApi(page);
@@ -178,5 +291,93 @@ test.describe('the run task grid', () => {
     // The picked cell says what the attempt reported, and its evidence opens beneath.
     await expect(page.getByRole('paragraph').filter({ hasText: 'no citations parsed' })).toBeVisible();
     await expect(page.getByTestId('task-result')).toContainText('at summarize.sh:14');
+  });
+});
+
+test.describe('external results', () => {
+  const sectionOf = (page: Page, header: string) =>
+    page
+      .locator('[data-ui="section"]')
+      .filter({ has: page.locator('[data-ui="section-header"]', { hasText: header }) });
+
+  /// What the run produced outside itself reaches the page as a link per result, each under the
+  /// mark of the service it points at.
+  test('lists every link the run reported, with its provider mark', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const section = sectionOf(page, 'Links');
+    await expect(section.getByRole('link')).toHaveCount(6);
+
+    const pr = section.getByRole('link', { name: /#412/ });
+    await expect(pr).toHaveAttribute('href', 'https://github.com/neuralmagic/crucible/pull/412');
+    await expect(pr).toHaveAttribute('target', '_blank');
+    await expect(pr).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(pr.locator('svg[aria-label="GitHub"]')).toBeVisible();
+    await expect(
+      section.getByRole('link', { name: /INFERENG-77/ }).locator('svg[aria-label="Jira"]'),
+    ).toBeVisible();
+  });
+
+  /// The task that reported them says so too: picking its cell lists that attempt's links.
+  test('shows a picked attempt its own links', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const attempts = sectionOf(page, 'Grid');
+    await page.getByTestId('run-grid').locator('[data-task="rank"][data-iter="1"]').click();
+    await expect(attempts.getByRole('link', { name: /survey-412/ })).toHaveCount(1);
+
+    await page.getByTestId('run-grid').locator('[data-task="summarize[flashinfer]"][data-iter="1"]').click();
+    await expect(attempts.getByRole('link', { name: /survey-412/ })).toHaveCount(0);
+  });
+
+  /// A task's node carries what it opened: the mark of the service and the label, linking out
+  /// from the graph itself.
+  test('draws a task its own links on its node', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const node = page.getByTestId('workflow-graph').locator('[data-node-links="rank"]');
+    const pr = node.getByRole('link', { name: /#412/ });
+    await expect(pr).toHaveAttribute('href', 'https://github.com/neuralmagic/crucible/pull/412');
+    await expect(pr).toHaveAttribute('target', '_blank');
+    await expect(pr).toHaveAttribute('rel', 'noopener noreferrer');
+    await expect(pr.locator('svg[aria-label="GitHub"]')).toBeVisible();
+    await expect(node.getByRole('link')).toHaveCount(2);
+    await expect(node).toContainText('+1');
+  });
+
+  /// A mapped task has as many links as the run spread it over, so its deck carries the tally and
+  /// the instances carry the links.
+  test('tallies a mapped task and leaves its instances their own links', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    const deck = graph.locator('[data-node-links="summarize"]');
+    await expect(deck.locator('span')).toHaveText(['GitHub2', 'GitLab1']);
+    await expect(deck.locator('svg[aria-label="GitHub"]')).toBeVisible();
+    await expect(deck.locator('svg[aria-label="GitLab"]')).toBeVisible();
+    await expect(deck.getByRole('link')).toHaveCount(0);
+
+    const instance = graph.locator('[data-node-links="summarize[paged-attention]"]');
+    await expect(instance.getByRole('link', { name: /#418/ })).toHaveAttribute(
+      'href',
+      'https://github.com/neuralmagic/crucible/pull/418',
+    );
+    await expect(
+      graph.locator('[data-node-links="summarize[flashinfer]"]').getByRole('link', { name: /!9/ }),
+    ).toHaveAttribute('href', 'https://gitlab.com/vllm/kernels/-/merge_requests/9');
+  });
+
+  /// A task that reported nothing outside the run gets no row at all.
+  test('draws no marks on a task that reported no links', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const graph = page.getByTestId('workflow-graph');
+    await expect(graph.locator('[data-node-links="read"]')).toHaveCount(0);
+    await expect(graph.locator('[data-node-links="file"]')).toHaveCount(0);
   });
 });

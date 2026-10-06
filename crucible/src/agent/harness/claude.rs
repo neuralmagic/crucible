@@ -2,7 +2,8 @@
 //! seeding, and transcript layout.
 
 use crate::agent::harness::{
-    AuthProvider, Backend, Broker, HarnessSpec, StreamDecoder, TranscriptLocator, TurnArtifacts,
+    AuthProvider, Backend, HarnessSpec, McpServer, StreamDecoder, TranscriptLocator, TurnArtifacts,
+    json_servers,
 };
 use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
@@ -20,8 +21,8 @@ impl Claude {
         skills_dir: ".claude/skills",
         home_var: "CLAUDE_CONFIG_DIR",
         home: "/sandbox/.claude",
-        // The generated `.mcp.json` (the provisioning-broker endpoint), loaded via
-        // `--mcp-config`. Absolute `/tmp`, like the env/prompt uploads.
+        // The generated `.mcp.json` (the turn's MCP servers), loaded via `--mcp-config`.
+        // Absolute `/tmp`, like the env/prompt uploads.
         config: "/tmp/.crucible-mcp.json",
         sandbox_env: &[
             ("CLAUDE_CODE_PLUGIN_SEED_DIR", "/sandbox/.claude-seed"),
@@ -99,16 +100,14 @@ fn insert_session_flags(a: &mut Vec<String>, session: &crate::agent::agent_sessi
     a.insert(at, flag.to_string());
 }
 
-/// The `.mcp.json` seeded into the sandbox: one streamable-http server pointing at the broker.
-/// `name` is the agent-visible MCP server name (the `mcp__<name>__…` tool prefix), domain-owned.
-/// `token`, when set, rides as an `Authorization: Bearer` header, the broker's port sits on a
-/// `0.0.0.0` bind, so the header is what makes the sandbox the only caller it answers.
-fn mcp_config_json(name: &str, url: &str, token: Option<&str>) -> String {
-    let mut server = serde_json::json!({ "type": "http", "url": url });
-    if let Some(t) = token {
-        server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {t}") });
-    }
-    serde_json::json!({ "mcpServers": { name: server } }).to_string()
+/// The `.mcp.json` seeded into the sandbox: one streamable-http entry per server in the turn's
+/// scope. A token rides as an `Authorization: Bearer` header.
+fn mcp_config_json(servers: &[McpServer<'_>]) -> String {
+    let servers = json_servers(
+        servers,
+        |s| serde_json::json!({ "type": "http", "url": s.url }),
+    );
+    serde_json::json!({ "mcpServers": servers }).to_string()
 }
 
 impl Backend for Claude {
@@ -138,17 +137,18 @@ impl Backend for Claude {
         Ok(a)
     }
 
-    /// The shared base args, plus `--mcp-config <path>` when an MCP config was seeded, so the
-    /// agent sees the broker's `request_trace` / `check_capture` tools. The flag goes just before
-    /// the trailing `-p`, the boundary [`claude_base_args`] guarantees (it ends with `-p`; the
-    /// prompt arrives over stdin).
+    /// The shared base args, plus `--strict-mcp-config` so no `.mcp.json` in the workspace or
+    /// home adds a server, and `--mcp-config <path>` when an MCP config was seeded. The flags go
+    /// just before the trailing `-p`, the boundary [`claude_base_args`] guarantees (it ends with
+    /// `-p`; the prompt arrives over stdin).
     fn sandbox_argv(&self, args: &Args, mcp_seeded: bool) -> Vec<String> {
         let mut a = claude_base_args(args);
+        let at = a.len().saturating_sub(1); // before the trailing `-p`
         if mcp_seeded {
-            let at = a.len().saturating_sub(1); // before the trailing `-p`
             a.insert(at, Self::SPEC.config.to_string());
             a.insert(at, "--mcp-config".to_string());
         }
+        a.insert(at, "--strict-mcp-config".to_string());
         a
     }
 
@@ -164,14 +164,14 @@ impl Backend for Claude {
         Ok(a)
     }
 
-    /// The `.mcp.json` pointing claude at the provisioning broker, only when the broker is on.
+    /// The `.mcp.json` listing the turn's MCP servers, only when it reaches any.
     fn config(
         &self,
         _args: &Args,
-        broker: Option<&Broker<'_>>,
+        servers: &[McpServer<'_>],
         _inference: &InferenceEnv,
     ) -> Option<String> {
-        broker.map(|b| mcp_config_json(b.name, b.url, b.token))
+        (!servers.is_empty()).then(|| mcp_config_json(servers))
     }
 
     fn decoder(
@@ -228,14 +228,12 @@ mod tests {
         crate::cli::Cli::parse_from(argv).run
     }
 
-    fn seeds(args: &Args, broker_url: Option<&str>, broker_token: Option<&str>) -> Vec<SeedFile> {
-        Claude.seed_files(
-            args,
-            broker_url,
-            broker_token,
-            &SandboxAuth::Gateway,
-            &Default::default(),
-        )
+    fn seeds(args: &Args, servers: &[McpServer<'_>]) -> Vec<SeedFile> {
+        Claude.seed_files(args, servers, &SandboxAuth::Gateway, &Default::default())
+    }
+
+    fn server<'a>(name: &'a str, url: &'a str, token: Option<&'a str>) -> McpServer<'a> {
+        McpServer { name, url, token }
     }
 
     /// A prompt is a prompt however it starts. Without the end-of-options marker a prompt
@@ -383,22 +381,29 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_args_inject_mcp_config_only_when_broker_on() {
+    fn sandbox_args_are_strict_and_inject_mcp_config_only_when_seeded() {
         let a = args(&[]);
-        // Not seeded: identical to the base args (ends with `-p`, no `--mcp-config`).
+        // Not seeded: the base args plus `--strict-mcp-config`, so no stray config adds a server.
         let off = Claude.sandbox_argv(&a, false);
-        assert_eq!(off, claude_base_args(&a));
+        let mut base = claude_base_args(&a);
+        base.insert(base.len() - 1, "--strict-mcp-config".to_string());
+        assert_eq!(off, base);
         assert!(!off.iter().any(|s| s == "--mcp-config"));
-        assert_eq!(off.last().unwrap(), "-p");
 
         // Seeded: `--mcp-config <path>` inserted right before the trailing `-p`.
         let on = Claude.sandbox_argv(&a, true);
         let i = on
             .iter()
-            .position(|s| s == "--mcp-config")
+            .position(|s| s == "--strict-mcp-config")
             .expect("flag present");
-        assert_eq!(&on[i..], &["--mcp-config", MCP_CONFIG, "-p"]);
-        assert_eq!(on.last().unwrap(), "-p", "prompt flag stays last");
+        assert_eq!(
+            &on[i..],
+            &["--strict-mcp-config", "--mcp-config", MCP_CONFIG, "-p"]
+        );
+        assert!(
+            !Claude.local_argv(&a, "p").iter().any(|s| s.contains("mcp")),
+            "a local turn keeps the operator's own MCP config"
+        );
     }
 
     #[test]
@@ -412,51 +417,53 @@ mod tests {
     }
 
     #[test]
-    fn mcp_config_json_points_one_http_server_at_the_url() {
-        let url = "http://host.containers.internal:8849/mcp";
-        let v: serde_json::Value =
-            serde_json::from_str(&mcp_config_json("epp-broker", url, None)).expect("valid json");
-        assert_eq!(v["mcpServers"]["epp-broker"]["type"], "http");
-        assert_eq!(v["mcpServers"]["epp-broker"]["url"], url);
+    fn mcp_config_json_lists_exactly_the_servers_given() {
+        let v: serde_json::Value = serde_json::from_str(&mcp_config_json(&[
+            server(
+                "jira",
+                "http://host.openshell.internal:8849/mcp",
+                Some("s3cr3t"),
+            ),
+            server("trace", "http://host.openshell.internal:8850/mcp", None),
+        ]))
+        .expect("valid json");
+        let names: Vec<&String> = v["mcpServers"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["jira", "trace"]);
+        assert_eq!(v["mcpServers"]["jira"]["type"], "http");
+        assert_eq!(
+            v["mcpServers"]["jira"]["url"],
+            "http://host.openshell.internal:8849/mcp"
+        );
+        assert_eq!(
+            v["mcpServers"]["jira"]["headers"]["Authorization"],
+            "Bearer s3cr3t"
+        );
         assert!(
-            v["mcpServers"]["epp-broker"].get("headers").is_none(),
+            v["mcpServers"]["trace"].get("headers").is_none(),
             "no token, no headers block"
         );
     }
 
-    #[test]
-    fn mcp_config_json_carries_the_bearer_header_when_token_set() {
-        let v: serde_json::Value = serde_json::from_str(&mcp_config_json(
-            "broker",
-            "http://host.containers.internal:8849/mcp",
-            Some("s3cr3t"),
-        ))
-        .expect("valid json");
-        assert_eq!(
-            v["mcpServers"]["broker"]["headers"]["Authorization"],
-            "Bearer s3cr3t"
-        );
-    }
-
-    /// A domain-owned name/url with JSON-hostile characters must not break the config (the old
-    /// `format!` builder would have).
+    /// A name/url with JSON-hostile characters must not break the config.
     #[test]
     fn mcp_config_json_escapes_hostile_values() {
-        let v: serde_json::Value =
-            serde_json::from_str(&mcp_config_json(r#"we"ird"#, "http://x/mcp", None))
-                .expect("valid json even with a quote in the name");
+        let v: serde_json::Value = serde_json::from_str(&mcp_config_json(&[server(
+            r#"we"ird"#,
+            "http://x/mcp",
+            None,
+        )]))
+        .expect("valid json even with a quote in the name");
         assert_eq!(v["mcpServers"][r#"we"ird"#]["url"], "http://x/mcp");
     }
 
     #[test]
-    fn seed_files_only_when_broker_url_present() {
-        let mut a = args(&[]);
-        assert!(seeds(&a, None, None).is_empty());
-        a.broker.enabled = true;
-        let seeds = seeds(&a, Some("http://host.containers.internal:8849/mcp"), None);
+    fn seed_files_only_when_a_server_is_in_scope() {
+        let a = args(&[]);
+        assert!(seeds(&a, &[]).is_empty());
+        let seeds = seeds(&a, &[server("broker", "http://h:8849/mcp", None)]);
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].dest, MCP_CONFIG);
         let v: serde_json::Value = serde_json::from_str(&seeds[0].content).expect("valid json");
-        assert!(v["mcpServers"].is_object());
+        assert_eq!(v["mcpServers"].as_object().map(|o| o.len()), Some(1));
     }
 }

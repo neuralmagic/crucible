@@ -937,7 +937,7 @@ async fn evict_target(state: &ApiState, secret_id: &str) {
         (status = 201, description = "The binding", body = SecretBindingDto),
         (status = 403, description = "Not an owner member, or the reference did not verify", body = ErrorBody),
         (status = 404, description = "No secret with that id", body = ErrorBody),
-        (status = 409, description = "That scope already binds this declared name or projection", body = ErrorBody),
+        (status = 409, description = "That scope already binds this declared name or projection, or `pack_rev` is a pack digest a newer tree digest superseded", body = ErrorBody),
         (status = 422, description = "The projection is not one this kind can take", body = ErrorBody),
         (status = 503, description = "No Vault client", body = ErrorBody)
     )
@@ -966,6 +966,28 @@ pub(crate) async fn bind_secret(
     let projection = body.projection.trim();
     if scope_id.is_empty() || projection.is_empty() {
         return unprocessable("a binding needs a scope id and a projection");
+    }
+    if let Some(rev) = body.pack_rev.as_deref()
+        && body.scope_kind == ScopeKind::Playbook
+        && crate::playbooks::api::registry::readable_playbook(
+            &state,
+            &caller,
+            scope_id,
+            crate::authz::action::Verb::Read,
+        )
+        .await
+        .is_ok()
+    {
+        match crate::playbooks::pack_trees::superseded_in(state.db.pool(), scope_id, rev).await {
+            Ok(Some(replacement)) => {
+                return conflict(format!(
+                    "pack revision {rev} is superseded by {replacement}; bind against the \
+                     revision now pinned"
+                ));
+            }
+            Ok(None) => {}
+            Err(e) => return AppError::from(e).into_response(),
+        }
     }
     if row.mode == SecretMode::Reference {
         let client = match vault(&state) {

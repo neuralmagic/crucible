@@ -45,16 +45,27 @@ pub(crate) async fn upsert_task_result(
         .map(serde_json::to_value)
         .transpose()
         .context("encoding the blocked reason")?;
+    let links = serde_json::to_value(&result.links).context("encoding the reported links")?;
+    let agent = result
+        .agent
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .context("encoding the resolved agent")?;
+    let repairs = serde_json::to_value(&result.repairs).context("encoding the repair turns")?;
     sqlx::query!(
         r#"
-        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links, agent, repairs)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (run_id, iter, task) DO UPDATE SET
             status = excluded.status,
             note = excluded.note,
             cost_usd = excluded.cost_usd,
             secs = excluded.secs,
-            blocked = excluded.blocked
+            blocked = excluded.blocked,
+            links = excluded.links,
+            agent = excluded.agent,
+            repairs = excluded.repairs
         "#,
         run_id,
         result.iter,
@@ -64,6 +75,9 @@ pub(crate) async fn upsert_task_result(
         result.cost_usd,
         result.secs,
         blocked,
+        links,
+        agent,
+        repairs,
     )
     .execute(ex)
     .await
@@ -103,7 +117,7 @@ pub(crate) async fn list_task_results(
     let rows = sqlx::query!(
         r#"
         SELECT iter AS "iter!: i64", task AS "task!", status AS "status!", note AS "note!",
-               cost_usd, secs, blocked
+               cost_usd, secs, blocked, links AS "links!", agent, repairs AS "repairs!"
         FROM run_task_results WHERE run_id = $1 ORDER BY iter, task
         "#,
         run_id,
@@ -118,6 +132,12 @@ pub(crate) async fn list_task_results(
                 .map(serde_json::from_value)
                 .transpose()
                 .with_context(|| format!("decoding the blocked reason of {}/{}", r.iter, r.task))?;
+            // A stored link this build cannot read drops out of the list; failing here would
+            // take the whole run's attempt history with it.
+            let links = crucible_contract::decode_links(&r.links);
+            // Same reasoning as the links above: a stored agent this build cannot read drops to
+            // None rather than failing the run's whole attempt history.
+            let agent = r.agent.and_then(|a| serde_json::from_value(a).ok());
             Ok(TaskResult {
                 iter: r.iter,
                 task: r.task,
@@ -126,6 +146,9 @@ pub(crate) async fn list_task_results(
                 cost_usd: r.cost_usd,
                 secs: r.secs,
                 blocked,
+                links,
+                agent,
+                repairs: crucible_contract::session::TaskRepair::decode_all(&r.repairs),
             })
         })
         .collect()
@@ -158,7 +181,14 @@ mod tests {
             cost_usd: Some(0.5),
             secs: Some(2.0),
             blocked: None,
+            links: Vec::new(),
+            agent: None,
+            repairs: Vec::new(),
         }
+    }
+
+    fn link(url: &str) -> crucible_contract::ExternalLink {
+        crucible_contract::ExternalLink::parse(url).expect("a link")
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -214,6 +244,120 @@ mod tests {
             "scan's retry passed, so only brief counts"
         );
         assert_eq!(count_transport_losses(&pool, "run-none").await?, 0);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn reported_links_round_trip_and_a_rerun_replaces_them(pool: PgPool) -> Result<()> {
+        let links = vec![
+            link("https://github.com/neuralmagic/crucible/pull/123"),
+            link("https://github.com/neuralmagic/crucible/tree/topic"),
+        ];
+        upsert_task_result(
+            &pool,
+            "run-3",
+            &TaskResult {
+                links: links.clone(),
+                ..result(0, "deliver", "pass")
+            },
+        )
+        .await?;
+        upsert_task_result(&pool, "run-3", &result(0, "brief", "pass")).await?;
+        let rows = list_task_results(&pool, "run-3").await?;
+        assert_eq!(rows[1].links, links);
+        assert_eq!(rows[0].links, Vec::new(), "a task that reported none");
+
+        upsert_task_result(
+            &pool,
+            "run-3",
+            &TaskResult {
+                links: vec![link("https://github.com/neuralmagic/crucible/pull/124")],
+                ..result(0, "deliver", "pass")
+            },
+        )
+        .await?;
+        let rows = list_task_results(&pool, "run-3").await?;
+        assert_eq!(rows[1].links.len(), 1, "the retry's links replaced them");
+        assert_eq!(rows[1].links[0].label, "#124");
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn the_resolved_agent_round_trips_and_a_command_stores_none(pool: PgPool) -> Result<()> {
+        let agent = crucible_contract::session::TaskAgent {
+            harness: "claude".to_string(),
+            model: "glm-5.3".to_string(),
+            effort: "low".to_string(),
+        };
+        upsert_task_result(
+            &pool,
+            "run-4",
+            &TaskResult {
+                agent: Some(agent.clone()),
+                ..result(0, "analyze", "pass")
+            },
+        )
+        .await?;
+        upsert_task_result(&pool, "run-4", &result(0, "build", "pass")).await?;
+        let rows = list_task_results(&pool, "run-4").await?;
+        assert_eq!(rows[0].agent.as_ref(), Some(&agent));
+        assert_eq!(rows[1].agent, None, "a command task ran on no agent");
+
+        upsert_task_result(
+            &pool,
+            "run-4",
+            &TaskResult {
+                agent: Some(crucible_contract::session::TaskAgent {
+                    model: "glm-5.4".to_string(),
+                    ..agent
+                }),
+                ..result(0, "analyze", "pass")
+            },
+        )
+        .await?;
+        let rows = list_task_results(&pool, "run-4").await?;
+        assert_eq!(
+            rows[0].agent.as_ref().map(|a| a.model.as_str()),
+            Some("glm-5.4"),
+            "the retry's agent replaced it"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn repair_turns_round_trip_and_an_unreadable_entry_drops_out(pool: PgPool) -> Result<()> {
+        let repair = crucible_contract::session::TaskRepair {
+            label: "plan repair 1/1".to_string(),
+            round: 1,
+            of: 1,
+            cost_usd: 0.125,
+            notes: vec!["output missing declared field \"lanes\"".to_string()],
+        };
+        upsert_task_result(
+            &pool,
+            "run-5",
+            &TaskResult {
+                repairs: vec![repair.clone()],
+                ..result(0, "plan", "pass")
+            },
+        )
+        .await?;
+        upsert_task_result(&pool, "run-5", &result(0, "probe", "pass")).await?;
+        let rows = list_task_results(&pool, "run-5").await?;
+        assert_eq!(rows[0].repairs, vec![repair]);
+        assert!(rows[1].repairs.is_empty(), "a task that took none");
+
+        sqlx::query(
+            "UPDATE run_task_results SET repairs = '[{\"label\": 7}, {\"label\": \"plan repair 1/1\", \"round\": 1, \"of\": 1}]'::jsonb WHERE run_id = 'run-5' AND task = 'plan'",
+        )
+        .execute(&pool)
+        .await?;
+        let rows = list_task_results(&pool, "run-5").await?;
+        assert_eq!(
+            rows[0].repairs.len(),
+            1,
+            "the unreadable entry dropped out alone"
+        );
         Ok(())
     }
 }

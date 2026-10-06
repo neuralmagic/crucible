@@ -169,10 +169,74 @@ pub async fn teams_for(
     Ok(resolve(&members, &claims))
 }
 
+/// A recorded launcher's principals: its login, the groups the record carries, and the teams
+/// those reach now. An empty group list proves nothing, so group and rule members stay unmatched.
+pub async fn recorded_principals(
+    pool: &sqlx::PgPool,
+    login: Option<&str>,
+    groups: &[String],
+) -> anyhow::Result<crate::authz::model::Principals> {
+    let teams = teams_for(pool, login, groups, !groups.is_empty()).await?;
+    Ok(crate::authz::model::Principals::new(login, groups).with_teams(teams))
+}
+
+/// A launch's principals at dispatch: the groups it recorded that its launcher still holds, and the
+/// teams those reach now. What the launcher holds is their stored groups, re-read through their
+/// offline credential as a session's are; an issuer that cannot be asked is the inner error. A
+/// launcher with no `users` row keeps the recorded groups behind the edge, and in native mode only
+/// while the launch is younger than the session group refresh window.
+pub async fn dispatch_principals(
+    pool: &sqlx::PgPool,
+    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
+    mode: crate::identity::auth::AuthMode,
+    login: Option<&str>,
+    recorded: &[String],
+    launched_at: &str,
+) -> anyhow::Result<
+    Result<crate::authz::model::Principals, crate::identity::oidc::credentials::GroupsUnavailable>,
+> {
+    use crate::identity::oidc::{credentials, users};
+    let row = match login {
+        Some(login) => users::stamped(pool, login).await?,
+        None => None,
+    };
+    let current = match row {
+        Some((sub, groups, at)) => {
+            match credentials::current_groups(refresh, &sub, groups, at.as_deref()).await {
+                Ok(groups) => Some(groups),
+                Err(unavailable) => return Ok(Err(unavailable)),
+            }
+        }
+        None => match mode {
+            crate::identity::auth::AuthMode::Proxy => None,
+            crate::identity::auth::AuthMode::Native => users::stale(
+                launched_at,
+                jiff::Timestamp::now(),
+                users::session_group_refresh_interval(),
+            )
+            .then(Vec::new),
+        },
+    };
+    let held = held_groups(recorded, current.as_deref());
+    recorded_principals(pool, login, &held).await.map(Ok)
+}
+
+/// The recorded groups the current record still holds, in recorded order. No record keeps them all.
+fn held_groups(recorded: &[String], current: Option<&[String]>) -> Vec<String> {
+    match current {
+        Some(current) => recorded
+            .iter()
+            .filter(|g| current.contains(g))
+            .cloned()
+            .collect(),
+        None => recorded.to_vec(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::authz::model::{MemberKind, MembershipRule, TeamRole};
+    use crate::authz::resolve::*;
 
     fn row(team: &str, kind: MemberKind, member: &str, role: TeamRole) -> MemberRow {
         MemberRow {
@@ -333,5 +397,19 @@ mod tests {
         assert!(!reachable(&members, &[], &slug("by-group")));
         assert!(!reachable(&members, &users, &slug("missing")));
         let _ = MembershipRule::EmailDomain("x.io".into());
+    }
+
+    #[test]
+    fn a_dispatch_holds_only_the_recorded_groups_the_current_record_still_has() {
+        let recorded = vec!["/g/a".to_string(), "/g/b".to_string(), "/g/c".to_string()];
+        let current = vec!["/g/c".to_string(), "/g/a".to_string(), "/g/new".to_string()];
+        assert_eq!(
+            held_groups(&recorded, Some(&current)),
+            vec!["/g/a".to_string(), "/g/c".to_string()],
+            "a group gained since the launch is not added, one lost is dropped"
+        );
+        assert!(held_groups(&recorded, Some(&[])).is_empty());
+        assert_eq!(held_groups(&recorded, None), recorded);
+        assert!(held_groups(&[], Some(&current)).is_empty());
     }
 }

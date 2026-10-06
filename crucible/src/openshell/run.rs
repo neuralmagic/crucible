@@ -14,7 +14,8 @@
 
 use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
 use crate::agent::harness::{
-    AuthProvider, HarnessRuntime, SandboxAuth, SandboxLayout, TranscriptLocator, TurnArtifacts,
+    AuthProvider, HarnessRuntime, McpServer, SandboxAuth, SandboxLayout, TranscriptLocator,
+    TurnArtifacts,
 };
 use crate::agent::relay;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
@@ -538,6 +539,19 @@ async fn try_turn(
         {
             endpoints.push(ep);
         }
+        // Each `[mcp]` server in the turn's scope, appended after the deny list like the broker.
+        let mcp: Vec<_> = args
+            .mcp
+            .iter()
+            .filter(|s| args.mcp_scope.contains(&s.key))
+            .map(|s| (s, format!("http://{}:{}/mcp", driver.broker_host(), s.port)))
+            .collect();
+        for (_, url) in &mcp {
+            let ep = crate::manifest::broker_endpoint_from_url(url)?;
+            if !endpoints.contains(&ep) {
+                endpoints.push(ep);
+            }
+        }
         let mut credential_bindings: Vec<grpc::EndpointCredentialBinding> = broker_ep
             .as_deref()
             .filter(|_| broker_provider)
@@ -629,20 +643,33 @@ async fn try_turn(
         .await?;
 
         // 7b. Seed the harness's pre-exec files (claude: `.mcp.json` toward the provisioning
-        //     broker, loaded via `--mcp-config`). `broker_url` was already resolved above
-        //     (step 4) so the URL and egress entry agree.
+        //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
+        //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
+        //     a fresh token naming this sandbox and its workdir.
         let seed_token = if broker_provider {
             Some(provider::broker_token_placeholder())
         } else {
             args.broker_token.clone()
         };
-        let seeds = backend.seed_files(
-            args,
-            broker_url.as_deref(),
-            seed_token.as_deref(),
-            &sandbox_auth,
-            &inference,
-        );
+        let tokens = crate::control::mcp::grant_all(
+            mcp.iter().map(|(s, _)| *s),
+            &name,
+            &SandboxLayout::workdir(&basename),
+        )?;
+        let mut servers: Vec<McpServer<'_>> = broker_url
+            .iter()
+            .map(|url| McpServer {
+                name: &args.broker.name,
+                url,
+                token: seed_token.as_deref(),
+            })
+            .collect();
+        servers.extend(mcp.iter().zip(&tokens).map(|((s, url), token)| McpServer {
+            name: &s.key,
+            url,
+            token: Some(token),
+        }));
+        let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
             run_os(
@@ -664,7 +691,7 @@ async fn try_turn(
 
         // 8. Exec the agent (prompt over stdin), streaming its stdout through the harness decoder.
         stage(sink, "sandbox ready — starting the agent");
-        let mcp_seeded = broker_url.is_some();
+        let mcp_seeded = !servers.is_empty();
         let argv = match session {
             Some(session) => backend
                 .sandbox_session_argv(args, mcp_seeded, session)
@@ -746,7 +773,7 @@ async fn try_turn(
 
         // 9. Download the workspace back (the agent's edits round-trip to the host).
         stage(sink, "agent turn done — downloading the workspace");
-        let sandbox_workdir = format!("{}/{basename}", SandboxLayout::HOME);
+        let sandbox_workdir = SandboxLayout::workdir(&basename);
         retrieve_workspace(&name, &sandbox_workdir, p.workspace.as_path(), &cancel).await?;
 
         // Save the updated native transcript before telemetry parsing and teardown. It is private
@@ -775,6 +802,11 @@ async fn try_turn(
     if !matches!(&result, Err(e) if e.downcast_ref::<OpenshellCliError>().is_some_and(|e| matches!(e, OpenshellCliError::WorkspaceRecovery { .. })))
     {
         let _ = gw.delete_sandbox(&name).await;
+    }
+    for server in &args.mcp {
+        if let Err(e) = server.tokens.revoke(&name) {
+            tracing::warn!("revoking {name}'s token on [mcp.{}]: {e:#}", server.key);
+        }
     }
     let _ = fs::write(forge::storage_root().join("turn-token"), "").await;
     result
@@ -1544,13 +1576,15 @@ pub const AGENT_VISIBLE_ENV: &str = "CRUCIBLE_AGENT_VISIBLE_ENV";
 
 /// Seed `env` with the declared secrets the agent may hold: those the manifest declares an `env`
 /// projection for AND [`AGENT_VISIBLE_ENV`] names. An unset or empty list relays nothing. A
-/// manifest-provided value wins, as with the Vertex keys.
+/// manifest-provided value wins, as with the Vertex keys. Returns what it relayed, as
+/// `[[secret]].name -> env var`.
 pub fn relay_agent_visible_secrets(
     secrets: &[crate::manifest::SecretDecl],
     env: &mut Vec<(String, String)>,
-) {
+) -> std::collections::BTreeMap<String, String> {
+    let mut relayed = std::collections::BTreeMap::new();
     let Ok(allowed) = std::env::var(AGENT_VISIBLE_ENV) else {
-        return;
+        return relayed;
     };
     let allowed: Vec<&str> = allowed
         .split(',')
@@ -1573,8 +1607,10 @@ pub fn relay_agent_visible_secrets(
             && !v.is_empty()
         {
             env.push((key.to_string(), v));
+            relayed.insert(secret.name.clone(), key.to_string());
         }
     }
+    relayed
 }
 
 /// Seed `env` with the process values of [`crate::openshell::policy::VERTEX_RELAY_KEYS`]: only keys that are set and

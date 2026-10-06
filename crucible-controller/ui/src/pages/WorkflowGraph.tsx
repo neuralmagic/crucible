@@ -29,10 +29,11 @@ import {
   type NodeProps,
   type NodeTypes,
 } from '@xyflow/react';
-import { cn, Split, SplitHandle, SplitPane } from '../ui';
+import { cn, ExternalLinkChip, ExternalLinkMark, Split, SplitHandle, SplitPane } from '../ui';
 import { useDeviceFlag } from '../useDeviceFlag';
 import {
   layoutWorkflow,
+  LINK_STRIP,
   STACK_CARDS,
   STACK_STEP,
   type LaidOutEdge,
@@ -43,13 +44,22 @@ import {
 import {
   badgeFor,
   detailRows,
+  fanoutLine,
+  fanoutRows,
   metaFor,
   runsLine,
   runtimeLine,
   runtimeRows,
   sourceFor,
 } from './workflowGraphCard';
-import { targetLabel, type OutputNode, type TaskRuntime, type TaskTone } from './taskGraph';
+import {
+  targetLabel,
+  type FanOutState,
+  type NodeLinks,
+  type OutputNode,
+  type TaskRuntime,
+  type TaskTone,
+} from './taskGraph';
 import { TaskEvidence } from './TaskEvidence';
 
 export interface WorkflowGraphProps {
@@ -61,6 +71,10 @@ export interface WorkflowGraphProps {
   /// The nodes that are declared outputs rather than tasks, keyed by node name. Drawn in their own
   /// style: they must not read as work the graph does.
   outputs?: ReadonlyMap<string, OutputNode>;
+  /// What each mapped task's fan-out came to, keyed by the mapped task's name.
+  fanoutState?: ReadonlyMap<string, FanOutState>;
+  /// The external results each node links out to, keyed by node name.
+  links?: ReadonlyMap<string, NodeLinks>;
   className?: string;
 }
 
@@ -82,7 +96,8 @@ const TONE_TEXT: Record<TaskTone, string> = {
 /// page it is already the overview.
 const MINIMAP_FROM = 8;
 
-/// The rule down a node's left edge: what runs the task.
+/// The rule down a node's left edge: what runs the task. A mapped task runs nothing itself and
+/// takes the full-ink rule instead.
 const KIND_RULE: Record<string, string> = {
   agent: 'bg-blue',
   command: 'bg-ink-2',
@@ -114,6 +129,8 @@ interface GraphView {
   nodes: ReadonlyMap<string, LaidOutNode>;
   runtime: ReadonlyMap<string, TaskRuntime>;
   outputs: ReadonlyMap<string, OutputNode>;
+  fanoutState: ReadonlyMap<string, FanOutState>;
+  links: ReadonlyMap<string, NodeLinks>;
   edges: ReadonlyMap<string, LaidOutEdge>;
   /// The hovered or focused task and everything it depends on; null when nothing is traced. A
   /// picked task is not traced: reading its metadata should not dim the graph it sits in.
@@ -143,6 +160,44 @@ function Chip({ children }: ChipProps) {
   );
 }
 
+/// How many links, or how many providers, fit across a card before the rest become a count.
+const LINKS_SHOWN = 2;
+const PROVIDERS_SHOWN = 4;
+
+/// Drawn over the strip the card reserves rather than inside it: the card is a button, and a link
+/// inside a button is neither valid nor reachable from the keyboard.
+function NodeLinkRow({ name, drawn, dim }: { name: string; drawn: NodeLinks; dim: boolean }) {
+  const cap = drawn.kind === 'counts' ? PROVIDERS_SHOWN : LINKS_SHOWN;
+  const total = drawn.kind === 'counts' ? drawn.counts.length : drawn.links.length;
+  return (
+    <span
+      data-node-links={name}
+      style={{ opacity: dim ? 0.2 : 1, height: LINK_STRIP, transition: 'opacity 120ms linear' }}
+      className="pointer-events-none absolute right-1.5 bottom-0.5 left-2 flex min-w-0 items-center gap-2 overflow-hidden"
+    >
+      {drawn.kind === 'counts'
+        ? drawn.counts.slice(0, cap).map((count) => (
+            <span
+              key={count.provider}
+              aria-label={`${count.count} ${count.provider}`}
+              className="pointer-events-auto inline-flex items-center gap-1 font-mono text-micro text-ink-2"
+            >
+              <ExternalLinkMark provider={count.provider} />
+              {count.count}
+            </span>
+          ))
+        : drawn.links.slice(0, cap).map((link) => (
+            <ExternalLinkChip
+              key={link.url}
+              link={link}
+              className="pointer-events-auto min-w-0 border-b-0 text-micro"
+            />
+          ))}
+      {total > cap && <Chip>{`+${total - cap}`}</Chip>}
+    </span>
+  );
+}
+
 /// One task, drawn. The card is a button: pressing it opens the task's metadata, and focusing it
 /// traces the same ancestry hovering does, so the graph reads from the keyboard.
 function TaskCard({ id }: NodeProps) {
@@ -161,6 +216,9 @@ function TaskCard({ id }: NodeProps) {
   const runs = runsLine(node);
   const meta = metaFor(node);
   const runtime = view.runtime.get(node.name) ?? null;
+  const spread = view.fanoutState.get(node.name) ?? null;
+  const links = view.links.get(node.name) ?? null;
+  const ran = runtime === null ? null : runtimeLine(runtime);
   const ports = PORTS[view.direction];
 
   return (
@@ -193,7 +251,11 @@ function TaskCard({ id }: NodeProps) {
           if (event.currentTarget.matches(':focus-visible')) view.onTrace(node.name);
         }}
         onBlur={() => view.onTrace(null)}
-        style={{ opacity: dim ? 0.2 : 1, transition: 'opacity 120ms linear' }}
+        style={{
+          opacity: dim ? 0.2 : 1,
+          transition: 'opacity 120ms linear',
+          paddingBottom: links === null ? undefined : LINK_STRIP,
+        }}
         className={cn(
           'relative flex h-full w-full flex-col overflow-hidden bg-raised py-0.5 pr-1.5 pl-2 text-left leading-tight',
           advisory ? 'border border-dashed border-rule-hard' : 'border border-ink-3',
@@ -206,7 +268,7 @@ function TaskCard({ id }: NodeProps) {
           aria-hidden
           className={cn(
             'absolute top-1 bottom-1 left-0 w-[2px]',
-            KIND_RULE[node.kind] ?? 'bg-ink-3'
+            fanout !== null ? 'bg-ink' : (KIND_RULE[node.kind] ?? 'bg-ink-3')
           )}
         />
         {/* The result task ends the graph: a solid end bar, the way a column ends. */}
@@ -241,10 +303,17 @@ function TaskCard({ id }: NodeProps) {
             {meta}
           </span>
         )}
-        {runtime !== null && (
-          <span className="block truncate font-mono text-micro text-ink-2">
-            {runtimeLine(runtime)}
+        {spread !== null && (
+          <span
+            data-fanout={node.name}
+            title={fanoutLine(spread)}
+            className="block truncate font-mono text-micro text-ink-2"
+          >
+            {fanoutLine(spread)}
           </span>
+        )}
+        {ran !== null && (
+          <span className="block truncate font-mono text-micro text-ink-2">{ran}</span>
         )}
         {emitted.length > 0 && (
           <span className="flex min-w-0 gap-1 overflow-hidden">
@@ -255,6 +324,7 @@ function TaskCard({ id }: NodeProps) {
           </span>
         )}
       </button>
+      {links !== null && <NodeLinkRow name={node.name} drawn={links} dim={dim} />}
       <Handle type="source" position={ports.out} isConnectable={false} className="opacity-0" />
     </>
   );
@@ -359,16 +429,21 @@ const EDGE_TYPES: EdgeTypes = { plan: PlanEdge };
 interface TaskPanelProps {
   laid: LaidOutNode;
   runtime: TaskRuntime | null;
+  spread: FanOutState | null;
   runId: string | undefined;
   onClose: () => void;
 }
 
 /// Everything the graph document holds about one task, the source it runs included: too long for a
 /// card, and the thing an importer most wants to read before registering a pack.
-function TaskPanel({ laid, runtime, runId, onClose }: TaskPanelProps) {
+function TaskPanel({ laid, runtime, spread, runId, onClose }: TaskPanelProps) {
   const { node } = laid;
   const source = sourceFor(node);
-  const rows = runtime === null ? detailRows(node) : [...runtimeRows(runtime), ...detailRows(node)];
+  const rows = [
+    ...(runtime === null ? [] : runtimeRows(runtime)),
+    ...(spread === null ? [] : fanoutRows(spread)),
+    ...detailRows(node),
+  ];
 
   return (
     <aside
@@ -422,11 +497,21 @@ function TaskPanel({ laid, runtime, runId, onClose }: TaskPanelProps) {
 
 const NO_RUNTIME: ReadonlyMap<string, TaskRuntime> = new Map();
 const NO_OUTPUTS: ReadonlyMap<string, OutputNode> = new Map();
+const NO_FANOUT: ReadonlyMap<string, FanOutState> = new Map();
+const NO_LINKS: ReadonlyMap<string, NodeLinks> = new Map();
 
 const CANVAS_ONLY = ['canvas'];
 const CANVAS_AND_PANEL = ['canvas', 'panel'];
 
-function GraphCanvas({ graph, runtime, runId, outputs, className }: WorkflowGraphProps) {
+function GraphCanvas({
+  graph,
+  runtime,
+  runId,
+  outputs,
+  fanoutState,
+  links,
+  className,
+}: WorkflowGraphProps) {
   const marker = useId().replace(/:/g, '');
   const markers = useMemo(
     () => ({ arrow: `arrow-${marker}`, arrowLit: `arrow-lit-${marker}` }),
@@ -493,13 +578,15 @@ function GraphCanvas({ graph, runtime, runId, outputs, className }: WorkflowGrap
       nodes: new Map(layout.nodes.map((laid) => [laid.node.name, laid])),
       runtime: runtime ?? NO_RUNTIME,
       outputs: outputs ?? NO_OUTPUTS,
+      fanoutState: fanoutState ?? NO_FANOUT,
+      links: links ?? NO_LINKS,
       edges: new Map(layout.edges.map((laid) => [edgeId(laid.from, laid.to), laid])),
       lit: traced === null ? null : (layout.ancestry.get(traced) ?? new Set([traced])),
       picked,
       onTrace: setTraced,
       onPick: setPicked,
     };
-  }, [direction, layout, runtime, outputs, traced, picked]);
+  }, [direction, layout, runtime, outputs, fanoutState, links, traced, picked]);
 
   const canvasRef = useRef<HTMLDivElement | null>(null);
   // The canvas changes size when a divider is dragged, the rail collapses, or the window resizes;
@@ -546,7 +633,7 @@ function GraphCanvas({ graph, runtime, runId, outputs, className }: WorkflowGrap
     tones.has('pass') ? 'green = passed' : null,
     tones.has('fail') ? 'red = failed' : null,
     layout.nodes.some((laid) => (laid.node.fanout ?? null) !== null)
-      ? 'stacked = mapped over a producer field'
+      ? 'MAP = mapped over a producer field'
       : null,
     layout.nodes.some((laid) => !laid.node.required) ? 'dashed = advisory' : null,
     layout.edges.some((laid) => laid.label !== null) ? 'passed = joins only on what passed' : null,
@@ -672,6 +759,7 @@ function GraphCanvas({ graph, runtime, runId, outputs, className }: WorkflowGrap
                   <TaskPanel
                     laid={pickedNode}
                     runtime={view.runtime.get(pickedNode.node.name) ?? null}
+                    spread={view.fanoutState.get(pickedNode.node.name) ?? null}
                     runId={runId}
                     onClose={close}
                   />

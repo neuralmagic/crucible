@@ -581,4 +581,12 @@ mod tests {
             None
         );
     }
+
+    #[test]
+    fn the_manifest_reserves_the_model_key_names_this_module_writes() {
+        assert_eq!(
+            crate::manifest::MODEL_API_KEY_ENVS,
+            [ANTHROPIC_API_KEY, OPENAI_API_KEY_ENV]
+        );
+    }
 }

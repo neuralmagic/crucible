@@ -29,7 +29,7 @@ use cron::CronSpec;
 use jiff::Timestamp;
 
 /// How many due schedules one sweep fires. A deeper backlog is a controller that was down for a
-/// while; the rest fire on the next discovery tick rather than holding the loop.
+/// while; the rest fire on the next pass rather than holding the loop.
 const FIRE_CAP: i64 = 32;
 
 /// How far the missed-window count walks before it stops counting. Bounds the walk for a
@@ -185,15 +185,14 @@ impl ScheduleStore {
         Ok(())
     }
 
-    /// Write the stored cursor file of the schedule that fired `issue_key` into the launch's
-    /// materialized pack, where the pack's own `[[workspace.inject]]` picks it up. Returns the
-    /// path written, or `None` when the launch is not a firing of a file-cursor schedule with a
-    /// stored value, in which case the pack's own copy stands.
-    pub(crate) async fn stage_cursor_file(
+    /// The stored cursor file of the schedule that fired `issue_key`: the pack-relative path the
+    /// run receives it at, where the pack's own `[[workspace.inject]]` picks it up, and its body.
+    /// `None` when the launch is not a firing of a file-cursor schedule with a stored value, in
+    /// which case the pack's own copy stands.
+    pub(crate) async fn cursor_file(
         &self,
         issue_key: &str,
-        pack_dir: &std::path::Path,
-    ) -> Result<Option<std::path::PathBuf>> {
+    ) -> Result<Option<(crucible_contract::pack_tree::PackFilePath, Vec<u8>)>> {
         let stored = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             "SELECT s.cursor_path, s.cursor_value
              FROM playbook_launches pl
@@ -207,19 +206,10 @@ impl ScheduleStore {
         let Some((Some(path), Some(value))) = stored else {
             return Ok(None);
         };
-        let path = crate::launches::model::PackPath::parse(&path)
-            .map_err(|e| anyhow::anyhow!("stored cursor path for {issue_key}: {e}"))?
-            .under(pack_dir);
-        if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating {}", parent.display()))?;
-        }
-        tokio::fs::write(&path, value.as_bytes())
-            .await
-            .with_context(|| format!("writing the cursor file {}", path.display()))?;
-        tracing::info!(issue_key, path = %path.display(), bytes = value.len(), "schedules: cursor file staged into the pack");
-        Ok(Some(path))
+        let path = path
+            .parse()
+            .with_context(|| format!("stored cursor path for {issue_key}"))?;
+        Ok(Some((path, value.into_bytes())))
     }
 }
 
@@ -260,6 +250,7 @@ pub(crate) struct Schedule {
     pub adopted_repo: Option<String>,
     pub adopted_path: Option<String>,
     pub adopted_rev: Option<String>,
+    pub adopted_tree_digest: Option<String>,
     pub eligible_draft_version: Option<i64>,
     pub params: serde_json::Value,
     pub schema_digest: String,
@@ -295,6 +286,16 @@ pub(crate) struct Schedule {
     pub updated_at: String,
 }
 
+impl Schedule {
+    /// How an audit line names what this schedule adopted.
+    pub(crate) fn adopted_label(&self) -> String {
+        crate::launches::standing::adopted_label(
+            self.adopted_rev.as_deref(),
+            self.adopted_tree_digest.as_deref(),
+        )
+    }
+}
+
 /// The column set every read projects: the core row beside the sidecar.
 #[derive(sqlx::FromRow)]
 struct ScheduleRow {
@@ -321,6 +322,7 @@ impl From<ScheduleRow> for Schedule {
             adopted_repo: c.adopted_repo,
             adopted_path: c.adopted_path,
             adopted_rev: c.adopted_rev,
+            adopted_tree_digest: c.adopted_tree_digest,
             eligible_draft_version: c.eligible_draft_version,
             params: c.params,
             schema_digest: c.schema_digest,
@@ -536,21 +538,36 @@ impl ScheduleStore {
         standing::expire_stale_owner_parks(self.db.pool(), Trigger::Schedule, schedule_id).await
     }
 
-    async fn due_rows(&self, now: Timestamp) -> Result<Vec<DueRow>> {
+    async fn due_rows(&self, now: Timestamp, held: &[String]) -> Result<Vec<DueRow>> {
         sqlx::query_as::<_, DueRow>(
             r#"
             SELECT s.id, s.cron_expr, s.tz, s.cursor_param, s.cursor_value
             FROM playbook_schedules s
             JOIN playbook_standing_launches c USING (id)
             WHERE c.enabled AND s.next_due_at IS NOT NULL AND s.next_due_at <= $1
+              AND s.id <> ALL($3)
             ORDER BY s.next_due_at, s.id LIMIT $2
             "#,
         )
         .bind(stamp(now))
         .bind(FIRE_CAP)
+        .bind(held)
         .fetch_all(self.db.pool())
         .await
         .context("the due schedules")
+    }
+
+    async fn next_due(&self, held: &[String]) -> Result<Option<Timestamp>> {
+        let earliest: Option<String> = sqlx::query_scalar(
+            "SELECT MIN(s.next_due_at) FROM playbook_schedules s
+             JOIN playbook_standing_launches c USING (id)
+             WHERE c.enabled AND s.next_due_at IS NOT NULL AND s.id <> ALL($1)",
+        )
+        .bind(held)
+        .fetch_one(self.db.pool())
+        .await
+        .context("the next due schedule")?;
+        standing::due_at(earliest)
     }
 
     async fn claim_due(
@@ -716,6 +733,7 @@ impl LaunchTrigger for ScheduleTrigger {
         _db: &'a Db,
         _cfg: SweepCfg,
         now: Timestamp,
+        held: &'a [String],
     ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
         let store = self.store.clone();
         let config = self.config.clone();
@@ -736,7 +754,7 @@ impl LaunchTrigger for ScheduleTrigger {
                     )
                     .await?;
             }
-            let rows = store.due_rows(now).await?;
+            let rows = store.due_rows(now, held).await?;
             Ok(rows
                 .into_iter()
                 .map(|row| {
@@ -752,6 +770,14 @@ impl LaunchTrigger for ScheduleTrigger {
                 })
                 .collect())
         })
+    }
+
+    fn next_due<'a>(
+        &'a self,
+        _db: &'a Db,
+        held: &'a [String],
+    ) -> TriggerFuture<'a, Result<Option<Timestamp>>> {
+        Box::pin(async move { self.store.next_due(held).await })
     }
 
     fn claim<'a, 'c>(
@@ -820,22 +846,28 @@ pub(crate) async fn fire_due_refreshing(
         now,
         refresh,
         None,
+        &[],
     )
-    .await?;
+    .await?
+    .fired;
     keys.truncate(cap);
     Ok(keys)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::daemon::queue::DiscoverySource;
     use crate::daemon::queue::{Enqueue, IssueKey};
     use crate::launches::model::NewPlaybookLaunch;
-    use crate::launches::standing::{clear_owner_signin, require_owner_signin};
+    use crate::launches::schedules::*;
+    use crate::launches::standing::{
+        StandingTarget, Unadoptable, clear_owner_signin, require_owner_signin,
+    };
     use crate::model::LaunchOrigin;
     use crate::model::MaxTime;
     use crate::model::Status;
+    use crate::playbooks::registry::PackRevision;
+    use crucible_contract::pack_tree::{PackTree, TreeDigest};
     use sqlx::PgPool;
     use std::sync::Arc;
 
@@ -870,39 +902,15 @@ mod tests {
     async fn schedule_due_at(pool: &PgPool, expr: &str, due: Option<&str>) -> Schedule {
         let max_time = MaxTime::parse("30m").expect("duration");
         let spec = CronSpec::parse(expr, "UTC").expect("expr");
+        let params = params();
         let stored = ScheduleStore::new(Db::new(pool.clone()))
             .create(
-                &NewSchedule {
-                    standing: NewStanding {
-                        playbook: "survey",
-                        target_kind: "adopted",
-                        eligible_draft_version: None,
-                        params: &params(),
-                        schema_digest: "sha256:schema",
-                        max_cost: 3.5,
-                        max_time: &max_time,
-                        advance_dedupe: true,
-                        enabled: true,
-                        created_by: Some("wren"),
-                        owner_principal: None,
-                        owner_groups: None,
-                        dispatch_target: None,
-                        agent_provider: None,
-                        agent_model: None,
-                    },
-                    cursor: None,
-                    spec: &spec,
-                },
+                &adopted(PackRevision::Bytes("sha256:tar"), &params, &max_time, &spec),
                 Timestamp::now(),
             )
             .await
             .expect("create");
-        sqlx::query("UPDATE playbook_schedules SET next_due_at = $2 WHERE id = $1")
-            .bind(&stored.id)
-            .bind(due)
-            .execute(pool)
-            .await
-            .expect("backdate");
+        set_due(pool, &stored.id, due).await;
         ScheduleStore::new(Db::new(pool.clone()))
             .get(&stored.id)
             .await
@@ -910,21 +918,119 @@ mod tests {
             .expect("row")
     }
 
-    /// A schedule adopts bytes once. Moving the registry pin afterward affects new schedules, not
-    /// the launch this existing recurrence materializes.
+    async fn set_due(pool: &PgPool, id: &str, due: Option<&str>) {
+        sqlx::query("UPDATE playbook_schedules SET next_due_at = $2 WHERE id = $1")
+            .bind(id)
+            .bind(due)
+            .execute(pool)
+            .await
+            .expect("backdate");
+    }
+
+    /// An hourly schedule of `survey` adopting `pin`.
+    fn adopted<'a>(
+        pin: PackRevision<'a>,
+        params: &'a serde_json::Value,
+        max_time: &'a MaxTime,
+        spec: &'a CronSpec,
+    ) -> NewSchedule<'a> {
+        NewSchedule {
+            standing: NewStanding {
+                playbook: "survey",
+                target: StandingTarget::Adopted(pin),
+                eligible_draft_version: None,
+                params,
+                schema_digest: "sha256:schema",
+                max_cost: 3.5,
+                max_time,
+                advance_dedupe: true,
+                enabled: true,
+                created_by: Some("wren"),
+                owner_principal: None,
+                owner_groups: None,
+                dispatch_target: None,
+                agent_provider: None,
+                agent_model: None,
+            },
+            cursor: None,
+            spec,
+        }
+    }
+
+    /// Point registry row `id` at `tree` the way registration stores it: the tree, its tarball as
+    /// the legacy bytes, and the tree column. Inserts the row when it is not registered yet.
+    async fn pin_tree(pool: &PgPool, id: &str, rev: &str, tree: &PackTree) -> TreeDigest {
+        let encoded = crate::playbooks::pack_trees::EncodedPack::new(tree.clone()).expect("encode");
+        let digest = crate::playbooks::pack_trees::put_tree(
+            &mut pool.acquire().await.expect("conn"),
+            &encoded,
+        )
+        .await
+        .expect("put tree");
+        let tarball = encoded.tarball();
+        sqlx::query(
+            r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz,
+                                      tar_digest, tar_bytes, params_schema, schema_digest,
+                                      core_rev, created_by, created_at, updated_at, tree_digest)
+               VALUES ($1, 'reads a paper', 'owner/packs', 'main', $2, '', $3, $4, $5,
+                       '{"type":"object"}'::jsonb, 'sha256:schema', 'core1', 'wren',
+                       '2026-08-23T00:00:00Z', '2026-08-23T00:00:00Z', $6)
+               ON CONFLICT (id) DO UPDATE SET rev = excluded.rev, tar_gz = excluded.tar_gz,
+                   tar_digest = excluded.tar_digest, tar_bytes = excluded.tar_bytes,
+                   tree_digest = excluded.tree_digest"#,
+        )
+        .bind(id)
+        .bind(rev)
+        .bind(tarball)
+        .bind(crucible_contract::content_digest(tarball))
+        .bind(i64::try_from(tarball.len()).expect("size"))
+        .bind(digest.as_str())
+        .execute(pool)
+        .await
+        .expect("pin");
+        digest
+    }
+
+    fn tree(body: &[u8]) -> PackTree {
+        PackTree::from_pairs(&[("crucible.toml", b"m"), ("workflow.star", body)]).expect("tree")
+    }
+
+    async fn launch_tree(pool: &PgPool, key: &str) -> (Option<String>, String) {
+        sqlx::query_as("SELECT tree_digest, digest FROM pack_tarballs WHERE issue_slug = $1")
+            .bind(crate::model::sanitize_key(key))
+            .fetch_one(pool)
+            .await
+            .expect("the launch's pack")
+    }
+
+    /// A schedule adopts a tree once. Moving the registry pin afterward affects new schedules, not
+    /// the launch this existing recurrence materializes: the firing records the adopted tree and
+    /// copies its bytes.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_schedule_fires_the_revision_it_adopted_before_a_repin(pool: PgPool) -> Result<()> {
-        register_row(&pool, "survey").await;
-        let scheduled = schedule_due_at(&pool, "0 * * * *", Some("2026-08-23T12:00:00Z")).await;
+        let first = tree(b"v1");
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &first).await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let scheduled = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
         assert_eq!(scheduled.adopted_rev.as_deref(), Some("abc123"));
-        sqlx::query(
-            "UPDATE playbooks SET rev = 'def456', tar_gz = $2, tar_digest = 'sha256:new', \
-             tar_bytes = 4 WHERE id = $1",
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT adopted_tree_digest FROM playbook_standing_launches WHERE id = $1",
         )
-        .bind("survey")
-        .bind(vec![9u8, 8, 7, 6])
-        .execute(&pool)
+        .bind(&scheduled.id)
+        .fetch_one(&pool)
         .await?;
+        assert_eq!(stored.as_deref(), Some(adopted_tree.as_str()));
+        set_due(&pool, &scheduled.id, Some("2026-08-23T12:00:00Z")).await;
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
 
         let db = Db::new(pool.clone());
         let keys = fire_due(
@@ -936,13 +1042,312 @@ mod tests {
         )
         .await?;
         assert_eq!(keys.len(), 1);
-        let slug = crate::model::sanitize_key(&keys[0]);
-        let digest: String =
-            sqlx::query_scalar("SELECT digest FROM pack_tarballs WHERE issue_slug = $1")
-                .bind(slug)
-                .fetch_one(&pool)
-                .await?;
-        assert_eq!(digest, "sha256:tar");
+        let (recorded, digest) = launch_tree(&pool, &keys[0]).await;
+        assert_eq!(recorded.as_deref(), Some(adopted_tree.as_str()));
+        assert_eq!(digest, crucible_contract::content_digest(&first.tarball()?));
+        Ok(())
+    }
+
+    /// A launch reports the exposure of the pack it runs. While the registry row still holds the
+    /// adopted tree, that is the row's stored exposure. Once a repin moves the row on, every launch
+    /// of the old tree, including one fired after the repin, reports the exposure extracted from
+    /// the tree it copied, never the new row's.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_adopted_launch_fired_after_a_repin_reports_the_adopted_trees_exposure(
+        pool: PgPool,
+    ) -> Result<()> {
+        use crate::playbooks::exposure::Exposure;
+        use crate::testing::fixtures::{PLAYBOOK_PACK_MANIFEST, WORKFLOW_TOPIC_DEPTH};
+        let first = PackTree::from_pairs(&[
+            ("crucible.toml", PLAYBOOK_PACK_MANIFEST.as_bytes()),
+            ("workflow.star", WORKFLOW_TOPIC_DEPTH.as_bytes()),
+        ])?;
+        let set_exposure = |marker: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let stored = serde_json::json!({
+                    "version": 1,
+                    "outputs": [{"kind": marker, "count": 1}],
+                });
+                sqlx::query("UPDATE playbooks SET exposure = $1 WHERE id = 'survey'")
+                    .bind(&stored)
+                    .execute(&pool)
+                    .await
+                    .expect("set exposure");
+                Exposure::from_value(stored).expect("exposure")
+            }
+        };
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &first).await;
+        let registered_first = set_exposure("first-row").await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let db = Db::new(pool.clone());
+        let scheduled = ScheduleStore::new(db.clone())
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
+        let fire = |due: &'static str, at: &'static str| {
+            let (db, pool, id) = (db.clone(), pool.clone(), scheduled.id.clone());
+            async move {
+                set_due(&pool, &id, Some(due)).await;
+                let keys = fire_due(&db, ts(at), 1, 5, std::time::Duration::from_secs(3600))
+                    .await
+                    .expect("fire");
+                assert_eq!(keys.len(), 1);
+                keys[0].clone()
+            }
+        };
+
+        let before = fire("2026-08-23T12:00:00Z", "2026-08-23T12:01:00Z").await;
+        assert_eq!(
+            crate::launches::store::exposure_for_issue(&pool, &before).await??,
+            Some(registered_first)
+        );
+
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+        let registered_second = set_exposure("second-row").await;
+        let after = fire("2026-08-23T13:00:00Z", "2026-08-23T13:01:00Z").await;
+        let extracted = {
+            let pack = crate::playbooks::packs::materialize_tree(&first)?;
+            crate::playbooks::exposure::extract(pack.path(), None)
+                .map_err(|e| anyhow::anyhow!("{e:?}"))?
+        };
+        for key in [&before, &after] {
+            let reported = crate::launches::store::exposure_for_issue(&pool, key).await??;
+            assert_eq!(reported.as_ref(), Some(&extracted), "{key}");
+            assert_ne!(reported, Some(registered_second.clone()), "{key}");
+        }
+        Ok(())
+    }
+
+    /// A schedule saved before tree storage holds its adopted bytes in the old encoding, and
+    /// conversion keeps them. Firing it after a repin copies those bytes over the registry copy and
+    /// still records the adopted tree.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_converted_schedule_fires_its_adopted_tree_after_a_repin(pool: PgPool) -> Result<()> {
+        use std::io::{Read as _, Write as _};
+        let first = tree(b"v1");
+        let adopted_tree = pin_tree(&pool, "survey", "abc123", &first).await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let scheduled = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &adopted(PackRevision::Tree(&adopted_tree), &params, &max_time, &spec),
+                Timestamp::now(),
+            )
+            .await?;
+        let mut tar = Vec::new();
+        flate2::read::GzDecoder::new(&first.tarball()?[..]).read_to_end(&mut tar)?;
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        gz.write_all(&tar)?;
+        let legacy = gz.finish()?;
+        assert_ne!(
+            legacy,
+            first.tarball()?,
+            "an encoding other than the tree's own"
+        );
+        sqlx::query(
+            "UPDATE playbook_standing_launches
+             SET adopted_tar_gz = $2, adopted_tar_digest = $3, adopted_tar_bytes = $4,
+                 adopted_tree_digest = NULL
+             WHERE id = $1",
+        )
+        .bind(&scheduled.id)
+        .bind(&legacy)
+        .bind(crucible_contract::content_digest(&legacy))
+        .bind(i64::try_from(legacy.len())?)
+        .execute(&pool)
+        .await?;
+        crate::playbooks::pack_migration::convert_pack_trees(&pool).await?;
+        let converted: Option<String> = sqlx::query_scalar(
+            "SELECT adopted_tree_digest FROM playbook_standing_launches WHERE id = $1",
+        )
+        .bind(&scheduled.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(converted.as_deref(), Some(adopted_tree.as_str()));
+        set_due(&pool, &scheduled.id, Some("2026-08-23T12:00:00Z")).await;
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+
+        let keys = fire_due(
+            &Db::new(pool.clone()),
+            ts("2026-08-23T12:01:00Z"),
+            1,
+            5,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+        assert_eq!(keys.len(), 1);
+        assert_eq!(
+            launch_tree(&pool, &keys[0]).await,
+            (
+                Some(adopted_tree.to_string()),
+                crucible_contract::content_digest(&legacy)
+            )
+        );
+        Ok(())
+    }
+
+    /// The endpoint authorizes against the registry row it read; a repin that lands before the
+    /// save commits refuses the save instead of adopting a revision nobody validated, and a
+    /// deregistration refuses it as gone. Nothing is written either way.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_repin_between_authorize_and_save_is_refused(pool: PgPool) -> Result<()> {
+        let authorized = pin_tree(&pool, "survey", "abc123", &tree(b"v1")).await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let new = adopted(PackRevision::Tree(&authorized), &params, &max_time, &spec);
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        let kept = store.create(&new, Timestamp::now()).await?;
+        let repinned = pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+
+        let refused = store
+            .create(&new, Timestamp::now())
+            .await
+            .expect_err("a repinned registry row refuses the save");
+        assert_eq!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(&Unadoptable::Repinned {
+                playbook: "survey".to_string(),
+                rev: format!("revision def456 (tree {repinned})")
+            })
+        );
+        let refused = store
+            .update(&kept.id, &new, Timestamp::now())
+            .await
+            .expect_err("a repinned registry row refuses the edit");
+        assert!(matches!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(Unadoptable::Repinned { .. })
+        ));
+        let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT adopted_rev, adopted_tree_digest FROM playbook_standing_launches",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(
+            rows,
+            vec![(Some("abc123".to_string()), Some(authorized.to_string()))],
+            "the refused create wrote nothing and the refused edit kept the adopted tree"
+        );
+
+        sqlx::query("DELETE FROM playbook_standing_launches")
+            .execute(&pool)
+            .await?;
+        sqlx::query("DELETE FROM playbooks").execute(&pool).await?;
+        let refused = store
+            .create(&new, Timestamp::now())
+            .await
+            .expect_err("a deregistered playbook refuses the save");
+        assert!(matches!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(Unadoptable::Gone { .. })
+        ));
+        Ok(())
+    }
+
+    /// A save authorized against a row with no tree pins its bytes, and still lands when startup
+    /// conversion records the tree in between: the bytes did not move.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_bytes_pin_survives_conversion_but_not_a_repin(pool: PgPool) -> Result<()> {
+        register_row(&pool, "survey").await;
+        let (max_time, spec, params) = (
+            MaxTime::parse("30m").expect("duration"),
+            CronSpec::parse("0 * * * *", "UTC").expect("expr"),
+            params(),
+        );
+        let new = adopted(PackRevision::Bytes("sha256:tar"), &params, &max_time, &spec);
+        let converted = crate::playbooks::pack_trees::put_tree(
+            &mut *pool.acquire().await?,
+            &crate::playbooks::pack_trees::EncodedPack::new(tree(b"v1"))?,
+        )
+        .await?;
+        sqlx::query("UPDATE playbooks SET tree_digest = $1")
+            .bind(converted.as_str())
+            .execute(&pool)
+            .await?;
+        let store = ScheduleStore::new(Db::new(pool.clone()));
+        store.create(&new, Timestamp::now()).await?;
+
+        sqlx::query("UPDATE playbooks SET tar_gz = 'moved', tar_digest = 'sha256:moved'")
+            .execute(&pool)
+            .await?;
+        let refused = store
+            .create(&new, Timestamp::now())
+            .await
+            .expect_err("moved bytes refuse a bytes pin");
+        assert!(matches!(
+            refused.downcast_ref::<Unadoptable>(),
+            Some(Unadoptable::Repinned { .. })
+        ));
+        Ok(())
+    }
+
+    /// An immediate launch copies the registered pack and records its tree, and refuses when the
+    /// registry row moved off the revision the endpoint authorized.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_launch_records_the_tree_it_was_authorized_against(pool: PgPool) -> Result<()> {
+        let first = tree(b"v1");
+        let authorized = pin_tree(&pool, "survey", "abc123", &first).await;
+        let max_time = MaxTime::parse("30m").expect("duration");
+        let params = params();
+        let launch = NewPlaybookLaunch {
+            playbook: "survey",
+            repo: "owner/packs",
+            title: "reads a paper",
+            params: &params,
+            schema_digest: "sha256:schema",
+            max_cost: 1.0,
+            max_time: &max_time,
+            advance_dedupe: false,
+            dedupe_schedule: None,
+            origin: LaunchOrigin::Manual,
+            draft_version: None,
+            created_by: Some("wren"),
+            launcher_groups: None,
+        };
+        let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
+        assert!(matches!(
+            crate::launches::store::adopt_playbook_launch(
+                &pool,
+                key,
+                &launch,
+                PackRevision::Tree(&authorized)
+            )
+            .await?,
+            crate::launches::store::AdoptPlaybookOutcome::Adopted
+        ));
+        let (recorded, digest) = launch_tree(&pool, key).await;
+        assert_eq!(recorded.as_deref(), Some(authorized.as_str()));
+        assert_eq!(digest, crucible_contract::content_digest(&first.tarball()?));
+
+        pin_tree(&pool, "survey", "def456", &tree(b"v2")).await;
+        let stale = "playbook:survey:0199c0de-7c2c-71a5-8000-b";
+        assert!(matches!(
+            crate::launches::store::adopt_playbook_launch(
+                &pool,
+                stale,
+                &launch,
+                PackRevision::Tree(&authorized)
+            )
+            .await?,
+            crate::launches::store::AdoptPlaybookOutcome::Repinned { ref rev } if rev == "def456"
+        ));
+        let launches: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launches, 1, "the refused launch wrote nothing");
         Ok(())
     }
 
@@ -958,7 +1363,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -1045,7 +1452,7 @@ mod tests {
                 &NewSchedule {
                     standing: NewStanding {
                         playbook: "studio",
-                        target_kind: "draft_head",
+                        target: crate::launches::standing::StandingTarget::DraftHead,
                         eligible_draft_version: Some(saved.version),
                         params: &serde_json::json!({}),
                         schema_digest: &schema_digest,
@@ -1089,6 +1496,118 @@ mod tests {
             launch.exposure.is_some(),
             "a draft-head launch carries its version's exposure"
         );
+        Ok(())
+    }
+
+    /// A draft-head row records no tree. Each firing records the tree of the draft's latest saved
+    /// version that compiles at that firing, so a later save moves the next firing and a save
+    /// that does not compile does not.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_draft_head_firing_records_the_latest_compiled_tree(pool: PgPool) -> Result<()> {
+        let saved = crate::playbooks::drafts::create(
+            &pool,
+            "studio",
+            "iterative pack",
+            crate::playbooks::drafts::DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("draft");
+        let schema_digest = saved.schema_digest.clone().expect("the skeleton compiles");
+        let max_time = MaxTime::parse("30m").expect("duration");
+        let spec = CronSpec::parse("0 * * * *", "UTC").expect("expr");
+        let params = serde_json::json!({});
+        let schedule = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &NewSchedule {
+                    standing: NewStanding {
+                        playbook: "studio",
+                        target: StandingTarget::DraftHead,
+                        eligible_draft_version: Some(saved.version),
+                        params: &params,
+                        schema_digest: &schema_digest,
+                        max_cost: 1.0,
+                        max_time: &max_time,
+                        advance_dedupe: false,
+                        enabled: true,
+                        created_by: Some("wren"),
+                        owner_principal: None,
+                        owner_groups: None,
+                        dispatch_target: None,
+                        agent_provider: None,
+                        agent_model: None,
+                    },
+                    cursor: None,
+                    spec: &spec,
+                },
+                ts("2026-08-23T11:00:00Z"),
+            )
+            .await?;
+        let adopted: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+            "SELECT adopted_tree_digest, adopted_tar_gz FROM playbook_standing_launches WHERE id = $1",
+        )
+        .bind(&schedule.id)
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(adopted, (None, None), "a draft-head row adopts nothing");
+
+        let version_tree = |version: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT tree_digest FROM playbook_draft_versions \
+                     WHERE draft_id = 'studio' AND version = $1",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("version tree")
+                .expect("a saved version records its tree")
+            }
+        };
+        let db = Db::new(pool.clone());
+        let fire_at = |due: &'static str, now: &'static str| {
+            let (db, pool, id) = (db.clone(), pool.clone(), schedule.id.clone());
+            async move {
+                set_due(&pool, &id, Some(due)).await;
+                let keys = fire_due(&db, ts(now), 1, 5, std::time::Duration::from_secs(3600))
+                    .await
+                    .expect("fire");
+                assert_eq!(keys.len(), 1, "one firing at {now}");
+                launch_tree(&pool, &keys[0]).await.0
+            }
+        };
+
+        let first = fire_at("2026-08-23T12:00:00Z", "2026-08-23T12:01:00Z").await;
+        assert_eq!(first, Some(version_tree(saved.version).await));
+
+        let mut files = crate::playbooks::drafts::files(&pool, "studio", None)
+            .await
+            .expect("files")
+            .expect("the draft")
+            .files;
+        files.insert("NOTES.md".to_string(), "second save".to_string());
+        let second =
+            crate::playbooks::drafts::save_version(&pool, "studio", files.clone(), None, None)
+                .await
+                .expect("second save");
+        assert!(second.schema_digest.is_some(), "the second save compiles");
+        files.insert(
+            "workflow.star".to_string(),
+            "this is not starlark(".to_string(),
+        );
+        let broken = crate::playbooks::drafts::save_version(&pool, "studio", files, None, None)
+            .await
+            .expect("third save");
+        assert!(
+            broken.schema_digest.is_none(),
+            "the third save does not compile"
+        );
+
+        let next = fire_at("2026-08-23T13:00:00Z", "2026-08-23T13:01:00Z").await;
+        assert_eq!(next, Some(version_tree(second.version).await));
+        assert_ne!(next, first, "the later save moved the next firing");
         Ok(())
     }
 
@@ -1560,7 +2079,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -1621,7 +2142,9 @@ mod tests {
                 &NewSchedule {
                     standing: NewStanding {
                         playbook: "survey",
-                        target_kind: "adopted",
+                        target: crate::launches::standing::StandingTarget::Adopted(
+                            crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                        ),
                         eligible_draft_version: None,
                         params: &params(),
                         schema_digest: "sha256:schema",
@@ -1915,6 +2438,7 @@ mod tests {
                     created_by: Some("wren"),
                     launcher_groups: None,
                 },
+                crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
             .await?,
             crate::launches::store::AdoptPlaybookOutcome::Adopted
@@ -2093,6 +2617,132 @@ mod tests {
             Some(later.clone()),
             "an undue row is untouched"
         );
+        Ok(())
+    }
+
+    /// A schedule whose adopted pack is unconvertible refuses every firing naming the reason,
+    /// launches nothing, and is auto-disabled at the threshold like any other failing firing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_unconvertible_adopted_pack_fails_each_firing_until_disabled(
+        pool: PgPool,
+    ) -> Result<()> {
+        let db = Db::new(pool.clone());
+        register_row(&pool, "survey").await;
+        let scheduled = schedule_due_at(&pool, "* * * * *", Some("2026-08-23T12:00:00Z")).await;
+        crate::testing::make_unconvertible(
+            &pool,
+            "playbook_standing_launches",
+            &format!("id = '{}'", scheduled.id),
+        )
+        .await;
+
+        for (attempt, now) in [
+            (1, "2026-08-23T12:00:30Z"),
+            (2, "2026-08-23T12:01:30Z"),
+            (3, "2026-08-23T12:02:30Z"),
+        ] {
+            let fired = fire_due(&db, ts(now), 8, 3, std::time::Duration::from_secs(3600)).await?;
+            assert!(fired.is_empty(), "attempt {attempt}: {fired:?}");
+            let row = ScheduleStore::new(Db::new(pool.clone()))
+                .get(&scheduled.id)
+                .await?
+                .expect("row");
+            assert_eq!(row.consecutive_failures, attempt);
+            assert_eq!(row.enabled, attempt < 3, "attempt {attempt}");
+        }
+
+        let events = events_for(&pool, &Trigger::Schedule.event_key(&scheduled.id)).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let reason = events[0].2.clone().expect("reason");
+        assert!(
+            reason.starts_with("auto-disabled after 3 consecutive firing failures")
+                && reason.contains(crate::testing::SYMLINK_REASON),
+            "{reason}"
+        );
+        let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launched, 0);
+        Ok(())
+    }
+
+    /// A draft-head firing whose newest compiling version is unconvertible is refused naming the
+    /// reason, launches nothing, and counts toward auto-disable.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_unconvertible_draft_head_fails_its_firing(pool: PgPool) -> Result<()> {
+        let saved = crate::playbooks::drafts::create(
+            &pool,
+            "studio",
+            "iterative pack",
+            crate::playbooks::drafts::DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("draft");
+        let schema_digest = saved.schema_digest.clone().expect("the skeleton compiles");
+        let max_time = MaxTime::parse("30m").expect("duration");
+        let spec = CronSpec::parse("0 * * * *", "UTC").expect("expr");
+        let schedule = ScheduleStore::new(Db::new(pool.clone()))
+            .create(
+                &NewSchedule {
+                    standing: NewStanding {
+                        playbook: "studio",
+                        target: crate::launches::standing::StandingTarget::DraftHead,
+                        eligible_draft_version: Some(saved.version),
+                        params: &serde_json::json!({}),
+                        schema_digest: &schema_digest,
+                        max_cost: 1.0,
+                        max_time: &max_time,
+                        advance_dedupe: false,
+                        enabled: true,
+                        created_by: Some("wren"),
+                        owner_principal: None,
+                        owner_groups: None,
+                        dispatch_target: None,
+                        agent_provider: None,
+                        agent_model: None,
+                    },
+                    cursor: None,
+                    spec: &spec,
+                },
+                ts("2026-08-23T11:00:00Z"),
+            )
+            .await?;
+        set_due(&pool, &schedule.id, Some("2026-08-23T12:00:00Z")).await;
+        crate::testing::make_unconvertible(&pool, "playbook_draft_versions", "draft_id = 'studio'")
+            .await;
+
+        let db = Db::new(pool.clone());
+        let fired = fire_due(
+            &db,
+            ts("2026-08-23T12:01:00Z"),
+            1,
+            1,
+            std::time::Duration::from_secs(3600),
+        )
+        .await?;
+
+        assert!(fired.is_empty(), "{fired:?}");
+        let row = ScheduleStore::new(Db::new(pool.clone()))
+            .get(&schedule.id)
+            .await?
+            .expect("row");
+        assert_eq!(row.consecutive_failures, 1);
+        assert!(
+            !row.enabled,
+            "a threshold of one disables on the first failure"
+        );
+        let events = events_for(&pool, &Trigger::Schedule.event_key(&schedule.id)).await;
+        let reason = events
+            .last()
+            .and_then(|e| e.2.clone())
+            .expect("the disable names the failure");
+        assert!(reason.contains(crate::testing::SYMLINK_REASON), "{reason}");
+        let launched: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM playbook_launches")
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(launched, 0);
         Ok(())
     }
 
@@ -2331,7 +2981,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -2384,7 +3036,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -2464,11 +3118,11 @@ mod tests {
     }
 
     /// A file cursor advances off the run's captured files, the event names the file by size and
-    /// digest rather than printing it, and the next firing finds the body staged into its pack at
-    /// the path the schedule named. A firing before any value landed stages nothing, so the
+    /// digest rather than printing it, and the next firing receives the body at the path the
+    /// schedule named. A firing before any value landed receives nothing, so the
     /// pack's own file stands.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_finished_run_advances_a_file_cursor_and_the_next_firing_is_staged_with_it(
+    async fn a_finished_run_advances_a_file_cursor_and_the_next_firing_receives_it(
         pool: PgPool,
     ) -> Result<()> {
         let db = Db::new(pool.clone());
@@ -2491,10 +3145,8 @@ mod tests {
             "a file cursor overlays no param"
         );
 
-        let pack = tempfile::tempdir()?;
         let store = ScheduleStore::new(db.clone());
-        assert_eq!(store.stage_cursor_file(&fired[0], pack.path()).await?, None);
-        assert!(!pack.path().join("state/cursor.json").exists());
+        assert_eq!(store.cursor_file(&fired[0]).await?, None);
 
         let body = br#"{"seen": [{"pr": 12345, "head_sha": "ab12"}]}"#;
         crate::runs::blob_store::put_run_files(
@@ -2526,10 +3178,10 @@ mod tests {
         );
 
         let key = refire(&db, &pool, &scheduled.id).await?;
-        let pack = tempfile::tempdir()?;
-        let written = store.stage_cursor_file(&key, pack.path()).await?;
-        assert_eq!(written, Some(pack.path().join("state/cursor.json")));
-        assert_eq!(std::fs::read(pack.path().join("state/cursor.json"))?, body);
+        assert_eq!(
+            store.cursor_file(&key).await?,
+            Some(("state/cursor.json".parse()?, body.to_vec()))
+        );
         Ok(())
     }
 
@@ -2593,9 +3245,9 @@ mod tests {
     }
 
     /// The cursor file is a scheduled firing's input. A launch of the same schedule that arrived
-    /// any other way is staged with nothing, exactly as it is passed no cursor param.
+    /// any other way receives nothing, exactly as it is passed no cursor param.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn only_a_scheduled_firing_is_staged_with_the_cursor_file(pool: PgPool) -> Result<()> {
+    async fn only_a_scheduled_firing_receives_the_cursor_file(pool: PgPool) -> Result<()> {
         let db = Db::new(pool.clone());
         register_row(&pool, "survey").await;
         schedule_with_cursor(&pool, &file_cursor(), Some("{\"seen\": []}")).await;
@@ -2611,12 +3263,7 @@ mod tests {
             .bind(&fired[0])
             .execute(&pool)
             .await?;
-        let pack = tempfile::tempdir()?;
-        let written = ScheduleStore::new(db)
-            .stage_cursor_file(&fired[0], pack.path())
-            .await?;
-        assert_eq!(written, None);
-        assert!(std::fs::read_dir(pack.path())?.next().is_none());
+        assert_eq!(ScheduleStore::new(db).cursor_file(&fired[0]).await?, None);
         Ok(())
     }
 
@@ -2632,7 +3279,9 @@ mod tests {
         let mut new = NewSchedule {
             standing: NewStanding {
                 playbook: "survey",
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                ),
                 eligible_draft_version: None,
                 params: &params(),
                 schema_digest: "sha256:schema",
@@ -2666,6 +3315,81 @@ mod tests {
         assert_eq!(repointed.cursor.as_ref(), Some(&moved));
         assert_eq!(repointed.cursor_value, None);
         assert_eq!(repointed.cursor_updated_at, None);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn next_due_is_the_earliest_window_of_an_enabled_unheld_schedule(
+        pool: PgPool,
+    ) -> Result<()> {
+        use crate::launches::standing::LaunchTrigger;
+        let db = Db::new(pool.clone());
+        let trigger = ScheduleTrigger::unpoliced(db.clone());
+        let at = |s: &str| Some(s.parse::<Timestamp>().expect("stamp"));
+        register_row(&pool, "survey").await;
+        assert_eq!(trigger.next_due(&db, &[]).await?, None);
+
+        let parked = schedule_due_at(&pool, "0 * * * *", None).await;
+        assert_eq!(
+            trigger.next_due(&db, &[]).await?,
+            None,
+            "a schedule with no next window is not due"
+        );
+        let later = schedule_due_at(&pool, "0 * * * *", Some("2031-01-02T00:00:00Z")).await;
+        let earlier = schedule_due_at(&pool, "0 * * * *", Some("2031-01-01T00:00:00Z")).await;
+        assert_eq!(
+            trigger.next_due(&db, &[]).await?,
+            at("2031-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            trigger
+                .next_due(&db, &[earlier.id.clone(), parked.id.clone()])
+                .await?,
+            at("2031-01-02T00:00:00Z"),
+            "a held schedule is left out"
+        );
+
+        standing::set_enabled(&pool, &later.id, false).await?;
+        assert_eq!(
+            trigger
+                .next_due(&db, std::slice::from_ref(&earlier.id))
+                .await?,
+            None,
+            "a disabled standing launch is not due"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_held_schedule_is_left_out_of_the_sweep(pool: PgPool) -> Result<()> {
+        let db = Db::new(pool.clone());
+        register_row(&pool, "survey").await;
+        let held = schedule_due_at(&pool, "0 * * * *", Some("2020-01-01T00:00:00Z")).await;
+        let free = schedule_due_at(&pool, "0 * * * *", Some("2020-01-01T00:00:00Z")).await;
+
+        let swept = standing::sweep(
+            &db,
+            &ScheduleTrigger::unpoliced(db.clone()),
+            ScheduleTrigger::sweep_cfg(5, std::time::Duration::from_secs(3600)),
+            Timestamp::now(),
+            None,
+            None,
+            std::slice::from_ref(&held.id),
+        )
+        .await?;
+        assert_eq!(swept.claimed, 1);
+        assert_eq!(swept.fired.len(), 1);
+        let store = ScheduleStore::new(db.clone());
+        assert_eq!(
+            store.get(&held.id).await?.unwrap().next_due_at.as_deref(),
+            Some("2020-01-01T00:00:00Z"),
+            "the held schedule was not claimed"
+        );
+        assert_ne!(
+            store.get(&free.id).await?.unwrap().next_due_at.as_deref(),
+            Some("2020-01-01T00:00:00Z"),
+            "the free schedule advanced"
+        );
         Ok(())
     }
 }

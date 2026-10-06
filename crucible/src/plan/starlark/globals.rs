@@ -18,13 +18,19 @@ use starlark_syntax::codemap::FileSpan;
 
 use crate::plan::starlark as dsl;
 use crate::plan::starlark::values::{
-    AnswerRefValue, CONVERTED, ExternalText, OutputRefValue, QuestionValue, SessionValue,
-    TaskValue, WorkflowValue,
+    AnswerRefValue, CONVERTED, ExternalText, OutputRefValue, QuestionValue, SchemaValue,
+    SessionValue, TaskValue, WorkflowValue,
 };
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 
 /// Constructors that historically took one positional argument. Everything else is named-only.
-const POSITIONAL: &[&str] = &["prompt_file", "param", "workflow", "default_autoresearch"];
+const POSITIONAL: &[&str] = &[
+    "prompt_file",
+    "schema_file",
+    "param",
+    "workflow",
+    "default_autoresearch",
+];
 
 /// The constructors every lane has.
 #[starlark_module]
@@ -67,6 +73,14 @@ pub(crate) fn common(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch("prompt_file", args, kwargs, eval)
+    }
+
+    fn schema_file<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("schema_file", args, kwargs, eval)
     }
 
     fn report<'v>(
@@ -246,7 +260,13 @@ fn call<'v>(
             ("prompt_file", dsl::Value::String(path)) => state
                 .context_mut()
                 .prompt_file(&path)
-                .map(dsl::Value::String),
+                .map(dsl::Value::String)
+                .map_err(|error| located(at, error)),
+            ("schema_file", dsl::Value::String(path)) => state
+                .context_mut()
+                .schema_file(&path)
+                .map(dsl::Value::Schema)
+                .map_err(|error| located(at, error)),
             ("param", dsl::Value::String(name)) => state.context_mut().param(&name),
             ("workflow", dsl::Value::List(tasks)) => {
                 let tasks = dsl::task_list("workflow", tasks)?;
@@ -386,6 +406,9 @@ fn convert_at(value: Value<'_>, depth: usize) -> dsl::Result<dsl::Value> {
     if let Some(workflow) = WorkflowValue::from_value(value) {
         return Ok(dsl::Value::Workflow(workflow.0.clone()));
     }
+    if let Some(schema) = SchemaValue::from_value(value) {
+        return Ok(dsl::Value::Schema(schema.0.clone()));
+    }
     Ok(dsl::Value::Opaque)
 }
 
@@ -440,5 +463,6 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         dsl::Value::Question(question) => heap.alloc(QuestionValue(question)),
         dsl::Value::Answer(answer) => heap.alloc(AnswerRefValue(answer)),
         dsl::Value::Workflow(workflow) => heap.alloc(WorkflowValue(workflow)),
+        dsl::Value::Schema(schema) => heap.alloc(SchemaValue(schema)),
     }
 }

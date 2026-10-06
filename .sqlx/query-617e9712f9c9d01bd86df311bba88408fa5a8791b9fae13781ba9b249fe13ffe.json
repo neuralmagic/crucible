@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT iter AS \"iter!: i64\", task AS \"task!\", status AS \"status!\", note AS \"note!\",\n               cost_usd, secs, blocked\n        FROM run_task_results WHERE run_id = $1 ORDER BY iter, task\n        ",
+  "query": "\n        SELECT iter AS \"iter!: i64\", task AS \"task!\", status AS \"status!\", note AS \"note!\",\n               cost_usd, secs, blocked, links AS \"links!\", agent, repairs AS \"repairs!\"\n        FROM run_task_results WHERE run_id = $1 ORDER BY iter, task\n        ",
   "describe": {
     "columns": [
       {
@@ -79,6 +79,39 @@
             "name": "blocked"
           }
         }
+      },
+      {
+        "ordinal": 7,
+        "name": "links!",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "links"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "agent",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "agent"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "repairs!",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "run_task_results",
+            "name": "repairs"
+          }
+        }
       }
     ],
     "parameters": {
@@ -93,8 +126,11 @@
       false,
       true,
       true,
-      true
+      true,
+      false,
+      true,
+      false
     ]
   },
-  "hash": "c717191ea42670fed910164bcdbf2d10dcf279963aca60f89c1fcc94879b82d6"
+  "hash": "617e9712f9c9d01bd86df311bba88408fa5a8791b9fae13781ba9b249fe13ffe"
 }

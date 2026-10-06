@@ -221,7 +221,7 @@ pub fn pin_digest(image_ref: &str, authfile: Option<&Path>) -> Result<String> {
         .build()
         .context("building the digest-resolve runtime")?;
     let digest = rt.block_on(async {
-        let client = Client::new(ClientConfig::default());
+        let client = amd64_client();
         with_retry(
             &format!("fetching manifest digest for {image_ref}"),
             &RETRY_DELAYS,
@@ -300,22 +300,36 @@ pub async fn derive_layer(
     .await
 }
 
-/// An OCI client whose platform resolver always picks the linux/amd64 entry of a manifest list: the
-/// target cluster runs amd64 regardless of where this runs (an arm64 laptop's current-platform resolver would pick the
-/// wrong arch or miss). Registries named in `FORGE_INSECURE_REGISTRIES` (comma-separated, e.g. a local
-/// `registry:2` in an e2e run) are contacted over plain HTTP; everything else stays HTTPS.
-fn amd64_client() -> Client {
-    let mut cfg = ClientConfig {
+/// The OCI client config every registry call shares. The platform resolver always picks the
+/// linux/amd64 entry of a manifest list: the target cluster runs amd64 regardless of where this runs
+/// (an arm64 laptop's current-platform resolver would pick the wrong arch or miss). Registries named in
+/// `FORGE_INSECURE_REGISTRIES` (comma-separated, e.g. a local `registry:2` in an e2e run) are
+/// contacted over plain HTTP; everything else stays HTTPS.
+pub fn client_config() -> ClientConfig {
+    ClientConfig {
         platform_resolver: Some(Box::new(linux_amd64_resolver)),
+        protocol: protocol(std::env::var("FORGE_INSECURE_REGISTRIES").ok().as_deref()),
         ..Default::default()
-    };
-    if let Ok(list) = std::env::var("FORGE_INSECURE_REGISTRIES")
-        && !list.trim().is_empty()
-    {
-        cfg.protocol =
-            ClientProtocol::HttpsExcept(list.split(',').map(|s| s.trim().to_string()).collect());
     }
-    Client::new(cfg)
+}
+
+fn protocol(insecure: Option<&str>) -> ClientProtocol {
+    let hosts: Vec<String> = insecure
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+        .collect();
+    if hosts.is_empty() {
+        ClientProtocol::Https
+    } else {
+        ClientProtocol::HttpsExcept(hosts)
+    }
+}
+
+fn amd64_client() -> Client {
+    Client::new(client_config())
 }
 
 /// Derive `target_ref` = `base_ref` + a single pre-built [`BuiltLayer`], pushing the result and
@@ -624,8 +638,21 @@ pub(crate) async fn unpack_rootfs(base_ref: &str, dest: &Path, auth: &RegistryAu
 #[cfg(test)]
 #[allow(clippy::disallowed_macros)]
 mod tests {
-    use super::*;
+    use crate::oci::*;
     use std::io::Read;
+
+    #[test]
+    fn only_listed_registries_use_plain_http() {
+        assert_eq!(protocol(None), ClientProtocol::Https);
+        assert_eq!(protocol(Some(" , ")), ClientProtocol::Https);
+        assert_eq!(
+            protocol(Some("localhost:5001, kind-registry:5000,")),
+            ClientProtocol::HttpsExcept(vec![
+                "localhost:5001".to_string(),
+                "kind-registry:5000".to_string()
+            ])
+        );
+    }
 
     #[test]
     fn overlay_layer_contains_the_file_and_is_deterministic() {

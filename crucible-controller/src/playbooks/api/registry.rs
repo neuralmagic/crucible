@@ -39,9 +39,10 @@ pub(crate) struct RegisterPlaybookBody {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct RegisterAck {
     pub(crate) id: String,
-    /// The commit the pack is pinned at, or the tarball digest of a draft-sourced pack.
+    /// The commit the pack is pinned at, or the tree digest of a draft-sourced pack.
     pub(crate) rev: String,
-    pub(crate) tar_digest: String,
+    /// The `tree1:` digest of the stored pack.
+    pub(crate) tree_digest: String,
     pub(crate) schema_digest: String,
     /// True when re-registering an existing id changed the launch form.
     pub(crate) schema_changed: bool,
@@ -49,6 +50,8 @@ pub(crate) struct RegisterAck {
     pub(crate) exposure_digest: Option<String>,
     /// True when re-registering an existing id changed the declared exposure.
     pub(crate) exposure_changed: bool,
+    /// Paths under an excluded segment (`state`, `.git`, `workspace`) that were not stored.
+    pub(crate) ignored_paths: Vec<String>,
 }
 
 impl From<crate::playbooks::registry::Registered> for RegisterAck {
@@ -56,11 +59,12 @@ impl From<crate::playbooks::registry::Registered> for RegisterAck {
         RegisterAck {
             id: r.id,
             rev: r.rev,
-            tar_digest: r.tar_digest,
+            tree_digest: r.tree_digest.to_string(),
             schema_digest: r.schema_digest,
             schema_changed: r.schema_changed,
             exposure_digest: r.exposure_digest,
             exposure_changed: r.exposure_changed,
+            ignored_paths: r.ignored,
         }
     }
 }
@@ -232,21 +236,29 @@ pub(crate) async fn authorize_image(
         .await
         .map_err(|e| AppError::from(e).into_response())?;
     let catalog = catalog(state).await?;
-    let verdict = crate::playbooks::preflight::preflight(agent, resolved.as_ref(), &catalog);
+    let verdict = crate::playbooks::preflight::preflight_pack(agent, resolved.as_ref(), &catalog);
     if verdict.refused() {
         return Err(refused(
-            "the pack's sandbox image fails the capability preflight",
+            refusal_headline(&verdict.refusals),
             verdict
                 .refusals
-                .iter()
-                .map(|message| crate::playbooks::registry::FieldError {
-                    field: "sandbox_image".to_string(),
-                    message: message.clone(),
+                .into_iter()
+                .map(|r| crate::playbooks::registry::FieldError {
+                    field: r.field,
+                    message: r.message,
                 })
                 .collect(),
         ));
     }
-    Ok(verdict)
+    Ok(verdict.image)
+}
+
+fn refusal_headline(refusals: &[crate::playbooks::preflight::ImageRefusal]) -> &'static str {
+    if refusals.iter().all(|r| r.field == "sandbox_image") {
+        "the pack's sandbox image fails the capability preflight"
+    } else {
+        "a sandbox image the pack names fails the capability preflight"
+    }
 }
 
 /// One registered playbook: what it is, where it is pinned, and the digest of the launch form the
@@ -256,9 +268,11 @@ pub struct PlaybookDto {
     pub id: String,
     pub description: String,
     pub source: PlaybookSourceDto,
-    /// The git commit, or the tarball digest of a draft-sourced pack.
+    /// The git commit, or the tree digest of a draft-sourced pack.
     pub rev: String,
-    pub tar_digest: String,
+    /// The `tree1:` digest of the stored pack; null until startup conversion reaches a row an
+    /// older controller wrote.
+    pub tree_digest: Option<String>,
     pub schema_digest: String,
     /// The engine pin the stored schema was extracted with.
     pub core_rev: String,
@@ -320,7 +334,7 @@ impl PlaybookDto {
             description: r.description,
             source: r.source.into(),
             rev: r.rev,
-            tar_digest: r.tar_digest,
+            tree_digest: r.tree_digest.map(|t| t.to_string()),
             exposure_digest: r.exposure_digest,
             schema_digest: r.schema_digest,
             core_rev: r.core_rev,
@@ -783,7 +797,14 @@ pub(crate) async fn launch_playbook(
         launcher_groups: Some(&saver.groups),
     };
     use crate::launches::store::AdoptPlaybookOutcome;
-    match crate::launches::store::adopt_playbook_launch(state.db.pool(), &key, &launch).await {
+    match crate::launches::store::adopt_playbook_launch(
+        state.db.pool(),
+        &key,
+        &launch,
+        pack.revision(),
+    )
+    .await
+    {
         Ok(AdoptPlaybookOutcome::Adopted) => {
             // The issue row the adopt just wrote is what every later dispatch reads its cluster
             // off, so the pin lands before the launch is enqueued.
@@ -802,6 +823,16 @@ pub(crate) async fn launch_playbook(
                 Json(ErrorBody::new(format!(
                     "playbook {id} was re-registered while the launch was being authorized \
                      (schema is now {current}); reload the form"
+                ))),
+            )
+                .into_response();
+        }
+        Ok(AdoptPlaybookOutcome::Repinned { rev }) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(ErrorBody::new(format!(
+                    "playbook {id} was re-registered at revision {rev} while the launch was being \
+                     authorized; reload the form"
                 ))),
             )
                 .into_response();

@@ -62,12 +62,12 @@ pub async fn record_login_on(
     Ok(())
 }
 
-/// Stamp the groups a login's claim carried, so a credential that carries no claim of its own —
-/// an API key — can still answer for its owner's membership.
+/// Stamp the groups a login's or an offline credential refresh's claim carried, so a credential
+/// that carries no claim of its own — an API key — can still answer for its owner's membership.
 ///
 /// Separate from [`record_login_on`] rather than an argument to it, because the paths that write a
-/// user row without seeing a claim (a schedule's fire-time backfill, a credential refresh) know
-/// nothing about groups, and must leave the last real answer standing instead of clearing it.
+/// user row without seeing a claim (a schedule's fire-time backfill) know nothing about groups,
+/// and must leave the last real answer standing instead of clearing it.
 pub async fn record_groups_on(
     conn: &mut sqlx::PgConnection,
     sub: &str,
@@ -88,11 +88,63 @@ pub async fn record_groups_on(
     Ok(())
 }
 
+/// Stamp a subject's stored groups empty, for when the offline credential that answered for them is
+/// refused, revoked, or gone. An API key then holds what a session would: nothing.
+pub async fn clear_groups_on(
+    conn: &mut sqlx::PgConnection,
+    sub: &str,
+    now: jiff::Timestamp,
+) -> anyhow::Result<()> {
+    let now = now.to_string();
+    sqlx::query!(
+        "UPDATE users SET groups = '[]'::jsonb, groups_at = $2, updated_at = $2 WHERE sub = $1",
+        sub,
+        now,
+    )
+    .execute(&mut *conn)
+    .await
+    .context("clearing the stored groups")?;
+    Ok(())
+}
+
+/// How stale a live session's group list may get before the next request re-reads it from the
+/// owner's offline credential.
+pub(crate) const DEFAULT_SESSION_GROUP_REFRESH: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
+/// `CONTROLLER_SESSION_GROUP_REFRESH_MINUTES`. Unset, unparseable, or zero is
+/// [`DEFAULT_SESSION_GROUP_REFRESH`] — a deployment must not be able to turn the check into a
+/// per-request round trip against the issuer by typo.
+pub(crate) fn session_group_refresh_interval() -> std::time::Duration {
+    std::env::var("CONTROLLER_SESSION_GROUP_REFRESH_MINUTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|m| *m > 0)
+        .map(|m| std::time::Duration::from_secs(m * 60))
+        .unwrap_or(DEFAULT_SESSION_GROUP_REFRESH)
+}
+
+/// Whether a stamped instant is older than `max_age`. An unparseable or missing stamp is stale:
+/// a session whose groups have no provenance has to prove them again.
+pub(crate) fn stale(at: &str, now: jiff::Timestamp, max_age: std::time::Duration) -> bool {
+    let Ok(at) = at.parse::<jiff::Timestamp>() else {
+        return true;
+    };
+    let Ok(span) = jiff::SignedDuration::try_from(max_age) else {
+        return true;
+    };
+    match at.checked_add(span) {
+        Ok(expires) => expires <= now,
+        Err(_) => true,
+    }
+}
+
 /// A signed-in user's subject, and the groups and stamp their last sign-in recorded, by login.
 pub async fn stamped(
     pool: &PgPool,
     login: &str,
 ) -> anyhow::Result<Option<(String, Vec<String>, Option<String>)>> {
+    let login = login.trim().to_lowercase();
     let row = sqlx::query!(
         r#"SELECT sub, groups AS "groups: sqlx::types::Json<Vec<String>>", groups_at FROM users WHERE login = $1"#,
         login
@@ -101,6 +153,21 @@ pub async fn stamped(
     .await
     .context("reading a user's stamped groups")?;
     Ok(row.map(|r| (r.sub, r.groups.0, r.groups_at)))
+}
+
+/// The groups and stamp `sub`'s row holds, read on `conn`.
+pub(crate) async fn stamp_on(
+    conn: &mut sqlx::PgConnection,
+    sub: &str,
+) -> anyhow::Result<Option<(Vec<String>, Option<String>)>> {
+    let row = sqlx::query!(
+        r#"SELECT groups AS "groups: sqlx::types::Json<Vec<String>>", groups_at FROM users WHERE sub = $1"#,
+        sub
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .context("reading a subject's stamped groups")?;
+    Ok(row.map(|r| (r.groups.0, r.groups_at)))
 }
 
 /// The subject a login currently belongs to, if any. The fire-time refresh starts from a

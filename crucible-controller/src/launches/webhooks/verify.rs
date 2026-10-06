@@ -132,11 +132,7 @@ pub(crate) fn material(
 }
 
 pub(crate) fn token_digest(token: &str) -> String {
-    lower_hex(&Sha256::digest(token.as_bytes()))
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crucible_contract::artifact::lower_hex(&Sha256::digest(token.as_bytes()))
 }
 
 /// What a delivery presented.
@@ -158,7 +154,8 @@ pub(crate) fn verify(verifier: &Verifier, material: &Material, p: &Presented<'_>
         }
         (VerifierKind::HmacSha256, Material::Secret(secret)) if p.path_token.is_none() => {
             let key = hmac::Key::new(hmac::HMAC_SHA256, secret.as_bytes());
-            let expected = lower_hex(hmac::sign(&key, p.body).as_ref());
+            let expected =
+                crucible_contract::artifact::lower_hex(hmac::sign(&key, p.body).as_ref());
             verifier
                 .header
                 .as_deref()

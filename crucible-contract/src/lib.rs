@@ -16,8 +16,11 @@ pub mod history;
 pub mod identity;
 pub mod inference;
 pub mod json;
+pub mod link;
 pub mod markers;
+pub mod mcp;
 pub mod outputs;
+pub mod pack_tree;
 pub mod refine;
 pub mod report;
 pub mod scope;
@@ -31,7 +34,7 @@ pub mod verdict;
 /// `crucible --contract-version` and the runtime image carries it as the
 /// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
 /// controller it talks to without a probe.
-pub const CONTRACT_VERSION: &str = "1.11.0";
+pub const CONTRACT_VERSION: &str = "1.14.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
@@ -45,6 +48,9 @@ pub use envelope::{Envelope, EnvelopeKind, SCHEMA_VERSION, TERMINATION_MESSAGE_C
 pub use event::{AgentEvent, ModelUsage, RawStream, Tokens};
 pub use identity::{
     ComponentIdentity, FORMAT_VERSION as IDENTITY_FORMAT_VERSION, RigIdentity, RunIdentity,
+};
+pub use link::{
+    ExternalLink, ExternalUrl, LinkError, LinkKind, LinkProvider, MAX_URL_LEN, decode_links,
 };
 pub use markers::{
     ENV_INGEST_TOKEN_PATH, ENV_INGEST_URL, ENV_POD_NAME, ENV_RUN_DISPLAY_NAME, ENV_RUN_NAME,

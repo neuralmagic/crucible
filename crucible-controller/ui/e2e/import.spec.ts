@@ -181,7 +181,7 @@ test.describe('pack import wizard', () => {
       git_ref: null,
       path: 'packs/survey',
       rev: '4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f8',
-      tar_digest: 'sha256:5555',
+      tree_digest: 'tree1:5555555555555555555555555555555555555555555555555555555555555555',
       params_schema: null,
       schema_digest: null,
       graph: null,
@@ -239,7 +239,7 @@ test.describe('pack import wizard', () => {
       git_ref: null,
       path: 'packs/survey',
       rev: '4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f8',
-      tar_digest: 'sha256:5555',
+      tree_digest: 'tree1:5555555555555555555555555555555555555555555555555555555555555555',
       params_schema: { type: 'object', properties: {}, required: [] },
       schema_digest: 'sha256:3333',
       graph: null,
@@ -351,7 +351,9 @@ test.describe('pack import wizard', () => {
     await page.keyboard.press('Escape');
     await expect(panel).toBeHidden();
 
-    // A mapped task says what it maps over and how wide it may get.
+    // A mapped task says what it maps over and how wide it may get, and the preview surface
+    // badges it as the fan-out it is rather than as what its instances run.
+    await expect(graph.locator('[data-task="summarize"]')).toContainText('MAP');
     await graph.locator('[data-task="summarize"]').click();
     const mapped = page.getByRole('complementary', { name: 'Task summarize' });
     await expect(mapped).toContainText('read.paper');

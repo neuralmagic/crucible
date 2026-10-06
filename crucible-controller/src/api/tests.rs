@@ -1,6 +1,6 @@
-use super::*;
 #[cfg(feature = "autoresearch")]
 use crate::api::dto::*;
+use crate::api::*;
 #[cfg(feature = "autoresearch")]
 use crate::builds::model::NewBuild;
 #[cfg(feature = "autoresearch")]
@@ -1210,6 +1210,106 @@ async fn run_iterations_ordered_by_iter_or_404(pool: PgPool) -> Result<()> {
 }
 
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let graph = r#"[{"name":"deliver","kind":"skill","depends_on":[],"session":"","needs":"all","required":true}]"#;
+    crate::runs::task_results::upsert_run_plan(db.pool(), "run-links", 1, graph).await?;
+    let links = ["https://github.com/neuralmagic/crucible/pull/42"]
+        .iter()
+        .map(|u| crucible_contract::ExternalLink::parse(u))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    crate::runs::task_results::upsert_task_result(
+        db.pool(),
+        "run-links",
+        &crate::runs::model::TaskResult {
+            iter: 1,
+            task: "deliver".to_string(),
+            status: "pass".to_string(),
+            note: String::new(),
+            cost_usd: None,
+            secs: None,
+            blocked: None,
+            links,
+            agent: None,
+            repairs: Vec::new(),
+        },
+    )
+    .await?;
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-links/graph").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        v["results"][0]["links"][0],
+        serde_json::json!({
+            "url": "https://github.com/neuralmagic/crucible/pull/42",
+            "provider": "github",
+            "kind": "pull_request",
+            "label": "#42",
+        }),
+        "the field names the SPA reads: {v}"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_serves_what_each_agent_task_ran_on(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let graph = r#"[{"name":"analyze","kind":"agent","depends_on":[],"session":"","needs":"all","required":true},
+                    {"name":"build","kind":"command","depends_on":[],"session":"","needs":"all","required":true}]"#;
+    crate::runs::task_results::upsert_run_plan(db.pool(), "run-agent", 1, graph).await?;
+    for (task, agent) in [
+        (
+            "analyze",
+            Some(crucible_contract::session::TaskAgent {
+                harness: "claude".to_string(),
+                model: "glm-5.3".to_string(),
+                effort: "low".to_string(),
+            }),
+        ),
+        ("build", None),
+    ] {
+        crate::runs::task_results::upsert_task_result(
+            db.pool(),
+            "run-agent",
+            &crate::runs::model::TaskResult {
+                iter: 1,
+                task: task.to_string(),
+                status: "pass".to_string(),
+                note: String::new(),
+                cost_usd: None,
+                secs: None,
+                blocked: None,
+                links: Vec::new(),
+                agent,
+                repairs: Vec::new(),
+            },
+        )
+        .await?;
+    }
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-agent/graph").await;
+    assert_eq!(st, StatusCode::OK);
+    let of = |task: &str| {
+        v["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .find(|r| r["task"] == task)
+            .expect("the task")["agent"]
+            .clone()
+    };
+    assert_eq!(
+        of("analyze"),
+        serde_json::json!({"harness": "claude", "model": "glm-5.3", "effort": "low"}),
+        "the field names the SPA reads: {v}"
+    );
+    assert_eq!(of("build"), serde_json::Value::Null, "a command ran none");
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
     let graph = r#"[{"name":"propose","kind":"agent","depends_on":[],"session":"solver","needs":"all","required":true},
@@ -1228,6 +1328,9 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
                 cost_usd: Some(0.25),
                 secs: Some(3.0),
                 blocked: None,
+                links: Vec::new(),
+                agent: None,
+                repairs: Vec::new(),
             },
         )
         .await?;
@@ -1260,6 +1363,50 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
         .oneshot(HttpRequest::get("/api/runs/run-legacy/graph").body(Body::empty())?)
         .await?;
     assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A launch whose registry row moved on and whose own pack the engine refuses still serves its
+/// run graph, as a revision that stored no exposure.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_of_a_launch_whose_pack_is_refused_omits_outputs(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let doc = serde_json::json!({"version": 1, "outputs": []});
+    let tree = |file: &str| crucible_contract::pack_tree::PackTree::from_pairs(&[(file, b"x")]);
+    crate::testing::pin_playbook(db.pool(), tree("SCOPE.md")?, &doc).await;
+    crate::testing::launch_playbook(db.pool(), "survey-1").await;
+    sqlx::query("UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL")
+        .execute(db.pool())
+        .await?;
+    crate::testing::pin_playbook(db.pool(), tree("crucible.toml")?, &doc).await;
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: "run-survey".to_string(),
+            scope: None,
+            issue: Some("survey-1".to_string()),
+            identity_digest: None,
+            status: "running".to_string(),
+            pod: None,
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    crate::runs::task_results::upsert_run_plan(
+        db.pool(),
+        "run-survey",
+        1,
+        r#"[{"name":"measure","kind":"command","depends_on":[],"session":"","needs":"all","required":true}]"#,
+    )
+    .await?;
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-survey/graph").await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["tasks"][0]["name"], "measure");
+    assert!(v.get("outputs").is_none(), "{v}");
     Ok(())
 }
 
@@ -3148,6 +3295,32 @@ async fn artifact_manifest_lists_local_files_and_derives_for_s3(pool: PgPool) ->
     Ok(())
 }
 
+/// The limits a draft save is checked against are retrievable, with the delivery budget the
+/// engine's render enforces.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn playbook_limits_report_the_draft_caps_and_the_delivery_budget(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app(db, Arc::new(Recorder::default()));
+
+    let res = app
+        .oneshot(HttpRequest::get("/api/playbook-limits").body(Body::empty())?)
+        .await?;
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+    let limits: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        limits,
+        serde_json::json!({
+            "max_draft_files": 128,
+            "max_draft_file_bytes": 512 * 1024,
+            "max_draft_save_bytes": 16 * 1024 * 1024,
+            "delivery_budget_bytes": crucible_contract::pack_tree::DELIVERY_BUDGET_BYTES,
+        })
+    );
+    Ok(())
+}
+
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
     let (db, _d) = db_with(pool);
@@ -3239,6 +3412,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbooks/{id}/launch",
         "/api/playbook-drafts",
         "/api/playbook-drafts/from-git",
+        "/api/playbook-limits",
         "/api/playbook-drafts/{id}",
         "/api/playbook-drafts/{id}/files",
         "/api/playbook-drafts/{id}/preview",
@@ -6166,11 +6340,17 @@ async fn an_operator_proposes_an_import_and_an_admin_registers_it(pool: PgPool) 
         "the mapped task carries what it maps over: {import}"
     );
     assert_eq!(import["diagnostics"], serde_json::json!([]));
+    assert_eq!(import["ignored_paths"], serde_json::json!([]));
 
-    // The link, opened cold: the same gate, without re-fetching anything.
+    // The link, opened cold: the same gate, without re-fetching anything. Ignored paths are
+    // reported by the fetch alone.
     let (status, reread) = get_json_object(&app, &format!("/api/playbooks/imports/{id}")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(reread, import, "a shared link rehydrates the proposal");
+    let mut proposed = import.clone();
+    if let Some(fields) = proposed.as_object_mut() {
+        fields.remove("ignored_paths");
+    }
+    assert_eq!(reread, proposed, "a shared link rehydrates the proposal");
 
     let (status, approvals) = get_json_object(&app, "/api/approvals").await;
     assert_eq!(status, StatusCode::OK);
@@ -6364,6 +6544,48 @@ async fn a_pending_import_opens_as_a_draft(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Opening a pending import whose frozen pack is unconvertible as a draft is refused naming the
+/// reason, and leaves the import unopened.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn opening_an_unconvertible_import_as_a_draft_is_refused_naming_the_reason(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let repo = import_fixture(dir.path(), IMPORT_WORKFLOW);
+    let app = app_with_roles(
+        db,
+        Arc::new(Recorder::default()),
+        vec!["wren".to_string()],
+        vec!["dana".to_string()],
+    );
+    let (status, import) = post_json_as(
+        &app,
+        "/api/playbooks/imports",
+        "dana",
+        serde_json::json!({"repo": &repo, "git_ref": "main", "path": "packs/survey"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{import}");
+    let id = import["id"].as_str().unwrap_or_default().to_string();
+    crate::testing::make_unconvertible(&pool, "pack_imports", &format!("id = '{id}'")).await;
+
+    let (status, body) = post_json_as(
+        &app,
+        &format!("/api/playbooks/imports/{id}/draft"),
+        "dana",
+        serde_json::json!({"id": "survey-draft", "description": "an agent's proposal, edited"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(crate::testing::SYMLINK_REASON), "{body}");
+    let (status, row) = get_json_object(&app, &format!("/api/playbooks/imports/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(row["draft_id"], serde_json::Value::Null);
+    Ok(())
+}
+
 /// The one-motion entry: a repo, a ref and a path go in, a draft comes out, and the pending import
 /// it minted is what says where those bytes came from. The draft's origin names that import, and
 /// its rebase source is the frozen pack.
@@ -6461,10 +6683,11 @@ async fn a_skeleton_draft_has_no_origin_to_rebase_onto(pool: PgPool) -> Result<(
     Ok(())
 }
 
-/// Any save downloads as the bytes it stored, named for the version it is.
+/// Any save downloads as its tree's tarball, named for the version it is, with the digest the
+/// version records.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn any_draft_version_downloads_as_a_tarball(pool: PgPool) -> Result<()> {
-    let (db, _d) = db_with(pool);
+async fn any_draft_version_downloads_as_its_tree(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
     let app = app_with_admins(db, vec!["wren".to_string()]);
     let (status, created) = {
         post_admin(
@@ -6499,15 +6722,28 @@ async fn any_draft_version_downloads_as_a_tarball(pool: PgPool) -> Result<()> {
             .and_then(|v| v.to_str().ok()),
         Some("attachment; filename=\"studio-v1.tar.gz\"")
     );
+    let digest = res
+        .headers()
+        .get("x-pack-digest")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
         .await
         .expect("body");
-    let pack =
-        crate::playbooks::packs::unpack_to_scratch(&bytes).expect("the download is a pack tarball");
+    let tree = crucible_contract::pack_tree::read_tar_gz(&bytes)
+        .expect("the download is a pack tarball")
+        .tree;
     assert!(
-        pack.path().join("crucible.toml").is_file(),
+        tree.files().keys().any(|p| p.as_str() == "crucible.toml"),
         "the download unpacks to the save's own files"
     );
+    let recorded: Option<String> = sqlx::query_scalar(
+        "SELECT tree_digest FROM playbook_draft_versions WHERE draft_id = 'studio' AND version = 1",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(digest, Some(tree.digest().to_string()));
+    assert_eq!(recorded, digest, "the download is the version's tree");
 
     let (status, _) = get_json_object(&app, "/api/playbook-drafts/studio/tarball?version=9").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -7757,7 +7993,9 @@ async fn a_launch_cannot_advance_another_playbooks_cursor(pool: PgPool) -> Resul
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: "triage",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &serde_json::json!({}),
                     schema_digest: "sha256:other",
@@ -8470,6 +8708,41 @@ async fn saving_a_draft_returns_the_form_the_graph_or_the_anchored_diagnostic(
     Ok(())
 }
 
+/// A save body over axum's 2 MiB default is read when the pack fits the delivery budget; one over
+/// the save cap is refused before it is buffered.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_save_body_is_capped_above_the_axum_default(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let with_filler = |count: usize| {
+        let mut files = draft_files();
+        for i in 0..count {
+            files[format!("filler/{i}.txt")] = serde_json::json!("pack filler\n".repeat(40_000));
+        }
+        serde_json::json!({"files": files})
+    };
+
+    let big = with_filler(8);
+    assert!(serde_json::to_vec(&big)?.len() > 2 * 1024 * 1024);
+    let (status, saved) = post_admin(&app, "/api/playbook-drafts/studio/versions", big).await;
+    assert_eq!(status, StatusCode::OK, "{saved}");
+    assert_eq!(saved["version"], 2);
+
+    let huge = with_filler(40);
+    assert!(serde_json::to_vec(&huge)?.len() > crate::playbooks::drafts::MAX_DRAFT_SAVE_BYTES);
+    let (status, _) = post_admin(&app, "/api/playbook-drafts/studio/versions", huge).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    Ok(())
+}
+
 /// The shared editing surface: a save names the version it edited from, the save that lands first
 /// wins, and the refusal carries who overtook it so the loser re-reads that version and merges.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -8694,6 +8967,67 @@ async fn a_draft_seeds_from_a_registered_pack(pool: PgPool) -> Result<()> {
         draft["origin"]["repo"].is_string(),
         "graduation pre-fills its target from here: {draft}"
     );
+    Ok(())
+}
+
+/// Cloning a template whose registered pack is unconvertible is refused naming the reason, and
+/// creates no draft.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn cloning_an_unconvertible_template_is_refused_naming_the_reason(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    crate::testing::make_unconvertible(&pool, "playbooks", "id = 'survey'").await;
+
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "forked", "template": "survey"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(error.contains(crate::testing::SYMLINK_REASON), "{body}");
+    let (status, _) = get_json_object(&app, "/api/playbook-drafts/studio").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}
+
+/// A draft launch recomputes its exposure from the version it launches; an unconvertible version
+/// is refused naming the reason, and no launch is recorded.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn launching_an_unconvertible_draft_version_is_refused_naming_the_reason(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    crate::testing::make_unconvertible(&pool, "playbook_draft_versions", "draft_id = 'studio'")
+        .await;
+
+    let (status, body) = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/launch",
+        serde_json::json!({"params": {}, "max_cost": 1.0, "max_time": "30m"}),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    let message = body["fields"][0]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(crate::testing::SYMLINK_REASON), "{body}");
+    let launches: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(launches, 0);
     Ok(())
 }
 
@@ -9338,8 +9672,8 @@ async fn a_draft_publishes_straight_to_the_registry_only_under_a_rule_naming_its
     assert_eq!(status, StatusCode::CREATED, "{first}");
     assert_eq!(first["id"], "mlr-pack");
     assert_eq!(
-        first["rev"], first["tar_digest"],
-        "a draft-sourced pack pins its bytes"
+        first["rev"], first["tree_digest"],
+        "a draft-sourced pack's rev is its tree"
     );
     let (status, pack) = send_as(
         &app,
@@ -9596,6 +9930,9 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
                 cost_usd: Some(cost),
                 secs: Some(4.0),
                 blocked: None,
+                links: Vec::new(),
+                agent: None,
+                repairs: Vec::new(),
             },
         )
         .await?;
@@ -9928,7 +10265,7 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
     drop(conn);
 
     let minted = crate::identity::api_key::mint(&pool, "sub-alice", "laptop", None).await?;
-    let who = crate::identity::api_key::verify(&pool, &minted.secret).await;
+    let who = crate::identity::api_key::verify(&pool, None, &minted.secret).await;
     let who = who.expect("the freshly minted key authenticates");
     assert_eq!(who.login, "alice");
     assert_eq!(who.sub, "sub-alice");
@@ -9943,13 +10280,13 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
         .expect("a minted key has both halves");
     let forged = format!("{}{id}_not-the-secret", crate::identity::api_key::PREFIX);
     assert_eq!(
-        crate::identity::api_key::verify(&pool, &forged)
+        crate::identity::api_key::verify(&pool, None, &forged)
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Unknown
     );
     assert_eq!(
-        crate::identity::api_key::verify(&pool, "not-a-key-at-all")
+        crate::identity::api_key::verify(&pool, None, "not-a-key-at-all")
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Malformed
@@ -9960,7 +10297,7 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
         crate::identity::api_key::mint(&pool, "sub-alice", "old", Some("2020-01-01T00:00:00Z"))
             .await?;
     assert!(matches!(
-        crate::identity::api_key::verify(&pool, &stale.secret)
+        crate::identity::api_key::verify(&pool, None, &stale.secret)
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Expired { .. }
@@ -9969,7 +10306,7 @@ async fn an_api_key_authenticates_as_the_person_who_minted_it(pool: PgPool) -> R
     // Revocation is immediate and says so by name.
     assert!(crate::identity::api_key::revoke(&pool, "sub-alice", &minted.key.id).await?);
     assert!(matches!(
-        crate::identity::api_key::verify(&pool, &minted.secret)
+        crate::identity::api_key::verify(&pool, None, &minted.secret)
             .await
             .unwrap_err(),
         crate::identity::api_key::KeyRefusal::Revoked { .. }
@@ -9989,7 +10326,7 @@ async fn a_key_is_revocable_only_by_its_owner(pool: PgPool) -> Result<()> {
 
     assert!(!crate::identity::api_key::revoke(&pool, "sub-bob", &alices.key.id).await?);
     assert!(
-        crate::identity::api_key::verify(&pool, &alices.secret)
+        crate::identity::api_key::verify(&pool, None, &alices.secret)
             .await
             .is_ok(),
         "bob's revoke must not have touched alice's key"
@@ -10022,7 +10359,10 @@ async fn the_mcp_surface_speaks_mcp_to_a_key_and_nothing_to_anyone_else(
     let (db, _d) = db_with(pool.clone());
     let app = crate::mcp::router(
         app(db, Arc::new(Recorder::default())),
-        pool,
+        crate::identity::auth::KeyGuard {
+            pool,
+            refresh: None,
+        },
         "https://crucible-api.example.com".to_string(),
     );
 
@@ -12759,9 +13099,11 @@ async fn sweep_webhooks(db: &Db) -> Vec<String> {
         jiff::Timestamp::now(),
         None,
         None,
+        &[],
     )
     .await
     .expect("sweep")
+    .fired
 }
 
 async fn delivery_outcomes(app: &Router, id: &str) -> Vec<String> {
@@ -13247,6 +13589,597 @@ async fn a_webhook_transform_is_checked_with_positions_and_its_url_is_readable(
         read["delivery_url"],
         format!("https://hooks.example.com/hooks/{id}"),
         "a signed webhook's full address is readable, since it carries no secret"
+    );
+    Ok(())
+}
+
+const TEAM_GROUP: &str = "/groups/tibrahim-all";
+
+/// Team `tibrahim-all` with group [`TEAM_GROUP`] as a member, tibrahim's draft `cve-triage` whose
+/// playbook scope binds a secret the team owns, and a router that takes api keys whose stale owner
+/// groups are re-read through `refresh`.
+async fn team_secret_draft(
+    pool: &PgPool,
+    refresh: Option<Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
+) -> Result<Router> {
+    let (db, _d) = db_with(pool.clone());
+    let state = ApiState {
+        playbook_caps: crate::config::PlaybookCaps {
+            max_cost: 10.0,
+            max_time: crate::model::MaxTime::parse("2h").expect("cap"),
+        },
+        ..ApiState::test(db, Arc::new(Recorder::default()))
+    };
+    let open = router(state.clone());
+    let mut guard = crate::identity::auth::BearerGuard::new(
+        crate::identity::auth::SharedToken::new("s3cr3t"),
+        None,
+        None,
+        None,
+        crate::identity::auth::AuthMode::Native,
+    )?;
+    guard.refresh = refresh;
+    let keyed = router(state).layer(axum::middleware::from_fn_with_state(
+        crate::identity::auth::HumanOrKeyGuard {
+            guard: Arc::new(guard),
+            pool: pool.clone(),
+        },
+        crate::identity::auth::require_auth_or_api_key,
+    ));
+
+    let (status, body) = send_as(
+        &open,
+        "POST",
+        "/api/teams",
+        "reed",
+        serde_json::json!({
+            "slug": "tibrahim-all",
+            "display_name": "tibrahim-all",
+            "members": [
+                {"kind": "user", "member": "reed", "role": "owner"},
+                {"kind": "group", "member": TEAM_GROUP, "role": "member"},
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send_as(
+        &open,
+        "POST",
+        "/api/playbook-drafts",
+        "tibrahim",
+        serde_json::json!({"id": "cve-triage", "description": "d"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(LAUNCH_WORKFLOW);
+    let (status, body) = send_as(
+        &open,
+        "POST",
+        "/api/playbook-drafts/cve-triage/versions",
+        "tibrahim",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let id = uuid::Uuid::now_v7().to_string();
+    let name = crate::secrets::SecretName::parse("buildit_kubeconfig")?;
+    let mut conn = pool.acquire().await?;
+    crate::secrets::store::insert(
+        &mut conn,
+        &crate::secrets::store::NewSecret {
+            id: &id,
+            name: &name,
+            owner: &crate::authz::model::Principal::parse("team:tibrahim-all")?,
+            kind: crate::secrets::SecretKind::Opaque,
+            visibility: crate::secrets::Visibility::BrokerOnly,
+            consumer: crate::secrets::ConsumerClass::Run,
+            mode: crate::secrets::SecretMode::Managed,
+            vault_path: "team:x/y",
+            current_version: Some(1),
+            created_by: Some("reed"),
+        },
+    )
+    .await?;
+    crate::secrets::store::insert_binding(
+        &mut conn,
+        &crate::secrets::store::NewBinding {
+            id: &uuid::Uuid::now_v7().to_string(),
+            secret_id: &id,
+            scope_kind: crate::secrets::ScopeKind::Playbook,
+            scope_id: "cve-triage",
+            projection_kind: crate::secrets::ProjectionKind::Env,
+            projection: "KUBECONFIG",
+            declared_name: &name,
+            pack_rev: None,
+            schema_digest: None,
+            created_by: Some("reed"),
+        },
+    )
+    .await?;
+    Ok(keyed)
+}
+
+/// Launch `cve-triage` with `key` as the bearer, then resolve its playbook scope the way the
+/// dispatch does.
+async fn launch_draft_with_key(
+    app: &Router,
+    pool: &PgPool,
+    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
+    key: &str,
+) -> Result<(
+    Vec<String>,
+    std::result::Result<Vec<crate::secrets::grant::GrantMint>, crate::secrets::launch::Refusal>,
+)> {
+    let req = HttpRequest::post("/api/playbook-drafts/cve-triage/launch")
+        .header(header::AUTHORIZATION, format!("Bearer {key}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "params": {"topic": "attention", "depth": "deep"},
+                "max_cost": 1.0,
+                "max_time": "30m",
+            })
+            .to_string(),
+        ))?;
+    let (status, body) = crate::testing::oneshot_bytes(app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+    let ack: serde_json::Value = serde_json::from_slice(&body)?;
+    let launch_key = ack["key"].as_str().expect("key");
+    let launch = crate::launches::store::get_playbook_launch(pool, launch_key)
+        .await?
+        .expect("launch row");
+    let launcher = crate::authz::resolve::dispatch_principals(
+        pool,
+        refresh,
+        crate::identity::auth::AuthMode::Native,
+        launch.created_by.as_deref(),
+        &launch.launcher_groups,
+        &launch.created_at,
+    )
+    .await??;
+    let resolved = crate::secrets::launch::resolve(
+        pool,
+        &crate::secrets::launch::Scope::playbook("cve-triage"),
+        &[],
+        &launcher,
+        crate::secrets::launch::OwnedRevision::Draft.as_revision(),
+        launch.exposure.as_ref(),
+    )
+    .await?;
+    Ok((launch.launcher_groups, resolved))
+}
+
+/// Stamp `tibrahim`'s stored groups `hours` ago.
+async fn stamp_groups(pool: &PgPool, groups: &[String], hours: i64) -> Result<()> {
+    let at = jiff::Timestamp::now().checked_sub(jiff::SignedDuration::from_hours(hours))?;
+    let mut conn = pool.acquire().await?;
+    crate::identity::oidc::users::record_groups_on(&mut conn, "sub-tibrahim", groups, at).await
+}
+
+fn team_not_owned(
+    resolved: &std::result::Result<
+        Vec<crate::secrets::grant::GrantMint>,
+        crate::secrets::launch::Refusal,
+    >,
+) -> bool {
+    matches!(
+        resolved,
+        Err(crate::secrets::launch::Refusal::NotOwned { owner, .. }) if owner == "team:tibrahim-all"
+    )
+}
+
+/// An api key launches with the groups its owner's `users` row holds, and the dispatch reaches the
+/// teams those groups are members of: a team-owned secret follows the group, and stops following
+/// once the owner's record drops it.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_api_key_launch_reaches_the_teams_its_owners_stored_groups_reach(
+    pool: PgPool,
+) -> Result<()> {
+    let keyed = team_secret_draft(&pool, None).await?;
+    crate::identity::oidc::users::record_login(
+        &pool,
+        "sub-tibrahim",
+        "tibrahim",
+        None,
+        jiff::Timestamp::now(),
+    )
+    .await?;
+    stamp_groups(&pool, &[TEAM_GROUP.to_string()], 0).await?;
+    let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
+
+    let (groups, resolved) = launch_draft_with_key(&keyed, &pool, None, &key.secret).await?;
+    assert_eq!(groups, vec![TEAM_GROUP.to_string()]);
+    assert_eq!(resolved?.len(), 1, "the group reaches the owning team");
+
+    stamp_groups(&pool, &[], 0).await?;
+    let (groups, resolved) = launch_draft_with_key(&keyed, &pool, None, &key.secret).await?;
+    assert!(groups.is_empty(), "{groups:?}");
+    assert!(team_not_owned(&resolved), "{resolved:?}");
+    Ok(())
+}
+
+/// Sign `tibrahim` in with `groups` stamped two hours ago and an offline credential sealed under the
+/// returned keys.
+async fn stale_owner(
+    pool: &PgPool,
+    groups: &[String],
+) -> Result<Arc<crate::identity::oidc::credentials::CredentialKeys>> {
+    let now = jiff::Timestamp::now();
+    crate::identity::oidc::users::record_login(pool, "sub-tibrahim", "tibrahim", None, now).await?;
+    stamp_groups(pool, groups, 2).await?;
+    let keys = Arc::new(crate::identity::oidc::credentials::CredentialKeys::new(
+        vec![vec![7u8; 32]],
+    )?);
+    let mut conn = pool.acquire().await?;
+    crate::identity::oidc::credentials::upsert(&mut conn, &keys, "sub-tibrahim", "offline", now)
+        .await?;
+    Ok(keys)
+}
+
+/// A refresher spending `tibrahim`'s credential against a local issuer whose ID token names `sub`
+/// with `groups`.
+async fn issuer_refresh(
+    pool: &PgPool,
+    keys: &Arc<crate::identity::oidc::credentials::CredentialKeys>,
+    sub: &str,
+    groups: &[&str],
+) -> (
+    wiremock::MockServer,
+    Arc<crate::identity::oidc::credentials::OwnerRefresh>,
+) {
+    let (server, provider) = crate::identity::oidc::tests::issuer_signing_for(sub, groups).await;
+    let refresh = Arc::new(crate::identity::oidc::credentials::OwnerRefresh::new(
+        pool.clone(),
+        provider,
+        keys.clone(),
+    ));
+    (server, refresh)
+}
+
+/// An api key whose owner's stamp has aged past the session window re-reads their groups through
+/// the offline credential, takes the issuer's current answer, and reaches the team it names.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_stale_api_key_owner_is_refreshed_into_the_issuers_groups(pool: PgPool) -> Result<()> {
+    let keys = stale_owner(&pool, &["/groups/left".to_string()]).await?;
+    let (_issuer, refresh) = issuer_refresh(&pool, &keys, "sub-tibrahim", &[TEAM_GROUP]).await;
+    let keyed = team_secret_draft(&pool, Some(refresh.clone())).await?;
+    let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
+
+    let (groups, resolved) =
+        launch_draft_with_key(&keyed, &pool, Some(&refresh), &key.secret).await?;
+    assert_eq!(groups, vec![TEAM_GROUP.to_string()]);
+    assert_eq!(resolved?.len(), 1);
+    let (_, stored, at) = crate::identity::oidc::users::stamped(&pool, "tibrahim")
+        .await?
+        .expect("users row");
+    assert_eq!(stored, vec![TEAM_GROUP.to_string()]);
+    let at: jiff::Timestamp = at.expect("stamped").parse()?;
+    assert!(
+        jiff::Timestamp::now().duration_since(at) < jiff::SignedDuration::from_mins(1),
+        "the refresh restamped the row: {at}"
+    );
+    Ok(())
+}
+
+/// An api key whose owner's stale stamp meets a refused refresh holds no groups, and its launch
+/// cannot reach the team secret.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_refused_refresh_leaves_a_stale_api_key_outside_the_team(pool: PgPool) -> Result<()> {
+    let keys = stale_owner(&pool, &[TEAM_GROUP.to_string()]).await?;
+    let (_issuer, refresh) = issuer_refresh(&pool, &keys, "sub-mallory", &[TEAM_GROUP]).await;
+    let keyed = team_secret_draft(&pool, Some(refresh.clone())).await?;
+    let key = crate::identity::api_key::mint(&pool, "sub-tibrahim", "laptop", None).await?;
+
+    let (groups, resolved) =
+        launch_draft_with_key(&keyed, &pool, Some(&refresh), &key.secret).await?;
+    assert!(groups.is_empty(), "{groups:?}");
+    assert!(team_not_owned(&resolved), "{resolved:?}");
+    let status = crate::identity::oidc::credentials::status(&pool, "sub-tibrahim")
+        .await?
+        .expect("credential row");
+    assert_eq!(status.failures, 1, "one refusal, recorded once");
+    Ok(())
+}
+
+/// At dispatch a stale stamp is refreshed: the recorded groups the issuer still asserts are kept,
+/// one it dropped is removed, and an issuer that cannot be reached defers the dispatch. With no
+/// refresher the stale stamp stands, as a session's does.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_stale_stamp_at_dispatch_is_refreshed(pool: PgPool) -> Result<()> {
+    use crate::identity::oidc::credentials::OwnerRefresh;
+    let recorded = [TEAM_GROUP.to_string(), "/groups/left".to_string()];
+    let keys = stale_owner(&pool, &recorded).await?;
+    let _ = team_secret_draft(&pool, None).await?;
+    let launched_at = jiff::Timestamp::now().to_string();
+    let dispatch = async |refresh: Option<&OwnerRefresh>| {
+        crate::authz::resolve::dispatch_principals(
+            &pool,
+            refresh,
+            crate::identity::auth::AuthMode::Native,
+            Some("tibrahim"),
+            &recorded,
+            &launched_at,
+        )
+        .await
+    };
+
+    let (_kept, refresh) = issuer_refresh(&pool, &keys, "sub-tibrahim", &[TEAM_GROUP]).await;
+    let launcher = dispatch(Some(&refresh)).await??;
+    assert_eq!(launcher.group_paths().collect::<Vec<_>>(), vec![TEAM_GROUP]);
+    assert!(!launcher.teams().is_empty(), "{launcher:?}");
+
+    stamp_groups(&pool, &recorded, 2).await?;
+    let (_dropped, refresh) = issuer_refresh(&pool, &keys, "sub-tibrahim", &["/groups/left"]).await;
+    let launcher = dispatch(Some(&refresh)).await??;
+    assert_eq!(
+        launcher.group_paths().collect::<Vec<_>>(),
+        vec!["/groups/left"]
+    );
+    assert!(launcher.teams().is_empty(), "{launcher:?}");
+
+    stamp_groups(&pool, &recorded, 2).await?;
+    let unreachable = OwnerRefresh::new(
+        pool.clone(),
+        crate::identity::oidc::tests::provider_at("http://127.0.0.1:1/realms/nobody"),
+        keys,
+    );
+    let launcher = dispatch(Some(&unreachable)).await?;
+    assert!(launcher.is_err(), "{launcher:?}");
+    let (_, stored, _) = crate::identity::oidc::users::stamped(&pool, "tibrahim")
+        .await?
+        .expect("users row");
+    assert_eq!(stored, recorded, "an outage leaves the stored groups alone");
+
+    let launcher = dispatch(None).await??;
+    assert_eq!(launcher.group_paths().collect::<Vec<_>>(), recorded);
+    assert!(!launcher.teams().is_empty(), "{launcher:?}");
+    Ok(())
+}
+
+/// A launcher with no `users` row keeps its recorded groups behind the edge. In native mode it keeps
+/// them while the launch is younger than the session group refresh window and holds none after,
+/// as does a launch that names no launcher.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launcher_with_no_users_row_holds_groups_by_mode_and_launch_age(
+    pool: PgPool,
+) -> Result<()> {
+    use crate::identity::auth::AuthMode;
+    let _ = team_secret_draft(&pool, None).await?;
+    let team = [TEAM_GROUP.to_string()];
+    let window = jiff::SignedDuration::try_from(
+        crate::identity::oidc::users::session_group_refresh_interval(),
+    )?;
+    let now = jiff::Timestamp::now();
+    let young = now.checked_sub(window / 2)?.to_string();
+    let old = now
+        .checked_sub(window + jiff::SignedDuration::from_mins(1))?
+        .to_string();
+    let dispatch = async |mode, login, launched_at: &str| {
+        crate::authz::resolve::dispatch_principals(&pool, None, mode, login, &team, launched_at)
+            .await
+    };
+    let edge = dispatch(AuthMode::Proxy, Some("proxy-user"), &old).await??;
+    assert!(!edge.teams().is_empty(), "{edge:?}");
+    for login in [Some("cli-user"), None] {
+        let fresh = dispatch(AuthMode::Native, login, &young).await??;
+        assert_eq!(
+            fresh.group_paths().collect::<Vec<_>>(),
+            vec![TEAM_GROUP],
+            "{login:?}"
+        );
+        assert!(!fresh.teams().is_empty(), "{login:?}: {fresh:?}");
+        let aged = dispatch(AuthMode::Native, login, &old).await??;
+        assert_eq!(aged.group_paths().count(), 0, "{login:?}: {aged:?}");
+        assert!(aged.teams().is_empty(), "{login:?}: {aged:?}");
+    }
+    Ok(())
+}
+
+/// Point the registered `survey` at a tree with one more file, keeping its rev.
+async fn repoint_survey_tree(pool: &PgPool) -> String {
+    let mut files = crate::playbooks::registry::pack(pool, "survey")
+        .await
+        .expect("read")
+        .expect("registered")
+        .files()
+        .clone();
+    files.insert("NOTES.md".parse().expect("path"), b"repointed\n".to_vec());
+    let pack = crate::playbooks::pack_trees::EncodedPack::new(
+        crucible_contract::pack_tree::PackTree::new(files).expect("tree"),
+    )
+    .expect("encode");
+    let digest =
+        crate::playbooks::pack_trees::put_tree(&mut pool.acquire().await.expect("conn"), &pack)
+            .await
+            .expect("put");
+    sqlx::query(
+        "UPDATE playbooks SET tree_digest = $1, tar_gz = $2, tar_digest = $3 WHERE id = 'survey'",
+    )
+    .bind(digest.as_str())
+    .bind(pack.tarball())
+    .bind(crucible_contract::content_digest(pack.tarball()))
+    .execute(pool)
+    .await
+    .expect("repoint");
+    sqlx::query(
+        "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at)
+         VALUES ('survey', $1, 'now')",
+    )
+    .bind(digest.as_str())
+    .execute(pool)
+    .await
+    .expect("revision");
+    digest.to_string()
+}
+
+/// A webhook edit that leaves the firing alone needs no launch right on the playbook; an edit
+/// after the playbook's tree moved under the same rev is a new firing, so it is decided against
+/// the playbook again, and the webhook then adopts the new tree.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_same_rev_tree_change_is_a_new_firing_on_webhook_edit(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_webhook_keys(db.clone());
+    register_survey(&app, dir.path(), WEBHOOK_WORKFLOW).await;
+    let share = |role: &str| {
+        let app = app.clone();
+        let body = serde_json::json!({ "role": role });
+        async move {
+            let (status, bytes) = send(
+                &app,
+                "PUT",
+                "/api/playbooks/survey/shares/user:bob",
+                "wren",
+                Some(body),
+            )
+            .await;
+            assert!(
+                status.is_success(),
+                "{status} {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+    };
+    share("launcher").await;
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/webhooks",
+        "bob",
+        Some(quay_webhook_body()),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let id = created["webhook"]["id"].as_str().expect("id").to_string();
+    let adopted = created["webhook"]["adopted_tree_digest"].clone();
+    assert!(
+        adopted.as_str().is_some_and(|t| t.starts_with("tree1:")),
+        "{created}"
+    );
+    let uri = format!("/api/webhooks/{id}");
+    share("viewer").await;
+
+    let (status, bytes) = send(&app, "PUT", &uri, "bob", Some(quay_webhook_body())).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unchanged firing: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+
+    let rev_before: String = sqlx::query_scalar("SELECT rev FROM playbooks WHERE id = 'survey'")
+        .fetch_one(db.pool())
+        .await?;
+    let repointed = repoint_survey_tree(db.pool()).await;
+    let (status, bytes) = send(&app, "PUT", &uri, "bob", Some(quay_webhook_body())).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "the same rev on another tree is decided again: {}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let (_, read) = get_json_object(&app, &uri).await;
+    assert_eq!(
+        read["adopted_tree_digest"], adopted,
+        "the refused edit kept the old tree"
+    );
+    assert_eq!(read["adopted_rev"], rev_before);
+
+    share("launcher").await;
+    let (status, bytes) = send(&app, "PUT", &uri, "bob", Some(quay_webhook_body())).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let stored: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(stored["adopted_rev"], rev_before);
+    assert_eq!(stored["adopted_tree_digest"], repointed);
+    Ok(())
+}
+
+/// A template pin a newer tree superseded names its replacement to a caller who may read the
+/// template. Everyone else, and a superseded pin whose tree the template never held, gets the
+/// answer an unknown pin gets, byte for byte.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_superseded_template_pin_names_its_replacement_only_to_a_reader(
+    pool: PgPool,
+) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), LAUNCH_WORKFLOW).await;
+    let repointed = repoint_survey_tree(db.pool()).await;
+    let mut conn = db.pool().acquire().await?;
+    let elsewhere = crate::playbooks::pack_trees::put_tree(
+        &mut conn,
+        &crate::playbooks::pack_trees::EncodedPack::new(
+            crucible_contract::pack_tree::PackTree::from_pairs(&[("a", b"1")])?,
+        )?,
+    )
+    .await?;
+    for (old, tree) in [
+        ("sha256:old", repointed.as_str()),
+        ("sha256:foreign", elsewhere.as_str()),
+    ] {
+        sqlx::query(
+            "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
+             VALUES ($1, $2, 'then')",
+        )
+        .bind(old)
+        .bind(tree)
+        .execute(db.pool())
+        .await?;
+    }
+    let clone = |user: &'static str, digest: &'static str| {
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                "POST",
+                "/api/playbook-drafts",
+                user,
+                Some(serde_json::json!({
+                    "id": "fork",
+                    "description": "d",
+                    "template": "survey",
+                    "template_digest": digest,
+                })),
+            )
+            .await
+        }
+    };
+
+    let (status, superseded) = clone("wren", "sha256:old").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    let superseded = String::from_utf8_lossy(&superseded).to_string();
+    assert!(
+        superseded.contains(&format!("superseded by {repointed}")),
+        "{superseded}"
+    );
+    let unknown = clone("wren", "sha256:never").await;
+    assert_eq!(unknown.0, StatusCode::CONFLICT);
+    assert_eq!(clone("wren", "sha256:foreign").await, unknown);
+
+    let outsider = clone("mallory", "sha256:never").await;
+    assert_eq!(outsider.0, StatusCode::NOT_FOUND);
+    assert_eq!(clone("mallory", "sha256:old").await, outsider);
+    assert!(
+        !String::from_utf8_lossy(&outsider.1).contains("tree1:"),
+        "{outsider:?}"
     );
     Ok(())
 }

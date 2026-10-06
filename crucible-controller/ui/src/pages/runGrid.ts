@@ -11,6 +11,9 @@ import {
   type TaskResult,
   type TaskTone,
 } from './taskGraph';
+import type { ExternalLinkRef } from '../ui';
+
+type TaskAgent = NonNullable<TaskResult['agent']>;
 
 /// One attempt, in the column of the iteration it reported from.
 export interface GridCell {
@@ -22,6 +25,19 @@ export interface GridCell {
   note: string;
   /// Why the executor never dispatched the task; set exactly when `status` is `blocked`.
   blocked: { reason: string; task: string | null } | null;
+  /// The external results the attempt reported, in declaration order.
+  links: ExternalLinkRef[];
+  /// What the attempt ran on, as the engine resolved it; null for a command task and for a run
+  /// logged before the engine reported it.
+  agent: TaskAgent | null;
+}
+
+/// What a row's attempts ran on. A field is null when they did not all run on the same thing: a
+/// mapped parent whose instances took different models has no one model to name.
+export interface RowAgent {
+  harness: string | null;
+  model: string | null;
+  effort: string | null;
 }
 
 export interface GridRow {
@@ -36,6 +52,9 @@ export interface GridRow {
   costUsd: number | null;
   /// How the task's latest attempt ended.
   tone: TaskTone;
+  /// What the row ran on; null for a task that runs no agent. A mapped parent takes its
+  /// instances' agreement rather than its own attempts, which it has none of.
+  agent: RowAgent | null;
 }
 
 export interface RunGrid {
@@ -110,7 +129,20 @@ function cellOf(r: TaskResult): GridCell {
     costUsd: r.cost_usd ?? null,
     note: r.note,
     blocked: r.blocked ? { reason: r.blocked.reason, task: r.blocked.task ?? null } : null,
+    links: r.links,
+    agent: r.agent ?? null,
   };
+}
+
+/// What a set of attempts ran on. Null when nothing reported an agent; a field is null when the
+/// attempts did not all name the same one.
+export function rowAgent(cells: (GridCell | null)[]): RowAgent | null {
+  const agents = cells.flatMap((cell) => (cell?.agent == null ? [] : [cell.agent]));
+  const [first] = agents;
+  if (first === undefined) return null;
+  const one = (pick: (a: TaskAgent) => string): string | null =>
+    agents.every((a) => pick(a) === pick(first)) ? pick(first) : null;
+  return { harness: one((a) => a.harness), model: one((a) => a.model), effort: one((a) => a.effort) };
 }
 
 /// The one line a blocked cell's tooltip adds: the typed reason, and the task it names.
@@ -148,8 +180,22 @@ export function runGridView(tasks: PlanTask[], reported: TaskResult[]): RunGrid 
       secs: sum(mine.map((r) => r.secs)),
       costUsd: sum(mine.map((r) => r.cost_usd)),
       tone: last === null ? 'none' : toneOf(last.status),
+      agent: rowAgent(cells),
     };
   });
+
+  // A mapped parent runs nothing itself; what it ran on is what its instances agreed on.
+  const instanceCells = new Map<string, (GridCell | null)[]>();
+  for (const row of rows) {
+    if (!row.mapped) continue;
+    const from = mappedFrom(row.task);
+    if (from === null) continue;
+    instanceCells.set(from, [...(instanceCells.get(from) ?? []), ...row.cells]);
+  }
+  for (const row of rows) {
+    const cells = instanceCells.get(row.task);
+    if (cells !== undefined) row.agent = rowAgent(cells);
+  }
 
   const maxSecs = rows.reduce<number | null>(
     (widest, row) => (row.secs === null ? widest : Math.max(widest ?? 0, row.secs)),
@@ -161,6 +207,49 @@ export function runGridView(tasks: PlanTask[], reported: TaskResult[]): RunGrid 
   const counts = [...tally].map(([status, count]) => ({ status, tone: toneOf(status), count }));
 
   return { iters, rows, maxSecs, counts };
+}
+
+/// A stretch of adjacent iterations a row reported the same status across, drawn as one block.
+export interface GridSegment {
+  /// How many columns the block spans.
+  span: number;
+  /// The attempts it melds, in iteration order. Empty for a stretch the task sat out.
+  cells: GridCell[];
+  /// The iterations it covers, in order.
+  iters: number[];
+}
+
+/// An attempt that said nothing but its status. One that left a note, a block reason or a link has
+/// something of its own to read, so it keeps its own cell rather than disappearing into a block.
+function plain(cell: GridCell): boolean {
+  return cell.note === '' && cell.blocked === null && cell.links.length === 0;
+}
+
+/// A row's cells melded on run boundaries: adjacent iterations that reported the same status
+/// become one block, and a stretch the task sat out becomes one gap. Nothing is merged across a
+/// change of status, so the order the run went in is still the order the row reads in.
+export function meldRow(cells: (GridCell | null)[], iters: number[]): GridSegment[] {
+  const segments: GridSegment[] = [];
+  cells.forEach((cell, index) => {
+    const iter = iters[index];
+    if (iter === undefined) return;
+    const last = segments[segments.length - 1];
+    // A block only ever holds plain cells, so its first one speaks for the rest.
+    const head = last?.cells[0];
+    const joins =
+      last !== undefined &&
+      (cell === null
+        ? last.cells.length === 0
+        : head !== undefined && head.status === cell.status && plain(head) && plain(cell));
+    if (last !== undefined && joins) {
+      last.span += 1;
+      last.iters.push(iter);
+      if (cell !== null) last.cells.push(cell);
+      return;
+    }
+    segments.push({ span: 1, cells: cell === null ? [] : [cell], iters: [iter] });
+  });
+  return segments;
 }
 
 /// A duration as the grid writes it: seconds under a minute, then minutes, then hours. Null stays

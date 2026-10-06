@@ -10,8 +10,11 @@
 //! here would buy no resistance and charge a hash to every request the key ever makes.
 //!
 //! A key carries its owner's identity and its owner's groups, which is why [`Authenticated`] holds
-//! both. Groups are whatever the owner's last login stamped on their `users` row: a key is never
-//! more powerful than the person it belongs to, and never fresher than their last sign-in.
+//! both. Groups are whatever the owner's last sign-in or offline credential refresh stamped on their
+//! `users` row: a key is never more powerful than the person it belongs to, and never fresher than
+//! the issuer's last answer about them. Where a refresher is configured, a stamp missing or older
+//! than a session's group refresh window is re-read through the owner's offline credential, and a
+//! refused, revoked, or absent credential, or an issuer that cannot be reached, holds no groups.
 
 use crate::clock::now_rfc3339;
 use anyhow::{Context, Result};
@@ -55,7 +58,7 @@ pub struct Authenticated {
     pub id: String,
     pub sub: String,
     pub login: String,
-    /// The owner's groups as their last login stamped them.
+    /// The owner's groups as the issuer last answered them.
     pub groups: Vec<String>,
 }
 
@@ -149,13 +152,17 @@ pub async fn mint(
 /// An unknown id and a wrong secret answer the same [`KeyRefusal::Unknown`]: telling the two apart
 /// would confirm which ids exist. Expiry and revocation are told apart from both, because their
 /// owner is entitled to know a key of theirs died and how.
-pub async fn verify(pool: &PgPool, presented: &str) -> Result<Authenticated, KeyRefusal> {
+pub async fn verify(
+    pool: &PgPool,
+    refresh: Option<&crate::identity::oidc::credentials::OwnerRefresh>,
+    presented: &str,
+) -> Result<Authenticated, KeyRefusal> {
     let Some((id, secret)) = split(presented) else {
         return Err(KeyRefusal::Malformed);
     };
     let row = sqlx::query!(
         r#"SELECT k.secret_hash AS "secret_hash!", k.expires_at, k.revoked_at,
-                  u.sub AS "sub!", u.login AS "login!", u.groups AS "groups!"
+                  u.sub AS "sub!", u.login AS "login!", u.groups AS "groups!", u.groups_at
            FROM api_keys k JOIN users u ON u.sub = k.sub
            WHERE k.id = $1"#,
         id,
@@ -190,6 +197,14 @@ pub async fn verify(pool: &PgPool, presented: &str) -> Result<Authenticated, Key
         tracing::error!(login = %row.login, error = %e, "unreadable stored groups; treating the key as group-less");
         Vec::new()
     });
+    let groups = crate::identity::oidc::credentials::current_groups(
+        refresh,
+        &row.sub,
+        groups,
+        row.groups_at.as_deref(),
+    )
+    .await
+    .unwrap_or_default();
     Ok(Authenticated {
         id: id.to_string(),
         sub: row.sub,

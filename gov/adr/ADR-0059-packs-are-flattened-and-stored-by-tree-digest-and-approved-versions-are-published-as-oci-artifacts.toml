@@ -1,0 +1,126 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0059"
+title = "Packs are flattened and stored by tree digest, and may be published to an OCI registry"
+status = "accepted"
+date = "2026-10-03"
+refs = [
+    "ADR-0057",
+    "RFC-0002:C-PACK-BASE",
+    "RFC-0003:C-APPROVALS",
+    "RFC-0004:C-LINKED-RENDER",
+    "RFC-0002:C-PACK-PUBLISH",
+    "RFC-0003:C-READ-SCOPING",
+]
+
+[content]
+context = """
+[[ADR-0057]] settled three problems with how a playbook pack reaches a run: the delivery ConfigMap's 900 KiB budget counted raw bytes while storage counted gzipped ones, every table and every launch held its own copy of the tarball, and a pack with a large shared core and small per-variant overlays had to be copied whole into one draft per variant. It chose Postgres storage by digest, one gzipped ConfigMap key, and base packs whose identity is the pair (base digest, overlay digest), and it deferred OCI distribution. The gzipped delivery is implemented on an open change (`pack_delivery_tarball`); storage and base packs are not.
+
+That ADR was reviewed only against the codebase. A survey of how other systems ship small file trees (40 projects, saved with the handoff notes as `research/pack-distribution-prior-art.json`) changes two of its choices and reopens OCI:
+
+- **Systems that reuse a shared base pin one identity for the composed result.** OPA's control-plane stacks, Zarf skeletons, and Flux's ArtifactGenerator flatten a base and an overlay at build time and pin the flattened artifact; Argo CD pins one git commit over a Kustomize base and overlay. Dagster's split dependency and source PEX is the closest two-key design, and OPA's run-time multi-bundle layering is where its overlap bugs are (open-policy-agent/opa#6313). No surveyed system makes every reader compose a pair of digests.
+- **Hash the tree, not the archive.** A digest over gzip bytes changes when compression does. Terraform added the `h1:` tree hash beside `zh:` for that reason, Go's `h1:` is a directory hash, and Nix's recursive hashes survived GitHub's 2023-01-30 gzip change while archive hashes broke. Crucible's `content_digest` is SHA-256 of gzip bytes (`crucible-contract/src/artifact.rs:19`).
+- **OCI's strengths are distribution, not storage.** Registries give a standard pull (`oras`, `crane`, `skopeo`), mirroring and air-gap tooling, tags people can read, per-node caching, signing (cosign, Notation), and Kubernetes image volumes, which mount an artifact with the kubelet's own pull path (KEP-4639: on by default in 1.35, GA in 1.36; CRI-O mounts non-image artifacts, containerd does not yet, containerd/containerd#11381). OpenTofu 1.10 added OCI for modules and providers for mirroring, not integrity.
+- **OCI's weaknesses fall on the paths crucible uses most.** Each push mints a manifest; registries collect untagged manifests on their own schedules (Quay's hidden one-hour tag for digest-only pushes, PROJQUAY-12886; Harbor's delete-untagged GC, goharbor/harbor#23570; ECR lifecycle rules), so a digest pin also needs a tag that never expires. No registry lists or searches artifacts, so the catalog, approvals and history stay in Postgres regardless. Pulling from inside workload pods is the least-used shape: Flux, Tekton, Crossplane and OPA pull once in a controller and hand content on; Kubewarden pulls per pod, and its documentation shows registry availability and pull credentials on the critical path of every restart. An init container running a registry client also ignores the runtime's mirror configuration (ImageDigestMirrorSet, `registries.conf`).
+
+Base packs are a requirement, not an optimization: component teams own their overlays of shared tooling, including their own launch parameters and defaults, while the team that owns the tooling owns the base. Parameters can only be declared in the workflow source a run names, never in a loaded library ([[RFC-0002:C-PLAYBOOK-PARAMS]]), and `load()` resolves within the pack. So the base carries the shared library, tools, and prompts, and each overlay carries a short `workflow.star` that declares its parameters and calls the library.
+
+The measured pack from [[ADR-0057]] still holds: a shared core of 212 KiB gzipped, one variant about 222 KiB, all seven variants 297 KiB, all under the 900 KiB delivery budget.
+
+The first concrete consumer of an OCI copy is delivery on CRI-O clusters, which include MPP: an image volume lets the kubelet pull and verify a pack by digest with the cluster's own pull path, with no ConfigMap and no registry client in the run pod. Mirroring packs to other clusters with existing tooling is the second. Neither is needed while every pack fits the ConfigMap, so publication is opt-in."""
+decision = """
+Postgres stays the record and the store of pack bytes, and a pack built on a base is flattened into one tree with one digest. Publishing packs to an OCI registry is opt-in: off unless a pack registry is configured, and never on the path of a save, a launch, or a dispatch.
+
+**Identity: a tree hash.** A pack's digest is written `tree1:<hex>`: SHA-256 over one line per pack file, in byte-wise order of path, each line the lowercase hex SHA-256 of the file's bytes, two spaces, and the file's path relative to the pack root with `/` separators, ending in a newline. This is Go's `h1:` directory hash with a distinct prefix. It does not depend on any archive format, compression, file mode, or timestamp; no file mode is part of a pack, and every pack file is delivered and published with mode 0755, as runs receive them today. Mode is left out because a draft edited in the browser has none and every pack script must run; and the `1` names the encoding so a later change is a new prefix rather than a silent rewrite. A path must be valid UTF-8 with no empty, `.`, or `..` segment and no newline; only regular files are pack files, and symlinks are refused. `pack_delivery_tarball` and every other encoding are derived from the tree, not part of its identity.
+
+**Storage: one table of trees keyed by digest.** Pack bytes move to one table keyed by tree digest and are stored once. Drafts, draft versions, registered packs, imports, adopted standing launches, and launches reference the digest instead of holding a copy. A stored tree is immutable and is deleted only when nothing references it. Every draft save lands here.
+
+**Base packs: flattened at save.** A draft version may name a base by its tree digest. Saving it places the overlay's files over the base's by path, an overlay file replacing a base file at the same path, and stores the result under its own digest. The base digest, the overlay's own tree digest, and which overlay paths replaced base paths are recorded on the version as provenance ([[RFC-0002:C-PACK-BASE]]); they keep no stored tree alive. Compilation, exposure extraction, approval, launch, and delivery see only the flattened tree and its digest. Moving to a newer base is a new save.
+
+Flattening copies the base's files into the saved pack. Anyone who may read the saved pack reads those files, and approving it needs no access to the base. [[ADR-0057]] withheld the composed tree and the approval from subjects who could not read the base; this decision drops that. Naming a base is a decision to disclose its contents to the derived pack's readers, and the save-time check that the saver may read the base is the only authorization applied to them.
+
+**Delivery.** Runs receive the flattened tree as one gzipped ConfigMap key, as built by `pack_delivery_tarball`, within the delivery budget. Where a dispatch target's runtime mounts OCI artifacts (CRI-O) and the pack is published, a launch may instead mount the artifact at its manifest digest as an image volume; `pack-stage` copies it into the domain emptyDir as it does the ConfigMap. Whether a target mounts artifacts is a setting on its cluster entry. If packs outgrow the ConfigMap, the controller serves a tree by digest over in-cluster HTTP and `pack-stage` fetches and verifies it. A run pod never runs its own registry client.
+
+**OCI publication (opt-in).** When a pack registry is configured, registering, importing, or approving a draft graduation pushes the flattened tree as an OCI artifact: the OCI empty config, `application/vnd.oci.image.layer.v1.tar+gzip` layers, and the pack type and tree digest in fixed manifest annotations. A pack saved on a base gets two layers, the base's full tree and then the overlay's files, so later files replace earlier ones on extraction; layers are written by one fixed encoder (sorted entries, zeroed metadata, fixed gzip level and header) so every pack on one base carries a byte-identical first layer. The empty config makes this an artifact, which only CRI-O mounts today; that is accepted, since CRI-O is the first consumer. All packs go to one repository under a tag derived from the tree digest, which is unique per tree, never moves, and survives transfers and renames; when two packs share a digest, the first publication's manifest serves both. Each version carries a publication state (unpublished, pending, published with the manifest digest, failed with the error), and transient failures are retried with backoff.
+
+**Registry access.** Pull credentials go to the controller and to dispatch targets the platform owns or a platform administrator marks registry-trusted (an audited mark no one else can set), never to a user or team; a brought cluster owned by a team gets controller-built delivery only, since one repository holds every pack. The registry is a delivery and mirroring channel, not a read path; people read packs through the controller, under [[RFC-0003:C-READ-SCOPING]].
+
+**Approvals.** A draft graduation's approval binds that draft and the tree digest it approved, as a Postgres row. Signing published manifests with cosign is a later decision.
+
+**Migration.** Every stored tarball's tree digest is computed from its stored bytes, and every pin, approval, base reference, and run-history record holding the old gzip digest is rewritten to it; the old digest is kept as a recorded alias, and a request naming an old digest is refused as superseded.
+
+**Specification.** [[RFC-0002:C-PACK-BASE]] and [[RFC-0003:C-APPROVALS]] as written for [[ADR-0057]] are amended to this decision, and [[RFC-0002:C-PACK-PUBLISH]] states the publication obligations."""
+consequences = """
+- A launch, a standing launch, and an approval each name one digest that covers the whole tree, base included. No reader composes anything after a save.
+- A base that later becomes unreadable or deleted does not affect packs already saved on it. A new save on that base is refused.
+- Saving on a base discloses the base's files to everyone who may read, share, launch, or approve the derived pack. [[ADR-0057]]'s read isolation for base content is gone. For shared tooling meant to be shared, this is the intent.
+- The tree digest is independent of tar format, gzip, and file modes. Changing its encoding is a new prefix and a migration.
+- Storage stops growing by one tarball per launch, but each variant's flattened tree holds its own copy of a shared core in Postgres. At 222 KiB per variant this is accepted.
+- With no pack registry configured, nothing changes for saves, launches, or dispatch. With one configured, the controller needs a push credential and each mounting cluster a pull secret, and pack contents sit in a registry that only the controller and clusters can read.
+- Image-volume mounts work only on CRI-O while the artifact uses the empty config; containerd clusters keep the ConfigMap.
+- Base-layer sharing in the registry and on nodes depends on the fixed layer encoder. Changing it breaks sharing but not identity.
+- If the controller-served HTTP fallback is used, pod start depends on the controller being reachable, which today it does not.
+- Every published tree keeps its tag until a retention decision removes tags whose digests nothing references.
+- The migration rewrites the digests that approvals and pins bind. Digests already copied outside the controller (run records, links) keep the old value; a request using one is refused with its replacement named.
+- A fix to the base reaches a component team's pack only when the team saves on the new base revision and the result is approved again. The controller reports when a version's base has a newer revision, so a rebase is one save, but nothing propagates on its own.
+- A component team owns its parameters by owning its overlay's `workflow.star`; shared workflow logic belongs in a library the base provides."""
+
+[[content.alternatives]]
+text = "Postgres stores flattened trees by tree digest; publication to an OCI registry is opt-in and feeds CRI-O image volumes and mirroring; runs get the ConfigMap otherwise"
+status = "accepted"
+pros = [
+    "Saves, launches, and dispatch have no registry dependency",
+    "One digest covers the whole tree, so pins and approvals compare one value",
+    "Published packs gain standard pull, mirroring, tags, and image-volume mounting",
+]
+cons = [
+    "Two stores: Postgres for everything, the registry for published versions",
+    "Each variant's flattened tree stores its own copy of a shared core in Postgres",
+    "Saving on a base discloses the base's files to the derived pack's readers",
+]
+
+[[content.alternatives]]
+text = "OCI as the store of record: every draft save pushes an artifact, and pack-stage pulls by digest from the registry"
+status = "rejected"
+pros = [
+    "One store and one delivery path for drafts and published packs",
+    "Layer reuse deduplicates a shared base everywhere",
+]
+cons = [
+    "A registry on every draft save and every pod start; an outage blocks editing and launching",
+    "Every save leaves a manifest that registries garbage-collect on their own schedules, so pins need never-expiring tags",
+    "Credentials and a registry client in every run pod, bypassing the runtime's mirror configuration",
+    "The catalog, approvals, and history stay in Postgres regardless, since registries do not list or search",
+]
+
+[[content.alternatives]]
+text = "[[ADR-0057]] as accepted: a base is controller metadata, identity is the (base, overlay) digest pair, and every reader composes the pair; no OCI"
+status = "rejected"
+pros = [
+    "A shared core is stored once in Postgres",
+    "No registry at all",
+]
+cons = [
+    "Every reader composes at read time and every comparison must compare two digests; no surveyed system composes trees at run time",
+    "Gives up OCI tooling, mirroring, and image volumes",
+]
+
+[[content.alternatives]]
+text = "Controller-served HTTP as the only transport beyond the ConfigMap: pack-stage fetches GET /packs/<tree digest> from the controller and verifies it; no OCI"
+status = "considered"
+pros = ["Removes the ConfigMap ceiling with no new infrastructure or credentials"]
+cons = [
+    "Run pods depend on the controller being reachable at start",
+    "No standard pull, mirroring, or signing for other consumers",
+]
+
+[[content.alternatives]]
+text = "Identity as a canonical tar digest (SHA-256 over a fully specified uncompressed tar), so it can equal an OCI layer diff_id"
+status = "rejected"
+pros = ["The hashed bytes are the bytes delivered and published"]
+cons = [
+    "Reproducing it needs the exact tar format, header fields, and long-path encoding; two tar libraries rarely agree",
+    "An identity tied to an archive format is the archive-hash problem the tree hash avoids",
+]

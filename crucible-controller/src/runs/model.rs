@@ -298,6 +298,14 @@ pub struct TaskResult {
     pub secs: Option<f64>,
     /// Present exactly when `status` is `blocked`.
     pub blocked: Option<crucible_contract::TaskBlocked>,
+    /// The external results the attempt reported, as the engine parsed them off the fields it
+    /// declared `link`/`links`.
+    pub links: Vec<crucible_contract::ExternalLink>,
+    /// What the attempts ran on, resolved. `None` for a command task and for a run logged before
+    /// the engine reported it.
+    pub agent: Option<crucible_contract::session::TaskAgent>,
+    /// The repair turns the attempt took, in order. Their cost is part of `cost_usd`.
+    pub repairs: Vec<crucible_contract::session::TaskRepair>,
 }
 
 /// The sort column for `GET /api/runs` (the leaderboard). `Created` orders by `run_id`, whose

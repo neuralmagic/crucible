@@ -25,7 +25,7 @@ pub mod users;
 #[cfg(test)]
 mod keycloak_e2e;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use anyhow::Context;
 use openidconnect::core::{

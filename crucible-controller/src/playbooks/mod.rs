@@ -7,6 +7,8 @@ pub mod dispatch;
 pub mod drafts;
 pub mod exposure;
 pub mod imports;
+pub mod pack_migration;
+pub mod pack_trees;
 pub mod packs;
 pub mod param_placeholder;
 pub mod plan_graph;

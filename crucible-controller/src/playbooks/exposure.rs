@@ -125,6 +125,18 @@ pub enum KnownCapability {
     ExternalCommands {
         present: bool,
     },
+    Sandbox {
+        name: String,
+        image: String,
+        #[serde(default)]
+        secrets: Vec<String>,
+        #[serde(default)]
+        relays: Vec<String>,
+        #[serde(default)]
+        broker: bool,
+        #[serde(default)]
+        egress: Vec<String>,
+    },
 }
 
 impl Capability {
@@ -173,6 +185,19 @@ impl Capability {
             KnownCapability::ExternalCommands { present } => {
                 format!("external-commands present:{present}")
             }
+            KnownCapability::Sandbox {
+                name,
+                image,
+                secrets,
+                relays,
+                broker,
+                egress,
+            } => format!(
+                "sandbox {name} {image} secrets [{}] relays [{}] broker:{broker} egress [{}]",
+                secrets.join(", "),
+                relays.join(", "),
+                egress.join(", ")
+            ),
         }
     }
 
@@ -272,9 +297,9 @@ impl Exposure {
 pub enum Extraction {
     /// The document the engine computed for the exact stored content.
     Declared(Exposure),
-    /// No document. A registered launch row stores none, since its disclosure is the registry
-    /// revision's; a row frozen before extraction existed reads back the same way. A launch
-    /// reading such a row grants the agent nothing it would have had to disclose.
+    /// No document. A registered launch passes this and records the registry row's instead; a
+    /// row frozen before extraction existed reads back the same way. A launch reading such a row
+    /// grants the agent nothing it would have had to disclose.
     Absent,
 }
 
@@ -432,6 +457,35 @@ mod tests {
                 .digest()
                 .expect("digests"),
             "a stored-and-reread document digests the same"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_renders_and_a_changed_sandbox_changes_the_digest() {
+        let with_sandbox = |egress: &str| {
+            DOC.replace(
+                r#"{"kind":"time-travel","era":"cretaceous"}"#,
+                &format!(
+                    r#"{{"kind":"sandbox","name":"go","image":"ghcr.io/acme/go@sha256:bb","secrets":["registry"],"relays":[],"broker":false,"egress":["{egress}"]}}"#
+                ),
+            )
+        };
+        let narrow: Exposure =
+            serde_json::from_str(&with_sandbox("proxy.golang.org:443:read-only")).expect("decodes");
+        assert!(
+            narrow.capability_lines().contains(
+                &"sandbox go ghcr.io/acme/go@sha256:bb secrets [registry] relays [] broker:false \
+                  egress [proxy.golang.org:443:read-only]"
+                    .to_string()
+            ),
+            "{:?}",
+            narrow.capability_lines()
+        );
+        let widened: Exposure =
+            serde_json::from_str(&with_sandbox("evil.example:443:full")).expect("decodes");
+        assert_ne!(
+            narrow.digest().expect("digest"),
+            widened.digest().expect("digest")
         );
     }
 

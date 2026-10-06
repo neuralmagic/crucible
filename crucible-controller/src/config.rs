@@ -243,6 +243,15 @@ pub struct ControllerCfg {
     /// without what it declared.
     #[arg(skip)]
     pub secret_provider: Option<std::sync::Arc<dyn crate::secrets::provider::SecretProvider>>,
+    /// The offline credential a launcher's stale groups are re-read through at dispatch, and the
+    /// launch triggers' fire-time refresh. Installed by the binary like
+    /// [`ControllerCfg::secret_provider`]; `None` leaves a launcher on their stored groups.
+    #[arg(skip)]
+    pub owner_refresh: Option<std::sync::Arc<crate::identity::oidc::credentials::OwnerRefresh>>,
+    /// `CONTROLLER_AUTH_MODE`. In native mode a launcher with no `users` row keeps the groups its
+    /// launch recorded only inside the session refresh window; behind the edge it keeps them.
+    #[arg(skip = crate::identity::auth::AuthMode::from_env())]
+    pub auth_mode: crate::identity::auth::AuthMode,
     /// The legacy state directory. Nothing durable lives here anymore; kept so
     /// `db migrate-state` can read an old volume. The daemon never requires it to exist.
     #[arg(long, env = "CONTROLLER_STATE_DIR", default_value = "state")]

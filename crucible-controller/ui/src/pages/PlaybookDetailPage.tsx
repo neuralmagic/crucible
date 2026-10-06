@@ -15,6 +15,7 @@ import {
   SectionBody,
   SectionHeader,
 } from '../ui';
+import { shortRev } from './draftStudio';
 import { FormActions, FormError, FormGrid, TextField } from './formControls';
 import { sourceLabel } from './playbookSource';
 import { SharesSection } from './SharesSection';
@@ -54,7 +55,7 @@ export function PlaybookDetailPage() {
           description: description.trim(),
           template: playbook.id,
           template_rev: playbook.rev,
-          template_digest: playbook.tar_digest,
+          template_digest: playbook.tree_digest,
         },
       });
       void navigate(`/playbooks/drafts/${encodeURIComponent(draftId.trim())}`);
@@ -96,7 +97,9 @@ export function PlaybookDetailPage() {
           <div className="mb-3 flex flex-wrap gap-x-6 gap-y-1 font-mono text-data text-ink-2">
             <span>{sourceLabel(playbook.source)}</span>
             <span>@ {playbook.rev}</span>
-            <span>{playbook.tar_digest}</span>
+            {playbook.tree_digest && playbook.tree_digest !== playbook.rev ? (
+              <span>{playbook.tree_digest}</span>
+            ) : null}
           </div>
           <div className="flex min-h-[32rem] flex-col gap-3 min-[900px]:flex-row">
             <FileTreePanel paths={paths} active={active} onSelect={setActive} />
@@ -119,7 +122,7 @@ export function PlaybookDetailPage() {
       <SharesSection path="/api/playbooks/{id}" id={playbook.id} />
 
       <Section>
-        <SectionHeader title="Edit a copy" note={`seeded from ${playbook.rev.slice(0, 7)}`} />
+        <SectionHeader title="Edit a copy" note={`seeded from ${shortRev(playbook.rev)}`} />
         <SectionBody>
           <FormGrid>
             <TextField

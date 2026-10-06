@@ -102,7 +102,7 @@ impl Transport for RouterTransport {
 /// Merged outside the human bearer guard by [`crate::serve`], like `/metrics` and the ingest
 /// drop-box — each of those authenticates with the credential its callers actually hold, and
 /// an MCP client holds an API key.
-pub fn router(api: Router, pool: sqlx::PgPool, public_url: String) -> Router {
+pub fn router(api: Router, keys: crate::identity::auth::KeyGuard, public_url: String) -> Router {
     let mut config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
     config.allowed_hosts = allowed_hosts(&public_url);
     // Stateless: every request is a POST that stands on its own, answered as plain JSON rather
@@ -136,7 +136,7 @@ pub fn router(api: Router, pool: sqlx::PgPool, public_url: String) -> Router {
         .nest_service("/mcp", service)
         .layer(axum::middleware::from_fn(carry_caller))
         .layer(axum::middleware::from_fn_with_state(
-            pool,
+            keys,
             crate::identity::auth::require_api_key,
         ))
 }

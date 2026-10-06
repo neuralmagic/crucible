@@ -18,7 +18,30 @@ use anyhow::{Context, Result};
 /// dispatch state back off these events, so the text is a shared constant rather than a literal.
 pub(crate) const PLAYBOOK_DISPATCH_FAILED: &str = "playbook dispatch failed";
 
+/// Dispatch `issue`'s playbook launch, parking it when its pack is unconvertible.
 pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
+    let Err(e) = start(db, cfg, issue).await else {
+        return Ok(());
+    };
+    let Some(refusal) = e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>() else {
+        return Err(e);
+    };
+    crate::issues::transitions::park(
+        db.pool(),
+        db.events(),
+        &issue.key,
+        Status::New,
+        &ParkReason::PackUnconvertible {
+            digest: refusal.digest.clone(),
+            reason: refusal.reason.clone(),
+        },
+        ParkedBy::Machine,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let day = crate::clock::today_utc();
     if db
         .decline_if_over_ceiling(&day, cfg.effective().daily_cost_ceiling)
@@ -56,9 +79,8 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         None => {
             let pack = crate::playbooks::registry::get(db.pool(), &launch.playbook).await?;
             (
-                crate::secrets::launch::OwnedRevision::Published(
-                    pack.as_ref().map(|p| p.rev.clone()),
-                ),
+                crate::launches::store::launch_revision(db.pool(), &issue.key, &launch.playbook)
+                    .await?,
                 pack.and_then(|p| p.agent),
             )
         }
@@ -83,25 +105,38 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
                         },
                     });
             let catalog = crate::images::store::list_images(db.pool()).await?;
-            let verdict =
-                crate::playbooks::preflight::preflight(pack_agent, resolved.as_ref(), &catalog);
-            if verdict.refused() {
+            let pack = crate::playbooks::preflight::preflight_pack(
+                pack_agent,
+                resolved.as_ref(),
+                &catalog,
+            );
+            if pack.refused() {
                 crate::issues::transitions::park(
                     db.pool(),
                     db.events(),
                     &issue.key,
                     Status::New,
                     &ParkReason::ImagePreflightRefused {
-                        image: verdict
+                        image: pack
+                            .image
                             .reference
                             .unwrap_or_else(|| "(no image)".to_string()),
-                        detail: verdict.refusals.join("; "),
+                        detail: pack
+                            .refusals
+                            .iter()
+                            .map(|r| match r.field.as_str() {
+                                "sandbox_image" => r.message.clone(),
+                                field => format!("{field}: {}", r.message),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; "),
                     },
                     ParkedBy::Machine,
                 )
                 .await?;
                 return Ok(());
             }
+            let verdict = pack.image;
             crate::runs::model::RunImage {
                 reference: verdict.reference,
                 digest: verdict.digest,
@@ -112,18 +147,34 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
         None => crate::runs::model::RunImage::default(),
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
-    let exposure = match launch.exposure.clone() {
-        Some(exposure) => Some(exposure),
-        None => crate::playbooks::exposure::registered(db.pool(), &launch.playbook)
-            .await?
-            .flatten(),
+    let exposure =
+        crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await??;
+    let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
+    let launcher = match crate::authz::resolve::dispatch_principals(
+        db.pool(),
+        cfg.owner_refresh.as_deref(),
+        cfg.auth_mode,
+        launch.created_by.as_deref(),
+        &launch.launcher_groups,
+        &launch.created_at,
+    )
+    .await?
+    {
+        Ok(launcher) => launcher,
+        Err(unavailable) => {
+            if !crate::secrets::store::bindings_for_scope(db.pool(), scope.kind, &scope.id)
+                .await?
+                .is_empty()
+            {
+                tracing::warn!(issue_key = %issue.key, error = %unavailable, "playbook dispatch deferred");
+                return Ok(());
+            }
+            crate::authz::model::Principals::new(launch.created_by.as_deref(), &[])
+        }
     };
     let secrets = Some(crate::runs::workpod::LaunchSecrets {
-        scope: crate::secrets::launch::Scope::playbook(&launch.playbook),
-        launcher: crate::authz::model::Principals::new(
-            launch.created_by.as_deref(),
-            &launch.launcher_groups,
-        ),
+        scope,
+        launcher,
         revision,
         provider: cfg.secret_provider.clone(),
         inference_provider: dispatch.map(|d| d.provider),
@@ -319,16 +370,13 @@ async fn dispatch_pod(
     let pack = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key)
         .await?
         .with_context(|| format!("no stored pack for playbook launch {}", issue.key))?;
-    crate::launches::schedules::ScheduleStore::new(db.clone())
-        .stage_cursor_file(&issue.key, pack.path())
-        .await?;
     let admission = crate::runs::workpod::dispatch_run(
         db,
         cfg,
         crate::runs::workpod::active_dispatcher(),
         &issue.key,
         run_id,
-        pack.path(),
+        &pack,
         &std::collections::BTreeMap::new(),
         None,
         opts,

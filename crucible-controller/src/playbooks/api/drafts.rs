@@ -16,9 +16,10 @@ use crate::playbooks::drafts::{
     StaleBase,
 };
 
+use anyhow::Context as _;
 use axum::extract::{Path, Query, State};
 
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderName, StatusCode, header};
 
 use axum::response::{IntoResponse, Response};
 
@@ -75,6 +76,10 @@ pub struct DraftOriginDto {
     pub rev: Option<String>,
     /// The rev that pack serves now.
     pub current_rev: Option<String>,
+    /// The `tree1:` digest the draft was seeded from.
+    pub digest: Option<String>,
+    /// The `tree1:` digest that pack serves now.
+    pub current_digest: Option<String>,
     pub moved: bool,
 }
 
@@ -89,6 +94,8 @@ impl From<DraftOrigin> for DraftOriginDto {
             path: o.path,
             rev: o.rev,
             current_rev: o.current_rev,
+            digest: o.digest,
+            current_digest: o.current_digest,
             moved,
         }
     }
@@ -166,7 +173,9 @@ dto! {
     /// One save in a draft's history.
     pub struct DraftVersionDto: From<v: DraftVersionRow> {
         pub version: i64,
-        pub tar_digest: String,
+        /// The save's `tree1:` digest; null until startup conversion reaches a row an older
+        /// controller wrote.
+        pub tree_digest: Option<String> = v.tree_digest.as_ref().map(|t| t.to_string()),
         /// Null when this save did not compile.
         pub schema_digest: Option<String>,
         pub diagnostics: i64 = v.diagnostics.len() as i64,
@@ -256,7 +265,7 @@ pub(crate) struct CreateDraftBody {
     /// Revision rendered by the inspector; cloning refuses if the registry moved meanwhile.
     #[serde(default)]
     template_rev: Option<String>,
-    /// Pack digest rendered by the inspector; protects same-revision repoints.
+    /// Tree digest rendered by the inspector; protects same-revision repoints.
     #[serde(default)]
     template_digest: Option<String>,
 }
@@ -422,6 +431,35 @@ pub(crate) async fn list_playbook_drafts(
     ))
 }
 
+/// The limits a draft save and a pack are checked against.
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct PlaybookLimits {
+    /// The most files one draft version holds.
+    max_draft_files: usize,
+    /// The largest single draft file, in bytes.
+    max_draft_file_bytes: usize,
+    /// The largest draft save request body, in bytes.
+    max_draft_save_bytes: usize,
+    /// The most gzipped bytes a pack may deliver to a run. Save, registration, and publication
+    /// refuse a pack over it.
+    delivery_budget_bytes: usize,
+}
+
+/// `GET /api/playbook-limits` — the draft and delivery limits.
+#[utoipa::path(
+    get,
+    path = "/api/playbook-limits",
+    responses((status = 200, description = "Draft and delivery limits", body = PlaybookLimits))
+)]
+pub(crate) async fn get_playbook_limits() -> Json<PlaybookLimits> {
+    Json(PlaybookLimits {
+        max_draft_files: crate::playbooks::drafts::MAX_DRAFT_FILES,
+        max_draft_file_bytes: crate::playbooks::drafts::MAX_DRAFT_FILE_BYTES,
+        max_draft_save_bytes: crate::playbooks::drafts::MAX_DRAFT_SAVE_BYTES,
+        delivery_budget_bytes: crucible_contract::pack_tree::DELIVERY_BUDGET_BYTES,
+    })
+}
+
 /// `GET /api/playbook-drafts/{id}` — one draft with its save history.
 #[utoipa::path(
     get,
@@ -584,14 +622,16 @@ pub(crate) async fn get_playbook_draft_origin_files(
     }
 }
 
-/// `GET /api/playbook-drafts/{id}/tarball` — one save as the bytes it stored. The same pack the
-/// launch path materializes, handed to whoever wants it in their own editor or their own CI.
+/// `GET /api/playbook-drafts/{id}/tarball` — one save's pack as its tarball, with its `tree1:`
+/// digest in `X-Pack-Digest`. The same pack the launch path materializes, handed to whoever wants
+/// it in their own editor or their own CI.
 #[utoipa::path(
     get,
     path = "/api/playbook-drafts/{id}/tarball",
     params(("id" = String, Path, description = "Draft id"), VersionQuery),
     responses(
-        (status = 200, description = "The version's pack tarball", content_type = "application/gzip"),
+        (status = 200, description = "The version's pack tarball", content_type = "application/gzip",
+            headers(("X-Pack-Digest" = String, description = "The pack's tree1: digest"))),
         (status = 404, description = "No draft or no such version", body = ErrorBody)
     )
 )]
@@ -606,14 +646,21 @@ pub(crate) async fn get_playbook_draft_tarball(
     {
         return Ok(refused);
     }
-    let Some((version, tar_gz)) =
-        crate::playbooks::drafts::tarball(state.db.pool(), &id, query.version).await?
+    let Some((version, tree)) =
+        crate::playbooks::drafts::version_tree(state.db.pool(), &id, query.version).await?
     else {
         return Ok(not_found(format!("no draft {id:?} at that version")));
     };
+    let tarball = tree
+        .tarball()
+        .context("encoding the draft pack for download")?;
     Ok((
         [
             (header::CONTENT_TYPE, "application/gzip".to_string()),
+            (
+                HeaderName::from_static(PACK_DIGEST_HEADER),
+                tree.digest().to_string(),
+            ),
             (
                 header::CONTENT_DISPOSITION,
                 format!(
@@ -622,10 +669,13 @@ pub(crate) async fn get_playbook_draft_tarball(
                 ),
             ),
         ],
-        tar_gz,
+        tarball,
     )
         .into_response())
 }
+
+/// The response header a pack download carries its `tree1:` digest in.
+pub(crate) const PACK_DIGEST_HEADER: &str = "x-pack-digest";
 
 /// A draft id is a validated slug, but the download names a file with it, so anything that is not
 /// one is flattened rather than trusted into a header.
@@ -900,7 +950,7 @@ pub(crate) async fn launch_playbook_draft(
         origin: crate::model::LaunchOrigin::Draft,
         draft_version: Some(latest.version),
         created_by: actor,
-        launcher_groups: None,
+        launcher_groups: Some(&saver.groups),
     };
     // A draft's content changes on every save, so the disclosure is recomputed from the version
     // being launched and lands in the same transaction that adopts it, before anything executes.
@@ -921,19 +971,19 @@ pub(crate) async fn launch_playbook_draft(
         Err(e) => return AppError::from(e).into_response(),
     };
 
-    use crate::launches::store::AdoptPlaybookOutcome;
+    use crate::launches::store::AdoptDraftOutcome;
     match crate::launches::store::adopt_draft_launch(state.db.pool(), &key, &launch, &exposure)
         .await
     {
-        Ok(AdoptPlaybookOutcome::Adopted) => {
+        Ok(AdoptDraftOutcome::Adopted) => {
             if let Err(refusal) =
                 crate::playbooks::api::saver::pin_dispatch(&state, &key, &saver).await
             {
                 return refusal;
             }
         }
-        Ok(AdoptPlaybookOutcome::UnknownPlaybook) => return not_found(format!("no draft {id:?}")),
-        Ok(AdoptPlaybookOutcome::SchemaDrifted { current }) => {
+        Ok(AdoptDraftOutcome::UnknownDraft) => return not_found(format!("no draft {id:?}")),
+        Ok(AdoptDraftOutcome::Saved { current }) => {
             return (
                 StatusCode::CONFLICT,
                 Json(ErrorBody::new(format!(
@@ -1124,7 +1174,7 @@ pub(crate) async fn publish_playbook_draft(
     {
         return refused;
     }
-    let (version, tar_gz) =
+    let (version, tree) =
         match crate::playbooks::drafts::newest_compiling(state.db.pool(), &id).await {
             Ok(newest) => newest,
             Err(e) => return draft_refusal(e),
@@ -1137,7 +1187,7 @@ pub(crate) async fn publish_playbook_draft(
         description: draft.description,
         draft: id.clone(),
         version,
-        tar_gz,
+        tree,
         replaces,
         accept_exposure_digest: body
             .accept_exposure_digest

@@ -103,6 +103,7 @@ pub(crate) fn run_iteration<R: Reporter>(
     // The runner and the on_result hook both need the reporter; collect the wire lines
     // here and append them after the executor returns (they're additive either way).
     let mut task_events = Vec::new();
+    let agent_args = runner.args.clone();
     let outcome = execute(
         &plan,
         &Substrate::detecting(
@@ -118,6 +119,7 @@ pub(crate) fn run_iteration<R: Reporter>(
                 cx.it,
                 task,
                 result,
+                Some(&agent_args),
             ));
         },
     )?;
@@ -254,6 +256,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
             commit_per_task: false,
             captured_bytes: std::sync::atomic::AtomicU64::new(0),
             staged: Default::default(),
+            budget_left: f64::INFINITY,
         },
         kept: kept.to_value(),
     };
@@ -272,6 +275,7 @@ pub(crate) fn run_epilogue<R: Reporter>(
                 kept.iter,
                 task,
                 result,
+                Some(args),
             ));
         },
     )?;
@@ -380,6 +384,10 @@ impl TaskRunner for EpilogueRunner {
     fn drop_captured(&mut self, task: &Task) {
         self.inner.drop_captured(task);
     }
+
+    fn budget_left(&mut self, usd: f64) {
+        self.inner.budget_left(usd);
+    }
 }
 
 /// What the propose task's post-turn drains decided, parked here for the driver: the
@@ -426,6 +434,7 @@ fn harness_runner(args: &Args, p: &Paths) -> crate::plan::harness::HarnessRunner
         commit_per_task: false,
         captured_bytes: std::sync::atomic::AtomicU64::new(0),
         staged: Default::default(),
+        budget_left: f64::INFINITY,
     }
 }
 
@@ -529,6 +538,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
             TurnVerdict::Proceed => Attempt {
                 outcome: AttemptOutcome::Pass(serde_json::json!({ "cost_usd": cost })),
                 cost_usd: cost,
+                repairs: Vec::new(),
             },
             TurnVerdict::Discard => {
                 self.signal = Some(Signal::Discard("turn failed".to_string()));
@@ -542,6 +552,7 @@ impl<R: Reporter> LoopTaskRunner<R> {
                     why,
                 )),
                 cost_usd: cost,
+                repairs: Vec::new(),
             },
             TurnVerdict::Escalate => {
                 self.signal = Some(Signal::Escalate);
@@ -785,6 +796,10 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
     fn drop_captured(&mut self, task: &Task) {
         self.workflow_runner.drop_captured(task);
     }
+
+    fn budget_left(&mut self, usd: f64) {
+        self.workflow_runner.budget_left(usd);
+    }
 }
 
 /// The graded reading's detail JSON, which the judge stringifies into the RESULTS row's
@@ -809,6 +824,7 @@ fn pass(v: Value) -> Attempt {
     Attempt {
         outcome: AttemptOutcome::Pass(v),
         cost_usd: 0.0,
+        repairs: Vec::new(),
     }
 }
 
@@ -919,6 +935,7 @@ pub(crate) fn run_wide_tournament<R: Reporter>(
                 0,
                 task,
                 result,
+                Some(args),
             ));
         },
     )?;
@@ -996,6 +1013,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
                 harness: None,
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -1012,6 +1030,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         });
     }
     for id in 0..cfg.n {
@@ -1037,6 +1056,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         });
     }
     tasks.push(Task {
@@ -1062,6 +1082,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         revise: None,
         timeout: None,
         history: None,
+        repair: 0,
     });
     Plan {
         version: 1,
@@ -1430,6 +1451,7 @@ mod tests {
             commit_per_task: false,
             captured_bytes: std::sync::atomic::AtomicU64::new(0),
             staged: Default::default(),
+            budget_left: f64::INFINITY,
         }
     }
 

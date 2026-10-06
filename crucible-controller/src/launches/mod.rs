@@ -2,7 +2,6 @@
 //! that fire it (a cron schedule, a one-shot, a tracker watch, a webhook), with the tracker clients and the
 //! review-trail emission that follow a launch.
 
-pub mod announce;
 pub(crate) mod api;
 pub mod emission;
 pub mod jira;

@@ -4,6 +4,7 @@ use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureC
 use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, OTEL_COLLECTOR_PORT};
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
+use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::networking::v1 as networking;
@@ -41,11 +42,11 @@ pub enum RenderError {
     )]
     EmptyPackDir { path: std::path::PathBuf },
     #[error(
-        "pack at {} is {bytes} bytes, over the {CONFIGMAP_MAX_BYTES}-byte ConfigMap budget — \
-         it won't fit in a ConfigMap; shrink the pack",
+        "pack at {} delivers {bytes} gzipped bytes, over the {DELIVERY_BUDGET_BYTES}-byte \
+         delivery budget; shrink the pack",
         .path.display()
     )]
-    PackOverConfigMapBudget {
+    PackOverDeliveryBudget {
         path: std::path::PathBuf,
         bytes: usize,
     },
@@ -161,6 +162,10 @@ pub struct PackDelivery {
     /// fixed directory name, so without this every run renders under the same name and shares
     /// its state subtree and claim.
     pub run_name: String,
+    /// Per-run files that are not pack content (steering, a schedule's cursor file). They ride
+    /// their own ConfigMap key and `pack-stage` writes them over the extracted pack, so the pack
+    /// key holds exactly the pack's tree.
+    pub inputs: BTreeMap<PackFilePath, Vec<u8>>,
 }
 
 /// The knobs a playbook launch supplies (see [`RenderOpts::playbook`]).
@@ -187,16 +192,19 @@ pub(super) const INGEST_TOKEN_TTL_SECS: i64 = 900;
 /// The in-pod init-container mount where the pack ConfigMap is projected (read-only) before it is
 /// staged into the writable domain dir.
 const PACK_SRC_DIR: &str = "/opt/crucible/pack-src";
-/// The pod-volume name for the pack ConfigMap projection.
+/// The pod-volume name for the pack ConfigMap (the tarball `pack-stage` extracts).
 const PACK_CM_VOLUME: &str = "pack-cm";
 /// The pod-volume name for the writable emptyDir the pack is staged into (the domain dir the wrapper
 /// resolves). Read-write: the loop writes `STEER.md`, `state/`, and the cloned workspace INTO the
-/// manifest dir, so a bare read-only ConfigMap mount would break it, the init-container copy is what
-/// makes the whole tree writable while still frozen-inject honest (see `command_judge`'s re-copy).
+/// manifest dir, so a bare read-only ConfigMap mount would break it; extracting the tarball here is
+/// what makes the whole tree writable while still frozen-inject honest (see `command_judge`'s re-copy).
 const PACK_WORKDIR_VOLUME: &str = "pack-workdir";
-/// A ConfigMap's hard size limit (1 MiB of keys). Packs are capped well under this upstream (#134);
-/// this is a defensive floor so an oversize pack fails the render loudly, not the kubelet silently.
-const CONFIGMAP_MAX_BYTES: usize = 900 * 1024;
+/// The pack ConfigMap key holding the pack's gzipped tar, which `pack-stage` extracts into the
+/// domain dir.
+pub const PACK_TARBALL_KEY: &str = "pack.tar.gz";
+/// The pack ConfigMap key holding [`PackDelivery::inputs`] as a gzipped tar, present only when
+/// there are inputs.
+pub const RUN_INPUTS_KEY: &str = "inputs.tar.gz";
 
 /// POSIX single-quote one argv element for the `/bin/sh -c` wrapper.
 fn sh_quote(s: &str) -> String {
@@ -226,6 +234,8 @@ pub struct RenderInput<'a> {
     /// (`/sandbox/<basename>`, the openshell driver's upload rule), projected as
     /// BROKER_SANDBOX_WORKDIR so the broker's live-sandbox pull targets the real tree.
     pub workspace_dir: &'a str,
+    /// The `[mcp]` servers the loop pod starts, one ingress port apiece.
+    pub mcp: &'a BTreeMap<String, crate::manifest::McpCfg>,
 }
 
 impl<'a> RenderInput<'a> {
@@ -245,6 +255,7 @@ impl<'a> RenderInput<'a> {
             deploy_targets,
             measure: composite.measure.as_ref(),
             workspace_dir: &composite.workspace.dir,
+            mcp: &composite.mcp,
         })
     }
 
@@ -280,6 +291,7 @@ impl<'a> RenderInput<'a> {
             deploy_targets,
             measure: manifest.measure.as_ref(),
             workspace_dir: &manifest.workspace.dir,
+            mcp: &manifest.mcp,
         }
     }
 }
@@ -328,7 +340,6 @@ pub fn render(
     let r = Renderer {
         input,
         domain,
-        manifest_dir,
         manifest_file,
         profile,
         opts,
@@ -361,149 +372,66 @@ pub fn render(
     // pack) keeps its exact three-doc [pod, rbac, netpol] layout, the controller extracts by `kind`,
     // never by index, so ordering is free here.
     if let Some(pack) = &opts.pack {
-        let cm = pack_configmap(
-            manifest_dir,
-            &pack.configmap_name,
-            &profile.cluster.loop_namespace,
-        )
-        .context("building the pack ConfigMap")?;
+        let cm = pack_configmap(manifest_dir, pack, &profile.cluster.loop_namespace)
+            .context("building the pack ConfigMap")?;
         let cm_yaml = serde_norway::to_string(&cm).context("serializing the pack ConfigMap")?;
         out.push_str(&format!("---\n{cm_yaml}"));
     }
     Ok(out)
 }
 
-/// Collect every pack file under `manifest_dir` into a ConfigMap: text files land in `data`, any
-/// non-UTF-8 file in `binaryData` (base64), and each file's key→relative-path mapping is preserved so
-/// the volume that mounts this CM reproduces the pack's EXACT layout, nested `tools/measure.sh` and
-/// all. ConfigMap data keys can't contain `/`, so a nested path is stored under a slash-free key while
-/// its true relative path rides the volume's `items:` mapping (emitted by the pod builder). The
-/// per-run `state/`, `.git/`, and any `workspace/` are skipped: they're pod-side runtime, never pack
-/// content. The [`CONFIGMAP_MAX_BYTES`] guard fails an oversize pack loudly (packs are capped upstream,
-/// so this only ever catches a regression).
-fn pack_configmap(manifest_dir: &Path, name: &str, namespace: &str) -> Result<core::ConfigMap> {
-    let files = collect_pack_files(manifest_dir)?;
-    if files.is_empty() {
+/// The pack ConfigMap: a `binaryData` key holding the
+/// [`crucible_contract::pack_tree::PackTree::tarball`] of the pack at `manifest_dir`, and one
+/// holding the run's inputs when it has any. Fails with [`RenderError::EmptyPackDir`] when the
+/// pack has no files and with [`RenderError::PackOverDeliveryBudget`] when the two tarballs
+/// together are over [`DELIVERY_BUDGET_BYTES`].
+fn pack_configmap(
+    manifest_dir: &Path,
+    pack: &PackDelivery,
+    namespace: &str,
+) -> Result<core::ConfigMap> {
+    let tree = walk_dir(manifest_dir)
+        .with_context(|| format!("reading the pack at {}", manifest_dir.display()))?
+        .tree;
+    if tree.is_empty() {
         return Err(RenderError::EmptyPackDir {
             path: manifest_dir.to_path_buf(),
         }
         .into());
     }
-    let total: usize = files.iter().map(|(_, b)| b.len()).sum();
-    if total > CONFIGMAP_MAX_BYTES {
-        return Err(RenderError::PackOverConfigMapBudget {
+    let mut binary_data = BTreeMap::from([(
+        PACK_TARBALL_KEY.to_string(),
+        tree.tarball().context("encoding the pack tarball")?,
+    )]);
+    if !pack.inputs.is_empty() {
+        binary_data.insert(
+            RUN_INPUTS_KEY.to_string(),
+            encode_tarball(&pack.inputs).context("encoding the run inputs")?,
+        );
+    }
+    let delivered = binary_data.values().map(Vec::len).sum::<usize>();
+    if delivered > DELIVERY_BUDGET_BYTES {
+        return Err(RenderError::PackOverDeliveryBudget {
             path: manifest_dir.to_path_buf(),
-            bytes: total,
+            bytes: delivered,
         }
         .into());
     }
-    let mut data: BTreeMap<String, String> = BTreeMap::new();
-    let mut binary: BTreeMap<String, k8s_openapi::ByteString> = BTreeMap::new();
-    let mut used_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    for (rel, bytes) in &files {
-        let key = unique_key(rel, &mut used_keys);
-        match String::from_utf8(bytes.clone()) {
-            Ok(text) => {
-                data.insert(key, text);
-            }
-            Err(_) => {
-                binary.insert(key, k8s_openapi::ByteString(bytes.clone()));
-            }
-        }
-    }
     Ok(core::ConfigMap {
         metadata: ObjectMeta {
-            name: Some(name.to_string()),
+            name: Some(pack.configmap_name.clone()),
             namespace: Some(namespace.to_string()),
             ..Default::default()
         },
-        data: (!data.is_empty()).then_some(data),
-        binary_data: (!binary.is_empty()).then_some(binary),
+        binary_data: Some(
+            binary_data
+                .into_iter()
+                .map(|(key, bytes)| (key, k8s_openapi::ByteString(bytes)))
+                .collect(),
+        ),
         immutable: Some(true),
+        ..Default::default()
     })
-}
-
-/// The `key → relative-path` list the pod's ConfigMap volume mounts with (`items:`), so the projected
-/// tree matches the pack layout exactly (subdirs and all). Deterministic: same walk + same key
-/// disambiguation as [`pack_configmap`], so the CM keys and the volume items always line up.
-fn pack_configmap_items(manifest_dir: &Path) -> Result<Vec<core::KeyToPath>> {
-    let files = collect_pack_files(manifest_dir)?;
-    let mut used_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    Ok(files
-        .iter()
-        .map(|(rel, _)| {
-            let key = unique_key(rel, &mut used_keys);
-            core::KeyToPath {
-                key,
-                path: rel.clone(),
-                mode: None,
-            }
-        })
-        .collect())
-}
-
-/// A slash-free, ConfigMap-legal key for a pack file's relative path. Replaces every char outside
-/// `[-._a-zA-Z0-9]` (notably `/`) with `_`, then disambiguates a collision with a `-N` suffix. The
-/// key spelling is cosmetic (the volume's `items:` entry carries the file's TRUE path) but it must
-/// be unique and legal, so two paths that sanitize alike still get distinct keys.
-fn unique_key(rel: &str, used: &mut std::collections::BTreeSet<String>) -> String {
-    let base: String = rel
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if used.insert(base.clone()) {
-        return base;
-    }
-    for n in 1.. {
-        let candidate = format!("{base}-{n}");
-        if used.insert(candidate.clone()) {
-            return candidate;
-        }
-    }
-    unreachable!("the counter is unbounded")
-}
-
-/// Walk `manifest_dir` and return `(relative-path, bytes)` for every pack file, sorted by path (a
-/// stable render). Skips pod-side runtime dirs (`state/`, `.git/`, `workspace/`) at any depth. Paths
-/// use `/` separators (the in-pod layout), independent of the host OS.
-fn collect_pack_files(manifest_dir: &Path) -> Result<Vec<(String, Vec<u8>)>> {
-    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) -> Result<()> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir)
-            .with_context(|| format!("reading pack dir {}", dir.display()))?
-            .collect::<std::io::Result<Vec<_>>>()
-            .with_context(|| format!("listing pack dir {}", dir.display()))?;
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let rel = if prefix.is_empty() {
-                name.clone()
-            } else {
-                format!("{prefix}/{name}")
-            };
-            let file_type = entry.file_type().with_context(|| format!("stat {rel}"))?;
-            if file_type.is_dir() {
-                // Pod-side runtime, never pack content, the loop creates these IN the pod.
-                if matches!(name.as_str(), "state" | ".git" | "workspace") {
-                    continue;
-                }
-                walk(&entry.path(), &rel, out)?;
-            } else if file_type.is_file() {
-                let bytes = std::fs::read(entry.path())
-                    .with_context(|| format!("reading pack file {rel}"))?;
-                out.push((rel, bytes));
-            }
-        }
-        Ok(())
-    }
-    let mut out = Vec::new();
-    walk(manifest_dir, "", &mut out)?;
-    Ok(out)
 }
 
 /// One render's resolved inputs, the shared context every builder method reads, so the helpers stop
@@ -512,9 +440,6 @@ struct Renderer<'a> {
     input: RenderInput<'a>,
     /// The domain pack's directory name (where the loop image baked it).
     domain: &'a str,
-    /// The pack dir on disk (the manifest's parent), walked to build the ConfigMap `items:` mapping
-    /// under pack delivery. Unused for a baked-domain render.
-    manifest_dir: &'a Path,
     /// The manifest's file name (the wrapper passes it to the nested `crucible --manifest`).
     manifest_file: &'a str,
     profile: &'a DeployProfile,
@@ -642,6 +567,18 @@ impl Renderer<'_> {
         }
     }
 
+    /// The run-state claim mounted over the domain dir's `state/`, or None when this render
+    /// persists nothing.
+    fn state_mount(&self) -> Option<core::VolumeMount> {
+        self.state_pvc()?;
+        Some(core::VolumeMount {
+            name: "run-state".to_string(),
+            mount_path: format!("{}/state", self.domain_dir()),
+            sub_path: self.state_sub_path(),
+            ..Default::default()
+        })
+    }
+
     /// Generated when `state_pvc` is a template. No ownerReferences: a static render has no owner
     /// UID to point at, and the claim outliving the pod is the point.
     fn state_pvc_doc(&self) -> Option<core::PersistentVolumeClaim> {
@@ -758,34 +695,46 @@ impl Renderer<'_> {
         )
     }
 
-    /// The pack-staging init-container, present only under pack delivery: copy the read-only ConfigMap
-    /// projection into the writable domain-dir emptyDir so the main container reads AND writes there
-    /// (`STEER.md`, `state/`, the workspace clone). `-L` dereferences the ConfigMap's `..data` symlinks
-    /// into real files. Reuses the loop image (it has `/bin/sh` + `cp`), no extra pull.
+    /// The pack-staging init-container, present only under pack delivery: extract the ConfigMap's pack
+    /// tarball into the writable domain-dir emptyDir so the main container reads AND writes there
+    /// (`STEER.md`, `state/`, the workspace clone). It mounts the run-state claim where the main
+    /// container does, so inputs under `state/` land where the run reads them. Reuses the loop
+    /// image (it has `/bin/sh`, `tar`, and `gzip`), no extra pull.
     fn init_containers(&self) -> Option<Vec<core::Container>> {
-        let _pack = self.opts.pack.as_ref()?;
+        let pack = self.opts.pack.as_ref()?;
         let domain_dir = self.domain_dir();
+        let mut script = format!(
+            "set -e\nmkdir -p {domain_dir}\ntar -xzf {PACK_SRC_DIR}/{PACK_TARBALL_KEY} -C {domain_dir}\n"
+        );
+        if !pack.inputs.is_empty() {
+            script.push_str(&format!(
+                "tar -xzf {PACK_SRC_DIR}/{RUN_INPUTS_KEY} -C {domain_dir}\n"
+            ));
+        }
         Some(vec![core::Container {
             name: "pack-stage".to_string(),
             image: Some(self.image.clone()),
             image_pull_policy: Some("IfNotPresent".to_string()),
             command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-            args: Some(vec![format!(
-                "set -e\nmkdir -p {domain_dir}\ncp -rL {PACK_SRC_DIR}/. {domain_dir}/\n"
-            )]),
-            volume_mounts: Some(vec![
-                core::VolumeMount {
-                    name: PACK_CM_VOLUME.to_string(),
-                    mount_path: PACK_SRC_DIR.to_string(),
-                    read_only: Some(true),
-                    ..Default::default()
-                },
-                core::VolumeMount {
-                    name: PACK_WORKDIR_VOLUME.to_string(),
-                    mount_path: domain_dir,
-                    ..Default::default()
-                },
-            ]),
+            args: Some(vec![script]),
+            volume_mounts: Some(
+                [
+                    core::VolumeMount {
+                        name: PACK_CM_VOLUME.to_string(),
+                        mount_path: PACK_SRC_DIR.to_string(),
+                        read_only: Some(true),
+                        ..Default::default()
+                    },
+                    core::VolumeMount {
+                        name: PACK_WORKDIR_VOLUME.to_string(),
+                        mount_path: domain_dir,
+                        ..Default::default()
+                    },
+                ]
+                .into_iter()
+                .chain(self.state_mount())
+                .collect(),
+            ),
             ..Default::default()
         }])
     }
@@ -1078,6 +1027,7 @@ exit $rc
         let harness_flag = harness_flag(self.opts.harness, '=');
         let model_flag = model_flag(self.opts.model.as_ref(), '=');
         let resume_flag = self.resume_flag();
+        let ended = crate::plan::INVALID_VERDICT_EXIT;
         Ok(format!(
             r#"D={domain_dir}
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
@@ -1087,6 +1037,7 @@ if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
+case $rc in {ended}) exit 0 ;; esac
 exit $rc
 "#
         ))
@@ -1133,14 +1084,7 @@ exit $rc
         }
         // Persistent run state: mounted OVER the domain dir's state/ subdir so session.jsonl and
         // the agent-session files outlive the pod (the wrapper's `--resume` reads them back).
-        if self.state_pvc().is_some() {
-            mounts.push(core::VolumeMount {
-                name: "run-state".to_string(),
-                mount_path: format!("{}/state", self.domain_dir()),
-                sub_path: self.state_sub_path(),
-                ..Default::default()
-            });
-        }
+        mounts.extend(self.state_mount());
         // Tier 2 ingest token (Tier 2 ingest): the projected `crucible-ingest`-audience token the loop
         // reads to POST its run-session. Mounted read-only, only when the drop-box URL is configured.
         if self.profile.cluster.ingest_url.is_some() {
@@ -1280,23 +1224,13 @@ exit $rc
             ..Default::default()
         });
 
-        // Pack delivery: the read-only ConfigMap projection (items preserve the pack's nested layout)
-        // + the writable emptyDir the init-container stages it into.
+        // Pack delivery: the read-only ConfigMap holding the pack tarball + the writable emptyDir the
+        // init-container extracts it into.
         if let Some(pack) = &self.opts.pack {
-            // Re-walk the same pack dir `render()` fed the ConfigMap builder, so keys ↔ items line up.
-            // An unreadable pack dir already failed the CM build in `render()`, so an empty list here
-            // only ever means a flat pack (no nesting), which needs no `items:`.
-            let items = pack_configmap_items(self.manifest_dir).unwrap_or_default();
             volumes.push(core::Volume {
                 name: PACK_CM_VOLUME.to_string(),
                 config_map: Some(core::ConfigMapVolumeSource {
                     name: pack.configmap_name.clone(),
-                    items: (!items.is_empty()).then_some(items),
-                    // ConfigMap volumes default files to 0644; the staging `cp` preserves that and
-                    // the pack's gate scripts lose their execute bit, iteration 0 then dies with
-                    // "measure produced no JSON line" (the live failure). 0755 across the pack is
-                    // harmless: it's all text the loop already trusts.
-                    default_mode: Some(0o755),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1395,9 +1329,9 @@ exit $rc
     /// NetworkPolicy on the loop pod. Under `podman` the sandbox is nested inside the loop pod and
     /// reaches the broker over the pod-internal bridge (traffic a NetworkPolicy never sees), so this
     /// is a pure deny-all-ingress lockdown. Under `kubernetes` the sandbox is a sibling pod, so
-    /// gateway (:17670), broker (:8849), and OTLP collector (:17671) traffic becomes real cluster
-    /// networking. The policy then allows ingress **only** from sandbox pods, **only** on those
-    /// three ports. Sandbox pods are
+    /// gateway (:17670), broker (:8849), OTLP collector (:17671), and `[mcp]` server traffic becomes
+    /// real cluster networking. The policy then allows ingress **only** from sandbox pods, **only**
+    /// on those ports. Sandbox pods are
     /// matched by either identity they may carry: the OpenShell managed-by label (the driver only
     /// stamps it on SPIFFE-enabled pods since the CRD path landed), or the agent-sandbox
     /// controller's name-hash label, which every Sandbox-CR pod gets. Dropping either selector
@@ -1406,6 +1340,13 @@ exit $rc
     /// survives either way. Defense in depth alongside the broker's bearer token. Egress is
     /// untouched (registry, k8s API, forges, Vertex).
     fn netpol(&self) -> networking::NetworkPolicy {
+        let mcp_ports = crate::manifest::mcp::ports(self.input.mcp).map(|(_, port)| {
+            networking::NetworkPolicyPort {
+                port: Some(IntOrString::Int(port.into())),
+                protocol: Some("TCP".to_string()),
+                ..Default::default()
+            }
+        });
         let ingress = match self.driver {
             ComputeDriver::Podman => None,
             ComputeDriver::Kubernetes => Some(vec![networking::NetworkPolicyIngressRule {
@@ -1432,30 +1373,35 @@ exit $rc
                         ..Default::default()
                     },
                 ]),
-                ports: Some(vec![
-                    networking::NetworkPolicyPort {
-                        port: Some(IntOrString::Int(GATEWAY_PORT.into())),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    networking::NetworkPolicyPort {
-                        // The manifest's `[agent.broker].bind` port, never a second constant: a
-                        // domain that moves the broker must not silently lose its ingress rule.
-                        port: Some(IntOrString::Int(broker_ingress_port(
-                            &self.input.agent.broker.bind,
-                        ))),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                    networking::NetworkPolicyPort {
-                        // The turn's in-process OTLP collector; the agent's exporter posts here
-                        // from the sandbox. Rendered unconditionally: with telemetry off nothing
-                        // listens and the rule is inert.
-                        port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
-                        protocol: Some("TCP".to_string()),
-                        ..Default::default()
-                    },
-                ]),
+                ports: Some(
+                    vec![
+                        networking::NetworkPolicyPort {
+                            port: Some(IntOrString::Int(GATEWAY_PORT.into())),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                        networking::NetworkPolicyPort {
+                            // The manifest's `[agent.broker].bind` port, never a second constant: a
+                            // domain that moves the broker must not silently lose its ingress rule.
+                            port: Some(IntOrString::Int(broker_ingress_port(
+                                &self.input.agent.broker.bind,
+                            ))),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                        networking::NetworkPolicyPort {
+                            // The turn's in-process OTLP collector; the agent's exporter posts here
+                            // from the sandbox. Rendered unconditionally: with telemetry off nothing
+                            // listens and the rule is inert.
+                            port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
+                            protocol: Some("TCP".to_string()),
+                            ..Default::default()
+                        },
+                    ]
+                    .into_iter()
+                    .chain(mcp_ports)
+                    .collect(),
+                ),
             }]),
         };
         networking::NetworkPolicy {
@@ -2604,6 +2550,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-llm-d-1650-pack".to_string(),
                     run_name: "alpha".to_string(),
+                    inputs: Default::default(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -2631,14 +2578,13 @@ mod tests {
             cm.contains("name: crucible-run-llm-d-1650-pack"),
             "CM named from the controller-supplied name: {cm}"
         );
-        // Every pack file rides the CM data (text), the stale state/ file does NOT.
-        assert!(cm.contains("crucible.toml"));
-        assert!(cm.contains("goal.md"));
-        assert!(cm.contains("immutable: true"), "pack CM is immutable");
+        // The whole pack rides one binary key; no file is spelled out as its own key.
         assert!(
-            !cm.contains("STALE") && !cm.contains("session.jsonl"),
-            "the runtime state/ dir is skipped, never delivered: {cm}"
+            cm.contains("binaryData:") && cm.contains("pack.tar.gz:"),
+            "{cm}"
         );
+        assert!(!cm.contains("\ndata:"), "no per-file text keys: {cm}");
+        assert!(cm.contains("immutable: true"), "pack CM is immutable");
 
         // The pod mounts the CM by the same name and stages it into the domain dir the wrapper resolves.
         assert!(
@@ -2648,66 +2594,359 @@ mod tests {
         assert!(docs[0].contains("pack-stage"), "the staging init-container");
         assert!(
             docs[0].contains(
-                "cp -rL /opt/crucible/pack-src/. /opt/crucible/domains/llm-d_llm-d-router_1650/"
+                "tar -xzf /opt/crucible/pack-src/pack.tar.gz -C /opt/crucible/domains/llm-d_llm-d-router_1650"
             ),
-            "init copies the CM into the writable domain dir: {}",
+            "init extracts the pack tarball into the writable domain dir: {}",
+            docs[0]
+        );
+        assert!(
+            docs[0].contains(
+                "- configMap:\n      name: crucible-run-llm-d-1650-pack\n    name: pack-cm\n"
+            ),
+            "the pack volume mounts the whole ConfigMap, no per-file items: {}",
             docs[0]
         );
         // The main container mounts the writable emptyDir at the domain path (so STEER.md/state writes).
         assert!(docs[0].contains("mountPath: /opt/crucible/domains/llm-d_llm-d-router_1650"));
+        assert!(
+            !yaml.contains(RUN_INPUTS_KEY),
+            "a run without inputs has no inputs key or extraction"
+        );
     }
 
-    /// A nested pack file (`tools/measure.sh`) round-trips exactly through the mount: its slash-free
-    /// ConfigMap key maps back to the real `tools/measure.sh` path via the volume's `items:` entry, so
-    /// the projected tree reproduces the pack layout the loop expects.
+    /// A delivery under ConfigMap name `cm` carrying `inputs`.
+    fn delivery(inputs: BTreeMap<PackFilePath, Vec<u8>>) -> PackDelivery {
+        PackDelivery {
+            configmap_name: "cm".to_string(),
+            run_name: "run".to_string(),
+            inputs,
+        }
+    }
+
+    /// Per-run inputs ride their own key, the pack key stays the pack's own tarball, and
+    /// `pack-stage` extracts the inputs over the pack, excluded paths included.
     #[test]
-    fn pack_render_preserves_nested_paths_via_items() {
+    fn run_inputs_ride_beside_the_pack_and_stage_over_it() {
         let (manifest, profile) = pack_manifest_and_profile();
-        let tmp = Scratch::new("nested");
-        let dir = tmp.path().join("pack");
+        let tmp = Scratch::new("inputs");
+        let dir = tmp.path().join("llm-d_llm-d-router_1650");
         std::fs::create_dir_all(&dir).expect("mkdir pack");
         write_pack_dir(&dir);
+        let inputs = BTreeMap::from([
+            ("goal.md".parse().expect("path"), b"# steered\n".to_vec()),
+            ("state/cursor.json".parse().expect("path"), b"{}".to_vec()),
+        ]);
 
-        let input = RenderInput::from_manifest(&manifest, "pack").expect("render input");
+        let mut cm = pack_configmap(&dir, &delivery(inputs.clone()), "ns").expect("configmap");
+        let mut data = cm.binary_data.take().expect("binary data");
+        assert_eq!(
+            data.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec![RUN_INPUTS_KEY, PACK_TARBALL_KEY]
+        );
+        let pack = data.remove(PACK_TARBALL_KEY).expect("pack").0;
+        assert_eq!(
+            pack,
+            delivered_tarball(&dir),
+            "the pack key ignores the inputs"
+        );
+        let staged = data.remove(RUN_INPUTS_KEY).expect("inputs").0;
+        assert_eq!(
+            unpack_delivery(&staged),
+            vec![
+                ("goal.md".to_string(), 0o755, b"# steered\n".to_vec()),
+                ("state/cursor.json".to_string(), 0o755, b"{}".to_vec()),
+            ]
+        );
+
+        let out = tmp.path().join("domain");
+        std::fs::create_dir_all(&out).expect("mkdir domain");
+        for (key, bytes) in [(PACK_TARBALL_KEY, &pack), (RUN_INPUTS_KEY, &staged)] {
+            let path = tmp.path().join(key);
+            std::fs::write(&path, bytes).expect("write");
+            let status = std::process::Command::new("tar")
+                .arg("-xzf")
+                .arg(&path)
+                .arg("-C")
+                .arg(&out)
+                .status()
+                .expect("run tar");
+            assert!(status.success(), "tar -xzf {key} exits 0");
+        }
+        assert_eq!(
+            std::fs::read(out.join("goal.md")).expect("goal"),
+            b"# steered\n"
+        );
+        assert_eq!(
+            std::fs::read(out.join("state/cursor.json")).expect("cursor"),
+            b"{}"
+        );
+        assert_eq!(
+            std::fs::read(out.join("tools/measure.sh")).expect("measure"),
+            b"#!/bin/sh\necho 1\n"
+        );
+
+        let input =
+            RenderInput::from_manifest(&manifest, "llm-d_llm-d-router_1650").expect("render input");
         let yaml = render(
             input,
             &dir,
             "crucible.toml",
             &profile,
             &RenderOpts {
-                iterations: 1,
-                max_cost: 0.0,
-                digests: None,
-                pr_repo: None,
-                pack: Some(PackDelivery {
-                    configmap_name: "pack-cm-name".to_string(),
-                    run_name: "alpha".to_string(),
-                }),
-                clusters_file: None,
-                harness: None,
-                model: None,
-                playbook: None,
+                pack: Some(delivery(inputs)),
+                ..RenderOpts::default()
             },
         )
         .expect("render");
-
-        // The CM key can't hold a `/`, so the nested file lands under a slash-free key.
-        let cm = yaml
-            .split("\n---\n")
-            .find(|d| d.contains("kind: ConfigMap"))
-            .expect("configmap");
+        let domain = "-C /opt/crucible/domains/llm-d_llm-d-router_1650\n";
+        let extract = |key: &str| {
+            yaml.find(&format!("tar -xzf /opt/crucible/pack-src/{key} {domain}"))
+                .unwrap_or_else(|| panic!("pack-stage extracts {key}: {yaml}"))
+        };
         assert!(
-            cm.contains("tools_measure.sh"),
-            "nested key is slash-free: {cm}"
-        );
-        // The volume's items: maps that key back to the TRUE nested path, so the mount rebuilds it.
-        let pod = yaml.split("\n---\n").next().expect("pod doc");
-        assert!(pod.contains("key: tools_measure.sh"), "items key: {pod}");
-        assert!(
-            pod.contains("path: tools/measure.sh"),
-            "items maps to the real path: {pod}"
+            extract(PACK_TARBALL_KEY) < extract(RUN_INPUTS_KEY),
+            "the inputs land over the pack"
         );
     }
+
+    /// Under a run-state claim, `pack-stage` mounts the claim where the main container does, so
+    /// an input under `state/` is extracted onto the claim the run reads rather than into the
+    /// emptyDir the claim hides.
+    #[test]
+    fn pack_stage_writes_state_inputs_onto_the_run_state_claim() {
+        let (manifest, mut profile) = pack_manifest_and_profile();
+        profile.cluster.state_pvc = Some(crate::deploy::profile::StatePvc::Existing(
+            "shared".to_string(),
+        ));
+        let tmp = Scratch::new("state-inputs");
+        let dir = tmp.path().join("alpha");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let yaml = render(
+            input,
+            &dir,
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                pack: Some(delivery(BTreeMap::from([(
+                    "state/cursor.json".parse().expect("path"),
+                    b"{}".to_vec(),
+                )]))),
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render");
+        let pod: core::Pod = serde_norway::from_str(
+            yaml.split("\n---\n")
+                .find(|d| d.contains("kind: Pod"))
+                .expect("a Pod doc"),
+        )
+        .expect("pod parses");
+        let spec = pod.spec.expect("pod spec");
+        let mounts = |c: &core::Container| {
+            c.volume_mounts
+                .iter()
+                .flatten()
+                .filter(|m| m.name == "run-state")
+                .map(|m| (m.mount_path.clone(), m.sub_path.clone()))
+                .collect::<Vec<_>>()
+        };
+        let claim = vec![(
+            "/opt/crucible/domains/alpha/state".to_string(),
+            Some("state/alpha".to_string()),
+        )];
+        let stage = spec
+            .init_containers
+            .iter()
+            .flatten()
+            .find(|c| c.name == "pack-stage")
+            .expect("pack-stage");
+        assert_eq!(mounts(stage), claim, "pack-stage writes onto the claim");
+        assert_eq!(
+            mounts(&spec.containers[0]),
+            claim,
+            "the run reads the claim"
+        );
+
+        profile.cluster.state_pvc = None;
+        let yaml = render(
+            RenderInput::from_manifest(&manifest, "alpha").expect("render input"),
+            &dir,
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                pack: Some(delivery(BTreeMap::new())),
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render");
+        assert!(
+            !yaml.contains("run-state"),
+            "no claim, no claim mount: {yaml}"
+        );
+    }
+
+    /// The tarball the pack ConfigMap for `dir` delivers.
+    fn delivered_tarball(dir: &Path) -> Vec<u8> {
+        let cm = pack_configmap(dir, &delivery(BTreeMap::new()), "ns").expect("configmap");
+        cm.binary_data
+            .expect("binary data")
+            .remove(PACK_TARBALL_KEY)
+            .expect("the pack tarball key")
+            .0
+    }
+
+    /// Unpack a delivery tarball into `(path, mode, bytes)` rows, in archive order.
+    fn unpack_delivery(tarball: &[u8]) -> Vec<(String, u32, Vec<u8>)> {
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
+        archive
+            .entries()
+            .expect("tar entries")
+            .map(|entry| {
+                let mut entry = entry.expect("tar entry");
+                let path = entry
+                    .path()
+                    .expect("entry path")
+                    .to_string_lossy()
+                    .into_owned();
+                let mode = entry.header().mode().expect("entry mode");
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut bytes).expect("entry bytes");
+                (path, mode, bytes)
+            })
+            .collect()
+    }
+
+    /// The delivered tarball holds every pack file at its nested path, executable, and skips the
+    /// pod-side `state/` dir, so extraction rebuilds the tree the loop expects.
+    #[test]
+    fn the_delivered_tarball_round_trips_the_tree() {
+        let tmp = Scratch::new("tarball");
+        let dir = tmp.path().join("pack");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+
+        let rows = unpack_delivery(&delivered_tarball(&dir));
+
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "crucible.toml".to_string(),
+                    0o755,
+                    b"# pack manifest\n".to_vec()
+                ),
+                ("goal.md".to_string(), 0o755, b"# goal\n".to_vec()),
+                (
+                    "tools/measure.sh".to_string(),
+                    0o755,
+                    b"#!/bin/sh\necho 1\n".to_vec()
+                ),
+            ]
+        );
+    }
+
+    /// `pack-stage`'s own command, run with the system `tar`, rebuilds the pack tree with every file
+    /// executable, so the gate scripts run without a separate chmod.
+    #[test]
+    fn pack_stage_tar_extracts_an_executable_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = Scratch::new("extract");
+        let (dir, out) = (tmp.path().join("pack"), tmp.path().join("domain"));
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        std::fs::create_dir_all(&out).expect("mkdir domain");
+        write_pack_dir(&dir);
+        let tarball = tmp.path().join(PACK_TARBALL_KEY);
+        std::fs::write(&tarball, delivered_tarball(&dir)).expect("write");
+
+        let status = std::process::Command::new("tar")
+            .arg("-xzf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(&out)
+            .status()
+            .expect("run tar");
+
+        assert!(status.success(), "tar -xzf exits 0");
+        let measure = out.join("tools/measure.sh");
+        assert_eq!(
+            std::fs::read(&measure).expect("measure.sh"),
+            b"#!/bin/sh\necho 1\n"
+        );
+        let mode = std::fs::metadata(&measure)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_ne!(mode & 0o111, 0, "measure.sh is executable: {mode:o}");
+        assert!(!out.join("state").exists(), "state/ is never delivered");
+    }
+
+    /// The same tree yields the same bytes whatever the files' timestamps or the walk's timing, so
+    /// the in-process and command-line renders agree.
+    #[test]
+    fn the_delivered_tarball_is_byte_identical_for_the_same_tree() {
+        let tmp = Scratch::new("deterministic");
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        for dir in [&a, &b] {
+            std::fs::create_dir_all(dir).expect("mkdir pack");
+            write_pack_dir(dir);
+        }
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        std::fs::File::options()
+            .write(true)
+            .open(b.join("goal.md"))
+            .expect("open goal.md")
+            .set_modified(old)
+            .expect("set mtime");
+
+        assert_eq!(delivered_tarball(&a), delivered_tarball(&b));
+    }
+
+    /// A pack whose gzipped tarball is over the delivery budget fails the render with the size, so
+    /// dispatch refuses it instead of the API server rejecting the ConfigMap.
+    #[test]
+    fn pack_over_the_delivery_budget_fails_the_render() {
+        let tmp = Scratch::new("over-budget");
+        let dir = tmp.path().join("pack");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        // Incompressible bytes: a xorshift stream, so gzip cannot shrink it under the budget.
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let noise: Vec<u8> = (0..DELIVERY_BUDGET_BYTES + 64 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        std::fs::write(dir.join("blob.bin"), noise).expect("blob");
+
+        let err = pack_configmap(&dir, &delivery(BTreeMap::new()), "ns").expect_err("over budget");
+
+        match err.downcast_ref::<RenderError>() {
+            Some(RenderError::PackOverDeliveryBudget { bytes, .. }) => {
+                assert!(*bytes > DELIVERY_BUDGET_BYTES, "{bytes}");
+            }
+            other => panic!("expected PackOverDeliveryBudget, got {other:?}: {err:#}"),
+        }
+    }
+
+    /// A pack holding a symlink is refused at render with the link named, not delivered without it.
+    #[test]
+    fn a_pack_with_a_symlink_is_refused() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().join("pack");
+        std::fs::create_dir_all(&dir).expect("mkdir pack");
+        write_pack_dir(&dir);
+        std::os::unix::fs::symlink("crucible.toml", dir.join("link.toml")).expect("symlink");
+
+        let err = pack_configmap(&dir, &delivery(BTreeMap::new()), "ns").expect_err("symlink");
+
+        assert!(format!("{err:#}").contains("link.toml"), "{err:#}");
+    }
+
     #[test]
     fn avoid_nodes_render_the_notin_affinity_on_every_pod() {
         let manifest: Manifest = toml::from_str(
@@ -3231,9 +3470,12 @@ mod tests {
     }
 
     fn render_k8s(profile: &DeployProfile) -> String {
-        let manifest = k8s_manifest();
+        render_k8s_manifest(&k8s_manifest(), profile)
+    }
+
+    fn render_k8s_manifest(manifest: &Manifest, profile: &DeployProfile) -> String {
         let dir = std::path::Path::new("/opt/crucible/domains/alpha");
-        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let input = RenderInput::from_manifest(manifest, "alpha").expect("render input");
         render(
             input,
             dir,
@@ -3789,12 +4031,20 @@ mod tests {
     }
 
     /// The NetworkPolicy under kubernetes allows ingress from sandbox pods (the openshell
-    /// managed-by label) on exactly the gateway port (17670), broker port (8849), and OTLP
-    /// collector port (17671).
+    /// managed-by label) on the gateway port (17670), broker port (8849), OTLP collector port
+    /// (17671), and each `[mcp]` server's port.
     #[test]
-    fn kubernetes_netpol_allows_sandbox_ingress_on_three_ports() {
+    fn kubernetes_netpol_allows_sandbox_ingress_on_the_engines_ports() {
         let profile = k8s_profile("");
-        let yaml = render_k8s(&profile);
+        let mut manifest = k8s_manifest();
+        manifest.mcp.insert(
+            "buildit".into(),
+            crate::manifest::McpCfg {
+                bin: "buildit".into(),
+                ..Default::default()
+            },
+        );
+        let yaml = render_k8s_manifest(&manifest, &profile);
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
         let netpol = docs
             .iter()
@@ -3811,7 +4061,6 @@ mod tests {
             netpol.contains("openshell.ai/managed-by: openshell"),
             "sandbox podSelector: {netpol}"
         );
-        // Exactly three ports: gateway (17670), broker (8849), OTLP collector (17671).
         assert!(
             netpol.contains("port: 17670"),
             "gateway port in netpol: {netpol}"
@@ -3823,6 +4072,10 @@ mod tests {
         assert!(
             netpol.contains("port: 17671"),
             "otel collector port in netpol: {netpol}"
+        );
+        assert!(
+            netpol.contains("port: 8850"),
+            "mcp port in netpol: {netpol}"
         );
         // policyTypes still declares Ingress.
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");
@@ -4392,6 +4645,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "alpha-pack".to_string(),
                     run_name: "alpha".to_string(),
+                    inputs: Default::default(),
                 }),
                 clusters_file: None,
                 harness: None,
@@ -4429,6 +4683,7 @@ mod tests {
                 pack: Some(PackDelivery {
                     configmap_name: "crucible-run-7-pack".to_string(),
                     run_name: "crucible-run-7".to_string(),
+                    inputs: Default::default(),
                 }),
                 playbook,
                 ..RenderOpts::default()
@@ -4555,6 +4810,22 @@ mod tests {
             clean.calls().iter().all(|call| !call.contains("--resume")),
             "a pod that cannot resume never asks to"
         );
+    }
+
+    #[test]
+    fn the_loop_wrapper_ends_a_run_its_log_already_closed() {
+        let starts = Starts::new(&render_loop_pod(&k8s_profile(r#"state_pvc = "shared""#)));
+        assert_eq!(
+            starts.start(i32::from(crate::plan::INVALID_VERDICT_EXIT)),
+            Some(0),
+            "a setup failure is in the log; restarting would repeat it"
+        );
+        assert_eq!(
+            starts.start(1),
+            Some(1),
+            "an engine error is still an error"
+        );
+        assert_eq!(starts.start(137), Some(137), "a killed engine restarts");
     }
 
     #[test]

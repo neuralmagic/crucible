@@ -7,6 +7,7 @@ mod broker;
 mod capability;
 mod deploy;
 mod judge;
+pub mod mcp;
 mod measure;
 mod openshell;
 pub mod outputs;
@@ -25,6 +26,7 @@ pub use broker::{BrokerCfg, broker_endpoint_from_url, broker_port, resolve_broke
 pub use capability::{CapabilitiesCfg, CredentialContext};
 pub use deploy::DeployCfg;
 pub use judge::JudgeCfg;
+pub use mcp::McpCfg;
 pub use measure::MeasureCfg;
 pub use openshell::OpenshellCfg;
 pub use outputs::OutputsCfg;
@@ -71,6 +73,24 @@ pub enum ManifestError {
         "[agent.broker].bin is required when the broker is enabled (the domain's broker binary)"
     )]
     BrokerBinRequired,
+    #[error("[agent.sandbox] name {name:?} must be 1..=64 characters of [a-z0-9_-]")]
+    SandboxName { name: String },
+    #[error("[agent.sandbox.{name}] needs a non-empty image")]
+    SandboxImage { name: String },
+    #[error(
+        "[agent.sandbox.{name}] names secret {secret:?}, which no [[secret]] declares with an env \
+         projection; a file secret reaches a sandbox only through a relay listed in `relays`"
+    )]
+    SandboxSecret { name: String, secret: String },
+    #[error("[agent.sandbox.{name}] names relay {dest:?}, which no [[agent.relay]] declares")]
+    SandboxRelay { name: String, dest: String },
+    #[error(
+        "[[secret]] {secret:?} projects to {env}, which the engine sets itself for the model; a \
+         pack with named sandboxes cannot withhold it, so use another name"
+    )]
+    SandboxReservedEnv { secret: String, env: String },
+    #[error("task {task:?} runs in sandbox {name:?}, which no [agent.sandbox.{name}] declares")]
+    UnknownSandbox { task: String, name: String },
     #[error("manifest has no [judge] (task mode)")]
     NoJudge,
     #[error("{table} requires a [judge]: a task manifest has no scores to rank, grade, or seed")]
@@ -295,6 +315,9 @@ pub struct Manifest {
     /// Declared credentials, the half of the capability disclosure a name alone cannot state.
     #[serde(default)]
     pub capabilities: CapabilitiesCfg,
+    /// MCP servers by `[mcp.<key>]`, started on the loop pod.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpCfg>,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -726,6 +749,115 @@ pub struct AgentCfg {
     /// The loop-pod provisioning broker. Off unless a domain opts in.
     #[serde(default)]
     pub broker: BrokerCfg,
+    /// The `[mcp]` servers turns without a named sandbox reach. Empty reaches none.
+    #[serde(default)]
+    pub mcp: Vec<String>,
+    /// Named sandboxes, by `[agent.sandbox.<name>]`. An `agent(sandbox = "<name>")` task runs in
+    /// that sandbox instead of the defaults above.
+    #[serde(default)]
+    pub sandbox: BTreeMap<String, SandboxProfile>,
+}
+
+/// The env vars the engine writes for the model's own credential on every turn.
+pub const MODEL_API_KEY_ENVS: [&str; 2] = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"];
+
+/// One `[agent.sandbox.<name>]`: the image a task's sandbox starts from, the declared env secrets
+/// and `[[agent.relay]]` files passed in (every other one is withheld), whether it reaches the
+/// broker, and egress endpoints added to `[agent.openshell]`'s.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxProfile {
+    pub image: String,
+    /// `[[secret]]` names. Empty passes no declared secret in.
+    #[serde(default)]
+    pub secrets: Vec<String>,
+    /// `[[agent.relay]]` destinations. Empty relays no file in.
+    #[serde(default)]
+    pub relays: Vec<String>,
+    /// Whether the turn reaches the `[agent.broker]`.
+    #[serde(default)]
+    pub broker: bool,
+    /// The `[mcp]` servers the turn reaches. Empty reaches none.
+    #[serde(default)]
+    pub mcp: Vec<String>,
+    /// `host:port[:access...]` entries added to the pack's egress allowlist.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+}
+
+fn validate_sandboxes(agent: &AgentCfg, secrets: &[SecretDecl]) -> Result<(), ManifestError> {
+    if !agent.sandbox.is_empty()
+        && let Some((decl, env)) = secrets.iter().find_map(|decl| {
+            let env = decl.env.as_deref().map(str::trim)?;
+            MODEL_API_KEY_ENVS.contains(&env).then_some((decl, env))
+        })
+    {
+        return Err(ManifestError::SandboxReservedEnv {
+            secret: decl.name.clone(),
+            env: env.to_string(),
+        });
+    }
+    for (name, profile) in &agent.sandbox {
+        if !plain_name(name) {
+            return Err(ManifestError::SandboxName { name: name.clone() });
+        }
+        if profile.image.trim().is_empty() {
+            return Err(ManifestError::SandboxImage { name: name.clone() });
+        }
+        for secret in &profile.secrets {
+            let projected = secrets.iter().any(|decl| {
+                decl.name == *secret && decl.env.as_deref().is_some_and(|e| !e.trim().is_empty())
+            });
+            if !projected {
+                return Err(ManifestError::SandboxSecret {
+                    name: name.clone(),
+                    secret: secret.clone(),
+                });
+            }
+        }
+        for dest in &profile.relays {
+            if !agent.relay.iter().any(|relay| relay.dest == *dest) {
+                return Err(ManifestError::SandboxRelay {
+                    name: name.clone(),
+                    dest: dest.clone(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 1 to 64 characters of `[a-z0-9_-]`.
+pub(crate) fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+fn validate_task_sandboxes(agent: &AgentCfg, workflow: &WorkflowCfg) -> Result<(), ManifestError> {
+    match undeclared_sandbox(&workflow.tasks, |name| agent.sandbox.contains_key(name)) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+/// The first task naming a sandbox `declared` does not know.
+pub fn undeclared_sandbox(
+    tasks: &[crate::plan::ir::Task],
+    declared: impl Fn(&str) -> bool,
+) -> Option<ManifestError> {
+    tasks.iter().find_map(|task| match &task.task {
+        crate::plan::ir::TaskKind::Agent {
+            sandbox: Some(name),
+            ..
+        } if !declared(name) => Some(ManifestError::UnknownSandbox {
+            task: task.name.0.clone(),
+            name: name.clone(),
+        }),
+        _ => None,
+    })
 }
 
 fn default_model() -> String {
@@ -785,6 +917,7 @@ struct CommonCfg<'a> {
     secrets: &'a [SecretDecl],
     outputs: &'a OutputsCfg,
     capabilities: &'a CapabilitiesCfg,
+    mcp: &'a BTreeMap<String, McpCfg>,
 }
 
 fn validate_common(c: CommonCfg<'_>) -> Result<()> {
@@ -794,9 +927,12 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     validate_carry_forward(&c.workspace.carry_forward)?;
     validate_artifacts(&c.workspace.artifact)?;
     validate_codex_api_key(c.agent.codex.api_key.as_deref())?;
+    validate_sandboxes(c.agent, c.secrets)?;
+    mcp::validate(c.mcp, c.agent)?;
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
+        validate_task_sandboxes(c.agent, w)?;
     }
     match c.judge {
         Some(judge) => {
@@ -950,6 +1086,7 @@ impl Manifest {
             secrets: &self.secrets,
             outputs: &self.outputs,
             capabilities: &self.capabilities,
+            mcp: &self.mcp,
         })
     }
 
@@ -1113,6 +1250,9 @@ pub struct CompositeManifest {
     /// Declared credentials, the half of the capability disclosure a name alone cannot state.
     #[serde(default)]
     pub capabilities: CapabilitiesCfg,
+    /// MCP servers by `[mcp.<key>]`, started on the loop pod.
+    #[serde(default)]
+    pub mcp: BTreeMap<String, McpCfg>,
 }
 
 #[derive(Deserialize)]
@@ -1222,6 +1362,7 @@ impl CompositeManifest {
             secrets: &self.secrets,
             outputs: &self.outputs,
             capabilities: &self.capabilities,
+            mcp: &self.mcp,
         })
     }
 
@@ -1282,16 +1423,28 @@ impl CompositeManifest {
     }
 }
 
-/// Every `[[workspace.inject]].src` must resolve under `manifest_dir`, as a hard error rather than a
-/// `crucible check` finding. `deploy render` calls this: a dangling inject renders a perfectly valid-looking pack
+/// Every `[[workspace.inject]].src` must resolve under `manifest_dir` or among `staged`, the
+/// pack-relative files the run receives beside it, as a hard error rather than a `crucible check`
+/// finding. `deploy render` calls this: a dangling inject renders a perfectly valid-looking pack
 /// whose missing file only surfaces inside the sandbox, mid-turn, as whatever the agent was supposed
 /// to read not being there.
-pub fn ensure_injects_resolve(m: &Manifest, manifest_dir: &Path) -> Result<(), ManifestError> {
+pub fn ensure_injects_resolve(
+    m: &Manifest,
+    manifest_dir: &Path,
+    staged: &[&str],
+) -> Result<(), ManifestError> {
+    let is_staged = |src: &str| {
+        let src = src.trim_start_matches("./").trim_end_matches('/');
+        staged.iter().any(|path| {
+            path.strip_prefix(src)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    };
     let missing: Vec<String> = m
         .workspace
         .injects(manifest_dir)?
         .iter()
-        .filter(|inject| !manifest_dir.join(&inject.src).exists())
+        .filter(|inject| !manifest_dir.join(&inject.src).exists() && !is_staged(&inject.src))
         .map(|inject| format!("  {} -> {}", inject.src, inject.dst))
         .collect();
     if missing.is_empty() {
@@ -2425,6 +2578,173 @@ mod tests {
         assert!(m.validate().is_ok());
     }
 
+    fn sandbox_manifest(backend: &str, profile: &str, task_sandbox: &str) -> Manifest {
+        toml::from_str::<Manifest>(&format!(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            backend = "{backend}"
+            agent_cmd = "true"
+            goal = "g"
+            {profile}
+            [[secret]]
+            name = "jira"
+            kind = "opaque"
+            env = "JIRA_TOKEN"
+            [[secret]]
+            name = "registry"
+            kind = "registry_authfile"
+            path = "/etc/registry/auth.json"
+            [workflow]
+            type = "playbook"
+            [[workflow.task]]
+            name = "a"
+            kind = "agent"
+            prompt = "p"
+            {task_sandbox}
+        "#
+        ))
+        .expect("parses")
+    }
+
+    const GO_PROFILE: &str = r#"
+            [agent.sandbox.go]
+            image = "ghcr.io/acme/sandbox-go@sha256:bb"
+            secrets = ["jira"]
+            endpoints = ["proxy.golang.org:443:read-only"]
+    "#;
+
+    #[test]
+    fn a_task_runs_in_a_declared_sandbox() {
+        let m = sandbox_manifest("openshell", GO_PROFILE, r#"sandbox = "go""#);
+        m.validate().expect("valid");
+        let go = &m.agent.sandbox["go"];
+        assert_eq!(go.image, "ghcr.io/acme/sandbox-go@sha256:bb");
+        assert_eq!(go.secrets, ["jira"]);
+        assert!(
+            go.relays.is_empty() && !go.broker,
+            "nothing else unless listed"
+        );
+        assert_eq!(go.endpoints, ["proxy.golang.org:443:read-only"]);
+        let crate::plan::ir::TaskKind::Agent { sandbox, .. } =
+            &m.workflow.as_ref().unwrap().tasks[0].task
+        else {
+            panic!("an agent task");
+        };
+        assert_eq!(sandbox.as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn a_sandbox_is_optional_for_every_task() {
+        sandbox_manifest("command", "", "")
+            .validate()
+            .expect("no sandbox, any backend");
+        sandbox_manifest("openshell", GO_PROFILE, "")
+            .validate()
+            .expect("a declared sandbox nobody uses is fine");
+    }
+
+    #[test]
+    fn a_malformed_sandbox_fails_validation() {
+        for (profile, expected) in [
+            (
+                "[agent.sandbox.Go]\nimage = \"i\"",
+                "must be 1..=64 characters of [a-z0-9_-]",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \" \"",
+                "needs a non-empty image",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \"i\"\nsecrets = [\"github\"]",
+                "names secret \"github\"",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \"i\"\nsecrets = [\"registry\"]",
+                "a file secret reaches a sandbox only through a relay",
+            ),
+            (
+                "[agent.sandbox.go]\nimage = \"i\"\nrelays = [\".kube/config\"]",
+                "names relay \".kube/config\", which no [[agent.relay]] declares",
+            ),
+        ] {
+            let err = sandbox_manifest("openshell", profile, "")
+                .validate()
+                .expect_err(profile);
+            assert!(err.to_string().contains(expected), "{profile}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn a_pack_with_sandboxes_cannot_declare_a_model_key_as_a_secret() {
+        let with_key = |profile: &str| {
+            let text = format!(
+                r#"
+                [repo]
+                path = "."
+                [agent]
+                goal = "g"
+                {profile}
+                [[secret]]
+                name = "key"
+                kind = "opaque"
+                env = "ANTHROPIC_API_KEY"
+            "#
+            );
+            toml::from_str::<Manifest>(&text)
+                .expect("parses")
+                .validate()
+        };
+        with_key("").expect("no sandbox withholds anything");
+        let err = with_key("[agent.sandbox.bare]\nimage = \"i\"").expect_err("reserved");
+        assert!(
+            err.to_string()
+                .contains(r#"[[secret]] "key" projects to ANTHROPIC_API_KEY"#),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_profile_refuses_unknown_keys() {
+        let err = toml::from_str::<Manifest>(
+            r#"
+            [repo]
+            path = "."
+            [agent]
+            goal = "g"
+            [agent.sandbox.go]
+            image = "i"
+            secret = ["jira"]
+        "#,
+        )
+        .err()
+        .expect("a typo in a secret list must not silently pass every secret");
+        assert!(
+            err.to_string().contains("unknown field `secret`"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_task_naming_an_undeclared_sandbox_fails_validation() {
+        let err = sandbox_manifest("openshell", GO_PROFILE, r#"sandbox = "rust""#)
+            .validate()
+            .expect_err("undeclared");
+        assert!(
+            err.to_string()
+                .contains(r#"task "a" runs in sandbox "rust", which no [agent.sandbox.rust]"#),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_validates_on_any_manifest_backend() {
+        sandbox_manifest("local", GO_PROFILE, r#"sandbox = "go""#)
+            .validate()
+            .expect("a loop pod runs openshell whatever the manifest says; the turn checks");
+    }
+
     #[test]
     fn a_manifest_with_no_secret_block_declares_none() {
         let m = toml::from_str::<Manifest>(
@@ -2506,7 +2826,7 @@ dst = "traces/median_block.txt"
         .expect("write manifest");
         let m = Manifest::load(&manifest_path).expect("manifest parses");
 
-        let err = ensure_injects_resolve(&m, &dir).expect_err("a missing src must fail");
+        let err = ensure_injects_resolve(&m, &dir, &[]).expect_err("a missing src must fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("traces/median_block.txt"),
@@ -2517,9 +2837,18 @@ dst = "traces/median_block.txt"
             "a resolvable src must not be reported: {msg}"
         );
 
+        for near in ["traces/median_block.txt.bak", "traces/median", "trace"] {
+            ensure_injects_resolve(&m, &dir, &[near])
+                .expect_err("a staged file at another path does not resolve the src");
+        }
+        ensure_injects_resolve(&m, &dir, &["traces/median_block.txt"])
+            .expect("a staged file resolves its src");
+        ensure_injects_resolve(&m, &dir, &["traces/median_block.txt/inner"])
+            .expect("a staged file under a directory src resolves it");
+
         std::fs::create_dir_all(dir.join("traces")).expect("mkdir");
         std::fs::write(dir.join("traces/median_block.txt"), "y").expect("write");
-        ensure_injects_resolve(&m, &dir).expect("all srcs present now");
+        ensure_injects_resolve(&m, &dir, &[]).expect("all srcs present now");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

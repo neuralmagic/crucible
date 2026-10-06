@@ -21,6 +21,8 @@ use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
 use crate::plan::turn_log::{Heartbeat, TurnLog};
 use crucible_contract::TransportCause;
+use crucible_contract::emits::DeclaredFile;
+use crucible_contract::session::TaskRepair;
 use std::path::{Path, PathBuf};
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -150,14 +152,14 @@ fn fingerprint(path: &Path) -> Fingerprint {
 struct PriorContents(BTreeMap<String, Fingerprint>);
 
 impl PriorContents {
-    fn of(workspace: &Path, declared: &[String]) -> Self {
+    fn of(workspace: &Path, declared: &[DeclaredFile]) -> Self {
         PriorContents(
             declared
                 .iter()
-                .map(|path| {
-                    let held = confined(workspace, path)
+                .map(|file| {
+                    let held = confined(workspace, &file.path)
                         .map_or(Fingerprint::Unreadable, |resolved| fingerprint(&resolved));
-                    (path.clone(), held)
+                    (file.path.clone(), held)
                 })
                 .collect(),
         )
@@ -191,6 +193,8 @@ pub struct HarnessRunner {
     /// and materialized into that task's own root when it runs. A task with no entry is one the
     /// executor never staged, and its `inputs/` is left alone.
     pub staged: BTreeMap<TaskName, Vec<StagedInput>>,
+    /// What the run may still spend, as the executor last reported it.
+    pub budget_left: f64,
 }
 
 impl HarnessRunner {
@@ -235,9 +239,14 @@ impl TaskRunner for HarnessRunner {
                 attempt,
                 inputs,
                 deadline,
+                budget_left: self.budget_left,
             },
             None,
         )
+    }
+
+    fn budget_left(&mut self, usd: f64) {
+        self.budget_left = usd;
     }
 
     /// Record what this task's ancestors declared, for [`run_task`] to lay down under
@@ -252,7 +261,7 @@ impl TaskRunner for HarnessRunner {
             .flat_map(|producer| {
                 producer.emits_files.iter().map(|declared| StagedInput {
                     producer: producer.name.0.clone(),
-                    declared: declared.clone(),
+                    declared: declared.path.clone(),
                 })
             })
             .collect();
@@ -334,6 +343,7 @@ impl TaskRunner for HarnessRunner {
                     attempt: b.attempt,
                     inputs: &b.inputs,
                     deadline: b.deadline,
+                    budget_left: self.budget_left,
                 },
                 None,
             )];
@@ -352,6 +362,7 @@ impl TaskRunner for HarnessRunner {
         };
         let captured = &self.captured_bytes;
         let staged = &self.staged;
+        let budget_left = self.budget_left;
         std::thread::scope(|scope| {
             let handles: Vec<_> = batch
                 .iter()
@@ -372,6 +383,7 @@ impl TaskRunner for HarnessRunner {
                                 attempt: b.attempt,
                                 inputs: &b.inputs,
                                 deadline: b.deadline,
+                                budget_left,
                             },
                             Some(pending),
                         )
@@ -399,12 +411,14 @@ struct Dispatch<'a> {
     staged: Option<&'a [StagedInput]>,
 }
 
-/// One attempt of one task: its number, its inputs, and when it must be over by.
+/// One attempt of one task: its number, its inputs, when it must be over by, and what the run
+/// may still spend on it.
 #[derive(Clone, Copy)]
 struct Job<'a> {
     attempt: u32,
     inputs: &'a BTreeMap<TaskName, Value>,
     deadline: Option<Deadline>,
+    budget_left: f64,
 }
 
 /// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
@@ -492,8 +506,9 @@ fn run_task(cx: &Dispatch<'_>, task: &Task, job: Job<'_>, pending: Option<&str>)
 /// Take a settled attempt's declared files, or withhold the whole set.
 ///
 /// A declared file that is absent after an otherwise-passing attempt is output drift, and it
-/// fails at the task that promised it rather than as a mystery in whatever depended on it. It is
-/// not retried: a task that ran and did not produce what it promised will not produce it twice.
+/// fails at the task that promised it rather than as a mystery in whatever depended on it. So is
+/// a declared file whose captured content its schema does not admit. Neither is retried: a task
+/// that ran and did not produce what it promised will not produce it twice.
 ///
 /// A failing attempt's set is captured too, for a consumer joining `settled`, and it is captured
 /// before [`TaskRunner::settled`] discards the workspace. On that path a declared path counts
@@ -527,7 +542,8 @@ fn capture_declared(
     let _ = std::fs::remove_dir_all(&staging);
     let mut charged = 0u64;
     let taken = (|| -> Result<(), String> {
-        for declared in &task.emits_files {
+        for file in &task.emits_files {
+            let declared = &file.path;
             let from = confined(workspace, declared)?;
             let size = match std::fs::metadata(&from) {
                 Ok(metadata) if metadata.is_file() => metadata.len(),
@@ -564,6 +580,13 @@ fn capture_declared(
             std::fs::copy(&from, &to)
                 .map_err(|error| format!("capturing {declared:?}: {error}"))?;
             engine_mode(&to);
+            if !failing && file.schema.is_some() {
+                let bytes = std::fs::read(&to)
+                    .map_err(|error| format!("reading captured {declared:?}: {error}"))?;
+                if let Some(why) = file.refusal(&bytes) {
+                    return Err(why);
+                }
+            }
         }
         Ok(())
     })();
@@ -604,6 +627,7 @@ fn withheld(attempt: Attempt, why: String) -> Attempt {
     Attempt {
         outcome,
         cost_usd: attempt.cost_usd,
+        repairs: attempt.repairs,
     }
 }
 
@@ -681,7 +705,115 @@ fn prepare_and_run(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Att
     Attempt {
         outcome: out.outcome.settle_declared(),
         cost_usd: out.cost_usd,
+        repairs: out.repairs,
     }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum SandboxError {
+    #[error(
+        "task runs in sandbox {name:?}, which only the openshell backend provides; this run's \
+         backend is {backend}"
+    )]
+    NotOpenshell { name: String, backend: String },
+    #[error("task names sandbox {name:?}, which the manifest does not declare")]
+    Undeclared { name: String },
+}
+
+/// Point a turn at its named sandbox: the profile's image, its endpoints added to the pack's
+/// egress, and every relayed secret, relay file, broker, and MCP server it does not list withheld.
+pub(crate) fn enter_sandbox(args: &mut Args, name: &str) -> Result<(), SandboxError> {
+    if args.agent_backend != crate::manifest::AgentBackend::Openshell {
+        return Err(SandboxError::NotOpenshell {
+            name: name.to_string(),
+            backend: args.agent_backend.as_str().to_string(),
+        });
+    }
+    let Some(profile) = args.sandboxes.get(name).cloned() else {
+        return Err(SandboxError::Undeclared {
+            name: name.to_string(),
+        });
+    };
+    let withheld: std::collections::BTreeSet<&str> = args
+        .relayed_secrets
+        .iter()
+        .filter(|(secret, _)| !profile.secrets.contains(secret))
+        .map(|(_, env)| env.as_str())
+        .collect();
+    args.env.retain(|(key, _)| !withheld.contains(key.as_str()));
+    args.relay
+        .retain(|relay| profile.relays.contains(&relay.dest));
+    args.broker.enabled &= profile.broker;
+    args.mcp_scope = profile.mcp;
+    args.sandbox_image = Some(profile.image.trim().to_string());
+    for endpoint in profile.endpoints {
+        if !args.openshell.endpoints.contains(&endpoint) {
+            args.openshell.endpoints.push(endpoint);
+        }
+    }
+    Ok(())
+}
+
+/// The run's agent knobs with a task's own applied over them. Err names the knob the plan got
+/// wrong.
+fn agent_knobs(
+    args: &Args,
+    harness: Option<&String>,
+    model: Option<&String>,
+    effort: Option<&String>,
+) -> Result<Args, String> {
+    let mut args = args.clone();
+    if let Some(h) = harness {
+        args.harness = Some(
+            crate::manifest::Harness::from_str(h, true)
+                .map_err(|e| format!("task names unknown harness {h:?}: {e}"))?,
+        );
+    }
+    if let Some(m) = model {
+        args.model = Some(m.clone());
+    }
+    if let Some(e) = effort {
+        args.reasoning_effort = Some(
+            crate::manifest::ReasoningEffort::from_str(e, true)
+                .map_err(|err| format!("task names unknown effort {e:?}: {err}"))?,
+        );
+    }
+    Ok(args)
+}
+
+/// What a task's attempts run on, as the result event reports it. None for a task that runs no
+/// agent and for one whose knobs do not parse. The model comes off the backend rather than off
+/// `Args`, so a harness with a model slot of its own reports what it hands the turn. An unset
+/// effort stays empty rather than naming a default the harness may not use.
+pub(crate) fn resolved_agent(
+    args: &Args,
+    task: &Task,
+) -> Option<crucible_contract::session::TaskAgent> {
+    let knobs = match &task.task {
+        TaskKind::Agent {
+            harness,
+            model,
+            effort,
+            ..
+        } => (harness.as_ref(), model.as_ref(), effort.as_ref()),
+        // The loop's candidate turn is the only engine op that runs an agent, and it runs on the
+        // run's knobs with none of its own.
+        TaskKind::Engine {
+            op: crate::plan::ir::EngineOp::Propose,
+            ..
+        } => (None, None, None),
+        _ => return None,
+    };
+    let args = agent_knobs(args, knobs.0, knobs.1, knobs.2).ok()?;
+    let backend = crate::agent::harness::HarnessRuntime::backend(args.harness());
+    Some(crucible_contract::session::TaskAgent {
+        harness: args.harness().as_str().to_string(),
+        model: backend.model(&args).to_string(),
+        effort: args
+            .reasoning_effort
+            .map(|e| e.as_flag().to_string())
+            .unwrap_or_default(),
+    })
 }
 
 /// One task against a specific workspace. `Command` tasks go to the shell runner; `Agent`
@@ -691,14 +823,16 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         attempt,
         inputs,
         deadline,
+        budget_left,
     } = job;
-    let (prompt, harness, model, effort) = match &task.task {
+    let (prompt, harness, model, effort, sandbox) = match &task.task {
         TaskKind::Agent {
             prompt,
             harness,
             model,
             effort,
-        } => (prompt, harness, model, effort),
+            sandbox,
+        } => (prompt, harness, model, effort, sandbox),
         TaskKind::Command { .. }
         | TaskKind::Evaluate { .. }
         | TaskKind::Route { .. }
@@ -722,31 +856,19 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     };
 
     // Per-task knob overrides on a cloned Args: the heterogeneity axis. Unknown values
-    // are a measured failure: a plan naming a harness we can't parse is wrong, not
-    // unlucky.
-    let mut args = args.clone();
+    // are a measured failure.
+    let mut args = match agent_knobs(args, harness.as_ref(), model.as_ref(), effort.as_ref()) {
+        Ok(args) => args,
+        Err(note) => return Attempt::failed(0.0, note),
+    };
     // Name the task to the turn. A deterministic stand-in needs to know which task it is
     // without matching prompt prose, and a real harness gets it for free in its transcript.
     args.env
         .push((crate::plan::TASK_NAME_ENV.to_string(), task.name.0.clone()));
-    if let Some(h) = harness {
-        match crate::manifest::Harness::from_str(h, true) {
-            Ok(h) => args.harness = Some(h),
-            Err(e) => {
-                return Attempt::failed(0.0, format!("task names unknown harness {h:?}: {e}"));
-            }
-        }
-    }
-    if let Some(m) = model {
-        args.model = Some(m.clone());
-    }
-    if let Some(e) = effort {
-        match crate::manifest::ReasoningEffort::from_str(e, true) {
-            Ok(e) => args.reasoning_effort = Some(e),
-            Err(err) => {
-                return Attempt::failed(0.0, format!("task names unknown effort {e:?}: {err}"));
-            }
-        }
+    if let Some(name) = sandbox
+        && let Err(err) = enter_sandbox(&mut args, name)
+    {
+        return Attempt::failed(0.0, err.to_string());
     }
     if let Err(e) = crate::cli::workspace::install_toolbox(
         paths,
@@ -764,29 +886,97 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         Err(e) => return Attempt::failed(0.0, format!("inputs not serializable: {e}")),
     };
 
+    let ledgered = task.session.is_some();
+    let session =
+        match crate::agent::agent_session::prepare_named(&paths.state, task.session.as_deref()) {
+            Ok(Some(turn)) => Some(turn),
+            Ok(None) if task.repair > 0 => Some(crate::agent::agent_session::SessionTurn {
+                logical_name: task.name.0.clone(),
+                provider_id: uuid::Uuid::now_v7().to_string(),
+                completed_turns: 0,
+            }),
+            Ok(None) => None,
+            Err(note) => return Attempt::transport(TransportCause::Workspace, note),
+        };
+    let cx = TurnCx {
+        args: &args,
+        paths,
+        name: &task.name.0,
+        deadline,
+        ledgered,
+    };
+    let (cost, end) = agent_turn(&cx, &full_prompt, session.as_ref());
+    let attempt = end.into_attempt(cost);
+    match session {
+        Some(session) if task.repair > 0 => repaired(&cx, task, session, attempt, budget_left),
+        _ => attempt,
+    }
+}
+
+/// What one agent turn needs besides its prompt and session.
+struct TurnCx<'a> {
+    args: &'a Args,
+    paths: &'a Paths,
+    name: &'a str,
+    deadline: Option<Deadline>,
+    /// Whether the session is a named one whose ledger cursor advances after the turn. A task's
+    /// own repair conversation is not, so a later attempt starts it fresh.
+    ledgered: bool,
+}
+
+/// How one agent turn ended, before it is read as an attempt.
+enum TurnEnd {
+    Wrote(Value),
+    Unreadable(String),
+    Silent,
+    TimedOut(Deadline),
+    Transport(TransportFailure),
+}
+
+impl TurnEnd {
+    fn into_attempt(self, cost: f64) -> Attempt {
+        let outcome = match self {
+            TurnEnd::Wrote(value) => AttemptOutcome::Pass(value),
+            TurnEnd::Unreadable(note) => AttemptOutcome::fail(note),
+            TurnEnd::Silent => AttemptOutcome::fail(format!(
+                "turn ended without writing {RESULT_FILE} — nothing to grade"
+            )),
+            TurnEnd::TimedOut(deadline) => AttemptOutcome::TimedOut(deadline),
+            TurnEnd::Transport(failure) => AttemptOutcome::Transport(failure),
+        };
+        Attempt {
+            outcome,
+            cost_usd: cost,
+            repairs: Vec::new(),
+        }
+    }
+}
+
+/// Run one agent turn in `cx.paths.workspace` and read the result file it left.
+fn agent_turn(
+    cx: &TurnCx<'_>,
+    prompt: &str,
+    session: Option<&crate::agent::agent_session::SessionTurn>,
+) -> (f64, TurnEnd) {
+    let paths = cx.paths;
     let result_path = paths.workspace.join(RESULT_FILE);
     // Drain any stale result so a pass can only come from THIS turn.
     let _ = std::fs::remove_file(&result_path);
 
-    let name = task.name.0.clone();
+    let name = cx.name.to_string();
     let mut transport_error: Option<TransportFailure> = None;
-    let prepared =
-        match crate::agent::agent_session::prepare_named(&paths.state, task.session.as_deref()) {
-            Ok(prepared) => prepared,
-            Err(note) => return Attempt::transport(TransportCause::Workspace, note),
-        };
     let log = Arc::new(Mutex::new(TurnLog::new(Instant::now())));
     let heartbeat = {
         let name = name.clone();
         Heartbeat::spawn(Arc::clone(&log), move |line| eprintln!("[{name}] {line}"))
     };
     let turn = crate::agent::run_turn_with_session(
-        &args,
+        cx.args,
         paths,
-        &full_prompt,
+        prompt,
         false,
-        prepared.as_ref(),
-        deadline,
+        session,
+        cx.deadline,
         |line, stream, ev| {
             if !line.trim().is_empty() && stream == RawStream::Stderr {
                 eprintln!("[{name}] {line}");
@@ -807,7 +997,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     let cost = turn.cost_usd;
     if let Some(TurnFailure::DeadlineExceeded(deadline)) = turn.failure() {
         let _ = std::fs::remove_file(&result_path);
-        return Attempt::timed_out(cost, *deadline);
+        return (cost, TurnEnd::TimedOut(*deadline));
     }
     if let Some(failure) = turn.failure() {
         transport_error = Some(TransportFailure::new(
@@ -817,34 +1007,158 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
     }
     if let Some(note) = crate::agent::agent_session::commit_if_ok(
         &paths.state,
-        prepared.as_ref(),
+        session.filter(|_| cx.ledgered),
         transport_error.is_none(),
     ) {
         transport_error = Some(TransportFailure::new(TransportCause::Workspace, note));
     }
 
-    match std::fs::read_to_string(&result_path) {
+    let end = match std::fs::read_to_string(&result_path) {
         Ok(body) => {
             let _ = std::fs::remove_file(&result_path);
             match serde_json::from_str::<Value>(&body) {
-                Ok(v) => Attempt {
-                    outcome: AttemptOutcome::Pass(v),
-                    cost_usd: cost,
-                },
-                Err(e) => Attempt::failed(cost, format!("{RESULT_FILE} is not valid JSON: {e}")),
+                Ok(v) => TurnEnd::Wrote(v),
+                Err(e) => TurnEnd::Unreadable(format!("{RESULT_FILE} is not valid JSON: {e}")),
             }
         }
         Err(_) => match transport_error {
-            Some(failure) => Attempt {
-                outcome: AttemptOutcome::Transport(failure),
-                cost_usd: cost,
-            },
-            None => Attempt::failed(
-                cost,
-                format!("turn ended without writing {RESULT_FILE} — nothing to grade"),
-            ),
+            Some(failure) => TurnEnd::Transport(failure),
+            None => TurnEnd::Silent,
         },
+    };
+    (cost, end)
+}
+
+/// Resume `session` to fix a passing attempt whose output breaks the task's declared emits or
+/// files, for at most `task.repair` turns. Each turn is told what broke, in the masked notes
+/// validation produced, and its result replaces the attempt's; a turn that writes no result
+/// leaves the previous one standing. Repairs stop when the output holds, when the attempt has
+/// spent `budget_left`, or when a turn does not end in a result to check.
+fn repaired(
+    cx: &TurnCx<'_>,
+    task: &Task,
+    mut session: crate::agent::agent_session::SessionTurn,
+    mut attempt: Attempt,
+    budget_left: f64,
+) -> Attempt {
+    for round in 1..=task.repair {
+        attempt.outcome = attempt.outcome.settle_declared();
+        let AttemptOutcome::Pass(output) = &attempt.outcome else {
+            break;
+        };
+        let notes = drift(task, &cx.paths.workspace, output);
+        if notes.is_empty() || attempt.cost_usd >= budget_left {
+            break;
+        }
+        if let Some(deadline) = cx.deadline
+            && Instant::now() >= deadline.at
+        {
+            attempt.outcome = AttemptOutcome::TimedOut(deadline);
+            break;
+        }
+        let previous = output.clone();
+        session = match (&task.session, cx.ledgered) {
+            (Some(name), true) => match crate::agent::agent_session::prepare(&cx.paths.state, name)
+            {
+                Ok(next) => next,
+                Err(e) => {
+                    attempt.outcome = AttemptOutcome::Fail {
+                        note: format!(
+                            "{}; repair {round}/{} could not resume the session: {e:#}",
+                            notes.join("; "),
+                            task.repair
+                        ),
+                        output: Some(previous),
+                    };
+                    break;
+                }
+            },
+            _ => crate::agent::agent_session::SessionTurn {
+                completed_turns: round,
+                ..session
+            },
+        };
+        let label = format!("{} repair {round}/{}", task.name, task.repair);
+        eprintln!("[{}] {label}: {}", task.name, notes.join("; "));
+        let (cost, end) = agent_turn(
+            cx,
+            &repair_prompt(round, task.repair, &notes),
+            Some(&session),
+        );
+        attempt.cost_usd += cost;
+        attempt.repairs.push(TaskRepair {
+            label,
+            round,
+            of: task.repair,
+            cost_usd: cost,
+            notes: notes.clone(),
+        });
+        attempt.outcome = match end {
+            TurnEnd::Wrote(value) => AttemptOutcome::Pass(value),
+            TurnEnd::Silent => AttemptOutcome::Pass(previous),
+            TurnEnd::Unreadable(note) => AttemptOutcome::Fail {
+                note,
+                output: Some(previous),
+            },
+            TurnEnd::TimedOut(deadline) => AttemptOutcome::TimedOut(deadline),
+            TurnEnd::Transport(failure) => AttemptOutcome::Fail {
+                note: format!(
+                    "{}; repair {round}/{} did not complete: {failure}",
+                    notes.join("; "),
+                    task.repair
+                ),
+                output: Some(previous),
+            },
+        };
     }
+    attempt
+}
+
+/// Every way a passing output and the workspace break what the task declares, as the masked
+/// notes a repair turn is shown.
+fn drift(task: &Task, workspace: &Path, output: &Value) -> Vec<String> {
+    let mut notes =
+        crate::plan::exec::emits_violations(&task.emits, output, crate::plan::exec::Echo::Masked);
+    notes.extend(
+        task.emits_files
+            .iter()
+            .filter_map(|file| file_drift(workspace, file)),
+    );
+    notes
+}
+
+fn file_drift(workspace: &Path, file: &DeclaredFile) -> Option<String> {
+    let declared = &file.path;
+    let from = match confined(workspace, declared) {
+        Ok(from) => from,
+        Err(why) => return Some(why),
+    };
+    let size = match std::fs::metadata(&from) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
+        Ok(_) => return Some(format!("declared file {declared:?} is not a regular file")),
+        Err(_) => return Some(format!("declared file {declared:?} is absent")),
+    };
+    file.schema.as_ref()?;
+    if size > MAX_CAPTURED_BYTES {
+        return Some(format!(
+            "declared file {declared:?} exceeds {MAX_CAPTURED_BYTES} bytes"
+        ));
+    }
+    match std::fs::read(&from) {
+        Ok(bytes) => file.refusal(&bytes),
+        Err(error) => Some(format!("reading declared file {declared:?}: {error}")),
+    }
+}
+
+/// What a repair turn is told: the notes, and what to do about them.
+fn repair_prompt(round: u32, of: u32, notes: &[String]) -> String {
+    let listed: Vec<String> = notes.iter().map(|note| format!("- {note}")).collect();
+    format!(
+        "Your last turn finished, but its result does not match what this task declares:\n\n\
+         {}\n\nFix it in place: correct each declared file listed, and write {RESULT_FILE} again \
+         with the complete result object. This is repair {round} of {of}.\n",
+        listed.join("\n")
+    )
 }
 
 /// An agent-stream error the turn cannot recover from. A typed `Error` event is the provider or
@@ -881,6 +1195,292 @@ fn task_worktree_name(name: &TaskName) -> String {
 mod tests {
     use crate::plan::exec::{ExecCfg, PlanExit, Substrate, TaskStatus};
     use crate::plan::harness::*;
+
+    fn relay(dest: &str) -> crate::manifest::RelayFile {
+        crate::manifest::RelayFile {
+            dest: dest.into(),
+            template: Some("x".into()),
+            from_file: None,
+            from_cmd: None,
+        }
+    }
+
+    fn sandboxed_args() -> Args {
+        let mut args = Args::defaults().expect("the default flags parse");
+        args.agent_backend = crate::manifest::AgentBackend::Openshell;
+        args.sandbox_image = Some("ghcr.io/acme/default@sha256:aa".into());
+        args.env = vec![
+            ("JIRA_TOKEN".into(), "jira".into()),
+            ("REGISTRY_TOKEN".into(), "registry".into()),
+            ("CLOUD_ML_REGION".into(), "us-east5".into()),
+        ];
+        args.relayed_secrets = [
+            ("jira".to_string(), "JIRA_TOKEN".to_string()),
+            ("registry".to_string(), "REGISTRY_TOKEN".to_string()),
+        ]
+        .into();
+        args.relay = vec![relay(".jira"), relay(".kube/config")];
+        args.broker.enabled = true;
+        args.mcp_scope = vec!["jira".into()];
+        args.openshell.endpoints = vec!["github.com:443:full".into()];
+        args.sandboxes = [
+            (
+                "go".to_string(),
+                crate::manifest::SandboxProfile {
+                    image: " ghcr.io/acme/sandbox-go@sha256:bb ".into(),
+                    secrets: vec!["registry".into()],
+                    relays: vec![".kube/config".into()],
+                    broker: true,
+                    mcp: vec!["buildit".into()],
+                    endpoints: vec![
+                        "proxy.golang.org:443:read-only".into(),
+                        "github.com:443:full".into(),
+                    ],
+                },
+            ),
+            (
+                "bare".to_string(),
+                crate::manifest::SandboxProfile {
+                    image: "ghcr.io/acme/bare@sha256:cc".into(),
+                    ..Default::default()
+                },
+            ),
+        ]
+        .into();
+        args
+    }
+
+    fn env_keys(args: &Args) -> Vec<&str> {
+        args.env.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    fn relay_dests(args: &Args) -> Vec<&str> {
+        args.relay.iter().map(|r| r.dest.as_str()).collect()
+    }
+
+    #[test]
+    fn a_named_sandbox_passes_in_only_what_it_lists() {
+        let mut args = sandboxed_args();
+        enter_sandbox(&mut args, "go").unwrap();
+        assert_eq!(
+            args.sandbox_image.as_deref(),
+            Some("ghcr.io/acme/sandbox-go@sha256:bb")
+        );
+        assert_eq!(env_keys(&args), ["REGISTRY_TOKEN", "CLOUD_ML_REGION"]);
+        assert_eq!(relay_dests(&args), [".kube/config"]);
+        assert!(args.broker.enabled);
+        assert_eq!(args.mcp_scope, ["buildit"]);
+        assert_eq!(
+            args.openshell.endpoints,
+            ["github.com:443:full", "proxy.golang.org:443:read-only"],
+            "added once, after the pack's own"
+        );
+    }
+
+    #[test]
+    fn a_bare_sandbox_gets_no_secret_relay_or_broker() {
+        let mut args = sandboxed_args();
+        enter_sandbox(&mut args, "bare").unwrap();
+        assert_eq!(env_keys(&args), ["CLOUD_ML_REGION"]);
+        assert!(relay_dests(&args).is_empty());
+        assert!(!args.broker.enabled);
+        assert!(args.mcp_scope.is_empty());
+        assert_eq!(args.openshell.endpoints, ["github.com:443:full"]);
+    }
+
+    #[test]
+    fn a_sandbox_withholds_only_what_the_secret_relay_added() {
+        let mut args = sandboxed_args();
+        args.env
+            .push(("REGION_LITERAL".into(), "from [agent.env]".into()));
+        args.relayed_secrets.remove("registry");
+        enter_sandbox(&mut args, "bare").unwrap();
+        assert_eq!(
+            env_keys(&args),
+            ["REGISTRY_TOKEN", "CLOUD_ML_REGION", "REGION_LITERAL"],
+            "a value the secret relay did not add is not a withheld secret"
+        );
+    }
+
+    #[test]
+    fn a_sandbox_is_refused_outside_openshell() {
+        for backend in [
+            crate::manifest::AgentBackend::Local,
+            crate::manifest::AgentBackend::Command,
+        ] {
+            let mut args = sandboxed_args();
+            args.agent_backend = backend;
+            let err = enter_sandbox(&mut args, "bare").unwrap_err();
+            assert_eq!(
+                err,
+                SandboxError::NotOpenshell {
+                    name: "bare".into(),
+                    backend: backend.as_str().into(),
+                }
+            );
+            assert_eq!(env_keys(&args).len(), 3, "nothing changed");
+        }
+    }
+
+    #[test]
+    fn an_undeclared_sandbox_is_a_failed_attempt_not_the_default_one() {
+        let mut args = sandboxed_args();
+        let err = enter_sandbox(&mut args, "rust").unwrap_err();
+        assert_eq!(
+            err,
+            SandboxError::Undeclared {
+                name: "rust".into()
+            }
+        );
+        assert_eq!(
+            args.sandbox_image.as_deref(),
+            Some("ghcr.io/acme/default@sha256:aa"),
+            "nothing changed"
+        );
+        assert_eq!(env_keys(&args).len(), 3);
+    }
+
+    #[test]
+    fn an_agent_task_naming_an_undeclared_sandbox_is_a_measured_failure() {
+        let t = crate::plan::ir::Task {
+            name: "a".into(),
+            task: TaskKind::Agent {
+                prompt: "go".into(),
+                harness: None,
+                model: None,
+                effort: None,
+                sandbox: Some("rust".into()),
+            },
+            depends_on: vec![],
+            session: None,
+            needs: "any".into(),
+            required: true,
+            isolation: None,
+            join: Join::default(),
+            stage: Stage::Iteration,
+            emits: crate::plan::ir::Emits::default(),
+            emits_files: Vec::new(),
+            over: None,
+            max_fanout: None,
+            when: None,
+            revise: None,
+            timeout: None,
+            history: None,
+            repair: 0,
+        };
+        let mut runner = HarnessRunner {
+            args: sandboxed_args(),
+            paths: crate::args::Paths::for_manifest(
+                std::env::temp_dir(),
+                std::env::temp_dir(),
+                &std::env::temp_dir(),
+                None,
+            ),
+            commit_per_task: false,
+            captured_bytes: AtomicU64::new(0),
+            staged: Default::default(),
+            budget_left: f64::INFINITY,
+        };
+        let a = runner.run(&t, 1, &BTreeMap::new(), None);
+        match a.outcome {
+            AttemptOutcome::Fail { note, .. } => {
+                assert!(note.contains("sandbox \"rust\""), "{note}");
+            }
+            _ => panic!("expected a measured failure"),
+        }
+    }
+
+    #[test]
+    fn a_task_reports_the_knobs_it_resolved_and_a_command_reports_none() {
+        let agent = |harness: Option<&str>, model: Option<&str>, effort: Option<&str>| {
+            crate::plan::ir::Task {
+                task: TaskKind::Agent {
+                    prompt: "go".into(),
+                    harness: harness.map(str::to_string),
+                    model: model.map(str::to_string),
+                    effort: effort.map(str::to_string),
+                    sandbox: None,
+                },
+                ..emitting("a", &[])
+            }
+        };
+        let mut args = sandboxed_args();
+        args.harness = Some(crate::manifest::Harness::Claude);
+        args.model = Some("opus".into());
+
+        let run = resolved_agent(&args, &agent(None, None, None)).expect("an agent task");
+        assert_eq!(
+            (run.harness.as_str(), run.model.as_str()),
+            ("claude", "opus")
+        );
+        assert_eq!(run.effort, "", "nothing pinned an effort");
+
+        let pinned = resolved_agent(&args, &agent(Some("codex"), Some("glm-5.3"), Some("low")))
+            .expect("an agent task");
+        assert_eq!(
+            (
+                pinned.harness.as_str(),
+                pinned.model.as_str(),
+                pinned.effort.as_str()
+            ),
+            ("codex", "glm-5.3", "low"),
+            "the task's own knobs win over the run's"
+        );
+
+        let mut claude_named = args.clone();
+        claude_named.model = Some("claude-opus-4-6".into());
+        let codex = resolved_agent(&claude_named, &agent(Some("codex"), None, None))
+            .expect("an agent task");
+        assert_eq!(
+            codex.model,
+            crate::manifest::Harness::Codex.default_model(),
+            "codex refuses a Claude name and runs its own default"
+        );
+
+        let mut slotted = claude_named.clone();
+        slotted.codex.model = Some("gpt-5.6-terra".into());
+        assert_eq!(
+            resolved_agent(&slotted, &agent(Some("codex"), None, None))
+                .expect("an agent task")
+                .model,
+            "gpt-5.6-terra",
+            "the harness's own model slot is what it hands the turn"
+        );
+
+        let propose = crate::plan::ir::Task {
+            task: TaskKind::Engine {
+                op: crate::plan::ir::EngineOp::Propose,
+                source: None,
+                tiebreak: None,
+            },
+            ..emitting("a", &[])
+        };
+        assert_eq!(
+            resolved_agent(&args, &propose).map(|a| a.model),
+            Some("opus".to_string()),
+            "the loop's candidate turn runs on the run's knobs"
+        );
+        let measure = crate::plan::ir::Task {
+            task: TaskKind::Engine {
+                op: crate::plan::ir::EngineOp::Measure,
+                source: None,
+                tiebreak: None,
+            },
+            ..emitting("a", &[])
+        };
+        assert_eq!(
+            resolved_agent(&args, &measure),
+            None,
+            "measure runs no agent"
+        );
+
+        assert_eq!(
+            resolved_agent(&args, &agent(Some("nope"), None, None)),
+            None,
+            "a task whose knobs do not parse never runs"
+        );
+        assert_eq!(resolved_agent(&args, &emitting("a", &[])), None);
+    }
 
     /// The executor's own transitions are in its table; a test that trips one fails here.
     fn execute(
@@ -919,13 +1519,14 @@ mod tests {
             join: Join::default(),
             stage: Stage::Iteration,
             emits: crate::plan::ir::Emits::default(),
-            emits_files: files.iter().map(|f| (*f).to_string()).collect(),
+            emits_files: files.iter().map(|f| DeclaredFile::from(*f)).collect(),
             over: None,
             max_fanout: None,
             when: None,
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -933,6 +1534,7 @@ mod tests {
         Attempt {
             outcome: AttemptOutcome::Pass(Value::Null),
             cost_usd: 0.0,
+            repairs: Vec::new(),
         }
     }
 
@@ -1104,6 +1706,14 @@ mod tests {
     fn run_playbook_recording(
         dir: &std::path::Path,
     ) -> (crate::plan::exec::PlanOutcome, HarnessRunner) {
+        run_playbook_within(dir, f64::MAX)
+    }
+
+    /// The same run under a plan budget of `usd`.
+    fn run_playbook_within(
+        dir: &std::path::Path,
+        usd: f64,
+    ) -> (crate::plan::exec::PlanOutcome, HarnessRunner) {
         let mut manifest = crate::manifest::Manifest::load(&dir.join("crucible.toml")).unwrap();
         manifest.resolve_workflow(dir).unwrap();
         let workflow = manifest.workflow.as_ref().unwrap();
@@ -1115,7 +1725,7 @@ mod tests {
         let plan = crate::plan::ir::Plan {
             version: 1,
             reason: None,
-            budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+            budget: crate::plan::ir::PlanBudget { usd },
             tasks: workflow.tasks.clone(),
             params: BTreeMap::new(),
         }
@@ -2884,6 +3494,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
                 harness: Some("not-a-harness".into()),
                 model: None,
                 effort: None,
+                sandbox: None,
             },
             depends_on: vec![],
             session: None,
@@ -2900,6 +3511,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])
@@ -2914,6 +3526,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             commit_per_task: false,
             captured_bytes: AtomicU64::new(0),
             staged: Default::default(),
+            budget_left: f64::INFINITY,
         };
         let a = runner.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
@@ -3240,6 +3853,346 @@ workflow(type = "playbook", tasks = [probe, report])
         assert!(
             !log.contains("task probe"),
             "a failed task committed: {log}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Real command tasks against real schemas: a matching output feeds its consumer and its file
+    /// is captured, and a field or file the schema rejects fails at the producer, once, naming
+    /// where the value went wrong.
+    #[test]
+    fn a_schema_typed_output_and_file_fail_at_the_producer_when_they_do_not_match() {
+        let dir = playbook_pack(
+            "schema-typed",
+            r#"
+good = command(
+    name = "good",
+    run = "printf '{\"ok\": true}' > RESULT.json && printf 'notes' > NOTES.md && printf '{\"lanes\": [\"a\", \"b\"]}\n'",
+    emits = {"lanes": schema_file("schemas/lanes.json")},
+    emits_files = {"RESULT.json": schema_file("schemas/result.json"), "NOTES.md": None},
+)
+lane = command(
+    name = "lane",
+    run = "printf '{\"done\": true}\n'",
+    depends_on = [good],
+    over = good.lanes,
+    max_fanout = 4,
+)
+bad_field = command(
+    name = "bad_field",
+    run = "printf '{\"lanes\": [\"a\", 7]}\n'",
+    emits = {"lanes": schema_file("schemas/lanes.json")},
+    required = False,
+)
+after = command(name = "after", run = "printf '{}\n'", depends_on = [bad_field], required = False)
+bad_file = command(
+    name = "bad_file",
+    run = "printf '{\"ok\": \"yes\"}' > BAD.json && printf '{}\n'",
+    emits_files = {"BAD.json": schema_file("schemas/result.json")},
+    required = False,
+)
+not_json = command(
+    name = "not_json",
+    run = "printf 'ok' > PLAIN.json && printf '{}\n'",
+    emits_files = {"PLAIN.json": schema_file("schemas/result.json")},
+    required = False,
+)
+workflow(type = "playbook", tasks = [good, lane, bad_field, after, bad_file, not_json])
+"#,
+        );
+        std::fs::create_dir_all(dir.join("schemas")).unwrap();
+        std::fs::write(
+            dir.join("schemas/lanes.json"),
+            r#"{"type": "array", "items": {"type": "string"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("schemas/result.json"),
+            r#"{"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}"#,
+        )
+        .unwrap();
+        let out = run_playbook(&dir);
+        let result = |name: &str| &out.results[&name.into()];
+
+        assert_eq!(
+            result("good").status,
+            TaskStatus::Pass,
+            "{:?}",
+            result("good").note
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/good/RESULT.json")).unwrap(),
+            "{\"ok\": true}"
+        );
+        let lanes: Vec<_> = out
+            .results
+            .iter()
+            .filter(|(name, _)| name.0.starts_with("lane["))
+            .collect();
+        assert_eq!(lanes.len(), 2, "{:?}", out.results.keys());
+        assert!(lanes.iter().all(|(_, r)| r.status == TaskStatus::Pass));
+
+        let bad_field = result("bad_field");
+        assert_eq!(bad_field.status, TaskStatus::Fail);
+        assert_eq!(
+            bad_field.attempts, 1,
+            "a schema mismatch must not be retried"
+        );
+        assert_eq!(
+            bad_field.note.as_deref(),
+            Some(
+                "output field \"lanes\" does not match its schema: /1: value is not of type \"string\""
+            )
+        );
+        assert_eq!(result("after").status, TaskStatus::Blocked);
+
+        let bad_file = result("bad_file");
+        assert_eq!(bad_file.status, TaskStatus::Fail);
+        assert_eq!(
+            bad_file.attempts, 1,
+            "a schema mismatch must not be retried"
+        );
+        assert_eq!(
+            bad_file.note.as_deref(),
+            Some(
+                "declared file \"BAD.json\" does not match its schema: /ok: value is not of type \"boolean\""
+            )
+        );
+        assert!(
+            !dir.join("state/files/bad_file").exists(),
+            "a file its schema rejects was published"
+        );
+
+        let not_json = result("not_json");
+        assert_eq!(not_json.status, TaskStatus::Fail);
+        assert!(
+            not_json
+                .note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("declared file \"PLAIN.json\" is not JSON: ")),
+            "{:?}",
+            not_json.note
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A pack whose `plan` agent turn is scripted per turn, with the schemas the tests declare.
+    fn repair_pack(tag: &str, workflow: &str, agents: Value) -> std::path::PathBuf {
+        let dir = playbook_pack(tag, workflow);
+        std::fs::write(dir.join("agents.json"), agents.to_string()).unwrap();
+        std::fs::create_dir_all(dir.join("schemas")).unwrap();
+        std::fs::write(
+            dir.join("schemas/lanes.json"),
+            r#"{"type": "array", "items": {"type": "string"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("schemas/result.json"),
+            r#"{"type": "object", "required": ["ok"], "properties": {"ok": {"type": "boolean"}}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    const REPAIRED_PLAN: &str = r#"
+plan = agent(
+    name = "plan",
+    prompt = "plan the lanes",
+    emits = {"lanes": schema_file("schemas/lanes.json")},
+    emits_files = {"RESULT.json": schema_file("schemas/result.json")},
+    repair = 2,
+)
+workflow(type = "playbook", tasks = [plan])
+"#;
+
+    #[test]
+    fn a_repair_turn_resumes_the_session_and_fixes_the_output_in_place() {
+        let log = std::env::temp_dir().join(format!("crucible-repair-log-{}", std::process::id()));
+        let _ = std::fs::remove_file(&log);
+        let record = format!("{}", log.display());
+        let dir = repair_pack(
+            "repair-fixed",
+            REPAIRED_PLAN,
+            serde_json::json!({
+                "plan": {
+                    "appends": {
+                        (record.clone()): "{ENV:CRUCIBLE_AGENT_SESSION_ACTION} {ENV:CRUCIBLE_AGENT_SESSION_ID}\n{ENV:CRUCIBLE_PROMPT}\n--\n"
+                    },
+                    "turns": [
+                        {"result": {"lanes": ["a", 7]}, "writes": {"RESULT.json": "{\"ok\": \"hunter2\"}"}, "cost_usd": 0.5},
+                        {"result": {"lanes": ["a", "b"]}, "writes": {"RESULT.json": "{\"ok\": true}"}, "cost_usd": 0.25}
+                    ]
+                }
+            }),
+        );
+        let out = run_playbook(&dir);
+        let plan = &out.results[&"plan".into()];
+        assert_eq!(plan.status, TaskStatus::Pass, "{:?}", plan.note);
+        assert_eq!(plan.attempts, 1, "a repair is not a transport retry");
+        assert!((plan.cost_usd - 0.75).abs() < 1e-9, "{}", plan.cost_usd);
+        assert_eq!(plan.output, Some(serde_json::json!({"lanes": ["a", "b"]})));
+        assert_eq!(plan.repairs.len(), 1, "{:?}", plan.repairs);
+        let repair = &plan.repairs[0];
+        assert_eq!(repair.label, "plan repair 1/2");
+        assert_eq!((repair.round, repair.of), (1, 2));
+        assert!((repair.cost_usd - 0.25).abs() < 1e-9);
+        assert_eq!(
+            repair.notes,
+            [
+                "output field \"lanes\" does not match its schema: /1: value is not of type \"string\"",
+                "declared file \"RESULT.json\" does not match its schema: /ok: value is not of type \"boolean\"",
+            ]
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("state/files/plan/RESULT.json")).unwrap(),
+            "{\"ok\": true}"
+        );
+
+        let turns = std::fs::read_to_string(&log).unwrap();
+        let turns: Vec<&str> = turns.split("--\n").filter(|t| !t.is_empty()).collect();
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        let (first, second) = (
+            turns[0].lines().next().unwrap(),
+            turns[1].lines().next().unwrap(),
+        );
+        let id = first.strip_prefix("start ").expect(first);
+        assert!(!id.is_empty());
+        assert_eq!(
+            second,
+            format!("resume {id}"),
+            "the repair resumed the same session"
+        );
+        assert!(turns[1].contains("This is repair 1 of 2."), "{}", turns[1]);
+        assert!(
+            turns[1].contains("/1: value is not of type"),
+            "{}",
+            turns[1]
+        );
+        assert!(
+            !turns[1].contains("hunter2"),
+            "a repair prompt repeated a refused value"
+        );
+        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repairs_that_never_fix_the_output_fail_the_task_once_with_the_last_note() {
+        let dir = repair_pack(
+            "repair-exhausted",
+            REPAIRED_PLAN,
+            serde_json::json!({"plan": {"result": {}, "cost_usd": 0.125}}),
+        );
+        let out = run_playbook(&dir);
+        let plan = &out.results[&"plan".into()];
+        assert_eq!(plan.status, TaskStatus::Fail);
+        assert_eq!(plan.attempts, 1);
+        assert!((plan.cost_usd - 0.375).abs() < 1e-9, "{}", plan.cost_usd);
+        assert_eq!(
+            plan.repairs
+                .iter()
+                .map(|r| r.label.as_str())
+                .collect::<Vec<_>>(),
+            ["plan repair 1/2", "plan repair 2/2"]
+        );
+        for repair in &plan.repairs {
+            assert_eq!(
+                repair.notes,
+                [
+                    "output missing declared field \"lanes\"",
+                    "declared file \"RESULT.json\" is absent",
+                ]
+            );
+        }
+        assert_eq!(
+            plan.note.as_deref(),
+            Some("declared file \"RESULT.json\" is absent after a passing attempt")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mapped_instances_are_repaired_independently() {
+        let dir = repair_pack(
+            "repair-mapped",
+            r#"
+discover = command(name = "discover", run = "printf '{\"targets\": [\"a\", \"b\"]}\n'", emits = ["targets"])
+audit = agent(
+    name = "audit",
+    prompt = "audit one target",
+    depends_on = [discover],
+    over = discover.targets,
+    max_fanout = 4,
+    emits = {"n": "integer"},
+    repair = 1,
+)
+workflow(type = "playbook", tasks = [discover, audit])
+"#,
+            serde_json::json!({
+                "audit[a]": {"turns": [{"result": {"n": "x"}}, {"result": {"n": 1}}]},
+                "audit[b]": {"result": {"n": 2}}
+            }),
+        );
+        let out = run_playbook(&dir);
+        let a = &out.results[&"audit[a]".into()];
+        let b = &out.results[&"audit[b]".into()];
+        assert_eq!(a.status, TaskStatus::Pass, "{:?}", a.note);
+        assert_eq!(b.status, TaskStatus::Pass, "{:?}", b.note);
+        assert_eq!(
+            a.repairs
+                .iter()
+                .map(|r| r.label.as_str())
+                .collect::<Vec<_>>(),
+            ["audit[a] repair 1/1"]
+        );
+        assert_eq!(
+            a.repairs[0].notes,
+            ["output field \"n\" is string, declared integer"]
+        );
+        assert!(b.repairs.is_empty(), "{:?}", b.repairs);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_repair_starts_once_the_attempt_has_spent_the_budget_left() {
+        let dir = repair_pack(
+            "repair-budget",
+            REPAIRED_PLAN,
+            serde_json::json!({"plan": {"result": {"lanes": [7]}, "cost_usd": 0.5}}),
+        );
+        let (out, _) = run_playbook_within(&dir, 0.5);
+        let plan = &out.results[&"plan".into()];
+        assert_eq!(plan.status, TaskStatus::Fail);
+        assert!(plan.repairs.is_empty(), "{:?}", plan.repairs);
+        assert!((out.spent_usd - 0.5).abs() < 1e-9, "{}", out.spent_usd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repair_turn_runs_under_the_attempts_own_timeout() {
+        let dir = repair_pack(
+            "repair-timeout",
+            &REPAIRED_PLAN.replace("repair = 2,", "repair = 2,\n    timeout = \"2s\","),
+            serde_json::json!({"plan": {"turns": [
+                {"result": {"lanes": [7]}},
+                {"result": {"lanes": ["a"]}, "writes": {"RESULT.json": "{\"ok\": true}"}, "sleep_ms": 6000}
+            ]}}),
+        );
+        let started = std::time::Instant::now();
+        let out = run_playbook(&dir);
+        let plan = &out.results[&"plan".into()];
+        assert_eq!(plan.status, TaskStatus::Fail);
+        assert_eq!(plan.repairs.len(), 1, "{:?}", plan.repairs);
+        assert!(
+            plan.note
+                .as_deref()
+                .is_some_and(|n| n.starts_with("timed out")),
+            "{:?}",
+            plan.note
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the repair turn outlived the task's timeout"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3691,6 +4644,7 @@ workflow(type = "playbook", tasks = [producer, report])
                 Attempt {
                     outcome,
                     cost_usd: 0.0,
+                    repairs: Vec::new(),
                 },
                 &counter,
                 &before,

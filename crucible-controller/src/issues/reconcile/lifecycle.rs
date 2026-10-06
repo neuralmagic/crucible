@@ -100,7 +100,12 @@ pub(super) async fn reconcile_awaiting(db: &Db, cfg: &ControllerCfg, issue: &Iss
     // the `building` state and let [`reconcile_building`] own the dispatch/poll — a pack with no
     // `[build]` block launches directly here, exactly as before the feature. Planning is a
     // hermetic manifest read (no `spawn_blocking`).
-    let pack = crate::playbooks::packs::materialize_pack_or_empty(db.pool(), &issue.key).await?;
+    let pack = crate::playbooks::packs::materialize_pack_or_empty(
+        db.pool(),
+        &issue.key,
+        scope.tree_digest.as_ref(),
+    )
+    .await?;
     let Some(requests) =
         plan_builds_or_park(db, issue, Status::AwaitingApproval, pack.path()).await?
     else {
@@ -120,15 +125,7 @@ pub(super) async fn reconcile_awaiting(db: &Db, cfg: &ControllerCfg, issue: &Iss
         return Ok(());
     }
 
-    launch_approved_run(
-        db,
-        cfg,
-        issue,
-        &scope,
-        Status::AwaitingApproval,
-        pack.path(),
-    )
-    .await
+    launch_approved_run(db, cfg, issue, &scope, Status::AwaitingApproval, &pack).await
 }
 
 /// Launch the approved pack's loop run and advance `from` → `running` (`from` is
@@ -143,7 +140,7 @@ async fn launch_approved_run(
     issue: &Issue,
     scope: &crate::issues::model::Scope,
     from: Status,
-    pack_dir: &std::path::Path,
+    pack: &crate::playbooks::packs::MaterializedPack,
 ) -> Result<()> {
     // Mint the run id before the dispatch so the pod is stamped with it (and the completion edge maps
     // back). The primitive renders the pack's loop pod, stamps it controller-owned (managed-by +
@@ -171,7 +168,7 @@ async fn launch_approved_run(
         crate::runs::workpod::active_dispatcher(),
         &issue.key,
         &run_id,
-        pack_dir,
+        pack,
         &build_digests,
         // The NAME; the dispatch resolves it against the configured set and projects the JSON onto
         // the loop container as BROKER_CODEGEN_TOOLS_OVERLAY.
@@ -186,7 +183,7 @@ async fn launch_approved_run(
         Some(&crate::runs::workpod::LaunchSecrets {
             scope: crate::secrets::launch::Scope::repo(&issue.repo),
             launcher: crate::authz::model::Principals::default(),
-            revision: crate::secrets::launch::OwnedRevision::Published(None),
+            revision: crate::secrets::launch::OwnedRevision::UNPINNED,
             provider: cfg.secret_provider.clone(),
             inference_provider: dispatch.map(|d| d.provider),
             exposure: scope.exposure.clone(),
@@ -291,7 +288,12 @@ pub(super) async fn reconcile_building(db: &Db, cfg: &ControllerCfg, issue: &Iss
     else {
         return Ok(());
     };
-    let pack = crate::playbooks::packs::materialize_pack_or_empty(db.pool(), &issue.key).await?;
+    let pack = crate::playbooks::packs::materialize_pack_or_empty(
+        db.pool(),
+        &issue.key,
+        scope.tree_digest.as_ref(),
+    )
+    .await?;
     let Some(requests) = plan_builds_or_park(db, issue, Status::Building, pack.path()).await?
     else {
         return Ok(());
@@ -340,7 +342,7 @@ pub(super) async fn reconcile_building(db: &Db, cfg: &ControllerCfg, issue: &Iss
         crate::builds::lifecycle::BuildsProgress::AllReady => {
             // Every image is built + pinned — the block lifts. Launch the run exactly as a build-free
             // pack would, advancing `building` → `running`.
-            launch_approved_run(db, cfg, issue, &scope, Status::Building, pack.path()).await
+            launch_approved_run(db, cfg, issue, &scope, Status::Building, &pack).await
         }
         // Still dispatching/building (or transiently capped): stay `building`, re-driven next pass.
         crate::builds::lifecycle::BuildsProgress::Waiting => Ok(()),

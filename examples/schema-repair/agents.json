@@ -1,0 +1,11 @@
+{
+  "plan": {
+    "result": {"lanes": ["a", "b"]},
+    "turns": [
+      {"writes": {"PLAN.json": "{\"ok\": \"hunter2\"}"}, "cost_usd": 0.25},
+      {"writes": {"PLAN.json": "{\"ok\": true}"}, "cost_usd": 0.125}
+    ]
+  },
+  "audit[a]": {"result": {}, "writes": {"AUDIT.json": "{\"ok\": true}"}, "cost_usd": 0.0625},
+  "audit[b]": {"result": {}, "writes": {"AUDIT.json": "{\"ok\": \"hunter2\"}"}, "cost_usd": 0.0625}
+}

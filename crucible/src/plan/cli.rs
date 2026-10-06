@@ -49,6 +49,9 @@ pub fn compile_workflow(
     for prompt_file in &compiled.prompt_files {
         eprintln!("embedded prompt: {}", prompt_file.display());
     }
+    for schema_file in &compiled.schema_files {
+        eprintln!("embedded schema: {}", schema_file.display());
+    }
     print!("{}", compiled.canonical_json);
     Ok(())
 }
@@ -609,6 +612,8 @@ pub fn run(
     let mut series_entry: Option<Option<TaskName>> = None;
     let mut playbook = false;
     let mut prior: Option<Prior> = None;
+    // The run's agent knobs; None for a precompiled plan, which has no manifest.
+    let mut agent_args: Option<crate::args::Args> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
         match (path, manifest) {
             (_, Some(m)) => {
@@ -621,6 +626,7 @@ pub fn run(
                     agent,
                 )?;
                 let session_log = prepared.paths.session_log.clone();
+                agent_args = Some(prepared.args.clone());
                 evidence = Some(prepared.paths.clone());
                 playbook = loaded.workflow.as_ref().is_some_and(|w| {
                     w.workflow_type == crate::plan::workflow::WorkflowType::Playbook
@@ -866,7 +872,13 @@ pub fn run(
             if let Some(f) = &events {
                 append(
                     f,
-                    &crate::plan::events::task_result_event(plan.plan().version, 0, task, result),
+                    &crate::plan::events::task_result_event(
+                        plan.plan().version,
+                        0,
+                        task,
+                        result,
+                        agent_args.as_ref(),
+                    ),
                 );
             }
         },
@@ -1294,9 +1306,10 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
-            &crate::plan::events::task_result_event(1, 0, t, &r),
+            &crate::plan::events::task_result_event(1, 0, t, &r, None),
         ))
         .unwrap();
         match back {
@@ -1613,6 +1626,68 @@ workflow(type = "playbook", tasks = [pick, gate, a, b, lint, optional, publish])
         assert_eq!(status("lint").as_deref(), Some("fail"));
         assert_eq!(status("optional").as_deref(), Some("skipped"));
         assert_eq!(status("publish").as_deref(), Some("pass"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_mcp_server_that_fails_to_start_ends_the_run_with_its_stderr() {
+        let _env = crucible::test_support::env_lock();
+        let dir = crate::testing::tempdir("mcp-start-fails");
+        std::fs::write(dir.join("tool.py"), "print('ok')\n").unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            "t = command(name = \"t\", run = \"python3 tool.py\")\nworkflow(type = \"playbook\", tasks = [t])\n",
+        )
+        .unwrap();
+        let manifest = dir.join("crucible.toml");
+        std::fs::write(
+            &manifest,
+            r#"
+            [workspace]
+            inject = ["tool.py"]
+            [agent]
+            backend = "openshell"
+            goal = "g"
+            mcp = ["buildit"]
+            [mcp.buildit]
+            bin = "sh"
+            args = ["-c", "echo 'buildit: KUBECONFIG names no cluster' >&2; exit 3"]
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+            "#,
+        )
+        .unwrap();
+
+        let error = run(
+            None,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            None,
+            Some(&manifest),
+            RunOpts {
+                ceilings: Ceilings {
+                    usd: Some(1.0),
+                    wall_clock: Some(std::time::Duration::from_secs(60)),
+                    wall_clock_raw: Some("60s".to_string()),
+                },
+                ..Default::default()
+            },
+        )
+        .expect_err("the run cannot start its server");
+
+        assert!(error.is::<crate::cli::setup::EndedAtSetup>(), "{error:#}");
+        let log = std::fs::read_to_string(dir.join("state/session.jsonl")).unwrap();
+        let last = log.lines().last().and_then(crate::report::session::decode);
+        let Some(crate::report::session::SessionEvent::Shutdown { outcome, reason }) = last else {
+            panic!("the session log does not end in a shutdown: {log}");
+        };
+        assert_eq!(outcome, "error");
+        assert!(
+            reason.contains("[mcp.buildit] (`sh`) exited")
+                && reason.ends_with("buildit: KUBECONFIG names no cluster"),
+            "{reason}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

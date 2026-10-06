@@ -573,6 +573,16 @@ async fn new_with_a_surviving_pack_goes_scoped_with_ledger_and_event(pool: PgPoo
         .expect("scope row");
     assert_eq!(scope.pack_digest.as_deref(), Some("v1:deadbeefcafef00d"));
     assert_eq!(scope.check_outcome.as_deref(), Some("PASS"));
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT tree_digest FROM pack_tarballs WHERE issue_slug = 'owner_repo_1'",
+    )
+    .fetch_one(db.pool())
+    .await?;
+    assert_eq!(
+        scope.tree_digest.map(String::from),
+        stored,
+        "the scope records the tree it froze"
+    );
 
     let report = crate::issues::store::latest_scope_report(db.pool(), "owner/repo#1")
         .await?
@@ -1649,6 +1659,111 @@ async fn approved_pack_with_a_build_blocks_the_run_at_building(pool: PgPool) -> 
         .fetch_one(db.pool())
         .await?;
     assert_eq!(runs.n, 0, "no loop run launched while building");
+    Ok(())
+}
+
+/// A fake run dispatcher that keeps the pack ConfigMaps it was asked to create.
+#[cfg(feature = "autoresearch")]
+#[derive(Default)]
+struct PackCapturingDispatcher {
+    configmaps: std::sync::Mutex<Vec<k8s_openapi::api::core::v1::ConfigMap>>,
+}
+
+#[cfg(feature = "autoresearch")]
+#[async_trait::async_trait]
+impl crate::runs::workpod::PodDispatcher for PackCapturingDispatcher {
+    async fn create(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        mut pod: k8s_openapi::api::core::v1::Pod,
+    ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        pod.metadata.uid = Some("run-pod-uid".to_string());
+        Ok(pod)
+    }
+    async fn create_configmap(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        cm: k8s_openapi::api::core::v1::ConfigMap,
+    ) -> Result<()> {
+        self.configmaps.lock().expect("lock").push(cm);
+        Ok(())
+    }
+    async fn await_terminal(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _name: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::runs::workpod::TerminalState> {
+        Ok(crate::runs::workpod::TerminalState {
+            phase: crate::runs::workpod::TurnPhase::Succeeded,
+            message: None,
+        })
+    }
+    async fn logs(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+        Ok(String::new())
+    }
+    async fn delete(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// An approved scope runs the tree it froze. A later write of the issue's pack (a re-scope that
+/// stored its pack and has not recorded its scope yet) changes neither build planning, which here
+/// would see a `[build]` block, nor the pack the run is delivered.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_approved_scope_runs_the_tree_it_froze_after_the_pack_is_rewritten(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "owner/repo#51";
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue(key)).await?;
+    assert!(
+        crate::issues::store::claim_issue(db.pool(), key, Status::New, Status::AwaitingApproval)
+            .await?
+    );
+    let frozen = tempfile::tempdir()?;
+    std::fs::write(
+        frozen.path().join("crucible.toml"),
+        crate::testing::fixtures::LOOP_PACK_MANIFEST,
+    )?;
+    let stored = crate::playbooks::packs::store_pack_tree(db.pool(), key, frozen.path()).await?;
+    let scope_id = approve_scope(&db, key).await?;
+    crate::issues::store::set_scope_tree(db.pool(), scope_id, &stored.tree).await?;
+    write_build_pack(&db, key).await;
+
+    let dispatcher = std::sync::Arc::new(PackCapturingDispatcher::default());
+    crate::runs::workpod::install_dispatcher(dispatcher.clone());
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    res?;
+
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .expect("issue")
+            .status,
+        Status::Running,
+        "planning read the frozen tree, which declares no builds"
+    );
+    let configmaps = dispatcher.configmaps.lock().expect("lock");
+    assert_eq!(configmaps.len(), 1, "one pack delivered");
+    let tarball = configmaps[0]
+        .binary_data
+        .as_ref()
+        .and_then(|data| data.get("pack.tar.gz"))
+        .expect("pack.tar.gz");
+    let delivered = crucible_contract::pack_tree::read_tar_gz(&tarball.0)?.tree;
+    assert_eq!(delivered.digest(), stored.tree);
     Ok(())
 }
 
@@ -4542,7 +4657,7 @@ async fn pod_scope_survival_without_a_pack_blob_fails_loudly(pool: PgPool) -> Re
         "no pack, no `scoped` — the row stays put for a retry"
     );
     assert!(
-        crate::runs::blob_store::get_pack_tarball(db.pool(), "owner_repo_71")
+        crate::runs::blob_store::get_pack(db.pool(), "owner_repo_71")
             .await?
             .is_none(),
         "nothing pretended to be a pack in the store"
@@ -6531,8 +6646,21 @@ async fn seed_registered_playbook(db: &Db, id: &str) {
 }
 
 async fn adopt_launch(db: &Db, key: &str, max_cost: f64) {
+    adopt_launch_with_groups(db, key, max_cost, None).await;
+}
+
+async fn adopt_launch_with_groups(
+    db: &Db,
+    key: &str,
+    max_cost: f64,
+    launcher_groups: Option<&serde_json::Value>,
+) {
     let params = serde_json::json!({"topic": "attention sinks", "depth": "deep"});
     let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+    let registered = crate::playbooks::registry::get(db.pool(), "survey")
+        .await
+        .expect("read the registry")
+        .expect("survey is registered");
     assert!(
         matches!(
             crate::launches::store::adopt_playbook_launch(
@@ -6551,8 +6679,9 @@ async fn adopt_launch(db: &Db, key: &str, max_cost: f64) {
                     origin: crate::model::LaunchOrigin::Manual,
                     draft_version: None,
                     created_by: Some("wren"),
-                    launcher_groups: None,
+                    launcher_groups,
                 },
+                registered.revision()
             )
             .await
             .expect("adopt"),
@@ -6570,12 +6699,18 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
         crate::launches::model::CursorSpec::parse("$.scan.newest_created_at", Some("since"), None)
             .expect("cursor");
     let params = serde_json::json!({"topic": "attention sinks"});
+    let registered = crate::playbooks::registry::get(db.pool(), "survey")
+        .await
+        .expect("read the registry")
+        .expect("survey is registered");
     let scheduled = crate::launches::schedules::ScheduleStore::new(db.clone())
         .create(
             &crate::launches::schedules::NewSchedule {
                 standing: crate::launches::standing::NewStanding {
                     playbook: "survey",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        registered.revision(),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:form",
@@ -6615,6 +6750,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             created_by: Some("wren"),
             launcher_groups: None,
         },
+        registered.revision(),
     )
     .await
     .expect("adopt");
@@ -6798,6 +6934,118 @@ async fn a_dequeued_playbook_key_dispatches_from_its_stored_row(pool: PgPool) ->
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].status, "running");
     assert!(runs[0].scope.is_none(), "a launch has no scope to point at");
+    Ok(())
+}
+
+/// Dispatch delivers only the tree stored under the launch's digest: when a stored file no longer
+/// hashes to it, the launch is refused with that reason, no pod is created, and it stays `new`.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_stored_tree_was_tampered_with_is_refused(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-9";
+    seed_registered_playbook(&db, "survey").await;
+    crate::playbooks::pack_migration::convert_pack_trees(db.pool()).await?;
+    adopt_launch(&db, key, 3.5).await;
+    let tree: String = sqlx::query_scalar(
+        "SELECT tree_digest FROM pack_tarballs WHERE issue_slug = $1 AND tree_digest IS NOT NULL",
+    )
+    .bind(crate::model::sanitize_key(key))
+    .fetch_one(db.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE pack_blobs SET content = 'print(\"evil\")' WHERE sha256 = \
+         (SELECT sha256 FROM pack_tree_files WHERE digest = $1 AND path = 'workflow.star')",
+    )
+    .bind(&tree)
+    .execute(db.pool())
+    .await?;
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::Succeeded,
+        logs: String::new(),
+        created: created.clone(),
+    }));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+
+    let err = format!(
+        "{:#}",
+        res.expect_err("a tampered tree is never dispatched")
+    );
+    assert!(
+        err.contains(&format!(
+            "pack tree {tree} no longer matches its stored files"
+        )),
+        "{err}"
+    );
+    assert!(
+        created.lock().expect("lock").is_empty(),
+        "no pod was created"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::New);
+    let failed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE key = $1 AND reason = $2")
+            .bind(key)
+            .bind(crate::runs::launch::PLAYBOOK_DISPATCH_FAILED)
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(failed, 1, "the refusal is on the launch's event log");
+    Ok(())
+}
+
+/// A launch whose pack conversion recorded as unconvertible is parked naming the reason, with no
+/// pod, on its first dispatch rather than retried.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_pack_is_unconvertible_parks_naming_the_reason(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
+    seed_registered_playbook(&db, "survey").await;
+    crate::testing::make_unconvertible(db.pool(), "playbooks", "id = 'survey'").await;
+    adopt_launch(&db, key, 3.5).await;
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::Succeeded,
+        logs: String::new(),
+        created: created.clone(),
+    }));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+
+    res?;
+    assert!(
+        created.lock().expect("lock").is_empty(),
+        "no pod was created"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    let reason = issue.parked_reason.expect("parked reason");
+    assert!(reason.contains(crate::testing::SYMLINK_REASON), "{reason}");
+    assert!(
+        matches!(
+            ParkReason::parse(&reason),
+            ParkReason::PackUnconvertible { reason, .. } if reason == crate::testing::SYMLINK_REASON
+        ),
+        "{reason}"
+    );
     Ok(())
 }
 
@@ -7089,6 +7337,184 @@ async fn a_local_launch_with_a_binding_parks_instead_of_running_without_it(
     Ok(())
 }
 
+const TEAM_GROUP: &str = "/groups/tibrahim-all";
+
+/// Team `tibrahim-all` with [`TEAM_GROUP`] as a member, the `survey` playbook, and `wren` signed in
+/// holding that group as of `stamped`.
+async fn seed_team_launcher(db: &Db, stamped: jiff::Timestamp) -> Result<()> {
+    use crate::authz::model::{Member, MemberRef, TeamRole, TeamSlug};
+    let team = TeamSlug::parse("tibrahim-all")?;
+    let now = jiff::Timestamp::now().to_string();
+    let mut conn = db.pool().acquire().await?;
+    crate::authz::store::insert_team(&mut conn, &team, "tibrahim-all", None, &now).await?;
+    crate::authz::store::replace_members(
+        &mut conn,
+        &team,
+        &[Member {
+            member: MemberRef::Group(TEAM_GROUP.to_string()),
+            role: TeamRole::Member,
+        }],
+        None,
+        &now,
+    )
+    .await?;
+    crate::identity::oidc::users::record_login(db.pool(), "sub-wren", "wren", None, stamped)
+        .await?;
+    crate::identity::oidc::users::record_groups_on(
+        &mut conn,
+        "sub-wren",
+        &[TEAM_GROUP.to_string()],
+        stamped,
+    )
+    .await?;
+    seed_registered_playbook(db, "survey").await;
+    Ok(())
+}
+
+/// The parked reason of `key`, which must be parked.
+async fn parked_reason(db: &Db, key: &str) -> Result<String> {
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked, "{:?}", issue.parked_reason);
+    Ok(format!("{:?}", issue.parked_reason))
+}
+
+/// A queued launch keeps only the recorded groups its launcher's `users` row still holds at
+/// dispatch: once the owner loses the group, a launch recorded with it no longer reaches the team.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_owner_lost_the_group_before_dispatch_is_refused(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let cfg = ControllerCfg {
+        playbook_executor: crucible_controller::PlaybookExecutor::Local,
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    seed_team_launcher(&db, jiff::Timestamp::now()).await?;
+    bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
+    let recorded = serde_json::json!([TEAM_GROUP]);
+    let held = "playbook:survey:0199c0de-7c2c-71a5-8000-e";
+    adopt_launch_with_groups(&db, held, 3.5, Some(&recorded)).await;
+    let lost = "playbook:survey:0199c0de-7c2c-71a5-8000-f";
+    adopt_launch_with_groups(&db, lost, 3.5, Some(&recorded)).await;
+
+    let res = async {
+        reconcile(&db, &cfg, held).await?;
+        let mut conn = db.pool().acquire().await?;
+        crate::identity::oidc::users::record_groups_on(
+            &mut conn,
+            "sub-wren",
+            &[],
+            jiff::Timestamp::now(),
+        )
+        .await?;
+        reconcile(&db, &cfg, lost).await
+    }
+    .await;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+    res?;
+
+    let resolved = parked_reason(&db, held).await?;
+    assert!(
+        resolved.contains("local executor delivers no secrets"),
+        "the owner still held the group, so the binding resolved: {resolved}"
+    );
+    let refused = parked_reason(&db, lost).await?;
+    assert!(
+        refused.contains("owned by team:tibrahim-all"),
+        "the owner lost the group before dispatch: {refused}"
+    );
+    Ok(())
+}
+
+/// An issuer that cannot be asked for a stale launcher's groups defers a launch whose scope binds a
+/// secret: it stays `new` for a later tick, and nothing runs or parks. A scope that binds nothing
+/// dispatches anyway. An issuer that refuses holds no groups, so the deferred launch parks.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_waits_out_an_unreachable_issuer_and_parks_on_a_refusal(
+    pool: PgPool,
+) -> Result<()> {
+    use crate::identity::oidc::credentials::{CredentialKeys, OwnerRefresh};
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let bin = fake_local_engine(dir.path(), &playbook_log("finished"));
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let now = jiff::Timestamp::now();
+    seed_team_launcher(&db, now.checked_sub(jiff::SignedDuration::from_hours(2))?).await?;
+    let keys = std::sync::Arc::new(CredentialKeys::new(vec![vec![7u8; 32]])?);
+    let mut conn = db.pool().acquire().await?;
+    crate::identity::oidc::credentials::upsert(&mut conn, &keys, "sub-wren", "offline", now)
+        .await?;
+    drop(conn);
+    let cfg_for = |provider| ControllerCfg {
+        playbook_executor: crucible_controller::PlaybookExecutor::Local,
+        owner_refresh: Some(std::sync::Arc::new(OwnerRefresh::new(
+            db.pool().clone(),
+            provider,
+            keys.clone(),
+        ))),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let unreachable = cfg_for(crate::identity::oidc::tests::provider_at(
+        "http://127.0.0.1:1/realms/nobody",
+    ));
+    let (_issuer, provider) = crate::identity::oidc::tests::issuer_answering(
+        wiremock::ResponseTemplate::new(400)
+            .set_body_json(serde_json::json!({ "error": "invalid_grant" })),
+    )
+    .await;
+    let refusing = cfg_for(provider);
+    let recorded = serde_json::json!([TEAM_GROUP]);
+    let unbound = "playbook:survey:0199c0de-7c2c-71a5-8000-10";
+    adopt_launch_with_groups(&db, unbound, 3.5, Some(&recorded)).await;
+    let bound = "playbook:survey:0199c0de-7c2c-71a5-8000-11";
+    adopt_launch_with_groups(&db, bound, 3.5, Some(&recorded)).await;
+
+    let res = async {
+        reconcile(&db, &unreachable, unbound).await?;
+        bind_playbook_secret(&db, "survey", "team:tibrahim-all", None).await;
+        reconcile(&db, &unreachable, bound).await?;
+        let deferred = crate::issues::store::get_issue(db.pool(), bound)
+            .await?
+            .expect("issue");
+        reconcile(&db, &refusing, bound).await?;
+        anyhow::Ok(deferred)
+    }
+    .await;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+    let deferred = res?;
+
+    let started = crate::issues::store::get_issue(db.pool(), unbound)
+        .await?
+        .expect("issue");
+    assert!(
+        matches!(started.status, Status::Running | Status::Done),
+        "{:?}: {:?}",
+        started.status,
+        started.parked_reason
+    );
+    assert_eq!(deferred.status, Status::New, "{:?}", deferred.parked_reason);
+    let reason = parked_reason(&db, bound).await?;
+    assert!(reason.contains("owned by team:tibrahim-all"), "{reason}");
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(runs, 1, "only the launch binding nothing ran");
+    Ok(())
+}
+
 /// Local mode: the launch runs as a supervised subprocess with the launcher's own values and
 /// ceilings, and its session lands in the same ledger rows a pod run's would — marked as the local
 /// run it was.
@@ -7346,6 +7772,70 @@ async fn a_playbook_launch_without_its_row_parks(pool: PgPool) -> Result<()> {
         issue.parked_reason.as_deref().map(ParkReason::parse),
         Some(ParkReason::PlaybookLaunchMissing)
     );
+    Ok(())
+}
+
+/// Dispatch preflights every image a pack runs, not only its default: a named sandbox on an image
+/// the catalog does not know parks the launch, naming the sandbox, even when the pack's own image
+/// passes and even when the pack waves its default image through with `allow_unverified_image`.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_whose_named_sandbox_image_fails_preflight_parks(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-9";
+    seed_registered_playbook(&db, "survey").await;
+    let digest = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+    crate::images::store::upsert_image(
+        db.pool(),
+        &crate::images::model::CatalogImage {
+            repository: "registry.example.com/sandbox".into(),
+            digest: digest.into(),
+            tags: vec!["latest".into()],
+            arches: vec!["amd64".into()],
+            created_at: None,
+            capabilities: Some(crucible_capability::CapabilityDoc {
+                features: vec!["base".into()],
+                image: "sandbox".into(),
+                predicates: [("agent.claude-code".to_string(), "2.1.270".to_string())].into(),
+                schema: crucible_capability::CAPABILITIES_SCHEMA.into(),
+            }),
+            capability_digest: Some("sha256:cap".into()),
+            intro_digest: None,
+            first_seen: "2026-09-30T00:00:00Z".into(),
+            last_seen: "2026-09-30T00:00:00Z".into(),
+        },
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE playbooks SET agent_backend = 'openshell', agent_sandbox_image = $2, \
+         agent_requirements = $3 WHERE id = $1",
+    )
+    .bind("survey")
+    .bind(format!("registry.example.com/sandbox@{digest}"))
+    .bind(serde_json::json!({
+        "allow_unverified_image": true,
+        "sandboxes": {"go": "quay.io/acme/uncatalogued:dev"},
+    }))
+    .execute(db.pool())
+    .await?;
+    adopt_launch(&db, key, 3.0).await;
+
+    reconcile(&db, &cfg, key).await?;
+
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    match issue.parked_reason.as_deref().map(ParkReason::parse) {
+        Some(ParkReason::ImagePreflightRefused { detail, .. }) => assert!(
+            detail.contains(
+                "sandbox.go: sandbox image quay.io/acme/uncatalogued:dev is not in the image catalog"
+            ),
+            "{detail}"
+        ),
+        other => panic!("expected an image preflight park, got {other:?}"),
+    }
     Ok(())
 }
 

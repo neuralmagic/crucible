@@ -7,13 +7,13 @@
 //! silent $0 success.
 //!
 //! Auth is Vertex ADC via the openshell gateway's metadata emulator (`uses_vertex_provider` stays
-//! true), key-free, exactly like claude; the env script sets no API key. MCP toward the
-//! provisioning broker rides hermes's own `config.yaml` (remote HTTP MCP with a bearer header), not
+//! true), key-free, exactly like claude; the env script sets no API key. MCP toward the turn's
+//! servers rides hermes's own `config.yaml` (remote HTTP MCP with a bearer header), not
 //! argv.
 
 use crate::agent::harness::{
-    AuthProvider, Backend, Broker, HarnessSpec, RawLines, StreamDecoder, TranscriptLocator,
-    TurnArtifacts,
+    AuthProvider, Backend, HarnessSpec, McpServer, RawLines, StreamDecoder, TranscriptLocator,
+    TurnArtifacts, json_servers,
 };
 use crate::agent::inference::InferenceEnv;
 use crate::args::Args;
@@ -59,19 +59,15 @@ impl Hermes {
             "chat".to_string(),
             "--yolo".to_string(),
             "--model".to_string(),
-            Self::model(args).to_string(),
+            Hermes.model(args).to_string(),
         ]
-    }
-
-    fn model(args: &Args) -> &str {
-        args.hermes.model.as_deref().unwrap_or_else(|| args.model())
     }
 }
 
-/// Render hermes's `config.yaml`: model + provider + `display.tool_progress: all`, plus a
-/// `mcp_servers:` entry toward the broker when it is on. serde_norway (a serde_yaml fork, already a
+/// Render hermes's `config.yaml`: model + provider + `display.tool_progress: all`, plus an
+/// `mcp_servers:` entry per server in the turn's scope. serde_norway (a serde_yaml fork, already a
 /// dep) keeps this escape-safe versus a hand-rolled string.
-fn config_yaml(model: &str, broker: Option<&Broker<'_>>) -> String {
+fn config_yaml(model: &str, servers: &[McpServer<'_>]) -> String {
     let mut cfg = serde_json::Map::new();
     cfg.insert("model".into(), serde_json::json!(model));
     cfg.insert("provider".into(), serde_json::json!(PROVIDER));
@@ -79,12 +75,11 @@ fn config_yaml(model: &str, broker: Option<&Broker<'_>>) -> String {
         "display".into(),
         serde_json::json!({ "tool_progress": "all" }),
     );
-    if let Some(b) = broker {
-        let mut server = serde_json::json!({ "url": b.url });
-        if let Some(t) = b.token {
-            server["headers"] = serde_json::json!({ "Authorization": format!("Bearer {t}") });
-        }
-        cfg.insert("mcp_servers".into(), serde_json::json!({ b.name: server }));
+    if !servers.is_empty() {
+        cfg.insert(
+            "mcp_servers".into(),
+            json_servers(servers, |s| serde_json::json!({ "url": s.url })),
+        );
     }
     serde_norway::to_string(&serde_json::Value::Object(cfg)).unwrap_or_default()
 }
@@ -102,6 +97,11 @@ impl From<crate::agent::hermes_trace::HermesTurn> for TurnArtifacts {
 impl Backend for Hermes {
     fn spec(&self) -> &'static HarnessSpec {
         &Self::SPEC
+    }
+
+    /// `[agent.hermes].model` overrides the shared `[agent].model`.
+    fn model<'a>(&self, args: &'a Args) -> &'a str {
+        args.hermes.model.as_deref().unwrap_or_else(|| args.model())
     }
 
     /// The prompt rides inline as the `-q` value (a local spawn feeds argv directly, no stdin
@@ -123,15 +123,15 @@ impl Backend for Hermes {
         a
     }
 
-    /// `config.yaml`, ALWAYS (it carries the model and tool-progress display). When the broker is
-    /// on, its remote HTTP MCP server is merged in with a bearer header.
+    /// `config.yaml`, ALWAYS (it carries the model and tool-progress display), with each of the
+    /// turn's remote HTTP MCP servers and its bearer header.
     fn config(
         &self,
         args: &Args,
-        broker: Option<&Broker<'_>>,
+        servers: &[McpServer<'_>],
         _inference: &InferenceEnv,
     ) -> Option<String> {
-        Some(config_yaml(Self::model(args), broker))
+        Some(config_yaml(self.model(args), servers))
     }
 
     fn decoder(
@@ -190,18 +190,8 @@ mod tests {
         crate::cli::Cli::parse_from(["crucible"]).run
     }
 
-    fn seed_files(
-        args: &Args,
-        broker_url: Option<&str>,
-        broker_token: Option<&str>,
-    ) -> Vec<SeedFile> {
-        Hermes.seed_files(
-            args,
-            broker_url,
-            broker_token,
-            &SandboxAuth::Gateway,
-            &Default::default(),
-        )
+    fn seed_files(args: &Args, servers: &[McpServer<'_>]) -> Vec<SeedFile> {
+        Hermes.seed_files(args, servers, &SandboxAuth::Gateway, &Default::default())
     }
 
     #[test]
@@ -243,27 +233,40 @@ mod tests {
     #[test]
     fn config_yaml_always_seeds_model_and_display() {
         let a = args();
-        let seeds = seed_files(&a, None, None);
+        let seeds = seed_files(&a, &[]);
         assert_eq!(seeds.len(), 1, "config.yaml is always seeded");
         assert_eq!(seeds[0].dest, CONFIG);
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
         assert_eq!(v["model"], a.model());
         assert_eq!(v["provider"], PROVIDER);
         assert_eq!(v["display"]["tool_progress"], "all");
-        assert!(v.get("mcp_servers").is_none(), "no broker ⇒ no mcp_servers");
+        assert!(
+            v.get("mcp_servers").is_none(),
+            "no server in scope, no mcp_servers"
+        );
     }
 
     #[test]
-    fn config_yaml_merges_the_broker_mcp_server_with_a_bearer_header() {
-        let mut a = args();
-        a.broker.name = "epp-broker".into();
-        a.broker_token = Some("s3cr3t".into());
+    fn config_yaml_lists_exactly_the_turns_servers() {
+        let a = args();
         let seeds = seed_files(
             &a,
-            Some("http://host.containers.internal:8849/mcp"),
-            a.broker_token.as_deref(),
+            &[
+                McpServer {
+                    name: "epp-broker",
+                    url: "http://host.containers.internal:8849/mcp",
+                    token: Some("s3cr3t"),
+                },
+                McpServer {
+                    name: "jira",
+                    url: "http://x/mcp",
+                    token: None,
+                },
+            ],
         );
         let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
+        let names: Vec<&String> = v["mcp_servers"].as_object().unwrap().keys().collect();
+        assert_eq!(names, ["epp-broker", "jira"]);
         assert_eq!(
             v["mcp_servers"]["epp-broker"]["url"],
             "http://host.containers.internal:8849/mcp"
@@ -272,16 +275,8 @@ mod tests {
             v["mcp_servers"]["epp-broker"]["headers"]["Authorization"],
             "Bearer s3cr3t"
         );
-    }
-
-    #[test]
-    fn config_yaml_omits_headers_without_a_token() {
-        let mut a = args();
-        a.broker.name = "b".into();
-        let seeds = seed_files(&a, Some("http://x/mcp"), None);
-        let v: serde_json::Value = serde_norway::from_str(&seeds[0].content).expect("valid yaml");
-        assert_eq!(v["mcp_servers"]["b"]["url"], "http://x/mcp");
-        assert!(v["mcp_servers"]["b"].get("headers").is_none());
+        assert_eq!(v["mcp_servers"]["jira"]["url"], "http://x/mcp");
+        assert!(v["mcp_servers"]["jira"].get("headers").is_none());
     }
 
     #[test]

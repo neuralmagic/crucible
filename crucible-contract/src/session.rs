@@ -160,6 +160,10 @@ pub struct PlanTaskWire {
     /// Empty when the task declares none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<crate::emits::EmitWire>,
+    /// The files the task's output includes, each with its schema when the declaration gave one.
+    /// Empty when the task declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits_files: Vec<crate::emits::DeclaredFile>,
     /// How long one attempt may run (`90s`, `10m`, `2h`), empty when the task declares no limit
     /// and only the run's wall-clock ceiling bounds it.
     #[serde(default)]
@@ -289,6 +293,49 @@ impl LoopPhase {
 impl std::fmt::Display for LoopPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+/// What an agent task's attempts actually ran on, once the task's own knobs, the CLI flags and
+/// the manifest defaults have been resolved against each other. Absent for a task that runs no
+/// agent. Every field defaults, so a reader older than the writer keeps what it recognizes rather
+/// than dropping the attempt the object rode in on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskAgent {
+    #[serde(default)]
+    pub harness: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+/// One repair turn of an agent attempt: the session was resumed with `notes`, the masked
+/// validation notes its previous turn earned, and asked to fix its output in place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRepair {
+    /// `<task> repair <round>/<of>`, the sub-attempt as a reader names it.
+    pub label: String,
+    pub round: u32,
+    pub of: u32,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl TaskRepair {
+    /// Every repair in a stored or logged array that this build can read, in order. An entry it
+    /// cannot read drops out rather than costing the reader the attempt it rode in on.
+    pub fn decode_all(raw: &serde_json::Value) -> Vec<TaskRepair> {
+        raw.as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -470,6 +517,17 @@ pub enum SessionEvent {
         metric: Option<f64>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<serde_json::Value>,
+        /// The external results the task reported: the urls of every field it declared `link` or
+        /// `links`, parsed by the engine that validated them. A reader renders these rather than
+        /// re-reading urls out of `output`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        links: Vec<crate::link::ExternalLink>,
+        /// What the attempts ran on, resolved. Present exactly when the task runs an agent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent: Option<TaskAgent>,
+        /// The repair turns the attempts took, in order. Their cost is part of `cost_usd`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        repairs: Vec<TaskRepair>,
         #[serde(default)]
         note: String,
         /// Present exactly when `status` is `blocked`; `note` is its rendered form.
@@ -881,6 +939,26 @@ mod tests {
                         field: "note".into(),
                         ty: None,
                     },
+                    crate::emits::EmitWire {
+                        field: "lanes".into(),
+                        ty: Some(crate::emits::FieldType::Schema(
+                            crate::emits::JsonSchema::new(serde_json::json!({
+                                "type": "array",
+                                "items": {"type": "string", "default": null}
+                            }))
+                            .expect("a valid schema"),
+                        )),
+                    },
+                ],
+                emits_files: vec![
+                    "REPORT.md".into(),
+                    crate::emits::DeclaredFile {
+                        path: "RESULT.json".into(),
+                        schema: Some(
+                            crate::emits::JsonSchema::new(serde_json::json!({"type": "object"}))
+                                .expect("a valid schema"),
+                        ),
+                    },
                 ],
                 timeout: "10m".into(),
                 history_depth: 5,
@@ -950,6 +1028,7 @@ mod tests {
             revise,
             max_rounds: 0,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             timeout: String::new(),
             history_depth: 0,
         };
@@ -1013,12 +1092,21 @@ mod tests {
             cost_usd: 0.3,
             metric: None,
             output: Some(serde_json::json!({"score": 234.0})),
+            links: Vec::new(),
             note: String::new(),
             blocked: None,
             transport: None,
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            agent: None,
+            repairs: vec![TaskRepair {
+                label: "measure-a repair 1/2".into(),
+                round: 1,
+                of: 2,
+                cost_usd: 0.1,
+                notes: vec!["output missing declared field \"score\"".into()],
+            }],
         });
         // A minimal line (old writers, other contexts) still decodes: every field but
         // task/status defaults.
@@ -1059,6 +1147,7 @@ mod tests {
             cost_usd: 0.0,
             metric: None,
             output: None,
+            links: Vec::new(),
             note: "required task brief failed".into(),
             blocked: Some(TaskBlocked {
                 reason: BlockedReasonKind::RequiredTaskFailed,
@@ -1068,6 +1157,8 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            agent: None,
+            repairs: Vec::new(),
         };
         assert_eq!(
             encode(&ev),
@@ -1116,12 +1207,15 @@ mod tests {
             cost_usd: 0.0,
             metric: None,
             output: None,
+            links: Vec::new(),
             note: "transport retries exhausted (3 attempts): gateway did not become healthy".into(),
             blocked: None,
             transport: Some(TransportCause::Gateway),
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            agent: None,
+            repairs: Vec::new(),
         };
         assert_eq!(
             encode(&ev),
@@ -1142,6 +1236,50 @@ mod tests {
                 format!("\"{token}\"")
             );
         }
+    }
+
+    #[test]
+    fn an_agent_task_result_names_what_its_attempts_ran_on() {
+        let ev = SessionEvent::TaskResult {
+            task: "analyze[RHAI-1217]".into(),
+            status: "pass".into(),
+            plan_version: 1,
+            task_kind: "agent".into(),
+            iter: 2,
+            digest: String::new(),
+            job: String::new(),
+            attempts: 1,
+            cost_usd: 0.25,
+            metric: None,
+            output: None,
+            links: Vec::new(),
+            note: String::new(),
+            blocked: None,
+            transport: None,
+            secs: 0.0,
+            trace_id: String::new(),
+            span_id: String::new(),
+            agent: Some(TaskAgent {
+                harness: "claude".into(),
+                model: "glm-5.3".into(),
+                effort: "low".into(),
+            }),
+            repairs: Vec::new(),
+        };
+        assert!(
+            encode(&ev)
+                .contains(r#""agent":{"harness":"claude","model":"glm-5.3","effort":"low"}"#)
+        );
+        assert_round_trips(ev);
+        // A log written before 1.13.0 names no agent.
+        let old = decode(
+            r#"{"v":1,"kind":"task_result","task":"analyze","status":"pass","task_kind":"agent"}"#,
+        )
+        .unwrap();
+        let SessionEvent::TaskResult { agent, .. } = old else {
+            panic!("decoded the wrong event");
+        };
+        assert_eq!(agent, None);
     }
 
     #[test]

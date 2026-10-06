@@ -13,6 +13,7 @@ import { flowEnrichedMessage, validTraceId } from './flowEnriched';
 import { MarkdownView } from './MarkdownView';
 import { flowThemeStyle, injectFlowTheme } from './flowTheme';
 import { AgentProviderTag } from './ProviderIcon';
+import { RunLinks } from './RunLinks';
 import { useLiveEvents } from '../api/useLiveEvents';
 import { formatError } from '../api/errors';
 import { LiveSession } from '../live/LiveSession';
@@ -62,7 +63,7 @@ import {
 import { runStatusColor } from './runStatus';
 import { runLabel } from './runLabel';
 import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
-import { type RunGraph } from './RunTaskGraph';
+import { RunTaskGraph, type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
 import { RunTaskGrid } from './RunTaskGrid';
 import { absoluteTime, relativeTime } from './journeyView';
@@ -240,6 +241,8 @@ export function RunDetailPage() {
         </Section>
       )}
 
+      <RunLinks runId={runId} />
+
       {isLiveRun && (
         <Section>
           <SectionHeader title="Live session" />
@@ -248,6 +251,8 @@ export function RunDetailPage() {
           </SectionBody>
         </Section>
       )}
+
+      <RunTaskGraph runId={runId} />
 
       <RunTaskGrid runId={runId} />
 

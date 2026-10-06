@@ -400,6 +400,11 @@ dto! {
         pub needs: String,
         /// Whether a failure of this task fails the plan.
         pub required: bool,
+        /// `producer.field` when the task runs once per element of an upstream list, empty
+        /// otherwise.
+        pub over: String,
+        /// The most instances `over` may produce; 0 when the task is not mapped.
+        pub max_fanout: u32,
     }
 }
 
@@ -415,6 +420,51 @@ dto! {
         pub secs: Option<f64>,
         /// Why the executor never dispatched the task; present exactly when `status` is `blocked`.
         pub blocked: Option<TaskBlockedDto> = r.blocked.map(TaskBlockedDto::from),
+        /// The external results the attempt reported, in declaration order.
+        pub links: Vec<ExternalLinkDto> = r.links.into_iter().map(ExternalLinkDto::from).collect(),
+        /// What the attempts ran on, resolved; null for a command task.
+        pub agent: Option<TaskAgentDto> = r.agent.map(TaskAgentDto::from),
+        /// The repair turns the attempt took, in order; their cost is part of `cost_usd`.
+        pub repairs: Vec<TaskRepairDto> = r.repairs.into_iter().map(TaskRepairDto::from).collect(),
+    }
+}
+
+dto! {
+    /// One repair turn: the agent's session resumed with the masked validation notes its previous
+    /// turn earned.
+    pub struct TaskRepairDto: From<r: crucible_contract::session::TaskRepair> {
+        /// `<task> repair <round>/<of>`.
+        pub label: String,
+        pub round: u32,
+        pub of: u32,
+        pub cost_usd: f64,
+        pub notes: Vec<String>,
+    }
+}
+
+dto! {
+    /// One result a task produced outside the run. The url is the only stored field; the rest the
+    /// engine read off it, so a reader renders a mark and a label without parsing urls itself.
+    pub struct ExternalLinkDto: From<l: crucible_contract::ExternalLink> {
+        pub url: String = l.url.into(),
+        /// `github`/`gitlab`/`jira`/`other`.
+        #[schema(value_type = String)]
+        pub provider: crucible_contract::LinkProvider,
+        /// `pull_request`/`merge_request`/`branch`/`commit`/`compare`/`issue`/`page`.
+        #[schema(value_type = String)]
+        pub kind: crucible_contract::LinkKind,
+        /// `#123`, a branch, a short sha, an issue key, or the host.
+        pub label: String,
+    }
+}
+
+dto! {
+    /// What an agent task's attempts ran on, after the task's own knobs were applied over the
+    /// run's. `effort` is empty when nothing pinned one.
+    pub struct TaskAgentDto: From<a: crucible_contract::session::TaskAgent> {
+        pub harness: String,
+        pub model: String,
+        pub effort: String,
     }
 }
 
@@ -444,6 +494,17 @@ pub struct RunGraphDto {
     /// unextracted pack off as one that writes nothing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outputs: Option<Vec<GraphOutputDto>>,
+    /// How wide each mapped task's producer actually made it. A mapped task is absent here when
+    /// the run stored no session or its producer emitted no list: how many instances started is
+    /// in `results`, but how many were asked for is only knowable from the producer's payload.
+    pub fanout: Vec<FanOutCountDto>,
+}
+
+/// One mapped task against the number of items its producer emitted.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FanOutCountDto {
+    pub task: String,
+    pub items: i64,
 }
 
 /// Where an output bound came from.
@@ -1135,7 +1196,10 @@ mod tests {
                 path: "examples/paper".to_string(),
             },
             rev: "7c2c1a563813ce952dd4039745730397cf2295c2".to_string(),
-            tar_digest: "sha256:beef".to_string(),
+            tree_digest: Some(
+                "tree1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ),
             schema_digest: "sha256:cafe".to_string(),
             core_rev: "7c2c1a563813ce952dd4039745730397cf2295c2".to_string(),
             dispatch: crate::playbooks::api::registry::PackDispatchDto::new(
@@ -1166,7 +1230,14 @@ mod tests {
             })
         );
         assert_eq!(v["rev"], "7c2c1a563813ce952dd4039745730397cf2295c2");
-        assert_eq!(v["tar_digest"], "sha256:beef");
+        assert_eq!(
+            v["tree_digest"],
+            "tree1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert!(
+            v.get("tar_digest").is_none(),
+            "the bytes digest is not on the wire"
+        );
         assert_eq!(v["schema_digest"], "sha256:cafe");
         assert_eq!(v["core_rev"], "7c2c1a563813ce952dd4039745730397cf2295c2");
         assert_eq!(v["dispatch"]["backend"], "openshell");

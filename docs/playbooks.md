@@ -152,6 +152,28 @@ poem pass
 check pass
 ```
 
+## Report a pull request or a pushed branch
+
+A task that produces something outside the run declares the field holding its url as `link`,
+or a list of them as `links`:
+
+```python
+deliver = skill(
+    name = "deliver",
+    skill = "open-pr",
+    depends_on = [check],
+    emits = {"pushed": "links", "pr": "link"},
+)
+```
+
+```json
+{"pushed": ["https://github.com/neuralmagic/crucible/tree/haiku"], "pr": "https://github.com/neuralmagic/crucible/pull/123"}
+```
+
+Only http(s) urls pass; anything else fails the task where it happened. The engine reads the
+host and path of each one to name it (`github`, a pull request, `#123`), and the run and task
+views render a provider mark linking out to it.
+
 ## If the run is interrupted
 
 `plan run --resume` continues the run in `state/`:
@@ -194,6 +216,57 @@ The harness is `claude`, `codex`, `opencode`, `pi` or `hermes`. `--harness` and 
 `agent(..., harness = "codex", model = "...")`. A real run spends money, which is what
 `--max-cost` is for.
 
+Under `openshell`, a task can also run in its own sandbox. Declare it in the manifest and name
+it on the task:
+
+```toml
+[agent.sandbox.go]
+image = "ghcr.io/acme/sandbox-go@sha256:..."
+secrets = []                                  # [[secret]] names with an env projection
+relays = []                                   # [[agent.relay]] destinations
+broker = false                                # reach the [agent.broker]
+mcp = []                                      # [mcp] servers this sandbox reaches
+endpoints = ["proxy.golang.org:443:read-only"]
+```
+
+```python
+analyze = agent(name = "analyze", prompt = "...", sandbox = "go")
+```
+
+The turn starts from that image and adds those endpoints to `[agent.openshell]`'s. Of the pack's
+declared secrets, relay files, and `[mcp]` servers it receives only the ones listed, and it
+reaches the broker only when `broker = true`. The deployment's own model credentials still reach every turn. A task
+without `sandbox` runs in `sandbox_image` with every declared secret and relay. Tasks that
+share a session must share a sandbox. A sandbox limits what the engine provisions, not what a task
+reads from upstream: output, files, and workspace changes from a task that held a secret still
+reach the tasks after it. The capability disclosure lists each sandbox, and the controller
+checks each sandbox image against the catalog at launch.
+
+## MCP servers
+
+Under `openshell`, a pack can start MCP servers on the loop pod for tools that hold credentials
+the sandbox must not:
+
+```toml
+[mcp.buildit]
+bin = "/usr/local/bin/buildit"
+args = ["mcp"]
+env = { BUILDIT_NAMESPACE = "builds" }        # set on the server
+inherit = ["KUBERNETES_SERVICE_HOST", "KUBERNETES_SERVICE_PORT"]  # copied from the loop pod
+tools = ["build", "run", "logs"]              # passed as MCP_TOOLS
+
+[agent]
+mcp = ["buildit"]                             # turns without a named sandbox
+```
+
+A turn reaches only the servers its scope names: `[agent].mcp`, or the `mcp` of the named sandbox
+it runs in. The default is none, and the turn's harness config lists exactly those servers.
+Each server runs as its own process on its own port, from 8850 in key order, with only `PATH`,
+`HOME`, its `env` and `inherit` names, and `MCP_NAME`, `MCP_BIND`, `MCP_TOKENS_FILE` and
+`MCP_TOOLS`. Every turn gets a fresh token per server, written to `MCP_TOKENS_FILE` with the
+turn's sandbox and workdir ([format](crucible-contract.md#62-mcp-token-file-mcp_tokens_file)) and
+revoked when the sandbox is deleted, so the server knows who is calling from the token alone.
+
 ## Parameters
 
 A pack that takes input declares a `params` block as the first statement of `workflow.star`:
@@ -222,18 +295,18 @@ the compiler refuses the pack:
 ```text
 argument "run" carries a value supplied from outside the pack. A prompt marks such a span so
 an agent can tell it from an instruction; nothing else can, so do not build it into "run". A
-command or evaluate task reads it as data from the "params" entry of $CRUCIBLE_INPUTS.
+command or evaluate task reads it as data from the "params" entry of the inputs JSON in $CRUCIBLE_INPUTS_FILE.
 ```
 
-A command or evaluate task reads every declared parameter from the `params` entry of the JSON
-in `CRUCIBLE_INPUTS`, under its name and in its declared type, beside its dependencies'
+A command or evaluate task reads every declared parameter from the `params` entry of the inputs
+JSON (the file `CRUCIBLE_INPUTS_FILE` names), under its name and in its declared type, beside its dependencies'
 outputs. A source with no `params` block gives it an empty object. Agent tasks get no such
 entry; their values reach them only through the prompt.
 
 ```python
 fetch = command(
     name = "fetch",
-    run = "python3 -c 'import json, os; p = json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"params\"]; print(json.dumps({\"topic\": p[\"topic\"]}))'",
+    run = "python3 -c 'import json, os; p = json.load(open(os.environ[\"CRUCIBLE_INPUTS_FILE\"]))[\"params\"]; print(json.dumps({\"topic\": p[\"topic\"]}))'",
 )
 ```
 
@@ -268,7 +341,7 @@ first, failed and timed-out runs included:
  "dropped": 0}
 ```
 
-A command reads it from `CRUCIBLE_INPUTS`. An agent sees it in its prompt, marked as external
+A command reads it from the inputs file `CRUCIBLE_INPUTS_FILE` names. An agent sees it in its prompt, marked as external
 input, because an earlier agent wrote part of it. When the records exceed the operator's size
 limit, the oldest are dropped whole and counted in `dropped`; `crucible check` prints the limit.
 A manual launch belongs to no series and gets an empty list, which is also what a local
@@ -284,7 +357,7 @@ it:
 
 ```sh
 crux draft-create haiku --description "a haiku, reviewed"
-crux draft-push haiku ./haiku --base 1
+crux draft-push haiku ./haiku --base-version 1
 crux draft-launch haiku --max-cost 1 --max-time 5m
 ```
 

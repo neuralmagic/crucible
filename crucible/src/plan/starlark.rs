@@ -1,6 +1,6 @@
 //! Deterministic Starlark frontend for [`WorkflowCfg`]. Scope freezes the compiled IR, so runtime
-//! never evaluates the source. Only `prompt_file` and `load` can read files, and both are confined
-//! to the pack directory; process, environment, network, clock, and randomness APIs are
+//! never evaluates the source. Only `prompt_file`, `schema_file`, and `load` can read files, and
+//! all are confined to the pack directory; process, environment, network, clock, and randomness APIs are
 //! unavailable.
 
 pub mod error;
@@ -26,21 +26,22 @@ use crate::duration::TaskTimeout;
 use crate::errors::FileError;
 use crate::plan::diag;
 use crate::plan::ir::{
-    Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING, OutputField,
-    OutputRef, ReportDestination, Revise, SlackDestination, Stage, Task, TaskKind, TaskName, When,
+    Decider, Emits, EngineOp, Isolation, Join, MAX_FANOUT_CEILING, MAX_REPAIR_CEILING,
+    MAX_ROUNDS_CEILING, OutputField, OutputRef, ReportDestination, Revise, SlackDestination, Stage,
+    Task, TaskKind, TaskName, When,
 };
 use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
-    MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SOURCE_BYTES, MAX_TASKS,
-    MAX_TOTAL_PROMPT_BYTES, MAX_TOTAL_SOURCE_BYTES, SourceAnchor,
+    MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SCHEMA_BYTES, MAX_SOURCE_BYTES,
+    MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, SourceAnchor,
 };
-use crate::plan::starlark::values::{SessionDecl, WorkflowValue};
+use crate::plan::starlark::values::{SchemaFile, SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 use crucible_contract::decision::{
     ChoiceOption, IdentError, Label, NOUL_YES, Question, QuestionId, QuestionKind, UNCERTAIN,
 };
-use crucible_contract::emits::FieldType;
+use crucible_contract::emits::{DeclaredFile, FieldType, JsonSchema};
 
 type Result<T> = std::result::Result<T, CompileError>;
 
@@ -49,6 +50,8 @@ pub struct CompiledWorkflow {
     pub workflow: WorkflowCfg,
     /// Pack-relative prompts embedded in the task IR.
     pub prompt_files: Vec<PathBuf>,
+    /// Pack-relative JSON Schemas embedded in the task IR.
+    pub schema_files: Vec<PathBuf>,
     /// Stable, pretty JSON used by golden tests and review tooling.
     pub canonical_json: String,
     /// Whether the source declares a `params` block. Such a graph is a function of its launch
@@ -66,7 +69,8 @@ struct CompileContext {
     /// author as the prompt around it, so it is not outside text and marking it would be noise.
     supplied: BTreeSet<String>,
     prompt_files: BTreeSet<PathBuf>,
-    total_prompt_bytes: usize,
+    schema_files: BTreeSet<PathBuf>,
+    total_embedded_bytes: usize,
     /// Every task a DSL constructor built, keyed by name. A constructed-but-dropped task
     /// silently never runs, so it is a compile error.
     constructed_tasks: BTreeMap<String, FileSpan>,
@@ -88,6 +92,7 @@ struct CompileContext {
 #[derive(Clone, Copy)]
 enum PathKind {
     Prompt,
+    Schema,
     Module,
 }
 
@@ -95,6 +100,7 @@ impl PathKind {
     fn metadata(self) -> &'static str {
         match self {
             PathKind::Prompt => "reading prompt metadata",
+            PathKind::Schema => "reading schema metadata",
             PathKind::Module => "reading module metadata",
         }
     }
@@ -103,6 +109,7 @@ impl PathKind {
     fn call(self) -> &'static str {
         match self {
             PathKind::Prompt => "prompt_file",
+            PathKind::Schema => "schema_file",
             PathKind::Module => "load",
         }
     }
@@ -110,7 +117,16 @@ impl PathKind {
     fn resolving(self) -> &'static str {
         match self {
             PathKind::Prompt => "resolving prompt file",
+            PathKind::Schema => "resolving schema file",
             PathKind::Module => "resolving module file",
+        }
+    }
+
+    fn reading(self) -> &'static str {
+        match self {
+            PathKind::Prompt => "reading prompt file",
+            PathKind::Schema => "reading schema file",
+            PathKind::Module => "reading module file",
         }
     }
 }
@@ -252,35 +268,60 @@ impl CompileContext {
         }
     }
 
-    fn prompt_file(&mut self, raw: &str) -> Result<String> {
+    /// The bytes of a pack file a constructor embeds in the IR, charged to the workflow's embed
+    /// budget.
+    fn embed(&mut self, raw: &str, kind: PathKind, max: usize) -> Result<(PathBuf, Vec<u8>)> {
         let (relative, canonical) = self
-            .resolve_in_pack(raw, PathKind::Prompt)
-            .map_err(|rejection| rejection.at(PathKind::Prompt, raw))?;
+            .resolve_in_pack(raw, kind)
+            .map_err(|rejection| rejection.at(kind, raw))?;
+        let too_large = |bytes: u64| CompileError::EmbedTooLarge {
+            call: kind.call(),
+            raw: raw.to_owned(),
+            bytes,
+            max,
+        };
         // Size comes from the directory entry, before the bytes are read. Reading a file whole
         // and refusing it afterwards is the read the limit exists to prevent.
         let declared = std::fs::metadata(&canonical)
-            .map_err(FileError::at("reading prompt file", &canonical))?
+            .map_err(FileError::at(kind.reading(), &canonical))?
             .len();
-        if declared > MAX_PROMPT_BYTES as u64 {
-            return Err(CompileError::PromptTooLarge {
-                raw: raw.to_owned(),
-                bytes: declared as usize,
-            });
+        if declared > u64::try_from(max).unwrap_or(u64::MAX) {
+            return Err(too_large(declared));
         }
-        let bytes =
-            std::fs::read(&canonical).map_err(FileError::at("reading prompt file", &canonical))?;
-        if bytes.len() > MAX_PROMPT_BYTES {
-            return Err(CompileError::PromptTooLarge {
-                raw: raw.to_owned(),
-                bytes: bytes.len(),
-            });
+        let bytes = std::fs::read(&canonical).map_err(FileError::at(kind.reading(), &canonical))?;
+        if bytes.len() > max {
+            return Err(too_large(u64::try_from(bytes.len()).unwrap_or(u64::MAX)));
         }
-        self.total_prompt_bytes = self.total_prompt_bytes.saturating_add(bytes.len());
-        if self.total_prompt_bytes > MAX_TOTAL_PROMPT_BYTES {
-            return Err(CompileError::PromptBudgetSpent);
+        self.total_embedded_bytes = self.total_embedded_bytes.saturating_add(bytes.len());
+        if self.total_embedded_bytes > MAX_TOTAL_EMBED_BYTES {
+            return Err(CompileError::EmbedBudgetSpent);
         }
+        Ok((relative, bytes))
+    }
+
+    fn prompt_file(&mut self, raw: &str) -> Result<String> {
+        let (relative, bytes) = self.embed(raw, PathKind::Prompt, MAX_PROMPT_BYTES)?;
         self.prompt_files.insert(relative);
         Ok(String::from_utf8(bytes)?)
+    }
+
+    fn schema_file(&mut self, raw: &str) -> Result<SchemaFile> {
+        let (relative, bytes) = self.embed(raw, PathKind::Schema, MAX_SCHEMA_BYTES)?;
+        let invalid = |error| CompileError::InvalidSchema {
+            raw: raw.to_owned(),
+            error,
+        };
+        let document = serde_json::from_slice(&bytes).map_err(|error| {
+            invalid(crucible_contract::emits::SchemaError::NotJson {
+                error: error.to_string(),
+            })
+        })?;
+        let schema = JsonSchema::new(document).map_err(invalid)?;
+        self.schema_files.insert(relative);
+        Ok(SchemaFile {
+            path: raw.to_owned(),
+            schema,
+        })
     }
 }
 
@@ -315,7 +356,8 @@ impl CompileState {
                 params: BTreeMap::new(),
                 supplied: BTreeSet::new(),
                 prompt_files: BTreeSet::new(),
-                total_prompt_bytes: 0,
+                schema_files: BTreeSet::new(),
+                total_embedded_bytes: 0,
                 constructed_tasks: BTreeMap::new(),
                 otherwise: BTreeSet::new(),
                 sessions: BTreeMap::new(),
@@ -395,6 +437,8 @@ enum Value {
     Question(Question),
     /// `route.question`, carrying the labels it can resolve to.
     Answer(values::AnswerRef),
+    /// `schema_file(path)`.
+    Schema(SchemaFile),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -477,6 +521,7 @@ const COMMON_FUNCTIONS: &[&str] = &[
     "param",
     "prompt_file",
     "report",
+    "schema_file",
     "session",
     "workflow",
 ];
@@ -520,6 +565,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "harness",
             "model",
             "effort",
+            "sandbox",
             "session",
             "emits",
             "depends_on",
@@ -538,6 +584,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "repair",
         ],
         "skill" => &[
             "name",
@@ -546,6 +593,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "harness",
             "model",
             "effort",
+            "sandbox",
             "session",
             "emits",
             "depends_on",
@@ -564,6 +612,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "when",
             "answers",
             "otherwise",
+            "repair",
         ],
         "command" => &[
             "name",
@@ -731,7 +780,10 @@ fn constructor(
             .map_err(|error| CompileError::InvalidQuestion { error })?;
         return Ok(Value::Question(question));
     }
-    if matches!(function, "prompt_file" | "param" | "default_autoresearch") {
+    if matches!(
+        function,
+        "prompt_file" | "schema_file" | "param" | "default_autoresearch"
+    ) {
         return Err(CompileError::NotOnePositional {
             function: function.to_owned(),
         });
@@ -748,6 +800,7 @@ fn constructor(
             let mut harness = take_optional_string(&mut named, "harness")?;
             let mut model = take_optional_string(&mut named, "model")?;
             let mut effort = take_optional_string(&mut named, "effort")?;
+            let sandbox = take_optional_string(&mut named, "sandbox")?;
             let session = take_session(&mut named, state, at)?;
             if let Some(decl) = &session {
                 // A session is one serial conversation under one agent config, so
@@ -778,6 +831,7 @@ fn constructor(
                 harness,
                 model,
                 effort,
+                sandbox,
             };
             dsl_task(&mut named, state, name, kind, session.map(|decl| decl.name))?
         }
@@ -824,6 +878,7 @@ fn constructor(
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -864,6 +919,7 @@ fn constructor(
                 timeout: None,
                 when: None,
                 history: None,
+                repair: 0,
             }
         }
         "route" => {
@@ -897,6 +953,7 @@ fn constructor(
                 when: take_when(&mut named, state, &name)?,
                 name,
                 history: None,
+                repair: 0,
             }
         }
         "propose" => {
@@ -1129,6 +1186,7 @@ fn dsl_task(
     session: Option<String>,
 ) -> Result<Task> {
     let when = take_when(named, state, &name)?;
+    let repair = take_repair(named, &kind)?;
     let task = Task {
         name,
         task: kind,
@@ -1147,6 +1205,7 @@ fn dsl_task(
         revise: take_revise(named)?,
         timeout: take_timeout(named)?,
         history: take_optional_history(named)?,
+        repair,
     };
     check_fanout(&task)?;
     if task.join == Join::Settled && task.depends_on.is_empty() {
@@ -1199,25 +1258,40 @@ fn check_fanout(task: &Task) -> Result<()> {
     }
 }
 
-/// The paths a task promises as output. Shape is checked here, where the author wrote them: an
-/// absolute path or a `..` cannot be a workspace-relative output whatever the filesystem says.
-fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>> {
-    let Some(value) = named.remove("emits_files") else {
-        return Ok(Vec::new());
+/// The paths a task promises as output, as a list of paths or a dict from path to its
+/// `schema_file(...)` or `None`. Shape is checked here, where the author wrote them: an absolute
+/// path or a `..` cannot be a workspace-relative output whatever the filesystem says.
+fn take_emitted_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<DeclaredFile>> {
+    let entries: Vec<(String, Option<JsonSchema>)> = match named.remove("emits_files") {
+        None => return Ok(Vec::new()),
+        Some(Value::List(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(path) => Ok((path, None)),
+                _ => Err(CompileError::EmitsFilesNotList),
+            })
+            .collect::<Result<_>>()?,
+        Some(Value::Map(files)) => files
+            .into_iter()
+            .map(|(path, schema)| match schema {
+                Value::None => Ok((path, None)),
+                Value::Schema(file) => Ok((path, Some(file.schema))),
+                _ => Err(CompileError::EmitsFilesNotList),
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => return Err(CompileError::EmitsFilesNotList),
     };
-    let Value::List(items) = value else {
-        return Err(CompileError::EmitsFilesNotList);
-    };
-    let mut paths = Vec::new();
-    for item in items {
-        let Value::String(path) = item else {
-            return Err(CompileError::EmitsFilesNotList);
-        };
-        let relative = safe_relative_path(&path)
-            .map_err(|_| CompileError::EmitsFileNotRelative { path: path.clone() })?;
-        paths.push(relative.display().to_string());
-    }
-    Ok(paths)
+    entries
+        .into_iter()
+        .map(|(path, schema)| {
+            let relative = safe_relative_path(&path)
+                .map_err(|_| CompileError::EmitsFileNotRelative { path: path.clone() })?;
+            Ok(DeclaredFile {
+                path: relative.display().to_string(),
+                schema,
+            })
+        })
+        .collect()
 }
 
 fn identifier<T>(argument: &str, made: std::result::Result<T, IdentError>) -> Result<T> {
@@ -1384,10 +1458,24 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
         });
         let Some(asked) = asked else { continue };
         let listed_here = listed.get(&(when.task.clone(), when.question.clone()));
+        let possible = tasks
+            .iter()
+            .find(|route| route.name == when.task)
+            .and_then(|route| {
+                crate::plan::ir::typed_answers(route, &when.question, |name| {
+                    tasks.iter().find(|task| &task.name == name)
+                })
+            })
+            .map(|(_, _, possible)| possible);
         let rest: Vec<Label> = asked
             .labels()
             .into_iter()
             .chain([Label::uncertain()])
+            .filter(|label| {
+                possible
+                    .as_ref()
+                    .is_none_or(|possible| possible.contains(label))
+            })
             .filter(|label| !listed_here.is_some_and(|l| l.contains(label)))
             .filter(|label| !asked.drop.contains(label))
             .collect();
@@ -1419,7 +1507,15 @@ fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     match named.remove("over") {
         None | Some(Value::None) => Ok(None),
         Some(Value::Output(output)) => match output.ty {
-            None | Some(FieldType::List) => Ok(Some(output.reference)),
+            None => Ok(Some(output.reference)),
+            Some(declared) if declared.is_list() => match declared.item_refusal() {
+                None => Ok(Some(output.reference)),
+                Some(why) => Err(CompileError::OverItemsNotStrings {
+                    reference: output.reference.to_string(),
+                    declared,
+                    why,
+                }),
+            },
             Some(declared) => Err(CompileError::OverNotAList {
                 reference: output.reference.to_string(),
                 declared,
@@ -1435,6 +1531,25 @@ fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u3
         Some(Value::Int(n)) if n >= 1 && n as u32 <= MAX_FANOUT_CEILING => Ok(Some(n as u32)),
         Some(Value::Int(n)) => Err(CompileError::FanoutOutOfRange { got: n }),
         Some(_) => Err(CompileError::FanoutNotInteger),
+    }
+}
+
+/// `repair = N` on an agent task. A command or evaluate task naming it gets its own refusal
+/// rather than an unknown-argument one, since the argument exists and is refused on purpose.
+fn take_repair(named: &mut BTreeMap<String, Value>, kind: &TaskKind) -> Result<u32> {
+    let Some(value) = named.remove("repair") else {
+        return Ok(0);
+    };
+    if !matches!(kind, TaskKind::Agent { .. }) {
+        return Err(CompileError::RepairOnDeterministicTask { kind: kind.label() });
+    }
+    match value {
+        Value::None => Ok(0),
+        Value::Int(n) => match u32::try_from(n) {
+            Ok(rounds) if rounds <= MAX_REPAIR_CEILING => Ok(rounds),
+            _ => Err(CompileError::RepairOutOfRange { got: n }),
+        },
+        _ => Err(CompileError::RepairNotInteger),
     }
 }
 
@@ -1528,6 +1643,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         revise: None,
         timeout: None,
         history: None,
+        repair: 0,
     }
 }
 
@@ -1554,7 +1670,7 @@ fn take_output_fields(named: &mut BTreeMap<String, Value>) -> Result<Emits> {
     }
 }
 
-/// One value of a typed `emits`: a type token, or a list of labels.
+/// One value of a typed `emits`: a type token, a list of labels, or a `schema_file(...)`.
 fn field_type(field: &str, value: Value) -> Result<FieldType> {
     let ty = match value {
         Value::String(token) => {
@@ -1565,6 +1681,7 @@ fn field_type(field: &str, value: Value) -> Result<FieldType> {
                 got: token,
             })?
         }
+        Value::Schema(file) => FieldType::Schema(file.schema),
         Value::List(labels) => FieldType::OneOf(
             labels
                 .into_iter()
@@ -2296,6 +2413,7 @@ fn compile_source_here(
     Ok(CompiledWorkflow {
         workflow,
         prompt_files: context.prompt_files.into_iter().collect(),
+        schema_files: context.schema_files.into_iter().collect(),
         canonical_json,
         declares_params,
     })
@@ -3753,6 +3871,274 @@ workflow(type = "playbook", tasks = [scan, audit])
         let _ = std::fs::remove_dir_all(&pack);
     }
 
+    const LANES: &str = r#"{"type": "array", "items": {"type": "string", "default": null}}"#;
+    const RESULT: &str = r#"{"type": "object", "required": ["ok"]}"#;
+
+    const SCHEMA_TYPED: &str = r#"plan = command(
+    name = "plan",
+    run = "./plan.sh",
+    emits = {"lanes": schema_file("crucible/schemas/lanes.json"), "tickets": "integer"},
+    emits_files = {"RESULT.json": schema_file("crucible/schemas/result.json"), "REPORT.md": None},
+)
+lane = command(name = "lane", run = "./lane.sh", depends_on = [plan], over = plan.lanes, max_fanout = 4)
+workflow(type = "playbook", tasks = [plan, lane])
+"#;
+
+    fn schema_pack(tag: &str, lanes: &str) -> PathBuf {
+        let pack = temp_pack(tag);
+        std::fs::create_dir_all(pack.join("crucible/schemas")).unwrap();
+        std::fs::write(pack.join("crucible/schemas/lanes.json"), lanes).unwrap();
+        std::fs::write(pack.join("crucible/schemas/result.json"), RESULT).unwrap();
+        pack
+    }
+
+    fn compile_schema_pack(
+        pack: &Path,
+        source: &str,
+    ) -> std::result::Result<CompiledWorkflow, String> {
+        compile_source(source, &pack.join("workflow.star"), pack)
+            .map_err(|error| crate::errors::report(&error))
+    }
+
+    #[test]
+    fn schema_file_compiles_its_content_into_typed_emits_and_declared_files() {
+        let pack = schema_pack("schema-typed", LANES);
+        let compiled = compile_schema_pack(&pack, SCHEMA_TYPED).unwrap_or_else(|e| panic!("{e}"));
+        let plan = &compiled.workflow.tasks[0];
+        let lanes = JsonSchema::parse(LANES).unwrap();
+        let result = JsonSchema::parse(RESULT).unwrap();
+        assert_eq!(
+            plan.emits,
+            Emits::Typed(BTreeMap::from([
+                (
+                    OutputField("lanes".into()),
+                    FieldType::Schema(lanes.clone())
+                ),
+                (OutputField("tickets".into()), FieldType::Integer),
+            ]))
+        );
+        assert_eq!(
+            plan.emits_files,
+            [
+                DeclaredFile::from("REPORT.md"),
+                DeclaredFile {
+                    path: "RESULT.json".into(),
+                    schema: Some(result),
+                },
+            ]
+        );
+        assert_eq!(
+            compiled.schema_files,
+            [
+                PathBuf::from("crucible/schemas/lanes.json"),
+                PathBuf::from("crucible/schemas/result.json"),
+            ]
+        );
+        assert!(
+            !compiled.canonical_json.contains("crucible/schemas"),
+            "the plan pins the schema's content, not its path"
+        );
+
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        let back: WorkflowCfg = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(back.tasks[0].emits, plan.emits);
+        assert_eq!(back.tasks[0].emits_files, plan.emits_files);
+        assert_eq!(toml::to_string(&back).unwrap(), text);
+
+        std::fs::write(
+            pack.join("crucible/schemas/lanes.json"),
+            r#"{"type": "array", "items": {"type": "string"}, "minItems": 2}"#,
+        )
+        .unwrap();
+        let edited = compile_schema_pack(&pack, SCHEMA_TYPED).unwrap_or_else(|e| panic!("{e}"));
+        assert_ne!(
+            edited.canonical_json, compiled.canonical_json,
+            "an edited schema must change the compiled plan"
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn schema_file_refuses_a_file_that_is_not_a_usable_schema() {
+        for (tag, lanes, needle) in [
+            ("schema-not-json", "{\"type\": ", "the schema is not JSON"),
+            (
+                "schema-invalid",
+                r#"{"type": "lane"}"#,
+                "not a valid 2020-12 JSON Schema",
+            ),
+            (
+                "schema-dialect",
+                r#"{"$schema": "http://json-schema.org/draft-07/schema#"}"#,
+                "declares $schema",
+            ),
+            (
+                "schema-remote",
+                r#"{"$ref": "https://example.com/lanes.json"}"#,
+                "not a valid 2020-12 JSON Schema",
+            ),
+        ] {
+            let pack = schema_pack(tag, lanes);
+            let err = compile_schema_pack(&pack, SCHEMA_TYPED).unwrap_err();
+            assert!(
+                err.contains("schema_file(\"crucible/schemas/lanes.json\")"),
+                "{tag}: {err}"
+            );
+            assert!(err.contains(needle), "{tag}: {err}");
+            assert!(
+                err.contains(&column_of(SCHEMA_TYPED, "emits = {", "schema_file")),
+                "{tag}: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&pack);
+        }
+    }
+
+    #[test]
+    fn schema_file_refuses_a_missing_escaping_or_oversize_path() {
+        let pack = schema_pack("schema-paths", LANES);
+        let with = |path: &str| SCHEMA_TYPED.replace("crucible/schemas/lanes.json", path);
+        let err = compile_schema_pack(&pack, &with("crucible/schemas/absent.json")).unwrap_err();
+        assert!(err.contains("reading schema metadata"), "{err}");
+        let err = compile_schema_pack(&pack, &with("../lanes.json")).unwrap_err();
+        assert!(
+            err.contains("schema_file") && err.contains("may not contain"),
+            "{err}"
+        );
+        std::fs::write(
+            pack.join("crucible/schemas/huge.json"),
+            format!("{{\"description\": \"{}\"}}", "x".repeat(MAX_SCHEMA_BYTES)),
+        )
+        .unwrap();
+        let err = compile_schema_pack(&pack, &with("crucible/schemas/huge.json")).unwrap_err();
+        assert!(
+            err.contains(&format!("maximum is {MAX_SCHEMA_BYTES}")),
+            "{err}"
+        );
+        let err = compile_schema_pack(
+            &pack,
+            &SCHEMA_TYPED.replace(
+                "schema_file(\"crucible/schemas/lanes.json\")",
+                "schema_file(3)",
+            ),
+        )
+        .unwrap_err();
+        assert!(err.contains("schema_file"), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_schema_field_feeds_over_only_when_its_top_level_type_is_array() {
+        for (tag, lanes, declared) in [
+            (
+                "schema-over-object",
+                r#"{"type": "object"}"#,
+                "schema (object)",
+            ),
+            (
+                "schema-over-untyped",
+                r#"{"items": {"type": "string"}}"#,
+                "schema with no single top-level type",
+            ),
+        ] {
+            let pack = schema_pack(tag, lanes);
+            let err = compile_schema_pack(&pack, SCHEMA_TYPED).unwrap_err();
+            assert!(
+                err.contains(&format!(
+                    "maps over plan.lanes, which is declared {declared}; `over` needs a list"
+                )),
+                "{tag}: {err}"
+            );
+            let _ = std::fs::remove_dir_all(&pack);
+        }
+    }
+
+    #[test]
+    fn a_malformed_dict_emits_files_is_refused() {
+        let pack = schema_pack("schema-files-bad", LANES);
+        for (replacement, needle) in [
+            (
+                r#"emits_files = {"RESULT.json": "object", "REPORT.md": None}"#,
+                "must be a list of workspace-relative path strings, or a dict",
+            ),
+            (
+                r#"emits_files = {"../RESULT.json": schema_file("crucible/schemas/result.json")}"#,
+                "is not workspace-relative",
+            ),
+            (
+                r#"emits_files = [schema_file("crucible/schemas/result.json")]"#,
+                "must be a list of workspace-relative path strings, or a dict",
+            ),
+        ] {
+            let source = SCHEMA_TYPED.replace(
+                r#"emits_files = {"RESULT.json": schema_file("crucible/schemas/result.json"), "REPORT.md": None}"#,
+                replacement,
+            );
+            let err = compile_schema_pack(&pack, &source).unwrap_err();
+            assert!(err.contains(needle), "{replacement}: {err}");
+        }
+        let listed = SCHEMA_TYPED.replace(
+            r#"emits_files = {"RESULT.json": schema_file("crucible/schemas/result.json"), "REPORT.md": None}"#,
+            r#"emits_files = ["RESULT.json", "REPORT.md"]"#,
+        );
+        let compiled = compile_schema_pack(&pack, &listed).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            compiled.workflow.tasks[0].emits_files,
+            [
+                DeclaredFile::from("RESULT.json"),
+                DeclaredFile::from("REPORT.md")
+            ]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn repair_compiles_on_agent_and_skill_tasks_only() {
+        let pack = temp_pack("repair");
+        std::fs::create_dir_all(pack.join("skills/fix")).unwrap();
+        std::fs::write(pack.join("skills/fix/SKILL.md"), "Fix it.\n").unwrap();
+        let compile = |source: &str| {
+            compile_source(source, &pack.join("workflow.star"), &pack)
+                .map_err(|error| crate::errors::report(&error))
+        };
+        let compiled = compile(
+            "a = agent(name = \"a\", prompt = \"p\", repair = 2)\n\
+             s = skill(name = \"s\", skill = \"skills/fix\", repair = 3)\n\
+             b = agent(name = \"b\", prompt = \"p\")\n\
+             workflow(type = \"playbook\", tasks = [a, s, b])\n",
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let repair: Vec<u32> = compiled.workflow.tasks.iter().map(|t| t.repair).collect();
+        assert_eq!(repair, [2, 3, 0]);
+        for (source, needle) in [
+            (
+                "c = command(name = \"c\", run = \"true\", repair = 1)\nworkflow(type = \"playbook\", tasks = [c])\n",
+                "\"repair\" applies to agent and skill tasks; a command task is deterministic",
+            ),
+            (
+                "e = evaluate(name = \"e\", run = \"true\", repair = 1)\nworkflow(type = \"playbook\", tasks = [e])\n",
+                "a evaluate task is deterministic",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", repair = 4)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "repair = 4 is outside 0..=3",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", repair = -1)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "repair = -1 is outside 0..=3",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", repair = \"2\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "\"repair\" must be an integer",
+            ),
+        ] {
+            let err = compile(source).unwrap_err();
+            assert!(err.contains(needle), "{source}: {err}");
+            assert!(err.contains("workflow.star:1:"), "{source}: {err}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
     #[test]
     fn a_malformed_dict_emits_is_an_error_at_the_emits_argument() {
         for (replacement, needle) in [
@@ -3762,11 +4148,12 @@ workflow(type = "playbook", tasks = [scan, audit])
             ),
             (
                 r#""count": 3"#,
-                "emits field \"count\" must map to a type name or a list of label strings",
+                "emits field \"count\" must map to a type name, a list of label strings, or \
+                 schema_file(...)",
             ),
             (
                 r#""count": ["high", 1]"#,
-                "emits field \"count\" must map to a type name or a list",
+                "emits field \"count\" must map to a type name, a list",
             ),
             (
                 r#""count": ["hi-gh"]"#,
@@ -3857,7 +4244,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
         };
         for ok in [
             r#"{"area": ["scheduler", "frontend"], "urgent": "boolean"}"#,
-            r#"{"area": ["frontend", "uncertain"], "urgent": ["yes", "no"]}"#,
+            r#"{"area": ["scheduler", "uncertain"], "urgent": ["yes", "no"]}"#,
             r#"["area", "urgent"]"#,
         ] {
             let pack = temp_pack("typed-route-ok");
@@ -3875,17 +4262,167 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
                 "which declares it string; \"area\" answers labels from",
             ),
             (
-                r#"{"area": ["scheduler"], "urgent": "string"}"#,
+                r#"{"area": ["scheduler", "frontend"], "urgent": "string"}"#,
                 "which declares it string; \"urgent\" answers \"boolean\" or labels from yes|no|uncertain",
             ),
             (
-                r#"{"area": ["scheduler"]}"#,
+                r#"{"area": ["scheduler", "frontend"]}"#,
                 "reads question \"urgent\" from \"classify\", which declares emits without it",
+            ),
+            (
+                r#"{"area": ["frontend", "uncertain"], "urgent": "boolean"}"#,
+                "task \"fix\": gate.area can never be answered \"scheduler\"; \"gate\" reads it from \"classify\", which declares it one of frontend|uncertain, so it answers only frontend, uncertain",
             ),
         ] {
             let err = typed_error("typed-route-bad", &routed(bad));
             assert!(err.contains(needle), "{bad}: {err}");
         }
+    }
+
+    /// A pack with `schemas/<name>.json` for each schema given, compiled from `source`.
+    fn compile_with_schemas(
+        tag: &str,
+        schemas: &[(&str, &str)],
+        source: &str,
+    ) -> std::result::Result<CompiledWorkflow, String> {
+        let pack = temp_pack(tag);
+        std::fs::create_dir_all(pack.join("schemas")).unwrap();
+        for (name, document) in schemas {
+            std::fs::write(pack.join(format!("schemas/{name}.json")), document).unwrap();
+        }
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .map_err(|error| crate::errors::report(&error));
+        let _ = std::fs::remove_dir_all(&pack);
+        compiled
+    }
+
+    #[test]
+    fn over_a_schema_field_needs_string_items_at_the_over_argument() {
+        let source = "discover = command(name = \"discover\", run = \"./d.sh\", emits = {\"lanes\": schema_file(\"schemas/lanes.json\")})\n\
+                      audit = command(name = \"audit\", run = \"./a.sh\", depends_on = [discover], over = discover.lanes, max_fanout = 4)\n\
+                      workflow(type = \"playbook\", tasks = [discover, audit])\n";
+        for ok in [
+            r#"{"type": "array", "items": {"type": "string"}}"#,
+            r#"{"type": "array", "items": {"enum": ["a", "b"]}}"#,
+            r##"{"type": "array", "$defs": {"lane": {"const": "x"}}, "items": {"$ref": "#/$defs/lane"}}"##,
+        ] {
+            compile_with_schemas("over-items-ok", &[("lanes", ok)], source)
+                .unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for (bad, needle) in [
+            (
+                r#"{"type": "array"}"#,
+                "argument \"over\" maps over discover.lanes, which is declared schema (list), but it declares no `items`, so an item may be anything; a mapped instance is named by its item, so `over` needs a list of strings",
+            ),
+            (
+                r#"{"type": "array", "items": {"type": "integer"}}"#,
+                "but its `items` is {\"type\":\"integer\"}, which does not make every item a string",
+            ),
+        ] {
+            let err =
+                compile_with_schemas("over-items-bad", &[("lanes", bad)], source).unwrap_err();
+            assert!(err.contains(needle), "{bad}: {err}");
+            assert!(
+                err.contains(&column_of(source, "audit = command", "over = ")),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_reads_a_schema_typed_source_by_its_enum() {
+        let source = "classify = command(name = \"classify\", run = \"./c.sh\", emits = {\"area\": schema_file(\"schemas/area.json\"), \"urgent\": schema_file(\"schemas/urgent.json\")})\n\
+gate = route(name = \"gate\", depends_on = [classify], source = classify, questions = {\"area\": choice(ask = \"Which?\", options = {\"scheduler\": None, \"frontend\": None}), \"urgent\": noul(ask = \"Now?\")})\n\
+fix = command(name = \"fix\", run = \"./f.sh\", depends_on = [gate], when = gate.area, answers = \"scheduler\")\n\
+rest = command(name = \"rest\", run = \"./r.sh\", depends_on = [gate], when = gate.area, otherwise = True)\n\
+now = command(name = \"now\", run = \"./n.sh\", depends_on = [gate], when = gate.urgent, answers = \"yes\")\n\
+later = command(name = \"later\", run = \"./l.sh\", depends_on = [gate], when = gate.urgent, otherwise = True)\n\
+workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n";
+        let compiled = compile_with_schemas(
+            "route-schema-ok",
+            &[
+                (
+                    "area",
+                    r#"{"type": "string", "enum": ["scheduler", "frontend"]}"#,
+                ),
+                ("urgent", r#"{"type": "boolean"}"#),
+            ],
+            source,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let when = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .and_then(|t| t.when.as_ref())
+                .map(|w| w.is.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            when("rest"),
+            ["frontend"],
+            "otherwise covers only the answers the source can give"
+        );
+        assert_eq!(when("later"), ["no"]);
+
+        for (area, urgent, needle) in [
+            (
+                r#"{"type": "string", "enum": ["scheduler", "backend"]}"#,
+                r#"{"type": "boolean"}"#,
+                "reads question \"area\" from \"classify\", which declares it schema (string); \"area\" answers labels from frontend|scheduler|uncertain",
+            ),
+            (
+                r#"{"type": "string"}"#,
+                r#"{"type": "boolean"}"#,
+                "reads question \"area\" from \"classify\", which declares it schema (string)",
+            ),
+            (
+                r#"{"enum": ["scheduler", "frontend"]}"#,
+                r#"{"type": "string"}"#,
+                "reads question \"urgent\" from \"classify\", which declares it schema (string); \"urgent\" answers \"boolean\" or labels from yes|no|uncertain",
+            ),
+            (
+                r#"{"const": "frontend"}"#,
+                r#"{"type": "boolean"}"#,
+                "task \"fix\": gate.area can never be answered \"scheduler\"; \"gate\" reads it from \"classify\", which declares it schema with no single top-level type, so it answers only frontend",
+            ),
+        ] {
+            let err = compile_with_schemas(
+                "route-schema-bad",
+                &[("area", area), ("urgent", urgent)],
+                source,
+            )
+            .unwrap_err();
+            assert!(err.contains(needle), "{area} / {urgent}: {err}");
+            assert!(err.contains("workflow.star:"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_score_schema_whose_enum_names_a_non_number_is_refused() {
+        let source = "m = command(name = \"m\", run = \"true\", emits = {\"score\": schema_file(\"schemas/score.json\")})\n\
+                      p = top_k(name = \"p\", k = 1, direction = \"lower\", depends_on = [m])\n\
+                      workflow(type = \"custom\", tasks = [m, p], result = p)\n";
+        compile_with_schemas(
+            "score-enum-ok",
+            &[("score", r#"{"type": "number", "enum": [1, 2.5]}"#)],
+            source,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let err = compile_with_schemas(
+            "score-enum-bad",
+            &[("score", r#"{"type": "number", "enum": [1, "high"]}"#)],
+            source,
+        )
+        .unwrap_err();
+        assert!(
+            err.contains(
+                "task \"p\" reads a numeric `score` from \"m\", which declares it schema (number)"
+            ),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3957,11 +4494,11 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3, repair = 1{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
@@ -3973,11 +4510,11 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
-                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
+                "s = session(name = \"sess\")\nu = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", session = s, emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", revise = u, max_rounds = 2, history = 3, repair = 1{extra})\nworkflow(type = \"playbook\", tasks = [u, a])\n",
             ),
             (
                 "command",
@@ -4080,6 +4617,38 @@ workflow(type = "playbook", tasks = [classify, gate, fix, rest])
             );
             assert!(err.contains(&format!("{function}()")), "{function}: {err}");
         }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_task_names_its_sandbox() {
+        let pack = temp_pack("sandbox");
+        std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
+        std::fs::write(pack.join("skills/demo/SKILL.md"), "demo").unwrap();
+        let compiled = compile_source(
+            "a = agent(name = \"a\", prompt = \"p\", sandbox = \"go\")\n\
+             s = skill(name = \"s\", skill = \"skills/demo\", sandbox = \"python\")\n\
+             b = agent(name = \"b\", prompt = \"p\")\n\
+             workflow(type = \"playbook\", tasks = [a, s, b])\n",
+            &pack.join("workflow.star"),
+            &pack,
+        )
+        .unwrap();
+        let sandboxes: Vec<Option<&str>> = compiled
+            .workflow
+            .tasks
+            .iter()
+            .map(|task| match &task.task {
+                TaskKind::Agent { sandbox, .. } => sandbox.as_deref(),
+                _ => panic!("agent tasks only"),
+            })
+            .collect();
+        assert_eq!(sandboxes, [Some("go"), Some("python"), None]);
+        let unnamed = serde_json::to_value(&compiled.workflow.tasks[2].task).unwrap();
+        assert!(
+            unnamed.get("sandbox").is_none(),
+            "an unset sandbox leaves the serialized plan unchanged: {unnamed}"
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 
@@ -4485,7 +5054,7 @@ workflow(type = "playbook", tasks = [discover, audit])
             .iter()
             .find(|t| t.name.0 == "analyze")
             .expect("analyze");
-        assert_eq!(analyze.emits_files, ["SPEC.md"]);
+        assert_eq!(analyze.emits_files, [DeclaredFile::from("SPEC.md")]);
         let TaskKind::Agent { prompt, .. } = &analyze.task else {
             panic!("a skill is an agent task")
         };
@@ -5684,7 +6253,7 @@ workflow(type = "playbook", tasks = [a])
                 "{what}: {error}"
             );
             assert!(
-                error.contains("\"params\" entry of $CRUCIBLE_INPUTS"),
+                error.contains("\"params\" entry of the inputs JSON in $CRUCIBLE_INPUTS_FILE"),
                 "{what}: the refusal does not say where a command reads the value: {error}"
             );
         }
@@ -5809,7 +6378,7 @@ workflow(type = "playbook", tasks = [a])
         assert_eq!(prompt.matches(EXTERNAL_OPEN).count(), 1, "{prompt}");
 
         // It is an ordinary agent task in every other respect.
-        assert_eq!(task.emits_files, ["SPEC.md"]);
+        assert_eq!(task.emits_files, [DeclaredFile::from("SPEC.md")]);
         assert_eq!(
             compiled.prompt_files,
             [PathBuf::from("skills/analyze/SKILL.md")]
@@ -6222,7 +6791,10 @@ workflow(reviews + [gate("gate", reviews)])
         let pack = temp_pack("declared-path");
         let source = "a = agent(name = \"a\", prompt = \"p\", emits_files = [\"./A.md\"])\nworkflow(type = \"playbook\", tasks = [a])\n";
         let compiled = compile_source(source, &pack.join("workflow.star"), &pack).unwrap();
-        assert_eq!(compiled.workflow.tasks[0].emits_files, ["A.md"]);
+        assert_eq!(
+            compiled.workflow.tasks[0].emits_files,
+            [DeclaredFile::from("A.md")]
+        );
         let _ = std::fs::remove_dir_all(&pack);
     }
 
