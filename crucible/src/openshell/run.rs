@@ -862,9 +862,13 @@ async fn replay_sandbox_log(
     }
 }
 
-/// Probe the provider (`GetProvider`) → create on the first turn, update (swap the token)
-/// thereafter. The token rides the request body, never an argv or a log line.
+/// Ensure the `google-cloud` profile, then probe the provider (`GetProvider`) → create on the
+/// first turn, update (swap the token) thereafter. The token rides the request body, never an
+/// argv or a log line.
 async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str) -> Result<()> {
+    gw.ensure_provider_profile(provider::google_cloud_profile())
+        .await
+        .context("importing the google-cloud provider profile")?;
     if gw.provider_exists(provider::PROVIDER_NAME).await {
         gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
             .await
@@ -891,7 +895,7 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
 /// provider, update-or-create like the Vertex provider: the token changes every run, the
 /// provider object survives across runs on a shared gateway.
 async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
-    gw.import_provider_profile(provider::broker_profile())
+    gw.ensure_provider_profile(provider::broker_profile())
         .await
         .context("importing the broker provider profile")?;
     if gw.provider_exists(provider::BROKER_PROVIDER_NAME).await {
@@ -916,6 +920,9 @@ async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
 
 async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     use openshell_core::proto::ProviderCredentialRefreshStrategy;
+    gw.ensure_provider_profile(provider::aws_s3_profile())
+        .await
+        .context("importing the aws-s3 provider profile")?;
     if !gw.provider_exists(provider::AWS_PROVIDER_NAME).await {
         gw.create_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
             .await

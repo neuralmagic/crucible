@@ -12,16 +12,16 @@ use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
-    DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderProfileRequest,
+    GetProviderRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
     GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, NetworkBinary,
     NetworkCredentialBinding, NetworkEndpoint, NetworkEnforcementMode, NetworkPolicyRule,
     NetworkTlsMode, PolicyMergeOperation, PolicyStatus, Provider,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileImportItem,
-    ResourceRequirements, RotateProviderCredentialRequest, SandboxCondition, SandboxLogLine,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest,
-    UpdateProviderRequest, exec_sandbox_event::Payload as ExecPayload,
-    policy_merge_operation::Operation as MergeOp,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
+    ProviderProfileImportItem, ResourceRequirements, RotateProviderCredentialRequest,
+    SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    ServiceStatus, UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
+    exec_sandbox_event::Payload as ExecPayload, policy_merge_operation::Operation as MergeOp,
 };
 use prost_types::Struct;
 use std::collections::{BTreeMap, HashMap};
@@ -722,25 +722,68 @@ impl Gateway {
             .map_err(Into::into)
     }
 
-    /// Import (or refresh) a custom provider profile, platform-scoped
-    /// (`ImportProviderProfiles`). Existing custom profiles with the same id are replaced, so
-    /// re-running per turn is idempotent.
-    #[tracing::instrument(skip_all, fields(rpc = "import_provider_profiles", profile = profile.id.as_str()))]
-    pub async fn import_provider_profile(&self, profile: ProviderProfile) -> Result<()> {
+    /// Make the workspace's custom provider profile `profile.id` equal `profile`: import it when
+    /// absent (`ImportProviderProfiles`), leave it when it already matches, and replace it
+    /// otherwise (`UpdateProviderProfiles`, guarded by the stored resource version). Import is
+    /// create-only, so the read decides which write applies. A response that reports the profile
+    /// was not written fails with its diagnostics.
+    #[tracing::instrument(skip_all, fields(rpc = "ensure_provider_profile", profile = profile.id.as_str()))]
+    pub async fn ensure_provider_profile(&self, profile: ProviderProfile) -> Result<()> {
         let id = profile.id.clone();
         let mut client = self.client();
-        client
-            .import_provider_profiles(scoped(ImportProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
-                    profile: Some(profile),
-                    source: "crucible".to_string(),
-                }],
+        let stored = match client
+            .get_provider_profile(scoped(GetProviderProfileRequest {
+                id: id.clone(),
                 ..Default::default()
             }))
             .await
-            .map(|_| ())
-            .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))
-            .map_err(Into::into)
+        {
+            Ok(resp) => resp.into_inner().profile,
+            Err(s) if s.code() == tonic::Code::NotFound => None,
+            Err(s) => return Err(GrpcError::rpc(format!("get_provider_profile({id})"))(s).into()),
+        };
+        let item = ProviderProfileImportItem {
+            profile: Some(profile.clone()),
+            source: PROFILE_SOURCE.to_string(),
+        };
+        let diagnostics = match stored {
+            None => {
+                let resp = client
+                    .import_provider_profiles(scoped(ImportProviderProfilesRequest {
+                        profiles: vec![item],
+                        ..Default::default()
+                    }))
+                    .await
+                    .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))?
+                    .into_inner();
+                if resp.imported {
+                    return Ok(());
+                }
+                resp.diagnostics
+            }
+            Some(stored) if same_profile(&stored, &profile) => return Ok(()),
+            Some(stored) => {
+                let resp = client
+                    .update_provider_profiles(scoped(UpdateProviderProfilesRequest {
+                        profile: Some(item),
+                        expected_resource_version: stored.resource_version,
+                        id: id.clone(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .map_err(GrpcError::rpc(format!("update_provider_profiles({id})")))?
+                    .into_inner();
+                if resp.updated {
+                    return Ok(());
+                }
+                resp.diagnostics
+            }
+        };
+        Err(GrpcError::ProfileRejected {
+            id,
+            diagnostics: render_diagnostics(&diagnostics),
+        }
+        .into())
     }
 
     /// Register a provider whose credentials are gateway-minted (`CreateProvider` with an EMPTY
@@ -1071,6 +1114,33 @@ fn build_provider(name: &str, cred_key: &str, token: &str) -> Provider {
     }
 }
 
+/// The import source the gateway records on crucible's profiles.
+const PROFILE_SOURCE: &str = "crucible";
+
+/// Whether the gateway's stored profile already says what `wanted` says. The fields the gateway
+/// sets on its side (resource version, provenance, visibility) are not part of the comparison.
+fn same_profile(stored: &ProviderProfile, wanted: &ProviderProfile) -> bool {
+    let normalized = ProviderProfile {
+        resource_version: wanted.resource_version,
+        source: wanted.source.clone(),
+        scope: wanted.scope.clone(),
+        ..stored.clone()
+    };
+    normalized == *wanted
+}
+
+/// A profile write's diagnostics as one line: `severity field: message`, joined by `; `.
+fn render_diagnostics(diagnostics: &[ProviderProfileDiagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return "the gateway reported no diagnostics".to_string();
+    }
+    diagnostics
+        .iter()
+        .map(|d| format!("{} {}: {}", d.severity, d.field, d.message))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// A deployment variable holding JSON, `None` when unset.
 fn env_json<T: serde::de::DeserializeOwned>(name: &str) -> Result<Option<T>> {
     match std::env::var(name) {
@@ -1349,6 +1419,8 @@ pub enum GrpcError {
     SandboxNotReady { name: String, stage: ReadyStage },
     #[error("sandbox '{name}' still exists {seconds}s after delete")]
     SandboxStillExists { name: String, seconds: u64 },
+    #[error("provider profile '{id}' was not written: {diagnostics}")]
+    ProfileRejected { id: String, diagnostics: String },
     #[error("policy version {version} failed to load: {load_error}")]
     PolicyLoadFailed { version: u32, load_error: String },
     #[error("timed out waiting for policy version {version} to load on '{name}'")]
@@ -2015,6 +2087,59 @@ pYBZ
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_stored_profile_matches_when_only_gateway_fields_differ() {
+        let wanted = ProviderProfile {
+            id: "p".into(),
+            display_name: "P".into(),
+            credentials: vec![openshell_core::proto::ProviderProfileCredential {
+                name: "token".into(),
+                env_vars: vec!["TOKEN".into()],
+                required: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let stored = ProviderProfile {
+            resource_version: 7,
+            source: "user".into(),
+            scope: "workspace".into(),
+            ..wanted.clone()
+        };
+        assert!(same_profile(&stored, &wanted));
+        let edited = ProviderProfile {
+            description: "something else".into(),
+            ..stored
+        };
+        assert!(!same_profile(&edited, &wanted));
+    }
+
+    #[test]
+    fn profile_diagnostics_render_on_one_line() {
+        let diagnostics = [
+            ProviderProfileDiagnostic {
+                field: "id".into(),
+                message: "custom provider profile 'x' already exists".into(),
+                severity: "error".into(),
+                ..Default::default()
+            },
+            ProviderProfileDiagnostic {
+                field: "endpoints[0]".into(),
+                message: "bad host".into(),
+                severity: "warning".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            render_diagnostics(&diagnostics),
+            "error id: custom provider profile 'x' already exists; warning endpoints[0]: bad host"
+        );
+        assert_eq!(
+            render_diagnostics(&[]),
+            "the gateway reported no diagnostics"
+        );
     }
 
     #[test]
