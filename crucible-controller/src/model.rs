@@ -150,6 +150,13 @@ pub enum ParkReason {
         pod: String,
         last_observation: Option<String>,
     },
+    /// A dispatched pod stayed non-terminal past its run's deadline, so the controller deleted it.
+    RunPodOverran {
+        run_id: String,
+        pod: String,
+        deadline_secs: u64,
+        last_observation: Option<String>,
+    },
     /// Session bytes were present, but did not contain a valid terminal shutdown event.
     TerminalSessionInvalid { run_id: String, detail: String },
     /// The run's own shutdown reported `outcome: "error"`; `engine_reason` rides verbatim (opaque
@@ -255,6 +262,19 @@ impl std::fmt::Display for ParkReason {
             } => write!(
                 f,
                 "run {run_id} infrastructure failure: pod {pod} disappeared before terminal session evidence{}; redispatch the run",
+                last_observation
+                    .as_deref()
+                    .map(|detail| format!(" (last observed: {detail})"))
+                    .unwrap_or_default()
+            ),
+            Self::RunPodOverran {
+                run_id,
+                pod,
+                deadline_secs,
+                last_observation,
+            } => write!(
+                f,
+                "run {run_id} infrastructure failure: pod {pod} was still not terminal {deadline_secs}s after dispatch and was deleted{}; redispatch the run",
                 last_observation
                     .as_deref()
                     .map(|detail| format!(" (last observed: {detail})"))
@@ -385,7 +405,7 @@ impl ParkReason {
                 (evidence != "no build-log pointer published").then(|| evidence.to_string());
             return Self::ImageBuildFailed { evidence };
         }
-        // NoSessionDelimiter / NoSessionEmpty / RunPodLost / TerminalSessionInvalid / RunErrored / DemotedToN / Unrelated /
+        // NoSessionDelimiter / NoSessionEmpty / RunPodLost / RunPodOverran / TerminalSessionInvalid / RunErrored / DemotedToN / Unrelated /
         // BuildCapUnadmittable / ScopeFailed carry enough free text (log tails, rationale, arbitrary stage names) that a
         // round-trip parse isn't attempted — nothing downstream needs to recover THEIR structure
         // from a stored string today (see inventory: none of them are string-matched). They render
