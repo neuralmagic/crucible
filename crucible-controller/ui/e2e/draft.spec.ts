@@ -757,4 +757,45 @@ test.describe('editor preferences', () => {
     await expect(builds).toHaveCount(1);
     await expect(builds).toContainText('latest');
   });
+
+  test('images excluded for the same reason fold under it', async ({ page }) => {
+    await stubApi(page);
+    const lacking = (name: string, n: string) => ({
+      image: {
+        ...RANKED_IMAGES.excluded[0]!.image,
+        name,
+        repository: `ghcr.io/acme/${name}`,
+        digest: `sha256:${n.repeat(64)}`,
+      },
+      unsatisfied: [{ predicate: 'agent.claude-code', required: '*', found: null }],
+    });
+    await page.route('**/api/images/rank', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          ...RANKED_IMAGES,
+          excluded: [
+            ...RANKED_IMAGES.excluded,
+            lacking('sandbox-go-codex', 'a'),
+            lacking('sandbox-rust-pi', 'b'),
+            lacking('sandbox-vllm-codex', 'c'),
+          ],
+        }),
+      }),
+    );
+    await ready(page, STUDIO);
+    await treeItem(page, 'crucible.toml').click();
+
+    const excluded = page.getByTestId('studio-excluded-images');
+    await expect(excluded.locator(':scope > li')).toHaveCount(3);
+    const group = excluded.locator('details');
+    await expect(group.locator('summary')).toHaveText('lacks agent.claude-code3 images');
+    await expect(group.getByText('sandbox-rust-pi')).toBeHidden();
+
+    await group.locator('summary').click();
+    await expect(group.locator('li')).toHaveText(['sandbox-go-codex', 'sandbox-rust-pi', 'sandbox-vllm-codex']);
+    await expect(excluded).toContainText('lacks toolchain.go');
+    await expect(excluded).toContainText('unverified');
+  });
 });

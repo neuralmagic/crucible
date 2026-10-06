@@ -3,7 +3,14 @@ import { formatError } from '../api/errors';
 import type { components } from '../api/schema';
 import { Mono } from '../ui';
 import { FormError, RichSelectField } from './formControls';
-import { buildLabel, imageChoices, unavailableImages, type Build, type ImageChoice } from './imageChoices';
+import {
+  buildLabel,
+  byReason,
+  imageChoices,
+  unavailableImages,
+  type Build,
+  type ImageChoice,
+} from './imageChoices';
 import { pinnedReference, shortDigest } from './imagePicker';
 
 type PackDispatchDto = components['schemas']['PackDispatchDto'];
@@ -124,14 +131,34 @@ export function ImagePickerField({ idPrefix, dispatch, current, onPick }: ImageP
       )}
       {unavailable.length === 0 ? null : (
         <ul className="m-0 list-none p-0" data-testid={`${idPrefix}-excluded-images`}>
-          {unavailable.map((row) => (
-            <li key={row.repository} className="flex flex-wrap items-baseline gap-2 py-0.5 text-ink-2">
-              <span>{row.name}</span>
-              <Mono size="data" tone="amber">
-                {row.reason}
-              </Mono>
-            </li>
-          ))}
+          {byReason(unavailable).map(({ reason, rows }) =>
+            rows.length === 1 ? (
+              <li key={reason} className="flex flex-wrap items-baseline gap-2 py-0.5 text-ink-2">
+                <span>{rows[0]?.name}</span>
+                <Mono size="data" tone="amber">
+                  {reason}
+                </Mono>
+              </li>
+            ) : (
+              <li key={reason} className="py-0.5 text-ink-2">
+                <details>
+                  <summary className="flex cursor-pointer flex-wrap items-baseline gap-2 select-none">
+                    <Mono size="data" tone="amber">
+                      {reason}
+                    </Mono>
+                    <span>{rows.length} images</span>
+                  </summary>
+                  <ul className="m-0 mt-1 ml-4 list-none p-0">
+                    {rows.map((row) => (
+                      <li key={row.repository} className="py-0.5">
+                        {row.name}
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+              </li>
+            )
+          )}
         </ul>
       )}
     </div>
