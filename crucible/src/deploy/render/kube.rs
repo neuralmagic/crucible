@@ -1433,13 +1433,16 @@ exit $rc
         )
     }
 
-    /// The RBAC the kubernetes sandbox driver needs, cross-checked against OpenShell's own helm
-    /// chart (`role.yaml`, `clusterrole.yaml`):
+    /// The RBAC the kubernetes sandbox driver needs, matching OpenShell v0.1.2's helm chart for
+    /// shared workspace mode with `allowDriverConfig` (`role.yaml`, `clusterrole.yaml`):
     ///
-    ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs + event/pod reads +
-    ///     secret writes (the loop pod publishes the sandbox client-TLS Secret).
+    ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs, event reads, the
+    ///     supervisor pod lifecycle, the boundary Service, bootstrap Secrets, the egress
+    ///     NetworkPolicy, PVC metadata reads for resource admission, plus the client-TLS Secret
+    ///     the loop pod publishes.
     ///  2. A `RoleBinding` granting that Role to the loop SA.
-    ///  3. A `ClusterRole`: `tokenreviews` (create) + `nodes` (get/list/watch).
+    ///  3. A `ClusterRole`: `tokenreviews` (create), `nodes` (get/list/watch), and the
+    ///     `runtimeclasses`/`priorityclasses`/`namespaces` reads admission and UID resolution do.
     ///  4. A `ClusterRoleBinding` granting it to the loop SA.
     fn sandbox_rbac(&self) -> Vec<SandboxRbacObject> {
         let sa = &self.profile.cluster.service_account;
@@ -1447,7 +1450,8 @@ exit $rc
         let role_name = format!("{sa}-sandbox");
         let cr_name = format!("{sa}-node-reader");
 
-        // 1. Namespaced Role: sandbox CRD + events + pods + the published client-TLS secret.
+        // 1. Namespaced Role: sandbox CRD + events + the sandbox-runtime companions + the
+        //    published client-TLS secret.
         let role = rbac::Role {
             metadata: ObjectMeta {
                 name: Some(role_name.clone()),
@@ -1478,9 +1482,36 @@ exit $rc
                     verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
                     ..Default::default()
                 },
+                // The driver creates the supervisor pod itself and patches away its bootstrap
+                // scheduling gate; the gateway resolves TokenReview pod names via get.
                 rbac::PolicyRule {
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["pods".to_string()]),
+                    verbs: vec![
+                        "create".to_string(),
+                        "delete".to_string(),
+                        "get".to_string(),
+                        "list".to_string(),
+                        "patch".to_string(),
+                        "watch".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec![String::new()]),
+                    resources: Some(vec!["services".to_string()]),
+                    verbs: vec!["create".to_string(), "get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec!["networking.k8s.io".to_string()]),
+                    resources: Some(vec!["networkpolicies".to_string()]),
+                    verbs: vec!["create".to_string(), "get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec![String::new()]),
+                    resources: Some(vec!["persistentvolumeclaims".to_string()]),
                     verbs: vec!["get".to_string()],
                     ..Default::default()
                 },
@@ -1488,11 +1519,12 @@ exit $rc
                 // gateway back over mTLS (server-side apply = create on first boot, patch on
                 // cert refresh). Two rules because RBAC can't constrain `create` by
                 // resourceNames (the name doesn't exist yet at admission), while get/patch
-                // stay pinned to the one Secret we own.
+                // stay pinned to the one Secret we own. The driver's generation-scoped bootstrap
+                // Secrets need create and, on recovery, delete by name.
                 rbac::PolicyRule {
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["secrets".to_string()]),
-                    verbs: vec!["create".to_string()],
+                    verbs: vec!["create".to_string(), "delete".to_string()],
                     ..Default::default()
                 },
                 rbac::PolicyRule {
@@ -1514,7 +1546,8 @@ exit $rc
             ns.clone(),
         );
 
-        // 3. ClusterRole: tokenreviews (IssueSandboxToken bootstrap) + nodes.
+        // 3. ClusterRole: tokenreviews (IssueSandboxToken bootstrap) + nodes + the
+        //    cluster-scoped reads resource admission and SCC UID resolution make.
         let cr = rbac::ClusterRole {
             metadata: ObjectMeta {
                 name: Some(cr_name.clone()),
@@ -1531,6 +1564,24 @@ exit $rc
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["nodes".to_string()]),
                     verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec!["node.k8s.io".to_string()]),
+                    resources: Some(vec!["runtimeclasses".to_string()]),
+                    verbs: vec!["get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec!["scheduling.k8s.io".to_string()]),
+                    resources: Some(vec!["priorityclasses".to_string()]),
+                    verbs: vec!["get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec![String::new()]),
+                    resources: Some(vec!["namespaces".to_string()]),
+                    verbs: vec!["get".to_string()],
                     ..Default::default()
                 },
             ]),
@@ -4039,6 +4090,100 @@ mod tests {
         assert!(
             crb_doc.contains("autoresearch-publisher"),
             "subject SA: {crb_doc}"
+        );
+    }
+
+    /// Every `(apiGroup, resource, resourceNames) -> verbs` grant in one rendered RBAC doc.
+    fn rbac_grants(
+        rules: &[rbac::PolicyRule],
+    ) -> BTreeMap<(String, String, Vec<String>), Vec<String>> {
+        let mut grants = BTreeMap::new();
+        for rule in rules {
+            for group in rule.api_groups.iter().flatten() {
+                for resource in rule.resources.iter().flatten() {
+                    let mut verbs = rule.verbs.clone();
+                    verbs.sort();
+                    grants.insert(
+                        (
+                            group.clone(),
+                            resource.clone(),
+                            rule.resource_names.clone().unwrap_or_default(),
+                        ),
+                        verbs,
+                    );
+                }
+            }
+        }
+        grants
+    }
+
+    /// The Role and ClusterRole grant exactly what OpenShell v0.1.2's helm chart grants its
+    /// gateway in shared mode with `allowDriverConfig`, plus the client-TLS Secret the loop pod
+    /// publishes itself.
+    #[test]
+    fn the_sandbox_rbac_matches_the_openshell_chart() {
+        let yaml = render_k8s(&k8s_profile(""));
+        let docs: Vec<&str> = yaml.split("\n---\n").collect();
+        let role: rbac::Role = docs
+            .iter()
+            .find(|d| d.starts_with("apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\n"))
+            .map(|d| serde_norway::from_str(d).expect("Role parses"))
+            .expect("Role doc");
+        let cluster_role: rbac::ClusterRole = docs
+            .iter()
+            .find(|d| {
+                d.starts_with("apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\n")
+            })
+            .map(|d| serde_norway::from_str(d).expect("ClusterRole parses"))
+            .expect("ClusterRole doc");
+        let grant = |group: &str, resource: &str, names: &[&str], verbs: &[&str]| {
+            let mut verbs: Vec<String> = verbs.iter().map(|v| v.to_string()).collect();
+            verbs.sort();
+            (
+                (
+                    group.to_string(),
+                    resource.to_string(),
+                    names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                ),
+                verbs,
+            )
+        };
+        let crud = [
+            "create", "delete", "get", "list", "patch", "update", "watch",
+        ];
+        assert_eq!(
+            rbac_grants(role.rules.as_deref().unwrap_or_default()),
+            BTreeMap::from([
+                grant("agents.x-k8s.io", "sandboxes", &[], &crud),
+                grant("agents.x-k8s.io", "sandboxes/status", &[], &crud),
+                grant("", "events", &[], &["get", "list", "watch"]),
+                grant(
+                    "",
+                    "pods",
+                    &[],
+                    &["create", "delete", "get", "list", "patch", "watch"]
+                ),
+                grant("", "services", &[], &["create", "get"]),
+                grant(
+                    "networking.k8s.io",
+                    "networkpolicies",
+                    &[],
+                    &["create", "get"]
+                ),
+                grant("", "persistentvolumeclaims", &[], &["get"]),
+                grant("", "secrets", &[], &["create", "delete"]),
+                grant("", "secrets", &[CLIENT_TLS_SECRET], &["get", "patch"]),
+            ])
+        );
+        assert_eq!(
+            rbac_grants(cluster_role.rules.as_deref().unwrap_or_default()),
+            BTreeMap::from([
+                grant("authentication.k8s.io", "tokenreviews", &[], &["create"]),
+                grant("", "nodes", &[], &["get", "list", "watch"]),
+                grant("node.k8s.io", "runtimeclasses", &[], &["get"]),
+                grant("scheduling.k8s.io", "priorityclasses", &[], &["get"]),
+                grant("", "namespaces", &[], &["get"]),
+            ])
         );
     }
 
