@@ -3,11 +3,10 @@
 //! bootstrap mirrors crucible's: `https://localhost:17670`, mTLS from the registered gateway's
 //! cert dir. Upload/download have no RPC (SSH-tar), so `sandbox download` stays on the CLI.
 
+use crate::workspace::scoped;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
-use openshell_core::proto::{
-    ExecSandboxRequest, GetSandboxRequest, exec_sandbox_event::Payload as ExecPayload,
-};
+use openshell_core::proto::{ExecSandboxRequest, exec_sandbox_event::Payload as ExecPayload};
 use std::path::PathBuf;
 use std::time::Duration;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -31,8 +30,6 @@ pub(crate) enum GatewayError {
         #[source]
         status: Box<tonic::Status>,
     },
-    #[error("sandbox '{name}': {why}")]
-    SandboxUnresolved { name: String, why: &'static str },
     #[error("exec_sandbox({name}) stream ended without an exit event")]
     NoExit { name: String },
     #[error("building a fallback runtime for the gateway exec: {0}")]
@@ -119,34 +116,12 @@ async fn exec_collect_async(name: &str, command: &[String]) -> Result<ExecOutput
     let channel = build_channel()?;
     let mut client = OpenShellClient::with_interceptor(channel, EdgeAuthInterceptor::noop());
 
-    let sandbox = client
-        .get_sandbox(GetSandboxRequest {
-            name: name.to_string(),
-            ..Default::default()
-        })
-        .await
-        .map_err(rpc_err("get_sandbox"))?
-        .into_inner()
-        .sandbox
-        .ok_or_else(|| GatewayError::SandboxUnresolved {
-            name: name.to_string(),
-            why: "missing from the get_sandbox response",
-        })?;
-    let sandbox_id = sandbox
-        .metadata
-        .map(|m| m.id)
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| GatewayError::SandboxUnresolved {
-            name: name.to_string(),
-            why: "has no id",
-        })?;
-
     let mut stream = client
-        .exec_sandbox(ExecSandboxRequest {
-            sandbox_id,
+        .exec_sandbox(scoped(ExecSandboxRequest {
+            sandbox: name.to_string(),
             command: command.to_vec(),
             ..ExecSandboxRequest::default()
-        })
+        }))
         .await
         .map_err(rpc_err("exec_sandbox"))?
         .into_inner();

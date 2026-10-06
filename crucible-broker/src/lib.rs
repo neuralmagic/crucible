@@ -44,6 +44,7 @@ pub mod telemetry;
 pub(crate) mod turn;
 pub mod types;
 pub(crate) mod watch;
+pub mod workspace;
 
 pub use admission::{Admission, AdmissionDecision, GpuNeed};
 pub use approval::{ApprovalBackend, ApprovalChannel, ApprovalRequest, ApprovalState};
