@@ -289,8 +289,12 @@ async fn refresh_codex_token(
 /// role, not the endpoint access flag.
 pub const AWS_PROVIDER_NAME: &str = "crucible-s3-ro";
 
-/// The provider profile id (`providers/aws-s3.yaml`): generic STS refresh + S3 signing endpoints.
+/// The provider profile id of [`aws_s3_profile`]: STS refresh + S3 signing endpoints.
 pub const AWS_PROVIDER_TYPE: &str = "aws-s3";
+
+/// The ceiling on an `aws-s3` credential's lifetime. The gateway assumes the sandbox role from a
+/// role session of its own, and STS caps a chained session at one hour.
+pub const AWS_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(3600);
 
 /// The primary credential the STS refresh attaches to; one mint co-populates the secret key and
 /// session token siblings.
@@ -338,9 +342,158 @@ pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
     }
 }
 
+/// The `google-cloud` profile: the one static ADC access-token credential crucible mints and
+/// re-mints itself. No refresh and no endpoints: the gateway's metadata emulator serves the token,
+/// and the Vertex hosts come from the sandbox policy. Shaped after upstream's
+/// `providers/google-cloud.yaml`, minus the refresh strategies crucible does not use.
+pub fn google_cloud_profile() -> openshell_core::proto::ProviderProfile {
+    use openshell_core::proto::{
+        ProviderProfile, ProviderProfileCategory, ProviderProfileCredential,
+    };
+    ProviderProfile {
+        id: PROVIDER_TYPE.to_string(),
+        display_name: "Google Cloud (GCP APIs)".to_string(),
+        description: "Native GCP SDK credentials for sandboxes via metadata emulator".to_string(),
+        category: ProviderProfileCategory::Other.into(),
+        credentials: vec![ProviderProfileCredential {
+            name: "adc_token".to_string(),
+            description: "GCP access token minted by crucible from application default credentials"
+                .to_string(),
+            env_vars: vec![CRED_KEY.to_string()],
+            required: true,
+            auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+/// The `aws-s3` profile: one STS `AssumeRole` mints the access key, secret, and session token,
+/// and the proxy SigV4-signs sandbox S3 requests with them. Mirrors upstream's
+/// `providers/aws-s3.yaml`; the credential lifetime is held to [`AWS_MAX_LIFETIME`].
+pub fn aws_s3_profile() -> openshell_core::proto::ProviderProfile {
+    use openshell_core::proto::{
+        NetworkAccessPreset, NetworkBinary, NetworkEndpoint, NetworkEnforcementMode,
+        ProviderCredentialRefresh, ProviderCredentialRefreshMaterial,
+        ProviderCredentialRefreshOutput, ProviderCredentialRefreshStrategy, ProviderProfile,
+        ProviderProfileCategory, ProviderProfileCredential,
+    };
+    let seconds = |secs: u64| prost_types::Duration {
+        seconds: i64::try_from(secs).unwrap_or(i64::MAX),
+        nanos: 0,
+    };
+    let material = |name: &str, description: &str, required: bool, secret: bool| {
+        ProviderCredentialRefreshMaterial {
+            name: name.to_string(),
+            description: description.to_string(),
+            required,
+            secret,
+        }
+    };
+    let s3_endpoint = |host: &str| NetworkEndpoint {
+        host: host.to_string(),
+        port: 443,
+        protocol: "rest".to_string(),
+        access: NetworkAccessPreset::ReadWrite.into(),
+        enforcement: NetworkEnforcementMode::Enforce.into(),
+        credential_signing: "sigv4".to_string(),
+        signing_service: "s3".to_string(),
+        ..Default::default()
+    };
+    ProviderProfile {
+        id: AWS_PROVIDER_TYPE.to_string(),
+        display_name: "AWS S3".to_string(),
+        description: "AWS S3 storage via STS temporary credentials".to_string(),
+        category: ProviderProfileCategory::Other.into(),
+        credentials: vec![
+            ProviderProfileCredential {
+                name: "access_key_id".to_string(),
+                description: "AWS access key ID (gateway-minted via STS)".to_string(),
+                env_vars: vec![AWS_PRIMARY_CRED.to_string()],
+                required: true,
+                refresh: Some(ProviderCredentialRefresh {
+                    strategy: ProviderCredentialRefreshStrategy::AwsStsAssumeRole.into(),
+                    refresh_before: Some(seconds(300)),
+                    max_lifetime: Some(seconds(AWS_MAX_LIFETIME.as_secs())),
+                    material: vec![
+                        material("role_arn", "ARN of the IAM role to assume", true, false),
+                        material(
+                            "session_name",
+                            "Session name for CloudTrail attribution",
+                            false,
+                            false,
+                        ),
+                        material(
+                            "external_id",
+                            "External ID for cross-account role assumption",
+                            false,
+                            false,
+                        ),
+                        material("aws_region", "AWS region for STS endpoint", false, false),
+                    ],
+                    additional_outputs: vec![
+                        ProviderCredentialRefreshOutput {
+                            output: "secret_access_key".to_string(),
+                            credential: "secret_access_key".to_string(),
+                        },
+                        ProviderCredentialRefreshOutput {
+                            output: "session_token".to_string(),
+                            credential: "session_token".to_string(),
+                        },
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            ProviderProfileCredential {
+                name: "secret_access_key".to_string(),
+                description: "AWS secret access key (co-managed with access_key_id)".to_string(),
+                env_vars: vec!["AWS_SECRET_ACCESS_KEY".to_string()],
+                required: true,
+                ..Default::default()
+            },
+            ProviderProfileCredential {
+                name: "session_token".to_string(),
+                description: "AWS session token (co-managed with access_key_id)".to_string(),
+                env_vars: vec!["AWS_SESSION_TOKEN".to_string()],
+                required: true,
+                ..Default::default()
+            },
+        ],
+        endpoints: [
+            "*.s3.amazonaws.com",
+            "s3.amazonaws.com",
+            "*.s3.*.amazonaws.com",
+            "s3.*.amazonaws.com",
+            "*.s3.dualstack.*.amazonaws.com",
+            "s3.dualstack.*.amazonaws.com",
+        ]
+        .into_iter()
+        .map(s3_endpoint)
+        .collect(),
+        binaries: [
+            "/sandbox/.venv/bin/python",
+            "/sandbox/.venv/bin/python3",
+            "/sandbox/.uv/python/**",
+            "/usr/bin/python3",
+            "/usr/bin/python3.*",
+            "/usr/bin/curl",
+            "/usr/local/bin/aws",
+            "/bin/bash",
+        ]
+        .into_iter()
+        .map(|path| NetworkBinary {
+            path: path.to_string(),
+        })
+        .collect(),
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::openshell::provider::*;
 
     #[test]
     fn provider_identity_constants_are_stable() {
@@ -348,6 +501,124 @@ mod tests {
         assert_eq!(PROVIDER_NAME, "ci-gcp");
         assert_eq!(PROVIDER_TYPE, "google-cloud");
         assert_eq!(CRED_KEY, "GCP_ADC_ACCESS_TOKEN");
+    }
+
+    #[test]
+    fn the_google_cloud_profile_declares_the_token_crucible_mints() {
+        let profile = google_cloud_profile();
+        assert_eq!(profile.id, PROVIDER_TYPE);
+        assert!(
+            profile.endpoints.is_empty(),
+            "the metadata emulator serves it"
+        );
+        let [credential] = profile.credentials.as_slice() else {
+            panic!("one credential: {:?}", profile.credentials);
+        };
+        assert_eq!(credential.env_vars, vec![CRED_KEY.to_string()]);
+        assert!(credential.required);
+        assert!(
+            credential.refresh.is_none(),
+            "crucible re-mints the token itself"
+        );
+    }
+
+    #[test]
+    fn the_aws_s3_profile_mints_all_three_credentials_with_one_assume_role() {
+        use openshell_core::proto::ProviderCredentialRefreshStrategy;
+        let profile = aws_s3_profile();
+        assert_eq!(profile.id, AWS_PROVIDER_TYPE);
+        let env: Vec<&str> = profile
+            .credentials
+            .iter()
+            .flat_map(|c| c.env_vars.iter().map(String::as_str))
+            .collect();
+        assert_eq!(
+            env,
+            [
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_SESSION_TOKEN"
+            ]
+        );
+        let primary = profile
+            .credentials
+            .iter()
+            .find(|c| c.env_vars == [AWS_PRIMARY_CRED])
+            .expect("primary credential");
+        let refresh = primary
+            .refresh
+            .as_ref()
+            .expect("primary carries the refresh");
+        assert_eq!(
+            refresh.strategy(),
+            ProviderCredentialRefreshStrategy::AwsStsAssumeRole
+        );
+        let outputs: Vec<(&str, &str)> = refresh
+            .additional_outputs
+            .iter()
+            .map(|o| (o.output.as_str(), o.credential.as_str()))
+            .collect();
+        assert_eq!(
+            outputs,
+            [
+                ("secret_access_key", "secret_access_key"),
+                ("session_token", "session_token")
+            ]
+        );
+        let required: Vec<&str> = refresh
+            .material
+            .iter()
+            .filter(|m| m.required)
+            .map(|m| m.name.as_str())
+            .collect();
+        assert_eq!(required, ["role_arn"]);
+        assert!(
+            refresh.material.iter().all(|m| !m.secret),
+            "no static source key: the gateway assumes the role from its ambient identity"
+        );
+    }
+
+    #[test]
+    fn an_aws_s3_credential_never_outlives_a_chained_role_session() {
+        let profile = aws_s3_profile();
+        let lifetime = profile.credentials[0]
+            .refresh
+            .as_ref()
+            .and_then(|r| r.max_lifetime)
+            .expect("lifetime is set");
+        assert!(
+            lifetime.seconds > 0 && lifetime.seconds <= 3600,
+            "{lifetime:?}"
+        );
+        assert_eq!(lifetime.nanos, 0);
+        let before = profile.credentials[0]
+            .refresh
+            .as_ref()
+            .and_then(|r| r.refresh_before)
+            .expect("refresh lead is set");
+        assert!(before.seconds < lifetime.seconds);
+    }
+
+    #[test]
+    fn the_aws_s3_profile_signs_every_s3_host_shape() {
+        use openshell_core::proto::{NetworkAccessPreset, NetworkEnforcementMode};
+        let profile = aws_s3_profile();
+        assert_eq!(profile.endpoints.len(), 6);
+        for endpoint in &profile.endpoints {
+            assert_eq!(endpoint.port, 443, "{}", endpoint.host);
+            assert_eq!(endpoint.protocol, "rest", "{}", endpoint.host);
+            assert_eq!(endpoint.credential_signing, "sigv4", "{}", endpoint.host);
+            assert_eq!(endpoint.signing_service, "s3", "{}", endpoint.host);
+            assert_eq!(endpoint.access(), NetworkAccessPreset::ReadWrite);
+            assert_eq!(endpoint.enforcement(), NetworkEnforcementMode::Enforce);
+        }
+        assert!(
+            profile
+                .endpoints
+                .iter()
+                .any(|e| e.host == "s3.amazonaws.com")
+        );
+        assert!(!profile.binaries.is_empty());
     }
 
     #[test]

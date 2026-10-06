@@ -20,6 +20,7 @@
 use crate::openshell::grpc::{GATEWAY_NAME, GATEWAY_PORT, mtls_dir};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -35,6 +36,13 @@ pub enum GatewayError {
         crate::openshell::grpc::EXPECTED_GATEWAY_REV
     )]
     TooOld { reported: String, minimum: String },
+    #[error(
+        "{POD_IP_ENV} is unset: the kubernetes driver's supervisor pod dials the gateway at \
+         this pod's IP (render it from the downward API's status.podIP)"
+    )]
+    PodIpMissing,
+    #[error("{POD_IP_ENV}={raw:?} is not an IP address")]
+    PodIpUnparseable { raw: String },
     #[error("{origin} podman API socket did not appear at {}", .socket.display())]
     PodmanSocketMissing {
         origin: &'static str,
@@ -89,6 +97,61 @@ fn pod_identity() -> Option<(String, String)> {
     (!name.is_empty() && !uid.is_empty()).then_some((name, uid))
 }
 
+/// The env the loop pod renders the sandbox S3 read role into.
+pub const AWS_SANDBOX_ROLE_ENV: &str = "CRUCIBLE_AWS_SANDBOX_ROLE_ARN";
+
+/// Where the loop pod projects its `sts.amazonaws.com`-audience ServiceAccount token.
+pub const AWS_WEB_IDENTITY_TOKEN_PATH: &str = "/var/run/secrets/aws/token";
+
+/// The sandbox S3 read role, `None` when the deployment grants none.
+pub fn aws_sandbox_role() -> Option<String> {
+    std::env::var(AWS_SANDBOX_ROLE_ENV)
+        .ok()
+        .map(|arn| arn.trim().to_string())
+        .filter(|arn| !arn.is_empty())
+}
+
+/// One edit to the environment the gateway child inherits from the loop process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvChange {
+    Set(&'static str, String),
+    Remove(&'static str),
+}
+
+/// The gateway child's AWS identity. The loop process runs as the publish role (`AWS_ROLE_ARN`),
+/// which must never become the gateway's: with a sandbox role the gateway runs as that role via
+/// the projected token, and without one it gets no role at all. IMDS stays off either way, so the
+/// SDK chain cannot fall through to the node's instance role.
+fn gateway_aws_env(sandbox_role: Option<&str>) -> Vec<EnvChange> {
+    let mut env = match sandbox_role {
+        Some(arn) => vec![
+            EnvChange::Set("AWS_ROLE_ARN", arn.to_string()),
+            EnvChange::Set(
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                AWS_WEB_IDENTITY_TOKEN_PATH.to_string(),
+            ),
+        ],
+        None => vec![
+            EnvChange::Remove("AWS_ROLE_ARN"),
+            EnvChange::Remove("AWS_WEB_IDENTITY_TOKEN_FILE"),
+        ],
+    };
+    env.push(EnvChange::Set(
+        "AWS_EC2_METADATA_DISABLED",
+        "true".to_string(),
+    ));
+    env
+}
+
+fn apply_gateway_aws_env(cmd: &mut Command, sandbox_role: Option<&str>) {
+    for change in gateway_aws_env(sandbox_role) {
+        match change {
+            EnvChange::Set(name, value) => cmd.env(name, value),
+            EnvChange::Remove(name) => cmd.env_remove(name),
+        };
+    }
+}
+
 /// In-cluster k8s detection vars to strip from the gateway's environment before launch.
 /// (See the module docs, load-bearing under the podman driver in a pod, a no-op on a laptop;
 /// the kubernetes driver needs them, so the scrub is gated on the driver.)
@@ -105,7 +168,7 @@ pub enum ComputeDriver {
 }
 
 impl ComputeDriver {
-    /// The value OpenShell expects in `compute_drivers` and as the `[openshell.drivers.<name>]`
+    /// The value OpenShell expects in `compute_driver` and as the `[openshell.drivers.<name>]`
     /// table key.
     fn as_str(self) -> &'static str {
         match self {
@@ -141,25 +204,72 @@ fn needs_podman_socket(driver: ComputeDriver) -> bool {
     matches!(driver, ComputeDriver::Podman)
 }
 
+/// The env the loop pod renders the supervisor image into.
+pub const SUPERVISOR_IMAGE_ENV: &str = "OPENSHELL_SUPERVISOR_IMAGE";
+/// The env the loop pod renders the sandbox runtime image (the `openshell-sandbox` binary) into.
+pub const SANDBOX_RUNTIME_IMAGE_ENV: &str = "OPENSHELL_SANDBOX_RUNTIME_IMAGE";
+/// The env the loop pod's downward API carries its own IP in.
+pub const POD_IP_ENV: &str = "CRUCIBLE_POD_IP";
+
+/// The trusted images the compute driver pairs with every sandbox. `None` leaves the driver's
+/// default, which names upstream's registry at the gateway's own version tag.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DriverImages {
+    pub supervisor: Option<String>,
+    pub sandbox_runtime: Option<String>,
+}
+
+impl DriverImages {
+    pub fn from_env() -> Self {
+        let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        Self {
+            supervisor: var(SUPERVISOR_IMAGE_ENV),
+            sandbox_runtime: var(SANDBOX_RUNTIME_IMAGE_ENV),
+        }
+    }
+}
+
+/// This pod's IP from the downward API, `None` off-cluster.
+fn pod_ip() -> Result<Option<IpAddr>> {
+    match std::env::var(POD_IP_ENV) {
+        Ok(raw) if !raw.is_empty() => raw
+            .parse()
+            .map(Some)
+            .map_err(|_| GatewayError::PodIpUnparseable { raw }.into()),
+        _ => Ok(None),
+    }
+}
+
+/// The `[openshell.drivers.podman]` config. Only the image overrides; everything else is the
+/// driver's default.
+#[derive(Debug, Default, Serialize)]
+struct PodmanDriverConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supervisor_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sandbox_runtime_image: Option<String>,
+}
+
 /// The `[openshell.drivers.kubernetes]` config, emitted from a typed struct so the serde field
-/// names track the driver's own `KubernetesComputeConfig`. Every field is skip-if-empty: an
-/// omitted key means "use the driver's default", which is load-bearing (e.g. an empty
-/// `host_gateway_ip` deliberately omits the pod's `hostAliases`). `deny_unknown_fields` on the
+/// names track the driver's own `KubernetesComputeConfig`. Every optional field is
+/// skip-if-empty: an omitted key means "use the driver's default". `deny_unknown_fields` on the
 /// upstream struct rejects any name we mistype, so every field here must match exactly.
 #[derive(Debug, Default, Serialize)]
 pub struct KubernetesDriverConfig {
-    /// The gateway URL sandbox pods dial back (`OPENSHELL_ENDPOINT`, tonic-parsed). The driver
-    /// defaults it to the empty string and passes it verbatim, which the supervisor's policy
-    /// fetch rejects as "invalid gRPC endpoint" and crash-loops on, so this must always be
-    /// set. `https://` puts the sandbox client in mTLS mode, reading its material from the
-    /// mounted client-TLS secret; the hostname must match both a server-cert SAN and the
-    /// `hostAliases` entry the driver injects from `host_gateway_ip`.
+    /// Accept the per-sandbox `driver_config` crucible sends (node selector, tolerations,
+    /// runtime class, container resources). Resource admission still applies to what it names.
+    pub allow_driver_config: bool,
+    /// The gateway URL the supervisor pod dials (`OPENSHELL_ENDPOINT`, tonic-parsed). The driver
+    /// defaults it to the empty string and passes it verbatim, which the supervisor rejects as
+    /// "invalid gRPC endpoint" and crash-loops on, so this must always be set. The supervisor is
+    /// its own pod with cluster DNS only, so this is the loop pod's IP, which the gateway's
+    /// server certificate carries as an IP SAN.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub grpc_endpoint: String,
     /// The Secret (in the sandbox namespace) carrying the generated client mTLS material. The
-    /// driver mounts it into sandbox pods and points `OPENSHELL_TLS_CA/CERT/KEY` at its
-    /// `ca.crt`/`tls.crt`/`tls.key` keys, the only channel a sandbox gets TLS material
-    /// through, and an `https://` endpoint without it dies with "OPENSHELL_TLS_CA is required".
+    /// driver mounts it into the supervisor pod and points `OPENSHELL_TLS_CA/CERT/KEY` at its
+    /// `ca.crt`/`tls.crt`/`tls.key` keys, and an `https://` endpoint without it dies with
+    /// "OPENSHELL_TLS_CA is required".
     #[serde(skip_serializing_if = "String::is_empty")]
     pub client_tls_secret_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -171,41 +281,39 @@ pub struct KubernetesDriverConfig {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub image_pull_secrets: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_runtime_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub supervisor_image: Option<String>,
-    /// Always `init-container`: `image-volume` needs the `ImageVolume` feature gate our cluster
-    /// (v1.35) does not have.
-    pub supervisor_sideload_method: String,
+    /// The address `host.openshell.internal` resolves to for sandbox egress (broker, collector).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_gateway_ip: Option<String>,
-    /// Ubuntu 24.04 nodes run AppArmor enforcing; RuntimeDefault can block the
-    /// supervisor's netns setup. Set Unconfined.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub app_armor_profile: Option<String>,
+    pub host_gateway_ip: Option<IpAddr>,
 }
 
 impl KubernetesDriverConfig {
-    pub fn new(supervisor_image: Option<&str>) -> Self {
+    pub fn new(images: &DriverImages) -> Self {
         Self {
-            supervisor_image: supervisor_image.map(str::to_owned),
-            supervisor_sideload_method: "init-container".to_owned(),
+            allow_driver_config: true,
+            supervisor_image: images.supervisor.clone(),
+            sandbox_runtime_image: images.sandbox_runtime.clone(),
             ..Self::default()
         }
     }
 }
 
-/// Render `~/.config/openshell/gateway.toml` for `driver`. Under `Podman` an optional supervisor
-/// image override appends a `[openshell.drivers.podman]` block (the in-pod sandbox image source);
-/// under `Kubernetes` it flows into the typed `[openshell.drivers.kubernetes]` block. An
-/// `otlp_endpoint` appends `[openshell.gateway.otlp]` — the gateway's span export is switched
-/// on by that table's presence, not by the `OTEL_*` env vars it leaves to the SDK.
+/// Render `~/.config/openshell/gateway.toml` (schema version 2) for `driver`. The image
+/// overrides go to the driver's table. An `otlp_endpoint` appends `[openshell.gateway.otlp]`:
+/// the gateway's span export is switched on by that table's presence, not by the `OTEL_*` env
+/// vars it leaves to the SDK. Under `Kubernetes` the supervisor dials back to `pod_ip`, so it is
+/// required there.
 pub fn gateway_toml(
     port: u16,
     driver: ComputeDriver,
-    supervisor_image: Option<&str>,
+    images: &DriverImages,
     otlp_endpoint: Option<&str>,
+    pod_ip: Option<IpAddr>,
 ) -> Result<String> {
     let mut s = format!(
-        "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:{port}\"\ncompute_drivers = [\"{}\"]\n",
+        "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:{port}\"\ncompute_driver = \"{}\"\n",
         driver.as_str()
     );
     if let Some(endpoint) = otlp_endpoint {
@@ -215,10 +323,13 @@ pub fn gateway_toml(
     }
     match driver {
         ComputeDriver::Podman => {
-            if let Some(img) = supervisor_image {
-                s.push_str(&format!(
-                    "\n[openshell.drivers.podman]\nsupervisor_image = \"{img}\"\n"
-                ));
+            let cfg = PodmanDriverConfig {
+                supervisor_image: images.supervisor.clone(),
+                sandbox_runtime_image: images.sandbox_runtime.clone(),
+            };
+            if cfg.supervisor_image.is_some() || cfg.sandbox_runtime_image.is_some() {
+                let body = toml::to_string(&cfg).context("serializing podman driver config")?;
+                s.push_str(&format!("\n[openshell.drivers.podman]\n{body}"));
             }
         }
         ComputeDriver::Kubernetes => {
@@ -232,22 +343,13 @@ pub fn gateway_toml(
             // client cert = authorized, exactly what mtls_auth grants under podman. Sandbox
             // supervisor calls keep using gateway-minted JWTs either way.
             s.push_str("\n[openshell.gateway.auth]\nallow_unauthenticated_users = true\n");
-            let mut cfg = KubernetesDriverConfig::new(supervisor_image);
-            // `host.openshell.internal` is the one name that lines up end to end: it is the
-            // `--server-san` we pass to generate-certs, and the hostAlias the driver injects
-            // into sandbox pods from `host_gateway_ip`, so the sandbox resolves it to this
-            // pod and the TLS handshake's SAN check passes. The raw pod IP would resolve but
-            // fail SAN verification.
-            cfg.grpc_endpoint =
-                format!("https://{}:{port}", ComputeDriver::Kubernetes.broker_host());
+            let pod_ip = pod_ip.ok_or(GatewayError::PodIpMissing)?;
+            let mut cfg = KubernetesDriverConfig::new(images);
+            cfg.grpc_endpoint = format!("https://{}", SocketAddr::new(pod_ip, port));
             cfg.client_tls_secret_name = client_tls_secret_name();
+            cfg.host_gateway_ip = Some(pod_ip);
             // At runtime the render-projected env vars fill the driver config fields that
             // are unknowable at render time or vary per profile.
-            if let Ok(ip) = std::env::var("CRUCIBLE_POD_IP")
-                && !ip.is_empty()
-            {
-                cfg.host_gateway_ip = Some(ip);
-            }
             if let Ok(ns) = std::env::var("CRUCIBLE_SANDBOX_NAMESPACE")
                 && !ns.is_empty()
             {
@@ -274,11 +376,6 @@ pub fn gateway_toml(
                     cfg.image_pull_secrets = v;
                 }
             }
-            if let Ok(profile) = std::env::var("CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE")
-                && !profile.is_empty()
-            {
-                cfg.app_armor_profile = Some(profile);
-            }
             let body = toml::to_string(&cfg).context("serializing kubernetes driver config")?;
             s.push_str(&format!("\n[openshell.drivers.kubernetes]\n{body}"));
         }
@@ -286,15 +383,64 @@ pub fn gateway_toml(
     Ok(s)
 }
 
-/// `openshell-gateway generate-certs --output-dir <tls> --server-san host.openshell.internal`.
-pub fn generate_certs_args(tls_dir: &str) -> Vec<String> {
-    vec![
+/// Every field v0.1.2's `KubernetesComputeConfig` (`crates/openshell-driver-kubernetes/src/
+/// config.rs`) accepts. That struct is `deny_unknown_fields`, so a name outside this list kills
+/// the gateway on startup, and its log lands in `gateway.log`, not the pod log. Re-derive it
+/// from the struct whenever the pin moves.
+#[cfg(test)]
+pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
+    "allow_driver_config",
+    "resource_admission",
+    "workspace_mode",
+    "gateway_id",
+    "namespace",
+    "operator_namespace_label",
+    "operator_namespace_file",
+    "service_account_name",
+    "default_image",
+    "image_pull_policy",
+    "image_pull_secrets",
+    "managed_ssh_ingress",
+    "sandbox_runtime_image",
+    "sandbox_runtime_image_pull_policy",
+    "supervisor_image",
+    "supervisor_image_pull_policy",
+    "sandbox_runtime",
+    "https_proxy",
+    "no_proxy",
+    "proxy_auth_secret_name",
+    "proxy_auth_secret_key",
+    "proxy_auth_allow_insecure",
+    "proxy_connect_by_hostname",
+    "proxy_ca_bundle",
+    "grpc_endpoint",
+    "ssh_socket_path",
+    "client_tls_secret_name",
+    "host_gateway_ip",
+    "enable_user_namespaces",
+    "workspace_default_storage_size",
+    "workspace_storage_class",
+    "default_runtime_class_name",
+    "sa_token_ttl_secs",
+    "provider_spiffe_workload_api_socket_path",
+    "sandbox_uid",
+    "sandbox_gid",
+];
+
+/// `openshell-gateway generate-certs --output-dir <tls> --server-san host.openshell.internal`,
+/// plus `--server-san <pod_ip>` in a pod, the address the supervisor dials.
+pub fn generate_certs_args(tls_dir: &str, pod_ip: Option<IpAddr>) -> Vec<String> {
+    let mut args = vec![
         "generate-certs".into(),
         "--output-dir".into(),
         tls_dir.into(),
         "--server-san".into(),
         "host.openshell.internal".into(),
-    ]
+    ];
+    if let Some(ip) = pod_ip {
+        args.extend(["--server-san".into(), ip.to_string()]);
+    }
+    args
 }
 
 /// `openshell gateway add https://localhost:<port> --local --name ci`.
@@ -403,25 +549,16 @@ fn libc_getuid() -> u32 {
 /// answers newer RPCs with UNIMPLEMENTED mid-turn, so fail up front); a rev mismatch or an
 /// unparseable version returns `Ok(Some(warning))` for the caller's sink, never a hard fail.
 ///
-/// `supervisor_image` flows into the podman driver block (default emulator image used
-/// when `None`).
+/// The driver images come from the render-projected env ([`DriverImages::from_env`]).
 /// Fan-out instances run their turns on concurrent threads and each arrives here; a second
 /// `generate-certs` under a live gateway rotates the CA its clients were issued from.
 static BOOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[tracing::instrument(name = "gateway_boot", skip_all, fields(driver = ?driver))]
-pub async fn ensure_running(
-    driver: ComputeDriver,
-    supervisor_image: Option<&str>,
-) -> Result<Option<String>> {
+pub async fn ensure_running(driver: ComputeDriver) -> Result<Option<String>> {
     let _boot = BOOT.lock().await;
     if !is_running().await {
-        // The loop pod sets OPENSHELL_SUPERVISOR_IMAGE (e.g. the aws-provider supervisor);
-        // honor it when the caller didn't pass one explicitly.
-        let env_img = std::env::var("OPENSHELL_SUPERVISOR_IMAGE")
-            .ok()
-            .filter(|s| !s.is_empty());
-        boot(driver, supervisor_image.or(env_img.as_deref())).await?;
+        boot(driver, &DriverImages::from_env()).await?;
     }
     check_gateway_version().await
 }
@@ -461,7 +598,8 @@ async fn check_gateway_version() -> Result<Option<String>> {
     }
 }
 
-async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<()> {
+async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
+    let pod_ip = pod_ip()?;
     // 1. rootless podman API socket (the podman compute driver). Skipped under kubernetes,
     // where the sandbox is a sibling pod and there is no local daemon to boot.
     if needs_podman_socket(driver) {
@@ -501,12 +639,12 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
     }
 
     // 2. gateway config + 3. TLS certs.
-    write_config(driver, supervisor_image)?;
+    write_config(driver, images, pod_ip)?;
     let tls_dir = state_dir()?.join("tls");
     std::fs::create_dir_all(&tls_dir)
         .with_context(|| format!("creating tls dir {}", tls_dir.display()))?;
     let certs = Command::new("openshell-gateway")
-        .args(generate_certs_args(&tls_dir.to_string_lossy()))
+        .args(generate_certs_args(&tls_dir.to_string_lossy(), pod_ip))
         .env("OPENSHELL_LOCAL_TLS_DIR", &tls_dir)
         .output()
         .context("exec openshell-gateway generate-certs")?;
@@ -546,6 +684,7 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
                 gw.env_remove(var);
             }
         }
+        apply_gateway_aws_env(&mut gw, aws_sandbox_role().as_deref());
         gw.spawn().context("spawn openshell-gateway")?;
     }
 
@@ -751,7 +890,11 @@ fn state_dir() -> Result<PathBuf> {
 
 /// Write `~/.config/openshell/gateway.toml` if its content changed (avoids churning a config
 /// a running gateway may have read).
-fn write_config(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<()> {
+fn write_config(
+    driver: ComputeDriver,
+    images: &DriverImages,
+    pod_ip: Option<IpAddr>,
+) -> Result<()> {
     let home = std::env::var("HOME").context("HOME unset")?;
     let dir = PathBuf::from(home).join(".config/openshell");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -763,8 +906,9 @@ fn write_config(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result
     let rendered = gateway_toml(
         GATEWAY_PORT,
         driver,
-        supervisor_image,
+        images,
         otlp_endpoint.as_deref(),
+        pod_ip,
     )?;
     if std::fs::read_to_string(&path).ok().as_deref() == Some(rendered.as_str()) {
         return Ok(());
@@ -789,12 +933,90 @@ fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::openshell::gateway::*;
 
-    // The podman rendering must be byte-for-byte what `gateway_toml` produced before the driver
-    // became a knob. These are frozen snapshots.
-    const PODMAN_NO_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n";
-    const PODMAN_WITH_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n\n[openshell.drivers.podman]\nsupervisor_image = \"registry.example.com/epp-sandbox:x\"\n";
+    // Frozen snapshots of the schema version 2 podman rendering.
+    const PODMAN_NO_IMAGE: &str = "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_driver = \"podman\"\n";
+    const PODMAN_WITH_IMAGE: &str = "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_driver = \"podman\"\n\n[openshell.drivers.podman]\nsupervisor_image = \"registry.example.com/epp-sandbox:x\"\n";
+
+    fn images(supervisor: Option<&str>, sandbox_runtime: Option<&str>) -> DriverImages {
+        DriverImages {
+            supervisor: supervisor.map(str::to_owned),
+            sandbox_runtime: sandbox_runtime.map(str::to_owned),
+        }
+    }
+
+    fn pod_ip() -> Option<IpAddr> {
+        Some(IpAddr::from([10, 1, 2, 3]))
+    }
+
+    fn kubernetes_toml(images: &DriverImages) -> toml::Value {
+        let t = gateway_toml(17670, ComputeDriver::Kubernetes, images, None, pod_ip()).unwrap();
+        toml::from_str(&t).expect("kubernetes gateway.toml must parse")
+    }
+
+    #[test]
+    fn a_sandbox_role_becomes_the_gateway_identity() {
+        assert_eq!(
+            gateway_aws_env(Some("arn:aws:iam::1:role/sandbox-ro")),
+            vec![
+                EnvChange::Set("AWS_ROLE_ARN", "arn:aws:iam::1:role/sandbox-ro".into()),
+                EnvChange::Set(
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    "/var/run/secrets/aws/token".into()
+                ),
+                EnvChange::Set("AWS_EC2_METADATA_DISABLED", "true".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_sandbox_role_the_gateway_gets_no_aws_identity() {
+        assert_eq!(
+            gateway_aws_env(None),
+            vec![
+                EnvChange::Remove("AWS_ROLE_ARN"),
+                EnvChange::Remove("AWS_WEB_IDENTITY_TOKEN_FILE"),
+                EnvChange::Set("AWS_EC2_METADATA_DISABLED", "true".into()),
+            ]
+        );
+    }
+
+    /// The child is a real process: what it prints is what a spawned gateway would inherit.
+    fn child_aws_env(sandbox_role: Option<&str>) -> std::collections::BTreeMap<String, String> {
+        let mut cmd = Command::new("env");
+        cmd.env("AWS_ROLE_ARN", "arn:aws:iam::1:role/publish")
+            .env("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/aws/token");
+        apply_gateway_aws_env(&mut cmd, sandbox_role);
+        let out = cmd.output().expect("run env");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .filter(|(k, _)| k.starts_with("AWS_"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_gateway_child_never_inherits_the_publish_role() {
+        let with_role = child_aws_env(Some("arn:aws:iam::1:role/sandbox-ro"));
+        assert_eq!(
+            with_role.get("AWS_ROLE_ARN").map(String::as_str),
+            Some("arn:aws:iam::1:role/sandbox-ro")
+        );
+        assert_eq!(
+            with_role
+                .get("AWS_EC2_METADATA_DISABLED")
+                .map(String::as_str),
+            Some("true")
+        );
+        let without = child_aws_env(None);
+        assert!(!without.contains_key("AWS_ROLE_ARN"), "{without:?}");
+        assert!(
+            !without.contains_key("AWS_WEB_IDENTITY_TOKEN_FILE"),
+            "{without:?}"
+        );
+    }
 
     #[test]
     fn each_pod_publishes_its_client_material_under_its_own_name() {
@@ -835,7 +1057,14 @@ mod tests {
 
     #[test]
     fn podman_rendering_is_byte_identical_without_image() {
-        let t = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
+        let t = gateway_toml(
+            17670,
+            ComputeDriver::Podman,
+            &DriverImages::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(t, PODMAN_NO_IMAGE);
     }
 
@@ -844,7 +1073,8 @@ mod tests {
         let t = gateway_toml(
             17670,
             ComputeDriver::Podman,
-            Some("registry.example.com/epp-sandbox:x"),
+            &images(Some("registry.example.com/epp-sandbox:x"), None),
+            None,
             None,
         )
         .unwrap();
@@ -852,12 +1082,32 @@ mod tests {
     }
 
     #[test]
+    fn podman_rendering_carries_the_sandbox_runtime_image() {
+        let t = gateway_toml(
+            17670,
+            ComputeDriver::Podman,
+            &images(None, Some("ghcr.io/neuralmagic/openshell-sandbox:sha-abc")),
+            None,
+            None,
+        )
+        .unwrap();
+        let parsed: toml::Value = toml::from_str(&t).unwrap();
+        let podman = &parsed["openshell"]["drivers"]["podman"];
+        assert_eq!(
+            podman["sandbox_runtime_image"].as_str(),
+            Some("ghcr.io/neuralmagic/openshell-sandbox:sha-abc")
+        );
+        assert!(podman.get("supervisor_image").is_none());
+    }
+
+    #[test]
     fn otlp_endpoint_renders_gateway_otlp_table() {
         let t = gateway_toml(
             17670,
             ComputeDriver::Podman,
-            None,
+            &DriverImages::default(),
             Some("http://localhost:4317"),
+            None,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&t).expect("gateway.toml must parse");
@@ -869,34 +1119,35 @@ mod tests {
 
     #[test]
     fn kubernetes_rendering_parses_and_carries_expected_keys() {
-        let t = gateway_toml(
-            17670,
-            ComputeDriver::Kubernetes,
-            Some("registry.example.com/epp-sandbox:x"),
-            None,
-        )
-        .unwrap();
-        let parsed: toml::Value = toml::from_str(&t).expect("kubernetes gateway.toml must parse");
-
+        let parsed = kubernetes_toml(&images(
+            Some("registry.example.com/supervisor:x"),
+            Some("registry.example.com/sandbox:x"),
+        ));
+        assert_eq!(parsed["openshell"]["version"].as_integer(), Some(2));
         assert_eq!(
-            parsed["openshell"]["gateway"]["compute_drivers"]
-                .as_array()
-                .and_then(|a| a.first())
-                .and_then(toml::Value::as_str),
+            parsed["openshell"]["gateway"]["compute_driver"].as_str(),
             Some("kubernetes")
+        );
+        assert!(
+            parsed["openshell"]["gateway"]
+                .get("compute_drivers")
+                .is_none()
         );
         let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
         assert_eq!(
             k8s["supervisor_image"].as_str(),
-            Some("registry.example.com/epp-sandbox:x")
+            Some("registry.example.com/supervisor:x")
         );
         assert_eq!(
-            k8s["supervisor_sideload_method"].as_str(),
-            Some("init-container")
+            k8s["sandbox_runtime_image"].as_str(),
+            Some("registry.example.com/sandbox:x")
         );
+        assert_eq!(k8s["allow_driver_config"].as_bool(), Some(true));
+        assert_eq!(k8s["host_gateway_ip"].as_str(), Some("10.1.2.3"));
+        assert!(k8s.get("supervisor_sideload_method").is_none());
+        assert!(k8s.get("app_armor_profile").is_none());
         // Skip-if-empty fields must be absent, not emitted as empty strings, so the driver's
-        // own defaults win (e.g. an empty host_gateway_ip omits hostAliases).
-        assert!(k8s.get("host_gateway_ip").is_none());
+        // own defaults win.
         assert!(k8s.get("namespace").is_none());
         assert!(k8s.get("image_pull_secrets").is_none());
     }
@@ -908,90 +1159,107 @@ mod tests {
     /// singleplayer-driver auto-default, and the escape hatch would only widen it.
     #[test]
     fn kubernetes_rendering_allows_unauthenticated_local_users_podman_does_not() {
-        let k8s = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
-        let parsed: toml::Value = toml::from_str(&k8s).unwrap();
+        let parsed = kubernetes_toml(&DriverImages::default());
         assert_eq!(
             parsed["openshell"]["gateway"]["auth"]["allow_unauthenticated_users"].as_bool(),
             Some(true),
-            "{k8s}"
+            "{parsed}"
         );
 
-        let podman = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
+        let podman = gateway_toml(
+            17670,
+            ComputeDriver::Podman,
+            &DriverImages::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!podman.contains("allow_unauthenticated_users"), "{podman}");
     }
 
-    /// The driver defaults `grpc_endpoint` to "" and passes it verbatim into the sandbox's
+    /// The driver defaults `grpc_endpoint` to "" and passes it verbatim into the supervisor's
     /// `OPENSHELL_ENDPOINT`, which tonic rejects ("invalid gRPC endpoint") and the supervisor
-    /// crash-loops on, so the k8s rendering must always pin it. The hostname must be the
-    /// certgen `--server-san` AND the driver-injected hostAlias (both host.openshell.internal),
-    /// and the secret name must be exactly what `boot()` publishes.
+    /// crash-loops on, so the k8s rendering must always pin it. The supervisor pod resolves
+    /// nothing outside cluster DNS, so the endpoint is the pod IP, the same address certgen is
+    /// told to put in the server certificate; the secret name must be exactly what `boot()`
+    /// publishes.
     #[test]
-    fn kubernetes_rendering_pins_the_sandbox_dial_back_endpoint() {
-        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
-        let parsed: toml::Value = toml::from_str(&t).unwrap();
+    fn kubernetes_rendering_pins_the_supervisor_dial_back_to_the_pod_ip() {
+        let parsed = kubernetes_toml(&DriverImages::default());
         let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
         assert_eq!(
             k8s["grpc_endpoint"].as_str(),
-            Some("https://host.openshell.internal:17670")
+            Some("https://10.1.2.3:17670")
         );
         assert_eq!(
             k8s["client_tls_secret_name"].as_str(),
             Some(CLIENT_TLS_SECRET)
         );
+        assert!(
+            generate_certs_args("/tls", pod_ip())
+                .windows(2)
+                .any(|w| w == ["--server-san", "10.1.2.3"]),
+            "the endpoint's IP must be a server-cert SAN"
+        );
 
-        // Podman stays untouched (the frozen snapshots above also guard this).
-        let podman = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
+        let podman = gateway_toml(
+            17670,
+            ComputeDriver::Podman,
+            &DriverImages::default(),
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!podman.contains("grpc_endpoint"), "{podman}");
     }
 
     #[test]
-    fn kubernetes_rendering_omits_supervisor_image_when_absent() {
-        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
-        assert!(!t.contains("supervisor_image"), "{t}");
+    fn an_ipv6_pod_ip_is_bracketed_in_the_endpoint() {
+        let ip: IpAddr = "fd00::1".parse().unwrap();
+        let t = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            &DriverImages::default(),
+            None,
+            Some(ip),
+        )
+        .unwrap();
         assert!(
-            t.contains("supervisor_sideload_method = \"init-container\""),
+            t.contains("grpc_endpoint = \"https://[fd00::1]:17670\""),
             "{t}"
         );
     }
 
-    /// The field names `openshell-gateway`'s pinned fork (`wseaton/OpenShell@f25ab2e4`,
-    /// `crates/openshell-driver-kubernetes/src/config.rs::KubernetesComputeConfig`) actually
-    /// accepts. That struct is `#[serde(deny_unknown_fields)]`, so any name we emit that is not
-    /// in this list kills the gateway process on startup with no output in the pod log (its
-    /// stdout/stderr are captured to `gateway.log` in the state dir, not this process's own
-    /// log, see `boot`'s `tail_gateway_log`). Confirmed live against the pinned binary;
-    /// update this list (and re-verify live) whenever the fork pin bumps.
-    const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
-        "namespace",
-        "service_account_name",
-        "default_image",
-        "image_pull_policy",
-        "image_pull_secrets",
-        "supervisor_image",
-        "supervisor_image_pull_policy",
-        "supervisor_sideload_method",
-        "grpc_endpoint",
-        "ssh_socket_path",
-        "client_tls_secret_name",
-        "host_gateway_ip",
-        "enable_user_namespaces",
-        "app_armor_profile",
-        "workspace_default_storage_size",
-        "default_runtime_class_name",
-        "sa_token_ttl_secs",
-        "provider_spiffe_workload_api_socket_path",
-    ];
+    #[test]
+    fn kubernetes_rendering_refuses_without_a_pod_ip() {
+        let err = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            &DriverImages::default(),
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<GatewayError>(),
+                Some(GatewayError::PodIpMissing)
+            ),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn kubernetes_rendering_omits_images_when_absent() {
+        let parsed = kubernetes_toml(&DriverImages::default());
+        let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
+        assert!(k8s.get("supervisor_image").is_none());
+        assert!(k8s.get("sandbox_runtime_image").is_none());
+    }
 
     #[test]
     fn kubernetes_rendering_only_emits_fields_upstream_accepts() {
-        let t = gateway_toml(
-            17670,
-            ComputeDriver::Kubernetes,
-            Some("registry.example.com/epp-sandbox:x"),
-            None,
-        )
-        .unwrap();
-        let parsed: toml::Value = toml::from_str(&t).unwrap();
+        let parsed = kubernetes_toml(&images(Some("s"), Some("r")));
         let k8s = parsed["openshell"]["drivers"]["kubernetes"]
             .as_table()
             .expect("[openshell.drivers.kubernetes] must be a table");
@@ -1085,7 +1353,7 @@ mod tests {
 
     #[test]
     fn certs_request_the_internal_san() {
-        let v = generate_certs_args("/tls");
+        let v = generate_certs_args("/tls", None);
         assert_eq!(
             v,
             [
@@ -1094,6 +1362,23 @@ mod tests {
                 "/tls",
                 "--server-san",
                 "host.openshell.internal"
+            ]
+        );
+    }
+
+    #[test]
+    fn certs_in_a_pod_also_carry_its_ip() {
+        let v = generate_certs_args("/tls", pod_ip());
+        assert_eq!(
+            v,
+            [
+                "generate-certs",
+                "--output-dir",
+                "/tls",
+                "--server-san",
+                "host.openshell.internal",
+                "--server-san",
+                "10.1.2.3"
             ]
         );
     }
