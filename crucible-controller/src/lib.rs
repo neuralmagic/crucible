@@ -12,7 +12,7 @@
 //! On top of that sits the in-memory work [`queue`] (coalescing set + FIFO, backoff,
 //! park-after-N) and the [`daemon`] shell that `select!`s its sources (discovery timer, kube pod
 //! watch) over it, plus the HTTP [`api`] surface, mounted together with the React SPA by
-//! [`serve`].
+//! [`Surface::bind`].
 
 // So `#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]` resolves inside this crate's own
 // unit tests (a lib can't otherwise name itself). The migrator path is frozen by the work plan.
@@ -90,8 +90,9 @@ use anyhow::Context;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-/// What guards the human surface and what runs its logins. Built once by [`serve`] and handed to
-/// [`human_router`] so the guard and the `/auth/*` routes can never disagree about the mode.
+/// What guards the human surface and what runs its logins. Built once by [`Surface::bind`] and
+/// handed to [`human_router`] so the guard and the `/auth/*` routes can never disagree about the
+/// mode.
 pub(crate) struct HumanAuth {
     pub(crate) guard: Arc<identity::auth::BearerGuard>,
     pub(crate) routes: identity::oidc::routes::AuthState,
@@ -99,8 +100,8 @@ pub(crate) struct HumanAuth {
 
 /// The human surface: API + SPA behind the auth guard, the `/auth/*` login routes beside it, and
 /// the session layer over both. Machine surfaces (`/metrics`, ingest, the discovery mirror) never
-/// route through this. Shared with the API tests so the test stack cannot drift from what `serve`
-/// mounts.
+/// route through this. Shared with the API tests so the test stack cannot drift from what
+/// [`Surface::bind`] mounts.
 ///
 /// The layering is the whole point of native mode: sessions load OUTSIDE the guard, so a request
 /// may authenticate by cookie, and the login routes sit outside the guard, so a caller with no
@@ -139,132 +140,146 @@ fn hooks_addr_from_env() -> anyhow::Result<Option<SocketAddr>> {
     }
 }
 
-/// Mount the API + React SPA on one axum router and serve it at `addr`. The daemon owns calling
-/// this; it does not wire itself into the daemon. Without `CONTROLLER_API_TOKEN` set, the guard is
-/// off — so this forces the bind to loopback regardless of the requested `addr`'s host, matching
-/// the frozen "binds loopback by default" contract instead of trusting an unauthenticated port to
-/// whatever address the caller asked for.
-pub async fn serve(
-    state: api::state::ApiState,
-    addr: SocketAddr,
-    turn_accounts: config::TurnAccounts,
-    secure_session_cookies: bool,
-) -> anyhow::Result<()> {
-    let kube_user_auth = identity::kube_user::KubeUserAuth::from_env()
-        .context("building the cluster-token bearer check")?;
-    let oidc = identity::oidc::OidcProvider::from_env().context("reading the oidc registration")?;
-    let credential_keys = identity::oidc::credentials::CredentialKeys::from_env()
-        .context("reading the offline credential key")?;
-    if oidc.is_some() && credential_keys.is_none() {
-        tracing::warn!(
-            "no credential key mounted: logins store no offline credential, so scheduled launches stay on the schedule-row snapshot"
-        );
-    }
-    let webhook_keys = identity::oidc::credentials::CredentialKeys::webhook_from_env()
-        .context("reading the webhook key")?;
-    let pool_for_hooks = state.db.pool().clone();
-    let state = state
-        .with_oidc(oidc.clone(), credential_keys.clone())
-        .with_webhook_keys(webhook_keys.clone());
-    let auth_mode = identity::auth::AuthMode::from_env();
-    let guard = Arc::new(
-        identity::auth::BearerGuard::from_env(
-            kube_user_auth,
-            oidc.clone(),
-            Some(state.db.pool().clone()),
-        )
-        .context("building the bearer guard")?,
-    );
-    if guard.kube.is_some() {
-        tracing::info!(
-            "cluster-token bearer auth on: unrecognized bearers resolve via the own-cluster users/~"
-        );
-    }
-    tracing::info!(mode = ?auth_mode, "controller human-surface auth mode");
-    let bind_addr = if guard.is_open() {
-        tracing::warn!(
-            "CONTROLLER_API_TOKEN unset — binding the controller http surface to loopback only"
-        );
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
-    } else {
-        addr
-    };
+/// The controller's listeners, bound, and the routers they serve.
+pub struct Surface {
+    http: tokio::net::TcpListener,
+    router: axum::Router,
+    hooks: Option<(tokio::net::TcpListener, axum::Router)>,
+    tls: Option<tls::TlsListener>,
+}
 
-    // Cloned off the shared state before it moves into the router, for the separate ingest surface below.
-    let db = state.db.clone();
-    let cluster_stats_for_push = state.cluster_stats.clone();
-    let clusters = state.clusters.clone();
-    let pod_namespace_for_ingest = state.pod_namespace.clone();
+impl Surface {
+    /// Mount the API + React SPA on one axum router and bind it at `addr`, with the webhook and
+    /// TLS surfaces their environment configures. A listener that cannot bind is an error here,
+    /// before anything is served. Without `CONTROLLER_API_TOKEN` set, the guard is off — so this
+    /// forces the bind to loopback regardless of the requested `addr`'s host, matching the frozen
+    /// "binds loopback by default" contract instead of trusting an unauthenticated port to
+    /// whatever address the caller asked for.
+    pub async fn bind(
+        state: api::state::ApiState,
+        addr: SocketAddr,
+        turn_accounts: config::TurnAccounts,
+        secure_session_cookies: bool,
+    ) -> anyhow::Result<Self> {
+        let kube_user_auth = identity::kube_user::KubeUserAuth::from_env()
+            .context("building the cluster-token bearer check")?;
+        let oidc =
+            identity::oidc::OidcProvider::from_env().context("reading the oidc registration")?;
+        let credential_keys = identity::oidc::credentials::CredentialKeys::from_env()
+            .context("reading the offline credential key")?;
+        if oidc.is_some() && credential_keys.is_none() {
+            tracing::warn!(
+                "no credential key mounted: logins store no offline credential, so scheduled launches stay on the schedule-row snapshot"
+            );
+        }
+        let webhook_keys = identity::oidc::credentials::CredentialKeys::webhook_from_env()
+            .context("reading the webhook key")?;
+        let pool_for_hooks = state.db.pool().clone();
+        let state = state
+            .with_oidc(oidc.clone(), credential_keys.clone())
+            .with_webhook_keys(webhook_keys.clone());
+        let auth_mode = identity::auth::AuthMode::from_env();
+        let guard = Arc::new(
+            identity::auth::BearerGuard::from_env(
+                kube_user_auth,
+                oidc.clone(),
+                Some(state.db.pool().clone()),
+            )
+            .context("building the bearer guard")?,
+        );
+        if guard.kube.is_some() {
+            tracing::info!(
+                "cluster-token bearer auth on: unrecognized bearers resolve via the own-cluster users/~"
+            );
+        }
+        tracing::info!(mode = ?auth_mode, "controller human-surface auth mode");
+        let bind_addr = if guard.is_open() {
+            tracing::warn!(
+                "CONTROLLER_API_TOKEN unset — binding the controller http surface to loopback only"
+            );
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), addr.port())
+        } else {
+            addr
+        };
 
-    // The API + SPA sit behind the bearer guard; `/metrics` is merged in *after* the layer so the
-    // shared kube-prometheus-stack can scrape it without a token (the ServiceMonitor sends none),
-    // exactly as a health endpoint would be exempted.
-    // The MCP host's view of the API: the same routes, with no human guard layered over them,
-    // because the key its callers hold is checked at that surface's own edge. Built before the
-    // state moves into the human router.
-    let mcp_router = mcp::router(
-        api::router(state.clone()),
-        identity::auth::KeyGuard {
-            pool: db.pool().clone(),
-            refresh: guard.refresh.clone(),
-        },
-        state.public_url.clone().unwrap_or_default(),
-    );
+        // Cloned off the shared state before it moves into the router, for the separate ingest
+        // surface below.
+        let db = state.db.clone();
+        let cluster_stats_for_push = state.cluster_stats.clone();
+        let clusters = state.clusters.clone();
+        let pod_namespace_for_ingest = state.pod_namespace.clone();
 
-    let session_store = identity::session::store(db.pool())
-        .await
-        .context("building the session store")?;
-    identity::session::spawn_expiry_sweep(session_store.clone());
-    let guarded = human_router(
-        state.clone(),
-        session_store,
-        secure_session_cookies,
-        HumanAuth {
-            guard,
-            routes: identity::oidc::routes::AuthState {
-                mode: auth_mode,
-                oidc,
+        // The API + SPA sit behind the bearer guard; `/metrics` is merged in *after* the layer so
+        // the shared kube-prometheus-stack can scrape it without a token (the ServiceMonitor sends
+        // none), exactly as a health endpoint would be exempted. The MCP host's view of the API:
+        // the same routes, with no human guard layered over them, because the key its callers hold
+        // is checked at that surface's own edge. Built before the state moves into the human
+        // router.
+        let mcp_router = mcp::router(
+            api::router(state.clone()),
+            identity::auth::KeyGuard {
                 pool: db.pool().clone(),
-                credential_keys,
-                proxy_prefix: std::env::var("CONTROLLER_PROXY_PREFIX")
-                    .unwrap_or_else(|_| "/oauth2".to_string()),
+                refresh: guard.refresh.clone(),
             },
-        },
-        spa::Source::from_env(),
-    );
+            state.public_url.clone().unwrap_or_default(),
+        );
 
-    // One in-cluster client shared by the two non-bearer machine surfaces below (the ingest
-    // drop-box's TokenReview and the discovery mirror's upstream fetch); if it can't be built
-    // both fail closed (503) until kube is reachable.
-    let kube_client = clusters.client(runs::clusters::HUB_CLUSTER).await;
+        let session_store = identity::session::store(db.pool())
+            .await
+            .context("building the session store")?;
+        identity::session::spawn_expiry_sweep(session_store.clone());
+        let guarded = human_router(
+            state.clone(),
+            session_store,
+            secure_session_cookies,
+            HumanAuth {
+                guard,
+                routes: identity::oidc::routes::AuthState {
+                    mode: auth_mode,
+                    oidc,
+                    pool: db.pool().clone(),
+                    credential_keys,
+                    proxy_prefix: std::env::var("CONTROLLER_PROXY_PREFIX")
+                        .unwrap_or_else(|_| "/oauth2".to_string()),
+                },
+            },
+            spa::Source::from_env(),
+        );
 
-    // The Tier 2 ingest drop-box (turn result contract): merged in *after* the human bearer-guard layer,
-    // exactly like `/metrics`, because it authenticates with its OWN pod-bound TokenReview credential,
-    // not the oauth2-proxy/admin token. The validator is cluster-keyed: the uploading pod's ledger row
-    // selects which cluster's API server reviews its token. A cluster whose client cannot be built
-    // fails that POST closed (503); the rest of the surface stays up.
-    if let Err(e) = kube_client.as_ref() {
-        tracing::warn!(error = %e, "no hub kube client at startup — hub ingest TokenReviews fail closed until one is reachable");
-    }
-    let validator = Arc::new(runs::ingest_auth::IngestValidator::new(
-        Arc::new(runs::ingest_auth::ClusterKube::new(
-            clusters.clone(),
-            pod_namespace_for_ingest.clone(),
-        )),
-        db.pool().clone(),
-        crucible_contract::INGEST_TOKEN_AUDIENCE,
-        runs::ingest_auth::ExpectedServiceAccount {
-            namespace: pod_namespace_for_ingest,
-            name: turn_accounts.hub,
-        },
-        turn_accounts.spokes,
-    ));
-    let ingest_router = runs::ingest_drop::router(runs::ingest_drop::IngestState { db, validator });
+        // One in-cluster client shared by the two non-bearer machine surfaces below (the ingest
+        // drop-box's TokenReview and the discovery mirror's upstream fetch); if it can't be built
+        // both fail closed (503) until kube is reachable.
+        let kube_client = clusters.client(runs::clusters::HUB_CLUSTER).await;
 
-    // The OIDC discovery mirror (hub-spoke trust bootstrap): mounted OUTSIDE the bearer layer
-    // like `/metrics` — public read-only by design. Disabled (routes 404) unless
-    // CONTROLLER_EXTERNAL_URL names the mirror's own external base URL.
-    let mirror = oidc_mirror::external_url_from_env().map(|base| {
+        // The Tier 2 ingest drop-box (turn result contract): merged in *after* the human
+        // bearer-guard layer, exactly like `/metrics`, because it authenticates with its OWN
+        // pod-bound TokenReview credential, not the oauth2-proxy/admin token. The validator is
+        // cluster-keyed: the uploading pod's ledger row selects which cluster's API server reviews
+        // its token. A cluster whose client cannot be built fails that POST closed (503); the rest
+        // of the surface stays up.
+        if let Err(e) = kube_client.as_ref() {
+            tracing::warn!(error = %e, "no hub kube client at startup — hub ingest TokenReviews fail closed until one is reachable");
+        }
+        let validator = Arc::new(runs::ingest_auth::IngestValidator::new(
+            Arc::new(runs::ingest_auth::ClusterKube::new(
+                clusters.clone(),
+                pod_namespace_for_ingest.clone(),
+            )),
+            db.pool().clone(),
+            crucible_contract::INGEST_TOKEN_AUDIENCE,
+            runs::ingest_auth::ExpectedServiceAccount {
+                namespace: pod_namespace_for_ingest,
+                name: turn_accounts.hub,
+            },
+            turn_accounts.spokes,
+        ));
+        let ingest_router =
+            runs::ingest_drop::router(runs::ingest_drop::IngestState { db, validator });
+
+        // The OIDC discovery mirror (hub-spoke trust bootstrap): mounted OUTSIDE the bearer layer
+        // like `/metrics` — public read-only by design. Disabled (routes 404) unless
+        // CONTROLLER_EXTERNAL_URL names the mirror's own external base URL.
+        let mirror = oidc_mirror::external_url_from_env().map(|base| {
         let upstream: Arc<dyn oidc_mirror::DiscoveryUpstream> = match kube_client.as_ref() {
             Ok(client) => Arc::new(oidc_mirror::KubeUpstream(client.clone())),
             Err(e) => {
@@ -275,74 +290,125 @@ pub async fn serve(
         oidc_mirror::Mirror::new(upstream, base)
     });
 
-    // The cluster-snapshot push surface: outside the bearer guard like the ingest drop-box,
-    // authenticated by its own per-cluster static tokens (see `cluster_push`'s module doc for
-    // why TokenReview can't work for unreachable spokes).
-    let push_router = {
-        let tokens =
-            runs::cluster_push::PushTokens::from_env().context("parsing CONTROLLER_PUSH_TOKENS")?;
-        if tokens.is_empty() {
-            tracing::info!("CONTROLLER_PUSH_TOKENS unset — cluster snapshot pushes answer 401");
-        }
-        runs::cluster_push::router(runs::cluster_push::PushState {
-            stats: cluster_stats_for_push,
-            tokens: Arc::new(tokens),
-        })
-    };
-
-    let router = guarded
-        .merge(api::metrics::router(state))
-        .merge(ingest_router)
-        .merge(push_router)
-        .merge(mcp_router)
-        .merge(oidc_mirror::router(mirror));
-
-    if let Some(hooks_addr) = hooks_addr_from_env()? {
-        let hooks = launches::webhooks::receive::router(
-            launches::webhooks::receive::HooksState::new(pool_for_hooks, webhook_keys.clone()),
-        );
-        let listener = tokio::net::TcpListener::bind(hooks_addr)
-            .await
-            .with_context(|| format!("binding the webhook delivery surface to {hooks_addr}"))?;
-        tracing::info!(%hooks_addr, "crucible-controller webhook delivery surface listening");
-        tokio::spawn(async move {
-            if let Err(e) = axum::serve(listener, hooks).await {
-                tracing::error!(error = %e, "webhook delivery surface exited");
+        // The cluster-snapshot push surface: outside the bearer guard like the ingest drop-box,
+        // authenticated by its own per-cluster static tokens (see `cluster_push`'s module doc for
+        // why TokenReview can't work for unreachable spokes).
+        let push_router = {
+            let tokens = runs::cluster_push::PushTokens::from_env()
+                .context("parsing CONTROLLER_PUSH_TOKENS")?;
+            if tokens.is_empty() {
+                tracing::info!("CONTROLLER_PUSH_TOKENS unset — cluster snapshot pushes answer 401");
             }
-        });
+            runs::cluster_push::router(runs::cluster_push::PushState {
+                stats: cluster_stats_for_push,
+                tokens: Arc::new(tokens),
+            })
+        };
+
+        let router = guarded
+            .merge(api::metrics::router(state))
+            .merge(ingest_router)
+            .merge(push_router)
+            .merge(mcp_router)
+            .merge(oidc_mirror::router(mirror));
+
+        let hooks = match hooks_addr_from_env()? {
+            Some(hooks_addr) => {
+                let hooks = launches::webhooks::receive::router(
+                    launches::webhooks::receive::HooksState::new(
+                        pool_for_hooks,
+                        webhook_keys.clone(),
+                    ),
+                );
+                let listener = tokio::net::TcpListener::bind(hooks_addr)
+                    .await
+                    .with_context(|| {
+                        format!("binding the webhook delivery surface to {hooks_addr}")
+                    })?;
+                tracing::info!(%hooks_addr, "crucible-controller webhook delivery surface listening");
+                Some((listener, hooks))
+            }
+            None => None,
+        };
+
+        let http = tokio::net::TcpListener::bind(bind_addr)
+            .await
+            .with_context(|| format!("binding the controller http surface to {bind_addr}"))?;
+        tracing::info!(%bind_addr, "crucible-controller http surface listening");
+
+        // The TLS surface serves the same router, for the redemption Route's reencrypt hop. It
+        // follows the loopback rule above: an unauthenticated deployment exposes nothing off-host.
+        let tls_front = tls::TlsFront::from_env()
+            .context("reading the controller tls surface's configuration")?
+            .map(|front| front.with_host(bind_addr.ip()));
+        let tls = match tls_front {
+            Some(front) => {
+                let listener = tls::bind(&front).await?;
+                tracing::info!(addr = %front.addr, "crucible-controller tls surface listening");
+                Some(listener)
+            }
+            None => None,
+        };
+        Ok(Self {
+            http,
+            router,
+            hooks,
+            tls,
+        })
     }
 
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("binding the controller http surface to {bind_addr}"))?;
-    tracing::info!(%bind_addr, "crucible-controller http surface listening");
-    let http = {
-        let router = router.clone();
-        async move {
-            axum::serve(listener, router)
-                .await
-                .context("serving the controller http surface")
+    /// Serve every bound listener. Each one serves for the life of the process, so this resolves
+    /// only when one of them stops, to the error naming it.
+    pub async fn serve(self) -> SurfaceStopped {
+        let Self {
+            http,
+            router,
+            hooks,
+            tls,
+        } = self;
+        let hooks = async move {
+            match hooks {
+                Some((listener, hooks)) => stopped(
+                    "webhook delivery surface",
+                    axum::serve(listener, hooks).await,
+                ),
+                None => std::future::pending().await,
+            }
+        };
+        let tls_router = router.clone();
+        let tls = async move {
+            match tls {
+                Some(listener) => stopped("tls surface", axum::serve(listener, tls_router).await),
+                None => std::future::pending().await,
+            }
+        };
+        let http = async move { stopped("http surface", axum::serve(http, router).await) };
+        tokio::select! {
+            e = http => e,
+            e = hooks => e,
+            e = tls => e,
         }
-    };
+    }
+}
 
-    // The TLS surface serves the same router, for the redemption Route's reencrypt hop. It follows
-    // the loopback rule above: an unauthenticated deployment exposes nothing off-host.
-    let tls_front = tls::TlsFront::from_env()
-        .context("reading the controller tls surface's configuration")?
-        .map(|front| front.with_host(bind_addr.ip()));
-    let Some(front) = tls_front else {
-        http.await?;
-        return Ok(());
-    };
-    let tls_listener = tls::bind(&front).await?;
-    tracing::info!(addr = %front.addr, "crucible-controller tls surface listening");
-    let tls = async move {
-        axum::serve(tls_listener, router)
-            .await
-            .context("serving the controller tls surface")
-    };
-    tokio::try_join!(http, tls)?;
-    Ok(())
+/// Why [`Surface::serve`] resolved: one of its listeners stopped serving.
+#[derive(Debug, thiserror::Error)]
+pub enum SurfaceStopped {
+    #[error("the controller {surface} stopped serving")]
+    Returned { surface: &'static str },
+    #[error("serving the controller {surface}")]
+    Failed {
+        surface: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+fn stopped(surface: &'static str, served: std::io::Result<()>) -> SurfaceStopped {
+    match served {
+        Ok(()) => SurfaceStopped::Returned { surface },
+        Err(source) => SurfaceStopped::Failed { surface, source },
+    }
 }
 
 /// The one migration set, referenced by every `#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]`.

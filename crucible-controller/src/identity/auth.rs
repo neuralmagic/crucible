@@ -1,6 +1,6 @@
-//! The guard on the controller's HTTP API + debug UI. A request authenticates by session cookie
-//! or by bearer; with no expected token and no issuer configured the guard is off (an operator
-//! who trusts the network they bound to) and [`crate::serve`] forces a loopback bind, since an
+//! The guard on the controller's HTTP API + debug UI. A request authenticates by session cookie or
+//! by bearer; with no expected token and no issuer configured the guard is off (an operator who
+//! trusts the network they bound to) and [`crate::Surface::bind`] forces a loopback bind, since an
 //! open guard has no business answering the world.
 //!
 //! Which credential proved the caller decides who they may claim to be:
@@ -380,8 +380,9 @@ impl BearerGuard {
         })
     }
 
-    /// No expected token and no issuer: the guard admits everything, which is why [`crate::serve`]
-    /// binds loopback. An issuer alone is enough to keep it closed — that deployment has logins.
+    /// No expected token and no issuer: the guard admits everything, which is why
+    /// [`crate::Surface::bind`] binds loopback. An issuer alone is enough to keep it closed — that
+    /// deployment has logins.
     pub(crate) fn is_open(&self) -> bool {
         self.expected.is_none() && self.oidc.is_none()
     }

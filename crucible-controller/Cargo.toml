@@ -48,8 +48,9 @@ moka.workspace = true
 # Killing a local run's whole process group.
 nix = { version = "0.31.3", features = ["signal"] }
 # `sync` on top of the workspace feature set: the queue's coalescing state waits on
-# `tokio::sync::Notify`, and the daemon's graceful-shutdown signal is one too.
-tokio = { workspace = true, features = ["sync", "process"] }
+# `tokio::sync::Notify`, and the daemon's graceful-shutdown signal is one too. `signal` is the
+# autopilot's SIGTERM handler.
+tokio = { workspace = true, features = ["sync", "process", "signal"] }
 # Async storage: Postgres working state + embedded migrations, compile-time checked queries in
 # offline mode (checked-in `.sqlx/`). The controller is the workspace's only sqlx user.
 # The `sqlite` driver exists ONLY for `db import-sqlite` (the one-shot cutover reader of a

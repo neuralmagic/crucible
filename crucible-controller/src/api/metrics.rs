@@ -2,8 +2,9 @@
 
 /// The `/metrics` handler: render the registry (refreshing DB-mirrored gauges first) as the
 /// Prometheus text format. Served unauthenticated so the shared kube-prometheus-stack can scrape it
-/// — [`crate::serve`] merges this router in *after* the bearer-guard layer, exempting it (the same
-/// way a health endpoint is). A `Db` built without metrics (never in production) answers 503.
+/// — [`crate::Surface::bind`] merges this router in *after* the bearer-guard layer, exempting it
+/// (the same way a health endpoint is). A `Db` built without metrics (never in production) answers
+/// 503.
 async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<crate::api::state::ApiState>,
 ) -> axum::response::Response {

@@ -12,7 +12,8 @@ use clap::Parser;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Ctrl-C flips this; a poller translates it into the daemon's `Notify`-based shutdown signal.
+/// Ctrl-C or SIGTERM flips this; a poller translates it into the daemon's `Notify`-based shutdown
+/// signal.
 static STOP: AtomicBool = AtomicBool::new(false);
 
 /// Top-level CLI: every subcommand is an outer-loop arm; there is no default run.
@@ -779,8 +780,13 @@ fn dispatch_autopilot(mut cfg: crucible_controller::ControllerCfg, once: bool) -
         .enable_all()
         .build()
         .context("build tokio runtime for autopilot")?;
-    rt.block_on(run_autopilot_daemon(cfg))
+    let ran = rt.block_on(run_autopilot_daemon(cfg));
+    rt.shutdown_timeout(AUTOPILOT_DRAIN);
+    ran
 }
+
+/// How long a stopping autopilot waits on blocking work after its tasks are dropped.
+const AUTOPILOT_DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The offline credential a launcher's stale groups are re-read through. A broken issuer or key
 /// config is logged and leaves none.
@@ -988,18 +994,28 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         launch_probe: crucible_controller::daemon::launch_loop::PROBE_INTERVAL,
     };
 
-    // Ctrl-C flips the STOP flag; a poller translates it into the daemon's `Notify`-based shutdown
-    // signal (no `signal` tokio feature needed for one flag).
+    // Ctrl-C and SIGTERM flip the STOP flag; a poller translates it into the daemon's
+    // `Notify`-based shutdown signal.
     let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
     let shutdown_poller = shutdown.clone();
     tokio::spawn(async move {
-        while !STOP.load(Ordering::SeqCst) {
+        loop {
+            // `notify_waiters` wakes only the futures already waiting, and startup registers its
+            // waiters late, so the stop is re-announced until the process exits.
+            if STOP.load(Ordering::SeqCst) {
+                shutdown_poller.notify_waiters();
+            }
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
-        shutdown_poller.notify_waiters();
     });
     ctrlc::set_handler(|| STOP.store(true, Ordering::SeqCst))
         .context("installing the autopilot ctrl-c handler")?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the autopilot SIGTERM handler")?;
+    tokio::spawn(async move {
+        sigterm.recv().await;
+        STOP.store(true, Ordering::SeqCst);
+    });
 
     // The overrides watch: re-list the ConfigMap on a fixed cadence, swap on a valid change, keep
     // last-good otherwise. Shares the daemon's shutdown signal so it stops cleanly.
@@ -1023,7 +1039,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         crucible_controller::QueueOverrideSink::new(override_store.clone(), queue.clone()),
     );
     let serve_addr = controller_api_addr();
-    let serve_shutdown = shutdown.clone();
     let serve_turn_accounts = cfg
         .turn_accounts()
         .context("validating the per-cluster turn service accounts")?;
@@ -1132,222 +1147,244 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     )
     .with_vault(serve_vault);
     let images_refresh = serve_state.images_refresh();
-    tokio::spawn(async move {
-        tokio::select! {
-            r = crucible_controller::serve(serve_state, serve_addr, serve_turn_accounts, serve_secure_cookies) => {
-                if let Err(e) = r {
-                    tracing::error!(error = %format!("{e:#}"), "autopilot: http surface exited");
-                }
-            }
-            _ = serve_shutdown.notified() => {}
-        }
-    });
+    let surface = crucible_controller::Surface::bind(
+        serve_state,
+        serve_addr,
+        serve_turn_accounts,
+        serve_secure_cookies,
+    )
+    .await?;
+    let mut serving = tokio::spawn(surface.serve());
 
-    // ADR-0049 §1: everything below writes the ledger, so it waits for leadership. A standby
-    // stops here — serving the API and SPA above off the shared tables — until it wins the
-    // lease and the advisory-lock fence. Shutdown while standing by is a clean exit.
-    let Some(leadership) = crucible_controller::daemon::leader::campaign(
-        crucible_controller::daemon::leader::LeaderConfig::from_env(),
-        db.pool(),
-        shutdown.clone(),
-    )
-    .await?
-    else {
-        return Ok(());
-    };
+    let lead = async {
+        // ADR-0049 §1: everything below writes the ledger, so it waits for leadership. A standby
+        // stops here — serving the API and SPA above off the shared tables — until it wins the
+        // lease and the advisory-lock fence. Shutdown while standing by is a clean exit.
+        let Some(leadership) = crucible_controller::daemon::leader::campaign(
+            crucible_controller::daemon::leader::LeaderConfig::from_env(),
+            db.pool(),
+            shutdown.clone(),
+        )
+        .await?
+        else {
+            return Ok(());
+        };
 
-    // Convert legacy pack bytes to stored trees before anything below reads a pack. A failure
-    // leaves rows on their legacy bytes, which every reader still falls back to.
-    match crucible_controller::playbooks::pack_migration::convert_pack_trees(db.pool()).await {
-        Ok(report) if report == Default::default() => {}
-        Ok(report) => tracing::info!(
-            converted = report.converted,
-            unconvertible = report.unconvertible,
-            pinned = report.pinned,
-            "autopilot: legacy packs converted to stored trees and pins derived"
-        ),
-        Err(e) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "autopilot: pack tree conversion failed; unconverted packs read their legacy bytes"
-        ),
-    }
-    match crucible_controller::playbooks::pack_trees::collect(db.pool()).await {
-        Ok(collected) if collected == Default::default() => {}
-        Ok(collected) => tracing::info!(
-            count = collected.trees,
-            blobs = collected.blobs,
-            "autopilot: unpinned pack trees collected"
-        ),
-        Err(e) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "autopilot: pack tree collection failed; unpinned trees and blobs stay until the next start"
-        ),
-    }
-    // Re-extract the params schema of every registered playbook whose stored engine pin is not
-    // this binary's. Startup, not a discovery tick: the trigger is a new binary. The maintenance
-    // advisory lock above is what keeps it single-writer.
-    match crucible_controller::playbooks::registry::rederive_stale(db.pool()).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(
-            count = n,
-            "autopilot: playbook schemas re-derived for this engine revision"
-        ),
-        Err(e) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "autopilot: playbook schema re-derivation failed; stored schemas stand"
-        ),
-    }
-    // Fill in the agent substrate of any stored pack that predates the columns recording it, so a
-    // launch reads what the pack declares rather than refusing for want of a stamp.
-    match crucible_controller::playbooks::dispatch::backfill_pack_agents(db.pool()).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "autopilot: pack agent substrate backfilled"),
-        Err(e) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "autopilot: pack agent backfill failed; unstamped packs cannot launch"
-        ),
-    }
-    #[cfg(feature = "autoresearch")]
-    if cfg.autoresearch_enabled() {
-        // Seed the runtime repo watch-set (Lane O3) from the boot-time env config: idempotent, and
-        // never un-watches or overwrites a row an admin already added/paused/unwatched. Discovery
-        // itself never reads `cfg.repos` again after this — see `Db::watched_repos`.
-        crucible_controller::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)
-            .await
-            .context("seeding the watched-repo set from CONTROLLER_WATCHED_REPOS")?;
-    }
-    // Recover the dispatch location of runs written before `runs.cluster` existed, so the live
-    // relay stops asking the hub about pods that only ever existed on a spoke. Needs the cluster
-    // registry above to ask each spoke for its namespace, so it runs here rather than beside the
-    // other startup backfills; the maintenance lock held for the daemon's lifetime still covers it.
-    match crucible_controller::playbooks::dispatch::backfill_run_locations(
-        db.pool(),
-        &clusters,
-        &cfg.pod_namespace,
-    )
-    .await
-    {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(count = n, "autopilot: run dispatch locations backfilled"),
-        Err(e) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "autopilot: run location backfill failed; those runs still read as hub"
-        ),
-    }
-    // Unparking writes the ledger, so it re-checks after the sweep under the fence.
-    {
-        let contracts = contracts.clone();
-        let db = db.clone();
-        tokio::spawn(async move {
-            match crucible_controller::runs::contract::release_parked(&db, &contracts).await {
-                Ok(0) => {}
-                Ok(n) => tracing::info!(
-                    released = n,
-                    "contract check: unparked issues whose image now matches"
-                ),
-                Err(e) => {
-                    tracing::warn!(error = %format!("{e:#}"), "contract check: releasing parked issues failed")
-                }
-            }
-        });
-    }
-    crucible_controller::reconcile_on_startup(
-        &db,
-        dispatcher.as_ref(),
-        &cfg.pod_namespace,
-        cfg.effective().failed_pod_keep,
-    )
-    .await;
-    #[cfg(feature = "autoresearch")]
-    if cfg.autoresearch_enabled() {
-        // Re-adopt in-flight builds by listing Jobs/runs (never from memory): a build whose Job/run
-        // vanished during downtime resolves from the registry in one pass instead of waiting out its
-        // full timeout. Best-effort — a failed sweep only delays that resolution to the next poll.
-        if let Err(e) = crucible_controller::builds::lifecycle::adopt_builds(&db, &cfg).await {
-            tracing::warn!(
+        // Convert legacy pack bytes to stored trees before anything below reads a pack. A failure
+        // leaves rows on their legacy bytes, which every reader still falls back to.
+        match crucible_controller::playbooks::pack_migration::convert_pack_trees(db.pool()).await {
+            Ok(report) if report == Default::default() => {}
+            Ok(report) => tracing::info!(
+                converted = report.converted,
+                unconvertible = report.unconvertible,
+                pinned = report.pinned,
+                "autopilot: legacy packs converted to stored trees and pins derived"
+            ),
+            Err(e) => tracing::warn!(
                 error = %format!("{e:#}"),
-                "autopilot: build startup adoption failed, the next reconcile poll retries"
-            );
+                "autopilot: pack tree conversion failed; unconverted packs read their legacy bytes"
+            ),
         }
-    }
-    // Settle the local-mode runs a restart orphaned before anything re-drives them: the
-    // supervisor died with the last process, so their launches would sit at `running` forever.
-    if let Err(e) = crucible_controller::runs::local_run::adopt_orphans(&db, &cfg).await {
-        tracing::warn!(
-            error = %format!("{e:#}"),
-            "autopilot: local run startup adoption failed"
-        );
-    }
-    let keys = crucible_controller::issues::store::non_terminal_keys(db.pool()).await?;
-    tracing::info!(
-        count = keys.len(),
-        "autopilot: non-terminal issues re-enqueued at startup"
-    );
-    #[cfg(feature = "autoresearch")]
-    if cfg.autoresearch_enabled() {
-        // Backfill `upstream_updated_at` for rows ingested before the column existed, so the rank
-        // horizon can gate on it. Spawned (a rate-limited GitHub must not stall boot) and repeated by
-        // the discovery cycle while NULL rows remain, so a failure here only delays the stamp.
-        let backfill_db = db.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
-                crucible_controller::issues::triage::backfill_upstream_updated_at(&backfill_db)
-                    .await
-            {
+        match crucible_controller::playbooks::pack_trees::collect(db.pool()).await {
+            Ok(collected) if collected == Default::default() => {}
+            Ok(collected) => tracing::info!(
+                count = collected.trees,
+                blobs = collected.blobs,
+                "autopilot: unpinned pack trees collected"
+            ),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "autopilot: pack tree collection failed; unpinned trees and blobs stay until the next start"
+            ),
+        }
+        // Re-extract the params schema of every registered playbook whose stored engine pin is not
+        // this binary's. Startup, not a discovery tick: the trigger is a new binary. The
+        // maintenance advisory lock above is what keeps it single-writer.
+        match crucible_controller::playbooks::registry::rederive_stale(db.pool()).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(
+                count = n,
+                "autopilot: playbook schemas re-derived for this engine revision"
+            ),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "autopilot: playbook schema re-derivation failed; stored schemas stand"
+            ),
+        }
+        // Fill in the agent substrate of any stored pack that predates the columns recording it, so
+        // a launch reads what the pack declares rather than refusing for want of a stamp.
+        match crucible_controller::playbooks::dispatch::backfill_pack_agents(db.pool()).await {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "autopilot: pack agent substrate backfilled"),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "autopilot: pack agent backfill failed; unstamped packs cannot launch"
+            ),
+        }
+        #[cfg(feature = "autoresearch")]
+        if cfg.autoresearch_enabled() {
+            // Seed the runtime repo watch-set (Lane O3) from the boot-time env config: idempotent,
+            // and never un-watches or overwrites a row an admin already added/paused/unwatched.
+            // Discovery itself never reads `cfg.repos` again after this — see `Db::watched_repos`.
+            crucible_controller::issues::repo_watch::seed_watched_repos(db.pool(), &cfg.repos)
+                .await
+                .context("seeding the watched-repo set from CONTROLLER_WATCHED_REPOS")?;
+        }
+        // Recover the dispatch location of runs written before `runs.cluster` existed, so the live
+        // relay stops asking the hub about pods that only ever existed on a spoke. Needs the
+        // cluster registry above to ask each spoke for its namespace, so it runs here rather than
+        // beside the other startup backfills; the maintenance lock held for the daemon's lifetime
+        // still covers it.
+        match crucible_controller::playbooks::dispatch::backfill_run_locations(
+            db.pool(),
+            &clusters,
+            &cfg.pod_namespace,
+        )
+        .await
+        {
+            Ok(0) => {}
+            Ok(n) => tracing::info!(count = n, "autopilot: run dispatch locations backfilled"),
+            Err(e) => tracing::warn!(
+                error = %format!("{e:#}"),
+                "autopilot: run location backfill failed; those runs still read as hub"
+            ),
+        }
+        // Unparking writes the ledger, so it re-checks after the sweep under the fence.
+        {
+            let contracts = contracts.clone();
+            let db = db.clone();
+            tokio::spawn(async move {
+                match crucible_controller::runs::contract::release_parked(&db, &contracts).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!(
+                        released = n,
+                        "contract check: unparked issues whose image now matches"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "contract check: releasing parked issues failed")
+                    }
+                }
+            });
+        }
+        crucible_controller::reconcile_on_startup(
+            &db,
+            dispatcher.as_ref(),
+            &cfg.pod_namespace,
+            cfg.effective().failed_pod_keep,
+        )
+        .await;
+        #[cfg(feature = "autoresearch")]
+        if cfg.autoresearch_enabled() {
+            // Re-adopt in-flight builds by listing Jobs/runs (never from memory): a build whose
+            // Job/run vanished during downtime resolves from the registry in one pass instead of
+            // waiting out its full timeout. Best-effort — a failed sweep only delays that
+            // resolution to the next poll.
+            if let Err(e) = crucible_controller::builds::lifecycle::adopt_builds(&db, &cfg).await {
                 tracing::warn!(
                     error = %format!("{e:#}"),
-                    "autopilot: upstream_updated_at backfill failed, the next discovery cycle retries"
+                    "autopilot: build startup adoption failed, the next reconcile poll retries"
                 );
             }
-        });
-    }
-    // The MLflow exporter: a controller-only background task that pushes each folded run's traces
-    // and metrics to a per-deployment MLflow, off unless CONTROLLER_MLFLOW_TRACKING_URI is set.
-    // Post-fold, allow-failure — a failed export marks its bookkeeping row and retries.
-    if let Some(mlflow_cfg) = crucible_controller::runs::mlflow::MlflowConfig::from_env() {
-        tokio::spawn(crucible_controller::runs::mlflow::export_loop(
-            db.clone(),
-            mlflow_cfg,
-            shutdown.clone(),
-        ));
-    }
-    // The image catalog watcher: sweeps the configured repositories on an interval and on
-    // `POST /api/images/refresh`; off when no repository is configured.
-    if !cfg.image_catalog_repos.is_empty() {
-        let reader = std::sync::Arc::new(
-            crucible_controller::images::registry::LiveRegistryReader::new(
-                cfg.registry_authfile.clone(),
-            ),
+        }
+        // Settle the local-mode runs a restart orphaned before anything re-drives them: the
+        // supervisor died with the last process, so their launches would sit at `running` forever.
+        if let Err(e) = crucible_controller::runs::local_run::adopt_orphans(&db, &cfg).await {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "autopilot: local run startup adoption failed"
+            );
+        }
+        let keys = crucible_controller::issues::store::non_terminal_keys(db.pool()).await?;
+        tracing::info!(
+            count = keys.len(),
+            "autopilot: non-terminal issues re-enqueued at startup"
         );
-        tokio::spawn(crucible_controller::images::sweep::watch_loop(
-            db.clone(),
-            reader,
-            crucible_controller::images::sweep::CatalogConfig {
-                repositories: cfg.image_catalog_repos.clone(),
-                interval: std::time::Duration::from_secs(cfg.image_catalog_interval_secs),
-            },
-            images_refresh.clone(),
-            shutdown.clone(),
-        ));
-    }
-    // The pod-completion edge: a namespaced watch over the managed-by selector on every connected
-    // cluster, mapped to the finished pods' issue keys. Enqueued like any other source; reconcile of
-    // a `running` row folds the run in.
-    let completions =
-        crucible_controller::daemon::kube_completion_stream(clusters.clone(), &cfg.pod_namespace);
+        #[cfg(feature = "autoresearch")]
+        if cfg.autoresearch_enabled() {
+            // Backfill `upstream_updated_at` for rows ingested before the column existed, so the
+            // rank horizon can gate on it. Spawned (a rate-limited GitHub must not stall boot) and
+            // repeated by the discovery cycle while NULL rows remain, so a failure here only delays
+            // the stamp.
+            let backfill_db = db.clone();
+            tokio::spawn(async move {
+                if let Err(e) =
+                    crucible_controller::issues::triage::backfill_upstream_updated_at(&backfill_db)
+                        .await
+                {
+                    tracing::warn!(
+                        error = %format!("{e:#}"),
+                        "autopilot: upstream_updated_at backfill failed, the next discovery cycle retries"
+                    );
+                }
+            });
+        }
+        // The MLflow exporter: a controller-only background task that pushes each folded run's
+        // traces and metrics to a per-deployment MLflow, off unless CONTROLLER_MLFLOW_TRACKING_URI
+        // is set. Post-fold, allow-failure — a failed export marks its bookkeeping row and retries.
+        if let Some(mlflow_cfg) = crucible_controller::runs::mlflow::MlflowConfig::from_env() {
+            tokio::spawn(crucible_controller::runs::mlflow::export_loop(
+                db.clone(),
+                mlflow_cfg,
+                shutdown.clone(),
+            ));
+        }
+        // The image catalog watcher: sweeps the configured repositories on an interval and on
+        // `POST /api/images/refresh`; off when no repository is configured.
+        if !cfg.image_catalog_repos.is_empty() {
+            let reader = std::sync::Arc::new(
+                crucible_controller::images::registry::LiveRegistryReader::new(
+                    cfg.registry_authfile.clone(),
+                ),
+            );
+            tokio::spawn(crucible_controller::images::sweep::watch_loop(
+                db.clone(),
+                reader,
+                crucible_controller::images::sweep::CatalogConfig {
+                    repositories: cfg.image_catalog_repos.clone(),
+                    interval: std::time::Duration::from_secs(cfg.image_catalog_interval_secs),
+                },
+                images_refresh.clone(),
+                shutdown.clone(),
+            ));
+        }
+        // The pod-completion edge: a namespaced watch over the managed-by selector on every
+        // connected cluster, mapped to the finished pods' issue keys. Enqueued like any other
+        // source; reconcile of a `running` row folds the run in.
+        let completions = crucible_controller::daemon::kube_completion_stream(
+            clusters.clone(),
+            &cfg.pod_namespace,
+        );
 
-    // Everything else — reconcile core + override drain, machine park, the approval polls, the drift
-    // check — is the library's one production assembly (shared with the integration harness).
-    let wiring = crucible_controller::daemon::assemble(
-        &db,
-        &cfg,
-        queue,
-        override_store,
-        completions,
-        daemon_policy,
-    );
-    crucible_controller::daemon::run_led(keys, daemon_cfg, wiring, shutdown, None, Some(leadership))
+        // Everything else — reconcile core + override drain, machine park, the approval polls, the
+        // drift check — is the library's one production assembly (shared with the integration
+        // harness).
+        let wiring = crucible_controller::daemon::assemble(
+            &db,
+            &cfg,
+            queue,
+            override_store,
+            completions,
+            daemon_policy,
+        );
+        crucible_controller::daemon::run_led(
+            keys,
+            daemon_cfg,
+            wiring,
+            shutdown,
+            None,
+            Some(leadership),
+        )
         .await
+    };
+    let led = tokio::select! {
+        led = lead => led,
+        joined = &mut serving => Err(match joined {
+            Ok(stopped) => stopped.into(),
+            Err(e) => anyhow::Error::new(e).context("joining the controller http surface"),
+        }),
+    };
+    serving.abort();
+    led
 }
 
 /// Drift check cadence as a multiple of the discovery interval — the rebuild-and-diff is expensive
