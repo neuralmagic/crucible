@@ -125,6 +125,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     crate::plan::ir::Decider::Model { min_confidence } =>
                         format!("model >= {min_confidence}"),
                     crate::plan::ir::Decider::Output { task } => format!("from {task}"),
+                    crate::plan::ir::Decider::Human { .. } => "human".to_string(),
                 }
             ),
             TaskKind::Report { .. } => "report".to_string(),
@@ -734,7 +735,6 @@ pub fn run(
     });
     // Manifest runs append plan wire events to the run's session log so tailers (and the
     // controller's ingest) see the graph and its live progress; shell runs have no state dir.
-    let substrate = Substrate::detecting(caps.clone(), &crucible::inference::from_process_env()?);
     let append = |f: &std::fs::File, ev: &crate::report::session::SessionEvent| {
         use std::io::Write;
         let mut w = f;
@@ -743,6 +743,13 @@ pub fn run(
     // A log that already ends in a shutdown is closed: the run finished, and nothing may follow
     // its last line.
     let events = events.filter(|_| !prior.as_ref().is_some_and(|p| p.shut_down));
+    // A run with an ingest surface can open decision requests, which is the `human` capability.
+    let desk = crate::plan::desk::HttpDesk::from_env(events.as_ref());
+    let mut caps = caps.clone();
+    if desk.is_some() {
+        caps.insert(crucible::plan::ir::NEEDS_HUMAN.to_owned());
+    }
+    let substrate = Substrate::detecting(caps, &crucible::inference::from_process_env()?);
     if let Some(f) = &events {
         if let Some(prior) = &prior {
             append(
@@ -864,6 +871,9 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
+            decisions: desk
+                .as_ref()
+                .map(|d| d as &dyn crucible::plan::decide::DecisionDesk),
             ..ExecCfg::default()
         },
         runner.as_mut(),

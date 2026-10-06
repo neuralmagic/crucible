@@ -412,6 +412,12 @@ pub enum Decider {
     },
     /// A dependency's output, which carries one declared label per question id.
     Output { task: TaskName },
+    /// A person allowed to approve the run, answering a decision request the run opens.
+    Human {
+        /// A pack template rendered into the review shown above the evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
 }
 
 /// Run a task only when one question of a route it depends on resolved to a listed label.
@@ -431,6 +437,9 @@ impl fmt::Display for When {
 
 /// The capability a model-decided route task needs.
 pub const NEEDS_SYSTEMONE: &str = "systemone";
+
+/// The capability a human-decided route task needs: an orchestrator that takes answers.
+pub const NEEDS_HUMAN: &str = "human";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -823,10 +832,13 @@ pub enum PlanError {
     },
     #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
     MinConfidenceOutOfRange { task: String, got: f64 },
-    #[error(
-        "model-decided route task {task:?} must declare needs = \"{NEEDS_SYSTEMONE}\", got {got:?}"
-    )]
-    RouteNeeds { task: String, got: String },
+    #[error("{decider}-decided route task {task:?} must declare needs = \"{want}\", got {got:?}")]
+    RouteNeeds {
+        task: String,
+        decider: &'static str,
+        want: &'static str,
+        got: String,
+    },
     #[error(
         "route task {task:?} decides from {source_task:?}, which is not one of its dependencies"
     )]
@@ -1254,7 +1266,13 @@ impl Plan {
             if t.timeout.is_some()
                 && !matches!(
                     t.task,
-                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                    TaskKind::Agent { .. }
+                        | TaskKind::Command { .. }
+                        | TaskKind::Evaluate { .. }
+                        | TaskKind::Route {
+                            decider: Decider::Human { .. },
+                            ..
+                        }
                 )
             {
                 return Err(PlanError::TimeoutOnUntimedTask {
@@ -1348,6 +1366,18 @@ impl Plan {
                         if t.needs != NEEDS_SYSTEMONE {
                             return Err(PlanError::RouteNeeds {
                                 task: task(),
+                                decider: "model",
+                                want: NEEDS_SYSTEMONE,
+                                got: t.needs.clone(),
+                            });
+                        }
+                    }
+                    Decider::Human { .. } => {
+                        if t.needs != NEEDS_HUMAN {
+                            return Err(PlanError::RouteNeeds {
+                                task: task(),
+                                decider: "human",
+                                want: NEEDS_HUMAN,
                                 got: t.needs.clone(),
                             });
                         }
@@ -2150,6 +2180,8 @@ mod tests {
             plan(vec![gate]).validate().unwrap_err(),
             PlanError::RouteNeeds {
                 task: "gate".into(),
+                decider: "model",
+                want: NEEDS_SYSTEMONE,
                 got: "any".into()
             }
         );
@@ -2159,6 +2191,37 @@ mod tests {
         ])
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn a_human_route_must_need_human() {
+        let mut gate = model_route("gate", &[], &[]);
+        if let TaskKind::Route { decider, .. } = &mut gate.task {
+            *decider = Decider::Human { review: None };
+        }
+        gate.needs = NEEDS_SYSTEMONE.into();
+        assert_eq!(
+            plan(vec![gate.clone()]).validate().unwrap_err(),
+            PlanError::RouteNeeds {
+                task: "gate".into(),
+                decider: "human",
+                want: NEEDS_HUMAN,
+                got: NEEDS_SYSTEMONE.into()
+            }
+        );
+        gate.needs = NEEDS_HUMAN.into();
+        plan(vec![gate]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_human_route_round_trips_through_toml_with_its_review() {
+        let decider = Decider::Human {
+            review: Some("reviews/gate.md.j2".into()),
+        };
+        let text = toml::to_string(&decider).unwrap();
+        assert_eq!(toml::from_str::<Decider>(&text).unwrap(), decider);
+        let bare = toml::to_string(&Decider::Human { review: None }).unwrap();
+        assert!(!bare.contains("review"), "{bare}");
     }
 
     #[test]

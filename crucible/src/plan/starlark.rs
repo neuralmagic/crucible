@@ -664,6 +664,9 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "questions",
             "min_confidence",
             "source",
+            "human",
+            "review",
+            "timeout",
             "depends_on",
             "required",
             "join",
@@ -927,12 +930,23 @@ fn constructor(
             let questions = take_questions(&mut named)?;
             let min_confidence = take_optional_number(&mut named, "min_confidence")?;
             let source = take_optional_task_name(&mut named, "source")?;
-            let (decider, needs) = match (min_confidence, source) {
-                (Some(min_confidence), None) => (
+            let human = take_bool_default(&mut named, "human", false)?;
+            let review = match take_optional_string(&mut named, "review")? {
+                Some(_) if !human => return Err(CompileError::ReviewWithoutHuman { task: name.0 }),
+                Some(path) => Some(state.context_mut().prompt_file(&path)?),
+                None => None,
+            };
+            let timeout = take_timeout(&mut named)?;
+            if timeout.is_some() && !human {
+                return Err(CompileError::TimeoutWithoutHuman { task: name.0 });
+            }
+            let (decider, needs) = match (min_confidence, source, human) {
+                (Some(min_confidence), None, false) => (
                     Decider::Model { min_confidence },
                     crate::plan::ir::NEEDS_SYSTEMONE,
                 ),
-                (None, Some(task)) => (Decider::Output { task }, "any"),
+                (None, Some(task), false) => (Decider::Output { task }, "any"),
+                (None, None, true) => (Decider::Human { review }, crate::plan::ir::NEEDS_HUMAN),
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
             };
             Task {
@@ -949,7 +963,7 @@ fn constructor(
                 over: None,
                 max_fanout: None,
                 revise: None,
-                timeout: None,
+                timeout,
                 when: take_when(&mut named, state, &name)?,
                 name,
                 history: None,
@@ -3277,6 +3291,76 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
     }
 
     #[test]
+    fn a_human_route_compiles_with_its_review_inlined_and_its_timeout() {
+        let pack = temp_pack("routed-human");
+        std::fs::create_dir_all(pack.join("reviews")).unwrap();
+        std::fs::write(
+            pack.join("reviews/gate.md.j2"),
+            "Fix {{ inputs.classify.output.area }}?",
+        )
+        .unwrap();
+        let source = ROUTED.replace(
+            "min_confidence = 0.8",
+            "human = True, review = \"reviews/gate.md.j2\", timeout = \"2h\"",
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let gate = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "gate")
+            .unwrap();
+        assert_eq!(gate.needs, crate::plan::ir::NEEDS_HUMAN);
+        assert_eq!(gate.timeout.map(|t| t.get().as_secs()), Some(7200));
+        assert!(matches!(
+            &gate.task,
+            TaskKind::Route { decider: Decider::Human { review: Some(review) }, .. }
+                if review == "Fix {{ inputs.classify.output.area }}?"
+        ));
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn human_excludes_the_other_deciders_and_owns_review_and_timeout() {
+        for (edit, needle) in [
+            (
+                "min_confidence = 0.8, human = True",
+                "needs exactly one of min_confidence",
+            ),
+            (
+                "source = classify, human = True",
+                "needs exactly one of min_confidence",
+            ),
+            (
+                "min_confidence = 0.8, review = \"r.md\"",
+                "it needs human = True",
+            ),
+            (
+                "min_confidence = 0.8, timeout = \"1h\"",
+                "it needs human = True",
+            ),
+        ] {
+            let err = routed_error(
+                "routed-human-err",
+                &ROUTED.replace("min_confidence = 0.8", edit),
+            );
+            assert!(err.contains(needle), "{edit}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_missing_review_file_is_a_compile_error() {
+        let err = routed_error(
+            "routed-human-review",
+            &ROUTED.replace(
+                "min_confidence = 0.8",
+                "human = True, review = \"reviews/nope.md\"",
+            ),
+        );
+        assert!(err.contains("reviews"), "{err}");
+    }
+
+    #[test]
     fn an_unknown_answer_is_located_at_the_argument_with_a_suggestion() {
         let err = routed_error(
             "routed-answer",
@@ -4491,7 +4575,12 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
         let pack = temp_pack("kwarg-slices");
         std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
         std::fs::write(pack.join("skills/demo/SKILL.md"), "demo\n").unwrap();
+        std::fs::write(pack.join("review.md"), "launch?\n").unwrap();
         let cases: &[(&str, &str)] = &[
+            (
+                "route",
+                "u = command(name = \"u\", run = \"true\")\ng = route(name = \"g\", human = True, review = \"review.md\", timeout = \"1h\", depends_on = [u], questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])}{extra})\nworkflow(type = \"playbook\", tasks = [u, g])\n",
+            ),
             (
                 "agent",
                 "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",

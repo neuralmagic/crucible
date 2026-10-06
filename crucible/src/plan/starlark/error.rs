@@ -503,10 +503,16 @@ pub enum CompileError {
         error: crucible_contract::decision::QuestionError,
     },
     #[error(
-        "route {task:?} needs exactly one of min_confidence (a decision model answers) or \
-         source (a dependency's output answers)"
+        "route {task:?} needs exactly one of min_confidence (a decision model answers), \
+         source (a dependency's output answers), or human = True (a person answers)"
     )]
     RouteDecider { task: String },
+    #[error("route {task:?}: review is shown to the person who answers, so it needs human = True")]
+    ReviewWithoutHuman { task: String },
+    #[error(
+        "route {task:?}: timeout bounds how long a person has to answer, so it needs human = True"
+    )]
+    TimeoutWithoutHuman { task: String },
     #[error("argument \"when\" must be one question of a route task, like `gate.area`")]
     WhenNotAnAnswer,
     #[error("argument \"answers\" has no meaning without \"when\"")]

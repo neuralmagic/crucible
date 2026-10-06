@@ -82,6 +82,8 @@ url = "2"
 tempfile = "3"
 # Credential relay: base64 for embedding a CA into a relayed kubeconfig (`${file64:}`).
 base64 = "0.22"
+# Review templates for human-decided routes, the same engine report templates use.
+minijinja = "2"
 # `crucible plan show --render`: mermaid -> PNG, fully offline (vendored dagre layout +
 # resvg raster; see third_party/NOTICE).
 xai-grok-mermaid = { path = "../third_party/xai-grok-mermaid" }

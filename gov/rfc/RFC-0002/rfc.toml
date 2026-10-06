@@ -33,6 +33,8 @@ clauses = [
     "clauses/C-RUN-HISTORY.toml",
     "clauses/C-PACK-BASE.toml",
     "clauses/C-PACK-PUBLISH.toml",
+    "clauses/C-HUMAN-DECISION.toml",
+    "clauses/C-DECISION-EVIDENCE.toml",
 ]
 
 [[changelog]]
@@ -44,6 +46,7 @@ added = [
     "C-PACK-BASE: a pack's digest is SHA-256 over its canonical tree; a draft may name a base, flattened at save into one tree with one digest, base and overlay digests kept as provenance; an unavailable base refused at save; the delivery budget checked at save and dispatch",
     "C-PACK-BASE: a pack's digest is a tree hash (tree1:); a draft may name a base, flattened at save into one tree with one digest and recorded provenance; an unavailable base is refused at save; the delivery budget is checked at save, registration, import, and dispatch; old digests are rewritten",
     "C-PACK-PUBLISH: optional OCI publication of registered, imported, and approved packs, readable only by the controller and dispatch targets, under digest-derived tags with a publication state",
+    "C-HUMAN-DECISION, C-DECISION-EVIDENCE: a human-decided route opens one decision request per run and route, polled by the run, answered against an evidence digest, recorded as uncertain on expiry; the controller shows the evidence with sandboxed visualizations and notifies approvers",
 ]
 changed = [
     "a settled join forwards a dependency that settled not taken",

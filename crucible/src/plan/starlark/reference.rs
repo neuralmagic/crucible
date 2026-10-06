@@ -565,6 +565,28 @@ pub fn functions() -> Vec<Function> {
                      question answers, or `\"boolean\"` for a noul.",
                 ),
                 Kwarg::new(
+                    "human",
+                    "bool",
+                    "True: a person allowed to approve the run answers, from the controller \
+                     UI, after seeing the dependencies' declared outputs and files. Needs the \
+                     `human` capability. Tasks that do not depend on the route keep running \
+                     while it waits.",
+                ),
+                Kwarg::new(
+                    "review",
+                    "path",
+                    "With `human`: a Markdown template in the pack, rendered over the evidence \
+                     (`inputs`, `run`, `gated`) and shown above it. Every inserted value is \
+                     escaped.",
+                ),
+                Kwarg::new(
+                    "timeout",
+                    "duration",
+                    "With `human`: how long the request stays open, from when it opens; the \
+                     run's wall-clock ceiling by default. An unanswered request records every \
+                     question as `\"uncertain\"`.",
+                ),
+                Kwarg::new(
                     "depends_on",
                     "list[task]",
                     "Dependencies. Their outputs are the state the questions are asked about.",

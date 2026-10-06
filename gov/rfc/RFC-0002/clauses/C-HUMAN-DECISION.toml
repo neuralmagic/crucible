@@ -1,0 +1,26 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-HUMAN-DECISION"
+title = "Human-decided routes"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+A human-decided route takes its answers from a person allowed to approve the run, and holds the route's dependents until one answers or the request expires. It is how a playbook keeps an expensive or irreversible branch, such as a compute job an agent turn proposed, from starting before someone has seen what it would act on. The questions, labels, and when coverage rules of [[RFC-0001:C-ROUTE]] apply to it unchanged.
+
+A human-decided route MUST declare needs = "human", verified before dispatch under [[RFC-0002:C-PLAYBOOK-CAPS]]. A run whose orchestrator cannot take an answer from a person does not have that capability.
+
+When a human-decided route is dispatched, the engine MUST open a decision request with the orchestrator. The request MUST carry the run, the route's name, its questions with their declared labels, the evidence and its digest under [[RFC-0002:C-DECISION-EVIDENCE]], and the time it expires. A request is identified by its run and route name. The orchestrator MUST hold at most one request per pair, and an open for a pair that already has one MUST return that request, with any answer recorded on it, rather than open another or reset its expiry. The engine MUST obtain the answer through requests it initiates; the orchestrator MUST NOT be required to open a connection to the run. Failure to reach the orchestrator is a transport failure and retries as one, and MUST NOT answer or expire the request.
+
+While a request is open, the route runs no agent turn and spends nothing. Tasks that do not depend on the route MUST continue to dispatch as the graph allows. The wait counts against the run's wall-clock ceiling as any attempt does under [[RFC-0002:C-PLAYBOOK-BUDGET]].
+
+A human-decided route MAY declare a timeout. A declared timeout MUST be positive, and one exceeding the run's wall-clock ceiling MUST be rejected before any task is dispatched; with none declared, the ceiling is the timeout. Expiry MUST be counted from the time the request was first opened, and neither a restart nor a resume MAY extend it. When a request expires unanswered, the engine MUST record every question as "uncertain" and settle the route passing. This replaces, for a human-decided route only, the measured failure [[RFC-0002:C-PLAYBOOK-BUDGET]] prescribes when an attempt reaches its own limit: an unanswered request is an outcome the author routes, and the coverage rule of [[RFC-0001:C-ROUTE]] requires that they route it. When the run's wall-clock ceiling falls first, the route settles as that clause prescribes for the ceiling.
+
+An answer MUST give exactly one declared label for every question; "uncertain" MUST NOT be accepted as an answer. An answer MAY carry a note of bounded size, and the bound MUST be operator-configured and discoverable before a run starts. The orchestrator MUST accept an answer only from a subject allowed `approve` on the run under [[RFC-0003:C-DECISION]], only while the request is open, and only when it names the evidence digest the request carries. It MUST refuse any other answer with a refusal that names the reason. The first accepted answer is final. A later answer that repeats it exactly from the same subject MUST be acknowledged without effect, and any other later answer MUST be refused. Stopping the run while a request is open MUST withdraw the request, and an expired or withdrawn request MUST refuse every answer.
+
+The route's output MUST carry, for each question, the resolved label with probability 1, or "uncertain" with an empty distribution and confidence 0, in the shape [[RFC-0001:C-ROUTE]] gives an output-decided route. It MUST also carry the decision: the deciding user principal, the time, the evidence digest, and the note or null, or, for an expired request, a null principal and the outcome "expired". This output is the record [[RFC-0002:C-PLAYBOOK-RESUME]] folds, so a resumed run never asks again for a route that settled. A resumed run whose human-decided route has no folded result MUST open its request again, and MUST settle on any answer recorded while the run was down.
+
+A note is text from outside the pack. It MUST reach an agent prompt only inside a region the prompt marks as external input, under the obligation [[RFC-0002:C-PLAYBOOK-PARAMS]] states for parameter values."""

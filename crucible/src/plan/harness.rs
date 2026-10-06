@@ -273,6 +273,10 @@ impl TaskRunner for HarnessRunner {
         captured_dir(&self.paths.state, &task.name.0).is_dir()
     }
 
+    fn captured_file(&self, task: &Task, declared: &str) -> Option<Vec<u8>> {
+        std::fs::read(captured_path(&self.paths.state, &task.name.0, declared)).ok()
+    }
+
     /// Discards the set published under this task's name, and for a mapped node the sets
     /// published under its instances' names too: a node that did not expand this run has no
     /// instance rows, so nothing else in the run ever reaches them.

@@ -211,7 +211,7 @@ fn slack_escape(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn template_value(value: &serde_json::Value) -> minijinja::Value {
+pub fn template_value(value: &serde_json::Value) -> minijinja::Value {
     match value {
         serde_json::Value::Null => minijinja::Value::from(()),
         serde_json::Value::Bool(value) => minijinja::Value::from(*value),

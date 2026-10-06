@@ -29,6 +29,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The ingest drop-box coordinates, read from the pod's env. Present only when the controller
 /// injected `CRUCIBLE_INGEST_URL` (i.e. the deploy profile named a drop-box) AND the pod knows its
 /// own name, otherwise `None`, and the caller emits markers as before.
+#[derive(Debug, Clone)]
 pub struct IngestConfig {
     /// The controller's ingest base URL, e.g. `http://crucible-controller.autoresearch.svc:8080`.
     base_url: String,
@@ -64,6 +65,18 @@ impl IngestConfig {
             pod: pod.into(),
             token_path,
         }
+    }
+
+    /// `{base}/api/pods/{pod}/{tail}`: this pod's ingest surface.
+    pub fn pod_url(&self, tail: &str) -> String {
+        format!("{}/api/pods/{}/{tail}", self.base_url, self.pod)
+    }
+
+    /// The current bearer: the token file is rotated under the process, so it is read per call.
+    pub fn bearer(&self) -> std::io::Result<String> {
+        Ok(std::fs::read_to_string(&self.token_path)?
+            .trim()
+            .to_string())
     }
 
     fn url(&self, kind: ArtifactKind) -> String {

@@ -1,0 +1,24 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-DECISION-EVIDENCE"
+title = "Decision evidence and notification"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+The evidence of a decision request is what the approver decides on. It MUST consist of exactly: each of the route's dependencies with its terminal status, its declared JSON output where it passed, and its declared files staged under [[RFC-0002:C-TASK-FILES]], as the route's join would give them to it as inputs; the run's spend, elapsed time, and both ceilings at the time the request opened; for each task whose when names a question of the route, its name, kind, needs, and the labels that dispatch it, so the approver sees what each answer starts; and the rendered review, where the route declares one. Nothing a task did not declare MAY appear in it: no prompt, stdout, undeclared workspace file, or credential.
+
+A human-decided route MAY declare a review: a template file in the pack, rendered into a CommonMark document shown above the rest of the evidence. The template MUST be able to read every part of the evidence above and nothing else. The renderer MUST escape every value the template inserts, and the controller MUST display the rendered review without executing any raw HTML in it.
+
+The total encoded size of the evidence MUST be bounded, and the bound MUST be operator-configured and discoverable before a run starts. Evidence exceeding it MUST fail the route before the request opens, naming the bound, and MUST NOT be truncated.
+
+The evidence MUST have a digest computed over its canonical encoding, rendered review and file contents included. The digest MUST be recorded on the request and on the decision. The controller MUST present the approver the evidence that digest names, and an answer is bound to the evidence it names: [[RFC-0002:C-HUMAN-DECISION]] refuses an answer naming any other digest.
+
+The controller MUST present a request's evidence to an approver on one page together with the controls that answer it, with each question's declared labels as the only choices. Declared JSON outputs MUST be shown as structured values that keep their JSON types. Declared files MUST be shown inline by media type at least for PNG, JPEG, GIF, and SVG images, Markdown, CSV as a table, JSON as a structured value, and HTML as an interactive document; a file of any other type, and a file whose inline presentation fails, MUST be offered for download. An HTML file is how a pack ships a visualization: a self-contained document whose scripts run when it is shown.
+
+Every file in the evidence is untrusted: an agent may have written it. The controller MUST show SVG and HTML evidence in a context that cannot run script with the controller's origin, read its cookies or storage, call its API, navigate the page that embeds it, or make any network request. A visualization therefore has to carry its scripts and data inline.
+
+The controller MUST list the open decision requests a subject may answer, and MUST publish an event on its live event stream when a request opens and when it closes, delivered only to subjects that may read the run. The event for an open request MUST say whether the receiving subject may answer it. The web UI, while open in a browser that granted it notification permission, MUST raise a system notification for each request the signed-in subject may answer, linking to the request's evidence page, and MUST NOT raise one for a request the subject cannot answer. Delivery to a browser with no open session of the web UI is outside this clause."""
