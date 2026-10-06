@@ -1,0 +1,8 @@
+[agent]
+backend = "openshell"
+goal = "Boot the gateway."
+sandbox_image = "ghcr.io/org/sandbox:latest"
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
