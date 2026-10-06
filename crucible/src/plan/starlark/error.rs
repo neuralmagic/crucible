@@ -515,6 +515,11 @@ pub enum CompileError {
     TimeoutWithoutHuman { task: String },
     #[error("argument \"when\" must be one question of a route task, like `gate.area`")]
     WhenNotAnAnswer,
+    #[error(
+        "\"source\" must name a declared list field of a task the route depends on, as \
+         `source = producer.field`"
+    )]
+    PickNotOutputField,
     #[error("argument \"answers\" has no meaning without \"when\"")]
     AnswersWithoutWhen,
     #[error("argument \"answers\" lists no labels")]

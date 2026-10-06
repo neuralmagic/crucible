@@ -39,7 +39,8 @@ use crate::plan::starlark::error::{
 use crate::plan::starlark::values::{SchemaFile, SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 use crucible_contract::decision::{
-    ChoiceOption, IdentError, Label, NOUL_YES, Question, QuestionId, QuestionKind, UNCERTAIN,
+    ChoiceOption, IdentError, Label, NOUL_YES, PickSource, Question, QuestionId, QuestionKind,
+    UNCERTAIN,
 };
 use crucible_contract::emits::{DeclaredFile, FieldType, JsonSchema};
 
@@ -538,7 +539,7 @@ const SCORED_FUNCTIONS: &[&str] = &[
 ];
 
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
-const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route"];
+const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "pick", "route"];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
@@ -676,7 +677,8 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "otherwise",
         ],
         "noul" => &["ask", "drop"],
-        "choice" => &["ask", "options", "drop"],
+        "choice" => &["ask", "options", "multiple", "drop"],
+        "pick" => &["ask", "source", "multiple"],
         "report" => &[
             "name",
             "destination",
@@ -762,16 +764,24 @@ fn constructor(
             .insert(decl.name.clone(), (decl.clone(), at.clone()));
         return Ok(Value::Session(decl));
     }
-    if matches!(function, "noul" | "choice") {
+    if matches!(function, "noul" | "choice" | "pick") {
         let instructions = take_string(&mut named, "ask")?;
-        let kind = if function == "noul" {
-            QuestionKind::Noul
-        } else {
-            QuestionKind::Choice {
+        let kind = match function {
+            "noul" => QuestionKind::Noul,
+            "choice" => QuestionKind::Choice {
                 options: take_options(&mut named)?,
-            }
+                multiple: take_bool_default(&mut named, "multiple", false)?,
+            },
+            _ => QuestionKind::Pick {
+                source: take_pick_source(&mut named)?,
+                multiple: take_bool_default(&mut named, "multiple", false)?,
+            },
         };
-        let drop = take_labels(&mut named, "drop")?.unwrap_or_default();
+        let drop = if function == "pick" {
+            Vec::new()
+        } else {
+            take_labels(&mut named, "drop")?.unwrap_or_default()
+        };
         no_unknown_kwargs(function, &named)?;
         let question = Question {
             instructions,
@@ -1334,6 +1344,16 @@ fn take_labels(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Option
 }
 
 /// `options = ["a", "b"]`, or `options = {"a": "what a means", "b": None}`.
+fn take_pick_source(named: &mut BTreeMap<String, Value>) -> Result<PickSource> {
+    match take_value(named, "source")? {
+        Value::Output(output) => Ok(PickSource {
+            task: output.reference.task.0,
+            field: output.reference.field.0,
+        }),
+        _ => Err(CompileError::PickNotOutputField),
+    }
+}
+
 fn take_options(named: &mut BTreeMap<String, Value>) -> Result<Vec<ChoiceOption>> {
     let expected = "a list of labels or a dict of label to description";
     match take_value(named, "options")? {
@@ -1414,6 +1434,7 @@ fn take_when(
         return Err(CompileError::EmptyAnswers);
     }
     let is = match (answers, &asked.asked.kind) {
+        (_, QuestionKind::Pick { .. }) => return Err(CompileError::WhenNotAnAnswer),
         (Some(answers), _) => answers,
         (None, QuestionKind::Noul) => vec![identifier("answers", Label::new(NOUL_YES))?],
         (None, QuestionKind::Choice { .. }) => {
@@ -3215,7 +3236,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
             area.labels().iter().map(Label::as_str).collect::<Vec<_>>(),
             ["frontend", "scheduler"]
         );
-        let QuestionKind::Choice { options } = &area.kind else {
+        let QuestionKind::Choice { options, .. } = &area.kind else {
             panic!("area is not a choice");
         };
         assert_eq!(
@@ -3345,6 +3366,82 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
                 &ROUTED.replace("min_confidence = 0.8", edit),
             );
             assert!(err.contains(needle), "{edit}: {err}");
+        }
+    }
+
+    const PICKED: &str = r#"
+scan = command(name = "scan", run = "true", emits = {"nodes": "list"})
+gate = route(
+    name = "gate",
+    human = True,
+    depends_on = [scan],
+    questions = {
+        "nodes": pick(ask = "Which nodes?", source = scan.nodes, multiple = True),
+        "checks": choice(ask = "Which checks?", options = ["lint", "unit"], multiple = True),
+    },
+)
+lint = command(name = "lint", run = "true", depends_on = [gate], when = gate.checks, answers = ["lint"])
+unit = command(name = "unit", run = "true", depends_on = [gate], when = gate.checks, answers = ["unit", "uncertain"])
+launch = command(name = "launch", run = "true", depends_on = [gate], over = gate.nodes, max_fanout = 8)
+workflow(type = "playbook", tasks = [scan, gate, lint, unit, launch])
+"#;
+
+    #[test]
+    fn a_pick_and_a_multiple_choice_compile_and_a_task_maps_over_the_picks() {
+        let pack = temp_pack("routed-pick");
+        let compiled = compile_source(PICKED, &pack.join("workflow.star"), &pack).unwrap();
+        let task = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .unwrap()
+        };
+        let TaskKind::Route { questions, .. } = &task("gate").task else {
+            panic!("gate is not a route");
+        };
+        assert_eq!(
+            questions[&QuestionId::new("nodes").unwrap()].kind,
+            QuestionKind::Pick {
+                source: PickSource {
+                    task: "scan".into(),
+                    field: "nodes".into(),
+                },
+                multiple: true,
+            }
+        );
+        assert!(questions[&QuestionId::new("checks").unwrap()].multiple());
+        let over = task("launch").over.as_ref().unwrap();
+        assert_eq!(
+            (over.task.0.as_str(), over.field.0.as_str()),
+            ("gate", "nodes")
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_pick_refuses_when_a_non_field_source_and_a_model_decider() {
+        for (edit, needle) in [
+            (
+                (
+                    "when = gate.checks, answers = [\"lint\"]",
+                    "when = gate.nodes, answers = [\"lint\"]",
+                ),
+                "must be one question of a route task",
+            ),
+            (
+                ("source = scan.nodes", "source = scan"),
+                "\"source\" must name a declared list field",
+            ),
+            (("source = scan.nodes", "source = scan.other"), "other"),
+            (
+                ("human = True", "min_confidence = 0.8"),
+                "only a person answers a",
+            ),
+        ] {
+            let err = routed_error("routed-pick-err", &PICKED.replace(edit.0, edit.1));
+            assert!(err.contains(needle), "{edit:?}: {err}");
         }
     }
 
@@ -4640,6 +4737,14 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
             (
                 "choice",
                 "g = route(name = \"g\", min_confidence = 0.5, questions = {\"q\": choice(ask = \"q?\", options = [\"a\", \"b\"], drop = [\"b\"]{extra})})\nworkflow(type = \"custom\", tasks = [g], result = g)\n",
+            ),
+            (
+                "choice",
+                "g = route(name = \"g\", human = True, questions = {\"q\": choice(ask = \"q?\", options = [\"a\", \"b\"], multiple = True, drop = [\"a\", \"b\", \"uncertain\"]{extra})})\nworkflow(type = \"custom\", tasks = [g], result = g)\n",
+            ),
+            (
+                "pick",
+                "u = command(name = \"u\", run = \"true\", emits = {\"nodes\": \"list\"})\ng = route(name = \"g\", human = True, depends_on = [u], questions = {\"q\": pick(ask = \"q?\", source = u.nodes, multiple = True{extra})})\nworkflow(type = \"custom\", tasks = [u, g], result = g)\n",
             ),
             (
                 "top_k",

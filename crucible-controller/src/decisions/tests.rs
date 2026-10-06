@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use crucible_contract::decision::{ChoiceOption, Label, Question, QuestionId, QuestionKind};
+use crucible_contract::decision::{
+    ChoiceOption, Label, PickSource, Question, QuestionId, QuestionKind,
+};
 use crucible_contract::decision_request::{
     Evidence, InputEvidence, OpenRequest, RequestState, RequestStatus, RunEvidence,
 };
@@ -21,20 +23,25 @@ impl crate::daemon::queue::OverrideSink for NoOverrides {
     fn submit(&self, _ov: crate::daemon::queue::Override) {}
 }
 
-fn question() -> Question {
+fn choice(labels: &[&str], multiple: bool) -> Question {
     Question {
         instructions: "launch the job?".into(),
         kind: QuestionKind::Choice {
-            options: ["approve", "deny"]
+            options: labels
                 .iter()
                 .map(|l| ChoiceOption {
                     label: Label::new(*l).unwrap(),
                     description: None,
                 })
                 .collect(),
+            multiple,
         },
         drop: Vec::new(),
     }
+}
+
+fn question() -> Question {
+    choice(&["approve", "deny"], false)
 }
 
 fn request(task: &str, gpus: u64, timeout_secs: u64) -> OpenRequest {
@@ -55,6 +62,7 @@ fn request(task: &str, gpus: u64, timeout_secs: u64) -> OpenRequest {
         },
         gated: Vec::new(),
         review: None,
+        choices: BTreeMap::new(),
     };
     OpenRequest {
         task: task.into(),
@@ -65,8 +73,38 @@ fn request(task: &str, gpus: u64, timeout_secs: u64) -> OpenRequest {
     }
 }
 
-fn labels(go: &str) -> BTreeMap<QuestionId, Label> {
-    BTreeMap::from([(QuestionId::new("go").unwrap(), Label::new(go).unwrap())])
+fn labels(go: &str) -> BTreeMap<QuestionId, Vec<String>> {
+    BTreeMap::from([(QuestionId::new("go").unwrap(), vec![go.to_owned()])])
+}
+
+/// `go`, plus `checks` (several of lint/unit/e2e) and `nodes` (one or more picked from the
+/// plan's node list).
+fn multi_request() -> OpenRequest {
+    let mut req = request("gate", 8, 3600);
+    req.questions.insert(
+        QuestionId::new("checks").unwrap(),
+        choice(&["lint", "unit", "e2e"], true),
+    );
+    req.questions.insert(
+        QuestionId::new("nodes").unwrap(),
+        Question {
+            instructions: "which nodes?".into(),
+            kind: QuestionKind::Pick {
+                source: PickSource {
+                    task: "plan".into(),
+                    field: "nodes".into(),
+                },
+                multiple: true,
+            },
+            drop: Vec::new(),
+        },
+    );
+    req.evidence.choices = BTreeMap::from([(
+        QuestionId::new("nodes").unwrap(),
+        vec!["a1".to_owned(), "b2".to_owned()],
+    )]);
+    req.evidence_digest = req.evidence.digest().unwrap();
+    req
 }
 
 /// A playbook launch by `wren`, its issue, and one running run attributed to her.
@@ -244,6 +282,12 @@ async fn an_expired_request_reads_expired_and_refuses_answers(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(refused, Err(Refused::Closed("expired")));
+    assert!(store::withdraw_run(&pool, "r1").await.unwrap().is_empty());
+    assert_eq!(
+        store::get(&pool, &d.id).await.unwrap().unwrap().status,
+        RequestStatus::Expired,
+        "a run ending after expiry leaves the request expired"
+    );
 }
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -397,11 +441,17 @@ async fn the_launcher_sees_and_answers_the_request_and_a_stranger_does_neither(p
     assert_eq!(shown["can_answer"], true);
     assert_eq!(shown["inputs"][0]["output"]["gpus"], 8);
     assert_eq!(
-        shown["questions"][0]["labels"],
-        serde_json::json!(["approve", "deny"])
+        shown["questions"][0],
+        serde_json::json!({
+            "id": "go",
+            "instructions": "launch the job?",
+            "kind": "choice",
+            "multiple": false,
+            "options": ["approve", "deny"],
+        })
     );
 
-    let answer = |go: &str, digest: &str| serde_json::json!({"labels": {"go": go}, "evidence_digest": digest, "note": "ok"});
+    let answer = |go: &str, digest: &str| serde_json::json!({"labels": {"go": [go]}, "evidence_digest": digest, "note": "ok"});
     let uri = format!("/api/decisions/{}/answer", d.id);
     let (status, _) = send(
         &app,
@@ -449,6 +499,10 @@ async fn the_launcher_sees_and_answers_the_request_and_a_stranger_does_neither(p
     assert_eq!(status, StatusCode::OK, "{answered}");
     assert_eq!(answered["state"], "answered");
     assert_eq!(answered["answer"]["decided_by"], "user:wren");
+    assert_eq!(
+        answered["answer"]["labels"]["go"],
+        serde_json::json!(["approve"])
+    );
     let (status, _) = send(
         &app,
         "POST",
@@ -469,6 +523,146 @@ async fn the_launcher_sees_and_answers_the_request_and_a_stranger_does_neither(p
     assert_eq!(audited, 1, "one accepted answer, one audit row");
     let (_, listed) = send(&app, "GET", "/api/decisions", (wren.0, &wren.1), None).await;
     assert_eq!(listed["open"], serde_json::json!([]));
+}
+
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_multiple_choice_and_a_pick_take_distinct_offered_values(pool: PgPool) {
+    seed_run(&pool, "r1").await;
+    let req = multi_request();
+    let (d, _) = store::open(&pool, "r1", Some("pb#1"), &req).await.unwrap();
+    let app = api(&pool);
+    let wren = as_user("wren");
+
+    let (_, shown) = send(
+        &app,
+        "GET",
+        &format!("/api/decisions/{}", d.id),
+        (wren.0, &wren.1),
+        None,
+    )
+    .await;
+    let question = |id: &str| {
+        shown["questions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|q| q["id"] == id)
+            .cloned()
+            .unwrap()
+    };
+    assert_eq!(question("checks")["kind"], "choice");
+    assert_eq!(question("checks")["multiple"], true);
+    assert_eq!(
+        question("nodes"),
+        serde_json::json!({
+            "id": "nodes",
+            "instructions": "which nodes?",
+            "kind": "pick",
+            "multiple": true,
+            "options": ["a1", "b2"],
+        })
+    );
+
+    let uri = format!("/api/decisions/{}/answer", d.id);
+    let answer = |go: serde_json::Value, checks: serde_json::Value, nodes: serde_json::Value| {
+        serde_json::json!({
+            "labels": {"go": go, "checks": checks, "nodes": nodes},
+            "evidence_digest": req.evidence_digest,
+        })
+    };
+    use serde_json::json;
+    for (bad, why) in [
+        (
+            answer(json!(["approve", "deny"]), json!(["lint"]), json!(["a1"])),
+            "two for a single choice",
+        ),
+        (
+            answer(json!([]), json!(["lint"]), json!(["a1"])),
+            "nothing for go",
+        ),
+        (
+            answer(json!(["approve"]), json!([]), json!(["a1"])),
+            "nothing for checks",
+        ),
+        (
+            answer(json!(["approve"]), json!(["lint", "lint"]), json!(["a1"])),
+            "a repeated label",
+        ),
+        (
+            answer(
+                json!(["approve"]),
+                json!(["lint", "uncertain"]),
+                json!(["a1"]),
+            ),
+            "uncertain",
+        ),
+        (
+            answer(json!(["approve"]), json!(["lint"]), json!(["zz"])),
+            "a value the pick did not offer",
+        ),
+        (
+            answer(json!(["approve"]), json!(["lint"]), json!(["a1", "a1"])),
+            "a repeated pick",
+        ),
+        (
+            json!({"labels": {"go": ["approve"], "checks": ["lint"]}, "evidence_digest": req.evidence_digest}),
+            "no answer for nodes",
+        ),
+        (
+            json!({"labels": {"go": "approve", "checks": ["lint"], "nodes": ["a1"]}, "evidence_digest": req.evidence_digest}),
+            "a bare string",
+        ),
+    ] {
+        let (status, _) = send(&app, "POST", &uri, (wren.0, &wren.1), Some(bad)).await;
+        assert!(
+            status == StatusCode::UNPROCESSABLE_ENTITY || status == StatusCode::BAD_REQUEST,
+            "{why}: {status}"
+        );
+    }
+
+    let (status, answered) = send(
+        &app,
+        "POST",
+        &uri,
+        (wren.0, &wren.1),
+        Some(answer(
+            json!(["approve"]),
+            json!(["unit", "lint"]),
+            json!(["b2", "a1"]),
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answered}");
+    assert_eq!(
+        answered["answer"]["labels"]["checks"],
+        json!(["unit", "lint"])
+    );
+    assert_eq!(answered["answer"]["labels"]["nodes"], json!(["b2", "a1"]));
+    let read = store::get(&pool, &d.id).await.unwrap().unwrap();
+    let RequestStatus::Answered { answer: record } = read.status else {
+        panic!("{:?}", read.status);
+    };
+    assert_eq!(
+        record.labels[&QuestionId::new("nodes").unwrap()],
+        ["b2", "a1"]
+    );
+    let (status, _) = send(
+        &app,
+        "POST",
+        &uri,
+        (wren.0, &wren.1),
+        Some(answer(
+            json!(["approve"]),
+            json!(["unit", "lint"]),
+            json!(["b2", "a1"]),
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the same answer again is acknowledged"
+    );
 }
 
 /// utoipa keeps the last schema registered under a name, so a decision DTO that took an existing

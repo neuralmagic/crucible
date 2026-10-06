@@ -721,7 +721,7 @@ pub fn execute(
     // Human-decided routes waiting on their requests, by route: request id and when it was last
     // polled. A parked route is neither dispatchable nor settled, so its dependents wait while
     // everything independent of it keeps dispatching.
-    let mut parked: BTreeMap<TaskName, (String, Option<Instant>)> = BTreeMap::new();
+    let mut parked: BTreeMap<TaskName, Parked> = BTreeMap::new();
     loop {
         let settled_before = results.len();
         let mut dispatch: Vec<&Task> = Vec::new();
@@ -895,8 +895,8 @@ pub fn execute(
                     &clock,
                     cfg,
                 ) {
-                    Opened::Parked(id) => {
-                        parked.insert(t.name.clone(), (id, Some(Instant::now())));
+                    Opened::Parked(p) => {
+                        parked.insert(t.name.clone(), p);
                     }
                     Opened::Settled(r) => {
                         let event = settled_event(&r);
@@ -938,8 +938,8 @@ pub fn execute(
             dispatch.retain(|t| reports && t.stage == Stage::Epilogue);
         }
         if !parked.is_empty() {
-            // A run that halted, or whose wall-clock ceiling fell while a request was open, settles
-            // the waiting routes as blocked rather than answered.
+            // A run that halted, or whose wall-clock ceiling fell while a request was open, fails
+            // the waiting routes rather than answering them.
             if halted.is_none() && clock.past(cfg.wall_clock) {
                 halt(&mut halted, &mut plan_machine, Halt::Time)?;
             }
@@ -2648,21 +2648,28 @@ fn not_taken(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> Option<(Task
                 ));
             }
             Some(TaskStatus::Pass) => {
-                let label = results
+                let answer = results
                     .get(&when.task)
                     .and_then(|r| r.output.as_ref())
                     .and_then(|o| o.get(when.question.as_str()))
-                    .and_then(|a| a.get("label"))
-                    .and_then(Value::as_str);
-                if !when.is.iter().any(|l| Some(l.as_str()) == label) {
+                    .and_then(|a| serde_json::from_value::<Answer>(a.clone()).ok());
+                if !answer
+                    .as_ref()
+                    .is_some_and(|a| when.is.iter().any(|l| a.chose(l)))
+                {
+                    let chosen = match &answer {
+                        Some(a) if a.labels.is_empty() => a.label.to_string(),
+                        Some(a) => a
+                            .labels
+                            .iter()
+                            .map(Label::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                        None => "nothing".to_owned(),
+                    };
                     return Some((
                         TaskEvent::ConditionUnmet,
-                        format!(
-                            "{}.{} resolved to {}",
-                            when.task,
-                            when.question,
-                            label.unwrap_or("nothing")
-                        ),
+                        format!("{}.{} resolved to {chosen}", when.task, when.question),
                     ));
                 }
             }
@@ -2689,9 +2696,15 @@ fn not_taken(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> Option<(Task
     None
 }
 
-/// The deterministic decider: read one declared label per question from `source`'s output.
+/// A human-decided route waiting on its request.
+struct Parked {
+    id: String,
+    polled: Instant,
+    choices: BTreeMap<QuestionId, Vec<String>>,
+}
+
 enum Opened {
-    Parked(String),
+    Parked(Parked),
     Settled(TaskResult),
 }
 
@@ -2730,6 +2743,7 @@ fn open_decision(
     let evidence = match crate::plan::decide::build_evidence(crate::plan::decide::EvidenceInputs {
         plan,
         route: t,
+        questions,
         results,
         runner,
         run,
@@ -2752,6 +2766,7 @@ fn open_decision(
         (None, Some(left)) => left,
         (None, None) => DECISION_TIMEOUT_UNBOUNDED,
     };
+    let choices = evidence.choices.clone();
     let request = OpenRequest {
         task: t.name.0.clone(),
         questions: questions.clone(),
@@ -2766,9 +2781,13 @@ fn open_decision(
         }
         match desk.open(&request) {
             Ok(state) => {
-                return match crate::plan::decide::settle(questions, &state) {
+                return match crate::plan::decide::settle(questions, &choices, &state) {
                     Some(r) => Opened::Settled(r),
-                    None => Opened::Parked(state.id),
+                    None => Opened::Parked(Parked {
+                        id: state.id,
+                        polled: Instant::now(),
+                        choices,
+                    }),
                 };
             }
             Err(e) => last = e,
@@ -2791,25 +2810,26 @@ fn open_decision(
 /// nor expires the request: the route stays parked and the next poll tries again.
 fn poll_decision(
     t: &Task,
-    parked: &mut BTreeMap<TaskName, (String, Option<Instant>)>,
+    parked: &mut BTreeMap<TaskName, Parked>,
     cfg: ExecCfg<'_>,
     interval: Duration,
 ) -> Option<TaskResult> {
-    let (id, last) = parked.get_mut(&t.name)?;
-    if last.is_some_and(|at| at.elapsed() < interval) {
+    let p = parked.get_mut(&t.name)?;
+    if p.polled.elapsed() < interval {
         return None;
     }
-    *last = Some(Instant::now());
+    p.polled = Instant::now();
     let TaskKind::Route { questions, .. } = &t.task else {
         return None;
     };
-    let state = cfg.decisions?.poll(id).ok()?;
-    crate::plan::decide::settle(questions, &state)
+    let state = cfg.decisions?.poll(&p.id).ok()?;
+    crate::plan::decide::settle(questions, &p.choices, &state)
 }
 
 /// A human-decided route's timeout in a run with no wall-clock ceiling and none declared.
 const DECISION_TIMEOUT_UNBOUNDED: Duration = Duration::from_secs(7 * 24 * 3600);
 
+/// The deterministic decider: read one declared label per question from `source`'s output.
 fn decide_from_output(
     inputs: &BTreeMap<TaskName, Value>,
     questions: &BTreeMap<QuestionId, Question>,
@@ -2863,6 +2883,7 @@ fn decide_from_output(
                 label,
                 confidence,
                 probabilities,
+                labels: Vec::new(),
             },
         );
     }
@@ -4754,6 +4775,7 @@ mod tests {
                         description: None,
                     })
                     .collect(),
+                multiple: false,
             },
             drop,
         )
@@ -4869,7 +4891,7 @@ mod tests {
         request(
             crucible_contract::decision_request::RequestStatus::Answered {
                 answer: crucible_contract::decision_request::AnswerRecord {
-                    labels: BTreeMap::from([(QuestionId::new("go").unwrap(), label(go))]),
+                    labels: BTreeMap::from([(QuestionId::new("go").unwrap(), vec![go.to_owned()])]),
                     decided_by: "user:wren".into(),
                     decided_at: "2026-10-06T17:00:00Z".into(),
                     evidence_digest: "sha256:ab".into(),
@@ -4890,6 +4912,7 @@ mod tests {
                         description: None,
                     })
                     .collect(),
+                multiple: false,
             },
             &[],
         )
@@ -5092,6 +5115,192 @@ mod tests {
         let desk = Desk::scripted(vec![open(), Err("502".into()), answered("approve")]);
         let (out, _) = run_gated(&desk, &human_gated(None), None);
         assert_eq!(out.results[&"launch".into()].status, TaskStatus::Pass);
+    }
+
+    /// plan -> gate(checks: multiple choice, nodes: pick from plan.nodes)
+    ///        -> lint [lint], unit [unit], e2e [e2e]
+    ///        -> launch over gate.nodes
+    fn picked() -> ValidPlan {
+        use crucible_contract::decision::{ChoiceOption, PickSource, QuestionKind};
+        let checks = question(
+            QuestionKind::Choice {
+                options: ["lint", "unit", "e2e"]
+                    .iter()
+                    .map(|o| ChoiceOption {
+                        label: label(o),
+                        description: None,
+                    })
+                    .collect(),
+                multiple: true,
+            },
+            &["uncertain"],
+        );
+        let nodes = question(
+            QuestionKind::Pick {
+                source: PickSource {
+                    task: "plan".into(),
+                    field: "nodes".into(),
+                },
+                multiple: true,
+            },
+            &[],
+        );
+        let mut launch = mapped_node("launch", "gate", "nodes", false);
+        launch.depends_on = vec!["gate".into()];
+        valid(
+            vec![
+                task("plan", &[], "any", true),
+                Task {
+                    task: TaskKind::Route {
+                        questions: BTreeMap::from([
+                            (QuestionId::new("checks").unwrap(), checks),
+                            (QuestionId::new("nodes").unwrap(), nodes),
+                        ]),
+                        decider: Decider::Human { review: None },
+                    },
+                    ..task("gate", &["plan"], crate::plan::ir::NEEDS_HUMAN, true)
+                },
+                when(task("lint", &["gate"], "any", false), "checks", &["lint"]),
+                when(task("unit", &["gate"], "any", false), "checks", &["unit"]),
+                when(task("e2e", &["gate"], "any", false), "checks", &["e2e"]),
+                launch,
+            ],
+            10.0,
+        )
+    }
+
+    fn run_picked(desk: &Desk) -> (PlanOutcome, ScriptRunner) {
+        let mut r = ScriptRunner::new();
+        r.outputs.insert(
+            "plan".into(),
+            serde_json::json!({"nodes": ["a1", "b2", "c3", "a1"]}),
+        );
+        let out = execute(
+            &picked(),
+            &human_substrate(),
+            ExecCfg {
+                decisions: Some(desk),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        (out, r)
+    }
+
+    fn answered_with(labels: &[(&str, &[&str])]) -> Result<RequestState, String> {
+        request(
+            crucible_contract::decision_request::RequestStatus::Answered {
+                answer: crucible_contract::decision_request::AnswerRecord {
+                    labels: labels
+                        .iter()
+                        .map(|(q, ls)| {
+                            (
+                                QuestionId::new(*q).unwrap(),
+                                ls.iter().map(|l| (*l).to_owned()).collect(),
+                            )
+                        })
+                        .collect(),
+                    decided_by: "user:wren".into(),
+                    decided_at: "2026-10-06T17:00:00Z".into(),
+                    evidence_digest: "sha256:ab".into(),
+                    note: None,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn a_pick_offers_the_source_list_and_the_picks_and_chosen_labels_route_the_run() {
+        let desk = Desk::scripted(vec![
+            open(),
+            answered_with(&[("checks", &["lint", "e2e"]), ("nodes", &["c3", "a1"])]),
+        ]);
+        let (out, r) = run_picked(&desk);
+        assert!(out.valid, "{:?}", out.results);
+        let opened = desk.opened.borrow();
+        assert_eq!(
+            opened[0].evidence.choices[&QuestionId::new("nodes").unwrap()],
+            ["a1", "b2", "c3"]
+        );
+        assert!(
+            !opened[0]
+                .evidence
+                .choices
+                .contains_key(&QuestionId::new("checks").unwrap())
+        );
+        assert_eq!(
+            names(&r),
+            ["plan", "lint", "e2e", "launch[c3]", "launch[a1]"]
+        );
+        assert_eq!(out.results[&"unit".into()].status, TaskStatus::NotTaken);
+        assert_eq!(
+            out.results[&"unit".into()].note.as_deref(),
+            Some("gate.checks resolved to lint, e2e")
+        );
+        let gate = out.results[&"gate".into()].output.clone().unwrap();
+        assert_eq!(gate["nodes"], serde_json::json!(["c3", "a1"]));
+        assert_eq!(gate["checks"]["labels"], serde_json::json!(["lint", "e2e"]));
+    }
+
+    #[test]
+    fn a_pick_the_request_did_not_offer_fails_the_route() {
+        let desk = Desk::scripted(vec![answered_with(&[
+            ("checks", &["lint"]),
+            ("nodes", &["zz"]),
+        ])]);
+        let (out, r) = run_picked(&desk);
+        assert!(!out.valid);
+        assert_eq!(names(&r), ["plan"]);
+        let gate = &out.results[&"gate".into()];
+        assert_eq!(gate.status, TaskStatus::Fail);
+        assert!(
+            gate.note.as_deref().unwrap().contains("did not offer"),
+            "{gate:?}"
+        );
+    }
+
+    #[test]
+    fn an_expired_pick_maps_over_nothing() {
+        let desk = Desk::scripted(vec![request(
+            crucible_contract::decision_request::RequestStatus::Expired,
+        )]);
+        let (out, r) = run_picked(&desk);
+        assert_eq!(names(&r), ["plan"]);
+        let gate = out.results[&"gate".into()].output.clone().unwrap();
+        assert_eq!(gate["nodes"], serde_json::json!([]));
+        for name in ["lint", "unit", "e2e"] {
+            assert_eq!(
+                out.results[&name.into()].status,
+                TaskStatus::NotTaken,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pick_whose_source_holds_no_strings_fails_without_opening_a_request() {
+        let desk = Desk::scripted(vec![open()]);
+        let mut r = ScriptRunner::new();
+        r.outputs
+            .insert("plan".into(), serde_json::json!({"nodes": [1, 2]}));
+        let out = execute(
+            &picked(),
+            &human_substrate(),
+            ExecCfg {
+                decisions: Some(&desk),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        assert!(desk.opened.borrow().is_empty());
+        let gate = &out.results[&"gate".into()];
+        assert_eq!(gate.status, TaskStatus::Fail);
+        assert!(
+            gate.note.as_deref().unwrap().contains("not a string"),
+            "{gate:?}"
+        );
     }
 
     #[test]

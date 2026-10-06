@@ -18,7 +18,9 @@ const SUMMARY = {
 const DECISION = {
   ...SUMMARY,
   state: 'open',
-  questions: [{ id: 'go', instructions: 'Launch the training job?', labels: ['approve', 'deny'] }],
+  questions: [
+    { id: 'go', instructions: 'Launch the training job?', kind: 'choice', multiple: false, options: ['approve', 'deny'] },
+  ],
   inputs: [
     {
       task: 'plan',
@@ -51,27 +53,41 @@ const DECISION = {
 const json = (route: Route, body: unknown) =>
   route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) });
 
-async function stubDecisions(page: Page, open: () => unknown[]): Promise<{ answers: unknown[] }> {
+const MULTI = {
+  ...DECISION,
+  questions: [
+    ...DECISION.questions,
+    { id: 'checks', instructions: 'Which checks first?', kind: 'choice', multiple: true, options: ['lint', 'unit', 'e2e'] },
+    { id: 'nodes', instructions: 'Which nodes?', kind: 'pick', multiple: true, options: ['gpu-a1', 'gpu-b2', 'gpu-c3'] },
+  ],
+};
+
+async function stubDecisions(
+  page: Page,
+  open: () => unknown[],
+  decision: object = DECISION,
+): Promise<{ answers: unknown[] }> {
   const answers: unknown[] = [];
-  let answered = false;
+  let answered: unknown = null;
   await page.route('**/api/decisions', (route) => json(route, { open: answered ? [] : open() }));
   await page.route(`**/api/decisions/${ID}`, (route) =>
     json(
       route,
       answered
         ? {
-            ...DECISION,
+            ...decision,
             state: 'answered',
             can_answer: false,
-            answer: { labels: { go: 'approve' }, decided_by: 'user:wren', decided_at: '2026-10-06T12:05:00Z', note: 'ship it' },
+            answer: { labels: answered, decided_by: 'user:wren', decided_at: '2026-10-06T12:05:00Z', note: 'ship it' },
           }
-        : DECISION,
+        : decision,
     ),
   );
   await page.route(`**/api/decisions/${ID}/answer`, (route) => {
-    answers.push(route.request().postDataJSON());
-    answered = true;
-    return json(route, { ...DECISION, state: 'answered', can_answer: false });
+    const body: unknown = route.request().postDataJSON();
+    answers.push(body);
+    answered = typeof body === 'object' && body !== null && 'labels' in body ? body.labels : {};
+    return json(route, { ...decision, state: 'answered', can_answer: false });
   });
   return { answers };
 }
@@ -133,7 +149,61 @@ test.describe('decision requests', () => {
 
     await expect(page.getByTestId('decision-answer')).toContainText('✓ approve');
     await expect(page.getByTestId('decision-answer')).toContainText('user:wren');
-    expect(answers).toEqual([{ labels: { go: 'approve' }, evidence_digest: DIGEST, note: 'ship it' }]);
+    expect(answers).toEqual([{ labels: { go: ['approve'] }, evidence_digest: DIGEST, note: 'ship it' }]);
+  });
+
+  test('a multiple choice toggles several labels and a pick sends the values in the order chosen', async ({ page }) => {
+    await stubApi(page);
+    const { answers } = await stubDecisions(page, () => [SUMMARY], MULTI);
+    await page.goto(`/decisions/${ID}`);
+
+    const submit = page.getByRole('button', { name: 'Submit' });
+    const checks = page.locator('fieldset[data-kind="choice"][data-multiple="true"]');
+    const nodes = page.locator('fieldset[data-kind="pick"]');
+    await expect(checks.locator('legend')).toContainText('any');
+    await expect(nodes.getByRole('button')).toHaveText(['gpu-a1', 'gpu-b2', 'gpu-c3']);
+    await expect(nodes.getByRole('button', { name: 'gpu-a1' })).toHaveCSS('text-transform', 'none');
+
+    await page.getByRole('button', { name: 'approve' }).click();
+    await checks.getByRole('button', { name: 'unit' }).click();
+    await checks.getByRole('button', { name: 'lint' }).click();
+    await checks.getByRole('button', { name: 'e2e' }).click();
+    await checks.getByRole('button', { name: 'e2e' }).click();
+    await expect(checks.getByRole('button', { name: 'unit' })).toHaveAttribute('aria-pressed', 'true');
+    await expect(checks.getByRole('button', { name: 'e2e' })).toHaveAttribute('aria-pressed', 'false');
+    await expect(submit).toBeDisabled();
+    await nodes.getByRole('button', { name: 'gpu-c3' }).click();
+    await nodes.getByRole('button', { name: 'gpu-a1' }).click();
+    await submit.click();
+
+    expect(answers).toEqual([
+      {
+        labels: { go: ['approve'], checks: ['unit', 'lint'], nodes: ['gpu-c3', 'gpu-a1'] },
+        evidence_digest: DIGEST,
+        note: null,
+      },
+    ]);
+    const shown = page.getByTestId('decision-answer');
+    await expect(shown).toContainText('✓ unit');
+    await expect(shown).toContainText('✓ lint');
+    await expect(shown).toContainText('✓ gpu-c3');
+  });
+
+  test('a page that throws while rendering shows the error and the rest of the app keeps working', async ({ page }) => {
+    await stubApi(page);
+    await stubDecisions(page, () => [SUMMARY], {
+      ...DECISION,
+      questions: [{ id: 'go', instructions: 'Launch the training job?', labels: ['approve', 'deny'] }],
+    });
+    await page.goto(`/decisions/${ID}`);
+
+    const failed = page.getByTestId('error-boundary');
+    await expect(failed).toContainText('Page failed');
+    await expect(failed.getByRole('button', { name: 'Reload' })).toBeVisible();
+    await page.getByRole('link', { name: 'Approvals' }).first().click();
+    await expect(page).toHaveURL('/approvals');
+    await expect(failed).toHaveCount(0);
+    await expect(page.getByTestId('decisions-open')).toBeVisible();
   });
 
   test('a request that opens while the app is up raises a notification that opens it', async ({ page }) => {

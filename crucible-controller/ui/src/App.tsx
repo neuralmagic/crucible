@@ -7,11 +7,11 @@ import {
   type LazyExoticComponent,
   type ReactNode,
 } from 'react';
-import { Route, Routes, Link, NavLink, Navigate } from 'react-router-dom';
+import { Route, Routes, Link, NavLink, Navigate, useLocation } from 'react-router-dom';
 import { $api } from './api/client';
 import { useAutoresearch } from './api/lanes';
 import { budgetPercent, budgetState, usd, yourSpendToday, type BudgetState } from './budget';
-import { cn, Spinner, Status, Tooltip } from './ui';
+import { cn, ErrorBoundary, Spinner, Status, Tooltip } from './ui';
 import { useDeviceFlag } from './useDeviceFlag';
 import { relativeTime } from './pages/journeyView';
 import { DisplayPrefs } from './DisplayPrefs';
@@ -416,6 +416,7 @@ export function App() {
   useResetOnActAs();
   const [collapsed, toggleRail] = useRailCollapsed();
   const autoresearch = useAutoresearch() === true;
+  const { pathname } = useLocation();
 
   return (
     <div className="flex h-screen min-h-0 flex-col">
@@ -451,6 +452,7 @@ export function App() {
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
         <main data-ui="main" className="min-h-0 min-w-0 flex-1 overflow-y-auto">
+          <ErrorBoundary key={pathname}>
           <Suspense
             fallback={
               <div className="p-4">
@@ -508,6 +510,7 @@ export function App() {
             />
             </Routes>
           </Suspense>
+          </ErrorBoundary>
         </main>
       </div>
     </div>

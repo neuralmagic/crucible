@@ -129,3 +129,10 @@ export function labelTone(label: string): LabelTone {
   if (STOP.has(key)) return 'stop';
   return 'neutral';
 }
+
+/// The options chosen after clicking `option`: it replaces a single answer, and toggles in a
+/// multiple one, which keeps the order options were chosen in.
+export function choose(current: readonly string[], option: string, multiple: boolean): string[] {
+  if (!multiple) return [option];
+  return current.includes(option) ? current.filter((o) => o !== option) : [...current, option];
+}

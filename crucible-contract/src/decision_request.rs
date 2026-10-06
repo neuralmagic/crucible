@@ -37,6 +37,9 @@ pub struct Evidence {
     /// The rendered review, CommonMark.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<String>,
+    /// Each pick question's options, read from its source when the request opened.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub choices: BTreeMap<QuestionId, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -103,7 +106,9 @@ pub struct RequestState {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RequestStatus {
     Open,
-    Answered { answer: AnswerRecord },
+    Answered {
+        answer: AnswerRecord,
+    },
     Expired,
     /// The run stopped while the request was open.
     Withdrawn,
@@ -112,7 +117,9 @@ pub enum RequestStatus {
 /// The accepted answer, filed in the route's output under [`DECISION_KEY`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnswerRecord {
-    pub labels: BTreeMap<QuestionId, Label>,
+    /// Every question's chosen values: one label for a single choice, one or more labels for a
+    /// multiple choice, one or more of the request's options for a pick.
+    pub labels: BTreeMap<QuestionId, Vec<String>>,
     /// The deciding user principal, `user:<login>`.
     pub decided_by: String,
     /// RFC 3339.
@@ -125,7 +132,7 @@ pub struct AnswerRecord {
 /// What a person submits. The orchestrator checks it against the open request.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubmitAnswer {
-    pub labels: BTreeMap<QuestionId, Label>,
+    pub labels: BTreeMap<QuestionId, Vec<String>>,
     pub evidence_digest: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -163,6 +170,10 @@ mod tests {
                 labels: vec![Label::new("approve").unwrap()],
             }],
             review: Some("# Launch 8 GPUs?".into()),
+            choices: BTreeMap::from([(
+                QuestionId::new("regions").unwrap(),
+                vec!["us-east-1".to_string(), "eu-west-1".to_string()],
+            )]),
         }
     }
 
@@ -177,6 +188,13 @@ mod tests {
         let mut c = evidence();
         c.run.spent_usd = 0.13;
         assert_ne!(a.digest().unwrap(), c.digest().unwrap());
+        let mut d = evidence();
+        d.choices.clear();
+        assert_ne!(
+            a.digest().unwrap(),
+            d.digest().unwrap(),
+            "the pick options are evidence"
+        );
     }
 
     #[test]
@@ -189,7 +207,7 @@ mod tests {
                 answer: AnswerRecord {
                     labels: BTreeMap::from([(
                         QuestionId::new("go").unwrap(),
-                        Label::new("approve").unwrap(),
+                        vec!["approve".to_string()],
                     )]),
                     decided_by: "user:wseaton".into(),
                     decided_at: "2026-10-06T17:00:00Z".into(),
@@ -200,7 +218,10 @@ mod tests {
         };
         let text = serde_json::to_string(&answered).unwrap();
         assert!(text.contains(r#""state":"answered""#), "{text}");
-        assert_eq!(serde_json::from_str::<RequestState>(&text).unwrap(), answered);
+        assert_eq!(
+            serde_json::from_str::<RequestState>(&text).unwrap(),
+            answered
+        );
         for status in [
             RequestStatus::Open,
             RequestStatus::Expired,

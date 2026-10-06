@@ -45,5 +45,11 @@ data = json.dumps([{"label": n["node"], "usd": round(n["gpus"] * rate * hours, 2
   }});
 </script>
 """)
-print(json.dumps({"model": "llama-8b", "gpus": gpus, "hours": hours, "est_usd": cost}))
+print(json.dumps({
+    "model": "llama-8b",
+    "gpus": gpus,
+    "hours": hours,
+    "est_usd": cost,
+    "nodes": [n["node"] for n in nodes],
+}))
 PY

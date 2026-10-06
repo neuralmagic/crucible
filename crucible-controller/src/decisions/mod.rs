@@ -4,15 +4,15 @@
 
 pub(crate) mod store;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use crucible_contract::decision::{Label, QuestionId};
-use crucible_contract::decision_request::{OpenRequest, RequestStatus, SubmitAnswer};
+use crucible_contract::decision::{Label, Question, QuestionId, QuestionKind};
+use crucible_contract::decision_request::{Evidence, OpenRequest, RequestStatus, SubmitAnswer};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use utoipa::ToSchema;
@@ -221,8 +221,12 @@ pub(crate) struct DecisionsDto {
 pub(crate) struct DecisionQuestionDto {
     pub id: String,
     pub instructions: String,
-    /// The labels an answer may give.
-    pub labels: Vec<String>,
+    /// `noul`, `choice`, or `pick`.
+    pub kind: String,
+    /// Whether an answer may give more than one option.
+    pub multiple: bool,
+    /// The options an answer gives from: a choice's labels, or the values a pick offers.
+    pub options: Vec<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -251,7 +255,7 @@ pub(crate) struct DecisionGatedDto {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct DecisionAnswerDto {
-    pub labels: BTreeMap<String, String>,
+    pub labels: BTreeMap<String, Vec<String>>,
     pub decided_by: String,
     pub decided_at: String,
     pub note: Option<String>,
@@ -297,7 +301,7 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
             labels: answer
                 .labels
                 .iter()
-                .map(|(q, l)| (q.to_string(), l.to_string()))
+                .map(|(q, values)| (q.to_string(), values.clone()))
                 .collect(),
             decided_by: answer.decided_by.clone(),
             decided_at: answer.decided_at.clone(),
@@ -313,7 +317,14 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
             .map(|(id, q)| DecisionQuestionDto {
                 id: id.to_string(),
                 instructions: q.instructions.clone(),
-                labels: q.labels().iter().map(Label::to_string).collect(),
+                kind: match q.kind {
+                    QuestionKind::Noul => "noul",
+                    QuestionKind::Choice { .. } => "choice",
+                    QuestionKind::Pick { .. } => "pick",
+                }
+                .to_owned(),
+                multiple: q.multiple(),
+                options: options(&d.evidence, id, q),
             })
             .collect(),
         inputs: d
@@ -418,18 +429,27 @@ pub(crate) async fn get_decision(
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct DecisionAnswerBody {
-    /// Question id to the chosen label.
-    pub labels: BTreeMap<String, String>,
+    /// Question id to the chosen options: one, or one or more for a question that takes several.
+    pub labels: BTreeMap<String, Vec<String>>,
     /// The digest of the evidence the answer was made on.
     pub evidence_digest: String,
     pub note: Option<String>,
 }
 
-/// Every question gets exactly one of its declared labels, never `uncertain`, and nothing else.
+/// The options a question offers: a pick's values from the evidence, else its labels.
+fn options(evidence: &Evidence, id: &QuestionId, q: &Question) -> Vec<String> {
+    if q.pick_source().is_some() {
+        return evidence.choices.get(id).cloned().unwrap_or_default();
+    }
+    q.labels().iter().map(Label::to_string).collect()
+}
+
+/// Every question gets one of its options, or for a question that takes several one or more
+/// distinct ones, never `uncertain`, and nothing else.
 fn checked(
     d: &store::Decision,
     body: &DecisionAnswerBody,
-) -> Result<BTreeMap<QuestionId, Label>, String> {
+) -> Result<BTreeMap<QuestionId, Vec<String>>, String> {
     if let Some(extra) = body
         .labels
         .keys()
@@ -439,14 +459,21 @@ fn checked(
     }
     let mut labels = BTreeMap::new();
     for (id, question) in &d.questions {
-        let Some(raw) = body.labels.get(id.as_str()) else {
-            return Err(format!("no label for {id}"));
+        let values = match body.labels.get(id.as_str()).map(Vec::as_slice) {
+            None | Some([]) => return Err(format!("no answer for {id}")),
+            Some(values) => values,
         };
-        let label = Label::new(raw.clone()).map_err(|e| e.to_string())?;
-        if label.is_uncertain() || !question.resolves_to(&label) {
-            return Err(format!("{id} has no label {raw:?}"));
+        if values.len() > 1 && !question.multiple() {
+            return Err(format!("{id} takes one answer"));
         }
-        labels.insert(id.clone(), label);
+        if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+            return Err(format!("{id} repeats an answer"));
+        }
+        let offered = options(&d.evidence, id, question);
+        if let Some(value) = values.iter().find(|v| !offered.contains(v)) {
+            return Err(format!("{id} has no option {value:?}"));
+        }
+        labels.insert(id.clone(), values.to_vec());
     }
     Ok(labels)
 }

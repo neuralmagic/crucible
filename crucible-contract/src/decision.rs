@@ -101,11 +101,35 @@ pub struct ChoiceOption {
     pub description: Option<String>,
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+/// Where a pick question's options come from: a list field of one of the route's dependencies,
+/// read when the route opens its request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PickSource {
+    pub task: String,
+    pub field: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QuestionKind {
     Noul,
-    Choice { options: Vec<ChoiceOption> },
+    /// One declared label, or with `multiple` one or more.
+    Choice {
+        options: Vec<ChoiceOption>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        multiple: bool,
+    },
+    /// One value, or with `multiple` one or more, from a list a dependency produced. A pick has
+    /// no labels, so no `when` may name it.
+    Pick {
+        source: PickSource,
+        #[serde(default, skip_serializing_if = "is_false")]
+        multiple: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,7 +183,28 @@ impl Question {
     pub fn labels(&self) -> Vec<Label> {
         match &self.kind {
             QuestionKind::Noul => vec![Label(NOUL_YES.to_owned()), Label(NOUL_NO.to_owned())],
-            QuestionKind::Choice { options } => options.iter().map(|o| o.label.clone()).collect(),
+            QuestionKind::Choice { options, .. } => {
+                options.iter().map(|o| o.label.clone()).collect()
+            }
+            QuestionKind::Pick { .. } => Vec::new(),
+        }
+    }
+
+    /// Whether an answer may hold more than one value.
+    pub fn multiple(&self) -> bool {
+        match &self.kind {
+            QuestionKind::Noul => false,
+            QuestionKind::Choice { multiple, .. } | QuestionKind::Pick { multiple, .. } => {
+                *multiple
+            }
+        }
+    }
+
+    /// The source of a pick question's options.
+    pub fn pick_source(&self) -> Option<&PickSource> {
+        match &self.kind {
+            QuestionKind::Pick { source, .. } => Some(source),
+            _ => None,
         }
     }
 
@@ -171,7 +216,7 @@ impl Question {
         if self.instructions.trim().is_empty() {
             return Err(QuestionError::EmptyInstructions);
         }
-        if let QuestionKind::Choice { options } = &self.kind {
+        if let QuestionKind::Choice { options, .. } = &self.kind {
             if options.len() < 2 {
                 return Err(QuestionError::TooFewOptions { got: options.len() });
             }
@@ -239,6 +284,7 @@ impl Question {
             label,
             confidence,
             probabilities,
+            labels: Vec::new(),
         })
     }
 }
@@ -278,6 +324,20 @@ pub struct Answer {
     pub label: Label,
     pub confidence: f64,
     pub probabilities: BTreeMap<Label, f64>,
+    /// Every label chosen, for a question that takes more than one; `label` is then the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub labels: Vec<Label>,
+}
+
+impl Answer {
+    /// Whether the answer chose `label`: one of a multiple answer's labels, else its one label.
+    pub fn chose(&self, label: &Label) -> bool {
+        if self.labels.is_empty() {
+            &self.label == label
+        } else {
+            self.labels.contains(label)
+        }
+    }
 }
 
 /// A route task's output: one answer per declared question.
@@ -304,6 +364,7 @@ mod tests {
                         description: None,
                     })
                     .collect(),
+                multiple: false,
             },
             drop: vec![],
         }
@@ -471,5 +532,55 @@ mod tests {
         let v = serde_json::to_value(&decision).unwrap();
         assert_eq!(v["urgent"]["label"], "yes");
         assert_eq!(v["urgent"]["probabilities"]["no"], 0.1);
+    }
+
+    #[test]
+    fn a_multiple_choice_and_a_pick_round_trip_and_a_single_choice_omits_multiple() {
+        let multiple: Question = serde_json::from_value(serde_json::json!({
+            "instructions": "which checks?",
+            "type": "choice",
+            "options": [{"label": "lint"}, {"label": "smoke"}],
+            "multiple": true,
+        }))
+        .unwrap();
+        assert!(multiple.multiple());
+        assert_eq!(multiple.labels(), vec![label("lint"), label("smoke")]);
+        let pick: Question = serde_json::from_value(serde_json::json!({
+            "instructions": "which regions?",
+            "type": "pick",
+            "source": {"task": "plan", "field": "regions"},
+        }))
+        .unwrap();
+        assert!(!pick.multiple());
+        assert!(pick.labels().is_empty());
+        assert_eq!(
+            pick.pick_source().map(|s| s.field.as_str()),
+            Some("regions")
+        );
+        pick.validate().unwrap();
+        for q in [&multiple, &pick] {
+            let text = serde_json::to_string(q).unwrap();
+            assert_eq!(&serde_json::from_str::<Question>(&text).unwrap(), q);
+        }
+        let single = serde_json::to_value(choice(&["a", "b"])).unwrap();
+        assert!(single.get("multiple").is_none(), "{single}");
+    }
+
+    #[test]
+    fn an_answer_chose_its_label_or_any_of_its_labels() {
+        let one = Answer {
+            label: label("a"),
+            confidence: 1.0,
+            probabilities: BTreeMap::new(),
+            labels: Vec::new(),
+        };
+        assert!(one.chose(&label("a")) && !one.chose(&label("b")));
+        let many = Answer {
+            labels: vec![label("a"), label("c")],
+            ..one
+        };
+        assert!(many.chose(&label("a")) && many.chose(&label("c")) && !many.chose(&label("b")));
+        let wire = serde_json::to_value(&many).unwrap();
+        assert_eq!(wire["labels"], serde_json::json!(["a", "c"]));
     }
 }

@@ -21,6 +21,7 @@ import {
 import { usd } from '../budget';
 import { MarkdownView } from './MarkdownView';
 import {
+  choose,
   decodeText,
   fileView,
   labelTone,
@@ -160,7 +161,7 @@ function Decision({ d }: { d: DecisionDto }) {
 
 function Answer({ d }: { d: DecisionDto }) {
   const queryClient = useQueryClient();
-  const [labels, setLabels] = useState<Record<string, string>>({});
+  const [labels, setLabels] = useState<Record<string, string[]>>({});
   const [note, setNote] = useState('');
   const mutation = $api.useMutation('post', '/api/decisions/{id}/answer');
 
@@ -170,12 +171,19 @@ function Answer({ d }: { d: DecisionDto }) {
         <SectionHeader title="Answer" />
         <SectionBody>
           <div className="flex flex-wrap gap-3" data-testid="decision-answer">
-            {Object.entries(d.answer.labels).map(([q, l]) => (
-              <span key={q} className="flex items-baseline gap-2">
+            {Object.entries(d.answer.labels).map(([q, values]) => (
+              <span key={q} className="flex flex-wrap items-baseline gap-2">
                 <Mono size="data" tone="ink-3">
                   {q}
                 </Mono>
-                <span className={cn(CHIP, CHOSEN[labelTone(l)])}>✓ {l}</span>
+                {values.map((value) => (
+                  <span
+                    key={value}
+                    className={cn(CHIP, CHOSEN[labelTone(value)], kindOf(d, q) === 'pick' && 'normal-case')}
+                  >
+                    ✓ {value}
+                  </span>
+                ))}
               </span>
             ))}
             <Mono size="data" tone="ink-3">
@@ -189,22 +197,33 @@ function Answer({ d }: { d: DecisionDto }) {
   }
   if (!d.can_answer) return null;
 
-  const complete = d.questions.every((q) => labels[q.id] !== undefined);
+  const complete = d.questions.every((q) => (labels[q.id] ?? []).length > 0);
   return (
     <Section>
       <SectionHeader title="Answer" />
       <SectionBody>
         {d.questions.map((q) => (
-          <fieldset key={q.id} className="m-0 mb-3 border-0 p-0">
-            <legend className="mb-1.5 text-ink">{q.instructions}</legend>
-            <div className="flex gap-2">
-              {q.labels.map((label) => (
+          <fieldset key={q.id} className="m-0 mb-3 border-0 p-0" data-kind={q.kind} data-multiple={q.multiple}>
+            <legend className="mb-1.5 flex items-baseline gap-2 text-ink">
+              {q.instructions}
+              {q.multiple ? (
+                <Mono size="data" tone="ink-3">
+                  any
+                </Mono>
+              ) : null}
+            </legend>
+            <div className="flex flex-wrap gap-2">
+              {q.options.map((option) => (
                 <LabelChoice
-                  key={label}
-                  label={label}
-                  chosen={labels[q.id] === label}
+                  key={option}
+                  label={option}
+                  literal={q.kind === 'pick'}
+                  chosen={(labels[q.id] ?? []).includes(option)}
                   onChoose={() => {
-                    setLabels((current) => ({ ...current, [q.id]: label }));
+                    setLabels((current) => ({
+                      ...current,
+                      [q.id]: choose(current[q.id] ?? [], option, q.multiple),
+                    }));
                   }}
                 />
               ))}
@@ -269,14 +288,28 @@ const CHOSEN: Record<LabelTone, string> = {
   neutral: 'border-ink bg-ink text-surface',
 };
 
-function LabelChoice({ label, chosen, onChoose }: { label: string; chosen: boolean; onChoose: () => void }) {
+function kindOf(d: DecisionDto, question: string): string | undefined {
+  return d.questions.find((q) => q.id === question)?.kind;
+}
+
+function LabelChoice({
+  label,
+  literal,
+  chosen,
+  onChoose,
+}: {
+  label: string;
+  literal: boolean;
+  chosen: boolean;
+  onChoose: () => void;
+}) {
   const tone = labelTone(label);
   return (
     <button
       type="button"
       aria-pressed={chosen}
       data-tone={tone}
-      className={cn(CHIP, 'cursor-pointer', chosen ? CHOSEN[tone] : OFFERED[tone])}
+      className={cn(CHIP, 'cursor-pointer', literal && 'normal-case', chosen ? CHOSEN[tone] : OFFERED[tone])}
       onClick={onChoose}
     >
       {chosen ? '✓ ' : ''}

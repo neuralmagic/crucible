@@ -2,7 +2,7 @@
 //! route's decision request through a [`DecisionDesk`], parks the route while other work runs,
 //! and settles it from the request's terminal state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::plan::exec::{TaskResult, TaskRunner, TaskStatus};
 use crate::plan::ir::{Task, TaskName, ValidPlan};
-use crucible_contract::decision::{Answer, Decision, Label, Question, QuestionId};
+use crucible_contract::decision::{Answer, Decision, Label, Question, QuestionId, QuestionKind};
 use crucible_contract::decision_request::{
     AnswerRecord, DECISION_KEY, Evidence, FileEvidence, GatedTask, InputEvidence, OpenRequest,
     RequestState, RequestStatus, RunEvidence,
@@ -40,6 +40,7 @@ pub fn evidence_limit() -> usize {
 pub struct EvidenceInputs<'a> {
     pub plan: &'a ValidPlan,
     pub route: &'a Task,
+    pub questions: &'a BTreeMap<QuestionId, Question>,
     pub results: &'a BTreeMap<TaskName, TaskResult>,
     pub runner: &'a dyn TaskRunner,
     pub run: RunEvidence,
@@ -51,6 +52,7 @@ pub fn build_evidence(inputs: EvidenceInputs<'_>) -> Result<Evidence, String> {
     let EvidenceInputs {
         plan,
         route,
+        questions,
         results,
         runner,
         run,
@@ -101,11 +103,25 @@ pub fn build_evidence(inputs: EvidenceInputs<'_>) -> Result<Evidence, String> {
             })
         })
         .collect();
+    let mut choices = BTreeMap::new();
+    for (id, question) in questions {
+        if let Some(source) = question.pick_source() {
+            let output = results
+                .get(&TaskName(source.task.clone()))
+                .filter(|r| r.status == TaskStatus::Pass)
+                .and_then(|r| r.output.as_ref());
+            choices.insert(
+                id.clone(),
+                pick_options(output, &source.task, &source.field)?,
+            );
+        }
+    }
     let mut evidence = Evidence {
         inputs: deps,
         run,
         gated,
         review: None,
+        choices,
     };
     if let Some(template) = review {
         let context = serde_json::to_value(&evidence).map_err(|e| e.to_string())?;
@@ -120,6 +136,35 @@ pub fn build_evidence(inputs: EvidenceInputs<'_>) -> Result<Evidence, String> {
         ));
     }
     Ok(evidence)
+}
+
+/// A pick question's options: the strings of a list field of its source's output, first
+/// occurrence kept.
+fn pick_options(output: Option<&Value>, task: &str, field: &str) -> Result<Vec<String>, String> {
+    let Some(output) = output else {
+        return Err(format!("{task} produced no output to pick {field} from"));
+    };
+    let Some(items) = output.get(field).and_then(Value::as_array) else {
+        return Err(format!("{task}.{field} is not a list"));
+    };
+    let mut seen = BTreeSet::new();
+    let mut options = Vec::new();
+    for item in items {
+        let Some(item) = item.as_str() else {
+            return Err(format!(
+                "{task}.{field} holds {item}, which is not a string"
+            ));
+        };
+        if seen.insert(item) {
+            options.push(item.to_owned());
+        }
+    }
+    if options.is_empty() {
+        return Err(format!(
+            "{task}.{field} is empty, so there is nothing to pick"
+        ));
+    }
+    Ok(options)
 }
 
 /// Render a review template over the evidence. Every inserted value is escaped for CommonMark,
@@ -172,30 +217,37 @@ fn media_type(path: &str) -> &'static str {
     }
 }
 
-/// The route's settled result for a terminal request state; `None` while it is open.
+/// The route's settled result for a terminal request state; `None` while it is open. `choices`
+/// are the pick options the request's evidence offered.
 pub fn settle(
     questions: &BTreeMap<QuestionId, Question>,
+    choices: &BTreeMap<QuestionId, Vec<String>>,
     state: &RequestState,
 ) -> Option<TaskResult> {
     match &state.status {
         RequestStatus::Open => None,
-        RequestStatus::Answered { answer } => Some(answered(questions, answer)),
+        RequestStatus::Answered { answer } => Some(answered(questions, choices, answer)),
         RequestStatus::Expired => {
-            let decision = questions
-                .keys()
-                .map(|id| {
-                    (
+            let mut decision = BTreeMap::new();
+            let mut picks = BTreeMap::new();
+            for (id, question) in questions {
+                if question.pick_source().is_some() {
+                    picks.insert(id.clone(), Vec::new());
+                } else {
+                    decision.insert(
                         id.clone(),
                         Answer {
                             label: Label::uncertain(),
                             confidence: 0.0,
                             probabilities: BTreeMap::new(),
+                            labels: Vec::new(),
                         },
-                    )
-                })
-                .collect();
+                    );
+                }
+            }
             Some(passing(
                 Decision(decision),
+                picks,
                 serde_json::json!({
                     "outcome": "expired",
                     "decided_by": null,
@@ -207,43 +259,91 @@ pub fn settle(
     }
 }
 
-fn answered(questions: &BTreeMap<QuestionId, Question>, answer: &AnswerRecord) -> TaskResult {
+fn answered(
+    questions: &BTreeMap<QuestionId, Question>,
+    choices: &BTreeMap<QuestionId, Vec<String>>,
+    answer: &AnswerRecord,
+) -> TaskResult {
     if let Some(extra) = answer.labels.keys().find(|id| !questions.contains_key(*id)) {
         return failing(format!(
             "the answer names {extra:?}, which the route does not ask"
         ));
     }
     let mut decision = BTreeMap::new();
+    let mut picks = BTreeMap::new();
     for (id, question) in questions {
-        let Some(label) = answer.labels.get(id) else {
-            return failing(format!("the answer gives no label for {id:?}"));
+        let values = match answer.labels.get(id).map(Vec::as_slice) {
+            None | Some([]) => return failing(format!("the answer gives nothing for {id:?}")),
+            Some(values) => values,
         };
-        if label.is_uncertain() || !question.resolves_to(label) {
+        if values.len() > 1 && !question.multiple() {
             return failing(format!(
-                "the answer gives {label:?} for {id:?}, which the question does not declare"
+                "the answer gives {} values for {id:?}, which takes one",
+                values.len()
             ));
         }
+        if values.iter().collect::<BTreeSet<_>>().len() != values.len() {
+            return failing(format!("the answer repeats a value for {id:?}"));
+        }
+        if let QuestionKind::Pick { .. } = question.kind {
+            let offered = choices.get(id).map_or(&[][..], Vec::as_slice);
+            if let Some(value) = values.iter().find(|v| !offered.contains(v)) {
+                return failing(format!(
+                    "the answer picks {value:?} for {id:?}, which the request did not offer"
+                ));
+            }
+            picks.insert(id.clone(), values.to_vec());
+            continue;
+        }
+        let mut labels = Vec::with_capacity(values.len());
+        for value in values {
+            match Label::new(value.as_str()) {
+                Ok(label) if !label.is_uncertain() && question.resolves_to(&label) => {
+                    labels.push(label);
+                }
+                _ => {
+                    return failing(format!(
+                        "the answer gives {value:?} for {id:?}, which the question does not declare"
+                    ));
+                }
+            }
+        }
+        let Some(first) = labels.first().cloned() else {
+            return failing(format!("the answer gives nothing for {id:?}"));
+        };
         decision.insert(
             id.clone(),
             Answer {
-                label: label.clone(),
+                label: first,
                 confidence: 1.0,
-                probabilities: BTreeMap::from([(label.clone(), 1.0)]),
+                probabilities: labels.iter().map(|l| (l.clone(), 1.0)).collect(),
+                labels: if question.multiple() {
+                    labels
+                } else {
+                    Vec::new()
+                },
             },
         );
     }
     match serde_json::to_value(answer) {
-        Ok(record) => passing(Decision(decision), record),
+        Ok(record) => passing(Decision(decision), picks, record),
         Err(e) => failing(e.to_string()),
     }
 }
 
-fn passing(decision: Decision, record: Value) -> TaskResult {
+fn passing(
+    decision: Decision,
+    picks: BTreeMap<QuestionId, Vec<String>>,
+    record: Value,
+) -> TaskResult {
     let mut output = match serde_json::to_value(decision) {
         Ok(output) => output,
         Err(e) => return failing(e.to_string()),
     };
     if let Some(object) = output.as_object_mut() {
+        for (id, values) in picks {
+            object.insert(id.to_string(), Value::from(values));
+        }
         object.insert(DECISION_KEY.to_owned(), record);
     }
     TaskResult {
@@ -276,9 +376,9 @@ pub(crate) fn failing(note: String) -> TaskResult {
 #[cfg(test)]
 mod tests {
     use crate::plan::decide::*;
+    use crucible_contract::decision::{ChoiceOption, PickSource};
 
-    fn choice(labels: &[&str]) -> Question {
-        use crucible_contract::decision::{ChoiceOption, QuestionKind};
+    fn choice(labels: &[&str], multiple: bool) -> Question {
         Question {
             instructions: "launch it?".into(),
             kind: QuestionKind::Choice {
@@ -289,13 +389,50 @@ mod tests {
                         description: None,
                     })
                     .collect(),
+                multiple,
             },
             drop: Vec::new(),
         }
     }
 
+    fn pick(multiple: bool) -> Question {
+        Question {
+            instructions: "which nodes?".into(),
+            kind: QuestionKind::Pick {
+                source: PickSource {
+                    task: "plan".into(),
+                    field: "nodes".into(),
+                },
+                multiple,
+            },
+            drop: Vec::new(),
+        }
+    }
+
+    fn id(name: &str) -> QuestionId {
+        QuestionId::new(name).unwrap()
+    }
+
     fn questions() -> BTreeMap<QuestionId, Question> {
-        BTreeMap::from([(QuestionId::new("go").unwrap(), choice(&["approve", "deny"]))])
+        BTreeMap::from([(id("go"), choice(&["approve", "deny"], false))])
+    }
+
+    fn mixed() -> BTreeMap<QuestionId, Question> {
+        BTreeMap::from([
+            (id("go"), choice(&["approve", "deny"], false)),
+            (id("checks"), choice(&["lint", "unit", "e2e"], true)),
+            (id("node"), pick(false)),
+            (id("nodes"), pick(true)),
+        ])
+    }
+
+    fn offered() -> BTreeMap<QuestionId, Vec<String>> {
+        let nodes = vec!["a1".to_owned(), "b2".to_owned(), "c3".to_owned()];
+        BTreeMap::from([(id("node"), nodes.clone()), (id("nodes"), nodes)])
+    }
+
+    fn none() -> BTreeMap<QuestionId, Vec<String>> {
+        BTreeMap::new()
     }
 
     fn state(status: RequestStatus) -> RequestState {
@@ -307,12 +444,12 @@ mod tests {
         }
     }
 
-    fn answer(labels: &[(&str, &str)]) -> RequestStatus {
+    fn answer(labels: &[(&str, &[&str])]) -> RequestStatus {
         RequestStatus::Answered {
             answer: AnswerRecord {
                 labels: labels
                     .iter()
-                    .map(|(q, l)| (QuestionId::new(*q).unwrap(), Label::new(*l).unwrap()))
+                    .map(|(q, ls)| (id(q), ls.iter().map(|l| (*l).to_owned()).collect()))
                     .collect(),
                 decided_by: "user:wseaton".into(),
                 decided_at: "2026-10-06T17:00:00Z".into(),
@@ -324,48 +461,161 @@ mod tests {
 
     #[test]
     fn an_open_request_settles_nothing() {
-        assert!(settle(&questions(), &state(RequestStatus::Open)).is_none());
+        assert!(settle(&questions(), &none(), &state(RequestStatus::Open)).is_none());
     }
 
     #[test]
     fn an_answer_settles_the_route_with_its_labels_and_the_record() {
-        let r = settle(&questions(), &state(answer(&[("go", "approve")]))).unwrap();
+        let r = settle(
+            &questions(),
+            &none(),
+            &state(answer(&[("go", &["approve"])])),
+        )
+        .unwrap();
         assert_eq!(r.status, TaskStatus::Pass);
         let out = r.output.unwrap();
         assert_eq!(out["go"]["label"], "approve");
         assert_eq!(out["go"]["confidence"], 1.0);
+        assert!(out["go"].get("labels").is_none());
         assert_eq!(out[DECISION_KEY]["decided_by"], "user:wseaton");
         assert_eq!(out[DECISION_KEY]["note"], "ship it");
+        assert_eq!(
+            out[DECISION_KEY]["labels"]["go"],
+            serde_json::json!(["approve"])
+        );
     }
 
     #[test]
     fn an_answer_off_the_declared_labels_fails_the_route() {
-        for labels in [
-            vec![("go", "maybe")],
-            vec![("go", "uncertain")],
-            vec![],
-            vec![("go", "approve"), ("other", "approve")],
-        ] {
-            let r = settle(&questions(), &state(answer(&labels))).unwrap();
+        let cases: [&[(&str, &[&str])]; 7] = [
+            &[("go", &["maybe"])],
+            &[("go", &["uncertain"])],
+            &[("go", &["Not A Label"])],
+            &[],
+            &[("go", &[])],
+            &[("go", &["approve", "deny"])],
+            &[("go", &["approve"]), ("other", &["approve"])],
+        ];
+        for labels in cases {
+            let r = settle(&questions(), &none(), &state(answer(labels))).unwrap();
             assert_eq!(r.status, TaskStatus::Fail, "{labels:?}");
         }
     }
 
     #[test]
+    fn a_multiple_choice_and_picks_settle_with_every_value() {
+        let r = settle(
+            &mixed(),
+            &offered(),
+            &state(answer(&[
+                ("go", &["approve"]),
+                ("checks", &["unit", "lint"]),
+                ("node", &["b2"]),
+                ("nodes", &["c3", "a1"]),
+            ])),
+        )
+        .unwrap();
+        assert_eq!(r.status, TaskStatus::Pass, "{:?}", r.note);
+        let out = r.output.unwrap();
+        assert_eq!(out["checks"]["label"], "unit");
+        assert_eq!(out["checks"]["labels"], serde_json::json!(["unit", "lint"]));
+        assert_eq!(out["checks"]["probabilities"]["lint"], 1.0);
+        let checks: Answer = serde_json::from_value(out["checks"].clone()).unwrap();
+        assert!(checks.chose(&Label::new("lint").unwrap()));
+        assert!(!checks.chose(&Label::new("e2e").unwrap()));
+        assert_eq!(out["node"], serde_json::json!(["b2"]));
+        assert_eq!(out["nodes"], serde_json::json!(["c3", "a1"]));
+    }
+
+    #[test]
+    fn a_multiple_answer_holding_one_label_still_lists_it() {
+        let r = settle(
+            &mixed(),
+            &offered(),
+            &state(answer(&[
+                ("go", &["deny"]),
+                ("checks", &["e2e"]),
+                ("node", &["a1"]),
+                ("nodes", &["a1"]),
+            ])),
+        )
+        .unwrap();
+        let out = r.output.unwrap();
+        assert_eq!(out["checks"]["labels"], serde_json::json!(["e2e"]));
+    }
+
+    #[test]
+    fn a_pick_or_multiple_answer_off_its_bounds_fails_the_route() {
+        let base: [(&str, &[&str]); 4] = [
+            ("go", &["approve"]),
+            ("checks", &["lint"]),
+            ("node", &["a1"]),
+            ("nodes", &["a1"]),
+        ];
+        let cases: [(&str, &[&str]); 7] = [
+            ("node", &["zz"]),
+            ("node", &["a1", "b2"]),
+            ("nodes", &["a1", "a1"]),
+            ("nodes", &[]),
+            ("checks", &["lint", "lint"]),
+            ("checks", &["lint", "nope"]),
+            ("checks", &["uncertain"]),
+        ];
+        for (question, values) in cases {
+            let labels: Vec<(&str, &[&str])> = base
+                .iter()
+                .map(|(q, v)| {
+                    if *q == question {
+                        (*q, values)
+                    } else {
+                        (*q, *v)
+                    }
+                })
+                .collect();
+            let r = settle(&mixed(), &offered(), &state(answer(&labels))).unwrap();
+            assert_eq!(r.status, TaskStatus::Fail, "{question} {values:?}");
+        }
+        let r = settle(&mixed(), &none(), &state(answer(&base))).unwrap();
+        assert_eq!(
+            r.status,
+            TaskStatus::Fail,
+            "a pick the request did not offer"
+        );
+    }
+
+    #[test]
     fn expiry_answers_every_question_uncertain_and_passes() {
-        let r = settle(&questions(), &state(RequestStatus::Expired)).unwrap();
+        let r = settle(&mixed(), &offered(), &state(RequestStatus::Expired)).unwrap();
         assert_eq!(r.status, TaskStatus::Pass);
         let out = r.output.unwrap();
         assert_eq!(out["go"]["label"], "uncertain");
         assert_eq!(out["go"]["confidence"], 0.0);
+        assert_eq!(out["checks"]["label"], "uncertain");
+        assert!(out["checks"].get("labels").is_none());
+        assert_eq!(out["nodes"], serde_json::json!([]));
+        assert_eq!(out["node"], serde_json::json!([]));
         assert_eq!(out[DECISION_KEY]["outcome"], "expired");
         assert!(out[DECISION_KEY]["decided_by"].is_null());
     }
 
     #[test]
     fn withdrawal_fails_the_route() {
-        let r = settle(&questions(), &state(RequestStatus::Withdrawn)).unwrap();
+        let r = settle(&questions(), &none(), &state(RequestStatus::Withdrawn)).unwrap();
         assert_eq!(r.status, TaskStatus::Fail);
+    }
+
+    #[test]
+    fn pick_options_are_the_source_strings_in_order_without_repeats() {
+        let out =
+            serde_json::json!({"nodes": ["b", "a", "b"], "n": 3, "mixed": ["a", 1], "none": []});
+        assert_eq!(
+            pick_options(Some(&out), "plan", "nodes").unwrap(),
+            ["b", "a"]
+        );
+        for field in ["n", "mixed", "none", "missing"] {
+            assert!(pick_options(Some(&out), "plan", field).is_err(), "{field}");
+        }
+        assert!(pick_options(None, "plan", "nodes").is_err());
     }
 
     #[test]

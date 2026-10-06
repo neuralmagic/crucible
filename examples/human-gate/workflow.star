@@ -1,7 +1,13 @@
 plan = command(
     name = "plan",
     run = "./plan.sh",
-    emits = {"model": "string", "gpus": "integer", "hours": "number", "est_usd": "number"},
+    emits = {
+        "model": "string",
+        "gpus": "integer",
+        "hours": "number",
+        "est_usd": "number",
+        "nodes": "list",
+    },
     emits_files = ["out/cost.html", "out/nodes.csv", "out/plan.md"],
 )
 
@@ -21,6 +27,20 @@ gate = route(
                 "deny": "shelve the plan",
             },
         ),
+        "nodes": pick(
+            ask = "Which nodes should run it?",
+            source = plan.nodes,
+            multiple = True,
+        ),
+        "checks": choice(
+            ask = "Which checks run alongside it?",
+            options = {
+                "smoke": "a one-step smoke run",
+                "eval": "the held-out eval",
+            },
+            multiple = True,
+            drop = ["uncertain"],
+        ),
     },
 )
 
@@ -30,6 +50,24 @@ launch = command(
     depends_on = [gate],
     when = gate.launch,
     answers = "approve",
+    over = gate.nodes,
+    max_fanout = 8,
+)
+
+smoke = command(
+    name = "smoke",
+    run = "./act.sh smoke",
+    depends_on = [gate],
+    when = gate.checks,
+    answers = "smoke",
+)
+
+held_out = command(
+    name = "eval",
+    run = "./act.sh eval",
+    depends_on = [gate],
+    when = gate.checks,
+    answers = "eval",
 )
 
 shelve = command(
@@ -43,8 +81,12 @@ shelve = command(
 done = command(
     name = "done",
     run = "./act.sh done",
-    depends_on = [launch, shelve, lint],
+    depends_on = [launch, smoke, held_out, shelve, lint],
     join = "passed",
 )
 
-workflow(type = "playbook", tasks = [plan, lint, gate, launch, shelve, done], result = done)
+workflow(
+    type = "playbook",
+    tasks = [plan, lint, gate, launch, smoke, held_out, shelve, done],
+    result = done,
+)

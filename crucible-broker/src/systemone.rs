@@ -94,7 +94,8 @@ pub fn request_body(
             let mut body = json!({ "instructions": q.instructions });
             match &q.kind {
                 QuestionKind::Noul => body["type"] = json!("noul"),
-                QuestionKind::Choice { options } => {
+                QuestionKind::Pick { .. } => body["type"] = json!("pick"),
+                QuestionKind::Choice { options, .. } => {
                     body["type"] = json!("choice");
                     body["criteria"] = Value::Object(
                         options
@@ -172,6 +173,9 @@ fn probabilities(
         ))),
         (QuestionKind::Choice { .. }, WireAnswer::Noul { .. }) => Err(invalid(format!(
             "question {id:?} is a choice but was answered as a noul"
+        ))),
+        (QuestionKind::Pick { .. }, _) => Err(invalid(format!(
+            "question {id:?} is a pick, which only a person answers"
         ))),
     }
 }
@@ -261,6 +265,7 @@ mod tests {
                                 description: None,
                             },
                         ],
+                        multiple: false,
                     },
                     drop: vec![],
                 },

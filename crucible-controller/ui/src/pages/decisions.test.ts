@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   EVIDENCE_CSP,
+  choose,
   decodeText,
   fileView,
   labelTone,
@@ -128,5 +129,26 @@ describe("labelTone", () => {
     for (const label of ["approve", "Yes", "launch"]) expect(labelTone(label)).toBe("go");
     for (const label of ["deny", "NO", "shelve"]) expect(labelTone(label)).toBe("stop");
     for (const label of ["scheduler", "maybe", ""]) expect(labelTone(label)).toBe("neutral");
+  });
+});
+
+describe('choose', () => {
+  it('replaces a single answer', () => {
+    expect(choose([], 'approve', false)).toEqual(['approve']);
+    expect(choose(['approve'], 'deny', false)).toEqual(['deny']);
+    expect(choose(['approve'], 'approve', false)).toEqual(['approve']);
+  });
+
+  it('toggles a multiple answer in the order chosen', () => {
+    const picked = choose(choose([], 'c3', true), 'a1', true);
+    expect(picked).toEqual(['c3', 'a1']);
+    expect(choose(picked, 'c3', true)).toEqual(['a1']);
+    expect(choose(choose(picked, 'c3', true), 'a1', true)).toEqual([]);
+  });
+
+  it('leaves its input alone', () => {
+    const current = ['a1'];
+    choose(current, 'b2', true);
+    expect(current).toEqual(['a1']);
   });
 });

@@ -2,7 +2,7 @@
 //! is the one every reader and the answer path agree on.
 
 use anyhow::{Context, Result};
-use crucible_contract::decision::{Label, Question, QuestionId};
+use crucible_contract::decision::{Question, QuestionId};
 use crucible_contract::decision_request::{
     AnswerRecord, Evidence, OpenRequest, RequestState, RequestStatus,
 };
@@ -49,6 +49,14 @@ macro_rules! select {
     };
 }
 
+#[derive(Debug, thiserror::Error)]
+enum StoreError {
+    #[error("decision request in unknown state {0:?}")]
+    UnknownState(String),
+    #[error("decision request {0} vanished")]
+    Vanished(String),
+}
+
 fn decode(row: &sqlx::postgres::PgRow) -> Result<Decision> {
     let state: String = row.try_get("state")?;
     let evidence_digest: String = row.try_get("evidence_digest")?;
@@ -68,7 +76,7 @@ fn decode(row: &sqlx::postgres::PgRow) -> Result<Decision> {
                 },
             }
         }
-        other => anyhow::bail!("decision request in unknown state {other:?}"),
+        other => return Err(StoreError::UnknownState(other.to_owned()).into()),
     };
     let questions: serde_json::Value = row.try_get("questions")?;
     let evidence: serde_json::Value = row.try_get("evidence")?;
@@ -154,7 +162,7 @@ pub(crate) enum Refused {
 pub(crate) async fn answer(
     conn: &mut sqlx::PgConnection,
     id: &str,
-    labels: &BTreeMap<QuestionId, Label>,
+    labels: &BTreeMap<QuestionId, Vec<String>>,
     evidence_digest: &str,
     decided_by: &str,
     note: Option<&str>,
@@ -181,7 +189,7 @@ pub(crate) async fn answer(
         .fetch_optional(&mut *conn)
         .await?;
     let Some(current) = row.as_ref().map(decode).transpose()? else {
-        anyhow::bail!("decision request {id} vanished");
+        return Err(StoreError::Vanished(id.to_owned()).into());
     };
     Ok(Err(match &current.status {
         RequestStatus::Open if current.evidence_digest != evidence_digest => Refused::StaleEvidence,
@@ -203,7 +211,7 @@ pub(crate) async fn answer(
 pub(crate) async fn withdraw_run(pool: &PgPool, run_id: &str) -> Result<Vec<Decision>> {
     let ids: Vec<String> = sqlx::query_scalar(
         "UPDATE decision_requests SET state = 'withdrawn' \
-         WHERE run_id = $1 AND state = 'open' RETURNING id",
+         WHERE run_id = $1 AND state = 'open' AND expires_at > now() RETURNING id",
     )
     .bind(run_id)
     .fetch_all(pool)
