@@ -1,16 +1,10 @@
 use crate::client::Db;
 use crate::config::ControllerCfg;
-#[cfg(feature = "autoresearch")]
 use crate::event_log::Event;
-#[cfg(feature = "autoresearch")]
 use crate::issues::approvals;
 use crate::issues::model::Issue;
-#[cfg(feature = "autoresearch")]
 use crate::model::{ParkReason, ParkedBy, Status};
-use crate::runs::completion::ingest_completion;
-#[cfg(feature = "autoresearch")]
 use crate::runs::model::{NewRun, new_run_id};
-#[cfg(feature = "autoresearch")]
 use anyhow::Context;
 use anyhow::Result;
 
@@ -19,7 +13,6 @@ use anyhow::Result;
 /// queue retry a deterministic failure `park_after` times before parking on a stringified anyhow.
 /// `from` is the caller's current state (`awaiting-approval` at the plan-time check, `building` once
 /// the run is build-blocked).
-#[cfg(feature = "autoresearch")]
 async fn park_on_permanent_plan_error(
     db: &Db,
     issue_key: &str,
@@ -41,7 +34,6 @@ async fn park_on_permanent_plan_error(
     Ok(())
 }
 
-#[cfg(feature = "autoresearch")]
 async fn plan_builds_or_park(
     db: &Db,
     issue: &Issue,
@@ -64,7 +56,6 @@ async fn plan_builds_or_park(
 /// concurrency cap (`max_concurrent_pods`): over it the dispatch declines ([`RunAdmission::Capped`])
 /// and the row simply stays `awaiting-approval`, the durable per-issue queue re-driven when a slot
 /// frees (no separate work-pod queue row — the issue state IS the queue for a run).
-#[cfg(feature = "autoresearch")]
 pub(super) async fn reconcile_awaiting(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let Some(scope) = crate::issues::store::latest_scope_for_issue(db.pool(), &issue.key).await?
     else {
@@ -133,7 +124,6 @@ pub(super) async fn reconcile_awaiting(db: &Db, cfg: &ControllerCfg, issue: &Iss
 /// dispatches the loop pod through the WorkPod primitive (non-blocking), and — on a won CAS —
 /// records the run + logs the transition + clears any redispatch stash. A full concurrency cap
 /// declines with a `capped` ledger row, leaving the issue at `from` to re-drive when a slot frees.
-#[cfg(feature = "autoresearch")]
 async fn launch_approved_run(
     db: &Db,
     cfg: &ControllerCfg,
@@ -282,7 +272,6 @@ async fn launch_approved_run(
 /// a digest → launch the run (`building` → `running`). A failed/timed-out build (or one the
 /// backend keeps refusing) parks the issue (machine) with the build-log pointer as the reason. NOT gated on
 /// the autopilot pause — a build in flight is in-progress work, like a `running` run, not new spend.
-#[cfg(feature = "autoresearch")]
 pub(super) async fn reconcile_building(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let Some(scope) = crate::issues::store::latest_scope_for_issue(db.pool(), &issue.key).await?
     else {
@@ -364,34 +353,13 @@ pub(super) async fn reconcile_building(db: &Db, cfg: &ControllerCfg, issue: &Iss
     }
 }
 
-/// `running`: normal completion stays event-driven — the kube pod watch sees the pod finish and
-/// calls [`complete_run`] (ingest + advance) in seconds. A reconcile of a live run acts on two
-/// exceptions: a **runless** `running` row (no live run behind the status — an unparked no-session
-/// park, or a crash-lost `record_run`) self-heals back to the approval gate, where a standing
-/// approval re-dispatches; and the upstream issue **closing** stops the run (via the run's
+/// `running`, past the completion edge [`crate::issues::reconcile::reconcile`] runs ahead of the
+/// status dispatch: a **runless** `running` row (no live run behind the status — an unparked
+/// no-session park, or a crash-lost `record_run`) self-heals back to the approval gate, where a
+/// standing approval re-dispatches; and the upstream issue **closing** stops the run (via the run's
 /// own stop machinery, so a kept candidate still lands its draft PR) and parks it "upstream closed" —
 /// budget is not spent on solved problems. A no-op when GitHub isn't configured or the issue is open.
 pub(super) async fn reconcile_running(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
-    // The pod-completion edge: the pod watch enqueued this key because its loop pod
-    // finished, so fold the published session log in and advance to `done`. `false` means the run is
-    // still in flight (a stale/upstream-poll re-enqueue), so fall through to the upstream-close check.
-    match ingest_completion(db, cfg, &issue.key).await {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(issue_key = %issue.key, error = format!("{e:#}"), "ingest: completion check failed")
-        }
-    }
-    #[cfg(feature = "autoresearch")]
-    if cfg.autoresearch_enabled() {
-        return heal_or_watch_upstream(db, cfg, issue).await;
-    }
-    Ok(())
-}
-
-/// The scored lane's half of [`reconcile_running`].
-#[cfg(feature = "autoresearch")]
-async fn heal_or_watch_upstream(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     // Self-heal the runless-`running` wedge: no run row is live for this issue (the last run went
     // terminal — e.g. a no-session park later unparked back to `running` — or a crash lost the row
     // between the status claim and `record_run`). The completion edge already fired or never will,
@@ -424,7 +392,6 @@ async fn heal_or_watch_upstream(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> 
 /// horizon (the poll source refreshes it); the next reconcile pass scopes the revived row.
 /// Other machine parks stay resting, which keeps a deliberate startup re-enqueue of parked
 /// rows harmless.
-#[cfg(feature = "autoresearch")]
 pub(super) async fn reconcile_parked(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     if issue.parked_by == Some(ParkedBy::Machine)
         && issue

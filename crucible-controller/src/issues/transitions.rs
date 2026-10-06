@@ -92,9 +92,11 @@ pub async fn park(
     Ok(true)
 }
 
-/// Atomically park a running issue and terminalize the run pod that supplied the failure
-/// evidence. The issue, event, queued-work purge, run status, and optional work-pod status are one
-/// state transition; observers cannot see a parked issue whose run still appears live.
+/// Terminalize a failed run and the run pod that supplied the failure evidence, and park the issue
+/// when this run is the live run of a `running` issue. The issue, event, queued-work purge, run
+/// status, and optional work-pod status are one state transition; observers cannot see a parked
+/// issue whose run still appears live. An issue already off `running` (a human park) keeps its
+/// status while its run and pod still close. Returns whether the issue parked.
 #[tracing::instrument(name = "db.park_failed_run", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key, run_id = %run_id), err)]
 pub(crate) async fn park_failed_run(
     pool: &PgPool,
@@ -108,17 +110,22 @@ pub(crate) async fn park_failed_run(
     let rendered = reason.to_string();
     let now = crate::clock::now_rfc3339();
     let mut tx = pool.begin().await?;
-    let Some((ev, purged)) = claim_park_event(
-        &mut tx,
-        key,
-        Status::Running,
-        &rendered,
-        ParkedBy::Machine,
-        &now,
-    )
-    .await?
-    else {
-        return Ok(false);
+    let is_live_run = crate::runs::store::running_run_for_issue(&mut *tx, key)
+        .await?
+        .is_some_and(|live| live.run_id == run_id);
+    let parked = match is_live_run {
+        true => {
+            claim_park_event(
+                &mut tx,
+                key,
+                Status::Running,
+                &rendered,
+                ParkedBy::Machine,
+                &now,
+            )
+            .await?
+        }
+        false => None,
     };
     crate::runs::store::set_run_status(&mut *tx, run_id, run_status).await?;
     if let Some(pod) = pod {
@@ -132,6 +139,9 @@ pub(crate) async fn park_failed_run(
         .await?;
     }
     tx.commit().await?;
+    let Some((ev, purged)) = parked else {
+        return Ok(false);
+    };
     events.publish(&ev);
     if purged > 0 {
         tracing::debug!(issue_key = %key, purged, "park deleted queued work pods");

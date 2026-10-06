@@ -412,6 +412,29 @@ pub async fn work_pods_in_states(
     rows.iter().map(decode_work_pod).collect()
 }
 
+/// The `running` run pod rows of `issue_key` whose run already left `running`, as
+/// `(pod_name, run status)`.
+#[tracing::instrument(name = "db.terminal_runs_with_running_pods", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]
+pub(crate) async fn terminal_runs_with_running_pods(
+    ex: impl PgExecutor<'_>,
+    issue_key: &str,
+) -> Result<Vec<(String, String)>> {
+    let rows = sqlx::query(
+        "SELECT w.pod_name, r.status FROM work_pods w JOIN runs r ON r.pod = w.pod_name \
+         WHERE w.issue_key = $1 AND w.kind = $2 AND w.state = $3 AND r.status <> 'running' \
+         ORDER BY w.created_at ASC",
+    )
+    .bind(issue_key)
+    .bind(crate::runs::workpod::WorkKind::Run.label_value())
+    .bind(WorkPodState::Running.as_str())
+    .fetch_all(ex)
+    .await
+    .context("terminal_runs_with_running_pods")?;
+    rows.iter()
+        .map(|r| Ok((r.try_get("pod_name")?, r.try_get("status")?)))
+        .collect()
+}
+
 /// Fetch one work pod by name, or `None` if untracked.
 #[tracing::instrument(name = "db.get_work_pod", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod_name = %pod_name), err)]
 pub(crate) async fn get_work_pod(

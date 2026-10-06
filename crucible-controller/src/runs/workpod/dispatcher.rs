@@ -16,7 +16,7 @@ use std::time::Duration;
 /// trait is `dyn`, so `async_trait` boxes the futures). Dispatch of an [`WorkKind::AgentTurn`] now
 /// drives only `create` (non-blocking); the out-of-band COLLECTION (the adopt path + the timeout
 /// sweep) drives `await_terminal`/`logs`/`delete`. A [`WorkKind::Run`] likewise only `create`s at
-/// launch (watched out-of-band by the shared pod watch) and `delete`s on collection. Production is
+/// launch (collected out-of-band by the run completion edge) and `delete`s on collection. Production is
 /// [`KubePodDispatcher`]; a test installs a fake so the accounting + state machine run without a cluster.
 #[async_trait::async_trait]
 pub trait PodDispatcher: Send + Sync {

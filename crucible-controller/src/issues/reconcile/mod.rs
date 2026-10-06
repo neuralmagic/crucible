@@ -15,6 +15,7 @@
 
 #[cfg(feature = "autoresearch")]
 mod grounded;
+#[cfg(feature = "autoresearch")]
 mod lifecycle;
 #[cfg(feature = "autoresearch")]
 mod scope;
@@ -42,9 +43,8 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(feature = "autoresearch")]
 use grounded::apply_grounded_disposition;
-use lifecycle::reconcile_running;
 #[cfg(feature = "autoresearch")]
-use lifecycle::{reconcile_awaiting, reconcile_building, reconcile_parked};
+use lifecycle::{reconcile_awaiting, reconcile_building, reconcile_parked, reconcile_running};
 #[cfg(feature = "autoresearch")]
 use scope::{apply_pod_scope_outcome, reconcile_new, reconcile_scoped};
 
@@ -108,13 +108,24 @@ async fn reconcile_step(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<()> {
         // pass's `issue` snapshot is stale now, so stop here — the next enqueue continues.
         return Ok(());
     }
+    // The run-completion edge, whatever the status: a run pod outlives a park of its issue, and its
+    // ingest, loss, or overrun must still close the run.
+    match crate::runs::completion::ingest_completion(db, cfg, key).await {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            tracing::warn!(issue_key = %key, error = format!("{e:#}"), "ingest: completion check failed")
+        }
+    }
     match issue.status {
         // A playbook launch has no scope turn ahead of it: the pack is registered and pinned, and
         // the validated POST that wrote its launch row is the authorization.
         Status::New if matches!(issue.kind, crate::issues::model::InputKind::Playbook { .. }) => {
             crate::runs::launch::launch(db, cfg, &issue).await
         }
-        Status::Running => reconcile_running(db, cfg, &issue).await,
+        #[cfg(feature = "autoresearch")]
+        Status::Running if cfg.autoresearch_enabled() => reconcile_running(db, cfg, &issue).await,
+        Status::Running => Ok(()),
         // `pr-open` waits on a human merge, `done` is terminal — record only, no action.
         Status::PrOpen | Status::Done => Ok(()),
         #[cfg(feature = "autoresearch")]

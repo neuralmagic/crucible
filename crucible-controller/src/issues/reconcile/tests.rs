@@ -4,13 +4,14 @@
 use super::grounded::TierGate;
 #[cfg(feature = "autoresearch")]
 use super::grounded::*;
-use super::lifecycle::*;
 #[cfg(feature = "autoresearch")]
 use super::scope::*;
 use super::*;
 use crate::Db;
 use crate::config::Profile;
 use crate::issues::model::{NewIssue, NewScope};
+#[cfg(feature = "autoresearch")]
+use crate::issues::reconcile::lifecycle::*;
 use crate::model::{ParkReason, ParkedBy};
 use crate::runs::completion::*;
 use crate::runs::model::NewRun;
@@ -2729,16 +2730,13 @@ async fn a_playbook_issue_with_a_live_pod_run_completes_instead_of_self_healing(
         },
     )
     .await?;
-    let issue = crate::issues::store::get_issue(db.pool(), key)
-        .await?
-        .expect("issue");
 
     crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::TimedOut,
         logs: String::new(),
         created: Default::default(),
     }));
-    let in_flight = reconcile_running(&db, &cfg, &issue).await;
+    let in_flight = reconcile(&db, &cfg, key).await;
     crate::runs::workpod::reset_dispatcher();
     in_flight?;
     assert_eq!(
@@ -2768,7 +2766,7 @@ async fn a_playbook_issue_with_a_live_pod_run_completes_instead_of_self_healing(
         logs: format!("plan v1: completed\n{session}\n"),
         created: Default::default(),
     }));
-    let finished = reconcile_running(&db, &cfg, &issue).await;
+    let finished = reconcile(&db, &cfg, key).await;
     crate::runs::workpod::reset_dispatcher();
     finished?;
     assert_eq!(
@@ -2807,14 +2805,7 @@ async fn in_flight_running_is_not_self_healed(pool: PgPool) -> Result<()> {
         logs: String::new(),
         created: Default::default(),
     }));
-    let res = reconcile_running(
-        &db,
-        &cfg,
-        &crate::issues::store::get_issue(db.pool(), "owner/repo#89")
-            .await?
-            .unwrap(),
-    )
-    .await;
+    let res = reconcile(&db, &cfg, "owner/repo#89").await;
     crate::runs::workpod::reset_dispatcher();
     res?;
 
@@ -7884,6 +7875,718 @@ async fn a_capped_playbook_launch_stays_new(pool: PgPool) -> Result<()> {
         issue.status,
         Status::New,
         "capped launches wait, they never park"
+    );
+    Ok(())
+}
+
+// --- run pod resync -----------------------------------------------------------
+
+/// A run pod on one named cluster. Every call aimed at any other cluster answers 404, as the API
+/// server of a cluster that never had the pod does, so a lookup on the wrong cluster reads as a
+/// lost pod instead of a finished one. `gone` answers 404 on the pod's own cluster too.
+struct ClusterRunPodDispatcher {
+    cluster: &'static str,
+    phase: crate::runs::workpod::TurnPhase,
+    message: Option<String>,
+    logs: String,
+    gone: bool,
+    deleted: std::sync::Mutex<Vec<(String, String)>>,
+}
+
+impl ClusterRunPodDispatcher {
+    fn on(cluster: &'static str, phase: crate::runs::workpod::TurnPhase) -> Self {
+        ClusterRunPodDispatcher {
+            cluster,
+            phase,
+            message: None,
+            logs: String::new(),
+            gone: false,
+            deleted: Default::default(),
+        }
+    }
+
+    fn not_found() -> anyhow::Error {
+        kube::Error::Api(Box::new(kube::core::Status {
+            status: Some(kube::core::response::StatusSummary::Failure),
+            message: "pod not found".into(),
+            reason: "NotFound".into(),
+            code: 404,
+            ..Default::default()
+        }))
+        .into()
+    }
+
+    fn reachable(&self, cluster: &str) -> Result<()> {
+        match cluster == self.cluster && !self.gone {
+            true => Ok(()),
+            false => Err(Self::not_found()),
+        }
+    }
+
+    fn deleted(&self) -> Vec<(String, String)> {
+        self.deleted.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::runs::workpod::PodDispatcher for ClusterRunPodDispatcher {
+    async fn create(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _pod: k8s_openapi::api::core::v1::Pod,
+    ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        panic!("collecting a run never creates a pod")
+    }
+    async fn await_terminal(
+        &self,
+        cluster: &str,
+        _ns: &str,
+        _name: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::runs::workpod::TerminalState> {
+        self.reachable(cluster)?;
+        Ok(crate::runs::workpod::TerminalState {
+            phase: self.phase,
+            message: self.message.clone(),
+        })
+    }
+    async fn logs(&self, cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+        self.reachable(cluster)?;
+        Ok(self.logs.clone())
+    }
+    async fn delete(&self, cluster: &str, _ns: &str, name: &str) -> Result<()> {
+        self.reachable(cluster)?;
+        self.deleted
+            .lock()
+            .expect("lock")
+            .push((cluster.to_string(), name.to_string()));
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingEnqueue(std::sync::Mutex<Vec<String>>);
+
+impl crate::daemon::queue::Enqueue for RecordingEnqueue {
+    fn enqueue(&self, key: crate::daemon::queue::IssueKey) {
+        self.0.lock().expect("lock").push(key.0);
+    }
+}
+
+/// One discovery tick of the run pod resync, returning the keys it enqueued.
+async fn resync_tick(db: &Db) -> Result<Vec<String>> {
+    use crate::daemon::queue::DiscoverySource;
+    let recorded = std::sync::Arc::new(RecordingEnqueue::default());
+    crate::runs::workpod::RunPodResync::new(db.clone())
+        .poll(recorded.clone())
+        .await?;
+    let keys = recorded.0.lock().expect("lock").clone();
+    Ok(keys)
+}
+
+/// Install `dispatcher`, run one resync tick and reconcile every key it enqueued, the way the
+/// daemon's queue worker drains them.
+async fn resync_and_reconcile(
+    db: &Db,
+    cfg: &ControllerCfg,
+    dispatcher: std::sync::Arc<ClusterRunPodDispatcher>,
+) -> Result<Vec<String>> {
+    crate::runs::workpod::install_dispatcher(dispatcher);
+    let keys = resync_tick(db).await;
+    let mut outcome = keys
+        .as_ref()
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("{e:#}"));
+    if let Ok(keys) = &keys {
+        for key in keys {
+            if let Err(e) = reconcile(db, cfg, key).await {
+                outcome = Err(e);
+            }
+        }
+    }
+    crate::runs::workpod::reset_dispatcher();
+    outcome?;
+    keys
+}
+
+/// A `running` playbook run on a pod recorded on `cluster`, created `age` ago.
+async fn seed_playbook_pod_run(
+    db: &Db,
+    key: &str,
+    run_id: &str,
+    pod: &str,
+    cluster: &str,
+    age: std::time::Duration,
+) -> Result<()> {
+    seed_registered_playbook(db, "survey").await;
+    adopt_launch(db, key, 3.5).await;
+    assert!(crate::issues::store::claim_issue(db.pool(), key, Status::New, Status::Running).await?);
+    insert_running_run_pod(db, key, run_id, None, pod, cluster, age).await
+}
+
+async fn insert_running_run_pod(
+    db: &Db,
+    key: &str,
+    run_id: &str,
+    scope: Option<i64>,
+    pod: &str,
+    cluster: &str,
+    age: std::time::Duration,
+) -> Result<()> {
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: run_id.into(),
+            scope,
+            issue: Some(key.into()),
+            identity_digest: None,
+            status: "running".into(),
+            pod: Some(pod.into()),
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    crate::runs::work_pods::insert_work_pod(
+        db.pool(),
+        &crate::runs::workpod::NewWorkPod {
+            pod_name: pod.into(),
+            kind: crate::runs::workpod::WorkKind::Run.label_value().into(),
+            issue_key: Some(key.into()),
+            state: crate::runs::workpod::WorkPodState::Running,
+            cost_tag: crate::runs::workpod::WorkKind::Run.cost_tag().into(),
+            cluster: cluster.into(),
+        },
+    )
+    .await?;
+    let created = jiff::Timestamp::now() - jiff::SignedDuration::try_from(age)?;
+    sqlx::query("UPDATE work_pods SET created_at = $2 WHERE pod_name = $1")
+        .bind(pod)
+        .bind(crate::clock::stamp(created))
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// The operator's park of a live run, as the human override applies it: status and authority
+/// only, the run and its pod untouched.
+async fn human_park(db: &Db, key: &str, reason: &str) -> Result<()> {
+    crate::issues::store::park_issue(
+        db.pool(),
+        key,
+        reason,
+        ParkedBy::Human,
+        &crate::clock::now_rfc3339(),
+    )
+    .await
+}
+
+async fn run_status(db: &Db, run_id: &str) -> Result<String> {
+    Ok(
+        sqlx::query_scalar("SELECT status FROM runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_one(db.pool())
+            .await?,
+    )
+}
+
+async fn work_pod(db: &Db, pod: &str) -> Result<crate::runs::workpod::WorkPodRow> {
+    crate::runs::work_pods::get_work_pod(db.pool(), pod)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("no work_pods row for {pod}"))
+}
+
+/// The live failure: a playbook pod on a spoke finished after its issue was parked by hand, and
+/// its `running` row sat untouched for days. No watch event is involved here; the resync tick
+/// alone finds the row, collects the pod on the spoke the row names, and books the run, while the
+/// human park stays.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_finished_spoke_pod_of_a_human_parked_playbook_run_is_collected_by_the_resync(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-20";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-spoke-1",
+        "crucible-run-prevalent-nyala",
+        "waldorf",
+        std::time::Duration::from_secs(20 * 60),
+    )
+    .await?;
+    human_park(&db, key, "A/B moved to pirate").await?;
+    assert!(
+        crate::issues::store::latest_scope_for_issue(db.pool(), key)
+            .await?
+            .is_none(),
+        "a playbook launch has no scope row"
+    );
+
+    let session = [
+        r#"{"v":1,"kind":"budget","spent":0.28,"elapsed_secs":53}"#,
+        r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":"graph complete"}"#,
+    ]
+    .join("\n");
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher {
+        logs: format!(
+            "plan v1: completed\n=================== SESSION (rc=0) ===================\n{session}\n"
+        ),
+        ..ClusterRunPodDispatcher::on("waldorf", crate::runs::workpod::TurnPhase::Succeeded)
+    });
+    let enqueued = resync_and_reconcile(&db, &cfg, dispatcher.clone()).await?;
+
+    assert_eq!(enqueued, vec![key.to_string()]);
+    assert_eq!(run_status(&db, "run-spoke-1").await?, "finished");
+    let row = work_pod(&db, "crucible-run-prevalent-nyala").await?;
+    assert_eq!(row.state, crate::runs::workpod::WorkPodState::Collected);
+    assert_eq!(
+        row.result.as_deref(),
+        Some("loop run finished; session ingested")
+    );
+    assert_eq!(
+        dispatcher.deleted(),
+        vec![(
+            "waldorf".to_string(),
+            "crucible-run-prevalent-nyala".to_string()
+        )],
+        "the pod is deleted on the spoke it ran on"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked, "the human park stands");
+    assert_eq!(issue.parked_by, Some(ParkedBy::Human));
+    assert_eq!(issue.parked_reason.as_deref(), Some("A/B moved to pirate"));
+
+    assert!(
+        resync_tick(&db).await?.is_empty(),
+        "a collected row is not re-driven"
+    );
+    Ok(())
+}
+
+/// The scenario wedge: a loop pod stuck in init, parked by hand, then deleted by hand. With its
+/// issue off `running`, nothing ever looked at the pod again. The resync records the loss on the
+/// run and its pod row without overriding the human park.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_deleted_pod_of_a_human_parked_run_is_recorded_lost_by_the_resync(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "owner/repo#120";
+    let pod = "crucible-run-scenario-120";
+    let scope = seed_running_pod_run(&db, key, "run-120", pod).await?;
+    sqlx::query("DELETE FROM runs WHERE run_id = 'run-120'")
+        .execute(db.pool())
+        .await?;
+    insert_running_run_pod(
+        &db,
+        key,
+        "run-120",
+        Some(scope),
+        pod,
+        "waldorf",
+        std::time::Duration::from_secs(60 * 60),
+    )
+    .await?;
+    crate::runs::work_pods::set_work_pod_state(
+        db.pool(),
+        pod,
+        crate::runs::workpod::WorkPodState::Running,
+        None,
+        Some("PodInitializing"),
+    )
+    .await?;
+    human_park(&db, key, "zombie pod deleted by hand").await?;
+
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher {
+        gone: true,
+        ..ClusterRunPodDispatcher::on("waldorf", crate::runs::workpod::TurnPhase::TimedOut)
+    });
+    resync_and_reconcile(&db, &cfg, dispatcher).await?;
+
+    assert_eq!(run_status(&db, "run-120").await?, "infrastructure-error");
+    let row = work_pod(&db, pod).await?;
+    assert_eq!(row.state, crate::runs::workpod::WorkPodState::Failed);
+    let error = row.error.unwrap_or_default();
+    assert!(
+        error.contains("disappeared before terminal session evidence")
+            && error.contains("PodInitializing"),
+        "the row carries the loss and the last observation: {error:?}"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.parked_by, Some(ParkedBy::Human));
+    assert_eq!(
+        issue.parked_reason.as_deref(),
+        Some("zombie pod deleted by hand")
+    );
+    assert!(
+        db.events()
+            .read_for_key(key)
+            .await?
+            .iter()
+            .all(|e| e.to != "parked"),
+        "no second park is logged over the human one"
+    );
+    assert!(resync_tick(&db).await?.is_empty());
+    Ok(())
+}
+
+/// A pod deleted under a `running` playbook run emits no completion the watch maps, so before the
+/// resync only a restart or a manual reconcile noticed. One tick parks it as lost.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_deleted_pod_of_a_running_playbook_run_is_parked_lost_on_the_next_tick(
+    pool: PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-21";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-lost-1",
+        "crucible-run-democratic-ferret",
+        "rdu4",
+        std::time::Duration::from_secs(5 * 60),
+    )
+    .await?;
+
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher {
+        gone: true,
+        ..ClusterRunPodDispatcher::on("rdu4", crate::runs::workpod::TurnPhase::TimedOut)
+    });
+    resync_and_reconcile(&db, &cfg, dispatcher).await?;
+
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    assert_eq!(issue.parked_by, Some(ParkedBy::Machine));
+    assert!(
+        issue
+            .parked_reason
+            .unwrap_or_default()
+            .contains("pod crucible-run-democratic-ferret disappeared")
+    );
+    assert_eq!(run_status(&db, "run-lost-1").await?, "infrastructure-error");
+    assert_eq!(
+        work_pod(&db, "crucible-run-democratic-ferret").await?.state,
+        crate::runs::workpod::WorkPodState::Failed
+    );
+    Ok(())
+}
+
+/// A playbook pod that never leaves init is bounded by its launch's `max_time` (30m here) plus the
+/// startup margin: inside the bound it is left running, past it the pod is deleted on its cluster
+/// and the run fails with the last observation.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_playbook_pod_stuck_past_its_max_time_is_deleted_and_parked(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-22";
+    let pod = "crucible-run-stuck-1";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-stuck-1",
+        pod,
+        "waldorf",
+        std::time::Duration::from_secs(80 * 60),
+    )
+    .await?;
+    let stuck = || {
+        std::sync::Arc::new(ClusterRunPodDispatcher {
+            message: Some("PodInitializing".into()),
+            ..ClusterRunPodDispatcher::on("waldorf", crate::runs::workpod::TurnPhase::TimedOut)
+        })
+    };
+
+    let inside = stuck();
+    resync_and_reconcile(&db, &cfg, inside.clone()).await?;
+    assert!(inside.deleted().is_empty(), "80m is inside 30m + 1h");
+    assert_eq!(run_status(&db, "run-stuck-1").await?, "running");
+    assert_eq!(
+        work_pod(&db, pod).await?.error.as_deref(),
+        Some("PodInitializing")
+    );
+
+    sqlx::query("UPDATE work_pods SET created_at = $2 WHERE pod_name = $1")
+        .bind(pod)
+        .bind(crate::clock::stamp(
+            jiff::Timestamp::now() - jiff::SignedDuration::from_secs(91 * 60),
+        ))
+        .execute(db.pool())
+        .await?;
+    let past = stuck();
+    resync_and_reconcile(&db, &cfg, past.clone()).await?;
+
+    assert_eq!(
+        past.deleted(),
+        vec![("waldorf".to_string(), pod.to_string())]
+    );
+    assert_eq!(
+        run_status(&db, "run-stuck-1").await?,
+        "infrastructure-error"
+    );
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    let reason = issue.parked_reason.unwrap_or_default();
+    assert!(
+        reason.contains("was still not terminal 5400s after dispatch")
+            && reason.contains("PodInitializing"),
+        "{reason:?}"
+    );
+    assert_eq!(
+        work_pod(&db, pod).await?.state,
+        crate::runs::workpod::WorkPodState::Failed
+    );
+    Ok(())
+}
+
+/// A loop run has no `max_time`; its pod is bounded by the controller's loop-run bound instead.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_loop_pod_is_bounded_by_the_loop_run_max_age(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = ControllerCfg {
+        loop_run_max_age: crate::model::MaxTime::hours(2),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "owner/repo#121";
+    let pod = "crucible-run-121";
+    let scope = seed_running_pod_run(&db, key, "run-121", pod).await?;
+    sqlx::query("DELETE FROM runs WHERE run_id = 'run-121'")
+        .execute(db.pool())
+        .await?;
+    insert_running_run_pod(
+        &db,
+        key,
+        "run-121",
+        Some(scope),
+        pod,
+        "hub",
+        std::time::Duration::from_secs(119 * 60),
+    )
+    .await?;
+    let running = || {
+        std::sync::Arc::new(ClusterRunPodDispatcher::on(
+            "hub",
+            crate::runs::workpod::TurnPhase::TimedOut,
+        ))
+    };
+
+    let inside = running();
+    resync_and_reconcile(&db, &cfg, inside.clone()).await?;
+    assert!(inside.deleted().is_empty());
+    assert_eq!(run_status(&db, "run-121").await?, "running");
+
+    sqlx::query("UPDATE work_pods SET created_at = $2 WHERE pod_name = $1")
+        .bind(pod)
+        .bind(crate::clock::stamp(
+            jiff::Timestamp::now() - jiff::SignedDuration::from_secs(121 * 60),
+        ))
+        .execute(db.pool())
+        .await?;
+    let past = running();
+    resync_and_reconcile(&db, &cfg, past.clone()).await?;
+    assert_eq!(past.deleted(), vec![("hub".to_string(), pod.to_string())]);
+    assert_eq!(run_status(&db, "run-121").await?, "infrastructure-error");
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .expect("issue")
+            .status,
+        Status::Parked
+    );
+    Ok(())
+}
+
+/// A pod the cluster does not answer for (a transient error, not a 404) is neither failed nor
+/// deleted, even past its bound: closing the row then could orphan a live pod.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_overrun_pod_whose_delete_gets_no_answer_keeps_its_row(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-23";
+    let pod = "crucible-run-mute-1";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-mute-1",
+        pod,
+        "waldorf",
+        std::time::Duration::from_secs(3 * 60 * 60),
+    )
+    .await?;
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(MuteDeleteDispatcher));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    res?;
+
+    assert_eq!(run_status(&db, "run-mute-1").await?, "running");
+    assert_eq!(
+        work_pod(&db, pod).await?.state,
+        crate::runs::workpod::WorkPodState::Running
+    );
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .expect("issue")
+            .status,
+        Status::Running
+    );
+    Ok(())
+}
+
+/// Reports the pod still running and answers every delete with a 503.
+struct MuteDeleteDispatcher;
+
+#[async_trait::async_trait]
+impl crate::runs::workpod::PodDispatcher for MuteDeleteDispatcher {
+    async fn create(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _pod: k8s_openapi::api::core::v1::Pod,
+    ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        panic!("collecting a run never creates a pod")
+    }
+    async fn await_terminal(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _name: &str,
+        _timeout: std::time::Duration,
+    ) -> Result<crate::runs::workpod::TerminalState> {
+        Ok(crate::runs::workpod::TerminalState {
+            phase: crate::runs::workpod::TurnPhase::TimedOut,
+            message: None,
+        })
+    }
+    async fn logs(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<String> {
+        panic!("a running pod's logs are not scraped")
+    }
+    async fn delete(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<()> {
+        Err(kube::Error::Api(Box::new(kube::core::Status {
+            status: Some(kube::core::response::StatusSummary::Failure),
+            message: "service unavailable".into(),
+            reason: "ServiceUnavailable".into(),
+            code: 503,
+            ..Default::default()
+        }))
+        .into())
+    }
+}
+
+/// A collection that failed after the ingest leaves the pod row `running` behind a run that is
+/// already terminal. The resync re-drives it and the row closes with the run's real disposition.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_run_pod_row_left_running_behind_a_terminal_run_is_closed(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-24";
+    let pod = "crucible-run-leftover-1";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-leftover-1",
+        pod,
+        "waldorf",
+        std::time::Duration::from_secs(10 * 60),
+    )
+    .await?;
+    crate::runs::store::set_run_status(db.pool(), "run-leftover-1", "error").await?;
+
+    let dispatcher = std::sync::Arc::new(ClusterRunPodDispatcher::on(
+        "waldorf",
+        crate::runs::workpod::TurnPhase::Succeeded,
+    ));
+    let enqueued = resync_and_reconcile(&db, &cfg, dispatcher.clone()).await?;
+
+    assert_eq!(enqueued, vec![key.to_string()]);
+    let row = work_pod(&db, pod).await?;
+    assert_eq!(row.state, crate::runs::workpod::WorkPodState::Collected);
+    assert_eq!(
+        row.result.as_deref(),
+        Some("loop run errored; session ingested")
+    );
+    assert_eq!(
+        dispatcher.deleted(),
+        vec![("waldorf".to_string(), pod.to_string())]
+    );
+    assert!(resync_tick(&db).await?.is_empty());
+    Ok(())
+}
+
+/// A failure of a run that is not the issue's live run closes that run and its pod but leaves
+/// the issue to the run that is.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_failed_run_that_is_not_the_live_run_does_not_park_the_issue(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-25";
+    seed_playbook_pod_run(
+        &db,
+        key,
+        "run-old",
+        "crucible-run-old",
+        "hub",
+        std::time::Duration::from_secs(60),
+    )
+    .await?;
+    insert_running_run_pod(
+        &db,
+        key,
+        "run-new",
+        None,
+        "crucible-run-new",
+        "hub",
+        std::time::Duration::from_secs(30),
+    )
+    .await?;
+
+    let parked = crate::issues::transitions::park_failed_run(
+        db.pool(),
+        db.events(),
+        key,
+        &ParkReason::RunPodLost {
+            run_id: "run-old".into(),
+            pod: "crucible-run-old".into(),
+            last_observation: None,
+        },
+        "run-old",
+        "infrastructure-error",
+        Some("crucible-run-old"),
+    )
+    .await?;
+
+    assert!(!parked);
+    assert_eq!(run_status(&db, "run-old").await?, "infrastructure-error");
+    assert_eq!(
+        work_pod(&db, "crucible-run-old").await?.state,
+        crate::runs::workpod::WorkPodState::Failed
+    );
+    assert_eq!(run_status(&db, "run-new").await?, "running");
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), key)
+            .await?
+            .expect("issue")
+            .status,
+        Status::Running
     );
     Ok(())
 }

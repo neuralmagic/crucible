@@ -1823,7 +1823,7 @@ checksum = "d0a5c400df2834b80a4c3327b3aad3a4c4cd4de0629063962b03235697506a28"
 
 [[package]]
 name = "crucible"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "allocative",
  "anyhow",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-broker"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1909,7 +1909,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-capability"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "semver",
  "serde",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-contract"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "flate2",
  "jsonschema",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-controller"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2014,7 +2014,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-harness"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "axum",
  "crucible-contract",
@@ -2026,7 +2026,7 @@ dependencies = [
 
 [[package]]
 name = "crucible-vcs"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "git2",
@@ -2040,7 +2040,7 @@ checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
 name = "crux"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3044,7 +3044,7 @@ dependencies = [
 
 [[package]]
 name = "forge"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -9859,7 +9859,7 @@ checksum = "ec7a2a501ed189703dba8b08142f057e887dfc4b2cc4db2d343ac6376ba3e0b9"
 
 [[package]]
 name = "xtask"
-version = "0.3.1"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",

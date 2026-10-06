@@ -175,6 +175,7 @@ pub fn assemble(
             )),
         )])),
         Arc::new(crate::launches::webhooks::trigger::WebhookHousekeeping::new(db.clone())),
+        Arc::new(crate::runs::workpod::RunPodResync::new(db.clone())),
     ];
     #[cfg(feature = "autoresearch")]
     if cfg.autoresearch_enabled() {
