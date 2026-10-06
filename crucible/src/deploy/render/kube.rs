@@ -1295,13 +1295,16 @@ exit $rc
     /// Pod-spec `hostAliases` merged from the cluster profile and the spoke entry (if any),
     /// grouped by IP with hostnames sorted (BTreeMap order) so the render is deterministic.
     fn host_aliases(&self) -> Option<Vec<core::HostAlias>> {
-        let mut by_ip: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-        for (hostname, ip) in &self.profile.cluster.host_aliases {
-            by_ip.entry(ip.as_str()).or_default().push(hostname.clone());
+        let mut by_ip: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (hostname, ip) in self.profile.cluster.host_aliases.iter() {
+            by_ip
+                .entry(ip.to_string())
+                .or_default()
+                .push(hostname.to_string());
         }
         if let Some((_, entry)) = self.spoke.as_ref() {
             for (hostname, ip) in &entry.host_aliases {
-                by_ip.entry(ip.as_str()).or_default().push(hostname.clone());
+                by_ip.entry(ip.clone()).or_default().push(hostname.clone());
             }
         }
         if by_ip.is_empty() {
@@ -1311,7 +1314,7 @@ exit $rc
             by_ip
                 .into_iter()
                 .map(|(ip, hostnames)| core::HostAlias {
-                    ip: ip.to_string(),
+                    ip,
                     hostnames: Some(hostnames),
                 })
                 .collect(),
