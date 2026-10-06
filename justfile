@@ -213,3 +213,14 @@ route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
 # Remove the deployment and free its GPU.
 route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
     kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found
+
+# Build the macOS desktop app and install it as ~/Applications/Crucible.app.
+desktop-install:
+    cd crucible-desktop && bunx @tauri-apps/cli@2.12.1 build --bundles app
+    mkdir -p ~/Applications
+    rm -rf ~/Applications/Crucible.app
+    ditto crucible-desktop/target/release/bundle/macos/Crucible.app ~/Applications/Crucible.app
+
+# Format, lint and test the desktop app, which is its own Cargo workspace.
+desktop-check:
+    cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
