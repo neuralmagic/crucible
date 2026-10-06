@@ -11,7 +11,7 @@
 //!   * `GET /openid/v1/jwks` — the public signing keys, passed through verbatim.
 //!
 //! Nothing else is proxied — the upstream paths are hardcoded constants, never derived from the
-//! request, and any other path 404s. Mounted by [`crate::serve`] OUTSIDE the bearer layer
+//! request, and any other path 404s. Mounted by [`crate::Surface::bind`] OUTSIDE the bearer layer
 //! (public read-only, like `/metrics`). `CONTROLLER_EXTERNAL_URL` unset/empty disables the
 //! mirror entirely: the routes stay mounted and answer 404.
 //!

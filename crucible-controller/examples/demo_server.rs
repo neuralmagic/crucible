@@ -65,13 +65,14 @@ async fn main() -> anyhow::Result<()> {
             .expect("the shipped default policy set loads"),
         &cfg,
     );
-    crucible_controller::serve(
+    let surface = crucible_controller::Surface::bind(
         state,
         addr,
         crucible_controller::config::TurnAccounts::default(),
         cfg.session_secure_cookies,
     )
-    .await
+    .await?;
+    Err(surface.serve().await.into())
 }
 
 async fn seed(db: &Db) -> anyhow::Result<()> {

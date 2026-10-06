@@ -81,11 +81,13 @@ FIX="$ROOT/e2e/kind"
 ID="${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-$$}"
 CLUSTER="crucible-e2e-$ID"
 REG="crucible-e2e-reg-$ID"
-REGPORT="${REGPORT:-$((20000 + RANDOM % 10000))}"
-PORT="${PORT:-$((30000 + RANDOM % 10000))}"
-HOOKPORT="${HOOKPORT:-$((40000 + RANDOM % 10000))}"
-PEERPORT="${PEERPORT:-$((50000 + RANDOM % 5000))}"
-PEERHOOKPORT="${PEERHOOKPORT:-$((55000 + RANDOM % 5000))}"
+# Every listen port sits below the kernel's ephemeral range: a port inside it is handed to outbound
+# connections as their source port, and one such socket between two boots blocks the rebind.
+REGPORT="${REGPORT:-$((20000 + RANDOM % 2000))}"
+PORT="${PORT:-$((22000 + RANDOM % 2000))}"
+HOOKPORT="${HOOKPORT:-$((24000 + RANDOM % 2000))}"
+PEERPORT="${PEERPORT:-$((26000 + RANDOM % 2000))}"
+PEERHOOKPORT="${PEERHOOKPORT:-$((28000 + RANDOM % 2000))}"
 NS=crucible-e2e
 DRAFT=e2e
 SKOPEO=quay.io/skopeo/stable:v1.20
@@ -108,6 +110,18 @@ log() { echo "==> $*"; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 pass() { echo "PASS: $*"; }
 
+if [ -r /proc/sys/net/ipv4/ip_local_port_range ]; then
+    read -r EPHEMERAL_LOW EPHEMERAL_HIGH </proc/sys/net/ipv4/ip_local_port_range
+else
+    EPHEMERAL_LOW=$(sysctl -n net.inet.ip.portrange.first)
+    EPHEMERAL_HIGH=$(sysctl -n net.inet.ip.portrange.last)
+fi
+for p in "$REGPORT" "$PORT" "$HOOKPORT" "$PEERPORT" "$PEERHOOKPORT"; do
+    if [ "$p" -ge "$EPHEMERAL_LOW" ] && [ "$p" -le "$EPHEMERAL_HIGH" ]; then
+        fail "port $p is inside the ephemeral range $EPHEMERAL_LOW-$EPHEMERAL_HIGH, where any outbound connection can take it"
+    fi
+done
+
 collect() {
     mkdir -p "$ARTIFACT_DIR"
     cp "$WORK"/*.log "$WORK"/*.json "$ARTIFACT_DIR"/ 2>/dev/null || true
@@ -121,12 +135,27 @@ collect() {
     echo "artifacts: $ARTIFACT_DIR" >&2
 }
 
+# halt <pid>: SIGTERM, reaped; a process still running 30s later is SIGKILLed and halt returns 1.
+halt() {
+    kill "$1" 2>/dev/null || return 0
+    for _ in $(seq 1 120); do
+        kill -0 "$1" 2>/dev/null || break
+        sleep 0.25
+    done
+    local rc=0
+    if kill -0 "$1" 2>/dev/null; then
+        kill -9 "$1" 2>/dev/null || true
+        rc=1
+    fi
+    wait "$1" 2>/dev/null || true
+    return "$rc"
+}
+
 cleanup() {
     local rc=$?
     for p in "$CONTROLLER_PID" "$PEER_PID"; do
         [ -n "$p" ] || continue
-        kill "$p" 2>/dev/null || true
-        wait "$p" 2>/dev/null || true
+        halt "$p" || true
     done
     for p in ${BG_PIDS[@]+"${BG_PIDS[@]}"} ${API_PIDS[@]+"${API_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
     [ "$rc" -ne 0 ] && collect
@@ -304,19 +333,44 @@ run_controller() {
         "$CONTROLLER_BIN" autopilot >"$3" 2>&1 &
 }
 
+# ports_free <what> <port>...: wait up to 30s for nothing to accept on each loopback port.
+ports_free() {
+    local what="$1" p
+    shift
+    for p in "$@"; do
+        for _ in $(seq 1 30); do
+            (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null || continue 2
+            sleep 1
+        done
+        fail "$what: 127.0.0.1:$p still accepts connections before the boot: $(ss -Hltnp "sport = :$p" 2>/dev/null || true)"
+    done
+}
+
+# await_health <what> <pid> <url> <log>: wait for <url>/healthz, failing early when <pid> exits.
+await_health() {
+    local what="$1" pid="$2" url="$3" log="$4"
+    for _ in $(seq 1 90); do
+        curl -sf "$url/healthz" >/dev/null 2>&1 && return 0
+        kill -0 "$pid" 2>/dev/null || fail "$what exited before answering $url; its log ends:
+$(tail -n 20 "$log")"
+        sleep 1
+    done
+    fail "timed out after 90s waiting for $what health"
+}
+
 # start_controller [profile]: boot CONTROLLER_BIN on PORT and wait for it to answer and lead.
 start_controller() {
     BOOT=$((BOOT + 1))
     log "starting controller (boot $BOOT) on $CONTROLLER_URL ${CONTROLLER_ENV[*]+${CONTROLLER_ENV[*]}}"
+    ports_free "controller (boot $BOOT)" "$PORT" "$HOOKPORT"
     run_controller "$PORT" "$HOOKPORT" "$WORK/controller-$BOOT.log" "${1:-$WORK/profile.toml}"
     CONTROLLER_PID=$!
-    wait_for 90 "controller health" curl -sf "$CONTROLLER_URL/healthz"
+    await_health "controller (boot $BOOT)" "$CONTROLLER_PID" "$CONTROLLER_URL" "$WORK/controller-$BOOT.log"
     wait_for 180 "startup pack conversion" grep -q 'issues re-enqueued at startup' "$WORK/controller-$BOOT.log"
 }
 
 stop_controller() {
-    kill "$CONTROLLER_PID"
-    wait "$CONTROLLER_PID" 2>/dev/null || true
+    halt "$CONTROLLER_PID" || fail "controller (boot $BOOT) was still running 30s after SIGTERM"
     CONTROLLER_PID=""
 }
 
@@ -324,14 +378,14 @@ stop_controller() {
 # it to answer. Its log is $WORK/controller-peer.log.
 start_peer() {
     log "starting the peer controller on $PEER_URL ${CONTROLLER_ENV[*]+${CONTROLLER_ENV[*]}}"
+    ports_free "peer controller" "$PEERPORT" "$PEERHOOKPORT"
     run_controller "$PEERPORT" "$PEERHOOKPORT" "$WORK/controller-peer.log" "$WORK/profile.toml"
     PEER_PID=$!
-    wait_for 90 "peer health" curl -sf "$PEER_URL/healthz"
+    await_health "peer controller" "$PEER_PID" "$PEER_URL" "$WORK/controller-peer.log"
 }
 
 stop_peer() {
-    kill "$PEER_PID"
-    wait "$PEER_PID" 2>/dev/null || true
+    halt "$PEER_PID" || fail "the peer controller was still running 30s after SIGTERM"
     PEER_PID=""
 }
 

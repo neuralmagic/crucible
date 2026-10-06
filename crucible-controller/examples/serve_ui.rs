@@ -1,11 +1,11 @@
 //! Serve the debug UI over an existing controller ledger, standalone — a local viewer until
-//! the daemon mounts `serve` itself (lane I). Overrides submitted from the UI are logged and
+//! the daemon mounts [`Surface`] itself (lane I). Overrides submitted from the UI are logged and
 //! dropped (no daemon, no reconciler to hand them to).
 //!
 //!   cargo run -p crucible-controller --example serve_ui -- <state-dir> [port]
 
 use crucible_controller::api::state::ApiState;
-use crucible_controller::{ControllerCfg, Db, Override, OverrideSink, serve};
+use crucible_controller::{ControllerCfg, Db, Override, OverrideSink, Surface};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,11 +62,12 @@ async fn main() -> anyhow::Result<()> {
             .expect("the shipped default policy set loads"),
         &cfg,
     );
-    serve(
+    let surface = Surface::bind(
         state,
         addr,
         crucible_controller::config::TurnAccounts::default(),
         cfg.session_secure_cookies,
     )
-    .await
+    .await?;
+    Err(surface.serve().await.into())
 }

@@ -1965,6 +1965,7 @@ dependencies = [
  "kube",
  "mime_guess",
  "moka",
+ "nix 0.31.3",
  "oci-client",
  "openidconnect",
  "opentelemetry 0.31.0",

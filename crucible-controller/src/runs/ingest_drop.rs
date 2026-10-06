@@ -45,8 +45,9 @@ impl FromRef<IngestState> for Arc<IngestValidator> {
     }
 }
 
-/// The ingest router. Mounted by [`crate::serve`] *after* the bearer-guard layer (like `/metrics`),
-/// so it is exempt from the human oauth2-proxy stack and governed only by its own TokenReview auth.
+/// The ingest router. Mounted by [`crate::Surface::bind`] *after* the bearer-guard layer (like
+/// `/metrics`), so it is exempt from the human oauth2-proxy stack and governed only by its own
+/// TokenReview auth.
 pub(crate) fn router(state: IngestState) -> Router {
     Router::new()
         .route("/api/pods/{pod}/artifacts/{kind}", post(ingest_artifact))

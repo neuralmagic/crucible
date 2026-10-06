@@ -99,8 +99,8 @@ impl Transport for RouterTransport {
 
 /// The MCP surface, guarded by its own credential.
 ///
-/// Merged outside the human bearer guard by [`crate::serve`], like `/metrics` and the ingest
-/// drop-box — each of those authenticates with the credential its callers actually hold, and
+/// Merged outside the human bearer guard by [`crate::Surface::bind`], like `/metrics` and the
+/// ingest drop-box — each of those authenticates with the credential its callers actually hold, and
 /// an MCP client holds an API key.
 pub fn router(api: Router, keys: crate::identity::auth::KeyGuard, public_url: String) -> Router {
     let mut config = rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default();
