@@ -8,7 +8,6 @@ use std::time::Duration;
 use base64::Engine as _;
 use serde_json::Value;
 
-use crate::plan::exec::{TaskResult, TaskRunner, TaskStatus};
 use crate::plan::ir::{Task, TaskName, ValidPlan};
 use crucible_contract::decision::{Answer, Decision, Label, Question, QuestionId, QuestionKind};
 use crucible_contract::decision_request::{
@@ -36,13 +35,21 @@ pub fn evidence_limit() -> usize {
         .unwrap_or(DEFAULT_EVIDENCE_MAX)
 }
 
+/// A settled dependency of the route, as its evidence shows it.
+pub struct Dependency<'a> {
+    pub status: &'a str,
+    pub passed: bool,
+    pub output: Option<&'a Value>,
+}
+
 /// What a route's request carries beside its questions.
 pub struct EvidenceInputs<'a> {
     pub plan: &'a ValidPlan,
     pub route: &'a Task,
     pub questions: &'a BTreeMap<QuestionId, Question>,
-    pub results: &'a BTreeMap<TaskName, TaskResult>,
-    pub runner: &'a dyn TaskRunner,
+    pub dependencies: &'a BTreeMap<TaskName, Dependency<'a>>,
+    /// The captured copy of a file a task declared, when the run captured it.
+    pub captured: &'a dyn Fn(&Task, &str) -> Option<Vec<u8>>,
     pub run: RunEvidence,
     pub review: Option<&'a str>,
     pub max_bytes: usize,
@@ -53,30 +60,28 @@ pub fn build_evidence(inputs: EvidenceInputs<'_>) -> Result<Evidence, String> {
         plan,
         route,
         questions,
-        results,
-        runner,
+        dependencies,
+        captured,
         run,
         review,
         max_bytes,
     } = inputs;
     let mut deps = BTreeMap::new();
     for dep in &route.depends_on {
-        let Some(result) = results.get(dep) else {
+        let Some(result) = dependencies.get(dep) else {
             continue;
         };
-        let passed = result.status == TaskStatus::Pass;
+        let passed = result.passed;
         let files = match plan.get(dep).filter(|_| passed) {
             Some(producer) => producer
                 .emits_files
                 .iter()
                 .filter_map(|declared| {
-                    runner
-                        .captured_file(producer, &declared.path)
-                        .map(|bytes| FileEvidence {
-                            path: declared.path.clone(),
-                            media_type: media_type(&declared.path).to_owned(),
-                            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-                        })
+                    captured(producer, &declared.path).map(|bytes| FileEvidence {
+                        path: declared.path.clone(),
+                        media_type: media_type(&declared.path).to_owned(),
+                        base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    })
                 })
                 .collect(),
             None => Vec::new(),
@@ -84,8 +89,8 @@ pub fn build_evidence(inputs: EvidenceInputs<'_>) -> Result<Evidence, String> {
         deps.insert(
             dep.0.clone(),
             InputEvidence {
-                status: result.status.as_str().to_owned(),
-                output: result.output.clone().filter(|_| passed),
+                status: result.status.to_owned(),
+                output: result.output.filter(|_| passed).cloned(),
                 files,
             },
         );
@@ -106,10 +111,10 @@ pub fn build_evidence(inputs: EvidenceInputs<'_>) -> Result<Evidence, String> {
     let mut choices = BTreeMap::new();
     for (id, question) in questions {
         if let Some(source) = question.pick_source() {
-            let output = results
+            let output = dependencies
                 .get(&TaskName(source.task.clone()))
-                .filter(|r| r.status == TaskStatus::Pass)
-                .and_then(|r| r.output.as_ref());
+                .filter(|r| r.passed)
+                .and_then(|r| r.output);
             choices.insert(
                 id.clone(),
                 pick_options(output, &source.task, &source.field)?,
@@ -217,13 +222,20 @@ fn media_type(path: &str) -> &'static str {
     }
 }
 
+/// How a route's request settled: passing with the route's output, or failing with why.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Settled {
+    Pass(Value),
+    Fail(String),
+}
+
 /// The route's settled result for a terminal request state; `None` while it is open. `choices`
 /// are the pick options the request's evidence offered.
 pub fn settle(
     questions: &BTreeMap<QuestionId, Question>,
     choices: &BTreeMap<QuestionId, Vec<String>>,
     state: &RequestState,
-) -> Option<TaskResult> {
+) -> Option<Settled> {
     match &state.status {
         RequestStatus::Open => None,
         RequestStatus::Answered { answer } => Some(answered(questions, choices, answer)),
@@ -263,7 +275,7 @@ fn answered(
     questions: &BTreeMap<QuestionId, Question>,
     choices: &BTreeMap<QuestionId, Vec<String>>,
     answer: &AnswerRecord,
-) -> TaskResult {
+) -> Settled {
     if let Some(extra) = answer.labels.keys().find(|id| !questions.contains_key(*id)) {
         return failing(format!(
             "the answer names {extra:?}, which the route does not ask"
@@ -331,11 +343,7 @@ fn answered(
     }
 }
 
-fn passing(
-    decision: Decision,
-    picks: BTreeMap<QuestionId, Vec<String>>,
-    record: Value,
-) -> TaskResult {
+fn passing(decision: Decision, picks: BTreeMap<QuestionId, Vec<String>>, record: Value) -> Settled {
     let mut output = match serde_json::to_value(decision) {
         Ok(output) => output,
         Err(e) => return failing(e.to_string()),
@@ -346,31 +354,11 @@ fn passing(
         }
         object.insert(DECISION_KEY.to_owned(), record);
     }
-    TaskResult {
-        status: TaskStatus::Pass,
-        attempts: 1,
-        cost_usd: 0.0,
-        output: Some(output),
-        note: None,
-        fanout: None,
-        blocked: None,
-        transport: None,
-        repairs: Vec::new(),
-    }
+    Settled::Pass(output)
 }
 
-pub(crate) fn failing(note: String) -> TaskResult {
-    TaskResult {
-        status: TaskStatus::Fail,
-        attempts: 1,
-        cost_usd: 0.0,
-        output: None,
-        note: Some(note),
-        fanout: None,
-        blocked: None,
-        transport: None,
-        repairs: Vec::new(),
-    }
+fn failing(note: String) -> Settled {
+    Settled::Fail(note)
 }
 
 #[cfg(test)]
@@ -472,8 +460,9 @@ mod tests {
             &state(answer(&[("go", &["approve"])])),
         )
         .unwrap();
-        assert_eq!(r.status, TaskStatus::Pass);
-        let out = r.output.unwrap();
+        let Settled::Pass(out) = r else {
+            panic!("{r:?}");
+        };
         assert_eq!(out["go"]["label"], "approve");
         assert_eq!(out["go"]["confidence"], 1.0);
         assert!(out["go"].get("labels").is_none());
@@ -498,7 +487,7 @@ mod tests {
         ];
         for labels in cases {
             let r = settle(&questions(), &none(), &state(answer(labels))).unwrap();
-            assert_eq!(r.status, TaskStatus::Fail, "{labels:?}");
+            assert!(matches!(r, Settled::Fail(_)), "{labels:?}");
         }
     }
 
@@ -515,8 +504,9 @@ mod tests {
             ])),
         )
         .unwrap();
-        assert_eq!(r.status, TaskStatus::Pass, "{:?}", r.note);
-        let out = r.output.unwrap();
+        let Settled::Pass(out) = r else {
+            panic!("{r:?}");
+        };
         assert_eq!(out["checks"]["label"], "unit");
         assert_eq!(out["checks"]["labels"], serde_json::json!(["unit", "lint"]));
         assert_eq!(out["checks"]["probabilities"]["lint"], 1.0);
@@ -540,7 +530,9 @@ mod tests {
             ])),
         )
         .unwrap();
-        let out = r.output.unwrap();
+        let Settled::Pass(out) = r else {
+            panic!("{r:?}");
+        };
         assert_eq!(out["checks"]["labels"], serde_json::json!(["e2e"]));
     }
 
@@ -573,12 +565,11 @@ mod tests {
                 })
                 .collect();
             let r = settle(&mixed(), &offered(), &state(answer(&labels))).unwrap();
-            assert_eq!(r.status, TaskStatus::Fail, "{question} {values:?}");
+            assert!(matches!(r, Settled::Fail(_)), "{question} {values:?}");
         }
         let r = settle(&mixed(), &none(), &state(answer(&base))).unwrap();
-        assert_eq!(
-            r.status,
-            TaskStatus::Fail,
+        assert!(
+            matches!(r, Settled::Fail(_)),
             "a pick the request did not offer"
         );
     }
@@ -586,8 +577,9 @@ mod tests {
     #[test]
     fn expiry_answers_every_question_uncertain_and_passes() {
         let r = settle(&mixed(), &offered(), &state(RequestStatus::Expired)).unwrap();
-        assert_eq!(r.status, TaskStatus::Pass);
-        let out = r.output.unwrap();
+        let Settled::Pass(out) = r else {
+            panic!("{r:?}");
+        };
         assert_eq!(out["go"]["label"], "uncertain");
         assert_eq!(out["go"]["confidence"], 0.0);
         assert_eq!(out["checks"]["label"], "uncertain");
@@ -601,7 +593,7 @@ mod tests {
     #[test]
     fn withdrawal_fails_the_route() {
         let r = settle(&questions(), &none(), &state(RequestStatus::Withdrawn)).unwrap();
-        assert_eq!(r.status, TaskStatus::Fail);
+        assert!(matches!(r, Settled::Fail(_)));
     }
 
     #[test]

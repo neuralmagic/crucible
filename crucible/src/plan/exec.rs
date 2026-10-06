@@ -953,7 +953,7 @@ pub fn execute(
                     // The route is in flight, so it settles as a failure naming the halt, as
                     // an attempt the ceiling terminates does.
                     Some(halt) => Some((
-                        crate::plan::decide::failing(format!(
+                        decision_failed(format!(
                             "{} while the decision request was open",
                             halt.blocked()
                         )),
@@ -2736,26 +2736,42 @@ fn open_decision(
     cfg: ExecCfg<'_>,
 ) -> Opened {
     let Some(desk) = cfg.decisions else {
-        return Opened::Settled(crate::plan::decide::failing(
+        return Opened::Settled(decision_failed(
             "no orchestrator takes answers for this run".to_owned(),
         ));
     };
+    let dependencies = t
+        .depends_on
+        .iter()
+        .filter_map(|dep| {
+            let r = results.get(dep)?;
+            Some((
+                dep.clone(),
+                crate::plan::decide::Dependency {
+                    status: r.status.as_str(),
+                    passed: r.status == TaskStatus::Pass,
+                    output: r.output.as_ref(),
+                },
+            ))
+        })
+        .collect();
+    let captured = |task: &Task, declared: &str| runner.captured_file(task, declared);
     let evidence = match crate::plan::decide::build_evidence(crate::plan::decide::EvidenceInputs {
         plan,
         route: t,
         questions,
-        results,
-        runner,
+        dependencies: &dependencies,
+        captured: &captured,
         run,
         review,
         max_bytes: crate::plan::decide::evidence_limit(),
     }) {
         Ok(evidence) => evidence,
-        Err(note) => return Opened::Settled(crate::plan::decide::failing(note)),
+        Err(note) => return Opened::Settled(decision_failed(note)),
     };
     let evidence_digest = match evidence.digest() {
         Ok(digest) => digest,
-        Err(e) => return Opened::Settled(crate::plan::decide::failing(e.to_string())),
+        Err(e) => return Opened::Settled(decision_failed(e.to_string())),
     };
     let remaining = cfg
         .wall_clock
@@ -2782,7 +2798,7 @@ fn open_decision(
         match desk.open(&request) {
             Ok(state) => {
                 return match crate::plan::decide::settle(questions, &choices, &state) {
-                    Some(r) => Opened::Settled(r),
+                    Some(settled) => Opened::Settled(decided(settled)),
                     None => Opened::Parked(Parked {
                         id: state.id,
                         polled: Instant::now(),
@@ -2823,7 +2839,39 @@ fn poll_decision(
         return None;
     };
     let state = cfg.decisions?.poll(&p.id).ok()?;
-    crate::plan::decide::settle(questions, &p.choices, &state)
+    crate::plan::decide::settle(questions, &p.choices, &state).map(decided)
+}
+
+/// A human-decided route's result for how its request settled.
+fn decided(settled: crate::plan::decide::Settled) -> TaskResult {
+    match settled {
+        crate::plan::decide::Settled::Pass(output) => TaskResult {
+            status: TaskStatus::Pass,
+            attempts: 1,
+            cost_usd: 0.0,
+            output: Some(output),
+            note: None,
+            fanout: None,
+            blocked: None,
+            transport: None,
+            repairs: Vec::new(),
+        },
+        crate::plan::decide::Settled::Fail(note) => decision_failed(note),
+    }
+}
+
+fn decision_failed(note: String) -> TaskResult {
+    TaskResult {
+        status: TaskStatus::Fail,
+        attempts: 1,
+        cost_usd: 0.0,
+        output: None,
+        note: Some(note),
+        fanout: None,
+        blocked: None,
+        transport: None,
+        repairs: Vec::new(),
+    }
 }
 
 /// A human-decided route's timeout in a run with no wall-clock ceiling and none declared.
