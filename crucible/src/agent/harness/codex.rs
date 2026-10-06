@@ -33,7 +33,10 @@ pub(crate) struct Codex;
 impl Codex {
     pub(crate) const SPEC: HarnessSpec = HarnessSpec {
         name: "codex",
-        binaries: &["/usr/local/bin/codex"],
+        binaries: &[
+            "/usr/local/bin/codex",
+            "/usr/local/lib/node_modules/@openai/codex/**",
+        ],
         // Codex has no skills discovery; the toolbox still lands where domain prompts reference it.
         skills_dir: ".claude/skills",
         // Relocates config, auth, and the rollout store off `~/.codex`.
@@ -932,6 +935,12 @@ mod tests {
         .concat();
         assert!(Codex.parse_transcript(&torn).tool_calls.is_empty());
         assert!(Codex.content_records(&torn).is_empty());
-        assert_eq!(DEFAULT_BINARIES, ["/usr/local/bin/codex"]);
+        assert_eq!(
+            DEFAULT_BINARIES,
+            [
+                "/usr/local/bin/codex",
+                "/usr/local/lib/node_modules/@openai/codex/**"
+            ]
+        );
     }
 }
