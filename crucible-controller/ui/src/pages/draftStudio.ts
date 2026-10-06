@@ -251,14 +251,22 @@ export function originLabel(origin: DraftOrigin | null | undefined): string {
   return rev === '' ? name : `${name}@${rev}`;
 }
 
-/// The rebase prompt: which rev the origin serves now, against the one the draft was taken at.
+/// The rebase prompt: which rev the origin serves now, against the one the draft was taken at, or
+/// which tree when the rev stayed the same.
 export function originMovedLabel(origin: DraftOrigin | null | undefined): string | null {
   if (origin === null || origin === undefined || !origin.moved) return null;
   const name = origin.kind === 'playbook' ? (origin.playbook ?? 'the origin pack') : 'the origin';
-  return `${name} re-pinned to ${shortRev(origin.current_rev)} since this draft was taken at ${shortRev(origin.rev)}.`;
+  const sameRev = origin.rev === origin.current_rev;
+  const now = sameRev ? origin.current_digest : origin.current_rev;
+  const then = sameRev ? origin.digest : origin.rev;
+  return `${name} re-pinned to ${shortRev(now)} since this draft was taken at ${shortRev(then)}.`;
 }
 
-function shortRev(rev: string | null | undefined): string {
+/// A rev or digest cut to what a reader compares by eye: a `sha256:` or `tree1:` prefix and the 8
+/// characters after it, or the first 8 of a commit.
+export function shortRev(rev: string | null | undefined): string {
   if (rev === null || rev === undefined) return '';
-  return rev.length > 8 ? rev.slice(0, 8) : rev;
+  const colon = rev.indexOf(':');
+  const prefix = colon < 0 ? '' : rev.slice(0, colon + 1);
+  return prefix + rev.slice(prefix.length, prefix.length + 8);
 }

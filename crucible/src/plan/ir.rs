@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use crucible_contract::decision::{
     Label, Question, QuestionError, QuestionId, QuestionKind, UNCERTAIN,
 };
-use crucible_contract::emits::{FieldType, FieldTypeError};
+use crucible_contract::emits::{DeclaredFile, FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
 
 /// The reserved input a task that declares a history depth receives its launch series' earlier
@@ -471,11 +471,12 @@ pub struct Task {
     /// routes, `over`) at validation. Empty = undeclared.
     #[serde(default, skip_serializing_if = "Emits::is_empty")]
     pub emits: Emits,
-    /// Workspace-relative paths this task's output includes as files. A declared file is part
-    /// of the task's output, not part of the workspace state that isolation discards, so a
-    /// dependent receives it either way.
+    /// Workspace-relative paths this task's output includes as files, each with the schema its
+    /// JSON content must satisfy when one is declared. A declared file is part of the task's
+    /// output, not part of the workspace state that isolation discards, so a dependent receives
+    /// it either way.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub emits_files: Vec<String>,
+    pub emits_files: Vec<DeclaredFile>,
     /// An upstream list this task runs once per element of. The task is one node in the graph
     /// however many elements arrive, so the graph stays renderable before any spend; only the
     /// number of instances is decided at run time.
@@ -498,6 +499,14 @@ pub struct Task {
     /// How many earlier runs of the launch series this task reads under [`HISTORY_INPUT`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<u32>,
+    /// How many times an agent task's session is resumed to fix a passing attempt whose output
+    /// breaks its declared emits or files, within the attempt's deadline. Zero for none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub repair: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `tasks` run again with the
@@ -551,6 +560,9 @@ impl From<Revise> for ReviseRepr {
 
 /// The most rounds one revise loop may run. Operator-owned, like [`MAX_FANOUT_CEILING`].
 pub const MAX_ROUNDS_CEILING: u32 = 5;
+
+/// The most repair turns one agent attempt may take.
+pub const MAX_REPAIR_CEILING: u32 = 3;
 
 /// Executor-enforced accounting limit; overruns fail the plan.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -857,6 +869,19 @@ pub enum PlanError {
         producer: String,
         declared: FieldType,
     },
+    #[error(
+        "task {task:?} maps over {reference}, which {producer:?} declares {declared}, but {why}; a \
+         mapped instance is named by its item, so `over` needs a list of strings"
+    )]
+    OverItemsNotStrings {
+        task: String,
+        reference: String,
+        producer: String,
+        declared: Box<FieldType>,
+        why: String,
+    },
+    #[error("{0}")]
+    WhenNeverAnswered(Box<NeverAnswered>),
     #[error("route task {task:?} declares `over`; routing each element of a list is not supported")]
     RouteWithOver { task: String },
     #[error("task {task:?}: when names {route:?}, which is not one of its dependencies")]
@@ -924,6 +949,13 @@ pub enum PlanError {
     ReviseTargetUnreachable { task: String, target: String },
     #[error("task {task:?}: max_rounds = {got} is outside 2..={MAX_ROUNDS_CEILING}")]
     RoundsOutOfRange { task: String, got: u32 },
+    #[error("task {task:?}: repair = {got} is outside 0..={MAX_REPAIR_CEILING}")]
+    RepairOutOfRange { task: String, got: u32 },
+    #[error(
+        "task {task:?} is a {kind} task and declares repair; only an agent task's session can be \
+         resumed to fix its output, and a {kind} task would produce the same output again"
+    )]
+    RepairOnUnsupportedTask { task: String, kind: &'static str },
     #[error(
         "task {task:?}'s revise loop includes {member:?}, a {kind} task; only agent, command, and \
          evaluate tasks take part in a revise loop"
@@ -994,14 +1026,59 @@ pub enum PlanError {
     },
 }
 
+/// A `when` naming a label its route can never give, because the route's source bounds that
+/// question's field to other answers.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[error(
+    "task {task:?}: {route}.{question} can never be answered {label:?}; {route:?} reads it from \
+     {source_task:?}, which declares it {declared}, so it answers only {}",
+    .possible.join(", ")
+)]
+pub struct NeverAnswered {
+    pub task: String,
+    pub route: String,
+    pub question: String,
+    pub label: String,
+    pub source_task: String,
+    pub declared: FieldType,
+    pub possible: Vec<String>,
+}
+
 /// Whether every value of `declared` is an answer an output-decided route accepts for
-/// `question`: one of its labels or `uncertain`, or, for a noul, a boolean.
+/// `question`: one of its labels or `uncertain`, where a boolean answers `yes` or `no`.
 fn answers(question: &Question, declared: &FieldType) -> bool {
-    match (declared, &question.kind) {
-        (FieldType::Boolean, QuestionKind::Noul) => true,
-        (FieldType::OneOf(labels), _) => labels.iter().all(|l| question.resolves_to(l)),
-        _ => false,
-    }
+    declared
+        .route_answers()
+        .is_some_and(|labels| labels.iter().all(|l| question.resolves_to(l)))
+}
+
+/// The answers a route can give `question` when it reads them from a dependency whose emits type
+/// that field with finitely many values the question accepts, with the source task and the type.
+/// `None` for a route a model decides, or one whose source leaves the field untyped, where any
+/// label of the question may arrive, and for a source the route cannot read at all, which
+/// validation refuses on its own.
+pub(crate) fn typed_answers<'a>(
+    route: &Task,
+    question: &QuestionId,
+    find: impl Fn(&TaskName) -> Option<&'a Task>,
+) -> Option<(&'a TaskName, &'a FieldType, BTreeSet<Label>)> {
+    let TaskKind::Route {
+        questions,
+        decider: Decider::Output { task: source },
+    } = &route.task
+    else {
+        return None;
+    };
+    let asked = questions.get(question)?;
+    let source = find(source)?;
+    let Declared::Typed(declared) = source.emits.field(question.as_str()) else {
+        return None;
+    };
+    let possible = declared.route_answers()?;
+    possible
+        .iter()
+        .all(|label| asked.resolves_to(label))
+        .then_some((&source.name, declared, possible))
 }
 
 fn answerable_types(question: &Question) -> String {
@@ -1343,8 +1420,25 @@ impl Plan {
                         question: question(),
                     });
                 }
+                let typed = typed_answers(target, &when.question, |name| {
+                    index.get(name).map(|&i| &self.tasks[i])
+                });
                 let mut listed = BTreeSet::new();
                 for label in &when.is {
+                    if let Some((source, declared, possible)) = &typed
+                        && asked.resolves_to(label)
+                        && !possible.contains(label)
+                    {
+                        return Err(PlanError::WhenNeverAnswered(Box::new(NeverAnswered {
+                            task: task(),
+                            route: route(),
+                            question: question(),
+                            label: label.to_string(),
+                            source_task: source.0.clone(),
+                            declared: (*declared).clone(),
+                            possible: possible.iter().map(ToString::to_string).collect(),
+                        })));
+                    }
                     if !asked.resolves_to(label) {
                         return Err(PlanError::WhenUnknownLabel {
                             task: task(),
@@ -1520,9 +1614,18 @@ impl Plan {
                     }
                     let producer = &self.tasks[index[&reference.task]];
                     match producer.emits.field(&reference.field.0) {
-                        Declared::Unchecked
-                        | Declared::Untyped
-                        | Declared::Typed(FieldType::List) => {}
+                        Declared::Unchecked | Declared::Untyped => {}
+                        Declared::Typed(declared) if declared.is_list() => {
+                            if let Some(why) = declared.item_refusal() {
+                                return Err(PlanError::OverItemsNotStrings {
+                                    task: task(),
+                                    reference: reference.to_string(),
+                                    producer: reference.task.0.clone(),
+                                    declared: Box::new(declared.clone()),
+                                    why,
+                                });
+                            }
+                        }
                         Declared::Omitted => {
                             return Err(PlanError::OverFieldOmitted {
                                 task: task(),
@@ -1554,6 +1657,18 @@ impl Plan {
                         });
                     }
                 }
+            }
+            if t.repair > MAX_REPAIR_CEILING {
+                return Err(PlanError::RepairOutOfRange {
+                    task: task(),
+                    got: t.repair,
+                });
+            }
+            if t.repair > 0 && !matches!(t.task, TaskKind::Agent { .. }) {
+                return Err(PlanError::RepairOnUnsupportedTask {
+                    task: task(),
+                    kind: t.task.label(),
+                });
             }
             if let Some(revise) = &t.revise {
                 if t.when.is_some() {
@@ -1594,16 +1709,26 @@ impl Plan {
             }
         }
         for ((route, question), listed) in &handled {
-            let TaskKind::Route { questions, .. } = &self.tasks[index[route]].task else {
+            let route_task = &self.tasks[index[route]];
+            let TaskKind::Route { questions, .. } = &route_task.task else {
                 continue;
             };
             let Some(asked) = questions.get(question) else {
                 continue;
             };
+            let possible = typed_answers(route_task, question, |name| {
+                index.get(name).map(|&i| &self.tasks[i])
+            })
+            .map(|(_, _, possible)| possible);
             let unrouted: Vec<String> = asked
                 .labels()
                 .into_iter()
                 .chain([Label::uncertain()])
+                .filter(|l| {
+                    possible
+                        .as_ref()
+                        .is_none_or(|possible| possible.contains(l))
+                })
                 .filter(|l| !listed.contains(l) && !asked.drop.contains(l))
                 .map(|l| l.to_string())
                 .collect();
@@ -1752,7 +1877,7 @@ impl Plan {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::plan::ir::*;
 
     fn agent(name: &str, deps: &[&str]) -> Task {
         Task {
@@ -1779,6 +1904,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -2418,6 +2544,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -2568,6 +2695,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -3086,6 +3214,304 @@ emits = ["lines"]
                 }
             );
         }
+    }
+
+    fn schema(document: serde_json::Value) -> FieldType {
+        FieldType::Schema(crucible_contract::emits::JsonSchema::new(document).unwrap())
+    }
+
+    #[test]
+    fn a_schema_field_satisfies_a_consumer_through_its_top_level_type() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let over = |ty: FieldType| {
+            let mut discover = agent("discover", &[]);
+            discover.emits = typed(&[("targets", ty)]);
+            let mut audit = agent("audit", &["discover"]);
+            audit.over = Some(targets.clone());
+            audit.max_fanout = Some(4);
+            plan(vec![discover, audit]).validate()
+        };
+        over(schema(
+            serde_json::json!({"type": "array", "items": {"type": "string"}}),
+        ))
+        .unwrap();
+        for bad in [
+            schema(serde_json::json!({"type": "object"})),
+            schema(serde_json::json!({"items": {"type": "string"}})),
+            schema(serde_json::json!({"type": ["array", "null"]})),
+        ] {
+            assert_eq!(
+                over(bad.clone()).unwrap_err(),
+                PlanError::OverNotAList {
+                    task: "audit".into(),
+                    reference: "discover.targets".into(),
+                    producer: "discover".into(),
+                    declared: bad,
+                }
+            );
+        }
+
+        let scored = |ty: FieldType| {
+            let mut e = agent("e", &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: Some(0.5),
+                direction: Some(Direction::Higher),
+            };
+            e.emits = typed(&[("score", ty)]);
+            plan(vec![e]).validate()
+        };
+        scored(schema(serde_json::json!({"type": "number", "minimum": 0}))).unwrap();
+        scored(schema(serde_json::json!({"type": "integer"}))).unwrap();
+        let unscored = schema(serde_json::json!({"minimum": 0}));
+        assert_eq!(
+            scored(unscored.clone()).unwrap_err(),
+            PlanError::ScoreNotNumeric {
+                task: "e".into(),
+                source_task: "e".into(),
+                declared: unscored,
+            }
+        );
+
+        let routed = |ty: FieldType| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[("urgent", ty)]);
+            plan(vec![classify, noul_route("gate", "classify")]).validate()
+        };
+        routed(schema(serde_json::json!({"type": "boolean"}))).unwrap();
+        routed(schema(
+            serde_json::json!({"enum": ["yes", "no", "uncertain"]}),
+        ))
+        .unwrap();
+        routed(schema(serde_json::json!({"enum": [true, false]}))).unwrap();
+        let unanswerable = schema(serde_json::json!({"enum": ["yes", "maybe"]}));
+        assert_eq!(
+            routed(unanswerable.clone()).unwrap_err(),
+            PlanError::RouteSourceUnanswerable {
+                task: "gate".into(),
+                source_task: "classify".into(),
+                question: "urgent".into(),
+                declared: Box::new(unanswerable),
+                expected: "\"boolean\" or labels from yes|no|uncertain".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn over_a_schema_field_needs_items_that_are_provably_strings() {
+        let targets = OutputRef {
+            task: "discover".into(),
+            field: OutputField("targets".into()),
+        };
+        let over = |document: serde_json::Value| {
+            let mut discover = agent("discover", &[]);
+            discover.emits = typed(&[("targets", schema(document))]);
+            let mut audit = agent("audit", &["discover"]);
+            audit.over = Some(targets.clone());
+            audit.max_fanout = Some(4);
+            plan(vec![discover, audit]).validate()
+        };
+        for ok in [
+            serde_json::json!({"type": "array", "items": {"type": "string"}}),
+            serde_json::json!({"type": "array", "items": {"enum": ["a", "b"]}}),
+            serde_json::json!({"type": "array", "items": {"const": "only"}}),
+            serde_json::json!({
+                "type": "array",
+                "$defs": {"lane": {"type": "string", "minLength": 1}},
+                "items": {"$ref": "#/$defs/lane"}
+            }),
+            serde_json::json!({"type": "array", "items": {"anyOf": [{"const": "a"}, {"type": "string"}]}}),
+            serde_json::json!({"type": "array", "prefixItems": [{"const": "x"}], "items": false}),
+        ] {
+            over(ok.clone()).unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        for (bad, why) in [
+            (
+                serde_json::json!({"type": "array"}),
+                "it declares no `items`, so an item may be anything",
+            ),
+            (
+                serde_json::json!({"type": "array", "items": {"type": "integer"}}),
+                "its `items` is {\"type\":\"integer\"}, which does not make every item a string",
+            ),
+            (
+                serde_json::json!({"type": "array", "items": {"enum": ["a", 1]}}),
+                "its `items` is {\"enum\":[\"a\",1]}, which does not make every item a string",
+            ),
+            (
+                serde_json::json!({"type": "array", "items": {"anyOf": [{"type": "string"}, {"type": "null"}]}}),
+                "which does not make every item a string",
+            ),
+            (
+                serde_json::json!({"type": "array", "prefixItems": [{"type": "integer"}], "items": {"type": "string"}}),
+                "its `prefixItems[0]` is {\"type\":\"integer\"}",
+            ),
+            (
+                serde_json::json!({"type": "array", "prefixItems": [{"type": "string"}]}),
+                "an item past its `prefixItems` may be anything",
+            ),
+        ] {
+            match over(bad.clone()).unwrap_err() {
+                PlanError::OverItemsNotStrings {
+                    task,
+                    reference,
+                    why: got,
+                    ..
+                } => {
+                    assert_eq!(
+                        (task.as_str(), reference.as_str()),
+                        ("audit", "discover.targets")
+                    );
+                    assert!(got.contains(why), "{bad}: {got}");
+                }
+                other => panic!("{bad}: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_toml_plan_gets_the_same_exact_checks() {
+        let toml = |items: &str| {
+            format!(
+                "version = 1\n[budget]\nusd = 1.0\n\
+                 [[task]]\nname = \"discover\"\nkind = \"command\"\ncommand = \"true\"\n\
+                 emits = {{ lanes = {{ schema = '{{\"type\":\"array\",\"items\":{items}}}' }} }}\n\
+                 [[task]]\nname = \"audit\"\nkind = \"command\"\ncommand = \"true\"\n\
+                 depends_on = [\"discover\"]\nover = {{ task = \"discover\", field = \"lanes\" }}\nmax_fanout = 4\n"
+            )
+        };
+        Plan::from_toml_str(&toml(r#"{"type":"string"}"#))
+            .unwrap()
+            .validate()
+            .unwrap();
+        let err = Plan::from_toml_str(&toml(r#"{"type":"number"}"#))
+            .unwrap()
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(err, PlanError::OverItemsNotStrings { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_numeric_schema_whose_enum_holds_a_non_number_is_no_score() {
+        let scored = |document: serde_json::Value| {
+            let mut e = agent("e", &[]);
+            e.task = TaskKind::Evaluate {
+                command: "./x.sh".into(),
+                threshold: Some(0.5),
+                direction: Some(Direction::Higher),
+            };
+            e.emits = typed(&[("score", schema(document))]);
+            plan(vec![e]).validate()
+        };
+        scored(serde_json::json!({"type": "number", "enum": [0, 0.5, 1]})).unwrap();
+        assert!(matches!(
+            scored(serde_json::json!({"type": "number", "enum": [0, "high"]})).unwrap_err(),
+            PlanError::ScoreNotNumeric { .. }
+        ));
+    }
+
+    #[test]
+    fn a_when_label_a_typed_source_can_never_give_is_refused() {
+        let with = |ty: FieldType, is: &[&str], rest: &[&str]| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[("area", ty)]);
+            plan(vec![
+                classify,
+                output_route("gate", "classify", &[]),
+                on(agent("fix", &["gate"]), "gate", "area", is),
+                on(agent("rest", &["gate"]), "gate", "area", rest),
+            ])
+            .validate()
+        };
+        let enum_of = |labels: &[&str]| schema(serde_json::json!({"enum": labels}));
+        for ty in [
+            one_of(&["scheduler", "frontend"]),
+            enum_of(&["scheduler", "frontend"]),
+        ] {
+            with(ty.clone(), &["scheduler"], &["frontend"]).unwrap_or_else(|e| {
+                panic!("{ty}: labels the source cannot give need no task: {e}")
+            });
+            assert_eq!(
+                with(ty.clone(), &["scheduler"], &["frontend", "uncertain"]).unwrap_err(),
+                PlanError::WhenNeverAnswered(Box::new(NeverAnswered {
+                    task: "rest".into(),
+                    route: "gate".into(),
+                    question: "area".into(),
+                    label: "uncertain".into(),
+                    source_task: "classify".into(),
+                    declared: ty.clone(),
+                    possible: vec!["frontend".into(), "scheduler".into()],
+                })),
+                "{ty}"
+            );
+            assert!(
+                matches!(
+                    with(ty.clone(), &["scheduler"], &[]).unwrap_err(),
+                    PlanError::WhenWithoutLabels { .. }
+                ),
+                "{ty}"
+            );
+        }
+        let untyped = with(FieldType::String, &["scheduler"], &["frontend"]);
+        assert!(
+            matches!(untyped, Err(PlanError::RouteSourceUnanswerable { .. })),
+            "{untyped:?}"
+        );
+        let message = with(
+            enum_of(&["scheduler", "frontend"]),
+            &["scheduler"],
+            &["frontend", "uncertain"],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains("gate.area can never be answered \"uncertain\""),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_task_with_schema_types_round_trips_through_json_and_toml() {
+        let mut t = agent("probe", &[]);
+        t.emits = typed(&[(
+            "lanes",
+            schema(serde_json::json!({"type": "array", "items": {"default": null}})),
+        )]);
+        t.emits_files = vec![
+            "REPORT.md".into(),
+            DeclaredFile {
+                path: "RESULT.json".into(),
+                schema: Some(
+                    crucible_contract::emits::JsonSchema::new(
+                        serde_json::json!({"type": "object", "properties": {"x": {"const": null}}}),
+                    )
+                    .unwrap(),
+                ),
+            },
+        ];
+        let json = serde_json::to_string(&t).unwrap();
+        let back: Task = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.emits, t.emits);
+        assert_eq!(back.emits_files, t.emits_files);
+        let toml = toml::to_string(&t).unwrap();
+        let back: Task = toml::from_str(&toml).unwrap();
+        assert_eq!(back.emits, t.emits);
+        assert_eq!(back.emits_files, t.emits_files);
+
+        let untyped = agent("plain", &[]);
+        let mut listed = untyped.clone();
+        listed.emits_files = vec!["A.md".into(), "B.md".into()];
+        assert!(
+            serde_json::to_string(&listed)
+                .unwrap()
+                .contains(r#""emits_files":["A.md","B.md"]"#)
+        );
     }
 
     #[test]
@@ -3646,6 +4072,45 @@ emits = ["lines"]
                 member: "fold".into(),
                 kind: "top_k"
             }
+        );
+    }
+
+    #[test]
+    fn repair_is_bounded_and_belongs_to_agent_tasks() {
+        for ok in [0, 1, MAX_REPAIR_CEILING] {
+            let mut t = agent("plan", &[]);
+            t.repair = ok;
+            plan(vec![t]).validate().unwrap();
+        }
+        let mut t = agent("plan", &[]);
+        t.repair = MAX_REPAIR_CEILING + 1;
+        assert_eq!(
+            refused(vec![t]),
+            PlanError::RepairOutOfRange {
+                task: "plan".into(),
+                got: MAX_REPAIR_CEILING + 1,
+            }
+        );
+        let mut t = agent("probe", &[]);
+        t.task = TaskKind::Command {
+            command: "./probe.sh".into(),
+        };
+        t.repair = 1;
+        assert_eq!(
+            refused(vec![t]),
+            PlanError::RepairOnUnsupportedTask {
+                task: "probe".into(),
+                kind: "command",
+            }
+        );
+        let mut t = agent("plan", &[]);
+        t.repair = 2;
+        let json = serde_json::to_string(&t).unwrap();
+        assert!(json.contains(r#""repair":2"#), "{json}");
+        assert!(
+            !serde_json::to_string(&agent("plain", &[]))
+                .unwrap()
+                .contains("repair")
         );
     }
 

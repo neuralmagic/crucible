@@ -297,9 +297,9 @@ impl Exposure {
 pub enum Extraction {
     /// The document the engine computed for the exact stored content.
     Declared(Exposure),
-    /// No document. A registered launch row stores none, since its disclosure is the registry
-    /// revision's; a row frozen before extraction existed reads back the same way. A launch
-    /// reading such a row grants the agent nothing it would have had to disclose.
+    /// No document. A registered launch passes this and records the registry row's instead; a
+    /// row frozen before extraction existed reads back the same way. A launch reading such a row
+    /// grants the agent nothing it would have had to disclose.
     Absent,
 }
 

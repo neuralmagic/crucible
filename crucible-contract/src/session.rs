@@ -160,6 +160,10 @@ pub struct PlanTaskWire {
     /// Empty when the task declares none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub emits: Vec<crate::emits::EmitWire>,
+    /// The files the task's output includes, each with its schema when the declaration gave one.
+    /// Empty when the task declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emits_files: Vec<crate::emits::DeclaredFile>,
     /// How long one attempt may run (`90s`, `10m`, `2h`), empty when the task declares no limit
     /// and only the run's wall-clock ceiling bounds it.
     #[serde(default)]
@@ -304,6 +308,35 @@ pub struct TaskAgent {
     pub model: String,
     #[serde(default)]
     pub effort: String,
+}
+
+/// One repair turn of an agent attempt: the session was resumed with `notes`, the masked
+/// validation notes its previous turn earned, and asked to fix its output in place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskRepair {
+    /// `<task> repair <round>/<of>`, the sub-attempt as a reader names it.
+    pub label: String,
+    pub round: u32,
+    pub of: u32,
+    #[serde(default)]
+    pub cost_usd: f64,
+    #[serde(default)]
+    pub notes: Vec<String>,
+}
+
+impl TaskRepair {
+    /// Every repair in a stored or logged array that this build can read, in order. An entry it
+    /// cannot read drops out rather than costing the reader the attempt it rode in on.
+    pub fn decode_all(raw: &serde_json::Value) -> Vec<TaskRepair> {
+        raw.as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| serde_json::from_value(item.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 /// Why the executor never dispatched a task. `task` names the required task whose failure
@@ -492,6 +525,9 @@ pub enum SessionEvent {
         /// What the attempts ran on, resolved. Present exactly when the task runs an agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent: Option<TaskAgent>,
+        /// The repair turns the attempts took, in order. Their cost is part of `cost_usd`.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        repairs: Vec<TaskRepair>,
         #[serde(default)]
         note: String,
         /// Present exactly when `status` is `blocked`; `note` is its rendered form.
@@ -903,6 +939,26 @@ mod tests {
                         field: "note".into(),
                         ty: None,
                     },
+                    crate::emits::EmitWire {
+                        field: "lanes".into(),
+                        ty: Some(crate::emits::FieldType::Schema(
+                            crate::emits::JsonSchema::new(serde_json::json!({
+                                "type": "array",
+                                "items": {"type": "string", "default": null}
+                            }))
+                            .expect("a valid schema"),
+                        )),
+                    },
+                ],
+                emits_files: vec![
+                    "REPORT.md".into(),
+                    crate::emits::DeclaredFile {
+                        path: "RESULT.json".into(),
+                        schema: Some(
+                            crate::emits::JsonSchema::new(serde_json::json!({"type": "object"}))
+                                .expect("a valid schema"),
+                        ),
+                    },
                 ],
                 timeout: "10m".into(),
                 history_depth: 5,
@@ -972,6 +1028,7 @@ mod tests {
             revise,
             max_rounds: 0,
             emits: Vec::new(),
+            emits_files: Vec::new(),
             timeout: String::new(),
             history_depth: 0,
         };
@@ -1043,6 +1100,13 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             agent: None,
+            repairs: vec![TaskRepair {
+                label: "measure-a repair 1/2".into(),
+                round: 1,
+                of: 2,
+                cost_usd: 0.1,
+                notes: vec!["output missing declared field \"score\"".into()],
+            }],
         });
         // A minimal line (old writers, other contexts) still decodes: every field but
         // task/status defaults.
@@ -1094,6 +1158,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             agent: None,
+            repairs: Vec::new(),
         };
         assert_eq!(
             encode(&ev),
@@ -1150,6 +1215,7 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             agent: None,
+            repairs: Vec::new(),
         };
         assert_eq!(
             encode(&ev),
@@ -1198,6 +1264,7 @@ mod tests {
                 model: "glm-5.3".into(),
                 effort: "low".into(),
             }),
+            repairs: Vec::new(),
         };
         assert!(
             encode(&ev)

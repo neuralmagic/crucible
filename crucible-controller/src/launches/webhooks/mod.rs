@@ -211,19 +211,9 @@ pub(crate) async fn record_delivery(
         .execute(&mut *tx)
         .await
         .context("stamp the last delivery")?;
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(DELIVERY_CHANNEL)
-        .bind(webhook_id)
-        .execute(&mut *tx)
-        .await
-        .context("announce the delivery")?;
     tx.commit().await.context("record delivery: commit")?;
     Ok(id)
 }
-
-/// The channel a committed delivery is announced on. Any replica records deliveries; only the
-/// leader's launch loop listens.
-pub(crate) const DELIVERY_CHANNEL: &str = "crucible_webhook_delivery";
 
 /// How many webhooks and deliveries a list returns.
 pub(crate) const LIST_LIMIT: i64 = 200;

@@ -11,7 +11,7 @@
 use axum::Router;
 use axum::routing::get;
 use utoipa::OpenApi;
-use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouterExt};
 use utoipa_axum::routes;
 
 pub mod state;
@@ -87,6 +87,7 @@ pub(crate) mod tests;
         crate::playbooks::api::import::create_draft_from_git,
         crate::playbooks::api::drafts::create_playbook_draft,
         crate::playbooks::api::drafts::list_playbook_drafts,
+        crate::playbooks::api::drafts::get_playbook_limits,
         crate::playbooks::api::drafts::get_playbook_draft,
         crate::playbooks::api::drafts::get_playbook_draft_files,
         crate::playbooks::api::drafts::get_playbook_draft_preview,
@@ -264,6 +265,7 @@ pub(crate) mod tests;
         crate::playbooks::api::drafts::PublishDraftBody,
         crate::playbooks::api::drafts::PlaybookDraftDto,
         crate::playbooks::api::drafts::PlaybookDraftDetail,
+        crate::playbooks::api::drafts::PlaybookLimits,
         crate::playbooks::api::drafts::DraftVersionDto,
         crate::playbooks::api::drafts::DraftCompileDto,
         crate::playbooks::api::drafts::DraftFilesDto,
@@ -475,6 +477,7 @@ pub fn router(state: ApiState) -> Router {
             crate::playbooks::api::drafts::get_playbook_draft,
             crate::playbooks::api::drafts::delete_playbook_draft
         ))
+        .routes(routes!(crate::playbooks::api::drafts::get_playbook_limits))
         .routes(routes!(
             crate::playbooks::api::drafts::get_playbook_draft_files
         ))
@@ -487,7 +490,13 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(
             crate::playbooks::api::drafts::get_playbook_draft_tarball
         ))
-        .routes(routes!(crate::playbooks::api::drafts::save_playbook_draft))
+        .routes(
+            routes!(crate::playbooks::api::drafts::save_playbook_draft).layer(
+                axum::extract::DefaultBodyLimit::max(
+                    crate::playbooks::drafts::MAX_DRAFT_SAVE_BYTES,
+                ),
+            ),
+        )
         .routes(routes!(
             crate::playbooks::api::drafts::launch_playbook_draft
         ))

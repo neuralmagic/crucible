@@ -9,6 +9,7 @@
 use crate::launches::model::{NewPlaybookLaunch, PlaybookLaunch, PlaybookRun};
 use crate::model::{LaunchOrigin, Status};
 use crate::playbooks::exposure::Exposure;
+use crate::playbooks::registry::PackRevision;
 use crate::runs::model::Run;
 use crate::runs::store::RUN_COLS;
 use anyhow::{Context, Result};
@@ -27,9 +28,9 @@ use std::collections::BTreeMap;
 /// one-shots land the same row through the same function. `Ok(false)` when the registry id is
 /// unknown (nothing is written).
 ///
-/// A draft one-shot records its exposure on the launch row itself. A registered launch passes
-/// [`Extraction::Absent`](crate::playbooks::exposure::Extraction::Absent): its disclosure is the registry
-/// row's, not a per-launch copy.
+/// A draft launch records the exposure it is passed. A registered launch passes
+/// [`Extraction::Absent`](crate::playbooks::exposure::Extraction::Absent) and records the registry
+/// row's exposure, read with the pack it copies.
 #[tracing::instrument(name = "db.insert_playbook_launch_with", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn insert_playbook_launch_with(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -78,25 +79,17 @@ pub(crate) async fn insert_playbook_launch_with(
     .execute(&mut **tx)
     .await
     .context("insert_playbook_launch: insert launch")?;
-    sqlx::query("SELECT pg_notify($1, $2)")
-        .bind(LAUNCH_CHANNEL)
-        .bind(key)
-        .execute(&mut **tx)
-        .await
-        .context("insert_playbook_launch: announce")?;
     let slug = crate::model::sanitize_key(key);
     match launch.draft_version {
         Some(version) => {
             crate::playbooks::drafts::copy_draft_pack_to(&mut **tx, launch.playbook, version, &slug)
                 .await
         }
-        None => crate::playbooks::registry::copy_pack_to(&mut **tx, launch.playbook, &slug).await,
+        None => {
+            crate::playbooks::registry::copy_pack_to_launch(&mut **tx, launch.playbook, key).await
+        }
     }
 }
-
-/// The channel a committed launch is announced on. Any replica mints launches; only the leader
-/// dispatches them.
-pub(crate) const LAUNCH_CHANNEL: &str = "crucible_launch";
 
 /// Read back what a launch was authorized to run with. `None` when the key names no launch — a
 /// row whose launch went missing parks rather than dispatching on guessed values.
@@ -311,6 +304,22 @@ pub(crate) enum AdoptPlaybookOutcome {
     SchemaDrifted {
         current: String,
     },
+    /// The registry row was repinned to another revision between the endpoint's authorization and
+    /// this transaction.
+    Repinned {
+        rev: String,
+    },
+}
+
+/// What adopting a draft launch did, decided under a share lock on the draft version.
+pub(crate) enum AdoptDraftOutcome {
+    Adopted,
+    UnknownDraft,
+    /// The draft was saved between the endpoint's validation and this transaction: `current` is
+    /// the version's schema digest, or the newer version that superseded it.
+    Saved {
+        current: String,
+    },
 }
 
 /// Mint one draft launch. The registry foreign key cannot cover a draft, so this is where the
@@ -322,7 +331,7 @@ pub(crate) async fn adopt_draft_launch(
     key: &str,
     launch: &NewPlaybookLaunch<'_>,
     exposure: &crate::playbooks::exposure::Extraction,
-) -> Result<AdoptPlaybookOutcome> {
+) -> Result<AdoptDraftOutcome> {
     let version = launch
         .draft_version
         .context("adopt_draft_launch: a draft launch names its version")?;
@@ -343,21 +352,21 @@ pub(crate) async fn adopt_draft_launch(
     .await
     .context("adopt_draft_launch: re-read the newest version")?;
     let outcome = match current {
-        None => AdoptPlaybookOutcome::UnknownPlaybook,
+        None => AdoptDraftOutcome::UnknownDraft,
         Some(stored) if stored.as_deref() != Some(launch.schema_digest) => {
-            AdoptPlaybookOutcome::SchemaDrifted {
+            AdoptDraftOutcome::Saved {
                 current: stored.unwrap_or_default(),
             }
         }
-        Some(_) if newest != Some(version) => AdoptPlaybookOutcome::SchemaDrifted {
+        Some(_) if newest != Some(version) => AdoptDraftOutcome::Saved {
             current: format!("version {}", newest.unwrap_or_default()),
         },
         Some(_) => {
             if insert_playbook_launch_with(&mut tx, key, launch, exposure).await? {
                 tx.commit().await.context("adopt_draft_launch: commit")?;
-                return Ok(AdoptPlaybookOutcome::Adopted);
+                return Ok(AdoptDraftOutcome::Adopted);
             }
-            AdoptPlaybookOutcome::UnknownPlaybook
+            AdoptDraftOutcome::UnknownDraft
         }
     };
     tx.rollback()
@@ -366,24 +375,27 @@ pub(crate) async fn adopt_draft_launch(
     Ok(outcome)
 }
 
+/// Mint one registered launch. The registry row is re-read `FOR SHARE`, and the launch is refused
+/// unless it still serves the schema and holds the revision the endpoint authorized, so the pack
+/// copied to the launch is the one its values were validated against.
 #[tracing::instrument(name = "db.adopt_playbook_launch", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", key = %key), err)]
 pub(crate) async fn adopt_playbook_launch(
     pool: &PgPool,
     key: &str,
     launch: &NewPlaybookLaunch<'_>,
+    authorized: PackRevision<'_>,
 ) -> Result<AdoptPlaybookOutcome> {
     let mut tx = pool.begin().await.context("adopt_playbook_launch: begin")?;
-    let current = sqlx::query_scalar!(
-        "SELECT schema_digest FROM playbooks WHERE id = $1 FOR SHARE",
-        launch.playbook,
-    )
-    .fetch_optional(&mut *tx)
-    .await
-    .context("adopt_playbook_launch: re-read the schema digest")?;
+    let current = crate::playbooks::registry::lock_revision(&mut tx, launch.playbook).await?;
     let outcome = match current {
         None => AdoptPlaybookOutcome::UnknownPlaybook,
-        Some(current) if current != launch.schema_digest => {
-            AdoptPlaybookOutcome::SchemaDrifted { current }
+        Some(current) if current.schema_digest != launch.schema_digest => {
+            AdoptPlaybookOutcome::SchemaDrifted {
+                current: current.schema_digest,
+            }
+        }
+        Some(current) if !current.holds(authorized) => {
+            AdoptPlaybookOutcome::Repinned { rev: current.rev }
         }
         Some(_) => {
             if insert_playbook_launch_with(
@@ -406,32 +418,251 @@ pub(crate) async fn adopt_playbook_launch(
     Ok(outcome)
 }
 
-/// The exposure a run of `issue_key` executes under: the launch's own recomputed disclosure (a
-/// draft one-shot), else the registry revision's, else the frozen scope pack's. `None` is
-/// absent-legacy or an issue with neither a launch nor a scope.
-pub async fn exposure_for_issue(pool: &sqlx::PgPool, issue_key: &str) -> Result<Option<Exposure>> {
-    if let Some(launch) = get_playbook_launch(pool, issue_key).await? {
-        if launch.exposure.is_some() {
-            return Ok(launch.exposure);
-        }
-        return Ok(
-            crate::playbooks::exposure::registered(pool, &launch.playbook)
-                .await?
-                .flatten(),
-        );
-    }
-    Ok(
-        crate::issues::store::latest_scope_for_issue(pool, issue_key)
-            .await?
-            .and_then(|s| s.exposure),
-    )
+/// A launch's own pack whose exposure the engine refuses to extract.
+#[derive(Debug, thiserror::Error)]
+#[error("extracting the exposure of launch {key}'s pack: {message}")]
+pub struct ExposureRefused {
+    key: String,
+    message: String,
 }
+
+/// The exposure a run of `issue_key` executes under: the launch's ([`launch_exposure`]), else the
+/// frozen scope pack's. `None` is absent-legacy or an issue with neither a launch nor a scope.
+pub async fn exposure_for_issue(
+    pool: &PgPool,
+    issue_key: &str,
+) -> Result<Result<Option<Exposure>, ExposureRefused>> {
+    if let Some(launch) = get_playbook_launch(pool, issue_key).await? {
+        return launch_exposure(pool, issue_key, &launch).await;
+    }
+    Ok(Ok(crate::issues::store::latest_scope_for_issue(
+        pool, issue_key,
+    )
+    .await?
+    .and_then(|s| s.exposure)))
+}
+
+/// The revision registered launch `issue_key` runs: the pack its `pack_tarballs` row froze, with
+/// the registry's source rev only while the registry row still holds that pack. A launch with no
+/// frozen pack runs the registry row as it stands.
+pub(crate) async fn launch_revision(
+    pool: &PgPool,
+    issue_key: &str,
+    playbook: &str,
+) -> Result<crate::secrets::launch::OwnedRevision> {
+    let frozen: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT CASE WHEN COALESCE(t.tree_digest = p.tree_digest, t.digest = p.tar_digest)
+                     THEN p.rev END,
+                COALESCE(t.tree_digest, t.digest)
+         FROM pack_tarballs t LEFT JOIN playbooks p ON p.id = $2
+         WHERE t.issue_slug = $1",
+    )
+    .bind(crate::model::sanitize_key(issue_key))
+    .bind(playbook)
+    .fetch_optional(pool)
+    .await
+    .context("reading the pack a launch froze")?;
+    let (rev, pack) = match frozen {
+        Some(frozen) => frozen,
+        None => crate::playbooks::registry::get(pool, playbook)
+            .await?
+            .map(|p| (Some(p.rev), p.tree_digest.map(|t| t.to_string())))
+            .unwrap_or_default(),
+    };
+    Ok(crate::secrets::launch::OwnedRevision::Published { rev, pack })
+}
+
+/// The exposure launch `issue_key` runs under: the one its row records, else the registry row's
+/// while that row still holds the launch's pack, else the one extracted from the launch's own
+/// pack, which is then recorded on the launch row.
+pub(crate) async fn launch_exposure(
+    pool: &PgPool,
+    issue_key: &str,
+    launch: &PlaybookLaunch,
+) -> Result<Result<Option<Exposure>, ExposureRefused>> {
+    use sqlx::Row as _;
+    if launch.exposure.is_some() {
+        return Ok(Ok(launch.exposure.clone()));
+    }
+    let row = sqlx::query(
+        "SELECT p.exposure,
+                COALESCE(t.tree_digest = p.tree_digest, t.digest = p.tar_digest) AS registered
+         FROM pack_tarballs t LEFT JOIN playbooks p ON p.id = $2
+         WHERE t.issue_slug = $1",
+    )
+    .bind(crate::model::sanitize_key(issue_key))
+    .bind(&launch.playbook)
+    .fetch_optional(pool)
+    .await
+    .context("comparing a launch's pack with its registry row")?;
+    let Some(row) = row else {
+        return Ok(Ok(crate::playbooks::exposure::registered(
+            pool,
+            &launch.playbook,
+        )
+        .await?
+        .flatten()));
+    };
+    if row.try_get::<Option<bool>, _>("registered")? == Some(true) {
+        return row
+            .try_get::<Option<serde_json::Value>, _>("exposure")?
+            .map(Exposure::from_value)
+            .transpose()
+            .map(Ok);
+    }
+    let pack = crate::playbooks::packs::materialize_pack(pool, issue_key)
+        .await?
+        .with_context(|| format!("no stored pack for launch {issue_key}"))?;
+    let extracted =
+        tokio::task::spawn_blocking(move || crate::playbooks::exposure::extract(pack.path(), None))
+            .await
+            .context("joining the launch exposure worker")?;
+    let exposure = match extracted {
+        Ok(exposure) => exposure,
+        Err(crate::playbooks::exposure::ExtractError::Refused(message)) => {
+            return Ok(Err(ExposureRefused {
+                key: issue_key.to_string(),
+                message,
+            }));
+        }
+        Err(crate::playbooks::exposure::ExtractError::Internal(e)) => return Err(e),
+    };
+    sqlx::query(
+        "UPDATE playbook_launches SET exposure = $2, exposure_digest = $3
+         WHERE key = $1 AND exposure IS NULL",
+    )
+    .bind(issue_key)
+    .bind(exposure.to_value()?)
+    .bind(exposure.digest()?)
+    .execute(pool)
+    .await
+    .context("recording a launch's extracted exposure")?;
+    Ok(Ok(Some(exposure)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::launches::store::*;
+    use crate::testing::{launch_playbook as launch, pin_playbook as pin};
+    use crucible_contract::pack_tree::PackTree;
 
     use anyhow::Result;
     use sqlx::PgPool;
+
+    fn exposure_doc(marker: &str) -> serde_json::Value {
+        serde_json::json!({"version": 1, "outputs": [{"kind": marker, "count": 1}]})
+    }
+
+    /// A registered launch records the registry row's exposure with the pack it copies, so a
+    /// later repin moves neither.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_registered_launch_records_its_revisions_exposure(pool: PgPool) -> Result<()> {
+        let first = exposure_doc("first-row");
+        pin(
+            &pool,
+            PackTree::from_pairs(&[("crucible.toml", b"a")])?,
+            &first,
+        )
+        .await;
+        let launched = launch(&pool, "survey-1").await;
+        assert_eq!(
+            launched.exposure,
+            Some(Exposure::from_value(first.clone())?)
+        );
+
+        pin(
+            &pool,
+            PackTree::from_pairs(&[("crucible.toml", b"b")])?,
+            &exposure_doc("second-row"),
+        )
+        .await;
+        let launched = get_playbook_launch(&pool, "survey-1")
+            .await?
+            .expect("launch");
+        assert_eq!(
+            launch_exposure(&pool, "survey-1", &launched).await??,
+            Some(Exposure::from_value(first)?)
+        );
+        Ok(())
+    }
+
+    /// A launch that records no exposure and whose registry row moved on is read off its own
+    /// pack. A pack the engine refuses is a refusal the caller can tell from a failure, and the
+    /// launch row stays without an exposure.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_repinned_launch_whose_pack_is_refused_reports_the_refusal(
+        pool: PgPool,
+    ) -> Result<()> {
+        pin(
+            &pool,
+            PackTree::from_pairs(&[("SCOPE.md", b"no manifest")])?,
+            &exposure_doc("first-row"),
+        )
+        .await;
+        launch(&pool, "survey-1").await;
+        sqlx::query("UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL")
+            .execute(&pool)
+            .await?;
+        pin(
+            &pool,
+            PackTree::from_pairs(&[("crucible.toml", b"b")])?,
+            &exposure_doc("second-row"),
+        )
+        .await;
+
+        let launched = get_playbook_launch(&pool, "survey-1")
+            .await?
+            .expect("launch");
+        assert_eq!(launched.exposure, None);
+        let refused = launch_exposure(&pool, "survey-1", &launched)
+            .await?
+            .expect_err("refused");
+        assert!(refused.to_string().contains("survey-1"), "{refused}");
+        assert!(
+            exposure_for_issue(&pool, "survey-1").await?.is_err(),
+            "the issue read reports the same refusal"
+        );
+        Ok(())
+    }
+
+    /// The exposure extracted from a launch's own pack is recorded on the launch row, so the
+    /// next read does not extract again.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_extracted_launch_exposure_is_recorded(pool: PgPool) -> Result<()> {
+        use crate::testing::fixtures::{PLAYBOOK_PACK_MANIFEST, WORKFLOW_TOPIC_DEPTH};
+        pin(
+            &pool,
+            PackTree::from_pairs(&[
+                ("crucible.toml", PLAYBOOK_PACK_MANIFEST.as_bytes()),
+                ("workflow.star", WORKFLOW_TOPIC_DEPTH.as_bytes()),
+            ])?,
+            &exposure_doc("first-row"),
+        )
+        .await;
+        launch(&pool, "survey-1").await;
+        sqlx::query("UPDATE playbook_launches SET exposure = NULL, exposure_digest = NULL")
+            .execute(&pool)
+            .await?;
+        pin(
+            &pool,
+            PackTree::from_pairs(&[("crucible.toml", b"b")])?,
+            &exposure_doc("second-row"),
+        )
+        .await;
+
+        let launched = get_playbook_launch(&pool, "survey-1")
+            .await?
+            .expect("launch");
+        let extracted = launch_exposure(&pool, "survey-1", &launched)
+            .await??
+            .expect("extracted");
+        assert_ne!(extracted, Exposure::from_value(exposure_doc("first-row"))?);
+        let recorded = get_playbook_launch(&pool, "survey-1")
+            .await?
+            .expect("launch");
+        assert_eq!(recorded.exposure, Some(extracted));
+        Ok(())
+    }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn ledger_round_trips_and_rejects_duplicates(pool: PgPool) -> Result<()> {

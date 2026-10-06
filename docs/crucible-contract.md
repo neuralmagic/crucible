@@ -285,7 +285,9 @@ field becomes a measured failure at the producing task instead of a mystery down
 declares nothing and changes nothing. A dict, `emits = {"score": "number", "tier": ["high",
 "low"]}`, also promises each field's type; a wrongly typed field fails the producing task the
 same way, and compilation checks the types against `over`, score readers, and output-decided
-routes. See [Work graphs](./work-graphs.md#task-output).
+routes. A type may also be `schema_file("path")`, a JSON Schema the value must satisfy, and
+`emits_files` takes a dict from path to `schema_file(...)` or `None`. See
+[Work graphs](./work-graphs.md#schema-types).
 
 Compile errors carry `file:line:col` and a did-you-mean suggestion for unknown functions,
 kwargs, variables, and session names. A behavioral change from earlier releases: a task
@@ -355,12 +357,19 @@ one is an unknown-name error where it was written, and a did-you-mean never offe
 - `prompt_file(path)` reads a regular UTF-8 file below the pack directory and embeds its contents
   in the generated manifest. Absolute paths, `..`, symlinks, non-files, and oversized inputs are
   rejected.
+- `agent(..., repair = N)` and `skill(..., repair = N)` resume the task's conversation up to N
+  times (at most 3) to fix a passing turn whose output breaks its declared fields or files. See
+  [Work graphs](./work-graphs.md#repair).
+- `schema_file(path)` reads a JSON Schema (draft 2020-12) below the pack directory, under the same
+  path policy, and embeds its content as a field type in `emits` or a file's schema in
+  `emits_files`. A file that is not a valid 2020-12 schema, or references a remote `$ref`, is
+  rejected.
 - `load(path, name, ...)` pulls symbols from another `.star` file under the pack, resolved by the
   same policy as `prompt_file` and refused for absolute paths, `..`, symlinks, non-files, and
   cycles. Loaded modules run before the root against the same globals and the same compile state:
-  their `prompt_file()` calls resolve against the pack root and charge the same byte budget, their
-  `session()` declarations precede every root reference, and a task they construct at module level
-  must still appear in `workflow(tasks = ...)`. Re-export is off, so a symbol a library loads is
+  their `prompt_file()` and `schema_file()` calls resolve against the pack root and charge the
+  same byte budget, their `session()` declarations precede every root reference, and a task they
+  construct at module level must still appear in `workflow(tasks = ...)`. Re-export is off, so a symbol a library loads is
   not visible through it.
 - `workflow(type = ..., tasks = ..., result = ...)` is the explicit final expression. A list of
   tasks is accepted anywhere a list of task names is, in `tasks` and in `depends_on` alike, so a
@@ -400,7 +409,8 @@ for this: its tasks feed the loop's required `apply`, so a spliced sink cannot b
 For local review, `crucible plan compile-workflow --file workflow.star` prints stable canonical
 JSON. Add `--manifest crucible.toml` to also replace the generated `[workflow]` block. Compilation
 applies source-size, loaded-module, task-count, constructed-task, evaluation-tick, heap, call-depth,
-and prompt-size ceilings. The compiler exposes no filesystem API except `prompt_file` and `load`,
+and prompt- and schema-size ceilings. The compiler exposes no filesystem API except `prompt_file`,
+`schema_file`, and `load`,
 and no process, environment, network, clock, or randomness API.
 Scope validation renders the admitted graph to `WORKFLOW.png` for the scope PR, grouping
 `evaluate` and `grade` as Measurement.
@@ -771,6 +781,12 @@ the external results the task reported, one object per url with `url`, `provider
 task declared `link` or `links`, so every url in it is an http(s) url it validated. A reader
 renders these rather than reading urls out of `output`.
 
+A `plan_admitted` task carries `emits_files` (contract 1.14.0): each declared path, as a string,
+or `{path, schema}` when the declaration gave a schema. A field typed by a schema carries
+`{"schema": "<JSON Schema text>"}` as its `type`. A `task_result` event carries `repairs` (contract 1.14.0), one
+`{label, round, of, cost_usd, notes}` per repair turn an agent task took, omitted when there were
+none; their cost is already part of `cost_usd`.
+
 A `task_result` event carries an additive `agent` object (contract 1.13.0) on an `agent` task and
 on the loop's candidate turn, omitted on every task that runs no agent: `harness`, `model` and
 `effort`, as the executor resolved them for the attempts it made. The task's own knobs have
@@ -818,7 +834,7 @@ The engine orders the records by end time, oldest first, and gives a task declar
 records exactly as supplied, less whole records from the oldest end until the compact JSON
 encoding of that object fits `CRUCIBLE_HISTORY_MAX_BYTES` (default 65536), with `k` the number
 removed. A run outside a series gives such a task `{"records": [], "dropped": 0}`. A command or
-evaluate task reads it from `CRUCIBLE_INPUTS`; an agent task reads it in its prompt, inside the
+evaluate task reads it from the inputs file `CRUCIBLE_INPUTS_FILE` names; an agent task reads it in its prompt, inside the
 external-input markers, and never in its upstream-results JSON. `crucible check` prints the
 bound a playbook's run will apply, and refuses a malformed one.
 

@@ -15,6 +15,7 @@ import {
   SectionBody,
   SectionHeader,
 } from '../ui';
+import { shortRev } from './draftStudio';
 import { FormActions, FormError, FormGrid, Note, Notice, TextField } from './formControls';
 import { PlaybookPreviewGate } from './PlaybookPreviewGate';
 import { initialValues, parseParamsSchema } from './playbookLaunchForm';
@@ -300,7 +301,7 @@ export function PlaybookImportReviewPage() {
             }
           />
           <Notice label="Already registered">
-            {`${existing.id} is pinned at ${existing.rev.slice(0, 12)}. Registering this import re-pins it and replaces the launch form below.`}
+            {`${existing.id} is pinned at ${shortRev(existing.rev)}. Registering this import re-pins it and replaces the launch form below.`}
           </Notice>
           {(existing.exposure_digest ?? null) === preview.exposureDigest ? null : (
             <Notice label="Exposure changes">

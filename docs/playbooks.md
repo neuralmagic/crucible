@@ -295,18 +295,18 @@ the compiler refuses the pack:
 ```text
 argument "run" carries a value supplied from outside the pack. A prompt marks such a span so
 an agent can tell it from an instruction; nothing else can, so do not build it into "run". A
-command or evaluate task reads it as data from the "params" entry of $CRUCIBLE_INPUTS.
+command or evaluate task reads it as data from the "params" entry of the inputs JSON in $CRUCIBLE_INPUTS_FILE.
 ```
 
-A command or evaluate task reads every declared parameter from the `params` entry of the JSON
-in `CRUCIBLE_INPUTS`, under its name and in its declared type, beside its dependencies'
+A command or evaluate task reads every declared parameter from the `params` entry of the inputs
+JSON (the file `CRUCIBLE_INPUTS_FILE` names), under its name and in its declared type, beside its dependencies'
 outputs. A source with no `params` block gives it an empty object. Agent tasks get no such
 entry; their values reach them only through the prompt.
 
 ```python
 fetch = command(
     name = "fetch",
-    run = "python3 -c 'import json, os; p = json.loads(os.environ[\"CRUCIBLE_INPUTS\"])[\"params\"]; print(json.dumps({\"topic\": p[\"topic\"]}))'",
+    run = "python3 -c 'import json, os; p = json.load(open(os.environ[\"CRUCIBLE_INPUTS_FILE\"]))[\"params\"]; print(json.dumps({\"topic\": p[\"topic\"]}))'",
 )
 ```
 
@@ -341,7 +341,7 @@ first, failed and timed-out runs included:
  "dropped": 0}
 ```
 
-A command reads it from `CRUCIBLE_INPUTS`. An agent sees it in its prompt, marked as external
+A command reads it from the inputs file `CRUCIBLE_INPUTS_FILE` names. An agent sees it in its prompt, marked as external
 input, because an earlier agent wrote part of it. When the records exceed the operator's size
 limit, the oldest are dropped whole and counted in `dropped`; `crucible check` prints the limit.
 A manual launch belongs to no series and gets an empty list, which is also what a local
@@ -357,7 +357,7 @@ it:
 
 ```sh
 crux draft-create haiku --description "a haiku, reviewed"
-crux draft-push haiku ./haiku --base 1
+crux draft-push haiku ./haiku --base-version 1
 crux draft-launch haiku --max-cost 1 --max-time 5m
 ```
 

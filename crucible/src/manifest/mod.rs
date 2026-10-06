@@ -1423,16 +1423,28 @@ impl CompositeManifest {
     }
 }
 
-/// Every `[[workspace.inject]].src` must resolve under `manifest_dir`, as a hard error rather than a
-/// `crucible check` finding. `deploy render` calls this: a dangling inject renders a perfectly valid-looking pack
+/// Every `[[workspace.inject]].src` must resolve under `manifest_dir` or among `staged`, the
+/// pack-relative files the run receives beside it, as a hard error rather than a `crucible check`
+/// finding. `deploy render` calls this: a dangling inject renders a perfectly valid-looking pack
 /// whose missing file only surfaces inside the sandbox, mid-turn, as whatever the agent was supposed
 /// to read not being there.
-pub fn ensure_injects_resolve(m: &Manifest, manifest_dir: &Path) -> Result<(), ManifestError> {
+pub fn ensure_injects_resolve(
+    m: &Manifest,
+    manifest_dir: &Path,
+    staged: &[&str],
+) -> Result<(), ManifestError> {
+    let is_staged = |src: &str| {
+        let src = src.trim_start_matches("./").trim_end_matches('/');
+        staged.iter().any(|path| {
+            path.strip_prefix(src)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
+    };
     let missing: Vec<String> = m
         .workspace
         .injects(manifest_dir)?
         .iter()
-        .filter(|inject| !manifest_dir.join(&inject.src).exists())
+        .filter(|inject| !manifest_dir.join(&inject.src).exists() && !is_staged(&inject.src))
         .map(|inject| format!("  {} -> {}", inject.src, inject.dst))
         .collect();
     if missing.is_empty() {
@@ -2814,7 +2826,7 @@ dst = "traces/median_block.txt"
         .expect("write manifest");
         let m = Manifest::load(&manifest_path).expect("manifest parses");
 
-        let err = ensure_injects_resolve(&m, &dir).expect_err("a missing src must fail");
+        let err = ensure_injects_resolve(&m, &dir, &[]).expect_err("a missing src must fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("traces/median_block.txt"),
@@ -2825,9 +2837,18 @@ dst = "traces/median_block.txt"
             "a resolvable src must not be reported: {msg}"
         );
 
+        for near in ["traces/median_block.txt.bak", "traces/median", "trace"] {
+            ensure_injects_resolve(&m, &dir, &[near])
+                .expect_err("a staged file at another path does not resolve the src");
+        }
+        ensure_injects_resolve(&m, &dir, &["traces/median_block.txt"])
+            .expect("a staged file resolves its src");
+        ensure_injects_resolve(&m, &dir, &["traces/median_block.txt/inner"])
+            .expect("a staged file under a directory src resolves it");
+
         std::fs::create_dir_all(dir.join("traces")).expect("mkdir");
         std::fs::write(dir.join("traces/median_block.txt"), "y").expect("write");
-        ensure_injects_resolve(&m, &dir).expect("all srcs present now");
+        ensure_injects_resolve(&m, &dir, &[]).expect("all srcs present now");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

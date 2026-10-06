@@ -106,8 +106,10 @@ fresh-turn behavior.
 A task's output is JSON and becomes its dependents' input.
 
 - `command`: the last non-empty stdout line. Nonzero exit is a measured failure; a spawn
-  failure is a transport failure. Upstream outputs arrive as `CRUCIBLE_INPUTS` (a JSON object
-  keyed by task name), plus `CRUCIBLE_TASK`.
+  failure is a transport failure. Upstream outputs arrive as a JSON object keyed by task name,
+  in the file `CRUCIBLE_INPUTS_FILE` names, plus `CRUCIBLE_TASK`. The same JSON is also in
+  `CRUCIBLE_INPUTS` while it is at most 64 KiB; past that the variable is unset, because Linux
+  refuses an environment string over 128 KiB. Read the file.
 - `agent` under `--manifest`: the turn writes a single JSON object to `PLAN_TASK_RESULT.json`
   in the workspace root. A missing file after a normal turn is a measured failure; an explicit
   spawn, harness, or stream error is a transport failure and follows the retry policy.
@@ -158,6 +160,73 @@ At compile time the types are checked wherever the graph reads a field, before a
 A field declared without a type (list form) or a task with no `emits` stays unchecked at compile
 time. The generated TOML carries the types as a table (`emits = { score = "number" }`) and the
 `plan_admitted` event lists each field with its type.
+
+### Schema types
+
+`schema_file(path)` reads a JSON Schema (draft 2020-12) from the pack and stands in for a type,
+in `emits` and in a dict form of `emits_files`:
+
+```python
+plan = command(
+    name = "plan",
+    run = "./plan.sh",
+    emits = {"lanes": schema_file("crucible/schemas/lanes.json"), "tickets": "integer"},
+    emits_files = {"RESULT.json": schema_file("crucible/schemas/result.json"), "REPORT.md": None},
+)
+```
+
+The schema's content is compiled into the plan, so editing it changes the plan digest. A file
+that is not a valid 2020-12 schema, declares another `$schema`, or references a remote `$ref` is
+a compile error at the call; nothing is fetched. At runtime a passing output whose field the
+schema rejects, or a declared file that is not JSON or does not match, fails the producing task
+like a wrong type, with a note giving the first three errors as instance path and message:
+`output field "lanes" does not match its schema: /1: value is not of type "string"`. Notes never
+repeat the refused value.
+
+Each consumer checks the schema exactly, reading `type`, `const`, `enum`, local `$ref`, `allOf`,
+and every branch of `anyOf`/`oneOf`, and refusing what it cannot prove:
+
+- `over` needs `"type": "array"` whose `items` (and any `prefixItems`) are provably strings:
+  `"type": "string"`, or a `const`/`enum` of strings. A mapped instance is named by its item, so
+  `{"type": "array"}` with no `items`, or `"items": {"type": "integer"}`, is a compile error at the
+  `over` argument.
+- A score needs a numeric `type`, and its `const`/`enum` must hold numbers only.
+- A `route(source = ...)` question needs every value the schema bounds (`const`, `enum`, or
+  `"type": "boolean"`, which answers `yes`/`no`) to be a label the question accepts. A schema that
+  bounds nothing is refused, as `"string"` is.
+
+When a route's source bounds a question to finitely many answers, by a label list, `"boolean"`, or
+a schema, a `when` naming a label the source can never give is a compile error ("can never be
+answered"), such a label needs no task, and `otherwise` covers only the labels it can give. A schema
+with no single top-level type satisfies no consumer. On the wire a schema is its JSON text (`{ schema = "..." }` in the TOML,
+`{ path = "RESULT.json", schema = "..." }` for a file), since TOML cannot hold the nulls schemas
+often carry.
+
+### Repair
+
+An agent task can fix its own output instead of failing on it:
+
+```python
+plan = agent(
+    name = "plan",
+    prompt = prompt_file("prompts/plan.md"),
+    emits = {"lanes": schema_file("crucible/schemas/lanes.json")},
+    emits_files = {"RESULT.json": schema_file("crucible/schemas/result.json")},
+    repair = 2,
+)
+```
+
+When a turn passes but its output misses a declared field or file, or breaks a type or schema,
+the engine resumes the same conversation with the validation notes (masked as above) and asks for
+the output and files to be fixed in place, then checks again, up to `repair` times (at most 3).
+Repairs run within the attempt's `timeout`, cost what they cost against the run's budget, and do
+not start once the attempt has spent what the run had left. They are not retries: `attempts`
+stays 1, and when repairs run out the task fails with the note it would have failed with anyway.
+Each mapped instance repairs on its own. A task with no `session` gets a conversation for the
+attempt; one in a session continues it. `command` and `evaluate` refuse `repair`.
+
+Each repair is recorded on the task's `task_result` event under `repairs`, as
+`{label, round, of, cost_usd, notes}` with labels like `audit[RHAI-1] repair 1/2`.
 
 ## Execution semantics
 

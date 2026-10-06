@@ -547,6 +547,10 @@ pub struct PackImport {
     #[serde(default)]
     pub path: String,
     pub rev: String,
+    /// The frozen pack's `tree1:` digest. `tar_digest` is the name a controller from before tree
+    /// storage sends.
+    #[serde(default, alias = "tar_digest")]
+    pub tree_digest: Option<String>,
     #[serde(default)]
     pub schema_digest: Option<String>,
     #[serde(default)]

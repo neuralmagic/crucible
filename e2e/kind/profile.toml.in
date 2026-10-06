@@ -1,0 +1,17 @@
+[cluster]
+loop_namespace = "crucible-e2e"
+rig_namespace = "crucible-e2e"
+service_account = "crucible-loop"
+supervisor_image = "@LOOP_IMAGE@"
+sandbox_driver = "kubernetes"
+kubeconfig_configmap = "crucible-e2e-kubeconfig"
+
+[image]
+loop = "@LOOP_IMAGE@"
+pull_secret = "crucible-e2e-pull"
+
+[resources]
+cpu_request = "100m"
+mem_request = "128Mi"
+cpu_limit = "1"
+mem_limit = "512Mi"

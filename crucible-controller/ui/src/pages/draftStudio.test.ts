@@ -12,6 +12,7 @@ import {
   originMovedLabel,
   pathsOf,
   saveBody,
+  shortRev,
   staleBaseOf,
   studioReducer,
   type StudioState,
@@ -291,6 +292,23 @@ describe('a draft names what it is based on', () => {
     expect(moved).toContain('survey');
     expect(moved).toContain('aabbccdd');
     expect(moved).toContain('4d5e6f70');
+  });
+
+  it('names the trees when the origin moved under the same rev', () => {
+    const moved = originMovedLabel({
+      ...PACK,
+      digest: `tree1:${'1'.repeat(64)}`,
+      current_digest: `tree1:${'2'.repeat(64)}`,
+      moved: true,
+    });
+    expect(moved).toBe('survey re-pinned to tree1:22222222 since this draft was taken at tree1:11111111.');
+  });
+
+  it('keeps a digest prefix when it shortens one', () => {
+    expect(shortRev(`tree1:${'ab'.repeat(32)}`)).toBe('tree1:abababab');
+    expect(shortRev(`sha256:${'cd'.repeat(32)}`)).toBe('sha256:cdcdcdcd');
+    expect(shortRev('4d5e6f708192a3b4')).toBe('4d5e6f70');
+    expect(shortRev(null)).toBe('');
   });
 });
 

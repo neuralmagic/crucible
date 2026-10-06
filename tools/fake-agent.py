@@ -13,7 +13,8 @@ Tasks are addressed by CRUCIBLE_TASK, the task's own name, not by matching promp
       "audit":   {"reads": ["NOTES.md"], "result": {"findings": []}},
       "stale":   {"exit": 1, "stderr": "nothing to date the entries against"},
       "slow":    {"sleep_ms": 90000},
-      "flaky":   {"fail_attempts": 1, "result": {"ok": true}}
+      "flaky":   {"fail_attempts": 1, "result": {"ok": true}},
+      "fixer":   {"result": {"n": "x"}, "turns": [{}, {"result": {"n": 1}}]}
     }
 
 Directives, all optional:
@@ -26,6 +27,9 @@ Directives, all optional:
   stderr        text to emit on stderr
   exit          exit code (default 0); a nonzero code skips the result file
   result        object written to PLAN_TASK_RESULT.json and echoed to stdout
+  cost_usd      what the turn reports it cost, as a native result event on stdout
+  turns         per-invocation overrides: the Nth turn of the task applies the Nth entry over
+                the rest of its spec, and turns past the end apply the last
 
 Env the engine supplies, all readable from a template in `writes`/`result` as {ENV:NAME}:
   CRUCIBLE_TASK, CRUCIBLE_PROMPT, CRUCIBLE_INPUTS, CRUCIBLE_AGENT_SESSION,
@@ -76,6 +80,16 @@ def attempt_number(task: str) -> int:
     return seen + 1
 
 
+def turn_number(task: str) -> int:
+    """Count turns per task for `turns`, apart from the `fail_attempts` counter."""
+    root = pathlib.Path(os.environ.get("FAKE_AGENT_STATE", ATTEMPTS_DIR))
+    root.mkdir(parents=True, exist_ok=True)
+    counter = root / f"{task}.turns"
+    seen = int(counter.read_text().strip() or 0) if counter.exists() else 0
+    counter.write_text(str(seen + 1))
+    return seen + 1
+
+
 def main() -> int:
     task = os.environ.get("CRUCIBLE_TASK", "")
     if not task:
@@ -96,6 +110,10 @@ def main() -> int:
         known = ", ".join(sorted(script)) or "none"
         die(f"no entry for task {task!r} in {script_path} (known: {known})")
     spec = script[task]
+    turns: list[dict[str, Any]] = spec.get("turns", [])
+    if turns:
+        turn = turn_number(task)
+        spec = {**spec, **turns[min(turn, len(turns)) - 1]}
 
     reads: list[str] = expand(spec.get("reads", []))
     for required in reads:
@@ -126,6 +144,10 @@ def main() -> int:
 
     if "stderr" in spec:
         print(expand(spec["stderr"]), file=sys.stderr)
+
+    if "cost_usd" in spec:
+        event = {"v": 1, "kind": "result", "subtype": "success", "turns": 1}
+        print(json.dumps({**event, "cost_usd": float(spec["cost_usd"])}))
 
     code = int(spec.get("exit", 0))
     if code != 0:

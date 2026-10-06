@@ -168,7 +168,15 @@ pub(crate) async fn get_run_graph(
     // a pack that declares no outputs.
     let (issue_key, _) = crate::runs::store::run_issue_repo(state.db.pool(), &run_id).await?;
     let exposure = match issue_key.as_deref() {
-        Some(key) => crate::launches::store::exposure_for_issue(state.db.pool(), key).await?,
+        Some(key) => {
+            match crate::launches::store::exposure_for_issue(state.db.pool(), key).await? {
+                Ok(exposure) => exposure,
+                Err(refused) => {
+                    tracing::warn!(run_id, error = %refused, "run graph served without outputs");
+                    None
+                }
+            }
+        }
         None => None,
     };
     let names: Vec<TaskName> = tasks

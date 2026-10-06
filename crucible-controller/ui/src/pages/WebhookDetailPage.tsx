@@ -19,6 +19,7 @@ import {
   Status,
 } from '../ui';
 import { FormError, MetaRow, Notice } from './formControls';
+import { shortRev } from './draftStudio';
 import { CopyButton, SecretOnce } from './SecretOnce';
 import {
   bodyText,
@@ -255,7 +256,7 @@ export function WebhookDetailPage() {
                 {w.playbook}
               </Link>
               <Mono size="data" tone="ink-3" className="ml-2">
-                @ {(w.adopted_rev ?? '').slice(0, 12)}
+                @ {shortRev(w.adopted_rev)}
               </Mono>
             </MetaRow>
             <MetaRow label="Owner">

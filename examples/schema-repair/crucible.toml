@@ -1,0 +1,25 @@
+# schema-repair: schema-typed emits and agent repair turns with no model. The agent is
+# tools/fake-agent.py on the command backend; agents.json scripts each turn.
+#
+#   FAKE_AGENT=../../tools/fake-agent.py crucible plan run --manifest crucible.toml --max-cost 1
+#
+# The fake agent counts turns under workspace/.fake-agent, so remove state/ and workspace/ before
+# running it again.
+#
+# The kind e2e (scripts/kind-e2e.sh, scenario Y) runs it through the controller, where the loop
+# image ships the fake agent at its default path.
+
+[workspace]
+inject = ["agents.json"]
+
+[agent]
+backend   = "command"
+agent_cmd = "python3 ${FAKE_AGENT:-/usr/local/share/fake-agent/fake-agent.py}"
+goal      = "Plan the lanes and audit each one."
+
+[agent.env]
+FAKE_AGENT_SCRIPT = "agents.json"
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

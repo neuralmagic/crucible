@@ -46,6 +46,7 @@ pub(crate) fn plan_admitted_event(
                         ty: ty.cloned(),
                     })
                     .collect(),
+                emits_files: t.emits_files.clone(),
                 timeout: t
                     .timeout
                     .as_ref()
@@ -106,6 +107,7 @@ pub(crate) fn task_result_event(
         trace_id,
         span_id,
         agent: args.and_then(|args| crate::plan::harness::resolved_agent(args, task)),
+        repairs: r.repairs.clone(),
     }
 }
 
@@ -255,6 +257,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_admitted_plan_carries_each_schema_and_each_declared_file() {
+        use crucible_contract::emits::{DeclaredFile, EmitWire, FieldType, JsonSchema};
+        let plan = Plan::from_toml_str(
+            r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "plan"
+            kind = "command"
+            command = "true"
+            emits = { lanes = { schema = '{"type":"array","items":{"type":"string"}}' } }
+            emits_files = ["REPORT.md", { path = "RESULT.json", schema = '{"type":"object"}' }]
+            "#,
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let event = crate::plan::events::plan_admitted_event(&plan, None);
+        let SessionEvent::PlanAdmitted { tasks, .. } = &event else {
+            panic!("not a plan_admitted event");
+        };
+        let lanes = JsonSchema::parse(r#"{"type":"array","items":{"type":"string"}}"#).unwrap();
+        assert_eq!(
+            tasks[0].emits,
+            [EmitWire {
+                field: "lanes".into(),
+                ty: Some(FieldType::Schema(lanes)),
+            }]
+        );
+        assert_eq!(
+            tasks[0].emits_files,
+            [
+                DeclaredFile::from("REPORT.md"),
+                DeclaredFile {
+                    path: "RESULT.json".into(),
+                    schema: Some(JsonSchema::parse(r#"{"type":"object"}"#).unwrap()),
+                },
+            ]
+        );
+        let line = crucible_contract::encode(&event);
+        let back = crucible_contract::decode(&line).expect("decodes");
+        assert_eq!(crucible_contract::encode(&back), line);
+    }
+
     /// The urls a reader renders come off the declared `link`/`links` fields alone, parsed by the
     /// engine that validated them. A url elsewhere in the output is data.
     #[test]
@@ -288,6 +336,7 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         };
         let SessionEvent::TaskResult { links, .. } =
             crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None)
@@ -311,6 +360,42 @@ mod tests {
             panic!("not a task_result event");
         };
         assert!(links.is_empty(), "no output, no links");
+    }
+
+    #[test]
+    fn a_task_result_carries_its_repair_turns() {
+        let plan = Plan::from_toml_str(
+            "version = 1\n[budget]\nusd = 1.0\n[[task]]\nname = \"plan\"\nkind = \"agent\"\nprompt = \"p\"\nrepair = 2\n",
+        )
+        .unwrap()
+        .validate()
+        .unwrap();
+        let repair = crucible_contract::session::TaskRepair {
+            label: "plan repair 1/2".into(),
+            round: 1,
+            of: 2,
+            cost_usd: 0.25,
+            notes: vec!["output missing declared field \"lanes\"".into()],
+        };
+        let result = crate::plan::exec::TaskResult {
+            status: crate::plan::exec::TaskStatus::Pass,
+            attempts: 1,
+            cost_usd: 0.75,
+            output: Some(serde_json::json!({"lanes": []})),
+            note: None,
+            fanout: None,
+            blocked: None,
+            transport: None,
+            repairs: vec![repair.clone()],
+        };
+        let event =
+            crate::plan::events::task_result_event(1, 0, &plan.plan().tasks[0], &result, None);
+        let SessionEvent::TaskResult { repairs, .. } = &event else {
+            panic!("not a task_result event");
+        };
+        assert_eq!(repairs, &[repair]);
+        let line = crucible_contract::encode(&event);
+        assert!(line.contains(r#""label":"plan repair 1/2""#), "{line}");
     }
 
     #[test]
@@ -381,6 +466,7 @@ mod tests {
                 Attempt {
                     outcome,
                     cost_usd: 0.25,
+                    repairs: Vec::new(),
                 }
             }
         }

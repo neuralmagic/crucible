@@ -166,6 +166,7 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
                 note,
                 blocked,
                 transport,
+                repairs,
                 ..
             } => {
                 if !prior.admitted {
@@ -196,6 +197,7 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
                     fanout,
                     blocked,
                     transport,
+                    repairs,
                 };
                 if prior.results.insert(name.clone(), result).is_none() {
                     prior.order.push(name);

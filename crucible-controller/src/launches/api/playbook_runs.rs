@@ -450,7 +450,9 @@ pub(crate) async fn create_one_shot(
         &NewOneShot {
             standing: crate::launches::standing::NewStanding {
                 playbook: &authorized.pack.id,
-                target_kind: "adopted",
+                target: crate::launches::standing::StandingTarget::Adopted(
+                    authorized.pack.revision(),
+                ),
                 eligible_draft_version: None,
                 params: &authorized.params,
                 schema_digest: &authorized.pack.schema_digest,
@@ -471,14 +473,8 @@ pub(crate) async fn create_one_shot(
     )
     .await;
     let stored = match stored {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            return not_found(format!(
-                "playbook {:?} was deregistered while the one-shot was being authorized",
-                authorized.pack.id
-            ));
-        }
-        Err(e) => return AppError::from(e).into_response(),
+        Ok(s) => s,
+        Err(e) => return crate::launches::api::save_failed(e),
     };
 
     state

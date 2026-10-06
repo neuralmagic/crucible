@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PACK-PUBLISH"
+title = "Publishing packs to an OCI registry"
+kind = "normative"
+status = "active"
+since = "0.1.0"
+
+[content]
+text = """
+Publishing packs to an OCI registry (OCI publication) is optional. With no pack registry configured, the controller MUST NOT attempt it, and saving, registering, importing, approving, launching, and dispatching MUST NOT require a pack registry to be configured or reachable.
+
+A dispatch target is registry-trusted when it is owned by the platform administrator team or a platform administrator has marked it so. The mark MUST NOT be set or cleared by any other subject, including through `update` on the target, and every change to it MUST be audited. Pull access to the pack registry MUST be limited to the controller and to registry-trusted targets, and MUST NOT be granted to any user or team principal. A target that is not registry-trusted MUST receive packs only through controller-built delivery, never by registry pull. The pack registry is not a read path for people: reading a pack is decided under [[RFC-0003:C-READ-SCOPING]] through the controller.
+
+When a pack registry is configured, the controller MUST publish every registered pack revision, every imported pack revision, and every approved draft graduation, including those that existed before the registry was configured. OCI publication MUST NOT be refused for size. The artifact MUST use the OCI empty config and layers of media type `application/vnd.oci.image.layer.v1.tar+gzip` whose extraction in order, a later file replacing an earlier one at the same path, reproduces exactly the pack's files. A pack saved on a base MUST have two layers, the base's files and then the overlay's files, while the base's stored tree is held; when it is no longer held, the pack MUST be published as one layer holding its tree, and its publication state MUST record that the base layer is not shared. A pack with no base has one layer. A layer's bytes MUST be determined by the files it holds and the controller's layer encoding version alone, so that every pack published on one base under one encoding version carries an identical first layer. The layer layout applies only to the first publication of a digest: when the tag for a pack's digest already exists in the repository, the controller MUST NOT push a new manifest and MUST record the existing manifest digest as the pack's published manifest. The manifest MUST carry the annotation `dev.crucible.pack.digest` with the pack's digest as [[RFC-0002:C-PACK-BASE]] spells it, and `dev.crucible.pack.kind` with the value `playbook`.
+
+Every published pack MUST be published to one repository under the tag `tree1-` followed by the hex part of its digest. The controller MUST NOT move that tag to another manifest, and MUST keep it while any draft version, registered pack, launch, or standing launch records the digest.
+
+Each registered pack revision, imported pack revision, and approved draft graduation MUST carry a publication state of unpublished, pending, published with the manifest digest, or failed with the last error, readable by any subject that may read the pack. A failed OCI publication MUST NOT undo or block the registration, import, or approval it follows. A network error or a registry response of 429 or 5xx is transient; any other registry error is permanent. While a transient failure is retried with backoff, the state MUST be pending with the last error. The controller MUST NOT retry a permanent failure until a subject allowed the `update` action under [[RFC-0003:C-DECISION]] on the registered pack, the import, or the graduated draft requests a retry. Changing or removing the pack registry MUST reset every affected publication state to unpublished.
+
+A launch MAY be delivered by image volume only when its target is registry-trusted and can mount OCI artifacts and the pack's publication state is published. The mount MUST reference the recorded manifest digest. Every other launch MUST be delivered as the pack ConfigMap and is subject to the delivery budget of [[RFC-0002:C-PACK-BASE]]."""

@@ -1,0 +1,85 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0061"
+title = "Repair resumes the agent's session"
+status = "proposed"
+date = "2026-10-05"
+refs = [
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0002:C-TASK-FILES",
+    "RFC-0002:C-REVISE-LOOP",
+    "ADR-0060",
+]
+
+[content]
+context = """
+A passing agent turn whose output misses a declared field, holds one of the wrong type, or breaks a schema ([[ADR-0060]]) settles as a measured failure and is not retried ([[RFC-0001:C-WORKFLOW]]). The failure is usually small (a number written as a string, a missing key) and the agent that made it is the one best placed to fix it: it has the inputs, the work, and the files in front of it.
+
+What exists today:
+
+- Transport retries re-dispatch the attempt from scratch. They are for infrastructure failures and never apply to a measured one.
+- A revise loop ([[RFC-0002:C-REVISE-LOOP]]) sends a reviewer's failing verdict back to the tasks it names. It needs a second task, re-runs whole tasks with the verdict as an input, and refuses a task that maps over a list.
+- Named sessions keep one conversation across tasks through a ledger of provider ids, and the claude harness and the command backend start or resume a conversation by id.
+- The executor validates emits after the runner returns; the harness validates declared files while capturing them, and an isolated task's worktree is gone once the runner returns."""
+decision = """
+An agent task may declare `repair = N` (0 to 3). When a passing turn's output breaks its declared emits or files, the harness resumes the same conversation with the masked validation notes and asks for the output and files to be fixed in place, then validates again, up to N times, inside the same attempt.
+
+- **Where.** The loop runs in the harness, after the turn and before capture, in whichever root the attempt runs in, so an isolated worktree still holds the files being fixed. Each mapped instance is its own task to the runner and repairs on its own.
+- **Which conversation.** A task in a named session resumes it and advances its ledger as any turn does. A task with no session gets a conversation for the attempt: started with a known id, never written to the ledger, so a transport retry starts fresh.
+- **Bounds.** Repair turns share the attempt's deadline. Their cost is the attempt's cost. The executor reports what the run may still spend before each dispatch, and no repair starts once the attempt has spent that.
+- **Not a retry.** The attempt count does not move. A repair turn that dies on transport ends the attempt as a measured failure; one that writes no result leaves the previous result standing. When repairs run out the attempt settles exactly as it would have without them.
+- **Record.** Each repair turn is recorded on the task's result and `task_result` event with its label (`analyze[RHAI-1] repair 1/2`), round, cost, and notes.
+- **Only agents.** `command` and `evaluate` refuse the argument: they are deterministic, so a second run produces the same output."""
+consequences = """
+- A small output mistake costs one more turn of the same conversation instead of a failed task, and the turn starts with the context that produced the mistake.
+- Mapped tasks get a fix-up path; revise cannot run over a fan-out.
+- A repair uses the conversation's context window and cost, and a harness without Crucible-managed sessions cannot run it: a task declaring repair on such a harness fails its first turn as a transport error.
+- A task's cost and duration now include its repairs, so `timeout` and the run budget have to allow for them.
+- Within a concurrent batch, each attempt compares its own spend to what the run had left at dispatch, so concurrent repairs can together overrun the budget by up to one turn each; the executor's overrun check after the batch still halts the run.
+- An engine that predates `repair` ignores it in a plan file and fails the task as before. Nothing it enforces is weakened."""
+
+[[content.alternatives]]
+text = "Resume the same conversation inside the attempt"
+status = "accepted"
+pros = [
+    "The agent sees its own work and the inputs it used; the repair prompt only has to say what broke.",
+    "Cheaper than a fresh turn that re-reads every input.",
+    "Works in isolated worktrees and per mapped instance.",
+]
+cons = [
+    "Needs a harness with resumable sessions.",
+    "A conversation that went wrong once may repeat the mistake; N bounds it.",
+]
+
+[[content.alternatives]]
+text = "Re-dispatch the attempt with the validation notes appended to the prompt"
+status = "rejected"
+pros = ["Works on every harness."]
+cons = [
+    "Pays the whole turn again, inputs and exploration included, to fix one field.",
+    "Loses the work the first turn did; an isolated attempt's files are already discarded.",
+    "Reads as a retry while the executor promises measured failures are never retried.",
+]
+rejection_reason = "Cost and lost context for what is usually a one-line fix."
+
+[[content.alternatives]]
+text = "Express it as a revise loop with a validating reviewer"
+status = "rejected"
+pros = ["No new mechanism."]
+cons = [
+    "Needs a second task per producer only to validate what the engine already validates.",
+    "Revise refuses mapped tasks, which are where per-item output drift is most common.",
+    "Each round re-runs the whole task rather than continuing its conversation.",
+]
+rejection_reason = "Revise is for a reviewer's judgment, not for the engine's own validation, and it cannot cover fan-outs."
+
+[[content.alternatives]]
+text = "Run the loop in the executor through a new runner call"
+status = "rejected"
+pros = ["The executor already holds the budget and validates emits."]
+cons = [
+    "An isolated worktree is gone by the time the runner returns, so its files cannot be fixed in place.",
+    "File validation lives in the harness's capture, which the executor cannot see.",
+]
+rejection_reason = "The files and the conversation live in the harness; the executor only needs to report the budget."

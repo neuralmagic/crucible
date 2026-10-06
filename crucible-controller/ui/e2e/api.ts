@@ -128,8 +128,8 @@ const RUN_GRAPH = {
   ],
   fanout: [{ task: 'summarize', items: 3 }],
   results: [
-    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [] },
-    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [] },
+    { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [], repairs: [] },
+    { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [], repairs: [] },
     {
       iter: 1,
       task: 'summarize[paged-attention]',
@@ -190,6 +190,7 @@ const RETRY_GRAPH = {
     cost_usd: 0.01,
     secs: 3,
     links: [],
+    repairs: [],
   })),
 };
 
@@ -207,10 +208,10 @@ const TRIAGE_GRAPH = {
   ],
   fanout: [{ task: 'triage', items: 20 }],
   results: [
-    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
-    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
-    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'high' } },
-    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [], agent: null },
+    { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
+    { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'high' } },
+    { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [], repairs: [], agent: null },
   ],
 };
 
@@ -441,7 +442,7 @@ export const PACK_IMPORT = {
   git_ref: null,
   path: 'packs/survey',
   rev: '4d5e6f708192a3b4c5d6e7f80912a3b4c5d6e7f8',
-  tar_digest: 'sha256:5555',
+  tree_digest: 'tree1:5555555555555555555555555555555555555555555555555555555555555555',
   params_schema: PREVIEW_SCHEMA,
   schema_digest: 'sha256:3333',
   graph: PREVIEW_GRAPH,
@@ -688,7 +689,7 @@ export const ROUTES: Record<string, Json> = {
       description: 'Survey a topic across the tracked repos and file what it finds.',
       source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/survey' },
       rev: '9f2c1a4c0b3d5e6f7a8b9c0d1e2f3a4b5c6d7e8f',
-      tar_digest: 'sha256:1111',
+      tree_digest: 'tree1:1111111111111111111111111111111111111111111111111111111111111111',
       schema_digest: 'sha256:2222',
       core_rev: '7c2c1a5',
       dispatch: DISPATCHABLE,
@@ -703,7 +704,7 @@ export const ROUTES: Record<string, Json> = {
       description: 'Triage the inbox and park what cannot move.',
       source: { kind: 'git', repo: 'neuralmagic/crucible-packs', git_ref: null, path: 'packs/triage' },
       rev: '0a1b2c3d4e5f60718293a4b5c6d7e8f901234567',
-      tar_digest: 'sha256:3333',
+      tree_digest: 'tree1:3333333333333333333333333333333333333333333333333333333333333333',
       schema_digest: 'sha256:4444',
       core_rev: '7c2c1a5',
       dispatch: DISPATCHABLE,
@@ -796,7 +797,7 @@ export const ROUTES: Record<string, Json> = {
     versions: [
       {
         version: 1,
-        tar_digest: 'sha256:4444',
+        tree_digest: 'tree1:4444444444444444444444444444444444444444444444444444444444444444',
         schema_digest: 'sha256:3333',
         diagnostics: 0,
         core_rev: '7c2c1a5',

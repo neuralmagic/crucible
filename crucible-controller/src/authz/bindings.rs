@@ -75,6 +75,7 @@ pub static BINDINGS: &[Binding] = &[
     bind("GET", "/api/access", R::Platform, V::Read, Route),
     bind("GET", "/api/overview", R::Platform, V::Read, Route),
     bind("GET", "/api/funnel", R::Platform, V::Read, Route),
+    bind("GET", "/api/playbook-limits", R::Platform, V::Read, Route),
     bind("GET", "/api/ledger/summary", R::Platform, V::Read, Route),
     bind("GET", "/api/ledger/by-tag", R::Platform, V::Read, Route),
     bind("GET", "/api/events", R::Platform, V::Read, Route),

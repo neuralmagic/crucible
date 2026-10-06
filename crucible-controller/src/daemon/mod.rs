@@ -1,6 +1,6 @@
-//! The resident shell: `select!`s a discovery timer against a kube pod watch,
-//! both of which only ever call [`Enqueue::enqueue`] (sources never touch the
-//! database or act directly), and drives the [`WorkQueue`] worker loop alongside them.
+//! The resident shell: `select!`s a discovery timer against the manual trigger and leadership,
+//! and runs the [`WorkQueue`] worker, the launch loop, and the pod-completion watch alongside it.
+//! Every source only ever calls [`Enqueue::enqueue`].
 //!
 //! `crucible-controller autopilot` (no `--once`) builds a runtime, assembles the [`Wiring`], and calls
 //! [`run`]; `--once` ([`crate::daemon::autopilot::run_once`]) enqueues non-terminal rows and drains
@@ -13,6 +13,7 @@ pub mod autopilot;
 #[cfg(feature = "autoresearch")]
 pub mod autopilot_flag;
 pub mod import_sqlite;
+pub mod launch_loop;
 pub mod leader;
 pub mod overrides;
 pub mod overrides_store;
@@ -20,10 +21,10 @@ pub mod queue;
 pub mod rebuild;
 pub mod store;
 
-use crate::daemon::queue::DiscoverySource;
 use crate::daemon::queue::TestSyncMarker;
 use crate::daemon::queue::{
-    BoxFuture, Enqueue, IssueKey, ParkFn, QueueConfig, ReconcileFn, WakeStream, WorkQueue,
+    BoxFuture, DiscoverySource, DueSource, Enqueue, IssueKey, ParkFn, Pass, QueueConfig,
+    ReconcileFn, WorkQueue,
 };
 use anyhow::{Context, Result};
 use k8s_openapi::api::core::v1::Pod;
@@ -36,12 +37,6 @@ use tokio::time::{MissedTickBehavior, interval};
 /// `run` doesn't name a concrete stream type: production is [`kube_completion_stream`], the test
 /// harness feeds a channel-backed one so the daemon runs for real without a cluster.
 pub type CompletionStream = Pin<Box<dyn futures_util::Stream<Item = IssueKey> + Send>>;
-
-/// A source polled whenever its stream yields, in addition to every discovery tick.
-pub struct Wake {
-    pub(crate) signals: WakeStream,
-    pub(crate) source: Arc<dyn DiscoverySource>,
-}
 
 /// The periodic drift check: rebuild into a temp DB and diff it against the live one. `run`
 /// invokes it on its own long interval and logs the outcome; the callable itself (`verify`)
@@ -64,8 +59,8 @@ pub struct Wiring {
     park: ParkFn,
     discovery: Arc<dyn DiscoverySource>,
     completions: CompletionStream,
-    /// Recorded webhook deliveries, settled as they arrive. `None` leaves them to the cadence.
-    wake: Option<Wake>,
+    /// The due-time triggers the launch loop drives. `None` runs no launch loop.
+    launches: Option<Arc<dyn DueSource>>,
     verify: Option<VerifyFn>,
     /// Fresh non-terminal keys for the manual reconcile-now pass (the API's kick-it-now button):
     /// the pass runs a discovery poll AND a full re-enqueue, so stuck rows re-drive immediately
@@ -155,42 +150,31 @@ pub fn assemble(
             Some(policy.clone()),
         )
     };
-    let wake = Wake {
-        signals: crate::launches::announce::wakes(
-            db.pool().clone(),
-            &[
-                crate::launches::webhooks::DELIVERY_CHANNEL,
-                crate::launches::store::LAUNCH_CHANNEL,
-            ],
-        ),
-        source: Arc::new(MultiDiscovery::new(vec![
-            Arc::new(trigger_sweep(vec![Arc::new(
-                crate::launches::webhooks::trigger::WebhookTrigger,
-            )])),
-            Arc::new(crate::launches::pending::PendingLaunches::new(
-                db.pool().clone(),
-            )),
-        ])),
-    };
-    #[allow(unused_mut)]
-    let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
-        // The only source that writes: every launch trigger (a due one-shot, a due schedule, a
-        // watch hit, a webhook delivery) claims its row and mints the launch in one transaction,
-        // then enqueues the key.
+    // Every launch trigger claims its row and mints the launch in one transaction, then enqueues
+    // the key. The ones with a due time run on the launch loop; the watches poll a tracker, so
+    // they stay on the discovery cadence. Launches minted on any replica, the standby's included,
+    // reach this queue through the pending-launch source.
+    let launches: Arc<dyn DueSource> = Arc::new(MultiDue::new(vec![
         Arc::new(trigger_sweep(vec![
             Arc::new(crate::launches::one_shots::OneShotTrigger),
             Arc::new(crate::launches::schedules::ScheduleTrigger::new(
                 db.clone(),
                 cfg.overrides.clone(),
             )),
-            Arc::new(crate::launches::watches::WatchTrigger::new(
-                crate::launches::jira::trackers(cfg.jira_config()),
-            )),
             Arc::new(crate::launches::webhooks::trigger::WebhookTrigger),
         ])),
         Arc::new(crate::launches::pending::PendingLaunches::new(
             db.pool().clone(),
         )),
+    ]));
+    #[allow(unused_mut)]
+    let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
+        Arc::new(trigger_sweep(vec![Arc::new(
+            crate::launches::watches::WatchTrigger::new(crate::launches::jira::trackers(
+                cfg.jira_config(),
+            )),
+        )])),
+        Arc::new(crate::launches::webhooks::trigger::WebhookHousekeeping::new(db.clone())),
     ];
     #[cfg(feature = "autoresearch")]
     if cfg.autoresearch_enabled() {
@@ -259,7 +243,7 @@ pub fn assemble(
         park,
         discovery,
         completions,
-        wake: Some(wake),
+        launches: Some(launches),
         verify: Some(verify),
         reenqueue_all,
     }
@@ -295,6 +279,58 @@ impl DiscoverySource for MultiDiscovery {
     }
 }
 
+/// Several due sources as one: the earliest due time across them, and a pass over all of them. A
+/// source's error is logged and the rest still run.
+pub struct MultiDue {
+    sources: Vec<Arc<dyn DueSource>>,
+}
+
+impl MultiDue {
+    fn new(sources: Vec<Arc<dyn DueSource>>) -> Self {
+        MultiDue { sources }
+    }
+}
+
+impl DueSource for MultiDue {
+    fn next_due(&self, held: Vec<String>) -> BoxFuture<Result<Option<jiff::Timestamp>>> {
+        let sources = self.sources.clone();
+        Box::pin(async move {
+            let mut earliest: Option<jiff::Timestamp> = None;
+            for src in &sources {
+                match src.next_due(held.clone()).await {
+                    Ok(Some(due)) => earliest = Some(earliest.map_or(due, |e| e.min(due))),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        error = format!("{e:#}"),
+                        "daemon: a due source probe failed (continuing)"
+                    ),
+                }
+            }
+            Ok(earliest)
+        })
+    }
+
+    fn pass(&self, enqueue: Arc<dyn Enqueue>, held: Vec<String>) -> BoxFuture<Result<Pass>> {
+        let sources = self.sources.clone();
+        Box::pin(async move {
+            let mut total = Pass::default();
+            for src in &sources {
+                match src.pass(enqueue.clone(), held.clone()).await {
+                    Ok(pass) => {
+                        total.claimed += pass.claimed;
+                        total.held.extend(pass.held);
+                    }
+                    Err(e) => tracing::warn!(
+                        error = format!("{e:#}"),
+                        "daemon: a due source pass failed (continuing)"
+                    ),
+                }
+            }
+            Ok(total)
+        })
+    }
+}
+
 /// A live source of the current discovery cadence (Lane O2): a runtime override can retune it
 /// without a restart, so the loop re-reads it each tick rather than freezing the startup value.
 pub type DiscoveryIntervalFn = Arc<dyn Fn() -> Duration + Send + Sync>;
@@ -311,9 +347,13 @@ pub struct DaemonConfig {
     /// rebuild-and-diff never competes with discovery. Ignored when no verify hook is wired.
     pub verify_interval: Duration,
     /// The manual reconcile trigger (`POST /api/reconcile` fires it with `notify_one`). Each fire
-    /// runs one discovery poll plus a full non-terminal re-enqueue; the permit semantics coalesce
-    /// clicks that land while a pass is running. `None` (tests without an API) never fires.
+    /// runs one discovery poll plus a full non-terminal re-enqueue and wakes the launch loop; the
+    /// permit semantics coalesce clicks that land while a pass is running. `None` (tests without
+    /// an API) never fires.
     pub reconcile_now: Option<Arc<tokio::sync::Notify>>,
+    /// How often the launch loop re-reads the due times ([`launch_loop::PROBE_INTERVAL`] in
+    /// production).
+    pub launch_probe: Duration,
 }
 
 /// Project a watched `Pod` event into the issue key to reconcile, or `None` if it isn't a
@@ -583,18 +623,74 @@ pub async fn run_led(
         reconcile,
         park,
         discovery,
-        mut completions,
-        mut wake,
+        completions,
+        launches,
         verify,
         reenqueue_all,
     } = wiring;
 
     queue.reenqueue_startup(non_terminal_keys);
 
+    // A pod completion wakes the launch loop once its reconcile has freed the slot.
+    let launch_wake = Arc::new(tokio::sync::Notify::new());
+    let completed: Arc<std::sync::Mutex<std::collections::HashSet<String>>> = Arc::default();
+    let reconcile: ReconcileFn = {
+        let completed = completed.clone();
+        let wake = launch_wake.clone();
+        Arc::new(move |key: IssueKey| {
+            let completed = completed.clone();
+            let wake = wake.clone();
+            let reconciled = reconcile(key.clone());
+            Box::pin(async move {
+                let result = reconciled.await;
+                if completed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&key.0)
+                {
+                    wake.notify_one();
+                }
+                result
+            })
+        })
+    };
+
     let worker_queue = queue.clone();
     let worker = tokio::spawn(async move {
         worker_queue.run(reconcile, park, cfg.queue, sync).await;
     });
+
+    let mut sources = tokio::task::JoinSet::new();
+    let completion_queue = queue.clone();
+    sources.spawn(async move {
+        use futures_util::StreamExt;
+        let mut completions = completions;
+        while let Some(key) = completions.next().await {
+            completed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key.0.clone());
+            completion_queue.enqueue(key);
+        }
+    });
+    if let Some(launches) = launches {
+        let hold = match cfg.discovery_interval_fn.clone() {
+            Some(f) => f,
+            None => {
+                let fixed = cfg.discovery_interval;
+                Arc::new(move || fixed)
+            }
+        };
+        sources.spawn(launch_loop::run(
+            launches,
+            Arc::new(queue.clone()),
+            launch_loop::LaunchLoopCfg {
+                probe: cfg.launch_probe,
+                hold,
+            },
+            launch_wake.clone(),
+        ));
+    }
 
     let mut discovery_period = cfg.discovery_interval;
     let discovery_interval_fn = cfg.discovery_interval_fn.clone();
@@ -635,6 +731,7 @@ pub async fn run_led(
         tokio::select! {
             reason = stepped_down.as_mut() => {
                 shutdown.notify_waiters();
+                sources.shutdown().await;
                 queue.shut_down();
                 let _ = worker.await;
                 anyhow::bail!("stepping down: {reason}");
@@ -660,25 +757,15 @@ pub async fn run_led(
                         tracing::warn!(error = format!("{e:#}"), "daemon: scheduled drift check failed (continuing)");
                     }
             }
-            maybe_key = pod_next(&mut completions) => {
-                if let Some(key) = maybe_key {
-                    queue.enqueue(key);
-                }
-            }
-            _ = wake_next(&mut wake) => {
-                if let Some(w) = &wake
-                    && let Err(e) = w.source.poll(enqueue.clone()).await {
-                        tracing::warn!(error = format!("{e:#}"), "daemon: woken poll failed (continuing)");
-                    }
-            }
             // The manual pass: a discovery poll (what a tick does) plus a full non-terminal
             // re-enqueue (what startup does), so stuck rows re-drive without waiting out the
-            // cadence. Best-effort — a button press must never take the daemon down. A fresh
-            // `notified()` each iteration is safe here (unlike shutdown's `notify_waiters`):
-            // `notify_one` stores a permit, so a fire mid-arm is consumed next iteration, and
-            // several fires while a pass runs coalesce into one.
+            // cadence, and a launch-loop probe. Best-effort — a button press must never take the
+            // daemon down. A fresh `notified()` each iteration is safe here (unlike shutdown's
+            // `notify_waiters`): `notify_one` stores a permit, so a fire mid-arm is consumed next
+            // iteration, and several fires while a pass runs coalesce into one.
             _ = manual_trigger(cfg.reconcile_now.as_ref()) => {
                 tracing::info!("daemon: manual reconcile triggered");
+                launch_wake.notify_one();
                 if let Err(e) = discovery.poll(enqueue.clone()).await {
                     tracing::warn!(error = format!("{e:#}"), "daemon: manual reconcile discovery poll failed");
                 }
@@ -694,9 +781,8 @@ pub async fn run_led(
         }
     }
 
-    // Drop the sources (the loop above already exited its select — `completions` and
-    // `discovery_timer` go out of scope at the end of this fn), signal the queue to drain, and
-    // join the worker.
+    // Stop the sources, signal the queue to drain, and join the worker.
+    sources.shutdown().await;
     queue.shut_down();
     worker.await.context("joining the queue worker")?;
     Ok(())
@@ -709,25 +795,6 @@ async fn manual_trigger(trigger: Option<&Arc<tokio::sync::Notify>>) {
         Some(n) => n.notified().await,
         None => std::future::pending().await,
     }
-}
-
-/// The next wake, or never when nothing is wired. A stream that ends stops waking.
-async fn wake_next(wake: &mut Option<Wake>) {
-    use futures_util::StreamExt;
-    let woke = match wake {
-        Some(w) => w.signals.next().await,
-        None => None,
-    };
-    if woke.is_none() {
-        std::future::pending::<()>().await;
-    }
-}
-
-async fn pod_next(
-    stream: &mut std::pin::Pin<Box<dyn futures_util::Stream<Item = IssueKey> + Send>>,
-) -> Option<IssueKey> {
-    use futures_util::StreamExt;
-    stream.next().await
 }
 
 /// A small deterministic stagger (a quarter of the interval, floored at 1s) rather than a fixed
@@ -903,7 +970,8 @@ mod tests {
 
     /// The next key off the merged stream, with a bound so a regression fails instead of hanging.
     async fn next_key(stream: &mut CompletionStream) -> IssueKey {
-        tokio::time::timeout(Duration::from_secs(5), pod_next(stream))
+        use futures_util::StreamExt;
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
             .await
             .expect("a completion arrived")
             .expect("the merged stream is still open")
@@ -1096,7 +1164,21 @@ mod tests {
     fn manual_rig(
         reenqueue_keys: Vec<String>,
         notify: Arc<tokio::sync::Notify>,
-        wake: Option<Wake>,
+        launches: Option<Arc<dyn DueSource>>,
+    ) -> ManualRig {
+        rig_with(
+            reenqueue_keys,
+            notify,
+            launches,
+            Box::pin(futures_util::stream::pending()),
+        )
+    }
+
+    fn rig_with(
+        reenqueue_keys: Vec<String>,
+        notify: Arc<tokio::sync::Notify>,
+        launches: Option<Arc<dyn DueSource>>,
+        completions: CompletionStream,
     ) -> ManualRig {
         let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_cl = seen.clone();
@@ -1118,8 +1200,8 @@ mod tests {
             reconcile,
             park,
             discovery,
-            completions: Box::pin(futures_util::stream::pending()),
-            wake,
+            completions,
+            launches,
             verify: None,
             reenqueue_all: Arc::new(move || {
                 let keys = reenqueue_keys.clone();
@@ -1134,6 +1216,7 @@ mod tests {
             discovery_interval_fn: None,
             verify_interval: Duration::from_secs(3600),
             reconcile_now: Some(notify),
+            launch_probe: Duration::from_millis(5),
         };
         let sync = Arc::new(TestSyncMarker::new());
         let shutdown = Arc::new(tokio::sync::Notify::new());
@@ -1153,29 +1236,109 @@ mod tests {
         }
     }
 
+    /// A due source with one launch: due until its first pass fires it, then idle. Counts probes.
+    struct OneLaunch {
+        key: IssueKey,
+        fired: std::sync::atomic::AtomicBool,
+        probes: Arc<AtomicU32>,
+    }
+
+    impl OneLaunch {
+        fn new(key: &str) -> (Arc<Self>, Arc<AtomicU32>) {
+            let probes = Arc::new(AtomicU32::new(0));
+            let source = Arc::new(OneLaunch {
+                key: IssueKey(key.into()),
+                fired: std::sync::atomic::AtomicBool::new(false),
+                probes: probes.clone(),
+            });
+            (source, probes)
+        }
+    }
+
+    impl DueSource for OneLaunch {
+        fn next_due(&self, _held: Vec<String>) -> BoxFuture<Result<Option<jiff::Timestamp>>> {
+            self.probes.fetch_add(1, Ordering::SeqCst);
+            let due = (!self.fired.load(Ordering::SeqCst))
+                .then(|| jiff::Timestamp::now() - jiff::SignedDuration::from_secs(1));
+            Box::pin(async move { Ok(due) })
+        }
+
+        fn pass(
+            &self,
+            enqueue: Arc<dyn Enqueue>,
+            _held: Vec<String>,
+        ) -> BoxFuture<Result<queue::Pass>> {
+            let claimed = if self.fired.swap(true, Ordering::SeqCst) {
+                0
+            } else {
+                enqueue.enqueue_urgent(self.key.clone());
+                1
+            };
+            Box::pin(async move {
+                Ok(queue::Pass {
+                    claimed,
+                    held: Vec::new(),
+                })
+            })
+        }
+    }
+
     #[tokio::test]
-    async fn a_wake_polls_its_own_source_without_a_discovery_pass() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<()>();
-        let woken = Arc::new(AtomicU32::new(0));
-        let wake = Wake {
-            signals: Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|()| ((), rx))
-            })),
-            source: Arc::new(CountingDiscovery {
-                polls: woken.clone(),
-                key: IssueKey("owner/repo#7".into()),
-            }),
-        };
-        let rig = manual_rig(Vec::new(), Arc::new(tokio::sync::Notify::new()), Some(wake));
-        tx.send(()).expect("send");
+    async fn a_due_launch_reconciles_without_waiting_for_discovery() {
+        let (source, _) = OneLaunch::new("playbook:p:1");
+        let rig = manual_rig(
+            Vec::new(),
+            Arc::new(tokio::sync::Notify::new()),
+            Some(source),
+        );
         rig.sync.wait_for_count(1).await;
-        drop(tx);
+        rig.shutdown.notify_waiters();
+        rig.handle.await.expect("join").expect("run");
+
+        assert_eq!(*rig.seen.lock().expect("lock"), vec!["playbook:p:1"]);
+        assert_eq!(rig.polls.load(Ordering::SeqCst), 0, "no discovery pass ran");
+    }
+
+    #[tokio::test]
+    async fn a_completion_reaches_the_worker_from_its_own_task() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<IssueKey>();
+        let completions: CompletionStream =
+            Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|key| (key, rx))
+            }));
+        let rig = rig_with(
+            Vec::new(),
+            Arc::new(tokio::sync::Notify::new()),
+            None,
+            completions,
+        );
+        tx.send(IssueKey("owner/repo#7".into())).expect("send");
+        rig.sync.wait_for_count(1).await;
         rig.shutdown.notify_waiters();
         rig.handle.await.expect("join").expect("run");
 
         assert_eq!(*rig.seen.lock().expect("lock"), vec!["owner/repo#7"]);
-        assert_eq!(woken.load(Ordering::SeqCst), 1);
-        assert_eq!(rig.polls.load(Ordering::SeqCst), 0, "no discovery pass ran");
+    }
+
+    #[tokio::test]
+    async fn the_launch_loop_stops_with_the_daemon() {
+        let (source, probes) = OneLaunch::new("playbook:p:1");
+        let rig = manual_rig(
+            Vec::new(),
+            Arc::new(tokio::sync::Notify::new()),
+            Some(source),
+        );
+        rig.sync.wait_for_count(1).await;
+        rig.shutdown.notify_waiters();
+        rig.handle.await.expect("join").expect("run");
+
+        let stopped_at = probes.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            stopped_at,
+            "no probe after run returned"
+        );
     }
 
     #[tokio::test]

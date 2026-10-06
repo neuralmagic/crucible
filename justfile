@@ -162,6 +162,13 @@ hooks:
 forge-capture-e2e:
     scripts/forge-capture-e2e.sh
 
+# End-to-end proof of the pod executor on a throwaway kind cluster: the controller from this
+# checkout launches command-only drafts and playbooks as pods, across restarts and contract
+# mismatches (scenarios in the script header). Needs docker, kind, kubectl, jq, curl, git, shasum.
+# KEEP=1 leaves the cluster, registry, and Postgres up.
+kind-e2e:
+    scripts/kind-e2e.sh
+
 # End-to-end proof of a revise loop through a real OpenShell sandbox on local podman, with a
 # model-free `claude` image (examples/revise-loop). Needs podman, openshell, openshell-gateway.
 revise-loop-e2e:

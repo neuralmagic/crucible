@@ -8,7 +8,7 @@
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
-use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_ROUNDS_CEILING};
+use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
@@ -105,13 +105,20 @@ fn task_knobs() -> Vec<Kwarg> {
              `top_k` or grade score a number, and a `route(source = ...)` question labels it can \
              answer. A `link` is one http(s) url and `links` a list of them, each naming a result \
              the task produced outside the run (a pull request, a pushed branch, an issue), \
-             which the run and task views then link out to.",
+             which the run and task views then link out to. A `schema_file(...)` promises a value \
+             its JSON Schema admits, and is checked against each consumer exactly: `over` needs \
+             `\"type\": \"array\"` with string items (by `type`, `const` or `enum`), a score a \
+             numeric `type` with no non-number in its `enum`, and a route a `const`, `enum` or \
+             boolean whose every value it can answer. A `when` label such a source can never give \
+             is refused.",
         ),
         Kwarg::new(
             "emits_files",
-            "list[str]",
+            "list[str] | dict[str, schema | None]",
             "Workspace files the task produces. A dependent is staged with the declared files of \
-             every dependency that passed.",
+             every dependency that passed. The dict form maps a path to `schema_file(...)` or \
+             `None`; a file with a schema must hold JSON the schema admits when the task passes, \
+             or the task fails.",
         ),
         Kwarg::new(
             "over",
@@ -219,6 +226,17 @@ fn agent_knobs() -> Vec<Kwarg> {
             "session",
             "session | str",
             "Join a durable conversation. A task in a session cannot be isolated.",
+        ),
+        Kwarg::new(
+            "repair",
+            "int",
+            format!(
+                "Repair turns, up to {MAX_REPAIR_CEILING}. When a passing turn's output misses \
+                 a declared field or file, or breaks its type or schema, the same session is \
+                 resumed with the masked validation notes and asked to fix it in place, then \
+                 checked again. Repairs share the attempt's timeout and cost. Default 0; \
+                 refused on `command` and `evaluate`."
+            ),
         ),
     ]
 }
@@ -371,8 +389,8 @@ pub fn functions() -> Vec<Function> {
                       value may reach a prompt, with `+` and inside a region marked as external \
                       input, or a skill argument; `str()`, `%`, `.format()`, and string methods \
                       on it are refused, as is a value carrying the marker text. A command or \
-                      evaluate task reads it from `params` in `CRUCIBLE_INPUTS` instead of its \
-                      command line.",
+                      evaluate task reads it from `params` in the inputs JSON at \
+                      `CRUCIBLE_INPUTS_FILE` instead of its command line.",
             positional: Some("name"),
             kwargs: vec![],
         },
@@ -381,6 +399,17 @@ pub fn functions() -> Vec<Function> {
             lane: Lane::Common,
             purpose: "Embed a UTF-8 file below the pack directory. Absolute paths, `..`, \
                       symlinks, non-files, and oversized inputs are refused.",
+            positional: Some("path"),
+            kwargs: vec![],
+        },
+        Function {
+            name: "schema_file",
+            lane: Lane::Common,
+            purpose: "Read a JSON Schema (draft 2020-12) below the pack directory, for a field \
+                      type in `emits` or a file in `emits_files`. Its content, not its path, is \
+                      compiled into the plan. Paths are confined as for `prompt_file`; a file \
+                      that is not a valid 2020-12 schema, declares another `$schema`, or \
+                      references a remote `$ref` is refused.",
             positional: Some("path"),
             kwargs: vec![],
         },
@@ -739,8 +768,8 @@ pub fn markdown() -> String {
     );
     out.push_str(&dialect_sentence());
     out.push_str(
-        "\n\n`prompt_file()` and `load()` are the only file access, both confined below the pack \
-         directory, and a loaded module cannot re-export what it loaded. The surface has no \
+        "\n\n`prompt_file()`, `schema_file()`, and `load()` are the only file access, all confined \
+         below the pack directory, and a loaded module cannot re-export what it loaded. The surface has no \
          processes, network access, clock, or randomness.\n\n\
          For what the engine does with the compiled graph, see [Work graphs](./work-graphs.md); \
          for the normative rules, see the [implementation contract](./crucible-contract.md).\n\n",

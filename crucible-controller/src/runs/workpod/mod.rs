@@ -69,6 +69,7 @@ pub(crate) use core::*;
 pub(crate) use dispatcher::*;
 pub(crate) use globals::*;
 pub(crate) use markers::*;
+pub(crate) use run::run_inputs;
 #[cfg(feature = "autoresearch")]
 pub(crate) use run::*;
 pub(crate) use scrape::*;
