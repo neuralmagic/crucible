@@ -51,7 +51,6 @@ impl FromRef<IngestState> for Arc<IngestValidator> {
 pub(crate) fn router(state: IngestState) -> Router {
     Router::new()
         .route("/api/pods/{pod}/artifacts/{kind}", post(ingest_artifact))
-        .merge(crate::decisions::ingest_routes())
         .with_state(state)
 }
 

@@ -313,7 +313,7 @@ async fn a_run_ending_withdraws_its_open_requests_and_revokes_its_local_token(po
 }
 
 fn ingest(pool: &PgPool) -> axum::Router {
-    crate::runs::ingest_drop::router(IngestState {
+    crate::decisions::ingest_routes().with_state(IngestState {
         db: Db::new(pool.clone()),
         validator: Arc::new(IngestValidator::local_only(pool.clone())),
     })

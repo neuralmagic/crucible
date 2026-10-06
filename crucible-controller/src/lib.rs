@@ -274,8 +274,9 @@ impl Surface {
             },
             turn_accounts.spokes,
         ));
-        let ingest_router =
-            runs::ingest_drop::router(runs::ingest_drop::IngestState { db, validator });
+        let ingest_state = runs::ingest_drop::IngestState { db, validator };
+        let ingest_router = runs::ingest_drop::router(ingest_state.clone())
+            .merge(decisions::ingest_routes().with_state(ingest_state));
 
         // The OIDC discovery mirror (hub-spoke trust bootstrap): mounted OUTSIDE the bearer layer
         // like `/metrics` — public read-only by design. Disabled (routes 404) unless
