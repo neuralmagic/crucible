@@ -1,10 +1,11 @@
 name: OpenShell gateway image
 
-# Build the OpenShell gateway + CLI distribution image (and the matching supervisor image)
-# from the EXACT fork rev Cargo.lock pins for openshell-core, tagged sha-<rev>. The loop
-# images COPY the binaries out of the sha-tagged image, and docker.yml passes the same rev
-# as OPENSHELL_REV — so the gateway crucible ships is always the rev its gRPC client
-# compiled against.
+# Build the OpenShell gateway + CLI distribution image, and the supervisor and sandbox runtime
+# images the kubernetes driver pairs with every sandbox, from the EXACT fork rev Cargo.lock
+# pins for openshell-core, all tagged sha-<rev>. The loop images COPY the binaries out of the
+# sha-tagged gateway image, and docker.yml passes the same rev as OPENSHELL_REV, so the gateway
+# crucible ships is always the rev its gRPC client compiled against. The component builds
+# mirror upstream's build-images.yml: gateway and supervisor for glibc, sandbox for musl.
 #
 # Runs rarely: on Cargo.lock changes (a rev bump) and manual dispatch. The build is heavy
 # (bundled-z3 is a C++ compile; the OpenShell workspace is large), which is why it lives
@@ -40,7 +41,8 @@ env:
 jobs:
   build-push:
     # Pinned like docker.yml: binaries spliced onto UBI10 (glibc 2.39) must not be built on a
-    # newer glibc; ubuntu-24.04 matches. The supervisor is musl-static, unaffected.
+    # newer glibc; ubuntu-24.04 matches. The supervisor runs on distroless Debian 13 (glibc
+    # 2.41), and the sandbox runtime is musl-static, unaffected.
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -69,19 +71,24 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # sha-<rev> tags are immutable by construction; if both images exist this run is a no-op.
+      # sha-<rev> tags are immutable by construction; if all three images exist this run is a
+      # no-op.
       - name: Check whether the sha-tagged images already exist
         id: exists
         run: |
           rev='${{ steps.rev.outputs.rev }}'
-          have_gateway=false; have_supervisor=false
-          docker manifest inspect "ghcr.io/neuralmagic/openshell-gateway:sha-$rev" >/dev/null 2>&1 && have_gateway=true
-          docker manifest inspect "ghcr.io/neuralmagic/openshell-supervisor:sha-$rev" >/dev/null 2>&1 && have_supervisor=true
+          missing=0
+          for image in openshell-gateway openshell-supervisor openshell-sandbox; do
+            if ! docker manifest inspect "ghcr.io/neuralmagic/$image:sha-$rev" >/dev/null 2>&1; then
+              echo "missing ghcr.io/neuralmagic/$image:sha-$rev"
+              missing=1
+            fi
+          done
           if [ '${{ inputs.force }}' = 'true' ]; then
             echo "force rebuild requested — ignoring existing sha-$rev images"
             echo "skip=false" >> "$GITHUB_OUTPUT"
-          elif $have_gateway && $have_supervisor; then
-            echo "both images exist for sha-$rev — skipping the build"
+          elif [ "$missing" = 0 ]; then
+            echo "all three images exist for sha-$rev — skipping the build"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -137,15 +144,28 @@ jobs:
         if: steps.exists.outputs.skip != 'true'
         working-directory: openshell-src
         run: |
-          # bundled-z3 statically compiles z3 into the server binary, so the loop image needs no
-          # libz3 at runtime (UBI10 does not ship one). protoc comes bundled via protobuf-src.
+          # bundled-z3 statically compiles z3 into the gateway binary, so the loop image needs
+          # no libz3 at runtime (UBI10 does not ship one). The gateway binary is its own crate
+          # (openshell-gateway) since v0.1.2; openshell-server is now only its library.
           cargo build --release --locked \
-            -p openshell-cli -p openshell-server \
-            --features openshell-server/bundled-z3
+            -p openshell-cli --bin openshell \
+            -p openshell-gateway --bin openshell-gateway \
+            --features openshell-gateway/bundled-z3
+          tasks/scripts/verify-glibc-symbols.sh 2.39 target/release/openshell target/release/openshell-gateway
           mkdir -p ../dist/bin
           cp target/release/openshell target/release/openshell-gateway ../dist/bin/
 
-      - name: Build supervisor (musl static)
+      - name: Build supervisor (glibc)
+        if: steps.exists.outputs.skip != 'true'
+        working-directory: openshell-src
+        run: |
+          cargo build --release --locked -p openshell-supervisor --bin openshell-supervisor
+          tasks/scripts/verify-glibc-symbols.sh 2.39 target/release/openshell-supervisor
+          # Stage where upstream's Dockerfile.supervisor expects the binary.
+          mkdir -p deploy/docker/.build/prebuilt-binaries/amd64
+          cp target/release/openshell-supervisor deploy/docker/.build/prebuilt-binaries/amd64/
+
+      - name: Build sandbox runtime (musl static)
         if: steps.exists.outputs.skip != 'true'
         working-directory: openshell-src
         run: |
@@ -153,8 +173,11 @@ jobs:
           # Running from openshell-src, rustup's directory override resolves the fork's pinned
           # toolchain (rust-toolchain.toml), so the musl target lands on THAT toolchain.
           rustup target add x86_64-unknown-linux-musl
-          cargo build --release --locked --target x86_64-unknown-linux-musl -p openshell-sandbox
-          # Stage where the fork's own Dockerfile.supervisor expects the binary.
+          cargo build --release --locked --target x86_64-unknown-linux-musl \
+            -p openshell-sandbox --bin openshell-sandbox
+          tasks/scripts/verify-static-binary.sh \
+            target/x86_64-unknown-linux-musl/release/openshell-sandbox
+          # Stage where upstream's Dockerfile.sandbox expects the binary.
           mkdir -p deploy/docker/.build/prebuilt-binaries/amd64
           cp target/x86_64-unknown-linux-musl/release/openshell-sandbox \
              deploy/docker/.build/prebuilt-binaries/amd64/
@@ -208,3 +231,13 @@ jobs:
           platforms: linux/amd64
           push: true
           tags: ghcr.io/neuralmagic/openshell-supervisor:sha-${{ steps.rev.outputs.rev }}
+
+      - name: Build and push the sandbox runtime image
+        if: steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: openshell-src
+          file: openshell-src/deploy/docker/Dockerfile.sandbox
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/neuralmagic/openshell-sandbox:sha-${{ steps.rev.outputs.rev }}
