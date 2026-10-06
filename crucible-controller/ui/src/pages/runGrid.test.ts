@@ -27,6 +27,7 @@ const result = (
   secs: null,
   blocked: null,
   links: [],
+  repairs: [],
   ...extra,
 });
 

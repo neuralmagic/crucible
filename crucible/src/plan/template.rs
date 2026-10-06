@@ -52,6 +52,7 @@ pub(crate) fn iteration_template(
                 revise: None,
                 timeout: None,
                 history: None,
+                repair: 0,
             }
         };
     let mut tasks = vec![engine("propose", EngineOp::Propose, None, vec![])];

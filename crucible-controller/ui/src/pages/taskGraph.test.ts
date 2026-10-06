@@ -49,6 +49,7 @@ const result = (iter: number, taskName: string, status: string): TaskResult => (
   cost_usd: null,
   secs: null,
   links: [],
+  repairs: [],
 });
 
 describe('status folding', () => {

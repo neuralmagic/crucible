@@ -18,3 +18,6 @@ tar = "0.4"
 # the controller refuse the same ones.
 url.workspace = true
 percent-encoding.workspace = true
+# Schema-typed emits: the engine checks a task's output and the controller reads the same
+# schema off the admitted plan. No default features, so a `$ref` never fetches.
+jsonschema.workspace = true

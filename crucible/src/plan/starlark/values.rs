@@ -18,7 +18,7 @@ use starlark::values::{
 
 use crate::plan::diag;
 use crucible_contract::decision::{Question, QuestionId};
-use crucible_contract::emits::FieldType;
+use crucible_contract::emits::{FieldType, JsonSchema};
 
 use crate::plan::ir::{Declared, Emits, OutputField, OutputRef, Task, TaskKind, TaskName};
 use crate::plan::starlark::error::CompileError;
@@ -309,6 +309,27 @@ impl Display for SessionValue {
 
 #[starlark_value(type = "session")]
 impl<'v> StarlarkValue<'v> for SessionValue {}
+
+/// `schema_file(path)`: a JSON Schema read from the pack, and the path it was read from.
+#[derive(Clone, Debug)]
+pub(crate) struct SchemaFile {
+    pub(crate) path: String,
+    pub(crate) schema: JsonSchema,
+}
+
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct SchemaValue(#[allocative(skip)] pub(crate) SchemaFile);
+
+starlark_simple_value!(SchemaValue);
+
+impl Display for SchemaValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "schema_file({:?})", self.0.path)
+    }
+}
+
+#[starlark_value(type = "schema")]
+impl<'v> StarlarkValue<'v> for SchemaValue {}
 
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct WorkflowValue(#[allocative(skip)] pub(crate) WorkflowCfg);

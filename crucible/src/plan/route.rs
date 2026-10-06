@@ -25,6 +25,7 @@ pub fn model_attempt(
             Ok(output) => Attempt {
                 outcome: AttemptOutcome::Pass(output),
                 cost_usd: 0.0,
+                repairs: Vec::new(),
             },
             Err(e) => Attempt::failed(0.0, format!("encoding the decision: {e}")),
         },

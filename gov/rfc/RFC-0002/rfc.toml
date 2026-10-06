@@ -49,5 +49,7 @@ changed = [
     "a settled join forwards a dependency that settled not taken",
     "converting external text to a plain string, and a supplied value carrying a marker, are compile errors",
     "the run's wall-clock ceiling is the default and maximum per-attempt deadline; a timed-out attempt fails measured and is not retried",
+    "C-TASK-FILES: a declared file may carry a schema, validated from the captured copy when the task passes",
+    "C-TASK-FILES: an absent or mismatched file is a repair note for an agent task that declares repair",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

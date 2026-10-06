@@ -185,6 +185,7 @@ impl ShellRunner {
                             }),
                         ),
                         cost_usd: 0.0,
+                        repairs: Vec::new(),
                     },
                     Err(error) => Attempt::failed(0.0, error.to_string()),
                 };
@@ -253,6 +254,7 @@ impl ShellRunner {
                     output: last_json_line(&stdout).filter(Value::is_object),
                 },
                 cost_usd: 0.0,
+                repairs: Vec::new(),
             };
         }
         let Some(last) = stdout.lines().rev().find(|l| !l.trim().is_empty()) else {
@@ -397,6 +399,7 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
         return Attempt {
             outcome: AttemptOutcome::Pass(value),
             cost_usd: 0.0,
+            repairs: Vec::new(),
         };
     };
     let Some(object) = value.as_object_mut() else {
@@ -431,6 +434,7 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
         Attempt {
             outcome: AttemptOutcome::Pass(value),
             cost_usd: 0.0,
+            repairs: Vec::new(),
         }
     } else {
         let note = format!(
@@ -451,6 +455,7 @@ fn evaluation_attempt(task: &Task, mut value: Value) -> Attempt {
                 output: Some(value),
             },
             cost_usd: 0.0,
+            repairs: Vec::new(),
         }
     }
 }
@@ -504,6 +509,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -528,6 +534,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -748,6 +755,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let passed = run_plan(vec![evaluate("latency", 9.5)], None);
         assert_eq!(passed.results[&"latency".into()].status, TaskStatus::Pass);
@@ -783,6 +791,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let over = run_plan(
             vec![evaluate("over", r#"{"score": 100, "pass": true}"#)],
@@ -825,6 +834,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let green = run_plan(vec![evaluate("green", r#"{"pass": true}"#)], None);
         assert_eq!(green.results[&"green".into()].status, TaskStatus::Pass);
@@ -856,6 +866,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let out = run_plan(vec![task], None);
         let result = &out.results[&"malformed".into()];
@@ -896,6 +907,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let mut r = ShellRunner {
             workdir: std::env::temp_dir(),
@@ -936,6 +948,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
@@ -968,6 +981,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let out = run_plan(
             vec![t],
@@ -1010,6 +1024,7 @@ mod tests {
             revise: None,
             history: Some(4),
             timeout: None,
+            repair: 0,
         };
         let mut r = ShellRunner {
             agent_cmd: Some(
@@ -1087,6 +1102,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let measure = |name: &str, dep: &str| {
             command(
@@ -1119,6 +1135,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         let out = run_plan(
             vec![

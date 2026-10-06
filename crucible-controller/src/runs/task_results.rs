@@ -52,10 +52,11 @@ pub(crate) async fn upsert_task_result(
         .map(serde_json::to_value)
         .transpose()
         .context("encoding the resolved agent")?;
+    let repairs = serde_json::to_value(&result.repairs).context("encoding the repair turns")?;
     sqlx::query!(
         r#"
-        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links, agent)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links, agent, repairs)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (run_id, iter, task) DO UPDATE SET
             status = excluded.status,
             note = excluded.note,
@@ -63,7 +64,8 @@ pub(crate) async fn upsert_task_result(
             secs = excluded.secs,
             blocked = excluded.blocked,
             links = excluded.links,
-            agent = excluded.agent
+            agent = excluded.agent,
+            repairs = excluded.repairs
         "#,
         run_id,
         result.iter,
@@ -75,6 +77,7 @@ pub(crate) async fn upsert_task_result(
         blocked,
         links,
         agent,
+        repairs,
     )
     .execute(ex)
     .await
@@ -114,7 +117,7 @@ pub(crate) async fn list_task_results(
     let rows = sqlx::query!(
         r#"
         SELECT iter AS "iter!: i64", task AS "task!", status AS "status!", note AS "note!",
-               cost_usd, secs, blocked, links AS "links!", agent
+               cost_usd, secs, blocked, links AS "links!", agent, repairs AS "repairs!"
         FROM run_task_results WHERE run_id = $1 ORDER BY iter, task
         "#,
         run_id,
@@ -145,6 +148,7 @@ pub(crate) async fn list_task_results(
                 blocked,
                 links,
                 agent,
+                repairs: crucible_contract::session::TaskRepair::decode_all(&r.repairs),
             })
         })
         .collect()
@@ -179,6 +183,7 @@ mod tests {
             blocked: None,
             links: Vec::new(),
             agent: None,
+            repairs: Vec::new(),
         }
     }
 
@@ -315,6 +320,43 @@ mod tests {
             rows[0].agent.as_ref().map(|a| a.model.as_str()),
             Some("glm-5.4"),
             "the retry's agent replaced it"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn repair_turns_round_trip_and_an_unreadable_entry_drops_out(pool: PgPool) -> Result<()> {
+        let repair = crucible_contract::session::TaskRepair {
+            label: "plan repair 1/1".to_string(),
+            round: 1,
+            of: 1,
+            cost_usd: 0.125,
+            notes: vec!["output missing declared field \"lanes\"".to_string()],
+        };
+        upsert_task_result(
+            &pool,
+            "run-5",
+            &TaskResult {
+                repairs: vec![repair.clone()],
+                ..result(0, "plan", "pass")
+            },
+        )
+        .await?;
+        upsert_task_result(&pool, "run-5", &result(0, "probe", "pass")).await?;
+        let rows = list_task_results(&pool, "run-5").await?;
+        assert_eq!(rows[0].repairs, vec![repair]);
+        assert!(rows[1].repairs.is_empty(), "a task that took none");
+
+        sqlx::query(
+            "UPDATE run_task_results SET repairs = '[{\"label\": 7}, {\"label\": \"plan repair 1/1\", \"round\": 1, \"of\": 1}]'::jsonb WHERE run_id = 'run-5' AND task = 'plan'",
+        )
+        .execute(&pool)
+        .await?;
+        let rows = list_task_results(&pool, "run-5").await?;
+        assert_eq!(
+            rows[0].repairs.len(),
+            1,
+            "the unreadable entry dropped out alone"
         );
         Ok(())
     }
