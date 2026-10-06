@@ -20,6 +20,9 @@ const TOKEN_EMIT_STEP: u64 = 5_000;
 /// Read cannot balloon the session log.
 pub(crate) const TOOL_IO_LIMIT: usize = 2_048;
 
+/// Char bound on the excerpt a failed tool result leaves in the compact log.
+const TOOL_ERROR_LIMIT: usize = 300;
+
 /// Which streamed text block is currently open (its deltas buffer to line boundaries).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TextKind {
@@ -62,11 +65,10 @@ pub struct StreamJsonParser {
     stream_cost: f64,
 
     // Verbose tool IO (CRUCIBLE_SESSION_TOOL_IO=full): tool events carry bounded
-    // inputs, and the tool results claude echoes back as `user` messages become
-    // result-excerpt events. Off by default so the session log stays compact.
+    // inputs, and every tool result claude echoes back as a `user` message becomes a
+    // result-excerpt event. Off by default, when only failed results become events.
     tool_io: bool,
-    // The open `tool_use` block's id, and id -> name for labeling result excerpts.
-    // Only populated under verbose tool IO.
+    // The open `tool_use` block's id, and id -> name for labeling result events.
     tool_id: Option<String>,
     tool_names: HashMap<String, String>,
 }
@@ -128,7 +130,7 @@ impl StreamJsonParser {
                 });
             }
             Some("stream_event") => self.stream_event(&msg, &mut out),
-            // `user` echoes carry the tool results; only read under verbose tool IO.
+            // `user` echoes carry the tool results.
             Some("user") => self.tool_results(&msg, &mut out),
             // `assistant` echoes duplicate the text already streamed via `stream_event`, and
             // `rate_limit_event` carries nothing the turn accounts for.
@@ -169,10 +171,8 @@ impl StreamJsonParser {
                     Some("tool_use" | "server_tool_use") => {
                         self.tool_name = Some(str_field(block, "name"));
                         self.tool_json.clear();
-                        if self.tool_io {
-                            let id = str_field(block, "id");
-                            self.tool_id = (!id.is_empty()).then_some(id);
-                        }
+                        let id = str_field(block, "id");
+                        self.tool_id = (!id.is_empty()).then_some(id);
                     }
                     _ => {}
                 }
@@ -251,10 +251,10 @@ impl StreamJsonParser {
                 .map(|p| format_tool(&name, p))
                 .unwrap_or_default();
             let subagent = name == "Agent" || name == "Task";
+            if let Some(id) = self.tool_id.take() {
+                self.tool_names.insert(id, name.clone());
+            }
             let input = if self.tool_io {
-                if let Some(id) = self.tool_id.take() {
-                    self.tool_names.insert(id, name.clone());
-                }
                 parsed.as_ref().map(bounded_input)
             } else {
                 None
@@ -276,13 +276,10 @@ impl StreamJsonParser {
         }
     }
 
-    /// Under verbose tool IO, turn each `tool_result` block claude echoes back in a
-    /// `user` message into a Tool event carrying a bounded result excerpt, labeled
-    /// with the originating tool's name via the id map. A no-op by default.
+    /// Turn the `tool_result` blocks claude echoes back in a `user` message into Tool events
+    /// labeled with the originating tool's name. Under verbose tool IO every result carries a
+    /// bounded excerpt; by default only a failed result shows, as a one-line `failed:` summary.
     fn tool_results(&mut self, msg: &Value, out: &mut Vec<AgentEvent>) {
-        if !self.tool_io {
-            return;
-        }
         let Some(content) = msg
             .get("message")
             .and_then(|m| m.get("content"))
@@ -299,13 +296,26 @@ impl StreamJsonParser {
                 .tool_names
                 .remove(&id)
                 .unwrap_or_else(|| "tool".to_string());
-            out.push(AgentEvent::Tool {
-                name,
-                summary: "result".to_string(),
-                subagent: false,
-                input: None,
-                result: Some(truncate_chars(&result_text(block), TOOL_IO_LIMIT)),
-            });
+            let failed = bool_field(block, "is_error");
+            let text = result_text(block);
+            if self.tool_io {
+                out.push(AgentEvent::Tool {
+                    name,
+                    summary: if failed { "failed" } else { "result" }.to_string(),
+                    subagent: false,
+                    input: None,
+                    result: Some(truncate_chars(&text, TOOL_IO_LIMIT)),
+                });
+            } else if failed {
+                let reason = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                out.push(AgentEvent::Tool {
+                    name,
+                    summary: format!("failed: {}", truncate_chars(&reason, TOOL_ERROR_LIMIT)),
+                    subagent: false,
+                    input: None,
+                    result: None,
+                });
+            }
         }
     }
 
@@ -950,6 +960,82 @@ mod tests {
             r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"secret-ish output"}]}}"#,
         ]);
         assert!(ev.is_empty(), "compact mode drops tool results, got {ev:?}");
+    }
+
+    fn mcp_call_then(result: &str) -> [String; 4] {
+        [
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":"toolu_9","name":"mcp__buildit__run"}}}"#.to_string(),
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"build_id\":\"buildit-1\"}"}}}"#.to_string(),
+            r#"{"type":"stream_event","event":{"type":"content_block_stop"}}"#.to_string(),
+            format!(
+                r#"{{"type":"user","message":{{"content":[{{"type":"tool_result","tool_use_id":"toolu_9","is_error":true,"content":{result}}}]}}}}"#
+            ),
+        ]
+    }
+
+    #[test]
+    fn default_mode_shows_a_failed_tool_result_as_one_line() {
+        let lines = mcp_call_then(r#""`sh -c alloc` failed in pod buildit-1:\n  exit code 1""#);
+        let ev = run(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+        match &ev[..] {
+            [
+                AgentEvent::Tool { name: call, .. },
+                AgentEvent::Tool {
+                    name,
+                    summary,
+                    input,
+                    result,
+                    ..
+                },
+            ] => {
+                assert_eq!(call, "mcp__buildit__run");
+                assert_eq!(name, "mcp__buildit__run", "labeled by the call's id");
+                assert_eq!(
+                    summary,
+                    "failed: `sh -c alloc` failed in pod buildit-1: exit code 1"
+                );
+                assert!(
+                    input.is_none() && result.is_none(),
+                    "compact mode stays compact"
+                );
+            }
+            other => panic!("expected the call and its failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn default_mode_bounds_a_long_failure() {
+        let long = format!(r#"[{{"type":"text","text":"{}"}}]"#, "e".repeat(5_000));
+        let lines = mcp_call_then(&long);
+        let ev = run(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+        match ev.last() {
+            Some(AgentEvent::Tool { summary, .. }) => {
+                let reason = summary.strip_prefix("failed: ").unwrap();
+                assert_eq!(reason.chars().count(), TOOL_ERROR_LIMIT + 1);
+                assert!(reason.ends_with('…'));
+            }
+            other => panic!("expected a failure event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verbose_tool_io_marks_a_failed_result() {
+        let mut p = StreamJsonParser::default().with_tool_io(true);
+        let lines = mcp_call_then(r#""no live build""#);
+        let ev: Vec<AgentEvent> = lines.iter().flat_map(|l| p.push(l)).collect();
+        match ev.last() {
+            Some(AgentEvent::Tool {
+                name,
+                summary,
+                result,
+                ..
+            }) => {
+                assert_eq!(name, "mcp__buildit__run");
+                assert_eq!(summary, "failed");
+                assert_eq!(result.as_deref(), Some("no live build"));
+            }
+            other => panic!("expected a failure excerpt, got {other:?}"),
+        }
     }
 
     /// Golden test against a real `claude --output-format stream-json` capture. The parser is

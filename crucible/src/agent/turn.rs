@@ -191,6 +191,11 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
             ..
         } => {
             let icon = if *subagent { "\u{1f916}" } else { "\u{1f527}" };
+            let summary = if crate::turn_trace::redact_enabled() {
+                crate::turn_trace::redact(summary)
+            } else {
+                summary.clone()
+            };
             Some(format!("{icon} {name} {summary}").trim_end().to_string())
         }
         AgentEvent::Tokens(t) => Some(format!(
@@ -207,5 +212,27 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
             message,
         } => Some(format!("\u{274c} Error: {error_type}: {message}")),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crucible_contract::event::AgentEvent;
+
+    #[test]
+    fn tool_lines_scrub_credentials_from_the_summary() {
+        let ev = AgentEvent::Tool {
+            name: "mcp__buildit__run".to_string(),
+            summary: "failed: push to https://bot:hunter2@quay.io refused, GH_TOKEN=abc123"
+                .to_string(),
+            subagent: false,
+            input: None,
+            result: None,
+        };
+        let line = crate::agent::turn::human_line(&ev).unwrap();
+        assert_eq!(
+            line,
+            "\u{1f527} mcp__buildit__run failed: push to https://***@quay.io/ refused, GH_TOKEN=***"
+        );
     }
 }
