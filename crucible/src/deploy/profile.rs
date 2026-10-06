@@ -181,6 +181,11 @@ pub struct Cluster {
     pub kubeconfig_configmap: String,
     /// The OpenShell supervisor image the nested sandbox runtime pulls (`OPENSHELL_SUPERVISOR_IMAGE`).
     pub supervisor_image: String,
+    /// The image carrying the trusted `openshell-sandbox` binary the driver bootstraps every
+    /// sandbox with (`OPENSHELL_SANDBOX_RUNTIME_IMAGE`). Unset = the image the OpenShell image
+    /// workflow publishes for the pinned rev, see [`Cluster::sandbox_runtime_image`].
+    #[serde(default)]
+    pub sandbox_runtime_image: Option<String>,
     /// Publish-on-keep S3 base; when set, the wrapper passes `--results-bucket`. Unset = don't publish.
     #[serde(default)]
     pub results_bucket: Option<String>,
@@ -244,13 +249,41 @@ pub struct Cluster {
     pub gpu_sandbox: crate::openshell::placement::GpuPlacement,
 }
 
+/// Where the OpenShell image workflow pushes the sandbox runtime image, tagged `sha-<rev>`.
+pub const SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/neuralmagic/openshell-sandbox";
+
 impl Cluster {
+    /// The sandbox runtime image: `sandbox_runtime_image`, else [`SANDBOX_RUNTIME_IMAGE_REPO`] at
+    /// `sha-<rev>` for the OpenShell rev this binary compiled against. Fails when neither is
+    /// known (a build whose OpenShell dependency is not a git pin).
+    pub fn sandbox_runtime_image(&self) -> Result<String, NoSandboxRuntimeImage> {
+        match &self.sandbox_runtime_image {
+            Some(image) => Ok(image.clone()),
+            None => default_sandbox_runtime_image(crate::openshell::grpc::EXPECTED_GATEWAY_REV),
+        }
+    }
+
     /// The service account sandbox pods run as: `sandbox_service_account`, else the loop's.
     pub fn sandbox_service_account(&self) -> &str {
         self.sandbox_service_account
             .as_deref()
             .unwrap_or(&self.service_account)
     }
+}
+
+/// No sandbox runtime image to render: the profile names none and the build has no OpenShell rev.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "[cluster].sandbox_runtime_image is unset and this build has no pinned OpenShell rev to \
+     derive {SANDBOX_RUNTIME_IMAGE_REPO}:sha-<rev> from; set it in the profile"
+)]
+pub struct NoSandboxRuntimeImage;
+
+fn default_sandbox_runtime_image(rev: &str) -> Result<String, NoSandboxRuntimeImage> {
+    if rev == "unknown" {
+        return Err(NoSandboxRuntimeImage);
+    }
+    Ok(format!("{SANDBOX_RUNTIME_IMAGE_REPO}:sha-{rev}"))
 }
 
 /// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.
@@ -426,7 +459,7 @@ impl DeployProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::deploy::profile::*;
 
     const BASE: &str = r#"
         [cluster]
@@ -438,6 +471,43 @@ mod tests {
         loop = "registry.example.com/crucible-loop:latest"
         pull_secret = "quay-pull"
     "#;
+
+    #[test]
+    fn the_sandbox_runtime_image_defaults_to_the_pinned_rev() {
+        let profile: DeployProfile = toml::from_str(BASE).unwrap();
+        assert!(profile.cluster.sandbox_runtime_image.is_none());
+        assert_eq!(
+            default_sandbox_runtime_image("6648bd0c290efbc41ba131ee9831ee45cd431f94").unwrap(),
+            "ghcr.io/neuralmagic/openshell-sandbox:sha-6648bd0c290efbc41ba131ee9831ee45cd431f94"
+        );
+        let derived = profile.cluster.sandbox_runtime_image().unwrap();
+        assert_eq!(
+            derived,
+            format!(
+                "{SANDBOX_RUNTIME_IMAGE_REPO}:sha-{}",
+                crate::openshell::grpc::EXPECTED_GATEWAY_REV
+            )
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_pinned_rev_needs_an_explicit_sandbox_runtime_image() {
+        let err = default_sandbox_runtime_image("unknown").unwrap_err();
+        assert!(err.to_string().contains("sandbox_runtime_image"), "{err:#}");
+    }
+
+    #[test]
+    fn an_explicit_sandbox_runtime_image_wins() {
+        let profile: DeployProfile = toml::from_str(&BASE.replace(
+            "[image]",
+            "sandbox_runtime_image = \"registry.example.com/sandbox:x\"\n[image]",
+        ))
+        .unwrap();
+        assert_eq!(
+            profile.cluster.sandbox_runtime_image().unwrap(),
+            "registry.example.com/sandbox:x"
+        );
+    }
 
     /// Every profile written before `avoid_nodes` existed must keep parsing, with an empty list.
     #[test]

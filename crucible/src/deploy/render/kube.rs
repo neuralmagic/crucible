@@ -3,7 +3,7 @@ use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{
     AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, CLIENT_TLS_SECRET, ComputeDriver,
-    OTEL_COLLECTOR_PORT,
+    OTEL_COLLECTOR_PORT, POD_IP_ENV, SANDBOX_RUNTIME_IMAGE_ENV, SUPERVISOR_IMAGE_ENV,
 };
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
@@ -90,10 +90,6 @@ const OPENSHELL_MANAGED_BY_VALUE: &str = "openshell";
 /// the identity CRD-path sandbox pods actually carry (the managed-by label above is
 /// SPIFFE-gated in the pinned driver).
 const SANDBOX_NAME_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
-/// Env var injected via the downward API carrying the loop pod's own IP. The wrapper reads it
-/// and passes it into the gateway config as `host_gateway_ip`, so the kubernetes driver injects
-/// the right `hostAliases` on sandbox pods.
-pub(super) const POD_IP_ENV: &str = "CRUCIBLE_POD_IP";
 
 /// Options that vary per render invocation (not per cluster). `Default` is a manual
 /// `crucible deploy render`: one iteration, no budget, no pin, baked domain, the loop.
@@ -757,12 +753,9 @@ impl Renderer<'_> {
         // Generic pod env from secrets (e.g. the backend's Vertex ADC), names are the profile's.
         env.extend(secret_env_vars(self.profile));
 
-        // The nested-sandbox runtime image (the openshell backend's contract, engine-known, not a
-        // domain name, so the engine projects it).
-        env.push(plain(
-            "OPENSHELL_SUPERVISOR_IMAGE",
-            self.profile.cluster.supervisor_image.clone(),
-        ));
+        // The images the compute driver pairs with every sandbox (the openshell backend's
+        // contract, engine-known, not a domain name, so the engine projects them).
+        env.extend(driver_image_env(self.profile)?);
 
         // Broker / composite wiring (manifest-derived, the broker IS the engine, so these are generic).
         // BROKER_BUILD is set by crucible when it spawns the broker (from [agent.broker].build), not here.
@@ -874,7 +867,7 @@ impl Renderer<'_> {
         if self.driver == ComputeDriver::Kubernetes
             && let Some(sandbox_image) = self.sandbox_image.as_deref()
         {
-            env.extend(kubernetes_sandbox_env(self.profile, sandbox_image));
+            env.extend(kubernetes_sandbox_env(self.profile, sandbox_image)?);
         }
 
         let downward = |name: &str, field_path: &str| core::EnvVar {
@@ -1675,10 +1668,30 @@ pub(super) fn secret_env_vars(profile: &DeployProfile) -> Vec<core::EnvVar> {
 /// (`--compute-driver` unset) silently reverts to podman and the sandbox image pull is authenticated
 /// with the wrong credential. `status.podIP` (unknowable at render time) is the `host_gateway_ip`
 /// that makes sandbox hostAliases work; the rest comes from the profile.
+/// The supervisor and sandbox runtime images the gateway's compute driver launches, as the env
+/// `gateway::DriverImages::from_env` reads. Shared by the loop and turn renders.
+pub(super) fn driver_image_env(profile: &DeployProfile) -> Result<Vec<core::EnvVar>> {
+    let plain = |name: &str, value: String| core::EnvVar {
+        name: name.to_string(),
+        value: Some(value),
+        value_from: None,
+    };
+    Ok(vec![
+        plain(
+            SUPERVISOR_IMAGE_ENV,
+            profile.cluster.supervisor_image.clone(),
+        ),
+        plain(
+            SANDBOX_RUNTIME_IMAGE_ENV,
+            profile.cluster.sandbox_runtime_image()?,
+        ),
+    ])
+}
+
 pub(super) fn kubernetes_sandbox_env(
     profile: &DeployProfile,
     sandbox_image: &str,
-) -> Vec<core::EnvVar> {
+) -> Result<Vec<core::EnvVar>> {
     let plain = |name: &str, value: String| core::EnvVar {
         name: name.to_string(),
         value: Some(value),
@@ -1721,22 +1734,18 @@ pub(super) fn kubernetes_sandbox_env(
     }
     if !profile.cluster.host_aliases.is_empty() {
         let aliases = serde_json::to_string(&profile.cluster.host_aliases)
-            .expect("host aliases are JSON-serializable strings");
+            .context("serializing [cluster].host_aliases")?;
         env.push(plain("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
     }
     if !profile.cluster.gpu_sandbox.is_empty() {
         let placement = serde_json::to_string(&profile.cluster.gpu_sandbox)
-            .expect("GPU placement is JSON-serializable");
+            .context("serializing [cluster.gpu_sandbox]")?;
         env.push(plain(
             crate::openshell::placement::GPU_PLACEMENT_ENV,
             placement,
         ));
     }
-    env.push(plain(
-        "CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE",
-        "Unconfined".to_string(),
-    ));
-    env
+    Ok(env)
 }
 
 /// The profile's node avoid-list as a required nodeAffinity `NotIn` on `kubernetes.io/hostname`
@@ -3696,6 +3705,7 @@ mod tests {
     fn kubernetes_projects_gpu_sandbox_placement_only_when_configured() {
         let placement = |profile: &DeployProfile| {
             kubernetes_sandbox_env(profile, "sandbox:dev")
+                .unwrap()
                 .into_iter()
                 .find(|e| e.name == crate::openshell::placement::GPU_PLACEMENT_ENV)
                 .and_then(|e| e.value)
@@ -3798,12 +3808,12 @@ mod tests {
             "sandbox pull secrets env: {yaml}"
         );
         assert!(
-            yaml.contains("name: CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE"),
-            "sandbox app armor env: {yaml}"
+            !yaml.contains("CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE"),
+            "v0.1.2's kubernetes driver has no app_armor_profile key: {yaml}"
         );
         assert!(
-            yaml.contains("value: Unconfined"),
-            "app armor is Unconfined: {yaml}"
+            yaml.contains("name: OPENSHELL_SANDBOX_RUNTIME_IMAGE"),
+            "sandbox runtime image env: {yaml}"
         );
     }
 
@@ -4180,59 +4190,39 @@ mod tests {
     /// `deny_unknown_fields`).
     #[test]
     fn kubernetes_driver_config_round_trips_as_valid_toml() {
-        use crate::openshell::gateway::KubernetesDriverConfig;
+        use crate::openshell::gateway::{
+            DriverImages, KubernetesDriverConfig, UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS,
+        };
 
-        let mut cfg = KubernetesDriverConfig::new(Some("registry.example.com/supervisor:latest"));
+        let mut cfg = KubernetesDriverConfig::new(&DriverImages {
+            supervisor: Some("registry.example.com/supervisor:latest".to_string()),
+            sandbox_runtime: Some("registry.example.com/sandbox:latest".to_string()),
+        });
         cfg.namespace = Some("autoresearch".to_string());
         cfg.service_account_name = Some("autoresearch-publisher".to_string());
         cfg.default_image = Some("registry.example.com/alpha-sandbox:latest".to_string());
         cfg.image_pull_secrets = vec!["quay-pull".to_string()];
-        cfg.host_gateway_ip = Some("10.0.0.1".to_string());
-        cfg.app_armor_profile = Some("Unconfined".to_string());
+        cfg.host_gateway_ip = Some(std::net::IpAddr::from([10, 0, 0, 1]));
 
         let toml_str = toml::to_string(&cfg).expect("serialize to TOML");
-        // Re-parse as a generic TOML table to inspect field names.
         let table: toml::map::Map<String, toml::Value> =
             toml::from_str(&toml_str).expect("re-parse as TOML table");
 
-        // Every emitted field name must be one the real config struct accepts.
-        // Cross-checked against the authoritative `KubernetesComputeConfig` in os-pinned.
-        let accepted_fields = [
-            "namespace",
-            "service_account_name",
-            "default_image",
-            "image_pull_policy",
-            "image_pull_secrets",
-            "supervisor_image",
-            "supervisor_image_pull_policy",
-            "supervisor_sideload_method",
-            "grpc_endpoint",
-            "ssh_socket_path",
-            "client_tls_secret_name",
-            "host_gateway_ip",
-            "enable_user_namespaces",
-            "app_armor_profile",
-            "workspace_default_storage_size",
-            "default_runtime_class_name",
-            "sa_token_ttl_secs",
-            "provider_spiffe_workload_api_socket_path",
-        ];
         for key in table.keys() {
             assert!(
-                accepted_fields.contains(&key.as_str()),
+                UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS.contains(&key.as_str()),
                 "emitted field `{key}` is not in KubernetesComputeConfig (deny_unknown_fields \
-                 would reject it). Accepted: {accepted_fields:?}"
+                 would reject it)"
             );
         }
 
-        // Verify values round-tripped.
+        assert_eq!(table["allow_driver_config"].as_bool(), Some(true));
         assert_eq!(
-            table["supervisor_sideload_method"].as_str(),
-            Some("init-container")
+            table["sandbox_runtime_image"].as_str(),
+            Some("registry.example.com/sandbox:latest")
         );
         assert_eq!(table["namespace"].as_str(), Some("autoresearch"));
         assert_eq!(table["host_gateway_ip"].as_str(), Some("10.0.0.1"));
-        assert_eq!(table["app_armor_profile"].as_str(), Some("Unconfined"));
     }
 
     /// `sandbox_driver = "kubernetes"` parses in a profile, default is still podman.

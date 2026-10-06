@@ -310,7 +310,7 @@ async fn try_turn(
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
     stage(sink, "starting the openshell gateway");
-    let version_warning = gateway::ensure_running(args.compute_driver, None)
+    let version_warning = gateway::ensure_running(args.compute_driver)
         .await
         .context("ensuring the openshell gateway is up")?;
     // A degraded version check (rev mismatch, unparseable version) is turn telemetry, not a

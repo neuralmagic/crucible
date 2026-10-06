@@ -1,7 +1,8 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::kube::{
     FORGE_STORAGE_ROOT, INGEST_TOKEN_DIR, INGEST_TOKEN_TTL_SECS, INGEST_TOKEN_VOLUME,
-    PULL_AUTHFILE_PATH, kubernetes_sandbox_env, node_avoid_affinity, resources, secret_env_vars,
+    PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env, node_avoid_affinity, resources,
+    secret_env_vars,
 };
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
@@ -312,10 +313,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         value: Some(value),
         value_from: None,
     };
-    env.push(plain(
-        "OPENSHELL_SUPERVISOR_IMAGE",
-        profile.cluster.supervisor_image.clone(),
-    ));
+    env.extend(driver_image_env(profile)?);
     env.push(plain("FORGE_STORAGE_ROOT", FORGE_STORAGE_ROOT.to_string()));
     // See `Renderer::env`: podman reads REGISTRY_AUTH_FILE ahead of its own lookup path, so the
     // nested podman pulls a private sandbox without a `podman login` shell-out. Only when mounted.
@@ -328,7 +326,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // `sandbox_image` through the authfile path instead of the kubelet's `imagePullSecrets`, and
     // never creates a `Sandbox` CR.
     if profile.cluster.sandbox_driver == ComputeDriver::Kubernetes {
-        env.extend(kubernetes_sandbox_env(profile, &sandbox_image));
+        env.extend(kubernetes_sandbox_env(profile, &sandbox_image)?);
     }
     // The GitHub / gate / Vertex-project env the profile carries (rank-grounded fetches the issue
     // from the GitHub API; the backend needs its Vertex project/region). Generic, names are the
@@ -940,7 +938,8 @@ mod tests {
         assert!(yaml.contains("value: registry.example.com/epp-sandbox:latest"));
         assert!(yaml.contains("name: CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS"));
         assert!(yaml.contains("value: example-pull-secret"));
-        assert!(yaml.contains("name: CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE"));
+        assert!(yaml.contains("name: OPENSHELL_SANDBOX_RUNTIME_IMAGE"));
+        assert!(!yaml.contains("CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE"));
         // The podman-driver authfile env is untouched by the switch, still projected whenever the
         // profile mounts one, so a manual `--compute-driver=podman` override still works.
         assert!(yaml.contains("name: REGISTRY_AUTH_FILE"));
