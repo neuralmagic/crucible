@@ -746,6 +746,23 @@ pub fn apply_yaml(yaml: &str) -> Result<()> {
     })?
 }
 
+/// Create `secret` in its own namespace. Fails if a Secret by that name already exists.
+pub fn create_secret(secret: &Secret) -> Result<()> {
+    let name = secret.metadata.name.as_deref().unwrap_or_default();
+    let ns = secret
+        .metadata
+        .namespace
+        .as_deref()
+        .context("create_secret: secret has no metadata.namespace")?;
+    block_on(async {
+        let api: Api<Secret> = Api::namespaced(client().await?, ns);
+        api.create(&PostParams::default(), secret)
+            .await
+            .with_context(|| format!("creating Secret {name} in {ns}"))?;
+        Ok(())
+    })?
+}
+
 fn deployments(client: Client, ns: &str) -> Api<Deployment> {
     Api::namespaced(client, ns)
 }

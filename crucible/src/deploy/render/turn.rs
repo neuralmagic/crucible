@@ -350,24 +350,25 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
             crucible_contract::ENV_INGEST_TOKEN_PATH,
             format!("{INGEST_TOKEN_DIR}/token"),
         ));
-        // The pod learns its own name from the downward API, so the `{pod}` path segment it POSTs to
-        // equals the token's bound-pod claim by construction (pod-binding = turn-scoping). The uid
-        // rides along so the in-pod gateway can own the objects it publishes, which is what gets
-        // them garbage-collected with the turn.
-        let downward = |name: &str, field_path: &str| core::EnvVar {
-            name: name.to_string(),
-            value: None,
-            value_from: Some(core::EnvVarSource {
-                field_ref: Some(core::ObjectFieldSelector {
-                    field_path: field_path.to_string(),
-                    api_version: None,
-                }),
-                ..Default::default()
-            }),
-        };
-        env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
-        env.push(downward("CRUCIBLE_POD_UID", "metadata.uid"));
     }
+
+    // The pod learns its own name from the downward API, so the ingest `{pod}` path segment it
+    // POSTs to equals the token's bound-pod claim by construction (pod-binding = turn-scoping).
+    // Name + uid also let the in-pod gateway create a client-TLS Secret unique to this pod and
+    // owned by it, which is what gets it garbage-collected with the turn.
+    let downward = |name: &str, field_path: &str| core::EnvVar {
+        name: name.to_string(),
+        value: None,
+        value_from: Some(core::EnvVarSource {
+            field_ref: Some(core::ObjectFieldSelector {
+                field_path: field_path.to_string(),
+                api_version: None,
+            }),
+            ..Default::default()
+        }),
+    };
+    env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
+    env.push(downward("CRUCIBLE_POD_UID", "metadata.uid"));
 
     let TurnOpts {
         kind,

@@ -62,30 +62,76 @@ pub enum GatewayError {
 pub const OTEL_COLLECTOR_PORT: u16 = 17671;
 /// The Secret name carrying the generated client mTLS material to sandbox pods (see
 /// [`KubernetesDriverConfig::client_tls_secret_name`]). Published by `boot()` into the sandbox
-/// namespace from the local certgen output. Used verbatim only where one gateway owns the
-/// namespace; in a pod, [`client_tls_secret_name`] scopes it per gateway.
+/// namespace from the local certgen output. Used verbatim only off-cluster; in a pod,
+/// [`ClientTlsSecret`] makes it unique per boot.
 pub const CLIENT_TLS_SECRET: &str = "crucible-openshell-client-tls";
 
-/// The Secret this gateway publishes its client mTLS material under: [`CLIENT_TLS_SECRET`] suffixed
-/// with the pod name when running as one.
+/// The Secret one gateway boot publishes its client mTLS material under.
 ///
-/// Every gateway generates its own CA, so a fixed name means concurrent turns overwrite each
+/// Every boot generates its own CA, so a shared name means concurrent gateways overwrite each
 /// other's material and a sandbox presents a credential its own gateway's CA never signed.
-pub fn client_tls_secret_name() -> String {
-    secret_name(pod_identity().as_ref().map(|(name, _)| name.as_str()))
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientTlsSecret {
+    /// In a pod: a name no other boot uses, created once and owned by the pod. Creating needs only
+    /// the unscoped secrets `create` grant, never `get` or `patch` on a name RBAC can't predict.
+    PodOwned {
+        name: String,
+        pod: String,
+        uid: String,
+    },
+    /// Off-cluster: [`CLIENT_TLS_SECRET`], applied over whatever an earlier boot left.
+    Shared,
 }
 
-/// The client mTLS Secret name the gateway running in pod `pod` publishes. Deploy renders grant
-/// RBAC on exactly this name, so it is the single source for both.
-pub fn client_tls_secret_for_pod(pod: &str) -> String {
-    format!("{CLIENT_TLS_SECRET}-{pod}")
+/// How [`publish_client_tls_secret`] writes the Secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PublishVerb {
+    Create,
+    Apply,
 }
 
-fn secret_name(pod: Option<&str>) -> String {
-    match pod {
-        Some(pod) => client_tls_secret_for_pod(pod),
-        None => CLIENT_TLS_SECRET.to_string(),
+impl ClientTlsSecret {
+    /// The Secret for a boot of this process, keyed by `boot_id`.
+    pub fn for_boot(boot_id: &str) -> Self {
+        match pod_identity() {
+            Some((pod, uid)) => Self::for_pod(pod, uid, boot_id),
+            None => Self::Shared,
+        }
     }
+
+    pub(crate) fn for_pod(pod: String, uid: String, boot_id: &str) -> Self {
+        Self::PodOwned {
+            name: format!("{CLIENT_TLS_SECRET}-{pod}-{boot_id}"),
+            pod,
+            uid,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::PodOwned { name, .. } => name,
+            Self::Shared => CLIENT_TLS_SECRET,
+        }
+    }
+
+    fn owner(&self) -> Option<(String, String)> {
+        match self {
+            Self::PodOwned { pod, uid, .. } => Some((pod.clone(), uid.clone())),
+            Self::Shared => None,
+        }
+    }
+
+    pub(crate) fn verb(&self) -> PublishVerb {
+        match self {
+            Self::PodOwned { .. } => PublishVerb::Create,
+            Self::Shared => PublishVerb::Apply,
+        }
+    }
+}
+
+/// A short id unique to one gateway boot: the random tail of a UUIDv7.
+fn boot_id() -> String {
+    format!("{:012x}", uuid::Uuid::now_v7().as_u128() & 0xffff_ffff_ffff)
 }
 
 /// This pod's `(name, uid)` from the downward API, `None` off-cluster.
@@ -209,6 +255,7 @@ pub fn gateway_toml(
     driver: ComputeDriver,
     supervisor_image: Option<&str>,
     otlp_endpoint: Option<&str>,
+    client_tls_secret: &str,
 ) -> Result<String> {
     let mut s = format!(
         "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:{port}\"\ncompute_drivers = [\"{}\"]\n",
@@ -246,7 +293,7 @@ pub fn gateway_toml(
             // fail SAN verification.
             cfg.grpc_endpoint =
                 format!("https://{}:{port}", ComputeDriver::Kubernetes.broker_host());
-            cfg.client_tls_secret_name = client_tls_secret_name();
+            cfg.client_tls_secret_name = client_tls_secret.to_string();
             // At runtime the render-projected env vars fill the driver config fields that
             // are unknowable at render time or vary per profile.
             if let Ok(ip) = std::env::var("CRUCIBLE_POD_IP")
@@ -507,7 +554,8 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
     }
 
     // 2. gateway config + 3. TLS certs.
-    write_config(driver, supervisor_image)?;
+    let tls_secret = ClientTlsSecret::for_boot(&boot_id());
+    write_config(driver, supervisor_image, &tls_secret)?;
     let tls_dir = state_dir()?.join("tls");
     std::fs::create_dir_all(&tls_dir)
         .with_context(|| format!("creating tls dir {}", tls_dir.display()))?;
@@ -528,7 +576,7 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
     //     way the sandbox supervisor gets the CA/cert/key it needs to dial the https
     //     `grpc_endpoint` back to this gateway.
     if driver == ComputeDriver::Kubernetes {
-        publish_client_tls_secret(&tls_dir)?;
+        publish_client_tls_secret(&tls_dir, &tls_secret)?;
     }
 
     // 4. launch the gateway, scrubbing the in-cluster k8s detection vars only under podman
@@ -680,41 +728,46 @@ fn tail_gateway_log(path: &std::path::Path) -> String {
     }
 }
 
-/// Server-side apply this gateway's client mTLS Secret from the certgen output at `tls_dir`
-/// (`ca.crt`, `client/tls.crt`, `client/tls.key` → the `ca.crt`/`tls.crt`/`tls.key` keys the
-/// driver's mount points `OPENSHELL_TLS_CA/CERT/KEY` at). The name is [`client_tls_secret_name`],
-/// so concurrent gateways never share one. The namespace mirrors the driver config:
+/// Publish this boot's client mTLS Secret from the certgen output at `tls_dir` (`ca.crt`,
+/// `client/tls.crt`, `client/tls.key` → the `ca.crt`/`tls.crt`/`tls.key` keys the driver's mount
+/// points `OPENSHELL_TLS_CA/CERT/KEY` at). The namespace mirrors the driver config:
 /// `CRUCIBLE_SANDBOX_NAMESPACE`, falling back to the driver's own default.
 ///
 /// In a pod the Secret is owned by that pod, so it is garbage-collected with the turn rather than
 /// accumulating one per dispatch.
-fn publish_client_tls_secret(tls_dir: &std::path::Path) -> Result<()> {
+fn publish_client_tls_secret(tls_dir: &std::path::Path, target: &ClientTlsSecret) -> Result<()> {
     let read = |rel: &str| -> Result<String> {
         let p = tls_dir.join(rel);
         std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))
     };
-    let name = client_tls_secret_name();
+    let name = target.name();
     let ns = std::env::var("CRUCIBLE_SANDBOX_NAMESPACE")
         .ok()
         .filter(|s| !s.is_empty())
         // The kubernetes driver's DEFAULT_K8S_NAMESPACE, used when the config omits `namespace`.
         .unwrap_or_else(|| "openshell".to_string());
     let secret = client_tls_secret(
-        &name,
+        name,
         &ns,
-        pod_identity(),
+        target.owner(),
         [
             ("ca.crt".to_string(), read("ca.crt")?),
             ("tls.crt".to_string(), read("client/tls.crt")?),
             ("tls.key".to_string(), read("client/tls.key")?),
         ],
     );
-    let yaml = serde_norway::to_string(&secret).context("serializing the client TLS secret")?;
-    forge::kube::apply_yaml(&yaml)
-        .with_context(|| format!("publishing Secret {name} to namespace {ns}"))
+    match target.verb() {
+        PublishVerb::Create => forge::kube::create_secret(&secret),
+        PublishVerb::Apply => {
+            let yaml =
+                serde_norway::to_string(&secret).context("serializing the client TLS secret")?;
+            forge::kube::apply_yaml(&yaml)
+        }
+    }
+    .with_context(|| format!("publishing Secret {name} to namespace {ns}"))
 }
 
-/// The Secret object `publish_client_tls_secret` applies. `owner` present sets this gateway's pod
+/// The Secret object `publish_client_tls_secret` writes. `owner` present sets this gateway's pod
 /// as the owner so collection cascades; absent leaves the Secret standing (off-cluster, where
 /// nothing would collect it anyway).
 fn client_tls_secret(
@@ -757,7 +810,11 @@ fn state_dir() -> Result<PathBuf> {
 
 /// Write `~/.config/openshell/gateway.toml` if its content changed (avoids churning a config
 /// a running gateway may have read).
-fn write_config(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<()> {
+fn write_config(
+    driver: ComputeDriver,
+    supervisor_image: Option<&str>,
+    tls_secret: &ClientTlsSecret,
+) -> Result<()> {
     let home = std::env::var("HOME").context("HOME unset")?;
     let dir = PathBuf::from(home).join(".config/openshell");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -771,6 +828,7 @@ fn write_config(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result
         driver,
         supervisor_image,
         otlp_endpoint.as_deref(),
+        tls_secret.name(),
     )?;
     if std::fs::read_to_string(&path).ok().as_deref() == Some(rendered.as_str()) {
         return Ok(());
@@ -802,17 +860,67 @@ mod tests {
     const PODMAN_NO_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n";
     const PODMAN_WITH_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n\n[openshell.drivers.podman]\nsupervisor_image = \"registry.example.com/epp-sandbox:x\"\n";
 
+    fn pod_secret(pod: &str, boot: &str) -> ClientTlsSecret {
+        ClientTlsSecret::for_pod(pod.to_string(), format!("uid-{pod}"), boot)
+    }
+
     #[test]
-    fn each_pod_publishes_its_client_material_under_its_own_name() {
-        let a = secret_name(Some("crucible-turn-router-2316-abc"));
-        let b = secret_name(Some("crucible-turn-router-2399-def"));
-        assert_ne!(a, b, "concurrent turns must not share one secret");
-        assert!(a.starts_with(CLIENT_TLS_SECRET));
-        assert_eq!(
-            a,
-            client_tls_secret_for_pod("crucible-turn-router-2316-abc")
+    fn each_pod_boot_publishes_its_client_material_under_its_own_name() {
+        let a = pod_secret("crucible-turn-router-2316-abc", "000000000001");
+        let b = pod_secret("crucible-turn-router-2399-def", "000000000001");
+        let restarted = pod_secret("crucible-turn-router-2316-abc", "000000000002");
+        assert_ne!(
+            a.name(),
+            b.name(),
+            "concurrent turns must not share one secret"
         );
-        assert_eq!(secret_name(None), CLIENT_TLS_SECRET);
+        assert_ne!(
+            a.name(),
+            restarted.name(),
+            "a second boot in one pod must not collide with the first"
+        );
+        assert_eq!(
+            a.name(),
+            "crucible-openshell-client-tls-crucible-turn-router-2316-abc-000000000001"
+        );
+        assert_eq!(ClientTlsSecret::Shared.name(), CLIENT_TLS_SECRET);
+    }
+
+    #[test]
+    fn a_pod_boot_creates_its_secret_and_only_off_cluster_applies() {
+        let in_pod = pod_secret("crucible-turn-x-1", "000000000001");
+        assert_eq!(in_pod.verb(), PublishVerb::Create);
+        assert_eq!(
+            in_pod.owner(),
+            Some((
+                "crucible-turn-x-1".to_string(),
+                "uid-crucible-turn-x-1".to_string()
+            ))
+        );
+        assert_eq!(ClientTlsSecret::Shared.verb(), PublishVerb::Apply);
+        assert_eq!(ClientTlsSecret::Shared.owner(), None);
+    }
+
+    #[test]
+    fn boot_ids_are_twelve_hex_digits_and_differ_between_boots() {
+        let a = boot_id();
+        let b = boot_id();
+        for id in [&a, &b] {
+            assert_eq!(id.len(), 12, "{id}");
+            assert!(id.chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        }
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn kubernetes_rendering_names_the_secret_this_boot_publishes() {
+        let secret = pod_secret("crucible-run-r1", "00000000abcd");
+        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None, None, secret.name()).unwrap();
+        let parsed: toml::Value = toml::from_str(&t).unwrap();
+        assert_eq!(
+            parsed["openshell"]["drivers"]["kubernetes"]["client_tls_secret_name"].as_str(),
+            Some(secret.name())
+        );
     }
 
     #[test]
@@ -845,7 +953,7 @@ mod tests {
 
     #[test]
     fn podman_rendering_is_byte_identical_without_image() {
-        let t = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
+        let t = gateway_toml(17670, ComputeDriver::Podman, None, None, CLIENT_TLS_SECRET).unwrap();
         assert_eq!(t, PODMAN_NO_IMAGE);
     }
 
@@ -856,6 +964,7 @@ mod tests {
             ComputeDriver::Podman,
             Some("registry.example.com/epp-sandbox:x"),
             None,
+            CLIENT_TLS_SECRET,
         )
         .unwrap();
         assert_eq!(t, PODMAN_WITH_IMAGE);
@@ -868,6 +977,7 @@ mod tests {
             ComputeDriver::Podman,
             None,
             Some("http://localhost:4317"),
+            CLIENT_TLS_SECRET,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&t).expect("gateway.toml must parse");
@@ -884,6 +994,7 @@ mod tests {
             ComputeDriver::Kubernetes,
             Some("registry.example.com/epp-sandbox:x"),
             None,
+            CLIENT_TLS_SECRET,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&t).expect("kubernetes gateway.toml must parse");
@@ -918,7 +1029,14 @@ mod tests {
     /// singleplayer-driver auto-default, and the escape hatch would only widen it.
     #[test]
     fn kubernetes_rendering_allows_unauthenticated_local_users_podman_does_not() {
-        let k8s = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
+        let k8s = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            None,
+            None,
+            CLIENT_TLS_SECRET,
+        )
+        .unwrap();
         let parsed: toml::Value = toml::from_str(&k8s).unwrap();
         assert_eq!(
             parsed["openshell"]["gateway"]["auth"]["allow_unauthenticated_users"].as_bool(),
@@ -926,7 +1044,8 @@ mod tests {
             "{k8s}"
         );
 
-        let podman = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
+        let podman =
+            gateway_toml(17670, ComputeDriver::Podman, None, None, CLIENT_TLS_SECRET).unwrap();
         assert!(!podman.contains("allow_unauthenticated_users"), "{podman}");
     }
 
@@ -937,7 +1056,14 @@ mod tests {
     /// and the secret name must be exactly what `boot()` publishes.
     #[test]
     fn kubernetes_rendering_pins_the_sandbox_dial_back_endpoint() {
-        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
+        let t = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            None,
+            None,
+            CLIENT_TLS_SECRET,
+        )
+        .unwrap();
         let parsed: toml::Value = toml::from_str(&t).unwrap();
         let k8s = &parsed["openshell"]["drivers"]["kubernetes"];
         assert_eq!(
@@ -950,13 +1076,21 @@ mod tests {
         );
 
         // Podman stays untouched (the frozen snapshots above also guard this).
-        let podman = gateway_toml(17670, ComputeDriver::Podman, None, None).unwrap();
+        let podman =
+            gateway_toml(17670, ComputeDriver::Podman, None, None, CLIENT_TLS_SECRET).unwrap();
         assert!(!podman.contains("grpc_endpoint"), "{podman}");
     }
 
     #[test]
     fn kubernetes_rendering_omits_supervisor_image_when_absent() {
-        let t = gateway_toml(17670, ComputeDriver::Kubernetes, None, None).unwrap();
+        let t = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            None,
+            None,
+            CLIENT_TLS_SECRET,
+        )
+        .unwrap();
         assert!(!t.contains("supervisor_image"), "{t}");
         assert!(
             t.contains("supervisor_sideload_method = \"init-container\""),
@@ -999,6 +1133,7 @@ mod tests {
             ComputeDriver::Kubernetes,
             Some("registry.example.com/epp-sandbox:x"),
             None,
+            CLIENT_TLS_SECRET,
         )
         .unwrap();
         let parsed: toml::Value = toml::from_str(&t).unwrap();
