@@ -2,8 +2,8 @@ use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
 use crate::openshell::gateway::{
-    AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, CLIENT_TLS_SECRET, ComputeDriver,
-    OTEL_COLLECTOR_PORT, POD_IP_ENV, SANDBOX_RUNTIME_IMAGE_ENV, SUPERVISOR_IMAGE_ENV,
+    AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, ComputeDriver, OTEL_COLLECTOR_PORT,
+    POD_IP_ENV, SANDBOX_RUNTIME_IMAGE_ENV, SUPERVISOR_IMAGE_ENV,
 };
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
@@ -1438,8 +1438,8 @@ exit $rc
     ///
     ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs, event reads, the
     ///     supervisor pod lifecycle, the boundary Service, bootstrap Secrets, the egress
-    ///     NetworkPolicy, PVC metadata reads for resource admission, plus the client-TLS Secret
-    ///     the loop pod publishes.
+    ///     NetworkPolicy, and PVC metadata reads for resource admission. Bootstrap Secret
+    ///     creation also covers the client-TLS Secret each gateway boot publishes.
     ///  2. A `RoleBinding` granting that Role to the loop SA.
     ///  3. A `ClusterRole`: `tokenreviews` (create), `nodes` (get/list/watch), and the
     ///     `runtimeclasses`/`priorityclasses`/`namespaces` reads admission and UID resolution do.
@@ -1515,23 +1515,13 @@ exit $rc
                     verbs: vec!["get".to_string()],
                     ..Default::default()
                 },
-                // The loop pod publishes the client-TLS Secret sandbox pods mount to dial the
-                // gateway back over mTLS (server-side apply = create on first boot, patch on
-                // cert refresh). Two rules because RBAC can't constrain `create` by
-                // resourceNames (the name doesn't exist yet at admission), while get/patch
-                // stay pinned to the one Secret we own. The driver's generation-scoped bootstrap
-                // Secrets need create and, on recovery, delete by name.
+                // Each in-pod gateway boot creates a fresh client-TLS Secret that sandbox pods
+                // mount to dial it back over mTLS; no get or patch on any Secret. The driver's
+                // generation-scoped bootstrap Secrets need create and, on recovery, delete.
                 rbac::PolicyRule {
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["secrets".to_string()]),
                     verbs: vec!["create".to_string(), "delete".to_string()],
-                    ..Default::default()
-                },
-                rbac::PolicyRule {
-                    api_groups: Some(vec![String::new()]),
-                    resources: Some(vec!["secrets".to_string()]),
-                    resource_names: Some(vec![CLIENT_TLS_SECRET.to_string()]),
-                    verbs: vec!["get".to_string(), "patch".to_string()],
                     ..Default::default()
                 },
             ]),
@@ -1850,6 +1840,7 @@ fn model_flag(model: Option<&String>, sep: char) -> String {
 mod tests {
     use super::*;
     use crate::deploy::render::turn::{TurnKind, TurnOpts, render_turn};
+    use crate::openshell::gateway::{ClientTlsSecret, PublishVerb};
 
     /// The synthetic gamma composite fixture, the render tests' stand-in for a real composite
     /// domain pack, which lives out of tree.
@@ -4030,11 +4021,9 @@ mod tests {
             role_doc.contains("secrets"),
             "secrets resource (the published client-TLS Secret): {role_doc}"
         );
-        // The split grant: unrestricted create (RBAC can't name-scope create), get/patch
-        // pinned to the client-TLS Secret.
         assert!(
-            role_doc.contains(CLIENT_TLS_SECRET),
-            "get/patch resourceNames-scoped to the client-TLS Secret: {role_doc}"
+            !role_doc.contains("resourceNames"),
+            "the gateway creates a fresh Secret per boot, so no Secret name is pinned: {role_doc}"
         );
         let secrets_create_unscoped = role_doc.split("- apiGroups").any(|rule| {
             rule.contains("secrets") && rule.contains("create") && !rule.contains("resourceNames")
@@ -4093,6 +4082,130 @@ mod tests {
         );
     }
 
+    fn docs_of_kind<'a>(yaml: &'a str, kind: &str) -> impl Iterator<Item = &'a str> {
+        let line = format!("kind: {kind}");
+        yaml.split("\n---\n")
+            .filter(move |d| d.lines().any(|l| l == line))
+    }
+
+    fn rendered_roles(yaml: &str) -> Vec<rbac::Role> {
+        docs_of_kind(yaml, "Role")
+            .map(|d| serde_norway::from_str(d).expect("Role parses"))
+            .collect()
+    }
+
+    fn secret_verbs_granted(rules: &[rbac::PolicyRule]) -> Vec<String> {
+        rules
+            .iter()
+            .filter(|rule| rule.resources.iter().flatten().any(|res| res == "secrets"))
+            .flat_map(|rule| rule.verbs.iter().cloned())
+            .collect()
+    }
+
+    fn env_value(env: &[core::EnvVar], name: &str) -> Option<String> {
+        env.iter().find(|e| e.name == name)?.value.clone()
+    }
+
+    fn downward_field(env: &[core::EnvVar], name: &str) -> Option<String> {
+        env.iter()
+            .find(|e| e.name == name)?
+            .value_from
+            .as_ref()?
+            .field_ref
+            .as_ref()
+            .map(|f| f.field_path.clone())
+    }
+
+    #[test]
+    fn a_turn_pod_is_granted_exactly_the_secret_access_its_gateway_publishes_with() {
+        let profile = k8s_profile("");
+        let rbac_yaml = render_k8s(&profile);
+        let turn_name = "crucible-turn-owner-repo-42-abcd";
+        let mut opts = TurnOpts::new(
+            TurnKind::Scope,
+            turn_name,
+            "owner/repo#42",
+            "https://github.com/owner/repo.git",
+            "registry.example.com/alpha-sandbox:latest",
+        );
+        opts.max_cost = 1.0;
+        let turn: core::Pod =
+            serde_norway::from_str(&render_turn(&profile, &opts).expect("render turn"))
+                .expect("turn Pod parses");
+        let spec = turn.spec.as_ref().expect("turn spec");
+        let env = spec
+            .containers
+            .iter()
+            .find(|c| c.name == "turn")
+            .and_then(|c| c.env.clone())
+            .expect("turn env");
+
+        assert_eq!(
+            downward_field(&env, crucible_contract::ENV_POD_NAME).as_deref(),
+            Some("metadata.name"),
+            "without its pod name the gateway falls back to the shared, applied Secret"
+        );
+        assert_eq!(
+            downward_field(&env, "CRUCIBLE_POD_UID").as_deref(),
+            Some("metadata.uid")
+        );
+        let published =
+            ClientTlsSecret::for_pod(turn_name.to_string(), "uid".to_string(), "000000000001");
+        assert_eq!(published.verb(), PublishVerb::Create);
+        let publish_ns = env_value(&env, "CRUCIBLE_SANDBOX_NAMESPACE").expect("sandbox namespace");
+
+        let roles = rendered_roles(&rbac_yaml);
+        let sandbox_role = roles
+            .iter()
+            .find(|r| r.metadata.name.as_deref() == Some("autoresearch-publisher-sandbox"))
+            .expect("sandbox Role");
+        assert_eq!(
+            sandbox_role.metadata.namespace.as_deref(),
+            Some(publish_ns.as_str())
+        );
+        let rules = sandbox_role.rules.clone().unwrap_or_default();
+        let mut verbs = secret_verbs_granted(&rules);
+        verbs.sort();
+        assert_eq!(
+            verbs,
+            vec!["create".to_string(), "delete".to_string()],
+            "a fresh per-boot Secret needs only create; no get or patch: {rbac_yaml}"
+        );
+        assert!(
+            rules
+                .iter()
+                .filter(|r| r.resources.iter().flatten().any(|res| res == "secrets"))
+                .all(|r| r.resource_names.is_none()),
+            "the per-boot name can't be pinned, and create can't be name-scoped anyway"
+        );
+
+        let binding: rbac::RoleBinding = serde_norway::from_str(
+            docs_of_kind(&rbac_yaml, "RoleBinding")
+                .find(|d| d.contains("name: autoresearch-publisher-sandbox\n"))
+                .expect("sandbox RoleBinding"),
+        )
+        .expect("RoleBinding parses");
+        assert_eq!(binding.role_ref.name, "autoresearch-publisher-sandbox");
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(
+            Some(subjects[0].name.as_str()),
+            spec.service_account_name.as_deref(),
+            "the grant must bind the account the turn pod runs as"
+        );
+        assert_eq!(subjects[0].namespace.as_deref(), Some(publish_ns.as_str()));
+
+        let cluster_roles: Vec<rbac::ClusterRole> = docs_of_kind(&rbac_yaml, "ClusterRole")
+            .map(|d| serde_norway::from_str(d).expect("ClusterRole parses"))
+            .collect();
+        for cr in &cluster_roles {
+            assert!(
+                secret_verbs_granted(&cr.rules.clone().unwrap_or_default()).is_empty(),
+                "no cluster-wide Secret access: {rbac_yaml}"
+            );
+        }
+    }
+
     /// Every `(apiGroup, resource, resourceNames) -> verbs` grant in one rendered RBAC doc.
     fn rbac_grants(
         rules: &[rbac::PolicyRule],
@@ -4118,8 +4231,7 @@ mod tests {
     }
 
     /// The Role and ClusterRole grant exactly what OpenShell v0.1.2's helm chart grants its
-    /// gateway in shared mode with `allowDriverConfig`, plus the client-TLS Secret the loop pod
-    /// publishes itself.
+    /// gateway in shared mode with `allowDriverConfig`.
     #[test]
     fn the_sandbox_rbac_matches_the_openshell_chart() {
         let yaml = render_k8s(&k8s_profile(""));
@@ -4172,7 +4284,6 @@ mod tests {
                 ),
                 grant("", "persistentvolumeclaims", &[], &["get"]),
                 grant("", "secrets", &[], &["create", "delete"]),
-                grant("", "secrets", &[CLIENT_TLS_SECRET], &["get", "patch"]),
             ])
         );
         assert_eq!(
