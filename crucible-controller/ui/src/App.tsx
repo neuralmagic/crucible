@@ -11,6 +11,7 @@ import { IdentityBadge } from './IdentityBadge';
 import { OwnerSwitcher } from './OwnerSwitcher';
 import { AutopilotBanner } from './AutopilotBanner';
 import { ViewAsBanner } from './ViewAsBanner';
+import { CommandPalette } from './palette/CommandPalette';
 import { useResetOnActAs } from './actAs';
 import { DashboardPage } from './pages/DashboardPage';
 import { HomePage } from './pages/HomePage';
@@ -413,6 +414,7 @@ export function App() {
         </div>
       </header>
 
+      <CommandPalette />
       <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
