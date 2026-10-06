@@ -1068,6 +1068,39 @@ fn retained_row(pod_name: &str, terminal_at: Option<&str>) -> WorkPodRow {
 }
 
 #[test]
+fn the_resync_re_drives_each_issue_with_a_running_run_pod_once() {
+    let row = |pod: &str, kind: &str, state: WorkPodState, key: Option<&str>| WorkPodRow {
+        kind: kind.to_string(),
+        state,
+        issue_key: key.map(str::to_string),
+        ..retained_row(pod, None)
+    };
+    let rows = vec![
+        row("run-a", "run", WorkPodState::Running, Some("playbook:x:1")),
+        row(
+            "rank-a",
+            "grounded-rank",
+            WorkPodState::Running,
+            Some("owner/repo#2"),
+        ),
+        row(
+            "run-b",
+            "run",
+            WorkPodState::Collected,
+            Some("owner/repo#3"),
+        ),
+        row("run-c", "run", WorkPodState::Running, Some("scenario:4")),
+        row("run-d", "run", WorkPodState::Running, Some("playbook:x:1")),
+        row("run-e", "run", WorkPodState::Running, None),
+        row("run-f", "run", WorkPodState::Failed, Some("owner/repo#5")),
+    ];
+    assert_eq!(
+        run_pod_resync_keys(&rows),
+        vec!["playbook:x:1".to_string(), "scenario:4".to_string()]
+    );
+}
+
+#[test]
 fn failed_pod_overflow_keeps_the_newest_n() {
     let rows = vec![
         retained_row("pod-a", Some("2026-07-04T01:00:00Z")),

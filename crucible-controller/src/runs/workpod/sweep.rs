@@ -133,7 +133,8 @@ pub(crate) async fn sweep_failed_pod_overflow(
 /// against a re-drive that reached the pod first). Row age is `created_at`; the grounded deadline is
 /// flat ([`GROUNDED_RANK_TIMEOUT`]), the scope deadline scales with the effective gaming allowance
 /// ([`scope_deadline`]) — the same allowance the pod's argv was rendered with. Run pods are
-/// hours-long and watched out-of-band, so they're skipped. Returns the issue keys it freed, so the
+/// bounded by their completion edge ([`crate::runs::completion::ingest_completion`]), so they're
+/// skipped. Returns the issue keys it freed, so the
 /// caller re-drives them (a freed slot must re-dispatch). Best-effort: a per-row error is logged and
 /// the sweep continues.
 ///
@@ -180,7 +181,7 @@ pub(crate) async fn sweep_timed_out_turns(
         let deadline = match kind {
             WorkKind::AgentTurn(TurnKind::GroundedRank) => GROUNDED_RANK_TIMEOUT,
             WorkKind::AgentTurn(TurnKind::Scope) => scope_deadline(scope_gaming_rounds),
-            // A run is watched out-of-band (the shared pod watch ingests its session); never reaped here.
+            // A run's deadline is its completion edge's; never reaped here.
             WorkKind::Run => continue,
         };
         if !turn_row_overran(&row.created_at, deadline) {
@@ -296,6 +297,50 @@ impl crate::daemon::queue::DiscoverySource for TurnTimeoutPoll {
         Box::pin(async move {
             let dispatcher = active_dispatcher();
             for key in sweep_timed_out_turns(&db, dispatcher.as_ref(), &cfg).await {
+                enqueue.enqueue(crate::daemon::queue::IssueKey(key));
+            }
+            Ok(())
+        })
+    }
+}
+
+/// The issues behind `running` run pod rows, each once, in row order.
+pub(crate) fn run_pod_resync_keys(rows: &[WorkPodRow]) -> Vec<String> {
+    let run = WorkKind::Run.label_value();
+    let mut seen = std::collections::BTreeSet::new();
+    rows.iter()
+        .filter(|row| row.state == WorkPodState::Running && row.kind == run)
+        .filter_map(|row| row.issue_key.clone())
+        .filter(|key| seen.insert(key.clone()))
+        .collect()
+}
+
+/// A [`crate::daemon::queue::DiscoverySource`] that re-drives the issue of every `running` run pod
+/// row on the discovery tick, whatever the issue's status, so the completion edge
+/// ([`crate::runs::completion::ingest_completion`]) collects a finished pod, fails a vanished or
+/// overrun one, and never depends on the pod watch having delivered an event.
+pub struct RunPodResync {
+    db: Db,
+}
+
+impl RunPodResync {
+    pub(crate) fn new(db: Db) -> Self {
+        RunPodResync { db }
+    }
+}
+
+impl crate::daemon::queue::DiscoverySource for RunPodResync {
+    fn poll(
+        &self,
+        enqueue: std::sync::Arc<dyn crate::daemon::queue::Enqueue>,
+    ) -> crate::daemon::queue::BoxFuture<Result<()>> {
+        let db = self.db.clone();
+        Box::pin(async move {
+            let rows =
+                crate::runs::work_pods::work_pods_in_states(db.pool(), &[WorkPodState::Running])
+                    .await
+                    .context("reading running work pods for the run pod resync")?;
+            for key in run_pod_resync_keys(&rows) {
                 enqueue.enqueue(crate::daemon::queue::IssueKey(key));
             }
             Ok(())

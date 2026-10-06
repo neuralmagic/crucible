@@ -7,6 +7,7 @@ use crate::model::{ParkReason, ParkedBy, Status};
 use crate::runs::ingest;
 use crate::runs::workpod::RunDisposition;
 use anyhow::Result;
+use std::time::Duration;
 
 /// Fold a finished run into the ledger and advance the issue: ingest the session log
 /// (runs + per-candidate rows + the run's cost) then transition `running` → `pr-open` when the run
@@ -162,32 +163,66 @@ pub async fn complete_run(
     Ok(RunDisposition::Finished)
 }
 
-/// The pod-completion edge: if the `running` run behind `key` has
-/// published a complete session log, fold it into the ledger and advance `running` → `done`. Safe to
-/// call on *any* reconcile of a `running` row (the pod watch enqueues on completion, but an upstream
-/// poll may re-enqueue a still-live run): a run whose log isn't stored yet returns `Ok(false)` and
-/// the caller falls through to the other `running` edges. Idempotent — once advanced to `done` there
-/// is no `running` run to find, so a duplicate enqueue is a clean no-op. This is what makes
-/// crash recovery work cleanly: a restarted daemon re-enqueues the still-`running` row and ingests the
-/// completion it missed while down. Returns whether it ingested.
-///
-/// Not span-instrumented: this runs on every reconcile of a `running` row and answers "no" for the
-/// whole life of the run, so a span here is a 0-second trace per tick. [`complete_run`] — the branch
-/// that actually ingests — carries the span.
 fn processed_its_inputs(outcome: Option<&str>) -> bool {
     matches!(outcome, Some("finished" | "solved" | "complete"))
 }
 
+/// The pod-completion edge: if the live (`running`) run behind `key` has published a complete
+/// session log, fold it into the ledger and advance `running` → `done`; if its pod vanished or
+/// overran its deadline, fail the run. Runs on every reconcile whatever the issue's status, so a
+/// run whose issue was parked mid-flight is still collected (the issue keeps its status). A run
+/// whose log isn't stored yet returns `Ok(false)`. Idempotent: once the run leaves `running` there
+/// is nothing to find, so a duplicate enqueue is a clean no-op. With no live run, any `running` run
+/// pod row of `key` left behind by an already-terminal run is closed. Returns whether it ingested.
+///
+/// Not span-instrumented: this runs on every reconcile and answers "no" for the whole life of the
+/// run, so a span here is a 0-second trace per tick. [`complete_run`] — the branch that actually
+/// ingests — carries the span.
 pub async fn ingest_completion(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<bool> {
-    let Some(run) = crate::runs::store::running_run_for_issue(db.pool(), key).await? else {
-        return Ok(false);
-    };
+    match crate::runs::store::running_run_for_issue(db.pool(), key).await? {
+        Some(run) => settle_run(db, cfg, key, &run).await,
+        None => {
+            close_left_over_run_pods(db, cfg, key).await?;
+            Ok(false)
+        }
+    }
+}
+
+/// Close the `running` run pod rows of `key` whose run already reached a terminal status: a
+/// collection that failed after the ingest leaves one behind, and nothing else revisits it.
+async fn close_left_over_run_pods(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<()> {
+    for (pod, status) in
+        crate::runs::work_pods::terminal_runs_with_running_pods(db.pool(), key).await?
+    {
+        let disposition = match status.as_str() {
+            "error" => RunDisposition::Errored,
+            _ => RunDisposition::Finished,
+        };
+        crate::runs::workpod::collect_run_pod(
+            db,
+            crate::runs::workpod::active_dispatcher().as_ref(),
+            &cfg.pod_namespace,
+            &pod,
+            disposition,
+        )
+        .await?;
+        tracing::info!(issue_key = %key, pod_name = %pod, run_status = %status, "run completion: closed a run pod row its terminal run left running");
+    }
+    Ok(())
+}
+
+async fn settle_run(
+    db: &Db,
+    cfg: &ControllerCfg,
+    key: &str,
+    run: &crate::runs::model::RunningRun,
+) -> Result<bool> {
     // The artifact store first (an explicit `session_uri`, or the run-session artifact a local
     // launcher stored), else scrape the finished pod's own logs — a loop-run pod publishes only
     // onto its emptyDir, so for the pod path the scrape IS the normal completion edge.
-    let session = match locate_session(db, &run).await? {
+    let session = match locate_session(db, run).await? {
         Some(content) => Some(content),
-        None => scrape_pod_session(db, cfg, key, &run).await?,
+        None => scrape_pod_session(db, cfg, key, run).await?,
     };
     let Some(session) = session else {
         return Ok(false); // no complete log yet — the run is still in flight
@@ -355,6 +390,39 @@ async fn scrape_pod_session(
     {
         Ok(t) if t.phase != TurnPhase::TimedOut => {}
         Ok(t) => {
+            if let Some(row) = &work_pod {
+                let deadline = run_pod_deadline(db, cfg, key).await?;
+                if run_pod_overran(&row.created_at, deadline) {
+                    if !crate::runs::workpod::delete_for_sweep(
+                        dispatcher.as_ref(),
+                        &cluster,
+                        &ns,
+                        pod,
+                    )
+                    .await
+                    {
+                        return Ok(None);
+                    }
+                    tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, deadline_secs = deadline.as_secs(), "run completion: run pod overran its deadline; deleted it");
+                    fail_run_without_terminal_evidence(
+                        db,
+                        key,
+                        &run.run_id,
+                        Some(pod),
+                        ParkReason::RunPodOverran {
+                            run_id: run.run_id.clone(),
+                            pod: pod.to_string(),
+                            deadline_secs: deadline.as_secs(),
+                            last_observation: t
+                                .waiting_detail()
+                                .map(str::to_string)
+                                .or_else(|| row.error.clone()),
+                        },
+                    )
+                    .await?;
+                    return Ok(None);
+                }
+            }
             if let Some(detail) = t.waiting_detail() {
                 crate::runs::work_pods::set_work_pod_state(
                     db.pool(),
@@ -472,6 +540,32 @@ async fn scrape_pod_session(
     )
     .await?;
     Ok(None)
+}
+
+/// Slack past a playbook run's own `max_time` for scheduling, image pulls, and init before its
+/// pod counts as overrun.
+const RUN_POD_STARTUP_MARGIN: Duration = Duration::from_secs(60 * 60);
+
+/// How long a run pod of `key` may stay non-terminal after dispatch: a playbook launch's
+/// `max_time` plus [`RUN_POD_STARTUP_MARGIN`], else the controller's loop-run bound.
+async fn run_pod_deadline(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<Duration> {
+    Ok(
+        match crate::launches::store::get_playbook_launch(db.pool(), key).await? {
+            Some(launch) => Duration::from_secs(launch.max_time.secs()) + RUN_POD_STARTUP_MARGIN,
+            None => Duration::from_secs(cfg.loop_run_max_age.secs()),
+        },
+    )
+}
+
+/// Whether a run pod dispatched at `created_at` has outlived `deadline`. An unparseable stamp
+/// counts as overrun: a row with no usable clock cannot prove the pod is within its bound.
+fn run_pod_overran(created_at: &str, deadline: Duration) -> bool {
+    match crate::runs::workpod::parse_ts(created_at) {
+        Ok(created) => std::time::SystemTime::now()
+            .duration_since(created)
+            .is_ok_and(|age| age >= deadline),
+        Err(_) => true,
+    }
 }
 
 async fn fail_run_without_terminal_evidence(
