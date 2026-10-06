@@ -23,6 +23,7 @@ import { CommandPalette } from './palette/CommandPalette';
 import { useResetOnActAs } from './actAs';
 import { HomePage } from './pages/HomePage';
 import { approvalsWaiting } from './pages/home';
+import { useDecisionNotifications } from './pages/useDecisionNotifications';
 import { MoltenLogo } from './MoltenLogo';
 
 /// A page loads when first visited, so the first paint carries only the shell and Home.
@@ -42,6 +43,7 @@ const NewScenarioPage = page(() => import('./pages/NewScenarioPage'), 'NewScenar
 const NewJiraPage = page(() => import('./pages/NewJiraPage'), 'NewJiraPage');
 const InboxPage = page(() => import('./pages/InboxPage'), 'InboxPage');
 const ApprovalsPage = page(() => import('./pages/ApprovalsPage'), 'ApprovalsPage');
+const DecisionPage = page(() => import('./pages/DecisionPage'), 'DecisionPage');
 const ReposPage = page(() => import('./pages/ReposPage'), 'ReposPage');
 const RunsPage = page(() => import('./pages/RunsPage'), 'RunsPage');
 const RunDetailPage = page(() => import('./pages/RunDetailPage'), 'RunDetailPage');
@@ -114,6 +116,12 @@ interface StripItem {
 const STRIP_TONE: Record<StripTone, string> = { green: 'text-green', amber: 'text-amber', red: 'text-red' };
 
 const BUDGET_TONE: Record<BudgetState, StripTone> = { uncapped: 'green', ok: 'green', near: 'amber', spent: 'red' };
+
+/// Mounted once in the shell, so a request that opens while any page is up raises its notification.
+function DecisionNotifications() {
+  useDecisionNotifications();
+  return null;
+}
 
 function DatasheetStrip() {
   const autoresearch = useAutoresearch() === true;
@@ -272,6 +280,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
   const autoresearch = useAutoresearch() === true;
   const overview = $api.useQuery('get', '/api/overview', {}, POLL);
   const approvals = $api.useQuery('get', '/api/approvals', {}, POLL);
+  const decisions = $api.useQuery('get', '/api/decisions', {}, POLL);
   const repos = $api.useQuery('get', '/api/repos', {}, { enabled: autoresearch });
   const whoami = $api.useQuery('get', '/api/whoami');
 
@@ -287,7 +296,9 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
           to: '/approvals',
           label: 'Approvals',
           icon: 'AP',
-          count: approvals.isSuccess ? approvalsWaiting(approvals.data) : undefined,
+          count: approvals.isSuccess
+            ? approvalsWaiting(approvals.data) + (decisions.data?.open.length ?? 0)
+            : undefined,
         },
         { to: '/playbooks', label: 'Playbooks', icon: 'PB' },
         { to: '/playbooks/drafts', label: 'Drafts', icon: 'DR' },
@@ -432,6 +443,7 @@ export function App() {
       </header>
 
       <CommandPalette />
+      <DecisionNotifications />
       <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
@@ -457,6 +469,7 @@ export function App() {
             <Route path="/issues/:key/scope/progress" element={<Lane page={<ScopeProgressPage />} />} />
             <Route path="/inbox" element={<Lane page={<InboxPage />} />} />
             <Route path="/approvals" element={<ApprovalsPage />} />
+            <Route path="/decisions/:id" element={<DecisionPage />} />
             <Route path="/repos" element={<Lane page={<ReposPage />} />} />
             <Route path="/runs" element={<Lane page={<RunsPage />} />} />
             <Route path="/runs/:runId" element={<RunDetailPage />} />

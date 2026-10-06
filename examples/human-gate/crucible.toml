@@ -1,0 +1,25 @@
+# human-gate — a playbook that holds an expensive branch for a person. `plan` proposes a training
+# job and draws what it would cost; `gate` asks whoever may approve the run, in the controller UI,
+# before `launch` runs. `lint` does not depend on the gate, so it runs while the gate waits.
+#
+# It needs a controller to take the answer. On a laptop:
+#
+#   just controller-local
+#   crux draft-create human-gate --description "hold a launch for approval"
+#   crux draft-push human-gate examples/human-gate --base-version 1
+#   crux draft-launch human-gate --max-cost 1 --max-time 30m
+#
+# then open Approvals (or follow the notification) and answer. GPUS sets the job's size and
+# defaults to 8. Run without a controller, the plan truncates at `gate` before anything runs.
+
+[workspace]
+inject = ["plan.sh", "act.sh"]
+
+[agent]
+backend   = "command"
+agent_cmd = "true"
+goal      = "Launch a training job once someone approves its cost."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

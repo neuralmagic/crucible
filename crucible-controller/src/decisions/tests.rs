@@ -470,3 +470,39 @@ async fn the_launcher_sees_and_answers_the_request_and_a_stranger_does_neither(p
     let (_, listed) = send(&app, "GET", "/api/decisions", (wren.0, &wren.1), None).await;
     assert_eq!(listed["open"], serde_json::json!([]));
 }
+
+/// utoipa keeps the last schema registered under a name, so a decision DTO that took an existing
+/// name would silently replace that schema in the typed client.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn the_decision_schemas_shadow_no_other_schema(pool: PgPool) {
+    let app = api(&pool);
+    let (status, spec) = send(
+        &app,
+        "GET",
+        "/api/openapi.json",
+        ("x-auth-request-user", "wren"),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let schemas = &spec["components"]["schemas"];
+    for name in [
+        "DecisionDto",
+        "DecisionsDto",
+        "DecisionSummaryDto",
+        "DecisionQuestionDto",
+        "DecisionFileDto",
+        "DecisionInputDto",
+        "DecisionGatedDto",
+        "DecisionAnswerDto",
+        "DecisionAnswerBody",
+    ] {
+        assert!(schemas.get(name).is_some(), "missing schema {name}");
+    }
+    assert!(
+        schemas["EvidenceFileDto"]["properties"]
+            .get("name")
+            .is_some(),
+        "the task-evidence file schema is intact"
+    );
+}

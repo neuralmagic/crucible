@@ -218,7 +218,7 @@ pub(crate) struct DecisionsDto {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct QuestionDto {
+pub(crate) struct DecisionQuestionDto {
     pub id: String,
     pub instructions: String,
     /// The labels an answer may give.
@@ -226,23 +226,23 @@ pub(crate) struct QuestionDto {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct EvidenceFileDto {
+pub(crate) struct DecisionFileDto {
     pub path: String,
     pub media_type: String,
     pub base64: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct EvidenceInputDto {
+pub(crate) struct DecisionInputDto {
     pub task: String,
     pub status: String,
     #[schema(value_type = Option<Object>)]
     pub output: Option<serde_json::Value>,
-    pub files: Vec<EvidenceFileDto>,
+    pub files: Vec<DecisionFileDto>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct GatedTaskDto {
+pub(crate) struct DecisionGatedDto {
     pub name: String,
     pub kind: String,
     pub question: String,
@@ -250,7 +250,7 @@ pub(crate) struct GatedTaskDto {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct AnswerDto {
+pub(crate) struct DecisionAnswerDto {
     pub labels: BTreeMap<String, String>,
     pub decided_by: String,
     pub decided_at: String,
@@ -267,17 +267,17 @@ pub(crate) struct DecisionDto {
     pub state: String,
     pub opened_at: String,
     pub expires_at: String,
-    pub questions: Vec<QuestionDto>,
-    pub inputs: Vec<EvidenceInputDto>,
+    pub questions: Vec<DecisionQuestionDto>,
+    pub inputs: Vec<DecisionInputDto>,
     pub spent_usd: f64,
     pub elapsed_secs: u64,
     pub max_cost_usd: f64,
     pub max_time_secs: Option<u64>,
-    pub gated: Vec<GatedTaskDto>,
+    pub gated: Vec<DecisionGatedDto>,
     /// The rendered review, CommonMark.
     pub review: Option<String>,
     pub evidence_digest: String,
-    pub answer: Option<AnswerDto>,
+    pub answer: Option<DecisionAnswerDto>,
     /// Whether the caller may answer it.
     pub can_answer: bool,
 }
@@ -293,7 +293,7 @@ fn state_name(status: &RequestStatus) -> &'static str {
 
 fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
     let answer = match &d.status {
-        RequestStatus::Answered { answer } => Some(AnswerDto {
+        RequestStatus::Answered { answer } => Some(DecisionAnswerDto {
             labels: answer
                 .labels
                 .iter()
@@ -310,7 +310,7 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
         questions: d
             .questions
             .iter()
-            .map(|(id, q)| QuestionDto {
+            .map(|(id, q)| DecisionQuestionDto {
                 id: id.to_string(),
                 instructions: q.instructions.clone(),
                 labels: q.labels().iter().map(Label::to_string).collect(),
@@ -320,14 +320,14 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
             .evidence
             .inputs
             .into_iter()
-            .map(|(task, input)| EvidenceInputDto {
+            .map(|(task, input)| DecisionInputDto {
                 task,
                 status: input.status,
                 output: input.output,
                 files: input
                     .files
                     .into_iter()
-                    .map(|f| EvidenceFileDto {
+                    .map(|f| DecisionFileDto {
                         path: f.path,
                         media_type: f.media_type,
                         base64: f.base64,
@@ -343,7 +343,7 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
             .evidence
             .gated
             .into_iter()
-            .map(|g| GatedTaskDto {
+            .map(|g| DecisionGatedDto {
                 name: g.name,
                 kind: g.kind,
                 question: g.question.to_string(),
@@ -417,7 +417,7 @@ pub(crate) async fn get_decision(
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
-pub(crate) struct AnswerBody {
+pub(crate) struct DecisionAnswerBody {
     /// Question id to the chosen label.
     pub labels: BTreeMap<String, String>,
     /// The digest of the evidence the answer was made on.
@@ -426,7 +426,10 @@ pub(crate) struct AnswerBody {
 }
 
 /// Every question gets exactly one of its declared labels, never `uncertain`, and nothing else.
-fn checked(d: &store::Decision, body: &AnswerBody) -> Result<BTreeMap<QuestionId, Label>, String> {
+fn checked(
+    d: &store::Decision,
+    body: &DecisionAnswerBody,
+) -> Result<BTreeMap<QuestionId, Label>, String> {
     if let Some(extra) = body
         .labels
         .keys()
@@ -453,7 +456,7 @@ fn checked(d: &store::Decision, body: &AnswerBody) -> Result<BTreeMap<QuestionId
     post,
     path = "/api/decisions/{id}/answer",
     params(("id" = String, Path, description = "Decision request id")),
-    request_body = AnswerBody,
+    request_body = DecisionAnswerBody,
     responses(
         (status = 200, description = "The request, answered", body = DecisionDto),
         (status = 403, description = "The caller may not approve this run", body = ErrorBody),
@@ -466,7 +469,7 @@ pub(crate) async fn answer_decision(
     State(state): State<ApiState>,
     caller: Caller,
     Path(id): Path<String>,
-    axum::Json(body): axum::Json<AnswerBody>,
+    axum::Json(body): axum::Json<DecisionAnswerBody>,
 ) -> Response {
     let pool = state.db.pool();
     let d = match store::get(pool, &id).await {

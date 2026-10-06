@@ -9,6 +9,8 @@ const LIVE_PATHS = [
   '/api/issues',
   '/api/events',
   '/api/approvals',
+  '/api/decisions',
+  '/api/decisions/{id}',
   '/api/repos',
   '/api/runs',
   '/api/playbook-runs',
