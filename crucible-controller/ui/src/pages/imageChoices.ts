@@ -73,6 +73,20 @@ export interface Unavailable {
   reason: string;
 }
 
+export interface UnavailableGroup {
+  reason: string;
+  rows: Unavailable[];
+}
+
+/// Unavailable images that share a reason, the largest group first.
+export function byReason(rows: readonly Unavailable[]): UnavailableGroup[] {
+  const groups = new Map<string, Unavailable[]>();
+  for (const row of rows) groups.set(row.reason, [...(groups.get(row.reason) ?? []), row]);
+  return [...groups]
+    .map(([reason, members]) => ({ reason, rows: members }))
+    .sort((a, b) => b.rows.length - a.rows.length || a.reason.localeCompare(b.reason));
+}
+
 function exclusionReason(unsatisfied: ExcludedImage['unsatisfied']): string {
   return unsatisfied
     .map((u) =>

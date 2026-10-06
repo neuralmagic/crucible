@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { buildLabel, imageChoices, newestFirst, unavailableImages, type BuildRow } from './imageChoices';
+import {
+  buildLabel,
+  byReason,
+  imageChoices,
+  newestFirst,
+  unavailableImages,
+  type BuildRow,
+} from './imageChoices';
 
 const SHA_A = 'fd2438cd09d2ac0bd3d467e8ad25d511f06f9a4e';
 const SHA_B = '0a1b2c3d4e5f60718293a4b5c6d7e8f901234567';
@@ -144,5 +151,28 @@ describe('unavailableImages', () => {
       [{ repository: 'ghcr.io/acme/go' }],
     );
     expect(rows).toEqual([]);
+  });
+});
+
+describe('byReason', () => {
+  const row = (name: string, reason: string) => ({ repository: `ghcr.io/acme/${name}`, name, reason });
+
+  it('groups by reason, largest first, keeping the given order inside a group', () => {
+    const groups = byReason([
+      row('custom', 'unverified'),
+      row('go-codex', 'lacks agent.claude-code'),
+      row('rust-cc', 'lacks toolchain.go'),
+      row('rust-pi', 'lacks agent.claude-code'),
+      row('vllm-codex', 'lacks agent.claude-code'),
+    ]);
+    expect(groups.map((g) => [g.reason, g.rows.map((r) => r.name)])).toEqual([
+      ['lacks agent.claude-code', ['go-codex', 'rust-pi', 'vllm-codex']],
+      ['lacks toolchain.go', ['rust-cc']],
+      ['unverified', ['custom']],
+    ]);
+  });
+
+  it('is empty for no rows', () => {
+    expect(byReason([])).toEqual([]);
   });
 });
