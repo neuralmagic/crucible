@@ -542,6 +542,34 @@ mod tests {
     use clap::Parser;
 
     #[test]
+    fn npm_installed_harnesses_allow_their_canonical_install_tree() {
+        let features = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../images/features");
+        for (harness, feature) in [
+            (Harness::Claude, "claude-code"),
+            (Harness::Codex, "codex"),
+            (Harness::OpenCode, "opencode"),
+            (Harness::Pi, "pi"),
+        ] {
+            let script = std::fs::read_to_string(features.join(feature).join("install.sh"))
+                .unwrap_or_else(|e| panic!("{feature}/install.sh: {e}"));
+            let package = script
+                .lines()
+                .find_map(|line| {
+                    let rest = line.trim().strip_prefix("npm install -g ")?;
+                    let quoted = rest.trim_matches('"');
+                    let at = quoted.rfind('@').filter(|&i| i > 0)?;
+                    Some(quoted[..at].to_string())
+                })
+                .unwrap_or_else(|| panic!("{feature}/install.sh installs no npm package"));
+            let tree = format!("/usr/local/lib/node_modules/{package}/**");
+            assert!(
+                harness.spec().binaries.contains(&tree.as_str()),
+                "{harness:?} does not allow {tree}"
+            );
+        }
+    }
+
+    #[test]
     fn exec_wrapper_cds_sources_and_redirects_stdin() {
         let v = exec_wrapper("ws", &["claude".into(), "-p".into()]);
         assert_eq!(&v[0..2], &["bash", "-c"]);

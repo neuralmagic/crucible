@@ -49,7 +49,10 @@ exit "$rc"
 impl OpenCode {
     pub(crate) const SPEC: HarnessSpec = HarnessSpec {
         name: "opencode",
-        binaries: &["/usr/local/bin/opencode"],
+        binaries: &[
+            "/usr/local/bin/opencode",
+            "/usr/local/lib/node_modules/opencode-ai/**",
+        ],
         // OpenCode discovers Claude Code's skills tree, so the toolbox lands where claude's does.
         skills_dir: ".claude/skills",
         // Relocates the session store (and the export) off `~/.local/share`.
