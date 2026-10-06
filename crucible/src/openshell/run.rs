@@ -851,7 +851,7 @@ async fn replay_sandbox_log(
             continue;
         }
         let ev = AgentEvent::SandboxLog {
-            ts_ms: line.timestamp_ms,
+            ts_ms: grpc::event_time_ms(line),
             level: line.level.clone(),
             target: line.target.clone(),
             message: line.message.trim_end().to_string(),

@@ -14,12 +14,13 @@ use openshell_core::proto::{
     DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
     GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, NetworkBinary,
-    NetworkCredentialBinding, NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation,
-    PolicyStatus, Provider, ProviderCredentialRefreshStrategy, ProviderProfile,
-    ProviderProfileImportItem, ResourceRequirements, RotateProviderCredentialRequest,
-    SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    ServiceStatus, UpdateConfigRequest, UpdateProviderRequest,
-    exec_sandbox_event::Payload as ExecPayload, policy_merge_operation::Operation as MergeOp,
+    NetworkCredentialBinding, NetworkEndpoint, NetworkEnforcementMode, NetworkPolicyRule,
+    NetworkTlsMode, PolicyMergeOperation, PolicyStatus, Provider,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileImportItem,
+    ResourceRequirements, RotateProviderCredentialRequest, SandboxCondition, SandboxLogLine,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, ServiceStatus, UpdateConfigRequest,
+    UpdateProviderRequest, exec_sandbox_event::Payload as ExecPayload,
+    policy_merge_operation::Operation as MergeOp,
 };
 use prost_types::Struct;
 use std::collections::{BTreeMap, HashMap};
@@ -308,7 +309,7 @@ impl HealthProbe {
 /// the "minimum protocol version" that turns that late surprise into an upfront, actionable
 /// failure. Comparison is on the numeric triple only (pre-release/`-dev` suffixes ignored):
 /// `0.0.82-dev.11` counts as 0.0.82.
-pub const MIN_GATEWAY_VERSION: (u64, u64, u64) = (0, 0, 82);
+pub const MIN_GATEWAY_VERSION: (u64, u64, u64) = (0, 1, 2);
 
 /// The openshell-core git rev this binary compiled against, embedded from Cargo.lock by
 /// crucible's build script ("unknown" when the dep is not a git source).
@@ -436,34 +437,6 @@ impl Gateway {
                 inner: EdgeAuthInterceptor::noop(),
             },
         )
-    }
-
-    /// Resolve a sandbox name to its gateway object id (`GetSandbox`, canonical name→id lookup).
-    #[tracing::instrument(skip_all, fields(rpc = "get_sandbox", sandbox = name))]
-    async fn sandbox_id(&self, name: &str) -> Result<String> {
-        let mut client = self.client();
-        let sandbox = client
-            .get_sandbox(GetSandboxRequest {
-                name: name.to_string(),
-                ..Default::default()
-            })
-            .await
-            .map_err(GrpcError::rpc(format!("get_sandbox({name})")))?
-            .into_inner()
-            .sandbox
-            .ok_or_else(|| GrpcError::SandboxMissing {
-                name: name.to_owned(),
-            })?;
-        sandbox
-            .metadata
-            .map(|m| m.id)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                GrpcError::SandboxHasNoId {
-                    name: name.to_owned(),
-                }
-                .into()
-            })
     }
 
     /// Create the sandbox and wait for it to reach `Ready`. `--no-auto-providers` is expressed
@@ -873,7 +846,6 @@ impl Gateway {
         client
             .update_provider(UpdateProviderRequest {
                 provider: Some(provider),
-                credential_expires_at_ms: HashMap::new(),
                 ..Default::default()
             })
             .await
@@ -933,7 +905,7 @@ impl Gateway {
         let version = self
             .client()
             .update_config(UpdateConfigRequest {
-                name: name.to_string(),
+                sandbox: name.to_string(),
                 merge_operations,
                 ..UpdateConfigRequest::default()
             })
@@ -952,7 +924,7 @@ impl Gateway {
             attempts += 1;
             let status = match client
                 .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                    name: name.to_string(),
+                    sandbox: name.to_string(),
                     version,
                     global: false,
                     ..Default::default()
@@ -1011,15 +983,11 @@ impl Gateway {
     /// as INFO, so a WARN floor would drop them.
     #[tracing::instrument(skip_all, fields(rpc = "get_sandbox_logs", sandbox = name))]
     pub async fn sandbox_logs(&self, name: &str) -> Vec<SandboxLogLine> {
-        let Ok(sandbox_id) = self.sandbox_id(name).await else {
-            return Vec::new();
-        };
         let mut client = self.client();
         client
             .get_sandbox_logs(GetSandboxLogsRequest {
-                sandbox_id,
+                sandbox: name.to_string(),
                 lines: 1000,
-                since_ms: 0,
                 sources: vec!["sandbox".to_string()],
                 min_level: "INFO".to_string(),
                 ..Default::default()
@@ -1047,9 +1015,8 @@ impl Gateway {
         cancel: &CancellationToken,
         mut on_stdout_line: impl FnMut(&str),
     ) -> Result<ExecResult> {
-        let sandbox_id = self.sandbox_id(name).await?;
         let request = ExecSandboxRequest {
-            sandbox_id,
+            sandbox: name.to_string(),
             command: command.to_vec(),
             ..ExecSandboxRequest::default()
         };
@@ -1120,7 +1087,6 @@ fn build_provider(name: &str, cred_key: &str, token: &str) -> Provider {
         r#type: String::new(),
         credentials: HashMap::from([(cred_key.to_string(), token.to_string())]),
         config: HashMap::new(),
-        credential_expires_at_ms: HashMap::new(),
         ..Default::default()
     }
 }
@@ -1247,6 +1213,15 @@ pub fn is_denial(line: &SandboxLogLine) -> bool {
     classify_denial(line).is_some()
 }
 
+/// A log line's event time as Unix epoch milliseconds, `0` when the gateway sent none or an
+/// out-of-range one.
+pub fn event_time_ms(line: &SandboxLogLine) -> i64 {
+    line.event_time
+        .as_ref()
+        .and_then(|t| openshell_core::time::timestamp_to_millis(t).ok())
+        .unwrap_or(0)
+}
+
 /// Whether a structured `action` field value names a denial.
 fn is_deny_action(action: &str) -> bool {
     let a = action.to_ascii_lowercase();
@@ -1301,7 +1276,7 @@ fn build_merge_operations_with_tls_skip(
                 .iter()
                 .any(|(host, port)| endpoint.host == *host && endpoint.port == *port)
             {
-                endpoint.tls = "skip".to_string();
+                endpoint.tls = NetworkTlsMode::Skip.into();
             }
             if let Some(b) = credential_bindings
                 .iter()
@@ -1388,10 +1363,6 @@ pub enum GrpcError {
         #[source]
         status: tonic::Status,
     },
-    #[error("sandbox '{name}' missing from response")]
-    SandboxMissing { name: String },
-    #[error("sandbox '{name}' has no id")]
-    SandboxHasNoId { name: String },
     #[error("sandbox '{name}' entered the error phase during provisioning")]
     SandboxErrorPhase { name: String },
     #[error("sandbox '{name}' {stage}")]
@@ -1486,16 +1457,14 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
     let access = parts.get(2).copied().unwrap_or("").trim();
     let protocol = parts.get(3).copied().unwrap_or("").trim();
     let enforcement = parts.get(4).copied().unwrap_or("").trim();
-    if !access.is_empty() && !matches!(access, "read-only" | "read-write" | "full") {
-        return Err(reject(EndpointProblem::Access));
-    }
+    let access_preset = openshell_policy::network_access_preset_from_str(access)
+        .ok_or_else(|| reject(EndpointProblem::Access))?;
     if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
         return Err(reject(EndpointProblem::Protocol));
     }
-    if !enforcement.is_empty() && !matches!(enforcement, "enforce" | "audit") {
-        return Err(reject(EndpointProblem::Enforcement));
-    }
-    if !enforcement.is_empty() && protocol.is_empty() {
+    let enforcement_mode = openshell_policy::network_enforcement_mode_from_str(enforcement)
+        .ok_or_else(|| reject(EndpointProblem::Enforcement))?;
+    if enforcement_mode != NetworkEnforcementMode::Unspecified && protocol.is_empty() {
         return Err(reject(EndpointProblem::EnforcementWithoutProtocol));
     }
     Ok(NetworkEndpoint {
@@ -1503,8 +1472,8 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
         port,
         ports: vec![port],
         protocol: protocol.to_string(),
-        enforcement: enforcement.to_string(),
-        access: access.to_string(),
+        enforcement: enforcement_mode.into(),
+        access: access_preset.into(),
         ..NetworkEndpoint::default()
     })
 }
@@ -1561,7 +1530,8 @@ impl LineSplitter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::openshell::grpc::*;
+    use openshell_core::proto::NetworkAccessPreset;
 
     /// A throwaway self-signed cert (CN=localhost, EC P-256) used only to exercise channel
     /// construction; no handshake ever happens and the key protects nothing.
@@ -1813,17 +1783,17 @@ pYBZ
         assert_eq!(ep.host, "github.com");
         assert_eq!(ep.port, 443);
         assert_eq!(ep.ports, vec![443]);
-        assert_eq!(ep.access, "full");
+        assert_eq!(ep.access(), NetworkAccessPreset::Full);
         assert!(ep.protocol.is_empty());
-        assert!(ep.enforcement.is_empty());
+        assert_eq!(ep.enforcement(), NetworkEnforcementMode::Unspecified);
     }
 
     #[test]
     fn parse_endpoint_with_protocol_and_enforcement() {
         let ep = parse_endpoint_spec("api.example.com:443:read-write:rest:enforce").unwrap();
-        assert_eq!(ep.access, "read-write");
+        assert_eq!(ep.access(), NetworkAccessPreset::ReadWrite);
         assert_eq!(ep.protocol, "rest");
-        assert_eq!(ep.enforcement, "enforce");
+        assert_eq!(ep.enforcement(), NetworkEnforcementMode::Enforce);
     }
 
     #[test]
@@ -1856,8 +1826,8 @@ pYBZ
                 _ => None,
             })
             .collect();
-        assert_eq!(endpoints[0].tls, "skip");
-        assert_eq!(endpoints[1].tls, "");
+        assert_eq!(endpoints[0].tls(), NetworkTlsMode::Skip);
+        assert_eq!(endpoints[1].tls(), NetworkTlsMode::Unspecified);
     }
 
     #[test]
@@ -1941,7 +1911,7 @@ pYBZ
             Some("crucible-broker")
         );
         assert_eq!(eps[1].protocol, "rest");
-        assert_eq!(eps[1].access, "full");
+        assert_eq!(eps[1].access(), NetworkAccessPreset::Full);
     }
 
     #[test]
@@ -2055,7 +2025,7 @@ pYBZ
     fn log_line(level: &str, message: &str, fields: &[(&str, &str)]) -> SandboxLogLine {
         SandboxLogLine {
             sandbox_id: "s".into(),
-            timestamp_ms: 0,
+            event_time: None,
             level: level.into(),
             target: "proxy".into(),
             message: message.into(),
@@ -2065,6 +2035,26 @@ pYBZ
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_log_line_event_time_reads_as_epoch_millis() {
+        let mut line = log_line("INFO", "x", &[]);
+        assert_eq!(event_time_ms(&line), 0, "no event time reads as zero");
+        line.event_time = Some(prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 123_456_789,
+        });
+        assert_eq!(event_time_ms(&line), 1_700_000_000_123);
+        line.event_time = Some(prost_types::Timestamp {
+            seconds: 1,
+            nanos: -1,
+        });
+        assert_eq!(
+            event_time_ms(&line),
+            0,
+            "a non-canonical timestamp reads as zero"
+        );
     }
 
     #[test]
@@ -2402,7 +2392,7 @@ pYBZ
             status: status.to_string(),
             reason: reason.to_string(),
             message: String::new(),
-            last_transition_time: String::new(),
+            transition_time: None,
         }
     }
 
