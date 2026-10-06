@@ -1313,10 +1313,7 @@ fn build_merge_operations_with_tls_skip(
         .collect::<Result<Vec<_>>>()?;
     let net_binaries: Vec<NetworkBinary> = dedup(binaries)
         .into_iter()
-        .map(|path| NetworkBinary {
-            path,
-            ..NetworkBinary::default()
-        })
+        .map(|path| NetworkBinary { path })
         .collect();
     endpoints
         .iter()
