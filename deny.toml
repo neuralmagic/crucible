@@ -36,6 +36,7 @@ ignore = [
     # legacy hyper 0.14 client (fixed-endpoint S3/STS); the workspace's h2 0.4 line is on 0.4.16.
     { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via legacy aws-sdk hyper stack; client to fixed AWS endpoints, 0.4 line patched" },
     { id = "RUSTSEC-2023-0071", reason = "rsa via openidconnect; the controller only verifies RS256 ID-token signatures with the issuer's public JWKS, no private-key operation exists for the timing side channel to leak, and no fixed release exists" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile via openshell-core v0.1.2 (one rustls_pemfile::certs call in driver_utils); unmaintained, not vulnerable, and still used on upstream main" },
 ]
 
 [licenses]

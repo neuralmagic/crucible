@@ -124,12 +124,16 @@ jobs:
         run: |
           rev=$(cargo run --quiet -p xtask -- openshell-rev)
           echo "rev=$rev" >> "$GITHUB_OUTPUT"
-          if ! docker manifest inspect "ghcr.io/neuralmagic/openshell-gateway:sha-$rev" >/dev/null 2>&1; then
-            echo "ghcr.io/neuralmagic/openshell-gateway:sha-$rev does not exist yet." >&2
-            echo "Publish the OpenShell gateway distribution image for this rev first, then re-run." >&2
-            exit 1
-          fi
-          echo "OpenShell rev: $rev (dist image present)"
+          # The loop image COPYs the gateway out; deployments default their supervisor and
+          # sandbox runtime images to the same sha tag, so all three must exist.
+          for image in openshell-gateway openshell-supervisor openshell-sandbox; do
+            if ! docker manifest inspect "ghcr.io/neuralmagic/$image:sha-$rev" >/dev/null 2>&1; then
+              echo "ghcr.io/neuralmagic/$image:sha-$rev does not exist yet." >&2
+              echo "Run the OpenShell gateway image workflow for this rev first, then re-run." >&2
+              exit 1
+            fi
+          done
+          echo "OpenShell rev: $rev (gateway, supervisor, and sandbox images present)"
 
       - name: Image metadata (tags + labels)
         id: meta

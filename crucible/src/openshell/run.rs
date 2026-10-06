@@ -310,7 +310,7 @@ async fn try_turn(
     // 1. Gateway up (idempotent, boots on the first turn, no-ops after). `None` = the
     //    default supervisor emulator image; the *agent* image is `--from` on create below.
     stage(sink, "starting the openshell gateway");
-    let version_warning = gateway::ensure_running(args.compute_driver, None)
+    let version_warning = gateway::ensure_running(args.compute_driver)
         .await
         .context("ensuring the openshell gateway is up")?;
     // A degraded version check (rev mismatch, unparseable version) is turn telemetry, not a
@@ -367,15 +367,15 @@ async fn try_turn(
     };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
-    //     provider signs sandbox S3 egress at the proxy via a read-only role assumed with the
-    //     loop pod's projected web-identity token. Gated on the rendered env, absent, no
-    //     provider and no S3 signing.
-    let aws_provider = match std::env::var("CRUCIBLE_AWS_SANDBOX_ROLE_ARN") {
-        Ok(arn) if !arn.trim().is_empty() => {
-            ensure_aws_provider(&gw, arn.trim()).await?;
+    //     provider signs sandbox S3 egress at the proxy via the read-only sandbox role, which
+    //     the gateway holds through the loop pod's projected web-identity token and assumes
+    //     again for each mint. Gated on the rendered env, absent, no provider and no S3 signing.
+    let aws_provider = match crate::openshell::gateway::aws_sandbox_role() {
+        Some(arn) => {
+            ensure_aws_provider(&gw, &arn).await?;
             true
         }
-        _ => false,
+        None => false,
     };
 
     // 2c. Broker token hardening: the per-run bearer token becomes a static credential on the
@@ -392,9 +392,9 @@ async fn try_turn(
     };
 
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
-    //    turn whose create failed (e.g. ContainerExited mid-provision) leaves the name behind,
-    //    and a bare create then fails "already exists" for the rest of the run. Clearing it
-    //    makes create idempotent. Labels make the sandbox discoverable via `list --selector`.
+    //    turn killed mid-create, or whose cleanup delete failed, leaves the name behind, and a
+    //    bare create then fails "already exists" for the rest of the run. Clearing it makes
+    //    create idempotent. Labels make the sandbox discoverable via `list --selector`.
     let name = sandbox::name_for(&p.workspace);
     tracing::Span::current().record("sandbox", name.as_str());
     let basename = workdir_basename(p)?;
@@ -851,7 +851,7 @@ async fn replay_sandbox_log(
             continue;
         }
         let ev = AgentEvent::SandboxLog {
-            ts_ms: line.timestamp_ms,
+            ts_ms: grpc::event_time_ms(line),
             level: line.level.clone(),
             target: line.target.clone(),
             message: line.message.trim_end().to_string(),
@@ -862,9 +862,13 @@ async fn replay_sandbox_log(
     }
 }
 
-/// Probe the provider (`GetProvider`) → create on the first turn, update (swap the token)
-/// thereafter. The token rides the request body, never an argv or a log line.
+/// Ensure the `google-cloud` profile, then probe the provider (`GetProvider`) → create on the
+/// first turn, update (swap the token) thereafter. The token rides the request body, never an
+/// argv or a log line.
 async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str) -> Result<()> {
+    gw.ensure_provider_profile(provider::google_cloud_profile())
+        .await
+        .context("importing the google-cloud provider profile")?;
     if gw.provider_exists(provider::PROVIDER_NAME).await {
         gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
             .await
@@ -883,15 +887,11 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     }
 }
 
-/// Idempotent AWS provider setup: create the `aws-s3` provider if absent, (re)configure its
-/// web-identity STS refresh, then rotate once so the credentials exist BEFORE the sandbox's
-/// first request, the proxy fails closed on unminted credentials and the refresh worker's
-/// tick is up to 60s away. Re-configuring each turn keeps a rotated role ARN current.
 /// Import the endpointless broker profile and set this run's token on the `crucible-broker`
 /// provider, update-or-create like the Vertex provider: the token changes every run, the
 /// provider object survives across runs on a shared gateway.
 async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
-    gw.import_provider_profile(provider::broker_profile())
+    gw.ensure_provider_profile(provider::broker_profile())
         .await
         .context("importing the broker provider profile")?;
     if gw.provider_exists(provider::BROKER_PROVIDER_NAME).await {
@@ -914,23 +914,24 @@ async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
     }
 }
 
+/// Idempotent AWS provider setup: import the `aws-s3` profile, create the provider if absent,
+/// (re)configure its STS `AssumeRole` refresh, then rotate once so the credentials exist BEFORE
+/// the sandbox's first request, the proxy fails closed on unminted credentials and the refresh
+/// worker's tick is up to 60s away. Re-configuring each turn keeps a rotated role ARN current.
+/// The gateway's own identity is the same role (see `gateway::aws_sandbox_role`), so the mint
+/// is a self-assume.
 async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     use openshell_core::proto::ProviderCredentialRefreshStrategy;
-    // The STS refresh strategy is gated behind the gateway's providers-v2 global setting
-    // (default off). Idempotent flip; this gateway is crucible's own, booted per pod.
-    gw.set_global_bool_setting("providers_v2_enabled", true)
+    gw.ensure_provider_profile(provider::aws_s3_profile())
         .await
-        .context("enabling providers_v2 on the gateway")?;
+        .context("importing the aws-s3 provider profile")?;
     if !gw.provider_exists(provider::AWS_PROVIDER_NAME).await {
         gw.create_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
             .await
             .context("creating the aws-s3 provider")?;
     }
-    let token_file = std::env::var("CRUCIBLE_AWS_SANDBOX_TOKEN_FILE")
-        .unwrap_or_else(|_| "/var/run/secrets/aws/token".to_string());
     let mut material = std::collections::HashMap::from([
         ("role_arn".to_string(), role_arn.to_string()),
-        ("web_identity_token_file".to_string(), token_file),
         ("session_name".to_string(), "crucible-sandbox".to_string()),
     ]);
     if let Ok(region) = std::env::var("CRUCIBLE_AWS_SANDBOX_REGION")
@@ -945,7 +946,7 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
         material,
     )
     .await
-    .context("configuring the aws-s3 web-identity refresh")?;
+    .context("configuring the aws-s3 assume-role refresh")?;
     gw.rotate_provider_credential(provider::AWS_PROVIDER_NAME, provider::AWS_PRIMARY_CRED)
         .await
         .context("pre-warming the aws-s3 credentials")

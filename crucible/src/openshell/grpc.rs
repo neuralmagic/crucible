@@ -7,18 +7,20 @@
 //! CLI, see [`crate::openshell::gateway`] and `openshell::run`.
 
 use anyhow::{Context, Result};
+use crucible_broker::workspace::scoped;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
-    DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderProfileRequest,
+    GetProviderRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
     GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, NetworkBinary,
-    NetworkCredentialBinding, NetworkEndpoint, NetworkPolicyRule, PolicyMergeOperation,
-    PolicyStatus, Provider, ProviderCredentialRefreshStrategy, ProviderProfile,
+    NetworkCredentialBinding, NetworkEndpoint, NetworkEnforcementMode, NetworkPolicyRule,
+    NetworkTlsMode, PolicyMergeOperation, PolicyStatus, Provider,
+    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
     ProviderProfileImportItem, ResourceRequirements, RotateProviderCredentialRequest,
     SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    ServiceStatus, UpdateConfigRequest, UpdateProviderRequest,
+    ServiceStatus, UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
     exec_sandbox_event::Payload as ExecPayload, policy_merge_operation::Operation as MergeOp,
 };
 use prost_types::Struct;
@@ -308,7 +310,7 @@ impl HealthProbe {
 /// the "minimum protocol version" that turns that late surprise into an upfront, actionable
 /// failure. Comparison is on the numeric triple only (pre-release/`-dev` suffixes ignored):
 /// `0.0.82-dev.11` counts as 0.0.82.
-pub const MIN_GATEWAY_VERSION: (u64, u64, u64) = (0, 0, 82);
+pub const MIN_GATEWAY_VERSION: (u64, u64, u64) = (0, 1, 2);
 
 /// The openshell-core git rev this binary compiled against, embedded from Cargo.lock by
 /// crucible's build script ("unknown" when the dep is not a git source).
@@ -438,38 +440,11 @@ impl Gateway {
         )
     }
 
-    /// Resolve a sandbox name to its gateway object id (`GetSandbox`, canonical name→id lookup).
-    #[tracing::instrument(skip_all, fields(rpc = "get_sandbox", sandbox = name))]
-    async fn sandbox_id(&self, name: &str) -> Result<String> {
-        let mut client = self.client();
-        let sandbox = client
-            .get_sandbox(GetSandboxRequest {
-                name: name.to_string(),
-                ..Default::default()
-            })
-            .await
-            .map_err(GrpcError::rpc(format!("get_sandbox({name})")))?
-            .into_inner()
-            .sandbox
-            .ok_or_else(|| GrpcError::SandboxMissing {
-                name: name.to_owned(),
-            })?;
-        sandbox
-            .metadata
-            .map(|m| m.id)
-            .filter(|id| !id.is_empty())
-            .ok_or_else(|| {
-                GrpcError::SandboxHasNoId {
-                    name: name.to_owned(),
-                }
-                .into()
-            })
-    }
-
-    /// Create the sandbox and wait for it to reach `Ready`. `--no-auto-providers` is expressed
-    /// by passing exactly the providers we manage (the gateway attaches only those). Labels ride
-    /// the create request; the image lands on the template. No boot command is run, the
-    /// sandbox stays up for a later [`Gateway::exec`], so the old `-- true` no-op is gone.
+    /// Create the sandbox and wait for it to reach `Ready`, deleting it if either step fails.
+    /// `--no-auto-providers` is expressed by passing exactly the providers we manage (the gateway
+    /// attaches only those). Labels ride the create request; the image lands on the template. No
+    /// boot command is run, the sandbox stays up for a later [`Gateway::exec`], so the old
+    /// `-- true` no-op is gone.
     #[tracing::instrument(skip_all, fields(rpc = "create_sandbox", sandbox = name))]
     pub async fn create_sandbox(
         &self,
@@ -503,7 +478,7 @@ impl Gateway {
         // ops exist), so declaring paths cannot disturb egress. `include_workdir` must stay true —
         // it is what makes the agent's own workspace writable.
         let policy = sandbox_filesystem_policy(read_only_paths);
-        let request = CreateSandboxRequest {
+        let request = scoped(CreateSandboxRequest {
             spec: Some(SandboxSpec {
                 providers: providers.to_vec(),
                 template,
@@ -518,13 +493,18 @@ impl Gateway {
             name: name.to_string(),
             labels: labels.iter().cloned().collect(),
             ..Default::default()
-        };
+        });
         let mut client = self.client();
-        client
-            .create_sandbox(request)
-            .await
-            .map_err(GrpcError::rpc(format!("create_sandbox({name})")))?;
-        self.wait_ready(name).await
+        let created = match client.create_sandbox(request).await {
+            Ok(_) => self.wait_ready(name).await,
+            Err(s) => Err(GrpcError::rpc(format!("create_sandbox({name})"))(s).into()),
+        };
+        if created.is_err()
+            && let Err(e) = self.delete_sandbox(name).await
+        {
+            tracing::warn!("deleting sandbox {name} after its create failed: {e:#}");
+        }
+        created
     }
 
     /// Poll `GetSandbox` until the sandbox is `Ready` (or `Error`/timeout). A fresh create starts
@@ -552,10 +532,10 @@ impl Gateway {
             attempts += 1;
             let status =
                 match client
-                    .get_sandbox(GetSandboxRequest {
+                    .get_sandbox(scoped(GetSandboxRequest {
                         name: name.to_string(),
                         ..Default::default()
-                    })
+                    }))
                     .await
                 {
                     Ok(resp) => resp.into_inner().sandbox.and_then(|s| s.status),
@@ -627,10 +607,10 @@ impl Gateway {
     pub async fn delete_sandbox(&self, name: &str) -> Result<()> {
         let mut client = self.client();
         match client
-            .delete_sandbox(DeleteSandboxRequest {
+            .delete_sandbox(scoped(DeleteSandboxRequest {
                 name: name.to_string(),
                 ..Default::default()
-            })
+            }))
             .await
         {
             Ok(_) => Ok(()),
@@ -650,10 +630,10 @@ impl Gateway {
         let mut client = self.poll_client();
         loop {
             match client
-                .get_sandbox(GetSandboxRequest {
+                .get_sandbox(scoped(GetSandboxRequest {
                     name: name.to_string(),
                     ..Default::default()
-                })
+                }))
                 .await
             {
                 Err(s) if s.code() == tonic::Code::NotFound => return Ok(()),
@@ -682,10 +662,10 @@ impl Gateway {
     pub async fn provider_exists(&self, name: &str) -> bool {
         let mut client = self.client();
         client
-            .get_provider(GetProviderRequest {
+            .get_provider(scoped(GetProviderRequest {
                 name: name.to_string(),
                 ..Default::default()
-            })
+            }))
             .await
             .is_ok()
     }
@@ -710,10 +690,10 @@ impl Gateway {
         ]);
         let mut client = self.client();
         client
-            .create_provider(CreateProviderRequest {
+            .create_provider(scoped(CreateProviderRequest {
                 provider: Some(provider),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             // The token is in the request body, not this message; but keep any surfaced
@@ -738,35 +718,78 @@ impl Gateway {
         provider.r#type = provider_type.to_string();
         let mut client = self.client();
         client
-            .create_provider(CreateProviderRequest {
+            .create_provider(scoped(CreateProviderRequest {
                 provider: Some(provider),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("create_provider({name})")))
             .map_err(Into::into)
     }
 
-    /// Import (or refresh) a custom provider profile, platform-scoped
-    /// (`ImportProviderProfiles`). Existing custom profiles with the same id are replaced, so
-    /// re-running per turn is idempotent.
-    #[tracing::instrument(skip_all, fields(rpc = "import_provider_profiles", profile = profile.id.as_str()))]
-    pub async fn import_provider_profile(&self, profile: ProviderProfile) -> Result<()> {
+    /// Make the workspace's custom provider profile `profile.id` equal `profile`: import it when
+    /// absent (`ImportProviderProfiles`), leave it when it already matches, and replace it
+    /// otherwise (`UpdateProviderProfiles`, guarded by the stored resource version). Import is
+    /// create-only, so the read decides which write applies. A response that reports the profile
+    /// was not written fails with its diagnostics.
+    #[tracing::instrument(skip_all, fields(rpc = "ensure_provider_profile", profile = profile.id.as_str()))]
+    pub async fn ensure_provider_profile(&self, profile: ProviderProfile) -> Result<()> {
         let id = profile.id.clone();
         let mut client = self.client();
-        client
-            .import_provider_profiles(ImportProviderProfilesRequest {
-                profiles: vec![ProviderProfileImportItem {
-                    profile: Some(profile),
-                    source: "crucible".to_string(),
-                }],
+        let stored = match client
+            .get_provider_profile(scoped(GetProviderProfileRequest {
+                id: id.clone(),
                 ..Default::default()
-            })
+            }))
             .await
-            .map(|_| ())
-            .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))
-            .map_err(Into::into)
+        {
+            Ok(resp) => resp.into_inner().profile,
+            Err(s) if s.code() == tonic::Code::NotFound => None,
+            Err(s) => return Err(GrpcError::rpc(format!("get_provider_profile({id})"))(s).into()),
+        };
+        let item = ProviderProfileImportItem {
+            profile: Some(profile.clone()),
+            source: PROFILE_SOURCE.to_string(),
+        };
+        let diagnostics = match stored {
+            None => {
+                let resp = client
+                    .import_provider_profiles(scoped(ImportProviderProfilesRequest {
+                        profiles: vec![item],
+                        ..Default::default()
+                    }))
+                    .await
+                    .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))?
+                    .into_inner();
+                if resp.imported {
+                    return Ok(());
+                }
+                resp.diagnostics
+            }
+            Some(stored) if same_profile(&stored, &profile) => return Ok(()),
+            Some(stored) => {
+                let resp = client
+                    .update_provider_profiles(scoped(UpdateProviderProfilesRequest {
+                        profile: Some(item),
+                        expected_resource_version: stored.resource_version,
+                        id: id.clone(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .map_err(GrpcError::rpc(format!("update_provider_profiles({id})")))?
+                    .into_inner();
+                if resp.updated {
+                    return Ok(());
+                }
+                resp.diagnostics
+            }
+        };
+        Err(GrpcError::ProfileRejected {
+            id,
+            diagnostics: render_diagnostics(&diagnostics),
+        }
+        .into())
     }
 
     /// Register a provider whose credentials are gateway-minted (`CreateProvider` with an EMPTY
@@ -785,38 +808,17 @@ impl Gateway {
         };
         let mut client = self.client();
         client
-            .create_provider(CreateProviderRequest {
+            .create_provider(scoped(CreateProviderRequest {
                 provider: Some(provider),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("create_provider({name})")))
             .map_err(Into::into)
     }
 
-    /// Flip one global gateway setting (`UpdateConfig`, global scope, single-key mutation).
-    /// Idempotent, re-setting the same value is a no-op server-side.
-    #[tracing::instrument(skip_all, fields(rpc = "update_config", setting = key))]
-    pub async fn set_global_bool_setting(&self, key: &str, value: bool) -> Result<()> {
-        use openshell_core::proto::{SettingValue, setting_value};
-        let mut client = self.client();
-        client
-            .update_config(UpdateConfigRequest {
-                global: true,
-                setting_key: key.to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(value)),
-                }),
-                ..Default::default()
-            })
-            .await
-            .map(|_| ())
-            .map_err(GrpcError::rpc(format!("update_config(setting {key})")))
-            .map_err(Into::into)
-    }
-
-    /// Point a credential's refresh at an STS web-identity mint (`ConfigureProviderRefresh`).
+    /// Point a credential's refresh at a gateway-side mint (`ConfigureProviderRefresh`).
     /// Configuring only STORES the refresh state, the worker mints on its next tick (≤60s), so
     /// follow with [`Gateway::rotate_provider_credential`] before the sandbox's first request
     /// (the proxy fails closed on unminted credentials).
@@ -830,13 +832,13 @@ impl Gateway {
     ) -> Result<()> {
         let mut client = self.client();
         client
-            .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            .configure_provider_refresh(scoped(ConfigureProviderRefreshRequest {
                 provider: name.to_string(),
                 credential_key: credential_key.to_string(),
                 strategy: strategy.into(),
                 material,
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!(
@@ -851,11 +853,11 @@ impl Gateway {
     pub async fn rotate_provider_credential(&self, name: &str, credential_key: &str) -> Result<()> {
         let mut client = self.client();
         client
-            .rotate_provider_credential(RotateProviderCredentialRequest {
+            .rotate_provider_credential(scoped(RotateProviderCredentialRequest {
                 provider: name.to_string(),
                 credential_key: credential_key.to_string(),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!(
@@ -871,11 +873,10 @@ impl Gateway {
         let provider = build_provider(name, cred_key, token);
         let mut client = self.client();
         client
-            .update_provider(UpdateProviderRequest {
+            .update_provider(scoped(UpdateProviderRequest {
                 provider: Some(provider),
-                credential_expires_at_ms: HashMap::new(),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("update_provider({name})")))
@@ -932,11 +933,11 @@ impl Gateway {
         )?;
         let version = self
             .client()
-            .update_config(UpdateConfigRequest {
-                name: name.to_string(),
+            .update_config(scoped(UpdateConfigRequest {
+                sandbox: name.to_string(),
                 merge_operations,
                 ..UpdateConfigRequest::default()
-            })
+            }))
             .await
             .map(|r| r.into_inner().version)
             .map_err(GrpcError::rpc(format!("update_config({name})")))?;
@@ -951,12 +952,12 @@ impl Gateway {
         let (outcome, result) = loop {
             attempts += 1;
             let status = match client
-                .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
-                    name: name.to_string(),
+                .get_sandbox_policy_status(scoped(GetSandboxPolicyStatusRequest {
+                    sandbox: name.to_string(),
                     version,
                     global: false,
                     ..Default::default()
-                })
+                }))
                 .await
             {
                 Ok(resp) => resp
@@ -1011,19 +1012,15 @@ impl Gateway {
     /// as INFO, so a WARN floor would drop them.
     #[tracing::instrument(skip_all, fields(rpc = "get_sandbox_logs", sandbox = name))]
     pub async fn sandbox_logs(&self, name: &str) -> Vec<SandboxLogLine> {
-        let Ok(sandbox_id) = self.sandbox_id(name).await else {
-            return Vec::new();
-        };
         let mut client = self.client();
         client
-            .get_sandbox_logs(GetSandboxLogsRequest {
-                sandbox_id,
+            .get_sandbox_logs(scoped(GetSandboxLogsRequest {
+                sandbox: name.to_string(),
                 lines: 1000,
-                since_ms: 0,
                 sources: vec!["sandbox".to_string()],
                 min_level: "INFO".to_string(),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|r| r.into_inner().logs)
             .unwrap_or_default()
@@ -1047,12 +1044,11 @@ impl Gateway {
         cancel: &CancellationToken,
         mut on_stdout_line: impl FnMut(&str),
     ) -> Result<ExecResult> {
-        let sandbox_id = self.sandbox_id(name).await?;
-        let request = ExecSandboxRequest {
-            sandbox_id,
+        let request = scoped(ExecSandboxRequest {
+            sandbox: name.to_string(),
             command: command.to_vec(),
             ..ExecSandboxRequest::default()
-        };
+        });
 
         // Open the stream first so a start failure (e.g. sandbox not ready) surfaces here rather
         // than half-way through the pump.
@@ -1120,9 +1116,35 @@ fn build_provider(name: &str, cred_key: &str, token: &str) -> Provider {
         r#type: String::new(),
         credentials: HashMap::from([(cred_key.to_string(), token.to_string())]),
         config: HashMap::new(),
-        credential_expires_at_ms: HashMap::new(),
         ..Default::default()
     }
+}
+
+/// The import source the gateway records on crucible's profiles.
+const PROFILE_SOURCE: &str = "crucible";
+
+/// Whether the gateway's stored profile already says what `wanted` says. The fields the gateway
+/// sets on its side (resource version, provenance, visibility) are not part of the comparison.
+fn same_profile(stored: &ProviderProfile, wanted: &ProviderProfile) -> bool {
+    let normalized = ProviderProfile {
+        resource_version: wanted.resource_version,
+        source: wanted.source.clone(),
+        scope: wanted.scope.clone(),
+        ..stored.clone()
+    };
+    normalized == *wanted
+}
+
+/// A profile write's diagnostics as one line: `severity field: message`, joined by `; `.
+fn render_diagnostics(diagnostics: &[ProviderProfileDiagnostic]) -> String {
+    if diagnostics.is_empty() {
+        return "the gateway reported no diagnostics".to_string();
+    }
+    diagnostics
+        .iter()
+        .map(|d| format!("{} {}: {}", d.severity, d.field, d.message))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// A deployment variable holding JSON, `None` when unset.
@@ -1247,6 +1269,15 @@ pub fn is_denial(line: &SandboxLogLine) -> bool {
     classify_denial(line).is_some()
 }
 
+/// A log line's event time as Unix epoch milliseconds, `0` when the gateway sent none or an
+/// out-of-range one.
+pub fn event_time_ms(line: &SandboxLogLine) -> i64 {
+    line.event_time
+        .as_ref()
+        .and_then(|t| openshell_core::time::timestamp_to_millis(t).ok())
+        .unwrap_or(0)
+}
+
 /// Whether a structured `action` field value names a denial.
 fn is_deny_action(action: &str) -> bool {
     let a = action.to_ascii_lowercase();
@@ -1288,10 +1319,7 @@ fn build_merge_operations_with_tls_skip(
         .collect::<Result<Vec<_>>>()?;
     let net_binaries: Vec<NetworkBinary> = dedup(binaries)
         .into_iter()
-        .map(|path| NetworkBinary {
-            path,
-            ..NetworkBinary::default()
-        })
+        .map(|path| NetworkBinary { path })
         .collect();
     endpoints
         .iter()
@@ -1301,7 +1329,7 @@ fn build_merge_operations_with_tls_skip(
                 .iter()
                 .any(|(host, port)| endpoint.host == *host && endpoint.port == *port)
             {
-                endpoint.tls = "skip".to_string();
+                endpoint.tls = NetworkTlsMode::Skip.into();
             }
             if let Some(b) = credential_bindings
                 .iter()
@@ -1388,16 +1416,14 @@ pub enum GrpcError {
         #[source]
         status: tonic::Status,
     },
-    #[error("sandbox '{name}' missing from response")]
-    SandboxMissing { name: String },
-    #[error("sandbox '{name}' has no id")]
-    SandboxHasNoId { name: String },
     #[error("sandbox '{name}' entered the error phase during provisioning")]
     SandboxErrorPhase { name: String },
     #[error("sandbox '{name}' {stage}")]
     SandboxNotReady { name: String, stage: ReadyStage },
     #[error("sandbox '{name}' still exists {seconds}s after delete")]
     SandboxStillExists { name: String, seconds: u64 },
+    #[error("provider profile '{id}' was not written: {diagnostics}")]
+    ProfileRejected { id: String, diagnostics: String },
     #[error("policy version {version} failed to load: {load_error}")]
     PolicyLoadFailed { version: u32, load_error: String },
     #[error("timed out waiting for policy version {version} to load on '{name}'")]
@@ -1486,16 +1512,14 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
     let access = parts.get(2).copied().unwrap_or("").trim();
     let protocol = parts.get(3).copied().unwrap_or("").trim();
     let enforcement = parts.get(4).copied().unwrap_or("").trim();
-    if !access.is_empty() && !matches!(access, "read-only" | "read-write" | "full") {
-        return Err(reject(EndpointProblem::Access));
-    }
+    let access_preset = openshell_policy::network_access_preset_from_str(access)
+        .ok_or_else(|| reject(EndpointProblem::Access))?;
     if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
         return Err(reject(EndpointProblem::Protocol));
     }
-    if !enforcement.is_empty() && !matches!(enforcement, "enforce" | "audit") {
-        return Err(reject(EndpointProblem::Enforcement));
-    }
-    if !enforcement.is_empty() && protocol.is_empty() {
+    let enforcement_mode = openshell_policy::network_enforcement_mode_from_str(enforcement)
+        .ok_or_else(|| reject(EndpointProblem::Enforcement))?;
+    if enforcement_mode != NetworkEnforcementMode::Unspecified && protocol.is_empty() {
         return Err(reject(EndpointProblem::EnforcementWithoutProtocol));
     }
     Ok(NetworkEndpoint {
@@ -1503,8 +1527,8 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
         port,
         ports: vec![port],
         protocol: protocol.to_string(),
-        enforcement: enforcement.to_string(),
-        access: access.to_string(),
+        enforcement: enforcement_mode.into(),
+        access: access_preset.into(),
         ..NetworkEndpoint::default()
     })
 }
@@ -1561,7 +1585,8 @@ impl LineSplitter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::openshell::grpc::*;
+    use openshell_core::proto::NetworkAccessPreset;
 
     /// A throwaway self-signed cert (CN=localhost, EC P-256) used only to exercise channel
     /// construction; no handshake ever happens and the key protects nothing.
@@ -1813,17 +1838,17 @@ pYBZ
         assert_eq!(ep.host, "github.com");
         assert_eq!(ep.port, 443);
         assert_eq!(ep.ports, vec![443]);
-        assert_eq!(ep.access, "full");
+        assert_eq!(ep.access(), NetworkAccessPreset::Full);
         assert!(ep.protocol.is_empty());
-        assert!(ep.enforcement.is_empty());
+        assert_eq!(ep.enforcement(), NetworkEnforcementMode::Unspecified);
     }
 
     #[test]
     fn parse_endpoint_with_protocol_and_enforcement() {
         let ep = parse_endpoint_spec("api.example.com:443:read-write:rest:enforce").unwrap();
-        assert_eq!(ep.access, "read-write");
+        assert_eq!(ep.access(), NetworkAccessPreset::ReadWrite);
         assert_eq!(ep.protocol, "rest");
-        assert_eq!(ep.enforcement, "enforce");
+        assert_eq!(ep.enforcement(), NetworkEnforcementMode::Enforce);
     }
 
     #[test]
@@ -1856,8 +1881,8 @@ pYBZ
                 _ => None,
             })
             .collect();
-        assert_eq!(endpoints[0].tls, "skip");
-        assert_eq!(endpoints[1].tls, "");
+        assert_eq!(endpoints[0].tls(), NetworkTlsMode::Skip);
+        assert_eq!(endpoints[1].tls(), NetworkTlsMode::Unspecified);
     }
 
     #[test]
@@ -1941,7 +1966,7 @@ pYBZ
             Some("crucible-broker")
         );
         assert_eq!(eps[1].protocol, "rest");
-        assert_eq!(eps[1].access, "full");
+        assert_eq!(eps[1].access(), NetworkAccessPreset::Full);
     }
 
     #[test]
@@ -2055,7 +2080,7 @@ pYBZ
     fn log_line(level: &str, message: &str, fields: &[(&str, &str)]) -> SandboxLogLine {
         SandboxLogLine {
             sandbox_id: "s".into(),
-            timestamp_ms: 0,
+            event_time: None,
             level: level.into(),
             target: "proxy".into(),
             message: message.into(),
@@ -2065,6 +2090,87 @@ pYBZ
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn a_stored_profile_matches_when_only_gateway_fields_differ() {
+        let wanted = ProviderProfile {
+            id: "p".into(),
+            display_name: "P".into(),
+            credentials: vec![openshell_core::proto::ProviderProfileCredential {
+                name: "token".into(),
+                env_vars: vec!["TOKEN".into()],
+                required: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let stored = ProviderProfile {
+            resource_version: 7,
+            source: "user".into(),
+            scope: "workspace".into(),
+            ..wanted.clone()
+        };
+        assert!(same_profile(&stored, &wanted));
+        let edited = ProviderProfile {
+            description: "something else".into(),
+            ..stored
+        };
+        assert!(!same_profile(&edited, &wanted));
+    }
+
+    #[test]
+    fn profile_diagnostics_render_on_one_line() {
+        let diagnostics = [
+            ProviderProfileDiagnostic {
+                field: "id".into(),
+                message: "custom provider profile 'x' already exists".into(),
+                severity: "error".into(),
+                ..Default::default()
+            },
+            ProviderProfileDiagnostic {
+                field: "endpoints[0]".into(),
+                message: "bad host".into(),
+                severity: "warning".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            render_diagnostics(&diagnostics),
+            "error id: custom provider profile 'x' already exists; warning endpoints[0]: bad host"
+        );
+        assert_eq!(
+            render_diagnostics(&[]),
+            "the gateway reported no diagnostics"
+        );
+    }
+
+    #[test]
+    fn every_engine_gateway_request_is_scoped() {
+        assert_eq!(
+            crucible_broker::workspace::unscoped_request_literals(include_str!("grpc.rs")),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_log_line_event_time_reads_as_epoch_millis() {
+        let mut line = log_line("INFO", "x", &[]);
+        assert_eq!(event_time_ms(&line), 0, "no event time reads as zero");
+        line.event_time = Some(prost_types::Timestamp {
+            seconds: 1_700_000_000,
+            nanos: 123_456_789,
+        });
+        assert_eq!(event_time_ms(&line), 1_700_000_000_123);
+        line.event_time = Some(prost_types::Timestamp {
+            seconds: 1,
+            nanos: -1,
+        });
+        assert_eq!(
+            event_time_ms(&line),
+            0,
+            "a non-canonical timestamp reads as zero"
+        );
     }
 
     #[test]
@@ -2402,7 +2508,7 @@ pYBZ
             status: status.to_string(),
             reason: reason.to_string(),
             message: String::new(),
-            last_transition_time: String::new(),
+            transition_time: None,
         }
     }
 
@@ -2542,5 +2648,192 @@ pYBZ
             stalled.to_string(),
             "sandbox 'ci-abc' not ready 300s after image pull completed"
         );
+    }
+
+    #[derive(Clone)]
+    struct FakeGateway {
+        create: Result<(), tonic::Code>,
+        phase: SandboxPhase,
+        deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    struct Unary<F>(F);
+
+    impl<Req, Resp, F, Fut> tonic::server::UnaryService<Req> for Unary<F>
+    where
+        F: FnMut(tonic::Request<Req>) -> Fut,
+        Fut: std::future::Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+    {
+        type Response = Resp;
+        type Future = Fut;
+        fn call(&mut self, request: tonic::Request<Req>) -> Fut {
+            (self.0)(request)
+        }
+    }
+
+    async fn unary<Req, Resp, S>(
+        service: S,
+        req: tonic::codegen::http::Request<tonic::body::Body>,
+    ) -> tonic::codegen::http::Response<tonic::body::Body>
+    where
+        Req: tonic_prost::prost::Message + Default + Send + 'static,
+        Resp: tonic_prost::prost::Message + Send + 'static,
+        S: tonic::server::UnaryService<Req, Response = Resp>,
+    {
+        tonic::server::Grpc::new(tonic_prost::ProstCodec::<Resp, Req>::default())
+            .unary(service, req)
+            .await
+    }
+
+    impl tonic::server::NamedService for FakeGateway {
+        const NAME: &'static str = "openshell.v1.OpenShell";
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::Body>> for FakeGateway {
+        type Response = tonic::codegen::http::Response<tonic::body::Body>;
+        type Error = std::convert::Infallible;
+        type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+        fn poll_ready(
+            &mut self,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, req: tonic::codegen::http::Request<tonic::body::Body>) -> Self::Future {
+            use openshell_core::proto::{
+                DeleteSandboxResponse, DeletionOutcome, Sandbox, SandboxResponse, SandboxStatus,
+            };
+            let this = self.clone();
+            Box::pin(async move {
+                Ok(match req.uri().path() {
+                    "/openshell.v1.OpenShell/CreateSandbox" => {
+                        let create = this.create;
+                        unary(
+                            Unary(move |_: tonic::Request<CreateSandboxRequest>| async move {
+                                create
+                                    .map(|()| tonic::Response::new(SandboxResponse::default()))
+                                    .map_err(|code| tonic::Status::new(code, "create refused"))
+                            }),
+                            req,
+                        )
+                        .await
+                    }
+                    "/openshell.v1.OpenShell/GetSandbox" => {
+                        let phase = this.phase;
+                        unary(
+                            Unary(move |_: tonic::Request<GetSandboxRequest>| async move {
+                                Ok(tonic::Response::new(SandboxResponse {
+                                    sandbox: Some(Sandbox {
+                                        status: Some(SandboxStatus {
+                                            phase: phase.into(),
+                                            ..SandboxStatus::default()
+                                        }),
+                                        ..Sandbox::default()
+                                    }),
+                                    ..SandboxResponse::default()
+                                }))
+                            }),
+                            req,
+                        )
+                        .await
+                    }
+                    "/openshell.v1.OpenShell/DeleteSandbox" => {
+                        let deleted = this.deleted.clone();
+                        unary(
+                            Unary(move |r: tonic::Request<DeleteSandboxRequest>| {
+                                let deleted = deleted.clone();
+                                async move {
+                                    deleted
+                                        .lock()
+                                        .map_err(|e| tonic::Status::internal(e.to_string()))?
+                                        .push(r.into_inner().name);
+                                    Ok(tonic::Response::new(DeleteSandboxResponse {
+                                        outcome: DeletionOutcome::Completed.into(),
+                                        ..DeleteSandboxResponse::default()
+                                    }))
+                                }
+                            }),
+                            req,
+                        )
+                        .await
+                    }
+                    _ => tonic::Status::unimplemented(req.uri().path().to_string()).into_http(),
+                })
+            })
+        }
+    }
+
+    /// Drive `Gateway::create_sandbox` against a real gRPC server on a loopback port and return
+    /// the create's outcome plus every name the server was asked to delete.
+    fn create_against(
+        create: Result<(), tonic::Code>,
+        phase: SandboxPhase,
+    ) -> (Result<()>, Vec<String>) {
+        let _guard = crate::test_support::env_lock();
+        let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fake = FakeGateway {
+            create,
+            phase,
+            deleted: deleted.clone(),
+        };
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(fake)
+                    .serve_with_incoming(tonic::transport::server::TcpIncoming::from(listener)),
+            );
+            let gw = Gateway {
+                channel: Endpoint::from_shared(format!("http://{addr}"))
+                    .unwrap()
+                    .connect_lazy(),
+            };
+            gw.create_sandbox(
+                "ci-leak",
+                None,
+                &[],
+                &[],
+                &[],
+                &crate::manifest::SandboxResources::default(),
+            )
+            .await
+        });
+        let deleted = deleted.lock().unwrap().clone();
+        (result, deleted)
+    }
+
+    #[test]
+    fn a_sandbox_that_reaches_error_is_deleted() {
+        let (result, deleted) = create_against(Ok(()), SandboxPhase::Error);
+        let err = result.expect_err("an Error-phase sandbox must fail the create");
+        assert!(
+            matches!(
+                err.downcast_ref::<GrpcError>(),
+                Some(GrpcError::SandboxErrorPhase { name }) if name == "ci-leak"
+            ),
+            "{err:#}"
+        );
+        assert_eq!(deleted, ["ci-leak"]);
+    }
+
+    #[test]
+    fn a_refused_create_rpc_still_deletes_the_name() {
+        let (result, deleted) = create_against(Err(tonic::Code::Unavailable), SandboxPhase::Ready);
+        assert!(result.is_err());
+        assert_eq!(deleted, ["ci-leak"]);
+    }
+
+    #[test]
+    fn a_ready_sandbox_is_kept() {
+        let (result, deleted) = create_against(Ok(()), SandboxPhase::Ready);
+        assert!(result.is_ok(), "{:?}", result.err());
+        assert!(deleted.is_empty(), "{deleted:?}");
     }
 }

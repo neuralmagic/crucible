@@ -1,7 +1,10 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
-use crate::openshell::gateway::{ComputeDriver, OTEL_COLLECTOR_PORT};
+use crate::openshell::gateway::{
+    AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, ComputeDriver, OTEL_COLLECTOR_PORT,
+    POD_IP_ENV, SANDBOX_RUNTIME_IMAGE_ENV, SUPERVISOR_IMAGE_ENV,
+};
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
@@ -71,9 +74,9 @@ pub use crucible_contract::MANAGED_BY_SELECTOR as MANAGED_BY_LABEL;
 /// it from the same path, so the loop pod mounts the same claim writable. Must match the broker's
 /// BROKER_CODEGEN_ARTIFACTS_MOUNT default.
 const ARTIFACTS_MOUNT: &str = "/artifacts";
-/// Mount + file for the IRSA web-identity token (publish-on-keep).
+/// Mount + file for the IRSA web-identity token (publish-on-keep, the gateway's sandbox role).
 const AWS_TOKEN_DIR: &str = "/var/run/secrets/aws";
-const AWS_TOKEN_PATH: &str = "/var/run/secrets/aws/token";
+const AWS_TOKEN_PATH: &str = AWS_WEB_IDENTITY_TOKEN_PATH;
 /// Mount + file for the spoke kubeconfig Secret (key `kubeconfig`) named by the selected
 /// `[clusters.<name>]` entry; the in-pod broker reads it via BROKER_CODEGEN_KUBECONFIG.
 const SPOKE_KUBECONFIG_DIR: &str = "/etc/crucible/spoke";
@@ -87,10 +90,6 @@ const OPENSHELL_MANAGED_BY_VALUE: &str = "openshell";
 /// the identity CRD-path sandbox pods actually carry (the managed-by label above is
 /// SPIFFE-gated in the pinned driver).
 const SANDBOX_NAME_HASH_LABEL: &str = "agents.x-k8s.io/sandbox-name-hash";
-/// Env var injected via the downward API carrying the loop pod's own IP. The wrapper reads it
-/// and passes it into the gateway config as `host_gateway_ip`, so the kubernetes driver injects
-/// the right `hostAliases` on sandbox pods.
-pub(super) const POD_IP_ENV: &str = "CRUCIBLE_POD_IP";
 
 /// Options that vary per render invocation (not per cluster). `Default` is a manual
 /// `crucible deploy render`: one iteration, no budget, no pin, baked domain, the loop.
@@ -754,12 +753,9 @@ impl Renderer<'_> {
         // Generic pod env from secrets (e.g. the backend's Vertex ADC), names are the profile's.
         env.extend(secret_env_vars(self.profile));
 
-        // The nested-sandbox runtime image (the openshell backend's contract, engine-known, not a
-        // domain name, so the engine projects it).
-        env.push(plain(
-            "OPENSHELL_SUPERVISOR_IMAGE",
-            self.profile.cluster.supervisor_image.clone(),
-        ));
+        // The images the compute driver pairs with every sandbox (the openshell backend's
+        // contract, engine-known, not a domain name, so the engine projects them).
+        env.extend(driver_image_env(self.profile)?);
 
         // Broker / composite wiring (manifest-derived, the broker IS the engine, so these are generic).
         // BROKER_BUILD is set by crucible when it spawns the broker (from [agent.broker].build), not here.
@@ -858,16 +854,12 @@ impl Renderer<'_> {
             ));
         }
 
-        // Sandbox S3 reads: the gateway's `aws-s3` provider assumes this read-only role via the
-        // same projected token and signs sandbox egress at the proxy (see openshell::run).
+        // Sandbox S3 reads: the gateway runs as this read-only role via the same projected token
+        // and its `aws-s3` provider signs sandbox egress at the proxy (see openshell::run).
         if let Some(arn) = self.profile.cluster.aws_sandbox_role_arn.as_deref()
             && !arn.is_empty()
         {
-            env.push(plain("CRUCIBLE_AWS_SANDBOX_ROLE_ARN", arn.to_string()));
-            env.push(plain(
-                "CRUCIBLE_AWS_SANDBOX_TOKEN_FILE",
-                AWS_TOKEN_PATH.to_string(),
-            ));
+            env.push(plain(AWS_SANDBOX_ROLE_ENV, arn.to_string()));
         }
 
         // Under the kubernetes driver, project the config the runtime `gateway_toml()` reads to
@@ -875,7 +867,7 @@ impl Renderer<'_> {
         if self.driver == ComputeDriver::Kubernetes
             && let Some(sandbox_image) = self.sandbox_image.as_deref()
         {
-            env.extend(kubernetes_sandbox_env(self.profile, sandbox_image));
+            env.extend(kubernetes_sandbox_env(self.profile, sandbox_image)?);
         }
 
         let downward = |name: &str, field_path: &str| core::EnvVar {
@@ -1303,13 +1295,16 @@ exit $rc
     /// Pod-spec `hostAliases` merged from the cluster profile and the spoke entry (if any),
     /// grouped by IP with hostnames sorted (BTreeMap order) so the render is deterministic.
     fn host_aliases(&self) -> Option<Vec<core::HostAlias>> {
-        let mut by_ip: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-        for (hostname, ip) in &self.profile.cluster.host_aliases {
-            by_ip.entry(ip.as_str()).or_default().push(hostname.clone());
+        let mut by_ip: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (hostname, ip) in self.profile.cluster.host_aliases.iter() {
+            by_ip
+                .entry(ip.to_string())
+                .or_default()
+                .push(hostname.to_string());
         }
         if let Some((_, entry)) = self.spoke.as_ref() {
             for (hostname, ip) in &entry.host_aliases {
-                by_ip.entry(ip.as_str()).or_default().push(hostname.clone());
+                by_ip.entry(ip.clone()).or_default().push(hostname.clone());
             }
         }
         if by_ip.is_empty() {
@@ -1319,7 +1314,7 @@ exit $rc
             by_ip
                 .into_iter()
                 .map(|(ip, hostnames)| core::HostAlias {
-                    ip: ip.to_string(),
+                    ip,
                     hostnames: Some(hostnames),
                 })
                 .collect(),
@@ -1438,14 +1433,16 @@ exit $rc
         )
     }
 
-    /// The RBAC the kubernetes sandbox driver needs, cross-checked against OpenShell's own helm
-    /// chart (`role.yaml`, `clusterrole.yaml`):
+    /// The RBAC the kubernetes sandbox driver needs, matching OpenShell v0.1.2's helm chart for
+    /// shared workspace mode with `allowDriverConfig` (`role.yaml`, `clusterrole.yaml`):
     ///
-    ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs + event/pod reads +
-    ///     secret `create` (the loop pod publishes the sandbox client-TLS Secret).
+    ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs, event reads, the
+    ///     supervisor pod lifecycle, the boundary Service, bootstrap Secrets, the egress
+    ///     NetworkPolicy, and PVC metadata reads for resource admission. Bootstrap Secret
+    ///     creation also covers the client-TLS Secret each gateway boot publishes.
     ///  2. A `RoleBinding` granting that Role to the loop SA.
-    ///  3. A `ClusterRole`: `tokenreviews` (create) + `nodes` (get/list/watch) + the sandbox
-    ///     namespace (get).
+    ///  3. A `ClusterRole`: `tokenreviews` (create), `nodes` (get/list/watch), and the
+    ///     `runtimeclasses`/`priorityclasses`/`namespaces` reads admission and UID resolution do.
     ///  4. A `ClusterRoleBinding` granting it to the loop SA.
     fn sandbox_rbac(&self) -> Vec<SandboxRbacObject> {
         let sa = &self.profile.cluster.service_account;
@@ -1453,7 +1450,8 @@ exit $rc
         let role_name = format!("{sa}-sandbox");
         let cr_name = format!("{sa}-node-reader");
 
-        // 1. Namespaced Role: sandbox CRD + events + pods + client-TLS secret creation.
+        // 1. Namespaced Role: sandbox CRD + events + the sandbox-runtime companions + the
+        //    published client-TLS secret.
         let role = rbac::Role {
             metadata: ObjectMeta {
                 name: Some(role_name.clone()),
@@ -1484,18 +1482,46 @@ exit $rc
                     verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
                     ..Default::default()
                 },
+                // The driver creates the supervisor pod itself and patches away its bootstrap
+                // scheduling gate; the gateway resolves TokenReview pod names via get.
                 rbac::PolicyRule {
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["pods".to_string()]),
+                    verbs: vec![
+                        "create".to_string(),
+                        "delete".to_string(),
+                        "get".to_string(),
+                        "list".to_string(),
+                        "patch".to_string(),
+                        "watch".to_string(),
+                    ],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec![String::new()]),
+                    resources: Some(vec!["services".to_string()]),
+                    verbs: vec!["create".to_string(), "get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec!["networking.k8s.io".to_string()]),
+                    resources: Some(vec!["networkpolicies".to_string()]),
+                    verbs: vec!["create".to_string(), "get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec![String::new()]),
+                    resources: Some(vec!["persistentvolumeclaims".to_string()]),
                     verbs: vec!["get".to_string()],
                     ..Default::default()
                 },
                 // Each in-pod gateway boot creates a fresh client-TLS Secret that sandbox pods
-                // mount to dial it back over mTLS. Create only: no get/patch on any Secret.
+                // mount to dial it back over mTLS; no get or patch on any Secret. The driver's
+                // generation-scoped bootstrap Secrets need create and, on recovery, delete.
                 rbac::PolicyRule {
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["secrets".to_string()]),
-                    verbs: vec!["create".to_string()],
+                    verbs: vec!["create".to_string(), "delete".to_string()],
                     ..Default::default()
                 },
             ]),
@@ -1510,9 +1536,8 @@ exit $rc
             ns.clone(),
         );
 
-        // 3. ClusterRole: tokenreviews (IssueSandboxToken bootstrap) + nodes + the sandbox
-        // namespace, whose OpenShift SCC annotations set the sandbox UID/GID. Without the
-        // namespace read the driver falls back to a default UID the SCC rejects.
+        // 3. ClusterRole: tokenreviews (IssueSandboxToken bootstrap) + nodes + the
+        //    cluster-scoped reads resource admission and SCC UID resolution make.
         let cr = rbac::ClusterRole {
             metadata: ObjectMeta {
                 name: Some(cr_name.clone()),
@@ -1532,9 +1557,20 @@ exit $rc
                     ..Default::default()
                 },
                 rbac::PolicyRule {
+                    api_groups: Some(vec!["node.k8s.io".to_string()]),
+                    resources: Some(vec!["runtimeclasses".to_string()]),
+                    verbs: vec!["get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec!["scheduling.k8s.io".to_string()]),
+                    resources: Some(vec!["priorityclasses".to_string()]),
+                    verbs: vec!["get".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["namespaces".to_string()]),
-                    resource_names: Some(vec![ns.clone()]),
                     verbs: vec!["get".to_string()],
                     ..Default::default()
                 },
@@ -1676,10 +1712,30 @@ pub(super) fn secret_env_vars(profile: &DeployProfile) -> Vec<core::EnvVar> {
 /// (`--compute-driver` unset) silently reverts to podman and the sandbox image pull is authenticated
 /// with the wrong credential. `status.podIP` (unknowable at render time) is the `host_gateway_ip`
 /// that makes sandbox hostAliases work; the rest comes from the profile.
+/// The supervisor and sandbox runtime images the gateway's compute driver launches, as the env
+/// `gateway::DriverImages::from_env` reads. Shared by the loop and turn renders.
+pub(super) fn driver_image_env(profile: &DeployProfile) -> Result<Vec<core::EnvVar>> {
+    let plain = |name: &str, value: String| core::EnvVar {
+        name: name.to_string(),
+        value: Some(value),
+        value_from: None,
+    };
+    Ok(vec![
+        plain(
+            SUPERVISOR_IMAGE_ENV,
+            profile.cluster.supervisor_image.clone(),
+        ),
+        plain(
+            SANDBOX_RUNTIME_IMAGE_ENV,
+            profile.cluster.sandbox_runtime_image()?,
+        ),
+    ])
+}
+
 pub(super) fn kubernetes_sandbox_env(
     profile: &DeployProfile,
     sandbox_image: &str,
-) -> Vec<core::EnvVar> {
+) -> Result<Vec<core::EnvVar>> {
     let plain = |name: &str, value: String| core::EnvVar {
         name: name.to_string(),
         value: Some(value),
@@ -1722,22 +1778,18 @@ pub(super) fn kubernetes_sandbox_env(
     }
     if !profile.cluster.host_aliases.is_empty() {
         let aliases = serde_json::to_string(&profile.cluster.host_aliases)
-            .expect("host aliases are JSON-serializable strings");
+            .context("serializing [cluster].host_aliases")?;
         env.push(plain("CRUCIBLE_SANDBOX_HOST_ALIASES", aliases));
     }
     if !profile.cluster.gpu_sandbox.is_empty() {
         let placement = serde_json::to_string(&profile.cluster.gpu_sandbox)
-            .expect("GPU placement is JSON-serializable");
+            .context("serializing [cluster.gpu_sandbox]")?;
         env.push(plain(
             crate::openshell::placement::GPU_PLACEMENT_ENV,
             placement,
         ));
     }
-    env.push(plain(
-        "CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE",
-        "Unconfined".to_string(),
-    ));
-    env
+    Ok(env)
 }
 
 /// The profile's node avoid-list as a required nodeAffinity `NotIn` on `kubernetes.io/hostname`
@@ -3698,6 +3750,7 @@ mod tests {
     fn kubernetes_projects_gpu_sandbox_placement_only_when_configured() {
         let placement = |profile: &DeployProfile| {
             kubernetes_sandbox_env(profile, "sandbox:dev")
+                .unwrap()
                 .into_iter()
                 .find(|e| e.name == crate::openshell::placement::GPU_PLACEMENT_ENV)
                 .and_then(|e| e.value)
@@ -3800,12 +3853,12 @@ mod tests {
             "sandbox pull secrets env: {yaml}"
         );
         assert!(
-            yaml.contains("name: CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE"),
-            "sandbox app armor env: {yaml}"
+            !yaml.contains("CRUCIBLE_SANDBOX_APP_ARMOR_PROFILE"),
+            "v0.1.2's kubernetes driver has no app_armor_profile key: {yaml}"
         );
         assert!(
-            yaml.contains("value: Unconfined"),
-            "app armor is Unconfined: {yaml}"
+            yaml.contains("name: OPENSHELL_SANDBOX_RUNTIME_IMAGE"),
+            "sandbox runtime image env: {yaml}"
         );
     }
 
@@ -3943,9 +3996,7 @@ mod tests {
         // The sandbox Role with the CRD verbs.
         let role_doc = docs
             .iter()
-            .find(|d| {
-                d.contains("kind: Role\n") && d.contains("name: autoresearch-publisher-sandbox")
-            })
+            .find(|d| d.contains("kind: Role") && d.contains("sandbox"))
             .expect("sandbox Role doc");
         assert!(
             role_doc.contains("agents.x-k8s.io"),
@@ -4113,10 +4164,12 @@ mod tests {
             Some(publish_ns.as_str())
         );
         let rules = sandbox_role.rules.clone().unwrap_or_default();
+        let mut verbs = secret_verbs_granted(&rules);
+        verbs.sort();
         assert_eq!(
-            secret_verbs_granted(&rules),
-            vec!["create".to_string()],
-            "create is all a fresh per-boot Secret needs: {rbac_yaml}"
+            verbs,
+            vec!["create".to_string(), "delete".to_string()],
+            "a fresh per-boot Secret needs only create; no get or patch: {rbac_yaml}"
         );
         assert!(
             rules
@@ -4153,28 +4206,95 @@ mod tests {
         }
     }
 
+    /// Every `(apiGroup, resource, resourceNames) -> verbs` grant in one rendered RBAC doc.
+    fn rbac_grants(
+        rules: &[rbac::PolicyRule],
+    ) -> BTreeMap<(String, String, Vec<String>), Vec<String>> {
+        let mut grants = BTreeMap::new();
+        for rule in rules {
+            for group in rule.api_groups.iter().flatten() {
+                for resource in rule.resources.iter().flatten() {
+                    let mut verbs = rule.verbs.clone();
+                    verbs.sort();
+                    grants.insert(
+                        (
+                            group.clone(),
+                            resource.clone(),
+                            rule.resource_names.clone().unwrap_or_default(),
+                        ),
+                        verbs,
+                    );
+                }
+            }
+        }
+        grants
+    }
+
+    /// The Role and ClusterRole grant exactly what OpenShell v0.1.2's helm chart grants its
+    /// gateway in shared mode with `allowDriverConfig`.
     #[test]
-    fn the_cluster_role_reads_only_the_sandbox_namespace() {
+    fn the_sandbox_rbac_matches_the_openshell_chart() {
         let yaml = render_k8s(&k8s_profile(""));
-        let cr: rbac::ClusterRole = serde_norway::from_str(
-            docs_of_kind(&yaml, "ClusterRole")
-                .next()
-                .expect("ClusterRole doc"),
-        )
-        .expect("ClusterRole parses");
-        let ns_rules: Vec<_> = cr
-            .rules
+        let docs: Vec<&str> = yaml.split("\n---\n").collect();
+        let role: rbac::Role = docs
             .iter()
-            .flatten()
-            .filter(|r| r.resources.iter().flatten().any(|res| res == "namespaces"))
-            .collect();
-        assert_eq!(ns_rules.len(), 1, "one namespaces rule: {yaml}");
-        assert_eq!(ns_rules[0].api_groups, Some(vec![String::new()]));
-        assert_eq!(ns_rules[0].verbs, vec!["get".to_string()]);
+            .find(|d| d.starts_with("apiVersion: rbac.authorization.k8s.io/v1\nkind: Role\n"))
+            .map(|d| serde_norway::from_str(d).expect("Role parses"))
+            .expect("Role doc");
+        let cluster_role: rbac::ClusterRole = docs
+            .iter()
+            .find(|d| {
+                d.starts_with("apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\n")
+            })
+            .map(|d| serde_norway::from_str(d).expect("ClusterRole parses"))
+            .expect("ClusterRole doc");
+        let grant = |group: &str, resource: &str, names: &[&str], verbs: &[&str]| {
+            let mut verbs: Vec<String> = verbs.iter().map(|v| v.to_string()).collect();
+            verbs.sort();
+            (
+                (
+                    group.to_string(),
+                    resource.to_string(),
+                    names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                ),
+                verbs,
+            )
+        };
+        let crud = [
+            "create", "delete", "get", "list", "patch", "update", "watch",
+        ];
         assert_eq!(
-            ns_rules[0].resource_names,
-            Some(vec!["autoresearch".to_string()]),
-            "pinned to the namespace CRUCIBLE_SANDBOX_NAMESPACE names"
+            rbac_grants(role.rules.as_deref().unwrap_or_default()),
+            BTreeMap::from([
+                grant("agents.x-k8s.io", "sandboxes", &[], &crud),
+                grant("agents.x-k8s.io", "sandboxes/status", &[], &crud),
+                grant("", "events", &[], &["get", "list", "watch"]),
+                grant(
+                    "",
+                    "pods",
+                    &[],
+                    &["create", "delete", "get", "list", "patch", "watch"]
+                ),
+                grant("", "services", &[], &["create", "get"]),
+                grant(
+                    "networking.k8s.io",
+                    "networkpolicies",
+                    &[],
+                    &["create", "get"]
+                ),
+                grant("", "persistentvolumeclaims", &[], &["get"]),
+                grant("", "secrets", &[], &["create", "delete"]),
+            ])
+        );
+        assert_eq!(
+            rbac_grants(cluster_role.rules.as_deref().unwrap_or_default()),
+            BTreeMap::from([
+                grant("authentication.k8s.io", "tokenreviews", &[], &["create"]),
+                grant("", "nodes", &[], &["get", "list", "watch"]),
+                grant("node.k8s.io", "runtimeclasses", &[], &["get"]),
+                grant("scheduling.k8s.io", "priorityclasses", &[], &["get"]),
+                grant("", "namespaces", &[], &["get"]),
+            ])
         );
     }
 
@@ -4255,7 +4375,11 @@ mod tests {
         let yaml = render_loop_pod(&profile);
         assert!(yaml.contains("name: CRUCIBLE_AWS_SANDBOX_ROLE_ARN"));
         assert!(yaml.contains("value: arn:aws:iam::1:role/sandbox-ro"));
-        assert!(yaml.contains("name: CRUCIBLE_AWS_SANDBOX_TOKEN_FILE"));
+        assert!(
+            !yaml.contains("CRUCIBLE_AWS_SANDBOX_TOKEN_FILE"),
+            "the gateway reads the token from its own AWS_WEB_IDENTITY_TOKEN_FILE"
+        );
+        assert!(yaml.contains("mountPath: /var/run/secrets/aws"), "{yaml}");
         assert!(
             yaml.contains("audience: sts.amazonaws.com"),
             "sts token projected without aws_role_arn: {yaml}"
@@ -4325,59 +4449,39 @@ mod tests {
     /// `deny_unknown_fields`).
     #[test]
     fn kubernetes_driver_config_round_trips_as_valid_toml() {
-        use crate::openshell::gateway::KubernetesDriverConfig;
+        use crate::openshell::gateway::{
+            DriverImages, KubernetesDriverConfig, UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS,
+        };
 
-        let mut cfg = KubernetesDriverConfig::new(Some("registry.example.com/supervisor:latest"));
+        let mut cfg = KubernetesDriverConfig::new(&DriverImages {
+            supervisor: Some("registry.example.com/supervisor:latest".to_string()),
+            sandbox_runtime: Some("registry.example.com/sandbox:latest".to_string()),
+        });
         cfg.namespace = Some("autoresearch".to_string());
         cfg.service_account_name = Some("autoresearch-publisher".to_string());
         cfg.default_image = Some("registry.example.com/alpha-sandbox:latest".to_string());
         cfg.image_pull_secrets = vec!["quay-pull".to_string()];
-        cfg.host_gateway_ip = Some("10.0.0.1".to_string());
-        cfg.app_armor_profile = Some("Unconfined".to_string());
+        cfg.host_gateway_ip = Some(std::net::IpAddr::from([10, 0, 0, 1]));
 
         let toml_str = toml::to_string(&cfg).expect("serialize to TOML");
-        // Re-parse as a generic TOML table to inspect field names.
         let table: toml::map::Map<String, toml::Value> =
             toml::from_str(&toml_str).expect("re-parse as TOML table");
 
-        // Every emitted field name must be one the real config struct accepts.
-        // Cross-checked against the authoritative `KubernetesComputeConfig` in os-pinned.
-        let accepted_fields = [
-            "namespace",
-            "service_account_name",
-            "default_image",
-            "image_pull_policy",
-            "image_pull_secrets",
-            "supervisor_image",
-            "supervisor_image_pull_policy",
-            "supervisor_sideload_method",
-            "grpc_endpoint",
-            "ssh_socket_path",
-            "client_tls_secret_name",
-            "host_gateway_ip",
-            "enable_user_namespaces",
-            "app_armor_profile",
-            "workspace_default_storage_size",
-            "default_runtime_class_name",
-            "sa_token_ttl_secs",
-            "provider_spiffe_workload_api_socket_path",
-        ];
         for key in table.keys() {
             assert!(
-                accepted_fields.contains(&key.as_str()),
+                UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS.contains(&key.as_str()),
                 "emitted field `{key}` is not in KubernetesComputeConfig (deny_unknown_fields \
-                 would reject it). Accepted: {accepted_fields:?}"
+                 would reject it)"
             );
         }
 
-        // Verify values round-tripped.
+        assert_eq!(table["allow_driver_config"].as_bool(), Some(true));
         assert_eq!(
-            table["supervisor_sideload_method"].as_str(),
-            Some("init-container")
+            table["sandbox_runtime_image"].as_str(),
+            Some("registry.example.com/sandbox:latest")
         );
         assert_eq!(table["namespace"].as_str(), Some("autoresearch"));
         assert_eq!(table["host_gateway_ip"].as_str(), Some("10.0.0.1"));
-        assert_eq!(table["app_armor_profile"].as_str(), Some("Unconfined"));
     }
 
     /// `sandbox_driver = "kubernetes"` parses in a profile, default is still podman.

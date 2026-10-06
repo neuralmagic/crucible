@@ -39,10 +39,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time",
 uuid = { version = "1", features = ["v7"] }
 # The OpenShell gateway's native gRPC clients + auth interceptor — one pin for every crate that
 # talks to the gateway (engine + broker), so the two can never link different protos.
-openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "3b41f71e2ada135899de4dbb81dec7477697a629", default-features = false }
+openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "3441f91a1de8ee1688c2add95d72fec53d404812", default-features = false }
 # Same rev as openshell-core: the sandbox filesystem defaults (/dev/null, /usr, /etc ...) live here,
 # and crucible extends them rather than restating them.
-openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "3b41f71e2ada135899de4dbb81dec7477697a629", default-features = false }
+openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "3441f91a1de8ee1688c2add95d72fec53d404812", default-features = false }
 tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 thiserror = "2"
 strum = { version = "0.27", features = ["derive"] }

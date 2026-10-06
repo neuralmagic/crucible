@@ -12,6 +12,7 @@ use anyhow::{Context, Result};
 use forge::fleet::{ClusterEntry, FleetFile};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::path::Path;
 
 #[derive(Deserialize)]
@@ -181,14 +182,20 @@ pub struct Cluster {
     pub kubeconfig_configmap: String,
     /// The OpenShell supervisor image the nested sandbox runtime pulls (`OPENSHELL_SUPERVISOR_IMAGE`).
     pub supervisor_image: String,
+    /// The image carrying the trusted `openshell-sandbox` binary the driver bootstraps every
+    /// sandbox with (`OPENSHELL_SANDBOX_RUNTIME_IMAGE`). Unset = the image the OpenShell image
+    /// workflow publishes for the pinned rev, see [`Cluster::sandbox_runtime_image`].
+    #[serde(default)]
+    pub sandbox_runtime_image: Option<String>,
     /// Publish-on-keep S3 base; when set, the wrapper passes `--results-bucket`. Unset = don't publish.
     #[serde(default)]
     pub results_bucket: Option<String>,
     /// IRSA role the loop pod assumes to publish (renderer projects an sts-audience token + `AWS_ROLE_ARN`).
     #[serde(default)]
     pub aws_role_arn: Option<String>,
-    /// Read-only role the in-pod gateway assumes (web identity, same projected token) to SigV4-sign
-    /// sandbox S3 egress at the proxy, the read half of the S3 role split. Unset = no S3 provider.
+    /// Read-only role the in-pod gateway runs as (web identity, same projected token) and assumes
+    /// again to mint the credentials it SigV4-signs sandbox S3 egress with, the read half of the
+    /// S3 role split. Its trust policy must admit itself. Unset = no S3 provider.
     #[serde(default)]
     pub aws_sandbox_role_arn: Option<String>,
     /// The OpenShell compute driver for the sandbox: `podman` nests it inside the loop pod
@@ -234,8 +241,10 @@ pub struct Cluster {
     /// restricted PSA/SCC instead of scheduling it. Requires an SCC that permits them.
     #[serde(default)]
     pub buildah_capabilities: bool,
+    /// Hostname to IP entries for names cluster DNS cannot answer: the loop pod's `hostAliases`
+    /// and, under the kubernetes driver, the sandbox supervisor's static hosts.
     #[serde(default)]
-    pub host_aliases: BTreeMap<String, String>,
+    pub host_aliases: SandboxHostAliases,
     /// Where a sandbox that asks for GPUs (`[agent.resources] gpus`) is scheduled: the GPU nodes'
     /// labels, their taints' tolerations, and the runtime class that exposes the devices. Applied
     /// only to GPU sandboxes. Takes effect under `sandbox_driver = "kubernetes"`.
@@ -243,13 +252,135 @@ pub struct Cluster {
     pub gpu_sandbox: crate::openshell::placement::GpuPlacement,
 }
 
+/// `[cluster].host_aliases`, checked against the rules the kubernetes driver applies to a
+/// sandbox's static hosts, so a profile it would refuse at `CreateSandbox` fails at render.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(try_from = "BTreeMap<String, String>")]
+pub struct SandboxHostAliases(BTreeMap<String, IpAddr>);
+
+/// A `[cluster].host_aliases` entry the driver would refuse.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HostAliasError {
+    #[error("host_aliases: {hostname:?} maps to {raw:?}, which is not an IP address")]
+    NotAnIp { hostname: String, raw: String },
+    #[error("host_aliases: {0:?} is not a valid DNS name")]
+    InvalidHostname(String),
+    #[error("host_aliases: {0:?} is an IP literal and needs no entry")]
+    IpLiteralHostname(String),
+    #[error(
+        "host_aliases: {0:?} is answered by the sandbox supervisor itself and cannot be overridden"
+    )]
+    ReservedHostname(String),
+    #[error(
+        "host_aliases: {hostname:?} maps to {address}, a loopback, link-local, unspecified, or \
+         multicast address no sandbox may reach"
+    )]
+    BlockedAddress { hostname: String, address: IpAddr },
+}
+
+/// Names the sandbox supervisor answers itself.
+const RESERVED_HOSTNAMES: &[&str] = &[
+    "localhost",
+    "policy.local",
+    "host.openshell.internal",
+    "host.containers.internal",
+    "host.docker.internal",
+];
+
+impl TryFrom<BTreeMap<String, String>> for SandboxHostAliases {
+    type Error = HostAliasError;
+
+    fn try_from(raw: BTreeMap<String, String>) -> Result<Self, Self::Error> {
+        let mut aliases = BTreeMap::new();
+        for (hostname, ip) in raw {
+            let address: IpAddr = ip.trim().parse().map_err(|_| HostAliasError::NotAnIp {
+                hostname: hostname.clone(),
+                raw: ip.clone(),
+            })?;
+            validate_alias_hostname(&hostname)?;
+            if openshell_core::net::is_always_blocked_ip(address) || address.is_multicast() {
+                return Err(HostAliasError::BlockedAddress { hostname, address });
+            }
+            aliases.insert(hostname, address);
+        }
+        Ok(Self(aliases))
+    }
+}
+
+fn validate_alias_hostname(raw: &str) -> Result<(), HostAliasError> {
+    let hostname = raw.trim_end_matches('.').to_ascii_lowercase();
+    if hostname.parse::<IpAddr>().is_ok() {
+        return Err(HostAliasError::IpLiteralHostname(raw.to_string()));
+    }
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if hostname.is_empty() || hostname.len() > 253 || !hostname.split('.').all(valid_label) {
+        return Err(HostAliasError::InvalidHostname(raw.to_string()));
+    }
+    if RESERVED_HOSTNAMES.contains(&hostname.as_str())
+        || openshell_core::net::is_known_metadata_hostname(&hostname)
+    {
+        return Err(HostAliasError::ReservedHostname(raw.to_string()));
+    }
+    Ok(())
+}
+
+impl SandboxHostAliases {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, IpAddr)> {
+        self.0.iter().map(|(hostname, ip)| (hostname.as_str(), *ip))
+    }
+
+    pub fn get(&self, hostname: &str) -> Option<IpAddr> {
+        self.0.get(hostname).copied()
+    }
+}
+
+/// Where the OpenShell image workflow pushes the sandbox runtime image, tagged `sha-<rev>`.
+pub const SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/neuralmagic/openshell-sandbox";
+
 impl Cluster {
+    /// The sandbox runtime image: `sandbox_runtime_image`, else [`SANDBOX_RUNTIME_IMAGE_REPO`] at
+    /// `sha-<rev>` for the OpenShell rev this binary compiled against. Fails when neither is
+    /// known (a build whose OpenShell dependency is not a git pin).
+    pub fn sandbox_runtime_image(&self) -> Result<String, NoSandboxRuntimeImage> {
+        match &self.sandbox_runtime_image {
+            Some(image) => Ok(image.clone()),
+            None => default_sandbox_runtime_image(crate::openshell::grpc::EXPECTED_GATEWAY_REV),
+        }
+    }
+
     /// The service account sandbox pods run as: `sandbox_service_account`, else the loop's.
     pub fn sandbox_service_account(&self) -> &str {
         self.sandbox_service_account
             .as_deref()
             .unwrap_or(&self.service_account)
     }
+}
+
+/// No sandbox runtime image to render: the profile names none and the build has no OpenShell rev.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "[cluster].sandbox_runtime_image is unset and this build has no pinned OpenShell rev to \
+     derive {SANDBOX_RUNTIME_IMAGE_REPO}:sha-<rev> from; set it in the profile"
+)]
+pub struct NoSandboxRuntimeImage;
+
+fn default_sandbox_runtime_image(rev: &str) -> Result<String, NoSandboxRuntimeImage> {
+    if rev == "unknown" {
+        return Err(NoSandboxRuntimeImage);
+    }
+    Ok(format!("{SANDBOX_RUNTIME_IMAGE_REPO}:sha-{rev}"))
 }
 
 /// `state_pvc = "name"` (existing claim) or a `[cluster.state_pvc]` template.
@@ -425,7 +556,7 @@ impl DeployProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::deploy::profile::*;
 
     const BASE: &str = r#"
         [cluster]
@@ -437,6 +568,43 @@ mod tests {
         loop = "registry.example.com/crucible-loop:latest"
         pull_secret = "quay-pull"
     "#;
+
+    #[test]
+    fn the_sandbox_runtime_image_defaults_to_the_pinned_rev() {
+        let profile: DeployProfile = toml::from_str(BASE).unwrap();
+        assert!(profile.cluster.sandbox_runtime_image.is_none());
+        assert_eq!(
+            default_sandbox_runtime_image("6648bd0c290efbc41ba131ee9831ee45cd431f94").unwrap(),
+            "ghcr.io/neuralmagic/openshell-sandbox:sha-6648bd0c290efbc41ba131ee9831ee45cd431f94"
+        );
+        let derived = profile.cluster.sandbox_runtime_image().unwrap();
+        assert_eq!(
+            derived,
+            format!(
+                "{SANDBOX_RUNTIME_IMAGE_REPO}:sha-{}",
+                crate::openshell::grpc::EXPECTED_GATEWAY_REV
+            )
+        );
+    }
+
+    #[test]
+    fn a_build_without_a_pinned_rev_needs_an_explicit_sandbox_runtime_image() {
+        let err = default_sandbox_runtime_image("unknown").unwrap_err();
+        assert!(err.to_string().contains("sandbox_runtime_image"), "{err:#}");
+    }
+
+    #[test]
+    fn an_explicit_sandbox_runtime_image_wins() {
+        let profile: DeployProfile = toml::from_str(&BASE.replace(
+            "[image]",
+            "sandbox_runtime_image = \"registry.example.com/sandbox:x\"\n[image]",
+        ))
+        .unwrap();
+        assert_eq!(
+            profile.cluster.sandbox_runtime_image().unwrap(),
+            "registry.example.com/sandbox:x"
+        );
+    }
 
     /// Every profile written before `avoid_nodes` existed must keep parsing, with an empty list.
     #[test]
@@ -466,12 +634,92 @@ mod tests {
         );
         let profile: DeployProfile = toml::from_str(&text).expect("profile parses");
         assert_eq!(
-            profile
-                .cluster
-                .host_aliases
-                .get("maas.example.com")
-                .map(String::as_str),
-            Some("10.0.0.1")
+            profile.cluster.host_aliases.get("maas.example.com"),
+            Some(IpAddr::from([10, 0, 0, 1]))
+        );
+    }
+
+    fn host_aliases(entries: &[(&str, &str)]) -> Result<SandboxHostAliases, HostAliasError> {
+        SandboxHostAliases::try_from(
+            entries
+                .iter()
+                .map(|(h, ip)| (h.to_string(), ip.to_string()))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    }
+
+    #[test]
+    fn host_aliases_the_driver_would_refuse_fail_at_parse() {
+        for (entry, want) in [
+            (("maas.example.com", "not-an-ip"), "is not an IP address"),
+            (("bad_name", "10.0.0.1"), "not a valid DNS name"),
+            (("-x.example.com", "10.0.0.1"), "not a valid DNS name"),
+            (("10.0.0.9", "10.0.0.1"), "IP literal"),
+            (
+                ("localhost", "10.0.0.1"),
+                "answered by the sandbox supervisor",
+            ),
+            (
+                ("policy.local", "10.0.0.1"),
+                "answered by the sandbox supervisor",
+            ),
+            (
+                ("Host.OpenShell.Internal.", "10.0.0.1"),
+                "answered by the sandbox supervisor",
+            ),
+            (
+                ("host.containers.internal", "10.0.0.1"),
+                "answered by the sandbox supervisor",
+            ),
+            (
+                ("host.docker.internal", "10.0.0.1"),
+                "answered by the sandbox supervisor",
+            ),
+            (
+                ("metadata.google.internal", "10.0.0.1"),
+                "answered by the sandbox supervisor",
+            ),
+            (("maas.example.com", "127.0.0.1"), "no sandbox may reach"),
+            (
+                ("maas.example.com", "169.254.169.254"),
+                "no sandbox may reach",
+            ),
+            (("maas.example.com", "0.0.0.0"), "no sandbox may reach"),
+            (("maas.example.com", "::1"), "no sandbox may reach"),
+            (("maas.example.com", "fe80::1"), "no sandbox may reach"),
+            (("maas.example.com", "224.0.0.1"), "no sandbox may reach"),
+        ] {
+            let err = host_aliases(&[entry]).unwrap_err().to_string();
+            assert!(err.contains(want), "{entry:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_routable_host_alias_parses_and_serializes_as_a_string_map() {
+        let aliases = host_aliases(&[
+            ("maas.example.com", "150.239.114.201"),
+            ("v6.example.com", "fd00::8"),
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&aliases).unwrap(),
+            serde_json::json!({"maas.example.com": "150.239.114.201", "v6.example.com": "fd00::8"})
+        );
+    }
+
+    #[test]
+    fn a_bad_host_alias_fails_the_profile_load() {
+        let text = BASE.replace(
+            "[image]",
+            "[cluster.host_aliases]\n\"host.openshell.internal\" = \"10.0.0.1\"\n\n[image]",
+        );
+        let err = toml::from_str::<DeployProfile>(&text)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("host.openshell.internal")),
+            "{err:?}"
         );
     }
 
