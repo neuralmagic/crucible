@@ -30,12 +30,46 @@ const CEILING_SLACK: Duration = Duration::from_secs(120);
 /// How many trailing output lines ride a failure that published no session.
 const TAIL_LINES: usize = 40;
 
-/// A launch running as a subprocess: the child, and the directory it runs in.
+/// A launch running as a subprocess: the child, its process group, and the directory it runs in.
 pub struct LocalRun {
     child: tokio::process::Child,
+    group: ProcessGroup,
     dir: PathBuf,
     run_id: String,
     deadline: Duration,
+}
+
+/// The process group a local run's engine leads, holding everything it spawned. Dropped armed, it
+/// SIGKILLs the group, so a run whose supervisor goes away (a controller shutdown, a run row that
+/// never committed) leaves no process behind.
+struct ProcessGroup(Option<nix::unistd::Pid>);
+
+impl ProcessGroup {
+    fn led_by(child: &tokio::process::Child) -> Result<Self> {
+        let pid = child
+            .id()
+            .context("the spawned engine was reaped before its process group was recorded")?;
+        let pid = i32::try_from(pid).with_context(|| format!("engine pid {pid} is not a pid_t"))?;
+        Ok(Self(Some(nix::unistd::Pid::from_raw(pid))))
+    }
+
+    /// Leave the group running: the engine exited on its own, and whatever it left behind is its
+    /// business.
+    fn release(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        let Some(pgid) = self.0 else { return };
+        match nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(e) => {
+                tracing::warn!(%pgid, error = %e, "killing a local run's process group failed")
+            }
+        }
+    }
 }
 
 /// Where the engine publishes its session log inside a local run's directory.
@@ -205,11 +239,15 @@ pub async fn start(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawning `{} plan run` for {run_id}", bin.display()))?;
+    let group = ProcessGroup::led_by(&child)?;
     tracing::info!(%issue_key, %run_id, dir = %dir.display(), "playbook launch running locally");
     Ok(Some(LocalRun {
         child,
+        group,
         dir,
         run_id: run_id.to_string(),
         deadline,
@@ -223,6 +261,7 @@ pub async fn start(
 pub async fn supervise(db: Db, key: String, run: LocalRun) {
     let LocalRun {
         mut child,
+        group,
         dir,
         run_id,
         deadline,
@@ -244,10 +283,17 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
     }
 
     let outcome = match tokio::time::timeout(deadline, child.wait()).await {
-        Ok(Ok(status)) => format!("engine exited {status}"),
-        Ok(Err(e)) => format!("waiting on the engine failed: {e}"),
+        Ok(Ok(status)) => {
+            group.release();
+            format!("engine exited {status}")
+        }
+        Ok(Err(e)) => {
+            drop(group);
+            format!("waiting on the engine failed: {e}")
+        }
         Err(_) => {
-            let _ = child.kill().await;
+            drop(group);
+            let _ = child.wait().await;
             format!(
                 "the engine outlived its ceiling by {}s and was killed",
                 CEILING_SLACK.as_secs()
@@ -531,8 +577,8 @@ mod tests {
         assert_eq!(looped.tracker_item("owner/repo#3"), Some("owner/repo#3"));
     }
 
-    use super::*;
     use crate::model::MaxTime;
+    use crate::runs::local_run::*;
 
     #[test]
     fn the_argv_is_the_pod_paths_flags_against_a_local_manifest() {
@@ -617,6 +663,65 @@ mod tests {
         assert!(gone.is_none(), "an unwritable dir keeps no log");
         let still = pump(BufReader::new(&b"tail\n"[..]), "r1", "stdout", gone).await;
         assert_eq!(still, vec!["tail"], "output still reaches the failure tail");
+    }
+
+    fn spawn_group_with_straggler() -> (tokio::process::Child, ProcessGroup) {
+        let child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 300 & echo $!; wait"])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn sh");
+        let group = ProcessGroup::led_by(&child).expect("the child has a pid");
+        (child, group)
+    }
+
+    async fn straggler_pid(child: &mut tokio::process::Child) -> nix::unistd::Pid {
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().expect("stdout is piped"))
+            .read_line(&mut line)
+            .await
+            .expect("read the background pid");
+        nix::unistd::Pid::from_raw(line.trim().parse().expect("a pid"))
+    }
+
+    fn alive(pid: nix::unistd::Pid) -> bool {
+        nix::sys::signal::kill(pid, None).is_ok()
+    }
+
+    /// A shutdown drops the supervisor mid-run: the engine and whatever it started go with it,
+    /// not just the direct child.
+    #[tokio::test]
+    async fn dropping_an_armed_process_group_kills_what_the_engine_spawned() {
+        let (mut child, group) = spawn_group_with_straggler();
+        let straggler = straggler_pid(&mut child).await;
+        assert!(alive(straggler), "the background sleep is running");
+        drop(group);
+        child.wait().await.expect("reap the killed leader");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while alive(straggler) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "pid {straggler} outlived its process group's kill"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_released_process_group_is_left_running() {
+        let (mut child, group) = spawn_group_with_straggler();
+        let straggler = straggler_pid(&mut child).await;
+        group.release();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(alive(straggler), "a released group is not signalled");
+        nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(i32::try_from(child.id().expect("running")).expect("pid")),
+            nix::sys::signal::Signal::SIGKILL,
+        )
+        .expect("clean up the group");
+        child.wait().await.expect("reap");
     }
 
     /// A run directory is per launch and safe to build from a run id, which carries the launch

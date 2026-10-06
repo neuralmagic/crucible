@@ -45,6 +45,8 @@ jiff.workspace = true
 # TTL caches: the ingest TokenReview accept/reject caches (sync), and the OIDC-mirror /
 # github-app single-flight refreshes (`future::Cache::get_with` coalesces concurrent inits).
 moka.workspace = true
+# Killing a local run's whole process group.
+nix = { version = "0.31.3", features = ["signal"] }
 # `sync` on top of the workspace feature set: the queue's coalescing state waits on
 # `tokio::sync::Notify`, and the daemon's graceful-shutdown signal is one too.
 tokio = { workspace = true, features = ["sync", "process"] }
