@@ -17,7 +17,12 @@ pub(crate) struct Claude;
 impl Claude {
     pub(crate) const SPEC: HarnessSpec = HarnessSpec {
         name: "claude",
-        binaries: &["/usr/local/bin/claude", "/usr/local/bin/opencode"],
+        binaries: &[
+            "/usr/local/bin/claude",
+            "/usr/local/lib/node_modules/@anthropic-ai/claude-code/**",
+            "/usr/local/bin/opencode",
+            "/usr/local/lib/node_modules/opencode-ai/**",
+        ],
         skills_dir: ".claude/skills",
         home_var: "CLAUDE_CONFIG_DIR",
         home: "/sandbox/.claude",

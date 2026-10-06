@@ -43,7 +43,12 @@ impl Pi {
         // `pi` is a node script, so the process that opens the socket is node itself (the
         // sandbox policy matches the kernel-resolved binary); the UBI rpm and a tarball install
         // put it in different places.
-        binaries: &["/usr/local/bin/pi", "/usr/bin/node", "/usr/local/bin/node"],
+        binaries: &[
+            "/usr/local/bin/pi",
+            "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent/**",
+            "/usr/bin/node",
+            "/usr/local/bin/node",
+        ],
         // Pi discovers project skills under `.agents/skills` (the Agent Skills layout).
         skills_dir: ".agents/skills",
         // Relocates settings, models.json, and the session store off `~/.pi/agent`.
