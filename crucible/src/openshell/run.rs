@@ -916,11 +916,6 @@ async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
 
 async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     use openshell_core::proto::ProviderCredentialRefreshStrategy;
-    // The STS refresh strategy is gated behind the gateway's providers-v2 global setting
-    // (default off). Idempotent flip; this gateway is crucible's own, booted per pod.
-    gw.set_global_bool_setting("providers_v2_enabled", true)
-        .await
-        .context("enabling providers_v2 on the gateway")?;
     if !gw.provider_exists(provider::AWS_PROVIDER_NAME).await {
         gw.create_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
             .await

@@ -768,27 +768,6 @@ impl Gateway {
             .map_err(Into::into)
     }
 
-    /// Flip one global gateway setting (`UpdateConfig`, global scope, single-key mutation).
-    /// Idempotent, re-setting the same value is a no-op server-side.
-    #[tracing::instrument(skip_all, fields(rpc = "update_config", setting = key))]
-    pub async fn set_global_bool_setting(&self, key: &str, value: bool) -> Result<()> {
-        use openshell_core::proto::{SettingValue, setting_value};
-        let mut client = self.client();
-        client
-            .update_config(UpdateConfigRequest {
-                global: true,
-                setting_key: key.to_string(),
-                setting_value: Some(SettingValue {
-                    value: Some(setting_value::Value::BoolValue(value)),
-                }),
-                ..Default::default()
-            })
-            .await
-            .map(|_| ())
-            .map_err(GrpcError::rpc(format!("update_config(setting {key})")))
-            .map_err(Into::into)
-    }
-
     /// Point a credential's refresh at an STS web-identity mint (`ConfigureProviderRefresh`).
     /// Configuring only STORES the refresh state, the worker mints on its next tick (≤60s), so
     /// follow with [`Gateway::rotate_provider_credential`] before the sandbox's first request
