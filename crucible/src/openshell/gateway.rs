@@ -75,9 +75,15 @@ pub fn client_tls_secret_name() -> String {
     secret_name(pod_identity().as_ref().map(|(name, _)| name.as_str()))
 }
 
+/// The client mTLS Secret name the gateway running in pod `pod` publishes. Deploy renders grant
+/// RBAC on exactly this name, so it is the single source for both.
+pub fn client_tls_secret_for_pod(pod: &str) -> String {
+    format!("{CLIENT_TLS_SECRET}-{pod}")
+}
+
 fn secret_name(pod: Option<&str>) -> String {
     match pod {
-        Some(pod) => format!("{CLIENT_TLS_SECRET}-{pod}"),
+        Some(pod) => client_tls_secret_for_pod(pod),
         None => CLIENT_TLS_SECRET.to_string(),
     }
 }
@@ -802,6 +808,10 @@ mod tests {
         let b = secret_name(Some("crucible-turn-router-2399-def"));
         assert_ne!(a, b, "concurrent turns must not share one secret");
         assert!(a.starts_with(CLIENT_TLS_SECRET));
+        assert_eq!(
+            a,
+            client_tls_secret_for_pod("crucible-turn-router-2316-abc")
+        );
         assert_eq!(secret_name(None), CLIENT_TLS_SECRET);
     }
 

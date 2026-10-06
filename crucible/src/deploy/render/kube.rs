@@ -1,7 +1,7 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
-use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, OTEL_COLLECTOR_PORT};
+use crate::openshell::gateway::{ComputeDriver, OTEL_COLLECTOR_PORT, client_tls_secret_for_pod};
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
@@ -481,6 +481,10 @@ pub(crate) fn agent_security_context(driver: ComputeDriver) -> Option<core::Secu
 }
 
 impl Renderer<'_> {
+    fn loop_pod_name(&self) -> String {
+        format!("{}-loop", self.input.name)
+    }
+
     /// Whether the loop pod runs buildah itself (`build_epp` / codegen builds). containerd's
     /// default AppArmor profile denies mount syscalls even inside a user namespace, which kills
     /// every in-pod build (storage init, layer extraction, chroot isolation), so those pods need
@@ -638,7 +642,7 @@ impl Renderer<'_> {
 
         Ok(core::Pod {
             metadata: ObjectMeta {
-                name: Some(format!("{}-loop", self.input.name)),
+                name: Some(self.loop_pod_name()),
                 namespace: Some(self.profile.cluster.loop_namespace.clone()),
                 annotations: Some(BTreeMap::from([(
                     "sidecar.istio.io/inject".to_string(),
@@ -1442,17 +1446,21 @@ exit $rc
     /// chart (`role.yaml`, `clusterrole.yaml`):
     ///
     ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs + event/pod reads +
-    ///     secret writes (the loop pod publishes the sandbox client-TLS Secret).
+    ///     secret `create` (the loop pod publishes the sandbox client-TLS Secret).
     ///  2. A `RoleBinding` granting that Role to the loop SA.
-    ///  3. A `ClusterRole`: `tokenreviews` (create) + `nodes` (get/list/watch).
+    ///  3. A `ClusterRole`: `tokenreviews` (create) + `nodes` (get/list/watch) + the sandbox
+    ///     namespace (get).
     ///  4. A `ClusterRoleBinding` granting it to the loop SA.
+    ///  5. A per-run `Role` + `RoleBinding`: get/patch on this run's loop pod client-TLS Secret.
     fn sandbox_rbac(&self) -> Vec<SandboxRbacObject> {
         let sa = &self.profile.cluster.service_account;
         let ns = &self.profile.cluster.loop_namespace;
         let role_name = format!("{sa}-sandbox");
         let cr_name = format!("{sa}-node-reader");
+        let loop_pod = self.loop_pod_name();
+        let tls_role_name = format!("{loop_pod}-client-tls");
 
-        // 1. Namespaced Role: sandbox CRD + events + pods + the published client-TLS secret.
+        // 1. Namespaced Role: sandbox CRD + events + pods + client-TLS secret creation.
         let role = rbac::Role {
             metadata: ObjectMeta {
                 name: Some(role_name.clone()),
@@ -1490,21 +1498,14 @@ exit $rc
                     ..Default::default()
                 },
                 // The loop pod publishes the client-TLS Secret sandbox pods mount to dial the
-                // gateway back over mTLS (server-side apply = create on first boot, patch on
-                // cert refresh). Two rules because RBAC can't constrain `create` by
-                // resourceNames (the name doesn't exist yet at admission), while get/patch
-                // stay pinned to the one Secret we own.
+                // gateway back over mTLS. Server-side apply authorizes as `patch` on the name
+                // plus `create` when it doesn't exist yet. RBAC can't constrain `create` by
+                // resourceNames, so it lives here; the name-pinned get/patch is the per-run
+                // Role below, since this Role is shared by every run under the SA.
                 rbac::PolicyRule {
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["secrets".to_string()]),
                     verbs: vec!["create".to_string()],
-                    ..Default::default()
-                },
-                rbac::PolicyRule {
-                    api_groups: Some(vec![String::new()]),
-                    resources: Some(vec!["secrets".to_string()]),
-                    resource_names: Some(vec![CLIENT_TLS_SECRET.to_string()]),
-                    verbs: vec!["get".to_string(), "patch".to_string()],
                     ..Default::default()
                 },
             ]),
@@ -1519,7 +1520,9 @@ exit $rc
             ns.clone(),
         );
 
-        // 3. ClusterRole: tokenreviews (IssueSandboxToken bootstrap) + nodes.
+        // 3. ClusterRole: tokenreviews (IssueSandboxToken bootstrap) + nodes + the sandbox
+        // namespace, whose OpenShift SCC annotations set the sandbox UID/GID. Without the
+        // namespace read the driver falls back to a default UID the SCC rejects.
         let cr = rbac::ClusterRole {
             metadata: ObjectMeta {
                 name: Some(cr_name.clone()),
@@ -1536,6 +1539,13 @@ exit $rc
                     api_groups: Some(vec![String::new()]),
                     resources: Some(vec!["nodes".to_string()]),
                     verbs: vec!["get".to_string(), "list".to_string(), "watch".to_string()],
+                    ..Default::default()
+                },
+                rbac::PolicyRule {
+                    api_groups: Some(vec![String::new()]),
+                    resources: Some(vec!["namespaces".to_string()]),
+                    resource_names: Some(vec![ns.clone()]),
+                    verbs: vec!["get".to_string()],
                     ..Default::default()
                 },
             ]),
@@ -1560,11 +1570,37 @@ exit $rc
             }]),
         };
 
+        // 5. Per-run Role: get/patch pinned to the Secret this run's gateway publishes.
+        let tls_role = rbac::Role {
+            metadata: ObjectMeta {
+                name: Some(tls_role_name.clone()),
+                namespace: Some(ns.clone()),
+                ..Default::default()
+            },
+            rules: Some(vec![rbac::PolicyRule {
+                api_groups: Some(vec![String::new()]),
+                resources: Some(vec!["secrets".to_string()]),
+                resource_names: Some(vec![client_tls_secret_for_pod(&loop_pod)]),
+                verbs: vec!["get".to_string(), "patch".to_string()],
+                ..Default::default()
+            }]),
+        };
+        let tls_rb = role_binding(
+            tls_role_name.clone(),
+            ns.clone(),
+            "Role",
+            &tls_role_name,
+            sa.clone(),
+            ns.clone(),
+        );
+
         vec![
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(rb),
             SandboxRbacObject::ClusterRole(cr),
             SandboxRbacObject::ClusterRoleBinding(crb),
+            SandboxRbacObject::Role(tls_role),
+            SandboxRbacObject::RoleBinding(tls_rb),
         ]
     }
 }
@@ -1832,14 +1868,14 @@ mod tests {
         .expect("render");
 
         // This profile runs the kubernetes sandbox driver, so the render also carries the
-        // sandbox CRD RBAC (Role + RoleBinding + ClusterRole + ClusterRoleBinding) alongside the base
-        // pod + edit RoleBinding + netpol.
+        // sandbox CRD RBAC (Role + RoleBinding + ClusterRole + ClusterRoleBinding + client-TLS
+        // Role + RoleBinding) alongside the base pod + edit RoleBinding + netpol.
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
         assert_eq!(
             docs.len(),
-            7,
+            9,
             "pod + edit RoleBinding + netpol + sandbox Role + sandbox RoleBinding + ClusterRole + \
-             ClusterRoleBinding: {yaml}"
+             ClusterRoleBinding + client-TLS Role + client-TLS RoleBinding: {yaml}"
         );
         assert!(docs[0].contains("kind: Pod"));
         assert!(docs[1].contains("kind: RoleBinding"));
@@ -3936,13 +3972,16 @@ mod tests {
         let profile = k8s_profile("");
         let yaml = render_k8s(&profile);
         let docs: Vec<&str> = yaml.split("\n---\n").collect();
-        // pod + edit RoleBinding + netpol + Role + sandbox RoleBinding + ClusterRole + ClusterRoleBinding
-        assert_eq!(docs.len(), 7, "7 docs for kubernetes: {yaml}");
+        // pod + edit RoleBinding + netpol + Role + sandbox RoleBinding + ClusterRole
+        // + ClusterRoleBinding + client-TLS Role + client-TLS RoleBinding
+        assert_eq!(docs.len(), 9, "9 docs for kubernetes: {yaml}");
 
         // The sandbox Role with the CRD verbs.
         let role_doc = docs
             .iter()
-            .find(|d| d.contains("kind: Role") && d.contains("sandbox"))
+            .find(|d| {
+                d.contains("kind: Role\n") && d.contains("name: autoresearch-publisher-sandbox")
+            })
             .expect("sandbox Role doc");
         assert!(
             role_doc.contains("agents.x-k8s.io"),
@@ -3967,11 +4006,9 @@ mod tests {
             role_doc.contains("secrets"),
             "secrets resource (the published client-TLS Secret): {role_doc}"
         );
-        // The split grant: unrestricted create (RBAC can't name-scope create), get/patch
-        // pinned to the client-TLS Secret.
         assert!(
-            role_doc.contains(CLIENT_TLS_SECRET),
-            "get/patch resourceNames-scoped to the client-TLS Secret: {role_doc}"
+            !role_doc.contains("resourceNames"),
+            "the shared Role pins no Secret name; that lives on the per-run Role: {role_doc}"
         );
         let secrets_create_unscoped = role_doc.split("- apiGroups").any(|rule| {
             rule.contains("secrets") && rule.contains("create") && !rule.contains("resourceNames")
@@ -4027,6 +4064,180 @@ mod tests {
         assert!(
             crb_doc.contains("autoresearch-publisher"),
             "subject SA: {crb_doc}"
+        );
+    }
+
+    fn docs_of_kind<'a>(yaml: &'a str, kind: &str) -> impl Iterator<Item = &'a str> {
+        let line = format!("kind: {kind}");
+        yaml.split("\n---\n")
+            .filter(move |d| d.lines().any(|l| l == line))
+    }
+
+    fn rendered_roles(yaml: &str) -> Vec<rbac::Role> {
+        docs_of_kind(yaml, "Role")
+            .map(|d| serde_norway::from_str(d).expect("Role parses"))
+            .collect()
+    }
+
+    fn secret_names_granted(roles: &[rbac::Role], verb: &str) -> Vec<String> {
+        roles
+            .iter()
+            .flat_map(|r| r.rules.iter().flatten())
+            .filter(|rule| {
+                rule.resources.iter().flatten().any(|res| res == "secrets")
+                    && rule.verbs.iter().any(|v| v == verb)
+            })
+            .flat_map(|rule| rule.resource_names.iter().flatten().cloned())
+            .collect()
+    }
+
+    #[test]
+    fn the_role_grants_get_and_patch_on_the_secret_the_loop_pod_gateway_publishes() {
+        let yaml = render_k8s(&k8s_profile(""));
+        let pod: core::Pod =
+            serde_norway::from_str(docs_of_kind(&yaml, "Pod").next().expect("loop Pod doc"))
+                .expect("Pod parses");
+        let pod_name = pod.metadata.name.clone().expect("loop pod name");
+        let env = pod
+            .spec
+            .as_ref()
+            .expect("pod spec")
+            .containers
+            .iter()
+            .find(|c| c.name == "loop")
+            .and_then(|c| c.env.clone())
+            .expect("loop env");
+        let pod_name_env = env
+            .iter()
+            .find(|e| e.name == crucible_contract::ENV_POD_NAME)
+            .expect("the gateway reads its pod name from the downward API");
+        assert_eq!(
+            pod_name_env
+                .value_from
+                .as_ref()
+                .and_then(|v| v.field_ref.as_ref())
+                .map(|f| f.field_path.as_str()),
+            Some("metadata.name"),
+        );
+
+        let published = client_tls_secret_for_pod(&pod_name);
+        assert_eq!(published, "crucible-openshell-client-tls-alpha-loop");
+        let roles = rendered_roles(&yaml);
+        for verb in ["get", "patch"] {
+            assert_eq!(
+                secret_names_granted(&roles, verb),
+                vec![published.clone()],
+                "{verb} must be pinned to exactly the published Secret: {yaml}"
+            );
+        }
+        assert!(
+            roles
+                .iter()
+                .all(|r| r.metadata.namespace.as_deref() == Some("autoresearch")),
+            "the Secret is published into the loop namespace, so the grant must live there"
+        );
+
+        let tls_role = roles
+            .iter()
+            .find(|r| secret_names_granted(std::slice::from_ref(*r), "patch").contains(&published))
+            .expect("per-run client-TLS Role");
+        let tls_role_name = tls_role.metadata.name.clone().expect("role name");
+        let binding: rbac::RoleBinding = serde_norway::from_str(
+            docs_of_kind(&yaml, "RoleBinding")
+                .find(|d| d.contains(&format!("name: {tls_role_name}\n")))
+                .expect("client-TLS RoleBinding"),
+        )
+        .expect("RoleBinding parses");
+        assert_eq!(binding.role_ref.kind, "Role");
+        assert_eq!(binding.role_ref.name, tls_role_name);
+        let subjects = binding.subjects.expect("subjects");
+        assert_eq!(subjects.len(), 1);
+        assert_eq!(subjects[0].name, "autoresearch-publisher");
+        assert_eq!(subjects[0].namespace.as_deref(), Some("autoresearch"));
+    }
+
+    #[test]
+    fn concurrent_runs_render_distinct_client_tls_grants_and_an_identical_shared_role() {
+        let render_named = |name: &str| {
+            let manifest = k8s_manifest();
+            let input = RenderInput::from_manifest(&manifest, name).expect("render input");
+            render(
+                input,
+                std::path::Path::new("/opt/crucible/domains/alpha"),
+                "crucible.toml",
+                &k8s_profile(""),
+                &RenderOpts {
+                    iterations: 1,
+                    max_cost: 0.0,
+                    digests: None,
+                    pr_repo: None,
+                    pack: None,
+                    clusters_file: None,
+                    harness: None,
+                    model: None,
+                    playbook: None,
+                },
+            )
+            .expect("render")
+        };
+        let a = rendered_roles(&render_named("alpha"));
+        let b = rendered_roles(&render_named("beta"));
+        let shared = |roles: &[rbac::Role]| {
+            roles
+                .iter()
+                .find(|r| r.metadata.name.as_deref() == Some("autoresearch-publisher-sandbox"))
+                .cloned()
+                .expect("shared sandbox Role")
+        };
+        assert_eq!(
+            shared(&a),
+            shared(&b),
+            "the shared Role is applied by every run; any per-run content would clobber the others"
+        );
+        assert_eq!(
+            secret_names_granted(&a, "patch"),
+            vec![client_tls_secret_for_pod("alpha-loop")]
+        );
+        assert_eq!(
+            secret_names_granted(&b, "patch"),
+            vec![client_tls_secret_for_pod("beta-loop")]
+        );
+        let tls_role_names = |roles: &[rbac::Role]| -> Vec<String> {
+            roles
+                .iter()
+                .filter_map(|r| r.metadata.name.clone())
+                .filter(|n| n != "autoresearch-publisher-sandbox")
+                .collect()
+        };
+        assert_eq!(
+            tls_role_names(&a),
+            vec!["alpha-loop-client-tls".to_string()]
+        );
+        assert_eq!(tls_role_names(&b), vec!["beta-loop-client-tls".to_string()]);
+    }
+
+    #[test]
+    fn the_cluster_role_reads_only_the_sandbox_namespace() {
+        let yaml = render_k8s(&k8s_profile(""));
+        let cr: rbac::ClusterRole = serde_norway::from_str(
+            docs_of_kind(&yaml, "ClusterRole")
+                .next()
+                .expect("ClusterRole doc"),
+        )
+        .expect("ClusterRole parses");
+        let ns_rules: Vec<_> = cr
+            .rules
+            .iter()
+            .flatten()
+            .filter(|r| r.resources.iter().flatten().any(|res| res == "namespaces"))
+            .collect();
+        assert_eq!(ns_rules.len(), 1, "one namespaces rule: {yaml}");
+        assert_eq!(ns_rules[0].api_groups, Some(vec![String::new()]));
+        assert_eq!(ns_rules[0].verbs, vec!["get".to_string()]);
+        assert_eq!(
+            ns_rules[0].resource_names,
+            Some(vec!["autoresearch".to_string()]),
+            "pinned to the namespace CRUCIBLE_SANDBOX_NAMESPACE names"
         );
     }
 
