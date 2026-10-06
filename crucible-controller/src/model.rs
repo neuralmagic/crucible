@@ -176,6 +176,9 @@ pub enum ParkReason {
     /// The pack's sandbox image failed the capability preflight at dispatch. Deterministic until
     /// the pack, its image, or the dispatch default changes.
     ImagePreflightRefused { image: String, detail: String },
+    /// The launch's pack is legacy bytes that cannot be a tree. Deterministic: the same bytes are
+    /// refused on every attempt.
+    PackUnconvertible { digest: String, reason: String },
     /// A playbook launch's stored row is gone, so there is nothing to dispatch. Never expected —
     /// the row is written in the same transaction as the issue — but a launch must not run on
     /// guessed values, so the row parks instead.
@@ -290,6 +293,9 @@ impl std::fmt::Display for ParkReason {
             Self::PlaybookLaunchMissing => {
                 write!(f, "playbook launch row is missing; nothing to run")
             }
+            Self::PackUnconvertible { digest, reason } => {
+                write!(f, "pack {digest} is unconvertible: {reason}")
+            }
             Self::UnsupportedTurnOption { option } => {
                 write!(f, "unsupported turn option: {option}")
             }
@@ -364,6 +370,14 @@ impl ParkReason {
                 image: image.to_string(),
                 engine_version: engine_version.to_string(),
                 controller_version: controller_version.to_string(),
+            };
+        }
+        if let Some(rest) = s.strip_prefix("pack ")
+            && let Some((digest, reason)) = rest.split_once(" is unconvertible: ")
+        {
+            return Self::PackUnconvertible {
+                digest: digest.to_string(),
+                reason: reason.to_string(),
             };
         }
         if let Some(evidence) = s.strip_prefix("image build failed: ") {

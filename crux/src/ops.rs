@@ -10,6 +10,7 @@ use crate::client::{AdoptBody, Client, DraftSave, encode};
 use crate::dto;
 use crate::render;
 use anyhow::{Context, Result, bail};
+use crucible_contract::pack_tree::{TreeDigest, walk_dir};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -509,31 +510,49 @@ pub async fn draft_save(
     files: &std::collections::BTreeMap<String, String>,
     as_json: bool,
 ) -> Result<String> {
-    match c.save_draft(draft_id, files, base_version).await? {
+    save_reporting(c, draft_id, base_version, files, None, as_json).await
+}
+
+/// A save, and when it came from a directory, what that directory read as.
+async fn save_reporting(
+    c: &Client,
+    draft_id: &str,
+    base_version: i64,
+    files: &std::collections::BTreeMap<String, String>,
+    local: Option<&LocalPack>,
+    as_json: bool,
+) -> Result<String> {
+    let (mut raw, text) = match c.save_draft(draft_id, files, base_version).await? {
         DraftSave::Saved(mut raw) => {
             let saved: dto::DraftCompile = serde_json::from_value(raw.clone())?;
             let url = studio_url(c, draft_id);
-            if as_json {
-                if let Some(obj) = raw.as_object_mut() {
-                    obj.insert("studio_url".to_string(), Value::String(url));
-                }
-                return json(&raw);
+            let text = render::draft_saved(draft_id, &saved, &url);
+            if let Some(obj) = raw.as_object_mut() {
+                obj.insert("studio_url".to_string(), Value::String(url));
             }
-            Ok(render::draft_saved(draft_id, &saved, &url))
+            (raw, text)
         }
-        DraftSave::Stale(stale) => {
-            if as_json {
-                return json(&serde_json::to_value(serde_json::json!({
-                    "error": stale.error,
-                    "base_version": stale.base_version,
-                    "current_version": stale.current_version,
-                    "saved_by": stale.saved_by,
-                    "saved_at": stale.saved_at,
-                }))?);
-            }
-            Ok(render::stale_base(draft_id, &stale))
+        DraftSave::Stale(stale) => (
+            serde_json::json!({
+                "error": stale.error,
+                "base_version": stale.base_version,
+                "current_version": stale.current_version,
+                "saved_by": stale.saved_by,
+                "saved_at": stale.saved_at,
+            }),
+            render::stale_base(draft_id, &stale),
+        ),
+    };
+    if as_json {
+        if let (Some(local), Some(obj)) = (local, raw.as_object_mut()) {
+            local.insert_into(obj);
         }
+        return json(&raw);
     }
+    Ok(match local {
+        Some(local) => text + &render::local_pack(&local.digest, &local.ignored),
+        None => text,
+    })
 }
 
 pub async fn playbook_caps(c: &Client, as_json: bool) -> Result<String> {
@@ -732,20 +751,29 @@ pub async fn draft_pull(
             .with_context(|| format!("writing {}", target.display()))?;
         written.push(path.clone());
     }
+    let local = read_pack_dir(dir).with_context(|| {
+        format!(
+            "wrote version {} into {}, but a push cannot send that directory back",
+            pulled.version,
+            dir.display()
+        )
+    })?;
     if as_json {
-        return json(&serde_json::json!({
+        let mut out = serde_json::json!({
             "draft_id": draft_id,
             "version": pulled.version,
             "dir": dir.to_string_lossy(),
             "files": written,
-        }));
+        });
+        if let Some(obj) = out.as_object_mut() {
+            local.insert_into(obj);
+        }
+        return json(&out);
     }
-    Ok(render::draft_pulled(
-        draft_id,
-        pulled.version,
-        dir,
-        &written,
-    ))
+    Ok(
+        render::draft_pulled(draft_id, pulled.version, dir, &written)
+            + &render::local_pack(&local.digest, &local.ignored),
+    )
 }
 
 /// Save a directory back as the next draft version. The whole tree is the save, so a file deleted
@@ -757,53 +785,70 @@ pub async fn draft_push(
     base_version: i64,
     as_json: bool,
 ) -> Result<String> {
-    let files = read_pack_dir(dir)?;
-    if files.is_empty() {
+    let local = read_pack_dir(dir)?;
+    if local.files.is_empty() {
         bail!(
             "{} holds no files; a save with none would empty the pack",
             dir.display()
         );
     }
-    draft_save(c, draft_id, base_version, &files, as_json).await
+    save_reporting(
+        c,
+        draft_id,
+        base_version,
+        &local.files,
+        Some(&local),
+        as_json,
+    )
+    .await
 }
 
-/// A pack directory as the `{path: content}` map a save is. Symlinks and non-text files are
-/// refused rather than followed or dropped: a save is the whole tree, and a file this cannot carry
-/// is a file the save would delete.
-fn read_pack_dir(dir: &Path) -> Result<BTreeMap<String, String>> {
-    let mut files = BTreeMap::new();
-    let mut stack = vec![PathBuf::new()];
-    while let Some(relative) = stack.pop() {
-        let here = dir.join(&relative);
-        let entries =
-            std::fs::read_dir(&here).with_context(|| format!("reading {}", here.display()))?;
-        for entry in entries {
-            let entry = entry.with_context(|| format!("reading an entry of {}", here.display()))?;
-            let name = entry.file_name();
-            let child = relative.join(&name);
-            let kind = entry
-                .file_type()
-                .with_context(|| format!("stat {}", entry.path().display()))?;
-            if kind.is_symlink() {
-                bail!(
-                    "{} is a symlink; a pack holds regular files only",
-                    child.display()
-                );
-            }
-            if kind.is_dir() {
-                stack.push(child);
-                continue;
-            }
-            let path = child.to_string_lossy().to_string();
-            pack_relative(&path)?;
-            let bytes = std::fs::read(entry.path())
-                .with_context(|| format!("reading {}", entry.path().display()))?;
-            let text = String::from_utf8(bytes)
-                .with_context(|| format!("{path} is not text, so it cannot be saved as a draft"))?;
-            files.insert(path, text);
-        }
+/// A pack directory read the way the controller and the engine read one.
+#[derive(Debug)]
+struct LocalPack {
+    /// The `{path: content}` map a save is, `/`-separated whatever the platform.
+    files: BTreeMap<String, String>,
+    digest: TreeDigest,
+    /// The `state`, `workspace` and `.git` paths skipped, which a save never carries.
+    ignored: Vec<String>,
+}
+
+impl LocalPack {
+    fn insert_into(&self, obj: &mut serde_json::Map<String, Value>) {
+        obj.insert(
+            "local_tree_digest".to_string(),
+            Value::String(self.digest.to_string()),
+        );
+        obj.insert(
+            "ignored".to_string(),
+            Value::Array(self.ignored.iter().cloned().map(Value::String).collect()),
+        );
     }
-    Ok(files)
+}
+
+/// A pack directory as the save it is. Symlinks and non-text files are refused rather than
+/// followed or dropped: a save is the whole tree, and a file this cannot carry is a file the save
+/// would delete.
+fn read_pack_dir(dir: &Path) -> Result<LocalPack> {
+    let read = walk_dir(dir).with_context(|| format!("reading the pack in {}", dir.display()))?;
+    let digest = read.tree.digest();
+    let files = read
+        .tree
+        .into_files()
+        .into_iter()
+        .map(|(path, bytes)| {
+            let path = path.to_string();
+            match String::from_utf8(bytes) {
+                Ok(text) => Ok((path, text)),
+                Err(_) => bail!("{path} is not text, so it cannot be saved as a draft"),
+            }
+        })
+        .collect::<Result<_>>()?;
+    Ok(LocalPack {
+        files,
+        digest,
+        ignored: read.ignored,
+    })
 }
 
 fn import_preview_path(import_id: &str, id: Option<&str>, description: Option<&str>) -> String {
@@ -1034,7 +1079,7 @@ pub async fn webhook_preview(c: &Client, file: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::ops::*;
 
     /// The proposer's naming rides the link so the admin opens the review page on what the agent
     /// decided, rather than retyping it. An id it never supplied must not appear as an empty one.
@@ -1090,19 +1135,85 @@ mod tests {
         std::fs::create_dir_all(root.join("skills/read")).expect("mkdir");
         std::fs::write(root.join("crucible.toml"), "[workflow]\n").expect("write");
         std::fs::write(root.join("skills/read/SKILL.md"), "read it\n").expect("write");
-        let files = read_pack_dir(root).expect("read");
+        let local = read_pack_dir(root).expect("read");
         assert_eq!(
-            files.keys().cloned().collect::<Vec<_>>(),
+            local.files.keys().cloned().collect::<Vec<_>>(),
             vec![
                 "crucible.toml".to_string(),
                 "skills/read/SKILL.md".to_string()
             ]
         );
-        assert_eq!(files["skills/read/SKILL.md"], "read it\n");
+        assert_eq!(local.files["skills/read/SKILL.md"], "read it\n");
+        assert!(local.ignored.is_empty(), "{:?}", local.ignored);
 
         std::os::unix::fs::symlink("/etc/passwd", root.join("sneaky")).expect("symlink");
         let refused = read_pack_dir(root).expect_err("a symlink is not a pack file");
-        assert!(format!("{refused:#}").contains("symlink"), "{refused:#}");
+        assert!(
+            format!("{refused:#}").contains("sneaky is a symbolic link"),
+            "{refused:#}"
+        );
+    }
+
+    /// `state`, `workspace` and `.git` subtrees are skipped at any depth and listed, a symlink
+    /// inside one is never looked at, and the digest is the one the controller computes for the
+    /// same files.
+    #[test]
+    fn a_pack_directory_skips_and_lists_runtime_subtrees() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("skills/read/state")).expect("mkdir");
+        std::fs::create_dir_all(root.join("workspace")).expect("mkdir");
+        std::fs::create_dir_all(root.join(".git")).expect("mkdir");
+        std::fs::write(root.join("crucible.toml"), "[workflow]\n").expect("write");
+        std::fs::write(root.join("skills/read/SKILL.md"), "read it\n").expect("write");
+        std::fs::write(root.join("skills/read/state/cursor"), [0xff, 0xfe]).expect("write");
+        std::fs::write(root.join("workspace/main.go"), "package main\n").expect("write");
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").expect("write");
+        std::os::unix::fs::symlink("/etc/passwd", root.join("workspace/link")).expect("symlink");
+
+        let local = read_pack_dir(root).expect("read");
+        assert_eq!(
+            local.files.keys().cloned().collect::<Vec<_>>(),
+            vec![
+                "crucible.toml".to_string(),
+                "skills/read/SKILL.md".to_string()
+            ]
+        );
+        assert_eq!(local.ignored, [".git", "skills/read/state", "workspace"]);
+        let expected = crucible_contract::pack_tree::PackTree::from_pairs(&[
+            ("crucible.toml", b"[workflow]\n"),
+            ("skills/read/SKILL.md", b"read it\n"),
+        ])
+        .expect("tree");
+        assert_eq!(local.digest, expected.digest());
+
+        let rendered = render::local_pack(&local.digest, &local.ignored);
+        assert_eq!(
+            rendered,
+            format!(
+                "local tree: {}\nignored: .git, skills/read/state, workspace\n",
+                expected.digest()
+            )
+        );
+        assert_eq!(
+            render::local_pack(&local.digest, &[]),
+            format!("local tree: {}\n", expected.digest())
+        );
+    }
+
+    /// A file that is not text cannot ride a save's `{path: content}` map, so it is refused by
+    /// name rather than dropped.
+    #[test]
+    fn a_pack_directory_refuses_a_binary_file_by_name() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        std::fs::write(root.join("crucible.toml"), "[workflow]\n").expect("write");
+        std::fs::write(root.join("blob.bin"), [0xff, 0xfe, 0x00]).expect("write");
+        let refused = read_pack_dir(root).expect_err("a binary file is not a draft file");
+        assert!(
+            format!("{refused:#}").contains("blob.bin is not text"),
+            "{refused:#}"
+        );
     }
 
     /// The round trip the subcommands are: pull a version into a directory, edit it there, and
@@ -1189,6 +1300,16 @@ mod tests {
             .expect("pull");
         assert!(pulled.contains("version 4"), "{pulled}");
         assert!(pulled.contains("base_version=4"), "{pulled}");
+        let pulled_tree = crucible_contract::pack_tree::PackTree::from_pairs(&[
+            ("crucible.toml", b"[workflow]\n"),
+            ("skills/read/SKILL.md", b"read it\n"),
+        ])
+        .expect("tree");
+        assert!(
+            pulled.contains(&format!("local tree: {}\n", pulled_tree.digest())),
+            "{pulled}"
+        );
+        assert!(!pulled.contains("ignored:"), "{pulled}");
         assert_eq!(
             std::fs::read_to_string(root.join("skills/read/SKILL.md")).expect("pulled file"),
             "read it\n"
@@ -1196,10 +1317,24 @@ mod tests {
 
         std::fs::write(root.join("workflow.star"), "params = {}\n").expect("write");
         std::fs::remove_file(root.join("skills/read/SKILL.md")).expect("delete");
+        std::fs::create_dir_all(root.join("state")).expect("mkdir");
+        std::fs::write(root.join("state/run.json"), "{}").expect("write");
+        let pushed_tree = crucible_contract::pack_tree::PackTree::from_pairs(&[
+            ("crucible.toml", b"[workflow]\n"),
+            ("workflow.star", b"params = {}\n"),
+        ])
+        .expect("tree");
         let pushed = draft_push(&client, "studio", &root, 4, false)
             .await
             .expect("push");
         assert!(pushed.contains("version 5"), "{pushed}");
+        assert!(
+            pushed.ends_with(&format!(
+                "local tree: {}\nignored: state\n",
+                pushed_tree.digest()
+            )),
+            "{pushed}"
+        );
         let landed = {
             let saved = saved.lock().expect("lock");
             assert_eq!(saved.len(), 1);
@@ -1211,14 +1346,44 @@ mod tests {
             "the whole tree is the save, so a deleted file is deleted"
         );
 
+        let pushed: Value = serde_json::from_str(
+            &draft_push(&client, "studio", &root, 4, true)
+                .await
+                .expect("push"),
+        )
+        .expect("json");
+        assert_eq!(pushed["version"], 5);
+        assert_eq!(
+            pushed["local_tree_digest"],
+            pushed_tree.digest().to_string()
+        );
+        assert_eq!(pushed["ignored"], serde_json::json!(["state"]));
+        assert_eq!(saved.lock().expect("lock").len(), 2);
+
         let refused = draft_push(&client, "studio", &root, 3, false)
             .await
             .expect("a stale base is a refusal, not an error");
         assert!(refused.starts_with("REFUSED:"), "{refused}");
         assert!(refused.contains("base_version=4"), "{refused}");
+        assert!(
+            refused.contains(&format!("local tree: {}", pushed_tree.digest())),
+            "{refused}"
+        );
+        let refused: Value = serde_json::from_str(
+            &draft_push(&client, "studio", &root, 3, true)
+                .await
+                .expect("a stale base is a refusal, not an error"),
+        )
+        .expect("json");
+        assert_eq!(refused["current_version"], 4);
+        assert_eq!(
+            refused["local_tree_digest"],
+            pushed_tree.digest().to_string()
+        );
+        assert_eq!(refused["ignored"], serde_json::json!(["state"]));
         assert_eq!(
             saved.lock().expect("lock").len(),
-            1,
+            2,
             "the stale push wrote nothing"
         );
     }

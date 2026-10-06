@@ -31,6 +31,7 @@ use crucible_contract::decision::{
     Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId,
 };
 use crucible_contract::inference::{InferenceRole, ResolvedInference};
+use crucible_contract::session::TaskRepair;
 
 /// What the substrate can measure. Missing caps truncate the plan fail-closed.
 #[derive(Clone, Debug, Default)]
@@ -131,7 +132,10 @@ impl AttemptOutcome {
 
 pub struct Attempt {
     pub outcome: AttemptOutcome,
+    /// What the attempt cost, its repair turns included.
     pub cost_usd: f64,
+    /// The repair turns this attempt took, in order.
+    pub repairs: Vec<TaskRepair>,
 }
 
 impl Attempt {
@@ -139,6 +143,7 @@ impl Attempt {
         Self {
             outcome: AttemptOutcome::fail(note),
             cost_usd,
+            repairs: Vec::new(),
         }
     }
 
@@ -146,6 +151,7 @@ impl Attempt {
         Self {
             outcome: AttemptOutcome::Transport(TransportFailure::new(cause, note)),
             cost_usd: 0.0,
+            repairs: Vec::new(),
         }
     }
 
@@ -153,6 +159,7 @@ impl Attempt {
         Self {
             outcome: AttemptOutcome::TimedOut(deadline),
             cost_usd,
+            repairs: Vec::new(),
         }
     }
 }
@@ -207,6 +214,10 @@ pub trait TaskRunner {
     /// Discard any file set published under `task`'s name. Called when a task settles without
     /// producing evidence, so a set from an earlier run cannot outlive its producer's silence.
     fn drop_captured(&mut self, _task: &Task) {}
+
+    /// What the run may still spend, called before each dispatch. A runner that takes repair
+    /// turns starts none once an attempt's own spend reaches it; the default takes none.
+    fn budget_left(&mut self, _usd: f64) {}
 
     fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
         batch
@@ -430,6 +441,9 @@ pub struct TaskResult {
     /// Present exactly when `status` is [`TaskStatus::Transport`]: what the last attempt died on.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<TransportCause>,
+    /// The repair turns the settling attempt took. Their cost is part of `cost_usd`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repairs: Vec<TaskRepair>,
 }
 
 impl TaskResult {
@@ -459,6 +473,7 @@ impl TaskResult {
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         }
     }
 }
@@ -955,6 +970,7 @@ pub fn execute(
                         fanout: None,
                         blocked: None,
                         transport: None,
+                        repairs: Vec::new(),
                     };
                     record(
                         &mut *runner,
@@ -2168,6 +2184,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
             passed,
             failed,
         }),
+        repairs: Vec::new(),
     }
 }
 
@@ -2243,25 +2260,61 @@ fn enforce_emits(task: &Task, outcome: AttemptOutcome) -> AttemptOutcome {
 /// The first way a passing output breaks its declared emits: a missing field, or a field whose
 /// value is not of its declared type.
 fn emits_violation(emits: &crate::plan::ir::Emits, value: &Value) -> Option<String> {
-    emits.fields().into_iter().find_map(|(field, ty)| {
-        let Some(found) = value.get(&field.0) else {
-            return Some(format!("output missing declared field {:?}", field.0));
-        };
-        let ty = ty.filter(|ty| !ty.admits(found))?;
-        if let Some(why) = ty.link_refusal(found) {
-            return Some(format!("output field {:?} declared {ty}: {why}", field.0));
-        }
-        Some(match (ty, found) {
-            (crucible_contract::emits::FieldType::OneOf(_), Value::String(label)) => {
-                format!("output field {:?} is {label:?}, declared {ty}", field.0)
+    emits_violations(emits, value, Echo::Label)
+        .into_iter()
+        .next()
+}
+
+/// Whether a violation note may repeat the label a field held.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Echo {
+    Label,
+    Masked,
+}
+
+/// Every way a passing output breaks its declared emits, in field order.
+pub fn emits_violations(emits: &crate::plan::ir::Emits, value: &Value, echo: Echo) -> Vec<String> {
+    emits
+        .fields()
+        .into_iter()
+        .filter_map(|(field, ty)| {
+            let Some(found) = value.get(&field.0) else {
+                return Some(format!("output missing declared field {:?}", field.0));
+            };
+            let ty = ty.filter(|ty| !ty.admits(found))?;
+            if let Some(why) = ty.link_refusal(found) {
+                return Some(format!("output field {:?} declared {ty}: {why}", field.0));
             }
-            _ => format!(
-                "output field {:?} is {}, declared {ty}",
-                field.0,
-                crucible_contract::emits::value_type(found)
-            ),
+            if let crucible_contract::emits::FieldType::Schema(schema) = ty
+                && let Some(why) = schema.refusal(found)
+            {
+                return Some(format!(
+                    "output field {:?} does not match its schema: {why}",
+                    field.0
+                ));
+            }
+            Some(match (ty, found, echo) {
+                (
+                    crucible_contract::emits::FieldType::OneOf(_),
+                    Value::String(label),
+                    Echo::Label,
+                ) => {
+                    format!("output field {:?} is {label:?}, declared {ty}", field.0)
+                }
+                (crucible_contract::emits::FieldType::OneOf(_), Value::String(_), Echo::Masked) => {
+                    format!(
+                        "output field {:?} is a string outside its labels, declared {ty}",
+                        field.0
+                    )
+                }
+                _ => format!(
+                    "output field {:?} is {}, declared {ty}",
+                    field.0,
+                    crucible_contract::emits::value_type(found)
+                ),
+            })
         })
-    })
+        .collect()
 }
 
 /// A finished attempt as the task's result, or the transport note when it should be retried.
@@ -2269,6 +2322,7 @@ fn settle_attempt(
     outcome: AttemptOutcome,
     attempts: u32,
     cost_usd: f64,
+    repairs: Vec<TaskRepair>,
 ) -> Result<(TaskResult, TaskEvent), TransportFailure> {
     let (status, output, note, event) = match outcome {
         AttemptOutcome::Pass(output) => (TaskStatus::Pass, Some(output), None, TaskEvent::Passed),
@@ -2299,6 +2353,7 @@ fn settle_attempt(
             fanout: None,
             blocked: None,
             transport: None,
+            repairs,
         },
         event,
     ))
@@ -2334,6 +2389,7 @@ fn transport_result(
             fanout: None,
             blocked: None,
             transport: Some(failure.cause),
+            repairs: Vec::new(),
         },
         event,
     )
@@ -2357,13 +2413,14 @@ fn run_with_retries(
     while attempts < max_attempts {
         attempts += 1;
         let deadline = Deadline::for_attempt(Instant::now(), t.timeout, run_ceiling);
+        runner.budget_left(budget - *spent);
         let a = runner.run(t, attempts, inputs, deadline);
         cost += a.cost_usd;
         *spent += a.cost_usd;
         let outcome = enforce_emits(t, a.outcome);
         let mut overrun = Overrun::of(&outcome);
         overrun.budget = *spent > budget;
-        match settle_attempt(outcome, attempts, cost) {
+        match settle_attempt(outcome, attempts, cost, a.repairs) {
             Ok((result, event)) => return (result, event, overrun),
             Err(failure) => {
                 if *spent > budget || (*spent >= budget && attempts < max_attempts) {
@@ -2413,6 +2470,7 @@ fn run_batch_with_retries<'a>(
                 deadline: Deadline::for_attempt(now, b.task.timeout, run_ceiling),
             })
             .collect();
+        runner.budget_left(budget - *spent);
         let attempts = runner.run_many(&items);
         let mut attempted = Vec::new();
         for ((idx, item), a) in wave.into_iter().zip(attempts) {
@@ -2420,13 +2478,13 @@ fn run_batch_with_retries<'a>(
             cost_so_far[idx] += a.cost_usd;
             let outcome = enforce_emits(item.task, a.outcome);
             overrun.time |= Overrun::of(&outcome).time;
-            attempted.push((idx, item, outcome));
+            attempted.push((idx, item, outcome, a.repairs));
         }
         let retry_budget_blocked = *spent >= budget;
         overrun.budget |= *spent > budget;
         let mut next: Vec<(usize, BatchItem<'a>)> = Vec::new();
-        for (idx, item, outcome) in attempted {
-            match settle_attempt(outcome, item.attempt, cost_so_far[idx]) {
+        for (idx, item, outcome, repairs) in attempted {
+            match settle_attempt(outcome, item.attempt, cost_so_far[idx], repairs) {
                 Ok(settled) => {
                     done.insert(idx, settled);
                 }
@@ -2538,6 +2596,7 @@ fn decide_from_output(
         fanout: None,
         blocked: None,
         transport: None,
+        repairs: Vec::new(),
     };
     let Some(output) = inputs.get(source) else {
         return fail(format!("source {source} contributed no output"));
@@ -2589,6 +2648,7 @@ fn decide_from_output(
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         },
         Err(e) => fail(format!("encoding the decision: {e}")),
     }
@@ -2609,6 +2669,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
                     fanout: None,
                     blocked: None,
                     transport: None,
+                    repairs: Vec::new(),
                 };
             }
         }
@@ -2631,6 +2692,7 @@ fn reduce_top_k(inputs: &BTreeMap<TaskName, Value>, k: u32, direction: Direction
         fanout: None,
         blocked: None,
         transport: None,
+        repairs: Vec::new(),
     }
 }
 
@@ -2771,12 +2833,14 @@ mod tests {
                 return Attempt {
                     outcome: outcome(),
                     cost_usd: self.default_cost,
+                    repairs: Vec::new(),
                 };
             }
             match self.script.get(&(task.name.0.clone(), attempt)) {
                 Some((f, cost)) => Attempt {
                     outcome: f(),
                     cost_usd: *cost,
+                    repairs: Vec::new(),
                 },
                 None => Attempt {
                     outcome: AttemptOutcome::Pass(
@@ -2786,6 +2850,7 @@ mod tests {
                             .unwrap_or_else(|| serde_json::json!({"score": 1.0})),
                     ),
                     cost_usd: self.default_cost,
+                    repairs: Vec::new(),
                 },
             }
         }
@@ -2812,6 +2877,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         }
     }
 
@@ -2939,6 +3005,7 @@ mod tests {
                     Attempt {
                         outcome: AttemptOutcome::Pass(serde_json::json!({})),
                         cost_usd: 0.02,
+                        repairs: Vec::new(),
                     }
                 }
             }
@@ -3584,6 +3651,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -3646,6 +3714,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -3730,6 +3799,7 @@ mod tests {
                 Attempt {
                     outcome: AttemptOutcome::Pass(serde_json::json!({})),
                     cost_usd: 0.0,
+                    repairs: Vec::new(),
                 }
             }
             fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
@@ -3741,6 +3811,7 @@ mod tests {
                     .map(|_| Attempt {
                         outcome: AttemptOutcome::Pass(serde_json::json!({})),
                         cost_usd: 0.0,
+                        repairs: Vec::new(),
                     })
                     .collect()
             }
@@ -3847,6 +3918,7 @@ mod tests {
             revise: None,
             timeout: None,
             history: None,
+            repair: 0,
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -4019,6 +4091,7 @@ mod tests {
                             ))
                         },
                         cost_usd: 0.1,
+                        repairs: Vec::new(),
                     })
                     .collect()
             }
@@ -4150,6 +4223,17 @@ mod tests {
                 json!("https://github.com/o/r/pull/1"),
                 "declared links: string is not a list",
             ),
+            (
+                FieldType::Schema(
+                    crucible_contract::emits::JsonSchema::new(
+                        json!({"type": "array", "items": {"type": "string"}}),
+                    )
+                    .unwrap(),
+                ),
+                json!(["a", "b"]),
+                json!(["a", 2]),
+                "does not match its schema: /1: value is not of type \"string\"",
+            ),
         ];
         for (ty, good, bad, note) in cases {
             let plan = valid(
@@ -4193,6 +4277,41 @@ mod tests {
                 "{ctx}"
             );
         }
+    }
+
+    #[test]
+    fn every_violation_is_listed_and_the_masked_form_does_not_repeat_a_label() {
+        let emits = crate::plan::ir::Emits::Typed(
+            [
+                ("count", FieldType::Integer),
+                ("missing", FieldType::String),
+                ("tier", one_of(&["high", "low"])),
+            ]
+            .into_iter()
+            .map(|(f, ty)| (crate::plan::ir::OutputField(f.to_string()), ty))
+            .collect(),
+        );
+        let value = json!({"count": "seven", "tier": "hunter2"});
+        assert_eq!(
+            emits_violations(&emits, &value, Echo::Masked),
+            [
+                "output field \"count\" is string, declared integer",
+                "output missing declared field \"missing\"",
+                "output field \"tier\" is a string outside its labels, declared one of high|low",
+            ]
+        );
+        assert_eq!(
+            emits_violations(&emits, &value, Echo::Label)[2],
+            "output field \"tier\" is \"hunter2\", declared one of high|low"
+        );
+        assert!(
+            emits_violations(
+                &emits,
+                &json!({"count": 1, "missing": "", "tier": "low"}),
+                Echo::Masked
+            )
+            .is_empty()
+        );
     }
 
     #[test]
@@ -4874,6 +4993,7 @@ mod tests {
                 return Attempt {
                     outcome: AttemptOutcome::Pass(serde_json::json!({"targets": self.items})),
                     cost_usd: 0.0,
+                    repairs: Vec::new(),
                 };
             }
             let item = inputs
@@ -4891,6 +5011,7 @@ mod tests {
             Attempt {
                 outcome,
                 cost_usd: self.cost,
+                repairs: Vec::new(),
             }
         }
 
@@ -5082,7 +5203,7 @@ mod tests {
     #[test]
     fn only_passing_instances_stage_their_files_downstream() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let mut consumer = task("roundup", &["audit"], "any", true);
         consumer.join = Join::Passed;
         let plan = valid(
@@ -5195,6 +5316,7 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         };
         for status in [
             TaskStatus::Fail,
@@ -5862,7 +5984,7 @@ mod tests {
     #[test]
     fn a_failed_producers_files_reach_a_settled_dependent_and_not_a_settled_descendant() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let plan = valid(
             vec![
                 probe,
@@ -5896,7 +6018,7 @@ mod tests {
     #[test]
     fn the_files_flag_is_false_without_a_set_staged_for_this_consumer() {
         let mut hoard = task("hoard", &[], "any", false);
-        hoard.emits_files = vec!["evidence/hoard.json".to_string()];
+        hoard.emits_files = vec!["evidence/hoard.json".into()];
         let plan = valid(
             vec![
                 task("quiet", &[], "any", false),
@@ -5931,7 +6053,7 @@ mod tests {
     #[test]
     fn a_mapped_producers_files_flag_is_per_instance() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let plan = valid(
             vec![
                 task("discover", &[], "any", true),
@@ -6103,7 +6225,7 @@ mod tests {
     #[test]
     fn a_failed_mapped_grandparents_instances_reach_no_settled_descendant() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let plan = valid(
             vec![
                 task("discover", &[], "any", true),
@@ -6138,7 +6260,7 @@ mod tests {
     #[test]
     fn a_passed_join_is_staged_nothing_from_a_failed_direct_dependency() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let mut roundup = task("roundup", &["probe", "other"], "any", true);
         roundup.join = Join::Passed;
         let plan = valid(vec![probe, task("other", &[], "any", false), roundup], 10.0);
@@ -6319,11 +6441,11 @@ mod tests {
     #[test]
     fn an_epilogue_is_staged_with_failed_and_passing_main_graph_evidence() {
         let mut build = task("build", &[], "any", true);
-        build.emits_files = vec!["evidence/build.json".to_string()];
+        build.emits_files = vec!["evidence/build.json".into()];
         let mut probe = task("probe", &["build"], "any", true);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let mut deliver = task("deliver", &["probe"], "any", true);
-        deliver.emits_files = vec!["DELIVER.md".to_string()];
+        deliver.emits_files = vec!["DELIVER.md".into()];
         let plan = valid(
             vec![build, probe, deliver, epilogue("report", &[], true)],
             10.0,
@@ -6356,7 +6478,7 @@ mod tests {
     #[test]
     fn an_epilogue_reports_no_files_for_a_failure_without_a_captured_set() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let plan = valid(vec![probe, epilogue("report", &[], true)], 10.0);
         let mut r = ScriptRunner::new();
         r.on(
@@ -6376,9 +6498,9 @@ mod tests {
     #[test]
     fn an_epilogue_is_not_staged_with_a_skipped_or_transport_failed_set() {
         let mut quiet = task("quiet", &[], "any", false);
-        quiet.emits_files = vec!["evidence/quiet.json".to_string()];
+        quiet.emits_files = vec!["evidence/quiet.json".into()];
         let mut flaky = task("flaky", &[], "any", false);
-        flaky.emits_files = vec!["evidence/flaky.json".to_string()];
+        flaky.emits_files = vec!["evidence/flaky.json".into()];
         let plan = valid(vec![quiet, flaky, epilogue("report", &[], true)], 10.0);
         let mut r = ScriptRunner::new();
         r.captured.insert("quiet".to_string());
@@ -6414,7 +6536,7 @@ mod tests {
     #[test]
     fn an_epilogue_is_staged_with_each_mapped_instances_set() {
         let mut node = mapped_node("audit", "discover", "targets", false);
-        node.emits_files = vec!["OUT.md".to_string()];
+        node.emits_files = vec!["OUT.md".into()];
         let plan = valid(
             vec![
                 task("discover", &[], "any", true),
@@ -6447,9 +6569,9 @@ mod tests {
     #[test]
     fn a_main_graph_task_is_not_staged_with_unrelated_failure_evidence() {
         let mut probe = task("probe", &[], "any", false);
-        probe.emits_files = vec!["evidence/probe.json".to_string()];
+        probe.emits_files = vec!["evidence/probe.json".into()];
         let mut other = task("other", &[], "any", true);
-        other.emits_files = vec!["evidence/other.json".to_string()];
+        other.emits_files = vec!["evidence/other.json".into()];
         let plan = valid(
             vec![
                 probe,
@@ -6909,7 +7031,7 @@ mod tests {
         );
         let mut plan_tasks = plan.plan().tasks.clone();
         for t in &mut plan_tasks {
-            t.emits_files = vec![format!("{}.json", t.name)];
+            t.emits_files = vec![format!("{}.json", t.name).into()];
         }
         let plan = valid(plan_tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -7202,7 +7324,7 @@ mod tests {
     fn the_reviewers_captured_evidence_is_staged_into_every_target() {
         let mut tasks = fix_chain(Join::All).plan().tasks.clone();
         for t in &mut tasks {
-            t.emits_files = vec![format!("{}.json", t.name)];
+            t.emits_files = vec![format!("{}.json", t.name).into()];
         }
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -7609,6 +7731,7 @@ mod tests {
             Attempt {
                 outcome: self.outcomes[&task.name.0](),
                 cost_usd: 0.1,
+                repairs: Vec::new(),
             }
         }
 
@@ -7628,6 +7751,7 @@ mod tests {
                     Attempt {
                         outcome: self.outcomes[&b.task.name.0](),
                         cost_usd: 0.1,
+                        repairs: Vec::new(),
                     }
                 })
                 .collect()

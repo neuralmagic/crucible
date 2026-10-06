@@ -14,8 +14,8 @@
 //!   issue whose upstream issue closed stops the pod (kube delete, so the loop's interrupt handler
 //!   still publishes what it kept) and parks `(machine, "upstream closed")`.
 //! - **review-comment reseed** ([`ReviewCommentPoll`]) — new human comments on a kept candidate's
-//!   draft PRs insert `pack_steering` rows; pack materialization injects them onto the next
-//!   run's `STEER.md` (the `pr_watch.rs` reseed mechanism, moved off disk).
+//!   draft PRs insert `pack_steering` rows; dispatch appends them onto the `STEER.md` the next
+//!   run receives beside its pack (the `pr_watch.rs` reseed mechanism, moved off disk).
 //!
 //! All GitHub reads honor `GITHUB_API_URL` + `GITHUB_TOKEN`/`GH_TOKEN` (the `triage`/`scope.rs`
 //! pattern) so tests point them at a local wiremock; the writes shell `gh` (matching
@@ -673,8 +673,8 @@ fn sanitize_body(body: &str) -> String {
 }
 
 /// The review-comment reseed approval as a discovery source, absorbing `watch-pr`. Polls each
-/// kept-candidate PR; new authorized human comments become `pack_steering` rows, injected onto
-/// `STEER.md` when the issue's pack is next materialized. Does not enqueue — reseed feeds the
+/// kept-candidate PR; new authorized human comments become `pack_steering` rows, appended onto the
+/// `STEER.md` the issue's next run receives beside its pack. Does not enqueue — reseed feeds the
 /// *next* run's first turn, it doesn't change the issue's status.
 pub struct ReviewCommentPoll {
     db: Db,

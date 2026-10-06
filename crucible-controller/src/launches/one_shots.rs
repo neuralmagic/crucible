@@ -129,21 +129,10 @@ const SELECT: &str = const_format::concatcp!(
 
 /// Store a deferred one-shot. The values were validated against the pack's stored schema and the
 /// ceilings bounded by the admin caps at the endpoint, exactly as for an immediate launch.
-///
-/// `Ok(None)` when the playbook was deregistered between that authorization and this insert, which
-/// the endpoint reports as a 404 rather than letting the constraint violation surface as a 500.
-pub(crate) async fn create(pool: &PgPool, new: &NewOneShot<'_>) -> Result<Option<OneShot>> {
+pub(crate) async fn create(pool: &PgPool, new: &NewOneShot<'_>) -> Result<OneShot> {
     let id = uuid::Uuid::now_v7().to_string();
     let now = crate::clock::now_rfc3339();
     let mut tx = pool.begin().await.context("create one-shot: begin")?;
-    let registered: Option<String> = sqlx::query_scalar("SELECT id FROM playbooks WHERE id = $1")
-        .bind(new.standing.playbook)
-        .fetch_optional(&mut *tx)
-        .await
-        .context("create one-shot: registry")?;
-    if registered.is_none() {
-        return Ok(None);
-    }
     standing::insert(&mut tx, &id, Trigger::Deferred, &new.standing, &now).await?;
     sqlx::query(
         "INSERT INTO playbook_one_shots (id, dedupe_schedule, fire_at) VALUES ($1, $2, $3)",
@@ -155,7 +144,9 @@ pub(crate) async fn create(pool: &PgPool, new: &NewOneShot<'_>) -> Result<Option
     .await
     .context("create one-shot")?;
     tx.commit().await.context("create one-shot: commit")?;
-    get(pool, &id).await
+    get(pool, &id)
+        .await?
+        .context("the one-shot just stored is gone")
 }
 
 /// Every one-shot, soonest-due first among the pending ones.
@@ -214,7 +205,7 @@ fn one_shot_key(id: &str) -> String {
 
 /// The deferred trigger: a pending row whose instant has passed is a firing. The claim is the
 /// `pending → fired` CAS; a row the sweep cannot launch parks as `failed` so the earliest-first
-/// order does not re-pick it on every tick and starve the rows behind it.
+/// order does not re-pick it on every pass and starve the rows behind it.
 pub struct OneShotTrigger;
 
 impl LaunchTrigger for OneShotTrigger {
@@ -227,6 +218,7 @@ impl LaunchTrigger for OneShotTrigger {
         db: &'a Db,
         _cfg: SweepCfg,
         now: Timestamp,
+        held: &'a [String],
     ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
         let db = db.clone();
         Box::pin(async move {
@@ -234,10 +226,12 @@ impl LaunchTrigger for OneShotTrigger {
                 "SELECT o.id, o.dedupe_schedule FROM playbook_one_shots o
                  JOIN playbook_standing_launches c USING (id)
                  WHERE o.status = 'pending' AND c.enabled AND o.fire_at <= $1
+                   AND o.id <> ALL($3)
                  ORDER BY o.fire_at, o.id LIMIT $2",
             )
             .bind(stamp(now))
             .bind(FIRE_CAP)
+            .bind(held)
             .fetch_all(db.pool())
             .await
             .context("the due one-shots")?;
@@ -249,6 +243,25 @@ impl LaunchTrigger for OneShotTrigger {
                     claim
                 })
                 .collect())
+        })
+    }
+
+    fn next_due<'a>(
+        &'a self,
+        db: &'a Db,
+        held: &'a [String],
+    ) -> TriggerFuture<'a, Result<Option<Timestamp>>> {
+        Box::pin(async move {
+            let earliest: Option<String> = sqlx::query_scalar(
+                "SELECT MIN(o.fire_at) FROM playbook_one_shots o
+                 JOIN playbook_standing_launches c USING (id)
+                 WHERE o.status = 'pending' AND c.enabled AND o.id <> ALL($1)",
+            )
+            .bind(held)
+            .fetch_one(db.pool())
+            .await
+            .context("the next due one-shot")?;
+            standing::due_at(earliest)
         })
     }
 
@@ -347,7 +360,9 @@ pub(crate) async fn fire_due(db: &Db, now: &str, cap: usize) -> Result<Vec<Strin
         auto_disable_after: 1,
         owner_ttl: std::time::Duration::from_secs(3600),
     };
-    let mut keys = standing::sweep(db, &OneShotTrigger, cfg, now, None, None).await?;
+    let mut keys = standing::sweep(db, &OneShotTrigger, cfg, now, None, None, &[])
+        .await?
+        .fired;
     keys.truncate(cap);
     Ok(keys)
 }
@@ -390,7 +405,9 @@ mod tests {
             &NewOneShot {
                 standing: NewStanding {
                     playbook: "survey",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params(),
                     schema_digest: "sha256:schema",
@@ -411,7 +428,6 @@ mod tests {
         )
         .await
         .expect("create")
-        .expect("the playbook is registered")
     }
 
     #[test]
@@ -644,6 +660,91 @@ mod tests {
             keys.iter().all(|k| k.starts_with("playbook:survey:")),
             "{keys:?}"
         );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn next_due_is_the_earliest_pending_enabled_unheld_one_shot(pool: PgPool) -> Result<()> {
+        let db = Db::new(pool.clone());
+        let at = |s: &str| Some(s.parse::<Timestamp>().expect("stamp"));
+        register_row(&pool, "survey").await;
+        assert_eq!(OneShotTrigger.next_due(&db, &[]).await?, None);
+
+        let later = defer(&pool, "2031-01-02T00:00:00Z").await;
+        let earlier = defer(&pool, "2031-01-01T00:00:00Z").await;
+        assert_eq!(
+            OneShotTrigger.next_due(&db, &[]).await?,
+            at("2031-01-01T00:00:00Z")
+        );
+        assert_eq!(
+            OneShotTrigger
+                .next_due(&db, std::slice::from_ref(&earlier.id))
+                .await?,
+            at("2031-01-02T00:00:00Z"),
+            "a held row is left out"
+        );
+
+        standing::set_enabled(&pool, &later.id, false).await?;
+        assert_eq!(
+            OneShotTrigger
+                .next_due(&db, std::slice::from_ref(&earlier.id))
+                .await?,
+            None,
+            "a disabled standing launch is not due"
+        );
+
+        cancel(&pool, &earlier.id).await?;
+        assert_eq!(OneShotTrigger.next_due(&db, &[]).await?, None);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_launch_loop_pass_enqueues_urgent_and_counts_its_claims(pool: PgPool) -> Result<()> {
+        use crate::daemon::queue::DueSource;
+
+        #[derive(Default)]
+        struct Recorder {
+            plain: std::sync::Mutex<Vec<String>>,
+            urgent: std::sync::Mutex<Vec<String>>,
+        }
+        impl Enqueue for Recorder {
+            fn enqueue(&self, key: IssueKey) {
+                self.plain.lock().expect("lock").push(key.0);
+            }
+            fn enqueue_urgent(&self, key: IssueKey) {
+                self.urgent.lock().expect("lock").push(key.0);
+            }
+        }
+
+        let db = Db::new(pool.clone());
+        register_row(&pool, "survey").await;
+        let held = defer(&pool, "2020-01-01T00:00:00Z").await;
+        defer(&pool, "2020-01-02T00:00:00Z").await;
+        defer(&pool, "2020-01-03T00:00:00Z").await;
+        let sweep = standing::TriggerSweep::new(
+            db,
+            vec![Arc::new(OneShotTrigger)],
+            5,
+            std::time::Duration::from_secs(3600),
+            None,
+            None,
+        );
+
+        let recorder = Arc::new(Recorder::default());
+        let pass = DueSource::pass(&sweep, recorder.clone(), vec![held.id.clone()]).await?;
+        assert_eq!(pass.claimed, 2);
+        assert!(pass.held.is_empty());
+        assert_eq!(recorder.urgent.lock().expect("lock").len(), 2);
+        assert!(recorder.plain.lock().expect("lock").is_empty());
+        assert_eq!(
+            sweep.next_due(vec![]).await?,
+            Some("2020-01-01T00:00:00Z".parse()?),
+            "the held row is still pending"
+        );
+
+        let pass = DueSource::pass(&sweep, recorder.clone(), vec![]).await?;
+        assert_eq!(pass.claimed, 1);
+        assert_eq!(sweep.next_due(vec![]).await?, None);
         Ok(())
     }
 }

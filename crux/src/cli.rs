@@ -480,7 +480,7 @@ enum Command {
         /// The directory holding the pack.
         dir: std::path::PathBuf,
         /// The version these edits were made against (what `draft-pull` printed).
-        #[arg(long = "base-version", visible_alias = "base")]
+        #[arg(long = "base-version")]
         base_version: i64,
         #[arg(long)]
         json: bool,
@@ -966,7 +966,7 @@ fn read_files(source: &str) -> Result<std::collections::BTreeMap<String, String>
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::cli::*;
     use clap::CommandFactory;
 
     #[test]
@@ -1324,9 +1324,21 @@ mod tests {
             Cli::try_parse_from(["crux", "draft-push", "calibrate", "./pack"]).is_err(),
             "a push with no base is not a save"
         );
-        match Cli::try_parse_from(["crux", "draft-push", "calibrate", "./pack", "--base", "4"])
-            .expect("parses")
-            .command
+        assert!(
+            Cli::try_parse_from(["crux", "draft-push", "calibrate", "./pack", "--base", "4"])
+                .is_err(),
+            "--base is left free for a base digest"
+        );
+        match Cli::try_parse_from([
+            "crux",
+            "draft-push",
+            "calibrate",
+            "./pack",
+            "--base-version",
+            "4",
+        ])
+        .expect("parses")
+        .command
         {
             Command::DraftPush {
                 draft_id,

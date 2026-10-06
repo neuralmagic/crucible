@@ -17,10 +17,18 @@ const MIB: u64 = 1024 * 1024;
 /// engine and the controller drop-box call this, so the two digests are byte-for-byte comparable
 /// and a mismatch always indicates a real integrity failure.
 pub fn content_digest(bytes: &[u8]) -> String {
-    let hash = Sha256::digest(bytes);
-    let mut s = String::with_capacity("sha256:".len() + hash.len() * 2);
-    s.push_str("sha256:");
-    for b in hash {
+    format!("sha256:{}", sha256_hex(bytes))
+}
+
+/// The lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    lower_hex(&Sha256::digest(bytes))
+}
+
+/// `bytes` as lowercase hex.
+pub fn lower_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
         // Infallible: writing to a String never errors.
         let _ = write!(s, "{b:02x}");
     }

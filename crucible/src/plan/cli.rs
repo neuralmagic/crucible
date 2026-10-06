@@ -49,6 +49,9 @@ pub fn compile_workflow(
     for prompt_file in &compiled.prompt_files {
         eprintln!("embedded prompt: {}", prompt_file.display());
     }
+    for schema_file in &compiled.schema_files {
+        eprintln!("embedded schema: {}", schema_file.display());
+    }
     print!("{}", compiled.canonical_json);
     Ok(())
 }
@@ -1303,6 +1306,7 @@ mod tests {
             fanout: None,
             blocked: None,
             transport: None,
+            repairs: Vec::new(),
         };
         let back = crate::report::session::decode(&crate::report::session::encode(
             &crate::plan::events::task_result_event(1, 0, t, &r, None),

@@ -175,6 +175,9 @@ $ crux draft-graduate calibrate --repo wren/packs --path packs/calibrate
 
 A push carries the version it edited from, and a save that another editor overtook comes back as
 the refusal naming the version that landed since, not as an error: re-pull, merge, push again.
+Pull and push read the directory the way the controller does: `state/`, `workspace/` and `.git`
+are skipped and listed as `ignored`, a symlink is refused, and `local tree:` prints the
+directory's `tree1:` digest.
 `skills/draft-a-playbook/SKILL.md` is the full authoring workflow.
 
 ### `secrets` / `secret-bind`

@@ -19,11 +19,12 @@ const SECRET_COLUMNS: &str = "id, name, owner, kind, visibility, consumer, mode,
                               current_version, created_by, created_at, updated_at";
 
 const BINDING_COLUMNS: &str = "id, secret_id, scope_kind, scope_id, projection_kind, projection, \
-                               declared_name, pack_rev, schema_digest, created_by, created_at";
+                               declared_name, pack_rev, pack_digest, schema_digest, created_by, \
+                               created_at";
 
 /// [`BINDING_COLUMNS`] qualified by the `b` alias, for the bindings-with-secrets join.
 const BINDING_COLUMNS_B: &str = "b.id, b.secret_id, b.scope_kind, b.scope_id, b.projection_kind, b.projection, \
-    b.declared_name, b.pack_rev, b.schema_digest, b.created_by, b.created_at";
+    b.declared_name, b.pack_rev, b.pack_digest, b.schema_digest, b.created_by, b.created_at";
 
 /// [`SECRET_COLUMNS`] qualified by the `s` alias and renamed `sec_*`, so the join's secret half
 /// decodes apart from its binding half.
@@ -92,6 +93,10 @@ pub struct BindingRow {
     #[sqlx(try_from = "String")]
     pub declared_name: SecretName,
     pub pack_rev: Option<String>,
+    /// The tree the bound playbook held at `pack_rev` when the binding was made, or the tree a
+    /// pre-tree `pack_rev` became; `None` when the binding names no revision or one neither
+    /// names.
+    pub pack_digest: Option<String>,
     pub schema_digest: Option<String>,
     pub created_by: Option<String>,
     pub created_at: String,
@@ -302,7 +307,9 @@ pub async fn delete(conn: &mut PgConnection, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Store a binding.
+/// Store a binding. A playbook binding pins the playbook's current tree when `pack_rev` is the
+/// playbook's current rev, else the tree a pre-tree `pack_rev` became: the pin startup conversion
+/// derives.
 pub async fn insert_binding(
     conn: &mut PgConnection,
     new: &NewBinding<'_>,
@@ -310,8 +317,13 @@ pub async fn insert_binding(
     let row = sqlx::query(const_format::formatcp!(
         r#"INSERT INTO secret_bindings (id, secret_id, scope_kind, scope_id, projection_kind,
                                         projection, declared_name, pack_rev, schema_digest,
-                                        created_by, created_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                                        created_by, created_at, pack_digest)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                   COALESCE(
+                       (SELECT tree_digest FROM playbooks
+                        WHERE $3 = 'playbook' AND id = $4 AND rev = $8),
+                       (SELECT tree_digest FROM pack_digest_aliases
+                        WHERE $3 = 'playbook' AND old_digest = $8)))
            RETURNING {BINDING_COLUMNS}"#
     ))
     .bind(new.id)

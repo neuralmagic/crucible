@@ -937,6 +937,7 @@ mod tests {
                     timeout: String::new(),
                     max_rounds: 0,
                     emits: Vec::new(),
+                    emits_files: Vec::new(),
                     history_depth: 0,
                 },
                 PlanTaskWire {
@@ -955,6 +956,7 @@ mod tests {
                     timeout: String::new(),
                     max_rounds: 0,
                     emits: Vec::new(),
+                    emits_files: Vec::new(),
                     history_depth: 0,
                 },
             ],

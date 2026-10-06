@@ -42,14 +42,22 @@ fn turn_specs_convert_bare_repo_slugs_to_clone_urls() {
         "URLs pass through"
     );
 }
-use super::*;
 #[cfg(feature = "autoresearch")]
 use crate::runs::workpod::spec::TurnSpec as _;
+use crate::runs::workpod::*;
 #[cfg(feature = "autoresearch")]
 use crucible::deploy::ProposeTier;
 #[cfg(feature = "autoresearch")]
 use crucible_contract::{Disposition, Tier};
 use std::sync::Mutex;
+
+/// The pack at `dir`, written to scratch as dispatch writes a stored pack.
+fn materialized(dir: impl AsRef<Path>) -> crate::playbooks::packs::MaterializedPack {
+    let tree = crucible_contract::pack_tree::walk_dir(dir.as_ref())
+        .expect("a fixture pack")
+        .tree;
+    crate::playbooks::packs::materialize_tree(&tree).expect("materialize")
+}
 
 #[test]
 fn work_kind_label_and_cost_tag_round_trip() {
@@ -874,7 +882,8 @@ fn parse_scope_report_logs_tolerates_a_missing_or_garbled_transcript() {
 }
 
 /// A gzip'd tar of a tiny pack tree, built with the same crates the engine emits with — the
-/// blob the pack-marker tests and the unpack tests share.
+/// blob the pack-marker tests share.
+#[cfg(feature = "autoresearch")]
 fn sample_pack_tgz() -> Vec<u8> {
     use std::io::Write as _;
     let dir = tempfile::tempdir().expect("tempdir");
@@ -924,74 +933,6 @@ fn parse_scope_pack_logs_distinguishes_absent_error_and_garbled() {
     let (blob, err) = parse_scope_pack_logs(&logs);
     assert!(blob.is_none());
     assert!(err.is_some(), "a garbled payload names itself");
-}
-
-#[test]
-fn unpack_pack_tgz_lands_the_tree_and_replaces_a_stale_dir() {
-    let tgz = sample_pack_tgz();
-    let dest = tempfile::tempdir().expect("tempdir");
-    let out = dest.path().join("pack");
-    // A stale pack from a prior scope must not survive the unpack.
-    std::fs::create_dir_all(&out).unwrap();
-    std::fs::write(out.join("stale.md"), "old pack leftovers").unwrap();
-
-    crate::playbooks::packs::unpack_pack_tgz(&tgz, &out).expect("unpacks");
-    assert_eq!(
-        std::fs::read_to_string(out.join("crucible.toml")).expect("manifest landed"),
-        "[repo]\nurl = \"x\"\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(out.join("prompts/goal.md")).expect("nested file landed"),
-        "fix the thing\n"
-    );
-    assert!(
-        !out.join("stale.md").exists(),
-        "the stale pack dir was replaced, not merged into"
-    );
-}
-
-/// Traversal entries reject the WHOLE pack — the blob came from an agent-authored pod, and a
-/// pack that half-unpacked outside the dir must never be trusted.
-#[test]
-fn unpack_pack_tgz_rejects_traversal_entries() {
-    use std::io::Write as _;
-    // `tar::Builder::append_data` itself refuses `..` paths, so a hostile archive has to be
-    // crafted at the raw-header level — exactly what a malicious pod could emit.
-    let evil_tgz = |path: &str| -> Vec<u8> {
-        let mut header = tar::Header::new_gnu();
-        let name = &mut header.as_gnu_mut().expect("gnu header").name;
-        name[..path.len()].copy_from_slice(path.as_bytes());
-        header.set_size(4);
-        header.set_mode(0o644);
-        header.set_cksum();
-        let mut builder = tar::Builder::new(Vec::new());
-        builder
-            .append(&header, "evil".as_bytes())
-            .expect("append evil entry");
-        let tar_bytes = builder.into_inner().unwrap();
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        enc.write_all(&tar_bytes).unwrap();
-        enc.finish().unwrap()
-    };
-
-    let dest = tempfile::tempdir().expect("tempdir");
-    let out = dest.path().join("pack");
-    for path in [
-        "../escaped.md",
-        "nested/../../escaped.md",
-        "/tmp/escaped.md",
-    ] {
-        let err = crate::playbooks::packs::unpack_pack_tgz(&evil_tgz(path), &out)
-            .expect_err("traversal must reject");
-        assert!(
-            format!("{err:#}").contains("escapes"),
-            "the rejection names the escape for {path}: {err:#}"
-        );
-        assert!(
-            !dest.path().join("escaped.md").exists(),
-            "nothing landed outside the pack dir for {path}"
-        );
-    }
 }
 
 #[test]
@@ -2609,7 +2550,7 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
         dispatcher,
         "owner/repo#8",
         "owner_repo_8-1",
-        &pack,
+        &materialized(&pack),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -2659,7 +2600,7 @@ async fn dispatch_run_creates_and_stamps_both_docs_and_owner_refs_the_cm(
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -2715,6 +2656,93 @@ async fn dispatch_run_creates_and_stamps_both_docs_and_owner_refs_the_cm(
     Ok(())
 }
 
+/// The pack key of a dispatched run's ConfigMap holds exactly the stored tree, and the run's
+/// steering rides beside it as the `STEER.md` the run reads. A pack directory that no longer reads
+/// back to the tree it was materialized from is refused before any pod is created.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn dispatch_delivers_the_stored_tree_with_steering_beside_it(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    use crucible_contract::pack_tree::{read_tar_gz, walk_dir};
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+    let db = Db::new(pool);
+    let cfg = pod_cfg(&profile, "img");
+    let created_pods = Arc::new(Mutex::new(Vec::new()));
+    let created_cms = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(RunBundleDispatcher {
+        created_pods: created_pods.clone(),
+        created_cms: created_cms.clone(),
+        deleted: Arc::new(Mutex::new(Vec::new())),
+    });
+    let dir = crate::testing::fixtures::write_loop_pack(tmp.path());
+    std::fs::write(dir.join("STEER.md"), "frozen guidance\n")?;
+    let stored = walk_dir(&dir)?.tree;
+    crate::playbooks::packs::store_pack_tree(db.pool(), "owner/repo#7", &dir).await?;
+    crate::runs::blob_store::append_steering(db.pool(), "owner_repo_7", "go left", None).await?;
+    let pack = crate::playbooks::packs::materialize_pack(db.pool(), "owner/repo#7")
+        .await?
+        .expect("stored");
+    let no_builds = BTreeMap::new();
+    let dispatch = |run_id: &'static str| {
+        dispatch_run(
+            &db,
+            &cfg,
+            dispatcher.clone(),
+            "owner/repo#7",
+            run_id,
+            &pack,
+            &no_builds,
+            None,
+            RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
+            None,
+        )
+    };
+
+    let out = dispatch("owner_repo_7-1").await?;
+    assert!(matches!(out, RunAdmission::Launched { .. }), "{out:?}");
+    let data = created_cms.lock().expect("lock")[0]
+        .binary_data
+        .clone()
+        .expect("binary data");
+    assert_eq!(
+        data.keys().map(String::as_str).collect::<Vec<_>>(),
+        vec![
+            crucible::deploy::RUN_INPUTS_KEY,
+            crucible::deploy::PACK_TARBALL_KEY
+        ]
+    );
+    let delivered = &data[crucible::deploy::PACK_TARBALL_KEY].0;
+    assert_eq!(
+        delivered,
+        &stored.tarball()?,
+        "the stored tree's own tarball"
+    );
+    let inputs = read_tar_gz(&data[crucible::deploy::RUN_INPUTS_KEY].0)?.tree;
+    let steer = String::from_utf8(inputs.files()[&"STEER.md".parse()?].clone())?;
+    assert_eq!(inputs.files().len(), 1, "steering is the only input");
+    assert!(
+        steer.starts_with("frozen guidance\n<!-- steer @"),
+        "{steer}"
+    );
+    assert!(steer.ends_with("by control -->\ngo left\n"), "{steer}");
+
+    std::fs::write(pack.path().join("stray.txt"), "not stored")?;
+    let err = format!(
+        "{:#}",
+        dispatch("owner_repo_7-2")
+            .await
+            .expect_err("a changed pack dir")
+    );
+    assert!(
+        err.contains(&format!("not the stored tree {}", stored.digest())),
+        "{err}"
+    );
+    assert_eq!(created_pods.lock().expect("lock").len(), 1, "no second pod");
+    Ok(())
+}
+
 async fn seed_running_issue(db: &Db, key: &str) -> Result<()> {
     crate::issues::store::upsert_issue(
         db.pool(),
@@ -2766,7 +2794,7 @@ async fn dispatch_run_launches_tracks_and_returns_the_stamped_pod(
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -2888,7 +2916,9 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(&tmp.path().join("loop")),
+        &materialized(crate::testing::fixtures::write_loop_pack(
+            &tmp.path().join("loop"),
+        )),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -2913,10 +2943,10 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
         dispatcher,
         "playbook:survey:0199c0de-7c2c-71a5-8000-1",
         "playbook_survey_0199c0de-42",
-        &crate::testing::fixtures::write_playbook_pack(
+        &materialized(crate::testing::fixtures::write_playbook_pack(
             &tmp.path().join("playbook"),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
-        ),
+        )),
         &BTreeMap::new(),
         None,
         RunRenderOpts::Playbook {
@@ -2964,7 +2994,7 @@ async fn dispatch_run_forwards_iteration_and_budget_knobs(pool: sqlx::PgPool) ->
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -3009,7 +3039,7 @@ async fn dispatch_run_forwards_the_mapped_pr_repo(pool: sqlx::PgPool) -> Result<
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -3065,7 +3095,7 @@ async fn dispatch_run_omits_pr_repo_when_unmapped(pool: sqlx::PgPool) -> Result<
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -3118,6 +3148,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
                 model: None,
             },
         },
+        Default::default(),
         None,
     )?
     .0;
@@ -3130,6 +3161,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
             "owner/repo",
             AgentSelection::from_resolved(resolved.as_ref()),
         ),
+        Default::default(),
         None,
     )?
     .0;
@@ -3146,7 +3178,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &pack,
+        &materialized(&pack),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(
@@ -3219,7 +3251,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(
@@ -3282,10 +3314,10 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
         dispatcher,
         "playbook:survey:1",
         "playbook_survey_1-42",
-        &crate::testing::fixtures::write_playbook_pack(
+        &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
-        ),
+        )),
         &BTreeMap::new(),
         None,
         RunRenderOpts::Playbook {
@@ -3335,7 +3367,7 @@ async fn dispatch_run_caps_at_the_concurrency_limit(pool: sqlx::PgPool) -> Resul
         dispatcher,
         "owner/repo#3",
         "owner_repo_3-1",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -3402,7 +3434,7 @@ async fn dispatch_run_honors_a_runtime_override_tightening_the_cap(
         dispatcher,
         "owner/repo#2",
         "owner_repo_2-1",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -3442,10 +3474,10 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
         dispatcher,
         "playbook:survey:0199c0de-7c2c-71a5-8000-1",
         "playbook_survey_0199c0de-42",
-        &crate::testing::fixtures::write_playbook_pack(
+        &materialized(crate::testing::fixtures::write_playbook_pack(
             tmp.path(),
             crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
-        ),
+        )),
         &BTreeMap::new(),
         None,
         RunRenderOpts::Playbook {
@@ -4570,7 +4602,7 @@ fn repo_secrets(launcher: crate::authz::model::Principals) -> crate::runs::workp
     crate::runs::workpod::LaunchSecrets {
         scope: crate::secrets::launch::Scope::repo("owner/repo"),
         launcher,
-        revision: crate::secrets::launch::OwnedRevision::Published(None),
+        revision: crate::secrets::launch::OwnedRevision::UNPINNED,
         provider: Some(std::sync::Arc::new(
             crate::secrets::provider::MapProvider::new([(
                 "pr_token".to_string(),
@@ -4623,7 +4655,7 @@ async fn a_dispatch_with_bindings_records_the_created_pods_uid(pool: sqlx::PgPoo
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -4686,7 +4718,7 @@ async fn a_redeemed_agent_visible_controller_key_refuses_the_dispatch(
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -4730,7 +4762,7 @@ async fn the_pod_spec_carries_a_secret_reference_and_no_value(pool: sqlx::PgPool
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -4862,7 +4894,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -5085,7 +5117,7 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(
@@ -5232,7 +5264,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
             dispatcher,
             "owner/repo#7",
             "owner_repo_7-42",
-            &pack,
+            &materialized(&pack),
             &BTreeMap::new(),
             None,
             RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -5343,7 +5375,7 @@ async fn an_already_exists_create_fails_the_dispatch(pool: sqlx::PgPool) -> Resu
         Arc::new(AlreadyExistsDispatcher),
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -5404,7 +5436,7 @@ async fn a_launcher_who_does_not_own_a_bound_secret_is_refused_before_anything_i
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
@@ -5447,7 +5479,7 @@ async fn a_run_pod_carries_its_id_and_its_display_name(pool: sqlx::PgPool) -> Re
         dispatcher,
         "owner/repo#7",
         "owner_repo_7-42",
-        &crate::testing::fixtures::write_loop_pack(tmp.path()),
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
         &BTreeMap::new(),
         None,
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),

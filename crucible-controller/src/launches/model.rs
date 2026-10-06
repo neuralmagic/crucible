@@ -7,6 +7,7 @@ use crate::model::LaunchOrigin;
 use crate::wire_enum::wire_enum;
 
 use anyhow::Result;
+use crucible_contract::pack_tree::PackFilePath;
 
 /// What one launch of a registered playbook is authorized to run with, as written at adopt time.
 /// `repo` and `title` are the registry row's, so a launch groups and reads sanely everywhere the
@@ -148,42 +149,19 @@ impl RunFileKey {
     }
 }
 
-/// Where in the pack a file cursor is written before a firing runs: a relative path that cannot
-/// leave the pack directory.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PackPath(String);
-
-impl PackPath {
-    pub(crate) fn parse(raw: &str) -> Result<Self, String> {
-        let raw = raw.trim();
-        let safe = !raw.is_empty()
-            && !raw.starts_with('/')
-            && raw
-                .split('/')
-                .all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains('\\'));
-        if !safe {
-            return Err(format!(
-                "{raw:?} must be a relative path inside the pack, without `.` or `..` segments"
-            ));
-        }
-        Ok(PackPath(raw.to_string()))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub(crate) fn under(&self, pack_dir: &std::path::Path) -> std::path::PathBuf {
-        pack_dir.join(&self.0)
-    }
-}
-
 /// A schedule's cursor: what one firing's finished run leaves behind, and how the next firing
-/// receives it. A field of the result rides as a param; a captured file is written into the pack.
+/// receives it. A field of the result rides as a param; a captured file is delivered beside the
+/// pack at its path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CursorSpec {
-    Field { from: ResultPath, param: String },
-    File { from: RunFileKey, path: PackPath },
+    Field {
+        from: ResultPath,
+        param: String,
+    },
+    File {
+        from: RunFileKey,
+        path: PackFilePath,
+    },
 }
 
 impl CursorSpec {
@@ -229,7 +207,9 @@ impl CursorSpec {
                 "name the pack path the cursor file is written to".to_string(),
             ));
         };
-        let path = PackPath::parse(path).map_err(|e| ("cursor.path", e))?;
+        let path = path
+            .parse::<PackFilePath>()
+            .map_err(|e| ("cursor.path", e.to_string()))?;
         Ok(CursorSpec::File { from, path })
     }
 
@@ -387,7 +367,7 @@ mod tests {
             CursorSpec::from_columns(Some("rollup/STATE.json"), None, Some("state.json")),
             Some(CursorSpec::File {
                 from: RunFileKey::parse("rollup/STATE.json").expect("key"),
-                path: PackPath::parse("state.json").expect("path"),
+                path: "state.json".parse().expect("path"),
             })
         );
         for (from, param, path) in [
@@ -435,6 +415,7 @@ mod tests {
             "./state.json",
             "a//b",
             "a\\b",
+            "a\nb.json",
             " ",
         ] {
             assert_eq!(
@@ -445,15 +426,5 @@ mod tests {
         }
         assert!(field("rollup/STATE.json", None, Some("state/cursor.json")).is_ok());
         assert!(field("rollup[x]/STATE.json", None, Some("state.json")).is_ok());
-    }
-
-    /// The pack path resolves under the pack directory and nowhere else.
-    #[test]
-    fn pack_path_resolves_under_the_pack() {
-        let path = PackPath::parse("state/cursor.json").expect("path");
-        assert_eq!(
-            path.under(std::path::Path::new("/packs/p")),
-            std::path::PathBuf::from("/packs/p/state/cursor.json")
-        );
     }
 }

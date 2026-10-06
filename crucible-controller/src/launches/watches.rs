@@ -52,6 +52,7 @@ pub(crate) struct Watch {
     pub adopted_repo: Option<String>,
     pub adopted_path: Option<String>,
     pub adopted_rev: Option<String>,
+    pub adopted_tree_digest: Option<String>,
     pub params: serde_json::Value,
     pub schema_digest: String,
     pub max_cost: f64,
@@ -78,6 +79,16 @@ pub(crate) struct Watch {
     pub updated_at: String,
 }
 
+impl Watch {
+    /// How an audit line names what this watch adopted.
+    pub(crate) fn adopted_label(&self) -> String {
+        crate::launches::standing::adopted_label(
+            self.adopted_rev.as_deref(),
+            self.adopted_tree_digest.as_deref(),
+        )
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct WatchRow {
     #[sqlx(flatten)]
@@ -99,6 +110,7 @@ impl From<WatchRow> for Watch {
             adopted_repo: c.adopted_repo,
             adopted_path: c.adopted_path,
             adopted_rev: c.adopted_rev,
+            adopted_tree_digest: c.adopted_tree_digest,
             params: c.params,
             schema_digest: c.schema_digest,
             max_cost: c.max_cost,
@@ -378,6 +390,7 @@ impl LaunchTrigger for WatchTrigger {
         db: &'a Db,
         cfg: SweepCfg,
         now: Timestamp,
+        _held: &'a [String],
     ) -> TriggerFuture<'a, Result<Vec<Claim>>> {
         let db = db.clone();
         Box::pin(async move {
@@ -510,8 +523,10 @@ pub(crate) async fn sweep(
         now,
         refresh,
         None,
+        &[],
     )
     .await
+    .map(|swept| swept.fired)
 }
 
 #[cfg(test)]
@@ -617,7 +632,9 @@ mod tests {
             &NewWatch {
                 standing: NewStanding {
                     playbook: "backport",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:schema",
@@ -782,7 +799,9 @@ mod tests {
             &NewWatch {
                 standing: NewStanding {
                     playbook: "backport",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:schema",
@@ -1042,7 +1061,9 @@ mod tests {
             &NewWatch {
                 standing: NewStanding {
                     playbook: "backport",
-                    target_kind: "adopted",
+                    target: crate::launches::standing::StandingTarget::Adopted(
+                        crate::playbooks::registry::PackRevision::Bytes("sha256:tar"),
+                    ),
                     eligible_draft_version: None,
                     params: &params,
                     schema_digest: "sha256:schema",

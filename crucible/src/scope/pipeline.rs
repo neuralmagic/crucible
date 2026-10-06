@@ -1275,15 +1275,15 @@ fn render_refine_section(rounds: &[RoundRecord]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::agent::activity::{ACTIVITY_MIN_INTERVAL, ACTIVITY_TEXT_CAP, ACTIVITY_TOOL_CAP};
     use crate::agent::event::Tokens;
     use crate::manifest::AgentBackend;
     use crate::scope::cli::{SCOPE_REPORT_MARKER, execute};
     use crate::scope::pack::{
-        CONTROLS_DIR, PACK_PAYLOAD_CAP_BYTES, PACK_TAR_CAP_BYTES, SCOPE_PACK_MARKER,
-        pack_marker_line, pack_marker_payload, repo_pin, tar_pack_dir,
+        CONTROLS_DIR, PACK_PAYLOAD_CAP_BYTES, PACK_TAR_CAP_BYTES, SCOPE_PACK_MARKER, pack_gz,
+        pack_marker_line, pack_marker_payload, read_pack, repo_pin,
     };
+    use crate::scope::pipeline::*;
     use crate::scope::progress::{
         PROGRESS_DOING_CAP, SCOPE_PROGRESS_MARKER, ScopeProgress, cap_doing,
     };
@@ -2831,15 +2831,20 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let _ = fs::remove_dir_all(&dest);
     }
 
-    /// A `.git` subtree in the pack (a checkout the propose agent left behind) is excluded from
-    /// the tar: the run phase re-clones from the manifest, and git packfiles are incompressible,
-    /// they blew the encoded budget on the first live checkpoint build.
+    /// `.git`, `state/` and `workspace/` subtrees are skipped at any depth: the run re-clones its
+    /// checkout from the manifest and owns its own state, and git packfiles are incompressible.
     #[test]
-    fn tar_pack_dir_excludes_git_subtrees() {
-        let pack = tempdir("pack-gitless");
+    fn the_pack_skips_runtime_and_repository_subtrees_at_any_depth() {
+        let pack = tempdir("pack-excluded");
         fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
+        fs::create_dir_all(pack.join("prompts/state")).unwrap();
+        fs::write(pack.join("prompts/goal.md"), "fix the thing\n").unwrap();
+        fs::write(pack.join("prompts/state/cursor"), "7\n").unwrap();
+        fs::create_dir_all(pack.join("state")).unwrap();
+        fs::write(pack.join("state/run.json"), "{}").unwrap();
+        fs::create_dir_all(pack.join(".git/objects")).unwrap();
+        fs::write(pack.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         fs::create_dir_all(pack.join("workspace/.git/objects/pack")).unwrap();
-        // Incompressible "packfile", with .git included this alone would overflow the payload cap.
         let mut buf = vec![0u8; 8 * 1024 * 1024];
         let mut x: u64 = 7;
         for b in &mut buf {
@@ -2855,26 +2860,90 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         .unwrap();
         fs::write(pack.join("workspace/main.go"), "package main\n").unwrap();
 
-        let tar = tar_pack_dir(&pack).expect("a gitless tar emits");
-        assert!(
-            tar.len() < 1024 * 1024,
-            "the .git payload is gone: {} bytes",
-            tar.len()
+        let tree = read_pack(&pack).expect("the pack reads");
+        let paths: Vec<&str> = tree.files().keys().map(|p| p.as_str()).collect();
+        assert_eq!(paths, ["crucible.toml", "prompts/goal.md"]);
+
+        let gz = pack_gz(&pack).expect("the pack encodes");
+        assert!(gz.len() < 1024 * 1024, "{} bytes", gz.len());
+        let entries = pack_entries(&gz);
+        assert_eq!(entries, ["crucible.toml", "prompts/goal.md"]);
+        let _ = fs::remove_dir_all(&pack);
+    }
+
+    /// The archive lists files in byte-wise path order whatever order the directory was written
+    /// in, so the same pack always encodes to the same bytes and the controller reads back the
+    /// digest the engine computed.
+    #[test]
+    fn the_pack_encodes_in_sorted_order_to_the_digest_the_controller_reads() {
+        let pack = tempdir("pack-sorted");
+        fs::create_dir_all(pack.join("z/a")).unwrap();
+        fs::create_dir_all(pack.join("a")).unwrap();
+        fs::write(pack.join("z/a/late.md"), "late\n").unwrap();
+        fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
+        fs::write(pack.join("a/early.md"), "early\n").unwrap();
+        fs::write(pack.join("B.md"), "upper\n").unwrap();
+
+        let gz = pack_gz(&pack).expect("the pack encodes");
+        assert_eq!(
+            pack_entries(&gz),
+            ["B.md", "a/early.md", "crucible.toml", "z/a/late.md"]
         );
-        let names: Vec<String> = tar::Archive::new(&tar[..])
+        assert_eq!(pack_gz(&pack).expect("again"), gz, "the encoding is stable");
+        let read = crucible_contract::pack_tree::read_tar_gz(&gz).expect("the controller reads it");
+        assert_eq!(
+            read.tree.digest(),
+            read_pack(&pack).expect("the pack reads").digest()
+        );
+        assert!(read.ignored.is_empty(), "{:?}", read.ignored);
+        let _ = fs::remove_dir_all(&pack);
+    }
+
+    /// A symlink is refused rather than followed, wherever it sits, and names its path; one under
+    /// an excluded subtree is never looked at.
+    #[test]
+    fn a_symlink_in_the_pack_is_refused_naming_it() {
+        let pack = tempdir("pack-symlink");
+        fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
+        fs::create_dir_all(pack.join("state")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", pack.join("state/link")).unwrap();
+        pack_gz(&pack).expect("a link under state/ is skipped");
+
+        fs::create_dir_all(pack.join("prompts")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", pack.join("prompts/goal.md")).unwrap();
+        let err = pack_gz(&pack).expect_err("a symlink is not a pack file");
+        assert!(
+            format!("{err:#}").contains("prompts/goal.md is a symbolic link"),
+            "{err:#}"
+        );
+        let line = pack_marker_line(
+            &ScopeReport {
+                stages: vec![stage(StageName::Freeze, true)],
+                digest: Some("v1:beef".into()),
+                cost: Some(0.1),
+                rounds: Vec::new(),
+                transcript: String::new(),
+            },
+            &pack,
+        )
+        .expect("a survival emits");
+        let payload = line.strip_prefix(SCOPE_PACK_MARKER).unwrap().trim();
+        let v: serde_json::Value = serde_json::from_str(payload).expect("an error object");
+        assert!(
+            v["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("symbolic link")),
+            "{payload}"
+        );
+        let _ = fs::remove_dir_all(&pack);
+    }
+
+    fn pack_entries(gz: &[u8]) -> Vec<String> {
+        tar::Archive::new(flate2::read::GzDecoder::new(gz))
             .entries()
             .unwrap()
             .map(|e| e.unwrap().path().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            names.iter().any(|n| n.ends_with("workspace/main.go")),
-            "workspace files survive: {names:?}"
-        );
-        assert!(
-            !names.iter().any(|n| n.contains(".git")),
-            "no .git entries: {names:?}"
-        );
-        let _ = fs::remove_dir_all(&pack);
+            .collect()
     }
 
     /// The cap binds the ENCODED payload, not the raw tar: a text-heavy pack well over the old
@@ -2926,11 +2995,15 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
     /// An oversize pack refuses to emit, an explicit error, never a truncated blob the controller
     /// could mistake for the real pack.
     #[test]
-    fn tar_pack_dir_refuses_an_oversize_pack() {
+    fn an_oversize_pack_refuses_to_encode() {
         let pack = tempdir("pack-oversize");
         fs::write(pack.join("crucible.toml"), "[repo]\nurl = \"x\"\n").unwrap();
-        fs::write(pack.join("bloat.bin"), vec![0u8; PACK_TAR_CAP_BYTES + 1]).unwrap();
-        let err = tar_pack_dir(&pack).expect_err("over the cap must refuse");
+        fs::write(
+            pack.join("bloat.bin"),
+            vec![0u8; PACK_TAR_CAP_BYTES as usize + 1],
+        )
+        .unwrap();
+        let err = pack_gz(&pack).expect_err("over the cap must refuse");
         assert!(
             format!("{err:#}").contains("cap"),
             "the error names the cap: {err:#}"
@@ -2987,7 +3060,11 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             "a dead proposal has no pack to deliver"
         );
 
-        fs::write(pack.join("bloat.bin"), vec![0u8; PACK_TAR_CAP_BYTES + 1]).unwrap();
+        fs::write(
+            pack.join("bloat.bin"),
+            vec![0u8; PACK_TAR_CAP_BYTES as usize + 1],
+        )
+        .unwrap();
         let line = pack_marker_line(&survived, &pack).expect("an oversize survival still emits");
         let payload = line.strip_prefix(SCOPE_PACK_MARKER).unwrap().trim();
         let v: serde_json::Value = serde_json::from_str(payload).expect("an error object");

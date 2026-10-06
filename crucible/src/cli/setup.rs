@@ -383,6 +383,7 @@ pub(crate) fn prep_plan_runner_with_params(
             commit_per_task,
             captured_bytes: std::sync::atomic::AtomicU64::new(0),
             staged: Default::default(),
+            budget_left: f64::INFINITY,
         },
         m,
     ))

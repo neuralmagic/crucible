@@ -1,8 +1,8 @@
 //! Draft packs: a pack authored in the controller instead of imported from a git pin. A draft is
-//! a versioned blob — every save tars the editor's `{path: content}` map, compiles it with the
-//! pinned engine, and stores the tarball beside whatever the engine made of it. A save that does
-//! not compile is still a version: the diagnostics are the payload the studio renders, not an
-//! error that loses the bytes.
+//! a versioned blob — every save stores the editor's `{path: content}` map as a pack tree, compiles
+//! it with the pinned engine, and stores the tree and its tarball beside whatever the engine made
+//! of it. A save that does not compile is still a version: the diagnostics are the payload the
+//! studio renders, not an error that loses the bytes.
 //!
 //! Drafts never enter the registry. [`graduate`] exports one as a PR over the same branch-pair
 //! push the scope-pack approval uses, and [`retire_matching`] stamps the draft retired once the
@@ -10,11 +10,11 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use crate::playbooks::packs::MaterializedPack;
+use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::plan_graph::WorkflowGraphDto;
-use crate::playbooks::registry::{MAX_PACK_TAR_BYTES, RegisterError, validate_id, validate_path};
+use crate::playbooks::registry::{RegisterError, validate_id, validate_path};
 use anyhow::{Context, Result};
-use crucible_contract::content_digest;
+use crucible_contract::pack_tree::{PackTree, TreeDigest};
 use serde::{Deserialize, Serialize};
 use sqlx::{PgPool, Row};
 use std::collections::BTreeMap;
@@ -22,18 +22,22 @@ use std::path::Path;
 
 /// How many files one draft may hold. A playbook pack is a manifest, a workflow source and a
 /// handful of skills; a save past this is not one.
-const MAX_DRAFT_FILES: usize = 128;
+pub(crate) const MAX_DRAFT_FILES: usize = 128;
 
 /// How large one draft file may be, before gzip.
-const MAX_DRAFT_FILE_BYTES: usize = 512 * 1024;
+pub(crate) const MAX_DRAFT_FILE_BYTES: usize = 512 * 1024;
+
+/// The largest draft save request body. Above axum's 2 MiB default so a compressible pack under
+/// the delivery budget can be saved.
+pub(crate) const MAX_DRAFT_SAVE_BYTES: usize = 16 * 1024 * 1024;
 
 /// The manifest a draft starts from when no template seeds it.
-const SKELETON_MANIFEST: &str =
+pub(crate) const SKELETON_MANIFEST: &str =
     "[agent]\n\n[workflow]\ntype = \"playbook\"\nfile = \"workflow.star\"\n";
 
 /// The workflow a draft starts from: the smallest graph that compiles, so the studio opens on a
 /// green preview rather than on a diagnostic.
-const SKELETON_WORKFLOW: &str = concat!(
+pub(crate) const SKELETON_WORKFLOW: &str = concat!(
     "params = {}\n",
     "\n",
     "hello = command(name = \"hello\", run = \"echo hello\")\n",
@@ -58,7 +62,21 @@ pub enum DraftError {
     #[error("{0}")]
     Push(String),
     #[error(transparent)]
-    Internal(#[from] anyhow::Error),
+    Internal(anyhow::Error),
+}
+
+/// An [`Unconvertible`](crate::playbooks::pack_trees::Unconvertible) pack is refused as invalid,
+/// naming its reason; anything else is internal.
+impl From<anyhow::Error> for DraftError {
+    fn from(e: anyhow::Error) -> Self {
+        if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
+            .is_some()
+        {
+            DraftError::Invalid(format!("{e:#}"))
+        } else {
+            DraftError::Internal(e)
+        }
+    }
 }
 
 impl From<crate::playbooks::packs::ReadTreeError> for DraftError {
@@ -67,7 +85,9 @@ impl From<crate::playbooks::packs::ReadTreeError> for DraftError {
             crate::playbooks::packs::ReadTreeError::NotText(rel) => DraftError::Invalid(format!(
                 "{rel} is not text, so it cannot be edited as a draft"
             )),
-            crate::playbooks::packs::ReadTreeError::Io(e) => DraftError::Internal(e),
+            crate::playbooks::packs::ReadTreeError::NotAPack(e) => {
+                DraftError::Invalid(e.to_string())
+            }
         }
     }
 }
@@ -95,6 +115,15 @@ impl std::fmt::Display for StaleBase {
     }
 }
 
+impl From<crate::playbooks::packs::PackRefusal> for DraftError {
+    fn from(e: crate::playbooks::packs::PackRefusal) -> Self {
+        match e {
+            crate::playbooks::packs::PackRefusal::Encode(e) => Self::Internal(e.into()),
+            refusal => Self::Invalid(refusal.to_string()),
+        }
+    }
+}
+
 impl From<RegisterError> for DraftError {
     fn from(e: RegisterError) -> Self {
         match e {
@@ -103,7 +132,7 @@ impl From<RegisterError> for DraftError {
             RegisterError::RevMoved(rev) => DraftError::Conflict(format!("the ref moved to {rev}")),
             RegisterError::Conflict(m) => DraftError::Conflict(m),
             e @ RegisterError::ExposureChanged { .. } => DraftError::Conflict(e.to_string()),
-            RegisterError::Internal(e) => DraftError::Internal(e),
+            RegisterError::Internal(e) => DraftError::from(e),
         }
     }
 }
@@ -225,10 +254,10 @@ impl OriginKind {
     }
 }
 
-/// A draft's origin, resolved against where that pack lives now. `rev` is what the draft was
-/// seeded from and `current_rev` is what the origin serves today: a registry re-pin moves them
-/// apart, which is what the studio offers a rebase against. An import's bytes are frozen, so its
-/// two revs are the same one.
+/// A draft's origin, resolved against where that pack lives now. `rev` and `digest` are what the
+/// draft was seeded from and `current_rev` and `current_digest` are what the origin serves today:
+/// a registry re-pin moves them apart, which is what the studio offers a rebase against. An
+/// import's bytes are frozen, so its two pins are the same one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftOrigin {
     pub kind: OriginKind,
@@ -238,21 +267,26 @@ pub struct DraftOrigin {
     pub path: Option<String>,
     pub rev: Option<String>,
     pub current_rev: Option<String>,
+    pub digest: Option<String>,
+    pub current_digest: Option<String>,
 }
 
 impl DraftOrigin {
-    /// Whether the origin pack re-pinned under the draft.
+    /// Whether the origin pack re-pinned under the draft: a different tree, or a different rev
+    /// when either side has no tree recorded.
     pub fn moved(&self) -> bool {
-        match (self.rev.as_deref(), self.current_rev.as_deref()) {
-            (Some(seeded), Some(current)) => seeded != current,
-            _ => false,
-        }
+        let pins = match (self.digest.as_deref(), self.current_digest.as_deref()) {
+            (Some(seeded), Some(current)) => Some((seeded, current)),
+            _ => self.rev.as_deref().zip(self.current_rev.as_deref()),
+        };
+        pins.is_some_and(|(seeded, current)| seeded != current)
     }
 
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Option<Self>> {
         let playbook: Option<String> = row.try_get("origin_playbook")?;
         let import_id: Option<String> = row.try_get("origin_import")?;
         let rev: Option<String> = row.try_get("origin_rev")?;
+        let digest: Option<String> = row.try_get("origin_digest")?;
         if let Some(playbook) = playbook {
             return Ok(Some(DraftOrigin {
                 kind: OriginKind::Playbook,
@@ -262,6 +296,8 @@ impl DraftOrigin {
                 path: row.try_get("origin_playbook_path")?,
                 rev,
                 current_rev: row.try_get("origin_current_rev")?,
+                digest,
+                current_digest: row.try_get("origin_current_digest")?,
             }));
         }
         let Some(import_id) = import_id else {
@@ -275,16 +311,19 @@ impl DraftOrigin {
             path: row.try_get("origin_import_path")?,
             current_rev: rev.clone(),
             rev,
+            current_digest: digest.clone(),
+            digest,
         }))
     }
 }
 
 /// Every draft column the studio reads, joined to whatever its origin is now.
 const DRAFT_COLUMNS: &str = "d.id, d.description, d.origin_playbook, d.origin_rev, \
-                             d.origin_import, d.graduation_repo, d.graduation_path, \
-                             d.graduation_pr_url, d.retired_at, d.owner, d.created_by, d.created_at, \
-                             d.updated_at, p.repo AS origin_playbook_repo, \
-                             p.path AS origin_playbook_path, p.rev AS origin_current_rev, \
+                             d.origin_digest, d.origin_import, d.graduation_repo, \
+                             d.graduation_path, d.graduation_pr_url, d.retired_at, d.owner, \
+                             d.created_by, d.created_at, d.updated_at, \
+                             p.repo AS origin_playbook_repo, p.path AS origin_playbook_path, \
+                             p.rev AS origin_current_rev, p.tree_digest AS origin_current_digest, \
                              i.repo AS origin_import_repo, i.path AS origin_import_path, \
                              sp.id AS published_playbook";
 
@@ -330,11 +369,12 @@ impl DraftRow {
     }
 }
 
-/// One stored save, without its tarball.
+/// One stored save, without its files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DraftVersionRow {
     pub version: i64,
-    pub tar_digest: String,
+    /// The stored tree; `None` until startup conversion reaches a row an older controller wrote.
+    pub tree_digest: Option<TreeDigest>,
     pub schema_digest: Option<String>,
     pub diagnostics: Vec<Diagnostic>,
     pub core_rev: String,
@@ -347,7 +387,11 @@ impl DraftVersionRow {
         let diagnostics: serde_json::Value = row.try_get("diagnostics")?;
         Ok(DraftVersionRow {
             version: row.try_get("version")?,
-            tar_digest: row.try_get("tar_digest")?,
+            tree_digest: row
+                .try_get::<Option<String>, _>("tree_digest")?
+                .map(TreeDigest::try_from)
+                .transpose()
+                .map_err(anyhow::Error::msg)?,
             schema_digest: row.try_get("schema_digest")?,
             diagnostics: serde_json::from_value(diagnostics)
                 .context("decoding stored draft diagnostics")?,
@@ -410,9 +454,15 @@ fn write_tree(files: &BTreeMap<String, String>, root: &Path) -> Result<(), Draft
         if path.trim().is_empty() {
             return Err(DraftError::Invalid("a draft file needs a path".to_string()));
         }
-        validate_path(path).map_err(|_| {
+        let pack_path: crucible_contract::pack_tree::PackFilePath = path.parse().map_err(|_| {
             DraftError::Invalid(format!("{path:?} is not a relative path inside the pack"))
         })?;
+        if pack_path.is_excluded() {
+            return Err(DraftError::Invalid(format!(
+                "{path} is under {}, which a pack never carries",
+                crucible_contract::pack_tree::EXCLUDED_SEGMENTS.join(", ")
+            )));
+        }
         if content.len() > MAX_DRAFT_FILE_BYTES {
             return Err(DraftError::Invalid(format!(
                 "{path} is {} bytes, over the {MAX_DRAFT_FILE_BYTES}-byte per-file limit",
@@ -482,8 +532,8 @@ pub enum DraftSeed<'a> {
         expected_rev: Option<&'a str>,
         expected_digest: Option<&'a str>,
     },
-    /// A pending import's frozen tarball, at the rev it was taken at.
-    Import { id: &'a str, tar_gz: &'a [u8] },
+    /// A pending import's frozen tree, at the rev it was taken at.
+    Import { id: &'a str, tree: &'a PackTree },
 }
 
 /// The origin columns one create writes.
@@ -492,6 +542,27 @@ struct SeededOrigin {
     playbook: Option<String>,
     import_id: Option<String>,
     rev: Option<String>,
+    digest: Option<String>,
+}
+
+/// The refusal for a template pin `supplied` that the registry no longer serves: superseded,
+/// naming its replacement, when it is a pre-tree digest of a tree `template` has held, and
+/// `otherwise` for anything else, so an unknown pin and a superseded one the template never held
+/// read alike. The caller may read `template`.
+async fn superseded_or(
+    pool: &PgPool,
+    template: &str,
+    supplied: &str,
+    otherwise: impl FnOnce() -> String,
+) -> DraftError {
+    match crate::playbooks::pack_trees::superseded_in(pool, template, supplied).await {
+        Ok(Some(replacement)) => DraftError::Conflict(format!(
+            "playbook {template:?} revision {supplied} is superseded by {replacement}; reload \
+             before cloning"
+        )),
+        Ok(None) => DraftError::Conflict(otherwise()),
+        Err(e) => DraftError::Internal(e),
+    }
 }
 
 /// Whether a draft can be created under `id`: a valid slug, a description, and an id the registry
@@ -544,52 +615,62 @@ pub async fn create(
                 .await
                 .map_err(DraftError::Internal)?
                 .ok_or_else(|| DraftError::NotFound(format!("no playbook {template:?}")))?;
-            if expected_rev.is_some_and(|rev| rev != registered.rev) {
-                return Err(DraftError::Conflict(format!(
-                    "playbook {template:?} moved from inspected revision {} to {}; reload before cloning",
-                    expected_rev.unwrap_or_default(),
-                    registered.rev
-                )));
+            if let Some(rev) = expected_rev
+                && rev != registered.rev
+            {
+                return Err(superseded_or(pool, template, rev, || {
+                    format!(
+                        "playbook {template:?} moved from inspected revision {rev} to {}; \
+                         reload before cloning",
+                        registered.rev
+                    )
+                })
+                .await);
             }
-            let pack = crate::playbooks::registry::materialize_at_rev(
+            let pinned = expected_digest
+                .map(str::to_string)
+                .or_else(|| registered.tree_digest.map(|t| t.to_string()));
+            let tree = crate::playbooks::registry::pack_at_rev(
                 pool,
                 template,
                 &registered.rev,
-                expected_digest,
+                pinned.as_deref(),
             )
-            .await
-            .map_err(DraftError::Internal)?
-            .ok_or_else(|| {
-                DraftError::Conflict(format!(
-                    "playbook {template:?} moved while cloning; reload before retrying"
-                ))
-            })?;
+            .await?;
+            let Some(tree) = tree else {
+                let moved =
+                    || format!("playbook {template:?} moved while cloning; reload before retrying");
+                return Err(match expected_digest {
+                    Some(digest) => superseded_or(pool, template, digest, moved).await,
+                    None => DraftError::Conflict(moved()),
+                });
+            };
             (
-                crate::playbooks::packs::read_tree(pack.path())?,
+                crate::playbooks::packs::text_files(tree)?,
                 SeededOrigin {
                     playbook: Some(registered.id),
                     import_id: None,
                     rev: Some(registered.rev),
+                    digest: pinned,
                 },
             )
         }
-        DraftSeed::Import { id: import, tar_gz } => {
-            let rev: Option<String> =
-                sqlx::query_scalar("SELECT rev FROM pack_imports WHERE id = $1")
+        DraftSeed::Import { id: import, tree } => {
+            let pins: Option<(String, Option<String>)> =
+                sqlx::query_as("SELECT rev, tree_digest FROM pack_imports WHERE id = $1")
                     .bind(import)
                     .fetch_optional(pool)
                     .await
                     .context("reading the rev a draft is seeded at")
                     .map_err(DraftError::Internal)?;
-            let pack = crate::playbooks::packs::unpack_to_scratch(tar_gz)
-                .context("unpacking the pack tarball the draft is seeded from")
-                .map_err(DraftError::Internal)?;
+            let (rev, digest) = pins.unzip();
             (
-                crate::playbooks::packs::read_tree(pack.path())?,
+                crate::playbooks::packs::text_files(tree.clone())?,
                 SeededOrigin {
                     playbook: None,
                     import_id: Some(import.to_string()),
                     rev,
+                    digest: digest.flatten(),
                 },
             )
         }
@@ -605,8 +686,8 @@ pub async fn create(
     let now = crate::clock::now_rfc3339();
     let inserted = sqlx::query(
         r#"INSERT INTO playbook_drafts (id, description, origin_playbook, origin_import, origin_rev,
-                                        created_by, created_at, updated_at, owner)
-           VALUES ($1, $2, $3, $6, $7, $4, $5, $5, $8) ON CONFLICT (id) DO NOTHING"#,
+                                        created_by, created_at, updated_at, owner, origin_digest)
+           VALUES ($1, $2, $3, $6, $7, $4, $5, $5, $8, $9) ON CONFLICT (id) DO NOTHING"#,
     )
     .bind(id)
     .bind(description.trim())
@@ -616,6 +697,7 @@ pub async fn create(
     .bind(&origin.import_id)
     .bind(&origin.rev)
     .bind(owner.to_string())
+    .bind(&origin.digest)
     .execute(pool)
     .await
     .context("creating a playbook draft")
@@ -627,10 +709,10 @@ pub async fn create(
     save_version(pool, id, files, actor, None).await
 }
 
-/// Store a save: tar the file map, compile it, and write the next version row either way. A
-/// `base_version` that is not the newest save is refused with [`DraftError::StaleBase`] carrying
-/// the version that overtook it, so the writer re-reads and merges instead of clobbering the other
-/// editor; `None` appends onto whatever is latest.
+/// Store a save: store the file map's tree, compile it, and write the next version row either
+/// way. A `base_version` that is not the newest save is refused with [`DraftError::StaleBase`]
+/// carrying the version that overtook it, so the writer re-reads and merges instead of clobbering
+/// the other editor; `None` appends onto whatever is latest.
 pub async fn save_version(
     pool: &PgPool,
     id: &str,
@@ -657,22 +739,14 @@ pub async fn save_version(
             .context("creating the draft tree")
             .map_err(DraftError::Internal)?;
         write_tree(&files, &root)?;
-        let tar_gz = crate::playbooks::packs::tar_pack_tree(&root)
-            .context("taring the draft tree")
-            .map_err(DraftError::Internal)?;
-        if tar_gz.len() > MAX_PACK_TAR_BYTES {
-            return Err(DraftError::Invalid(format!(
-                "the draft tarball is {} bytes, over the {MAX_PACK_TAR_BYTES}-byte limit",
-                tar_gz.len()
-            )));
-        }
-        Ok::<_, DraftError>((tar_gz, compile_tree(&root)))
+        let pack = crate::playbooks::packs::deliverable(&root)?;
+        Ok::<_, DraftError>((pack, compile_tree(&root)))
     })
     .await
     .context("joining the draft compile worker")
     .map_err(DraftError::Internal)?;
     let (
-        tar_gz,
+        pack,
         CompiledTree {
             params_schema,
             schema_digest,
@@ -683,7 +757,6 @@ pub async fn save_version(
     ) = compiled?;
 
     let core_rev = crate::playbooks::registry::core_rev().map_err(DraftError::Internal)?;
-    let tar_digest = content_digest(&tar_gz);
     let now = crate::clock::now_rfc3339();
     let graph_json = graph
         .as_ref()
@@ -756,18 +829,26 @@ pub async fn save_version(
             saved_at,
         }));
     }
+    let tree_digest = crate::playbooks::pack_trees::put_tree(&mut tx, pack.pack())
+        .await
+        .map_err(DraftError::Internal)?;
     let version: i64 = sqlx::query_scalar(
         r#"INSERT INTO playbook_draft_versions (draft_id, version, tar_gz, tar_digest, tar_bytes,
                                                 params_schema, schema_digest, graph, diagnostics,
                                                 agent_backend, agent_sandbox_image, core_rev,
-                                                created_by, created_at, agent_requirements)
-           VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15)
+                                                created_by, created_at, agent_requirements,
+                                                tree_digest)
+           VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $15, $16)
            RETURNING version"#,
     )
     .bind(id)
-    .bind(&tar_gz)
-    .bind(&tar_digest)
-    .bind(tar_gz.len() as i64)
+    .bind(pack.tarball())
+    .bind(pack.tarball_digest())
+    .bind(
+        i64::try_from(pack.tarball().len())
+            .context("pack size")
+            .map_err(DraftError::Internal)?,
+    )
     .bind(&params_schema)
     .bind(&schema_digest)
     .bind(&graph_json)
@@ -779,6 +860,7 @@ pub async fn save_version(
     .bind(&now)
     .bind(current + 1)
     .bind(agent.as_ref().map(|a| a.requirements_json()))
+    .bind(tree_digest.as_str())
     .fetch_one(&mut *tx)
     .await
     .context("storing a draft version")
@@ -868,7 +950,7 @@ pub async fn get(pool: &PgPool, id: &str) -> Result<Option<DraftRow>> {
 /// A draft's save history, newest first.
 pub async fn versions(pool: &PgPool, id: &str) -> Result<Vec<DraftVersionRow>> {
     let rows = sqlx::query(
-        r#"SELECT version, tar_digest, schema_digest, diagnostics, core_rev, created_by, created_at
+        r#"SELECT version, tree_digest, schema_digest, diagnostics, core_rev, created_by, created_at
            FROM playbook_draft_versions WHERE draft_id = $1 ORDER BY version DESC"#,
     )
     .bind(id)
@@ -953,7 +1035,7 @@ pub async fn files(
     id: &str,
     version: Option<i64>,
 ) -> Result<Option<DraftFiles>, DraftError> {
-    let Some((head, pack)) = materialize(pool, id, version)
+    let Some((head, tree)) = version_pack(pool, id, version)
         .await
         .map_err(DraftError::Internal)?
     else {
@@ -964,7 +1046,7 @@ pub async fn files(
         saved_by: head.saved_by,
         saved_at: head.saved_at,
         diagnostics: head.diagnostics,
-        files: crate::playbooks::packs::read_tree(pack.path())?,
+        files: crate::playbooks::packs::text_files(tree)?,
     }))
 }
 
@@ -975,17 +1057,17 @@ pub async fn exposure_of(
     id: &str,
     version: i64,
 ) -> Result<Option<crate::playbooks::exposure::Extraction>, DraftError> {
-    let Some((_, pack)) = materialize(pool, id, Some(version))
-        .await
-        .map_err(DraftError::Internal)?
-    else {
+    let Some((_, tree)) = version_pack(pool, id, Some(version)).await? else {
         return Ok(None);
     };
-    let extraction =
-        tokio::task::spawn_blocking(move || crate::playbooks::exposure::extract(pack.path(), None))
-            .await
-            .context("joining the draft exposure worker")
-            .map_err(DraftError::Internal)?;
+    let extraction = tokio::task::spawn_blocking(move || {
+        let pack = crate::playbooks::packs::materialize_tree(&tree)
+            .map_err(crate::playbooks::exposure::ExtractError::Internal)?;
+        crate::playbooks::exposure::extract(pack.path(), None)
+    })
+    .await
+    .context("joining the draft exposure worker")
+    .map_err(DraftError::Internal)?;
     match extraction {
         Ok(exposure) => Ok(Some(crate::playbooks::exposure::Extraction::Declared(
             exposure,
@@ -1010,51 +1092,45 @@ pub struct DraftFiles {
     pub files: BTreeMap<String, String>,
 }
 
-/// Who saved a materialized version, and when.
-struct MaterializedHead {
+/// Who saved a stored version, and when.
+struct VersionHead {
     version: i64,
     saved_by: Option<String>,
     saved_at: String,
     diagnostics: Vec<Diagnostic>,
 }
 
-/// Unpack a stored version into a scratch tree.
-async fn materialize(
+/// A stored version's pack, the newest when `version` is `None`.
+async fn version_pack(
     pool: &PgPool,
     id: &str,
     version: Option<i64>,
-) -> Result<Option<(MaterializedHead, MaterializedPack)>> {
-    let row = match version {
-        Some(v) => sqlx::query(
-            "SELECT version, created_by, created_at, diagnostics, tar_gz \
-             FROM playbook_draft_versions WHERE draft_id = $1 AND version = $2",
-        )
-        .bind(id)
-        .bind(v),
-        None => sqlx::query(
-            "SELECT version, created_by, created_at, diagnostics, tar_gz \
-             FROM playbook_draft_versions WHERE draft_id = $1 ORDER BY version DESC LIMIT 1",
-        )
-        .bind(id),
-    }
+) -> Result<Option<(VersionHead, PackTree)>> {
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT version, created_by, created_at, diagnostics, {PACK_COLS}
+         FROM playbook_draft_versions WHERE draft_id = $1 AND ($2::BIGINT IS NULL OR version = $2)
+         ORDER BY version DESC LIMIT 1"
+    ))
+    .bind(id)
+    .bind(version)
     .fetch_optional(pool)
     .await
-    .context("reading a draft tarball")?;
+    .context("reading a draft version")?;
     let Some(row) = row else {
         return Ok(None);
     };
     let version: i64 = row.try_get("version")?;
     let diagnostics: serde_json::Value = row.try_get("diagnostics")?;
-    let head = MaterializedHead {
+    let head = VersionHead {
         version,
         saved_by: row.try_get("created_by")?,
         saved_at: row.try_get("created_at")?,
         diagnostics: serde_json::from_value(diagnostics)
             .context("decoding stored draft diagnostics")?,
     };
-    let tar_gz: Vec<u8> = row.try_get("tar_gz")?;
-    let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-        .with_context(|| format!("unpacking draft {id} version {version}"))?;
+    let pack = crate::playbooks::pack_trees::load_row(pool, &row)
+        .await
+        .with_context(|| format!("reading draft {id} version {version}"))?;
     Ok(Some((head, pack)))
 }
 
@@ -1085,9 +1161,8 @@ pub async fn origin_files(pool: &PgPool, id: &str) -> Result<Option<OriginFiles>
             let playbook = origin.playbook.ok_or_else(|| {
                 DraftError::Internal(anyhow::anyhow!("origin without a playbook"))
             })?;
-            let pack = crate::playbooks::registry::materialize(pool, &playbook)
-                .await
-                .map_err(DraftError::Internal)?
+            let tree = crate::playbooks::registry::pack(pool, &playbook)
+                .await?
                 .ok_or_else(|| {
                     DraftError::NotFound(format!(
                         "draft {id} came from playbook {playbook}, which is no longer registered"
@@ -1097,64 +1172,49 @@ pub async fn origin_files(pool: &PgPool, id: &str) -> Result<Option<OriginFiles>
                 kind: OriginKind::Playbook,
                 reference: playbook,
                 rev: origin.current_rev,
-                files: crate::playbooks::packs::read_tree(pack.path())?,
+                files: crate::playbooks::packs::text_files(tree)?,
             }))
         }
         OriginKind::Import => {
             let import = origin.import_id.ok_or_else(|| {
                 DraftError::Internal(anyhow::anyhow!("origin without an import id"))
             })?;
-            let tar_gz: Option<Vec<u8>> =
-                sqlx::query_scalar("SELECT tar_gz FROM pack_imports WHERE id = $1")
-                    .bind(&import)
-                    .fetch_optional(pool)
-                    .await
-                    .context("reading the import tarball a draft came from")
-                    .map_err(DraftError::Internal)?;
-            let tar_gz = tar_gz.ok_or_else(|| {
+            let row = sqlx::query(const_format::formatcp!(
+                "SELECT {} FROM pack_imports WHERE id = $1",
+                crate::playbooks::pack_trees::PACK_COLS
+            ))
+            .bind(&import)
+            .fetch_optional(pool)
+            .await
+            .context("reading the import a draft came from")?
+            .ok_or_else(|| {
                 DraftError::NotFound(format!(
                     "draft {id} came from import {import}, which no longer exists"
                 ))
             })?;
-            let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-                .context("unpacking the import a draft came from")
-                .map_err(DraftError::Internal)?;
+            let tree = crate::playbooks::pack_trees::load_row(pool, &row)
+                .await
+                .with_context(|| format!("reading the frozen pack of import {import}"))?;
             Ok(Some(OriginFiles {
                 kind: OriginKind::Import,
                 reference: import,
                 rev: origin.rev,
-                files: crate::playbooks::packs::read_tree(pack.path())?,
+                files: crate::playbooks::packs::text_files(tree)?,
             }))
         }
     }
 }
 
-/// One stored version's tarball, exactly the bytes the save stored. `None` when the draft or the
+/// One stored version's pack, the newest when `version` is `None`. `None` when the draft or the
 /// version is unknown.
-pub async fn tarball(
+pub async fn version_tree(
     pool: &PgPool,
     id: &str,
     version: Option<i64>,
-) -> Result<Option<(i64, Vec<u8>)>> {
-    let row = match version {
-        Some(v) => sqlx::query(
-            "SELECT version, tar_gz FROM playbook_draft_versions WHERE draft_id = $1 AND version = $2",
-        )
-        .bind(id)
-        .bind(v),
-        None => sqlx::query(
-            "SELECT version, tar_gz FROM playbook_draft_versions WHERE draft_id = $1 \
-             ORDER BY version DESC LIMIT 1",
-        )
-        .bind(id),
-    }
-    .fetch_optional(pool)
-    .await
-    .context("reading a draft tarball for download")?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    Ok(Some((row.try_get("version")?, row.try_get("tar_gz")?)))
+) -> Result<Option<(i64, PackTree)>> {
+    Ok(version_pack(pool, id, version)
+        .await?
+        .map(|(head, tree)| (head.version, tree)))
 }
 
 /// Drop a draft and every version it holds.
@@ -1176,12 +1236,12 @@ pub(crate) async fn copy_draft_pack_to<'e>(
     slug: &str,
 ) -> Result<bool> {
     let res = sqlx::query(
-        r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at)
-           SELECT $3, tar_gz, tar_digest, tar_bytes, $4 FROM playbook_draft_versions
+        r#"INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
+           SELECT $3, tar_gz, tar_digest, tar_bytes, $4, tree_digest FROM playbook_draft_versions
            WHERE draft_id = $1 AND version = $2
            ON CONFLICT (issue_slug) DO UPDATE SET
                tar_gz = excluded.tar_gz, digest = excluded.digest, bytes = excluded.bytes,
-               created_at = excluded.created_at"#,
+               created_at = excluded.created_at, tree_digest = excluded.tree_digest"#,
     )
     .bind(id)
     .bind(version)
@@ -1193,12 +1253,12 @@ pub(crate) async fn copy_draft_pack_to<'e>(
     Ok(res.rows_affected() > 0)
 }
 
-/// The newest version of draft `id` that compiled, with its tarball.
-pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, Vec<u8>), DraftError> {
-    let row = sqlx::query(
-        r#"SELECT version, tar_gz FROM playbook_draft_versions
-           WHERE draft_id = $1 AND schema_digest IS NOT NULL ORDER BY version DESC LIMIT 1"#,
-    )
+/// The newest version of draft `id` that compiled, with its pack.
+pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, PackTree), DraftError> {
+    let row = sqlx::query(const_format::formatcp!(
+        "SELECT version, {PACK_COLS} FROM playbook_draft_versions
+         WHERE draft_id = $1 AND schema_digest IS NOT NULL ORDER BY version DESC LIMIT 1"
+    ))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -1212,10 +1272,10 @@ pub async fn newest_compiling(pool: &PgPool, id: &str) -> Result<(i64, Vec<u8>),
     let version: i64 = row
         .try_get("version")
         .map_err(|e| DraftError::Internal(e.into()))?;
-    let tar_gz: Vec<u8> = row
-        .try_get("tar_gz")
-        .map_err(|e| DraftError::Internal(e.into()))?;
-    Ok((version, tar_gz))
+    let tree = crate::playbooks::pack_trees::load_row(pool, &row)
+        .await
+        .with_context(|| format!("reading draft {id} version {version}"))?;
+    Ok((version, tree))
 }
 
 /// The playbook a publish of `draft` writes: the one asked for, else the one it last published
@@ -1274,7 +1334,7 @@ pub async fn graduate(
         return Err(DraftError::Invalid(format!("repo {repo:?} is not a repo")));
     }
 
-    let (version, tar_gz) = newest_compiling(pool, id).await?;
+    let (version, tree) = newest_compiling(pool, id).await?;
 
     let title = format!("[pack] {id}");
     let body = format!(
@@ -1285,9 +1345,6 @@ pub async fn graduate(
     let (branch_repo, branch_path, branch_key) =
         (repo.to_string(), path.to_string(), format!("draft/{id}"));
     let pushed = tokio::task::spawn_blocking(move || {
-        let pack = crate::playbooks::packs::unpack_to_scratch(&tar_gz)
-            .context("unpacking the draft for export")
-            .map_err(DraftError::Internal)?;
         let scratch = tempfile::tempdir()
             .context("draft export scratch dir")
             .map_err(DraftError::Internal)?;
@@ -1296,7 +1353,7 @@ pub async fn graduate(
         } else {
             scratch.path().join(&branch_path)
         };
-        copy_tree(pack.path(), &out).map_err(DraftError::Internal)?;
+        crate::playbooks::packs::write_tree(&tree, &out).map_err(DraftError::Internal)?;
         crate::runs::engine::open_draft_pr(
             &branch_repo,
             &branch_key,
@@ -1329,31 +1386,49 @@ pub async fn graduate(
     Ok(url)
 }
 
-/// Copy a tree of regular files, creating `to`.
-fn copy_tree(from: &Path, to: &Path) -> Result<()> {
-    std::fs::create_dir_all(to).with_context(|| format!("creating {}", to.display()))?;
-    for entry in std::fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
-        let entry = entry.context("reading a tree entry")?;
-        let target = to.join(entry.file_name());
-        if entry.path().is_dir() {
-            copy_tree(&entry.path(), &target)?;
-        } else {
-            std::fs::copy(entry.path(), &target)
-                .with_context(|| format!("copying {}", entry.path().display()))?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::playbooks::drafts::*;
+    use crucible_contract::content_digest;
 
     fn skeleton() -> BTreeMap<String, String> {
         BTreeMap::from([
             ("crucible.toml".to_string(), SKELETON_MANIFEST.to_string()),
             ("workflow.star".to_string(), SKELETON_WORKFLOW.to_string()),
         ])
+    }
+
+    /// A save whose files each fit the per-file cap, but whose delivered tarball is over the
+    /// delivery budget, is refused and stores no version.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_save_over_the_delivery_budget_stores_nothing(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("the skeleton compiles");
+        let before = versions(&pool, "studio").await.expect("versions").len();
+
+        let mut files = skeleton();
+        for seed in 1..=3 {
+            files.insert(
+                format!("blob{seed}.txt"),
+                crate::testing::fixtures::incompressible_text(500 * 1024, seed),
+            );
+        }
+        match save_version(&pool, "studio", files, None, None).await {
+            Err(DraftError::Invalid(msg)) => assert!(msg.contains("delivery budget"), "{msg}"),
+            other => panic!("expected a delivery-budget refusal, got {other:?}"),
+        }
+        assert_eq!(
+            versions(&pool, "studio").await.expect("versions").len(),
+            before
+        );
     }
 
     /// The docs-drift case, at the layer that reported it clean: a draft whose manifest declares
@@ -1485,9 +1560,17 @@ mod tests {
     }
 
     #[test]
-    fn a_file_map_that_escapes_the_pack_is_refused() {
+    fn a_file_map_that_escapes_the_pack_or_names_an_excluded_dir_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for bad in ["../escape.star", "/etc/passwd", ""] {
+        for bad in [
+            "../escape.star",
+            "/etc/passwd",
+            "",
+            "a\\b",
+            "skills/state/notes.md",
+            "workspace/flow.star",
+            ".git/config",
+        ] {
             let files = BTreeMap::from([(bad.to_string(), "x".to_string())]);
             assert!(
                 matches!(write_tree(&files, dir.path()), Err(DraftError::Invalid(_))),
@@ -1498,6 +1581,113 @@ mod tests {
             write_tree(&BTreeMap::new(), dir.path()),
             Err(DraftError::Invalid(_))
         ));
+    }
+
+    /// Saving the same file map twice appends two versions on one stored tree, and each version
+    /// stores that tree's own tarball beside the tree it names.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_identical_file_map_saved_twice_shares_one_tree(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("create");
+        let again = save_version(&pool, "studio", skeleton(), None, None)
+            .await
+            .expect("save");
+        assert_eq!(again.version, 2);
+
+        let expected = PackTree::from_pairs(&[
+            ("crucible.toml", SKELETON_MANIFEST.as_bytes()),
+            ("workflow.star", SKELETON_WORKFLOW.as_bytes()),
+        ])
+        .expect("tree");
+        let tarball = expected.tarball().expect("tarball");
+        let rows: Vec<(Option<String>, Vec<u8>, String)> = sqlx::query_as(
+            "SELECT tree_digest, tar_gz, tar_digest FROM playbook_draft_versions \
+             WHERE draft_id = 'studio' ORDER BY version",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("versions");
+        let row = (
+            Some(expected.digest().to_string()),
+            tarball.clone(),
+            content_digest(&tarball),
+        );
+        assert_eq!(rows, vec![row.clone(), row]);
+        let trees: i64 = sqlx::query_scalar("SELECT count(*) FROM pack_trees")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(trees, 1);
+    }
+
+    /// Each save that changes one file of a pack stores exactly one new blob and one new tree,
+    /// and every version reads back as the file map it saved.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_save_that_changes_one_file_stores_one_new_blob(pool: PgPool) {
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("wren"),
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("create");
+        let counts = || async {
+            sqlx::query_as::<_, (i64, i64)>(
+                "SELECT (SELECT count(*) FROM pack_blobs), (SELECT count(*) FROM pack_trees)",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("counts")
+        };
+        let mut files = skeleton();
+        for n in 0..8 {
+            files.insert(format!("docs/{n}.md"), format!("doc {n}\n"));
+        }
+        save_version(&pool, "studio", files.clone(), None, None)
+            .await
+            .expect("save");
+        let mut saved = vec![files.clone()];
+        let (mut blobs, mut trees) = counts().await;
+
+        for round in 0..5 {
+            files.insert(format!("docs/{}.md", round % 8), format!("edit {round}\n"));
+            save_version(&pool, "studio", files.clone(), None, None)
+                .await
+                .expect("save");
+            saved.push(files.clone());
+            assert_eq!(counts().await, (blobs + 1, trees + 1), "round {round}");
+            (blobs, trees) = counts().await;
+        }
+
+        for (i, expected) in saved.iter().enumerate() {
+            let version = i64::try_from(i).expect("version") + 2;
+            let (_, tree) = version_tree(&pool, "studio", Some(version))
+                .await
+                .expect("read")
+                .expect("stored");
+            let read: BTreeMap<String, String> = tree
+                .into_files()
+                .into_iter()
+                .map(|(path, bytes)| {
+                    (
+                        path.as_str().to_string(),
+                        String::from_utf8(bytes).expect("utf8"),
+                    )
+                })
+                .collect();
+            assert_eq!(&read, expected, "version {version}");
+        }
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -1539,12 +1729,8 @@ mod tests {
             vec![3, 2, 1]
         );
         assert_ne!(
-            history[0].tar_digest, history[1].tar_digest,
-            "an edited file is different bytes"
-        );
-        assert_eq!(
-            history[1].tar_digest, history[1].tar_digest,
-            "a digest is stable"
+            history[0].tree_digest, history[1].tree_digest,
+            "an edited file is a different tree"
         );
 
         assert_eq!(
@@ -1888,7 +2074,9 @@ mod tests {
             "d",
             DraftSeed::Import {
                 id: "imp-1",
-                tar_gz: &import_tar,
+                tree: &crucible_contract::pack_tree::read_tar_gz(&import_tar)
+                    .expect("read")
+                    .tree,
             },
             None,
             &crate::authz::model::Principal::platform(),
@@ -2004,10 +2192,9 @@ mod tests {
         );
     }
 
-    /// A save's bytes come back as the bytes: the tarball a download serves is the one the version
-    /// stored, and it unpacks to that save's files.
+    /// Each version reads back as the tree its save stored, under the digest its row records.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn every_version_downloads_as_the_tarball_it_stored(pool: PgPool) {
+    async fn every_version_reads_back_as_the_tree_it_stored(pool: PgPool) {
         create(
             &pool,
             "studio",
@@ -2020,44 +2207,55 @@ mod tests {
         .expect("create");
         let mut second = skeleton();
         second.insert("skills/read/SKILL.md".to_string(), "read it\n".to_string());
-        save_version(&pool, "studio", second, None, Some(1))
+        save_version(&pool, "studio", second.clone(), None, Some(1))
             .await
             .expect("save");
+        let recorded = |version: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT tree_digest FROM playbook_draft_versions
+                     WHERE draft_id = 'studio' AND version = $1",
+                )
+                .bind(version)
+                .fetch_one(&pool)
+                .await
+                .expect("tree column")
+            }
+        };
 
-        let (version, bytes) = tarball(&pool, "studio", None)
+        let (version, tree) = version_tree(&pool, "studio", None)
             .await
-            .expect("tarball")
+            .expect("read")
             .expect("a version");
         assert_eq!(version, 2);
-        let pack = crate::playbooks::packs::unpack_to_scratch(&bytes).expect("unpack");
-        let files = crate::playbooks::packs::read_tree(pack.path()).expect("read");
         assert_eq!(
-            files.get("skills/read/SKILL.md").map(String::as_str),
-            Some("read it\n")
+            crate::playbooks::packs::text_files(tree.clone()).expect("text"),
+            second
         );
+        assert_eq!(recorded(2).await, Some(tree.digest().to_string()));
 
-        let (version, first) = tarball(&pool, "studio", Some(1))
+        let (version, first) = version_tree(&pool, "studio", Some(1))
             .await
-            .expect("tarball")
+            .expect("read")
             .expect("a version");
         assert_eq!(version, 1);
-        let pack = crate::playbooks::packs::unpack_to_scratch(&first).expect("unpack");
-        assert!(
-            !crate::playbooks::packs::read_tree(pack.path())
-                .expect("read")
-                .contains_key("skills/read/SKILL.md"),
+        assert_eq!(
+            crate::playbooks::packs::text_files(first.clone()).expect("text"),
+            skeleton(),
             "version 1 is version 1"
         );
+        assert_eq!(recorded(1).await, Some(first.digest().to_string()));
         assert!(
-            tarball(&pool, "studio", Some(9))
+            version_tree(&pool, "studio", Some(9))
                 .await
-                .expect("tarball")
+                .expect("read")
                 .is_none()
         );
         assert!(
-            tarball(&pool, "nope", None)
+            version_tree(&pool, "nope", None)
                 .await
-                .expect("tarball")
+                .expect("read")
                 .is_none()
         );
     }
@@ -2175,5 +2373,343 @@ mod tests {
             Some("workflow.star")
         );
         assert!(refused.diagnostics[0].line.is_some());
+    }
+
+    /// The origin pin is the tree. A registry repoint that keeps the rev but changes the tree
+    /// moves the origin, a template pin naming the old tree is refused, and a pre-tree digest is
+    /// refused as superseded only when the template has held its replacement. A superseded digest
+    /// whose tree the template never held reads exactly as an unknown one.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_same_rev_repoint_to_another_tree_moves_the_origin(pool: PgPool) {
+        let tree = |marker: &str| {
+            PackTree::from_pairs(&[
+                ("crucible.toml", SKELETON_MANIFEST.as_bytes()),
+                (
+                    "workflow.star",
+                    format!("params = {{}}\n# {marker}\n").as_bytes(),
+                ),
+            ])
+            .expect("tree")
+        };
+        let (first, second, elsewhere) = (tree("first"), tree("second"), tree("elsewhere"));
+        let mut conn = pool.acquire().await.expect("conn");
+        let mut stored = Vec::new();
+        for t in [&first, &second, &elsewhere] {
+            let pack = crate::playbooks::pack_trees::EncodedPack::new(t.clone()).expect("encode");
+            crate::playbooks::pack_trees::put_tree(&mut conn, &pack)
+                .await
+                .expect("put");
+            stored.push(pack);
+        }
+        let pin = |pack: &crate::playbooks::pack_trees::EncodedPack| {
+            let pool = pool.clone();
+            let (tarball, digest) = (pack.tarball().to_vec(), pack.tree().digest().to_string());
+            async move {
+                sqlx::query(
+                    "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, \
+                     tar_digest, tar_bytes, params_schema, schema_digest, core_rev, created_at, \
+                     updated_at, tree_digest) \
+                     VALUES ('survey', 'd', 'o/r', 'aaa', '', $1, $2, 1, '{}'::jsonb, 's', \
+                     'pin', 'now', 'now', $3) \
+                     ON CONFLICT (id) DO UPDATE SET tar_gz = excluded.tar_gz, \
+                     tar_digest = excluded.tar_digest, tree_digest = excluded.tree_digest",
+                )
+                .bind(&tarball)
+                .bind(content_digest(&tarball))
+                .bind(&digest)
+                .execute(&pool)
+                .await
+                .expect("pin");
+                sqlx::query(
+                    "INSERT INTO playbook_revisions (playbook_id, tree_digest, first_seen_at) \
+                     VALUES ('survey', $1, 'now') ON CONFLICT DO NOTHING",
+                )
+                .bind(&digest)
+                .execute(&pool)
+                .await
+                .expect("revision");
+            }
+        };
+        fn template(expected_digest: Option<&str>) -> DraftSeed<'_> {
+            DraftSeed::Template {
+                id: "survey",
+                expected_rev: Some("aaa"),
+                expected_digest,
+            }
+        }
+        async fn refuse(pool: &PgPool, seed: DraftSeed<'_>) -> String {
+            match create(
+                pool,
+                "again",
+                "d",
+                seed,
+                None,
+                &crate::authz::model::Principal::platform(),
+            )
+            .await
+            {
+                Err(DraftError::Conflict(msg)) => msg,
+                other => panic!("expected a conflict, got {other:?}"),
+            }
+        }
+        pin(&stored[0]).await;
+        let first_digest = first.digest().to_string();
+        create(
+            &pool,
+            "fork",
+            "d",
+            template(Some(&first_digest)),
+            None,
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("fork");
+        let origin = || async {
+            get(&pool, "fork")
+                .await
+                .expect("read")
+                .expect("draft")
+                .origin
+                .expect("origin")
+        };
+        let seeded = origin().await;
+        assert_eq!(seeded.digest.as_deref(), Some(first_digest.as_str()));
+        assert!(!seeded.moved());
+
+        pin(&stored[1]).await;
+        let repointed = origin().await;
+        assert_eq!(repointed.rev, repointed.current_rev, "the rev did not move");
+        assert_eq!(repointed.current_digest, Some(second.digest().to_string()));
+        assert!(repointed.moved(), "the tree did");
+
+        let unknown = refuse(&pool, template(Some("sha256:never"))).await;
+        assert!(unknown.contains("moved while cloning"), "{unknown}");
+        assert_eq!(refuse(&pool, template(Some(&first_digest))).await, unknown);
+
+        for (old, tree) in [("sha256:old", &second), ("sha256:foreign", &elsewhere)] {
+            sqlx::query(
+                "INSERT INTO pack_digest_aliases (old_digest, tree_digest, recorded_at)
+                 VALUES ($1, $2, 'then')",
+            )
+            .bind(old)
+            .bind(tree.digest().as_str())
+            .execute(&pool)
+            .await
+            .expect("alias");
+        }
+        let superseded = refuse(&pool, template(Some("sha256:old"))).await;
+        assert!(
+            superseded.contains(&format!("superseded by {}", second.digest())),
+            "{superseded}"
+        );
+        assert_eq!(
+            refuse(&pool, template(Some("sha256:foreign"))).await,
+            unknown,
+            "a tree the template never held is not named"
+        );
+        let stale_rev = refuse(
+            &pool,
+            DraftSeed::Template {
+                id: "survey",
+                expected_rev: Some("sha256:old"),
+                expected_digest: None,
+            },
+        )
+        .await;
+        assert!(
+            stale_rev.contains(&format!("superseded by {}", second.digest())),
+            "{stale_rev}"
+        );
+    }
+
+    /// Text shaped like a pack's docs: headings over lines drawn from a pool of 512 sentences, so
+    /// gzip finds the repeated phrasing it finds in written prose (about 7x).
+    fn pack_prose(len: usize, seed: u64) -> String {
+        const WORDS: [&str; 48] = [
+            "the", "pack", "run", "agent", "tree", "file", "step", "build", "image", "draft",
+            "save", "check", "result", "error", "test", "cluster", "pod", "turn", "score",
+            "launch", "workflow", "manifest", "with", "from", "into", "when", "each", "every",
+            "before", "after", "returns", "stores", "reads", "writes", "compiles", "refuses", "a",
+            "an", "of", "to", "is", "and", "or", "not", "this", "that", "its", "once",
+        ];
+        let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+        let mut next = move |bound: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            usize::try_from(x % bound).expect("bounded")
+        };
+        let sentences: Vec<String> = (0..512)
+            .map(|_| {
+                let words: Vec<&str> = (0..5 + next(6)).map(|_| WORDS[next(48)]).collect();
+                format!("{}.", words.join(" "))
+            })
+            .collect();
+        let mut out = String::with_capacity(len + 256);
+        let mut line = 0;
+        while out.len() < len {
+            if line % 24 == 0 {
+                out.push_str(&format!("\n## Section {}\n\n", next(1000)));
+            }
+            out.push_str(&sentences[next(512)]);
+            out.push(' ');
+            out.push_str(&sentences[next(512)]);
+            out.push('\n');
+            line += 1;
+        }
+        out.truncate(len);
+        out
+    }
+
+    fn percentile(samples: &[f64], p: f64) -> f64 {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let rank = (p * sorted.len() as f64).ceil() as usize;
+        sorted[rank.clamp(1, sorted.len()) - 1]
+    }
+
+    async fn relation_bytes(pool: &PgPool) -> Vec<(&'static str, i64)> {
+        let mut sizes = Vec::new();
+        for table in [
+            "pack_trees",
+            "pack_tree_files",
+            "pack_blobs",
+            "playbook_draft_versions",
+        ] {
+            let bytes: Option<i64> =
+                sqlx::query_scalar("SELECT pg_total_relation_size(to_regclass($1))")
+                    .bind(table)
+                    .fetch_one(pool)
+                    .await
+                    .expect("relation size");
+            if let Some(bytes) = bytes {
+                sizes.push((table, bytes));
+            }
+        }
+        sizes
+    }
+
+    /// The draft save path on a large pack: 40 files of 125 KB of prose saved 20 times, one file
+    /// changed per save, with each phase timed on the same input and the tables' growth.
+    ///
+    /// `cargo nextest run --release -p crucible-controller --run-ignored only --no-capture
+    /// large_pack_save_profile`
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    #[ignore = "a measurement, not a check"]
+    async fn large_pack_save_profile(pool: PgPool) {
+        const FILES: u64 = 40;
+        const FILE_BYTES: usize = 125 * 1024;
+        const SAVES: u64 = 20;
+
+        create(
+            &pool,
+            "studio",
+            "a large drafted pack",
+            DraftSeed::Skeleton,
+            None,
+            &crate::authz::model::Principal::platform(),
+        )
+        .await
+        .expect("the skeleton compiles");
+        let mut files = skeleton();
+        for n in 0..FILES {
+            files.insert(format!("docs/{n:02}.md"), pack_prose(FILE_BYTES, n));
+        }
+        let raw: usize = files.values().map(String::len).sum();
+        let before = relation_bytes(&pool).await;
+
+        let phases = [
+            "json decode",
+            "write_tree",
+            "walk_dir",
+            "tarball encode",
+            "hashes",
+            "compile",
+            "save_version",
+            "db + rest",
+        ];
+        let mut samples: Vec<Vec<f64>> = vec![Vec::new(); phases.len()];
+        let ms = |since: std::time::Instant| since.elapsed().as_secs_f64() * 1000.0;
+        let mut delivered = 0;
+        for save in 0..SAVES {
+            let changed = format!("docs/{:02}.md", save % FILES);
+            files.insert(changed, pack_prose(FILE_BYTES, 1000 + save));
+
+            let body = serde_json::to_vec(&serde_json::json!({ "files": &files })).expect("json");
+            let start = std::time::Instant::now();
+            let decoded: BTreeMap<String, BTreeMap<String, String>> =
+                serde_json::from_slice(&body).expect("decode");
+            let decode = ms(start);
+            assert_eq!(decoded.get("files"), Some(&files));
+
+            let scratch = tempfile::tempdir().expect("tempdir");
+            let root = scratch.path().join("pack");
+            std::fs::create_dir_all(&root).expect("mkdir");
+            let start = std::time::Instant::now();
+            write_tree(&files, &root).expect("write_tree");
+            let write = ms(start);
+            let start = std::time::Instant::now();
+            let walked = crucible_contract::pack_tree::walk_dir(&root).expect("walk");
+            let walk = ms(start);
+            let start = std::time::Instant::now();
+            let encoded =
+                crate::playbooks::pack_trees::EncodedPack::new(walked.tree).expect("encode");
+            let encode = ms(start);
+            delivered = encoded.tarball().len();
+            let start = std::time::Instant::now();
+            let _ = encoded.tree().digest_with_file_hashes();
+            let hashes = ms(start);
+            let start = std::time::Instant::now();
+            let compiled = compile_tree(&root);
+            let compile = ms(start);
+            assert!(
+                compiled.diagnostics.is_empty(),
+                "{:?}",
+                compiled.diagnostics
+            );
+
+            let start = std::time::Instant::now();
+            save_version(&pool, "studio", files.clone(), None, None)
+                .await
+                .expect("save");
+            let total = ms(start);
+            let rest = total - write - walk - encode - hashes - compile;
+            for (i, value) in [decode, write, walk, encode, hashes, compile, total, rest]
+                .into_iter()
+                .enumerate()
+            {
+                samples[i].push(value);
+            }
+            println!("save {:>2}: {total:>7.1} ms", save + 1);
+        }
+
+        let after = relation_bytes(&pool).await;
+        println!(
+            "\npack: {FILES} files, {raw} raw bytes, {delivered} gzipped ({:.2}x); {SAVES} saves",
+            raw as f64 / delivered as f64
+        );
+        println!(
+            "{:<16} {:>9} {:>9} {:>9}",
+            "phase (ms)", "p50", "p95", "first"
+        );
+        for (phase, values) in phases.iter().zip(&samples) {
+            println!(
+                "{phase:<16} {:>9.1} {:>9.1} {:>9.1}",
+                percentile(values, 0.5),
+                percentile(values, 0.95),
+                values[0]
+            );
+        }
+        println!(
+            "\n{:<24} {:>12} {:>12} {:>12} {:>12}",
+            "relation", "before", "after", "growth", "per save"
+        );
+        for ((table, from), (_, to)) in before.iter().zip(&after) {
+            println!(
+                "{table:<24} {from:>12} {to:>12} {:>12} {:>12}",
+                to - from,
+                (to - from) / i64::try_from(SAVES).expect("saves")
+            );
+        }
     }
 }

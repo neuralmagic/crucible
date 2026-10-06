@@ -394,16 +394,18 @@ pub(super) enum PackSource<'a> {
     LocalTree(&'a std::path::Path),
 }
 
-/// Compute the exposure of the pack just stored for `key` with the linked engine. Read back from
-/// storage, not from the turn's scratch tree: an approval binds to the exact stored bytes.
+/// Compute the exposure of the pack tree just stored for `key` with the linked engine. Read back
+/// from storage, not from the turn's scratch tree: an approval binds to the exact stored tree.
 /// `pr_repo` is the fork a loop run of this pack would be rendered with, so the disclosed
 /// `draft-pr` default is the one the run resolves.
 async fn extract_scope_exposure(
     pool: &sqlx::PgPool,
     key: &str,
+    tree: &crucible_contract::pack_tree::TreeDigest,
     pr_repo: Option<String>,
 ) -> Result<crate::playbooks::exposure::Extraction> {
-    let Some(pack) = crate::playbooks::packs::materialize_pack(pool, key).await? else {
+    let Some(pack) = crate::playbooks::packs::materialize_frozen(pool, key, Some(tree)).await?
+    else {
         anyhow::bail!("no stored pack for {key}");
     };
     let extraction = tokio::task::spawn_blocking(move || {
@@ -463,14 +465,10 @@ async fn apply_scope_report(
         // loudly here instead of transitioning to `scoped` over nothing and wedging silently later.
         let landed = match (&source, &report.pack_tgz) {
             (PackSource::LocalTree(tree), _) => {
-                crate::playbooks::packs::store_pack_tree(db.pool(), &issue.key, tree)
-                    .await
-                    .map(|_| ())
+                crate::playbooks::packs::store_pack_tree(db.pool(), &issue.key, tree).await
             }
             (PackSource::PodLogs, Some(tgz)) => {
-                crate::playbooks::packs::store_pack_tarball(db.pool(), &issue.key, tgz)
-                    .await
-                    .map(|_| ())
+                crate::playbooks::packs::store_pack_tarball(db.pool(), &issue.key, tgz).await
             }
             (PackSource::PodLogs, None) => Err(anyhow::anyhow!(
                 "the turn pod delivered no recoverable pack blob{}",
@@ -481,17 +479,21 @@ async fn apply_scope_report(
                     .unwrap_or_default()
             )),
         };
-        if let Err(e) = landed {
-            let reason = format!("scope survived but the pack handoff failed: {e:#}");
-            tracing::warn!(issue_key = %issue.key, %reason, "scope pack handoff failed");
-            annotate(db, &issue.key, issue.status, &reason, None).await?;
-            return Ok(());
-        }
+        let stored = match landed {
+            Ok(stored) => stored,
+            Err(e) => {
+                let reason = format!("scope survived but the pack handoff failed: {e:#}");
+                tracing::warn!(issue_key = %issue.key, %reason, "scope pack handoff failed");
+                annotate(db, &issue.key, issue.status, &reason, None).await?;
+                return Ok(());
+            }
+        };
         // A scope stored without its exposure would skip every enforcement that reads it, so any
         // error here — a refusal included — fails the freeze rather than storing the scope.
         let extraction = match extract_scope_exposure(
             db.pool(),
             &issue.key,
+            &stored.tree,
             cfg.pr_repo_for(&issue.repo),
         )
         .await
@@ -519,6 +521,7 @@ async fn apply_scope_report(
             )
             .await?;
             crate::issues::store::set_scope_exposure(&mut *tx, scope_id, &extraction).await?;
+            crate::issues::store::set_scope_tree(&mut *tx, scope_id, &stored.tree).await?;
             let ev = Event::now(
                 &issue.key,
                 "new",
@@ -588,11 +591,11 @@ async fn reconcile_scope_now(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Res
 pub(super) async fn reconcile_scoped(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     // A pack whose PR is already open (a prior run got that far) may have drifted from the upstream
     // issue since freeze — check before doing anything else (advisory: a hiccup logs, never parks).
-    if let Some(scope) = crate::issues::store::latest_scope_for_issue(db.pool(), &issue.key).await?
+    let scope = crate::issues::store::latest_scope_for_issue(db.pool(), &issue.key).await?;
+    if let Some(scope) = &scope
         && scope.approval_pr.is_some()
         && let Err(e) =
-            approvals::reconcile_staleness(db, &issue.key, Status::Scoped, &scope, &issue.kind)
-                .await
+            approvals::reconcile_staleness(db, &issue.key, Status::Scoped, scope, &issue.kind).await
     {
         tracing::warn!(issue_key = %issue.key, error = format!("{e:#}"), "approvals: staleness check failed");
     }
@@ -615,14 +618,18 @@ pub(super) async fn reconcile_scoped(db: &Db, cfg: &ControllerCfg, issue: &Issue
     if engine::pack_pr_repo().is_none() {
         return Ok(());
     }
-    let pack = crate::playbooks::packs::materialize_pack(db.pool(), &issue.key)
-        .await?
-        .with_context(|| {
-            format!(
-                "no stored pack for {} — cannot open its approval PR",
-                issue.key
-            )
-        })?;
+    let pack = crate::playbooks::packs::materialize_frozen(
+        db.pool(),
+        &issue.key,
+        scope.as_ref().and_then(|s| s.tree_digest.as_ref()),
+    )
+    .await?
+    .with_context(|| {
+        format!(
+            "no stored pack for {} — cannot open its approval PR",
+            issue.key
+        )
+    })?;
     let token = crate::runs::engine::resolve_pack_pr_token(cfg).await?;
     let Some(pr_url) = engine::open_pack_pr(&issue.key, pack.path(), token)? else {
         return Ok(());
@@ -630,8 +637,7 @@ pub(super) async fn reconcile_scoped(db: &Db, cfg: &ControllerCfg, issue: &Issue
     // Record the PR before flipping the status: anything that observes `awaiting-approval` (the
     // approval poll, a crash-restarted daemon) must find `approval_pr` set, or the row wedges.
     // A crash between the two leaves the row `scoped`; the retry re-runs the idempotent open.
-    if let Some(scope) = crate::issues::store::latest_scope_for_issue(db.pool(), &issue.key).await?
-    {
+    if let Some(scope) = &scope {
         crate::issues::store::set_scope_approval_pr(db.pool(), scope.id, &pr_url).await?;
     }
     crate::issues::transitions::transition(

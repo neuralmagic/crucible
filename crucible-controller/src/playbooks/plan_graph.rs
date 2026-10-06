@@ -124,7 +124,7 @@ struct CompiledTask {
     #[serde(default)]
     emits: crucible::plan::ir::Emits,
     #[serde(default)]
-    emits_files: Vec<String>,
+    emits_files: Vec<crucible_contract::emits::DeclaredFile>,
     #[serde(default)]
     over: Option<CompiledOver>,
     #[serde(default)]
@@ -200,7 +200,7 @@ pub fn graph_from_compiled(compiled: &[u8]) -> Result<WorkflowGraphDto, String> 
             join: task.join,
             isolation: task.isolation,
             emits: task.emits.names(),
-            emits_files: task.emits_files,
+            emits_files: task.emits_files.into_iter().map(|file| file.path).collect(),
             fanout: task.over.map(|over| FanOutDto {
                 over_task: over.task,
                 over_field: over.field,
@@ -240,7 +240,9 @@ mod tests {
          "required":true,"isolation":null,"join":"all","over":{"task":"fan","field":"idea"},
          "max_fanout":4},
         {"name":"check","kind":"command","command":"true","depends_on":["work"],"needs":"all",
-         "required":false,"isolation":null,"join":"passed","emits_files":["out.json"]},
+         "required":false,"isolation":null,"join":"passed","emits_files":["out.json",
+         {"path":"result.json","schema":"{\"type\":\"object\"}"}],
+         "emits":{"rows":{"schema":"{\"type\":\"array\"}"}}},
         {"name":"final","kind":"command","command":"true","depends_on":["check","ghost"],
          "needs":"any","required":true,"isolation":null,"join":"passed"}
       ]
@@ -268,8 +270,9 @@ mod tests {
         assert_eq!(node(&graph, "check").needs, Needs::All);
         assert_eq!(
             node(&graph, "check").emits_files,
-            vec!["out.json".to_string()]
+            vec!["out.json".to_string(), "result.json".to_string()]
         );
+        assert_eq!(node(&graph, "check").emits, vec!["rows".to_string()]);
     }
 
     /// What a task actually runs: the agent knobs and prompt, or the command line.

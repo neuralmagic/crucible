@@ -171,6 +171,78 @@ pub(crate) async fn call(
     )
 }
 
+/// Register (or repin) playbook `survey` to `tree`, with `exposure` as its stored disclosure.
+#[cfg(test)]
+pub(crate) async fn pin_playbook(
+    pool: &sqlx::PgPool,
+    tree: crucible_contract::pack_tree::PackTree,
+    exposure: &serde_json::Value,
+) {
+    let pack = crate::playbooks::pack_trees::EncodedPack::new(tree).expect("encode");
+    let digest =
+        crate::playbooks::pack_trees::put_tree(&mut pool.acquire().await.expect("conn"), &pack)
+            .await
+            .expect("put tree");
+    sqlx::query(
+        r#"INSERT INTO playbooks (id, description, repo, git_ref, rev, path, tar_gz, tar_digest,
+                                  tar_bytes, params_schema, schema_digest, core_rev, created_by,
+                                  created_at, updated_at, tree_digest, exposure)
+           VALUES ('survey', 'reads a paper', 'owner/packs', 'main', $1, '', $2, $1, $3,
+                   '{"type":"object"}'::jsonb, 'sha256:schema', 'core1', 'wren',
+                   '2026-08-23T00:00:00Z', '2026-08-23T00:00:00Z', $4, $5)
+           ON CONFLICT (id) DO UPDATE SET rev = excluded.rev, tar_gz = excluded.tar_gz,
+               tar_digest = excluded.tar_digest, tar_bytes = excluded.tar_bytes,
+               tree_digest = excluded.tree_digest, exposure = excluded.exposure"#,
+    )
+    .bind(pack.tarball_digest())
+    .bind(pack.tarball())
+    .bind(i64::try_from(pack.tarball().len()).expect("size"))
+    .bind(digest.as_str())
+    .bind(exposure)
+    .execute(pool)
+    .await
+    .expect("pin");
+}
+
+/// Launch the registered playbook [`pin_playbook`] stored, as `key`.
+#[cfg(test)]
+pub(crate) async fn launch_playbook(
+    pool: &sqlx::PgPool,
+    key: &str,
+) -> crate::launches::model::PlaybookLaunch {
+    let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+    let params = serde_json::json!({});
+    let mut tx = pool.begin().await.expect("tx");
+    let inserted = crate::launches::store::insert_playbook_launch_with(
+        &mut tx,
+        key,
+        &crate::launches::model::NewPlaybookLaunch {
+            playbook: "survey",
+            repo: "owner/repo",
+            title: "survey",
+            params: &params,
+            schema_digest: "sha256:schema",
+            max_cost: 1.0,
+            max_time: &max_time,
+            advance_dedupe: false,
+            dedupe_schedule: None,
+            origin: crate::model::LaunchOrigin::Manual,
+            draft_version: None,
+            created_by: Some("wren"),
+            launcher_groups: None,
+        },
+        &crate::playbooks::exposure::Extraction::Absent,
+    )
+    .await
+    .expect("insert launch");
+    assert!(inserted, "playbook survey is registered");
+    tx.commit().await.expect("commit");
+    crate::launches::store::get_playbook_launch(pool, key)
+        .await
+        .expect("read launch")
+        .expect("launch")
+}
+
 /// Register a Chat Completions provider at `url` and make it the platform's autoresearch default,
 /// so the ranker's calls land on a `wiremock` server serving canned verdicts.
 #[cfg(test)]
@@ -252,6 +324,80 @@ pub(crate) async fn register_inference_key(
     )
     .await?;
     Ok(())
+}
+
+/// Why [`symlink_pack`] cannot be a tree.
+#[cfg(test)]
+pub(crate) const SYMLINK_REASON: &str = "link is a symbolic link; a pack holds regular files only";
+
+/// A gzipped tarball an older controller could have stored: a compiling draft skeleton beside a
+/// symlink, so conversion records it unconvertible.
+#[cfg(test)]
+pub(crate) fn symlink_pack() -> Vec<u8> {
+    use crate::playbooks::drafts::{SKELETON_MANIFEST, SKELETON_WORKFLOW};
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut builder = tar::Builder::new(gz);
+    for (path, body) in [
+        ("crucible.toml", SKELETON_MANIFEST),
+        ("workflow.star", SKELETON_WORKFLOW),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        builder
+            .append_data(&mut header, path, body.as_bytes())
+            .expect("file");
+    }
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    builder
+        .append_link(&mut header, "link", "crucible.toml")
+        .expect("link");
+    builder.into_inner().expect("tar").finish().expect("gzip")
+}
+
+/// Write [`symlink_pack`] into the legacy pack columns of every `table` row matching `filter`,
+/// then run startup conversion, which records those bytes unconvertible and leaves the rows
+/// without a tree.
+#[cfg(test)]
+pub(crate) async fn make_unconvertible(pool: &sqlx::PgPool, table: &str, filter: &str) {
+    let tgz = symlink_pack();
+    let digest = crucible_contract::content_digest(&tgz);
+    let (bytes_col, digest_col, size_col, tree_col) = match table {
+        "playbook_standing_launches" => (
+            "adopted_tar_gz",
+            "adopted_tar_digest",
+            "adopted_tar_bytes",
+            "adopted_tree_digest",
+        ),
+        "pack_tarballs" => ("tar_gz", "digest", "bytes", "tree_digest"),
+        _ => ("tar_gz", "tar_digest", "tar_bytes", "tree_digest"),
+    };
+    let updated = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "UPDATE {table} SET {bytes_col} = $1, {digest_col} = $2, {size_col} = $3 WHERE {filter}"
+    )))
+    .bind(&tgz)
+    .bind(&digest)
+    .bind(i64::try_from(tgz.len()).expect("size"))
+    .execute(pool)
+    .await
+    .expect("write legacy bytes")
+    .rows_affected();
+    assert!(updated > 0, "no {table} row matches {filter}");
+    crate::playbooks::pack_migration::convert_pack_trees(pool)
+        .await
+        .expect("convert");
+    let (treeless, reason): (i64, Option<String>) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT (SELECT count(*) FROM {table} WHERE {filter} AND {tree_col} IS NULL),
+                (SELECT unconvertible_reason FROM pack_digest_aliases WHERE old_digest = $1)"
+    )))
+    .bind(&digest)
+    .fetch_one(pool)
+    .await
+    .expect("read conversion");
+    assert_eq!(treeless, i64::try_from(updated).expect("count"));
+    assert_eq!(reason.as_deref(), Some(SYMLINK_REASON));
 }
 
 /// Real engine inputs for tests that render through the linked `crucible` library: a deploy
@@ -403,6 +549,34 @@ pub mod fixtures {
         std::fs::write(pack.join("crucible.toml"), PLAYBOOK_PACK_MANIFEST).expect("write manifest");
         std::fs::write(pack.join("workflow.star"), source).expect("write workflow");
         pack
+    }
+
+    /// `len` bytes of text gzip cannot shrink much (a xorshift stream over 64 symbols), for packs
+    /// that must be over the delivery budget while each file stays under the draft per-file cap.
+    pub fn incompressible_text(len: usize, seed: u64) -> String {
+        const SYMBOLS: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                char::from(SYMBOLS[(x >> 58) as usize])
+            })
+            .collect()
+    }
+
+    /// Write three files that each fit the draft per-file cap but together gzip past the delivery
+    /// budget.
+    pub fn write_over_budget_blobs(dir: &Path) {
+        for seed in 1..=3 {
+            std::fs::write(
+                dir.join(format!("blob{seed}.txt")),
+                incompressible_text(500 * 1024, seed),
+            )
+            .expect("blob");
+        }
     }
 
     /// The params schema the engine extracts from `source`, for asserting what a registration
