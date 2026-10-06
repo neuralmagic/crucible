@@ -3,6 +3,7 @@
 //! bootstrap mirrors crucible's: `https://localhost:17670`, mTLS from the registered gateway's
 //! cert dir. Upload/download have no RPC (SSH-tar), so `sandbox download` stays on the CLI.
 
+use crate::workspace::scoped;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{ExecSandboxRequest, exec_sandbox_event::Payload as ExecPayload};
@@ -116,11 +117,11 @@ async fn exec_collect_async(name: &str, command: &[String]) -> Result<ExecOutput
     let mut client = OpenShellClient::with_interceptor(channel, EdgeAuthInterceptor::noop());
 
     let mut stream = client
-        .exec_sandbox(ExecSandboxRequest {
+        .exec_sandbox(scoped(ExecSandboxRequest {
             sandbox: name.to_string(),
             command: command.to_vec(),
             ..ExecSandboxRequest::default()
-        })
+        }))
         .await
         .map_err(rpc_err("exec_sandbox"))?
         .into_inner();

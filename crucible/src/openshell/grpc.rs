@@ -7,6 +7,7 @@
 //! CLI, see [`crate::openshell::gateway`] and `openshell::run`.
 
 use anyhow::{Context, Result};
+use crucible_broker::workspace::scoped;
 use openshell_core::auth::EdgeAuthInterceptor;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{
@@ -476,7 +477,7 @@ impl Gateway {
         // ops exist), so declaring paths cannot disturb egress. `include_workdir` must stay true —
         // it is what makes the agent's own workspace writable.
         let policy = sandbox_filesystem_policy(read_only_paths);
-        let request = CreateSandboxRequest {
+        let request = scoped(CreateSandboxRequest {
             spec: Some(SandboxSpec {
                 providers: providers.to_vec(),
                 template,
@@ -491,7 +492,7 @@ impl Gateway {
             name: name.to_string(),
             labels: labels.iter().cloned().collect(),
             ..Default::default()
-        };
+        });
         let mut client = self.client();
         client
             .create_sandbox(request)
@@ -525,10 +526,10 @@ impl Gateway {
             attempts += 1;
             let status =
                 match client
-                    .get_sandbox(GetSandboxRequest {
+                    .get_sandbox(scoped(GetSandboxRequest {
                         name: name.to_string(),
                         ..Default::default()
-                    })
+                    }))
                     .await
                 {
                     Ok(resp) => resp.into_inner().sandbox.and_then(|s| s.status),
@@ -600,10 +601,10 @@ impl Gateway {
     pub async fn delete_sandbox(&self, name: &str) -> Result<()> {
         let mut client = self.client();
         match client
-            .delete_sandbox(DeleteSandboxRequest {
+            .delete_sandbox(scoped(DeleteSandboxRequest {
                 name: name.to_string(),
                 ..Default::default()
-            })
+            }))
             .await
         {
             Ok(_) => Ok(()),
@@ -623,10 +624,10 @@ impl Gateway {
         let mut client = self.poll_client();
         loop {
             match client
-                .get_sandbox(GetSandboxRequest {
+                .get_sandbox(scoped(GetSandboxRequest {
                     name: name.to_string(),
                     ..Default::default()
-                })
+                }))
                 .await
             {
                 Err(s) if s.code() == tonic::Code::NotFound => return Ok(()),
@@ -655,10 +656,10 @@ impl Gateway {
     pub async fn provider_exists(&self, name: &str) -> bool {
         let mut client = self.client();
         client
-            .get_provider(GetProviderRequest {
+            .get_provider(scoped(GetProviderRequest {
                 name: name.to_string(),
                 ..Default::default()
-            })
+            }))
             .await
             .is_ok()
     }
@@ -683,10 +684,10 @@ impl Gateway {
         ]);
         let mut client = self.client();
         client
-            .create_provider(CreateProviderRequest {
+            .create_provider(scoped(CreateProviderRequest {
                 provider: Some(provider),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             // The token is in the request body, not this message; but keep any surfaced
@@ -711,10 +712,10 @@ impl Gateway {
         provider.r#type = provider_type.to_string();
         let mut client = self.client();
         client
-            .create_provider(CreateProviderRequest {
+            .create_provider(scoped(CreateProviderRequest {
                 provider: Some(provider),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("create_provider({name})")))
@@ -729,13 +730,13 @@ impl Gateway {
         let id = profile.id.clone();
         let mut client = self.client();
         client
-            .import_provider_profiles(ImportProviderProfilesRequest {
+            .import_provider_profiles(scoped(ImportProviderProfilesRequest {
                 profiles: vec![ProviderProfileImportItem {
                     profile: Some(profile),
                     source: "crucible".to_string(),
                 }],
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))
@@ -758,10 +759,10 @@ impl Gateway {
         };
         let mut client = self.client();
         client
-            .create_provider(CreateProviderRequest {
+            .create_provider(scoped(CreateProviderRequest {
                 provider: Some(provider),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("create_provider({name})")))
@@ -782,13 +783,13 @@ impl Gateway {
     ) -> Result<()> {
         let mut client = self.client();
         client
-            .configure_provider_refresh(ConfigureProviderRefreshRequest {
+            .configure_provider_refresh(scoped(ConfigureProviderRefreshRequest {
                 provider: name.to_string(),
                 credential_key: credential_key.to_string(),
                 strategy: strategy.into(),
                 material,
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!(
@@ -803,11 +804,11 @@ impl Gateway {
     pub async fn rotate_provider_credential(&self, name: &str, credential_key: &str) -> Result<()> {
         let mut client = self.client();
         client
-            .rotate_provider_credential(RotateProviderCredentialRequest {
+            .rotate_provider_credential(scoped(RotateProviderCredentialRequest {
                 provider: name.to_string(),
                 credential_key: credential_key.to_string(),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!(
@@ -823,10 +824,10 @@ impl Gateway {
         let provider = build_provider(name, cred_key, token);
         let mut client = self.client();
         client
-            .update_provider(UpdateProviderRequest {
+            .update_provider(scoped(UpdateProviderRequest {
                 provider: Some(provider),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("update_provider({name})")))
@@ -883,11 +884,11 @@ impl Gateway {
         )?;
         let version = self
             .client()
-            .update_config(UpdateConfigRequest {
+            .update_config(scoped(UpdateConfigRequest {
                 sandbox: name.to_string(),
                 merge_operations,
                 ..UpdateConfigRequest::default()
-            })
+            }))
             .await
             .map(|r| r.into_inner().version)
             .map_err(GrpcError::rpc(format!("update_config({name})")))?;
@@ -902,12 +903,12 @@ impl Gateway {
         let (outcome, result) = loop {
             attempts += 1;
             let status = match client
-                .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+                .get_sandbox_policy_status(scoped(GetSandboxPolicyStatusRequest {
                     sandbox: name.to_string(),
                     version,
                     global: false,
                     ..Default::default()
-                })
+                }))
                 .await
             {
                 Ok(resp) => resp
@@ -964,13 +965,13 @@ impl Gateway {
     pub async fn sandbox_logs(&self, name: &str) -> Vec<SandboxLogLine> {
         let mut client = self.client();
         client
-            .get_sandbox_logs(GetSandboxLogsRequest {
+            .get_sandbox_logs(scoped(GetSandboxLogsRequest {
                 sandbox: name.to_string(),
                 lines: 1000,
                 sources: vec!["sandbox".to_string()],
                 min_level: "INFO".to_string(),
                 ..Default::default()
-            })
+            }))
             .await
             .map(|r| r.into_inner().logs)
             .unwrap_or_default()
@@ -994,11 +995,11 @@ impl Gateway {
         cancel: &CancellationToken,
         mut on_stdout_line: impl FnMut(&str),
     ) -> Result<ExecResult> {
-        let request = ExecSandboxRequest {
+        let request = scoped(ExecSandboxRequest {
             sandbox: name.to_string(),
             command: command.to_vec(),
             ..ExecSandboxRequest::default()
-        };
+        });
 
         // Open the stream first so a start failure (e.g. sandbox not ready) surfaces here rather
         // than half-way through the pump.
@@ -2014,6 +2015,14 @@ pYBZ
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn every_engine_gateway_request_is_scoped() {
+        assert_eq!(
+            crucible_broker::workspace::unscoped_request_literals(include_str!("grpc.rs")),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
