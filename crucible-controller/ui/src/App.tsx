@@ -1,4 +1,12 @@
-import { lazy, Suspense, useCallback, useEffect, type ReactNode } from 'react';
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  type ComponentType,
+  type LazyExoticComponent,
+  type ReactNode,
+} from 'react';
 import { Route, Routes, Link, NavLink, Navigate } from 'react-router-dom';
 import { $api } from './api/client';
 import { useAutoresearch } from './api/lanes';
@@ -13,48 +21,57 @@ import { AutopilotBanner } from './AutopilotBanner';
 import { ViewAsBanner } from './ViewAsBanner';
 import { CommandPalette } from './palette/CommandPalette';
 import { useResetOnActAs } from './actAs';
-import { DashboardPage } from './pages/DashboardPage';
 import { HomePage } from './pages/HomePage';
 import { approvalsWaiting } from './pages/home';
-import { IssuesPage } from './pages/IssuesPage';
-import { IssueDetailPage } from './pages/IssueDetailPage';
-import { ScopeFormPage } from './pages/ScopeFormPage';
-import { ScopeProgressPage } from './pages/ScopeProgressPage';
-import { NewScenarioPage } from './pages/NewScenarioPage';
-import { NewJiraPage } from './pages/NewJiraPage';
-import { InboxPage } from './pages/InboxPage';
-import { ApprovalsPage } from './pages/ApprovalsPage';
-import { ReposPage } from './pages/ReposPage';
-import { RunsPage } from './pages/RunsPage';
-import { RunDetailPage } from './pages/RunDetailPage';
-import { BuildsPage } from './pages/BuildsPage';
-import { PlaybooksPage } from './pages/PlaybooksPage';
-import { PlaybookDetailPage } from './pages/PlaybookDetailPage';
-import { PlaybookImportPage } from './pages/PlaybookImportPage';
-import { PlaybookImportReviewPage } from './pages/PlaybookImportReviewPage';
-import { PlaybookDraftsPage } from './pages/PlaybookDraftsPage';
-import { DraftStudioPage } from './pages/DraftStudioPage';
-import { PlaybookLaunchPage } from './pages/PlaybookLaunchPage';
-import { PlaybookRunsPage } from './pages/PlaybookRunsPage';
-import { SchedulesPage } from './pages/SchedulesPage';
-import { WebhooksPage } from './pages/WebhooksPage';
-import { WebhookDetailPage } from './pages/WebhookDetailPage';
-import { EditWebhookPage, NewWebhookPage } from './pages/NewWebhookPage';
 import { MoltenLogo } from './MoltenLogo';
-import { PlaybookLaunchDetailPage } from './pages/PlaybookLaunchDetailPage';
-import { TurnsPage } from './pages/TurnsPage';
-import { TurnLivePage } from './pages/TurnLivePage';
-import { ActivityPage } from './pages/ActivityPage';
-import { LivePage } from './pages/LivePage';
-import { AdminPage } from './pages/AdminPage';
-import { PolicyPage } from './pages/PolicyPage';
-import { SecretsPage } from './pages/SecretsPage';
-import { ProvidersPage } from './pages/ProvidersPage';
-import { SettingsPage } from './pages/SettingsPage';
-import { TeamsPage } from './pages/TeamsPage';
-import { TeamDetailPage } from './pages/TeamDetailPage';
 
-// Explore carries the DuckDB-WASM bundle (multi-MB of wasm), so it loads only when visited.
+/// A page loads when first visited, so the first paint carries only the shell and Home.
+function page<K extends string>(
+  load: () => Promise<Record<K, ComponentType>>,
+  name: K
+): LazyExoticComponent<ComponentType> {
+  return lazy(() => load().then((module) => ({ default: module[name] })));
+}
+
+const DashboardPage = page(() => import('./pages/DashboardPage'), 'DashboardPage');
+const IssuesPage = page(() => import('./pages/IssuesPage'), 'IssuesPage');
+const IssueDetailPage = page(() => import('./pages/IssueDetailPage'), 'IssueDetailPage');
+const ScopeFormPage = page(() => import('./pages/ScopeFormPage'), 'ScopeFormPage');
+const ScopeProgressPage = page(() => import('./pages/ScopeProgressPage'), 'ScopeProgressPage');
+const NewScenarioPage = page(() => import('./pages/NewScenarioPage'), 'NewScenarioPage');
+const NewJiraPage = page(() => import('./pages/NewJiraPage'), 'NewJiraPage');
+const InboxPage = page(() => import('./pages/InboxPage'), 'InboxPage');
+const ApprovalsPage = page(() => import('./pages/ApprovalsPage'), 'ApprovalsPage');
+const ReposPage = page(() => import('./pages/ReposPage'), 'ReposPage');
+const RunsPage = page(() => import('./pages/RunsPage'), 'RunsPage');
+const RunDetailPage = page(() => import('./pages/RunDetailPage'), 'RunDetailPage');
+const BuildsPage = page(() => import('./pages/BuildsPage'), 'BuildsPage');
+const PlaybooksPage = page(() => import('./pages/PlaybooksPage'), 'PlaybooksPage');
+const PlaybookDetailPage = page(() => import('./pages/PlaybookDetailPage'), 'PlaybookDetailPage');
+const PlaybookImportPage = page(() => import('./pages/PlaybookImportPage'), 'PlaybookImportPage');
+const PlaybookImportReviewPage = page(() => import('./pages/PlaybookImportReviewPage'), 'PlaybookImportReviewPage');
+const PlaybookDraftsPage = page(() => import('./pages/PlaybookDraftsPage'), 'PlaybookDraftsPage');
+const DraftStudioPage = page(() => import('./pages/DraftStudioPage'), 'DraftStudioPage');
+const PlaybookLaunchPage = page(() => import('./pages/PlaybookLaunchPage'), 'PlaybookLaunchPage');
+const PlaybookRunsPage = page(() => import('./pages/PlaybookRunsPage'), 'PlaybookRunsPage');
+const SchedulesPage = page(() => import('./pages/SchedulesPage'), 'SchedulesPage');
+const WebhooksPage = page(() => import('./pages/WebhooksPage'), 'WebhooksPage');
+const WebhookDetailPage = page(() => import('./pages/WebhookDetailPage'), 'WebhookDetailPage');
+const EditWebhookPage = page(() => import('./pages/NewWebhookPage'), 'EditWebhookPage');
+const NewWebhookPage = page(() => import('./pages/NewWebhookPage'), 'NewWebhookPage');
+const PlaybookLaunchDetailPage = page(() => import('./pages/PlaybookLaunchDetailPage'), 'PlaybookLaunchDetailPage');
+const TurnsPage = page(() => import('./pages/TurnsPage'), 'TurnsPage');
+const TurnLivePage = page(() => import('./pages/TurnLivePage'), 'TurnLivePage');
+const ActivityPage = page(() => import('./pages/ActivityPage'), 'ActivityPage');
+const LivePage = page(() => import('./pages/LivePage'), 'LivePage');
+const AdminPage = page(() => import('./pages/AdminPage'), 'AdminPage');
+const PolicyPage = page(() => import('./pages/PolicyPage'), 'PolicyPage');
+const SecretsPage = page(() => import('./pages/SecretsPage'), 'SecretsPage');
+const ProvidersPage = page(() => import('./pages/ProvidersPage'), 'ProvidersPage');
+const SettingsPage = page(() => import('./pages/SettingsPage'), 'SettingsPage');
+const TeamsPage = page(() => import('./pages/TeamsPage'), 'TeamsPage');
+const TeamDetailPage = page(() => import('./pages/TeamDetailPage'), 'TeamDetailPage');
+// Explore carries the DuckDB-WASM bundle (multi-MB of wasm).
 const ExplorePage = lazy(() => import('./pages/ExplorePage'));
 
 const POLL = { refetchInterval: 30_000 };
@@ -422,7 +439,14 @@ export function App() {
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
         <main data-ui="main" className="min-h-0 min-w-0 flex-1 overflow-y-auto">
-          <Routes>
+          <Suspense
+            fallback={
+              <div className="p-4">
+                <Spinner label="Loading" />
+              </div>
+            }
+          >
+            <Routes>
             <Route path="/" element={<HomePage />} />
             <Route path="/autoresearch" element={<Lane page={<DashboardPage />} />} />
             <Route path="/issues" element={<Lane page={<IssuesPage />} />} />
@@ -467,23 +491,10 @@ export function App() {
             <Route path="/policy" element={<PolicyPage />} />
             <Route
               path="/explore"
-              element={
-                <Lane
-                  page={
-                    <Suspense
-                      fallback={
-                        <div className="p-4">
-                          <Spinner label="Loading explore" />
-                        </div>
-                      }
-                    >
-                      <ExplorePage />
-                    </Suspense>
-                  }
-                />
-              }
+              element={<Lane page={<ExplorePage />} />}
             />
-          </Routes>
+            </Routes>
+          </Suspense>
         </main>
       </div>
     </div>
