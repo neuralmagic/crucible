@@ -187,8 +187,9 @@ pub struct Cluster {
     /// IRSA role the loop pod assumes to publish (renderer projects an sts-audience token + `AWS_ROLE_ARN`).
     #[serde(default)]
     pub aws_role_arn: Option<String>,
-    /// Read-only role the in-pod gateway assumes (web identity, same projected token) to SigV4-sign
-    /// sandbox S3 egress at the proxy, the read half of the S3 role split. Unset = no S3 provider.
+    /// Read-only role the in-pod gateway runs as (web identity, same projected token) and assumes
+    /// again to mint the credentials it SigV4-signs sandbox S3 egress with, the read half of the
+    /// S3 role split. Its trust policy must admit itself. Unset = no S3 provider.
     #[serde(default)]
     pub aws_sandbox_role_arn: Option<String>,
     /// The OpenShell compute driver for the sandbox: `podman` nests it inside the loop pod

@@ -89,6 +89,61 @@ fn pod_identity() -> Option<(String, String)> {
     (!name.is_empty() && !uid.is_empty()).then_some((name, uid))
 }
 
+/// The env the loop pod renders the sandbox S3 read role into.
+pub const AWS_SANDBOX_ROLE_ENV: &str = "CRUCIBLE_AWS_SANDBOX_ROLE_ARN";
+
+/// Where the loop pod projects its `sts.amazonaws.com`-audience ServiceAccount token.
+pub const AWS_WEB_IDENTITY_TOKEN_PATH: &str = "/var/run/secrets/aws/token";
+
+/// The sandbox S3 read role, `None` when the deployment grants none.
+pub fn aws_sandbox_role() -> Option<String> {
+    std::env::var(AWS_SANDBOX_ROLE_ENV)
+        .ok()
+        .map(|arn| arn.trim().to_string())
+        .filter(|arn| !arn.is_empty())
+}
+
+/// One edit to the environment the gateway child inherits from the loop process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EnvChange {
+    Set(&'static str, String),
+    Remove(&'static str),
+}
+
+/// The gateway child's AWS identity. The loop process runs as the publish role (`AWS_ROLE_ARN`),
+/// which must never become the gateway's: with a sandbox role the gateway runs as that role via
+/// the projected token, and without one it gets no role at all. IMDS stays off either way, so the
+/// SDK chain cannot fall through to the node's instance role.
+fn gateway_aws_env(sandbox_role: Option<&str>) -> Vec<EnvChange> {
+    let mut env = match sandbox_role {
+        Some(arn) => vec![
+            EnvChange::Set("AWS_ROLE_ARN", arn.to_string()),
+            EnvChange::Set(
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                AWS_WEB_IDENTITY_TOKEN_PATH.to_string(),
+            ),
+        ],
+        None => vec![
+            EnvChange::Remove("AWS_ROLE_ARN"),
+            EnvChange::Remove("AWS_WEB_IDENTITY_TOKEN_FILE"),
+        ],
+    };
+    env.push(EnvChange::Set(
+        "AWS_EC2_METADATA_DISABLED",
+        "true".to_string(),
+    ));
+    env
+}
+
+fn apply_gateway_aws_env(cmd: &mut Command, sandbox_role: Option<&str>) {
+    for change in gateway_aws_env(sandbox_role) {
+        match change {
+            EnvChange::Set(name, value) => cmd.env(name, value),
+            EnvChange::Remove(name) => cmd.env_remove(name),
+        };
+    }
+}
+
 /// In-cluster k8s detection vars to strip from the gateway's environment before launch.
 /// (See the module docs, load-bearing under the podman driver in a pod, a no-op on a laptop;
 /// the kubernetes driver needs them, so the scrub is gated on the driver.)
@@ -546,6 +601,7 @@ async fn boot(driver: ComputeDriver, supervisor_image: Option<&str>) -> Result<(
                 gw.env_remove(var);
             }
         }
+        apply_gateway_aws_env(&mut gw, aws_sandbox_role().as_deref());
         gw.spawn().context("spawn openshell-gateway")?;
     }
 
@@ -789,12 +845,75 @@ fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::openshell::gateway::*;
 
     // The podman rendering must be byte-for-byte what `gateway_toml` produced before the driver
     // became a knob. These are frozen snapshots.
     const PODMAN_NO_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n";
     const PODMAN_WITH_IMAGE: &str = "[openshell]\nversion = 1\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_drivers = [\"podman\"]\n\n[openshell.drivers.podman]\nsupervisor_image = \"registry.example.com/epp-sandbox:x\"\n";
+
+    #[test]
+    fn a_sandbox_role_becomes_the_gateway_identity() {
+        assert_eq!(
+            gateway_aws_env(Some("arn:aws:iam::1:role/sandbox-ro")),
+            vec![
+                EnvChange::Set("AWS_ROLE_ARN", "arn:aws:iam::1:role/sandbox-ro".into()),
+                EnvChange::Set(
+                    "AWS_WEB_IDENTITY_TOKEN_FILE",
+                    "/var/run/secrets/aws/token".into()
+                ),
+                EnvChange::Set("AWS_EC2_METADATA_DISABLED", "true".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_sandbox_role_the_gateway_gets_no_aws_identity() {
+        assert_eq!(
+            gateway_aws_env(None),
+            vec![
+                EnvChange::Remove("AWS_ROLE_ARN"),
+                EnvChange::Remove("AWS_WEB_IDENTITY_TOKEN_FILE"),
+                EnvChange::Set("AWS_EC2_METADATA_DISABLED", "true".into()),
+            ]
+        );
+    }
+
+    /// The child is a real process: what it prints is what a spawned gateway would inherit.
+    fn child_aws_env(sandbox_role: Option<&str>) -> std::collections::BTreeMap<String, String> {
+        let mut cmd = Command::new("env");
+        cmd.env("AWS_ROLE_ARN", "arn:aws:iam::1:role/publish")
+            .env("AWS_WEB_IDENTITY_TOKEN_FILE", "/var/run/secrets/aws/token");
+        apply_gateway_aws_env(&mut cmd, sandbox_role);
+        let out = cmd.output().expect("run env");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .filter(|(k, _)| k.starts_with("AWS_"))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn the_gateway_child_never_inherits_the_publish_role() {
+        let with_role = child_aws_env(Some("arn:aws:iam::1:role/sandbox-ro"));
+        assert_eq!(
+            with_role.get("AWS_ROLE_ARN").map(String::as_str),
+            Some("arn:aws:iam::1:role/sandbox-ro")
+        );
+        assert_eq!(
+            with_role
+                .get("AWS_EC2_METADATA_DISABLED")
+                .map(String::as_str),
+            Some("true")
+        );
+        let without = child_aws_env(None);
+        assert!(!without.contains_key("AWS_ROLE_ARN"), "{without:?}");
+        assert!(
+            !without.contains_key("AWS_WEB_IDENTITY_TOKEN_FILE"),
+            "{without:?}"
+        );
+    }
 
     #[test]
     fn each_pod_publishes_its_client_material_under_its_own_name() {

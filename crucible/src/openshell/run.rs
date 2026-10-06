@@ -367,15 +367,15 @@ async fn try_turn(
     };
 
     // 2b. Sandbox S3 reads (the read half of the S3 role split): a gateway-minted `aws-s3`
-    //     provider signs sandbox S3 egress at the proxy via a read-only role assumed with the
-    //     loop pod's projected web-identity token. Gated on the rendered env, absent, no
-    //     provider and no S3 signing.
-    let aws_provider = match std::env::var("CRUCIBLE_AWS_SANDBOX_ROLE_ARN") {
-        Ok(arn) if !arn.trim().is_empty() => {
-            ensure_aws_provider(&gw, arn.trim()).await?;
+    //     provider signs sandbox S3 egress at the proxy via the read-only sandbox role, which
+    //     the gateway holds through the loop pod's projected web-identity token and assumes
+    //     again for each mint. Gated on the rendered env, absent, no provider and no S3 signing.
+    let aws_provider = match crate::openshell::gateway::aws_sandbox_role() {
+        Some(arn) => {
+            ensure_aws_provider(&gw, &arn).await?;
             true
         }
-        _ => false,
+        None => false,
     };
 
     // 2c. Broker token hardening: the per-run bearer token becomes a static credential on the
@@ -887,10 +887,6 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     }
 }
 
-/// Idempotent AWS provider setup: create the `aws-s3` provider if absent, (re)configure its
-/// web-identity STS refresh, then rotate once so the credentials exist BEFORE the sandbox's
-/// first request, the proxy fails closed on unminted credentials and the refresh worker's
-/// tick is up to 60s away. Re-configuring each turn keeps a rotated role ARN current.
 /// Import the endpointless broker profile and set this run's token on the `crucible-broker`
 /// provider, update-or-create like the Vertex provider: the token changes every run, the
 /// provider object survives across runs on a shared gateway.
@@ -918,6 +914,12 @@ async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
     }
 }
 
+/// Idempotent AWS provider setup: import the `aws-s3` profile, create the provider if absent,
+/// (re)configure its STS `AssumeRole` refresh, then rotate once so the credentials exist BEFORE
+/// the sandbox's first request, the proxy fails closed on unminted credentials and the refresh
+/// worker's tick is up to 60s away. Re-configuring each turn keeps a rotated role ARN current.
+/// The gateway's own identity is the same role (see `gateway::aws_sandbox_role`), so the mint
+/// is a self-assume.
 async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     use openshell_core::proto::ProviderCredentialRefreshStrategy;
     gw.ensure_provider_profile(provider::aws_s3_profile())
@@ -928,11 +930,8 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
             .await
             .context("creating the aws-s3 provider")?;
     }
-    let token_file = std::env::var("CRUCIBLE_AWS_SANDBOX_TOKEN_FILE")
-        .unwrap_or_else(|_| "/var/run/secrets/aws/token".to_string());
     let mut material = std::collections::HashMap::from([
         ("role_arn".to_string(), role_arn.to_string()),
-        ("web_identity_token_file".to_string(), token_file),
         ("session_name".to_string(), "crucible-sandbox".to_string()),
     ]);
     if let Ok(region) = std::env::var("CRUCIBLE_AWS_SANDBOX_REGION")
@@ -947,7 +946,7 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
         material,
     )
     .await
-    .context("configuring the aws-s3 web-identity refresh")?;
+    .context("configuring the aws-s3 assume-role refresh")?;
     gw.rotate_provider_credential(provider::AWS_PROVIDER_NAME, provider::AWS_PRIMARY_CRED)
         .await
         .context("pre-warming the aws-s3 credentials")

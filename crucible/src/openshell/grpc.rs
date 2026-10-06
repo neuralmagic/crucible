@@ -812,7 +812,7 @@ impl Gateway {
             .map_err(Into::into)
     }
 
-    /// Point a credential's refresh at an STS web-identity mint (`ConfigureProviderRefresh`).
+    /// Point a credential's refresh at a gateway-side mint (`ConfigureProviderRefresh`).
     /// Configuring only STORES the refresh state, the worker mints on its next tick (≤60s), so
     /// follow with [`Gateway::rotate_provider_credential`] before the sandbox's first request
     /// (the proxy fails closed on unminted credentials).

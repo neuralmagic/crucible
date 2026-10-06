@@ -1,7 +1,10 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::manifest::{AgentCfg, CompositeManifest, DeployCfg, Manifest, MeasureCfg};
-use crate::openshell::gateway::{CLIENT_TLS_SECRET, ComputeDriver, OTEL_COLLECTOR_PORT};
+use crate::openshell::gateway::{
+    AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, CLIENT_TLS_SECRET, ComputeDriver,
+    OTEL_COLLECTOR_PORT,
+};
 use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
@@ -71,9 +74,9 @@ pub use crucible_contract::MANAGED_BY_SELECTOR as MANAGED_BY_LABEL;
 /// it from the same path, so the loop pod mounts the same claim writable. Must match the broker's
 /// BROKER_CODEGEN_ARTIFACTS_MOUNT default.
 const ARTIFACTS_MOUNT: &str = "/artifacts";
-/// Mount + file for the IRSA web-identity token (publish-on-keep).
+/// Mount + file for the IRSA web-identity token (publish-on-keep, the gateway's sandbox role).
 const AWS_TOKEN_DIR: &str = "/var/run/secrets/aws";
-const AWS_TOKEN_PATH: &str = "/var/run/secrets/aws/token";
+const AWS_TOKEN_PATH: &str = AWS_WEB_IDENTITY_TOKEN_PATH;
 /// Mount + file for the spoke kubeconfig Secret (key `kubeconfig`) named by the selected
 /// `[clusters.<name>]` entry; the in-pod broker reads it via BROKER_CODEGEN_KUBECONFIG.
 const SPOKE_KUBECONFIG_DIR: &str = "/etc/crucible/spoke";
@@ -858,16 +861,12 @@ impl Renderer<'_> {
             ));
         }
 
-        // Sandbox S3 reads: the gateway's `aws-s3` provider assumes this read-only role via the
-        // same projected token and signs sandbox egress at the proxy (see openshell::run).
+        // Sandbox S3 reads: the gateway runs as this read-only role via the same projected token
+        // and its `aws-s3` provider signs sandbox egress at the proxy (see openshell::run).
         if let Some(arn) = self.profile.cluster.aws_sandbox_role_arn.as_deref()
             && !arn.is_empty()
         {
-            env.push(plain("CRUCIBLE_AWS_SANDBOX_ROLE_ARN", arn.to_string()));
-            env.push(plain(
-                "CRUCIBLE_AWS_SANDBOX_TOKEN_FILE",
-                AWS_TOKEN_PATH.to_string(),
-            ));
+            env.push(plain(AWS_SANDBOX_ROLE_ENV, arn.to_string()));
         }
 
         // Under the kubernetes driver, project the config the runtime `gateway_toml()` reads to
@@ -4107,7 +4106,11 @@ mod tests {
         let yaml = render_loop_pod(&profile);
         assert!(yaml.contains("name: CRUCIBLE_AWS_SANDBOX_ROLE_ARN"));
         assert!(yaml.contains("value: arn:aws:iam::1:role/sandbox-ro"));
-        assert!(yaml.contains("name: CRUCIBLE_AWS_SANDBOX_TOKEN_FILE"));
+        assert!(
+            !yaml.contains("CRUCIBLE_AWS_SANDBOX_TOKEN_FILE"),
+            "the gateway reads the token from its own AWS_WEB_IDENTITY_TOKEN_FILE"
+        );
+        assert!(yaml.contains("mountPath: /var/run/secrets/aws"), "{yaml}");
         assert!(
             yaml.contains("audience: sts.amazonaws.com"),
             "sts token projected without aws_role_arn: {yaml}"
