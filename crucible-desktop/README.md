@@ -1,15 +1,19 @@
 # crucible-desktop
 
 macOS app around the controller UI, on Tauri 2. It is its own Cargo workspace, so the root
-workspace and CI do not build it; `just desktop-check` formats, lints and tests it.
+workspace does not build it. `just desktop-check` formats, lints and tests it; the Desktop workflow
+runs the same on macOS when anything under `crucible-desktop/` changes.
 
 ```sh
 just desktop-install
 ```
 
-That builds `Crucible.app` and installs it in `~/Applications`. The build is signed ad hoc, so the
-first launch of a fresh build needs a right-click, Open (or System Settings, Privacy & Security,
-Open Anyway). For a dev loop, `cargo run` in this directory.
+That builds `Crucible.app` and installs it in `~/Applications`. For a dev loop, `cargo run` in this
+directory.
+
+Each release also carries `Crucible-<tag>-aarch64-apple-darwin.zip`. The app is signed ad hoc, so
+macOS blocks a downloaded copy on first launch: allow it from System Settings, Privacy & Security,
+Open Anyway, or run `xattr -d com.apple.quarantine /Applications/Crucible.app`.
 
 Settings live in `~/.config/crucible-desktop/config.toml` (under `$XDG_CONFIG_HOME` when set),
 edited from Settings (Cmd-,). With no profiles in it, the app makes one named `default` from crux's
