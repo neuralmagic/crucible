@@ -170,3 +170,4 @@ opentelemetry_sdk = { version = "0.32", default-features = false, features = [
     "logs",
     "testing",
 ] }
+tonic-prost = "0.14"
