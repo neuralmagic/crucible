@@ -1243,7 +1243,7 @@ mod tests {
             name = "gate"
             kind = "route"
             depends_on = ["scan"]
-            needs = "systemone"
+            needs = "decision"
             over = { task = "scan", field = "items" }
             max_fanout = 4
             decider = { kind = "model", min_confidence = 0.8 }

@@ -27,7 +27,7 @@ An agent turn driven by a prompt.
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
+| `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
@@ -61,7 +61,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
+| `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
@@ -88,7 +88,7 @@ A deterministic shell task in the candidate workspace.
 | `name` | `str` | Task identity, unique within the workflow. |
 | `run` | `str` | The command, run through `sh -c`. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
+| `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
@@ -117,7 +117,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `threshold` | `number` | Grade the emitted score against this bound. An explicit `pass` wins. |
 | `direction` | `"lower" \| "higher"` | Which side of the threshold passes. |
 | `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
-| `needs` | `str` | The substrate capability the task needs, such as `"systemone"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
+| `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
 | `isolated` | `bool` | Run in a disposable worktree. File changes are discarded; only JSON output continues. |
@@ -274,7 +274,7 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `questions` | `dict[str, question]` | Question id to `noul()`, `choice()`, or `score()`. `gate.<id>` names one for `when`. |
-| `min_confidence` | `number` | A decision model answers, through the broker's `systemone` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence` and `source`. |
+| `min_confidence` | `number` | A decision model answers, through the broker's `decision` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence` and `source`. |
 | `source` | `task` | A dependency's output answers instead: it emits one declared label (or a boolean, for a noul) under each question id. Deterministic, free, and needs no capability. Any other value fails the route. When the dependency types its emits, each question's field must be typed with labels the question answers, or `"boolean"` for a noul. |
 | `files` | `list[str]` | Declared JSON files of dependencies the model reads, under `files` in its state, by dependency and path. Each must be declared by a dependency with a `schema_file(...)`. Not with `source`. |
 | `over` | `producer.field` | Decide once per item. A task mapped over the same list reads each item's answer with `when`; one mapped over another list, or not mapped, cannot. |

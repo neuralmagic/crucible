@@ -462,7 +462,7 @@ mod tests {
       "type": "playbook",
       "task": [
         {"name":"scan","kind":"command","command":"scan","emits":["targets","notes"]},
-        {"name":"triage","kind":"route","depends_on":["scan"],"needs":"systemone",
+        {"name":"triage","kind":"route","depends_on":["scan"],"needs":"decision",
          "over":{"task":"scan","field":"targets"},"max_fanout":120,
          "keyed":[{"task":"scan","field":"notes"}],
          "questions":{"tier":{"instructions":"how bad","type":"choice","options":[]},

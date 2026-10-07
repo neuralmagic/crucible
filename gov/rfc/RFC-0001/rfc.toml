@@ -74,6 +74,8 @@ changed = [
     "the declared lane scopes the constructor namespace, so a playbook cannot name or be offered a scored constructor",
     "session log gains asks_emitted, so what a run proposed is auditable apart from what an orchestrator admitted",
     "skill joins the enumerated constructors: an agent task whose prompt is assembled from a shipped SKILL.md and the invocation's arguments",
+    "a decision binding may speak decisions, the OpenAI Decisions API, reached at OpenAI's address when it names no URL (C-INFERENCE, C-ROUTE)",
+    "the capability a model-decided route needs is decision, not systemone, since it names the role rather than one API (C-ROUTE)",
 ]
 
 [[changelog]]

@@ -243,7 +243,7 @@ const ROUTE_GRAPH = {
   plan_version: 1,
   tasks: [
     { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
-    { name: 'triage', kind: 'route', depends_on: ['scan'], session: '', needs: 'systemone', required: true, over: 'scan.items', max_fanout: 120, when: '', keyed: ['scan.notes'] },
+    { name: 'triage', kind: 'route', depends_on: ['scan'], session: '', needs: 'decision', required: true, over: 'scan.items', max_fanout: 120, when: '', keyed: ['scan.notes'] },
     { name: 'fix', kind: 'agent', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true, over: 'scan.items', max_fanout: 120, when: 'triage.tier in high|low', keyed: ['scan.notes'] },
     { name: 'roll', kind: 'command', depends_on: ['fix'], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
   ],

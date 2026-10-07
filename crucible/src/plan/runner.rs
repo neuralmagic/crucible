@@ -85,6 +85,7 @@ impl ShellRunner {
     ) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
+        crate::inference::withhold_from_task(&mut cmd);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -205,7 +206,7 @@ impl ShellRunner {
                     );
                 };
                 let endpoint =
-                    match crucible_broker::systemone::Endpoint::from_binding(binding, |name| {
+                    match crucible_broker::decide::Endpoint::from_binding(binding, |name| {
                         std::env::var(name).ok()
                     }) {
                         Ok(endpoint) => endpoint,

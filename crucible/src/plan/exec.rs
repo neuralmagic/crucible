@@ -44,7 +44,7 @@ impl Substrate {
     /// `caps` plus the capabilities the run's inference bindings provide.
     pub fn detecting(mut caps: BTreeSet<String>, inference: &ResolvedInference) -> Self {
         if inference.binding(InferenceRole::Decision).is_some() {
-            caps.insert(crate::plan::ir::NEEDS_SYSTEMONE.to_owned());
+            caps.insert(crate::plan::ir::NEEDS_DECISION.to_owned());
         }
         Substrate { caps }
     }
@@ -9584,13 +9584,13 @@ mod tests {
                     files: Vec::new(),
                 },
             },
-            ..task("gate", &["prepare"], crate::plan::ir::NEEDS_SYSTEMONE, true)
+            ..task("gate", &["prepare"], crate::plan::ir::NEEDS_DECISION, true)
         })
     }
 
     fn deciding() -> Substrate {
         Substrate {
-            caps: BTreeSet::from([crate::plan::ir::NEEDS_SYSTEMONE.to_string()]),
+            caps: BTreeSet::from([crate::plan::ir::NEEDS_DECISION.to_string()]),
         }
     }
 
