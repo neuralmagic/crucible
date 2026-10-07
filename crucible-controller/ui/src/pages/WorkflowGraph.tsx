@@ -43,6 +43,8 @@ import {
 } from './workflowGraphLayout';
 import {
   badgeFor,
+  decisionLines,
+  decisionRows,
   detailRows,
   fanoutLine,
   fanoutRows,
@@ -57,6 +59,7 @@ import {
   type FanOutState,
   type NodeLinks,
   type OutputNode,
+  type RouteDecision,
   type TaskRuntime,
   type TaskTone,
 } from './taskGraph';
@@ -75,6 +78,8 @@ export interface WorkflowGraphProps {
   fanoutState?: ReadonlyMap<string, FanOutState>;
   /// The external results each node links out to, keyed by node name.
   links?: ReadonlyMap<string, NodeLinks>;
+  /// What each route node or route instance decided, keyed by its name.
+  decisions?: ReadonlyMap<string, RouteDecision[]>;
   className?: string;
 }
 
@@ -102,6 +107,7 @@ const KIND_RULE: Record<string, string> = {
   agent: 'bg-blue',
   command: 'bg-ink-2',
   engine: 'bg-amber',
+  route: 'bg-ink',
 };
 
 /// Which way the graph runs is a per-device choice: a wide screen reads left to right, a narrow
@@ -131,6 +137,7 @@ interface GraphView {
   outputs: ReadonlyMap<string, OutputNode>;
   fanoutState: ReadonlyMap<string, FanOutState>;
   links: ReadonlyMap<string, NodeLinks>;
+  decisions: ReadonlyMap<string, RouteDecision[]>;
   edges: ReadonlyMap<string, LaidOutEdge>;
   /// The hovered or focused task and everything it depends on; null when nothing is traced. A
   /// picked task is not traced: reading its metadata should not dim the graph it sits in.
@@ -212,8 +219,10 @@ function TaskCard({ id }: NodeProps) {
   const advisory = !node.required;
   const dim = view.lit !== null && !view.lit.has(id);
   const fanout = node.fanout ?? null;
+  const route = node.kind === 'route';
   const emitted = [...node.emits, ...node.emits_files];
-  const runs = runsLine(node);
+  const decided = decisionLines(view.decisions.get(node.name) ?? []);
+  const runs = decided.length === 0 ? runsLine(node) : null;
   const meta = metaFor(node);
   const runtime = view.runtime.get(node.name) ?? null;
   const spread = view.fanoutState.get(node.name) ?? null;
@@ -230,7 +239,10 @@ function TaskCard({ id }: NodeProps) {
           <span
             key={i}
             aria-hidden
-            className="absolute inset-0 border border-rule-hard bg-raised"
+            className={cn(
+              'absolute inset-0 border border-rule-hard',
+              route ? 'bg-sunk' : 'bg-raised'
+            )}
             style={{
               transform: `translate(${(STACK_CARDS - i) * STACK_STEP}px, ${
                 (STACK_CARDS - i) * STACK_STEP
@@ -257,8 +269,10 @@ function TaskCard({ id }: NodeProps) {
           paddingBottom: links === null ? undefined : LINK_STRIP,
         }}
         className={cn(
-          'relative flex h-full w-full flex-col overflow-hidden bg-raised py-0.5 pr-1.5 pl-2 text-left leading-tight',
+          'relative flex h-full w-full flex-col overflow-hidden py-0.5 pr-1.5 pl-2 text-left leading-tight',
+          route ? 'bg-sunk pl-3' : 'bg-raised',
           advisory ? 'border border-dashed border-rule-hard' : 'border border-ink-3',
+          route && !advisory && 'border-double border-[3px]',
           laid.isResult && 'border-2 border-ink',
           runtime !== null && TONE_BORDER[runtime.tone],
           view.picked === node.name && 'outline-2 outline-offset-2 outline-blue'
@@ -267,7 +281,7 @@ function TaskCard({ id }: NodeProps) {
         <span
           aria-hidden
           className={cn(
-            'absolute top-1 bottom-1 left-0 w-[2px]',
+            route ? 'absolute top-3 bottom-3 left-1 w-[2px]' : 'absolute top-1 bottom-1 left-0 w-[2px]',
             fanout !== null ? 'bg-ink' : (KIND_RULE[node.kind] ?? 'bg-ink-3')
           )}
         />
@@ -303,6 +317,16 @@ function TaskCard({ id }: NodeProps) {
             {meta}
           </span>
         )}
+        {decided.map((line) => (
+          <span
+            key={line}
+            data-decision={node.name}
+            title={line}
+            className="block truncate font-mono text-micro text-ink"
+          >
+            {line}
+          </span>
+        ))}
         {spread !== null && (
           <span
             data-fanout={node.name}
@@ -392,30 +416,47 @@ function PlanEdge({ id }: EdgeProps) {
 
   const lit = view.lit !== null && view.lit.has(laid.from) && view.lit.has(laid.to);
   const dim = view.lit !== null && !lit;
+  const tone = lit ? 'var(--ink)' : 'var(--ink-3)';
+  const width = lit ? 1.6 : 1;
 
   return (
     <>
+      {laid.aligned && (
+        <path
+          d={laid.path}
+          data-aligned-edge={id}
+          fill="none"
+          style={{
+            stroke: tone,
+            strokeWidth: width * 2 + 2.5,
+            strokeDasharray: laid.required ? undefined : '3 3',
+            opacity: dim ? 0.15 : 1,
+          }}
+        />
+      )}
       <BaseEdge
         id={id}
         path={laid.path}
         markerEnd={`url(#${lit ? markers.arrowLit : markers.arrow})`}
         style={{
-          stroke: lit ? 'var(--ink)' : 'var(--ink-3)',
-          strokeWidth: lit ? 1.6 : 1,
-          strokeDasharray: laid.required ? undefined : '3 3',
+          stroke: laid.aligned ? 'var(--paper)' : tone,
+          strokeWidth: laid.aligned ? 2.5 : width,
+          strokeDasharray: laid.required || laid.aligned ? undefined : '3 3',
           opacity: dim ? 0.15 : 1,
         }}
       />
-      {laid.label !== null && (
+      {(laid.label !== null || laid.reads !== null) && (
         <EdgeLabelRenderer>
           <span
-            className="absolute bg-paper px-1 font-mono text-micro tracking-label text-ink-2 uppercase"
+            data-edge-label={id}
+            className="absolute flex gap-1 bg-paper px-1 font-mono text-micro text-ink-2"
             style={{
               transform: `translate(-50%, -50%) translate(${laid.labelX}px, ${laid.labelY}px)`,
               opacity: dim ? 0.15 : 1,
             }}
           >
-            {laid.label}
+            {laid.label !== null && <span className="tracking-label uppercase">{laid.label}</span>}
+            {laid.reads !== null && <span className="text-ink">{laid.reads}</span>}
           </span>
         </EdgeLabelRenderer>
       )}
@@ -430,18 +471,20 @@ interface TaskPanelProps {
   laid: LaidOutNode;
   runtime: TaskRuntime | null;
   spread: FanOutState | null;
+  decisions: RouteDecision[];
   runId: string | undefined;
   onClose: () => void;
 }
 
 /// Everything the graph document holds about one task, the source it runs included: too long for a
 /// card, and the thing an importer most wants to read before registering a pack.
-function TaskPanel({ laid, runtime, spread, runId, onClose }: TaskPanelProps) {
+function TaskPanel({ laid, runtime, spread, decisions, runId, onClose }: TaskPanelProps) {
   const { node } = laid;
   const source = sourceFor(node);
   const rows = [
     ...(runtime === null ? [] : runtimeRows(runtime)),
     ...(spread === null ? [] : fanoutRows(spread)),
+    ...decisionRows(decisions),
     ...detailRows(node),
   ];
 
@@ -499,6 +542,7 @@ const NO_RUNTIME: ReadonlyMap<string, TaskRuntime> = new Map();
 const NO_OUTPUTS: ReadonlyMap<string, OutputNode> = new Map();
 const NO_FANOUT: ReadonlyMap<string, FanOutState> = new Map();
 const NO_LINKS: ReadonlyMap<string, NodeLinks> = new Map();
+const NO_DECISIONS: ReadonlyMap<string, RouteDecision[]> = new Map();
 
 const CANVAS_ONLY = ['canvas'];
 const CANVAS_AND_PANEL = ['canvas', 'panel'];
@@ -510,6 +554,7 @@ function GraphCanvas({
   outputs,
   fanoutState,
   links,
+  decisions,
   className,
 }: WorkflowGraphProps) {
   const marker = useId().replace(/:/g, '');
@@ -580,13 +625,14 @@ function GraphCanvas({
       outputs: outputs ?? NO_OUTPUTS,
       fanoutState: fanoutState ?? NO_FANOUT,
       links: links ?? NO_LINKS,
+      decisions: decisions ?? NO_DECISIONS,
       edges: new Map(layout.edges.map((laid) => [edgeId(laid.from, laid.to), laid])),
       lit: traced === null ? null : (layout.ancestry.get(traced) ?? new Set([traced])),
       picked,
       onTrace: setTraced,
       onPick: setPicked,
     };
-  }, [direction, layout, runtime, outputs, fanoutState, links, traced, picked]);
+  }, [direction, layout, runtime, outputs, fanoutState, links, decisions, traced, picked]);
 
   const canvasRef = useRef<HTMLDivElement | null>(null);
   // The canvas changes size when a divider is dragged, the rail collapses, or the window resizes;
@@ -635,6 +681,8 @@ function GraphCanvas({
     layout.nodes.some((laid) => (laid.node.fanout ?? null) !== null)
       ? 'MAP = mapped over a producer field'
       : null,
+    layout.nodes.some((laid) => laid.node.kind === 'route') ? 'DECIDE = route' : null,
+    layout.edges.some((laid) => laid.aligned) ? 'double line = per element' : null,
     layout.nodes.some((laid) => !laid.node.required) ? 'dashed = advisory' : null,
     layout.edges.some((laid) => laid.label !== null) ? 'passed = joins only on what passed' : null,
     layout.nodes.some((laid) => laid.isResult) ? 'end bar = result' : null,
@@ -760,6 +808,7 @@ function GraphCanvas({
                     laid={pickedNode}
                     runtime={view.runtime.get(pickedNode.node.name) ?? null}
                     spread={view.fanoutState.get(pickedNode.node.name) ?? null}
+                    decisions={view.decisions.get(pickedNode.node.name) ?? []}
                     runId={runId}
                     onClose={close}
                   />
