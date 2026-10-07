@@ -1866,6 +1866,59 @@ workflow(type = "playbook", tasks = [write, copy, review])
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A wedged agent instance is stopped and retried in a fresh turn while its batch sibling
+    /// keeps its own result, so one stuck agent costs a retry rather than the run's deadline.
+    #[test]
+    fn a_wedged_agent_is_stopped_and_retried_without_holding_its_batch() {
+        let dir =
+            std::env::temp_dir().join(format!("crucible-wedged-agent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("agents.json"),
+            r#"{
+              "stuck": {"loop_tool": "$ go list -deps ./cmd/server",
+                        "turns": [{}, {"loop_tool": null, "result": {"traced": true}}]},
+              "steady": {"result": {"ok": true}}
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("workflow.star"),
+            r#"
+stuck = agent(name = "stuck", prompt = "trace", isolated = True, timeout = "10m")
+steady = agent(name = "steady", prompt = "trace", isolated = True, timeout = "10m")
+workflow(type = "playbook", tasks = [stuck, steady])
+"#,
+        )
+        .unwrap();
+        fake_agent_manifest(&dir);
+        let manifest = std::fs::read_to_string(dir.join("crucible.toml")).unwrap();
+        std::fs::write(
+            dir.join("crucible.toml"),
+            manifest.replace(
+                "[agent.env]\n",
+                &format!(
+                    "[[agent.tool_plugins]]\n                plugin = \"repeat_guard\"\n                limit = 5\n                [agent.env]\n                FAKE_AGENT_STATE = \"{}\"\n",
+                    dir.join("fake-state").display()
+                ),
+            ),
+        )
+        .unwrap();
+
+        let started = std::time::Instant::now();
+        let out = run_playbook(&dir);
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+        assert!(out.valid, "{:?}", out.results);
+        let stuck = &out.results[&"stuck".into()];
+        assert_eq!(stuck.status, TaskStatus::Pass);
+        assert_eq!(stuck.attempts, 2, "the wedged turn was retried once");
+        assert_eq!(stuck.output.as_ref().unwrap()["traced"], true);
+        let steady = &out.results[&"steady".into()];
+        assert_eq!((steady.status, steady.attempts), (TaskStatus::Pass, 1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The file channel says what the JSON channel says. A producer that failed contributes
     /// nothing, including what a previous run of the same pack captured under its name.
     #[test]

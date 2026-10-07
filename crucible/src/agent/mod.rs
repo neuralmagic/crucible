@@ -26,10 +26,11 @@ pub(crate) mod harness;
 pub(crate) mod hermes_trace;
 pub(crate) mod inference;
 pub(crate) mod relay;
+pub(crate) mod tool_chain;
 pub(crate) mod turn;
 
 use crate::agent::event::{AgentEvent, RawStream, Tokens, estimate_cost};
-use crate::agent::harness::{HarnessRuntime, StreamDecoder};
+use crate::agent::harness::HarnessRuntime;
 use crate::args::{Args, Paths};
 #[cfg(feature = "autoresearch")]
 use crate::manifest::AgentBackend;
@@ -39,8 +40,10 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::thread;
 
+use crate::agent::tool_chain::ToolChain;
 use crate::agent::turn::{
-    StreamPump, TurnFailure, TurnOutcome, account, otel_enabled, otel_forward, tool_io_full,
+    PumpEnd, StreamPump, TurnFailure, TurnOutcome, account, ended_turn, otel_enabled, otel_forward,
+    report_chain, stop_event, tool_io_full,
 };
 
 /// Where a turn's events come from. Resolved once from [`Args`] (see
@@ -310,7 +313,7 @@ fn run_turn_with(
         }
     };
     let Spawned {
-        child,
+        mut child,
         stdout,
         stderr,
     } = spawned;
@@ -333,25 +336,41 @@ fn run_turn_with(
     let mut cost = 0.0_f64;
     // Highest cumulative token sample seen, for the estimate fallback below.
     let mut best_tokens: Option<Tokens> = None;
+    let mut stopped = None;
     if let Some(out) = stdout {
         if matches!(source, AgentSource::LocalClaude) {
             // Local agent: decode via the harness's stream decoder (shared with the openshell
             // exec path).
-            let decoder =
-                args.harness()
-                    .backend()
-                    .decoder(args, meters.as_ref(), tool_io_full(args));
-            let (c, bt) = pump_stream(out, json, decoder, &mut sink);
-            cost = c;
-            best_tokens = bt;
+            let backend = args.harness().backend();
+            let full = tool_io_full(args);
+            let pump = StreamPump::new(
+                backend.decoder(args, meters.as_ref(), full),
+                (!full).then(|| backend.decoder(args, None, true)),
+                ToolChain::for_args(args),
+            );
+            let end = pump_stream(out, json, pump, &mut sink);
+            cost = end.cost;
+            best_tokens = end.best_tokens;
+            stopped = end.stopped;
+            if stopped.is_some() {
+                child.kill();
+            }
         } else {
+            let mut chain = ToolChain::for_args(args);
             for line in BufReader::new(out).lines().map_while(Result::ok) {
                 let ev = line_event(&line, RawStream::Stdout);
                 if let Some(e) = ev.as_ref() {
                     account(e, &mut cost, &mut best_tokens);
                 }
                 sink(&line, RawStream::Stdout, ev.as_ref());
+                if let Some(reason) = ev.as_ref().and_then(|e| chain.observe(e)) {
+                    sink("", RawStream::Stderr, Some(&stop_event(reason)));
+                    child.kill();
+                    break;
+                }
             }
+            report_chain(&chain, &mut sink);
+            stopped = chain.into_stopped();
         }
     }
 
@@ -406,7 +425,7 @@ fn run_turn_with(
     }
     match killed_at {
         Some(deadline) => TurnOutcome::failed(cost, TurnFailure::DeadlineExceeded(deadline)),
-        None => TurnOutcome::completed(cost),
+        None => ended_turn(cost, stopped),
     }
 }
 
@@ -425,22 +444,24 @@ fn line_event(line: &str, stream: RawStream) -> Option<AgentEvent> {
     })
 }
 
-/// Stream agent stdout from `reader`, decoding each line into [`AgentEvent`]s via `decoder` and
-/// driving `sink`, returning the turn's (max authoritative cost, largest token sample). The
+/// Stream agent stdout from `reader` through `pump`, driving `sink`, until the stream ends or the
+/// pump's tool chain ends the turn. The
 /// local-child wrapper around [`StreamPump`]: it loops `BufReader` lines into the pump. Used by
 /// the local path ([`run_turn_with`]); the openshell `sandbox exec` path drives a
 /// [`StreamPump`] directly off its gRPC stream.
 pub(crate) fn pump_stream(
     reader: impl Read,
     json: bool,
-    decoder: Box<dyn StreamDecoder>,
+    mut pump: StreamPump,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> (f64, Option<Tokens>) {
-    let mut pump = StreamPump::new(decoder);
+) -> PumpEnd {
     for line in BufReader::new(reader).lines().map_while(Result::ok) {
         pump.push(&line, json, sink);
+        if pump.stopped().is_some() {
+            break;
+        }
     }
-    pump.finish()
+    pump.finish(sink)
 }
 
 impl Args {
@@ -572,6 +593,99 @@ mod tests {
             lines.iter().any(|l| l == "started"),
             "output before the kill is kept"
         );
+    }
+
+    /// The stand-in agent emits one tool event forever, from a child it forked, so the turn ends
+    /// only if the guard trips and the agent dies with its group.
+    const LOOPING_AGENT: &str = r#"(while true; do echo '{"v":1,"kind":"tool","name":"Bash","summary":"$ go list -deps ./cmd/server"}'; done) & wait"#;
+
+    fn wedged_turn(a: &Args, name: &str, deadline: Option<Deadline>) -> (TurnOutcome, Vec<String>) {
+        let p = workspace(name);
+        let src = AgentSource::Command(LOOPING_AGENT.to_string());
+        let started = std::time::Instant::now();
+        let mut errors = Vec::new();
+        let outcome = run_turn_with(
+            &src,
+            a,
+            &p,
+            "prompt",
+            false,
+            None,
+            deadline,
+            |_l, _s, ev| {
+                if let Some(AgentEvent::Error { message, .. }) = ev {
+                    errors.push(message.clone());
+                }
+            },
+        );
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the wedged agent was stopped, not waited out"
+        );
+        (outcome, errors)
+    }
+
+    #[test]
+    fn an_agent_repeating_one_tool_call_is_killed_and_the_turn_says_it_wedged() {
+        let deadline = crucible::deadline::Deadline::for_attempt(
+            std::time::Instant::now(),
+            Some("60s".parse().unwrap()),
+            None,
+        );
+        let (outcome, errors) = wedged_turn(&args(&[]), "wedged", deadline);
+        match outcome.failure() {
+            Some(TurnFailure::Stopped(crate::agent::tool_chain::StopReason::Wedged(wedged))) => {
+                assert_eq!(wedged.calls, ["Bash `$ go list -deps ./cmd/server`"]);
+                assert_eq!(wedged.repeats, 25);
+            }
+            other => panic!("expected a wedge, got {other:?}"),
+        }
+        assert_eq!(
+            outcome.failure().map(TurnFailure::transport_cause),
+            Some(crucible_contract::TransportCause::Agent),
+            "a wedge is retried like any agent transport failure"
+        );
+        assert_eq!(
+            errors.len(),
+            1,
+            "the wedge reached the run log once: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_wedged_agent_without_a_deadline_is_still_killed() {
+        let (outcome, _) = wedged_turn(&args(&[]), "wedged-nodeadline", None);
+        assert!(matches!(outcome.failure(), Some(TurnFailure::Stopped(_))));
+    }
+
+    #[test]
+    fn the_manifest_chain_sets_the_repeat_limit_for_the_turn() {
+        let mut a = args(&[]);
+        a.tool_plugins = Some(vec![crate::manifest::ToolPluginSpec::RepeatGuard {
+            limit: std::num::NonZeroUsize::new(4).unwrap(),
+        }]);
+        let (outcome, _) = wedged_turn(&a, "wedged-limit", None);
+        match outcome.failure() {
+            Some(TurnFailure::Stopped(crate::agent::tool_chain::StopReason::Wedged(wedged))) => {
+                assert_eq!(wedged.repeats, 4)
+            }
+            other => panic!("expected a wedge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_manifest_chain_lets_the_turn_run_to_its_end() {
+        let mut a = args(&[]);
+        a.tool_plugins = Some(Vec::new());
+        let p = workspace("no-plugins");
+        let src = AgentSource::Command(
+            r#"for i in $(seq 40); do echo '{"v":1,"kind":"tool","name":"Bash","summary":"$ ls"}'; done"#
+                .to_string(),
+        );
+        let outcome = run_turn_with(&src, &a, &p, "prompt", false, None, None, |_l, _s, _ev| {});
+        let _ = std::fs::remove_dir_all(&p.workspace);
+        assert_eq!(outcome.failure(), None);
     }
 
     /// Under a deadline the turn runs in its own, background process group, where a read from
