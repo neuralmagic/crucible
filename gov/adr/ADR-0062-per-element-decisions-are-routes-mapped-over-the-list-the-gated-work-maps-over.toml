@@ -34,7 +34,7 @@ decision = """
 Let a route map over a list, and evaluate a when on a mapped route per element in a task that maps over the same list. Two tasks mapped over the same producer field are aligned; their instances pair by key, which is already the identity a resume relies on. The normative rules are [[RFC-0001:C-ROUTE-EACH]] and [[RFC-0001:C-ROUTE-FILES]].
 
 - **One decision per element.** A mapped route's instance for a key is that element's decision, recorded and folded on resume like any instance, so an element is asked once per run.
-- **Per-element reads.** An aligned dependency reaches an instance as its own instance for the same key, under the dependency's own name, instead of the fold. This holds only where a route is on one side of the edge, so existing mapped-to-mapped graphs read exactly what they read today.
+- **Per-element reads.** On every aligned edge, the dependency reaches an instance as its own instance for the same key, under the dependency's own name, instead of the fold. One rule covers routes, the tasks they gate, and plain per-element pipelines alike, and an untaken element stays untaken down the whole aligned chain.
 - **Gating.** when keeps its meaning and gains a per-element reading. Partitioning by answer is several aligned tasks with whens on the same question, and the existing coverage rule makes every label lead somewhere.
 - **State.** An element's state is the route's inputs plus its key. keyed narrows a per-element object field to the element's entry, so a hundred-element route does not send the whole field a hundred times. A route may also read declared JSON files, which is how it judges an agent whose output is a file.
 - **Folds.** An instance not taken is not a failure. A fan-out whose instances were all untaken is itself untaken, so its "all" dependents are untaken as any branch's are and a "settled" reducer still runs.
@@ -60,15 +60,15 @@ review = agent(name = "review", depends_on = [judge], over = prepare.members, ma
 A ticket answered "settled" costs one decision and no turn. A deterministic output-decided route can sit in front of the model-decided one when the staged facts already carry an answer; the model route then declares a when on it and is asked only about the rest. A fix gate is the same shape over the fix list."""
 consequences = """
 - The expensive per-element turns become conditional per element, and an untaken element shows as a not-taken row under its own key rather than disappearing from the run.
-- Every element costs one decision request. max_fanout bounds the requests per run, and the run's ceilings are checked before each one. Decision spend is recorded as zero today, so the budget does not see it and the ceiling check before each request is in practice a wall-clock check; max_fanout covers that gap until decision usage is priced.
+- Every element costs one decision request. max_fanout bounds the requests per run, and the run's ceilings are checked before each one. Decision requests are not charged to the run's budget: they cost little next to the turns they gate, so the ceiling check before each request is in practice a wall-clock check, and max_fanout bounds the count.
 - An aligned dependent waits for the whole mapped dependency to settle before it expands. Starting element k's turn as soon as element k's decision lands is left out; the decision is the cheap stage, so the added latency is small next to the turns it gates.
-- A route on a mapped edge changes what the dependent instance reads (an instance, not the fold). Mapped-to-mapped edges without a route are unchanged, which leaves two read rules where one would be simpler; generalising alignment to every mapped edge would be a breaking change for packs that consume the fold.
+- An aligned mapped-to-mapped edge changes what the dependent instance reads: an instance, not the fold. This is breaking for a pack whose mapped task consumes the fold of another task mapped over the same list. No published example or known pack has such an edge; a task mapped over a different list, or not mapped, still reads the fold.
 - The fan-out summary gains a not_taken count. Readers that predate it read zero, and a fold that would have failed only because instances were untaken now passes.
 - Judging an agent's result feeds a review lane, not a send-back ([[ADR-0064]]).
 - A playbook that relied on every element getting a full turn now relies on the decision model's calibration and min_confidence. uncertain still has to be routed, so the author decides what happens when the model is unsure."""
 
 [[content.alternatives]]
-text = "Map a route over the list and read a when on it per element in aligned tasks"
+text = "Map a route over the list, read every aligned edge per element, and read a when on a mapped route per element"
 status = "accepted"
 pros = [
     "Reuses the instance key, the not-taken status, the coverage rule, and resume folding as they are.",
@@ -76,7 +76,7 @@ pros = [
     "Partitioning by answer and chaining a deterministic route in front of a model route need no new construct.",
 ]
 cons = [
-    "Introduces alignment and a per-element read rule that applies only to edges with a route.",
+    "An aligned mapped-to-mapped edge reads an instance instead of the fold, a breaking change for any pack that relied on the fold there.",
     "Each element is a separate decision request.",
 ]
 
@@ -115,11 +115,11 @@ cons = [
 rejection_reason = "Breaks compile-time questions and per-element failure isolation."
 
 [[content.alternatives]]
-text = "Generalise alignment to every edge between tasks mapped over the same list"
+text = "Read aligned edges per element only along chains that involve a route"
 status = "rejected"
-pros = [
-    "One read rule for mapped edges.",
-    "An agent-to-agent pipeline per element would get the same pairing.",
+pros = ["Existing mapped-to-mapped edges keep reading the fold."]
+cons = [
+    "Two read rules for the same shape of edge, chosen by what is upstream.",
+    "Needs a transitive per-element marking so an untaken element stays untaken past the first hop.",
 ]
-cons = ["Changes what existing mapped-to-mapped dependents read, a breaking change for packs that consume the fold."]
-rejection_reason = "Breaks packs that consume the fold on mapped-to-mapped edges; per-element reads follow routes and their gated chains only."
+rejection_reason = "No known pack consumes the fold on an aligned edge, so the compatibility it buys is not worth a second rule."
