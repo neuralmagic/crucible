@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crucible_contract::decision::{
-    Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId, QuestionKind,
+    Answer, AskedAs, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId, QuestionKind,
 };
 use crucible_contract::inference::InferenceBinding;
 use serde::Deserialize;
@@ -94,7 +94,7 @@ pub fn request_body(
             let mut body = json!({ "instructions": q.instructions });
             match &q.kind {
                 QuestionKind::Noul => body["type"] = json!("noul"),
-                QuestionKind::Choice { options } => {
+                QuestionKind::Choice { options } | QuestionKind::Score { levels: options } => {
                     body["type"] = json!("choice");
                     body["criteria"] = Value::Object(
                         options
@@ -126,9 +126,12 @@ pub fn parse_response(
             .ok_or_else(|| invalid(format!("the response omits question {id:?}")))?
             .ok_or_else(|| invalid(format!("the model left question {id:?} unanswered")))?;
         let probabilities = probabilities(id, question, answer)?;
-        let answer: Answer = question
+        let mut answer: Answer = question
             .resolve(probabilities, min_confidence)
             .map_err(|e| invalid(format!("question {id:?}: {e}")))?;
+        if let QuestionKind::Score { .. } = question.kind {
+            answer.asked_as = Some(AskedAs::Choice);
+        }
         decision.insert(id.clone(), answer);
     }
     if let Some(extra) = wire.answers.keys().next() {
@@ -159,7 +162,10 @@ fn probabilities(
                 (label(NOUL_NO)?, 1.0 - noul),
             ]))
         }
-        (QuestionKind::Choice { .. }, WireAnswer::Choice { probabilities }) => probabilities
+        (
+            QuestionKind::Choice { .. } | QuestionKind::Score { .. },
+            WireAnswer::Choice { probabilities },
+        ) => probabilities
             .into_iter()
             .map(|(name, p)| {
                 let label =
@@ -172,6 +178,9 @@ fn probabilities(
         ))),
         (QuestionKind::Choice { .. }, WireAnswer::Noul { .. }) => Err(invalid(format!(
             "question {id:?} is a choice but was answered as a noul"
+        ))),
+        (QuestionKind::Score { .. }, WireAnswer::Noul { .. }) => Err(invalid(format!(
+            "question {id:?} is a score asked as a choice but was answered as a noul"
         ))),
     }
 }
@@ -222,7 +231,7 @@ fn truncate(body: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::systemone::*;
     use crucible_contract::decision::ChoiceOption;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
@@ -444,6 +453,87 @@ mod tests {
                 Err(DecideError::Invalid(m)) => assert!(m.contains(needle), "{m} lacks {needle}"),
                 other => panic!("{body} gave {other:?}"),
             }
+        }
+    }
+
+    fn risk() -> BTreeMap<QuestionId, Question> {
+        BTreeMap::from([(
+            qid("risk"),
+            Question {
+                instructions: "How risky is the change?".into(),
+                kind: QuestionKind::Score {
+                    levels: ["low", "medium", "high"]
+                        .into_iter()
+                        .map(|l| ChoiceOption {
+                            label: label(l),
+                            description: Some(format!("{l} blast radius")),
+                        })
+                        .collect(),
+                },
+                drop: vec![],
+            },
+        )])
+    }
+
+    #[test]
+    fn a_score_question_is_sent_as_a_choice_over_its_levels() {
+        let body = request_body("dgemma", &risk(), &json!({}));
+        assert_eq!(
+            body["questions"]["risk"],
+            json!({
+                "instructions": "How risky is the change?",
+                "type": "choice",
+                "criteria": {
+                    "low": "low blast radius",
+                    "medium": "medium blast radius",
+                    "high": "high blast radius",
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn a_score_answered_as_a_choice_records_its_score_and_that_it_was_asked_as_one() {
+        let body = r#"{"answers":{"risk":{"type":"choice","choice":"low","probabilities":{"low":0.1,"medium":0.3,"high":0.6},"confidence":0.9,"score":0.1}}}"#;
+        let d = parse_response(body, &risk(), 0.5).unwrap();
+        let risk = &d.0[&qid("risk")];
+        assert_eq!(risk.label, label("high"));
+        assert!((risk.confidence - 0.6).abs() < 1e-12);
+        assert!((risk.score.unwrap() - 0.75).abs() < 1e-12);
+        assert_eq!(risk.asked_as, Some(AskedAs::Choice));
+        let recorded = serde_json::to_value(risk).unwrap();
+        assert_eq!(recorded["asked_as"], "choice");
+    }
+
+    #[test]
+    fn a_score_answered_as_another_type_or_with_no_mass_is_invalid() {
+        for (body, needle) in [
+            (
+                r#"{"answers":{"risk":{"type":"noul","noul":0.9}}}"#,
+                "is a score asked as a choice but was answered as a noul",
+            ),
+            (
+                r#"{"answers":{"risk":{"type":"score","probabilities":{"low":0.1,"medium":0.3,"high":0.6}}}}"#,
+                "decoding",
+            ),
+            (
+                r#"{"answers":{"risk":{"type":"choice","probabilities":{"low":0,"medium":0,"high":0}}}}"#,
+                "every level probability 0",
+            ),
+        ] {
+            match parse_response(body, &risk(), 0.5) {
+                Err(DecideError::Invalid(m)) => assert!(m.contains(needle), "{m} lacks {needle}"),
+                other => panic!("{body} gave {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn noul_and_choice_answers_record_no_score_or_form() {
+        let d = parse_response(GOOD, &questions(), 0.5).unwrap();
+        for answer in d.0.values() {
+            assert_eq!(answer.score, None);
+            assert_eq!(answer.asked_as, None);
         }
     }
 

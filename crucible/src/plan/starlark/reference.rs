@@ -205,7 +205,7 @@ fn answers_kwarg() -> Kwarg {
         "str | list[str]",
         format!(
             "The answers `when` accepts: labels the question declares, or `\"{UNCERTAIN}\"`. \
-             Defaults to `\"yes\"` for a noul and is required for a choice."
+             Defaults to `\"yes\"` for a noul and is required for a choice or a score."
         ),
     )
 }
@@ -546,7 +546,8 @@ pub fn functions() -> Vec<Function> {
                 Kwarg::new(
                     "questions",
                     "dict[str, question]",
-                    "Question id to `noul()` or `choice()`. `gate.<id>` names one for `when`.",
+                    "Question id to `noul()`, `choice()`, or `score()`. `gate.<id>` names one \
+                     for `when`.",
                 ),
                 Kwarg::new(
                     "min_confidence",
@@ -607,6 +608,31 @@ pub fn functions() -> Vec<Function> {
                     "list[str] | dict[str, str | None]",
                     "At least two distinct identifier labels, optionally each with a description \
                      the model sees. `\"uncertain\"` is reserved.",
+                ),
+                Kwarg::new(
+                    "drop",
+                    "str | list[str]",
+                    "Answers that deliberately lead nowhere, so no `when` has to list them.",
+                ),
+            ],
+        },
+        Function {
+            name: "score",
+            lane: Lane::Routed,
+            purpose: "An ordinal question for `route()`. It answers its most probable level, the \
+                      lowest on a tie, and records a score in [0, 1]: the expected level \
+                      position over the normalized distribution, 0 for the lowest level and 1 \
+                      for the highest. A `source` answers one level label, scored by its \
+                      position, and `\"uncertain\"` records no score.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new("ask", "str", "What to decide."),
+                Kwarg::new(
+                    "levels",
+                    "list[str] | dict[str, str | None]",
+                    "At least two distinct identifier labels, lowest first in the order written, \
+                     optionally each with a description the model sees. `\"uncertain\"` is \
+                     reserved.",
                 ),
                 Kwarg::new(
                     "drop",
