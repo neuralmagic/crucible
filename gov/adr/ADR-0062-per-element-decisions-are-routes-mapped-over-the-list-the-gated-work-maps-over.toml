@@ -47,14 +47,14 @@ gate = route(name = "gate", depends_on = [prepare], over = prepare.members, max_
              questions = {"depth": choice(ask = "...", options = {"settled": "...", "quick": "...", "deep": "..."},
                                           drop = ["settled"])})
 quick = agent(name = "quick", effort = "low", depends_on = [prepare, gate], over = prepare.members,
-              max_fanout = 120, when = gate.depth.quick, ...)
+              max_fanout = 120, when = gate.depth, answers = "quick", ...)
 deep = agent(name = "deep", effort = "high", depends_on = [prepare, gate], over = prepare.members,
-             max_fanout = 120, when = gate.depth.otherwise, ...)   # deep and uncertain
+             max_fanout = 120, when = gate.depth, otherwise = True, ...)   # deep and uncertain
 judge = route(name = "judge", depends_on = [quick, deep], join = "settled", over = prepare.members,
               max_fanout = 120, files = ["RESULT.json"], min_confidence = 0.8,
               questions = {"supported": noul(ask = "Does the evidence support the verdict?", drop = ["yes"])})
 review = agent(name = "review", depends_on = [judge], over = prepare.members, max_fanout = 120,
-               when = judge.supported.otherwise, ...)   # no and uncertain
+               when = judge.supported, otherwise = True, ...)   # no and uncertain
 ```
 
 A ticket answered "settled" costs one decision and no turn. A deterministic output-decided route can sit in front of the model-decided one when the staged facts already carry an answer; the model route then declares a when on it and is asked only about the rest. A fix gate is the same shape over the fix list."""
