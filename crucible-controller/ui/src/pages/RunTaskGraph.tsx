@@ -34,6 +34,7 @@ export function RunTaskGraph({ runId }: { runId: string }) {
             results: graph.results,
             outputs: graph.outputs ?? null,
             fanout: graph.fanout,
+            decisions: graph.decisions,
             running,
           }),
     [graph, running],
@@ -51,6 +52,7 @@ export function RunTaskGraph({ runId }: { runId: string }) {
           outputs={view.outputs}
           fanoutState={view.fanout}
           links={view.links}
+          decisions={view.decisions}
         />
         <EngineDefaults bounds={view.engineDefaults} />
       </SectionBody>

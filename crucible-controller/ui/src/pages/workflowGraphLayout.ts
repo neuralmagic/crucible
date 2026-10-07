@@ -32,10 +32,16 @@ export interface LaidOutEdge {
   /// What rides the edge: `passed` when the consumer joins on it, and the files the
   /// producer stages into the consumer (`ISSUES.md`, `TRIAGE.md +1`), dot-separated.
   label: string | null;
+  /// What the consumer reads off the edge rather than what rides it: its `when` (`tier: high|low`)
+  /// and the fields it narrows to each instance (`notes[item]`), dot-separated. Data, so drawn in
+  /// its own case.
+  reads: string | null;
   labelX: number;
   labelY: number;
   /// The consumer's flag: an edge into an advisory task is itself advisory.
   required: boolean;
+  /// Both ends map over the same list, so each instance reads its counterpart, not the fold.
+  aligned: boolean;
 }
 
 export interface WorkflowLayout {
@@ -58,6 +64,9 @@ export const NODE_H = 86;
 export const LINK_STRIP = 14;
 /// Gap between layers, along the direction the graph runs, and between the cards of one layer.
 const LAYER_GAP = 44;
+/// Advance of one character of an edge label (9px mono), and the label's own padding.
+const LABEL_CHAR = 5.6;
+const LABEL_PAD = 12;
 const ROW_GAP = 12;
 const PAD = 10;
 /// Offset of each card behind a mapped task, and how many are drawn.
@@ -223,6 +232,28 @@ function bendPrefix(names: Iterable<string>): string {
   return prefix;
 }
 
+/// What the consumer reads off an edge: the answers its `when` runs on, then each field it narrows
+/// to the instance's own entry.
+export function edgeReads(edge: WorkflowGraphEdge): string[] {
+  const when = edge.when ?? null;
+  return [
+    ...(when === null ? [] : [`${when.question}: ${when.labels.join('|')}`]),
+    ...edge.keyed.map((field) => `${field}[item]`),
+  ];
+}
+
+/// The gap between layers. Left to right, a label sits across the gutter it is drawn in, so a
+/// gutter widens to hold the widest `when` or narrowed-field label; top down it lies along it.
+function gapFor(edges: readonly WorkflowGraphEdge[], direction: LayoutDirection): number {
+  if (direction === 'TD') return LAYER_GAP;
+  const widest = edges.reduce((most, edge) => {
+    const reads = edgeReads(edge).join(' · ');
+    return reads === '' ? most : Math.max(most, reads.length + (edge.join === 'all' ? 0 : 8));
+  }, 0);
+  // The label is centred past the middle of the gutter, so the gap is a little over its width.
+  return Math.max(LAYER_GAP, Math.ceil(widest * LABEL_CHAR * 1.15) + LABEL_PAD);
+}
+
 /// Lay the compiled graph out in dependency layers, left to right or top down, in the flow's own
 /// coordinates: every task gets the same box, and a layer is centred against the widest one. An
 /// edge that spans more than one layer is broken at a bend in each layer it crosses, so it routes
@@ -263,7 +294,7 @@ export function layoutWorkflow(
       const a = chain[step];
       const b = chain[step + 1];
       if (a === undefined || b === undefined) continue;
-      segments.push({ from: a, to: b, join: edge.join, required: edge.required });
+      segments.push({ ...edge, from: a, to: b });
     }
   });
 
@@ -289,7 +320,8 @@ export function layoutWorkflow(
   const alongSize = direction === 'LR' ? NODE_W : NODE_H;
   const acrossSize = direction === 'LR' ? NODE_H : NODE_W;
   const stack = STACK_CARDS * STACK_STEP;
-  const layerPitch = alongSize + LAYER_GAP;
+  const layerGap = gapFor(edges, direction);
+  const layerPitch = alongSize + layerGap;
   const rowPitch = acrossSize + stack + ROW_GAP;
   const byName = new Map(graph.nodes.map((n) => [n.name, n]));
   const widest = layers.reduce(
@@ -305,7 +337,7 @@ export function layoutWorkflow(
   const cardRegion = Math.max(rowPitch, widest * rowPitch - ROW_GAP);
   const gutter = mostBends > 0 ? BEND_GUTTER + mostBends * BEND_GAP : 0;
   const acrossExtent = cardRegion + gutter + PAD * 2;
-  const alongExtent = Math.max(1, layers.length) * layerPitch - LAYER_GAP + PAD * 2;
+  const alongExtent = Math.max(1, layers.length) * layerPitch - layerGap + PAD * 2;
 
   const placed = new Map<string, LaidOutNode>();
   const bends = new Map<string, Along>();
@@ -389,14 +421,17 @@ export function layoutWorkflow(
       (part): part is string => part !== null
     );
     const [labelX, labelY] = toXY(direction, [label[0], label[1] - (direction === 'LR' ? 7 : 0)]);
+    const reads = edgeReads(edge);
     laidEdges.push({
       from: edge.from,
       to: edge.to,
       path,
       label: parts.length === 0 ? null : parts.join(' · '),
+      reads: reads.length === 0 ? null : reads.join(' · '),
       labelX,
       labelY,
       required: edge.required,
+      aligned: edge.aligned,
     });
   }
 

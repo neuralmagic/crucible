@@ -218,6 +218,10 @@ fn render_mermaid_styled(
         .enumerate()
         .map(|(i, t)| (t.name.clone(), format!("t{i}")))
         .collect();
+    let over: BTreeMap<_, _> = plan
+        .tasks_topo()
+        .map(|t| (t.name.clone(), t.over.as_ref()))
+        .collect();
     let mut regular_nodes = Vec::new();
     let mut measurement_nodes = Vec::new();
     let mut edges = Vec::new();
@@ -303,19 +307,26 @@ fn render_mermaid_styled(
             regular_nodes.push(node);
         }
         for d in &t.depends_on {
-            match t.when.as_ref().filter(|when| &when.task == d) {
-                Some(when) => {
-                    let labels: Vec<&str> = when.is.iter().map(|l| l.as_str()).collect();
-                    edges.push(format!(
-                        "    {} -->|\"{}: {}\"| {}\n",
-                        ids[d],
-                        mermaid_label(when.question.as_str()),
-                        mermaid_label(&labels.join(" / ")),
-                        ids[&t.name]
-                    ));
-                }
-                None => edges.push(format!("    {} --> {}\n", ids[d], ids[&t.name])),
+            let aligned = t.over.is_some() && over.get(d).copied().flatten() == t.over.as_ref();
+            let arrow = if aligned { "==>" } else { "-->" };
+            let mut labels = Vec::new();
+            if let Some(when) = t.when.as_ref().filter(|when| &when.task == d) {
+                let answers: Vec<&str> = when.is.iter().map(|l| l.as_str()).collect();
+                labels.push(format!(
+                    "{}: {}",
+                    mermaid_label(when.question.as_str()),
+                    mermaid_label(&answers.join(" / "))
+                ));
             }
+            for keyed in t.keyed.iter().filter(|keyed| &keyed.task == d) {
+                labels.push(format!("{}[item]", mermaid_label(&keyed.field.0)));
+            }
+            let (from, to) = (&ids[d], &ids[&t.name]);
+            edges.push(if labels.is_empty() {
+                format!("    {from} {arrow} {to}\n")
+            } else {
+                format!("    {from} {arrow}|\"{}\"| {to}\n", labels.join(" · "))
+            });
         }
     }
     for node in regular_nodes {
@@ -1118,6 +1129,103 @@ mod tests {
         );
         let with_caps = render_mermaid(&plan, &["gpu".to_string()].into());
         assert!(!with_caps.contains('⛔'));
+    }
+
+    const PER_ELEMENT: &str = r#"
+        version = 1
+        [budget]
+        usd = 1.0
+        [[task]]
+        name = "scan"
+        kind = "command"
+        command = "true"
+        emits = ["items", "notes"]
+        [[task]]
+        name = "classify"
+        kind = "command"
+        command = "true"
+        depends_on = ["scan"]
+        emits = ["area"]
+        [[task]]
+        name = "gate"
+        kind = "route"
+        depends_on = ["classify"]
+        decider = { kind = "output", task = "classify" }
+        [task.questions.area]
+        instructions = "Which component?"
+        type = "choice"
+        drop = ["frontend", "uncertain"]
+        options = [{ label = "scheduler" }, { label = "frontend" }]
+        [[task]]
+        name = "fix"
+        kind = "command"
+        command = "true"
+        depends_on = ["scan", "gate"]
+        over = { task = "scan", field = "items" }
+        max_fanout = 4
+        keyed = [{ task = "scan", field = "notes" }]
+        when = { task = "gate", question = "area", is = ["scheduler"] }
+        [[task]]
+        name = "check"
+        kind = "command"
+        command = "true"
+        depends_on = ["scan", "fix"]
+        over = { task = "scan", field = "items" }
+        max_fanout = 4
+        [[task]]
+        name = "roll"
+        kind = "command"
+        command = "true"
+        depends_on = ["check"]
+    "#;
+
+    fn mermaid_edge<'a>(out: &'a str, ids: &BTreeMap<&str, &str>, from: &str, to: &str) -> &'a str {
+        let (from, to) = (ids[from], ids[to]);
+        out.lines()
+            .find(|line| {
+                let line = line.trim();
+                line.starts_with(&format!("{from} ")) && line.ends_with(&format!(" {to}"))
+            })
+            .unwrap_or_else(|| panic!("an edge {from} -> {to}: {out}"))
+            .trim()
+    }
+
+    #[test]
+    fn mermaid_draws_aligned_edges_thick_and_labels_when_and_keyed_edges() {
+        let plan = Plan::from_toml_str(PER_ELEMENT)
+            .unwrap()
+            .validate()
+            .unwrap();
+        let out = render_mermaid(&plan, &BTreeSet::new());
+        let ids: BTreeMap<&str, &str> = [
+            ("scan", "t0"),
+            ("classify", "t1"),
+            ("gate", "t2"),
+            ("fix", "t3"),
+            ("check", "t4"),
+            ("roll", "t5"),
+        ]
+        .into();
+        assert!(
+            out.contains(r#"t2{"gate<br/>area?"}"#),
+            "route shape: {out}"
+        );
+        assert_eq!(mermaid_edge(&out, &ids, "fix", "check"), "t3 ==> t4");
+        assert_eq!(
+            mermaid_edge(&out, &ids, "gate", "fix"),
+            r#"t2 -->|"area: scheduler"| t3"#,
+            "an unmapped route's when edge reads the node"
+        );
+        assert_eq!(
+            mermaid_edge(&out, &ids, "scan", "fix"),
+            r#"t0 -->|"notes[item]"| t3"#
+        );
+        assert_eq!(
+            mermaid_edge(&out, &ids, "scan", "check"),
+            "t0 --> t4",
+            "the producer of the list is not aligned with what maps over it"
+        );
+        assert_eq!(mermaid_edge(&out, &ids, "check", "roll"), "t4 --> t5");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   countCrossings,
+  edgeReads,
   layoutWorkflow,
   NODE_H,
   NODE_W,
@@ -25,6 +26,9 @@ function task(name: string, overrides: Partial<WorkflowGraphNode> = {}): Workflo
     effort: null,
     prompt: null,
     command: null,
+    keyed: [],
+    when: null,
+    questions: [],
     ...overrides,
   };
 }
@@ -34,7 +38,7 @@ function edge(
   to: string,
   overrides: Partial<WorkflowGraphDoc['edges'][number]> = {}
 ): WorkflowGraphDoc['edges'][number] {
-  return { from, to, join: 'all', required: true, ...overrides };
+  return { from, to, join: 'all', required: true, when: null, aligned: false, keyed: [], ...overrides };
 }
 
 /// seed → fan → work → check → final, with work mapped over fan.idea and check advisory.
@@ -368,5 +372,62 @@ describe('ancestry', () => {
       edges: [edge('a', 'b'), edge('b', 'a')],
     });
     expect([...(layout.ancestry.get('a') ?? [])].sort()).toEqual(['a', 'b']);
+  });
+});
+
+describe('what an edge reads', () => {
+  const over = { over_task: 'scan', over_field: 'items', max_fanout: 4 };
+  const routed: WorkflowGraphDoc = {
+    workflow_type: 'playbook',
+    result: null,
+    nodes: [
+      task('scan'),
+      task('triage', { kind: 'route', fanout: over, questions: ['tier'] }),
+      task('fix', { fanout: over, keyed: ['scan.notes'] }),
+    ],
+    edges: [
+      edge('scan', 'triage'),
+      edge('triage', 'fix', {
+        aligned: true,
+        when: { route: 'triage', question: 'tier', labels: ['high', 'low'] },
+      }),
+      edge('scan', 'fix', { keyed: ['notes'] }),
+    ],
+  };
+  const laid = (from: string, to: string) => {
+    const found = layoutWorkflow(routed).edges.find((e) => e.from === from && e.to === to);
+    if (found === undefined) throw new Error(`${from} -> ${to} is not laid out`);
+    return found;
+  };
+
+  it('labels a when edge with its question and answers', () => {
+    expect(laid('triage', 'fix').reads).toBe('tier: high|low');
+    expect(laid('triage', 'fix').label).toBeNull();
+  });
+
+  it('labels a narrowed edge with the field each instance reads its entry of', () => {
+    expect(laid('scan', 'fix').reads).toBe('notes[item]');
+    expect(edgeReads(edge('a', 'b', { keyed: ['x', 'y'] }))).toEqual(['x[item]', 'y[item]']);
+  });
+
+  /// Left to right the label lies across the gutter, so the gutter holds it rather than letting
+  /// it run under the cards either side.
+  it('widens the gutters left to right to hold the widest label an edge reads', () => {
+    const plain = layoutWorkflow({ ...routed, edges: routed.edges.map((e) => edge(e.from, e.to)) });
+    const wide = layoutWorkflow(routed);
+    const x = (layout: ReturnType<typeof layoutWorkflow>, name: string) =>
+      layout.nodes.find((n) => n.node.name === name)?.x ?? 0;
+    const gap = x(wide, 'fix') - x(wide, 'triage') - NODE_W;
+    expect(x(plain, 'fix') - x(plain, 'triage') - NODE_W).toBe(44);
+    expect(gap).toBeGreaterThan('tier: high|low'.length * 5.6);
+    const down = layoutWorkflow(routed, 'TD');
+    const y = (name: string) => down.nodes.find((n) => n.node.name === name)?.y ?? 0;
+    expect(y('fix') - y('triage') - NODE_H).toBe(44);
+  });
+
+  it('carries which edges are read per element', () => {
+    expect(laid('triage', 'fix').aligned).toBe(true);
+    expect(laid('scan', 'triage').aligned).toBe(false);
+    expect(laid('scan', 'triage').reads).toBeNull();
   });
 });

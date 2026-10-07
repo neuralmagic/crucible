@@ -1,5 +1,5 @@
 //! The typed graph document a compiled plan reduces to: nodes, edges, and the per-task metadata a
-//! renderer needs to draw them (kind, advisory tasks, join mode, isolation, fan-out).
+//! renderer needs to draw them (kind, advisory tasks, join mode, isolation, fan-out, routing).
 //!
 //! The linked engine's compiled plan (`canonical_json`, what `crucible plan compile-workflow`
 //! prints) is the input; nothing else in the controller
@@ -16,6 +16,7 @@ pub enum TaskKind {
     Agent,
     Command,
     Engine,
+    Route,
     #[serde(other)]
     Other,
 }
@@ -52,6 +53,14 @@ pub struct FanOutDto {
     pub max_fanout: Option<u32>,
 }
 
+/// A task that runs only on some answers to one question of a route it depends on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+pub struct WhenDto {
+    pub route: String,
+    pub question: String,
+    pub labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub struct GraphNodeDto {
     pub name: String,
@@ -68,6 +77,12 @@ pub struct GraphNodeDto {
     pub emits_files: Vec<String>,
     /// Set when this task is mapped over a producer's field.
     pub fanout: Option<FanOutDto>,
+    /// `producer.field` references each instance receives narrowed to its own entry.
+    pub keyed: Vec<String>,
+    /// Set when the task runs only on some answers of a route.
+    pub when: Option<WhenDto>,
+    /// A route's question ids; empty for any other task.
+    pub questions: Vec<String>,
     /// The conversation an agent turn belongs to; null when the turn stands alone.
     pub session: Option<String>,
     /// The agent knobs the task set, null where it inherits the pack's defaults.
@@ -89,6 +104,12 @@ pub struct GraphEdgeDto {
     pub to: String,
     pub join: Join,
     pub required: bool,
+    /// The consumer's `when`, on the edge from the route it names.
+    pub when: Option<WhenDto>,
+    /// Both ends map over the same `producer.field`: instance k reads the producer's instance k.
+    pub aligned: bool,
+    /// The producer's fields the consumer narrows to each instance's entry.
+    pub keyed: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
@@ -101,10 +122,18 @@ pub struct WorkflowGraphDto {
     pub edges: Vec<GraphEdgeDto>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct CompiledOver {
     task: String,
     field: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompiledWhen {
+    task: String,
+    question: String,
+    #[serde(default)]
+    is: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +158,12 @@ struct CompiledTask {
     over: Option<CompiledOver>,
     #[serde(default)]
     max_fanout: Option<u32>,
+    #[serde(default)]
+    keyed: Vec<CompiledOver>,
+    #[serde(default)]
+    when: Option<CompiledWhen>,
+    #[serde(default)]
+    questions: std::collections::BTreeMap<String, serde::de::IgnoredAny>,
     #[serde(default)]
     session: Option<String>,
     #[serde(default)]
@@ -165,6 +200,14 @@ struct CompiledPlan {
     tasks: Vec<CompiledTask>,
 }
 
+fn when_dto(when: &CompiledWhen) -> WhenDto {
+    WhenDto {
+        route: when.task.clone(),
+        question: when.question.clone(),
+        labels: when.is.clone(),
+    }
+}
+
 /// Reduce a compiled plan's canonical JSON to the graph document. `Err` carries a message fit
 /// for a preview's diagnostics: a plan that will not parse is the engine's output changing shape,
 /// not a caller's mistake.
@@ -172,19 +215,34 @@ pub fn graph_from_compiled(compiled: &[u8]) -> Result<WorkflowGraphDto, String> 
     let plan: CompiledPlan = serde_json::from_slice(compiled)
         .map_err(|e| format!("the engine's compiled plan did not parse as JSON: {e}"))?;
 
-    let known: std::collections::HashSet<&str> =
-        plan.tasks.iter().map(|t| t.name.as_str()).collect();
+    let over: std::collections::HashMap<&str, Option<&CompiledOver>> = plan
+        .tasks
+        .iter()
+        .map(|t| (t.name.as_str(), t.over.as_ref()))
+        .collect();
     let mut edges = Vec::new();
     for task in &plan.tasks {
         for dep in &task.depends_on {
-            if !known.contains(dep.as_str()) {
+            let Some(dep_over) = over.get(dep.as_str()) else {
                 continue;
-            }
+            };
             edges.push(GraphEdgeDto {
                 from: dep.clone(),
                 to: task.name.clone(),
                 join: task.join,
                 required: task.required,
+                when: task
+                    .when
+                    .as_ref()
+                    .filter(|when| when.task == *dep)
+                    .map(when_dto),
+                aligned: task.over.is_some() && task.over.as_ref() == *dep_over,
+                keyed: task
+                    .keyed
+                    .iter()
+                    .filter(|keyed| keyed.task == *dep)
+                    .map(|keyed| keyed.field.clone())
+                    .collect(),
             });
         }
     }
@@ -206,6 +264,13 @@ pub fn graph_from_compiled(compiled: &[u8]) -> Result<WorkflowGraphDto, String> 
                 over_field: over.field,
                 max_fanout: task.max_fanout,
             }),
+            keyed: task
+                .keyed
+                .iter()
+                .map(|keyed| format!("{}.{}", keyed.task, keyed.field))
+                .collect(),
+            when: task.when.as_ref().map(when_dto),
+            questions: task.questions.into_keys().collect(),
             session: task.session,
             harness: task.harness,
             model: task.model,
@@ -225,7 +290,7 @@ pub fn graph_from_compiled(compiled: &[u8]) -> Result<WorkflowGraphDto, String> 
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::playbooks::plan_graph::*;
 
     const PLAN: &[u8] = br#"{
       "type": "playbook",
@@ -333,25 +398,37 @@ mod tests {
                     from: "seed".to_string(),
                     to: "fan".to_string(),
                     join: Join::All,
-                    required: true
+                    required: true,
+                    when: None,
+                    aligned: false,
+                    keyed: Vec::new(),
                 },
                 GraphEdgeDto {
                     from: "fan".to_string(),
                     to: "work".to_string(),
                     join: Join::All,
-                    required: true
+                    required: true,
+                    when: None,
+                    aligned: false,
+                    keyed: Vec::new(),
                 },
                 GraphEdgeDto {
                     from: "work".to_string(),
                     to: "check".to_string(),
                     join: Join::Passed,
-                    required: false
+                    required: false,
+                    when: None,
+                    aligned: false,
+                    keyed: Vec::new(),
                 },
                 GraphEdgeDto {
                     from: "check".to_string(),
                     to: "final".to_string(),
                     join: Join::Passed,
-                    required: true
+                    required: true,
+                    when: None,
+                    aligned: false,
+                    keyed: Vec::new(),
                 },
             ]
         );
@@ -379,6 +456,76 @@ mod tests {
         )
         .expect("reduces");
         assert_eq!(node(&graph, "a").emits, ["count", "tier"]);
+    }
+
+    const ROUTED: &[u8] = br#"{
+      "type": "playbook",
+      "task": [
+        {"name":"scan","kind":"command","command":"scan","emits":["targets","notes"]},
+        {"name":"triage","kind":"route","depends_on":["scan"],"needs":"systemone",
+         "over":{"task":"scan","field":"targets"},"max_fanout":120,
+         "keyed":[{"task":"scan","field":"notes"}],
+         "questions":{"tier":{"instructions":"how bad","type":"choice","options":[]},
+                      "scope":{"instructions":"how wide","type":"noul"}},
+         "decider":{"kind":"model","min_confidence":0.6}},
+        {"name":"fix","kind":"agent","prompt":"fix","depends_on":["scan","triage"],
+         "over":{"task":"scan","field":"targets"},"max_fanout":120,
+         "keyed":[{"task":"scan","field":"notes"}],
+         "when":{"task":"triage","question":"tier","is":["high","low"]}},
+        {"name":"roll","kind":"command","command":"roll","depends_on":["fix"]}
+      ]
+    }"#;
+
+    #[test]
+    fn a_route_reduces_to_a_route_node_with_its_question_ids() {
+        let graph = graph_from_compiled(ROUTED).expect("reduces");
+        let triage = node(&graph, "triage");
+        assert_eq!(triage.kind, TaskKind::Route);
+        assert_eq!(triage.questions, ["scope", "tier"]);
+        assert_eq!(triage.keyed, ["scan.notes"]);
+        assert!(node(&graph, "fix").questions.is_empty());
+        assert_eq!(
+            node(&graph, "fix").when,
+            Some(WhenDto {
+                route: "triage".to_string(),
+                question: "tier".to_string(),
+                labels: vec!["high".to_string(), "low".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn edges_carry_the_when_alignment_and_keyed_fields_they_are_read_through() {
+        let graph = graph_from_compiled(ROUTED).expect("reduces");
+        let edge = |from: &str, to: &str| {
+            graph
+                .edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .unwrap_or_else(|| panic!("{from} -> {to} is drawn"))
+        };
+        let into_route = edge("scan", "triage");
+        assert!(
+            !into_route.aligned,
+            "the producer of the list is not mapped"
+        );
+        assert_eq!(into_route.keyed, ["notes"]);
+        assert_eq!(into_route.when, None);
+
+        let routed = edge("triage", "fix");
+        assert!(routed.aligned, "both map over scan.targets");
+        assert!(routed.keyed.is_empty());
+        assert_eq!(
+            routed.when.as_ref().map(|w| w.question.as_str()),
+            Some("tier")
+        );
+
+        let narrowed = edge("scan", "fix");
+        assert_eq!(narrowed.when, None, "the when is on the route's edge only");
+        assert_eq!(narrowed.keyed, ["notes"]);
+
+        let fold = edge("fix", "roll");
+        assert!(!fold.aligned, "an unmapped consumer reads the fold");
     }
 
     #[test]

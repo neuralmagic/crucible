@@ -189,8 +189,8 @@ pub(crate) async fn get_run_graph(
             .map(|o| GraphOutputDto::from((o, names.as_slice())))
             .collect()
     });
-    let mapped = tasks.iter().any(|t| !t.over.is_empty());
-    let session = match mapped {
+    let read = tasks.iter().any(|t| !t.over.is_empty() || t.kind == ROUTE);
+    let session = match read {
         true => {
             crate::runs::task_evidence::run_session(state.db.pool(), &state.scratch_dir, &run_id)
                 .await?
@@ -198,12 +198,14 @@ pub(crate) async fn get_run_graph(
         false => None,
     };
     let fanout = mapped_widths(session.as_deref(), &tasks);
+    let decisions = route_decisions(session.as_deref(), &tasks);
     Ok(Json(RunGraphDto {
         plan_version: plan.plan_version,
         tasks,
         results: results.into_iter().map(TaskResultDto::from).collect(),
         outputs,
         fanout,
+        decisions,
     })
     .into_response())
 }
@@ -219,10 +221,88 @@ fn mapped_widths(session: Option<&str>, tasks: &[PlanTaskDto]) -> Vec<FanOutCoun
         .filter(|t| !t.over.is_empty())
         .filter_map(|t| {
             let items = crate::runs::task_evidence::fanout_width(session, &t.name, &t.over)?;
+            let not_taken = crate::runs::task_evidence::session_result(session, &t.name)
+                .and_then(|folded| folded.payload?.get("not_taken")?.as_i64())
+                .unwrap_or(0);
             Some(FanOutCountDto {
                 task: t.name.clone(),
                 items: i64::try_from(items).unwrap_or(i64::MAX),
+                not_taken,
             })
+        })
+        .collect()
+}
+
+const ROUTE: &str = "route";
+
+/// The mapped node a `node[key]` instance name belongs to. A declared name may not hold a bracket.
+fn instance_node(task: &str) -> Option<&str> {
+    let (node, rest) = task.split_once('[')?;
+    (!node.is_empty() && rest.ends_with(']')).then_some(node)
+}
+
+/// What each route decided, by the last output the session recorded for each route task and each
+/// instance of a mapped route. A mapped route's node tallies its instances' labels; its own folded
+/// output is a count, not a decision.
+fn route_decisions(session: Option<&str>, tasks: &[PlanTaskDto]) -> Vec<RouteDecisionDto> {
+    use std::collections::BTreeMap;
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    let routes: BTreeMap<&str, bool> = tasks
+        .iter()
+        .filter(|t| t.kind == ROUTE)
+        .map(|t| (t.name.as_str(), !t.over.is_empty()))
+        .collect();
+    if routes.is_empty() {
+        return Vec::new();
+    }
+    let mut last: BTreeMap<String, Option<serde_json::Value>> = BTreeMap::new();
+    for line in session.lines() {
+        let Ok(serde_json::Value::Object(event)) = serde_json::from_str(line) else {
+            continue;
+        };
+        if event.get("kind").and_then(serde_json::Value::as_str) != Some("task_result") {
+            continue;
+        }
+        let Some(task) = event.get("task").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let decides = match instance_node(task) {
+            Some(node) => routes.get(node) == Some(&true),
+            None => routes.get(task) == Some(&false),
+        };
+        if decides {
+            last.insert(task.to_string(), event.get("output").cloned());
+        }
+    }
+    let mut tallies: BTreeMap<(String, String), BTreeMap<String, i64>> = BTreeMap::new();
+    for (task, output) in last {
+        let Some(decision) = output.and_then(|output| {
+            serde_json::from_value::<crucible_contract::decision::Decision>(output).ok()
+        }) else {
+            continue;
+        };
+        let node = instance_node(&task).map(str::to_string);
+        for (question, answer) in decision.0 {
+            for owner in [Some(task.clone()), node.clone()].into_iter().flatten() {
+                *tallies
+                    .entry((owner, question.to_string()))
+                    .or_default()
+                    .entry(answer.label.to_string())
+                    .or_default() += 1;
+            }
+        }
+    }
+    tallies
+        .into_iter()
+        .map(|((task, question), labels)| RouteDecisionDto {
+            task,
+            question,
+            labels: labels
+                .into_iter()
+                .map(|(label, count)| LabelCountDto { label, count })
+                .collect(),
         })
         .collect()
 }
@@ -508,7 +588,7 @@ pub(crate) async fn export_iterations(State(state): State<ApiState>) -> Result<R
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::runs::api::runs::*;
 
     /// A plan task as the admitted plan stores it, with only the fields the fan-out count reads.
     fn task(name: &str, over: &str) -> PlanTaskDto {
@@ -521,7 +601,108 @@ mod tests {
             required: true,
             over: over.to_string(),
             max_fanout: 0,
+            when: String::new(),
+            keyed: Vec::new(),
         }
+    }
+
+    fn route(name: &str, over: &str) -> PlanTaskDto {
+        PlanTaskDto {
+            kind: ROUTE.to_string(),
+            ..task(name, over)
+        }
+    }
+
+    fn decided(task: &str, answers: &[(&str, &str)]) -> String {
+        let output: serde_json::Map<String, serde_json::Value> = answers
+            .iter()
+            .map(|(question, label)| {
+                (
+                    question.to_string(),
+                    serde_json::json!({"label": label, "confidence": 0.9,
+                                       "probabilities": {label.to_string(): 0.9}}),
+                )
+            })
+            .collect();
+        format!(
+            "{}\n",
+            serde_json::json!({"v":1,"kind":"task_result","task":task,"status":"pass",
+                               "attempts":1,"output":output})
+        )
+    }
+
+    fn label_counts(labels: &[(&str, i64)]) -> Vec<LabelCountDto> {
+        labels
+            .iter()
+            .map(|(label, count)| LabelCountDto {
+                label: label.to_string(),
+                count: *count,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_mapped_route_tallies_its_instances_and_each_instance_reports_its_own_label() {
+        let session = [
+            decided("gate", &[("ship", "yes")]),
+            decided("triage[a]", &[("tier", "high")]),
+            decided("triage[b]", &[("tier", "low")]),
+            decided("triage[c]", &[("tier", "low")]),
+            "{\"kind\":\"task_result\",\"task\":\"triage[d]\",\"status\":\"not_taken\",\"output\":null}\n".to_string(),
+            "{\"kind\":\"task_result\",\"task\":\"triage\",\"status\":\"pass\",\"output\":{\"instances\":4,\"passed\":3,\"failed\":0,\"not_taken\":1}}\n".to_string(),
+        ]
+        .concat();
+        let tasks = [
+            route("gate", ""),
+            route("triage", "scan.items"),
+            task("scan", ""),
+        ];
+        let decisions = route_decisions(Some(&session), &tasks);
+        let find = |task: &str| {
+            decisions
+                .iter()
+                .find(|d| d.task == task)
+                .unwrap_or_else(|| panic!("{task} decided: {decisions:?}"))
+        };
+        assert_eq!(find("gate").question, "ship");
+        assert_eq!(find("gate").labels, label_counts(&[("yes", 1)]));
+        assert_eq!(find("triage").question, "tier");
+        assert_eq!(
+            find("triage").labels,
+            label_counts(&[("high", 1), ("low", 2)])
+        );
+        assert_eq!(find("triage[b]").labels, label_counts(&[("low", 1)]));
+        assert!(
+            decisions.iter().all(|d| d.task != "triage[d]"),
+            "an instance not taken decided nothing"
+        );
+        assert_eq!(decisions.len(), 5, "{decisions:?}");
+    }
+
+    #[test]
+    fn a_retried_route_reports_its_last_decision() {
+        let session = [
+            decided("gate", &[("ship", "no")]),
+            decided("gate", &[("ship", "yes")]),
+        ]
+        .concat();
+        let decisions = route_decisions(Some(&session), &[route("gate", "")]);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].labels, label_counts(&[("yes", 1)]));
+    }
+
+    #[test]
+    fn a_settled_fan_out_reports_the_instances_its_fold_counts_not_taken() {
+        let session = "{\"kind\":\"task_result\",\"task\":\"fix\",\"status\":\"pass\",\"output\":{\"instances\":5,\"passed\":2,\"failed\":0,\"not_taken\":3}}\n";
+        let widths = mapped_widths(Some(session), &[task("fix", "scan.items")]);
+        assert_eq!(widths.len(), 1);
+        assert_eq!(widths[0].items, 5);
+        assert_eq!(widths[0].not_taken, 3);
+        assert_eq!(
+            mapped_widths(Some(SESSION), &[task("triage", "scan.issues")])[0].not_taken,
+            0,
+            "a fold that predates the count reads as zero"
+        );
     }
 
     /// A triage run's session: `triage` folded over three issues, and `audit` is still fanning
