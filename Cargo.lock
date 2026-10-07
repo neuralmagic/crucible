@@ -3837,7 +3837,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -5304,7 +5304,7 @@ dependencies = [
 [[package]]
 name = "openshell-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=3441f91a1de8ee1688c2add95d72fec53d404812#3441f91a1de8ee1688c2add95d72fec53d404812"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=aeeecb7d4072f0fb63eb29ad11d26344c79d8670#aeeecb7d4072f0fb63eb29ad11d26344c79d8670"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -5338,7 +5338,7 @@ dependencies = [
 [[package]]
 name = "openshell-extension-core"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=3441f91a1de8ee1688c2add95d72fec53d404812#3441f91a1de8ee1688c2add95d72fec53d404812"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=aeeecb7d4072f0fb63eb29ad11d26344c79d8670#aeeecb7d4072f0fb63eb29ad11d26344c79d8670"
 dependencies = [
  "hyper-util",
  "serde",
@@ -5351,7 +5351,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=3441f91a1de8ee1688c2add95d72fec53d404812#3441f91a1de8ee1688c2add95d72fec53d404812"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=aeeecb7d4072f0fb63eb29ad11d26344c79d8670#aeeecb7d4072f0fb63eb29ad11d26344c79d8670"
 dependencies = [
  "hickory-proto",
  "miette",
@@ -5365,7 +5365,7 @@ dependencies = [
 [[package]]
 name = "openshell-policy-schema"
 version = "0.0.0"
-source = "git+https://github.com/wseaton/OpenShell.git?rev=3441f91a1de8ee1688c2add95d72fec53d404812#3441f91a1de8ee1688c2add95d72fec53d404812"
+source = "git+https://github.com/wseaton/OpenShell.git?rev=aeeecb7d4072f0fb63eb29ad11d26344c79d8670#aeeecb7d4072f0fb63eb29ad11d26344c79d8670"
 dependencies = [
  "miette",
  "noyalib",
@@ -6166,7 +6166,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03da047801ff44bb6a4d407d4860c05fd70bb81714e6b2f3812603d5b145b042"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "petgraph 0.8.3",
@@ -6187,7 +6187,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.118",
@@ -6320,7 +6320,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.45",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6358,7 +6358,7 @@ dependencies = [
  "cfg_aliases 0.2.1",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.52.0",
 ]
