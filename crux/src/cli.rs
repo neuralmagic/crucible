@@ -152,6 +152,43 @@ enum Command {
         json: bool,
     },
 
+    /// Registered inference providers: kind, harness, default model, secret, owner, endpoint.
+    Providers {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a provider from a JSON body (`POST /api/providers`).
+    ProviderCreate {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`).
+    ProviderUpdate {
+        id: String,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Deregister a provider and every default naming it. Refused while issues or schedules pin
+    /// it; `provider-update` with `"enabled": false` retires one that work still names.
+    ProviderDelete {
+        id: String,
+    },
+
+    /// The provider each scope's unpinned dispatches take, per workload class, and its fallback.
+    DispatchDefaults {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only.
+    DispatchDefaultSet {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
     /// Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save
     /// does. Prints `ok`, or fails with one `field:line:col: message` per refusal.
     WebhookCheck {
@@ -678,6 +715,12 @@ pub async fn run() -> Result<()> {
             limit,
             json,
         } => ops::webhook_deliveries(&client, &id, before.as_deref(), limit, json).await?,
+        Command::Providers { json } => ops::providers(&client, json).await?,
+        Command::ProviderCreate { file } => ops::provider_create(&client, &file).await?,
+        Command::ProviderUpdate { id, file } => ops::provider_update(&client, &id, &file).await?,
+        Command::ProviderDelete { id } => ops::provider_delete(&client, &id).await?,
+        Command::DispatchDefaults { json } => ops::dispatch_defaults(&client, json).await?,
+        Command::DispatchDefaultSet { file } => ops::dispatch_default_set(&client, &file).await?,
         Command::WebhookCheck { file } => ops::webhook_check(&client, &file).await?,
         Command::WebhookPresets => ops::webhook_presets(&client).await?,
         Command::WebhookCreate { file } => ops::webhook_create(&client, &file).await?,

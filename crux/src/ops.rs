@@ -1136,6 +1136,50 @@ pub async fn webhook_delete(c: &Client, id: &str) -> Result<String> {
     Ok(format!("deleted webhook {id}\n"))
 }
 
+pub async fn providers(c: &Client, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.get::<Value>("/api/providers").await?);
+    }
+    let list: Vec<dto::Provider> = c.get("/api/providers").await?;
+    Ok(render::providers(&list))
+}
+
+/// Register a provider from a JSON body (`POST /api/providers`).
+pub async fn provider_create(c: &Client, file: &Path) -> Result<String> {
+    json(
+        &c.post::<Value>("/api/providers", Some(&read_body(file)?))
+            .await?,
+    )
+}
+
+/// Replace a provider's registration from a JSON body. Its id and owner stay as registered.
+pub async fn provider_update(c: &Client, id: &str, file: &Path) -> Result<String> {
+    let path = format!("/api/providers/{}", encode(id));
+    json(&c.put::<Value>(&path, &read_body(file)?).await?)
+}
+
+pub async fn provider_delete(c: &Client, id: &str) -> Result<String> {
+    c.delete(&format!("/api/providers/{}", encode(id))).await?;
+    Ok(format!("deleted provider {id}\n"))
+}
+
+pub async fn dispatch_defaults(c: &Client, as_json: bool) -> Result<String> {
+    let config: Value = c.get("/api/config/providers").await?;
+    if as_json {
+        return json(&config["defaults"]);
+    }
+    let config: dto::DispatchProviders = serde_json::from_value(config)?;
+    Ok(render::dispatch_defaults(&config.defaults))
+}
+
+/// Set one scope's default for one workload class from a JSON body. Admin only.
+pub async fn dispatch_default_set(c: &Client, file: &Path) -> Result<String> {
+    let set: dto::DispatchDefault = c
+        .put("/api/config/dispatch-defaults", &read_body(file)?)
+        .await?;
+    Ok(render::dispatch_defaults(std::slice::from_ref(&set)))
+}
+
 /// Check a transform the way a save does. Clean prints `ok`; otherwise one `field:line:col: message`
 /// per refusal, and the command fails so a script can gate on it.
 pub async fn webhook_check(c: &Client, file: &Path) -> Result<String> {
@@ -2176,6 +2220,124 @@ mod tests {
         .await
         .expect("create");
         assert!(bare.contains("\"id\": \"01b0\""), "{bare}");
+    }
+
+    /// The provider and dispatch-default commands send the body file as is to the path the
+    /// controller routes, and render what it answered.
+    #[tokio::test]
+    async fn provider_and_dispatch_default_commands_hit_their_routes() {
+        use axum::http::StatusCode;
+        use axum::routing::{get, put};
+
+        let provider = serde_json::json!({
+            "id": "enmaas",
+            "kind": "custom",
+            "harness": "claude",
+            "default_model": "claude-opus-5-5",
+            "protocol": "messages",
+            "endpoint": "https://api.enmaas.devshift.net",
+            "secret_name": "enmaas-api-key",
+            "enabled": true,
+            "owner": "team:tibrahim-all"
+        });
+        let listed = provider.clone();
+        let created = provider.clone();
+        let default = serde_json::json!({
+            "scope_kind": "platform",
+            "scope_ref": "",
+            "workload_class": "playbook",
+            "provider": "enmaas",
+            "model": null,
+            "fallback_provider": "vertex",
+            "fallback_model": null
+        });
+        let config = serde_json::json!({ "providers": [], "defaults": [default.clone()] });
+        let app = axum::Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .route(
+                "/api/providers",
+                get(move || async move { axum::Json(serde_json::json!([listed])) }).post(
+                    move |body: String| async move {
+                        let sent: Value = serde_json::from_str(&body).expect("JSON");
+                        assert_eq!(sent["id"], "enmaas");
+                        (StatusCode::CREATED, axum::Json(created))
+                    },
+                ),
+            )
+            .route(
+                "/api/providers/{id}",
+                axum::routing::delete(
+                    |axum::extract::Path(id): axum::extract::Path<String>| async move {
+                        assert_eq!(id, "pricetag-glm");
+                        StatusCode::NO_CONTENT
+                    },
+                )
+                .put(
+                    |axum::extract::Path(id): axum::extract::Path<String>, body: String| async move {
+                        assert_eq!(id, "enmaas");
+                        let sent: Value = serde_json::from_str(&body).expect("JSON");
+                        axum::Json(sent)
+                    },
+                ),
+            )
+            .route(
+                "/api/config/providers",
+                get(move || async move { axum::Json(config) }),
+            )
+            .route(
+                "/api/config/dispatch-defaults",
+                put(|body: String| async move {
+                    let sent: Value = serde_json::from_str(&body).expect("JSON");
+                    axum::Json(sent)
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = test_client(&url);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let body = dir.path().join("provider.json");
+        std::fs::write(&body, provider.to_string()).expect("write");
+        let default_body = dir.path().join("default.json");
+        std::fs::write(&default_body, default.to_string()).expect("write");
+
+        let table = providers(&client, false).await.expect("providers");
+        assert!(table.starts_with("1 providers\n"), "{table}");
+        assert!(table.contains("custom/messages"), "{table}");
+        assert!(table.contains("enmaas-api-key"), "{table}");
+
+        let made = provider_create(&client, &body).await.expect("create");
+        assert!(made.contains("\"id\": \"enmaas\""), "{made}");
+        let replaced = provider_update(&client, "enmaas", &body)
+            .await
+            .expect("update");
+        assert!(replaced.contains("claude-opus-5-5"), "{replaced}");
+
+        assert_eq!(
+            provider_delete(&client, "pricetag-glm")
+                .await
+                .expect("delete"),
+            "deleted provider pricetag-glm\n"
+        );
+
+        let defaults = dispatch_defaults(&client, false).await.expect("defaults");
+        assert!(defaults.contains("platform"), "{defaults}");
+        assert!(defaults.contains("vertex"), "{defaults}");
+        let raw = dispatch_defaults(&client, true).await.expect("json");
+        assert!(
+            raw.trim_start().starts_with('['),
+            "only the defaults: {raw}"
+        );
+
+        let set = dispatch_default_set(&client, &default_body)
+            .await
+            .expect("set");
+        assert!(set.starts_with("1 dispatch defaults\n"), "{set}");
+        assert!(set.contains("enmaas"), "{set}");
     }
 
     fn test_client(url: &str) -> Client {
