@@ -184,7 +184,8 @@ declared one; a choice or confidence the API reports alongside is not read.
 ```
 
 A label whose probability is under `min_confidence` is recorded as `"uncertain"`, which
-`otherwise` or `drop` has to cover.
+`otherwise` or `drop` has to cover. So is a question OpenAI declines to answer, with confidence 0
+and an empty distribution.
 
 **From the control plane.** A controller started with `just controller-local` passes its own
 `CRUCIBLE_*` variables to the runs it launches, so exporting `CRUCIBLE_INFERENCE` before starting

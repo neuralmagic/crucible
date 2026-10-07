@@ -2,11 +2,11 @@
 //! Decisions (`POST /v1/decisions`).
 //!
 //! Both answer the same typed questions with probabilities and differ only on the wire, so each
-//! API is a codec into [`WireAnswer`] over one transport and one validation path:
+//! API is a codec into [`Reply`] over one transport and one validation path:
 //!
 //! ```text
 //!   questions, state ──► DecisionApi::request_body ──► POST ──► DecisionApi::answers
-//!                                                                     │ id -> WireAnswer
+//!                                                                     │ id -> Reply
 //!                                    Decision ◄── Question::resolve ◄─┘
 //! ```
 
@@ -48,7 +48,7 @@ impl DecisionApi {
         }
     }
 
-    fn answers(self, body: &str) -> Result<BTreeMap<String, WireAnswer>, DecideError> {
+    fn answers(self, body: &str) -> Result<BTreeMap<String, Reply>, DecideError> {
         match self {
             DecisionApi::SystemOne => system_one_answers(body),
             DecisionApi::OpenAi => openai_answers(body),
@@ -125,13 +125,19 @@ impl std::fmt::Display for DecideError {
 
 impl std::error::Error for DecideError {}
 
-/// One question's answer as an API returned it, before it is checked against the question.
+/// What an API said about one question, before it is checked against the question.
+enum Reply {
+    Answered(WireAnswer),
+    /// The API declined to answer. It is recorded as `uncertain`, which every route already has to
+    /// route somewhere.
+    Refused,
+}
+
 enum WireAnswer {
     Noul(Number),
     Choice(BTreeMap<String, Number>),
     Score,
     Unanswered,
-    Refused,
 }
 
 fn system_one_body(
@@ -177,7 +183,7 @@ struct SystemOneResponse {
     answers: BTreeMap<String, Option<SystemOneAnswer>>,
 }
 
-fn system_one_answers(body: &str) -> Result<BTreeMap<String, WireAnswer>, DecideError> {
+fn system_one_answers(body: &str) -> Result<BTreeMap<String, Reply>, DecideError> {
     let wire: SystemOneResponse = serde_json::from_str(body)
         .map_err(|e| DecideError::Invalid(format!("decoding System One response: {e}")))?;
     Ok(wire
@@ -191,7 +197,7 @@ fn system_one_answers(body: &str) -> Result<BTreeMap<String, WireAnswer>, Decide
                     WireAnswer::Choice(probabilities)
                 }
             };
-            (id, answer)
+            (id, Reply::Answered(answer))
         })
         .collect())
 }
@@ -258,14 +264,16 @@ struct OpenAiResponse {
     answers: Vec<OpenAiAnswer>,
 }
 
-fn openai_answers(body: &str) -> Result<BTreeMap<String, WireAnswer>, DecideError> {
+fn openai_answers(body: &str) -> Result<BTreeMap<String, Reply>, DecideError> {
     let invalid = |m: String| DecideError::Invalid(m);
     let wire: OpenAiResponse = serde_json::from_str(body)
         .map_err(|e| invalid(format!("decoding OpenAI Decisions response: {e}")))?;
     let mut answers = BTreeMap::new();
     for answer in wire.answers {
         let (name, answer) = match answer {
-            OpenAiAnswer::Predicate { name, probability } => (name, WireAnswer::Noul(probability)),
+            OpenAiAnswer::Predicate { name, probability } => {
+                (name, Reply::Answered(WireAnswer::Noul(probability)))
+            }
             OpenAiAnswer::Choice {
                 name,
                 probabilities,
@@ -284,10 +292,10 @@ fn openai_answers(body: &str) -> Result<BTreeMap<String, WireAnswer>, DecideErro
                         )));
                     }
                 }
-                (name, WireAnswer::Choice(distribution))
+                (name, Reply::Answered(WireAnswer::Choice(distribution)))
             }
-            OpenAiAnswer::Score { name } => (name, WireAnswer::Score),
-            OpenAiAnswer::Refusal { name } => (name, WireAnswer::Refused),
+            OpenAiAnswer::Score { name } => (name, Reply::Answered(WireAnswer::Score)),
+            OpenAiAnswer::Refusal { name } => (name, Reply::Refused),
         };
         let name = name.ok_or_else(|| invalid("an answer names no question".to_owned()))?;
         if answers.insert(name.clone(), answer).is_some() {
@@ -312,10 +320,16 @@ pub fn parse_response(
         let answer = answers
             .remove(id.as_str())
             .ok_or_else(|| invalid(format!("the response omits question {id:?}")))?;
-        let probabilities = probabilities(id, question, answer)?;
-        let answer: Answer = question
-            .resolve(probabilities, min_confidence)
-            .map_err(|e| invalid(format!("question {id:?}: {e}")))?;
+        let answer = match answer {
+            Reply::Refused => Answer {
+                label: Label::uncertain(),
+                confidence: 0.0,
+                probabilities: BTreeMap::new(),
+            },
+            Reply::Answered(answer) => question
+                .resolve(probabilities(id, question, answer)?, min_confidence)
+                .map_err(|e| invalid(format!("question {id:?}: {e}")))?,
+        };
         decision.insert(id.clone(), answer);
     }
     if let Some(extra) = answers.keys().next() {
@@ -341,7 +355,6 @@ fn probabilities(
         (_, WireAnswer::Unanswered) => Err(invalid(format!(
             "the model left question {id:?} unanswered"
         ))),
-        (_, WireAnswer::Refused) => Err(invalid(format!("the model refused question {id:?}"))),
         (QuestionKind::Noul, WireAnswer::Noul(noul)) => {
             let noul = float(noul)?;
             Ok(BTreeMap::from([
@@ -822,6 +835,17 @@ mod tests {
     }
 
     #[test]
+    fn an_openai_refusal_is_uncertain_with_no_distribution() {
+        let body = r#"{"answers":[{"type":"predicate","name":"urgent","probability":0.9},{"type":"refusal","name":"area"}]}"#;
+        let d = parse_response(DecisionApi::OpenAi, body, &questions(), 0.5).unwrap();
+        let area = &d.0[&qid("area")];
+        assert!(area.label.is_uncertain());
+        assert_eq!(area.confidence, 0.0);
+        assert!(area.probabilities.is_empty());
+        assert_eq!(d.0[&qid("urgent")].label, label("yes"));
+    }
+
+    #[test]
     fn the_engine_ignores_openais_own_choice_and_confidence() {
         let body = OPENAI_GOOD
             .replace(r#""choice":"scheduler""#, r#""choice":"frontend""#)
@@ -839,10 +863,6 @@ mod tests {
         let cases = [
             ("{}".to_owned(), "decoding"),
             (answers(&[urgent]), "omits"),
-            (
-                answers(&[urgent, r#"{"type":"refusal","name":"area"}"#]),
-                "refused question \"area\"",
-            ),
             (
                 answers(&[
                     urgent,
