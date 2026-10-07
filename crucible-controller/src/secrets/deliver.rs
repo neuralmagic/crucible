@@ -5,6 +5,7 @@
 //! spec names the Secret and nothing else about it: kubelet does the projection, which is why
 //! there is no in-pod client and no endpoint to reach.
 
+use crate::playbooks::providers::{ModelRole, ResolvedModel};
 use crate::secrets::credentials::Credentials;
 use crate::secrets::grant::GrantMint;
 use crate::secrets::launch::{ProviderSecret, Refusal};
@@ -177,23 +178,79 @@ fn credential_key(secret: &str, var: &str) -> String {
     format!("{secret}.{var}")
 }
 
-/// Everything a resolved provider adds to a run: the endpoint it is reached at as plain
-/// environment, and its credentials, read from Vault and expanded one Secret key and one variable
-/// per entry. A provider that names no key contributes its endpoint alone; a deployment that cannot
-/// read values at all is an error rather than a keyless launch, because rendering the flags and
-/// withholding the credential would fail in the pod, minutes later and further from the cause.
-pub async fn provider_delivery(
+/// Everything a dispatch's resolved models add to it: the inference document the engine reads, as
+/// plain environment, and each role's credential, read from Vault and projected under the variable
+/// its binding names. A provider that names no key contributes its binding alone; a deployment
+/// that cannot read values at all is an error rather than a keyless launch, because rendering the
+/// binding and withholding the credential would fail in the pod, minutes later and further from
+/// the cause.
+pub async fn inference_delivery(
     pool: &sqlx::PgPool,
     reader: Option<&std::sync::Arc<dyn crate::secrets::provider::SecretProvider>>,
-    provider: &crate::playbooks::providers::ModelProvider,
+    models: &[ResolvedModel],
 ) -> anyhow::Result<Result<Delivery, Refusal>> {
-    let mut delivery = Delivery {
-        plain_env: provider.config_env(),
-        ..Delivery::default()
+    let mut delivery = Delivery::default();
+    if models.is_empty() {
+        return Ok(Ok(delivery));
+    }
+    let document = crate::playbooks::providers::inference_document(models)?;
+    delivery.plain_env.push((
+        crucible_contract::inference::ENV_INFERENCE.to_string(),
+        serde_json::to_string(&document)?,
+    ));
+    for model in models {
+        let (secret, credentials) = match read_credentials(pool, reader, model).await? {
+            Ok(Some(read)) => read,
+            Ok(None) => continue,
+            Err(refusal) => return Ok(Err(refusal)),
+        };
+        match role_credentials(model, &secret, credentials) {
+            Ok(projected) => delivery
+                .merge(projected)
+                .with_context(|| format!("folding the {} credential in", model.role.as_str()))?,
+            Err(reason) => {
+                return Ok(Err(Refusal::ProviderCredentials {
+                    provider: model.provider.id.clone(),
+                    name: secret.row.name.clone(),
+                    reason,
+                }));
+            }
+        }
+    }
+    Ok(Ok(delivery))
+}
+
+/// The key one resolved model spends, read the way a pod's delivery reads it, for a caller that
+/// asks the model in-process. `Ok(None)` is a provider that names no key.
+pub async fn model_key(
+    pool: &sqlx::PgPool,
+    reader: Option<&std::sync::Arc<dyn crate::secrets::provider::SecretProvider>>,
+    model: &ResolvedModel,
+) -> anyhow::Result<Result<Option<String>, Refusal>> {
+    let (secret, credentials) = match read_credentials(pool, reader, model).await? {
+        Ok(Some(read)) => read,
+        Ok(None) => return Ok(Ok(None)),
+        Err(refusal) => return Ok(Err(refusal)),
     };
+    match split_key(model, credentials) {
+        Ok((key, _)) => Ok(Ok(Some(key))),
+        Err(reason) => Ok(Err(Refusal::ProviderCredentials {
+            provider: model.provider.id.clone(),
+            name: secret.row.name.clone(),
+            reason,
+        })),
+    }
+}
+
+async fn read_credentials(
+    pool: &sqlx::PgPool,
+    reader: Option<&std::sync::Arc<dyn crate::secrets::provider::SecretProvider>>,
+    model: &ResolvedModel,
+) -> anyhow::Result<Result<Option<(ProviderSecret, Result<Credentials, String>)>, Refusal>> {
+    let provider = &model.provider;
     let secret = match crate::secrets::launch::resolve_provider_secret(pool, provider).await? {
         Ok(Some(secret)) => secret,
-        Ok(None) => return Ok(Ok(delivery)),
+        Ok(None) => return Ok(Ok(None)),
         Err(refusal) => return Ok(Err(refusal)),
     };
     let reader = reader.with_context(|| {
@@ -203,33 +260,47 @@ pub async fn provider_delivery(
         )
     })?;
     let value = reader.value_of(&secret.row).await?;
-    match expand_credentials(&secret, &value) {
-        Ok(expanded) => {
-            delivery.data.extend(expanded.data);
-            delivery.env.extend(expanded.env);
-        }
-        Err(reason) => {
-            return Ok(Err(Refusal::ProviderCredentials {
-                provider: provider.id.clone(),
-                name: secret.row.name.clone(),
-                reason,
-            }));
-        }
-    }
-    Ok(Ok(delivery))
+    let credentials = Credentials::parse(&value).map_err(|e| e.to_string());
+    Ok(Ok(Some((secret, credentials))))
 }
 
-/// A provider secret's bytes as Secret keys and the variables that read them. Pure, so the shape
-/// is testable without Vault.
-pub fn expand_credentials(secret: &ProviderSecret, value: &str) -> Result<Delivery, String> {
-    let creds = Credentials::parse(value).map_err(|e| e.to_string())?;
-    let vars = creds.for_env(secret.key_env).map_err(|e| e.to_string())?;
-    let mut delivery = Delivery::default();
+fn split_key(
+    model: &ResolvedModel,
+    credentials: Result<Credentials, String>,
+) -> Result<(String, BTreeMap<String, String>), String> {
+    let protocol = model.provider.protocol_for(model.role).ok_or_else(|| {
+        format!(
+            "provider {} cannot serve the {} role",
+            model.provider.id,
+            model.role.as_str()
+        )
+    })?;
+    credentials?
+        .split(protocol.as_str(), protocol.credential_key())
+        .map_err(|e| e.to_string())
+}
+
+/// One role's credential as Secret keys and the variables that read them: the key under the role's
+/// variable, and, for the agent, a map's other entries under their own names, as the harness reads
+/// them. Pure, so the shape is testable without Vault.
+pub fn role_credentials(
+    model: &ResolvedModel,
+    secret: &ProviderSecret,
+    credentials: Result<Credentials, String>,
+) -> Result<Delivery, String> {
+    let (key, rest) = split_key(model, credentials)?;
     let name = secret.row.name.to_string();
-    for (var, bytes) in vars {
-        let key = credential_key(&name, &var);
-        delivery.env.push((var, key.clone()));
-        delivery.data.insert(key, bytes);
+    let mut delivery = Delivery::default();
+    let mut project = |var: &str, bytes: String| {
+        let secret_key = credential_key(&name, var);
+        delivery.env.push((var.to_string(), secret_key.clone()));
+        delivery.data.insert(secret_key, bytes);
+    };
+    project(model.role.key_env(), key);
+    if model.role == ModelRole::Agent {
+        for (var, bytes) in rest {
+            project(&var, bytes);
+        }
     }
     Ok(delivery)
 }
@@ -354,7 +425,7 @@ pub fn stamp(pod: &mut core::Pod, secret: &str, delivery: &Delivery) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::secrets::deliver::*;
 
     fn env_delivery(entries: &[(&str, &str)]) -> Delivery {
         let mut d = Delivery::default();

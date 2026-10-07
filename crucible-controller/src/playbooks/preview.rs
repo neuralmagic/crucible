@@ -386,12 +386,18 @@ mod tests {
                     to: "t".to_string(),
                     join: crate::playbooks::plan_graph::Join::All,
                     required: true,
+                    when: None,
+                    aligned: false,
+                    keyed: Vec::new(),
                 },
                 crate::playbooks::plan_graph::GraphEdgeDto {
                     from: "t".to_string(),
                     to: "a".to_string(),
                     join: crate::playbooks::plan_graph::Join::All,
                     required: true,
+                    when: None,
+                    aligned: false,
+                    keyed: Vec::new(),
                 }
             ],
             "the dependency edge is drawn"

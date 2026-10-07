@@ -72,7 +72,7 @@ fn task_knobs() -> Vec<Kwarg> {
         Kwarg::new(
             "needs",
             "str",
-            "The substrate capability the task needs, such as `\"systemone\"`. The default \
+            "The substrate capability the task needs, such as `\"decision\"`. The default \
              `\"any\"` runs everywhere. A required task whose capability is unavailable truncates \
              the plan before dispatch; an advisory one is skipped with its dependents.",
         ),
@@ -132,6 +132,7 @@ fn task_knobs() -> Vec<Kwarg> {
                 "Instance cap for `over`, within the engine's ceiling of {MAX_FANOUT_CEILING}."
             ),
         ),
+        keyed_kwarg(),
         Kwarg::new(
             "revise",
             "task | list[task]",
@@ -176,6 +177,15 @@ fn task_knobs() -> Vec<Kwarg> {
     ]
 }
 
+fn keyed_kwarg() -> Kwarg {
+    Kwarg::new(
+        "keyed",
+        "list[producer.field]",
+        "Object fields of unmapped dependencies, keyed by item. Each instance receives only its \
+         own item's entry in place of the whole field. Needs `over`.",
+    )
+}
+
 fn when_kwarg() -> Kwarg {
     Kwarg::new(
         "when",
@@ -205,7 +215,7 @@ fn answers_kwarg() -> Kwarg {
         "str | list[str]",
         format!(
             "The answers `when` accepts: labels the question declares, or `\"{UNCERTAIN}\"`. \
-             Defaults to `\"yes\"` for a noul and is required for a choice."
+             Defaults to `\"yes\"` for a noul and is required for a choice or a score."
         ),
     )
 }
@@ -546,12 +556,13 @@ pub fn functions() -> Vec<Function> {
                 Kwarg::new(
                     "questions",
                     "dict[str, question]",
-                    "Question id to `noul()` or `choice()`. `gate.<id>` names one for `when`.",
+                    "Question id to `noul()`, `choice()`, or `score()`. `gate.<id>` names one \
+                     for `when`.",
                 ),
                 Kwarg::new(
                     "min_confidence",
                     "number",
-                    "A decision model answers, through the broker's `systemone` capability. An \
+                    "A decision model answers, through the broker's `decision` capability. An \
                      answer whose probability is below this, in (0, 1], is recorded as \
                      `\"uncertain\"`. Exactly one of `min_confidence` and `source`.",
                 ),
@@ -564,6 +575,28 @@ pub fn functions() -> Vec<Function> {
                      types its emits, each question's field must be typed with labels the \
                      question answers, or `\"boolean\"` for a noul.",
                 ),
+                Kwarg::new(
+                    "files",
+                    "list[str]",
+                    "Declared JSON files of dependencies the model reads, under `files` in its \
+                     state, by dependency and path. Each must be declared by a dependency with a \
+                     `schema_file(...)`. Not with `source`.",
+                ),
+                Kwarg::new(
+                    "over",
+                    "producer.field",
+                    "Decide once per item. A task mapped over the same list reads each item's \
+                     answer with `when`; one mapped over another list, or not mapped, cannot.",
+                ),
+                Kwarg::new(
+                    "max_fanout",
+                    "int",
+                    format!(
+                        "Instance cap for `over`, within the engine's ceiling of \
+                         {MAX_FANOUT_CEILING}."
+                    ),
+                ),
+                keyed_kwarg(),
                 Kwarg::new(
                     "depends_on",
                     "list[task]",
@@ -607,6 +640,31 @@ pub fn functions() -> Vec<Function> {
                     "list[str] | dict[str, str | None]",
                     "At least two distinct identifier labels, optionally each with a description \
                      the model sees. `\"uncertain\"` is reserved.",
+                ),
+                Kwarg::new(
+                    "drop",
+                    "str | list[str]",
+                    "Answers that deliberately lead nowhere, so no `when` has to list them.",
+                ),
+            ],
+        },
+        Function {
+            name: "score",
+            lane: Lane::Routed,
+            purpose: "An ordinal question for `route()`. It answers its most probable level, the \
+                      lowest on a tie, and records a score in [0, 1]: the expected level \
+                      position over the normalized distribution, 0 for the lowest level and 1 \
+                      for the highest. A `source` answers one level label, scored by its \
+                      position, and `\"uncertain\"` records no score.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new("ask", "str", "What to decide."),
+                Kwarg::new(
+                    "levels",
+                    "list[str] | dict[str, str | None]",
+                    "At least two distinct identifier labels, lowest first in the order written, \
+                     optionally each with a description the model sees. `\"uncertain\"` is \
+                     reserved.",
                 ),
                 Kwarg::new(
                     "drop",

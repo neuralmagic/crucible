@@ -11,6 +11,8 @@ const task = (name: string, depends_on: string[] = []): PlanTask => ({
   required: true,
   over: '',
   max_fanout: 0,
+  when: '',
+  keyed: [],
 });
 
 const result = (

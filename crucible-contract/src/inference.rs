@@ -45,6 +45,7 @@ pub enum InferenceProtocol {
     ChatCompletions,
     Responses,
     SystemOne,
+    Decisions,
 }
 
 impl InferenceProtocol {
@@ -54,13 +55,30 @@ impl InferenceProtocol {
             InferenceProtocol::ChatCompletions => "chat_completions",
             InferenceProtocol::Responses => "responses",
             InferenceProtocol::SystemOne => "system_one",
+            InferenceProtocol::Decisions => "decisions",
         }
     }
 
     pub fn serves(self, role: InferenceRole) -> bool {
-        match role {
-            InferenceRole::Agent => self != InferenceProtocol::SystemOne,
-            InferenceRole::Decision => self == InferenceProtocol::SystemOne,
+        match self {
+            InferenceProtocol::Messages
+            | InferenceProtocol::ChatCompletions
+            | InferenceProtocol::Responses => role == InferenceRole::Agent,
+            InferenceProtocol::SystemOne | InferenceProtocol::Decisions => {
+                role == InferenceRole::Decision
+            }
+        }
+    }
+
+    /// Where a decision binding that names no URL is reached, or `None` when the protocol has no
+    /// service address of its own.
+    pub fn decision_url(self) -> Option<&'static str> {
+        match self {
+            InferenceProtocol::Decisions => Some("https://api.openai.com/v1/decisions"),
+            InferenceProtocol::Messages
+            | InferenceProtocol::ChatCompletions
+            | InferenceProtocol::Responses
+            | InferenceProtocol::SystemOne => None,
         }
     }
 }
@@ -122,7 +140,7 @@ impl From<EnvName> for String {
 pub struct InferenceBinding {
     pub role: InferenceRole,
     pub protocol: InferenceProtocol,
-    /// Absent means the protocol's own service address. A decision binding always names one.
+    /// Absent means the protocol's own service address. A `system_one` binding always names one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     pub model: String,
@@ -164,6 +182,7 @@ pub enum InferenceError {
     },
     MissingUrl {
         role: InferenceRole,
+        protocol: InferenceProtocol,
     },
     Url {
         role: InferenceRole,
@@ -198,10 +217,10 @@ impl std::fmt::Display for InferenceError {
                     "the {role} binding speaks {protocol}, which does not serve that role"
                 )
             }
-            InferenceError::MissingUrl { role } => {
+            InferenceError::MissingUrl { role, protocol } => {
                 write!(
                     f,
-                    "the {role} binding names no url, and that role has no default address"
+                    "the {role} binding names no url, and {protocol} has no default address"
                 )
             }
             InferenceError::Url { role, url, why } => {
@@ -282,8 +301,13 @@ impl ResolvedInference {
             }
             match &binding.url {
                 Some(url) => check_url(role, url)?,
-                None if role == InferenceRole::Decision => {
-                    return Err(InferenceError::MissingUrl { role });
+                None if role == InferenceRole::Decision
+                    && binding.protocol.decision_url().is_none() =>
+                {
+                    return Err(InferenceError::MissingUrl {
+                        role,
+                        protocol: binding.protocol,
+                    });
                 }
                 None => {}
             }
@@ -422,8 +446,60 @@ mod tests {
         );
     }
 
+    fn openai_decision() -> InferenceBinding {
+        InferenceBinding {
+            role: InferenceRole::Decision,
+            protocol: InferenceProtocol::Decisions,
+            url: None,
+            model: "gpt-6-luna".into(),
+            key_env: Some(EnvName::new("OPENAI_API_KEY").unwrap()),
+        }
+    }
+
+    #[test]
+    fn an_openai_decisions_binding_has_a_pinned_wire_shape() {
+        let json = r#"{"version":1,"bindings":[{"role":"decision","protocol":"decisions","model":"gpt-6-luna","key_env":"OPENAI_API_KEY"}]}"#;
+        assert_eq!(
+            ResolvedInference::parse(json).unwrap(),
+            doc(vec![openai_decision()])
+        );
+        assert_eq!(
+            serde_json::to_string(&doc(vec![openai_decision()])).unwrap(),
+            json
+        );
+    }
+
+    #[test]
+    fn only_decisions_has_a_default_decision_address() {
+        assert_eq!(
+            InferenceProtocol::Decisions.decision_url(),
+            Some("https://api.openai.com/v1/decisions")
+        );
+        for protocol in [
+            InferenceProtocol::Messages,
+            InferenceProtocol::ChatCompletions,
+            InferenceProtocol::Responses,
+            InferenceProtocol::SystemOne,
+        ] {
+            assert_eq!(protocol.decision_url(), None, "{protocol}");
+        }
+    }
+
     #[test]
     fn a_protocol_must_serve_its_role() {
+        for protocol in [InferenceProtocol::SystemOne, InferenceProtocol::Decisions] {
+            assert!(protocol.serves(InferenceRole::Decision));
+            assert!(!protocol.serves(InferenceRole::Agent));
+            let mut b = agent();
+            b.protocol = protocol;
+            assert_eq!(
+                doc(vec![b]).validate(),
+                Err(InferenceError::ProtocolForRole {
+                    role: InferenceRole::Agent,
+                    protocol
+                })
+            );
+        }
         for protocol in [
             InferenceProtocol::Messages,
             InferenceProtocol::ChatCompletions,
@@ -441,15 +517,6 @@ mod tests {
                 })
             );
         }
-        let mut b = agent();
-        b.protocol = InferenceProtocol::SystemOne;
-        assert!(matches!(
-            doc(vec![b]).validate(),
-            Err(InferenceError::ProtocolForRole {
-                role: InferenceRole::Agent,
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -484,20 +551,28 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_binding_may_omit_its_url_and_a_decision_binding_may_not() {
+    fn an_agent_binding_and_a_decisions_binding_may_omit_their_url_and_system_one_may_not() {
         let mut stock = agent();
         stock.url = None;
         stock.key_env = None;
         doc(vec![stock.clone()]).validate().unwrap();
         let json = serde_json::to_string(&doc(vec![stock])).unwrap();
         assert!(!json.contains("url"), "{json}");
+        doc(vec![openai_decision()]).validate().unwrap();
         let mut b = decision();
         b.url = None;
+        let err = doc(vec![b]).validate().unwrap_err();
         assert_eq!(
-            doc(vec![b]).validate(),
-            Err(InferenceError::MissingUrl {
-                role: InferenceRole::Decision
-            })
+            err,
+            InferenceError::MissingUrl {
+                role: InferenceRole::Decision,
+                protocol: InferenceProtocol::SystemOne,
+            }
+        );
+        assert!(
+            err.to_string()
+                .contains("system_one has no default address"),
+            "{err}"
         );
     }
 

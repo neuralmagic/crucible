@@ -11,6 +11,8 @@ export type TaskResult = components['schemas']['TaskResultDto'];
 export type GraphOutput = components['schemas']['GraphOutputDto'];
 export type OutputTarget = components['schemas']['OutputTargetDto'];
 export type FanOutCount = components['schemas']['FanOutCountDto'];
+export type RouteDecision = components['schemas']['RouteDecisionDto'];
+export type When = components['schemas']['WhenDto'];
 type TaskKind = WorkflowGraphNode['kind'];
 type Needs = WorkflowGraphNode['needs'];
 
@@ -49,8 +51,11 @@ export interface FanOutState {
   items: number | null;
   started: number;
   passed: number;
-  /// Everything that reported something other than a pass, by the status it reported: a blocked
-  /// or skipped instance is neither a pass nor a failure, and dropping it loses the run's work.
+  /// Instances whose `when` left them out. Not a failure, and counted apart from one.
+  notTaken: number;
+  /// Everything that reported something other than a pass or not taken, by the status it
+  /// reported: a blocked or skipped instance is neither a pass nor a failure, and dropping it loses
+  /// the run's work.
   other: FanOutStatus[];
   /// Whether the run can still start the instances that have not.
   running: boolean;
@@ -97,6 +102,8 @@ export interface RunGraphView {
   fanout: ReadonlyMap<string, FanOutState>;
   /// The external results each node links out to, by node name.
   links: ReadonlyMap<string, NodeLinks>;
+  /// What each route node or route instance decided, by its name.
+  decisions: ReadonlyMap<string, RouteDecision[]>;
 }
 
 /// Everything the run graph endpoint answers with, plus whether the run is still going — which is
@@ -107,6 +114,7 @@ export interface RunGraphSource {
   /// Null for a revision that stored no exposure.
   outputs: GraphOutput[] | null;
   fanout: FanOutCount[];
+  decisions: RouteDecision[];
   running: boolean;
 }
 
@@ -139,7 +147,7 @@ export function toneOf(status: string | null): TaskTone {
 /// A reducer task is named after the reducer it runs (`top_k`), so a kind the graph document has no
 /// case for is drawn as a plain task rather than dropped.
 function kindOf(kind: string): TaskKind {
-  if (kind === 'agent' || kind === 'command' || kind === 'engine') return kind;
+  if (kind === 'agent' || kind === 'command' || kind === 'engine' || kind === 'route') return kind;
   return 'other';
 }
 
@@ -155,6 +163,9 @@ interface NodeSpec {
   required: boolean;
   session: string | null;
   fanout?: WorkflowGraphNode['fanout'];
+  keyed?: string[];
+  when?: When | null;
+  questions?: string[];
 }
 
 /// What a plan task maps over, as the graph document carries it. The wire writes `producer.field`
@@ -171,6 +182,42 @@ export function fanoutOf(task: PlanTask): WorkflowGraphNode['fanout'] {
   };
 }
 
+/// A plan task's `when`, which the wire writes as `route.question in a|b`.
+export function whenOf(task: PlanTask): When | null {
+  const [predicate, answers, ...rest] = task.when.split(' in ');
+  if (predicate === undefined || answers === undefined || rest.length > 0) return null;
+  const cut = predicate.lastIndexOf('.');
+  if (cut <= 0) return null;
+  return {
+    route: predicate.slice(0, cut),
+    question: predicate.slice(cut + 1),
+    labels: answers.split('|'),
+  };
+}
+
+/// One dependency as the graph document draws it: its consumer's join, the `when` it carries when
+/// the dependency is the route the consumer reads, whether both ends map over the same list, and
+/// which of the dependency's fields the consumer narrows per instance.
+export function planEdge(dep: PlanTask, task: PlanTask): WorkflowGraphEdge {
+  const when = whenOf(task);
+  return {
+    from: dep.name,
+    to: task.name,
+    join: 'all',
+    required: task.required,
+    when: when !== null && when.route === dep.name ? when : null,
+    aligned: task.over !== '' && task.over === dep.over,
+    keyed: task.keyed
+      .filter((ref) => ref.startsWith(`${dep.name}.`))
+      .map((ref) => ref.slice(dep.name.length + 1)),
+  };
+}
+
+/// An edge that carries nothing but the dependency itself.
+function plainEdge(from: string, to: string, required: boolean): WorkflowGraphEdge {
+  return { from, to, join: 'all', required, when: null, aligned: false, keyed: [] };
+}
+
 /// A plan task carries a fraction of what a compiled pack does: the rest of the document's fields
 /// are absent, not empty, and the card leaves their lines out.
 function nodeOf(spec: NodeSpec): WorkflowGraphNode {
@@ -181,6 +228,9 @@ function nodeOf(spec: NodeSpec): WorkflowGraphNode {
     emits: [],
     emits_files: [],
     fanout: spec.fanout ?? null,
+    keyed: spec.keyed ?? [],
+    when: spec.when ?? null,
+    questions: spec.questions ?? [],
     harness: null,
     model: null,
     effort: null,
@@ -239,6 +289,7 @@ export function fanoutStates(
   running: boolean,
 ): Map<string, FanOutState> {
   const items = new Map(counts.map((c) => [c.task, c.items]));
+  const folded = new Map(counts.map((c) => [c.task, c.not_taken]));
   const states = new Map<string, FanOutState>();
   for (const task of tasks) {
     if (task.over === '') continue;
@@ -246,6 +297,7 @@ export function fanoutStates(
       items: items.get(task.name) ?? null,
       started: 0,
       passed: 0,
+      notTaken: 0,
       other: [],
       running,
     });
@@ -259,9 +311,21 @@ export function fanoutStates(
       state.passed += 1;
       continue;
     }
+    if (result.status === 'not_taken') {
+      state.notTaken += 1;
+      continue;
+    }
     const seen = state.other.find((s) => s.status === result.status);
     if (seen === undefined) state.other.push({ status: result.status, count: 1 });
     else seen.count += 1;
+  }
+  // The settled node's fold is the engine's own count; instances it settled not taken without a
+  // row still settled.
+  for (const [name, state] of states) {
+    const unreported = (folded.get(name) ?? 0) - state.notTaken;
+    if (unreported <= 0) continue;
+    state.notTaken += unreported;
+    state.started += unreported;
   }
   return states;
 }
@@ -324,13 +388,15 @@ export function nodeLinks(tasks: PlanTask[], results: TaskResult[]): Map<string,
 
 /// Hide a dependency already implied by a longer path. The executor may retain such dependencies
 /// for admission semantics, but drawing both routes makes the DAG read as though downstream work
-/// starts directly from an ancestor.
+/// starts directly from an ancestor. An edge that carries a `when` or a narrowed field says
+/// something no other path does, and stays.
 function transitiveReduction(edges: WorkflowGraphEdge[]): WorkflowGraphEdge[] {
   const children = new Map<string, { to: string; edge: number }[]>();
   edges.forEach((edge, index) => {
     children.set(edge.from, [...(children.get(edge.from) ?? []), { to: edge.to, edge: index }]);
   });
   return edges.filter((edge, skipped) => {
+    if ((edge.when ?? null) !== null || edge.keyed.length > 0) return true;
     const pending = (children.get(edge.from) ?? [])
       .filter((child) => child.edge !== skipped)
       .map((child) => child.to);
@@ -372,18 +438,17 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
       required: t.required,
       session: t.session === '' ? null : t.session,
       fanout: fanoutOf(t),
+      keyed: t.keyed,
+      when: whenOf(t),
+      questions: questionsOf(t.name, source.decisions),
     }),
   );
   const declaredEdges: WorkflowGraphEdge[] = [];
   for (const t of tasks) {
     for (const dep of t.depends_on) {
-      if (!known.has(dep)) continue;
-      declaredEdges.push({
-        from: dep,
-        to: t.name,
-        join: 'all',
-        required: t.required,
-      });
+      const from = declared.get(dep);
+      if (from === undefined) continue;
+      declaredEdges.push(planEdge(from, t));
     }
   }
   // Core runs report tasks in the epilogue, after the ordinary task graph has finished. That
@@ -396,20 +461,27 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
     (task) => task.kind === 'report' && task.depends_on.length === 0,
   )) {
     for (const sink of sinks) {
-      declaredEdges.push({
-        from: sink.name,
-        to: report.name,
-        join: 'all',
-        required: report.required,
-      });
+      declaredEdges.push(plainEdge(sink.name, report.name, report.required));
     }
   }
   const edges: WorkflowGraphEdge[] = [];
+  // An instance a per-element edge feeds hangs off that edge, not off its own deck.
+  const pairedTargets = new Set<string>();
   for (const edge of transitiveReduction(declaredEdges)) {
     // Once a mapped task has concrete runtime instances, those instances are the leaves of its
     // subgraph. Draw downstream work after them instead of shortcutting directly from the
     // declared task node and making the consumer look like their sibling.
     const producers = instances.get(edge.from) ?? [edge.from];
+    // An aligned edge whose consumer has expanded too is read per element: each instance pairs
+    // with its counterpart, and the deck-to-deck edge keeps what the consumer reads off it.
+    const paired = edge.aligned
+      ? pairedInstances(edge, producers, latest, source.decisions)
+      : [];
+    if (paired.length > 0) {
+      edges.push(edge, ...paired);
+      for (const pair of paired) pairedTargets.add(pair.to);
+      continue;
+    }
     for (const producer of producers) {
       edges.push({ ...edge, from: producer });
     }
@@ -426,10 +498,11 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
         needs: mapped === undefined ? 'any' : needsOf(mapped.needs),
         required: mapped?.required ?? true,
         session: null,
+        questions: questionsOf(name, source.decisions),
       }),
     );
-    if (from !== null && mapped !== undefined) {
-      edges.push({ from, to: name, join: 'all', required: mapped.required });
+    if (from !== null && mapped !== undefined && !pairedTargets.has(name)) {
+      edges.push(plainEdge(from, name, mapped.required));
     }
   }
 
@@ -455,7 +528,7 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
   const attach = (name: string, from: string | null) => {
     const parents = from !== null && drawn.has(from) ? [from] : terminals;
     for (const parent of parents) {
-      edges.push({ from: parent, to: name, join: 'all', required: true });
+      edges.push(plainEdge(parent, name, true));
     }
   };
   if (declaredOutputs === null) {
@@ -507,5 +580,51 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
     engineDefaults,
     fanout,
     links: nodeLinks(tasks, results),
+    decisions: decisionsByTask(source.decisions),
   };
+}
+
+/// The per-element edges under an aligned edge: `producer[k]` to `consumer[k]` for every key both
+/// ends reported an instance for. Under a `when`, each carries the answer instance k's route gave.
+function pairedInstances(
+  edge: WorkflowGraphEdge,
+  producers: string[],
+  reported: ReadonlyMap<string, TaskResult>,
+  decisions: RouteDecision[],
+): WorkflowGraphEdge[] {
+  const when = edge.when ?? null;
+  return producers.flatMap((producer) => {
+    const consumer = `${edge.to}${producer.slice(edge.from.length)}`;
+    if (producer === edge.from || !reported.has(consumer)) return [];
+    const answer =
+      when === null
+        ? undefined
+        : decisions.find((d) => d.task === producer && d.question === when.question)?.labels[0]
+            ?.label;
+    return [
+      {
+        ...edge,
+        from: producer,
+        to: consumer,
+        when:
+          when === null || answer === undefined
+            ? null
+            : { route: producer, question: when.question, labels: [answer] },
+        keyed: [],
+      },
+    ];
+  });
+}
+
+function decisionsByTask(decisions: RouteDecision[]): Map<string, RouteDecision[]> {
+  const byTask = new Map<string, RouteDecision[]>();
+  for (const decision of decisions) {
+    byTask.set(decision.task, [...(byTask.get(decision.task) ?? []), decision]);
+  }
+  return byTask;
+}
+
+/// A route's question ids, as far as the run knows them: the ones it recorded a decision for.
+function questionsOf(task: string, decisions: RouteDecision[]): string[] {
+  return decisions.filter((d) => d.task === task).map((d) => d.question);
 }

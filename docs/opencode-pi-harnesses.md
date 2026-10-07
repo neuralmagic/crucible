@@ -25,9 +25,11 @@ sandbox. Which API the turn speaks follows the environment:
 | only `OPENAI_API_KEY` set | api.openai.com |
 | `ANTHROPIC_API_KEY` set (plus optional `ANTHROPIC_BASE_URL`) | Anthropic Messages, at api.anthropic.com or the base URL |
 
-The controller sets these from the provider a launch pinned: a custom provider with the
-`chat_completions` protocol lands as `OPENAI_BASE_URL` + `OPENAI_API_KEY`. A turn with neither key
-is refused before the sandbox starts.
+Under a controller these come from the run's agent binding in `CRUCIBLE_INFERENCE`, which the
+controller renders from the provider the launch resolved ([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)): the engine
+sets them inside the sandbox from the binding's endpoint, protocol and key. A custom provider with
+the `chat_completions` protocol lands as `OPENAI_BASE_URL` + `OPENAI_API_KEY`. A turn with neither
+key is refused before the sandbox starts.
 
 The seeded config registers the endpoint as a provider named `crucible` and the model under it, so
 the CLI never consults its own model catalog: opencode gets an `opencode.json` with the

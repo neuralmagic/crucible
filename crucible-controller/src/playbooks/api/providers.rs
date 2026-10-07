@@ -6,8 +6,8 @@ use crate::dto::dto;
 use crate::api::state::*;
 
 use crate::playbooks::providers::{
-    DefaultScope, DispatchDefault, Endpoint, InferenceProtocol, ModelProvider, ProviderKind,
-    ProviderSecretRef, WorkloadClass,
+    DefaultScope, DispatchDefault, Endpoint, InferenceProtocol, ModelProvider, ModelRole,
+    ProviderKind, ProviderSecretRef, WorkloadClass,
 };
 
 use axum::extract::{Path, Query, State};
@@ -28,7 +28,10 @@ dto! {
     /// knowing which secret pays for a provider.
     pub struct ProviderDto: From<p: ModelProvider> {
         /// The agent CLI a dispatch to this provider runs: claude, hermes, codex, opencode, or pi.
-        pub harness: String = crate::playbooks::providers::harness_name(p.harness()).to_string(),
+        /// Null for a provider that serves no agent.
+        pub harness: Option<String> = p.serves(ModelRole::Agent).then(|| crate::playbooks::providers::harness_name(p.harness()).to_string()),
+        /// What this provider can be chosen for: an agent, route decisions, or both.
+        pub roles: Vec<ModelRole> = p.roles(),
         pub id: String,
         pub display_name: String,
         pub kind: ProviderKind,
@@ -44,12 +47,14 @@ dto! {
 }
 
 dto! {
-    /// Where a scope's dispatches of one workload class go when the launch names nothing.
+    /// Where a scope's dispatches of one workload class go for one role when the launch names
+    /// nothing.
     pub struct DispatchDefaultDto: From<d: DispatchDefault> {
         pub scope_kind: DefaultScope,
         /// The domain name, empty for the platform-wide row.
         pub scope_ref: String,
         pub workload_class: WorkloadClass,
+        pub role: ModelRole,
         pub provider: String = d.provider_id,
         /// Null takes the provider's own default model.
         pub model: Option<String>,
@@ -173,7 +178,10 @@ dto! {
     /// A registration in full, including the credential it spends and whether it is offered at launch.
     pub struct ProviderDetailDto: From<p: ModelProvider> {
         /// The agent CLI a dispatch to this provider runs: claude, hermes, codex, opencode, or pi.
-        pub harness: String = crate::playbooks::providers::harness_name(p.harness()).to_string(),
+        /// Null for a provider that serves no agent.
+        pub harness: Option<String> = p.serves(ModelRole::Agent).then(|| crate::playbooks::providers::harness_name(p.harness()).to_string()),
+        /// What this provider can be chosen for: an agent, route decisions, or both.
+        pub roles: Vec<ModelRole> = p.roles(),
         /// The harness the registration named; null runs the default for the kind or protocol.
         pub harness_override: Option<String> = p.harness.map(|h| crate::playbooks::providers::harness_name(h).to_string()),
         pub id: String,
@@ -330,6 +338,13 @@ fn check_harness(
         return Ok(None);
     };
     let allowed = crate::playbooks::providers::allowed_harnesses(kind, protocol);
+    if allowed.is_empty() {
+        return Err(format!(
+            "harness: a {} provider{} serves route decisions and runs no harness",
+            kind.as_str(),
+            protocol.map_or(String::new(), |p| format!(" speaking {}", p.as_str())),
+        ));
+    }
     match crate::playbooks::providers::parse_harness(raw) {
         Some(harness) if allowed.contains(&harness) => Ok(Some(harness)),
         Some(_) => Err(format!(
@@ -519,7 +534,7 @@ async fn check_provider_secret(
     };
     // A provider with nowhere to put a key is refused before the registry is consulted: there is
     // no owner to disambiguate against, and the reference is wrong whatever it names.
-    if prospective.api_key_env().is_none() {
+    if !prospective.takes_secret() {
         return Ok(Err(format!(
             "a {} provider authenticates with the deploy profile's ambient credentials and must \
              not name a secret",
@@ -902,7 +917,7 @@ fn in_use_body(id: &str, usage: &crate::playbooks::providers::ProviderUsage) -> 
 
 // --- the defaults a launch inherits (admin) ----------------------------------
 
-/// Point one scope's dispatches of one workload class at a provider.
+/// Point one scope's dispatches of one workload class at a provider for one role.
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct DispatchDefaultBody {
     scope_kind: DefaultScope,
@@ -910,6 +925,9 @@ pub(crate) struct DispatchDefaultBody {
     #[serde(default)]
     scope_ref: Option<String>,
     workload_class: WorkloadClass,
+    /// What the default chooses a model for. Absent is the agent.
+    #[serde(default = "agent_role")]
+    role: ModelRole,
     /// The registered provider id every unpinned dispatch of this class takes.
     provider: String,
     /// Absent takes the provider's own default model.
@@ -924,6 +942,10 @@ pub(crate) struct DispatchDefaultBody {
     fallback_model: Option<String>,
 }
 
+fn agent_role() -> ModelRole {
+    ModelRole::Agent
+}
+
 /// Which default a `DELETE` clears.
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -932,6 +954,20 @@ pub(crate) struct DispatchDefaultQuery {
     #[serde(default)]
     scope_ref: Option<String>,
     workload_class: String,
+    /// Absent is the agent.
+    #[serde(default)]
+    role: Option<String>,
+}
+
+/// Whether `class` dispatches anything that asks a model for `role`. An autoresearch loop runs no
+/// route task, so a decision default there would be a choice nothing ever reads.
+fn require_role_for_class(class: WorkloadClass, role: ModelRole) -> Result<(), String> {
+    match (class, role) {
+        (WorkloadClass::Autoresearch, ModelRole::Decision) => Err(
+            "an autoresearch loop runs no route task, so it takes no decision default".to_string(),
+        ),
+        (_, ModelRole::Agent) | (WorkloadClass::Playbook, ModelRole::Decision) => Ok(()),
+    }
 }
 
 /// The scope half of a default, checked: a domain default names a domain, and the platform row's
@@ -971,16 +1007,30 @@ fn require_scope_ref(scope_kind: DefaultScope, scope_ref: Option<&str>) -> Resul
     }
 }
 
-/// One provider/model half of a default, checked: the provider is registered and enabled, and the
-/// model, when named, is a model name. `field` prefixes the body field a refusal names.
+/// One provider/model half of a default, checked: the provider is registered, enabled, and serves
+/// the role, and the model, when named, is a model name. `field` prefixes the body field a refusal
+/// names.
 async fn default_target(
     state: &ApiState,
     field: &str,
+    role: ModelRole,
     provider: &str,
     model: Option<&str>,
 ) -> anyhow::Result<Result<(String, Option<String>), String>> {
     let provider_id = provider.trim().to_string();
     match crate::playbooks::providers::get(state.db.pool(), &provider_id).await? {
+        Some(provider) if !provider.serves(role) => {
+            return Ok(Err(format!(
+                "{field}provider {provider_id:?} cannot serve the {} role; it serves {}",
+                role.as_str(),
+                provider
+                    .roles()
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            )));
+        }
         Some(provider) if provider.enabled => {}
         // A default is a standing choice for work that named nothing; pointing one at a provider
         // nobody may pick would refuse every dispatch that inherited it.
@@ -1025,8 +1075,11 @@ pub(crate) async fn put_dispatch_default(
         Ok(scope_ref) => scope_ref,
         Err(msg) => return unprocessable(msg),
     };
+    if let Err(msg) = require_role_for_class(body.workload_class, body.role) {
+        return unprocessable(msg);
+    }
     let (provider_id, model) =
-        match default_target(&state, "", &body.provider, body.model.as_deref()).await {
+        match default_target(&state, "", body.role, &body.provider, body.model.as_deref()).await {
             Ok(Ok(target)) => target,
             Ok(Err(msg)) => return unprocessable(msg),
             Err(e) => return AppError::from(e).into_response(),
@@ -1049,7 +1102,15 @@ pub(crate) async fn put_dispatch_default(
         }
         None => (None, None),
         Some(raw) => {
-            match default_target(&state, "fallback_", raw, body.fallback_model.as_deref()).await {
+            match default_target(
+                &state,
+                "fallback_",
+                body.role,
+                raw,
+                body.fallback_model.as_deref(),
+            )
+            .await
+            {
                 Ok(Ok((id, model))) => (Some(id), model),
                 Ok(Err(msg)) => return unprocessable(msg),
                 Err(e) => return AppError::from(e).into_response(),
@@ -1063,6 +1124,7 @@ pub(crate) async fn put_dispatch_default(
         scope_kind: body.scope_kind,
         scope_ref,
         workload_class: body.workload_class,
+        role: body.role,
         provider_id,
         model,
         fallback_provider_id,
@@ -1078,10 +1140,11 @@ pub(crate) async fn put_dispatch_default(
                 "config",
                 "config",
                 Some(&format!(
-                    "{} {} dispatches of {:?} now default to provider {}{}",
+                    "{} {} dispatches of {:?} now default their {} to provider {}{}",
                     row.scope_kind.as_str(),
                     row.scope_ref,
                     row.workload_class.as_str(),
+                    row.role.as_str(),
                     row.provider_id,
                     row.fallback_provider_id
                         .as_deref()
@@ -1105,7 +1168,7 @@ pub(crate) async fn put_dispatch_default(
         (status = 204, description = "Cleared; the scope inherits again"),
         (status = 400, description = "The scope kind or workload class did not parse", body = ErrorBody),
         (status = 403, description = "Caller is not an admin", body = ErrorBody),
-        (status = 404, description = "That scope had no default for that class", body = ErrorBody),
+        (status = 404, description = "That scope had no default for that class and role", body = ErrorBody),
         (status = 422, description = "The scope reference was refused", body = ErrorBody)
     )
 )]
@@ -1123,19 +1186,30 @@ pub(crate) async fn delete_dispatch_default(
         Ok(class) => class,
         Err(e) => return bad_request(e.to_string()),
     };
+    let role = match q.role.as_deref().map(ModelRole::parse).transpose() {
+        Ok(role) => role.unwrap_or(ModelRole::Agent),
+        Err(e) => return bad_request(e.to_string()),
+    };
     let scope_ref = match require_scope_ref(scope_kind, q.scope_ref.as_deref()) {
         Ok(scope_ref) => scope_ref,
         Err(msg) => return unprocessable(msg),
     };
-    match crate::playbooks::providers::clear_default(state.db.pool(), scope_kind, &scope_ref, class)
-        .await
+    match crate::playbooks::providers::clear_default(
+        state.db.pool(),
+        scope_kind,
+        &scope_ref,
+        class,
+        role,
+    )
+    .await
     {
         Ok(true) => {}
         Ok(false) => {
             return not_found(format!(
-                "{} {scope_ref:?} has no {} default",
+                "{} {scope_ref:?} has no {} {} default",
                 scope_kind.as_str(),
-                class.as_str()
+                class.as_str(),
+                role.as_str()
             ));
         }
         Err(e) => return AppError::from(e).into_response(),
@@ -1147,9 +1221,10 @@ pub(crate) async fn delete_dispatch_default(
                 "config",
                 "config",
                 Some(&format!(
-                    "{} {scope_ref} dispatches of {:?} inherit again",
+                    "{} {scope_ref} dispatches of {:?} inherit their {} again",
                     scope_kind.as_str(),
-                    class.as_str()
+                    class.as_str(),
+                    role.as_str()
                 )),
                 None,
             )
@@ -1263,6 +1338,12 @@ pub(crate) async fn require_agent_pin(
             format!("{why} (enabled: {known})"),
         )));
     };
+    if !provider.serves(ModelRole::Agent) {
+        return Ok(Err(PinRefusal::new(
+            "provider",
+            format!("provider {id:?} serves route decisions, not agents; pick an agent provider"),
+        )));
+    }
     Ok(Ok(AgentPin {
         provider: Some(provider.id.clone()),
         model,
@@ -1271,7 +1352,7 @@ pub(crate) async fn require_agent_pin(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::playbooks::api::providers::*;
 
     #[test]
     fn a_provider_slug_stays_in_the_url_vocabulary() {
