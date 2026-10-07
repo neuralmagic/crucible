@@ -31,11 +31,13 @@ One rev, five consumers, all derived from `Cargo.lock`:
 ## The divergence ledger
 
 Fork-only commits on `crucible/v0.1.2`, relative to upstream `v0.1.2` (`6648bd0c`), checked
-2026-10-05:
+2026-10-07:
 
 | sha | What | Why crucible needs it | Upstreamable? |
 | --- | --- | --- | --- |
 | `3441f91a` | `feat(kubernetes): answer driver-supplied static hosts in the supervisor`: the kubernetes driver accepts `pod.host_aliases` (hostname to IP) in a sandbox's `driver_config`, validates it, and the network supervisor answers those names before its resolver, with every policy and destination check still applied | Deployments reach hosts with no public DNS record (`[cluster].host_aliases`); stock v0.1.2 rejects the key, and sandbox egress is resolved by the supervisor, not by pod `hostAliases` | Yes, upstream PR pending |
+| `46dcbe04` | `fix(providers): restore supervisor-backed GCP metadata discovery`, a cherry-pick of upstream `f7273e48` (#3973): the seccomp network broker relays connects to `127.0.0.1:8174` to the supervisor, which serves the GCE metadata emulator again | v0.1.2 still injects `GCE_METADATA_HOST=127.0.0.1:8174` for `google-cloud` providers but dropped the emulator in the sandbox split, so Vertex-authenticated turns fail with `ECONNREFUSED` refreshing the token | Already upstream; drop when rebasing onto a tag that contains `f7273e48` |
+| `aeeecb7d` | `Pass StaticHosts to the metadata proxy tests`: the cherry-picked tests call two functions that `3441f91a` gave an extra argument | Keeps the fork's test suite compiling | No, fork-only; dropped once either commit above is |
 
 Dropped at this pin, relative to the previous `crucible/grpc-base` stack:
 
@@ -69,8 +71,8 @@ Timestamp and enum fields) break against every older gateway.
 
 Candidates to shrink the gap to zero:
 
-- **Static hosts** (`3441f91a`, the only fork commit). Once it lands upstream the fork is a bare
-  release pin.
+- **Static hosts** (`3441f91a`). Once it lands upstream and the next release tag carries the GCP
+  metadata fix, the fork is a bare release pin.
 - **Upload/download RPCs.** File transfer still goes through the `openshell` CLI (SSH-tar over the
   gateway's `CreateSshSession` relay) because no RPC covers it, one of the two CLI remnants named
   in `crucible/src/openshell/mod.rs`. A native upload/download RPC would let crucible drop the CLI
