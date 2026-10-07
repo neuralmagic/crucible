@@ -11,7 +11,7 @@ use serde::ser::{SerializeSeq, Serializer};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::decision::{Label, NOUL_NO, NOUL_YES};
+use crate::decision::{Label, NOUL_NO, NOUL_YES, QuestionKind};
 use crate::link::ExternalLink;
 
 /// The JSON type one declared output field holds.
@@ -139,6 +139,25 @@ impl FieldType {
         match self {
             FieldType::Object => true,
             FieldType::Schema(schema) => schema.coarse() == Some(FieldType::Object),
+            _ => false,
+        }
+    }
+
+    /// [`Self::route_answers`] for a question of `kind`. A score reads level labels only, so a
+    /// type that may hold a boolean answers nothing.
+    pub fn answers_to(&self, kind: &QuestionKind) -> Option<BTreeSet<Label>> {
+        if matches!(kind, QuestionKind::Score { .. }) && self.may_be_boolean() {
+            return None;
+        }
+        self.route_answers()
+    }
+
+    fn may_be_boolean(&self) -> bool {
+        match self {
+            FieldType::Boolean => true,
+            FieldType::Schema(schema) => schema
+                .finite_values()
+                .is_some_and(|values| values.iter().any(Value::is_boolean)),
             _ => false,
         }
     }
@@ -718,7 +737,7 @@ pub struct EmitWire {
 
 #[cfg(test)]
 mod tests {
-    use crate::decision::Label;
+    use crate::decision::{Label, QuestionKind};
     use crate::emits::{
         DRAFT_2020_12, DeclaredFile, EmitWire, FieldType, FieldTypeError, JsonSchema,
         MAX_SCHEMA_ERRORS, SchemaError, value_type,
@@ -1338,6 +1357,42 @@ mod tests {
         ] {
             assert_eq!(none.route_answers(), None, "{none}");
         }
+    }
+
+    #[test]
+    fn a_score_reads_no_answers_off_a_type_that_may_hold_a_boolean() {
+        use crate::decision::ChoiceOption;
+        let levels = |names: &[&str]| QuestionKind::Score {
+            levels: names
+                .iter()
+                .map(|n| ChoiceOption {
+                    label: Label::new(*n).unwrap(),
+                    description: None,
+                })
+                .collect(),
+        };
+        let score = levels(&["no", "yes"]);
+        assert_eq!(FieldType::Boolean.answers_to(&score), None);
+        assert_eq!(
+            FieldType::Schema(schema(json!({"type": "boolean"}))).answers_to(&score),
+            None
+        );
+        assert_eq!(
+            FieldType::Schema(schema(json!({"enum": ["no", true]}))).answers_to(&score),
+            None
+        );
+        assert_eq!(
+            labels(&["no", "yes"]).answers_to(&score),
+            labels(&["no", "yes"]).route_answers()
+        );
+        assert_eq!(
+            FieldType::Schema(schema(json!({"enum": ["no"]}))).answers_to(&score),
+            Some([Label::new("no").unwrap()].into_iter().collect())
+        );
+        assert_eq!(
+            FieldType::Boolean.answers_to(&QuestionKind::Noul),
+            FieldType::Boolean.route_answers()
+        );
     }
 
     #[test]

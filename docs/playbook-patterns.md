@@ -67,7 +67,20 @@ before anything spends.
 
 **Question types.** `choice(ask, options)` is one of N labels, and `options` may be a dict
 whose values describe each label for the model. `noul(ask)` answers `"yes"` or `"no"`, and
-`when = gate.urgent` with no `answers` runs on `"yes"`.
+`when = gate.urgent` with no `answers` runs on `"yes"`. `score(ask, levels)` is an ordinal
+question: `levels` lists at least two labels lowest first, in the order written, optionally as a
+dict of descriptions. It branches like a choice on its most probable level (the lower one on a
+tie) and also records a `score` in [0, 1], the expected level position, so `low`, `medium`,
+`high` count as 0, 0.5, 1:
+
+```python
+"risk": score(ask = "How risky is this change?",
+              levels = {"low": "cosmetic", "medium": "one component", "high": "crosses services"}),
+```
+
+A `source` answers a score with one level label, never a boolean, and records that level's
+position; `"uncertain"` records no score. System One has no ordinal question, so a model-backed
+score is asked as a choice over the levels and recorded with `"asked_as": "choice"`.
 
 **Every answer goes somewhere.** The compiler refuses a route where some answer a `when`
 could see, `"uncertain"` included, reaches no task. Cover the rest with `otherwise = True`,

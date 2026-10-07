@@ -427,13 +427,15 @@ enum Value {
     External(Vec<values::Segment>),
     /// A dictionary, ordered by key so a rendered prompt is the same on every compile.
     Map(BTreeMap<String, Value>),
+    /// A dictionary in source order, for an argument whose order is part of its meaning.
+    Ordered(Vec<(String, Value)>),
     List(Vec<Value>),
     Task(Box<Task>),
     /// `producer.field`, already checked against the producer's declared emits.
     Output(values::DeclaredOutput),
     Session(SessionDecl),
     Workflow(WorkflowCfg),
-    /// A `noul(...)` or `choice(...)` declaration.
+    /// A `noul(...)`, `choice(...)`, or `score(...)` declaration.
     Question(Question),
     /// `route.question`, carrying the labels it can resolve to.
     Answer(values::AnswerRef),
@@ -538,7 +540,7 @@ const SCORED_FUNCTIONS: &[&str] = &[
 ];
 
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
-const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route"];
+const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route", "score"];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
@@ -682,6 +684,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         ],
         "noul" => &["ask", "drop"],
         "choice" => &["ask", "options", "drop"],
+        "score" => &["ask", "levels", "drop"],
         "report" => &[
             "name",
             "destination",
@@ -767,14 +770,16 @@ fn constructor(
             .insert(decl.name.clone(), (decl.clone(), at.clone()));
         return Ok(Value::Session(decl));
     }
-    if matches!(function, "noul" | "choice") {
+    if matches!(function, "noul" | "choice" | "score") {
         let instructions = take_string(&mut named, "ask")?;
-        let kind = if function == "noul" {
-            QuestionKind::Noul
-        } else {
-            QuestionKind::Choice {
-                options: take_options(&mut named)?,
-            }
+        let kind = match function {
+            "noul" => QuestionKind::Noul,
+            "choice" => QuestionKind::Choice {
+                options: take_described(&mut named, "options")?,
+            },
+            _ => QuestionKind::Score {
+                levels: take_described(&mut named, "levels")?,
+            },
         };
         let drop = take_labels(&mut named, "drop")?.unwrap_or_default();
         no_unknown_kwargs(function, &named)?;
@@ -1341,39 +1346,38 @@ fn take_labels(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Option
 }
 
 /// `options = ["a", "b"]`, or `options = {"a": "what a means", "b": None}`.
-fn take_options(named: &mut BTreeMap<String, Value>) -> Result<Vec<ChoiceOption>> {
+fn take_described(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Vec<ChoiceOption>> {
     let expected = "a list of labels or a dict of label to description";
-    match take_value(named, "options")? {
+    let entries: Vec<(String, Value)> = match take_value(named, name)? {
         Value::List(items) => items
             .into_iter()
             .map(|item| match item {
-                Value::String(label) => Ok(ChoiceOption {
-                    label: identifier("options", Label::new(label))?,
-                    description: None,
-                }),
-                _ => Err(wrong_type("options", expected)),
+                Value::String(label) => Ok((label, Value::None)),
+                _ => Err(wrong_type(name, expected)),
             })
-            .collect(),
-        Value::Map(entries) => entries
-            .into_iter()
-            .map(|(label, description)| {
-                let description = match description {
-                    Value::None => None,
-                    Value::String(text) => Some(text),
-                    _ => return Err(wrong_type("options", expected)),
-                };
-                Ok(ChoiceOption {
-                    label: identifier("options", Label::new(label))?,
-                    description,
-                })
+            .collect::<Result<_>>()?,
+        Value::Map(entries) => entries.into_iter().collect(),
+        Value::Ordered(entries) => entries,
+        _ => return Err(wrong_type(name, expected)),
+    };
+    entries
+        .into_iter()
+        .map(|(label, description)| {
+            let description = match description {
+                Value::None => None,
+                Value::String(text) => Some(text),
+                _ => return Err(wrong_type(name, expected)),
+            };
+            Ok(ChoiceOption {
+                label: identifier(name, Label::new(label))?,
+                description,
             })
-            .collect(),
-        _ => Err(wrong_type("options", expected)),
-    }
+        })
+        .collect()
 }
 
 fn take_questions(named: &mut BTreeMap<String, Value>) -> Result<BTreeMap<QuestionId, Question>> {
-    let expected = "a dict of question id to noul(...) or choice(...)";
+    let expected = "a dict of question id to noul(...), choice(...), or score(...)";
     let Value::Map(entries) = take_value(named, "questions")? else {
         return Err(wrong_type("questions", expected));
     };
@@ -1423,7 +1427,7 @@ fn take_when(
     let is = match (answers, &asked.asked.kind) {
         (Some(answers), _) => answers,
         (None, QuestionKind::Noul) => vec![identifier("answers", Label::new(NOUL_YES))?],
-        (None, QuestionKind::Choice { .. }) => {
+        (None, QuestionKind::Choice { .. } | QuestionKind::Score { .. }) => {
             return Err(CompileError::MissingArgument {
                 argument: "answers".to_owned(),
             });
@@ -7083,5 +7087,136 @@ workflow(type = "playbook", tasks = [prepare, gate, quick, deep, judge, review, 
             assert!(report.contains(needle), "{report}");
         }
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    const SCORED_ROUTE: &str = r#"classify = command(name = "classify", run = "./classify.sh")
+gate = route(
+    name = "gate",
+    depends_on = [classify],
+    min_confidence = 0.6,
+    questions = {
+        "risk": score(
+            ask = "How risky is the change?",
+            levels = {"low": "cosmetic", "medium": None, "high": "touches the scheduler"},
+            drop = ["uncertain"],
+        ),
+    },
+)
+ship = command(name = "ship", run = "./ship.sh", depends_on = [gate], when = gate.risk, answers = ["low", "medium"])
+hold = command(name = "hold", run = "./hold.sh", depends_on = [gate], when = gate.risk, otherwise = True)
+workflow(type = "playbook", tasks = [classify, gate, ship, hold])
+"#;
+
+    #[test]
+    fn a_score_compiles_with_its_levels_in_the_order_written() {
+        let pack = temp_pack("score");
+        let compiled = compile_source(SCORED_ROUTE, &pack.join("workflow.star"), &pack).unwrap();
+        let tasks = &compiled.workflow.tasks;
+        let gate = tasks.iter().find(|t| t.name.0 == "gate").unwrap();
+        let TaskKind::Route { questions, .. } = &gate.task else {
+            panic!("gate is not a route");
+        };
+        let risk = &questions[&QuestionId::new("risk").unwrap()];
+        let QuestionKind::Score { levels } = &risk.kind else {
+            panic!("risk is not a score");
+        };
+        assert_eq!(
+            levels.iter().map(|l| l.label.as_str()).collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(levels[1].description, None);
+        assert_eq!(
+            levels[2].description.as_deref(),
+            Some("touches the scheduler")
+        );
+        let hold = tasks.iter().find(|t| t.name.0 == "hold").unwrap();
+        assert_eq!(
+            hold.when.as_ref().map(ToString::to_string).as_deref(),
+            Some("gate.risk in high")
+        );
+
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        assert!(text.contains("type = \"score\""), "{text}");
+        let back: WorkflowCfg = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(toml::to_string(&back).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_score_takes_a_list_of_levels_and_needs_two_of_them() {
+        let pack = temp_pack("score-list");
+        let source = SCORED_ROUTE.replace(
+            "{\"low\": \"cosmetic\", \"medium\": None, \"high\": \"touches the scheduler\"}",
+            "[\"low\", \"medium\", \"high\"]",
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let gate = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "gate")
+            .unwrap();
+        let TaskKind::Route { questions, .. } = &gate.task else {
+            panic!("gate is not a route");
+        };
+        assert_eq!(
+            questions[&QuestionId::new("risk").unwrap()]
+                .labels()
+                .iter()
+                .map(Label::as_str)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+
+        let err = routed_error(
+            "score-one-level",
+            &SCORED_ROUTE.replace(
+                "{\"low\": \"cosmetic\", \"medium\": None, \"high\": \"touches the scheduler\"}",
+                "[\"low\"]",
+            ),
+        );
+        assert!(err.contains("a score needs at least two levels"), "{err}");
+        let err = routed_error(
+            "score-bad-level",
+            &SCORED_ROUTE.replace("\"medium\": None", "\"medium\": 2"),
+        );
+        assert!(err.contains("levels"), "{err}");
+    }
+
+    #[test]
+    fn a_score_needs_answers_on_its_when() {
+        let err = routed_error(
+            "score-no-answers",
+            &SCORED_ROUTE.replace(
+                "when = gate.risk, answers = [\"low\", \"medium\"]",
+                "when = gate.risk",
+            ),
+        );
+        assert!(
+            err.contains("missing required argument \"answers\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn score_is_a_constructor_in_the_custom_lane_and_unknown_to_autoresearch() {
+        let pack = temp_pack("score-custom");
+        let source = SCORED_ROUTE.replace(
+            "workflow(type = \"playbook\", tasks = [classify, gate, ship, hold])",
+            "workflow(type = \"custom\", tasks = [classify, gate, ship, hold], result = classify)",
+        );
+        compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let _ = std::fs::remove_dir_all(&pack);
+
+        let err = routed_error(
+            "score-autoresearch",
+            "q = score(ask = \"How risky?\", levels = [\"low\", \"high\"])\nworkflow([])\n",
+        );
+        assert!(
+            err.contains("unknown workflow DSL function \"score\""),
+            "{err}"
+        );
     }
 }

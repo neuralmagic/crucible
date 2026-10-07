@@ -1138,10 +1138,11 @@ pub struct NeverAnswered {
 }
 
 /// Whether every value of `declared` is an answer an output-decided route accepts for
-/// `question`: one of its labels or `uncertain`, where a boolean answers `yes` or `no`.
+/// `question`: one of its labels or `uncertain`, where a boolean answers `yes` or `no` for
+/// anything but a score.
 fn answers(question: &Question, declared: &FieldType) -> bool {
     declared
-        .route_answers()
+        .answers_to(&question.kind)
         .is_some_and(|labels| labels.iter().all(|l| question.resolves_to(l)))
 }
 
@@ -1167,7 +1168,7 @@ pub(crate) fn typed_answers<'a>(
     let Declared::Typed(declared) = source.emits.field(question.as_str()) else {
         return None;
     };
-    let possible = declared.route_answers()?;
+    let possible = declared.answers_to(&asked.kind)?;
     possible
         .iter()
         .all(|label| asked.resolves_to(label))
@@ -1184,7 +1185,7 @@ fn answerable_types(question: &Question) -> String {
     let labels = format!("labels from {}", labels.join("|"));
     match question.kind {
         QuestionKind::Noul => format!("\"boolean\" or {labels}"),
-        QuestionKind::Choice { .. } => labels,
+        QuestionKind::Choice { .. } | QuestionKind::Score { .. } => labels,
     }
 }
 
@@ -4858,5 +4859,75 @@ emits = ["lines"]
                 declared: Box::new(one_of(&["scheduler", "frontend"])),
             }
         );
+    }
+
+    fn score_route(levels: &[&str]) -> Task {
+        use crucible_contract::decision::ChoiceOption;
+        Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(
+                    qid("risk"),
+                    Question {
+                        instructions: "How risky?".into(),
+                        kind: QuestionKind::Score {
+                            levels: levels
+                                .iter()
+                                .map(|l| ChoiceOption {
+                                    label: Label::new(*l).unwrap(),
+                                    description: None,
+                                })
+                                .collect(),
+                        },
+                        drop: Vec::new(),
+                    },
+                )]),
+                decider: Decider::Output {
+                    task: "classify".into(),
+                },
+            },
+            ..agent("gate", &["classify"])
+        }
+    }
+
+    #[test]
+    fn an_output_score_is_answerable_only_by_level_labels() {
+        let check = |levels: &[&str], ty: FieldType| {
+            let mut classify = agent("classify", &[]);
+            classify.emits = typed(&[("risk", ty)]);
+            plan(vec![classify, score_route(levels)]).validate()
+        };
+        for ok in [
+            one_of(&["low", "high"]),
+            one_of(&["high", "uncertain"]),
+            schema(serde_json::json!({"enum": ["low", "medium"]})),
+        ] {
+            check(&["low", "medium", "high"], ok).unwrap();
+        }
+        for (levels, bad) in [
+            (&["low", "high"][..], FieldType::Boolean),
+            (&["no", "yes"][..], FieldType::Boolean),
+            (
+                &["no", "yes"][..],
+                schema(serde_json::json!({"type": "boolean"})),
+            ),
+            (
+                &["no", "yes"][..],
+                schema(serde_json::json!({"enum": ["no", true]})),
+            ),
+            (&["low", "high"][..], FieldType::String),
+            (&["low", "high"][..], one_of(&["low", "extreme"])),
+        ] {
+            let expected = format!("labels from {}|uncertain", levels.join("|"));
+            assert_eq!(
+                check(levels, bad.clone()).unwrap_err(),
+                PlanError::RouteSourceUnanswerable {
+                    task: "gate".into(),
+                    source_task: "classify".into(),
+                    question: "risk".into(),
+                    declared: Box::new(bad),
+                    expected,
+                }
+            );
+        }
     }
 }

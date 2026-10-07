@@ -3052,8 +3052,17 @@ fn decide_from_output(
     };
     let mut decision = BTreeMap::new();
     for (id, question) in questions {
+        let is_score = matches!(
+            question.kind,
+            crucible_contract::decision::QuestionKind::Score { .. }
+        );
         let raw = match output.get(id.as_str()) {
             Some(Value::String(s)) => s.clone(),
+            Some(other @ Value::Bool(_)) if is_score => {
+                return fail(format!(
+                    "{source}.{id} is {other}, not one of the score's level labels"
+                ));
+            }
             Some(Value::Bool(true)) => NOUL_YES.to_owned(),
             Some(Value::Bool(false)) => NOUL_NO.to_owned(),
             Some(other) => {
@@ -3081,9 +3090,11 @@ fn decide_from_output(
         decision.insert(
             id.clone(),
             Answer {
+                score: question.level_score(&label),
                 label,
                 confidence,
                 probabilities,
+                asked_as: None,
             },
         );
     }
@@ -10046,5 +10057,85 @@ mod tests {
     fn a_route_that_reads_no_files_sends_no_files_key() {
         let (_, r) = run_per_element(per_element_setup);
         assert!(!r.seen_values["gate[a]"].contains_key(&TaskName(FILES_INPUT.into())));
+    }
+
+    fn risk() -> Question {
+        use crucible_contract::decision::{ChoiceOption, QuestionKind};
+        question(
+            QuestionKind::Score {
+                levels: ["low", "medium", "high"]
+                    .iter()
+                    .map(|o| ChoiceOption {
+                        label: label(o),
+                        description: None,
+                    })
+                    .collect(),
+            },
+            &[],
+        )
+    }
+
+    fn decide_risk(emitted: Value) -> TaskResult {
+        decide_from_output(
+            &BTreeMap::from([(TaskName("classify".into()), emitted)]),
+            &BTreeMap::from([(QuestionId::new("risk").unwrap(), risk())]),
+            &TaskName("classify".into()),
+        )
+    }
+
+    #[test]
+    fn an_output_decided_score_records_the_level_position_as_its_score() {
+        for (level, expected) in [("low", 0.0), ("medium", 0.5), ("high", 1.0)] {
+            let decided = decide_risk(serde_json::json!({ "risk": level }));
+            assert_eq!(decided.status, TaskStatus::Pass, "{:?}", decided.note);
+            let answer = &decided.output.unwrap()["risk"];
+            assert_eq!(answer["label"], level);
+            assert_eq!(answer["confidence"], 1.0);
+            assert_eq!(answer["score"], expected);
+            assert!(answer.get("asked_as").is_none(), "{answer}");
+        }
+    }
+
+    #[test]
+    fn an_output_decided_uncertain_score_records_no_score() {
+        let decided = decide_risk(serde_json::json!({ "risk": "uncertain" }));
+        assert_eq!(decided.status, TaskStatus::Pass, "{:?}", decided.note);
+        let answer = &decided.output.unwrap()["risk"];
+        assert_eq!(answer["label"], "uncertain");
+        assert!(answer.get("score").is_none(), "{answer}");
+    }
+
+    #[test]
+    fn an_output_decided_score_refuses_a_boolean_and_an_undeclared_level() {
+        for (emitted, needle) in [
+            (
+                serde_json::json!({ "risk": true }),
+                "not one of the score's level labels",
+            ),
+            (serde_json::json!({ "risk": "extreme" }), "does not declare"),
+            (serde_json::json!({ "risk": 2 }), "not a label string"),
+        ] {
+            let decided = decide_risk(emitted);
+            assert_eq!(decided.status, TaskStatus::Fail);
+            let note = decided.note.unwrap();
+            assert!(note.contains(needle), "{note} lacks {needle}");
+        }
+    }
+
+    #[test]
+    fn an_output_decided_choice_records_no_score() {
+        let decided = decide_from_output(
+            &BTreeMap::from([(
+                TaskName("classify".into()),
+                serde_json::json!({ "area": "frontend" }),
+            )]),
+            &BTreeMap::from([(QuestionId::new("area").unwrap(), area(&[]))]),
+            &TaskName("classify".into()),
+        );
+        let output = decided.output.unwrap();
+        assert_eq!(
+            output["area"],
+            serde_json::json!({"label": "frontend", "confidence": 1.0, "probabilities": {"frontend": 1.0}})
+        );
     }
 }
