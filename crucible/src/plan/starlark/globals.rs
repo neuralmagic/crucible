@@ -142,6 +142,14 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<Value<'v>> {
         dispatch("route", args, kwargs, eval)
     }
+
+    fn score<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("score", args, kwargs, eval)
+    }
 }
 
 /// The scored loop's own constructors. A playbook never sees these, so a playbook author
@@ -304,7 +312,14 @@ fn call<'v>(
     }
     let named = kwargs
         .into_iter()
-        .map(|(name, value)| Ok((name, convert(value)?)))
+        .map(|(name, value)| {
+            let value = if SOURCE_ORDERED.contains(&(function, name.as_str())) {
+                convert_ordered(value)?
+            } else {
+                convert(value)?
+            };
+            Ok((name, value))
+        })
         .collect::<dsl::Result<BTreeMap<String, dsl::Value>>>()
         .map_err(|error| located(at, error))?;
     dsl::constructor(function, named, state, at).map_err(|error| located(at, error))
@@ -325,6 +340,22 @@ fn located(at: &FileSpan, error: dsl::CompileError) -> dsl::CompileError {
 /// space becomes [`dsl::Value::Opaque`], which every `take_*` helper reports as a wrong type.
 fn convert(value: Value<'_>) -> dsl::Result<dsl::Value> {
     convert_at(value, 0)
+}
+
+/// Arguments whose dict keeps the order the source wrote it in.
+const SOURCE_ORDERED: &[(&str, &str)] = &[("score", "levels")];
+
+fn convert_ordered(value: Value<'_>) -> dsl::Result<dsl::Value> {
+    let Some(dict) = DictRef::from_value(value) else {
+        return convert(value);
+    };
+    dict.iter()
+        .map(|(key, value)| match key.unpack_str() {
+            Some(key) => Ok((plain(key)?, convert_at(value, 1)?)),
+            None => Err(dsl::CompileError::DictKeyNotString),
+        })
+        .collect::<dsl::Result<Vec<_>>>()
+        .map(dsl::Value::Ordered)
 }
 
 /// Marshal one argument, refusing a value nested deeper than a source is allowed to nest.
@@ -447,7 +478,7 @@ fn alloc_at<'v>(heap: Heap<'v>, value: dsl::Value, depth: usize) -> Value<'v> {
         }
         dsl::Value::External(segments) => heap.alloc(ExternalText(segments)),
         // A dictionary never travels back out: the constructors consume it.
-        dsl::Value::Map(_) => Value::new_none(),
+        dsl::Value::Map(_) | dsl::Value::Ordered(_) => Value::new_none(),
         dsl::Value::Task(task) => heap.alloc(TaskValue(*task)),
         dsl::Value::Output(output) => heap.alloc(OutputRefValue {
             declared: match output.ty {

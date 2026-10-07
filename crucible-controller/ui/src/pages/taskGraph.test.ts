@@ -4,16 +4,22 @@ import {
   fanoutStates,
   latestResults,
   nodeLinks,
+  planEdge,
   runGraphView,
   targetLabel,
   toneOf,
   UNDECLARED_OUTPUTS,
+  whenOf,
   type FanOutCount,
   type GraphOutput,
   type OutputTarget,
   type PlanTask,
+  type RouteDecision,
   type TaskResult,
 } from './taskGraph';
+
+/// What an edge carries when it is neither conditional, per element, nor narrowed.
+const PLAIN = { when: null, aligned: false, keyed: [] };
 
 const task = (name: string, depends_on: string[] = [], session = ''): PlanTask => ({
   name,
@@ -24,6 +30,8 @@ const task = (name: string, depends_on: string[] = [], session = ''): PlanTask =
   required: true,
   over: '',
   max_fanout: 0,
+  when: '',
+  keyed: [],
 });
 
 /// A task mapped over a producer's field, as the wire writes it.
@@ -39,7 +47,8 @@ const fold = (
   outputs: GraphOutput[] | null = [],
   fanout: FanOutCount[] = [],
   running = false,
-) => runGraphView({ tasks, results, outputs, fanout, running });
+  decisions: RouteDecision[] = [],
+) => runGraphView({ tasks, results, outputs, fanout, decisions, running });
 
 const result = (iter: number, taskName: string, status: string): TaskResult => ({
   iter,
@@ -94,9 +103,9 @@ describe('the graph document a run folds to', () => {
     );
     expect(g.names).toEqual(['propose-a', 'propose-b', 'pick', 'measure']);
     expect(g.edges).toEqual([
-      { from: 'propose-a', to: 'pick', join: 'all', required: true },
-      { from: 'propose-b', to: 'pick', join: 'all', required: true },
-      { from: 'pick', to: 'measure', join: 'all', required: true },
+      { from: 'propose-a', to: 'pick', join: 'all', required: true, ...PLAIN },
+      { from: 'propose-b', to: 'pick', join: 'all', required: true, ...PLAIN },
+      { from: 'pick', to: 'measure', join: 'all', required: true, ...PLAIN },
     ]);
     expect(g.runtime.get('propose-a')?.tone).toBe('pass');
     expect(g.runtime.get('measure')?.tone).toBe('fail');
@@ -166,6 +175,7 @@ describe('the graph document a run folds to', () => {
       to: 'summarize[flashinfer]',
       join: 'all',
       required: true,
+      ...PLAIN,
     });
   });
 
@@ -175,23 +185,25 @@ describe('the graph document a run folds to', () => {
       [result(0, 'triage[one]', 'pass'), result(0, 'triage[two]', 'pass')],
     );
     expect(g.edges).toEqual([
-      { from: 'scan', to: 'triage', join: 'all', required: true },
-      { from: 'triage[one]', to: 'roundup', join: 'all', required: true },
-      { from: 'triage[two]', to: 'roundup', join: 'all', required: true },
-      { from: 'triage', to: 'triage[one]', join: 'all', required: true },
-      { from: 'triage', to: 'triage[two]', join: 'all', required: true },
+      { from: 'scan', to: 'triage', join: 'all', required: true, ...PLAIN },
+      { from: 'triage[one]', to: 'roundup', join: 'all', required: true, ...PLAIN },
+      { from: 'triage[two]', to: 'roundup', join: 'all', required: true, ...PLAIN },
+      { from: 'triage', to: 'triage[one]', join: 'all', required: true, ...PLAIN },
+      { from: 'triage', to: 'triage[two]', join: 'all', required: true, ...PLAIN },
     ]);
     expect(g.edges).not.toContainEqual({
       from: 'triage',
       to: 'roundup',
       join: 'all',
       required: true,
+      ...PLAIN,
     });
     expect(g.edges).not.toContainEqual({
       from: 'scan',
       to: 'roundup',
       join: 'all',
       required: true,
+      ...PLAIN,
     });
   });
 
@@ -202,8 +214,8 @@ describe('the graph document a run folds to', () => {
       { ...task('publish-report'), kind: 'report' },
     ]);
     expect(g.edges).toEqual([
-      { from: 'scan', to: 'card', join: 'all', required: true },
-      { from: 'card', to: 'publish-report', join: 'all', required: true },
+      { from: 'scan', to: 'card', join: 'all', required: true, ...PLAIN },
+      { from: 'card', to: 'publish-report', join: 'all', required: true, ...PLAIN },
     ]);
   });
 
@@ -215,14 +227,14 @@ describe('the graph document a run folds to', () => {
     expect(g.names).toEqual(['propose', 'measure', 'full-eval', 'ghost']);
     expect(g.node('ghost')?.kind).toBe('other');
     expect(g.runtime.get('ghost')?.tone).toBe('fail');
-    expect(g.edges).toEqual([{ from: 'propose', to: 'measure', join: 'all', required: true }]);
+    expect(g.edges).toEqual([{ from: 'propose', to: 'measure', join: 'all', required: true, ...PLAIN }]);
   });
 
   it('drops edges to unknown tasks and keeps a cycle the wire carried', () => {
     const g = view([task('a', ['ghost', 'b']), task('b', ['a'])]);
     expect(g.edges).toEqual([
-      { from: 'b', to: 'a', join: 'all', required: true },
-      { from: 'a', to: 'b', join: 'all', required: true },
+      { from: 'b', to: 'a', join: 'all', required: true, ...PLAIN },
+      { from: 'a', to: 'b', join: 'all', required: true, ...PLAIN },
     ]);
   });
 });
@@ -251,9 +263,9 @@ describe('the declared outputs a graph terminates in', () => {
 
     const [pr, capture] = drawn.map(([name]) => name);
     expect(folded.graph.nodes.map((n) => n.name)).toContain(pr);
-    expect(folded.graph.edges).toContainEqual({ from: 'publish', to: pr, join: 'all', required: true });
+    expect(folded.graph.edges).toContainEqual({ from: 'publish', to: pr, join: 'all', required: true, ...PLAIN });
     // `publish` is the plan's only sink, so the unattached bound lands there too.
-    expect(folded.graph.edges).toContainEqual({ from: 'publish', to: capture, join: 'all', required: true });
+    expect(folded.graph.edges).toContainEqual({ from: 'publish', to: capture, join: 'all', required: true, ...PLAIN });
     expect(folded.outputs.get(pr)).toEqual({
       kind: 'draft-pr',
       count: 1,
@@ -315,9 +327,9 @@ describe('the declared outputs a graph terminates in', () => {
       [output('chat-message', 4, address('operator-channel'), null)],
     );
     const [name] = [...folded.outputs.keys()];
-    expect(folded.graph.edges).toContainEqual({ from: 'measure', to: name, join: 'all', required: true });
-    expect(folded.graph.edges).toContainEqual({ from: 'notify', to: name, join: 'all', required: true });
-    expect(folded.graph.edges).not.toContainEqual({ from: 'scan', to: name, join: 'all', required: true });
+    expect(folded.graph.edges).toContainEqual({ from: 'measure', to: name, join: 'all', required: true, ...PLAIN });
+    expect(folded.graph.edges).toContainEqual({ from: 'notify', to: name, join: 'all', required: true, ...PLAIN });
+    expect(folded.graph.edges).not.toContainEqual({ from: 'scan', to: name, join: 'all', required: true, ...PLAIN });
   });
 
   /// A bound naming a task this plan does not carry still renders, off the sink. An output the
@@ -325,7 +337,7 @@ describe('the declared outputs a graph terminates in', () => {
   it('falls back to the sink when the named producer is not in the plan', () => {
     const folded = fold(plan, [], [output('deploy', 1, address('cluster'), 'deploy_candidate')]);
     const [name] = [...folded.outputs.keys()];
-    expect(folded.graph.edges).toContainEqual({ from: 'publish', to: name, join: 'all', required: true });
+    expect(folded.graph.edges).toContainEqual({ from: 'publish', to: name, join: 'all', required: true, ...PLAIN });
   });
 
   /// Absent-legacy: the revision stored no exposure. That is not a pack that writes nothing, so it
@@ -347,6 +359,7 @@ describe('the declared outputs a graph terminates in', () => {
       to: UNDECLARED_OUTPUTS,
       join: 'all',
       required: true,
+      ...PLAIN,
     });
   });
 
@@ -374,11 +387,12 @@ describe('what a run made of a mapped task', () => {
   ];
 
   it('counts the items emitted against the instances that started and how they ended', () => {
-    const folded = fold(plan, ran, [], [{ task: 'triage', items: 20 }]);
+    const folded = fold(plan, ran, [], [{ task: 'triage', items: 20, not_taken: 0 }]);
     expect(folded.fanout.get('triage')).toEqual({
       items: 20,
       started: 2,
       passed: 1,
+      notTaken: 0,
       other: [{ status: 'fail', count: 1 }],
       running: false,
     });
@@ -391,6 +405,7 @@ describe('what a run made of a mapped task', () => {
       items: null,
       started: 2,
       passed: 1,
+      notTaken: 0,
       other: [{ status: 'fail', count: 1 }],
       running: false,
     });
@@ -401,12 +416,13 @@ describe('what a run made of a mapped task', () => {
       [task('scan'), mapped('triage', 'scan.issues', ['scan'])],
       [result(0, 'scan', 'pass')],
       [],
-      [{ task: 'triage', items: 0 }],
+      [{ task: 'triage', items: 0, not_taken: 0 }],
     );
     expect(folded.fanout.get('triage')).toEqual({
       items: 0,
       started: 0,
       passed: 0,
+      notTaken: 0,
       other: [],
       running: false,
     });
@@ -434,10 +450,11 @@ describe('what a run made of a mapped task', () => {
       result(0, 'triage[3]', 'skipped'),
       result(0, 'triage[4]', 'blocked'),
     ];
-    expect(fold(plan, settled, [], [{ task: 'triage', items: 4 }]).fanout.get('triage')).toEqual({
+    expect(fold(plan, settled, [], [{ task: 'triage', items: 4, not_taken: 0 }]).fanout.get('triage')).toEqual({
       items: 4,
       started: 4,
       passed: 1,
+      notTaken: 0,
       other: [
         { status: 'skipped', count: 2 },
         { status: 'blocked', count: 1 },
@@ -541,5 +558,163 @@ describe('the external results a node links out to', () => {
       kind: 'links',
       links: [pr(1)],
     });
+  });
+});
+
+/// A mapped route over scan.items, a fix aligned with it that runs on two of its answers and
+/// narrows scan.notes, and a roundup over the fold.
+describe('a routed plan a run folds to', () => {
+  const route = (name: string, over: string, depends_on: string[]): PlanTask => ({
+    ...mapped(name, over, depends_on),
+    kind: 'route',
+  });
+  const plan = [
+    task('scan'),
+    route('triage', 'scan.items', ['scan']),
+    {
+      ...mapped('fix', 'scan.items', ['scan', 'triage']),
+      when: 'triage.tier in high|low',
+      keyed: ['scan.notes'],
+    },
+    task('roll', ['fix']),
+  ];
+  const decided = (taskName: string, question: string, labels: [string, number][]) => ({
+    task: taskName,
+    question,
+    labels: labels.map(([label, count]) => ({ label, count })),
+  });
+  const decisions = [
+    decided('triage', 'tier', [
+      ['high', 2],
+      ['skip', 1],
+    ]),
+    decided('triage[a]', 'tier', [['high', 1]]),
+  ];
+
+  it('reads the wire when back into its route, question and labels', () => {
+    expect(whenOf(plan[2] ?? task('none'))).toEqual({
+      route: 'triage',
+      question: 'tier',
+      labels: ['high', 'low'],
+    });
+    expect(whenOf(task('plain'))).toBeNull();
+  });
+
+  it('draws a route as a route, asking the questions it recorded decisions for', () => {
+    const folded = fold(plan, [result(0, 'triage[a]', 'pass')], [], [], false, decisions);
+    const node = (name: string) => folded.graph.nodes.find((n) => n.name === name);
+    expect(node('triage')?.kind).toBe('route');
+    expect(node('triage')?.questions).toEqual(['tier']);
+    expect(node('triage[a]')?.kind).toBe('route');
+    expect(node('fix')?.keyed).toEqual(['scan.notes']);
+    expect(node('fix')?.when?.labels).toEqual(['high', 'low']);
+    expect(folded.decisions.get('triage')).toEqual([decisions[0]]);
+    expect(folded.decisions.get('triage[a]')).toEqual([decisions[1]]);
+  });
+
+  it('marks the edge the when reads, the aligned edge, and the narrowed one', () => {
+    const [scan, triage, fix, roll] = plan;
+    if (scan === undefined || triage === undefined || fix === undefined || roll === undefined) {
+      throw new Error('the plan has four tasks');
+    }
+    expect(planEdge(triage, fix)).toEqual({
+      from: 'triage',
+      to: 'fix',
+      join: 'all',
+      required: true,
+      when: { route: 'triage', question: 'tier', labels: ['high', 'low'] },
+      aligned: true,
+      keyed: [],
+    });
+    expect(planEdge(scan, fix)).toMatchObject({ when: null, aligned: false, keyed: ['notes'] });
+    expect(planEdge(scan, triage)).toMatchObject({ aligned: false, keyed: [] });
+    expect(planEdge(fix, roll)).toMatchObject({ aligned: false });
+  });
+
+  /// Instance k of fix reads instance k of triage, so once both have expanded the edges pair up:
+  /// the deck-to-deck edge carries the when, and each paired edge the answer that decided it.
+  it('pairs the instances of an aligned edge once both ends have expanded', () => {
+    const ran = [
+      result(0, 'triage[a]', 'pass'),
+      result(0, 'triage[b]', 'pass'),
+      result(0, 'fix[a]', 'pass'),
+    ];
+    const edges = fold(plan, ran, [], [], false, decisions).graph.edges;
+    const between = (from: string, to: string) => edges.filter((e) => e.from === from && e.to === to);
+    expect(between('triage', 'fix')).toHaveLength(1);
+    expect(between('triage', 'fix')[0]?.when?.labels).toEqual(['high', 'low']);
+    expect(between('triage[a]', 'fix[a]')).toEqual([
+      {
+        from: 'triage[a]',
+        to: 'fix[a]',
+        join: 'all',
+        required: true,
+        when: { route: 'triage[a]', question: 'tier', labels: ['high'] },
+        aligned: true,
+        keyed: [],
+      },
+    ]);
+    expect(edges.filter((e) => e.from === 'triage[b]' && e.to.startsWith('fix'))).toEqual([]);
+    expect(between('triage[a]', 'fix')).toEqual([]);
+  });
+
+  /// fix[a] already has one way in, from triage[a]; a second from its own deck would draw two
+  /// arrows into it for one dependency.
+  it('hangs a paired instance off its counterpart, not off its own deck', () => {
+    const ran = [result(0, 'triage[a]', 'pass'), result(0, 'fix[a]', 'pass')];
+    const edges = fold(plan, ran).graph.edges;
+    expect(edges.filter((e) => e.to === 'fix[a]').map((e) => e.from)).toEqual(['triage[a]']);
+    expect(edges.filter((e) => e.to === 'triage[a]').map((e) => e.from)).toEqual(['triage']);
+  });
+
+  it('leaves a paired edge unlabelled when its route recorded no answer for the question', () => {
+    const ran = [result(0, 'triage[b]', 'pass'), result(0, 'fix[b]', 'not_taken')];
+    const edge = fold(plan, ran, [], [], false, decisions).graph.edges.find(
+      (e) => e.from === 'triage[b]' && e.to === 'fix[b]',
+    );
+    expect(edge?.when).toBeNull();
+  });
+
+  it('runs every instance into an aligned consumer that has not expanded yet', () => {
+    const edges = fold(plan, [result(0, 'triage[a]', 'pass')]).graph.edges;
+    expect(edges.filter((e) => e.to === 'fix' && e.from.startsWith('triage'))).toMatchObject([
+      { from: 'triage[a]', aligned: true },
+    ]);
+  });
+
+  /// scan -> fix is implied by scan -> triage -> fix, but it is the edge fix narrows scan.notes
+  /// across, so hiding it would hide the narrowing.
+  it('keeps a narrowed edge a longer path already implies', () => {
+    const edges = fold(plan).graph.edges;
+    expect(edges.find((e) => e.from === 'scan' && e.to === 'fix')?.keyed).toEqual(['notes']);
+  });
+});
+
+describe('instances a when left out', () => {
+  const plan = [task('scan'), mapped('fix', 'scan.items', ['scan'])];
+
+  it('counts not-taken instances apart from failed ones', () => {
+    const ran = [
+      result(0, 'fix[a]', 'pass'),
+      result(0, 'fix[b]', 'not_taken'),
+      result(0, 'fix[c]', 'not_taken'),
+      result(0, 'fix[d]', 'fail'),
+    ];
+    expect(fold(plan, ran, [], [{ task: 'fix', items: 4, not_taken: 2 }]).fanout.get('fix')).toEqual({
+      items: 4,
+      started: 4,
+      passed: 1,
+      notTaken: 2,
+      other: [{ status: 'fail', count: 1 }],
+      running: false,
+    });
+  });
+
+  /// The fold is the engine's own count, so an instance it settled not taken without a row of
+  /// its own is still settled, not pending.
+  it('takes the fold count when instance rows are missing', () => {
+    const ran = [result(0, 'fix[a]', 'pass'), result(0, 'fix[b]', 'not_taken')];
+    const state = fold(plan, ran, [], [{ task: 'fix', items: 5, not_taken: 4 }]).fanout.get('fix');
+    expect(state).toMatchObject({ started: 5, passed: 1, notTaken: 4 });
   });
 });

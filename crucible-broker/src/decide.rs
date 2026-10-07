@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crucible_contract::decision::{
-    Answer, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId, QuestionKind,
+    Answer, AskedAs, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId, QuestionKind,
 };
 use crucible_contract::inference::{InferenceBinding, InferenceProtocol};
 use serde::Deserialize;
@@ -45,6 +45,16 @@ impl DecisionApi {
         match self {
             DecisionApi::SystemOne => system_one_body(model, questions, state),
             DecisionApi::OpenAi => openai_body(model, questions, state),
+        }
+    }
+
+    /// The form this API is asked a score question in: OpenAI's own score question, or, where the
+    /// API has no ordered question, a choice over the levels. `None` for any other question.
+    pub fn asked_as(self, question: &Question) -> Option<AskedAs> {
+        match (&question.kind, self) {
+            (QuestionKind::Score { .. }, DecisionApi::OpenAi) => Some(AskedAs::Score),
+            (QuestionKind::Score { .. }, DecisionApi::SystemOne) => Some(AskedAs::Choice),
+            (QuestionKind::Noul | QuestionKind::Choice { .. }, _) => None,
         }
     }
 
@@ -136,7 +146,7 @@ enum Reply {
 enum WireAnswer {
     Noul(Number),
     Choice(BTreeMap<String, Number>),
-    Score,
+    Score(BTreeMap<String, Number>),
     Unanswered,
 }
 
@@ -151,7 +161,7 @@ fn system_one_body(
             let mut body = json!({ "instructions": q.instructions });
             match &q.kind {
                 QuestionKind::Noul => body["type"] = json!("noul"),
-                QuestionKind::Choice { options } => {
+                QuestionKind::Choice { options } | QuestionKind::Score { levels: options } => {
                     body["type"] = json!("choice");
                     body["criteria"] = Value::Object(
                         options
@@ -229,6 +239,24 @@ fn openai_body(model: &str, questions: &BTreeMap<QuestionId, Question>, state: &
                     "choices": choices,
                 })
             }
+            QuestionKind::Score { levels } => {
+                let levels: Vec<Value> = levels
+                    .iter()
+                    .map(|l| {
+                        let mut level = json!({ "label": l.label.as_str() });
+                        if let Some(description) = &l.description {
+                            level["description"] = json!(description);
+                        }
+                        level
+                    })
+                    .collect();
+                json!({
+                    "type": "score",
+                    "name": id.as_str(),
+                    "instructions": q.instructions,
+                    "levels": levels,
+                })
+            }
         })
         .collect();
     json!({ "model": model, "input": state.to_string(), "questions": questions })
@@ -247,6 +275,7 @@ enum OpenAiAnswer {
     },
     Score {
         name: Option<String>,
+        probabilities: Vec<OpenAiLevelProbability>,
     },
     Refusal {
         name: Option<String>,
@@ -256,6 +285,12 @@ enum OpenAiAnswer {
 #[derive(Deserialize)]
 struct OpenAiProbability {
     value: Value,
+    probability: Number,
+}
+
+#[derive(Deserialize)]
+struct OpenAiLevelProbability {
+    label: String,
     probability: Number,
 }
 
@@ -294,7 +329,24 @@ fn openai_answers(body: &str) -> Result<BTreeMap<String, Reply>, DecideError> {
                 }
                 (name, Reply::Answered(WireAnswer::Choice(distribution)))
             }
-            OpenAiAnswer::Score { name } => (name, Reply::Answered(WireAnswer::Score)),
+            OpenAiAnswer::Score {
+                name,
+                probabilities,
+            } => {
+                let mut distribution = BTreeMap::new();
+                for p in probabilities {
+                    if distribution
+                        .insert(p.label.clone(), p.probability)
+                        .is_some()
+                    {
+                        return Err(invalid(format!(
+                            "question {name:?}: level {:?} has two probabilities",
+                            p.label
+                        )));
+                    }
+                }
+                (name, Reply::Answered(WireAnswer::Score(distribution)))
+            }
             OpenAiAnswer::Refusal { name } => (name, Reply::Refused),
         };
         let name = name.ok_or_else(|| invalid("an answer names no question".to_owned()))?;
@@ -320,15 +372,24 @@ pub fn parse_response(
         let answer = answers
             .remove(id.as_str())
             .ok_or_else(|| invalid(format!("the response omits question {id:?}")))?;
+        let asked_as = api.asked_as(question);
         let answer = match answer {
             Reply::Refused => Answer {
                 label: Label::uncertain(),
                 confidence: 0.0,
                 probabilities: BTreeMap::new(),
+                score: None,
+                asked_as,
             },
-            Reply::Answered(answer) => question
-                .resolve(probabilities(id, question, answer)?, min_confidence)
-                .map_err(|e| invalid(format!("question {id:?}: {e}")))?,
+            Reply::Answered(answer) => Answer {
+                asked_as,
+                ..question
+                    .resolve(
+                        probabilities(id, question, asked_as, answer)?,
+                        min_confidence,
+                    )
+                    .map_err(|e| invalid(format!("question {id:?}: {e}")))?
+            },
         };
         decision.insert(id.clone(), answer);
     }
@@ -343,6 +404,7 @@ pub fn parse_response(
 fn probabilities(
     id: &QuestionId,
     question: &Question,
+    asked_as: Option<AskedAs>,
     answer: WireAnswer,
 ) -> Result<BTreeMap<Label, f64>, DecideError> {
     let invalid = |m: String| DecideError::Invalid(m);
@@ -351,6 +413,12 @@ fn probabilities(
             .ok_or_else(|| invalid(format!("question {id:?}: {n} is not a probability")))
     };
     let label = |s: &str| Label::new(s).map_err(|e| invalid(format!("question {id:?}: {e}")));
+    let distribution = |probabilities: BTreeMap<String, Number>| {
+        probabilities
+            .into_iter()
+            .map(|(name, p)| Ok((label(&name)?, float(p)?)))
+            .collect()
+    };
     match (&question.kind, answer) {
         (_, WireAnswer::Unanswered) => Err(invalid(format!(
             "the model left question {id:?} unanswered"
@@ -362,19 +430,36 @@ fn probabilities(
                 (label(NOUL_NO)?, 1.0 - noul),
             ]))
         }
-        (QuestionKind::Choice { .. }, WireAnswer::Choice(probabilities)) => probabilities
-            .into_iter()
-            .map(|(name, p)| Ok((label(&name)?, float(p)?)))
-            .collect(),
-        (QuestionKind::Noul, WireAnswer::Choice(_)) => Err(invalid(format!(
-            "question {id:?} is a noul but was answered as a choice"
-        ))),
-        (QuestionKind::Choice { .. }, WireAnswer::Noul(_)) => Err(invalid(format!(
-            "question {id:?} is a choice but was answered as a noul"
-        ))),
-        (_, WireAnswer::Score) => Err(invalid(format!(
-            "question {id:?} was answered as a score, which no route asks"
-        ))),
+        (QuestionKind::Choice { .. }, WireAnswer::Choice(probabilities)) => {
+            distribution(probabilities)
+        }
+        (QuestionKind::Score { .. }, WireAnswer::Choice(probabilities))
+            if asked_as == Some(AskedAs::Choice) =>
+        {
+            distribution(probabilities)
+        }
+        (QuestionKind::Score { .. }, WireAnswer::Score(probabilities))
+            if asked_as == Some(AskedAs::Score) =>
+        {
+            distribution(probabilities)
+        }
+        (kind, answer) => {
+            let asked = match (kind, asked_as) {
+                (QuestionKind::Noul, _) => "a noul",
+                (QuestionKind::Choice { .. }, _) => "a choice",
+                (QuestionKind::Score { .. }, Some(AskedAs::Choice)) => "a score asked as a choice",
+                (QuestionKind::Score { .. }, _) => "a score",
+            };
+            let answered = match answer {
+                WireAnswer::Noul(_) => "a noul",
+                WireAnswer::Choice(_) => "a choice",
+                WireAnswer::Score(_) => "a score",
+                WireAnswer::Unanswered => "nothing",
+            };
+            Err(invalid(format!(
+                "question {id:?} is {asked} but was answered as {answered}"
+            )))
+        }
     }
 }
 
@@ -986,6 +1071,135 @@ mod tests {
                 assert!(m.starts_with("OpenAI Decisions answered"), "{m}")
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    fn risk() -> BTreeMap<QuestionId, Question> {
+        BTreeMap::from([(
+            qid("risk"),
+            Question {
+                instructions: "How risky is the change?".into(),
+                kind: QuestionKind::Score {
+                    levels: ["low", "medium", "high"]
+                        .into_iter()
+                        .map(|l| ChoiceOption {
+                            label: label(l),
+                            description: Some(format!("{l} blast radius")),
+                        })
+                        .collect(),
+                },
+                drop: vec![],
+            },
+        )])
+    }
+
+    #[test]
+    fn a_score_is_asked_natively_of_openai_and_as_a_choice_of_system_one() {
+        let openai = DecisionApi::OpenAi.request_body("gpt-6-luna", &risk(), &json!({}));
+        assert_eq!(
+            openai["questions"][0],
+            json!({
+                "type": "score",
+                "name": "risk",
+                "instructions": "How risky is the change?",
+                "levels": [
+                    {"label": "low", "description": "low blast radius"},
+                    {"label": "medium", "description": "medium blast radius"},
+                    {"label": "high", "description": "high blast radius"},
+                ],
+            })
+        );
+        let system_one = DecisionApi::SystemOne.request_body("dgemma", &risk(), &json!({}));
+        assert_eq!(
+            system_one["questions"]["risk"],
+            json!({
+                "instructions": "How risky is the change?",
+                "type": "choice",
+                "criteria": {
+                    "low": "low blast radius",
+                    "medium": "medium blast radius",
+                    "high": "high blast radius",
+                },
+            })
+        );
+    }
+
+    /// Either way the engine computes the score from the distribution and records the form it
+    /// asked in, ignoring the score and confidence the API reports.
+    #[test]
+    fn a_score_answer_records_the_engines_score_and_the_form_it_was_asked_in() {
+        let openai = r#"{"answers":[{"type":"score","name":"risk","score":0.1,"probabilities":[{"value":0,"label":"low","probability":0.1},{"value":1,"label":"medium","probability":0.3},{"value":2,"label":"high","probability":0.6}],"confidence":0.9}]}"#;
+        let system_one = r#"{"answers":{"risk":{"type":"choice","choice":"low","probabilities":{"low":0.1,"medium":0.3,"high":0.6},"confidence":0.9}}}"#;
+        for (api, body, form) in [
+            (DecisionApi::OpenAi, openai, AskedAs::Score),
+            (DecisionApi::SystemOne, system_one, AskedAs::Choice),
+        ] {
+            let d = parse_response(api, body, &risk(), 0.5).unwrap();
+            let risk = &d.0[&qid("risk")];
+            assert_eq!(risk.label, label("high"));
+            assert!((risk.confidence - 0.6).abs() < 1e-12);
+            assert!((risk.score.unwrap() - 0.75).abs() < 1e-12);
+            assert_eq!(risk.asked_as, Some(form));
+        }
+    }
+
+    #[test]
+    fn a_score_answered_in_another_form_or_with_no_mass_is_invalid() {
+        for (api, body, needle) in [
+            (
+                DecisionApi::SystemOne,
+                r#"{"answers":{"risk":{"type":"noul","noul":0.9}}}"#,
+                "is a score asked as a choice but was answered as a noul",
+            ),
+            (
+                DecisionApi::OpenAi,
+                r#"{"answers":[{"type":"choice","name":"risk","choice":"low","probabilities":[{"value":"low","probability":1.0}],"confidence":1.0}]}"#,
+                "is a score but was answered as a choice",
+            ),
+            (
+                DecisionApi::OpenAi,
+                r#"{"answers":[{"type":"score","name":"risk","score":0,"probabilities":[{"value":0,"label":"low","probability":0},{"value":1,"label":"medium","probability":0},{"value":2,"label":"high","probability":0}],"confidence":0}]}"#,
+                "every level probability 0",
+            ),
+            (
+                DecisionApi::OpenAi,
+                r#"{"answers":[{"type":"score","name":"risk","score":0,"probabilities":[{"value":0,"label":"low","probability":0.5},{"value":0,"label":"low","probability":0.5}],"confidence":0}]}"#,
+                "has two probabilities",
+            ),
+        ] {
+            match parse_response(api, body, &risk(), 0.5) {
+                Err(DecideError::Invalid(m)) => assert!(m.contains(needle), "{m} lacks {needle}"),
+                other => panic!("{body} gave {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_refused_score_is_uncertain_with_no_score_and_still_names_its_form() {
+        let d = parse_response(
+            DecisionApi::OpenAi,
+            r#"{"answers":[{"type":"refusal","name":"risk"}]}"#,
+            &risk(),
+            0.5,
+        )
+        .unwrap();
+        let risk = &d.0[&qid("risk")];
+        assert!(risk.label.is_uncertain());
+        assert_eq!(risk.score, None);
+        assert_eq!(risk.asked_as, Some(AskedAs::Score));
+    }
+
+    #[test]
+    fn noul_and_choice_answers_record_no_score_or_form() {
+        for (api, body) in [
+            (DecisionApi::SystemOne, GOOD),
+            (DecisionApi::OpenAi, OPENAI_GOOD),
+        ] {
+            let d = parse_response(api, body, &questions(), 0.5).unwrap();
+            for answer in d.0.values() {
+                assert_eq!(answer.score, None);
+                assert_eq!(answer.asked_as, None);
+            }
         }
     }
 }

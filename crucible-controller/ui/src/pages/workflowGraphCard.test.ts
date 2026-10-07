@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   badgeFor,
+  decisionLines,
+  decisionRows,
   detailRows,
   fanoutLine,
   fanoutRows,
@@ -30,6 +32,9 @@ function task(name: string, overrides: Partial<WorkflowGraphNode> = {}): Workflo
     effort: null,
     prompt: null,
     command: null,
+    keyed: [],
+    when: null,
+    questions: [],
     ...overrides,
   };
 }
@@ -215,6 +220,7 @@ describe('what a run made of a mapped task', () => {
     items: 4,
     started: 4,
     passed: 4,
+    notTaken: 0,
     other: [],
     running: false,
     ...overrides,
@@ -222,21 +228,21 @@ describe('what a run made of a mapped task', () => {
   const failed = (count: number) => [{ status: 'fail', count }];
 
   it('reads what passed against what went in', () => {
-    expect(fanoutLine(spread())).toBe('4 of 4 passed');
-    expect(fanoutLine(spread({ passed: 3, other: failed(1) }))).toBe('3 of 4 passed · 1 fail');
+    expect(fanoutLine(spread())).toBe('4 · 4 passed');
+    expect(fanoutLine(spread({ passed: 3, other: failed(1) }))).toBe('4 · 3 passed · 1 failed');
   });
 
   /// The case the panel exists for: 20 tickets went in, 4 needed an agent, 16 never started.
   it('says how many of the items never started', () => {
     expect(fanoutLine(spread({ items: 20, started: 4, passed: 4 }))).toBe(
-      '4 of 20 passed · 16 never started'
+      '20 · 4 passed · 16 never started'
     );
   });
 
   /// A run still going may yet reach them, so they are not a verdict yet.
   it('says the items it has not reached are pending while the run is going', () => {
     expect(fanoutLine(spread({ items: 20, started: 4, passed: 4, running: true }))).toBe(
-      '4 of 20 passed · 16 pending'
+      '20 · 4 passed · 16 pending'
     );
   });
 
@@ -252,7 +258,7 @@ describe('what a run made of a mapped task', () => {
         { status: 'blocked', count: 1 },
       ],
     });
-    expect(fanoutLine(state)).toBe('2 of 20 passed · 17 skipped · 1 blocked');
+    expect(fanoutLine(state)).toBe('20 · 2 passed · 17 skipped · 1 blocked');
   });
 
   it('says zero for a fan-out over nothing rather than going quiet', () => {
@@ -262,7 +268,7 @@ describe('what a run made of a mapped task', () => {
   /// A run with no stored session knows what started, not what was asked for.
   it('reports what started when the item count is unknown', () => {
     expect(fanoutLine(spread({ items: null, passed: 3, other: failed(1) }))).toBe(
-      '4 started · 3 passed · 1 fail'
+      '4 started · 3 passed · 1 failed'
     );
   });
 
@@ -299,5 +305,86 @@ describe('a task the run never reported on', () => {
   it('states its status and no figures at all', () => {
     expect(runtimeLine(never)).toBeNull();
     expect(runtimeRows(never)).toEqual([{ label: 'status', value: 'never ran' }]);
+  });
+});
+
+describe('a route', () => {
+  const route = (overrides: Partial<WorkflowGraphNode> = {}) =>
+    task('triage', { kind: 'route', questions: ['scope', 'tier'], ...overrides });
+  const over = { over_task: 'scan', over_field: 'items', max_fanout: 120 };
+
+  it('is badged as a decision whether or not it is mapped', () => {
+    expect(badgeFor(route())).toBe('DECIDE');
+    expect(badgeFor(route({ fanout: over }))).toBe('DECIDE');
+  });
+
+  it('says what it maps over like any mapped task', () => {
+    expect(metaFor(route({ fanout: over }))).toBe('over scan.items ≤120');
+  });
+
+  it('asks its questions until it has answers', () => {
+    expect(runsLine(route())).toBe('scope? tier?');
+    expect(runsLine(route({ questions: [] }))).toBeNull();
+  });
+
+  it('reads one decision as its label and a mapped tally most frequent first', () => {
+    const one = { task: 'triage', question: 'tier', labels: [{ label: 'high', count: 1 }] };
+    const tally = {
+      task: 'triage',
+      question: 'tier',
+      labels: [
+        { label: 'high', count: 80 },
+        { label: 'low', count: 2 },
+        { label: 'skip', count: 38 },
+      ],
+    };
+    expect(decisionLines([one])).toEqual(['tier: high']);
+    expect(decisionLines([tally])).toEqual(['tier: high 80 · skip 38 · low 2']);
+    expect(decisionRows([tally])).toEqual([{ label: 'tier', value: 'high 80 · skip 38 · low 2' }]);
+  });
+
+  it('lists its questions in the panel', () => {
+    const rows = detailRows(route());
+    expect(rows.find((row) => row.label === 'questions')?.value).toBe('scope tier');
+  });
+});
+
+describe('a task that reads a route or narrows a field', () => {
+  it('lists its when and the references it narrows', () => {
+    const rows = detailRows(
+      task('fix', {
+        when: { route: 'triage', question: 'tier', labels: ['high', 'low'] },
+        keyed: ['scan.notes', 'scan.owners'],
+      })
+    );
+    const value = (label: string) => rows.find((row) => row.label === label)?.value;
+    expect(value('when')).toBe('triage.tier in high|low');
+    expect(value('narrows')).toBe('scan.notes scan.owners');
+  });
+
+  it('leaves both rows out when it does neither', () => {
+    const labels = detailRows(task('plain')).map((row) => row.label);
+    expect(labels).not.toContain('when');
+    expect(labels).not.toContain('narrows');
+    expect(labels).not.toContain('questions');
+  });
+});
+
+describe('a fan-out a when partitioned', () => {
+  const state: FanOutState = {
+    items: 120,
+    started: 120,
+    passed: 80,
+    notTaken: 38,
+    other: [{ status: 'fail', count: 2 }],
+    running: false,
+  };
+
+  it('counts not-taken instances apart from failed ones', () => {
+    expect(fanoutLine(state)).toBe('120 · 80 passed · 38 not taken · 2 failed');
+  });
+
+  it('spells the not-taken count out in the panel', () => {
+    expect(fanoutRows(state).find((row) => row.label === 'not taken')?.value).toBe('38');
   });
 });
