@@ -147,7 +147,7 @@ pub struct PlanTaskWire {
     pub when: String,
     /// `producer.field` references whose per-element object each instance receives narrowed to
     /// its own entry. Empty when the task narrows nothing.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub keyed: Vec<String>,
     /// The tasks this task sends back when it settles failing, empty otherwise. Each round
     /// reports as `task[round-N]`, so a renderer draws the loop from this before any round runs.

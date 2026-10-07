@@ -1229,6 +1229,48 @@ mod tests {
     }
 
     #[test]
+    fn mermaid_draws_a_per_element_when_on_a_mapped_route_as_a_thick_labelled_edge() {
+        let src = r#"
+            version = 1
+            [budget]
+            usd = 1.0
+            [[task]]
+            name = "scan"
+            kind = "command"
+            command = "true"
+            emits = ["items"]
+            [[task]]
+            name = "gate"
+            kind = "route"
+            depends_on = ["scan"]
+            needs = "systemone"
+            over = { task = "scan", field = "items" }
+            max_fanout = 4
+            decider = { kind = "model", min_confidence = 0.8 }
+            [task.questions.area]
+            instructions = "Which component?"
+            type = "choice"
+            drop = ["frontend", "uncertain"]
+            options = [{ label = "scheduler" }, { label = "frontend" }]
+            [[task]]
+            name = "fix"
+            kind = "command"
+            command = "true"
+            depends_on = ["scan", "gate"]
+            over = { task = "scan", field = "items" }
+            max_fanout = 4
+            when = { task = "gate", question = "area", is = ["scheduler"] }
+        "#;
+        let plan = Plan::from_toml_str(src).unwrap().validate().unwrap();
+        let out = render_mermaid(&plan, &BTreeSet::new());
+        let ids: BTreeMap<&str, &str> = [("scan", "t0"), ("gate", "t1"), ("fix", "t2")].into();
+        assert_eq!(
+            mermaid_edge(&out, &ids, "gate", "fix"),
+            r#"t1 ==>|"area: scheduler"| t2"#
+        );
+    }
+
+    #[test]
     fn mermaid_uses_distinct_internal_ids_for_similar_task_names() {
         let src = r#"
             version = 1

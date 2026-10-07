@@ -1010,10 +1010,24 @@ pub fn execute(
                         .get(&node.name)
                         .map(|producers| producers.iter().collect())
                         .unwrap_or_default();
+                    let aligned_deps = per_element_deps(plan, node);
                     let refused = instances
                         .iter()
-                        .filter(|instance| !folded.contains_key(&instance.name))
-                        .find_map(|instance| runner.stage(instance, &producers).err());
+                        .zip(&keys)
+                        .filter(|(instance, _)| !folded.contains_key(&instance.name))
+                        .find_map(|(instance, key)| {
+                            let own: Vec<&Task> = producers
+                                .iter()
+                                .copied()
+                                .filter(|p| {
+                                    aligned_deps.iter().all(|d| {
+                                        !is_instance_of(d, &p.name)
+                                            || p.name == instance_name(d, key)
+                                    })
+                                })
+                                .collect();
+                            runner.stage(instance, &own).err()
+                        });
                     if let Some(why) = refused {
                         let reason = BlockedReason::StagingRefused(why);
                         let r = TaskResult::blocked(&reason);
@@ -1034,7 +1048,7 @@ pub fn execute(
                         .entry(node.name.clone())
                         .or_default()
                         .advance(TaskEvent::FannedOut)?;
-                    let per_element = per_element_deps(plan, node);
+                    let per_element = aligned_deps;
                     let staged: &[Task] = producers_for
                         .get(&node.name)
                         .map(Vec::as_slice)
@@ -1064,11 +1078,16 @@ pub fn execute(
                                         questions,
                                         decider: Decider::Output { task: source },
                                     } => {
+                                        let read = if per_element.contains(source) {
+                                            &inputs
+                                        } else {
+                                            &base
+                                        };
                                         let r = decide_instance(
                                             questions,
                                             source,
                                             key,
-                                            &inputs,
+                                            read,
                                             &per_element,
                                             node.join,
                                         );
@@ -2849,7 +2868,7 @@ fn instance_inputs(
             Some(r) => r,
             None => {
                 absent = TaskResult::undispatched(
-                    TaskStatus::Blocked,
+                    status_for_instance(d, key, results, per_element),
                     format!("{d} has no instance for {key:?}"),
                 );
                 &absent
@@ -10137,5 +10156,106 @@ mod tests {
             output["area"],
             serde_json::json!({"label": "frontend", "confidence": 1.0, "probabilities": {"frontend": 1.0}})
         );
+    }
+
+    #[test]
+    fn a_keyed_field_a_route_also_reads_its_answers_from_is_read_whole_by_the_decider() {
+        let mut reach = reach_gate("prepare");
+        reach.depends_on = vec!["prepare".into()];
+        reach.keyed = vec![crate::plan::ir::OutputRef {
+            task: "prepare".into(),
+            field: crate::plan::ir::OutputField("reachable".into()),
+        }];
+        let mut prepare = task("prepare", &[], "any", true);
+        prepare.emits = crate::plan::ir::Emits::Fields(
+            ["members", "reachable"]
+                .iter()
+                .map(|f| crate::plan::ir::OutputField((*f).into()))
+                .collect(),
+        );
+        let plan = valid(vec![prepare, reach], 10.0);
+        let mut r = ScriptRunner::new();
+        r.outputs.insert(
+            "prepare".into(),
+            serde_json::json!({"members": ["a", "b"], "reachable": {"a": "yes", "b": "no"}}),
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(
+            out.results[&"reach[a]".into()].output.as_ref().unwrap()["reachable"]["label"],
+            "yes"
+        );
+        assert_eq!(
+            out.results[&"reach[b]".into()].output.as_ref().unwrap()["reachable"]["label"],
+            "no"
+        );
+    }
+
+    #[test]
+    fn an_instance_is_staged_with_its_own_aligned_instance_only() {
+        let mut quick = over_members(task("probe", &["prepare"], "any", true));
+        quick.emits_files = vec!["RESULT.json".into()];
+        let plan = valid(
+            vec![
+                task("prepare", &[], "any", true),
+                quick,
+                over_members(task("review", &["prepare", "probe"], "any", true)),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.outputs
+            .insert("prepare".into(), serde_json::json!({"members": ["a", "b"]}));
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(r.staged["review[a]"], ["probe[a]"]);
+        assert_eq!(r.staged["review[b]"], ["probe[b]"]);
+    }
+
+    #[test]
+    fn a_settled_instance_reads_an_untaken_nodes_missing_instance_as_not_taken() {
+        let mut probe = over_members(task("probe", &["prepare", "gate"], "any", false));
+        probe = when(probe, "area", &["frontend"]);
+        let plan = valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&["uncertain"]), true),
+                task("prepare", &[], "any", true),
+                when(probe, "area", &["frontend"]),
+                when(
+                    task("other", &["gate"], "any", false),
+                    "area",
+                    &["scheduler"],
+                ),
+                joining(
+                    over_members(task("tally", &["prepare", "probe"], "any", true)),
+                    Join::Settled,
+                ),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("classify", 1, says_scheduler, 0.0);
+        r.outputs
+            .insert("prepare".into(), serde_json::json!({"members": ["a"]}));
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"probe".into()].status, TaskStatus::NotTaken);
+        assert_eq!(r.entry("tally[a]", "probe")["status"], "not_taken");
     }
 }

@@ -947,6 +947,11 @@ pub enum PlanError {
         declared: Box<FieldType>,
     },
     #[error(
+        "route task {task:?} reads its answers from {source_task:?}, which maps over a different \
+         list; a mapped route's source is either aligned with it or not mapped"
+    )]
+    RouteSourceMappedUnaligned { task: String, source_task: String },
+    #[error(
         "route task {task:?} depends on a task named {FILES_INPUT:?}, the key its declared files arrive under"
     )]
     RouteDependsOnFiles { task: String },
@@ -1456,6 +1461,12 @@ impl Plan {
                         let source_task = &self.tasks[index[source]];
                         let emits = &source_task.emits;
                         let keyed_source = t.over.is_some() && !aligned(t, source_task);
+                        if keyed_source && source_task.over.is_some() {
+                            return Err(PlanError::RouteSourceMappedUnaligned {
+                                task: task(),
+                                source_task: source.0.clone(),
+                            });
+                        }
                         for (id, question) in questions {
                             if keyed_source {
                                 if let Declared::Typed(declared) = emits.field(id.as_str())
@@ -4929,5 +4940,26 @@ emits = ["lines"]
                 }
             );
         }
+    }
+
+    #[test]
+    fn a_mapped_output_route_refuses_a_source_mapped_over_another_list() {
+        let mut gate = mapped(
+            output_route("gate", "facts", &["scheduler", "frontend", "uncertain"]),
+            "prepare",
+            "members",
+        );
+        gate.depends_on.push("prepare".into());
+        let facts = Task {
+            emits: typed(&[("area", FieldType::Object)]),
+            ..mapped(agent("facts", &["prepare"]), "prepare", "others")
+        };
+        assert_eq!(
+            plan(vec![producer(), facts, gate]).validate().unwrap_err(),
+            PlanError::RouteSourceMappedUnaligned {
+                task: "gate".into(),
+                source_task: "facts".into(),
+            }
+        );
     }
 }
