@@ -781,6 +781,14 @@ the external results the task reported, one object per url with `url`, `provider
 task declared `link` or `links`, so every url in it is an http(s) url it validated. A reader
 renders these rather than reading urls out of `output`.
 
+A `plan_admitted` task carries `keyed` (contract 1.16.0), each `producer.field` a mapped task
+narrows to its own item's entry, empty when it declares none. A mapped node's folded output and its
+`task_result` fan-out summary count the instances that settled not taken under `not_taken`; a
+reader that predates it reads the count as zero. A route may declare `over`, and its instances
+settle as `route[K]`, each with the decision for item `K` as its output. A score question's answer
+carries `score`, its expected level position in [0, 1], and `asked_as`, `score` or `choice`, the form
+the decision API was asked in.
+
 A `plan_admitted` task carries `emits_files` (contract 1.14.0): each declared path, as a string,
 or `{path, schema}` when the declaration gave a schema. A field typed by a schema carries
 `{"schema": "<JSON Schema text>"}` as its `type`. A `task_result` event carries `repairs` (contract 1.14.0), one
@@ -807,7 +815,9 @@ a chain, and stays a single name, or empty, otherwise. A reader should accept bo
 An orchestrator tells the engine where models are reached through one JSON document in
 `CRUCIBLE_INFERENCE` (contract 1.7.0), typed as `crucible_contract::inference::ResolvedInference`:
 `{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?}]}`. `role` is `agent` or
-`decision`; `protocol` is `messages`, `chat_completions`, `responses`, or `system_one`. `key_env`
+`decision`; `protocol` is `messages`, `chat_completions`, `responses`, `system_one`, or
+`decisions` (contract 1.15.0, the OpenAI Decisions API, at `https://api.openai.com/v1/decisions`
+when `url` is absent). A `decision` binding speaks `system_one` or `decisions`. `key_env`
 names the variable holding the credential and the document never holds the value. An unknown
 field or version fails the run before any task. A `decision` binding is what a model-decided
 route asks. An `agent` binding is the whole answer for agent turns: its model is the run's model,

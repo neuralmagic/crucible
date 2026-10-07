@@ -48,6 +48,7 @@ pub(crate) fn iteration_template(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                keyed: Vec::new(),
                 when: None,
                 revise: None,
                 timeout: None,

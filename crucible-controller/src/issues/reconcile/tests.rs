@@ -1,17 +1,17 @@
 #![allow(clippy::disallowed_macros)]
 
-#[cfg(feature = "autoresearch")]
-use super::grounded::TierGate;
-#[cfg(feature = "autoresearch")]
-use super::grounded::*;
-#[cfg(feature = "autoresearch")]
-use super::scope::*;
-use super::*;
 use crate::Db;
 use crate::config::Profile;
 use crate::issues::model::{NewIssue, NewScope};
 #[cfg(feature = "autoresearch")]
+use crate::issues::reconcile::grounded::TierGate;
+#[cfg(feature = "autoresearch")]
+use crate::issues::reconcile::grounded::*;
+#[cfg(feature = "autoresearch")]
 use crate::issues::reconcile::lifecycle::*;
+#[cfg(feature = "autoresearch")]
+use crate::issues::reconcile::scope::*;
+use crate::issues::reconcile::*;
 use crate::model::{ParkReason, ParkedBy};
 use crate::runs::completion::*;
 use crate::runs::model::NewRun;
@@ -4517,20 +4517,36 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
     let argv = crate::testing::fixtures::wrapper_of(pod);
     assert!(argv.contains("--harness codex"), "{argv}");
     assert!(argv.contains("--model gpt-5.6-sol"), "{argv}");
-    let key = pod
+    let env = pod
         .spec
         .as_ref()
         .and_then(|s| s.containers.first())
         .and_then(|c| c.env.as_ref())
-        .expect("env")
+        .expect("env");
+    let key = env
         .iter()
-        .find(|v| v.name == "OPENAI_API_KEY")
-        .expect("the provider's key on the turn container")
-        .clone();
+        .find(|v| v.name == "CRUCIBLE_INFERENCE_KEY_AGENT")
+        .expect("the provider's key on the turn container");
     assert!(
         key.value.is_none() && key.value_from.is_some(),
         "the key rides a secretKeyRef, never a plain value"
     );
+    let document = env
+        .iter()
+        .find(|v| v.name == crucible_contract::inference::ENV_INFERENCE)
+        .and_then(|v| v.value.as_deref())
+        .map(crucible_contract::inference::ResolvedInference::parse)
+        .expect("the inference document")
+        .expect("a valid document");
+    let agent = document
+        .binding(crucible_contract::inference::InferenceRole::Agent)
+        .expect("the agent binding");
+    assert_eq!(agent.model, "gpt-5.6-sol");
+    assert_eq!(
+        agent.key_env.as_ref().map(|k| k.as_str()),
+        Some("CRUCIBLE_INFERENCE_KEY_AGENT")
+    );
+    assert!(env.iter().all(|v| v.name != "OPENAI_API_KEY"));
     let secret = created_secrets.lock().expect("lock");
     assert_eq!(
         secret
@@ -4538,7 +4554,7 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
             .expect("the turn's Secret")
             .string_data
             .as_ref()
-            .and_then(|d| d.get("openai_key.OPENAI_API_KEY")),
+            .and_then(|d| d.get("openai_key.CRUCIBLE_INFERENCE_KEY_AGENT")),
         Some(&"value-of-openai_key".to_string())
     );
     Ok(())
@@ -7186,6 +7202,125 @@ async fn a_playbook_launch_with_a_binding_dispatches(pool: PgPool) -> Result<()>
             "the value itself must not reach a dispatched document: {doc}"
         );
     }
+    Ok(())
+}
+
+/// A playbook launch hands its run both models the defaults resolve: the agent it thinks with and
+/// the decision model its route tasks ask, in one inference document, each key under its role's
+/// variable and neither under a name a harness reads.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool) -> Result<()> {
+    use crate::playbooks::providers::{
+        DefaultScope, DispatchDefault, ModelRole, NewProvider, ProviderKind, ProviderSecretRef,
+        WorkloadClass,
+    };
+    use crucible_contract::inference::{InferenceProtocol, InferenceRole, ResolvedInference};
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(dir.path());
+    let cfg = ControllerCfg {
+        deploy_profile: Some(profile),
+        secret_provider: Some(std::sync::Arc::new(
+            crate::secrets::provider::MapProvider::new([(
+                "openai_key".to_string(),
+                SECRET_VALUE.to_string(),
+            )]),
+        )),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    crate::testing::register_inference_key(db.pool(), "user:platform-admin", "openai_key").await?;
+    crate::playbooks::providers::upsert(
+        db.pool(),
+        &NewProvider {
+            owner: crate::authz::model::Principal::platform(),
+            id: "openai",
+            display_name: "OpenAI",
+            kind: ProviderKind::OpenAi,
+            models: &[],
+            default_model: None,
+            secret: Some(&ProviderSecretRef {
+                name: "openai_key".to_string(),
+                owner: crate::authz::model::Principal::parse("user:platform-admin")
+                    .expect("a principal"),
+            }),
+            endpoint: None,
+            harness: None,
+            enabled: true,
+            created_by: "wren",
+        },
+    )
+    .await?;
+    for role in [ModelRole::Agent, ModelRole::Decision] {
+        crate::playbooks::providers::set_default(
+            db.pool(),
+            &DispatchDefault {
+                scope_kind: DefaultScope::Platform,
+                scope_ref: String::new(),
+                workload_class: WorkloadClass::Playbook,
+                role,
+                provider_id: "openai".to_string(),
+                model: None,
+                fallback_provider_id: None,
+                fallback_model: None,
+            },
+        )
+        .await?;
+    }
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-d";
+    seed_registered_playbook(&db, "survey").await;
+    adopt_launch(&db, key, 3.5).await;
+
+    let created = CreatedPods::default();
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::Succeeded,
+        logs: String::new(),
+        created: created.clone(),
+    }));
+    let res = reconcile(&db, &cfg, key).await;
+    crate::runs::workpod::reset_dispatcher();
+    res?;
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Running, "{:?}", issue.parked_reason);
+
+    let pods = created.lock().expect("lock");
+    let pod = pods.first().expect("the run pod");
+    assert!(
+        !serde_json::to_string(pod)?.contains(SECRET_VALUE),
+        "the key never reaches the pod spec"
+    );
+    let env = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .expect("env");
+    let document = env
+        .iter()
+        .find(|v| v.name == crucible_contract::inference::ENV_INFERENCE)
+        .and_then(|v| v.value.as_deref())
+        .map(ResolvedInference::parse)
+        .expect("the inference document")
+        .expect("a valid document");
+    let agent = document.binding(InferenceRole::Agent).expect("agent");
+    let decision = document.binding(InferenceRole::Decision).expect("decision");
+    assert_eq!(
+        (agent.protocol, agent.model.as_str()),
+        (InferenceProtocol::Responses, "gpt-5.6-luna")
+    );
+    assert_eq!(
+        (decision.protocol, decision.model.as_str()),
+        (InferenceProtocol::Decisions, "gpt-6-luna")
+    );
+    for binding in [agent, decision] {
+        let var = binding.key_env.as_ref().expect("a keyed binding").as_str();
+        assert!(
+            env.iter().any(|v| v.name == var && v.value_from.is_some()),
+            "{var} rides a secretKeyRef"
+        );
+    }
+    assert!(env.iter().all(|v| v.name != "OPENAI_API_KEY"));
     Ok(())
 }
 

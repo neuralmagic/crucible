@@ -255,6 +255,7 @@ pub(crate) async fn register_ranker(pool: &sqlx::PgPool, url: &str) -> anyhow::R
             scope_kind: crate::playbooks::providers::DefaultScope::Platform,
             scope_ref: String::new(),
             workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
+            role: crate::playbooks::providers::ModelRole::Agent,
             provider_id: "test-ranker".to_string(),
             model: None,
             fallback_provider_id: None,

@@ -2,7 +2,7 @@
 // kept out of the renderer so the mapping is testable without a flow.
 
 import { formatCost } from './runReport';
-import type { FanOutState, TaskRuntime } from './taskGraph';
+import type { FanOutState, RouteDecision, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
 
 /// A field the wire may carry as absent, null, or a string.
@@ -11,8 +11,10 @@ export function said(value: string | null | undefined): value is string {
 }
 
 /// A mapped task is a fan-out over a producer's field, not the work itself: the agent or command
-/// is what each of its instances runs, and the instances carry that badge.
+/// is what each of its instances runs, and the instances carry that badge. A route decides however
+/// many times it runs, and says so either way.
 export function badgeFor(node: WorkflowGraphNode): string {
+  if (node.kind === 'route') return 'DECIDE';
   if ((node.fanout ?? null) !== null) return 'MAP';
   if (node.kind === 'agent') return 'AGENT';
   if (node.kind === 'command') return 'CMD';
@@ -33,8 +35,12 @@ export function metaFor(node: WorkflowGraphNode): string | null {
   return null;
 }
 
-/// What a task runs, in one line: an agent's knobs, or the command line itself.
+/// What a task runs, in one line: an agent's knobs, the command line itself, or the questions a
+/// route asks.
 export function runsLine(node: WorkflowGraphNode): string | null {
+  if (node.kind === 'route') {
+    return node.questions.length === 0 ? null : node.questions.map((q) => `${q}?`).join(' ');
+  }
   if (node.kind === 'agent') {
     const knobs = [node.model, node.effort].filter(said);
     return knobs.length === 0 ? 'pack defaults' : knobs.join(' · ');
@@ -45,6 +51,26 @@ export function runsLine(node: WorkflowGraphNode): string | null {
 export interface DetailRow {
   label: string;
   value: string;
+}
+
+/// The labels one question resolved to, most frequent first. A single decision reads as its label
+/// alone; a tally of a mapped route's instances carries each label's count.
+export function decisionText(decision: RouteDecision): string {
+  const labels = [...decision.labels].sort(
+    (a, b) => b.count - a.count || a.label.localeCompare(b.label)
+  );
+  const [only, ...rest] = labels;
+  if (only !== undefined && rest.length === 0 && only.count === 1) return only.label;
+  return labels.map((l) => `${l.label} ${l.count}`).join(' · ');
+}
+
+/// One line per question a route resolved: `tier: high`, or `tier: high 80 · low 38`.
+export function decisionLines(decisions: RouteDecision[]): string[] {
+  return decisions.map((d) => `${d.question}: ${decisionText(d)}`);
+}
+
+export function decisionRows(decisions: RouteDecision[]): DetailRow[] {
+  return decisions.map((d) => ({ label: d.question, value: decisionText(d) }));
 }
 
 /// Everything the graph document holds about one task, as the panel lists it.
@@ -68,6 +94,15 @@ export function detailRows(node: WorkflowGraphNode): DetailRow[] {
       value: typeof fanout.max_fanout === 'number' ? String(fanout.max_fanout) : 'uncapped',
     });
   }
+  if (node.questions.length > 0) rows.push({ label: 'questions', value: node.questions.join(' ') });
+  const when = node.when ?? null;
+  if (when !== null) {
+    rows.push({
+      label: 'when',
+      value: `${when.route}.${when.question} in ${when.labels.join('|')}`,
+    });
+  }
+  if (node.keyed.length > 0) rows.push({ label: 'narrows', value: node.keyed.join(' ') });
   if (node.emits.length > 0) rows.push({ label: 'emits', value: node.emits.join(' ') });
   if (node.emits_files.length > 0) {
     rows.push({ label: 'emits files', value: node.emits_files.join(' ') });
@@ -101,18 +136,22 @@ function widthOf(state: FanOutState): number | null {
   return state.items;
 }
 
+/// How an instance status reads in a tally.
+function statusWord(status: string): string {
+  if (status === 'fail') return 'failed';
+  return status.replaceAll('_', ' ');
+}
+
 /// What a run made of a mapped task: how wide it was spread against how the instances that
-/// started ended. A fan-out over nothing says so — zero work asked for is a result, not an
-/// absence.
+/// started ended, not-taken instances apart from failed ones. A fan-out over nothing says so —
+/// zero work asked for is a result, not an absence.
 export function fanoutLine(state: FanOutState): string {
   if (state.items === 0 && state.started === 0) return '0 items';
   const width = widthOf(state);
-  const parts = [
-    width === null
-      ? `${state.started} started · ${state.passed} passed`
-      : `${state.passed} of ${width} passed`,
-  ];
-  for (const other of state.other) parts.push(`${other.count} ${other.status}`);
+  const parts = [width === null ? `${state.started} started` : String(width)];
+  parts.push(`${state.passed} passed`);
+  if (state.notTaken > 0) parts.push(`${state.notTaken} not taken`);
+  for (const other of state.other) parts.push(`${other.count} ${statusWord(other.status)}`);
   if (width !== null && state.started < width) {
     parts.push(`${width - state.started} ${state.running ? 'pending' : 'never started'}`);
   }
@@ -125,6 +164,7 @@ export function fanoutRows(state: FanOutState): DetailRow[] {
     { label: 'items', value: state.items === null ? '—' : String(state.items) },
     { label: 'started', value: String(state.started) },
     { label: 'passed', value: String(state.passed) },
+    ...(state.notTaken > 0 ? [{ label: 'not taken', value: String(state.notTaken) }] : []),
     ...state.other.map((other) => ({ label: other.status, value: String(other.count) })),
   ];
 }

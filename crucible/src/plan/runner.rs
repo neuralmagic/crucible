@@ -85,6 +85,7 @@ impl ShellRunner {
     ) -> Attempt {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
+        crate::inference::withhold_from_task(&mut cmd);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -192,7 +193,7 @@ impl ShellRunner {
             }
             TaskKind::Route {
                 questions,
-                decider: Decider::Model { min_confidence },
+                decider: Decider::Model { min_confidence, .. },
             } => {
                 let inference = match crate::inference::from_process_env() {
                     Ok(inference) => inference,
@@ -205,7 +206,7 @@ impl ShellRunner {
                     );
                 };
                 let endpoint =
-                    match crucible_broker::systemone::Endpoint::from_binding(binding, |name| {
+                    match crucible_broker::decide::Endpoint::from_binding(binding, |name| {
                         std::env::var(name).ok()
                     }) {
                         Ok(endpoint) => endpoint,
@@ -505,6 +506,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -530,6 +532,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -751,6 +754,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -787,6 +791,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -830,6 +835,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -862,6 +868,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -903,6 +910,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -944,6 +952,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -977,6 +986,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -1020,6 +1030,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             history: Some(4),
@@ -1098,6 +1109,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -1131,6 +1143,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,

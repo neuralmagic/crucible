@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ROUTE-FILES"
+title = "Declared files in a route's state"
+kind = "normative"
+status = "active"
+since = "0.2.0"
+
+[content]
+text = """
+A route may declare files, a list of workspace-relative paths. Each path must be declared under emits_files by at least one of the route's dependencies with a JSON Schema ([[RFC-0002:C-TASK-FILES]]); validation must reject a path no dependency declares, a path every declaring dependency declares without a schema, and a path declared only by a mapped dependency that is not aligned with the route under [[RFC-0001:C-ROUTE-EACH]], naming the path.
+
+The state sent to the decision model must carry, under the reserved key "files", one entry per dependency that declares a listed path, under that dependency's name, mapping each such path to the parsed content of the file staged for the route. For a route mapped over a list, an aligned dependency's file is its instance's for the same element. A dependency whose file was not staged for the route contributes no entry for that path. A staged file that does not parse as JSON, as a failed dependency's file under a "settled" join may not, must contribute null in its place, and the engine must record the path on the route's result. A route must not depend on a task named "files", whether or not it declares files, and validation must reject one that does. A route that declares no files sends no "files" key.
+
+An output-decided route reads its answers from its source's JSON output and must reject files at compile time, because it asks no model."""
