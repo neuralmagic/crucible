@@ -527,6 +527,7 @@ async fn register_ranker(db: &Db, url: &str) -> Result<()> {
             scope_kind: reg::DefaultScope::Platform,
             scope_ref: String::new(),
             workload_class: reg::WorkloadClass::Autoresearch,
+            role: reg::ModelRole::Agent,
             provider_id: "e2e-ranker".to_string(),
             model: None,
             fallback_provider_id: None,

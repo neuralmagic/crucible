@@ -175,7 +175,7 @@ async fn launch_approved_run(
             launcher: crate::authz::model::Principals::default(),
             revision: crate::secrets::launch::OwnedRevision::UNPINNED,
             provider: cfg.secret_provider.clone(),
-            inference_provider: dispatch.map(|d| d.provider),
+            inference: dispatch.iter().map(|d| d.inference()).collect(),
             exposure: scope.exposure.clone(),
         }),
     )
