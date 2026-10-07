@@ -1018,6 +1018,14 @@ pub fn secrets(list: &[dto::Secret]) -> String {
     )
 }
 
+pub fn secret_created(s: &dto::Secret) -> String {
+    format!(
+        "registered {} as {}\n  kind: {}  visibility: {}  mode: {}  owner: {}\n\
+         bind it: crux secret-bind {} --playbook <id> --env <VAR>\n",
+        s.name, s.id, s.kind, s.visibility, s.mode, s.owner, s.id
+    )
+}
+
 pub fn secret_bound(b: &dto::SecretBinding) -> String {
     format!(
         "bound {} to {}/{}: accepted\n  as {} -> {} {}\n  binding: {}\nactor: {}\n",

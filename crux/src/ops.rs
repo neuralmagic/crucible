@@ -571,6 +571,86 @@ pub async fn secrets(c: &Client, as_json: bool) -> Result<String> {
     Ok(render::secrets(&list))
 }
 
+/// What a registered value is, which decides how a binding may project it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum SecretKind {
+    Opaque,
+    File,
+    RegistryAuthfile,
+    Kubeconfig,
+    InferenceApiKey,
+}
+
+impl SecretKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Opaque => "opaque",
+            Self::File => "file",
+            Self::RegistryAuthfile => "registry_authfile",
+            Self::Kubeconfig => "kubeconfig",
+            Self::InferenceApiKey => "inference_api_key",
+        }
+    }
+}
+
+/// Whether the agent inside the sandbox may see the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum Visibility {
+    BrokerOnly,
+    AgentVisible,
+}
+
+impl Visibility {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::BrokerOnly => "broker_only",
+            Self::AgentVisible => "agent_visible",
+        }
+    }
+}
+
+/// A secret's bytes. No `Debug` and no `Display`, so it cannot be formatted into output or a log.
+pub struct SecretValue(String);
+
+impl SecretValue {
+    pub fn new(raw: String) -> Result<Self> {
+        let value = raw.trim_end_matches(['\r', '\n']).to_string();
+        if value.trim().is_empty() {
+            bail!("the secret value on stdin is empty");
+        }
+        Ok(Self(value))
+    }
+}
+
+/// What registering a secret sends. `visibility` and `owner` absent take the controller's
+/// defaults: `broker_only`, and the caller.
+pub struct SecretCreate<'a> {
+    pub name: &'a str,
+    pub kind: SecretKind,
+    pub visibility: Option<Visibility>,
+    pub owner: Option<&'a str>,
+    pub value: SecretValue,
+}
+
+pub async fn secret_create(c: &Client, create: SecretCreate<'_>, as_json: bool) -> Result<String> {
+    let mut body = serde_json::json!({
+        "name": create.name,
+        "kind": create.kind.as_str(),
+        "value": create.value.0,
+    });
+    put_trimmed(
+        &mut body,
+        "visibility",
+        create.visibility.map(Visibility::as_str),
+    );
+    put_trimmed(&mut body, "owner", create.owner);
+    if as_json {
+        return json(&c.create_secret::<Value>(&body).await?);
+    }
+    let created: dto::Secret = c.create_secret(&body).await?;
+    Ok(render::secret_created(&created))
+}
+
 /// What a binding says: which secret, at which scope, reaching the run as what.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecretBind<'a> {
@@ -1969,6 +2049,133 @@ mod tests {
             "each line exactly once"
         );
         assert_eq!(trailer, "-- run r1 is finished, 3 lines seen\n");
+    }
+
+    #[test]
+    fn a_secret_value_drops_only_the_trailing_newline() {
+        assert_eq!(
+            SecretValue::new("ghp_abc\n".into()).expect("value").0,
+            "ghp_abc"
+        );
+        assert_eq!(
+            SecretValue::new("ghp_abc\r\n".into()).expect("value").0,
+            "ghp_abc"
+        );
+        assert_eq!(
+            SecretValue::new("  a b  \n\n".into()).expect("value").0,
+            "  a b  ",
+            "inner and leading whitespace is part of the value"
+        );
+        assert!(SecretValue::new(String::new()).is_err());
+        assert!(SecretValue::new(" \n".into()).is_err());
+    }
+
+    #[test]
+    fn secret_enums_send_the_controller_spelling() {
+        assert_eq!(SecretKind::Opaque.as_str(), "opaque");
+        assert_eq!(SecretKind::File.as_str(), "file");
+        assert_eq!(SecretKind::RegistryAuthfile.as_str(), "registry_authfile");
+        assert_eq!(SecretKind::Kubeconfig.as_str(), "kubeconfig");
+        assert_eq!(SecretKind::InferenceApiKey.as_str(), "inference_api_key");
+        assert_eq!(Visibility::BrokerOnly.as_str(), "broker_only");
+        assert_eq!(Visibility::AgentVisible.as_str(), "agent_visible");
+    }
+
+    /// A create sends the name, kind, and value, adds visibility and owner only when given, and
+    /// prints the metadata the controller answered with, never the value.
+    #[tokio::test]
+    async fn secret_create_posts_the_value_and_prints_only_metadata() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        async fn create(body: String) -> (StatusCode, String) {
+            let sent: Value = serde_json::from_str(&body).expect("a JSON body");
+            let expected = if sent["name"] == "bare" {
+                serde_json::json!({ "name": "bare", "kind": "opaque", "value": "ghp_secret" })
+            } else {
+                serde_json::json!({
+                    "name": "bugwatch-label-token",
+                    "kind": "opaque",
+                    "value": "ghp_secret",
+                    "visibility": "broker_only",
+                    "owner": "user:wynn",
+                })
+            };
+            assert_eq!(sent, expected, "exactly the fields asked for");
+            (
+                StatusCode::CREATED,
+                serde_json::json!({
+                    "id": "01b0",
+                    "name": sent["name"],
+                    "owner": "user:wynn",
+                    "kind": "opaque",
+                    "visibility": "broker_only",
+                    "consumer": "run",
+                    "mode": "managed",
+                    "vault_path": "secret/x",
+                    "current_version": 1,
+                    "created_by": "wynn",
+                    "created_at": "2026-09-29T16:00:00Z",
+                    "updated_at": "2026-09-29T16:00:00Z"
+                })
+                .to_string(),
+            )
+        }
+
+        let app = axum::Router::new()
+            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/api/secrets", post(create));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let client = test_client(&url);
+
+        let printed = secret_create(
+            &client,
+            SecretCreate {
+                name: "bugwatch-label-token",
+                kind: SecretKind::Opaque,
+                visibility: Some(Visibility::BrokerOnly),
+                owner: Some(" user:wynn "),
+                value: SecretValue::new("ghp_secret\n".into()).expect("value"),
+            },
+            false,
+        )
+        .await
+        .expect("create");
+        assert!(
+            printed.starts_with("registered bugwatch-label-token as 01b0\n"),
+            "{printed}"
+        );
+        assert!(printed.contains("visibility: broker_only"), "{printed}");
+        assert!(printed.contains("crux secret-bind 01b0"), "{printed}");
+        assert!(
+            !printed.contains("ghp_secret"),
+            "never the value: {printed}"
+        );
+        assert!(
+            !printed.contains("secret/x"),
+            "never the vault path: {printed}"
+        );
+
+        let bare = secret_create(
+            &client,
+            SecretCreate {
+                name: "bare",
+                kind: SecretKind::Opaque,
+                visibility: None,
+                owner: None,
+                value: SecretValue::new("ghp_secret".into()).expect("value"),
+            },
+            true,
+        )
+        .await
+        .expect("create");
+        assert!(bare.contains("\"id\": \"01b0\""), "{bare}");
     }
 
     fn test_client(url: &str) -> Client {
