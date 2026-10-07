@@ -465,6 +465,8 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
     }
   }
   const edges: WorkflowGraphEdge[] = [];
+  // An instance a per-element edge feeds hangs off that edge, not off its own deck.
+  const pairedTargets = new Set<string>();
   for (const edge of transitiveReduction(declaredEdges)) {
     // Once a mapped task has concrete runtime instances, those instances are the leaves of its
     // subgraph. Draw downstream work after them instead of shortcutting directly from the
@@ -472,9 +474,12 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
     const producers = instances.get(edge.from) ?? [edge.from];
     // An aligned edge whose consumer has expanded too is read per element: each instance pairs
     // with its counterpart, and the deck-to-deck edge keeps what the consumer reads off it.
-    const paired = edge.aligned ? pairedInstances(edge, producers, latest) : [];
+    const paired = edge.aligned
+      ? pairedInstances(edge, producers, latest, source.decisions)
+      : [];
     if (paired.length > 0) {
       edges.push(edge, ...paired);
+      for (const pair of paired) pairedTargets.add(pair.to);
       continue;
     }
     for (const producer of producers) {
@@ -496,7 +501,7 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
         questions: questionsOf(name, source.decisions),
       }),
     );
-    if (from !== null && mapped !== undefined) {
+    if (from !== null && mapped !== undefined && !pairedTargets.has(name)) {
       edges.push(plainEdge(from, name, mapped.required));
     }
   }
@@ -580,16 +585,34 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
 }
 
 /// The per-element edges under an aligned edge: `producer[k]` to `consumer[k]` for every key both
-/// ends reported an instance for.
+/// ends reported an instance for. Under a `when`, each carries the answer instance k's route gave.
 function pairedInstances(
   edge: WorkflowGraphEdge,
   producers: string[],
   reported: ReadonlyMap<string, TaskResult>,
+  decisions: RouteDecision[],
 ): WorkflowGraphEdge[] {
+  const when = edge.when ?? null;
   return producers.flatMap((producer) => {
     const consumer = `${edge.to}${producer.slice(edge.from.length)}`;
     if (producer === edge.from || !reported.has(consumer)) return [];
-    return [{ ...edge, from: producer, to: consumer, when: null, keyed: [] }];
+    const answer =
+      when === null
+        ? undefined
+        : decisions.find((d) => d.task === producer && d.question === when.question)?.labels[0]
+            ?.label;
+    return [
+      {
+        ...edge,
+        from: producer,
+        to: consumer,
+        when:
+          when === null || answer === undefined
+            ? null
+            : { route: producer, question: when.question, labels: [answer] },
+        keyed: [],
+      },
+    ];
   });
 }
 

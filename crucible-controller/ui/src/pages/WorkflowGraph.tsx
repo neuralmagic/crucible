@@ -418,10 +418,13 @@ function PlanEdge({ id }: EdgeProps) {
   const dim = view.lit !== null && !lit;
   const tone = lit ? 'var(--ink)' : 'var(--ink-3)';
   const width = lit ? 1.6 : 1;
+  const untaken = view.runtime.get(laid.to)?.status === 'not_taken';
+  const fade = dim ? 0.15 : untaken ? 0.45 : 1;
+  const double = laid.aligned && !untaken;
 
   return (
     <>
-      {laid.aligned && (
+      {double && (
         <path
           d={laid.path}
           data-aligned-edge={id}
@@ -430,7 +433,7 @@ function PlanEdge({ id }: EdgeProps) {
             stroke: tone,
             strokeWidth: width * 2 + 2.5,
             strokeDasharray: laid.required ? undefined : '3 3',
-            opacity: dim ? 0.15 : 1,
+            opacity: fade,
           }}
         />
       )}
@@ -439,10 +442,10 @@ function PlanEdge({ id }: EdgeProps) {
         path={laid.path}
         markerEnd={`url(#${lit ? markers.arrowLit : markers.arrow})`}
         style={{
-          stroke: laid.aligned ? 'var(--paper)' : tone,
-          strokeWidth: laid.aligned ? 2.5 : width,
-          strokeDasharray: laid.required || laid.aligned ? undefined : '3 3',
-          opacity: dim ? 0.15 : 1,
+          stroke: double ? 'var(--paper)' : tone,
+          strokeWidth: double ? 2.5 : width,
+          strokeDasharray: untaken ? '2 4' : laid.required || double ? undefined : '3 3',
+          opacity: fade,
         }}
       />
       {(laid.label !== null || laid.reads !== null) && (
@@ -452,7 +455,7 @@ function PlanEdge({ id }: EdgeProps) {
             className="absolute flex gap-1 bg-paper px-1 font-mono text-micro text-ink-2"
             style={{
               transform: `translate(-50%, -50%) translate(${laid.labelX}px, ${laid.labelY}px)`,
-              opacity: dim ? 0.15 : 1,
+              opacity: fade,
             }}
           >
             {laid.label !== null && <span className="tracking-label uppercase">{laid.label}</span>}

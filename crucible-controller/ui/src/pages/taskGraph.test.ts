@@ -631,23 +631,48 @@ describe('a routed plan a run folds to', () => {
     expect(planEdge(fix, roll)).toMatchObject({ aligned: false });
   });
 
-  /// Instance k of fix reads instance k of triage, so once both have expanded the edges pair up
-  /// and the deck-to-deck edge alone carries the when.
+  /// Instance k of fix reads instance k of triage, so once both have expanded the edges pair up:
+  /// the deck-to-deck edge carries the when, and each paired edge the answer that decided it.
   it('pairs the instances of an aligned edge once both ends have expanded', () => {
     const ran = [
       result(0, 'triage[a]', 'pass'),
       result(0, 'triage[b]', 'pass'),
       result(0, 'fix[a]', 'pass'),
     ];
-    const edges = fold(plan, ran).graph.edges;
+    const edges = fold(plan, ran, [], [], false, decisions).graph.edges;
     const between = (from: string, to: string) => edges.filter((e) => e.from === from && e.to === to);
     expect(between('triage', 'fix')).toHaveLength(1);
-    expect(between('triage', 'fix')[0]?.when?.question).toBe('tier');
+    expect(between('triage', 'fix')[0]?.when?.labels).toEqual(['high', 'low']);
     expect(between('triage[a]', 'fix[a]')).toEqual([
-      { from: 'triage[a]', to: 'fix[a]', join: 'all', required: true, when: null, aligned: true, keyed: [] },
+      {
+        from: 'triage[a]',
+        to: 'fix[a]',
+        join: 'all',
+        required: true,
+        when: { route: 'triage[a]', question: 'tier', labels: ['high'] },
+        aligned: true,
+        keyed: [],
+      },
     ]);
     expect(edges.filter((e) => e.from === 'triage[b]' && e.to.startsWith('fix'))).toEqual([]);
     expect(between('triage[a]', 'fix')).toEqual([]);
+  });
+
+  /// fix[a] already has one way in, from triage[a]; a second from its own deck would draw two
+  /// arrows into it for one dependency.
+  it('hangs a paired instance off its counterpart, not off its own deck', () => {
+    const ran = [result(0, 'triage[a]', 'pass'), result(0, 'fix[a]', 'pass')];
+    const edges = fold(plan, ran).graph.edges;
+    expect(edges.filter((e) => e.to === 'fix[a]').map((e) => e.from)).toEqual(['triage[a]']);
+    expect(edges.filter((e) => e.to === 'triage[a]').map((e) => e.from)).toEqual(['triage']);
+  });
+
+  it('leaves a paired edge unlabelled when its route recorded no answer for the question', () => {
+    const ran = [result(0, 'triage[b]', 'pass'), result(0, 'fix[b]', 'not_taken')];
+    const edge = fold(plan, ran, [], [], false, decisions).graph.edges.find(
+      (e) => e.from === 'triage[b]' && e.to === 'fix[b]',
+    );
+    expect(edge?.when).toBeNull();
   });
 
   it('runs every instance into an aligned consumer that has not expanded yet', () => {
