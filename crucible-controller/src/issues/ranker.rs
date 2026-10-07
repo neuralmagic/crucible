@@ -26,8 +26,8 @@
 //!   a Chat Completions or Responses endpoint is registered the way `OPENAI_BASE_URL` is read (with
 //!   `/v1`), so it is used as given.
 //!
-//! A provider's key is read the way a pod's is ([`crate::secrets::deliver::provider_delivery`]),
-//! through the deployment's secret reader.
+//! A provider's key is read the way a pod's is ([`crate::secrets::deliver::model_key`]), through
+//! the deployment's secret reader.
 //!
 //! With nothing registered the ranker keeps the deployment's ambient Vertex: the model in
 //! `CONTROLLER_RANKER_MODEL` (a genai model string, default `vertex::claude-sonnet-5`) on ADC, so an
@@ -341,34 +341,28 @@ fn keyed_route(dispatch: &ResolvedDispatch) -> Result<Option<(AdapterKind, Strin
                 InferenceProtocol::Responses => {
                     (AdapterKind::OpenAIResp, custom_base(&endpoint.url))
                 }
+                InferenceProtocol::SystemOne | InferenceProtocol::Decisions => bail!(
+                    "custom provider {} speaks {}, which ranks nothing",
+                    provider.id,
+                    endpoint.protocol.as_str()
+                ),
             }
         }
     }))
 }
 
-/// The key a provider's registered secret projects under its key variable, read through the same
-/// path a pod's delivery takes. Empty for a provider that names no secret (an unauthenticated
-/// in-cluster endpoint ignores the header).
+/// The key a provider's registered secret holds, read through the same path a pod's delivery
+/// takes. Empty for a provider that names no secret (an unauthenticated in-cluster endpoint ignores
+/// the header).
 async fn provider_key(db: &Db, cfg: &ControllerCfg, dispatch: &ResolvedDispatch) -> Result<String> {
-    let provider = &dispatch.provider;
-    let delivery = crate::secrets::deliver::provider_delivery(
+    let key = crate::secrets::deliver::model_key(
         db.pool(),
         cfg.secret_provider.as_ref(),
-        provider,
+        &dispatch.inference(),
     )
     .await?
     .map_err(|refusal| anyhow::anyhow!("{refusal}"))?;
-    let Some(var) = provider.api_key_env() else {
-        return Ok(String::new());
-    };
-    let Some((_, secret_key)) = delivery.env.iter().find(|(v, _)| v == var) else {
-        return Ok(String::new());
-    };
-    delivery
-        .data
-        .get(secret_key)
-        .cloned()
-        .with_context(|| format!("provider {} delivery has no value for {var}", provider.id))
+    Ok(key.unwrap_or_default())
 }
 
 async fn candidate(db: &Db, cfg: &ControllerCfg, dispatch: &ResolvedDispatch) -> Result<Candidate> {
@@ -970,6 +964,7 @@ mod tests {
                 scope_kind: crate::playbooks::providers::DefaultScope::Platform,
                 scope_ref: String::new(),
                 workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
+                role: crate::playbooks::providers::ModelRole::Agent,
                 provider_id: primary.to_string(),
                 model: None,
                 fallback_provider_id: fallback.map(str::to_string),

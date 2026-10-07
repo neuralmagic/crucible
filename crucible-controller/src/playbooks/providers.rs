@@ -1,14 +1,16 @@
-//! The inference-provider registry, and the chain that turns a dispatch into a harness + model.
+//! The inference-provider registry, and the chain that turns a dispatch into the models it reaches.
 //!
-//! A provider is one place work can be sent to think: a kind (which harness runs, and which
-//! environment variable the key lands in), a curated model list, and optionally the name of a
+//! A provider is one place work can be sent to think: a kind (which service, and so which harness
+//! runs and which roles it can serve), a curated model list, and optionally the name of a
 //! secrets-registry entry that pays for it. A `custom` provider also names the endpoint it is
 //! reached at and the API it speaks, the non-secret half OpenShell keeps in a provider's `config`
 //! map. Nothing here holds a credential — Postgres holds the reference, Vault holds the bytes.
 //!
-//! Resolution is a four-step chain, tried in order and answered by the first step that has an
-//! answer: the override the launch pinned on its row, the default for the domain it belongs to, the
-//! platform default for its workload class, and finally nothing at all. Nothing is a real answer:
+//! A run reaches up to one model per [`ModelRole`]: the one its agent turns think with, and the
+//! one its route tasks ask. Each role resolves on its own, through a four-step chain tried in order
+//! and answered by the first step that has an answer: the override the launch pinned on its row
+//! (agent only), the default for the domain it belongs to, the platform default for its workload
+//! class, and finally nothing at all. Nothing is a real answer:
 //! it means render as before providers existed, letting the pack manifest's `[agent]` table decide.
 //! An empty registry therefore changes no dispatch.
 //!
@@ -21,6 +23,9 @@
 use crate::wire_enum::wire_enum;
 use anyhow::{Context, Result, bail};
 use crucible::manifest::Harness;
+use crucible_contract::inference::{
+    EnvName, InferenceBinding, InferenceProtocol as WireProtocol, InferenceRole, ResolvedInference,
+};
 use sqlx::{PgExecutor, PgPool, Row};
 
 /// Which service a provider talks to. The kind, not the display name, decides behaviour: it picks
@@ -97,7 +102,7 @@ pub fn harness_name(harness: Harness) -> &'static str {
 /// The harness a registration runs when it names none: the kind's, else its protocol's.
 pub fn default_harness(kind: ProviderKind, protocol: Option<InferenceProtocol>) -> Harness {
     kind.default_harness()
-        .or_else(|| protocol.map(InferenceProtocol::default_harness))
+        .or_else(|| protocol.and_then(InferenceProtocol::default_harness))
         .unwrap_or_default()
 }
 
@@ -112,9 +117,9 @@ pub fn allowed_harnesses(
     }
 }
 
-/// The API a custom provider speaks. Each protocol reads its key and base URL from one pair of
-/// environment variables and has a default harness (plus the others that can speak it), so the
-/// protocol is what a custom registration contributes in place of a fixed kind.
+/// The API a custom provider speaks. An agent protocol has a default harness (plus the others that
+/// can speak it); a decision protocol runs no harness and serves route tasks. The protocol is what
+/// a custom registration contributes in place of a fixed kind.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]
@@ -127,63 +132,108 @@ pub enum InferenceProtocol {
     ChatCompletions,
     /// The OpenAI Responses API (harmony); Codex speaks it over its `responses` wire API, pi too.
     Responses,
+    /// The System One decision API, which a route task asks.
+    SystemOne,
+    /// OpenAI's Decisions API, which a route task asks.
+    Decisions,
 }
 
 wire_enum!(InferenceProtocol, "inference protocol", both, {
     InferenceProtocol::Messages => "messages",
     InferenceProtocol::ChatCompletions => "chat_completions",
     InferenceProtocol::Responses => "responses",
+    InferenceProtocol::SystemOne => "system_one",
+    InferenceProtocol::Decisions => "decisions",
 });
 
 impl InferenceProtocol {
-    /// The harness that serves the protocol when a registration names none.
-    pub fn default_harness(self) -> Harness {
-        match self {
-            InferenceProtocol::Messages => Harness::Claude,
-            InferenceProtocol::ChatCompletions => Harness::OpenCode,
-            InferenceProtocol::Responses => Harness::Codex,
-        }
+    /// The harness that serves the protocol when a registration names none; `None` for a decision
+    /// protocol, which runs no harness.
+    pub fn default_harness(self) -> Option<Harness> {
+        self.harnesses().first().copied()
     }
 
-    /// Every harness that speaks the protocol, the default first.
+    /// Every harness that speaks the protocol, the default first. Empty for a decision protocol.
     pub fn harnesses(self) -> &'static [Harness] {
         match self {
             InferenceProtocol::Messages => &[Harness::Claude, Harness::OpenCode, Harness::Pi],
             InferenceProtocol::ChatCompletions => &[Harness::OpenCode, Harness::Pi],
             InferenceProtocol::Responses => &[Harness::Codex, Harness::Pi],
+            InferenceProtocol::SystemOne | InferenceProtocol::Decisions => &[],
         }
     }
 
-    pub fn api_key_env(self) -> &'static str {
+    pub fn serves(self, role: ModelRole) -> bool {
+        self.wire().serves(role.inference())
+    }
+
+    /// The protocol as the engine's inference document spells it.
+    pub fn wire(self) -> WireProtocol {
         match self {
-            InferenceProtocol::Messages => "ANTHROPIC_API_KEY",
-            InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => "OPENAI_API_KEY",
+            InferenceProtocol::Messages => WireProtocol::Messages,
+            InferenceProtocol::ChatCompletions => WireProtocol::ChatCompletions,
+            InferenceProtocol::Responses => WireProtocol::Responses,
+            InferenceProtocol::SystemOne => WireProtocol::SystemOne,
+            InferenceProtocol::Decisions => WireProtocol::Decisions,
         }
     }
 
-    /// The environment variable the harness reads its base URL from: OpenShell's config key for
-    /// the same provider type, so a route configured there and one configured here agree.
-    pub fn base_url_env(self) -> &'static str {
+    /// The entry a credential map keys this protocol's key under: the variable a client of the
+    /// protocol reads it from by convention. `None` for System One, whose secret is one bare key.
+    pub fn credential_key(self) -> Option<&'static str> {
         match self {
-            InferenceProtocol::Messages => "ANTHROPIC_BASE_URL",
-            InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => "OPENAI_BASE_URL",
-        }
-    }
-
-    /// The engine's wire-API token for an OpenAI-speaking protocol (Codex's `wire_api`
-    /// spelling, which opencode and pi read too), or `None` for Messages.
-    pub fn codex_wire_api(self) -> Option<&'static str> {
-        match self {
-            InferenceProtocol::Messages => None,
-            InferenceProtocol::ChatCompletions => Some("chat"),
-            InferenceProtocol::Responses => Some("responses"),
+            InferenceProtocol::Messages => Some("ANTHROPIC_API_KEY"),
+            InferenceProtocol::ChatCompletions
+            | InferenceProtocol::Responses
+            | InferenceProtocol::Decisions => Some("OPENAI_API_KEY"),
+            InferenceProtocol::SystemOne => None,
         }
     }
 }
 
-/// The environment variable a custom provider's Codex wire API travels in. Read by the linked
-/// engine when it renders Codex's `config.toml`.
-pub const WIRE_API_ENV: &str = "CRUCIBLE_INFERENCE_WIRE_API";
+/// What a model is reached for: the agent turns of a run, or its route tasks.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "snake_case")]
+#[derive(strum::EnumIter)]
+pub enum ModelRole {
+    Agent,
+    Decision,
+}
+
+wire_enum!(ModelRole, "inference role", both, {
+    ModelRole::Agent => "agent",
+    ModelRole::Decision => "decision",
+});
+
+impl ModelRole {
+    pub fn inference(self) -> InferenceRole {
+        match self {
+            ModelRole::Agent => InferenceRole::Agent,
+            ModelRole::Decision => InferenceRole::Decision,
+        }
+    }
+
+    /// The variable this role's credential is delivered under. The inference document names it as
+    /// the binding's `key_env`; no harness reads it, so a decision key never lands where an agent
+    /// sandbox would pick it up.
+    pub fn key_env(self) -> &'static str {
+        match self {
+            ModelRole::Agent => "CRUCIBLE_INFERENCE_KEY_AGENT",
+            ModelRole::Decision => "CRUCIBLE_INFERENCE_KEY_DECISION",
+        }
+    }
+}
 
 /// Where a custom provider is reached, and what it speaks there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,6 +301,15 @@ impl ProviderKind {
             ProviderKind::Anthropic | ProviderKind::Vertex => Some("claude-opus-4-6"),
             ProviderKind::OpenAi => Some("gpt-5.6-luna"),
             ProviderKind::Custom => None,
+        }
+    }
+
+    /// The model a decision default of this kind asks when it names none, or `None` for a kind
+    /// whose decision model is its own `default_model`.
+    pub fn default_decision_model(self) -> Option<&'static str> {
+        match self {
+            ProviderKind::OpenAi => Some("gpt-6-luna"),
+            ProviderKind::Anthropic | ProviderKind::Vertex | ProviderKind::Custom => None,
         }
     }
 }
@@ -352,12 +411,76 @@ pub struct ModelProvider {
 }
 
 impl ModelProvider {
-    /// The model this provider runs when the caller named none.
-    pub fn model_or_default(&self, requested: Option<&str>) -> String {
+    /// The model this provider is asked for `role` when the caller named `requested`, or none.
+    pub fn model_for(&self, role: ModelRole, requested: Option<&str>) -> String {
         match requested.map(str::trim).filter(|m| !m.is_empty()) {
             Some(m) => m.to_string(),
-            None => self.default_model.clone(),
+            None => match role {
+                ModelRole::Agent => self.default_model.clone(),
+                ModelRole::Decision => self
+                    .kind
+                    .default_decision_model()
+                    .map_or_else(|| self.default_model.clone(), str::to_owned),
+            },
         }
+    }
+
+    /// The API this provider is asked through for `role`, or `None` when it cannot serve it.
+    pub fn protocol_for(&self, role: ModelRole) -> Option<InferenceProtocol> {
+        match (self.kind, role, self.endpoint.as_ref()) {
+            (ProviderKind::Anthropic | ProviderKind::Vertex, ModelRole::Agent, _) => {
+                Some(InferenceProtocol::Messages)
+            }
+            (ProviderKind::OpenAi, ModelRole::Agent, _) => Some(InferenceProtocol::Responses),
+            (ProviderKind::OpenAi, ModelRole::Decision, _) => Some(InferenceProtocol::Decisions),
+            (ProviderKind::Custom, _, Some(endpoint)) => {
+                endpoint.protocol.serves(role).then_some(endpoint.protocol)
+            }
+            (ProviderKind::Anthropic | ProviderKind::Vertex, ModelRole::Decision, _)
+            | (ProviderKind::Custom, _, None) => None,
+        }
+    }
+
+    pub fn serves(&self, role: ModelRole) -> bool {
+        self.protocol_for(role).is_some()
+    }
+
+    /// Every role this provider can serve, agent first.
+    pub fn roles(&self) -> Vec<ModelRole> {
+        [ModelRole::Agent, ModelRole::Decision]
+            .into_iter()
+            .filter(|r| self.serves(*r))
+            .collect()
+    }
+
+    /// Whether a registered key has anywhere to go. Vertex runs on the deploy profile's ambient
+    /// application-default credentials, so a Vertex provider carrying a secret is a
+    /// misconfiguration rather than a key with nowhere to go.
+    pub fn takes_secret(&self) -> bool {
+        self.kind != ProviderKind::Vertex
+    }
+
+    /// This provider as the engine's binding for `role`, asking `model`. A provider that spends a
+    /// secret names the role's key variable; one that does not authenticates ambiently.
+    pub fn binding(&self, role: ModelRole, model: &str) -> Result<InferenceBinding> {
+        let Some(protocol) = self.protocol_for(role) else {
+            bail!(
+                "model provider {:?} cannot serve the {} role",
+                self.id,
+                role.as_str()
+            );
+        };
+        let key_env = match self.secret {
+            None => None,
+            Some(_) => Some(EnvName::new(role.key_env())?),
+        };
+        Ok(InferenceBinding {
+            role: role.inference(),
+            protocol: protocol.wire(),
+            url: self.endpoint.as_ref().map(|e| e.url.clone()),
+            model: model.to_owned(),
+            key_env,
+        })
     }
 
     /// The agent harness this provider's models run under: the one the registration named, else
@@ -367,36 +490,6 @@ impl ModelProvider {
         self.harness.unwrap_or_else(|| {
             default_harness(self.kind, self.endpoint.as_ref().map(|e| e.protocol))
         })
-    }
-
-    /// The environment variable a registered key is projected as, or `None` for a provider that
-    /// authenticates some other way. Vertex is the `None`: it runs on the deploy profile's ambient
-    /// application-default credentials, so a Vertex provider carrying a secret is a
-    /// misconfiguration rather than a key with nowhere to go.
-    pub fn api_key_env(&self) -> Option<&'static str> {
-        match (self.kind, self.endpoint.as_ref()) {
-            (ProviderKind::Anthropic, _) => Some("ANTHROPIC_API_KEY"),
-            (ProviderKind::OpenAi, _) => Some("OPENAI_API_KEY"),
-            (ProviderKind::Vertex, _) => None,
-            (ProviderKind::Custom, endpoint) => endpoint.map(|e| e.protocol.api_key_env()),
-        }
-    }
-
-    /// The non-secret environment a pod running against this provider carries: the base URL under
-    /// the name the harness reads, and the Codex wire API when the protocol has one. Empty for a
-    /// provider reached at its service's own address.
-    pub fn config_env(&self) -> Vec<(String, String)> {
-        let Some(endpoint) = self.endpoint.as_ref() else {
-            return Vec::new();
-        };
-        let mut env = vec![(
-            endpoint.protocol.base_url_env().to_string(),
-            endpoint.url.clone(),
-        )];
-        if let Some(wire) = endpoint.protocol.codex_wire_api() {
-            env.push((WIRE_API_ENV.to_string(), wire.to_string()));
-        }
-        env
     }
 }
 
@@ -430,13 +523,14 @@ pub struct ProviderSecretRef {
     pub owner: crate::authz::model::Principal,
 }
 
-/// One `dispatch_defaults` row: which provider a scope's dispatches of one class take.
+/// One `dispatch_defaults` row: which provider a scope's dispatches of one class take for one role.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchDefault {
     pub scope_kind: DefaultScope,
     /// The domain name, or empty for the platform-wide row.
     pub scope_ref: String,
     pub workload_class: WorkloadClass,
+    pub role: ModelRole,
     pub provider_id: String,
     /// `None` takes the provider's own `default_model`.
     pub model: Option<String>,
@@ -467,8 +561,45 @@ impl<'a> DispatchOverride<'a> {
     }
 }
 
-/// What a dispatch resolved to: the provider that will serve it, the model it will ask for, and the
-/// harness the pod renders with.
+/// What one role of a dispatch resolved to: the provider that serves it and the model it asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    pub role: ModelRole,
+    pub provider: ModelProvider,
+    pub model: String,
+}
+
+impl ResolvedModel {
+    fn new(role: ModelRole, provider: ModelProvider, model: Option<&str>) -> ResolvedModel {
+        let model = provider.model_for(role, model);
+        ResolvedModel {
+            role,
+            provider,
+            model,
+        }
+    }
+
+    /// This model as the engine's binding.
+    pub fn binding(&self) -> Result<InferenceBinding> {
+        self.provider.binding(self.role, &self.model)
+    }
+}
+
+/// The inference document a dispatch hands the engine: one binding per resolved role.
+pub fn inference_document(models: &[ResolvedModel]) -> Result<ResolvedInference> {
+    let document = ResolvedInference {
+        bindings: models
+            .iter()
+            .map(ResolvedModel::binding)
+            .collect::<Result<_>>()?,
+        ..ResolvedInference::default()
+    };
+    document.validate()?;
+    Ok(document)
+}
+
+/// What an agent dispatch resolved to: the provider that will serve it, the model it will ask for,
+/// and the harness the pod renders with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedDispatch {
     pub provider: ModelProvider,
@@ -499,12 +630,22 @@ impl AgentSelection {
 }
 
 impl ResolvedDispatch {
-    fn new(provider: ModelProvider, model: Option<&str>) -> ResolvedDispatch {
-        let model = provider.model_or_default(model);
-        let harness = provider.harness();
+    /// The agent role of this dispatch, as the inference document binds it.
+    pub fn inference(&self) -> ResolvedModel {
+        ResolvedModel {
+            role: ModelRole::Agent,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+        }
+    }
+}
+
+impl From<ResolvedModel> for ResolvedDispatch {
+    fn from(resolved: ResolvedModel) -> ResolvedDispatch {
+        let harness = resolved.provider.harness();
         ResolvedDispatch {
-            provider,
-            model,
+            provider: resolved.provider,
+            model: resolved.model,
             harness,
         }
     }
@@ -571,6 +712,7 @@ fn default_from_row(row: &sqlx::postgres::PgRow) -> Result<DispatchDefault> {
         scope_kind: DefaultScope::parse(&scope_kind)?,
         scope_ref: row.try_get("scope_ref")?,
         workload_class: WorkloadClass::parse(&workload_class)?,
+        role: row.try_get("role")?,
         provider_id: row.try_get("provider_id")?,
         model: row.try_get("model")?,
         fallback_provider_id: row.try_get("fallback_provider_id")?,
@@ -821,14 +963,15 @@ pub async fn delete(ex: impl PgExecutor<'_>, id: &str) -> Result<bool> {
     Ok(deleted.rows_affected() > 0)
 }
 
-/// Point a scope's dispatches of one class at a provider, replacing whatever it pointed at.
+/// Point a scope's dispatches of one class at a provider for one role, replacing whatever it
+/// pointed at.
 #[tracing::instrument(name = "db.set_dispatch_default", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", provider = %row.provider_id), err)]
 pub async fn set_default(ex: impl PgExecutor<'_>, row: &DispatchDefault) -> Result<()> {
     sqlx::query(
-        "INSERT INTO dispatch_defaults (scope_kind, scope_ref, workload_class, provider_id, model, \
-         fallback_provider_id, fallback_model) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
-         ON CONFLICT (scope_kind, scope_ref, workload_class) \
+        "INSERT INTO dispatch_defaults (scope_kind, scope_ref, workload_class, role, provider_id, \
+         model, fallback_provider_id, fallback_model) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (scope_kind, scope_ref, workload_class, role) \
          DO UPDATE SET provider_id = EXCLUDED.provider_id, model = EXCLUDED.model, \
          fallback_provider_id = EXCLUDED.fallback_provider_id, \
          fallback_model = EXCLUDED.fallback_model",
@@ -836,6 +979,7 @@ pub async fn set_default(ex: impl PgExecutor<'_>, row: &DispatchDefault) -> Resu
     .bind(row.scope_kind.as_str())
     .bind(&row.scope_ref)
     .bind(row.workload_class.as_str())
+    .bind(row.role)
     .bind(&row.provider_id)
     .bind(&row.model)
     .bind(&row.fallback_provider_id)
@@ -846,28 +990,30 @@ pub async fn set_default(ex: impl PgExecutor<'_>, row: &DispatchDefault) -> Resu
     Ok(())
 }
 
-/// Clear one scope's default for one class. `false` when it had none.
+/// Clear one scope's default for one class and role. `false` when it had none.
 #[tracing::instrument(name = "db.clear_dispatch_default", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql"), err)]
 pub async fn clear_default(
     ex: impl PgExecutor<'_>,
     scope_kind: DefaultScope,
     scope_ref: &str,
     class: WorkloadClass,
+    role: ModelRole,
 ) -> Result<bool> {
     let deleted = sqlx::query(
         "DELETE FROM dispatch_defaults \
-         WHERE scope_kind = $1 AND scope_ref = $2 AND workload_class = $3",
+         WHERE scope_kind = $1 AND scope_ref = $2 AND workload_class = $3 AND role = $4",
     )
     .bind(scope_kind.as_str())
     .bind(scope_ref)
     .bind(class.as_str())
+    .bind(role)
     .execute(ex)
     .await
     .context("clear_dispatch_default")?;
     Ok(deleted.rows_affected() > 0)
 }
 
-const DEFAULT_COLS: &str = "scope_kind, scope_ref, workload_class, provider_id, model, \
+const DEFAULT_COLS: &str = "scope_kind, scope_ref, workload_class, role, provider_id, model, \
      fallback_provider_id, fallback_model";
 
 /// Every default, so the launch pickers can preselect the one that would apply.
@@ -875,7 +1021,7 @@ const DEFAULT_COLS: &str = "scope_kind, scope_ref, workload_class, provider_id, 
 pub async fn list_defaults(ex: impl PgExecutor<'_>) -> Result<Vec<DispatchDefault>> {
     let sql = const_format::formatcp!(
         "SELECT {DEFAULT_COLS} FROM dispatch_defaults ORDER BY scope_kind, scope_ref, \
-         workload_class"
+         workload_class, role"
     );
     let rows = sqlx::query(sql)
         .fetch_all(ex)
@@ -889,24 +1035,27 @@ async fn get_default(
     scope_kind: DefaultScope,
     scope_ref: &str,
     class: WorkloadClass,
+    role: ModelRole,
 ) -> Result<Option<DispatchDefault>> {
     let sql = const_format::formatcp!(
         "SELECT {DEFAULT_COLS} FROM dispatch_defaults \
-         WHERE scope_kind = $1 AND scope_ref = $2 AND workload_class = $3"
+         WHERE scope_kind = $1 AND scope_ref = $2 AND workload_class = $3 AND role = $4"
     );
     let row = sqlx::query(sql)
         .bind(scope_kind.as_str())
         .bind(scope_ref)
         .bind(class.as_str())
+        .bind(role)
         .fetch_optional(ex)
         .await
         .context("get_dispatch_default")?;
     row.as_ref().map(default_from_row).transpose()
 }
 
-/// What this dispatch runs against: the first entry of [`resolve_chain`], or `None` to dispatch
-/// exactly as before providers existed. The pair reaches the pod as the `--harness`/`--model` flags
-/// of the loop wrapper or of `crucible plan run`, replacing the pack manifest's `[agent]` defaults.
+/// What this dispatch's agent runs against: the first entry of [`resolve_chain`], or `None` to
+/// dispatch exactly as before providers existed. The pair reaches the pod as the `--harness`/
+/// `--model` flags of the loop wrapper or of `crucible plan run`, and as the agent binding of the
+/// inference document.
 pub async fn resolve_dispatch(
     pool: &PgPool,
     over: Option<DispatchOverride<'_>>,
@@ -919,8 +1068,37 @@ pub async fn resolve_dispatch(
         .next())
 }
 
-/// Every provider this dispatch may run against, in the order to try them: the override the launch
-/// pinned, else the domain's default for this class, else the platform's. Empty means no answer.
+/// Every provider this dispatch's agent may run against, in the order to try them. See
+/// [`role_chain`].
+pub async fn resolve_chain(
+    pool: &PgPool,
+    over: Option<DispatchOverride<'_>>,
+    domain: Option<&str>,
+    class: WorkloadClass,
+) -> Result<Vec<ResolvedDispatch>> {
+    Ok(role_chain(pool, ModelRole::Agent, over, domain, class)
+        .await?
+        .into_iter()
+        .map(ResolvedDispatch::from)
+        .collect())
+}
+
+/// What a dispatch's route tasks ask: the decision default its domain or the platform names for
+/// `class`, or `None` when neither does. A launch pins no decision model.
+pub async fn resolve_decision(
+    pool: &PgPool,
+    domain: Option<&str>,
+    class: WorkloadClass,
+) -> Result<Option<ResolvedModel>> {
+    Ok(role_chain(pool, ModelRole::Decision, None, domain, class)
+        .await?
+        .into_iter()
+        .next())
+}
+
+/// Every provider one role of this dispatch may run against, in the order to try them: the
+/// override the launch pinned, else the domain's default for this class and role, else the
+/// platform's. Empty means no answer.
 ///
 /// A pin is one entry and never falls back: the work was committed to a specific service, and a
 /// pinned provider that has since been deregistered is an error rather than a silent fall-through,
@@ -931,12 +1109,13 @@ pub async fn resolve_dispatch(
 /// domain row with no fallback does not borrow the platform's. When neither entry can take work, a
 /// disabled primary is an error, and an enabled primary with a broken credential is returned alone
 /// so the launch refuses it with the credential's own reason.
-pub async fn resolve_chain(
+async fn role_chain(
     pool: &PgPool,
+    role: ModelRole,
     over: Option<DispatchOverride<'_>>,
     domain: Option<&str>,
     class: WorkloadClass,
-) -> Result<Vec<ResolvedDispatch>> {
+) -> Result<Vec<ResolvedModel>> {
     if let Some(over) = over {
         let Some(provider) = get(pool, over.provider_id).await? else {
             bail!(
@@ -944,7 +1123,14 @@ pub async fn resolve_chain(
                 over.provider_id
             );
         };
-        return Ok(vec![ResolvedDispatch::new(provider, over.model)]);
+        if !provider.serves(role) {
+            bail!(
+                "dispatch pinned model provider {:?}, which cannot serve the {} role",
+                over.provider_id,
+                role.as_str()
+            );
+        }
+        return Ok(vec![ResolvedModel::new(role, provider, over.model)]);
     }
     let domain = domain.map(str::trim).filter(|d| !d.is_empty());
     let scopes = [
@@ -952,7 +1138,7 @@ pub async fn resolve_chain(
         Some((DefaultScope::Platform, "")),
     ];
     for (scope_kind, scope_ref) in scopes.into_iter().flatten() {
-        let Some(row) = get_default(pool, scope_kind, scope_ref, class).await? else {
+        let Some(row) = get_default(pool, scope_kind, scope_ref, class, role).await? else {
             continue;
         };
         return default_chain(pool, &row).await;
@@ -960,22 +1146,37 @@ pub async fn resolve_chain(
     Ok(Vec::new())
 }
 
-async fn default_chain(pool: &PgPool, row: &DispatchDefault) -> Result<Vec<ResolvedDispatch>> {
+async fn default_chain(pool: &PgPool, row: &DispatchDefault) -> Result<Vec<ResolvedModel>> {
+    let role = row.role;
     let Some(primary) = get(pool, &row.provider_id).await? else {
         bail!(
-            "dispatch default {}/{} names model provider {:?}, which is no longer registered",
+            "{} default {}/{} names model provider {:?}, which is no longer registered",
+            role.as_str(),
             row.scope_kind.as_str(),
             row.scope_ref,
             row.provider_id
         );
     };
+    if !primary.serves(role) {
+        bail!(
+            "{} default {}/{} names model provider {:?}, which cannot serve that role",
+            role.as_str(),
+            row.scope_kind.as_str(),
+            row.scope_ref,
+            row.provider_id
+        );
+    }
     let fallback = match row.fallback_provider_id.as_deref() {
-        Some(id) => get(pool, id).await?,
+        Some(id) => get(pool, id).await?.filter(|p| p.serves(role)),
         None => None,
     };
     let mut chain = Vec::with_capacity(2);
     if takes_new_work(pool, &primary).await? {
-        chain.push(ResolvedDispatch::new(primary.clone(), row.model.as_deref()));
+        chain.push(ResolvedModel::new(
+            role,
+            primary.clone(),
+            row.model.as_deref(),
+        ));
     }
     if let Some(fallback) = fallback
         && takes_new_work(pool, &fallback).await?
@@ -985,10 +1186,12 @@ async fn default_chain(pool: &PgPool, row: &DispatchDefault) -> Result<Vec<Resol
                 primary = %primary.id,
                 fallback = %fallback.id,
                 class = row.workload_class.as_str(),
+                role = role.as_str(),
                 "dispatch default's primary provider cannot take new work; using its fallback"
             );
         }
-        chain.push(ResolvedDispatch::new(
+        chain.push(ResolvedModel::new(
+            role,
             fallback,
             row.fallback_model.as_deref(),
         ));
@@ -1000,14 +1203,19 @@ async fn default_chain(pool: &PgPool, row: &DispatchDefault) -> Result<Vec<Resol
     // a default is not a pin, so an unpinned dispatch inheriting one is new work.
     if !primary.enabled {
         bail!(
-            "dispatch default {}/{} names model provider {:?}, which is disabled and takes no new \
+            "{} default {}/{} names model provider {:?}, which is disabled and takes no new \
              work, and has no fallback that can",
+            role.as_str(),
             row.scope_kind.as_str(),
             row.scope_ref,
             row.provider_id
         );
     }
-    Ok(vec![ResolvedDispatch::new(primary, row.model.as_deref())])
+    Ok(vec![ResolvedModel::new(
+        role,
+        primary,
+        row.model.as_deref(),
+    )])
 }
 
 /// Whether a provider named by a default can take new work: enabled, with a credential reference
@@ -1030,10 +1238,9 @@ async fn takes_new_work(pool: &PgPool, provider: &ModelProvider) -> Result<bool>
 pub enum KeyLookup {
     /// No secret named: the deployment's ambient credentials pay.
     Ambient,
-    /// The registered key, and the variable it is projected as.
+    /// The registered key.
     Found {
         row: crate::secrets::store::SecretRow,
-        key_env: &'static str,
     },
     /// The kind authenticates some other way, so a named secret has nowhere to go.
     TakesNoSecret {
@@ -1058,11 +1265,11 @@ pub async fn lookup_key(pool: &PgPool, provider: &ModelProvider) -> Result<KeyLo
     let Some(secret) = provider.secret.as_ref() else {
         return Ok(KeyLookup::Ambient);
     };
-    let Some(key_env) = provider.api_key_env() else {
+    if !provider.takes_secret() {
         return Ok(KeyLookup::TakesNoSecret {
             name: secret.name.clone(),
         });
-    };
+    }
     let name = match crate::secrets::SecretName::parse(&secret.name) {
         Ok(name) => name,
         Err(e) => {
@@ -1084,7 +1291,7 @@ pub async fn lookup_key(pool: &PgPool, provider: &ModelProvider) -> Result<KeyLo
             kind: row.kind.as_str(),
         });
     }
-    Ok(KeyLookup::Found { row, key_env })
+    Ok(KeyLookup::Found { row })
 }
 
 /// What one issue's dispatch of `class` runs against: the first entry of [`chain_for_issue`].
@@ -1146,32 +1353,36 @@ mod tests {
     }
 
     #[test]
-    fn a_protocol_decides_the_harness_the_key_and_the_base_url() {
-        assert_eq!(
-            InferenceProtocol::Messages.default_harness(),
-            Harness::Claude
-        );
-        assert_eq!(
-            InferenceProtocol::Messages.api_key_env(),
-            "ANTHROPIC_API_KEY"
-        );
-        assert_eq!(
-            InferenceProtocol::Messages.base_url_env(),
-            "ANTHROPIC_BASE_URL"
-        );
-        assert_eq!(InferenceProtocol::Messages.codex_wire_api(), None);
-        for (protocol, wire, harness) in [
-            (
-                InferenceProtocol::ChatCompletions,
-                "chat",
-                Harness::OpenCode,
-            ),
-            (InferenceProtocol::Responses, "responses", Harness::Codex),
+    fn a_protocol_decides_the_harness_the_role_and_the_credential_entry() {
+        use InferenceProtocol::{ChatCompletions, Decisions, Messages, Responses, SystemOne};
+        for (protocol, harness, entry) in [
+            (Messages, Harness::Claude, "ANTHROPIC_API_KEY"),
+            (ChatCompletions, Harness::OpenCode, "OPENAI_API_KEY"),
+            (Responses, Harness::Codex, "OPENAI_API_KEY"),
         ] {
-            assert_eq!(protocol.default_harness(), harness);
-            assert_eq!(protocol.api_key_env(), "OPENAI_API_KEY");
-            assert_eq!(protocol.base_url_env(), "OPENAI_BASE_URL");
-            assert_eq!(protocol.codex_wire_api(), Some(wire));
+            assert_eq!(protocol.default_harness(), Some(harness));
+            assert!(protocol.serves(ModelRole::Agent) && !protocol.serves(ModelRole::Decision));
+            assert_eq!(protocol.credential_key(), Some(entry));
+        }
+        for protocol in [SystemOne, Decisions] {
+            assert_eq!(protocol.default_harness(), None);
+            assert!(protocol.harnesses().is_empty());
+            assert!(protocol.serves(ModelRole::Decision) && !protocol.serves(ModelRole::Agent));
+        }
+        assert_eq!(SystemOne.credential_key(), None);
+        assert_eq!(Decisions.credential_key(), Some("OPENAI_API_KEY"));
+    }
+
+    /// Every protocol the registry stores is one the engine's inference document spells the same
+    /// way, so a stored row and the binding rendered from it never disagree.
+    #[test]
+    fn every_protocol_maps_onto_the_engines_spelling() {
+        use strum::IntoEnumIterator;
+        for protocol in InferenceProtocol::iter() {
+            assert_eq!(protocol.wire().as_str(), protocol.as_str());
+        }
+        for role in ModelRole::iter() {
+            assert_eq!(role.inference().as_str(), role.as_str());
         }
     }
 
@@ -1290,14 +1501,14 @@ mod tests {
         assert_eq!(defaulted.harness, None);
         assert_eq!(defaulted.harness(), Harness::OpenCode);
         assert_eq!(
-            defaulted.config_env(),
-            vec![
-                (
-                    "OPENAI_BASE_URL".to_string(),
-                    "https://inference.example.com/llm/qwen/v1".to_string()
-                ),
-                (WIRE_API_ENV.to_string(), "chat".to_string()),
-            ]
+            defaulted.binding(ModelRole::Agent, "qwen-3-8-27b")?,
+            InferenceBinding {
+                role: InferenceRole::Agent,
+                protocol: WireProtocol::ChatCompletions,
+                url: Some("https://inference.example.com/llm/qwen/v1".to_string()),
+                model: "qwen-3-8-27b".to_string(),
+                key_env: None,
+            }
         );
         let pinned = get(&pool, "bay-pi").await?.expect("the row");
         assert_eq!(pinned.harness, Some(Harness::Pi));
@@ -1319,9 +1530,11 @@ mod tests {
     }
 
     /// A custom provider stores its endpoint and protocol, resolves to the harness its protocol is
-    /// spoken by, and hands the pod the base URL and wire API as plain environment.
+    /// spoken by, and binds the engine to its endpoint and protocol.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_custom_provider_round_trips_and_derives_its_env(pool: PgPool) -> anyhow::Result<()> {
+    async fn a_custom_provider_round_trips_and_derives_its_binding(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
         let endpoint = Endpoint {
             url: "http://vllm.internal:8000/v1".to_string(),
             protocol: InferenceProtocol::Responses,
@@ -1346,17 +1559,18 @@ mod tests {
         let stored = get(&pool, "onprem").await?.expect("the row");
         assert_eq!(stored.endpoint.as_ref(), Some(&endpoint));
         assert_eq!(stored.harness(), Harness::Codex);
-        assert_eq!(stored.api_key_env(), Some("OPENAI_API_KEY"));
+        assert_eq!(stored.roles(), vec![ModelRole::Agent]);
         assert_eq!(
-            stored.config_env(),
-            vec![
-                (
-                    "OPENAI_BASE_URL".to_string(),
-                    "http://vllm.internal:8000/v1".to_string()
-                ),
-                (WIRE_API_ENV.to_string(), "responses".to_string()),
-            ]
+            stored.binding(ModelRole::Agent, "gpt-oss-120b")?,
+            InferenceBinding {
+                role: InferenceRole::Agent,
+                protocol: WireProtocol::Responses,
+                url: Some("http://vllm.internal:8000/v1".to_string()),
+                model: "gpt-oss-120b".to_string(),
+                key_env: None,
+            }
         );
+        assert!(stored.binding(ModelRole::Decision, "gpt-oss-120b").is_err());
         let resolved = resolve_dispatch(
             &pool,
             Some(DispatchOverride {
@@ -1434,6 +1648,299 @@ mod tests {
         }
     }
 
+    fn registered(kind: ProviderKind, endpoint: Option<Endpoint>, keyed: bool) -> ModelProvider {
+        ModelProvider {
+            id: "p".to_string(),
+            display_name: "P".to_string(),
+            kind,
+            models: Vec::new(),
+            default_model: kind.default_model().unwrap_or("served-model").to_string(),
+            secret: keyed.then(|| ProviderSecretRef {
+                name: "key".to_string(),
+                owner: crate::authz::model::Principal::platform(),
+            }),
+            endpoint,
+            harness: None,
+            enabled: true,
+            owner: crate::authz::model::Principal::platform(),
+            created_by: String::new(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    /// Which roles each kind serves, and through which API: OpenAI serves both, the Anthropic
+    /// kinds only agents, and a custom provider whatever its protocol says.
+    #[test]
+    fn a_provider_serves_the_roles_its_kind_or_protocol_can() {
+        use InferenceProtocol::{ChatCompletions, Decisions, Messages, Responses, SystemOne};
+        let custom = |protocol| {
+            Some(Endpoint {
+                url: "http://h/v1".to_string(),
+                protocol,
+            })
+        };
+        let cases = [
+            (ProviderKind::Anthropic, None, Some(Messages), None),
+            (ProviderKind::Vertex, None, Some(Messages), None),
+            (ProviderKind::OpenAi, None, Some(Responses), Some(Decisions)),
+            (
+                ProviderKind::Custom,
+                custom(ChatCompletions),
+                Some(ChatCompletions),
+                None,
+            ),
+            (ProviderKind::Custom, custom(Messages), Some(Messages), None),
+            (
+                ProviderKind::Custom,
+                custom(SystemOne),
+                None,
+                Some(SystemOne),
+            ),
+            (
+                ProviderKind::Custom,
+                custom(Decisions),
+                None,
+                Some(Decisions),
+            ),
+        ];
+        for (kind, endpoint, agent, decision) in cases {
+            let p = registered(kind, endpoint, false);
+            assert_eq!(p.protocol_for(ModelRole::Agent), agent, "{kind:?} agent");
+            assert_eq!(
+                p.protocol_for(ModelRole::Decision),
+                decision,
+                "{kind:?} decision"
+            );
+            let roles: Vec<ModelRole> =
+                [(ModelRole::Agent, agent), (ModelRole::Decision, decision)]
+                    .into_iter()
+                    .filter_map(|(r, p)| p.map(|_| r))
+                    .collect();
+            assert_eq!(p.roles(), roles, "{kind:?}");
+        }
+    }
+
+    /// A binding names the role's key variable exactly when the provider spends a secret, and
+    /// carries the endpoint a custom provider is reached at.
+    #[test]
+    fn a_binding_names_the_roles_key_only_for_a_keyed_provider() -> anyhow::Result<()> {
+        let keyed = registered(ProviderKind::OpenAi, None, true);
+        assert_eq!(
+            keyed.binding(ModelRole::Decision, "gpt-6-luna")?,
+            InferenceBinding {
+                role: InferenceRole::Decision,
+                protocol: WireProtocol::Decisions,
+                url: None,
+                model: "gpt-6-luna".to_string(),
+                key_env: Some(EnvName::new("CRUCIBLE_INFERENCE_KEY_DECISION")?),
+            }
+        );
+        let ambient = registered(ProviderKind::Vertex, None, false);
+        assert_eq!(
+            ambient
+                .binding(ModelRole::Agent, "claude-opus-4-6")?
+                .key_env,
+            None
+        );
+        assert!(ambient.binding(ModelRole::Decision, "x").is_err());
+        let system_one = registered(
+            ProviderKind::Custom,
+            Some(Endpoint {
+                url: "http://dgemma:8011/v1/systemone".to_string(),
+                protocol: InferenceProtocol::SystemOne,
+            }),
+            false,
+        );
+        let binding = system_one.binding(ModelRole::Decision, "dgemma")?;
+        assert_eq!(binding.protocol, WireProtocol::SystemOne);
+        assert_eq!(
+            binding.url.as_deref(),
+            Some("http://dgemma:8011/v1/systemone")
+        );
+        assert_eq!(ModelRole::Agent.key_env(), "CRUCIBLE_INFERENCE_KEY_AGENT");
+        Ok(())
+    }
+
+    /// A decision default that names no model asks the kind's decision model, not the agent model
+    /// the provider defaults to; a custom provider's own default is its decision model.
+    #[test]
+    fn a_decision_without_a_model_asks_the_kinds_decision_model() {
+        let openai = registered(ProviderKind::OpenAi, None, false);
+        assert_eq!(openai.model_for(ModelRole::Agent, None), "gpt-5.6-luna");
+        assert_eq!(openai.model_for(ModelRole::Decision, None), "gpt-6-luna");
+        assert_eq!(
+            openai.model_for(ModelRole::Decision, Some(" gpt-6-sol ")),
+            "gpt-6-sol"
+        );
+        let custom = registered(ProviderKind::Custom, None, false);
+        assert_eq!(
+            custom.model_for(ModelRole::Decision, Some("")),
+            "served-model"
+        );
+    }
+
+    /// The document holds one binding per role, so two agents are refused before a pod sees them.
+    #[test]
+    fn the_inference_document_holds_one_binding_per_role() -> anyhow::Result<()> {
+        let openai = registered(ProviderKind::OpenAi, None, true);
+        let model = |role| ResolvedModel {
+            role,
+            provider: openai.clone(),
+            model: "m".to_string(),
+        };
+        let both = inference_document(&[model(ModelRole::Agent), model(ModelRole::Decision)])?;
+        assert_eq!(both.bindings.len(), 2);
+        assert!(inference_document(&[model(ModelRole::Agent), model(ModelRole::Agent)]).is_err());
+        Ok(())
+    }
+
+    fn decision_row(scope_kind: DefaultScope, scope_ref: &str, primary: &str) -> DispatchDefault {
+        DispatchDefault {
+            workload_class: WorkloadClass::Playbook,
+            role: ModelRole::Decision,
+            ..default_row(scope_kind, scope_ref, primary, None)
+        }
+    }
+
+    /// The decision role resolves through its own defaults: the domain row before the platform's,
+    /// never the agent's, and to nothing when no decision default exists.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_decision_resolves_through_its_own_defaults(pool: PgPool) -> anyhow::Result<()> {
+        upsert(&pool, &new_provider("openai", ProviderKind::OpenAi)).await?;
+        upsert(&pool, &new_provider("openai-eu", ProviderKind::OpenAi)).await?;
+        set_default(
+            &pool,
+            &DispatchDefault {
+                workload_class: WorkloadClass::Playbook,
+                ..default_row(DefaultScope::Platform, "", "openai", None)
+            },
+        )
+        .await?;
+        assert_eq!(
+            resolve_decision(&pool, None, WorkloadClass::Playbook).await?,
+            None,
+            "an agent default is not a decision default"
+        );
+
+        set_default(&pool, &decision_row(DefaultScope::Platform, "", "openai")).await?;
+        set_default(
+            &pool,
+            &decision_row(DefaultScope::Domain, "org/cve", "openai-eu"),
+        )
+        .await?;
+        let platform = resolve_decision(&pool, Some("org/other"), WorkloadClass::Playbook)
+            .await?
+            .expect("the platform decision default");
+        assert_eq!(
+            (
+                platform.role,
+                platform.provider.id.as_str(),
+                platform.model.as_str()
+            ),
+            (ModelRole::Decision, "openai", "gpt-6-luna")
+        );
+        let domain = resolve_decision(&pool, Some("org/cve"), WorkloadClass::Playbook)
+            .await?
+            .expect("the domain decision default");
+        assert_eq!(domain.provider.id, "openai-eu");
+
+        let agent = resolve_dispatch(&pool, None, Some("org/cve"), WorkloadClass::Playbook)
+            .await?
+            .expect("the agent default stands beside it");
+        assert_eq!(
+            (agent.provider.id.as_str(), agent.model.as_str()),
+            ("openai", "gpt-5.6-luna")
+        );
+
+        assert!(
+            clear_default(
+                &pool,
+                DefaultScope::Domain,
+                "org/cve",
+                WorkloadClass::Playbook,
+                ModelRole::Decision
+            )
+            .await?
+        );
+        let inherited = resolve_decision(&pool, Some("org/cve"), WorkloadClass::Playbook)
+            .await?
+            .expect("the platform row again");
+        assert_eq!(inherited.provider.id, "openai");
+        Ok(())
+    }
+
+    /// A default or a pin naming a provider that cannot serve its role is an error at resolution,
+    /// not a binding the engine would refuse later, and a fallback that cannot serve it is skipped.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_provider_that_cannot_serve_the_role_never_resolves_for_it(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        upsert(&pool, &new_provider("vertex", ProviderKind::Vertex)).await?;
+        upsert(&pool, &new_provider("openai", ProviderKind::OpenAi)).await?;
+        let dgemma = Endpoint {
+            url: "http://dgemma:8011/v1/systemone".to_string(),
+            protocol: InferenceProtocol::SystemOne,
+        };
+        upsert(
+            &pool,
+            &NewProvider {
+                default_model: Some("dgemma"),
+                endpoint: Some(&dgemma),
+                ..new_provider("dgemma", ProviderKind::Custom)
+            },
+        )
+        .await?;
+
+        set_default(&pool, &decision_row(DefaultScope::Platform, "", "vertex")).await?;
+        let err = resolve_decision(&pool, None, WorkloadClass::Playbook)
+            .await
+            .expect_err("vertex serves no decision");
+        assert!(err.to_string().contains("cannot serve that role"), "{err}");
+
+        let pinned = resolve_dispatch(
+            &pool,
+            Some(DispatchOverride {
+                provider_id: "dgemma",
+                model: None,
+            }),
+            None,
+            WorkloadClass::Playbook,
+        )
+        .await
+        .expect_err("a decision-only provider runs no agent");
+        assert!(
+            pinned.to_string().contains("cannot serve the agent role"),
+            "{pinned}"
+        );
+
+        set_default(
+            &pool,
+            &DispatchDefault {
+                fallback_provider_id: Some("vertex".to_string()),
+                ..decision_row(DefaultScope::Platform, "", "dgemma")
+            },
+        )
+        .await?;
+        let chain = role_chain(
+            &pool,
+            ModelRole::Decision,
+            None,
+            None,
+            WorkloadClass::Playbook,
+        )
+        .await?;
+        assert_eq!(
+            chain
+                .iter()
+                .map(|m| (m.provider.id.as_str(), m.model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("dgemma", "dgemma")],
+            "the fallback that cannot decide is dropped"
+        );
+        Ok(())
+    }
+
     /// The compatibility promise: with nothing registered, resolution answers nothing, which is
     /// what leaves the pack manifest deciding the harness and the model exactly as it did before.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -1472,6 +1979,7 @@ mod tests {
                 scope_kind: DefaultScope::Platform,
                 scope_ref: String::new(),
                 workload_class: WorkloadClass::Autoresearch,
+                role: ModelRole::Agent,
                 provider_id: "plat".to_string(),
                 model: None,
                 fallback_provider_id: None,
@@ -1500,6 +2008,7 @@ mod tests {
                 scope_kind: DefaultScope::Domain,
                 scope_ref: "org/vllm".to_string(),
                 workload_class: WorkloadClass::Autoresearch,
+                role: ModelRole::Agent,
                 provider_id: "dom".to_string(),
                 model: Some("claude-sonnet-5".to_string()),
                 fallback_provider_id: None,
@@ -1615,6 +2124,7 @@ mod tests {
                 scope_kind: DefaultScope::Platform,
                 scope_ref: String::new(),
                 workload_class: WorkloadClass::Autoresearch,
+                role: ModelRole::Agent,
                 provider_id: "retiring".to_string(),
                 model: None,
                 fallback_provider_id: None,
@@ -1648,6 +2158,7 @@ mod tests {
             scope_kind,
             scope_ref: scope_ref.to_string(),
             workload_class: WorkloadClass::Autoresearch,
+            role: ModelRole::Agent,
             provider_id: primary.to_string(),
             model: None,
             fallback_provider_id: fallback.map(|(id, _)| id.to_string()),
@@ -1901,6 +2412,7 @@ mod tests {
                 scope_kind: DefaultScope::Platform,
                 scope_ref: String::new(),
                 workload_class: WorkloadClass::Playbook,
+                role: ModelRole::Agent,
                 provider_id: "plat".to_string(),
                 model: None,
                 fallback_provider_id: None,
@@ -1945,6 +2457,7 @@ mod tests {
                     scope_kind,
                     scope_ref: scope_ref.to_string(),
                     workload_class: WorkloadClass::Playbook,
+                    role: ModelRole::Agent,
                     provider_id: "vertex".to_string(),
                     model: None,
                     fallback_provider_id: None,
@@ -2080,6 +2593,7 @@ mod tests {
             scope_kind: DefaultScope::Platform,
             scope_ref: String::new(),
             workload_class: WorkloadClass::Playbook,
+            role: ModelRole::Agent,
             provider_id: "plat".to_string(),
             model: None,
             fallback_provider_id: None,
@@ -2111,6 +2625,7 @@ mod tests {
             scope_kind: DefaultScope::Domain,
             scope_ref: "org/vllm".to_string(),
             workload_class: WorkloadClass::Autoresearch,
+            role: ModelRole::Agent,
             provider_id: "openai".to_string(),
             model: None,
             fallback_provider_id: None,
@@ -2127,7 +2642,8 @@ mod tests {
                 &pool,
                 DefaultScope::Domain,
                 "org/vllm",
-                WorkloadClass::Autoresearch
+                WorkloadClass::Autoresearch,
+                ModelRole::Agent
             )
             .await?
         );

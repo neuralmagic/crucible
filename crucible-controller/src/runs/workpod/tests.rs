@@ -4,8 +4,11 @@ use crate::client::Db;
 use crate::config::ControllerCfg;
 #[cfg(feature = "autoresearch")]
 use crate::issues::engine;
-use crate::playbooks::providers::AgentSelection;
+use crate::playbooks::providers::{AgentSelection, ModelRole, ResolvedModel};
 use anyhow::Result;
+use crucible_contract::inference::{
+    EnvName, InferenceBinding, InferenceProtocol as WireProtocol, InferenceRole, ResolvedInference,
+};
 #[cfg(feature = "autoresearch")]
 use crucible_contract::{ArtifactKind, ArtifactRef, Envelope, EnvelopeKind, content_digest};
 use k8s_openapi::api::core::v1::{ConfigMap, Container, EnvVar, Pod};
@@ -3261,6 +3264,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
             scope_kind: crate::playbooks::providers::DefaultScope::Platform,
             scope_ref: String::new(),
             workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
+            role: crate::playbooks::providers::ModelRole::Agent,
             provider_id: "openai-plat".to_string(),
             model: None,
             fallback_provider_id: None,
@@ -4642,7 +4646,7 @@ fn repo_secrets(launcher: crate::authz::model::Principals) -> crate::runs::workp
                 "value-of-pr_token".to_string(),
             )]),
         )),
-        inference_provider: None,
+        inference: Vec::new(),
         exposure: Some(crate::playbooks::exposure::Exposure {
             version: 1,
             outputs: Vec::new(),
@@ -4861,8 +4865,26 @@ async fn the_pod_spec_carries_a_secret_reference_and_no_value(pool: sqlx::PgPool
     Ok(())
 }
 
-/// The resolved provider's key rides the same per-run Secret as the scope's own bindings, projected
-/// as the environment variable its kind reads, and the value never appears in the pod spec.
+/// The run's inference document as the pod's plain environment carries it.
+fn inference_document(pod: &k8s_openapi::api::core::v1::Pod) -> ResolvedInference {
+    let value = pod
+        .spec
+        .as_ref()
+        .and_then(|s| s.containers.first())
+        .and_then(|c| c.env.as_ref())
+        .and_then(|env| {
+            env.iter()
+                .find(|v| v.name == crucible_contract::inference::ENV_INFERENCE)
+        })
+        .and_then(|v| v.value.clone())
+        .expect("the inference document rides plain environment");
+    ResolvedInference::parse(&value).expect("a valid document")
+}
+
+/// Each resolved role's key rides the same per-run Secret as the scope's own bindings, projected
+/// under the role's variable the inference document names, and the value never appears in the pod
+/// spec. One OpenAI provider serves both roles: the agent through Responses, route tasks through
+/// the Decisions API.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
     pool: sqlx::PgPool,
@@ -4913,7 +4935,18 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         created_cms: Arc::new(Mutex::new(Vec::new())),
     });
     let mut secrets = repo_secrets(crate::authz::model::Principals::new(Some("alice"), &[]));
-    secrets.inference_provider = Some(provider);
+    secrets.inference = vec![
+        ResolvedModel {
+            role: ModelRole::Agent,
+            provider: provider.clone(),
+            model: "gpt-5.6-luna".to_string(),
+        },
+        ResolvedModel {
+            role: ModelRole::Decision,
+            provider,
+            model: "gpt-6-luna".to_string(),
+        },
+    ];
     secrets.provider = Some(std::sync::Arc::new(
         crate::secrets::provider::MapProvider::new([
             ("pr_token".to_string(), "value-of-pr_token".to_string()),
@@ -4948,23 +4981,66 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         .and_then(|s| s.containers.first())
         .and_then(|c| c.env.as_ref())
         .expect("env");
-    let key = env
-        .iter()
-        .find(|v| v.name == "OPENAI_API_KEY")
-        .expect("the provider's key");
-    let selector = key
-        .value_from
-        .as_ref()
-        .and_then(|f| f.secret_key_ref.as_ref())
-        .expect("a secretKeyRef");
-    assert_eq!(
-        selector.name,
-        crate::secrets::deliver::secret_name(pod.metadata.name.as_deref().expect("a named pod"))
-    );
-    assert_eq!(selector.key, "openai_key.OPENAI_API_KEY");
+    for (var, secret_key) in [
+        (
+            "CRUCIBLE_INFERENCE_KEY_AGENT",
+            "openai_key.CRUCIBLE_INFERENCE_KEY_AGENT",
+        ),
+        (
+            "CRUCIBLE_INFERENCE_KEY_DECISION",
+            "openai_key.CRUCIBLE_INFERENCE_KEY_DECISION",
+        ),
+    ] {
+        let key = env
+            .iter()
+            .find(|v| v.name == var)
+            .unwrap_or_else(|| panic!("{var} is projected"));
+        let selector = key
+            .value_from
+            .as_ref()
+            .and_then(|f| f.secret_key_ref.as_ref())
+            .expect("a secretKeyRef");
+        assert_eq!(
+            selector.name,
+            crate::secrets::deliver::secret_name(
+                pod.metadata.name.as_deref().expect("a named pod")
+            )
+        );
+        assert_eq!(selector.key, secret_key);
+    }
+    for harness_var in [
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "CRUCIBLE_INFERENCE_WIRE_API",
+    ] {
+        assert!(
+            env.iter().all(|v| v.name != harness_var),
+            "{harness_var} is the engine's to set inside the sandbox, not the pod's"
+        );
+    }
     assert!(
         env.iter().any(|v| v.name == "AUTORESEARCH_PR_TOKEN"),
         "the scope's own binding still rides along"
+    );
+    let key_env = |name: &str| Some(EnvName::new(name).expect("a variable name"));
+    assert_eq!(
+        inference_document(pod).bindings,
+        vec![
+            InferenceBinding {
+                role: InferenceRole::Agent,
+                protocol: WireProtocol::Responses,
+                url: None,
+                model: "gpt-5.6-luna".to_string(),
+                key_env: key_env("CRUCIBLE_INFERENCE_KEY_AGENT"),
+            },
+            InferenceBinding {
+                role: InferenceRole::Decision,
+                protocol: WireProtocol::Decisions,
+                url: None,
+                model: "gpt-6-luna".to_string(),
+                key_env: key_env("CRUCIBLE_INFERENCE_KEY_DECISION"),
+            },
+        ]
     );
 
     let secrets = created_secrets.lock().expect("lock");
@@ -4974,16 +5050,18 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
         .string_data
         .as_ref()
         .expect("data");
-    assert_eq!(
-        data.get("openai_key.OPENAI_API_KEY"),
-        Some(&"value-of-openai_key".to_string())
-    );
+    for role in ["AGENT", "DECISION"] {
+        assert_eq!(
+            data.get(&format!("openai_key.CRUCIBLE_INFERENCE_KEY_{role}")),
+            Some(&"value-of-openai_key".to_string())
+        );
+    }
     assert_eq!(data.get("pr_token"), Some(&"value-of-pr_token".to_string()));
     Ok(())
 }
 
 /// A grounded rank runs under the autoresearch provider it resolved: the harness and model flags
-/// reach the turn, the endpoint rides plain environment, and the key rides the per-run Secret
+/// reach the turn, the endpoint rides the inference document, and the key rides the per-run Secret
 /// without ever appearing in the pod spec.
 #[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -5063,8 +5141,11 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
     for flag in ["--harness", "claude", "--model", "rits/zai-org/glm-5-3"] {
         assert!(doc.contains(flag), "{flag} missing from {doc}");
     }
-    assert!(doc.contains("ANTHROPIC_BASE_URL"), "{doc}");
-    assert!(doc.contains("https://gateway.example"), "{doc}");
+    let bindings = inference_document(pods.first().expect("a created pod")).bindings;
+    assert_eq!(bindings.len(), 1, "{bindings:?}");
+    assert_eq!(bindings[0].protocol, WireProtocol::Messages);
+    assert_eq!(bindings[0].url.as_deref(), Some("https://gateway.example"));
+    assert!(!doc.contains("ANTHROPIC_BASE_URL"), "{doc}");
     let secrets = created_secrets.lock().expect("lock");
     let data = secrets
         .first()
@@ -5080,9 +5161,8 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
     Ok(())
 }
 
-/// A custom provider hands the pod where to reach it as plain environment beside the secretKeyRef
-/// that carries its key: the base URL under the name the harness reads, the Codex wire API the
-/// engine renders into its config, and the harness flag its protocol decides.
+/// A custom provider hands the pod where to reach it in the inference document beside the
+/// secretKeyRef that carries its key, and the harness flag its protocol decides.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPool) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
@@ -5124,7 +5204,6 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
         crate::playbooks::providers::WorkloadClass::Autoresearch,
     )
     .await?;
-    let provider = resolved.as_ref().map(|r| r.provider.clone());
 
     let db = Db::new(pool);
     let cfg = pod_cfg(&profile, "img");
@@ -5136,7 +5215,7 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
         created_cms: Arc::new(Mutex::new(Vec::new())),
     });
     let mut secrets = repo_secrets(crate::authz::model::Principals::new(Some("alice"), &[]));
-    secrets.inference_provider = provider;
+    secrets.inference = resolved.iter().map(|r| r.inference()).collect();
     secrets.provider = Some(std::sync::Arc::new(
         crate::secrets::provider::MapProvider::new([(
             "vllm_key".to_string(),
@@ -5178,18 +5257,17 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
     let env = container.env.as_ref().expect("env");
     let var = |name: &str| env.iter().find(|v| v.name == name);
     assert_eq!(
-        var("OPENAI_BASE_URL")
-            .and_then(|v| v.value.clone())
-            .as_deref(),
-        Some("http://vllm.internal:8000/v1")
+        inference_document(pod).bindings,
+        vec![InferenceBinding {
+            role: InferenceRole::Agent,
+            protocol: WireProtocol::Responses,
+            url: Some("http://vllm.internal:8000/v1".to_string()),
+            model: "gpt-oss-120b".to_string(),
+            key_env: Some(EnvName::new("CRUCIBLE_INFERENCE_KEY_AGENT").expect("a name")),
+        }]
     );
-    assert_eq!(
-        var(crate::playbooks::providers::WIRE_API_ENV)
-            .and_then(|v| v.value.clone())
-            .as_deref(),
-        Some("responses")
-    );
-    let key = var("OPENAI_API_KEY").expect("the key");
+    assert!(var("OPENAI_BASE_URL").is_none() && var("OPENAI_API_KEY").is_none());
+    let key = var("CRUCIBLE_INFERENCE_KEY_AGENT").expect("the key");
     assert!(
         key.value.is_none() && key.value_from.is_some(),
         "the key rides a secretKeyRef"
@@ -5209,7 +5287,8 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
         .as_ref()
         .expect("data");
     assert_eq!(
-        data.get("vllm_key.OPENAI_API_KEY").map(String::as_str),
+        data.get("vllm_key.CRUCIBLE_INFERENCE_KEY_AGENT")
+            .map(String::as_str),
         Some("sk-onprem")
     );
     Ok(())
@@ -5289,7 +5368,11 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
                 ("openai_key".to_string(), "value-of-openai_key".to_string()),
             ]),
         ));
-        secrets.inference_provider = Some(provider);
+        secrets.inference = vec![ResolvedModel {
+            role: ModelRole::Agent,
+            model: provider.default_model.clone(),
+            provider,
+        }];
 
         let out = dispatch_run(
             &db,

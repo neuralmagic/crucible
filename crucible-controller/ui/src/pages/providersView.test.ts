@@ -33,6 +33,7 @@ const ONPREM: ProviderDetailDto = {
   protocol: 'responses',
   harness: 'codex',
   harness_override: null,
+  roles: ['agent'],
   enabled: true,
   created_by: 'alice',
   created_at: '2026-09-02T00:00:00Z',
@@ -78,6 +79,8 @@ describe('harness', () => {
     expect(defaultHarness('anthropic', 'chat_completions')).toBe('claude');
     expect(harnessOptions('custom', 'chat_completions').map((o) => o.value)).toEqual(['', 'opencode', 'pi']);
     expect(harnessOptions('custom', 'chat_completions')[0].label).toBe('default (OpenCode)');
+    expect(harnessOptions('custom', 'decisions')).toEqual([]);
+    expect(defaultHarness('custom', 'system_one')).toBeUndefined();
   });
 
   it('keeps a chosen harness across a kind or protocol change only while it still applies', () => {
@@ -127,6 +130,8 @@ describe('labels', () => {
     expect(keyVariable('custom', 'messages')).toBe('ANTHROPIC_API_KEY');
     expect(keyVariable('custom', 'responses')).toBe('OPENAI_API_KEY');
     expect(keyVariable('vertex', 'messages')).toBeNull();
+    expect(keyVariable('custom', 'decisions')).toBe('OPENAI_API_KEY');
+    expect(keyVariable('custom', 'system_one')).toBeNull();
   });
 
   it('says where a custom provider is reached', () => {
@@ -142,6 +147,7 @@ describe('dispatch defaults', () => {
     expect(defaultBody(primary)).toEqual({
       scope_kind: 'platform',
       workload_class: 'autoresearch',
+      role: 'agent',
       provider: 'pricetag-glm',
     });
     expect(
@@ -149,6 +155,7 @@ describe('dispatch defaults', () => {
     ).toEqual({
       scope_kind: 'platform',
       workload_class: 'autoresearch',
+      role: 'agent',
       provider: 'pricetag-glm',
       fallback_provider: 'vertex',
       fallback_model: 'claude-sonnet-5',
@@ -170,6 +177,10 @@ describe('dispatch defaults', () => {
 
   it('refuses what the server refuses', () => {
     expect(defaultErrors(emptyDefaultForm()).get('provider')).toBe('pick a provider');
+    expect(defaultErrors({ ...primary, role: 'decision' }).get('role')).toBe(
+      'an autoresearch loop runs no route task',
+    );
+    expect(defaultErrors({ ...primary, role: 'decision', workloadClass: 'playbook' }).has('role')).toBe(false);
     expect(defaultErrors({ ...primary, scopeKind: 'domain', scopeRef: 'vllm' }).get('scopeRef')).toBe(
       'a domain is spelled owner/repo',
     );
@@ -189,6 +200,7 @@ describe('dispatch defaults', () => {
       scope_kind: 'domain',
       scope_ref: 'org/vllm',
       workload_class: 'playbook',
+      role: 'decision',
       provider: 'pricetag-glm',
       model: null,
       fallback_provider: 'vertex',
@@ -198,6 +210,7 @@ describe('dispatch defaults', () => {
       scope_kind: 'domain',
       scope_ref: 'org/vllm',
       workload_class: 'playbook',
+      role: 'decision',
       provider: 'pricetag-glm',
       fallback_provider: 'vertex',
       fallback_model: 'claude-sonnet-5',

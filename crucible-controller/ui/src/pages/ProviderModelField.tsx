@@ -31,7 +31,9 @@ function platformDefault(
   defaults: readonly DispatchDefaultDto[],
   workloadClass: WorkloadClass
 ): DispatchDefaultDto | undefined {
-  return defaults.find((d) => d.scope_kind === 'platform' && d.workload_class === workloadClass);
+  return defaults.find(
+    (d) => d.scope_kind === 'platform' && d.workload_class === workloadClass && d.role === 'agent',
+  );
 }
 
 interface ProviderModelFieldProps {
@@ -55,7 +57,7 @@ export function ProviderModelField({
   const [freeText, setFreeText] = useState(false);
 
   if (registry.data === undefined) return null;
-  const providers = registry.data.providers;
+  const providers = registry.data.providers.filter((p) => p.roles.includes('agent'));
   if (providers.length === 0) return null;
 
   const inherited = platformDefault(registry.data.defaults, workloadClass);

@@ -33,6 +33,8 @@ import { ProviderIcon } from './ProviderIcon';
 import { SharesSection } from './SharesSection';
 import {
   CLASS_OPTIONS,
+  ROLE_OPTIONS,
+  servesRole,
   defaultBody,
   defaultErrors,
   defaultFormOf,
@@ -96,10 +98,17 @@ function columns(onOpen: (id: string) => void) {
       meta: { wrap: true, className: 'font-mono text-data text-ink-2' },
       cell: ({ row }) => reachLabel(row.original),
     }),
+    helper.accessor('roles', {
+      header: 'Serves',
+      enableSorting: false,
+      meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
+      cell: ({ getValue }) => getValue().join(' + '),
+    }),
     helper.accessor('harness', {
       header: 'Harness',
       enableSorting: false,
       meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
+      cell: ({ getValue }) => getValue() ?? '—',
     }),
     helper.accessor('default_model', {
       header: 'Default model',
@@ -201,7 +210,6 @@ function ProviderFormFields({ idPrefix, form, editing, onChange }: ProviderFormF
             value={form.endpoint}
             onChange={(endpoint) => { onChange({ ...form, endpoint }); }}
             placeholder="http://vllm.internal:8000/v1"
-            hint="The base URL the harness's API paths are appended to. Lands in the pod as OPENAI_BASE_URL or ANTHROPIC_BASE_URL, the same config key an OpenShell provider carries."
             error={form.endpoint.length > 0 ? error('endpoint') : null}
           />
           <SelectField
@@ -214,18 +222,19 @@ function ProviderFormFields({ idPrefix, form, editing, onChange }: ProviderFormF
               onChange({ ...form, protocol: next, harness: harnessFor(form.kind, next, form.harness) });
             }}
             options={PROTOCOL_OPTIONS}
-            hint="What the endpoint speaks. Chat completions runs OpenCode or Pi; responses runs Codex or Pi; messages runs Claude Code, OpenCode, or Pi."
           />
         </>
       )}
-      <SelectField
-        id={`${idPrefix}-harness`}
-        label="Harness"
-        value={form.harness}
-        onChange={(harness) => { onChange({ ...form, harness }); }}
-        options={harnessOptions(form.kind, form.protocol)}
-        hint="The agent CLI a dispatch to this provider runs. Blank takes the default for the kind or protocol."
-      />
+      {harnessOptions(form.kind, form.protocol).length > 0 && (
+        <SelectField
+          id={`${idPrefix}-harness`}
+          label="Harness"
+          value={form.harness}
+          onChange={(harness) => { onChange({ ...form, harness }); }}
+          options={harnessOptions(form.kind, form.protocol)}
+          hint="The agent CLI a dispatch to this provider runs. Blank takes the default for the kind or protocol."
+        />
+      )}
       <TextAreaField
         id={`${idPrefix}-models`}
         label="Models"
@@ -427,7 +436,7 @@ function DetailSection({ provider, onClose }: { provider: ProviderDetailDto; onC
 const defaultsHelper = createDataColumnHelper<DispatchDefaultDto>();
 
 function defaultKey(row: DispatchDefaultDto): string {
-  return `${row.scope_kind}:${row.scope_ref}:${row.workload_class}`;
+  return `${row.scope_kind}:${row.scope_ref}:${row.workload_class}:${row.role}`;
 }
 
 function defaultColumns(onEdit: ((row: DispatchDefaultDto) => void) | null, onClear: ((row: DispatchDefaultDto) => void) | null) {
@@ -447,6 +456,11 @@ function defaultColumns(onEdit: ((row: DispatchDefaultDto) => void) | null, onCl
     }),
     defaultsHelper.accessor('workload_class', {
       header: 'Class',
+      enableSorting: false,
+      meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
+    }),
+    defaultsHelper.accessor('role', {
+      header: 'Role',
       enableSorting: false,
       meta: { shrink: true, className: 'font-mono text-data text-ink-2' },
     }),
@@ -502,7 +516,9 @@ function DefaultFormFields({
 }) {
   const errors = defaultErrors(form);
   const error = (field: string) => errors.get(field) ?? null;
-  const providerOptions = providers.map((p) => ({ value: p.id, label: `${p.display_name} (${p.id})` }));
+  const providerOptions = providers
+    .filter((p) => servesRole(p, form.role))
+    .map((p) => ({ value: p.id, label: `${p.display_name} (${p.id})` }));
   const primary = providers.find((p) => p.id === form.provider);
   const fallback = providers.find((p) => p.id === form.fallbackProvider);
   return (
@@ -535,6 +551,23 @@ function DefaultFormFields({
         }}
         options={CLASS_OPTIONS}
       />
+      <SelectField
+        id="default-role"
+        label="Role"
+        value={form.role}
+        onChange={(role) => {
+          const next = optionValue(ROLE_OPTIONS, role, 'agent');
+          const keeps = (id: string) => providers.some((p) => p.id === id && servesRole(p, next));
+          onChange({
+            ...form,
+            role: next,
+            ...(keeps(form.provider) ? {} : { provider: '', model: '' }),
+            ...(keeps(form.fallbackProvider) ? {} : { fallbackProvider: '', fallbackModel: '' }),
+          });
+        }}
+        options={ROLE_OPTIONS}
+      />
+      {error('role') !== null && <Note>{error('role')}</Note>}
       <SelectField
         id="default-provider"
         label="Primary"
@@ -608,6 +641,7 @@ function DefaultsSection({ admin }: { admin: boolean }) {
           query: {
             scope_kind: row.scope_kind,
             workload_class: row.workload_class,
+            role: row.role,
             ...(row.scope_kind === 'domain' ? { scope_ref: row.scope_ref } : {}),
           },
         },

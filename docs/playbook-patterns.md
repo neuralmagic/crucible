@@ -187,11 +187,15 @@ A label whose probability is under `min_confidence` is recorded as `"uncertain"`
 `otherwise` or `drop` has to cover. So is a question OpenAI declines to answer, with confidence 0
 and an empty distribution.
 
-**From the control plane.** A controller started with `just controller-local` passes its own
-`CRUCIBLE_*` variables to the runs it launches, so exporting `CRUCIBLE_INFERENCE` before starting
-it gives every playbook launch the decision model. Name the key variable with the same prefix
-(`"key_env":"CRUCIBLE_JEV_API_KEY"`) and it passes through too. A deployed controller does not
-build a decision binding yet.
+**From the control plane.** A deployed controller binds the decision model from its provider
+registry: on the Providers page, add a default with role `decision` for the playbook class, on the
+platform or for one domain, naming an OpenAI provider (it asks `gpt-6-luna` unless the default
+names a model) or a custom provider whose protocol is `decisions` or `system_one`. Every playbook
+launch then carries the binding, with the provider's key, beside its agent's
+([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)). A controller started with `just controller-local` reads no secret
+values; it passes its own `CRUCIBLE_*` variables to the runs it launches instead, so export
+`CRUCIBLE_INFERENCE` before starting it and name the key variable with the same prefix
+(`"key_env":"CRUCIBLE_DECISION_KEY"`).
 
 `examples/route` is the runnable pack, with five sample tickets and a recipe for serving
 DiffusionGemma yourself.
