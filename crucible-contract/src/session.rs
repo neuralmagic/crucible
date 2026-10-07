@@ -145,6 +145,10 @@ pub struct PlanTaskWire {
     /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
     #[serde(default)]
     pub when: String,
+    /// `producer.field` references whose per-element object each instance receives narrowed to
+    /// its own entry. Empty when the task narrows nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyed: Vec<String>,
     /// The tasks this task sends back when it settles failing, empty otherwise. Each round
     /// reports as `task[round-N]`, so a renderer draws the loop from this before any round runs.
     #[serde(
@@ -928,6 +932,7 @@ mod tests {
                 over: "discover.targets".into(),
                 max_fanout: 8,
                 when: String::new(),
+                keyed: Vec::new(),
                 revise: vec!["draft".into(), "check".into()],
                 max_rounds: 3,
                 emits: vec![
@@ -1025,6 +1030,7 @@ mod tests {
             over: String::new(),
             max_fanout: 0,
             when: String::new(),
+            keyed: Vec::new(),
             revise,
             max_rounds: 0,
             emits: Vec::new(),

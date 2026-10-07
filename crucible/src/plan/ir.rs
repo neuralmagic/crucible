@@ -488,6 +488,9 @@ pub struct Task {
     /// whatever a global default happened to be.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_fanout: Option<u32>,
+    /// Object fields of unmapped dependencies each instance receives narrowed to its own entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyed: Vec<OutputRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<When>,
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
@@ -1900,6 +1903,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -2540,6 +2544,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -2691,6 +2696,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
