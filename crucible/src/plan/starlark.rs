@@ -576,6 +576,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -604,6 +605,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -626,6 +628,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -649,6 +652,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -664,6 +668,10 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "questions",
             "min_confidence",
             "source",
+            "files",
+            "over",
+            "max_fanout",
+            "keyed",
             "depends_on",
             "required",
             "join",
@@ -929,15 +937,22 @@ fn constructor(
             let questions = take_questions(&mut named)?;
             let min_confidence = take_optional_number(&mut named, "min_confidence")?;
             let source = take_optional_task_name(&mut named, "source")?;
+            let files = take_route_files(&mut named)?;
             let (decider, needs) = match (min_confidence, source) {
                 (Some(min_confidence), None) => (
-                    Decider::Model { min_confidence },
+                    Decider::Model {
+                        min_confidence,
+                        files,
+                    },
                     crate::plan::ir::NEEDS_SYSTEMONE,
                 ),
+                (None, Some(_)) if !files.is_empty() => {
+                    return Err(CompileError::RouteFilesWithSource { task: name.0 });
+                }
                 (None, Some(task)) => (Decider::Output { task }, "any"),
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
             };
-            Task {
+            let task = Task {
                 task: TaskKind::Route { questions, decider },
                 depends_on: take_task_names(&mut named)?,
                 session: None,
@@ -948,16 +963,18 @@ fn constructor(
                 stage: parse_stage(&take_string_default(&mut named, "stage", "iteration")?)?,
                 emits: crate::plan::ir::Emits::default(),
                 emits_files: Vec::new(),
-                over: None,
-                max_fanout: None,
-                keyed: Vec::new(),
+                over: take_over(&mut named)?,
+                max_fanout: take_optional_fanout(&mut named)?,
+                keyed: take_keyed(&mut named)?,
                 revise: None,
                 timeout: None,
                 when: take_when(&mut named, state, &name)?,
                 name,
                 history: None,
                 repair: 0,
-            }
+            };
+            check_fanout(&task)?;
+            task
         }
         "propose" => {
             let session = take_session(&mut named, state, at)?;
@@ -1204,7 +1221,7 @@ fn dsl_task(
         emits_files: take_emitted_files(named)?,
         over: take_over(named)?,
         max_fanout: take_optional_fanout(named)?,
-        keyed: Vec::new(),
+        keyed: take_keyed(named)?,
         when,
         revise: take_revise(named)?,
         timeout: take_timeout(named)?,
@@ -1527,6 +1544,44 @@ fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
         },
         Some(_) => Err(CompileError::OverNotOutputField),
     }
+}
+
+fn take_keyed(named: &mut BTreeMap<String, Value>) -> Result<Vec<OutputRef>> {
+    let items = match named.remove("keyed") {
+        None | Some(Value::None) => return Ok(Vec::new()),
+        Some(Value::List(items)) => items,
+        Some(single) => vec![single],
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::Output(output) => match output.ty {
+                Some(declared) if !declared.is_object() => Err(CompileError::KeyedNotObject {
+                    reference: output.reference.to_string(),
+                    declared,
+                }),
+                _ => Ok(output.reference),
+            },
+            _ => Err(CompileError::KeyedNotOutputField),
+        })
+        .collect()
+}
+
+fn take_route_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>> {
+    let items = match named.remove("files") {
+        None | Some(Value::None) => return Ok(Vec::new()),
+        Some(Value::List(items)) => items,
+        Some(_) => return Err(CompileError::RouteFilesNotList),
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::String(path) => safe_relative_path(&path)
+                .map(|relative| relative.display().to_string())
+                .map_err(|_| CompileError::EmitsFileNotRelative { path }),
+            _ => Err(CompileError::RouteFilesNotList),
+        })
+        .collect()
 }
 
 fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
@@ -3198,7 +3253,8 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
         assert_eq!(
             *decider,
             Decider::Model {
-                min_confidence: 0.8
+                min_confidence: 0.8,
+                files: Vec::new(),
             }
         );
         let area = &questions[&QuestionId::new("area").unwrap()];
@@ -4496,10 +4552,15 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
         let pack = temp_pack("kwarg-slices");
         std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
         std::fs::write(pack.join("skills/demo/SKILL.md"), "demo\n").unwrap();
+        std::fs::write(pack.join("r.schema.json"), r#"{"type": "object"}"#).unwrap();
         let cases: &[(&str, &str)] = &[
             (
+                "route",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\nd = agent(name = \"d\", prompt = \"p\", depends_on = [u], over = u.items, max_fanout = 4, emits_files = {\"r.json\": schema_file(\"r.schema.json\")})\ng = route(name = \"g\", min_confidence = 0.5, files = [\"r.json\"], over = u.items, max_fanout = 4, keyed = [u.facts], depends_on = [u, d], questions = {\"q\": noul(ask = \"q?\")}{extra})\nworkflow(type = \"custom\", tasks = [u, d, g], result = g)\n",
+            ),
+            (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
@@ -4507,15 +4568,15 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
@@ -6929,6 +6990,97 @@ workflow(type = "playbook", tasks = [seed, turn, helper, sweep, probe, mapped])
                 error.contains(&format!("{field:?} is reserved for early completion")),
                 "{error}"
             );
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_playbook_gates_each_tickets_turn_on_a_route_mapped_over_the_same_list() {
+        let pack = temp_pack("route-over");
+        std::fs::write(pack.join("result.json"), r#"{"type": "object"}"#).unwrap();
+        let source = r#"
+prepare = command(name = "prepare", run = "true", emits = {"members": "list", "facts": "object"})
+gate = route(
+    name = "gate",
+    depends_on = [prepare],
+    over = prepare.members,
+    max_fanout = 120,
+    keyed = [prepare.facts],
+    min_confidence = 0.8,
+    questions = {"depth": choice(ask = "How deep?", options = {"settled": "facts settle it", "quick": "a short look", "deep": "a full look"}, drop = ["settled"])},
+)
+quick = agent(name = "quick", prompt = "p", effort = "low", depends_on = [prepare, gate], over = prepare.members, max_fanout = 120, keyed = prepare.facts, when = gate.depth, answers = "quick", emits_files = {"RESULT.json": schema_file("result.json")})
+deep = agent(name = "deep", prompt = "p", effort = "high", depends_on = [prepare, gate], over = prepare.members, max_fanout = 120, when = gate.depth, otherwise = True, emits_files = {"RESULT.json": schema_file("result.json")})
+judge = route(name = "judge", depends_on = [prepare, quick, deep], join = "settled", over = prepare.members, max_fanout = 120, files = ["RESULT.json"], min_confidence = 0.8, questions = {"supported": noul(ask = "Does the evidence support the verdict?", drop = ["yes"])})
+review = agent(name = "review", prompt = "p", depends_on = [prepare, judge], over = prepare.members, max_fanout = 120, when = judge.supported, otherwise = True)
+report = command(name = "report", run = "true", depends_on = [quick, deep, review], join = "settled")
+workflow(type = "playbook", tasks = [prepare, gate, quick, deep, judge, review, report])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let task = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .expect("the task")
+        };
+        assert_eq!(
+            task("gate").over.as_ref().map(ToString::to_string),
+            Some("prepare.members".to_string())
+        );
+        let keyed: Vec<String> = task("quick")
+            .keyed
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(keyed, ["prepare.facts"]);
+        assert!(task("deep").keyed.is_empty());
+        let TaskKind::Route {
+            decider: Decider::Model { files, .. },
+            ..
+        } = &task("judge").task
+        else {
+            panic!("judge is a model route");
+        };
+        assert_eq!(files, &["RESULT.json"]);
+        let canonical: serde_json::Value = serde_json::from_str(&compiled.canonical_json).unwrap();
+        let gate = canonical["task"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "gate")
+            .unwrap();
+        assert_eq!(
+            gate["keyed"],
+            serde_json::json!([{"task": "prepare", "field": "facts"}])
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn keyed_and_route_files_are_refused_at_the_argument_that_breaks_them() {
+        let pack = temp_pack("keyed-refused");
+        let cases = [
+            (
+                "p = command(name = \"p\", run = \"true\", emits = {\"members\": \"list\", \"facts\": \"list\"})\na = agent(name = \"a\", prompt = \"x\", depends_on = [p], over = p.members, max_fanout = 2, keyed = [p.facts])\nworkflow(type = \"playbook\", tasks = [p, a])\n",
+                "keyed needs an object keyed by element",
+            ),
+            (
+                "p = command(name = \"p\", run = \"true\", emits = [\"members\"])\na = agent(name = \"a\", prompt = \"x\", depends_on = [p], over = p.members, max_fanout = 2, keyed = [\"facts\"])\nworkflow(type = \"playbook\", tasks = [p, a])\n",
+                "\"keyed\" must name declared output fields",
+            ),
+            (
+                "p = command(name = \"p\", run = \"true\", emits = [\"area\"])\ng = route(name = \"g\", source = p, files = [\"R.json\"], depends_on = [p], questions = {\"area\": noul(ask = \"a?\")})\nworkflow(type = \"playbook\", tasks = [p, g])\n",
+                "only a model reads files",
+            ),
+        ];
+        for (source, needle) in cases {
+            let error =
+                compile_source(source, &pack.join("workflow.star"), &pack).expect_err("refused");
+            let report = crate::errors::report(&error);
+            assert!(report.contains(needle), "{report}");
         }
         let _ = std::fs::remove_dir_all(&pack);
     }

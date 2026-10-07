@@ -271,6 +271,57 @@ def auditor(topic, blocking):
 auditors = [auditor(topic, blocking) for topic, blocking in AUDITS]
 ```
 
+## Decide per item
+
+A route can map over a list too. It asks once per item, and a task mapped over the same list
+reads each item's answer with `when`, so item k's turn runs only when item k's answer allows it:
+
+```python
+prepare = command(name = "prepare", run = "./stage.sh",
+                  emits = {"members": "list", "facts": "object"})
+
+gate = route(
+    name = "gate",
+    depends_on = [prepare],
+    over = prepare.members,
+    max_fanout = 120,
+    keyed = [prepare.facts],
+    min_confidence = 0.8,
+    questions = {"depth": choice(
+        ask = "How much work does this ticket need?",
+        options = {"settled": "the staged facts already answer it",
+                   "quick": "a short look", "deep": "a full investigation"},
+        drop = ["settled"],
+    )},
+)
+
+quick = agent(name = "quick", prompt = prompt_file("analyze.md"), effort = "low",
+              depends_on = [prepare, gate], over = prepare.members, max_fanout = 120,
+              keyed = [prepare.facts], when = gate.depth, answers = "quick")
+deep = agent(name = "deep", prompt = prompt_file("analyze.md"), effort = "high",
+             depends_on = [prepare, gate], over = prepare.members, max_fanout = 120,
+             keyed = [prepare.facts], when = gate.depth, otherwise = True)
+```
+
+- **Items pair by key.** Tasks mapped over the same `producer.field` are aligned: `quick[T-1]`
+  reads `gate[T-1]`, and any aligned dependency reaches an instance as its own instance for the
+  same key, not the whole fan-out.
+- **Untaken items stay visible.** `quick[T-2]` settles `not_taken` with the answer in its note.
+  It does not fail the fan-out, whose output counts it under `not_taken`, and an aligned task
+  joining `all` on it is not taken either.
+- **One request per item.** `max_fanout` bounds them. A resumed run keeps every decision it
+  already has and asks only for the rest.
+- **`keyed` narrows.** `prepare.facts` is an object keyed by item; each instance, route or not,
+  gets only its own entry under `facts`, so a hundred-item fan-out does not send every item's
+  facts to every turn.
+- **Judge a result file.** `files = ["RESULT.json"]` puts a dependency's declared JSON file in
+  the model's state under `files`, so a route mapped after the analysis can ask whether its
+  evidence supports its verdict and send the doubtful ones to a review lane with `when`.
+- **Deterministic first.** An output-decided route mapped over the list reads each item's
+  answer from an object keyed by item (`{"reachable": {"T-1": "no"}}`). Put it in front and give
+  the model route a `when` on it, so the model is asked only about the items the facts leave
+  open.
+
 ## Keep a conversation
 
 Agent tasks that share a `session` continue one conversation, in dependency order:

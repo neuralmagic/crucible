@@ -192,7 +192,7 @@ impl ShellRunner {
             }
             TaskKind::Route {
                 questions,
-                decider: Decider::Model { min_confidence },
+                decider: Decider::Model { min_confidence, .. },
             } => {
                 let inference = match crate::inference::from_process_env() {
                     Ok(inference) => inference,

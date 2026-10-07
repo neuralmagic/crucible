@@ -122,7 +122,7 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     .collect::<Vec<_>>()
                     .join(", "),
                 match decider {
-                    crate::plan::ir::Decider::Model { min_confidence } =>
+                    crate::plan::ir::Decider::Model { min_confidence, .. } =>
                         format!("model >= {min_confidence}"),
                     crate::plan::ir::Decider::Output { task } => format!("from {task}"),
                 }

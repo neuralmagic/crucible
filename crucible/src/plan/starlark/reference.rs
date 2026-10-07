@@ -132,6 +132,7 @@ fn task_knobs() -> Vec<Kwarg> {
                 "Instance cap for `over`, within the engine's ceiling of {MAX_FANOUT_CEILING}."
             ),
         ),
+        keyed_kwarg(),
         Kwarg::new(
             "revise",
             "task | list[task]",
@@ -174,6 +175,15 @@ fn task_knobs() -> Vec<Kwarg> {
         answers_kwarg(),
         otherwise_kwarg(),
     ]
+}
+
+fn keyed_kwarg() -> Kwarg {
+    Kwarg::new(
+        "keyed",
+        "list[producer.field]",
+        "Object fields of unmapped dependencies, keyed by item. Each instance receives only its \
+         own item's entry in place of the whole field. Needs `over`.",
+    )
 }
 
 fn when_kwarg() -> Kwarg {
@@ -564,6 +574,28 @@ pub fn functions() -> Vec<Function> {
                      types its emits, each question's field must be typed with labels the \
                      question answers, or `\"boolean\"` for a noul.",
                 ),
+                Kwarg::new(
+                    "files",
+                    "list[str]",
+                    "Declared JSON files of dependencies the model reads, under `files` in its \
+                     state, by dependency and path. Each must be declared by a dependency with a \
+                     `schema_file(...)`. Not with `source`.",
+                ),
+                Kwarg::new(
+                    "over",
+                    "producer.field",
+                    "Decide once per item. A task mapped over the same list reads each item's \
+                     answer with `when`; one mapped over another list, or not mapped, cannot.",
+                ),
+                Kwarg::new(
+                    "max_fanout",
+                    "int",
+                    format!(
+                        "Instance cap for `over`, within the engine's ceiling of \
+                         {MAX_FANOUT_CEILING}."
+                    ),
+                ),
+                keyed_kwarg(),
                 Kwarg::new(
                     "depends_on",
                     "list[task]",
