@@ -123,6 +123,10 @@ pub enum QuestionKind {
         #[serde(default, skip_serializing_if = "is_false")]
         multiple: bool,
     },
+    /// Ordered levels, lowest first.
+    Score {
+        levels: Vec<ChoiceOption>,
+    },
     /// One value, or with `multiple` one or more, from a list a dependency produced. A pick has
     /// no labels, so no `when` may name it.
     Pick {
@@ -147,6 +151,9 @@ pub enum QuestionError {
     TooFewOptions { got: usize },
     DuplicateOption { label: Label },
     ReservedOption,
+    TooFewLevels { got: usize },
+    DuplicateLevel { label: Label },
+    ReservedLevel,
     UnknownDrop { label: Label },
 }
 
@@ -166,6 +173,18 @@ impl std::fmt::Display for QuestionError {
                     "option {UNCERTAIN:?} is reserved for a low-confidence answer"
                 )
             }
+            QuestionError::TooFewLevels { got } => {
+                write!(f, "a score needs at least two levels, got {got}")
+            }
+            QuestionError::DuplicateLevel { label } => {
+                write!(f, "level {label:?} is declared twice")
+            }
+            QuestionError::ReservedLevel => {
+                write!(
+                    f,
+                    "level {UNCERTAIN:?} is reserved for a low-confidence answer"
+                )
+            }
             QuestionError::UnknownDrop { label } => {
                 write!(
                     f,
@@ -183,7 +202,7 @@ impl Question {
     pub fn labels(&self) -> Vec<Label> {
         match &self.kind {
             QuestionKind::Noul => vec![Label(NOUL_YES.to_owned()), Label(NOUL_NO.to_owned())],
-            QuestionKind::Choice { options, .. } => {
+            QuestionKind::Choice { options, .. } | QuestionKind::Score { levels: options } => {
                 options.iter().map(|o| o.label.clone()).collect()
             }
             QuestionKind::Pick { .. } => Vec::new(),
@@ -193,7 +212,7 @@ impl Question {
     /// Whether an answer may hold more than one value.
     pub fn multiple(&self) -> bool {
         match &self.kind {
-            QuestionKind::Noul => false,
+            QuestionKind::Noul | QuestionKind::Score { .. } => false,
             QuestionKind::Choice { multiple, .. } | QuestionKind::Pick { multiple, .. } => {
                 *multiple
             }
@@ -216,20 +235,21 @@ impl Question {
         if self.instructions.trim().is_empty() {
             return Err(QuestionError::EmptyInstructions);
         }
-        if let QuestionKind::Choice { options, .. } = &self.kind {
-            if options.len() < 2 {
-                return Err(QuestionError::TooFewOptions { got: options.len() });
+        match &self.kind {
+            QuestionKind::Noul | QuestionKind::Pick { .. } => {}
+            QuestionKind::Choice { options, .. } => {
+                distinct(options).map_err(|fault| match fault {
+                    OptionFault::TooFew { got } => QuestionError::TooFewOptions { got },
+                    OptionFault::Duplicate { label } => QuestionError::DuplicateOption { label },
+                    OptionFault::Reserved => QuestionError::ReservedOption,
+                })?;
             }
-            let mut seen = BTreeSet::new();
-            for option in options {
-                if option.label.is_uncertain() {
-                    return Err(QuestionError::ReservedOption);
-                }
-                if !seen.insert(&option.label) {
-                    return Err(QuestionError::DuplicateOption {
-                        label: option.label.clone(),
-                    });
-                }
+            QuestionKind::Score { levels } => {
+                distinct(levels).map_err(|fault| match fault {
+                    OptionFault::TooFew { got } => QuestionError::TooFewLevels { got },
+                    OptionFault::Duplicate { label } => QuestionError::DuplicateLevel { label },
+                    OptionFault::Reserved => QuestionError::ReservedLevel,
+                })?;
             }
         }
         for label in &self.drop {
@@ -242,8 +262,22 @@ impl Question {
         Ok(())
     }
 
+    /// The score recorded for answering `label` with certainty: its level position over n - 1.
+    /// `None` for a question that is not a score or a label that is not one of its levels.
+    pub fn level_score(&self, label: &Label) -> Option<f64> {
+        let QuestionKind::Score { levels } = &self.kind else {
+            return None;
+        };
+        let top = u32::try_from(levels.len().checked_sub(1)?)
+            .ok()
+            .filter(|top| *top > 0)?;
+        let at = u32::try_from(levels.iter().position(|level| &level.label == label)?).ok()?;
+        Some(f64::from(at) / f64::from(top))
+    }
+
     /// Pick the most probable declared label, or `uncertain` when it falls below
-    /// `min_confidence`. `probabilities` must hold exactly this question's labels.
+    /// `min_confidence`. `probabilities` must hold exactly this question's labels. A score's
+    /// distribution is normalized first, and its tie goes to the lowest level.
     pub fn resolve(
         &self,
         probabilities: BTreeMap<Label, f64>,
@@ -275,6 +309,9 @@ impl Question {
         let Some((top, confidence)) = best else {
             return Err(ResolveError::NoLabels);
         };
+        if let QuestionKind::Score { .. } = self.kind {
+            return self.resolve_score(&labels, probabilities, min_confidence);
+        }
         let label = if confidence < min_confidence {
             Label::uncertain()
         } else {
@@ -284,14 +321,86 @@ impl Question {
             label,
             confidence,
             probabilities,
+            score: None,
+            asked_as: None,
+            labels: Vec::new(),
+        })
+    }
+
+    fn resolve_score(
+        &self,
+        levels: &[Label],
+        probabilities: BTreeMap<Label, f64>,
+        min_confidence: f64,
+    ) -> Result<Answer, ResolveError> {
+        let total: f64 = probabilities.values().sum();
+        if total <= 0.0 {
+            return Err(ResolveError::AllZero);
+        }
+        let probabilities: BTreeMap<Label, f64> = probabilities
+            .into_iter()
+            .map(|(label, p)| (label, p / total))
+            .collect();
+        let mut best: Option<(&Label, f64)> = None;
+        let mut score = 0.0;
+        for level in levels {
+            let p = probabilities.get(level).copied().unwrap_or(0.0);
+            if best.is_none_or(|(_, top)| p > top) {
+                best = Some((level, p));
+            }
+            let position = self
+                .level_score(level)
+                .ok_or(ResolveError::TooFewLevels { got: levels.len() })?;
+            score += p * position;
+        }
+        let Some((top, confidence)) = best else {
+            return Err(ResolveError::NoLabels);
+        };
+        let label = if confidence < min_confidence {
+            Label::uncertain()
+        } else {
+            top.clone()
+        };
+        Ok(Answer {
+            label,
+            confidence,
+            probabilities,
+            score: Some(score),
+            asked_as: None,
             labels: Vec::new(),
         })
     }
 }
 
+enum OptionFault {
+    TooFew { got: usize },
+    Duplicate { label: Label },
+    Reserved,
+}
+
+fn distinct(options: &[ChoiceOption]) -> Result<(), OptionFault> {
+    if options.len() < 2 {
+        return Err(OptionFault::TooFew { got: options.len() });
+    }
+    let mut seen = BTreeSet::new();
+    for option in options {
+        if option.label.is_uncertain() {
+            return Err(OptionFault::Reserved);
+        }
+        if !seen.insert(&option.label) {
+            return Err(OptionFault::Duplicate {
+                label: option.label.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ResolveError {
     NoLabels,
+    AllZero,
+    TooFewLevels { got: usize },
     UndeclaredLabel { label: Label },
     MissingLabel { label: Label },
     ProbabilityOutOfRange { label: Label, probability: f64 },
@@ -301,6 +410,10 @@ impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ResolveError::NoLabels => f.write_str("the question declares no labels"),
+            ResolveError::AllZero => f.write_str("the model gave every level probability 0"),
+            ResolveError::TooFewLevels { got } => {
+                write!(f, "a score needs at least two levels, got {got}")
+            }
             ResolveError::UndeclaredLabel { label } => {
                 write!(f, "the model answered with undeclared label {label:?}")
             }
@@ -324,6 +437,12 @@ pub struct Answer {
     pub label: Label,
     pub confidence: f64,
     pub probabilities: BTreeMap<Label, f64>,
+    /// A score question's expected level position in [0, 1], recorded whatever the label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    /// The form a model-decided score question was put to the decision API in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asked_as: Option<AskedAs>,
     /// Every label chosen, for a question that takes more than one; `label` is then the first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub labels: Vec<Label>,
@@ -340,6 +459,13 @@ impl Answer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AskedAs {
+    Score,
+    Choice,
+}
+
 /// A route task's output: one answer per declared question.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -347,7 +473,7 @@ pub struct Decision(pub BTreeMap<QuestionId, Answer>);
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::decision::*;
 
     fn label(s: &str) -> Label {
         Label::new(s).unwrap()
@@ -365,6 +491,22 @@ mod tests {
                     })
                     .collect(),
                 multiple: false,
+            },
+            drop: vec![],
+        }
+    }
+
+    fn score(levels: &[&str]) -> Question {
+        Question {
+            instructions: "how risky?".into(),
+            kind: QuestionKind::Score {
+                levels: levels
+                    .iter()
+                    .map(|l| ChoiceOption {
+                        label: label(l),
+                        description: Some(format!("{l} risk")),
+                    })
+                    .collect(),
             },
             drop: vec![],
         }
@@ -572,6 +714,8 @@ mod tests {
             label: label("a"),
             confidence: 1.0,
             probabilities: BTreeMap::new(),
+            score: None,
+            asked_as: None,
             labels: Vec::new(),
         };
         assert!(one.chose(&label("a")) && !one.chose(&label("b")));
@@ -582,5 +726,162 @@ mod tests {
         assert!(many.chose(&label("a")) && many.chose(&label("c")) && !many.chose(&label("b")));
         let wire = serde_json::to_value(&many).unwrap();
         assert_eq!(wire["labels"], serde_json::json!(["a", "c"]));
+    }
+
+    #[test]
+    fn a_score_answers_its_levels_in_declared_order() {
+        assert_eq!(
+            score(&["low", "medium", "high"]).labels(),
+            vec![label("low"), label("medium"), label("high")]
+        );
+    }
+
+    #[test]
+    fn a_score_needs_two_distinct_unreserved_levels() {
+        assert_eq!(
+            score(&["low"]).validate(),
+            Err(QuestionError::TooFewLevels { got: 1 })
+        );
+        assert_eq!(
+            score(&["low", "low"]).validate(),
+            Err(QuestionError::DuplicateLevel {
+                label: label("low")
+            })
+        );
+        assert_eq!(
+            score(&["low", "uncertain"]).validate(),
+            Err(QuestionError::ReservedLevel)
+        );
+        assert_eq!(score(&["low", "high"]).validate(), Ok(()));
+        assert_eq!(
+            QuestionError::TooFewLevels { got: 1 }.to_string(),
+            "a score needs at least two levels, got 1"
+        );
+    }
+
+    #[test]
+    fn a_score_resolves_to_its_most_probable_level_with_the_expected_position() {
+        let a = score(&["low", "medium", "high"])
+            .resolve(probs(&[("low", 0.2), ("medium", 0.2), ("high", 0.6)]), 0.5)
+            .unwrap();
+        assert_eq!(a.label, label("high"));
+        assert!((a.confidence - 0.6).abs() < 1e-12);
+        assert!((a.score.unwrap() - 0.7).abs() < 1e-12);
+        assert_eq!(a.asked_as, None);
+    }
+
+    #[test]
+    fn a_score_normalizes_its_distribution_before_choosing() {
+        let a = score(&["low", "medium", "high"])
+            .resolve(probs(&[("low", 0.1), ("medium", 0.3), ("high", 0.0)]), 0.7)
+            .unwrap();
+        assert_eq!(a.label, label("medium"));
+        assert!((a.confidence - 0.75).abs() < 1e-12);
+        assert!((a.probabilities[&label("low")] - 0.25).abs() < 1e-12);
+        assert!((a.probabilities.values().sum::<f64>() - 1.0).abs() < 1e-12);
+        assert!((a.score.unwrap() - 0.375).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_score_tie_goes_to_the_lowest_level() {
+        let a = score(&["low", "medium", "high"])
+            .resolve(probs(&[("low", 0.0), ("medium", 0.4), ("high", 0.4)]), 0.5)
+            .unwrap();
+        assert_eq!(a.label, label("medium"));
+        assert!((a.score.unwrap() - 0.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_score_below_the_threshold_is_uncertain_and_keeps_its_score() {
+        let a = score(&["low", "high"])
+            .resolve(probs(&[("low", 0.45), ("high", 0.55)]), 0.8)
+            .unwrap();
+        assert!(a.label.is_uncertain());
+        assert!((a.score.unwrap() - 0.55).abs() < 1e-12);
+    }
+
+    #[test]
+    fn a_score_with_every_probability_zero_fails() {
+        assert_eq!(
+            score(&["low", "high"]).resolve(probs(&[("low", 0.0), ("high", 0.0)]), 0.5),
+            Err(ResolveError::AllZero)
+        );
+    }
+
+    #[test]
+    fn a_score_still_refuses_a_missing_or_undeclared_level() {
+        assert_eq!(
+            score(&["low", "high"]).resolve(probs(&[("low", 1.0)]), 0.5),
+            Err(ResolveError::MissingLabel {
+                label: label("high")
+            })
+        );
+        assert_eq!(
+            score(&["low", "high"])
+                .resolve(probs(&[("low", 0.5), ("high", 0.2), ("extreme", 0.3)]), 0.5),
+            Err(ResolveError::UndeclaredLabel {
+                label: label("extreme")
+            })
+        );
+    }
+
+    #[test]
+    fn a_level_score_is_its_position_over_the_top_position() {
+        let q = score(&["low", "medium", "high"]);
+        assert_eq!(q.level_score(&label("low")), Some(0.0));
+        assert_eq!(q.level_score(&label("medium")), Some(0.5));
+        assert_eq!(q.level_score(&label("high")), Some(1.0));
+        assert_eq!(q.level_score(&Label::uncertain()), None);
+        assert_eq!(choice(&["a", "b"]).level_score(&label("a")), None);
+    }
+
+    #[test]
+    fn noul_and_choice_answers_keep_their_wire_shape() {
+        let noul = noul()
+            .resolve(probs(&[("yes", 0.75), ("no", 0.25)]), 0.5)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&noul).unwrap(),
+            serde_json::json!({"label": "yes", "confidence": 0.75, "probabilities": {"yes": 0.75, "no": 0.25}})
+        );
+        let choice = choice(&["a", "b"])
+            .resolve(probs(&[("a", 0.25), ("b", 0.75)]), 0.5)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&choice).unwrap(),
+            serde_json::json!({"label": "b", "confidence": 0.75, "probabilities": {"a": 0.25, "b": 0.75}})
+        );
+    }
+
+    #[test]
+    fn a_score_answer_serializes_its_score_and_the_form_it_was_asked_in() {
+        let mut a = score(&["low", "high"])
+            .resolve(probs(&[("low", 0.25), ("high", 0.75)]), 0.5)
+            .unwrap();
+        a.asked_as = Some(AskedAs::Choice);
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "label": "high",
+                "confidence": 0.75,
+                "probabilities": {"low": 0.25, "high": 0.75},
+                "score": 0.75,
+                "asked_as": "choice",
+            })
+        );
+        let back: Answer = serde_json::from_value(v).unwrap();
+        assert_eq!(back, a);
+    }
+
+    #[test]
+    fn a_score_question_round_trips_with_its_levels_in_order() {
+        let q = score(&["low", "medium", "high"]);
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(v["type"], "score");
+        assert_eq!(v["levels"][0]["label"], "low");
+        assert_eq!(v["levels"][2]["label"], "high");
+        let back: Question = serde_json::from_value(v).unwrap();
+        assert_eq!(back, q);
     }
 }

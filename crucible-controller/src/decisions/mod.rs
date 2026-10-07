@@ -221,7 +221,7 @@ pub(crate) struct DecisionsDto {
 pub(crate) struct DecisionQuestionDto {
     pub id: String,
     pub instructions: String,
-    /// `noul`, `choice`, or `pick`.
+    /// `noul`, `choice`, `score`, or `pick`.
     pub kind: String,
     /// Whether an answer may give more than one option.
     pub multiple: bool,
@@ -320,6 +320,7 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
                 kind: match q.kind {
                     QuestionKind::Noul => "noul",
                     QuestionKind::Choice { .. } => "choice",
+                    QuestionKind::Score { .. } => "score",
                     QuestionKind::Pick { .. } => "pick",
                 }
                 .to_owned(),

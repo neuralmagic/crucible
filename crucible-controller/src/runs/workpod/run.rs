@@ -4,7 +4,7 @@ use crate::client::Db;
 use crate::config::ControllerCfg;
 #[cfg(feature = "autoresearch")]
 use crate::issues::engine::{self, GroundedVerdict};
-use crate::playbooks::providers::{AgentSelection, ModelProvider};
+use crate::playbooks::providers::AgentSelection;
 #[cfg(feature = "autoresearch")]
 use crate::runs::workpod::spec::{self, TurnSpec as _};
 use crate::runs::workpod::*;
@@ -510,10 +510,10 @@ pub struct LaunchSecrets {
     /// ([[ADR-0036]]). `None` leaves a scope that binds nothing launchable and one that binds
     /// something refused, rather than started without what it declared.
     pub provider: Option<Arc<dyn crate::secrets::provider::SecretProvider>>,
-    /// The model provider this dispatch resolved to, whose registered key (if it named one) is
-    /// projected alongside the scope's own bindings. `None` for a dispatch that resolved no
-    /// provider, which is every dispatch under an empty registry.
-    pub inference_provider: Option<ModelProvider>,
+    /// The models this dispatch resolved, one per role, rendered as the run's inference document
+    /// with each registered key projected alongside the scope's own bindings. Empty for a dispatch
+    /// that resolved no provider, which is every dispatch under an empty registry.
+    pub inference: Vec<crate::playbooks::providers::ResolvedModel>,
     /// The stored exposure of the exact revision being launched; a binding the agent can read has
     /// to be disclosed by it. `None` is absent-legacy, where the check is skipped.
     pub exposure: Option<crate::playbooks::exposure::Exposure>,
@@ -629,14 +629,16 @@ pub async fn dispatch_run(
     };
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
-    // The provider's endpoint and key, resolved and read before the row insert so a refusal leaves
-    // no work-pod row behind; a variable the scope's own bindings also claim is refused the same
-    // way once both are known.
-    let provider_extra = match secrets.and_then(|s| s.inference_provider.as_ref()) {
+    // The inference document and the models' keys, resolved and read before the row insert so a
+    // refusal leaves no work-pod row behind; a variable the scope's own bindings also claim is
+    // refused the same way once both are known.
+    let provider_extra = match secrets.filter(|s| !s.inference.is_empty()) {
         None => None,
-        Some(provider) => {
-            let reader = secrets.and_then(|s| s.provider.as_ref());
-            match crate::secrets::deliver::provider_delivery(db.pool(), reader, provider).await? {
+        Some(secrets) => {
+            let reader = secrets.provider.as_ref();
+            match crate::secrets::deliver::inference_delivery(db.pool(), reader, &secrets.inference)
+                .await?
+            {
                 Ok(extra) => {
                     let taken =
                         extra
@@ -657,9 +659,8 @@ pub async fn dispatch_run(
                         return Ok(secrets_refused(
                             db,
                             format!(
-                                "provider {} sets {var}, which this scope's binding of {bound} \
-                                 already holds; one of the two would be overwritten",
-                                provider.id
+                                "the run's model providers set {var}, which this scope's binding \
+                                 of {bound} already holds; one of the two would be overwritten"
                             ),
                         ));
                     }
@@ -1063,24 +1064,20 @@ pub(crate) async fn dispatch_grounded_rank(
         return Ok(DispatchOutcome::Failed);
     }
 
-    // The provider's key, read before anything is written: a turn that cannot pay for the service
+    // The model's key, read before anything is written: a turn that cannot pay for the service
     // it was pointed at must leave no work-pod row and no pod behind.
-    let delivery = match dispatch {
-        None => crate::secrets::deliver::Delivery::default(),
-        Some(d) => {
-            match crate::secrets::deliver::provider_delivery(
-                db.pool(),
-                cfg.secret_provider.as_ref(),
-                &d.provider,
-            )
-            .await?
-            {
-                Ok(delivery) => delivery,
-                Err(refusal) => {
-                    tracing::warn!(%issue_key, %refusal, "grounded rank refused its provider");
-                    return Ok(DispatchOutcome::Failed);
-                }
-            }
+    let models: Vec<_> = dispatch.iter().map(|d| d.inference()).collect();
+    let delivery = match crate::secrets::deliver::inference_delivery(
+        db.pool(),
+        cfg.secret_provider.as_ref(),
+        &models,
+    )
+    .await?
+    {
+        Ok(delivery) => delivery,
+        Err(refusal) => {
+            tracing::warn!(%issue_key, %refusal, "grounded rank refused its provider");
+            return Ok(DispatchOutcome::Failed);
         }
     };
 

@@ -262,12 +262,10 @@ pub async fn resolve(
 }
 
 /// The secret a resolved provider spends, once the registry has been asked whether it would take
-/// it: the row is what a delivery reads the bytes of, and the variable is where the harness expects
-/// the key.
+/// it: the row is what a delivery reads the bytes of.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSecret {
     pub row: SecretRow,
-    pub key_env: &'static str,
 }
 
 /// The secret a resolved provider contributes to a dispatch. `Ok(Ok(None))` is a provider that
@@ -285,7 +283,7 @@ pub async fn resolve_provider_secret(
     Ok(
         match crate::playbooks::providers::lookup_key(pool, provider).await? {
             KeyLookup::Ambient => Ok(None),
-            KeyLookup::Found { row, key_env } => Ok(Some(ProviderSecret { row, key_env })),
+            KeyLookup::Found { row } => Ok(Some(ProviderSecret { row })),
             KeyLookup::TakesNoSecret { name } => Err(Refusal::ProviderTakesNoSecret {
                 provider: id,
                 kind: provider.kind.as_str(),
@@ -1123,9 +1121,9 @@ mod tests {
         }
     }
 
-    /// The key lands in the variable the provider's own harness reads, and nowhere else.
+    /// Each provider resolves the secret its reference names, in the keyspace it names.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
-    async fn a_provider_key_projects_as_its_harness_env_var(pool: sqlx::PgPool) {
+    async fn a_provider_key_resolves_in_its_owners_keyspace(pool: sqlx::PgPool) {
         let anthropic = register(
             &pool,
             "group:/groups/platform",
@@ -1145,16 +1143,14 @@ mod tests {
                 crate::playbooks::providers::ProviderKind::Anthropic,
                 ("group:/groups/platform", "anthropic_key"),
                 anthropic,
-                "ANTHROPIC_API_KEY",
             ),
             (
                 crate::playbooks::providers::ProviderKind::OpenAi,
                 ("user:alice", "openai_key"),
                 openai,
-                "OPENAI_API_KEY",
             ),
         ];
-        for (kind, secret, id, env) in cases {
+        for (kind, secret, id) in cases {
             let name = secret.1;
             let found = resolve_provider_secret(&pool, &provider_owned("p", kind, Some(secret)))
                 .await
@@ -1162,7 +1158,6 @@ mod tests {
                 .expect("no refusal")
                 .expect("a secret");
             assert_eq!(found.row.id, id);
-            assert_eq!(found.key_env, env);
             assert_eq!(found.row.name.as_str(), name);
         }
     }
@@ -1288,11 +1283,10 @@ mod tests {
         );
     }
 
-    /// The mint feeds the same assembly every bound secret does, so the key reaches the pod as a
-    /// `secretKeyRef` and never as a plain value.
-    /// A single key lands under the harness's variable; a credentials map lands one variable per
-    /// entry, each in its own Secret key named after the secret, so two providers' keys and a
-    /// scope binding of the same name can never share one.
+    /// A key lands under its role's variable, in a Secret key named after the secret, so two
+    /// providers' keys and a scope binding of the same name can never share one. A credentials map
+    /// gives up the entry the protocol's clients read as the key; the agent keeps the map's other
+    /// entries under their own names, and a decision drops them.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
     async fn a_provider_key_expands_into_the_run_delivery(pool: sqlx::PgPool) {
         register(
@@ -1314,19 +1308,37 @@ mod tests {
         .expect("resolve")
         .expect("no refusal")
         .expect("a secret");
-        let single =
-            crate::secrets::deliver::expand_credentials(&found, "sk-test").expect("expand");
+        let agent = crate::playbooks::providers::ResolvedModel {
+            role: crate::playbooks::providers::ModelRole::Agent,
+            provider: provider(
+                "oa",
+                crate::playbooks::providers::ProviderKind::OpenAi,
+                Some("openai_key"),
+            ),
+            model: "gpt-5.6-luna".to_string(),
+        };
+        let decision = crate::playbooks::providers::ResolvedModel {
+            role: crate::playbooks::providers::ModelRole::Decision,
+            model: "gpt-6-luna".to_string(),
+            ..agent.clone()
+        };
+        let parse = |raw: &str| {
+            crate::secrets::credentials::Credentials::parse(raw).map_err(|e| e.to_string())
+        };
+
+        let single = crate::secrets::deliver::role_credentials(&agent, &found, parse("sk-test"))
+            .expect("expand");
         assert_eq!(
             single.env,
             vec![(
-                "OPENAI_API_KEY".to_string(),
-                "openai_key.OPENAI_API_KEY".to_string()
+                "CRUCIBLE_INFERENCE_KEY_AGENT".to_string(),
+                "openai_key.CRUCIBLE_INFERENCE_KEY_AGENT".to_string()
             )]
         );
         assert_eq!(
             single
                 .data
-                .get("openai_key.OPENAI_API_KEY")
+                .get("openai_key.CRUCIBLE_INFERENCE_KEY_AGENT")
                 .map(String::as_str),
             Some("sk-test")
         );
@@ -1335,22 +1347,38 @@ mod tests {
             "an inference key never crosses into the sandbox"
         );
 
-        let map = crate::secrets::deliver::expand_credentials(
-            &found,
-            r#"{"OPENAI_API_KEY": "sk-map", "OPENAI_ORG_ID": "org-7"}"#,
-        )
-        .expect("expand");
-        assert_eq!(map.env.len(), 2);
+        let map_raw = r#"{"OPENAI_API_KEY": "sk-map", "OPENAI_ORG_ID": "org-7"}"#;
+        let map = crate::secrets::deliver::role_credentials(&agent, &found, parse(map_raw))
+            .expect("expand");
         assert_eq!(
-            map.data.get("openai_key.OPENAI_ORG_ID").map(String::as_str),
-            Some("org-7")
+            map.data,
+            std::collections::BTreeMap::from([
+                (
+                    "openai_key.CRUCIBLE_INFERENCE_KEY_AGENT".to_string(),
+                    "sk-map".to_string()
+                ),
+                ("openai_key.OPENAI_ORG_ID".to_string(), "org-7".to_string()),
+            ])
         );
+        let decided = crate::secrets::deliver::role_credentials(&decision, &found, parse(map_raw))
+            .expect("expand");
+        assert_eq!(
+            decided.env,
+            vec![(
+                "CRUCIBLE_INFERENCE_KEY_DECISION".to_string(),
+                "openai_key.CRUCIBLE_INFERENCE_KEY_DECISION".to_string()
+            )]
+        );
+        let mut both = single.clone();
+        both.merge(decided)
+            .expect("two roles never share a variable or a Secret key");
 
-        let wrong = crate::secrets::deliver::expand_credentials(
+        let wrong = crate::secrets::deliver::role_credentials(
+            &agent,
             &found,
-            r#"{"ANTHROPIC_API_KEY": "sk-ant"}"#,
+            parse(r#"{"ANTHROPIC_API_KEY": "sk-ant"}"#),
         )
-        .expect_err("a map without the harness's key is refused");
+        .expect_err("a map without the protocol's entry is refused");
         assert!(wrong.contains("OPENAI_API_KEY"), "{wrong}");
     }
 }

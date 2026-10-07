@@ -154,7 +154,7 @@ impl Display for OutputRefValue {
 #[starlark_value(type = "output")]
 impl<'v> StarlarkValue<'v> for OutputRefValue {}
 
-/// A `noul(...)` or `choice(...)` declaration, consumed by `route(questions = ...)`.
+/// A `noul(...)`, `choice(...)`, or `score(...)` declaration, consumed by `route(questions = ...)`.
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct QuestionValue(#[allocative(skip)] pub(crate) Question);
 

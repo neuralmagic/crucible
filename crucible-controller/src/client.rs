@@ -218,7 +218,7 @@ pub(crate) async fn schema_version(ex: impl PgExecutor<'_>) -> Result<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::client::*;
     use crate::issues::model::NewIssue;
     use crate::model::{ParkedBy, Status};
     use crate::runs::model::{NewCandidate, NewRun};
@@ -445,7 +445,11 @@ mod tests {
                 "4f2444a5c159ac1f47d4bc0972d44e7d17b2cdcdf0e5e60e3aa025ed92a3f726",
             ),
             (
-                "0054_decision_requests.sql",
+                "0054_dispatch_default_role.sql",
+                "74774c07cce84368ef881707d8fa8d9d85b9608d8e09999f0f975eb1b3507c2c",
+            ),
+            (
+                "0055_decision_requests.sql",
                 "6c2b67f1b94117c9531015c357147f16aea9a15232584f9e8395392361bd2097",
             ),
         ];
@@ -943,11 +947,11 @@ mod tests {
             sqlx::Postgres::database_exists(&url).await?,
             "connect creates the database"
         );
-        assert_eq!(crate::schema_version(&pool).await?, 54);
+        assert_eq!(crate::schema_version(&pool).await?, 55);
 
         // Idempotent: re-opening an already-migrated DB is a no-op, not an error.
         let pool2 = connect(&url).await?;
-        assert_eq!(crate::schema_version(&pool2).await?, 54);
+        assert_eq!(crate::schema_version(&pool2).await?, 55);
         pool.close().await;
         pool2.close().await;
         let _ = sqlx::Postgres::drop_database(&url).await;

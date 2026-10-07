@@ -252,6 +252,8 @@ pub fn settle(
                             label: Label::uncertain(),
                             confidence: 0.0,
                             probabilities: BTreeMap::new(),
+                            score: None,
+                            asked_as: None,
                             labels: Vec::new(),
                         },
                     );
@@ -323,12 +325,15 @@ fn answered(
         let Some(first) = labels.first().cloned() else {
             return failing(format!("the answer gives nothing for {id:?}"));
         };
+        let score = question.level_score(&first);
         decision.insert(
             id.clone(),
             Answer {
                 label: first,
                 confidence: 1.0,
                 probabilities: labels.iter().map(|l| (l.clone(), 1.0)).collect(),
+                score,
+                asked_as: None,
                 labels: if question.multiple() {
                     labels
                 } else {

@@ -59,7 +59,7 @@ nothing, and does not affect the verdict. Anything that depends on it with the d
 | | Answered by | Cost |
 | --- | --- | --- |
 | `source = read` | A dependency's own output: `read` emits `{"bucket": "billing"}`. | Free and deterministic. |
-| `min_confidence = 0.8` | A decision model, through the broker's `systemone` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
+| `min_confidence = 0.8` | A decision model, through the broker's `decision` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
 
 A source that emits a label the question does not declare fails the route, and the run
 short-circuits there. A model-backed route with no decision binding truncates the plan
@@ -67,7 +67,20 @@ before anything spends.
 
 **Question types.** `choice(ask, options)` is one of N labels, and `options` may be a dict
 whose values describe each label for the model. `noul(ask)` answers `"yes"` or `"no"`, and
-`when = gate.urgent` with no `answers` runs on `"yes"`.
+`when = gate.urgent` with no `answers` runs on `"yes"`. `score(ask, levels)` is an ordinal
+question: `levels` lists at least two labels lowest first, in the order written, optionally as a
+dict of descriptions. It branches like a choice on its most probable level (the lower one on a
+tie) and also records a `score` in [0, 1], the expected level position, so `low`, `medium`,
+`high` count as 0, 0.5, 1:
+
+```python
+"risk": score(ask = "How risky is this change?",
+              levels = {"low": "cosmetic", "medium": "one component", "high": "crosses services"}),
+```
+
+A `source` answers a score with one level label, never a boolean, and records that level's
+position; `"uncertain"` records no score. System One has no ordinal question, so a model-backed
+score is asked as a choice over the levels and recorded with `"asked_as": "choice"`.
 
 **Every answer goes somewhere.** The compiler refuses a route where some answer a `when`
 could see, `"uncertain"` included, reaches no task. Cover the rest with `otherwise = True`,
@@ -84,10 +97,11 @@ the full pack, with a model-backed gate and a serving recipe for the decision mo
 ## Let a decision model answer
 
 A decision model reads the route's inputs and returns a probability for each label of each
-question, instead of text an agent would have to be trusted to format. Any server that speaks
-the System One decision API (`POST /v1/systemone`) works: the hosted Jev API, or vLLM's
-DiffusionGemma structured-reads server. The route declares the questions and the confidence it
-needs:
+question, instead of text an agent would have to be trusted to format. Two decision APIs work:
+OpenAI's Decisions API (`POST /v1/decisions`, protocol `decisions`), and any server that speaks
+the System One decision API (`POST /v1/systemone`, protocol `system_one`), such as the hosted Jev
+API or vLLM's DiffusionGemma structured-reads server. The route declares the questions and the
+confidence it needs, and is the same for either:
 
 ```python
 read = command(name = "read", run = "./read.sh", emits = ["ticket"])
@@ -117,17 +131,26 @@ The workflow never names the endpoint. Whoever launches the run binds one in
 `CRUCIBLE_INFERENCE`:
 
 ```sh
+export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"decisions",
+  "model":"gpt-6-luna","key_env":"OPENAI_API_KEY"}]}'
+crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
+```
+
+A `decisions` binding with no `url` reaches `https://api.openai.com/v1/decisions`; name one to go
+through a gateway. A `system_one` binding always names its server:
+
+```sh
 export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"system_one",
   "url":"https://api.example.com/v1/systemone","model":"jev-1","key_env":"JEV_API_KEY"}]}'
-crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
 ```
 
 `key_env` names the variable that holds the bearer key; the document never holds the key
 itself. With no `decision` binding the route cannot run, so the plan truncates before
 anything spends.
 
-**What the model sees.** One request per route: the outputs of the route's dependencies as
-`state`, and each question with its instructions and the description of each label:
+**What the model sees.** One request per route: the outputs of the route's dependencies, and
+each question with its instructions and the description of each label. System One takes the
+outputs as a `state` object:
 
 ```json
 {
@@ -143,11 +166,29 @@ anything spends.
 }
 ```
 
+OpenAI's API takes the same outputs serialized as JSON in its text `input`, a noul as a
+`predicate` question and a choice as a `choice` question named by the question id:
+
+```json
+{
+  "model": "gpt-6-luna",
+  "input": "{\"read\":{\"ticket\":\"I was charged twice for the March invoice. No rush, but please refund the duplicate.\"}}",
+  "questions": [
+    {"type": "choice", "name": "bucket", "instructions": "Which queue owns this ticket?",
+     "choices": [{"value": "outage", "description": "the product is down or unusable"},
+                 {"value": "billing", "description": "charges, invoices, refunds"},
+                 {"value": "feature", "description": "a request for something new"}]},
+    {"type": "predicate", "name": "urgent", "instructions": "Does the customer need a reply within the hour?"}
+  ]
+}
+```
+
 The label descriptions are the model's only definition of each queue, so write them the way
 you would brief a person.
 
 **What the run records.** The route's output is the decision: for each question the label, its
-confidence, and the whole distribution the model returned.
+confidence, and the whole distribution the model returned. The label is the most probable
+declared one; a choice or confidence the API reports alongside is not read.
 
 ```json
 {"bucket": {"label": "billing", "confidence": 0.9,
@@ -156,13 +197,18 @@ confidence, and the whole distribution the model returned.
 ```
 
 A label whose probability is under `min_confidence` is recorded as `"uncertain"`, which
-`otherwise` or `drop` has to cover.
+`otherwise` or `drop` has to cover. So is a question OpenAI declines to answer, with confidence 0
+and an empty distribution.
 
-**From the control plane.** A controller started with `just controller-local` passes its own
-`CRUCIBLE_*` variables to the runs it launches, so exporting `CRUCIBLE_INFERENCE` before starting
-it gives every playbook launch the decision model. Name the key variable with the same prefix
-(`"key_env":"CRUCIBLE_JEV_API_KEY"`) and it passes through too. A deployed controller does not
-build a decision binding yet.
+**From the control plane.** A deployed controller binds the decision model from its provider
+registry: on the Providers page, add a default with role `decision` for the playbook class, on the
+platform or for one domain, naming an OpenAI provider (it asks `gpt-6-luna` unless the default
+names a model) or a custom provider whose protocol is `decisions` or `system_one`. Every playbook
+launch then carries the binding, with the provider's key, beside its agent's
+([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)). A controller started with `just controller-local` reads no secret
+values; it passes its own `CRUCIBLE_*` variables to the runs it launches instead, so export
+`CRUCIBLE_INFERENCE` before starting it and name the key variable with the same prefix
+(`"key_env":"CRUCIBLE_DECISION_KEY"`).
 
 `examples/route` is the runnable pack, with five sample tickets and a recipe for serving
 DiffusionGemma yourself.
@@ -270,6 +316,57 @@ def auditor(topic, blocking):
 
 auditors = [auditor(topic, blocking) for topic, blocking in AUDITS]
 ```
+
+## Decide per item
+
+A route can map over a list too. It asks once per item, and a task mapped over the same list
+reads each item's answer with `when`, so item k's turn runs only when item k's answer allows it:
+
+```python
+prepare = command(name = "prepare", run = "./stage.sh",
+                  emits = {"members": "list", "facts": "object"})
+
+gate = route(
+    name = "gate",
+    depends_on = [prepare],
+    over = prepare.members,
+    max_fanout = 120,
+    keyed = [prepare.facts],
+    min_confidence = 0.8,
+    questions = {"depth": choice(
+        ask = "How much work does this ticket need?",
+        options = {"settled": "the staged facts already answer it",
+                   "quick": "a short look", "deep": "a full investigation"},
+        drop = ["settled"],
+    )},
+)
+
+quick = agent(name = "quick", prompt = prompt_file("analyze.md"), effort = "low",
+              depends_on = [prepare, gate], over = prepare.members, max_fanout = 120,
+              keyed = [prepare.facts], when = gate.depth, answers = "quick")
+deep = agent(name = "deep", prompt = prompt_file("analyze.md"), effort = "high",
+             depends_on = [prepare, gate], over = prepare.members, max_fanout = 120,
+             keyed = [prepare.facts], when = gate.depth, otherwise = True)
+```
+
+- **Items pair by key.** Tasks mapped over the same `producer.field` are aligned: `quick[T-1]`
+  reads `gate[T-1]`, and any aligned dependency reaches an instance as its own instance for the
+  same key, not the whole fan-out.
+- **Untaken items stay visible.** `quick[T-2]` settles `not_taken` with the answer in its note.
+  It does not fail the fan-out, whose output counts it under `not_taken`, and an aligned task
+  joining `all` on it is not taken either.
+- **One request per item.** `max_fanout` bounds them. A resumed run keeps every decision it
+  already has and asks only for the rest.
+- **`keyed` narrows.** `prepare.facts` is an object keyed by item; each instance, route or not,
+  gets only its own entry under `facts`, so a hundred-item fan-out does not send every item's
+  facts to every turn.
+- **Judge a result file.** `files = ["RESULT.json"]` puts a dependency's declared JSON file in
+  the model's state under `files`, so a route mapped after the analysis can ask whether its
+  evidence supports its verdict and send the doubtful ones to a review lane with `when`.
+- **Deterministic first.** An output-decided route mapped over the list reads each item's
+  answer from an object keyed by item (`{"reachable": {"T-1": "no"}}`). Put it in front and give
+  the model route a `when` on it, so the model is asked only about the items the facts leave
+  open.
 
 ## Keep a conversation
 

@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { RETRY_RUN, stubApi, TRIAGE_RUN } from './api';
+import { RETRY_RUN, ROUTE_RUN, stubApi, TRIAGE_RUN } from './api';
 
 const RUN = '/runs/RUN-0412';
 
@@ -38,6 +38,31 @@ test.describe('the run task graph', () => {
     await expect(page.getByText('red = failed')).toBeVisible();
   });
 
+  /// A mapped route reads as a decision, tallies what its instances answered, and the fix aligned
+  /// with it counts the elements its when left out apart from the one that failed.
+  test('draws a mapped route, its answers, and the per-element edges it feeds', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, `/runs/${ROUTE_RUN}`);
+
+    const graph = page.getByTestId('workflow-graph');
+    const route = graph.locator('[data-task="triage"]');
+    await expect(route).toContainText('DECIDE');
+    await expect(route).toContainText('over scan.items ≤120');
+    await expect(route).toContainText('tier: skip 2 · high 1 · low 1');
+    await expect(graph.locator('[data-task="triage[a]"]')).toContainText('tier: high');
+    await expect(graph.locator('[data-task="fix"]')).toContainText(
+      '4 · 1 passed · 2 not taken · 1 failed'
+    );
+    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'tier: high|low' }).first()).toBeVisible();
+    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'notes[item]' }).first()).toBeVisible();
+    await expect(page.getByText('double line = per element')).toBeVisible();
+
+    await route.click();
+    const panel = page.getByRole('complementary', { name: 'Task triage' });
+    await expect(panel).toContainText('narrows');
+    await expect(panel).toContainText('scan.notes');
+  });
+
   /// A mapped task is the fan-out, not the work: it says MAP, and the instances under it say what
   /// they actually run.
   test('badges a mapped task as a map and its instances as what they run', async ({ page }) => {
@@ -72,7 +97,7 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph.locator('[data-fanout="summarize"]')).toHaveText(
-      '1 of 3 passed · 1 fail · 1 pending',
+      '3 · 1 passed · 1 failed · 1 pending',
     );
     await expect(graph.locator('[data-task="file"]')).toContainText('pending');
 
@@ -94,7 +119,7 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph.locator('[data-fanout="triage"]')).toHaveText(
-      '2 of 20 passed · 18 never started',
+      '20 · 2 passed · 18 never started',
     );
   });
 

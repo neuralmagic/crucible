@@ -137,6 +137,7 @@ fn command_backend(
     session: Option<&crate::agent::agent_session::SessionTurn>,
 ) -> Command {
     let mut c = Command::new("sh");
+    crucible::inference::withhold_from_task(&mut c);
     c.arg("-c")
         .arg(cmd)
         .current_dir(&p.workspace)
@@ -191,6 +192,7 @@ fn local_command(
         return Err(std::io::Error::other("harness produced an empty argv"));
     };
     let mut cmd = Command::new(program);
+    crucible::inference::withhold_from_task(&mut cmd);
     cmd.args(rest)
         .current_dir(&p.workspace)
         .stdin(Stdio::null())

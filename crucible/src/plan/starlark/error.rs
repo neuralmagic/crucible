@@ -341,6 +341,28 @@ pub enum CompileError {
     )]
     OverNotOutputField,
     #[error(
+        "\"keyed\" must name declared output fields of tasks this one depends on, as \
+         `keyed = [producer.field]`"
+    )]
+    KeyedNotOutputField,
+    #[error("keyed {reference} is declared {declared}; keyed needs an object keyed by element")]
+    KeyedNotObject {
+        reference: String,
+        declared: crucible_contract::emits::FieldType,
+    },
+    #[error("\"files\" must be a list of workspace-relative paths, like [\"RESULT.json\"]")]
+    RouteFilesNotList,
+    #[error(
+        "route {task:?} reads files but is decided by source; only a model reads files, so drop \
+         files or use min_confidence"
+    )]
+    RouteFilesWithSource { task: String },
+    #[error(
+        "route {task:?} reads files but is decided by a person, who sees its dependencies' files \
+         as evidence already; drop files"
+    )]
+    RouteFilesWithHuman { task: String },
+    #[error(
         "argument {argument:?} carries a value supplied from outside the pack. A prompt marks \
          such a span so an agent can tell it from an instruction; nothing else can, so do not \
          build it into {argument:?}. A command or evaluate task reads it as data from the \

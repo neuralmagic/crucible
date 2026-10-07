@@ -121,12 +121,13 @@ const RUNS = [
 const RUN_GRAPH = {
   plan_version: 3,
   tasks: [
-    { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true, over: '', max_fanout: 0 },
-    { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'all', required: true, over: 'read.papers', max_fanout: 8 },
-    { name: 'rank', kind: 'top_k', depends_on: ['summarize'], session: '', needs: 'all', required: true, over: '', max_fanout: 0 },
-    { name: 'file', kind: 'command', depends_on: ['rank'], session: '', needs: 'all', required: true, over: '', max_fanout: 0 },
+    { name: 'read', kind: 'agent', depends_on: [], session: 'survey', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+    { name: 'summarize', kind: 'command', depends_on: ['read'], session: '', needs: 'all', required: true, over: 'read.papers', max_fanout: 8, when: '', keyed: [] },
+    { name: 'rank', kind: 'top_k', depends_on: ['summarize'], session: '', needs: 'all', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+    { name: 'file', kind: 'command', depends_on: ['rank'], session: '', needs: 'all', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
   ],
-  fanout: [{ task: 'summarize', items: 3 }],
+  fanout: [{ task: 'summarize', items: 3, not_taken: 0 }],
+  decisions: [],
   results: [
     { iter: 0, task: 'read', status: 'fail', note: 'the harness dropped the turn', cost_usd: 0.4, secs: 31, links: [], repairs: [] },
     { iter: 1, task: 'read', status: 'pass', note: 'read 14 papers', cost_usd: 1.1, secs: 240, links: [], repairs: [] },
@@ -179,9 +180,10 @@ const RETRY_STATUSES = ['pass', 'pass', 'pass', 'pass', 'pass', 'fail', 'pass', 
 const RETRY_GRAPH = {
   plan_version: 1,
   tasks: [
-    { name: 'probe', kind: 'command', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
+    { name: 'probe', kind: 'command', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
   ],
   fanout: [],
+  decisions: [],
   results: RETRY_STATUSES.map((status, iter) => ({
     iter,
     task: 'probe',
@@ -202,16 +204,71 @@ export const TRIAGE_RUN = 'playbook_triage-local_01a030fe-2592-7902-a02c-3e3b8d9
 const TRIAGE_GRAPH = {
   plan_version: 1,
   tasks: [
-    { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
-    { name: 'triage', kind: 'agent', depends_on: ['scan'], session: '', needs: 'any', required: false, over: 'scan.issues', max_fanout: 0 },
-    { name: 'roundup', kind: 'command', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true, over: '', max_fanout: 0 },
+    { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+    { name: 'triage', kind: 'agent', depends_on: ['scan'], session: '', needs: 'any', required: false, over: 'scan.issues', max_fanout: 0, when: '', keyed: [] },
+    { name: 'roundup', kind: 'command', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
   ],
-  fanout: [{ task: 'triage', items: 20 }],
+  fanout: [{ task: 'triage', items: 20, not_taken: 0 }],
+  decisions: [],
   results: [
     { iter: 0, task: 'scan', status: 'pass', note: '', cost_usd: 0.2659475, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
     { iter: 0, task: 'triage[1027]', status: 'pass', note: '', cost_usd: 0.2297655, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'low' } },
     { iter: 0, task: 'triage[952]', status: 'pass', note: '', cost_usd: 0.30397949999999996, secs: 0, links: [], repairs: [], agent: { harness: 'claude', model: 'glm-5.3', effort: 'high' } },
     { iter: 0, task: 'roundup', status: 'pass', note: '', cost_usd: 0, secs: 0, links: [], repairs: [], agent: null },
+  ],
+};
+
+/** A routed run: a decision model triaged each scanned item, a fix aligned with it ran on two of
+ * its answers and read only its own entry of the scan's notes, and the rest settled not taken. */
+export const ROUTE_RUN = 'RUN-0777';
+
+const routeResult = (task: string, status: string) => ({
+  iter: 0,
+  task,
+  status,
+  note: '',
+  cost_usd: null,
+  secs: 0,
+  links: [],
+  repairs: [],
+});
+
+const tier = (task: string, label: string, count = 1) => ({
+  task,
+  question: 'tier',
+  labels: [{ label, count }],
+});
+
+const ROUTE_GRAPH = {
+  plan_version: 1,
+  tasks: [
+    { name: 'scan', kind: 'agent', depends_on: [], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+    { name: 'triage', kind: 'route', depends_on: ['scan'], session: '', needs: 'decision', required: true, over: 'scan.items', max_fanout: 120, when: '', keyed: ['scan.notes'] },
+    { name: 'fix', kind: 'agent', depends_on: ['scan', 'triage'], session: '', needs: 'any', required: true, over: 'scan.items', max_fanout: 120, when: 'triage.tier in high|low', keyed: ['scan.notes'] },
+    { name: 'roll', kind: 'command', depends_on: ['fix'], session: '', needs: 'any', required: true, over: '', max_fanout: 0, when: '', keyed: [] },
+  ],
+  fanout: [
+    { task: 'triage', items: 4, not_taken: 0 },
+    { task: 'fix', items: 4, not_taken: 2 },
+  ],
+  decisions: [
+    { task: 'triage', question: 'tier', labels: [{ label: 'high', count: 1 }, { label: 'low', count: 1 }, { label: 'skip', count: 2 }] },
+    tier('triage[a]', 'high'),
+    tier('triage[b]', 'low'),
+    tier('triage[c]', 'skip'),
+    tier('triage[d]', 'skip'),
+  ],
+  results: [
+    routeResult('scan', 'pass'),
+    routeResult('triage[a]', 'pass'),
+    routeResult('triage[b]', 'pass'),
+    routeResult('triage[c]', 'pass'),
+    routeResult('triage[d]', 'pass'),
+    routeResult('fix[a]', 'pass'),
+    routeResult('fix[b]', 'fail'),
+    routeResult('fix[c]', 'not_taken'),
+    routeResult('fix[d]', 'not_taken'),
+    routeResult('roll', 'pass'),
   ],
 };
 
@@ -291,18 +348,18 @@ const PREVIEW_GRAPH = {
   workflow_type: 'playbook',
   result: 'file',
   nodes: [
-    { name: 'read', kind: 'agent', required: true, needs: 'any', join: 'all', isolation: 'worktree', emits: ['paper'], emits_files: [], fanout: null, session: 'survey', harness: 'claude', model: 'opus', effort: 'high', prompt: 'READ THE PAPER\n\nReport one entry per citation.\n', command: null },
-    { name: 'summarize', kind: 'command', required: true, needs: 'any', join: 'all', isolation: null, emits: [], emits_files: [], fanout: { over_task: 'read', over_field: 'paper', max_fanout: 3 }, session: null, harness: null, model: null, effort: null, prompt: null, command: './summarize.sh --one' },
-    { name: 'lint', kind: 'command', required: false, needs: 'any', join: 'all', isolation: null, emits: [], emits_files: [], fanout: null, session: null, harness: null, model: null, effort: null, prompt: null, command: './lint.sh' },
-    { name: '<img src=x onerror="alert(1)">', kind: 'engine', required: true, needs: 'any', join: 'all', isolation: null, emits: [], emits_files: [], fanout: null, session: null, harness: null, model: null, effort: null, prompt: null, command: null },
-    { name: 'file', kind: 'command', required: true, needs: 'all', join: 'passed', isolation: null, emits: [], emits_files: ['spec.md'], fanout: null, session: null, harness: null, model: null, effort: null, prompt: null, command: './file.sh' },
+    { name: 'read', kind: 'agent', required: true, needs: 'any', join: 'all', isolation: 'worktree', emits: ['paper'], emits_files: [], keyed: [], when: null, questions: [], fanout: null, session: 'survey', harness: 'claude', model: 'opus', effort: 'high', prompt: 'READ THE PAPER\n\nReport one entry per citation.\n', command: null },
+    { name: 'summarize', kind: 'command', required: true, needs: 'any', join: 'all', isolation: null, emits: [], emits_files: [], keyed: [], when: null, questions: [], fanout: { over_task: 'read', over_field: 'paper', max_fanout: 3 }, session: null, harness: null, model: null, effort: null, prompt: null, command: './summarize.sh --one' },
+    { name: 'lint', kind: 'command', required: false, needs: 'any', join: 'all', isolation: null, emits: [], emits_files: [], keyed: [], when: null, questions: [], fanout: null, session: null, harness: null, model: null, effort: null, prompt: null, command: './lint.sh' },
+    { name: '<img src=x onerror="alert(1)">', kind: 'engine', required: true, needs: 'any', join: 'all', isolation: null, emits: [], emits_files: [], keyed: [], when: null, questions: [], fanout: null, session: null, harness: null, model: null, effort: null, prompt: null, command: null },
+    { name: 'file', kind: 'command', required: true, needs: 'all', join: 'passed', isolation: null, emits: [], emits_files: ['spec.md'], keyed: [], when: null, questions: [], fanout: null, session: null, harness: null, model: null, effort: null, prompt: null, command: './file.sh' },
   ],
   edges: [
-    { from: 'read', to: 'summarize', join: 'all', required: true },
-    { from: 'read', to: 'lint', join: 'all', required: false },
-    { from: 'summarize', to: '<img src=x onerror="alert(1)">', join: 'all', required: true },
-    { from: '<img src=x onerror="alert(1)">', to: 'file', join: 'passed', required: true },
-    { from: 'lint', to: 'file', join: 'passed', required: true },
+    { from: 'read', to: 'summarize', join: 'all', required: true, when: null, aligned: false, keyed: [] },
+    { from: 'read', to: 'lint', join: 'all', required: false, when: null, aligned: false, keyed: [] },
+    { from: 'summarize', to: '<img src=x onerror="alert(1)">', join: 'all', required: true, when: null, aligned: false, keyed: [] },
+    { from: '<img src=x onerror="alert(1)">', to: 'file', join: 'passed', required: true, when: null, aligned: false, keyed: [] },
+    { from: 'lint', to: 'file', join: 'passed', required: true, when: null, aligned: false, keyed: [] },
   ],
 };
 
@@ -650,6 +707,9 @@ export const ROUTES: Record<string, Json> = {
   [`/api/runs/${TRIAGE_RUN}`]: { run: { ...RUNS[1], run_id: TRIAGE_RUN, issue_key: 'playbook:triage-local:01a030fe', cost_usd: 1.38, agent_provider: 'pricetag-glm', agent_model: 'glm-5.3' }, candidates: [] },
   [`/api/runs/${TRIAGE_RUN}/iterations`]: [],
   [`/api/runs/${TRIAGE_RUN}/graph`]: TRIAGE_GRAPH,
+  [`/api/runs/${ROUTE_RUN}`]: { run: { ...RUNS[0], run_id: ROUTE_RUN }, candidates: [] },
+  [`/api/runs/${ROUTE_RUN}/iterations`]: [],
+  [`/api/runs/${ROUTE_RUN}/graph`]: ROUTE_GRAPH,
   [`/api/runs/${TRIAGE_RUN}/log`]: TRIAGE_LOG,
   [`/api/runs/${TRIAGE_RUN}/tasks/triage[1027]/evidence`]: TRIAGE_EVIDENCE,
   [`/api/runs/${TRIAGE_RUN}/tasks/scan/evidence`]: SCAN_EVIDENCE,

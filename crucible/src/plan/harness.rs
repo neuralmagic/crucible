@@ -273,8 +273,8 @@ impl TaskRunner for HarnessRunner {
         captured_dir(&self.paths.state, &task.name.0).is_dir()
     }
 
-    fn captured_file(&self, task: &Task, declared: &str) -> Option<Vec<u8>> {
-        std::fs::read(captured_path(&self.paths.state, &task.name.0, declared)).ok()
+    fn captured_file(&self, producer: &TaskName, path: &str) -> Option<Vec<u8>> {
+        std::fs::read(captured_path(&self.paths.state, &producer.0, path)).ok()
     }
 
     /// Discards the set published under this task's name, and for a mapped node the sets
@@ -1366,6 +1366,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -1526,6 +1527,7 @@ mod tests {
             emits_files: files.iter().map(|f| DeclaredFile::from(*f)).collect(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -3511,6 +3513,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
