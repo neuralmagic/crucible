@@ -807,7 +807,9 @@ a chain, and stays a single name, or empty, otherwise. A reader should accept bo
 An orchestrator tells the engine where models are reached through one JSON document in
 `CRUCIBLE_INFERENCE` (contract 1.7.0), typed as `crucible_contract::inference::ResolvedInference`:
 `{"version":1,"bindings":[{"role","protocol","url"?,"model","key_env"?}]}`. `role` is `agent` or
-`decision`; `protocol` is `messages`, `chat_completions`, `responses`, or `system_one`. `key_env`
+`decision`; `protocol` is `messages`, `chat_completions`, `responses`, `system_one`, or
+`decisions` (contract 1.15.0, the OpenAI Decisions API, at `https://api.openai.com/v1/decisions`
+when `url` is absent). A `decision` binding speaks `system_one` or `decisions`. `key_env`
 names the variable holding the credential and the document never holds the value. An unknown
 field or version fails the run before any task. A `decision` binding is what a model-decided
 route asks. An `agent` binding is the whole answer for agent turns: its model is the run's model,

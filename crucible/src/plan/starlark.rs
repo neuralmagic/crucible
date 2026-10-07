@@ -930,7 +930,7 @@ fn constructor(
             let (decider, needs) = match (min_confidence, source) {
                 (Some(min_confidence), None) => (
                     Decider::Model { min_confidence },
-                    crate::plan::ir::NEEDS_SYSTEMONE,
+                    crate::plan::ir::NEEDS_DECISION,
                 ),
                 (None, Some(task)) => (Decider::Output { task }, "any"),
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
@@ -3186,7 +3186,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
         let compiled = compile_source(ROUTED, &pack.join("workflow.star"), &pack).unwrap();
         let tasks = &compiled.workflow.tasks;
         let gate = tasks.iter().find(|t| t.name.0 == "gate").unwrap();
-        assert_eq!(gate.needs, "systemone");
+        assert_eq!(gate.needs, "decision");
         let TaskKind::Route { questions, decider } = &gate.task else {
             panic!("gate is not a route");
         };

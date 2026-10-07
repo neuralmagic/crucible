@@ -1,5 +1,6 @@
-//! `crucible plan run` over a routed plan: the real binary, real shell tasks, and a System One
-//! endpoint served over a real socket in the wire shape vLLM's structured-reads server answers in.
+//! `crucible plan run` over a routed plan: the real binary, real shell tasks, and a decision
+//! endpoint served over a real socket, in the wire shape vLLM's System One server or OpenAI's
+//! Decisions API answers in.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
@@ -20,7 +21,7 @@ command = "echo '{\"ticket\": \"decode stalls when the batch is full\"}'"
 [[task]]
 name = "gate"
 kind = "route"
-needs = "systemone"
+needs = "decision"
 depends_on = ["scan"]
 decider = { kind = "model", min_confidence = 0.8 }
 [task.questions.area]
@@ -76,8 +77,16 @@ fn answers(scheduler: f64, urgent: f64) -> String {
 
 /// Answer every connection with `status` and `body` until the test ends; keep each request.
 fn serve(status: &'static str, body: String) -> (String, Arc<Mutex<Vec<String>>>) {
+    serve_at("/v1/systemone", status, body)
+}
+
+fn serve_at(
+    path: &'static str,
+    status: &'static str,
+    body: String,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let url = format!("http://{}/v1/systemone", listener.local_addr().unwrap());
+    let url = format!("http://{}{path}", listener.local_addr().unwrap());
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     std::thread::spawn(move || {
@@ -227,6 +236,66 @@ fn a_confident_answer_runs_its_branch_and_leaves_the_other_untaken() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn openai_answers(scheduler: f64, urgent: f64) -> String {
+    format!(
+        r#"{{"answers":[{{"type":"predicate","name":"urgent","probability":{urgent}}},{{"type":"choice","name":"area","choice":"frontend","probabilities":[{{"value":"scheduler","probability":{scheduler}}},{{"value":"frontend","probability":{}}}],"confidence":0.1}}],"model":"gpt-6-luna","usage":{{"input_tokens":90,"input_tokens_details":{{"cache_write_tokens":0,"cached_tokens":0}},"output_tokens":0,"output_tokens_details":{{"reasoning_tokens":0}},"total_tokens":90}}}}"#,
+        1.0 - scheduler
+    )
+}
+
+#[test]
+fn an_openai_decisions_binding_routes_the_same_plan_the_same_way() {
+    let (url, seen) = serve_at("/v1/decisions", "200 OK", openai_answers(0.93, 0.02));
+    let dir = workdir("openai", MODEL_PLAN);
+    let document = serde_json::json!({"version": 1, "bindings": [{
+        "role": "decision", "protocol": "decisions", "url": url, "model": "gpt-6-luna",
+        "key_env": "ROUTE_E2E_KEY",
+    }]})
+    .to_string();
+    let run = run_with(&dir, Some(&document), Some("sk-test"));
+    assert!(run.ok, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(ran(&dir), ["fix", "verify", "wrap"]);
+    assert_eq!(status_of(&run.stdout, "punt"), "not_taken");
+    assert_eq!(status_of(&run.stdout, "page"), "not_taken");
+    assert!(
+        run.stdout.contains("gate.area resolved to scheduler"),
+        "{}",
+        run.stdout
+    );
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 1, "one decision, one call");
+    let request = &requests[0];
+    assert!(
+        request.starts_with("POST /v1/decisions HTTP/1.1"),
+        "{request}"
+    );
+    assert!(
+        request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer sk-test"),
+        "{request}"
+    );
+    let body: serde_json::Value =
+        serde_json::from_str(request.rsplit('\n').next().unwrap()).unwrap();
+    assert_eq!(body["model"], "gpt-6-luna");
+    let input: serde_json::Value = serde_json::from_str(body["input"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        input["scan"]["ticket"],
+        "decode stalls when the batch is full"
+    );
+    assert_eq!(
+        body["questions"],
+        serde_json::json!([
+            {"type": "choice", "name": "area", "instructions": "Which component?",
+             "choices": [{"value": "scheduler", "description": "batching and queueing"},
+                         {"value": "frontend"}]},
+            {"type": "predicate", "name": "urgent", "instructions": "Reply within the hour?"}
+        ])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_answer_below_min_confidence_takes_the_uncertain_branch() {
     let (url, _seen) = serve("200 OK", answers(0.55, 0.97));
@@ -330,7 +399,7 @@ fn an_output_decided_route_branches_on_a_commands_answer_with_no_endpoint() {
             "echo '{\\\"ticket\\\": \\\"decode stalls when the batch is full\\\"}'",
             "echo '{\\\"area\\\": \\\"frontend\\\", \\\"urgent\\\": true}'",
         )
-        .replace("needs = \"systemone\"\n", "")
+        .replace("needs = \"decision\"\n", "")
         .replace(
             "decider = { kind = \"model\", min_confidence = 0.8 }",
             "decider = { kind = \"output\", task = \"scan\" }",

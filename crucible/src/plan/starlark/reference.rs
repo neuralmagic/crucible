@@ -72,7 +72,7 @@ fn task_knobs() -> Vec<Kwarg> {
         Kwarg::new(
             "needs",
             "str",
-            "The substrate capability the task needs, such as `\"systemone\"`. The default \
+            "The substrate capability the task needs, such as `\"decision\"`. The default \
              `\"any\"` runs everywhere. A required task whose capability is unavailable truncates \
              the plan before dispatch; an advisory one is skipped with its dependents.",
         ),
@@ -551,7 +551,7 @@ pub fn functions() -> Vec<Function> {
                 Kwarg::new(
                     "min_confidence",
                     "number",
-                    "A decision model answers, through the broker's `systemone` capability. An \
+                    "A decision model answers, through the broker's `decision` capability. An \
                      answer whose probability is below this, in (0, 1], is recorded as \
                      `\"uncertain\"`. Exactly one of `min_confidence` and `source`.",
                 ),

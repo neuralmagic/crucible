@@ -59,7 +59,7 @@ nothing, and does not affect the verdict. Anything that depends on it with the d
 | | Answered by | Cost |
 | --- | --- | --- |
 | `source = read` | A dependency's own output: `read` emits `{"bucket": "billing"}`. | Free and deterministic. |
-| `min_confidence = 0.8` | A decision model, through the broker's `systemone` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
+| `min_confidence = 0.8` | A decision model, through the broker's `decision` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
 
 A source that emits a label the question does not declare fails the route, and the run
 short-circuits there. A model-backed route with no decision binding truncates the plan
@@ -84,10 +84,11 @@ the full pack, with a model-backed gate and a serving recipe for the decision mo
 ## Let a decision model answer
 
 A decision model reads the route's inputs and returns a probability for each label of each
-question, instead of text an agent would have to be trusted to format. Any server that speaks
-the System One decision API (`POST /v1/systemone`) works: the hosted Jev API, or vLLM's
-DiffusionGemma structured-reads server. The route declares the questions and the confidence it
-needs:
+question, instead of text an agent would have to be trusted to format. Two decision APIs work:
+OpenAI's Decisions API (`POST /v1/decisions`, protocol `decisions`), and any server that speaks
+the System One decision API (`POST /v1/systemone`, protocol `system_one`), such as the hosted Jev
+API or vLLM's DiffusionGemma structured-reads server. The route declares the questions and the
+confidence it needs, and is the same for either:
 
 ```python
 read = command(name = "read", run = "./read.sh", emits = ["ticket"])
@@ -117,17 +118,26 @@ The workflow never names the endpoint. Whoever launches the run binds one in
 `CRUCIBLE_INFERENCE`:
 
 ```sh
+export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"decisions",
+  "model":"gpt-6-luna","key_env":"OPENAI_API_KEY"}]}'
+crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
+```
+
+A `decisions` binding with no `url` reaches `https://api.openai.com/v1/decisions`; name one to go
+through a gateway. A `system_one` binding always names its server:
+
+```sh
 export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"system_one",
   "url":"https://api.example.com/v1/systemone","model":"jev-1","key_env":"JEV_API_KEY"}]}'
-crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
 ```
 
 `key_env` names the variable that holds the bearer key; the document never holds the key
 itself. With no `decision` binding the route cannot run, so the plan truncates before
 anything spends.
 
-**What the model sees.** One request per route: the outputs of the route's dependencies as
-`state`, and each question with its instructions and the description of each label:
+**What the model sees.** One request per route: the outputs of the route's dependencies, and
+each question with its instructions and the description of each label. System One takes the
+outputs as a `state` object:
 
 ```json
 {
@@ -143,11 +153,29 @@ anything spends.
 }
 ```
 
+OpenAI's API takes the same outputs serialized as JSON in its text `input`, a noul as a
+`predicate` question and a choice as a `choice` question named by the question id:
+
+```json
+{
+  "model": "gpt-6-luna",
+  "input": "{\"read\":{\"ticket\":\"I was charged twice for the March invoice. No rush, but please refund the duplicate.\"}}",
+  "questions": [
+    {"type": "choice", "name": "bucket", "instructions": "Which queue owns this ticket?",
+     "choices": [{"value": "outage", "description": "the product is down or unusable"},
+                 {"value": "billing", "description": "charges, invoices, refunds"},
+                 {"value": "feature", "description": "a request for something new"}]},
+    {"type": "predicate", "name": "urgent", "instructions": "Does the customer need a reply within the hour?"}
+  ]
+}
+```
+
 The label descriptions are the model's only definition of each queue, so write them the way
 you would brief a person.
 
 **What the run records.** The route's output is the decision: for each question the label, its
-confidence, and the whole distribution the model returned.
+confidence, and the whole distribution the model returned. The label is the most probable
+declared one; a choice or confidence the API reports alongside is not read.
 
 ```json
 {"bucket": {"label": "billing", "confidence": 0.9,

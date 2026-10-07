@@ -205,7 +205,7 @@ impl ShellRunner {
                     );
                 };
                 let endpoint =
-                    match crucible_broker::systemone::Endpoint::from_binding(binding, |name| {
+                    match crucible_broker::decide::Endpoint::from_binding(binding, |name| {
                         std::env::var(name).ok()
                     }) {
                         Ok(endpoint) => endpoint,

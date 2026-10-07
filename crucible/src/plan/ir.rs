@@ -405,7 +405,7 @@ mod number {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Decider {
-    /// A System One decision model, reached through the broker.
+    /// A decision model, reached through the broker.
     Model {
         #[serde(deserialize_with = "number::required")]
         min_confidence: f64,
@@ -430,7 +430,7 @@ impl fmt::Display for When {
 }
 
 /// The capability a model-decided route task needs.
-pub const NEEDS_SYSTEMONE: &str = "systemone";
+pub const NEEDS_DECISION: &str = "decision";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -824,7 +824,7 @@ pub enum PlanError {
     #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
     MinConfidenceOutOfRange { task: String, got: f64 },
     #[error(
-        "model-decided route task {task:?} must declare needs = \"{NEEDS_SYSTEMONE}\", got {got:?}"
+        "model-decided route task {task:?} must declare needs = \"{NEEDS_DECISION}\", got {got:?}"
     )]
     RouteNeeds { task: String, got: String },
     #[error(
@@ -1345,7 +1345,7 @@ impl Plan {
                                 got: *min_confidence,
                             });
                         }
-                        if t.needs != NEEDS_SYSTEMONE {
+                        if t.needs != NEEDS_DECISION {
                             return Err(PlanError::RouteNeeds {
                                 task: task(),
                                 got: t.needs.clone(),
@@ -1951,7 +1951,7 @@ mod tests {
                     min_confidence: 0.8,
                 },
             },
-            needs: NEEDS_SYSTEMONE.into(),
+            needs: NEEDS_DECISION.into(),
             ..agent(name, deps)
         }
     }
@@ -2143,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn a_model_route_must_need_systemone_and_an_output_route_need_not() {
+    fn a_model_route_must_need_decision_and_an_output_route_need_not() {
         let mut gate = model_route("gate", &[], &[]);
         gate.needs = "any".into();
         assert_eq!(

@@ -89,7 +89,7 @@ pub fn speaks(harness: Harness, protocol: InferenceProtocol) -> bool {
         InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => {
             matches!(harness, Harness::Codex | Harness::OpenCode | Harness::Pi)
         }
-        InferenceProtocol::SystemOne => false,
+        InferenceProtocol::SystemOne | InferenceProtocol::Decisions => false,
     }
 }
 
@@ -101,7 +101,9 @@ impl AgentSelection {
         }
         match self.protocol {
             InferenceProtocol::ChatCompletions | InferenceProtocol::Responses => Harness::Codex,
-            InferenceProtocol::Messages | InferenceProtocol::SystemOne => Harness::Claude,
+            InferenceProtocol::Messages
+            | InferenceProtocol::SystemOne
+            | InferenceProtocol::Decisions => Harness::Claude,
         }
     }
 }
@@ -197,7 +199,7 @@ impl InferenceEnv {
                     _ => WireApi::Chat,
                 });
             }
-            InferenceProtocol::SystemOne => {
+            InferenceProtocol::SystemOne | InferenceProtocol::Decisions => {
                 return Err(NotAnAgentProtocol {
                     protocol: binding.protocol,
                 }
@@ -499,6 +501,7 @@ mod tests {
             Harness::Pi,
         ] {
             assert!(!speaks(harness, InferenceProtocol::SystemOne));
+            assert!(!speaks(harness, InferenceProtocol::Decisions));
         }
     }
 
