@@ -142,6 +142,10 @@ pub struct PlanTaskWire {
     /// worst-case width before any spend.
     #[serde(default)]
     pub max_fanout: u32,
+    /// Each `producer.field` a mapped task narrows to its own element's entry (contract 1.16.0),
+    /// empty when it declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keyed: Vec<String>,
     /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
     #[serde(default)]
     pub when: String,
@@ -927,6 +931,7 @@ mod tests {
                 stage: "iteration".into(),
                 over: "discover.targets".into(),
                 max_fanout: 8,
+                keyed: vec!["discover.facts".into()],
                 when: String::new(),
                 revise: vec!["draft".into(), "check".into()],
                 max_rounds: 3,
@@ -1024,6 +1029,7 @@ mod tests {
             stage: "iteration".into(),
             over: String::new(),
             max_fanout: 0,
+            keyed: Vec::new(),
             when: String::new(),
             revise,
             max_rounds: 0,

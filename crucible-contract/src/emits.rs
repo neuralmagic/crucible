@@ -134,6 +134,15 @@ impl FieldType {
         }
     }
 
+    /// True for a type every value of which is a JSON object.
+    pub fn is_object(&self) -> bool {
+        match self {
+            FieldType::Object => true,
+            FieldType::Schema(schema) => schema.coarse() == Some(FieldType::Object),
+            _ => false,
+        }
+    }
+
     /// True for a type every value of which is a JSON array.
     pub fn is_list(&self) -> bool {
         match self {

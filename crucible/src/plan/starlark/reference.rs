@@ -132,6 +132,7 @@ fn task_knobs() -> Vec<Kwarg> {
                 "Instance cap for `over`, within the engine's ceiling of {MAX_FANOUT_CEILING}."
             ),
         ),
+        keyed_kwarg(),
         Kwarg::new(
             "revise",
             "task | list[task]",
@@ -174,6 +175,15 @@ fn task_knobs() -> Vec<Kwarg> {
         answers_kwarg(),
         otherwise_kwarg(),
     ]
+}
+
+fn keyed_kwarg() -> Kwarg {
+    Kwarg::new(
+        "keyed",
+        "list[producer.field]",
+        "Object fields of unmapped dependencies, keyed by item, that each instance of a mapped \
+         task reads narrowed to its own item's entry.",
+    )
 }
 
 fn when_kwarg() -> Kwarg {
@@ -576,6 +586,28 @@ pub fn functions() -> Vec<Function> {
                     "Which dependency outputs form the state, as on any task.",
                 ),
                 Kwarg::new("stage", "\"iteration\" | \"epilogue\"", "As on any task."),
+                Kwarg::new(
+                    "files",
+                    "list[str]",
+                    "Declared JSON files of its dependencies the decision model reads, under \
+                     `files` in its state, by dependency. Each path must be declared with a \
+                     schema. A model decider only.",
+                ),
+                Kwarg::new(
+                    "over",
+                    "producer.field",
+                    "Decide once per item of a dependency's emitted list. A dependency mapped \
+                     over the same list is read per item, and so is a `when` on this route in a \
+                     task mapped over it.",
+                ),
+                Kwarg::new(
+                    "max_fanout",
+                    "int",
+                    format!(
+                        "Item cap for `over`, within the engine's ceiling of {MAX_FANOUT_CEILING}."
+                    ),
+                ),
+                keyed_kwarg(),
                 when_kwarg(),
                 answers_kwarg(),
                 otherwise_kwarg(),

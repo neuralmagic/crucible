@@ -1,0 +1,125 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0062"
+title = "Per-element decisions are routes mapped over the list the gated work maps over"
+status = "proposed"
+date = "2026-10-07"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0001:C-ROUTE-EACH",
+    "RFC-0001:C-ROUTE-FILES",
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0002:C-SETTLED-JOIN",
+    "RFC-0002:C-PLAYBOOK-RESUME",
+    "RFC-0002:C-REVISE-LOOP",
+    "ADR-0064",
+]
+
+[content]
+context = """
+A route ([[RFC-0001:C-ROUTE]]) asks a decision model typed questions once and gates downstream tasks with when. A route cannot declare over, so a playbook that fans agent turns out over a list cannot put a decision in front of each turn: the only decision available is one for the whole run.
+
+The motivating case is a CVE triage playbook: a command stages per-ticket facts and emits the ticket keys, an agent task maps over the keys with one turn per ticket, a command applies the verdicts and emits the keys worth fixing, and a second agent task maps over those. Most of the cost is the per-ticket turns, and the decisions that would cut it are per ticket: skip a turn when the staged facts already settle reachability, give hard tickets more effort than easy ones, gate a fix on whether the version bump keeps the API, judge whether an agent's result file is supported by its own evidence, and flag likely duplicates.
+
+What exists today:
+
+- A mapped task names each instance by its item, `node[key]`, and a resumed run keeps an instance's result by that key ([[RFC-0001:C-WORKFLOW]]).
+- A mapped dependency reaches its dependents as one folded output; a fold passes only when every instance passed.
+- A when is evaluated once per node, before the node expands.
+- Not taken is a terminal status, and an untaken branch is untaken to its leaves through "all" joins.
+- A route's state is its dependencies' JSON outputs. A task whose only output is a declared file gives a route nothing to read.
+- A revise loop refuses a body that maps over a list, and its reviewer must be an agent, command, or evaluate task ([[RFC-0002:C-REVISE-LOOP]])."""
+decision = """
+Let a route map over a list, and evaluate a when on a mapped route per element in a task that maps over the same list. Two tasks mapped over the same producer field are aligned; their instances pair by key, which is already the identity a resume relies on. The normative rules are [[RFC-0001:C-ROUTE-EACH]] and [[RFC-0001:C-ROUTE-FILES]].
+
+- **One decision per element.** A mapped route's instance for a key is that element's decision, recorded and folded on resume like any instance, so an element is asked once per run.
+- **Per-element reads.** On every aligned edge, the dependency reaches an instance as its own instance for the same key, under the dependency's own name, instead of the fold. One rule covers routes, the tasks they gate, and plain per-element pipelines alike, and an untaken element stays untaken down the whole aligned chain.
+- **Gating.** when keeps its meaning and gains a per-element reading. Partitioning by answer is several aligned tasks with whens on the same question, and the existing coverage rule makes every label lead somewhere.
+- **State.** An element's state is the route's inputs plus its key. keyed narrows a per-element object field to the element's entry, for any mapped task, so a hundred-element fan-out does not hand every instance, model request or agent turn, the whole field, and one element's facts cannot sway another's answer. A route may also read declared JSON files, which is how it judges an agent whose output is a file.
+- **Folds.** An instance not taken is not a failure. A fan-out whose instances were all untaken is itself untaken, so its "all" dependents are untaken as any branch's are and a "settled" reducer still runs.
+
+For the triage playbook, sketched (illustrative; the clauses above are the contract):
+
+```python
+gate = route(name = "gate", depends_on = [prepare], over = prepare.members, max_fanout = 120,
+             keyed = [prepare.facts], min_confidence = 0.8,
+             questions = {"depth": choice(ask = "...", options = {"settled": "...", "quick": "...", "deep": "..."},
+                                          drop = ["settled"])})
+quick = agent(name = "quick", effort = "low", depends_on = [prepare, gate], over = prepare.members,
+              max_fanout = 120, when = gate.depth.quick, ...)
+deep = agent(name = "deep", effort = "high", depends_on = [prepare, gate], over = prepare.members,
+             max_fanout = 120, when = gate.depth.otherwise, ...)   # deep and uncertain
+judge = route(name = "judge", depends_on = [quick, deep], join = "settled", over = prepare.members,
+              max_fanout = 120, files = ["RESULT.json"], min_confidence = 0.8,
+              questions = {"supported": noul(ask = "Does the evidence support the verdict?", drop = ["yes"])})
+review = agent(name = "review", depends_on = [judge], over = prepare.members, max_fanout = 120,
+               when = judge.supported.otherwise, ...)   # no and uncertain
+```
+
+A ticket answered "settled" costs one decision and no turn. A deterministic output-decided route can sit in front of the model-decided one when the staged facts already carry an answer; the model route then declares a when on it and is asked only about the rest. A fix gate is the same shape over the fix list."""
+consequences = """
+- The expensive per-element turns become conditional per element, and an untaken element shows as a not-taken row under its own key rather than disappearing from the run.
+- Every element costs one decision request. max_fanout bounds the requests per run, and the run's ceilings are checked before each one. Decision requests are not charged to the run's budget: they cost little next to the turns they gate, so the ceiling check before each request is in practice a wall-clock check, and max_fanout bounds the count.
+- An aligned dependent waits for the whole mapped dependency to settle before it expands. Starting element k's turn as soon as element k's decision lands is left out; the decision is the cheap stage, so the added latency is small next to the turns it gates.
+- An aligned mapped-to-mapped edge changes what the dependent instance reads: an instance, not the fold. This is breaking for a pack whose mapped task consumes the fold of another task mapped over the same list. No published example or known pack has such an edge; a task mapped over a different list, or not mapped, still reads the fold.
+- The fan-out summary gains a not_taken count. Readers that predate it read zero, and a fold that would have failed only because instances were untaken now passes.
+- Judging an agent's result feeds a review lane, not a send-back ([[ADR-0064]]).
+- A playbook that relied on every element getting a full turn now relies on the decision model's calibration and min_confidence. uncertain still has to be routed, so the author decides what happens when the model is unsure."""
+
+[[content.alternatives]]
+text = "Map a route over the list, read every aligned edge per element, and read a when on a mapped route per element"
+status = "accepted"
+pros = [
+    "Reuses the instance key, the not-taken status, the coverage rule, and resume folding as they are.",
+    "Every element keeps a row in every gated task, so the record shows why a turn did not run.",
+    "Partitioning by answer and chaining a deterministic route in front of a model route need no new construct.",
+]
+cons = [
+    "An aligned mapped-to-mapped edge reads an instance instead of the fold, a breaking change for any pack that relied on the fold there.",
+    "Each element is a separate decision request.",
+]
+
+[[content.alternatives]]
+text = "Map gated tasks over a filtered list taken from the route's fold (over = gate.depth.quick)"
+status = "rejected"
+pros = [
+    "No per-element when; a gated task simply has fewer instances.",
+    "Instance names stay keyed by item.",
+]
+cons = [
+    "An element the route sent elsewhere has no row in the gated task, so a settled reducer cannot tell untaken from never listed.",
+    "The coverage check would have to be rebuilt for list references instead of when labels.",
+    "over would read a list the engine synthesises from a route's record, a second meaning for a field reference.",
+]
+rejection_reason = "Loses the not-taken record and duplicates the coverage rule in a new place."
+
+[[content.alternatives]]
+text = "Quantified when on an unmapped route over the fold (any or all elements answered a label)"
+status = "rejected"
+pros = ["Small change to when; useful for run-level gates such as skipping a report."]
+cons = [
+    "Still one decision for the whole list, so it cannot gate element k's turn on element k's answer.",
+    "Does not address the cost driver, which is per-element turns.",
+]
+rejection_reason = "Answers a different question; it can be added later on top of mapped routes if a run-level gate is needed."
+
+[[content.alternatives]]
+text = "One route request per run carrying every element, answered as a map keyed by element"
+status = "rejected"
+pros = ["One request instead of N."]
+cons = [
+    "Neither decision API answers a question per element; the questions would have to be multiplied per key at run time, which C-ROUTE forbids because questions are compile-time.",
+    "One malformed answer fails every element, and a resume re-asks all of them.",
+]
+rejection_reason = "Breaks compile-time questions and per-element failure isolation."
+
+[[content.alternatives]]
+text = "Read aligned edges per element only along chains that involve a route"
+status = "rejected"
+pros = ["Existing mapped-to-mapped edges keep reading the fold."]
+cons = [
+    "Two read rules for the same shape of edge, chosen by what is upstream.",
+    "Needs a transitive per-element marking so an untaken element stays untaken past the first hop.",
+]
+rejection_reason = "No known pack consumes the fold on an aligned edge, so the compatibility it buys is not worth a second rule."

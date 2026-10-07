@@ -83,6 +83,35 @@ fn captured_path(state: &Path, task: &str, declared: &str) -> PathBuf {
     captured_dir(state, task).join(declared)
 }
 
+/// What a route's state carries under [`crate::plan::ir::FILES_INPUT`]: each listed file a
+/// dependency declared and this route had staged, parsed, under the dependency's name. A mapped
+/// dependency's instance is named by its node, since the route reads only its own element's. A
+/// file that does not parse is `null`.
+fn route_files(state: &Path, staged: &[StagedInput], files: &[String]) -> Value {
+    let mut by_producer: serde_json::Map<String, Value> = serde_json::Map::new();
+    for input in staged.iter().filter(|s| files.contains(&s.declared)) {
+        let node = input
+            .producer
+            .split_once('[')
+            .map_or(input.producer.as_str(), |(node, _)| node);
+        let path = captured_path(state, &input.producer, &input.declared);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let parsed = serde_json::from_str(&text).unwrap_or_else(|error| {
+            tracing::warn!(file = %input.declared, producer = %input.producer, %error, "route file does not parse; the model reads null");
+            Value::Null
+        });
+        if let Value::Object(entries) = by_producer
+            .entry(node.to_owned())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        {
+            entries.insert(input.declared.clone(), parsed);
+        }
+    }
+    Value::Object(by_producer)
+}
+
 /// The mode the engine gives a captured file, regardless of what the source carried. A
 /// declared output derived from a staged input arrives 0444, and a capture that kept that mode
 /// would make the next run's copy fail with EACCES.
@@ -227,6 +256,20 @@ impl TaskRunner for HarnessRunner {
         inputs: &BTreeMap<TaskName, Value>,
         deadline: Option<Deadline>,
     ) -> Attempt {
+        let with_files;
+        let inputs = match &task.task {
+            TaskKind::Route { files, .. } if !files.is_empty() => {
+                let staged = self.staged.get(&task.name).map(Vec::as_slice);
+                let mut extended = inputs.clone();
+                extended.insert(
+                    TaskName(crate::plan::ir::FILES_INPUT.to_string()),
+                    route_files(&self.paths.state, staged.unwrap_or_default(), files),
+                );
+                with_files = extended;
+                &with_files
+            }
+            _ => inputs,
+        };
         run_task(
             &Dispatch {
                 args: &self.args,
@@ -1362,6 +1405,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -1522,6 +1566,7 @@ mod tests {
             emits_files: files.iter().map(|f| DeclaredFile::from(*f)).collect(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -3507,6 +3552,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -5266,6 +5312,46 @@ workflow(type = "playbook", tasks = [author, repro])
         assert!(
             prompt.contains("}\n\n## Result contract"),
             "a prompt without history is laid out as before: {prompt}"
+        );
+    }
+
+    /// A route reads each listed file its staged producers captured, parsed, under the
+    /// producer's node name; a file that does not parse is null, and an unlisted one is absent.
+    #[test]
+    fn a_route_reads_its_listed_files_by_dependency() {
+        let state = tempfile::tempdir().unwrap();
+        let write = |task: &str, path: &str, body: &str| {
+            let dir = state.path().join("files").join(task);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(path), body).unwrap();
+        };
+        write(
+            "analyze[T-1]",
+            "RESULT.json",
+            r#"{"reachability": "unreachable"}"#,
+        );
+        write("analyze[T-1]", "notes.txt", "not listed");
+        write("triage", "RESULT.json", "{ torn");
+        let staged = [
+            StagedInput {
+                producer: "analyze[T-1]".into(),
+                declared: "RESULT.json".into(),
+            },
+            StagedInput {
+                producer: "analyze[T-1]".into(),
+                declared: "notes.txt".into(),
+            },
+            StagedInput {
+                producer: "triage".into(),
+                declared: "RESULT.json".into(),
+            },
+        ];
+        assert_eq!(
+            route_files(state.path(), &staged, &["RESULT.json".to_owned()]),
+            serde_json::json!({
+                "analyze": {"RESULT.json": {"reachability": "unreachable"}},
+                "triage": {"RESULT.json": null},
+            })
         );
     }
 }

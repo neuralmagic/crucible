@@ -35,6 +35,7 @@ An agent turn driven by a prompt.
 | `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item, that each instance of a mapped task reads narrowed to its own item's entry. |
 | `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
@@ -68,6 +69,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item, that each instance of a mapped task reads narrowed to its own item's entry. |
 | `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
@@ -94,6 +96,7 @@ A deterministic shell task in the candidate workspace.
 | `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item, that each instance of a mapped task reads narrowed to its own item's entry. |
 | `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
@@ -122,6 +125,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `emits_files` | `list[str] \| dict[str, schema \| None]` | Workspace files the task produces. A dependent is staged with the declared files of every dependency that passed. The dict form maps a path to `schema_file(...)` or `None`; a file with a schema must hold JSON the schema admits when the task passes, or the task fails. |
 | `over` | `producer.field` | Map the task over a dependency's emitted list, one instance per item. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
+| `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item, that each instance of a mapped task reads narrowed to its own item's entry. |
 | `revise` | `task \| list[task]` | The tasks this task sends back when it settles failing. They run again, in dependency order, with the verdict under `revision`, then this task does, until this task stops failing or `max_rounds` is spent. Every task on a path between them and this task must be listed. Playbooks only; not with `over`. |
 | `max_rounds` | `int` | Round cap for `revise`, counting the first, from 2 to the engine's ceiling of 5. |
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
@@ -276,6 +280,10 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `required` | `bool` | False makes the route advisory. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependency outputs form the state, as on any task. |
 | `stage` | `"iteration" \| "epilogue"` | As on any task. |
+| `files` | `list[str]` | Declared JSON files of its dependencies the decision model reads, under `files` in its state, by dependency. Each path must be declared with a schema. A model decider only. |
+| `over` | `producer.field` | Decide once per item of a dependency's emitted list. A dependency mapped over the same list is read per item, and so is a `when` on this route in a task mapped over it. |
+| `max_fanout` | `int` | Item cap for `over`, within the engine's ceiling of 256. |
+| `keyed` | `list[producer.field]` | Object fields of unmapped dependencies, keyed by item, that each instance of a mapped task reads narrowed to its own item's entry. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |

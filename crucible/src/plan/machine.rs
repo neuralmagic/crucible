@@ -72,6 +72,10 @@ pub enum TaskEvent {
     FanoutItemsInvalid,
     InstancesPassed,
     InstancesFailed,
+    /// Every instance of a fan-out node settled not taken.
+    InstancesNotTaken,
+    /// An instance's keyed input was absent or not an object keyed by element.
+    ElementInputInvalid,
     /// A reviewer and the task it revises entered their rounds.
     RoundsStarted,
     RoundsPassed,
@@ -106,6 +110,8 @@ pub const TASK_TRANSITIONS: &[(TaskState, TaskEvent, TaskState)] = {
         (S::Running, E::TransportCutByBudget, S::Transport),
         (S::Fanout, E::InstancesPassed, S::Pass),
         (S::Fanout, E::InstancesFailed, S::Fail),
+        (S::Fanout, E::InstancesNotTaken, S::NotTaken),
+        (S::Pending, E::ElementInputInvalid, S::Fail),
         (S::Pending, E::RoundsStarted, S::Revising),
         (S::Revising, E::RoundsPassed, S::Pass),
         (S::Revising, E::RoundsFailed, S::Fail),

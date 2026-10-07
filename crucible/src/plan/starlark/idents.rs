@@ -155,6 +155,10 @@ pub(crate) fn narrow(error: CompileError, idents: &Idents) -> CompileError {
         CompileError::OverNotAList { .. } | CompileError::OverItemsNotStrings { .. } => {
             (None, "over")
         }
+        CompileError::KeyedNotOutputFields | CompileError::KeyedNotAnObject { .. } => {
+            (None, "keyed")
+        }
+        CompileError::RouteFilesNotPaths => (Some("route"), "files"),
         CompileError::EmitsNotList
         | CompileError::EmitsEntryNotString
         | CompileError::UnknownFieldType { .. }

@@ -296,6 +296,94 @@ fn an_openai_decisions_binding_routes_the_same_plan_the_same_way() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+const MAPPED_PLAN: &str = r#"
+version = 1
+[budget]
+usd = 5.0
+
+[[task]]
+name = "scan"
+kind = "command"
+command = "echo '{\"items\": [\"a\", \"b\"], \"facts\": {\"a\": {\"lane\": \"needs_reach\"}, \"b\": {\"lane\": \"review\"}}}'"
+emits = ["items", "facts"]
+
+[[task]]
+name = "analyze"
+kind = "command"
+depends_on = ["scan"]
+over = { task = "scan", field = "items" }
+max_fanout = 4
+command = "echo '{}'"
+
+[[task]]
+name = "judge"
+kind = "route"
+needs = "decision"
+depends_on = ["scan", "analyze"]
+over = { task = "scan", field = "items" }
+max_fanout = 4
+keyed = [{ task = "scan", field = "facts" }]
+decider = { kind = "model", min_confidence = 0.5 }
+[task.questions.urgent]
+instructions = "Does the evidence support the claim?"
+type = "noul"
+drop = ["no", "uncertain"]
+
+[[task]]
+name = "fix"
+kind = "command"
+depends_on = ["scan", "judge"]
+over = { task = "scan", field = "items" }
+max_fanout = 4
+when = { task = "judge", question = "urgent", is = ["yes"] }
+command = "if [ -n \"$ROUTE_E2E_KEY$CRUCIBLE_INFERENCE\" ]; then echo '{\"saw\": true}'; else echo '{\"saw\": false}'; fi"
+"#;
+
+/// A route mapped over a list asks the model once per item, with that item and its keyed entry
+/// in its state, and the work mapped over the same list runs per item on its answer. No
+/// task process sees the decision binding or its key.
+#[test]
+fn a_mapped_route_asks_once_per_item_with_that_items_state() {
+    let (url, seen) = serve_at(
+        "/v1/decisions",
+        "200 OK",
+        r#"{"answers":[{"type":"predicate","name":"urgent","probability":0.97}]}"#.to_string(),
+    );
+    let dir = workdir("mapped", MAPPED_PLAN);
+    let document = serde_json::json!({"version": 1, "bindings": [{
+        "role": "decision", "protocol": "decisions", "url": url, "model": "gpt-6-luna",
+        "key_env": "ROUTE_E2E_KEY",
+    }]})
+    .to_string();
+    let run = run_with(&dir, Some(&document), Some("sk-test"));
+    assert!(run.ok, "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(status_of(&run.stdout, "judge"), "pass");
+    assert_eq!(status_of(&run.stdout, "fix"), "pass");
+    assert_eq!(
+        run.stdout.matches("{\"saw\":false}").count(),
+        2,
+        "every item ran, and no task process saw the decision binding: {}",
+        run.stdout
+    );
+
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2, "one decision per item");
+    let mut states: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|request| {
+            let body: serde_json::Value =
+                serde_json::from_str(request.rsplit('\n').next().unwrap()).unwrap();
+            serde_json::from_str(body["input"].as_str().unwrap()).unwrap()
+        })
+        .collect();
+    states.sort_by_key(|state| state["item"].as_str().map(str::to_owned));
+    for (state, (item, lane)) in states.iter().zip([("a", "needs_reach"), ("b", "review")]) {
+        assert_eq!(state["item"], item);
+        assert_eq!(state["scan"]["facts"], serde_json::json!({"lane": lane}));
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn an_answer_below_min_confidence_takes_the_uncertain_branch() {
     let (url, _seen) = serve("200 OK", answers(0.55, 0.97));

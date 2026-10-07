@@ -300,6 +300,63 @@ def auditor(topic, blocking):
 auditors = [auditor(topic, blocking) for topic, blocking in AUDITS]
 ```
 
+## Decide per item
+
+A route maps over a list like any task, and decides each item on its own. A task mapped over the
+same list reads it per item: instance `fix[K]` sees `judge[K]`'s answer and `analyze[K]`'s output,
+and its `when` is read against `judge[K]` alone. An item whose answer is not listed settles
+not taken, without dispatch or spend, and neither fails its fan-out nor holds up the other items:
+
+```python
+analyze = agent(
+    name = "analyze",
+    prompt = prompt_file("analyze.md"),
+    depends_on = [prepare],
+    over = prepare.members,
+    max_fanout = 120,
+    emits_files = {"RESULT.json": schema_file("result.schema.json")},
+)
+
+judge = route(
+    name = "judge",
+    depends_on = [prepare, analyze],
+    over = prepare.members,
+    max_fanout = 120,
+    keyed = [prepare.lanes],
+    files = ["RESULT.json"],
+    min_confidence = 0.8,
+    required = False,
+    questions = {
+        "supported": noul(
+            ask = "Does the evidence in RESULT.json support its reachability answer?",
+            drop = ["yes"],
+        ),
+    },
+)
+
+review = command(
+    name = "review",
+    run = "./flag.sh",
+    depends_on = [prepare, judge],
+    over = prepare.members,
+    max_fanout = 120,
+    when = judge.supported,
+    answers = ["no", "uncertain"],
+)
+```
+
+- `files` puts dependencies' declared JSON files in the decision model's state under `files`, by
+  dependency. A file has to be declared with a schema, and a mapped dependency's file is read only
+  by a route aligned with it, so `judge[K]` reads `analyze[K]`'s `RESULT.json`.
+- `keyed` narrows an object field of an unmapped dependency to the item's entry: `prepare.lanes`
+  is keyed by item, and `judge[K]` sees `lanes[K]` in place of the whole object. Any mapped task
+  may declare it.
+- A route's state also carries the item under `item`.
+- A fan-out whose every item was not taken settles not taken, and so does everything joining it
+  with `all`. Its folded output counts the items under `not_taken`.
+- Each item's decision is its own row, so a resumed run asks only about the items it has no
+  answer for.
+
 ## Keep a conversation
 
 Agent tasks that share a `session` continue one conversation, in dependency order:

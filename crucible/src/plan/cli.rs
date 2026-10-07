@@ -114,7 +114,9 @@ pub fn render(plan: &ValidPlan, caps: &BTreeSet<String>) -> String {
                     .unwrap_or_default()
             ),
             TaskKind::TopK { k, .. } => format!("top_k[k={k}]"),
-            TaskKind::Route { questions, decider } => format!(
+            TaskKind::Route {
+                questions, decider, ..
+            } => format!(
                 "route[{}; {}]",
                 questions
                     .keys()

@@ -576,6 +576,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -604,6 +605,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -626,6 +628,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -649,6 +652,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -664,10 +668,14 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "questions",
             "min_confidence",
             "source",
+            "files",
             "depends_on",
             "required",
             "join",
             "stage",
+            "over",
+            "max_fanout",
+            "keyed",
             "when",
             "answers",
             "otherwise",
@@ -874,6 +882,7 @@ fn constructor(
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -915,6 +924,7 @@ fn constructor(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                keyed: Vec::new(),
                 revise: None,
                 timeout: None,
                 when: None,
@@ -935,8 +945,13 @@ fn constructor(
                 (None, Some(task)) => (Decider::Output { task }, "any"),
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
             };
-            Task {
-                task: TaskKind::Route { questions, decider },
+            let files = take_route_files(&mut named)?;
+            let task = Task {
+                task: TaskKind::Route {
+                    questions,
+                    decider,
+                    files,
+                },
                 depends_on: take_task_names(&mut named)?,
                 session: None,
                 needs: needs.to_owned(),
@@ -946,15 +961,18 @@ fn constructor(
                 stage: parse_stage(&take_string_default(&mut named, "stage", "iteration")?)?,
                 emits: crate::plan::ir::Emits::default(),
                 emits_files: Vec::new(),
-                over: None,
-                max_fanout: None,
+                over: take_over(&mut named)?,
+                max_fanout: take_optional_fanout(&mut named)?,
+                keyed: take_keyed(&mut named)?,
                 revise: None,
                 timeout: None,
                 when: take_when(&mut named, state, &name)?,
                 name,
                 history: None,
                 repair: 0,
-            }
+            };
+            check_fanout(&task)?;
+            task
         }
         "propose" => {
             let session = take_session(&mut named, state, at)?;
@@ -1201,6 +1219,7 @@ fn dsl_task(
         emits_files: take_emitted_files(named)?,
         over: take_over(named)?,
         max_fanout: take_optional_fanout(named)?,
+        keyed: take_keyed(named)?,
         when,
         revise: take_revise(named)?,
         timeout: take_timeout(named)?,
@@ -1525,6 +1544,44 @@ fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     }
 }
 
+/// The object fields a mapped task narrows to its own element's entry, each written as
+/// `producer.field`.
+fn take_keyed(named: &mut BTreeMap<String, Value>) -> Result<Vec<OutputRef>> {
+    let items = match named.remove("keyed") {
+        None | Some(Value::None) => return Ok(Vec::new()),
+        Some(Value::List(items)) => items,
+        Some(_) => return Err(CompileError::KeyedNotOutputFields),
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::Output(output) => match output.ty {
+                Some(declared) if !declared.is_object() => Err(CompileError::KeyedNotAnObject {
+                    reference: output.reference.to_string(),
+                    declared,
+                }),
+                _ => Ok(output.reference),
+            },
+            _ => Err(CompileError::KeyedNotOutputFields),
+        })
+        .collect()
+}
+
+/// The dependency files a route's decision model reads, as workspace-relative paths.
+fn take_route_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>> {
+    match named.remove("files") {
+        None | Some(Value::None) => Ok(Vec::new()),
+        Some(Value::List(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(path) => Ok(path),
+                _ => Err(CompileError::RouteFilesNotPaths),
+            })
+            .collect(),
+        Some(_) => Err(CompileError::RouteFilesNotPaths),
+    }
+}
+
 fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
     match named.remove("max_fanout") {
         None | Some(Value::None) => Ok(None),
@@ -1639,6 +1696,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         emits_files: Vec::new(),
         over: None,
         max_fanout: None,
+        keyed: Vec::new(),
         when: None,
         revise: None,
         timeout: None,
@@ -3187,7 +3245,10 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
         let tasks = &compiled.workflow.tasks;
         let gate = tasks.iter().find(|t| t.name.0 == "gate").unwrap();
         assert_eq!(gate.needs, "decision");
-        let TaskKind::Route { questions, decider } = &gate.task else {
+        let TaskKind::Route {
+            questions, decider, ..
+        } = &gate.task
+        else {
             panic!("gate is not a route");
         };
         assert_eq!(
@@ -4491,10 +4552,11 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
         let pack = temp_pack("kwarg-slices");
         std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
         std::fs::write(pack.join("skills/demo/SKILL.md"), "demo\n").unwrap();
+        std::fs::write(pack.join("result.schema.json"), "{\"type\": \"object\"}").unwrap();
         let cases: &[(&str, &str)] = &[
             (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
@@ -4502,15 +4564,15 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
@@ -4543,6 +4605,10 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
             (
                 "route",
                 "u = command(name = \"u\", run = \"true\", emits = [\"q\", \"r\"])\ng = route(name = \"g\", source = u, min_confidence = None, depends_on = [u], required = True, join = \"all\", stage = \"iteration\", questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])})\nh = route(name = \"h\", source = u, depends_on = [u, g], when = g.q, answers = \"yes\", otherwise = False, questions = {\"r\": noul(ask = \"r?\")}{extra})\nw = command(name = \"w\", run = \"true\", depends_on = [h], join = \"settled\")\nworkflow(type = \"custom\", tasks = [u, g, h, w], result = w)\n",
+            ),
+            (
+                "route",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\na = command(name = \"a\", run = \"true\", depends_on = [u], over = u.items, max_fanout = 4, emits_files = {\"r.json\": schema_file(\"result.schema.json\")})\ng = route(name = \"g\", min_confidence = 0.5, depends_on = [u, a], over = u.items, max_fanout = 4, keyed = [u.facts], files = [\"r.json\"], questions = {\"q\": noul(ask = \"q?\", drop = [\"no\", \"uncertain\"])}{extra})\nworkflow(type = \"custom\", tasks = [u, a, g], result = g)\n",
             ),
             (
                 "noul",

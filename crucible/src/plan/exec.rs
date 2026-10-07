@@ -21,7 +21,8 @@ use crate::diagram::IllegalTransition;
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
     COMPLETE_FIELD, Decider, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT, PARAMS_INPUT,
-    REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName, ValidPlan,
+    REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName, ValidPlan, When,
+    aligned,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -419,6 +420,8 @@ pub struct FanoutSummary {
     pub instances: usize,
     pub passed: usize,
     pub failed: usize,
+    #[serde(default)]
+    pub not_taken: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -786,7 +789,7 @@ pub fn execute(
             if t.depends_on.iter().any(|d| !results.contains_key(d)) {
                 continue;
             }
-            if let Some((event, note)) = not_taken(t, &results) {
+            if let Some((event, note)) = not_taken(plan, t, &results) {
                 let r = TaskResult::undispatched(TaskStatus::NotTaken, note);
                 record(
                     &mut *runner,
@@ -801,7 +804,7 @@ pub fn execute(
                 )?;
                 continue;
             }
-            if !dependencies_allow(t, &results) {
+            if !dependencies_allow(plan, t, &results) {
                 // Nothing runs on top of a failure (or a skip): advisory failures gate
                 // their dependents even though they never gate validity.
                 let reason = BlockedReason::DependencyDidNotPass;
@@ -995,16 +998,51 @@ pub fn execute(
                             Some((&instance.name, results.get(&instance.name)?.clone()))
                         })
                         .collect();
-                    // An instance is staged under its own name: it runs in its own root, and
-                    // the node itself never runs.
-                    let producers: Vec<&Task> = producers_for
+                    let node_producers: &[Task] = producers_for
                         .get(&node.name)
-                        .map(|producers| producers.iter().collect())
+                        .map(Vec::as_slice)
                         .unwrap_or_default();
-                    let refused = instances
-                        .iter()
-                        .filter(|instance| !folded.contains_key(&instance.name))
-                        .find_map(|instance| runner.stage(instance, &producers).err());
+                    // An instance reads an aligned dependency's files from that dependency's
+                    // instance for the same key, and no other instance of it.
+                    let producers_of = |key: &str| -> Vec<Task> {
+                        node_producers
+                            .iter()
+                            .filter(|p| {
+                                !node.depends_on.iter().any(|d| {
+                                    aligned_dependency(plan, node, d)
+                                        && is_instance_of(d, &p.name)
+                                        && p.name != instance_name(d, key)
+                                })
+                            })
+                            .cloned()
+                            .collect()
+                    };
+                    let mut prepared: BTreeMap<TaskName, BTreeMap<TaskName, Value>> =
+                        BTreeMap::new();
+                    let mut undispatched: BTreeMap<TaskName, (TaskResult, TaskEvent)> =
+                        BTreeMap::new();
+                    let mut refused = None;
+                    for (instance, key) in instances.iter().zip(&keys) {
+                        if folded.contains_key(&instance.name) {
+                            continue;
+                        }
+                        let producers = producers_of(key);
+                        match element(plan, node, key, &base, &results, &producers) {
+                            Element::Settle(result, event) => {
+                                undispatched.insert(instance.name.clone(), (result, event));
+                            }
+                            Element::Dispatch(inputs) => {
+                                // An instance is staged under its own name: it runs in its own
+                                // root, and the node itself never runs.
+                                let staged: Vec<&Task> = producers.iter().collect();
+                                if let Err(why) = runner.stage(instance, &staged) {
+                                    refused = Some(why);
+                                    break;
+                                }
+                                prepared.insert(instance.name.clone(), inputs);
+                            }
+                        }
+                    }
                     if let Some(why) = refused {
                         let reason = BlockedReason::StagingRefused(why);
                         let r = TaskResult::blocked(&reason);
@@ -1025,23 +1063,35 @@ pub fn execute(
                         .entry(node.name.clone())
                         .or_default()
                         .advance(TaskEvent::FannedOut)?;
-                    let item_inputs = |key: &String| {
-                        let mut inputs = base.clone();
-                        inputs.insert(TaskName(ITEM_INPUT.to_string()), Value::String(key.clone()));
-                        inputs
-                    };
                     // Each instance settles in its own right, so a reader sees one row per item
                     // rather than one row standing for all of them.
                     let mut settled: Vec<(String, TaskResult)> = Vec::new();
+                    for (instance, key) in instances.iter().zip(&keys) {
+                        let Some((result, event)) = undispatched.remove(&instance.name) else {
+                            continue;
+                        };
+                        settled.push((key.clone(), result.clone()));
+                        record(
+                            &mut *runner,
+                            instance,
+                            result,
+                            event,
+                            &mut results,
+                            &mut machines,
+                            &mut halted,
+                            &mut plan_machine,
+                            false,
+                        )?;
+                    }
+                    let to_run = |task: &Task| prepared.contains_key(&task.name);
                     if node.isolation.is_some() {
                         let batch: Vec<BatchItem<'_>> = instances
                             .iter()
-                            .zip(&keys)
-                            .filter(|(task, _)| !folded.contains_key(&task.name))
-                            .map(|(task, key)| BatchItem {
+                            .filter(|task| to_run(task))
+                            .map(|task| BatchItem {
                                 task,
                                 attempt: 1,
-                                inputs: item_inputs(key),
+                                inputs: prepared.get(&task.name).cloned().unwrap_or_default(),
                                 deadline: None,
                             })
                             .collect();
@@ -1064,6 +1114,9 @@ pub fn execute(
                         for (instance, key) in instances.iter().zip(&keys) {
                             if let Some(result) = folded.get(&instance.name) {
                                 settled.push((key.clone(), result.clone()));
+                                continue;
+                            }
+                            if !to_run(instance) {
                                 continue;
                             }
                             let Some((task, result, event)) = live.next() else {
@@ -1092,6 +1145,9 @@ pub fn execute(
                                 settled.push((key.clone(), result.clone()));
                                 continue;
                             }
+                            let Some(inputs) = prepared.get(&instance.name) else {
+                                continue;
+                            };
                             if spent >= budget {
                                 halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                             } else if clock.past(cfg.wall_clock) {
@@ -1118,15 +1174,30 @@ pub fn execute(
                                 .entry(instance.name.clone())
                                 .or_default()
                                 .advance(TaskEvent::Dispatched)?;
-                            let (result, event, overrun) = run_with_retries(
-                                instance,
-                                &item_inputs(key),
-                                cfg,
-                                run_ceiling,
-                                runner,
-                                &mut spent,
-                                budget,
-                            );
+                            let (result, event, overrun) = match &instance.task {
+                                TaskKind::Route {
+                                    questions,
+                                    decider: Decider::Output { task: source },
+                                    ..
+                                } => {
+                                    let decided = decide_from_output(inputs, questions, source);
+                                    let event = if decided.status == TaskStatus::Pass {
+                                        TaskEvent::Passed
+                                    } else {
+                                        TaskEvent::Failed
+                                    };
+                                    (decided, event, Overrun::default())
+                                }
+                                _ => run_with_retries(
+                                    instance,
+                                    inputs,
+                                    cfg,
+                                    run_ceiling,
+                                    runner,
+                                    &mut spent,
+                                    budget,
+                                ),
+                            };
                             overrun.halt(node.stage, &mut halted, &mut plan_machine)?;
                             runner.settled(instance, result.status == TaskStatus::Pass);
                             settled.push((key.clone(), result.clone()));
@@ -1143,11 +1214,14 @@ pub fn execute(
                             )?;
                         }
                     }
+                    // Settled order follows the keys, so a fold reads the same whichever path
+                    // settled an instance.
+                    settled.sort_by_key(|(key, _)| keys.iter().position(|k| k == key));
                     let folded = fold_instances(settled);
-                    let event = if folded.status == TaskStatus::Pass {
-                        TaskEvent::InstancesPassed
-                    } else {
-                        TaskEvent::InstancesFailed
+                    let event = match folded.status {
+                        TaskStatus::Pass => TaskEvent::InstancesPassed,
+                        TaskStatus::NotTaken => TaskEvent::InstancesNotTaken,
+                        _ => TaskEvent::InstancesFailed,
                     };
                     record(
                         &mut *runner,
@@ -1182,6 +1256,7 @@ pub fn execute(
                 TaskKind::Route {
                     questions,
                     decider: Decider::Output { task: source },
+                    ..
                 } => {
                     let decided = decide_from_output(&inputs, questions, source);
                     let event = if decided.status == TaskStatus::Pass {
@@ -1792,9 +1867,9 @@ where
             let settled = if let Some(halt) = halted {
                 let reason = halt.blocked();
                 Err((TaskResult::blocked(&reason), reason.event()))
-            } else if let Some((event, note)) = not_taken(t, &view) {
+            } else if let Some((event, note)) = not_taken(plan, t, &view) {
                 Err((TaskResult::undispatched(TaskStatus::NotTaken, note), event))
-            } else if !dependencies_allow(t, &view) {
+            } else if !dependencies_allow(plan, t, &view) {
                 let reason = BlockedReason::DependencyDidNotPass;
                 Err((TaskResult::blocked(&reason), reason.event()))
             } else if let Some(halt) = ceiling_reached(cfg, ledger) {
@@ -2113,18 +2188,31 @@ fn rounds_event(status: TaskStatus) -> TaskEvent {
 }
 
 /// Whether `t`'s join lets it dispatch on its dependencies' settled results.
-fn dependencies_allow(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> bool {
+/// Whether `d` is a dependency `t` reads per element: both map over the same list.
+fn aligned_dependency(plan: &ValidPlan, t: &Task, d: &TaskName) -> bool {
+    plan.get(d).is_some_and(|dependency| aligned(t, dependency))
+}
+
+/// Whether the node's dependencies let it dispatch. An aligned dependency is judged per element
+/// once the node expands ([`element`]), so only the others count here.
+fn dependencies_allow(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+) -> bool {
+    let mut unaligned = t
+        .depends_on
+        .iter()
+        .filter(|d| !aligned_dependency(plan, t, d));
     match t.join {
-        Join::All => t
-            .depends_on
-            .iter()
-            .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
+        Join::All => unaligned.all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
         // Only passing outputs feed a lossy join. A mapped node contributes when any of its
-        // instances passed, so a fan-out reads the same as a set of siblings.
-        Join::Passed => t
-            .depends_on
-            .iter()
-            .any(|d| results.get(d).is_some_and(TaskResult::contributed)),
+        // instances passed, so a fan-out reads the same as a set of siblings. An aligned
+        // dependency may contribute for some elements, which only the elements can tell.
+        Join::Passed => {
+            t.depends_on.iter().any(|d| aligned_dependency(plan, t, d))
+                || unaligned.any(|d| results.get(d).is_some_and(TaskResult::contributed))
+        }
         // Every dependency already holds a result by the caller's guard, so terminality is
         // established and no status blocks the dispatch.
         Join::Settled => true,
@@ -2137,11 +2225,10 @@ fn dependencies_allow(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> boo
 /// dependent that wants whatever survived says so with `join = "passed"`, which is the vocabulary
 /// that already exists; a fan-out needs no join of its own.
 fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
-    let passed = settled
-        .iter()
-        .filter(|(_, r)| r.status == TaskStatus::Pass)
-        .count();
-    let failed = settled.len() - passed;
+    let count = |status| settled.iter().filter(|(_, r)| r.status == status).count();
+    let passed = count(TaskStatus::Pass);
+    let not_taken = count(TaskStatus::NotTaken);
+    let failed = settled.len() - passed - not_taken;
     let cost: f64 = settled.iter().map(|(_, r)| r.cost_usd).sum();
     // Only passing instances feed a downstream join. A failed instance contributed nothing, and
     // a null under its key reads as "it ran and found nothing", which is a different claim.
@@ -2153,7 +2240,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
     let note = (failed > 0).then(|| {
         let names: Vec<&str> = settled
             .iter()
-            .filter(|(_, r)| r.status != TaskStatus::Pass)
+            .filter(|(_, r)| !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken))
             .map(|(key, _)| key.as_str())
             .collect();
         format!(
@@ -2162,20 +2249,24 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
             names.join(", ")
         )
     });
+    let status = if failed > 0 {
+        TaskStatus::Fail
+    } else if !settled.is_empty() && not_taken == settled.len() {
+        TaskStatus::NotTaken
+    } else {
+        TaskStatus::Pass
+    };
     TaskResult {
         blocked: None,
         transport: None,
-        status: if failed == 0 {
-            TaskStatus::Pass
-        } else {
-            TaskStatus::Fail
-        },
+        status,
         attempts: 1,
         cost_usd: cost,
         output: Some(serde_json::json!({
             "instances": settled.len(),
             "passed": passed,
             "failed": failed,
+            "not_taken": not_taken,
             "outputs": Value::Object(outputs),
         })),
         note,
@@ -2183,6 +2274,7 @@ fn fold_instances(settled: Vec<(String, TaskResult)>) -> TaskResult {
             instances: settled.len(),
             passed,
             failed,
+            not_taken,
         }),
         repairs: Vec::new(),
     }
@@ -2529,49 +2621,22 @@ fn run_batch_with_retries<'a>(
 /// Engine-built-in fold: keep the k best inputs by their `score` field.
 /// Output: `{"kept": [{"task": ..., "score": ...}, ...]}`, best first.
 /// Why `t` settles not taken without dispatch, if it does. Every dependency holds a result.
-fn not_taken(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> Option<(TaskEvent, String)> {
-    let status = |d: &TaskName| results.get(d).map(|r| r.status);
-    if let Some(when) = &t.when {
-        match status(&when.task) {
-            Some(TaskStatus::NotTaken) => {
-                return Some((
-                    TaskEvent::BranchNotTaken,
-                    format!("route {} was not taken", when.task),
-                ));
-            }
-            Some(TaskStatus::Pass) => {
-                let label = results
-                    .get(&when.task)
-                    .and_then(|r| r.output.as_ref())
-                    .and_then(|o| o.get(when.question.as_str()))
-                    .and_then(|a| a.get("label"))
-                    .and_then(Value::as_str);
-                if !when.is.iter().any(|l| Some(l.as_str()) == label) {
-                    return Some((
-                        TaskEvent::ConditionUnmet,
-                        format!(
-                            "{}.{} resolved to {}",
-                            when.task,
-                            when.question,
-                            label.unwrap_or("nothing")
-                        ),
-                    ));
-                }
-            }
-            _ if t.join != Join::All => {
-                return Some((
-                    TaskEvent::ConditionUnmet,
-                    format!("route {} did not decide", when.task),
-                ));
-            }
-            _ => {}
-        }
+fn not_taken(
+    plan: &ValidPlan,
+    t: &Task,
+    results: &BTreeMap<TaskName, TaskResult>,
+) -> Option<(TaskEvent, String)> {
+    if let Some(when) = &t.when
+        && !aligned_dependency(plan, t, &when.task)
+        && let Some(unmet) = when_unmet(when, &when.task, results.get(&when.task), t.join)
+    {
+        return Some(unmet);
     }
     if t.join == Join::All
-        && let Some(d) = t
-            .depends_on
-            .iter()
-            .find(|d| status(d) == Some(TaskStatus::NotTaken))
+        && let Some(d) = t.depends_on.iter().find(|d| {
+            !aligned_dependency(plan, t, d)
+                && results.get(*d).map(|r| r.status) == Some(TaskStatus::NotTaken)
+        })
     {
         return Some((
             TaskEvent::BranchNotTaken,
@@ -2579,6 +2644,217 @@ fn not_taken(t: &Task, results: &BTreeMap<TaskName, TaskResult>) -> Option<(Task
         ));
     }
     None
+}
+
+/// Why `when` keeps a task from dispatching, read against `decided`, the result of the route
+/// (or, for an element, of the route's instance for the same key) recorded under `route`.
+/// `None` lets the task through, or leaves an undecided route under `all` to block it.
+fn when_unmet(
+    when: &When,
+    route: &TaskName,
+    decided: Option<&TaskResult>,
+    join: Join,
+) -> Option<(TaskEvent, String)> {
+    match decided.map(|r| r.status) {
+        Some(TaskStatus::NotTaken) => Some((
+            TaskEvent::BranchNotTaken,
+            format!("route {route} was not taken"),
+        )),
+        Some(TaskStatus::Pass) => {
+            let label = decided
+                .and_then(|r| r.output.as_ref())
+                .and_then(|o| o.get(when.question.as_str()))
+                .and_then(|a| a.get("label"))
+                .and_then(Value::as_str);
+            (!when.is.iter().any(|l| Some(l.as_str()) == label)).then(|| {
+                (
+                    TaskEvent::ConditionUnmet,
+                    format!(
+                        "{route}.{} resolved to {}",
+                        when.question,
+                        label.unwrap_or("nothing")
+                    ),
+                )
+            })
+        }
+        _ if join != Join::All => Some((
+            TaskEvent::ConditionUnmet,
+            format!("route {route} did not decide"),
+        )),
+        _ => None,
+    }
+}
+
+/// What one element of a mapped node dispatches with, or how it settles without dispatch.
+enum Element {
+    Dispatch(BTreeMap<TaskName, Value>),
+    Settle(TaskResult, TaskEvent),
+}
+
+/// One element of a mapped node ([[RFC-0001:C-ROUTE-EACH]]): a `when` on an aligned route and
+/// every aligned dependency are read through their instance for `key`, each keyed field is
+/// narrowed to its entry under `key`, and the item itself rides under [`ITEM_INPUT`].
+///
+/// ```text
+///   triage[K] ──when──► judge[K] ◄──all── analyze[K]       instance K reads instance K
+///      │                   │
+///      └── keyed: prepare.lanes ──► prepare.lanes[K]       unmapped object narrowed to K
+/// ```
+fn element(
+    plan: &ValidPlan,
+    node: &Task,
+    key: &str,
+    base: &BTreeMap<TaskName, Value>,
+    results: &BTreeMap<TaskName, TaskResult>,
+    staged: &[Task],
+) -> Element {
+    let instance = |d: &TaskName| results.get(&instance_name(d, key));
+    if let Some(when) = &node.when
+        && aligned_dependency(plan, node, &when.task)
+    {
+        let route = instance_name(&when.task, key);
+        if let Some((event, note)) = when_unmet(when, &route, instance(&when.task), node.join) {
+            return Element::Settle(TaskResult::undispatched(TaskStatus::NotTaken, note), event);
+        }
+    }
+    let mut inputs = base.clone();
+    let mut contributed = node.join != Join::Passed
+        || node.depends_on.iter().any(|d| {
+            !aligned_dependency(plan, node, d)
+                && results.get(d).is_some_and(TaskResult::contributed)
+        });
+    for d in node
+        .depends_on
+        .iter()
+        .filter(|d| aligned_dependency(plan, node, d))
+    {
+        let settled = instance(d);
+        let status = settled.map_or(TaskStatus::Blocked, |r| r.status);
+        match node.join {
+            Join::All if status == TaskStatus::NotTaken => {
+                return Element::Settle(
+                    TaskResult::undispatched(
+                        TaskStatus::NotTaken,
+                        format!("dependency {} was not taken", instance_name(d, key)),
+                    ),
+                    TaskEvent::BranchNotTaken,
+                );
+            }
+            Join::All if status != TaskStatus::Pass => {
+                let reason = BlockedReason::DependencyDidNotPass;
+                return Element::Settle(TaskResult::blocked(&reason), reason.event());
+            }
+            Join::All => {
+                let output = settled
+                    .and_then(|r| r.output.clone())
+                    .unwrap_or(Value::Null);
+                inputs.insert(d.clone(), output);
+            }
+            Join::Passed if status == TaskStatus::Pass => {
+                let output = settled
+                    .and_then(|r| r.output.clone())
+                    .unwrap_or(Value::Null);
+                inputs.insert(d.clone(), output);
+                contributed = true;
+            }
+            Join::Passed => {
+                inputs.remove(d);
+            }
+            Join::Settled => {
+                let name = instance_name(d, key);
+                let files = staged.iter().any(|p| p.name == name);
+                let entry = match settled {
+                    Some(r) => settled_entry(r, files),
+                    None => settled_entry(
+                        &TaskResult::blocked(&BlockedReason::DependencyDidNotPass),
+                        false,
+                    ),
+                };
+                inputs.insert(d.clone(), Value::Object(entry));
+            }
+        }
+    }
+    if !contributed {
+        let reason = BlockedReason::DependencyDidNotPass;
+        return Element::Settle(TaskResult::blocked(&reason), reason.event());
+    }
+    let mut narrowed: Vec<crate::plan::ir::OutputRef> = node.keyed.clone();
+    if let TaskKind::Route {
+        questions,
+        decider: Decider::Output { task: source },
+        ..
+    } = &node.task
+        && !aligned_dependency(plan, node, source)
+    {
+        narrowed.extend(questions.keys().map(|question| crate::plan::ir::OutputRef {
+            task: source.clone(),
+            field: crate::plan::ir::OutputField(question.to_string()),
+        }));
+    }
+    for reference in &narrowed {
+        if let Err(note) = narrow(&mut inputs, reference, node.join, key) {
+            return Element::Settle(
+                TaskResult::undispatched(TaskStatus::Fail, note),
+                TaskEvent::ElementInputInvalid,
+            );
+        }
+    }
+    inputs.insert(
+        TaskName(ITEM_INPUT.to_string()),
+        Value::String(key.to_owned()),
+    );
+    Element::Dispatch(inputs)
+}
+
+/// Replace an object field keyed by element with its entry under `key`.
+fn narrow(
+    inputs: &mut BTreeMap<TaskName, Value>,
+    reference: &crate::plan::ir::OutputRef,
+    join: Join,
+    key: &str,
+) -> Result<(), String> {
+    let slot = field_slot(inputs, reference, join)
+        .ok_or_else(|| format!("keyed {reference} is absent"))?;
+    let entry = match &*slot {
+        Value::Object(entries) => entries
+            .get(key)
+            .cloned()
+            .ok_or_else(|| format!("keyed {reference} has no entry for {key}"))?,
+        other => {
+            return Err(format!(
+                "keyed {reference} is a {}, not an object keyed by element",
+                json_kind(other)
+            ));
+        }
+    };
+    *slot = entry;
+    Ok(())
+}
+
+/// Where a keyed field's value sits in a dispatch's inputs: in the producer's output, which a
+/// `settled` join wraps in its entry.
+fn field_slot<'a>(
+    inputs: &'a mut BTreeMap<TaskName, Value>,
+    reference: &crate::plan::ir::OutputRef,
+    join: Join,
+) -> Option<&'a mut Value> {
+    let entry = inputs.get_mut(&reference.task)?;
+    let output = match join {
+        Join::Settled => entry.get_mut("output")?,
+        Join::All | Join::Passed => entry,
+    };
+    output.get_mut(reference.field.0.as_str())
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "list",
+        Value::Object(_) => "object",
+    }
 }
 
 /// The deterministic decider: read one declared label per question from `source`'s output.
@@ -2873,6 +3149,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -3647,6 +3924,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -3710,6 +3988,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -3914,6 +4193,7 @@ mod tests {
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -4538,6 +4818,7 @@ mod tests {
                 decider: Decider::Output {
                     task: "classify".into(),
                 },
+                files: Vec::new(),
             },
             ..task("gate", &["classify"], "any", required)
         }
@@ -9029,5 +9310,315 @@ mod tests {
         ] {
             assert_eq!(named(name), None, "{name}");
         }
+    }
+
+    fn over_targets(mut t: Task) -> Task {
+        t.over = Some(crate::plan::ir::OutputRef {
+            task: "discover".into(),
+            field: crate::plan::ir::OutputField("targets".to_string()),
+        });
+        t.max_fanout = Some(8);
+        t
+    }
+
+    fn keyed_on(mut t: Task, producer: &str, field: &str) -> Task {
+        t.keyed.push(crate::plan::ir::OutputRef {
+            task: producer.into(),
+            field: crate::plan::ir::OutputField(field.to_string()),
+        });
+        t
+    }
+
+    fn fix_question() -> Question {
+        question(
+            crucible_contract::decision::QuestionKind::Noul,
+            &["no", "uncertain"],
+        )
+    }
+
+    /// A route a model decides, mapped over discover's targets and reading analyze per element.
+    fn judge(required: bool) -> Task {
+        let mut judge = over_targets(task(
+            "judge",
+            &["discover", "analyze"],
+            "decision",
+            required,
+        ));
+        judge.task = TaskKind::Route {
+            questions: BTreeMap::from([(QuestionId::new("fix").unwrap(), fix_question())]),
+            decider: Decider::Model {
+                min_confidence: 0.5,
+            },
+            files: Vec::new(),
+        };
+        keyed_on(judge, "discover", "facts")
+    }
+
+    fn fix_when(t: Task) -> Task {
+        let mut t = t;
+        t.when = Some(crate::plan::ir::When {
+            task: "judge".into(),
+            question: QuestionId::new("fix").unwrap(),
+            is: vec![label("yes")],
+        });
+        t
+    }
+
+    /// discover -> analyze[k] -> judge[k] (route) -> fix[k] when judge[k].fix = yes -> wrap
+    fn judged(judge_required: bool) -> ValidPlan {
+        valid(
+            vec![
+                task("discover", &[], "any", true),
+                over_targets(task("analyze", &["discover"], "any", true)),
+                judge(judge_required),
+                fix_when(over_targets(task(
+                    "fix",
+                    &["discover", "judge", "analyze"],
+                    "any",
+                    true,
+                ))),
+                task("wrap", &["fix"], "any", true),
+            ],
+            10.0,
+        )
+    }
+
+    fn decided(fix: &str) -> Value {
+        let yes = if fix == "yes" { 0.9 } else { 0.1 };
+        serde_json::json!({"fix": {"label": fix, "confidence": 0.9, "probabilities": {"yes": yes, "no": 1.0 - yes}}})
+    }
+
+    fn judged_runner(answers: &[(&str, &str)], facts: Value) -> ScriptRunner {
+        let mut r = ScriptRunner::new();
+        let targets: Vec<&str> = answers.iter().map(|(k, _)| *k).collect();
+        r.outputs.insert(
+            "discover".into(),
+            serde_json::json!({"targets": targets, "facts": facts}),
+        );
+        for (key, fix) in answers {
+            r.outputs.insert(
+                format!("analyze[{key}]"),
+                serde_json::json!({"claim": format!("claim-{key}")}),
+            );
+            r.outputs.insert(format!("judge[{key}]"), decided(fix));
+        }
+        r
+    }
+
+    fn decision_substrate() -> Substrate {
+        Substrate {
+            caps: BTreeSet::from([crate::plan::ir::NEEDS_DECISION.to_owned()]),
+        }
+    }
+
+    /// A mapped route decides each element on its own; the aligned fan-out runs only the elements
+    /// its answer allows, and an untaken element neither runs nor fails its node.
+    #[test]
+    fn a_mapped_route_gates_each_element_of_an_aligned_fanout() {
+        let mut r = judged_runner(
+            &[("a", "yes"), ("b", "no"), ("c", "yes")],
+            serde_json::json!({"a": {"lane": "x"}, "b": {"lane": "y"}, "c": {"lane": "z"}}),
+        );
+        let out = execute(
+            &judged(true),
+            &decision_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        let status = |n: &str| out.results[&TaskName(n.to_string())].status;
+        assert_eq!(status("fix[a]"), TaskStatus::Pass);
+        assert_eq!(status("fix[b]"), TaskStatus::NotTaken);
+        assert_eq!(status("fix[c]"), TaskStatus::Pass);
+        assert_eq!(status("fix"), TaskStatus::Pass);
+        assert_eq!(
+            out.results[&TaskName("fix".into())].fanout,
+            Some(FanoutSummary {
+                instances: 3,
+                passed: 2,
+                failed: 0,
+                not_taken: 1,
+            })
+        );
+        assert!(
+            !r.dispatched.iter().any(|(n, _)| n == "fix[b]"),
+            "an untaken element is never dispatched"
+        );
+        assert_eq!(
+            out.results[&TaskName("fix[b]".into())].note.as_deref(),
+            Some("judge[b].fix resolved to no")
+        );
+
+        let seen = &r.seen_values["judge[b]"];
+        assert_eq!(
+            seen[&TaskName("analyze".into())],
+            serde_json::json!({"claim": "claim-b"})
+        );
+        assert_eq!(
+            seen[&TaskName("discover".into())]["facts"],
+            serde_json::json!({"lane": "y"}),
+            "keyed narrows the object to the element's entry"
+        );
+        assert_eq!(seen[&TaskName(ITEM_INPUT.into())], serde_json::json!("b"));
+        assert_eq!(
+            r.seen_values["fix[a]"][&TaskName("judge".into())],
+            decided("yes"),
+            "an aligned route reads as its own element's decision"
+        );
+    }
+
+    /// When every element is untaken, the node is untaken, and so is everything joining it with
+    /// `all`.
+    #[test]
+    fn a_fanout_with_every_element_untaken_is_untaken_to_its_leaves() {
+        let mut r = judged_runner(
+            &[("a", "no"), ("b", "no")],
+            serde_json::json!({"a": {}, "b": {}}),
+        );
+        let out = execute(
+            &judged(true),
+            &decision_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            out.results[&TaskName("fix".into())].status,
+            TaskStatus::NotTaken
+        );
+        assert_eq!(
+            out.results[&TaskName("wrap".into())].status,
+            TaskStatus::NotTaken
+        );
+        assert_eq!(
+            out.results[&TaskName("fix".into())]
+                .output
+                .as_ref()
+                .unwrap()["not_taken"],
+            2
+        );
+    }
+
+    /// A keyed object with no entry for an element fails that element alone, before any request;
+    /// the aligned work for it is blocked and the other elements go on.
+    #[test]
+    fn a_missing_keyed_entry_fails_only_its_element() {
+        let mut r = judged_runner(&[("a", "yes"), ("b", "yes")], serde_json::json!({"a": {}}));
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                over_targets(task("analyze", &["discover"], "any", true)),
+                judge(false),
+                fix_when(over_targets(task(
+                    "fix",
+                    &["discover", "judge", "analyze"],
+                    "any",
+                    false,
+                ))),
+                joining(task("wrap", &["fix"], "any", true), Join::Settled),
+            ],
+            10.0,
+        );
+        let out = execute(
+            &plan,
+            &decision_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        let result = |n: &str| &out.results[&TaskName(n.to_string())];
+        assert_eq!(result("judge[a]").status, TaskStatus::Pass);
+        assert_eq!(result("judge[b]").status, TaskStatus::Fail);
+        assert_eq!(
+            result("judge[b]").note.as_deref(),
+            Some("keyed discover.facts has no entry for b")
+        );
+        assert!(!r.dispatched.iter().any(|(n, _)| n == "judge[b]"));
+        assert_eq!(result("fix[a]").status, TaskStatus::Pass);
+        assert_eq!(result("fix[b]").status, TaskStatus::Blocked);
+        assert_eq!(result("fix").status, TaskStatus::Fail);
+    }
+
+    /// An output-decided mapped route reads each element's answer from an unmapped source's
+    /// object keyed by element, and spends nothing.
+    #[test]
+    fn an_output_decided_mapped_route_reads_each_elements_answer() {
+        let mut gate = over_targets(task("gate", &["discover"], "any", true));
+        gate.task = TaskKind::Route {
+            questions: BTreeMap::from([(QuestionId::new("fix").unwrap(), fix_question())]),
+            decider: Decider::Output {
+                task: "discover".into(),
+            },
+            files: Vec::new(),
+        };
+        let mut work = over_targets(task("work", &["discover", "gate"], "any", true));
+        work.when = Some(crate::plan::ir::When {
+            task: "gate".into(),
+            question: QuestionId::new("fix").unwrap(),
+            is: vec![label("yes")],
+        });
+        let plan = valid(vec![task("discover", &[], "any", true), gate, work], 10.0);
+        let mut r = ScriptRunner::new();
+        r.outputs.insert(
+            "discover".into(),
+            serde_json::json!({"targets": ["a", "b"], "fix": {"a": "yes", "b": "no"}}),
+        );
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert!(out.valid, "{:?}", out.results);
+        assert_eq!(
+            out.results[&TaskName("work[a]".into())].status,
+            TaskStatus::Pass
+        );
+        assert_eq!(
+            out.results[&TaskName("work[b]".into())].status,
+            TaskStatus::NotTaken
+        );
+        assert!(!r.dispatched.iter().any(|(n, _)| n.starts_with("gate")));
+        assert_eq!(out.results[&TaskName("gate".into())].cost_usd, 0.0);
+    }
+
+    fn output_routed() -> ValidPlan {
+        let mut gate = over_targets(task("gate", &["discover"], "any", true));
+        gate.task = TaskKind::Route {
+            questions: BTreeMap::from([(QuestionId::new("fix").unwrap(), fix_question())]),
+            decider: Decider::Output {
+                task: "discover".into(),
+            },
+            files: Vec::new(),
+        };
+        let mut work = over_targets(task("work", &["discover", "gate"], "any", true));
+        work.when = Some(crate::plan::ir::When {
+            task: "gate".into(),
+            question: QuestionId::new("fix").unwrap(),
+            is: vec![label("yes")],
+        });
+        valid(
+            vec![
+                task("discover", &[], "any", true),
+                gate,
+                work,
+                task("wrap", &["work"], "any", true),
+            ],
+            10.0,
+        )
+    }
+
+    /// Each element's decision is its instance's row, so a resume asks nothing it already has.
+    #[test]
+    fn a_mapped_route_resumes_from_every_cut() {
+        assert_resumes_from_every_cut(&output_routed(), ExecCfg::default(), |r| {
+            r.outputs.insert(
+                "discover".into(),
+                serde_json::json!({"targets": ["a", "b", "c"], "fix": {"a": "yes", "b": "no", "c": "yes"}}),
+            );
+        });
     }
 }

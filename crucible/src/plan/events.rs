@@ -30,6 +30,7 @@ pub(crate) fn plan_admitted_event(
                     .map(crate::plan::ir::OutputRef::to_string)
                     .unwrap_or_default(),
                 max_fanout: t.max_fanout.unwrap_or_default(),
+                keyed: t.keyed.iter().map(ToString::to_string).collect(),
                 when: t.when.as_ref().map(ToString::to_string).unwrap_or_default(),
                 revise: t
                     .revise
