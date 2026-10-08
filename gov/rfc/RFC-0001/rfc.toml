@@ -38,6 +38,7 @@ clauses = [
     "clauses/C-ROUTE-EACH.toml",
     "clauses/C-ROUTE-SCORE.toml",
     "clauses/C-ROUTE-FILES.toml",
+    "clauses/C-ROUTE-OPTIONS.toml",
 ]
 
 [[changelog]]
@@ -57,6 +58,7 @@ added = [
     "keyed: a mapped task may narrow an object field of an unmapped dependency to its own element's entry, and the admitted-plan event carries it (C-ROUTE-EACH)",
     "score questions: ordered levels answered by a per-level distribution and recorded with an engine-computed expected position; asked natively where the decision API has an ordered question and as a choice where it has none (C-ROUTE-SCORE)",
     "a route may put declared JSON files of its dependencies in the decision model's state (C-ROUTE-FILES)",
+    "a choice may read its options from a dependency's field at run time, per element on a mapped route, bounded at 64 and recorded with the answer; a when on it lists only uncertain or declares otherwise (C-ROUTE-OPTIONS)",
 ]
 changed = [
     "DSL grammar admits dictionaries, conditionals, comprehensions, iteration, user-defined functions, load() and the pure standard library",
@@ -76,6 +78,7 @@ changed = [
     "skill joins the enumerated constructors: an agent task whose prompt is assembled from a shipped SKILL.md and the invocation's arguments",
     "a decision binding may speak decisions, the OpenAI Decisions API, reached at OpenAI's address when it names no URL (C-INFERENCE, C-ROUTE)",
     "the capability a model-decided route needs is decision, not systemone, since it names the role rather than one API (C-ROUTE)",
+    "options are compile-time except a dynamic choice's, which a dependency supplies (C-ROUTE)",
 ]
 
 [[changelog]]

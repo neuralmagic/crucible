@@ -1,0 +1,112 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0066"
+title = "A dynamic choice reads its options from a dependency field, bounded and recorded"
+status = "proposed"
+date = "2026-10-08"
+refs = [
+    "RFC-0001:C-ROUTE",
+    "RFC-0001:C-ROUTE-EACH",
+    "RFC-0001:C-ROUTE-OPTIONS",
+    "ADR-0062",
+]
+
+[content]
+context = """
+A choice question's options are written in the playbook ([[RFC-0001:C-ROUTE]]), so a route can only pick among labels its author knew when the pack was written. Some decisions pick among data instead.
+
+The motivating case is a CVE triage playbook. A flaw names its affected package in free text ("Go net/http"), and the shipped image's SBOM lists the packages actually in it. Deciding whether the flaw touches the image is matching that text to one SBOM entry, or to none. The entries differ per image and per ticket, so the options cannot be authored, and with a route mapped over tickets ([[ADR-0062]]) each element needs its own list.
+
+What exists today:
+
+- A mapped route decides once per element, and keyed narrows an unmapped dependency's object field to the element's entry ([[RFC-0001:C-ROUTE-EACH]]).
+- Both decision APIs take a choice's options with each request: System One as a map of label to criterion, OpenAI Decisions as a list of value and description. Nothing in either wire shape needs the options to be known before the request is built.
+- Labels are identifiers, the engine derives the answer from the returned probabilities, and when, drop, otherwise, and label coverage are checked against declared labels at compile time.
+- A route's output is its decision record, folded on resume, so an element is asked once per run."""
+decision = """
+Let choice(options = producer.field) name a dependency's field in place of the option list. The normative rules are [[RFC-0001:C-ROUTE-OPTIONS]].
+
+- **Where the list comes from.** The field is read the way keyed reads one: from an unmapped dependency, as the list itself for an unmapped route and as the element's entry of an object keyed by element for a mapped route. The compiler checks the reference against the producer's declared emits exactly as it checks keyed.
+- **What an entry is.** A string label, or {value, description}. Labels stay identifiers, so the answer record, the probability map, and when keep one label type; a producer whose data is not identifier-shaped puts the raw text in the description and a short key in value, which is also what the model should see.
+- **Bounds and duplicates.** At most 64 entries, checked before any entry is read. Duplicated labels collapse to the first entry. Fewer than two options after that, a malformed entry, or the reserved "uncertain" fails that element's decision before any request, and other elements are unaffected.
+- **Codecs.** The engine resolves each dynamic choice into an ordinary choice before calling the broker, so both codecs build the request from resolved options they already know how to send, and refuse a question whose options were never resolved.
+- **Record.** The answer carries the resolved options beside the label and distribution, so a reader sees what the model chose among without re-running the producer.
+- **Gating.** Labels are unknown at compile time, so a when may list only "uncertain", and otherwise stands for every resolved option plus "uncertain" when nothing else lists it. The options count as one label for coverage. A downstream task reads which option was picked from the route's output.
+- **Deciders.** Only a model-decided route may ask a dynamic choice. An output-decided route reads a label its source already computed; matching it against a list the same source could check itself adds a rule and no decision.
+
+For the triage playbook, sketched (illustrative; the clause is the contract):
+
+```python
+prepare = command(name = "prepare", run = "...", emits = {"members": "list", "facts": "object", "packages": "object"})
+match = route(name = "match", depends_on = [prepare], over = prepare.members, max_fanout = 120,
+              keyed = [prepare.facts], min_confidence = 0.7,
+              questions = {"package": choice(ask = "Which shipped package does the flaw affect?",
+                                             options = prepare.packages)})
+analyze = agent(name = "analyze", depends_on = [prepare, match], over = prepare.members, max_fanout = 120,
+                when = match.package, otherwise = True, ...)
+review = agent(name = "review", depends_on = [prepare, match], over = prepare.members, max_fanout = 120,
+               when = match.package, answers = "uncertain", ...)
+```
+
+prepare emits, per ticket, the SBOM candidates as {"value": "p3", "description": "golang.org/x/net 0.17.0"} with a {"value": "none", "description": "No shipped package matches"} entry of its own, so "none" is always an option and the analyze turn reads which one the route picked."""
+consequences = """
+- A route can decide among data the pack does not know in advance, per element, with the same calibration, refusal handling, and resume behaviour as a declared choice.
+- A producer has to emit identifier labels. Raw package names such as golang.org/x/net are not identifiers, so the producer keys them and puts the name in the description. The engine does not invent labels on its behalf.
+- The 64-entry bound is the engine's, not the author's. A producer with a longer list has to narrow it first, which is also where match quality is won; truncating would silently drop the right answer.
+- An always-present option such as "none" is the producer's job. The engine adds no options, so a list the producer forgot to extend is a list without it.
+- when cannot branch on a particular option. Splitting work by which package matched means reading the label in the downstream task, or a second, declared choice over the dynamic answer.
+- Records grow by the option list for each dynamic answer.
+- The plan admitted event's when string and the compiled TOML gain the any-option flag; a reader that predates it sees only the listed labels."""
+
+[[content.alternatives]]
+text = "A field reference resolved per decision, identifier labels, bounded, recorded with the answer"
+status = "accepted"
+pros = [
+    "Reuses keyed's reference rules, the mapped-route instance key, the codecs, and the answer resolution unchanged.",
+    "Every rule about answers keeps one label type.",
+    "The record is self-contained for audit.",
+]
+cons = [
+    "Producers must shape labels as identifiers.",
+    "when cannot name an option.",
+]
+
+[[content.alternatives]]
+text = "Accept any string as an option value and record it verbatim"
+status = "rejected"
+pros = ["A producer can pass SBOM names through unchanged."]
+cons = [
+    "Answers, probability maps, and when would need a second label type, or labels would stop being identifiers everywhere.",
+    "Arbitrary text as a map key in the record invites collisions in case and whitespace that the model and the reader treat differently.",
+]
+rejection_reason = "Widens a type every route rule depends on to save the producer one mapping step."
+
+[[content.alternatives]]
+text = "Merge declared options with the dynamic list, so a fixed option such as none is always present and when may name it"
+status = "considered"
+pros = [
+    "The author guarantees none exists, and can gate on it.",
+]
+cons = [
+    "A label may come from either side, so collisions between declared and emitted labels need their own rule.",
+    "Coverage becomes partly static and partly any-option.",
+]
+rejection_reason = "Not needed for the first user, whose producer can emit none itself; it can be added later without changing this record's shape."
+
+[[content.alternatives]]
+text = "Truncate an over-long list to the bound"
+status = "rejected"
+pros = ["A run never fails on list length."]
+cons = ["The dropped tail may hold the right answer, and the model cannot say so."]
+rejection_reason = "A silent wrong answer is worse than a failed element the author can fix."
+
+[[content.alternatives]]
+text = "Do the matching in the producer and gate with an output-decided route"
+status = "rejected"
+pros = ["No new question form."]
+cons = [
+    "Free-text package names do not match SBOM entries by string rules; that judgment is what the decision model is for.",
+    "The match would carry no distribution or confidence.",
+]
+rejection_reason = "Moves the hard part into a script that cannot do it."
