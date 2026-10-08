@@ -1,18 +1,13 @@
-//! Caller identity. Every request must carry a bearer token whose SHA-256 is registered, either in
-//! the operator's static tenants file or in a controller-written tenant record; the matching entry
-//! pins the caller to one namespace, a role, and a queue allowlist. Nothing a tool receives in its
-//! arguments can widen that scope.
+//! Caller identity. A tenant token is registered by its SHA-256, either in the operator's static
+//! tenants file or in a controller-written tenant record; the matching entry pins the caller to one
+//! namespace, a role, and a queue allowlist. Realm access tokens carry the same scope as claims
+//! ([`crate::auth`]). Nothing a tool receives in its arguments can widen that scope.
 
-use axum::extract::{Request, State};
-use axum::http::{StatusCode, header};
-use axum::middleware::Next;
-use axum::response::{IntoResponse, Response};
 use crucible_contract::kueue::{TenantRecord, TenantRole};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Debug, thiserror::Error)]
@@ -119,6 +114,27 @@ impl fmt::Display for RunId {
     }
 }
 
+/// Who launched the run a delegated token acts for: the token's `sub`, kept as a label value.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Launcher(String);
+
+impl Launcher {
+    pub fn parse(value: &str) -> Result<Self, NameError> {
+        if is_label_value(value) {
+            Ok(Self(value.to_string()))
+        } else {
+            Err(NameError::NotLabelValue {
+                what: "launcher",
+                value: value.to_string(),
+            })
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Refusal {
     #[error("role {role:?} may not call {tool}; it needs the submitter role")]
@@ -137,6 +153,9 @@ pub struct Caller {
     pub role: TenantRole,
     /// Empty means every LocalQueue in the namespace.
     pub queues: Vec<QueueName>,
+    /// The human a delegated token acts for, stamped on everything this caller creates. Static
+    /// tenant tokens carry no launcher.
+    pub launched_by: Option<Launcher>,
 }
 
 impl Caller {
@@ -188,6 +207,7 @@ impl Entry {
                 .iter()
                 .map(|q| QueueName::parse(q))
                 .collect::<Result<_, _>>()?,
+            launched_by: None,
         };
         Ok((
             digest,
@@ -344,10 +364,8 @@ impl Registry {
         self.file.len()
     }
 
-    /// The caller a `Bearer` authorization header names, if its token is registered and unexpired
-    /// at `now` (Unix seconds).
-    pub async fn authenticate(&self, authorization: Option<&str>, now: u64) -> Option<Caller> {
-        let token = authorization?.strip_prefix("Bearer ")?;
+    /// The caller `token` belongs to, if it is registered and unexpired at `now` (Unix seconds).
+    pub async fn authenticate(&self, token: &str, now: u64) -> Option<Caller> {
         let digest: [u8; 32] = Sha256::digest(token.as_bytes()).into();
         match self.file.lookup(&digest, now) {
             Some(caller) => Some(caller),
@@ -359,37 +377,6 @@ impl Registry {
 fn parse_digest(value: &str) -> Option<[u8; 32]> {
     let bytes = hex::decode(value.trim()).ok()?;
     bytes.try_into().ok()
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-/// Rejects any request without a registered bearer token and attaches the [`Caller`] to the
-/// request extensions, where rmcp forwards it to the tool handlers.
-pub async fn require_caller(
-    State(registry): State<Arc<Registry>>,
-    mut req: Request,
-    next: Next,
-) -> Response {
-    let header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-    match registry.authenticate(header, unix_now()).await {
-        Some(caller) => {
-            req.extensions_mut().insert(caller);
-            next.run(req).await
-        }
-        None => (
-            StatusCode::UNAUTHORIZED,
-            [(header::CONTENT_TYPE, "application/json")],
-            r#"{"status":"error","error":"missing or unknown bearer token"}"#,
-        )
-            .into_response(),
-    }
 }
 
 #[cfg(test)]
@@ -430,7 +417,7 @@ queues = ["gpu"]
     #[tokio::test]
     async fn a_registered_token_resolves_to_its_tenant() {
         let reg = registry(&file("secret", ""));
-        let caller = reg.authenticate(Some("Bearer secret"), 0).await.unwrap();
+        let caller = reg.authenticate("secret", 0).await.unwrap();
         assert_eq!(caller.namespace.as_str(), "team-a");
         assert_eq!(caller.run_id.as_str(), "run-1");
         assert_eq!(caller.role, TenantRole::Submitter);
@@ -439,17 +426,15 @@ queues = ["gpu"]
     #[tokio::test]
     async fn unknown_missing_or_non_bearer_tokens_are_rejected() {
         let reg = registry(&file("secret", ""));
-        assert!(reg.authenticate(Some("Bearer nope"), 0).await.is_none());
-        assert!(reg.authenticate(None, 0).await.is_none());
-        assert!(reg.authenticate(Some("secret"), 0).await.is_none());
-        assert!(reg.authenticate(Some("Basic secret"), 0).await.is_none());
+        assert!(reg.authenticate("nope", 0).await.is_none());
+        assert!(reg.authenticate("", 0).await.is_none());
     }
 
     #[tokio::test]
     async fn an_expired_file_entry_stops_authenticating_at_its_expiry() {
         let reg = registry(&file("secret", "expires_at = 100"));
-        assert!(reg.authenticate(Some("Bearer secret"), 99).await.is_some());
-        assert!(reg.authenticate(Some("Bearer secret"), 100).await.is_none());
+        assert!(reg.authenticate("secret", 99).await.is_some());
+        assert!(reg.authenticate("secret", 100).await.is_none());
     }
 
     #[tokio::test]
@@ -458,11 +443,11 @@ queues = ["gpu"]
         let a = record("live-a", "run-a");
         let rejected = reg.replace_live([("ns/a", &a)]).await;
         assert!(rejected.is_empty());
-        let caller = reg.authenticate(Some("Bearer live-a"), 0).await.unwrap();
+        let caller = reg.authenticate("live-a", 0).await.unwrap();
         assert_eq!(caller.namespace.as_str(), "team-b");
         assert_eq!(caller.role, TenantRole::Viewer);
         reg.replace_live([]).await;
-        assert!(reg.authenticate(Some("Bearer live-a"), 0).await.is_none());
+        assert!(reg.authenticate("live-a", 0).await.is_none());
     }
 
     #[tokio::test]
@@ -471,8 +456,8 @@ queues = ["gpu"]
         let mut a = record("live-a", "run-a");
         a.expires_at = Some(50);
         reg.replace_live([("ns/a", &a)]).await;
-        assert!(reg.authenticate(Some("Bearer live-a"), 49).await.is_some());
-        assert!(reg.authenticate(Some("Bearer live-a"), 50).await.is_none());
+        assert!(reg.authenticate("live-a", 49).await.is_some());
+        assert!(reg.authenticate("live-a", 50).await.is_none());
     }
 
     #[tokio::test]
@@ -490,8 +475,8 @@ queues = ["gpu"]
         assert_eq!(sources, ["ns/bad", "ns/x"]);
         assert!(rejected[0].reason.contains("Not_A_Label"));
         assert!(rejected[1].reason.contains("abc"));
-        assert!(reg.authenticate(Some("Bearer good"), 0).await.is_some());
-        assert!(reg.authenticate(Some("Bearer bad"), 0).await.is_none());
+        assert!(reg.authenticate("good", 0).await.is_some());
+        assert!(reg.authenticate("bad", 0).await.is_none());
         assert_eq!(reg.live_len().await, 1);
     }
 
@@ -505,7 +490,7 @@ queues = ["gpu"]
             .replace_live([("ns/a", &a), ("ns/b", &b), ("ns/c", &c)])
             .await;
         assert_eq!(rejected.len(), 3);
-        assert!(reg.authenticate(Some("Bearer same"), 0).await.is_none());
+        assert!(reg.authenticate("same", 0).await.is_none());
     }
 
     #[tokio::test]
@@ -515,7 +500,7 @@ queues = ["gpu"]
         let rejected = reg.replace_live([("ns/shadow", &shadow)]).await;
         assert_eq!(rejected.len(), 1);
         assert!(rejected[0].reason.contains("static tenants file"));
-        let caller = reg.authenticate(Some("Bearer secret"), 0).await.unwrap();
+        let caller = reg.authenticate("secret", 0).await.unwrap();
         assert_eq!(caller.run_id.as_str(), "run-1");
     }
 
@@ -526,6 +511,7 @@ queues = ["gpu"]
             namespace: Namespace::parse("ns").unwrap(),
             role: TenantRole::Viewer,
             queues: vec![],
+            launched_by: None,
         };
         let err = caller.require_submitter("workload_submit").unwrap_err();
         assert!(err.to_string().contains("workload_submit"));
@@ -538,6 +524,7 @@ queues = ["gpu"]
             namespace: Namespace::parse("ns").unwrap(),
             role: TenantRole::Submitter,
             queues: vec![QueueName::parse("gpu").unwrap()],
+            launched_by: None,
         };
         assert!(
             caller

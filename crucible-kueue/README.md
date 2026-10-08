@@ -48,6 +48,15 @@ expires_at = 1791500000   # optional, Unix seconds
 
 `echo -n <token> | crucible-kueue --digest` prints a token's digest.
 
+### Access tokens
+
+With `--oidc-issuer`, `--oidc-jwks-uri`, and `--resource`, the server also accepts OAuth access
+tokens from the crucible realm (a compact JWT is never looked up as a tenant token). The token's
+`run_id`, `namespace`, `role`, and `queues` claims give the same scope as a tenant record, and its
+`sub` (the human the run acts for) is stamped on created workloads as `crucible.dev/launched-by`.
+`--tool-policy` adds per-tool scopes and CEL rules over the caller's claims and the call's
+arguments. Realm setup, the shipped policy, and the e2e are in [deploy/auth](deploy/auth/README.md).
+
 ## Deploy
 
 The deploy profile's `[kueue]` table renders the Deployment, Service, ServiceAccount, the

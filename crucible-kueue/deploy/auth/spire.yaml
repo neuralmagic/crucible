@@ -1,0 +1,74 @@
+# SPIRE on pirate through the Zero Trust Workload Identity Manager. All cluster-scoped; the
+# SpireAgent rolls a DaemonSet onto every node and the SpiffeCSIDriver registers csi.spiffe.io.
+#
+# Trust domain pirate.crucible. The JWT issuer is the OIDC discovery provider's Route host so a
+# JWT-SVID's `iss` matches the issuer Keycloak trusts; Keycloak fetches the keys in-cluster.
+apiVersion: operator.openshift.io/v1alpha1
+kind: ZeroTrustWorkloadIdentityManager
+metadata:
+  name: cluster
+spec:
+  trustDomain: pirate.crucible
+  clusterName: pirate
+  bundleConfigMap: spire-bundle
+---
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpireServer
+metadata:
+  name: cluster
+spec:
+  jwtIssuer: https://oidc-discovery.apps.openshift.nm.rdu4.corp.redhat.com
+  caKeyType: rsa-2048
+  jwtKeyType: rsa-2048
+  caSubject:
+    commonName: pirate.crucible SPIRE CA
+    country: US
+    organization: Red Hat
+  caValidity: 24h
+  defaultX509Validity: 1h
+  defaultJWTValidity: 5m
+  datastore:
+    databaseType: sqlite3
+    connectionString: /run/spire/data/datastore.sqlite3
+    maxIdleConns: 2
+    maxOpenConns: 100
+  persistence:
+    size: 2Gi
+    accessMode: ReadWriteOnce
+    storageClass: lvms-control-plane-storage
+  logLevel: info
+  logFormat: text
+---
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpireAgent
+metadata:
+  name: cluster
+spec:
+  nodeAttestor:
+    k8sPSATEnabled: "true"
+  workloadAttestors:
+    k8sEnabled: "true"
+    workloadAttestorsVerification:
+      type: auto
+  logLevel: info
+  logFormat: text
+---
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpiffeCSIDriver
+metadata:
+  name: cluster
+spec:
+  agentSocketPath: /run/spire/agent-sockets
+  pluginName: csi.spiffe.io
+---
+apiVersion: operator.openshift.io/v1alpha1
+kind: SpireOIDCDiscoveryProvider
+metadata:
+  name: cluster
+spec:
+  jwtIssuer: https://oidc-discovery.apps.openshift.nm.rdu4.corp.redhat.com
+  csiDriverName: csi.spiffe.io
+  managedRoute: "true"
+  replicaCount: 1
+  logLevel: info
+  logFormat: text

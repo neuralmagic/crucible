@@ -1,0 +1,66 @@
+# crucible-kueue tool policy (--tool-policy). Rules see `claims` (the access token's, or the
+# equivalent built for a tenant token) and `args` (the call's arguments). Unlisted tools are denied.
+
+[tools.whoami]
+scopes = ["kueue.read"]
+
+[tools.queues_list]
+scopes = ["kueue.read"]
+
+[tools.queue_describe]
+scopes = ["kueue.read"]
+
+[tools.hardware_describe]
+scopes = ["kueue.read"]
+
+[tools.workload_status]
+scopes = ["kueue.read"]
+
+[tools.workload_list]
+scopes = ["kueue.read"]
+
+[tools.workload_logs]
+scopes = ["kueue.read"]
+
+[tools.workload_plan]
+scopes = ["kueue.submit"]
+
+# Records which sandbox submitted the workload. Plan and submit inject the same value, so the
+# plan hash still matches.
+[[tools.workload_plan.mutate]]
+path = "/manifest/metadata/annotations/crucible.dev~1actor"
+value = "has(claims.act) ? claims.act.sub : null"
+
+[[tools.workload_plan.validate]]
+name = "queue-allowed"
+rule = "!has(claims.queues) || size(claims.queues) == 0 || args.queue in claims.queues"
+message = "the queue is not in this run's allowlist"
+
+[tools.workload_submit]
+scopes = ["kueue.submit"]
+
+[[tools.workload_submit.mutate]]
+path = "/manifest/metadata/annotations/crucible.dev~1actor"
+value = "has(claims.act) ? claims.act.sub : null"
+
+[[tools.workload_submit.validate]]
+name = "queue-allowed"
+rule = "!has(claims.queues) || size(claims.queues) == 0 || args.queue in claims.queues"
+message = "the queue is not in this run's allowlist"
+
+[tools.workload_scale]
+scopes = ["kueue.submit"]
+
+[[tools.workload_scale.validate]]
+name = "replica-cap"
+rule = "args.replicas >= 0 && args.replicas <= 8"
+message = "replicas must be between 0 and 8"
+
+[tools.workload_stop]
+scopes = ["kueue.submit"]
+
+[tools.workload_resume]
+scopes = ["kueue.submit"]
+
+[tools.workload_delete]
+scopes = ["kueue.submit"]

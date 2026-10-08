@@ -73,7 +73,11 @@ role = "viewer"
     };
     let config = kube::Config::from_kubeconfig(&options).await.unwrap();
     let client = kube::Client::try_from(config).unwrap();
-    let app = crucible_kueue::router(client, Arc::new(Registry::new(tenants)), &[]);
+    let auth = crucible_kueue::auth::Auth {
+        registry: Arc::new(Registry::new(tenants)),
+        oidc: None,
+    };
+    let app = crucible_kueue::router(client, auth, None, &[]);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });

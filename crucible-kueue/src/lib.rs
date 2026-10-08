@@ -1,6 +1,8 @@
 //! `crucible-kueue`: an MCP server through which sandboxed agents submit, inspect, and control
-//! Kueue workloads. It holds the Kubernetes credentials; agents hold only a per-run bearer token.
+//! Kueue workloads. It holds the Kubernetes credentials; agents hold only a per-run bearer token
+//! or an access token from the crucible realm.
 
+pub mod auth;
 pub mod hardware;
 pub mod kueue;
 pub mod manifest;
@@ -11,6 +13,8 @@ pub mod status;
 pub mod task;
 pub mod tenant;
 
+use crucible_mcp_auth::guard::PolicyGuard;
+use crucible_mcp_auth::policy::ToolPolicy;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
 };
@@ -24,10 +28,12 @@ pub fn install_tls_provider() {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 }
 
-/// The HTTP app: the MCP endpoint behind the bearer-token guard, plus an unauthenticated `/healthz`.
+/// The HTTP app: the MCP endpoint behind authentication and, when given, the tool policy; plus an
+/// unauthenticated `/healthz` and, with OIDC on, the RFC 9728 protected-resource metadata.
 pub fn router(
     client: kube::Client,
-    registry: Arc<tenant::Registry>,
+    auth: auth::Auth,
+    policy: Option<ToolPolicy>,
     extra_hosts: &[String],
 ) -> axum::Router {
     let mut config = StreamableHttpServerConfig::default()
@@ -44,12 +50,27 @@ pub fn router(
             Arc::new(NeverSessionManager::default()),
             config,
         );
-    axum::Router::new()
-        .nest_service(
-            MCP_PATH,
-            axum::Router::new().fallback_service(service).layer(
-                axum::middleware::from_fn_with_state(registry, tenant::require_caller),
-            ),
-        )
-        .route("/healthz", axum::routing::get(|| async { "ok" }))
+    let oidc = auth.oidc.clone();
+    let mut mcp = axum::Router::new().fallback_service(service);
+    if let Some(policy) = policy {
+        let guard = PolicyGuard {
+            policy,
+            server: oidc.clone(),
+        };
+        mcp = mcp.layer(axum::middleware::from_fn_with_state(
+            Arc::new(guard),
+            crucible_mcp_auth::guard::enforce,
+        ));
+    }
+    mcp = mcp.layer(axum::middleware::from_fn_with_state(
+        Arc::new(auth),
+        auth::authenticate,
+    ));
+    let app = axum::Router::new()
+        .nest_service(MCP_PATH, mcp)
+        .route("/healthz", axum::routing::get(|| async { "ok" }));
+    match oidc {
+        Some(server) => app.merge(crucible_mcp_auth::metadata::router(server)),
+        None => app,
+    }
 }

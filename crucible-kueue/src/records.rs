@@ -163,10 +163,10 @@ mod tests {
         let rejected = sync(&objects, "tenants", &registry).await;
         let sources: Vec<&str> = rejected.iter().map(|r| r.source.as_str()).collect();
         assert_eq!(sources, ["tenants/empty", "tenants/garbled"]);
-        let caller = registry.authenticate(Some("Bearer tok"), 0).await.unwrap();
+        let caller = registry.authenticate("tok", 0).await.unwrap();
         assert_eq!(caller.namespace.as_str(), "team-a");
         let rejected = sync(&objects[1..], "tenants", &registry).await;
         assert_eq!(rejected.len(), 2);
-        assert!(registry.authenticate(Some("Bearer tok"), 0).await.is_none());
+        assert!(registry.authenticate("tok", 0).await.is_none());
     }
 }

@@ -831,6 +831,7 @@ impl KueueMcp {
                 "namespace": c.namespace.as_str(),
                 "role": c.role,
                 "queues": c.queues.iter().map(QueueName::as_str).collect::<Vec<_>>(),
+                "launched_by": c.launched_by.as_ref().map(|l| l.as_str()),
                 "submittable_kinds": WorkloadKind::ALL.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
             })
         }))
@@ -1418,6 +1419,30 @@ mod tests {
     fn a_request_without_an_authenticated_caller_is_refused() {
         let (parts, _) = http::Request::new(()).into_parts();
         assert!(matches!(caller(&parts), Err(ToolError::NoCaller)));
+    }
+
+    #[test]
+    fn the_shipped_tool_policy_covers_every_tool_and_injects_nothing_into_schemas() {
+        let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(include_str!(
+            "../deploy/auth/kueue-policy.toml"
+        ))
+        .unwrap();
+        for tool in KueueMcp::tool_router().list_all() {
+            let scopes = policy.scopes(&tool.name).unwrap();
+            assert_eq!(
+                scopes.len(),
+                1,
+                "{} needs exactly one kueue scope",
+                tool.name
+            );
+            let mut schema = (*tool.input_schema).clone();
+            policy.hide_injected(&tool.name, &mut schema);
+            assert_eq!(
+                schema, *tool.input_schema,
+                "{}: its injected paths sit inside free-form fields",
+                tool.name
+            );
+        }
     }
 
     #[test]

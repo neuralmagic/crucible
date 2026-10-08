@@ -1,0 +1,38 @@
+# SPIFFE IDs for OpenShell sandbox supervisors. The supervisor pod is the one that fetches the
+# JWT-SVID and performs the token grant; the workload pod never sees it. The annotation (`.ai`,
+# not upstream's `.io`) is the OpenShell sandbox id, so every sandbox gets its own identity:
+#
+#   spiffe://pirate.crucible/openshell/sandbox/<sandbox-id>
+#
+# The crucible controller pins a per-run Keycloak client to exactly this subject.
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: openshell-sandbox-supervisor
+spec:
+  className: zero-trust-workload-identity-manager-spire
+  spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: crucible-system
+  podSelector:
+    matchLabels:
+      openshell.ai/boundary-role: supervisor
+  jwtTtl: 5m
+---
+# Same ID shape for the auth spike pod in `rhbk` (deploy/auth/spike.yaml), so the SVID -> Keycloak
+# exchange can be proven without launching a crucible run.
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: auth-spike
+spec:
+  className: zero-trust-workload-identity-manager-spire
+  spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: rhbk
+  podSelector:
+    matchLabels:
+      crucible.dev/auth-spike: "true"
+  jwtTtl: 5m

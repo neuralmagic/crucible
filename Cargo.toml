@@ -9,6 +9,7 @@ members = [
     "crucible-controller",
     "crux",
     "crucible-kueue",
+    "crucible-mcp-auth",
     "capability",
     "xtask",
 ]
@@ -62,6 +63,9 @@ url = "2"
 kube = { version = "4.0", default-features = false }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 percent-encoding = "2"
+# CEL for webhook transforms (ADR-0055) and MCP tool policy. 0.15 carries cel-rust#341, which makes
+# `map` and `filter` linear.
+cel = "0.15"
 
 [profile.release]
 opt-level = 2

@@ -1,0 +1,11 @@
+# OpenShift OAuth client Keycloak's openshift-v4 IdP uses to broker cluster logins into realm
+# `crucible`. Cluster-scoped. The secret is substituted at apply time (README.md); it must match
+# Secret rhbk/keycloak-openshift-oauth.
+apiVersion: oauth.openshift.io/v1
+kind: OAuthClient
+metadata:
+  name: keycloak-crucible
+secret: ${OPENSHIFT_OAUTH_CLIENT_SECRET}
+grantMethod: auto
+redirectURIs:
+  - https://keycloak.apps.openshift.nm.rdu4.corp.redhat.com/realms/crucible/broker/openshift-v4/endpoint

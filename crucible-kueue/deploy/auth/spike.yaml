@@ -1,0 +1,49 @@
+# Auth spike: a pod with the same SPIFFE ID shape as a sandbox supervisor
+# (spiffe://pirate.crucible/openshell/sandbox/auth-spike) that fetches one JWT-SVID with the
+# audience OpenShell's token grant would request (the realm issuer) and prints it. The token is
+# then posted to Keycloak as a client_credentials client_assertion, exactly as the supervisor
+# does. Delete and re-apply to mint a fresh one (JWT-SVIDs live 5m).
+apiVersion: v1
+kind: Pod
+metadata:
+  name: auth-spike
+  namespace: rhbk
+  labels:
+    crucible.dev/auth-spike: "true"
+  annotations:
+    openshell.ai/sandbox-id: auth-spike
+spec:
+  restartPolicy: OnFailure
+  automountServiceAccountToken: false
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1001510000
+    seccompProfile:
+      type: RuntimeDefault
+  containers:
+    - name: fetch
+      image: registry.redhat.io/zero-trust-workload-identity-manager/spiffe-spire-agent-rhel9@sha256:1bf815cd075391be392a77e8f196285958c9919c81257d0a98293fc4eb9dc47f
+      command:
+        - /spire-agent
+        - api
+        - fetch
+        - jwt
+        - -audience
+        - https://keycloak.apps.openshift.nm.rdu4.corp.redhat.com/realms/crucible
+        - -socketPath
+        - /spiffe-workload-api/spire-agent.sock
+        - -output
+        - json
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+      volumeMounts:
+        - name: spiffe-workload-api
+          mountPath: /spiffe-workload-api
+          readOnly: true
+  volumes:
+    - name: spiffe-workload-api
+      csi:
+        driver: csi.spiffe.io
+        readOnly: true

@@ -18,6 +18,7 @@ anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap.workspace = true
 crucible-contract = { path = "../crucible-contract" }
+crucible-mcp-auth = { path = "../crucible-mcp-auth" }
 futures-util = "0.3"
 hex = "0.4"
 http = "1"
@@ -32,8 +33,12 @@ sha2 = "0.10"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal", "sync"] }
 toml = "0.8"
+url.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
+serde_norway = "0.9"
+tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }
