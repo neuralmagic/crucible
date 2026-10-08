@@ -225,6 +225,7 @@ pub fn router(
         let guard = PolicyGuard {
             policy,
             server: oidc.clone(),
+            reviewer: None,
         };
         mcp = mcp.layer(axum::middleware::from_fn_with_state(
             Arc::new(guard),

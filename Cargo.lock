@@ -2119,6 +2119,7 @@ dependencies = [
  "jsonwebtoken 11.1.0",
  "k8s-openapi",
  "kube",
+ "moka",
  "reqwest 0.13.4",
  "serde",
  "serde_json",

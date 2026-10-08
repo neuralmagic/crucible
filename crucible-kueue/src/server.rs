@@ -10,7 +10,7 @@ use crate::manifest::{
 };
 use crate::status::{self, Rollup};
 use crate::task::{self, Outcome, TaskRef};
-use crate::tenant::{Caller, NameError, QueueName, Refusal};
+use crate::tenant::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
@@ -136,8 +136,9 @@ fn internal(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 
-fn new_task(kind: WorkloadKind, name: &str, obj: &DynamicObject) -> Task {
+fn new_task(namespace: &Namespace, kind: WorkloadKind, name: &str, obj: &DynamicObject) -> Task {
     let id = TaskRef {
+        namespace: Some(namespace.to_string()),
         kind,
         name: name.to_string(),
         uid: obj.metadata.uid.clone().unwrap_or_default(),
@@ -154,11 +155,15 @@ fn new_task(kind: WorkloadKind, name: &str, obj: &DynamicObject) -> Task {
         .with_status_message("submitted; waiting for Kueue admission")
 }
 
-fn task_caller(ctx: &RequestContext<RoleServer>) -> Result<Caller, McpError> {
+fn parse_task(id: &str) -> Result<TaskRef, McpError> {
+    TaskRef::parse(id).ok_or_else(|| McpError::invalid_params(format!("unknown task: {id}"), None))
+}
+
+fn task_caller(ctx: &RequestContext<RoleServer>, task: &TaskRef) -> Result<Caller, McpError> {
     ctx.extensions
         .get::<http::request::Parts>()
         .ok_or(ToolError::NoCaller)
-        .and_then(caller)
+        .and_then(|parts| caller(parts, task.namespace.as_deref()))
         .map_err(|e| McpError::invalid_request(e.to_string(), None))
 }
 
@@ -190,12 +195,13 @@ fn replicas_of(obj: &DynamicObject) -> i64 {
         .unwrap_or(1)
 }
 
-fn caller(parts: &http::request::Parts) -> Result<Caller, ToolError> {
-    parts
+/// The request's identity acting in `namespace` (its own when `None`).
+fn caller(parts: &http::request::Parts, namespace: Option<&str>) -> Result<Caller, ToolError> {
+    let identity = parts
         .extensions
-        .get::<Caller>()
-        .cloned()
-        .ok_or(ToolError::NoCaller)
+        .get::<Identity>()
+        .ok_or(ToolError::NoCaller)?;
+    Ok(identity.in_namespace(namespace)?)
 }
 
 fn api_rejection(kind: WorkloadKind, err: kube::Error) -> ToolError {
@@ -212,12 +218,18 @@ fn api_rejection(kind: WorkloadKind, err: kube::Error) -> ToolError {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueueArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// LocalQueue name in this run's namespace.
     pub queue: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PlanArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// LocalQueue name in this run's namespace.
     pub queue: String,
     /// The workload as a JSON object: batch/v1 Job, ray.io/v1 RayJob, or leaderworkerset.x-k8s.io/v1
@@ -227,6 +239,9 @@ pub struct PlanArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SubmitArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// LocalQueue name, the same one passed to workload_plan.
     pub queue: String,
     /// The manifest exactly as passed to workload_plan.
@@ -237,6 +252,9 @@ pub struct SubmitArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkloadRef {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub kind: WorkloadKind,
     /// metadata.name of the submitted object.
     pub name: String,
@@ -244,6 +262,9 @@ pub struct WorkloadRef {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LogArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
     pub kind: WorkloadKind,
     pub name: String,
     /// One pod's name; omit for up to four of the workload's pods.
@@ -261,6 +282,9 @@ pub struct LogArgs {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ScaleArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Deployment or StatefulSet.
     pub kind: WorkloadKind,
     pub name: String,
@@ -269,7 +293,17 @@ pub struct ScaleArgs {
 }
 
 #[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct NamespaceArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
 pub struct ListArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
     /// Include workloads other runs created in this namespace.
     #[serde(default)]
     pub all_runs: bool,
@@ -824,8 +858,12 @@ impl KueueMcp {
 #[tool_router]
 impl KueueMcp {
     #[tool(description = "The namespace, role, and queue allowlist this token is bound to.")]
-    async fn whoami(&self, Extension(parts): Extension<http::request::Parts>) -> String {
-        reply(caller(&parts).map(|c| {
+    async fn whoami(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<NamespaceArgs>,
+    ) -> String {
+        reply(caller(&parts, args.namespace.as_deref()).map(|c| {
             json!({
                 "run_id": c.run_id.as_str(),
                 "namespace": c.namespace.as_str(),
@@ -840,10 +878,14 @@ impl KueueMcp {
     #[tool(
         description = "LocalQueues this run may use, with their ClusterQueue and pending/admitted counts."
     )]
-    async fn queues_list(&self, Extension(parts): Extension<http::request::Parts>) -> String {
+    async fn queues_list(
+        &self,
+        Extension(parts): Extension<http::request::Parts>,
+        Parameters(args): Parameters<NamespaceArgs>,
+    ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, args.namespace.as_deref())?;
                 let all: Vec<LocalQueue> = kueue::list(
                     &self.client,
                     &kueue::local_queues(),
@@ -885,7 +927,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, args.namespace.as_deref())?;
                 let lq = self.local_queue(&c, &args.queue).await?;
                 let cq = self.cluster_queue(&lq).await?;
                 let usage: BTreeMap<(String, String), (Value, Value)> = cq
@@ -955,7 +997,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, args.namespace.as_deref())?;
                 let lq = self.local_queue(&c, &args.queue).await?;
                 let cq = self.cluster_queue(&lq).await?;
                 let nodes: Vec<Node> = Api::<Node>::all(self.client.clone())
@@ -986,7 +1028,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, args.namespace.as_deref())?;
                 let (n, cq) = self.plan(&c, &args.queue, args.manifest).await?;
                 self.create(&c, &n, true).await?;
                 let totals: BTreeMap<String, String> =
@@ -1031,7 +1073,9 @@ impl KueueMcp {
             .is_some_and(|c| c.supports_tasks());
         let parts = ctx.extensions.get::<http::request::Parts>();
         let submitted: Result<(Value, Task), ToolError> = async {
-                let c = parts.ok_or(ToolError::NoCaller).and_then(caller)?;
+                let c = parts
+                    .ok_or(ToolError::NoCaller)
+                    .and_then(|p| caller(p, args.namespace.as_deref()))?;
                 c.require_submitter("workload_submit")?;
                 let (n, _) = self.plan(&c, &args.queue, args.manifest).await?;
                 if n.plan_hash != args.plan_hash {
@@ -1043,7 +1087,7 @@ impl KueueMcp {
                 match self.create(&c, &n, false).await {
                     Ok(obj) => {
                         tracing::info!(kind = n.kind.kind(), name = %n.name, namespace = %c.namespace, run = %c.run_id, "workload submitted");
-                        let task = new_task(n.kind, &n.name, &obj);
+                        let task = new_task(&c.namespace, n.kind, &n.name, &obj);
                         Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.task_id, "submitted": true}), task))
                     }
                     Err(ToolError::Rejected { .. }) if self.get_object(&c, n.kind, &n.name).await.is_ok() => {
@@ -1062,7 +1106,7 @@ impl KueueMcp {
                                 existing: hash,
                             });
                         }
-                        let task = new_task(n.kind, &n.name, &existing);
+                        let task = new_task(&c.namespace, n.kind, &n.name, &existing);
                         Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.task_id, "submitted": false, "note": "already submitted with this plan"}), task))
                     }
                     Err(e) => Err(e),
@@ -1088,7 +1132,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, r.namespace.as_deref())?;
                 Ok(self.status_report(&c, r.kind, &r.name).await?.body)
             }
             .await,
@@ -1105,7 +1149,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, args.namespace.as_deref())?;
                 let ns = c.namespace.as_str();
                 let mut selector = format!("{MANAGED_LABEL}={MANAGED_VALUE}");
                 if !args.all_runs {
@@ -1162,7 +1206,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, args.namespace.as_deref())?;
                 let ns = c.namespace.as_str();
                 self.get_object(&c, args.kind, &args.name).await?;
                 let mut pods = self.pods_of(ns, &args.name).await?;
@@ -1213,7 +1257,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, args.namespace.as_deref())?;
                 c.require_submitter("workload_scale")?;
                 if !args.kind.is_scalable() {
                     return Err(ToolError::NotScalable {
@@ -1227,6 +1271,7 @@ impl KueueMcp {
                     });
                 }
                 let r = WorkloadRef {
+                    namespace: args.namespace,
                     kind: args.kind,
                     name: args.name,
                 };
@@ -1250,7 +1295,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, r.namespace.as_deref())?;
                 self.set_active(&c, &r, false).await
             }
             .await,
@@ -1265,7 +1310,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, r.namespace.as_deref())?;
                 self.set_active(&c, &r, true).await
             }
             .await,
@@ -1280,7 +1325,7 @@ impl KueueMcp {
     ) -> String {
         reply(
             async {
-                let c = caller(&parts)?;
+                let c = caller(&parts, r.namespace.as_deref())?;
                 c.require_submitter("workload_delete")?;
                 self.owned_object(&c, r.kind, &r.name).await?;
                 self.dynamic(r.kind, c.namespace.as_str())
@@ -1308,7 +1353,7 @@ impl ServerHandler for KueueMcp {
         request: GetTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        let c = task_caller(&ctx)?;
+        let c = task_caller(&ctx, &parse_task(&request.task_id)?)?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let detailed = self.detailed_task(&c, &t).await.map_err(internal)?;
         Ok(GetTaskResult::new(detailed))
@@ -1319,11 +1364,12 @@ impl ServerHandler for KueueMcp {
         request: CancelTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        let c = task_caller(&ctx)?;
+        let c = task_caller(&ctx, &parse_task(&request.task_id)?)?;
         c.require_submitter("tasks/cancel")
             .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let r = WorkloadRef {
+            namespace: t.namespace.clone(),
             kind: t.kind,
             name: t.name.clone(),
         };
@@ -1418,7 +1464,7 @@ mod tests {
     #[test]
     fn a_request_without_an_authenticated_caller_is_refused() {
         let (parts, _) = http::Request::new(()).into_parts();
-        assert!(matches!(caller(&parts), Err(ToolError::NoCaller)));
+        assert!(matches!(caller(&parts, None), Err(ToolError::NoCaller)));
     }
 
     #[test]
@@ -1442,6 +1488,105 @@ mod tests {
                 "{}: its injected paths sit inside free-form fields",
                 tool.name
             );
+        }
+    }
+
+    fn sample_args(tool: &str) -> serde_json::Map<String, Value> {
+        let job = json!({"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "j"}});
+        let args = match tool {
+            "whoami" | "queues_list" | "workload_list" => json!({"namespace": "team-b"}),
+            "queue_describe" | "hardware_describe" => {
+                json!({"namespace": "team-b", "queue": "gpu"})
+            }
+            "workload_plan" => json!({"namespace": "team-b", "queue": "gpu", "manifest": job}),
+            "workload_submit" => {
+                json!({"namespace": "team-b", "queue": "gpu", "manifest": job, "plan_hash": "h"})
+            }
+            "workload_scale" => {
+                json!({"namespace": "team-b", "kind": "Deployment", "name": "d", "replicas": 2})
+            }
+            _ => json!({"namespace": "team-b", "kind": "Job", "name": "j"}),
+        };
+        match args {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn the_shipped_policy_reviews_every_persons_call_but_whoami() {
+        let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(include_str!(
+            "../deploy/kueue-policy.toml"
+        ))
+        .unwrap();
+        let person = match json!({"sub": "p", "kube_user": "alice", "scope": "kueue.read kueue.submit"})
+        {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let scopes = ["kueue.read", "kueue.submit"].map(String::from).into();
+        for tool in KueueMcp::tool_router().list_all() {
+            let mut args = sample_args(&tool.name);
+            let checks = policy
+                .apply(&tool.name, &mut args, &person, &scopes)
+                .unwrap();
+            if tool.name == "whoami" {
+                assert!(checks.is_empty());
+                continue;
+            }
+            assert!(
+                !checks.is_empty(),
+                "{} is not reviewed for people",
+                tool.name
+            );
+            assert!(
+                checks.iter().all(|c| c.namespace == "team-b"),
+                "{}: {checks:?}",
+                tool.name
+            );
+        }
+        let mut plan = sample_args("workload_plan");
+        let checks = policy
+            .apply("workload_plan", &mut plan, &person, &scopes)
+            .unwrap();
+        let summary: Vec<_> = checks
+            .iter()
+            .map(|c| {
+                (
+                    c.verb.as_str(),
+                    c.group.as_str(),
+                    c.resource.as_str(),
+                    c.name.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("use", "kueue.x-k8s.io", "localqueues", "gpu"),
+                ("create", "batch", "jobs", "")
+            ]
+        );
+    }
+
+    #[test]
+    fn the_shipped_policy_leaves_tenant_tokens_to_their_record() {
+        let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(include_str!(
+            "../deploy/kueue-policy.toml"
+        ))
+        .unwrap();
+        let tenant = match json!({"sub": "tenant:r", "namespace": "team-b", "queues": [], "scope": "kueue.read kueue.submit"})
+        {
+            Value::Object(m) => m,
+            _ => unreachable!(),
+        };
+        let scopes = ["kueue.read", "kueue.submit"].map(String::from).into();
+        for tool in KueueMcp::tool_router().list_all() {
+            let mut args = sample_args(&tool.name);
+            let checks = policy
+                .apply(&tool.name, &mut args, &tenant, &scopes)
+                .unwrap();
+            assert!(checks.is_empty(), "{}", tool.name);
         }
     }
 

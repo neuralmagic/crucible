@@ -11,6 +11,9 @@
 
 pub mod guard;
 pub mod jwks;
+/// Kubernetes RBAC (SubjectAccessReview) as the authority for authorize rules.
+#[cfg(feature = "kube")]
+pub mod kube;
 pub mod metadata;
 pub mod policy;
 pub mod principal;

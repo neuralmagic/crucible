@@ -48,10 +48,32 @@ struct Cli {
     /// TOML tool policy: per-tool scopes, CEL validate rules, and claim-derived argument mutations.
     #[arg(long, env = "CRUCIBLE_KUEUE_TOOL_POLICY")]
     tool_policy: Option<PathBuf>,
+    /// Decide the policy's authorize rules with Kubernetes RBAC (SubjectAccessReview), taking the
+    /// caller's groups from OpenShift Group objects or the token's kube_groups claim. Turns on
+    /// people's tokens; needs a policy with authorize rules.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_KUBE_AUTHZ",
+        value_enum,
+        requires = "tool_policy"
+    )]
+    kube_authz: Option<KubeAuthz>,
     /// Read a token from stdin, print its SHA-256 digest for the tenants file, and exit.
     #[arg(long, exclusive = true)]
     digest: bool,
 }
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum KubeAuthz {
+    Openshift,
+    Token,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "--kube-authz needs a tool policy with authorize rules; without them no call would be checked"
+)]
+struct NoAuthorizeRules;
 
 #[derive(Debug, thiserror::Error)]
 #[error("no callers: pass --tenants with at least one entry, --tenant-namespace, or --issuer")]
@@ -144,8 +166,35 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-    let auth = crucible_kueue::auth::Auth { registry, oidc };
-    let app = crucible_kueue::router(client, auth, policy, &cli.allowed_hosts);
+    let reviewer: Option<Arc<dyn crucible_mcp_auth::guard::AccessReview>> = match cli.kube_authz {
+        Some(source) => {
+            if !policy.as_ref().is_some_and(|p| p.authorizes()) {
+                return Err(NoAuthorizeRules.into());
+            }
+            let groups = match source {
+                KubeAuthz::Openshift => crucible_mcp_auth::kube::GroupSource::OpenShift,
+                KubeAuthz::Token => crucible_mcp_auth::kube::GroupSource::Token,
+            };
+            tracing::info!(
+                ?groups,
+                "authorize rules decided by SubjectAccessReview; people's tokens accepted"
+            );
+            Some(Arc::new(
+                crucible_mcp_auth::kube::SubjectAccessReviewer::new(client.clone(), groups),
+            ))
+        }
+        None => None,
+    };
+    let app = crucible_kueue::router(
+        client,
+        crucible_kueue::Options {
+            registry,
+            oidc,
+            policy,
+            reviewer,
+            allowed_hosts: cli.allowed_hosts,
+        },
+    );
     let listener = tokio::net::TcpListener::bind(&cli.bind)
         .await
         .with_context(|| format!("binding {}", cli.bind))?;

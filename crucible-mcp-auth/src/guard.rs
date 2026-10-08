@@ -2,10 +2,11 @@
 //! the [`Principal`] in the request extensions and refuses the request without one.
 //!
 //! `tools/call` bodies are parsed, rewritten by the policy, and re-serialized, so rmcp executes
-//! exactly the arguments the rules saw. `tools/list` responses (JSON or SSE) have injected
-//! parameters removed from each tool's `inputSchema`.
+//! exactly the arguments the rules saw. The access checks a call's authorize rules produce go to
+//! the guard's [`AccessReview`]; every one must be allowed. `tools/list` responses (JSON or SSE)
+//! have injected parameters removed from each tool's `inputSchema`.
 
-use crate::policy::{Refusal, ToolPolicy};
+use crate::policy::{AccessCheck, Refusal, ToolPolicy};
 use crate::principal::Principal;
 use crate::server::{AuthError, ResourceServer};
 use axum::body::{Body, to_bytes};
@@ -15,6 +16,8 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::{Method, StatusCode, header};
 use serde_json::{Value, json};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 
 /// Largest request or `tools/list` response body the guard buffers.
@@ -23,10 +26,22 @@ const BODY_LIMIT: usize = 4 * 1024 * 1024;
 /// JSON-RPC error code for a call the policy refused (implementation-defined server error range).
 pub const POLICY_REFUSED: i64 = -32001;
 
+pub type ReviewFuture<'a> = Pin<
+    Box<dyn Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
+>;
+
+/// Decides an [`AccessCheck`] for a principal: `Ok(true)` allows, `Ok(false)` denies, an error
+/// refuses the call too.
+pub trait AccessReview: Send + Sync {
+    fn review<'a>(&'a self, principal: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a>;
+}
+
 pub struct PolicyGuard {
     pub policy: ToolPolicy,
     /// When set, a missing per-tool scope answers with this server's 403 step-up challenge.
     pub server: Option<Arc<ResourceServer>>,
+    /// Reviews authorize rules' checks. A call that needs one without a reviewer is refused.
+    pub reviewer: Option<Arc<dyn AccessReview>>,
 }
 
 pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: Next) -> Response {
@@ -55,7 +70,11 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
     match message.get("method").and_then(Value::as_str) {
         Some("tools/call") => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
-            if let Err(refusal) = apply(&guard.policy, &mut message, &principal) {
+            let decided = match apply(&guard.policy, &mut message, &principal) {
+                Ok(checks) => review(guard.reviewer.as_deref(), &principal, &checks).await,
+                Err(refusal) => Err(refusal),
+            };
+            if let Err(refusal) = decided {
                 tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "tool call refused");
                 return refuse(&guard, &parts.headers, id, refusal);
             }
@@ -79,7 +98,45 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
     }
 }
 
-fn apply(policy: &ToolPolicy, message: &mut Value, principal: &Principal) -> Result<(), Refusal> {
+async fn review(
+    reviewer: Option<&dyn AccessReview>,
+    principal: &Principal,
+    checks: &[AccessCheck],
+) -> Result<(), Refusal> {
+    for check in checks {
+        let Some(reviewer) = reviewer else {
+            return Err(Refusal::ReviewError {
+                tool: check.tool.clone(),
+                rule: check.rule.clone(),
+                error: "this server has no access reviewer".to_string(),
+            });
+        };
+        match reviewer.review(principal, check).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Refusal::Denied {
+                    tool: check.tool.clone(),
+                    rule: check.rule.clone(),
+                    message: check.message.clone(),
+                });
+            }
+            Err(error) => {
+                return Err(Refusal::ReviewError {
+                    tool: check.tool.clone(),
+                    rule: check.rule.clone(),
+                    error: error.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply(
+    policy: &ToolPolicy,
+    message: &mut Value,
+    principal: &Principal,
+) -> Result<Vec<AccessCheck>, Refusal> {
     let params = message
         .get_mut("params")
         .and_then(Value::as_object_mut)
@@ -300,6 +357,7 @@ mod tests {
         PolicyGuard {
             policy: ToolPolicy::from_toml(POLICY).unwrap(),
             server,
+            reviewer: None,
         }
     }
 

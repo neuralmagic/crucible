@@ -13,8 +13,11 @@ pub const CANCELLED_ANNOTATION: &str = "crucible.dev/task-cancelled";
 pub const COMPLETED_ANNOTATION: &str = "crucible.dev/task-completed";
 pub const POLL_INTERVAL_MS: u64 = 5_000;
 
+/// `<namespace>/<kind>/<name>/<uid>`. Ids minted before namespaces were per call have no
+/// namespace segment and resolve in the caller's own namespace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRef {
+    pub namespace: Option<String>,
     pub kind: WorkloadKind,
     pub name: String,
     pub uid: String,
@@ -22,14 +25,19 @@ pub struct TaskRef {
 
 impl TaskRef {
     pub fn encode(&self) -> String {
-        format!("{}/{}/{}", self.kind.kind(), self.name, self.uid)
+        match &self.namespace {
+            Some(ns) => format!("{ns}/{}/{}/{}", self.kind.kind(), self.name, self.uid),
+            None => format!("{}/{}/{}", self.kind.kind(), self.name, self.uid),
+        }
     }
 
     pub fn parse(id: &str) -> Option<Self> {
-        let mut parts = id.splitn(3, '/');
-        let kind_str = parts.next()?;
-        let name = parts.next()?;
-        let uid = parts.next()?;
+        let segments: Vec<&str> = id.splitn(4, '/').collect();
+        let (namespace, kind_str, name, uid) = match segments[..] {
+            [ns, kind, name, uid] if !ns.is_empty() => (Some(ns.to_string()), kind, name, uid),
+            [kind, name, uid] => (None, kind, name, uid),
+            _ => return None,
+        };
         let kind = WorkloadKind::ALL
             .into_iter()
             .find(|k| k.kind() == kind_str)?;
@@ -37,6 +45,7 @@ impl TaskRef {
             return None;
         }
         Some(Self {
+            namespace,
             kind,
             name: name.to_string(),
             uid: uid.to_string(),
@@ -141,12 +150,16 @@ mod tests {
     #[test]
     fn task_ids_round_trip_and_reject_garbage() {
         let t = TaskRef {
+            namespace: Some("team-a".into()),
             kind: WorkloadKind::Deployment,
             name: "svc".into(),
             uid: "6f1c-uid".into(),
         };
-        assert_eq!(t.encode(), "Deployment/svc/6f1c-uid");
+        assert_eq!(t.encode(), "team-a/Deployment/svc/6f1c-uid");
         assert_eq!(TaskRef::parse(&t.encode()), Some(t));
+        let legacy = TaskRef::parse("Deployment/svc/6f1c-uid").unwrap();
+        assert_eq!(legacy.namespace, None);
+        assert_eq!(legacy.encode(), "Deployment/svc/6f1c-uid");
         for bad in [
             "",
             "Job",
@@ -154,6 +167,8 @@ mod tests {
             "Job//u",
             "Pod/x/u",
             "Job/x/u/extra",
+            "team-a/Job/x/u/extra",
+            "/Job/x/u",
             "job/x/u",
         ] {
             assert_eq!(TaskRef::parse(bad), None, "{bad}");

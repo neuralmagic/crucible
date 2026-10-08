@@ -23,10 +23,12 @@ url = { workspace = true, features = ["serde"] }
 k8s-openapi = { workspace = true, optional = true }
 kube = { workspace = true, features = ["client", "rustls-tls"], optional = true }
 serde_norway = { version = "0.9", optional = true }
+moka = { workspace = true, optional = true }
 
 [features]
+kube = ["dep:k8s-openapi", "dep:kube", "dep:moka"]
 testing = ["jsonwebtoken/use_pem"]
-e2e = ["testing", "dep:k8s-openapi", "dep:kube", "dep:serde_norway", "reqwest/form"]
+e2e = ["testing", "kube", "dep:serde_norway", "reqwest/form"]
 
 [dev-dependencies]
 base64 = "0.22"

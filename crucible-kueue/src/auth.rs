@@ -1,11 +1,18 @@
 //! Request authentication: an OAuth access token from the crucible realm, or a registered tenant
-//! token. Either way the request leaves with a [`Caller`] (what the tools enforce) and a
-//! [`Principal`] (what the tool policy's rules see) in its extensions.
+//! token. Either way the request leaves with an [`Identity`] (what the tools resolve into a
+//! [`Caller`] per call) and a [`Principal`] (what the tool policy's rules see) in its extensions.
+//!
+//! | Token                    | Identity                                                        |
+//! |--------------------------|-----------------------------------------------------------------|
+//! | tenant token             | pinned to its record's namespace, role, queues                  |
+//! | realm token with run_id  | a run: pinned to its `namespace` claim, `role`, `queues`        |
+//! | realm token, no run_id   | a person: any namespace, decided per call by the policy's access |
+//! |                          | checks; accepted only when the server has an access reviewer    |
 //!
 //! The two are told apart by shape: an access token is a compact JWS (three dot-separated
 //! parts), a tenant token is opaque hex. A JWT never falls back to the tenant registry.
 
-use crate::tenant::{Caller, Launcher, NameError, Namespace, QueueName, Registry, RunId};
+use crate::tenant::{Caller, Identity, Launcher, NameError, Namespace, QueueName, Registry, RunId};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -20,6 +27,9 @@ pub struct Auth {
     pub registry: Arc<Registry>,
     /// Accept access tokens from this authorization server. `None` accepts tenant tokens only.
     pub oidc: Option<Arc<ResourceServer>>,
+    /// Accept people's tokens (no `run_id`). Only safe when the tool policy's access checks
+    /// decide every call, so the server sets it exactly when it has an access reviewer.
+    pub people: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,13 +42,18 @@ pub enum ClaimError {
     Role(String),
     #[error(transparent)]
     Name(#[from] NameError),
+    #[error("this server accepts only run tokens: it has no access reviewer for people")]
+    People,
+    #[error("a person's token needs a kube_user claim")]
+    NoKubeUser,
 }
 
-impl Caller {
-    /// The tenant scope a realm token carries in its `namespace`, `role`, and `queues` claims,
-    /// acting for the token's subject. A run's token names its run in `run_id`; a person's token
-    /// has none and owns its workloads under its own subject.
-    pub fn from_principal(principal: &Principal) -> Result<Self, ClaimError> {
+impl Identity {
+    /// The identity a realm token carries. A run's token (`run_id`) is pinned to its `namespace`
+    /// claim with its `role` and `queues`. A person's token (no `run_id`) needs `people` and a
+    /// `kube_user` claim; it owns its workloads under its own subject, may name any namespace
+    /// (its `namespace` claim, if any, is the default), and is limited by the access checks.
+    pub fn from_principal(principal: &Principal, people: bool) -> Result<Self, ClaimError> {
         let claim = |key: &'static str| {
             principal
                 .claims
@@ -46,6 +61,27 @@ impl Caller {
                 .and_then(Value::as_str)
                 .ok_or(ClaimError::Missing(key))
         };
+        let launched_by = Some(Launcher::parse(&principal.subject)?);
+        if !principal.claims.contains_key("run_id") {
+            if !people {
+                return Err(ClaimError::People);
+            }
+            if !principal.claims.contains_key("kube_user") {
+                return Err(ClaimError::NoKubeUser);
+            }
+            let namespace = match principal.claims.get("namespace") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(Namespace::parse(claim("namespace")?)?),
+            };
+            return Ok(Self {
+                run_id: RunId::parse(&principal.subject)?,
+                namespace,
+                pinned: false,
+                role: TenantRole::Submitter,
+                queues: Vec::new(),
+                launched_by,
+            });
+        }
         let role = claim("role")?;
         let role = serde_json::from_value::<TenantRole>(json!(role))
             .map_err(|_| ClaimError::Role(role.to_string()))?;
@@ -62,17 +98,17 @@ impl Caller {
             Some(_) => return Err(ClaimError::Queues),
         };
         Ok(Self {
-            run_id: match principal.claims.get("run_id") {
-                None => RunId::parse(&principal.subject)?,
-                Some(_) => RunId::parse(claim("run_id")?)?,
-            },
-            namespace: Namespace::parse(claim("namespace")?)?,
+            run_id: RunId::parse(claim("run_id")?)?,
+            namespace: Some(Namespace::parse(claim("namespace")?)?),
+            pinned: true,
             role,
             queues,
-            launched_by: Some(Launcher::parse(&principal.subject)?),
+            launched_by,
         })
     }
+}
 
+impl Caller {
     /// The principal a tenant token stands for, with claims shaped like a realm token's so one
     /// tool policy covers both. Its scopes follow the tenant role.
     pub fn tenant_principal(&self) -> Principal {
@@ -136,7 +172,7 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
             ),
         };
     };
-    let (caller, principal, via) = match (&auth.oidc, is_jwt(token)) {
+    let (identity, principal, via) = match (&auth.oidc, is_jwt(token)) {
         (Some(oidc), true) => {
             let principal = match oidc.authenticate(headers).await {
                 Ok(p) => p,
@@ -145,8 +181,8 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
                     return oidc.challenge(headers, &error);
                 }
             };
-            match Caller::from_principal(&principal) {
-                Ok(caller) => (caller, principal, "oidc"),
+            match Identity::from_principal(&principal, auth.people) {
+                Ok(identity) => (identity, principal, "oidc"),
                 Err(error) => {
                     tracing::info!(auth = "oidc", sub = %principal.subject, %error, "token carries no tenant scope");
                     return refused(
@@ -160,7 +196,7 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
         _ => match auth.registry.authenticate(token, unix_now()).await {
             Some(caller) => {
                 let principal = caller.tenant_principal();
-                (caller, principal, "tenant-token")
+                (Identity::pinned(caller), principal, "tenant-token")
             }
             None => {
                 tracing::info!(auth = "tenant-token", "unknown bearer token");
@@ -179,11 +215,12 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
         auth = via,
         sub = %principal.subject,
         presenter = principal.presenter(),
-        run = %caller.run_id,
-        namespace = %caller.namespace,
+        run = %identity.run_id,
+        namespace = identity.namespace.as_ref().map(Namespace::as_str),
+        pinned = identity.pinned,
         "caller authenticated"
     );
-    req.extensions_mut().insert(caller);
+    req.extensions_mut().insert(identity);
     req.extensions_mut().insert(principal);
     next.run(req).await
 }
@@ -215,9 +252,15 @@ mod tests {
         })
     }
 
+    fn run_caller(claims: Value) -> Result<Caller, ClaimError> {
+        let identity = Identity::from_principal(&principal(claims), false)?;
+        assert!(identity.pinned);
+        Ok(identity.in_namespace(None).unwrap())
+    }
+
     #[test]
-    fn a_realm_token_maps_to_a_caller_acting_for_its_subject() {
-        let c = Caller::from_principal(&principal(realm_claims())).unwrap();
+    fn a_run_token_is_pinned_and_acts_for_its_subject() {
+        let c = run_caller(realm_claims()).unwrap();
         assert_eq!(c.run_id.as_str(), "auth-spike");
         assert_eq!(c.namespace.as_str(), "crucible-kueue-e2e");
         assert_eq!(c.role, TenantRole::Submitter);
@@ -225,31 +268,68 @@ mod tests {
         assert_eq!(c.launched_by, Some(Launcher::parse("weaton").unwrap()));
     }
 
+    fn person_claims() -> Value {
+        json!({
+            "sub": "3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90",
+            "kube_user": "alice",
+            "scope": "kueue.read kueue.submit",
+        })
+    }
+
     #[test]
-    fn a_persons_token_owns_its_workloads_under_its_subject() {
-        let mut claims = realm_claims();
-        let map = claims.as_object_mut().unwrap();
-        map.remove("run_id");
-        map.remove("act");
-        map.insert("sub".into(), json!("3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90"));
-        let c = Caller::from_principal(&principal(claims)).unwrap();
+    fn a_persons_token_picks_its_namespace_and_owns_its_workloads_under_its_subject() {
+        let identity = Identity::from_principal(&principal(person_claims()), true).unwrap();
+        assert!(!identity.pinned);
+        assert_eq!(identity.role, TenantRole::Submitter);
+        assert!(identity.queues.is_empty());
+        assert!(matches!(
+            identity.in_namespace(None),
+            Err(crate::tenant::Refusal::NamespaceRequired)
+        ));
+        let c = identity.in_namespace(Some("team-b")).unwrap();
+        assert_eq!(c.namespace.as_str(), "team-b");
         assert_eq!(c.run_id.as_str(), "3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90");
         assert_eq!(
             c.launched_by.unwrap().as_str(),
             "3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90"
         );
+
+        let mut with_default = person_claims();
+        with_default["namespace"] = json!("team-a");
+        let identity = Identity::from_principal(&principal(with_default), true).unwrap();
+        assert_eq!(
+            identity.in_namespace(None).unwrap().namespace.as_str(),
+            "team-a"
+        );
+        assert_eq!(
+            identity
+                .in_namespace(Some("team-b"))
+                .unwrap()
+                .namespace
+                .as_str(),
+            "team-b"
+        );
+    }
+
+    #[test]
+    fn people_need_a_reviewing_server_and_a_kube_user() {
+        assert!(matches!(
+            Identity::from_principal(&principal(person_claims()), false),
+            Err(ClaimError::People)
+        ));
+        let mut no_user = person_claims();
+        no_user.as_object_mut().unwrap().remove("kube_user");
+        assert!(matches!(
+            Identity::from_principal(&principal(no_user), true),
+            Err(ClaimError::NoKubeUser)
+        ));
     }
 
     #[test]
     fn absent_queues_mean_every_queue() {
         let mut claims = realm_claims();
         claims.as_object_mut().unwrap().remove("queues");
-        assert!(
-            Caller::from_principal(&principal(claims))
-                .unwrap()
-                .queues
-                .is_empty()
-        );
+        assert!(run_caller(claims).unwrap().queues.is_empty());
     }
 
     #[test]
@@ -272,7 +352,7 @@ mod tests {
                 None => map.remove(key),
             };
             assert!(
-                Caller::from_principal(&principal(claims)).is_err(),
+                Identity::from_principal(&principal(claims), true).is_err(),
                 "{key} = {value:?}"
             );
         }
@@ -306,12 +386,18 @@ mod tests {
         let auth = Auth {
             registry: Arc::new(registry),
             oidc: None,
+            people: false,
         };
         axum::Router::new()
             .route(
                 "/mcp",
                 axum::routing::post(|req: Request| async move {
-                    let caller = req.extensions().get::<Caller>().unwrap();
+                    let caller = req
+                        .extensions()
+                        .get::<Identity>()
+                        .unwrap()
+                        .in_namespace(None)
+                        .unwrap();
                     let principal = req.extensions().get::<Principal>().unwrap();
                     format!("{} {}", caller.run_id, principal.subject)
                 }),

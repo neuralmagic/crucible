@@ -22,7 +22,6 @@ use crucible_controller::agent_auth::issuer::{
     AgentIssuer, AgentIssuerConfig, IssuerUrl, SandboxIdPrefix, SigningKey,
 };
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
-use crucible_kueue::auth::Auth;
 use crucible_kueue::tenant::{Registry, Tenants};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::policy::ToolPolicy;
@@ -254,12 +253,17 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
     };
     let http = cluster::routes_http(cluster::ingress_ip());
     let server = ResourceServer::with_jwks(config, |t| Jwks::new(http.clone(), t.jwks_uri.clone()));
-    let auth = Auth {
-        registry: Arc::new(Registry::new(tenants)),
-        oidc: Some(Arc::new(server)),
-    };
     let policy = ToolPolicy::from_toml(include_str!("../deploy/kueue-policy.toml")).unwrap();
-    let app = crucible_kueue::router(kube, auth, Some(policy), &[]);
+    let app = crucible_kueue::router(
+        kube,
+        crucible_kueue::Options {
+            registry: Arc::new(Registry::new(tenants)),
+            oidc: Some(Arc::new(server)),
+            policy: Some(policy),
+            reviewer: None,
+            allowed_hosts: Vec::new(),
+        },
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });

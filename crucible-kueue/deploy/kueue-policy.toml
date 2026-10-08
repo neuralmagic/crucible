@@ -1,5 +1,14 @@
 # crucible-kueue tool policy (--tool-policy). Rules see `claims` (the access token's, or the
 # equivalent built for a tenant token) and `args` (the call's arguments). Unlisted tools are denied.
+#
+# Authorize rules are SubjectAccessReviews (--kube-authz) for any token carrying kube_user: a
+# person acting as themselves, or a run acting as its launcher. Tenant tokens carry none; their
+# record already pins them. The server acts with its own service account either way: RBAC answers
+# whether this person may, on the objects they would be touching.
+#
+#   apiGroups: [kueue.x-k8s.io]  resources: [localqueues]  resourceNames: [<queue>]  verbs: [use]
+#
+# grants a queue. `use` is a verb only this policy asks about.
 
 [tools.whoami]
 scopes = ["kueue.read"]
@@ -7,20 +16,77 @@ scopes = ["kueue.read"]
 [tools.queues_list]
 scopes = ["kueue.read"]
 
+[[tools.queues_list.authorize]]
+name = "queues-list"
+when = "has(claims.kube_user)"
+group = "'kueue.x-k8s.io'"
+resource = "'localqueues'"
+verb = "'list'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+message = "you may not list LocalQueues in this namespace"
+
 [tools.queue_describe]
 scopes = ["kueue.read"]
+
+[[tools.queue_describe.authorize]]
+name = "queue-get"
+when = "has(claims.kube_user)"
+group = "'kueue.x-k8s.io'"
+resource = "'localqueues'"
+verb = "'get'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.queue"
+message = "you may not read this LocalQueue"
 
 [tools.hardware_describe]
 scopes = ["kueue.read"]
 
+[[tools.hardware_describe.authorize]]
+name = "queue-get"
+when = "has(claims.kube_user)"
+group = "'kueue.x-k8s.io'"
+resource = "'localqueues'"
+verb = "'get'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.queue"
+message = "you may not read this LocalQueue"
+
 [tools.workload_status]
 scopes = ["kueue.read"]
+
+[[tools.workload_status.authorize]]
+name = "workload-get"
+when = "has(claims.kube_user)"
+group = "{'Job': 'batch', 'RayJob': 'ray.io', 'LeaderWorkerSet': 'leaderworkerset.x-k8s.io', 'Deployment': 'apps', 'StatefulSet': 'apps'}[args.kind]"
+resource = "{'Job': 'jobs', 'RayJob': 'rayjobs', 'LeaderWorkerSet': 'leaderworkersets', 'Deployment': 'deployments', 'StatefulSet': 'statefulsets'}[args.kind]"
+verb = "'get'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.name"
+message = "you may not read this workload"
 
 [tools.workload_list]
 scopes = ["kueue.read"]
 
+[[tools.workload_list.authorize]]
+name = "workloads-list"
+when = "has(claims.kube_user)"
+group = "'kueue.x-k8s.io'"
+resource = "'workloads'"
+verb = "'list'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+message = "you may not list Kueue workloads in this namespace"
+
 [tools.workload_logs]
 scopes = ["kueue.read"]
+
+[[tools.workload_logs.authorize]]
+name = "pod-logs"
+when = "has(claims.kube_user)"
+resource = "'pods'"
+subresource = "'log'"
+verb = "'get'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+message = "you may not read pod logs in this namespace"
 
 [tools.workload_plan]
 scopes = ["kueue.submit"]
@@ -36,6 +102,25 @@ name = "queue-allowed"
 rule = "!has(claims.queues) || size(claims.queues) == 0 || args.queue in claims.queues"
 message = "the queue is not in this run's allowlist"
 
+[[tools.workload_plan.authorize]]
+name = "queue-use"
+when = "has(claims.kube_user)"
+group = "'kueue.x-k8s.io'"
+resource = "'localqueues'"
+verb = "'use'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.queue"
+message = "you may not submit to this queue"
+
+[[tools.workload_plan.authorize]]
+name = "workload-create"
+when = "has(claims.kube_user)"
+group = "{'Job': 'batch', 'RayJob': 'ray.io', 'LeaderWorkerSet': 'leaderworkerset.x-k8s.io', 'Deployment': 'apps', 'StatefulSet': 'apps'}[args.manifest.kind]"
+resource = "{'Job': 'jobs', 'RayJob': 'rayjobs', 'LeaderWorkerSet': 'leaderworkersets', 'Deployment': 'deployments', 'StatefulSet': 'statefulsets'}[args.manifest.kind]"
+verb = "'create'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+message = "you may not create this kind of workload in this namespace"
+
 [tools.workload_submit]
 scopes = ["kueue.submit"]
 
@@ -48,6 +133,25 @@ name = "queue-allowed"
 rule = "!has(claims.queues) || size(claims.queues) == 0 || args.queue in claims.queues"
 message = "the queue is not in this run's allowlist"
 
+[[tools.workload_submit.authorize]]
+name = "queue-use"
+when = "has(claims.kube_user)"
+group = "'kueue.x-k8s.io'"
+resource = "'localqueues'"
+verb = "'use'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.queue"
+message = "you may not submit to this queue"
+
+[[tools.workload_submit.authorize]]
+name = "workload-create"
+when = "has(claims.kube_user)"
+group = "{'Job': 'batch', 'RayJob': 'ray.io', 'LeaderWorkerSet': 'leaderworkerset.x-k8s.io', 'Deployment': 'apps', 'StatefulSet': 'apps'}[args.manifest.kind]"
+resource = "{'Job': 'jobs', 'RayJob': 'rayjobs', 'LeaderWorkerSet': 'leaderworkersets', 'Deployment': 'deployments', 'StatefulSet': 'statefulsets'}[args.manifest.kind]"
+verb = "'create'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+message = "you may not create this kind of workload in this namespace"
+
 [tools.workload_scale]
 scopes = ["kueue.submit"]
 
@@ -56,11 +160,52 @@ name = "replica-cap"
 rule = "args.replicas >= 0 && args.replicas <= 8"
 message = "replicas must be between 0 and 8"
 
+[[tools.workload_scale.authorize]]
+name = "workload-scale"
+when = "has(claims.kube_user)"
+group = "'apps'"
+resource = "{'Deployment': 'deployments', 'StatefulSet': 'statefulsets'}[args.kind]"
+subresource = "'scale'"
+verb = "'update'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.name"
+message = "you may not scale this workload"
+
 [tools.workload_stop]
 scopes = ["kueue.submit"]
+
+[[tools.workload_stop.authorize]]
+name = "workload-update"
+when = "has(claims.kube_user)"
+group = "{'Job': 'batch', 'RayJob': 'ray.io', 'LeaderWorkerSet': 'leaderworkerset.x-k8s.io', 'Deployment': 'apps', 'StatefulSet': 'apps'}[args.kind]"
+resource = "{'Job': 'jobs', 'RayJob': 'rayjobs', 'LeaderWorkerSet': 'leaderworkersets', 'Deployment': 'deployments', 'StatefulSet': 'statefulsets'}[args.kind]"
+verb = "'update'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.name"
+message = "you may not stop this workload"
 
 [tools.workload_resume]
 scopes = ["kueue.submit"]
 
+[[tools.workload_resume.authorize]]
+name = "workload-update"
+when = "has(claims.kube_user)"
+group = "{'Job': 'batch', 'RayJob': 'ray.io', 'LeaderWorkerSet': 'leaderworkerset.x-k8s.io', 'Deployment': 'apps', 'StatefulSet': 'apps'}[args.kind]"
+resource = "{'Job': 'jobs', 'RayJob': 'rayjobs', 'LeaderWorkerSet': 'leaderworkersets', 'Deployment': 'deployments', 'StatefulSet': 'statefulsets'}[args.kind]"
+verb = "'update'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.name"
+message = "you may not resume this workload"
+
 [tools.workload_delete]
 scopes = ["kueue.submit"]
+
+[[tools.workload_delete.authorize]]
+name = "workload-delete"
+when = "has(claims.kube_user)"
+group = "{'Job': 'batch', 'RayJob': 'ray.io', 'LeaderWorkerSet': 'leaderworkerset.x-k8s.io', 'Deployment': 'apps', 'StatefulSet': 'apps'}[args.kind]"
+resource = "{'Job': 'jobs', 'RayJob': 'rayjobs', 'LeaderWorkerSet': 'leaderworkersets', 'Deployment': 'deployments', 'StatefulSet': 'statefulsets'}[args.kind]"
+verb = "'delete'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.name"
+message = "you may not delete this workload"

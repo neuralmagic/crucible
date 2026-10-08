@@ -24,7 +24,7 @@ pub enum TenantsError {
     DuplicateToken { first: usize, second: usize },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum NameError {
     #[error(
         "{what} {value:?} is not a DNS-1123 label (lowercase alphanumerics and '-', 1-63 chars)"
@@ -137,6 +137,12 @@ impl Launcher {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Refusal {
+    #[error("this token is bound to namespace {pinned:?}, not {requested:?}")]
+    NamespacePinned { pinned: String, requested: String },
+    #[error("name a namespace: this token has no default one")]
+    NamespaceRequired,
+    #[error(transparent)]
+    Namespace(NameError),
     #[error("role {role:?} may not call {tool}; it needs the submitter role")]
     Role {
         role: TenantRole,
@@ -146,6 +152,56 @@ pub enum Refusal {
     Queue { queue: String, allowed: Vec<String> },
 }
 
+/// Who a request comes from, before it names a namespace. A run's or tenant's identity is pinned
+/// to one namespace; a person's picks one per call (authorized by the tool policy's access checks)
+/// and may have a default.
+#[derive(Debug, Clone)]
+pub struct Identity {
+    pub run_id: RunId,
+    pub namespace: Option<Namespace>,
+    pub pinned: bool,
+    pub role: TenantRole,
+    pub queues: Vec<QueueName>,
+    pub launched_by: Option<Launcher>,
+}
+
+impl Identity {
+    /// A caller fixed to `caller`'s namespace.
+    pub fn pinned(caller: Caller) -> Self {
+        Self {
+            run_id: caller.run_id,
+            namespace: Some(caller.namespace),
+            pinned: true,
+            role: caller.role,
+            queues: caller.queues,
+            launched_by: caller.launched_by,
+        }
+    }
+
+    /// The caller acting in `requested`, or in its own namespace when none is named.
+    pub fn in_namespace(&self, requested: Option<&str>) -> Result<Caller, Refusal> {
+        let namespace = match (requested, &self.namespace, self.pinned) {
+            (None, Some(own), _) => own.clone(),
+            (None, None, _) => return Err(Refusal::NamespaceRequired),
+            (Some(r), Some(own), true) if r != own.as_str() => {
+                return Err(Refusal::NamespacePinned {
+                    pinned: own.to_string(),
+                    requested: r.to_string(),
+                });
+            }
+            (Some(r), _, _) => Namespace::parse(r).map_err(Refusal::Namespace)?,
+        };
+        Ok(Caller {
+            run_id: self.run_id.clone(),
+            namespace,
+            role: self.role,
+            queues: self.queues.clone(),
+            launched_by: self.launched_by.clone(),
+        })
+    }
+}
+
+/// An [`Identity`] resolved to the one namespace a call acts in.
 #[derive(Debug, Clone)]
 pub struct Caller {
     pub run_id: RunId,
@@ -515,6 +571,56 @@ queues = ["gpu"]
         };
         let err = caller.require_submitter("workload_submit").unwrap_err();
         assert!(err.to_string().contains("workload_submit"));
+    }
+
+    #[test]
+    fn a_pinned_identity_acts_only_in_its_own_namespace() {
+        let identity = Identity::pinned(Caller {
+            run_id: RunId::parse("r").unwrap(),
+            namespace: Namespace::parse("team-a").unwrap(),
+            role: TenantRole::Submitter,
+            queues: vec![],
+            launched_by: None,
+        });
+        assert_eq!(
+            identity.in_namespace(None).unwrap().namespace.as_str(),
+            "team-a"
+        );
+        assert_eq!(
+            identity
+                .in_namespace(Some("team-a"))
+                .unwrap()
+                .namespace
+                .as_str(),
+            "team-a"
+        );
+        assert_eq!(
+            identity.in_namespace(Some("team-b")).unwrap_err(),
+            Refusal::NamespacePinned {
+                pinned: "team-a".into(),
+                requested: "team-b".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unpinned_identity_still_needs_a_valid_namespace() {
+        let identity = Identity {
+            run_id: RunId::parse("p").unwrap(),
+            namespace: None,
+            pinned: false,
+            role: TenantRole::Submitter,
+            queues: vec![],
+            launched_by: None,
+        };
+        assert!(matches!(
+            identity.in_namespace(Some("Not_Valid")),
+            Err(Refusal::Namespace(_))
+        ));
+        assert_eq!(
+            identity.in_namespace(None).unwrap_err(),
+            Refusal::NamespaceRequired
+        );
     }
 
     #[test]
