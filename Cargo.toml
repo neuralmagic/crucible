@@ -10,6 +10,7 @@ members = [
     "crux",
     "crucible-kueue",
     "crucible-mcp-auth",
+    "buildit",
     "capability",
     "xtask",
 ]
