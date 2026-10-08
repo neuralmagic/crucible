@@ -18,6 +18,14 @@ pub struct UnknownTurnKind {
     got: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "turn pods run their OpenShell gateway in-pod as the loop service account, which a profile \
+     with `[cluster] sandbox_namespace` under the kubernetes driver grants nothing in that \
+     namespace; turns are not supported with isolated gateways"
+)]
+pub struct TurnUnderIsolatedGateway;
+
 /// Where the init container clones the repo and where the turn container reads it.
 const CHECKOUT_DIR: &str = "/checkout";
 /// The `emptyDir` both containers share, carrying the checkout between them.
@@ -296,6 +304,9 @@ fn checked_git_ref(r: &str) -> Result<&str, BadRepoRef> {
 
 #[tracing::instrument(skip_all, fields(turn_kind = ?opts.kind, issue = %opts.issue, pinned = opts.digests.is_some()), err)]
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
+    if crate::deploy::render::gateway::isolated(profile) {
+        return Err(TurnUnderIsolatedGateway.into());
+    }
     let image = pin_image(
         opts.digests.as_deref(),
         "loop image",
@@ -860,6 +871,51 @@ mod tests {
             .find(|e| e.name == "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT")
             .and_then(|e| e.value.as_deref());
         assert_eq!(sandbox_sa, Some("autoresearch-sandbox"));
+    }
+
+    #[test]
+    fn a_turn_is_refused_under_an_isolated_gateway_profile() {
+        let profile: DeployProfile = toml::from_str(
+            r#"
+            [cluster]
+            loop_namespace = "autoresearch"
+            rig_namespace = "rig"
+            service_account = "autoresearch-publisher"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            sandbox_driver = "kubernetes"
+            sandbox_namespace = "sandboxes"
+            [image]
+            loop = "ghcr.io/neuralmagic/crucible:latest"
+            pull_secret = "example-pull-secret"
+        "#,
+        )
+        .expect("profile parses");
+        let err = render_turn(
+            &profile,
+            &TurnOpts {
+                kind: TurnKind::Rank,
+                name: "crucible-turn-owner-repo-42-abcd".to_string(),
+                issue: "owner/repo#42".to_string(),
+                goal_text: None,
+                repo_url: "https://github.com/owner/repo.git".to_string(),
+                repo_ref: None,
+                sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
+                max_cost: 5.0,
+                digests: None,
+                tier: None,
+                gaming_refine_rounds: 1,
+                skip_gaming_review: false,
+                authoritative: false,
+                harness: None,
+                model: None,
+                pack_path: None,
+            },
+        )
+        .expect_err("refused");
+        assert!(
+            err.downcast_ref::<TurnUnderIsolatedGateway>().is_some(),
+            "{err:#}"
+        );
     }
 
     /// Under `sandbox_driver = "kubernetes"` a turn pod must thread the same `--compute-driver`
