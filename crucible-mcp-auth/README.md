@@ -15,7 +15,9 @@ Status (2026-10-08):
 - **Decided and built.** No per-run Keycloak clients and no dynamic client registration. Agent
   tokens come from a token endpoint in the crucible controller, proven on pirate with a real SVID;
   Keycloak stays for human logins.
-- **Proposed.** Authorize queue access with Kubernetes RBAC through SubjectAccessReview.
+- **Built and proven on pirate.** Kubernetes RBAC decides tool access through SubjectAccessReview:
+  a person acts as themselves, a run as its launcher. One crucible-kueue deployment serves agents,
+  tenant tokens and people, and hosts can embed it.
 - **Open.** Sandboxes do not fetch tokens until the gateway wiring lands, and the Claude Code login
   has not been run end to end by a person yet.
 
@@ -333,47 +335,145 @@ an `/etc/hosts` entry for the Keycloak host because `*.apps` has no DNS.
 A person's tenant scope comes from admin-only user attributes set with `deploy/realm-dev.sh grant`.
 That is a stopgap; the next section replaces it with Kubernetes RBAC.
 
-## Kubernetes authorization (proposed)
+## Kubernetes authorization
 
-Queue access should follow Kubernetes RBAC, not a list kept in Keycloak. The server asks the API
-server whether the caller may use a queue, then acts with its own service account.
+Kubernetes RBAC decides what a caller may touch. Policy `authorize` rules turn a tool call into
+SubjectAccessReviews; the server asks the API server, then acts with its own service account.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant M as crucible-kueue
+    participant C as Caller
+    participant G as Guard (policy)
+    participant R as SubjectAccessReviewer
     participant A as Kubernetes API
-    Note over M: realm token: kube_user = alice, groups looked up
-    M->>A: SubjectAccessReview: may alice (groups) "use" localqueues/crucible-e2e in team-a?
-    alt allowed by a RoleBinding
-        A-->>M: allowed
-        M->>A: create the workload (own service account)
-    else denied
-        A-->>M: denied
-        M-->>M: refuse the call, naming the queue
+    participant K as crucible-kueue
+    C->>G: tools/call workload_plan {namespace, queue, manifest}
+    G->>G: scopes, mutate, validate, resolve authorize rules
+    G->>R: checks: use localqueues/gpu, create jobs.batch (in team-b)
+    R->>A: SubjectAccessReview as kube_user + groups
+    alt every check allowed
+        A-->>R: allowed (cached 30 s)
+        G->>K: forward the rewritten call
+        K->>A: create the Job (own service account)
+    else any check denied
+        A-->>R: denied (never cached)
+        G-->>C: JSON-RPC -32001 naming the rule
     end
 ```
 
-```yaml
-# Granting a person (or group) a queue is ordinary RBAC.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata: {name: kueue-crucible-e2e, namespace: team-a}
-rules:
-  - apiGroups: [kueue.x-k8s.io]
-    resources: [localqueues]
-    resourceNames: [crucible-e2e]
-    verbs: [use]
+```toml
+[[tools.workload_plan.authorize]]
+name = "queue-use"
+when = "has(claims.kube_user)"          # people, and runs acting as their launcher
+group = "'kueue.x-k8s.io'"
+resource = "'localqueues'"
+verb = "'use'"
+namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
+object = "args.queue"
+message = "you may not submit to this queue"
 ```
 
-- The server's service account gains only `create subjectaccessreviews` and `list` on OpenShift
-  `Group` objects, to pass the person's groups.
-- Agent runs check their launcher the same way, intersected with the run's grant: a run can only use
-  queues its human could use.
-- The token needs a Kubernetes username the server can trust: a `kube_user` claim set only by the
-  `openshift-v4` login, never from an attribute a user can edit.
-- Quotas and admission webhooks still see the service account; crucible-kueue's manifest checks and
-  Kueue quotas keep covering that.
+```yaml
+# Granting a person or group a queue is ordinary RBAC; `use` is a verb only the policy asks about.
+- apiGroups: [kueue.x-k8s.io]
+  resources: [localqueues]
+  resourceNames: [crucible-e2e]
+  verbs: [use]
+```
+
+**Who is asked about.** `kube_user` names the Kubernetes user; a `system:` identity is refused, so
+no token can stand in for a node or the cluster. Groups come from OpenShift `Group` objects (cached
+a minute) or a `kube_groups` claim with `system:` groups dropped; `system:authenticated` is always
+added. People get `kube_user` from their username, which only the OpenShift login sets
+(registration and username edits off, re-synced on every login, first-login review off). Runs get
+their launcher's username from the controller, so a run can only use queues its human could.
+
+**Which namespace.** Every crucible-kueue tool takes an optional `namespace`. Runs and tenant tokens
+are pinned to theirs, and naming another is refused. A person names any namespace, with an
+optional default from a claim, and the authorize rules decide. Task ids carry the namespace.
+
+**One deployment.** A single crucible-kueue serves all three callers:
+
+| Caller | Token | Identity | Decided by |
+| --- | --- | --- | --- |
+| Sandboxed agent | controller-issued, `run_id` + `act.sub` | pinned to the run's namespace and queues | the run's grant, then RBAC as the launcher |
+| Older run | tenant token | pinned to its record | the record |
+| Person (Claude Code) | Keycloak, `kube_user` | any namespace they name | RBAC as themselves |
+
+People's tokens are accepted only when the server has a reviewer (`--kube-authz openshift|token`)
+and a policy with authorize rules, so a misconfiguration cannot let a person act unchecked. The
+shipped policy checks every tool but `whoami`, and a unit test fails if a new tool goes unchecked.
+
+**Embedding.** `crucible_kueue::router(client, Options { registry, oidc, policy, reviewer,
+allowed_hosts })` builds the whole app, so a host such as the controller can mount it next to its
+own routes with the same issuers and reviewer.
+
+**Service account.** It gains `create` on `subjectaccessreviews` and `list` on
+`groups.user.openshift.io`. Its workload verbs are still granted per namespace by RoleBinding; a
+namespace people use needs that binding too. Quotas and admission webhooks still see the service
+account, and crucible-kueue's manifest checks and Kueue quotas keep covering that.
+
+## What this policy model enables
+
+Every tool call now passes one enforcement point that knows who launched the run, which sandbox
+is acting, what it is asking to do with which arguments, and what Kubernetes lets that person do.
+That point sits outside agent code, so nothing an agent does can skip it. Policy is data: a TOML
+file today, reviewable in a pull request, with rules that name themselves in every refusal.
+
+**Wins available with what is built:**
+
+- **Delegation that cannot exceed the human.** A run's reach is its grant intersected with its
+  launcher's RBAC. Once run tokens carry `kube_user`, revoking someone's RoleBinding cuts off their
+  running agents within 30 seconds (the allow cache).
+- **Queues and namespaces as ordinary RBAC.** Platform teams grant GPU queues with RoleBindings and
+  Groups they already manage. No second permission system lives in Keycloak or crucible.
+- **Server-owned arguments.** Mutate rules inject facts the client cannot forge: who launched it,
+  which sandbox acted, which namespace. Every workload carries provenance an admission policy or a
+  cost report can key on.
+- **Guardrails without code changes.** Replica caps, build timeouts, allowed kinds, and image or
+  registry allowlists are CEL rules. They change by editing the policy and restarting, not by a
+  server release.
+- **One policy surface for every MCP server.** buildit, crucible-kueue and future servers share
+  scopes, claims and rule semantics, so a rule written once ("runs never touch kube-system") holds
+  everywhere it is listed.
+- **Audit by construction.** Every decision logs the subject, the presenter, the tool and the rule
+  that decided it; a refused call names the rule to the agent, which can correct itself.
+
+**Next: decisions in Cedar.** The controller already authorizes with Cedar (`cedar-policy` 4.12):
+`UserPrincipal`, `TeamPrincipal` and `RunPrincipal` over owned, shared resources. A tool call maps
+onto the same model: principal = the run (with its launcher) or the person, action =
+`Mcp::Action::"kueue:workload_submit"`, resource = the queue or workload, context = the arguments
+and claims. Moving the CEL `validate` rules into a Cedar `Mcp::` namespace gives schema-checked
+policies, forbid-overrides, and one language for controller and MCP decisions. Scopes, mutate and
+SubjectAccessReview stay: Cedar decides what a run may do, RBAC decides whether its human may use
+the queue at all. `cedar-policy-mcp-schema-generator` turns an MCP tool manifest into the Cedar
+action schema.
+
+**Later: rules over history with Dogwood.** [Dogwood](https://github.com/dogwood-policy/dogwood)
+(AWS, Apache-2.0, released August 2026) embeds Cedar (every Cedar policy is a Dogwood policy) and
+adds rules over a session's history: `formerly within`, `since`, `count` and `sum` over windows.
+The session here is the run, which the token's `run_id` fixes, so a client cannot pick its own
+session. Rules that become expressible:
+
+| Rule | Needs |
+| --- | --- |
+| Submit only a plan this run made in the last 30 minutes (today a client can compute `plan_hash` and skip `workload_plan`) | plan responses |
+| A run's GPU-hours stay under a budget across all its submissions | submit requests; completions from Kueue |
+| Scaling past N replicas needs a human approval recorded in the last hour | controller approval events |
+| No more than 20 builds per sandbox per hour | build requests |
+| No resume after three stops of the same workload within 30 minutes | stop requests |
+| No `run` in buildit within 15 minutes of reading a secret through the controller | controller events |
+| Read a failed workload's logs before resubmitting it | logs requests, failure status |
+
+Getting there takes three pieces: the guard capturing `tools/call` responses as well as requests
+(JSON and SSE), an event store per run in the controller's Postgres shared by every MCP server, and
+a decision trait next to `AccessReview` that a Cedar or Dogwood engine implements. History must be
+fail-closed: a lost history makes `formerly` permits deny, but `count` and `sum` forbids would allow,
+so a server without its run's history denies those rules until it is replayed. Dogwood's crate
+(`dogwood-language` 1.0.0, Rust, on `cedar-policy` 4.11) calls itself a reference implementation,
+and its in-memory engine replays the whole trace on every decision. Start with rules in log-only
+mode behind a Postgres temporal engine, and enforce once the language stabilizes.
 
 ## Alternatives considered
 
@@ -405,10 +505,10 @@ rules:
 
 | Suite | What it proves |
 | --- | --- |
-| this crate, 47 unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting |
-| crucible-kueue, 70 unit tests | claims to caller, person tokens, tenant principals, launched-by label, shipped policy coverage |
+| this crate, unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting, authorize rules and `when`, Kubernetes identity and SubjectAccessReview requests |
+| crucible-kueue, unit tests | claims to identity, pinned and per-call namespaces, person tokens, tenant principals, launched-by label, every tool but `whoami` reviewed for people, namespaced task ids |
 | buildit, 60 unit tests | realm and tokens-file callers, refusals, challenges, launched-by label, a policy refusal over HTTP |
-| `crucible-kueue/tests/oidc_e2e.rs` (pirate) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused, tenant tokens under the same policy |
+| `crucible-kueue/tests/oidc_e2e.rs` (pirate) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused, tenant tokens under the same policy; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), a run pinned to its namespace |
 | `buildit/tests/oidc_e2e.rs` (pirate) | the `buildit mcp` binary with a realm token: challenge, metadata, authenticated status, policy refusal |
 
 The `testing` feature exposes real RSA keys, a loopback JWKS server and token minting for other
@@ -420,6 +520,9 @@ servers' tests; `e2e` adds the pirate helpers (spike pod, token exchange).
 2. Gateway wiring: `provider_spiffe_workload_api_socket_path` in crucible's `gateway_toml()`,
    `providers_v2_enabled`, the `token_grant` provider for each MCP server, and the OIDC flags rendered
    into the server Deployments.
-3. SubjectAccessReview queue authorization and the `kube_user` claim.
-4. A person runs the Claude Code login end to end.
-5. Keycloak TLS in-cluster; sandboxes out of `crucible-system`.
+3. The controller mints `kube_user` (the launcher's Kubernetes username) on run tokens.
+4. Render `--issuer`, `--tool-policy` and `--kube-authz` into the crucible-kueue Deployment with the
+   SubjectAccessReview and Group permissions, and RoleBindings for people's namespaces.
+5. A person runs the Claude Code login end to end.
+6. Response capture in the guard and a per-run event log, then Cedar, then Dogwood (above).
+7. Keycloak TLS in-cluster; sandboxes out of `crucible-system`.
