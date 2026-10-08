@@ -1380,33 +1380,34 @@ exit $rc
                     },
                 ]),
                 ports: Some(
-                    vec![
-                        networking::NetworkPolicyPort {
+                    (!crate::deploy::render::gateway::isolated(self.profile))
+                        .then_some(networking::NetworkPolicyPort {
                             port: Some(IntOrString::Int(GATEWAY_PORT.into())),
                             protocol: Some("TCP".to_string()),
                             ..Default::default()
-                        },
-                        networking::NetworkPolicyPort {
-                            // The manifest's `[agent.broker].bind` port, never a second constant: a
-                            // domain that moves the broker must not silently lose its ingress rule.
-                            port: Some(IntOrString::Int(broker_ingress_port(
-                                &self.input.agent.broker.bind,
-                            ))),
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        },
-                        networking::NetworkPolicyPort {
-                            // The turn's in-process OTLP collector; the agent's exporter posts here
-                            // from the sandbox. Rendered unconditionally: with telemetry off nothing
-                            // listens and the rule is inert.
-                            port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        },
-                    ]
-                    .into_iter()
-                    .chain(mcp_ports)
-                    .collect(),
+                        })
+                        .into_iter()
+                        .chain([
+                            networking::NetworkPolicyPort {
+                                // The manifest's `[agent.broker].bind` port, never a second constant: a
+                                // domain that moves the broker must not silently lose its ingress rule.
+                                port: Some(IntOrString::Int(broker_ingress_port(
+                                    &self.input.agent.broker.bind,
+                                ))),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            },
+                            networking::NetworkPolicyPort {
+                                // The turn's in-process OTLP collector; the agent's exporter posts here
+                                // from the sandbox. Rendered unconditionally: with telemetry off nothing
+                                // listens and the rule is inert.
+                                port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            },
+                        ])
+                        .chain(mcp_ports)
+                        .collect(),
                 ),
             }]),
         };
@@ -1456,9 +1457,16 @@ exit $rc
     ///     `runtimeclasses`/`priorityclasses`/`namespaces` reads admission and UID resolution do.
     ///  4. A `ClusterRoleBinding` granting it to the loop SA.
     fn sandbox_rbac(&self) -> Vec<SandboxRbacObject> {
-        let sa = &self.profile.cluster.service_account;
-        let ns = &self.profile.cluster.loop_namespace;
         let sandbox_ns = self.profile.cluster.sandbox_namespace().to_string();
+        let isolated = crate::deploy::render::gateway::isolated(self.profile);
+        let gateway_sa = crate::deploy::render::gateway::GATEWAY_SERVICE_ACCOUNT.to_string();
+        let (sa, ns) = match isolated {
+            true => (&gateway_sa, &sandbox_ns),
+            false => (
+                &self.profile.cluster.service_account,
+                &self.profile.cluster.loop_namespace,
+            ),
+        };
         let role_name = format!("{sa}-sandbox");
         let cr_name = format!("{sa}-node-reader");
 
@@ -1541,7 +1549,7 @@ exit $rc
 
         let rb = role_binding(
             role_name.clone(),
-            sandbox_ns,
+            sandbox_ns.clone(),
             "Role",
             &role_name,
             sa.clone(),
@@ -1608,12 +1616,23 @@ exit $rc
             }]),
         };
 
-        let mut objects = vec![
+        let mut objects = Vec::new();
+        if isolated {
+            objects.push(SandboxRbacObject::ServiceAccount(core::ServiceAccount {
+                metadata: ObjectMeta {
+                    name: Some(gateway_sa.clone()),
+                    namespace: Some(sandbox_ns.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        }
+        objects.extend([
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(rb),
             SandboxRbacObject::ClusterRole(cr),
             SandboxRbacObject::ClusterRoleBinding(crb),
-        ];
+        ]);
         objects.extend(self.sandbox_reader_rbac());
         objects
     }
@@ -1677,6 +1696,7 @@ exit $rc
 /// A typed wrapper so `sandbox_rbac()` can return a mixed vec of RBAC objects and they all
 /// serialize through one `serde_norway::to_string` call.
 enum SandboxRbacObject {
+    ServiceAccount(core::ServiceAccount),
     Role(rbac::Role),
     RoleBinding(rbac::RoleBinding),
     ClusterRole(rbac::ClusterRole),
@@ -1686,6 +1706,7 @@ enum SandboxRbacObject {
 impl serde::Serialize for SandboxRbacObject {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         match self {
+            Self::ServiceAccount(a) => a.serialize(s),
             Self::Role(r) => r.serialize(s),
             Self::RoleBinding(r) => r.serialize(s),
             Self::ClusterRole(r) => r.serialize(s),
@@ -3901,6 +3922,51 @@ mod tests {
     /// binding there, and the loop pod admits sandbox traffic only from that namespace. The
     /// binding's subject stays the loop SA in the loop namespace.
     #[test]
+    fn an_isolated_gateway_leaves_the_loop_sa_no_verbs_in_the_sandbox_namespace() {
+        let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
+        let docs: Vec<serde_json::Value> = moved
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let names_loop_sa =
+            |d: &serde_json::Value| {
+                d["subjects"].as_array().into_iter().flatten().any(|s| {
+                    s["name"] == "autoresearch-publisher" && s["namespace"] == "autoresearch"
+                })
+            };
+        for d in &docs {
+            let kind = d["kind"].as_str().unwrap_or_default();
+            let grants_in_sandbox_ns = (kind == "RoleBinding"
+                && d["metadata"]["namespace"] == "crucible-sandboxes")
+                || kind == "ClusterRoleBinding";
+            assert!(
+                !(grants_in_sandbox_ns && names_loop_sa(d)),
+                "the loop SA is granted verbs that reach the sandbox namespace: {d}"
+            );
+        }
+        let netpol = docs
+            .iter()
+            .find(|d| d["kind"] == "NetworkPolicy")
+            .expect("netpol");
+        let ports: Vec<i64> = netpol["spec"]["ingress"][0]["ports"]
+            .as_array()
+            .expect("ports")
+            .iter()
+            .filter_map(|p| p["port"].as_i64())
+            .collect();
+        assert!(
+            !ports.contains(&i64::from(GATEWAY_PORT)),
+            "the gateway no longer listens in the loop pod: {ports:?}"
+        );
+
+        let shared = render_k8s(&k8s_profile(""));
+        assert!(
+            shared.contains("name: autoresearch-publisher-sandbox"),
+            "without a sandbox namespace the in-pod gateway keeps the loop SA's RBAC"
+        );
+    }
+
+    #[test]
     fn a_sandbox_namespace_moves_the_sandboxes_and_their_rbac() {
         let default = render_k8s(&k8s_profile(""));
         assert_eq!(
@@ -3924,14 +3990,24 @@ mod tests {
         let named = |kind: &str| {
             docs.iter()
                 .find(|d| {
-                    d["kind"] == kind && d["metadata"]["name"] == "autoresearch-publisher-sandbox"
+                    d["kind"] == kind
+                        && d["metadata"]["name"] == "crucible-openshell-gateway-sandbox"
                 })
                 .unwrap_or_else(|| panic!("no {kind}: {moved}"))
         };
         assert_eq!(named("Role")["metadata"]["namespace"], "crucible-sandboxes");
         let binding = named("RoleBinding");
         assert_eq!(binding["metadata"]["namespace"], "crucible-sandboxes");
-        assert_eq!(binding["subjects"][0]["namespace"], "autoresearch");
+        assert_eq!(
+            binding["subjects"][0],
+            serde_json::json!({"kind": "ServiceAccount", "name": "crucible-openshell-gateway", "namespace": "crucible-sandboxes"})
+        );
+        assert!(
+            docs.iter().any(|d| d["kind"] == "ServiceAccount"
+                && d["metadata"]["name"] == "crucible-openshell-gateway"
+                && d["metadata"]["namespace"] == "crucible-sandboxes"),
+            "{moved}"
+        );
         let netpol = docs
             .iter()
             .find(|d| d["kind"] == "NetworkPolicy")
