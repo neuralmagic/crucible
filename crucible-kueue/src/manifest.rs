@@ -922,12 +922,12 @@ mod tests {
     #[test]
     fn a_delegated_callers_launcher_is_stamped_and_cannot_be_overridden() {
         let mut delegated = caller();
-        delegated.launched_by = Some(crate::tenant::Launcher::parse("weaton").unwrap());
+        delegated.launched_by = Some(crate::tenant::Launcher::parse("alice").unwrap());
         let n = normalize(job(), &delegated, &queue()).unwrap();
         assert_eq!(
             n.object
                 .pointer("/metadata/labels/crucible.dev~1launched-by"),
-            Some(&json!("weaton"))
+            Some(&json!("alice"))
         );
         let mut forged = job();
         forged["metadata"]["labels"] = json!({"crucible.dev/launched-by": "someone-else"});
@@ -940,7 +940,7 @@ mod tests {
     #[test]
     fn a_tenant_token_caller_cannot_claim_a_launcher() {
         let mut forged = job();
-        forged["metadata"]["labels"] = json!({"crucible.dev/launched-by": "weaton"});
+        forged["metadata"]["labels"] = json!({"crucible.dev/launched-by": "alice"});
         let n = normalize(forged, &caller(), &queue()).unwrap();
         assert_eq!(
             n.object
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn the_launcher_is_part_of_the_plan_hash() {
         let mut delegated = caller();
-        delegated.launched_by = Some(crate::tenant::Launcher::parse("weaton").unwrap());
+        delegated.launched_by = Some(crate::tenant::Launcher::parse("alice").unwrap());
         let a = normalize(job(), &caller(), &queue()).unwrap();
         let b = normalize(job(), &delegated, &queue()).unwrap();
         assert_ne!(a.plan_hash, b.plan_hash);

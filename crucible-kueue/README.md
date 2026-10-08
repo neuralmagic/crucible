@@ -40,7 +40,7 @@ Two sources, checked in this order:
 [[tenant]]
 run_id = "run-123"
 token_sha256 = "<sha256 hex of the bearer token>"
-namespace = "crucible-kueue-e2e"
+namespace = "team-a"
 role = "submitter"
 queues = ["crucible-e2e"]
 expires_at = 1791500000   # optional, Unix seconds
@@ -61,8 +61,9 @@ arguments. With `--kube-authz openshift|token` the policy's authorize rules beco
 SubjectAccessReviews for any token carrying `kube_user`, and people's tokens (no `run_id`) are
 accepted. Every tool takes an optional `namespace`: run and tenant tokens are pinned to theirs, and
 a person names one per call. Hosts can embed the server with
-`crucible_kueue::router(client, Options { … })`. The shipped policy is [deploy/kueue-policy.toml](deploy/kueue-policy.toml); realm setup and the e2e are in
-[crucible-mcp-auth/deploy](../crucible-mcp-auth/deploy/README.md).
+`crucible_kueue::router(client, Options { … })`. The shipped policy is
+[deploy/kueue-policy.toml](deploy/kueue-policy.toml); the auth design and the e2e's configuration
+are in [crucible-mcp-auth](../crucible-mcp-auth/README.md).
 
 ## Deploy
 
@@ -91,7 +92,7 @@ Cluster e2e of the server alone (creates and deletes real Jobs; apply
 `e2e/kueue/namespace.yaml` first):
 
 ```bash
-CRUCIBLE_KUEUE_E2E_CONTEXT=<ctx> CRUCIBLE_KUEUE_E2E_NAMESPACE=crucible-kueue-e2e \
+CRUCIBLE_KUEUE_E2E_CONTEXT=<ctx> CRUCIBLE_KUEUE_E2E_NAMESPACE=<namespace> \
 CRUCIBLE_KUEUE_E2E_QUEUE=crucible-e2e cargo test -p crucible-kueue --test cluster_e2e -- --ignored --nocapture
 ```
 

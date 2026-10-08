@@ -395,7 +395,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             body["received"]["params"]["arguments"],
-            json!({"queue": "crucible-e2e", "launched_by": "weaton"})
+            json!({"queue": "crucible-e2e", "launched_by": "alice"})
         );
     }
 

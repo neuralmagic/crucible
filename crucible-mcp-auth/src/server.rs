@@ -327,12 +327,12 @@ mod tests {
             .authenticate(&bearer(&sign("a", &run_claims())))
             .await
             .unwrap();
-        assert_eq!(p.subject, "weaton");
+        assert_eq!(p.subject, "alice");
         assert_eq!(
             p.presenter(),
-            "spiffe://pirate.crucible/openshell/sandbox/auth-spike"
+            "spiffe://example.crucible/openshell/sandbox/auth-spike"
         );
-        assert_eq!(p.namespace.as_deref(), Some("crucible-kueue-e2e"));
+        assert_eq!(p.namespace.as_deref(), Some("team-e2e"));
         assert_eq!(p.claims["queues"], json!(["crucible-e2e"]));
     }
 
@@ -521,7 +521,7 @@ mod tests {
         );
     }
 
-    const CONTROLLER: &str = "http://crucible-controller.tms.svc:8080";
+    const CONTROLLER: &str = "http://crucible-controller.crucible-system.svc:8080";
 
     fn realm_and_controller(realm: &JwksServer, controller: &JwksServer) -> ResourceServer {
         let mut cfg = testing::config(realm.url.clone());
@@ -606,18 +606,21 @@ mod tests {
 
     #[test]
     fn trusted_issuers_parse_as_issuer_equals_jwks_uri_and_keep_the_issuer_verbatim() {
-        let t: TrustedIssuer = "http://crucible-controller.tms.svc:8080=http://crucible-controller.tms.svc:8080/.well-known/jwks.json"
+        let t: TrustedIssuer = "http://crucible-controller.crucible-system.svc:8080=http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json"
             .parse()
             .unwrap();
-        assert_eq!(t.issuer, "http://crucible-controller.tms.svc:8080");
+        assert_eq!(
+            t.issuer,
+            "http://crucible-controller.crucible-system.svc:8080"
+        );
         assert_eq!(
             t.jwks_uri.as_str(),
-            "http://crucible-controller.tms.svc:8080/.well-known/jwks.json"
+            "http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json"
         );
-        let q: TrustedIssuer = "https://kc.example/realms/c=http://kc.rhbk.svc:8080/certs?x=1"
+        let q: TrustedIssuer = "https://kc.example/realms/c=http://kc.auth.svc:8080/certs?x=1"
             .parse()
             .unwrap();
-        assert_eq!(q.jwks_uri.as_str(), "http://kc.rhbk.svc:8080/certs?x=1");
+        assert_eq!(q.jwks_uri.as_str(), "http://kc.auth.svc:8080/certs?x=1");
         for bad in [
             "https://a.example",
             "not a url=https://a.example/keys",
@@ -764,10 +767,7 @@ mod tests {
         ok.extend(bearer(&sign("a", &run_claims())));
         let accepted = call(rs, ok).await;
         assert_eq!(accepted.status(), StatusCode::OK);
-        assert_eq!(
-            to_bytes(accepted.into_body(), 1024).await.unwrap(),
-            "weaton"
-        );
+        assert_eq!(to_bytes(accepted.into_body(), 1024).await.unwrap(), "alice");
     }
 
     #[tokio::test]

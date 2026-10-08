@@ -216,9 +216,9 @@ mod tests {
         let cli = Cli::try_parse_from([
             "crucible-kueue",
             "--issuer",
-            "http://crucible-controller.tms.svc:8080=http://crucible-controller.tms.svc:8080/.well-known/jwks.json",
+            "http://crucible-controller.crucible-system.svc:8080=http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json",
             "--issuer",
-            "https://keycloak.example/realms/crucible=http://keycloak.rhbk.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1",
+            "https://keycloak.example/realms/crucible=http://keycloak.auth.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1",
             "--resource",
             "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp",
         ])
@@ -230,12 +230,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 (
-                    "http://crucible-controller.tms.svc:8080",
-                    "http://crucible-controller.tms.svc:8080/.well-known/jwks.json"
+                    "http://crucible-controller.crucible-system.svc:8080",
+                    "http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json"
                 ),
                 (
                     "https://keycloak.example/realms/crucible",
-                    "http://keycloak.rhbk.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1"
+                    "http://keycloak.auth.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1"
                 ),
             ]
         );

@@ -1,21 +1,19 @@
-//! End-to-end against pirate's real SPIRE: the spike pod (crucible-mcp-auth/deploy) fetches a
-//! JWT-SVID shaped like a sandbox supervisor's, with the crucible controller's issuer as audience.
-//! The SVID is exchanged at the controller's agent token endpoint exactly as OpenShell's provider
-//! token grant does (client_credentials, jwt-bearer assertion, no client_id), for a sandbox a run
-//! pod bound in the controller's ledger. The resulting token drives crucible-kueue served on
-//! loopback with the shipped tool policy, trusting both the controller and the Keycloak realm.
+//! End-to-end against a cluster's real SPIRE: the spike pod fetches a JWT-SVID shaped like a
+//! sandbox supervisor's, with the crucible controller's issuer as audience. The SVID is exchanged
+//! at the controller's agent token endpoint exactly as OpenShell's provider token grant does
+//! (client_credentials, jwt-bearer assertion, no client_id), for a sandbox a run pod bound in the
+//! controller's ledger. The resulting token drives crucible-kueue served on loopback with the
+//! shipped tool policy, trusting both the controller and the Keycloak realm.
 //!
 //! The controller's token endpoint runs on loopback over a real Postgres ledger, and verifies the
-//! SVID against SPIRE's published JWKS through the discovery Route.
+//! SVID against SPIRE's published JWKS through its discovery host.
 //!
-//! Run with:
-//!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=crucible-kueue-e2e \
-//!   CRUCIBLE_KUEUE_E2E_QUEUE=crucible-e2e CRUCIBLE_E2E_INGRESS_IP=10.14.217.8 \
-//!   CRUCIBLE_KUEUE_E2E_DATABASE_URL=postgres://postgres@localhost:55432/crucible_oidc_e2e \
+//! Run with the cluster values `crucible_mcp_auth::testing::cluster` documents, plus:
+//!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=<namespace> \
+//!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> CRUCIBLE_KUEUE_E2E_DATABASE_URL=<postgres url> \
 //!   cargo test -p crucible-kueue --test oidc_e2e -- --ignored --nocapture --test-threads=1
-//! INGRESS_IP pins the `*.apps` Route hosts when they have no DNS.
-//! The realm's run-auth-spike client carries kube_user crucible-e2e-sar, whose only rights are
-//! crucible-mcp-auth/deploy/sar-e2e-rbac.yaml (Jobs on the queue, no Deployments).
+//! The RBAC test needs the realm's spike client to carry a kube_user whose only rights are Jobs on
+//! that queue (no Deployments).
 
 use base64::Engine;
 use crucible_contract::kueue::token_digest;
@@ -43,15 +41,27 @@ use url::Url;
 
 type Client = RunningService<RoleClient, ClientConfig>;
 
-/// The pirate controller's in-cluster Service: the issuer identifier sandboxes request SVIDs for.
-const CONTROLLER: &str = "http://crucible-controller.tms.svc.cluster.local:8080";
+/// The issuer identifier sandboxes request SVIDs for: the controller's in-cluster Service URL.
+const CONTROLLER: &str = "http://crucible-controller.crucible-system.svc.cluster.local:8080";
 const RESOURCE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
-const SANDBOX_PREFIX: &str = "spiffe://pirate.crucible/openshell/sandbox/";
-const SANDBOX: &str = "auth-spike";
 const RUN_POD: &str = "crucible-run-oidc-e2e";
 const RUN_ID: &str = "playbook_oidc-e2e_auth-spike";
 const TENANT_TOKEN: &str = "oidc-e2e-tenant-token";
 const IMAGE: &str = "registry.access.redhat.com/ubi9/ubi-minimal:latest";
+
+/// The spike's SPIFFE ID split at its last segment: the trust-domain path every sandbox ID sits
+/// under, and the spike's own sandbox ID.
+fn sandbox_prefix() -> String {
+    let id = cluster::spiffe_id();
+    let cut = id.rfind('/').map_or(0, |i| i + 1);
+    id[..cut].to_string()
+}
+
+fn sandbox() -> String {
+    let id = cluster::spiffe_id();
+    let cut = id.rfind('/').map_or(0, |i| i + 1);
+    id[cut..].to_string()
+}
 
 struct Env {
     context: String,
@@ -98,7 +108,7 @@ fn signing_key_pem() -> String {
     )
 }
 
-/// The run the spike's sandbox belongs to: a running run pod on pirate, launched by `weaton`,
+/// The run the spike's sandbox belongs to: a running run pod on the `dev` cluster,
 /// with the sandbox bound through the controller's own bind path.
 async fn seed_run(pool: &sqlx::PgPool) {
     for sql in [
@@ -107,7 +117,7 @@ async fn seed_run(pool: &sqlx::PgPool) {
         "DELETE FROM work_pods WHERE pod_name = $2",
     ] {
         sqlx::query(sql)
-            .bind(SANDBOX)
+            .bind(sandbox())
             .bind(RUN_POD)
             .execute(pool)
             .await
@@ -115,21 +125,21 @@ async fn seed_run(pool: &sqlx::PgPool) {
     }
     sqlx::query(
         "INSERT INTO work_pods (pod_name, kind, state, cost_tag, created_at, updated_at, cluster)
-         VALUES ($1, 'run', 'running', 'run', now()::text, now()::text, 'pirate')",
+         VALUES ($1, 'run', 'running', 'run', now()::text, now()::text, 'dev')",
     )
     .bind(RUN_POD)
     .execute(pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO runs (run_id, status, pod, attributed_to) VALUES ($1, 'running', $2, 'user:weaton')",
+        "INSERT INTO runs (run_id, status, pod, attributed_to) VALUES ($1, 'running', $2, 'user:alice')",
     )
     .bind(RUN_ID)
     .bind(RUN_POD)
     .execute(pool)
     .await
     .unwrap();
-    let run = bindings::bind(pool, RUN_POD, &SandboxId::parse(SANDBOX).unwrap())
+    let run = bindings::bind(pool, RUN_POD, &SandboxId::parse(&sandbox()).unwrap())
         .await
         .unwrap();
     assert_eq!(run, RUN_ID);
@@ -164,7 +174,7 @@ loop = "registry.example.com/crucible-loop:latest"
 pull_secret = "quay-pull"
 [kueue]
 image = "registry.example.com/crucible-kueue:latest"
-cluster = "pirate"
+cluster = "dev"
 namespace = "crucible-system"
 tenant_namespace = "crucible-kueue-tenants"
 workload_namespace = "{}"
@@ -178,10 +188,10 @@ record_writers = ["crucible-system/crucible-hub-dispatch"]
     let cfg = AgentIssuerConfig {
         issuer: IssuerUrl::parse(CONTROLLER).unwrap(),
         signing_key: SigningKey::from_pem(signing_key_pem().as_bytes()).unwrap(),
-        svid_issuer: cluster::SPIRE.to_string(),
-        svid_jwks_uri: Url::parse(&format!("{}/keys", cluster::SPIRE)).unwrap(),
+        svid_issuer: cluster::spire(),
+        svid_jwks_uri: Url::parse(&format!("{}/keys", cluster::spire())).unwrap(),
         svid_ca: None,
-        sandbox_prefix: SandboxIdPrefix::parse(SANDBOX_PREFIX).unwrap(),
+        sandbox_prefix: SandboxIdPrefix::parse(&sandbox_prefix()).unwrap(),
         audiences: vec![RESOURCE.to_string()],
     };
     let jwks = Jwks::new(
@@ -237,8 +247,12 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
             Url::parse(&format!("{controller}/.well-known/jwks.json")).unwrap(),
         ),
         (
-            cluster::REALM,
-            Url::parse(&format!("{}/protocol/openid-connect/certs", cluster::REALM)).unwrap(),
+            &cluster::realm(),
+            Url::parse(&format!(
+                "{}/protocol/openid-connect/certs",
+                cluster::realm()
+            ))
+            .unwrap(),
         ),
     ];
     let config = ResourceServerConfig {
@@ -324,7 +338,7 @@ fn job(name: &str) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "needs pirate's SPIRE and a Postgres; see the module docs"]
+#[ignore = "needs a cluster's SPIRE and a Postgres; see the module docs"]
 async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor() {
     let env = env();
     let kube = kube_client(&env).await;
@@ -371,7 +385,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
     let me = call(&client, "whoami", json!({})).await.unwrap();
     assert_eq!(me["run_id"], RUN_POD);
     assert_eq!(me["namespace"], env.namespace);
-    assert_eq!(me["launched_by"], "weaton");
+    assert_eq!(me["launched_by"], "alice");
     assert_eq!(me["queues"], json!([env.queue]));
 
     let name = format!("oidc-e2e-{}", std::process::id());
@@ -419,7 +433,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
     .await;
     assert_eq!(
         labels.get("crucible.dev/launched-by").map(String::as_str),
-        Some("weaton")
+        Some("alice")
     );
     assert_eq!(
         labels.get("crucible.dev/run-id").map(String::as_str),
@@ -427,7 +441,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
     );
     assert_eq!(
         annotations.get("crucible.dev/actor").map(String::as_str),
-        Some(cluster::SPIFFE_ID),
+        Some(cluster::spiffe_id().as_str()),
         "the policy replaced the agent's forged actor with the token's act.sub"
     );
 
@@ -439,7 +453,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
 }
 
 #[tokio::test]
-#[ignore = "needs pirate's SPIRE and a Postgres; see the module docs"]
+#[ignore = "needs a cluster's SPIRE and a Postgres; see the module docs"]
 async fn a_tampered_svid_or_a_foreign_audience_gets_no_token() {
     let env = env();
     let kube = kube_client(&env).await;
@@ -465,7 +479,7 @@ async fn a_tampered_svid_or_a_foreign_audience_gets_no_token() {
 }
 
 #[tokio::test]
-#[ignore = "needs pirate's SPIRE and a Postgres; see the module docs"]
+#[ignore = "needs a cluster's SPIRE and a Postgres; see the module docs"]
 async fn tenant_tokens_keep_working_beside_access_tokens_under_the_same_policy() {
     let env = env();
     let kube = kube_client(&env).await;
@@ -509,7 +523,7 @@ fn deployment(name: &str) -> Value {
 }
 
 #[tokio::test]
-#[ignore = "needs pirate's SPIRE + Keycloak; see the module docs"]
+#[ignore = "needs a cluster's SPIRE + Keycloak; see the module docs"]
 async fn kubernetes_rbac_decides_what_the_launcher_may_create() {
     let env = env();
     let kube = kube_client(&env).await;

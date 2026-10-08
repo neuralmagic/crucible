@@ -37,14 +37,14 @@ pub fn run_claims() -> Value {
     json!({
         "iss": ISSUER,
         "aud": [RESOURCE_SVC, RESOURCE_ROUTE],
-        "sub": "weaton",
+        "sub": "alice",
         "azp": "run-auth-spike",
         "exp": now() + 300,
         "iat": now(),
         "scope": "kueue.submit kueue.read",
-        "act": {"sub": "spiffe://pirate.crucible/openshell/sandbox/auth-spike"},
+        "act": {"sub": "spiffe://example.crucible/openshell/sandbox/auth-spike"},
         "run_id": "auth-spike",
-        "namespace": "crucible-kueue-e2e",
+        "namespace": "team-e2e",
         "queues": ["crucible-e2e"],
         "role": "submitter",
     })
@@ -127,6 +127,6 @@ pub fn resource_server(
     })
 }
 
-/// pirate cluster e2e: the spike pod and the realm token exchange.
+/// Cluster e2e: the spike pod and the realm token exchange.
 #[cfg(feature = "e2e")]
 pub mod cluster;

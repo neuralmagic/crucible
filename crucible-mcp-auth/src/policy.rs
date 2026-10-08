@@ -659,8 +659,8 @@ mod tests {
 
     fn claims() -> Map<String, Value> {
         obj(json!({
-            "sub": "weaton",
-            "act": {"sub": "spiffe://pirate.crucible/openshell/sandbox/s1"},
+            "sub": "alice",
+            "act": {"sub": "spiffe://example.crucible/openshell/sandbox/s1"},
             "queues": ["crucible-e2e"],
         }))
     }
@@ -691,10 +691,10 @@ mod tests {
             Value::Object(args),
             json!({
                 "queue": "crucible-e2e",
-                "launched_by": "weaton",
+                "launched_by": "alice",
                 "manifest": {"kind": "Job", "metadata": {
                     "name": "j",
-                    "annotations": {"crucible.dev/actor": "spiffe://pirate.crucible/openshell/sandbox/s1"},
+                    "annotations": {"crucible.dev/actor": "spiffe://example.crucible/openshell/sandbox/s1"},
                 }},
             })
         );
@@ -720,10 +720,10 @@ mod tests {
                 &scopes(&["kueue.submit"]),
             )
             .unwrap();
-        assert_eq!(args["launched_by"], "weaton");
+        assert_eq!(args["launched_by"], "alice");
         assert_eq!(
             args["manifest"]["metadata"]["annotations"],
-            json!({"crucible.dev/actor": "spiffe://pirate.crucible/openshell/sandbox/s1", "keep": "me"})
+            json!({"crucible.dev/actor": "spiffe://example.crucible/openshell/sandbox/s1", "keep": "me"})
         );
     }
 
@@ -1053,7 +1053,7 @@ mod tests {
     #[test]
     fn a_pinned_caller_cannot_steer_the_checked_namespace() {
         let policy = ToolPolicy::from_toml(AUTHZ).unwrap();
-        let run = obj(json!({"sub": "weaton", "kube_user": "weaton", "namespace": "team-a"}));
+        let run = obj(json!({"sub": "alice", "kube_user": "alice", "namespace": "team-a"}));
         let mut args = obj(json!({"namespace": "team-b", "queue": "gpu", "kind": "Job"}));
         let checks = policy.apply("plan", &mut args, &run, &scopes(&[])).unwrap();
         assert_eq!(args["namespace"], "team-a");

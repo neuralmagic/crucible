@@ -242,10 +242,10 @@ mod tests {
 
     fn realm_claims() -> Value {
         json!({
-            "sub": "weaton",
-            "act": {"sub": "spiffe://pirate.crucible/openshell/sandbox/s1"},
+            "sub": "alice",
+            "act": {"sub": "spiffe://example.crucible/openshell/sandbox/s1"},
             "run_id": "auth-spike",
-            "namespace": "crucible-kueue-e2e",
+            "namespace": "team-e2e",
             "role": "submitter",
             "queues": ["crucible-e2e"],
             "scope": "kueue.read kueue.submit",
@@ -262,10 +262,10 @@ mod tests {
     fn a_run_token_is_pinned_and_acts_for_its_subject() {
         let c = run_caller(realm_claims()).unwrap();
         assert_eq!(c.run_id.as_str(), "auth-spike");
-        assert_eq!(c.namespace.as_str(), "crucible-kueue-e2e");
+        assert_eq!(c.namespace.as_str(), "team-e2e");
         assert_eq!(c.role, TenantRole::Submitter);
         assert_eq!(c.queues, [QueueName::parse("crucible-e2e").unwrap()]);
-        assert_eq!(c.launched_by, Some(Launcher::parse("weaton").unwrap()));
+        assert_eq!(c.launched_by, Some(Launcher::parse("alice").unwrap()));
     }
 
     fn person_claims() -> Value {
@@ -342,7 +342,7 @@ mod tests {
             ("namespace", Some(json!("Not_A_Label"))),
             ("queues", Some(json!("crucible-e2e"))),
             ("queues", Some(json!([1]))),
-            ("sub", Some(json!("weaton@example.com"))),
+            ("sub", Some(json!("alice@example.com"))),
         ];
         for (key, value) in cases {
             let mut claims = realm_claims();

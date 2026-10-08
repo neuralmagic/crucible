@@ -1744,18 +1744,18 @@ mod tests {
         );
         assert_eq!(
             caller.launched_by.as_ref().map(Launcher::as_str),
-            Some("weaton")
+            Some("alice")
         );
         assert_eq!(
             principal.presenter(),
-            "spiffe://pirate.crucible/openshell/sandbox/auth-spike"
+            "spiffe://example.crucible/openshell/sandbox/auth-spike"
         );
         let pod = broker
             .builder_pod(&caller, &BuildId::parse("buildit-1").unwrap())
             .unwrap();
         assert_eq!(
             pod.metadata.labels.unwrap()["crucible.dev/launched-by"],
-            "weaton"
+            "alice"
         );
     }
 
@@ -1783,7 +1783,7 @@ mod tests {
             ("sandbox", None),
             ("sandbox", Some(serde_json::json!("not a name"))),
             ("workdir", Some(serde_json::json!("relative/path"))),
-            ("sub", Some(serde_json::json!("weaton@example.com"))),
+            ("sub", Some(serde_json::json!("alice@example.com"))),
         ];
         for (key, value) in cases {
             let mut claims = realm_claims();

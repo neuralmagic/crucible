@@ -117,28 +117,28 @@ mod tests {
     #[test]
     fn a_delegated_token_names_the_human_as_subject_and_the_sandbox_as_presenter() {
         let p = Principal::from_claims(claims(json!({
-            "sub": "weaton",
+            "sub": "alice",
             "azp": "run-auth-spike",
-            "namespace": "crucible-kueue-e2e",
+            "namespace": "team-e2e",
             "scope": "kueue.read  kueue.submit",
-            "act": {"sub": "spiffe://pirate.crucible/openshell/sandbox/s1",
-                    "act": {"sub": "spiffe://pirate.crucible/controller"}},
+            "act": {"sub": "spiffe://example.crucible/openshell/sandbox/s1",
+                    "act": {"sub": "spiffe://example.crucible/controller"}},
         })))
         .unwrap();
-        assert_eq!(p.subject, "weaton");
+        assert_eq!(p.subject, "alice");
         assert_eq!(
             p.actor_chain,
             [
-                "spiffe://pirate.crucible/openshell/sandbox/s1",
-                "spiffe://pirate.crucible/controller"
+                "spiffe://example.crucible/openshell/sandbox/s1",
+                "spiffe://example.crucible/controller"
             ]
         );
         assert_eq!(
             p.presenter(),
-            "spiffe://pirate.crucible/openshell/sandbox/s1"
+            "spiffe://example.crucible/openshell/sandbox/s1"
         );
         assert_eq!(p.client_id.as_deref(), Some("run-auth-spike"));
-        assert_eq!(p.namespace.as_deref(), Some("crucible-kueue-e2e"));
+        assert_eq!(p.namespace.as_deref(), Some("team-e2e"));
         assert_eq!(
             p.scopes.iter().map(String::as_str).collect::<Vec<_>>(),
             ["kueue.read", "kueue.submit"]
@@ -148,9 +148,9 @@ mod tests {
 
     #[test]
     fn an_undelegated_token_presents_as_its_subject() {
-        let p = Principal::from_claims(claims(json!({"sub": "weaton"}))).unwrap();
+        let p = Principal::from_claims(claims(json!({"sub": "alice"}))).unwrap();
         assert!(p.actor_chain.is_empty());
-        assert_eq!(p.presenter(), "weaton");
+        assert_eq!(p.presenter(), "alice");
         assert!(p.scopes.is_empty());
         assert_eq!(p.namespace, None);
     }

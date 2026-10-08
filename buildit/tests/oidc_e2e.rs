@@ -1,12 +1,11 @@
-//! End-to-end against pirate's real auth stack (crucible-mcp-auth/deploy): the `buildit mcp`
-//! binary serves with realm tokens and the shipped policy, and a token minted from the spike
-//! pod's JWT-SVID (sandbox claim `auth-spike`) drives it.
+//! End-to-end against a cluster's real auth stack: the `buildit mcp` binary serves with realm
+//! tokens and the shipped policy, and a token minted from the spike pod's JWT-SVID (the realm's
+//! spike client carries a `sandbox` claim) drives it.
 //!
-//! Run with:
-//!   BUILDIT_E2E_CONTEXT=<kube context> BUILDIT_E2E_NAMESPACE=crucible-kueue-e2e \
-//!   CRUCIBLE_E2E_INGRESS_IP=10.14.217.8 cargo test -p buildit --test oidc_e2e -- --ignored --nocapture
-//! The spawned server fetches the realm's keys itself, so the Keycloak Route host must resolve
-//! (an /etc/hosts entry on pirate, which has no wildcard DNS).
+//! Run with the cluster values `crucible_mcp_auth::testing::cluster` documents, plus:
+//!   BUILDIT_E2E_CONTEXT=<kube context> BUILDIT_E2E_NAMESPACE=<namespace> \
+//!   cargo test -p buildit --test oidc_e2e -- --ignored --nocapture
+//! The spawned server fetches the realm's keys itself, so the realm host must resolve locally.
 
 use crucible_mcp_auth::testing::cluster;
 use rmcp::ServiceExt;
@@ -57,7 +56,7 @@ async fn spawn_server(context: &str, namespace: &str) -> Server {
             "--sandbox-workdir",
             "/sandbox",
             "--issuer",
-            &format!("{0}={0}/protocol/openid-connect/certs", cluster::REALM),
+            &format!("{0}={0}/protocol/openid-connect/certs", cluster::realm()),
             "--resource",
             &format!("http://localhost:{PORT}/mcp"),
             "--tool-policy",
@@ -96,7 +95,7 @@ async fn call(client: &Client, tool: &str, args: Value) -> Result<String, String
 }
 
 #[tokio::test]
-#[ignore = "needs pirate's SPIRE + Keycloak; see the module docs"]
+#[ignore = "needs a cluster's SPIRE + Keycloak; see the module docs"]
 async fn a_sandbox_token_drives_buildit_under_the_shipped_policy() {
     let context = var("BUILDIT_E2E_CONTEXT");
     let namespace = var("BUILDIT_E2E_NAMESPACE");
@@ -128,7 +127,7 @@ async fn a_sandbox_token_drives_buildit_under_the_shipped_policy() {
         .json()
         .await
         .unwrap();
-    assert_eq!(metadata["authorization_servers"], json!([cluster::REALM]));
+    assert_eq!(metadata["authorization_servers"], json!([cluster::realm()]));
 
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(url.as_str()).auth_header(token),
