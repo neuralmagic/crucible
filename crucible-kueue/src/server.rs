@@ -14,7 +14,8 @@ use crate::status::{self, Rollup};
 use crate::task::{self, Outcome, TaskRef};
 use crate::tenant::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
 use crucible_contract::kueue::TenantRole;
-use crucible_mcp_auth::guard::AccessReview;
+use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
+use crucible_mcp_auth::guard::{AccessReview, MethodScopes};
 use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::policy::AccessCheck;
 use crucible_mcp_auth::principal::Principal;
@@ -43,7 +44,17 @@ pub const PLAN_HASH_ANNOTATION: &str = "crucible.dev/plan-hash";
 pub const STOPPED_REPLICAS_ANNOTATION: &str = "crucible.dev/stopped-replicas";
 /// The sandbox that presented the run's token when the workload was planned and submitted.
 pub const ACTOR_ANNOTATION: &str = "crucible.dev/actor";
-const SUBMIT_SCOPE: &str = "kueue.submit";
+/// The tasks extension's methods and the scopes each needs. The guard admits no other method.
+pub const METHODS: &[MethodScopes] = &[
+    MethodScopes {
+        method: "tasks/get",
+        scopes: &[SCOPE_READ],
+    },
+    MethodScopes {
+        method: "tasks/cancel",
+        scopes: &[SCOPE_SUBMIT],
+    },
+];
 const MAX_WORKLOADS_SHOWN: usize = 20;
 const MAX_REPLICAS: i64 = 1000;
 const MAX_LOG_PODS: usize = 4;
@@ -477,13 +488,10 @@ impl KueueMcp {
         let c = identity
             .in_namespace(t.namespace.as_deref())
             .map_err(refused)?;
-        let may_submit =
-            c.role == TenantRole::Submitter && principal.scopes.iter().any(|s| s == SUBMIT_SCOPE);
-        if access == TaskAccess::Cancel && !may_submit {
-            return Err(refused(format!(
-                "tasks/cancel needs the submitter role and scope {SUBMIT_SCOPE}"
-            )));
+        if access == TaskAccess::Cancel && c.role != TenantRole::Submitter {
+            return Err(refused("tasks/cancel needs the submitter role"));
         }
+        let may_submit = c.role == TenantRole::Submitter && principal.scopes.contains(SCOPE_SUBMIT);
         let reviewed = principal.claims.contains_key(USER_CLAIM);
         if reviewed || !identity.pinned {
             let Some(reviewer) = &self.reviewer else {

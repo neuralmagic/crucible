@@ -127,16 +127,6 @@ struct PolicyFile {
     unlisted: Unlisted,
     #[serde(default)]
     tools: BTreeMap<String, ToolFile>,
-    #[serde(default)]
-    methods: BTreeMap<String, MethodFile>,
-}
-
-/// A JSON-RPC method beyond `tools/*` and the protocol's own (`tasks/get`, `tasks/cancel`).
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MethodFile {
-    #[serde(default)]
-    scopes: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -241,7 +231,6 @@ struct ToolRules {
 pub struct ToolPolicy {
     unlisted: Unlisted,
     tools: BTreeMap<String, ToolRules>,
-    methods: BTreeMap<String, Vec<String>>,
 }
 
 impl ToolPolicy {
@@ -250,7 +239,6 @@ impl ToolPolicy {
         Self {
             unlisted: Unlisted::Allow,
             tools: BTreeMap::new(),
-            methods: BTreeMap::new(),
         }
     }
 
@@ -260,28 +248,10 @@ impl ToolPolicy {
         for (tool, rules) in file.tools {
             tools.insert(tool.clone(), compile_tool(&tool, rules)?);
         }
-        let methods = file
-            .methods
-            .into_iter()
-            .map(|(method, rules)| (method, rules.scopes))
-            .collect();
         Ok(Self {
             unlisted: file.unlisted,
             tools,
-            methods,
         })
-    }
-
-    /// Scope requirement for a JSON-RPC `method` outside `tools/*`, or the refusal for an
-    /// unlisted one under `deny`.
-    pub fn method_scopes(&self, method: &str) -> Result<&[String], Refusal> {
-        match (self.methods.get(method), self.unlisted) {
-            (Some(scopes), _) => Ok(scopes),
-            (None, Unlisted::Allow) => Ok(&[]),
-            (None, Unlisted::Deny) => Err(Refusal::Method {
-                method: method.to_string(),
-            }),
-        }
     }
 
     /// Scope requirement for `tool`, or the refusal for an unlisted tool under `deny`.
@@ -705,6 +675,12 @@ mod tests {
         obj(
             json!({"queue": "crucible-e2e", "manifest": {"kind": "Job", "metadata": {"name": "j"}}}),
         )
+    }
+
+    #[test]
+    fn a_methods_table_is_refused_since_servers_declare_their_methods() {
+        let text = "[methods.\"tasks/get\"]\nscopes = [\"kueue.read\"]\n";
+        assert!(ToolPolicy::from_toml(text).is_err());
     }
 
     #[test]

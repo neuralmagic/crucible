@@ -10,14 +10,8 @@
 #
 # grants a queue. `use` is a verb only this policy asks about.
 #
-# Unlisted protocol methods are refused. The server checks the tasks extension's methods against
-# RBAC itself: `get` on the task's workload to read it, `update` to cancel it.
-
-[methods."tasks/get"]
-scopes = ["kueue.read"]
-
-[methods."tasks/cancel"]
-scopes = ["kueue.submit"]
+# The tasks extension's methods are not configured here: the server declares their scopes and
+# checks them against RBAC itself (`get` on the task's workload to read it, `update` to cancel it).
 
 [tools.whoami]
 scopes = ["kueue.read"]

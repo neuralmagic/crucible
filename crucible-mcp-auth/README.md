@@ -313,9 +313,10 @@ credentials get an equivalent `Principal` so one policy covers both.
 | Flags | `--run-issuer` and `--person-issuer <issuer>=<jwks uri>` (repeatable), `--resource`, `--tool-policy`, `--jwks-ca`, `--insecure-jwks-http` | `--run-issuer` only (no people), the rest the same; the tokens file becomes optional |
 
 With any issuer the policy is required; a server with only its older credential runs with
-`ToolPolicy::allow_all()`. Policies list protocol methods as well as tools: `initialize`, `ping`,
-`server/discover`, notifications and `tools/list` always pass, `tools/call` goes through the tool
-rules, and any other method needs a `[methods."<method>"]` entry with its scopes or is refused.
+`ToolPolicy::allow_all()`. The policy covers tools only. `initialize`, `ping`, `server/discover`,
+notifications and `tools/list` always pass, `tools/call` goes through the tool rules, and any other
+method passes only if the server lists it in `PolicyGuard::methods` (its `MethodScopes`, declared in
+code) and the token has that method's scopes. Both servers list `tasks/get` and `tasks/cancel`.
 
 A unit test in each server fails if a tool is missing from its shipped policy, so a new tool
 cannot ship silently denied.

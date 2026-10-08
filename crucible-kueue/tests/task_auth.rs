@@ -137,30 +137,30 @@ async fn a_run_reaches_its_own_tasks_and_no_other_namespaces() {
 }
 
 #[tokio::test]
-async fn a_read_only_token_cannot_cancel_under_the_policy_or_without_one() {
+async fn cancelling_needs_the_submit_scope_whatever_the_policy_and_the_submitter_role() {
     let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
     let read_only = run_token(|c| {
         c.insert("scope".into(), json!("kueue.read"));
     });
+    for policy in [shipped_policy(), ToolPolicy::allow_all()] {
+        let url = serve(&jwks, policy).await;
+        let client = connect(&url, &read_only).await;
+        let refused = cancel(&client, OWN_TASK).await;
+        assert!(refused.contains("Insufficient scope"), "{refused}");
+        let read = get(&client, OWN_TASK).await;
+        assert!(reached_kubernetes(&read), "{read}");
+        let viewer = connect(&url, VIEWER_TOKEN).await;
+        let refused = cancel(&viewer, OWN_TASK).await;
+        assert!(refused.contains("Insufficient scope"), "{refused}");
+    }
 
     let url = serve(&jwks, shipped_policy()).await;
-    let client = connect(&url, &read_only).await;
+    let viewer_role = run_token(|c| {
+        c.insert("role".into(), json!("viewer"));
+    });
+    let client = connect(&url, &viewer_role).await;
     let refused = cancel(&client, OWN_TASK).await;
-    assert!(
-        refused.contains("Insufficient scope"),
-        "the policy wants kueue.submit: {refused}"
-    );
-    let read = get(&client, OWN_TASK).await;
-    assert!(reached_kubernetes(&read), "{read}");
-
-    let url = serve(&jwks, ToolPolicy::allow_all()).await;
-    let client = connect(&url, &read_only).await;
-    let refused = cancel(&client, OWN_TASK).await;
-    assert!(refused.contains("kueue.submit"), "{refused}");
-
-    let viewer = connect(&url, VIEWER_TOKEN).await;
-    let refused = cancel(&viewer, OWN_TASK).await;
-    assert!(refused.contains("submitter"), "{refused}");
+    assert!(refused.contains("submitter role"), "{refused}");
 }
 
 #[tokio::test]

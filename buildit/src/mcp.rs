@@ -34,7 +34,7 @@ use crate::pod::BuilderPod;
 use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace, is_label_value};
 use crate::step::{self, Fetch, Published, Snapshot, Status};
 use crate::task::{self, Progress, TaskRef};
-use crucible_mcp_auth::guard::PolicyGuard;
+use crucible_mcp_auth::guard::{MethodScopes, PolicyGuard};
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::principal::{Callers, Principal};
 use crucible_mcp_auth::server::{
@@ -233,6 +233,7 @@ pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -
     let oidc = broker.oidc.clone();
     let guard = PolicyGuard {
         policy,
+        methods: METHODS,
         server: oidc.clone(),
         reviewer: None,
     };
@@ -1315,6 +1316,18 @@ fn caller(ctx: &RequestContext<RoleServer>) -> Result<Caller> {
         .ok_or_else(|| anyhow!("request reached a tool without an authenticated caller"))
 }
 
+/// The tasks extension's methods and the scopes each needs. The guard admits no other method.
+pub const METHODS: &[MethodScopes] = &[
+    MethodScopes {
+        method: "tasks/get",
+        scopes: &[SCOPE_READ],
+    },
+    MethodScopes {
+        method: "tasks/cancel",
+        scopes: &[SCOPE_BUILD],
+    },
+];
+
 fn may_build(ctx: &RequestContext<RoleServer>) -> bool {
     ctx.extensions
         .get::<Parts>()
@@ -1529,12 +1542,6 @@ impl ServerHandler for BuilditMcp {
     ) -> Result<(), McpError> {
         let caller = caller(&ctx).map_err(internal)?;
         let t = task_ref(&request.task_id)?;
-        if !may_build(&ctx) {
-            return Err(McpError::invalid_request(
-                format!("tasks/cancel needs scope {SCOPE_BUILD}"),
-                None,
-            ));
-        }
         self.broker
             .cancel(&caller, &t)
             .await
@@ -2041,7 +2048,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_read_only_token_cannot_cancel_a_task_under_the_policy_or_without_one() {
+    async fn a_read_only_token_cannot_cancel_a_task_whatever_the_policy() {
         let dir = tempfile::tempdir().unwrap();
         let mut claims = realm_claims();
         claims["scope"] = serde_json::json!("buildit.read");
@@ -2067,9 +2074,9 @@ mod tests {
             })
             .to_string()
         };
-        for (policy, guarded) in [
-            (ToolPolicy::from_toml(POLICY).unwrap(), true),
-            (ToolPolicy::allow_all(), false),
+        for policy in [
+            ToolPolicy::from_toml(POLICY).unwrap(),
+            ToolPolicy::allow_all(),
         ] {
             let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
             let (addr, _task) = serve_with(broker, policy).await;
@@ -2080,16 +2087,8 @@ mod tests {
                 &body("tasks/cancel"),
             )
             .await;
-            if guarded {
-                assert_eq!(status, 403, "{reply}");
-                assert!(reply.contains("insufficient_scope"), "{reply}");
-            } else {
-                let reply = rpc_body(&reply);
-                assert_eq!(
-                    reply["error"]["message"], "tasks/cancel needs scope buildit.build",
-                    "{reply}"
-                );
-            }
+            assert_eq!(status, 403, "{reply}");
+            assert!(reply.contains("insufficient_scope"), "{reply}");
             let (_, reply) = post(&addr, "127.0.0.1", &auth("tasks/get"), &body("tasks/get")).await;
             let reply = rpc_body(&reply);
             assert_ne!(reply["error"]["code"], -32600, "a reader may poll: {reply}");

@@ -254,7 +254,7 @@ mod tests {
 
     fn principal(claims: Value) -> Principal {
         match claims {
-            Value::Object(m) => Principal::from_claims(m).unwrap(),
+            Value::Object(m) => Principal::from_claims(m, crate::principal::Callers::Runs).unwrap(),
             other => panic!("{other}"),
         }
     }

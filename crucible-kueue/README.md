@@ -62,8 +62,9 @@ its claims.
 Key sets are fetched over https; `--jwks-ca <pem>` adds CAs for the issuers' hosts, and
 `--insecure-jwks-http` allows plain http off loopback for a cluster network you trust.
 
-Any issuer needs `--tool-policy`: per-method and per-tool scopes and CEL rules over the caller's
-claims and the call's arguments, with unlisted methods refused. A server with only tenant tokens
+Any issuer needs `--tool-policy`: per-tool scopes and CEL rules over the caller's claims and the
+call's arguments. Protocol methods beyond the tools are limited to the tasks extension's, whose
+scopes the server declares (`server::METHODS`). A server with only tenant tokens
 runs without one. With `--kube-authz openshift|token` the policy's authorize rules become
 SubjectAccessReviews for any token carrying `kube_user`, and the server checks `tasks/get` (`get`)
 and `tasks/cancel` (`update`) on the task's workload the same way. Every tool takes an optional

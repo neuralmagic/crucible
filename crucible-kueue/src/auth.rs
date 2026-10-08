@@ -245,15 +245,15 @@ mod tests {
 
     fn principal(claims: Value) -> Principal {
         match claims {
-            Value::Object(m) => Principal::from_claims(m).unwrap(),
+            Value::Object(m) => Principal::from_claims(m, Callers::Runs).unwrap(),
             other => panic!("{other}"),
         }
     }
 
     fn person(claims: Value) -> Principal {
-        Principal {
-            callers: Callers::People,
-            ..principal(claims)
+        match claims {
+            Value::Object(m) => Principal::from_claims(m, Callers::People).unwrap(),
+            other => panic!("{other}"),
         }
     }
 

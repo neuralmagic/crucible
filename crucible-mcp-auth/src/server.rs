@@ -124,7 +124,7 @@ pub struct ResourceServerConfig {
 
 pub struct ResourceServer {
     config: ResourceServerConfig,
-    verifiers: Vec<Verifier>,
+    issuers: Vec<Issuer>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,6 +151,12 @@ impl AuthError {
     }
 }
 
+/// A trusted issuer's verifier and the kind of caller its tokens stand for.
+struct Issuer {
+    verifier: Verifier,
+    callers: Callers,
+}
+
 impl ResourceServer {
     /// A server fetching each issuer's keys over `tls`, without following redirects.
     pub fn new(config: ResourceServerConfig, tls: &JwksTls) -> Result<Self, SetupError> {
@@ -174,12 +180,15 @@ impl ResourceServer {
 
     /// A server whose key sets `jwks` builds, one per configured issuer.
     pub fn with_jwks(config: ResourceServerConfig, jwks: impl Fn(&TrustedIssuer) -> Jwks) -> Self {
-        let verifiers = config
+        let issuers = config
             .issuers
             .iter()
-            .map(|trusted| Verifier::new(trusted.issuer.clone(), jwks(trusted)))
+            .map(|trusted| Issuer {
+                verifier: Verifier::new(trusted.issuer.clone(), jwks(trusted)),
+                callers: trusted.callers,
+            })
             .collect();
-        Self { config, verifiers }
+        Self { config, issuers }
     }
 
     pub fn config(&self) -> &ResourceServerConfig {
@@ -189,17 +198,14 @@ impl ResourceServer {
     /// Validate a compact JWS access token and return its principal.
     pub async fn validate(&self, token: &str) -> Result<Principal, TokenError> {
         let issuer = unverified_issuer(token)?;
-        let (verifier, trusted) = self
-            .verifiers
+        let trusted = self
+            .issuers
             .iter()
-            .zip(&self.config.issuers)
-            .find(|(v, _)| v.issuer() == issuer)
+            .find(|i| i.verifier.issuer() == issuer)
             .ok_or(TokenError::UnknownIssuer(issuer))?;
         let audiences: Vec<&str> = self.config.resources.iter().map(Url::as_str).collect();
-        let claims = verifier.verify(token, &audiences).await?;
-        let mut principal = Principal::from_claims(claims)?;
-        principal.callers = trusted.callers;
-        Ok(principal)
+        let claims = trusted.verifier.verify(token, &audiences).await?;
+        Ok(Principal::from_claims(claims, trusted.callers)?)
     }
 
     /// The bearer token's principal, with the server-wide scopes checked.

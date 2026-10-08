@@ -1043,6 +1043,7 @@ mod tests {
         );
         let principal = crucible_mcp_auth::principal::Principal::from_claims(
             verified(&issuer, &minted.access_token).await,
+            crucible_mcp_auth::principal::Callers::Runs,
         )
         .unwrap();
         assert_eq!(

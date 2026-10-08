@@ -41,8 +41,18 @@ pub trait AccessReview: Send + Sync {
     fn review<'a>(&'a self, principal: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a>;
 }
 
+/// A JSON-RPC method a server serves beyond `tools/*` and the protocol's own, with the scopes a
+/// call needs.
+#[derive(Debug, Clone, Copy)]
+pub struct MethodScopes {
+    pub method: &'static str,
+    pub scopes: &'static [&'static str],
+}
+
 pub struct PolicyGuard {
     pub policy: ToolPolicy,
+    /// The only other methods that pass; the rest are refused.
+    pub methods: &'static [MethodScopes],
     /// When set, a missing per-tool scope answers with this server's 403 step-up challenge.
     pub server: Option<Arc<ResourceServer>>,
     /// Reviews authorize rules' checks. A call that needs one without a reviewer is refused.
@@ -91,21 +101,27 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
         }
         Some(method) => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
-            let permitted = guard.policy.method_scopes(method).and_then(|required| {
-                let missing: Vec<String> = principal
-                    .missing_scopes(required)
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect();
-                if missing.is_empty() {
-                    Ok(())
-                } else {
-                    Err(Refusal::Scope {
-                        tool: method.to_string(),
-                        missing,
-                    })
+            let permitted = match guard.methods.iter().find(|m| m.method == method) {
+                None => Err(Refusal::Method {
+                    method: method.to_string(),
+                }),
+                Some(listed) => {
+                    let missing: Vec<String> = listed
+                        .scopes
+                        .iter()
+                        .filter(|s| !principal.scopes.contains(**s))
+                        .map(|s| s.to_string())
+                        .collect();
+                    if missing.is_empty() {
+                        Ok(())
+                    } else {
+                        Err(Refusal::Scope {
+                            tool: method.to_string(),
+                            missing,
+                        })
+                    }
                 }
-            });
+            };
             if let Err(refusal) = permitted {
                 tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "method refused");
                 return refuse(&guard, &parts.headers, id, refusal);
@@ -317,6 +333,7 @@ fn rewrite_sse(policy: &ToolPolicy, bytes: &Bytes) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use crate::guard::*;
+    use crate::principal::Callers;
     use crate::testing::{self, JwksServer};
     use axum::body::to_bytes;
     use std::time::Duration;
@@ -333,11 +350,18 @@ mod tests {
         rule = "args.queue in claims.queues"
         message = "queue is not in this run's allowlist"
         [tools.whoami]
-        [methods."tasks/get"]
-        scopes = ["kueue.read"]
-        [methods."tasks/cancel"]
-        scopes = ["kueue.submit"]
     "#;
+
+    const METHODS: &[MethodScopes] = &[
+        MethodScopes {
+            method: "tasks/get",
+            scopes: &["kueue.read"],
+        },
+        MethodScopes {
+            method: "tasks/cancel",
+            scopes: &["kueue.submit"],
+        },
+    ];
 
     const TOOLS: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
         {"name":"workload_plan","inputSchema":{"type":"object","properties":{"queue":{"type":"string"},"launched_by":{"type":"string"}},"required":["queue","launched_by"]}},
@@ -347,7 +371,7 @@ mod tests {
         let mut claims = testing::run_claims();
         claims["scope"] = json!(scope);
         match claims {
-            Value::Object(m) => Principal::from_claims(m).unwrap(),
+            Value::Object(m) => Principal::from_claims(m, Callers::Runs).unwrap(),
             _ => unreachable!(),
         }
     }
@@ -397,6 +421,7 @@ mod tests {
     fn guard(server: Option<Arc<ResourceServer>>) -> PolicyGuard {
         PolicyGuard {
             policy: ToolPolicy::from_toml(POLICY).unwrap(),
+            methods: METHODS,
             server,
             reviewer: None,
         }
@@ -721,14 +746,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_allow_all_policy_admits_any_method() {
-        let open = PolicyGuard {
+    async fn methods_come_from_the_servers_list_whatever_the_policy() {
+        let open = |methods| PolicyGuard {
             policy: ToolPolicy::allow_all(),
+            methods,
             server: None,
             reviewer: None,
         };
-        let app = app(open, Some(principal("")), false);
-        let (_, _, body, _) = post(app, rpc("tasks/cancel", json!({"taskId": "t"}))).await;
-        assert_eq!(body["received"]["method"], "tasks/cancel");
+        let app_with = |methods| app(open(methods), Some(principal("kueue.read")), false);
+        let (_, _, body, _) = post(app_with(&[]), rpc("tasks/get", json!({"taskId": "t"}))).await;
+        assert_eq!(
+            body["error"]["message"], "method tasks/get is not permitted by policy",
+            "{body}"
+        );
+        let (_, _, body, _) =
+            post(app_with(METHODS), rpc("tasks/get", json!({"taskId": "t"}))).await;
+        assert_eq!(body["received"]["method"], "tasks/get", "{body}");
+        let (_, _, body, _) = post(
+            app_with(METHODS),
+            rpc("tasks/cancel", json!({"taskId": "t"})),
+        )
+        .await;
+        assert_eq!(
+            body["error"]["message"], "tasks/cancel needs scope kueue.submit",
+            "{body}"
+        );
     }
 }

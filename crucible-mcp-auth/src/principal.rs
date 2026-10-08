@@ -47,9 +47,8 @@ pub enum ClaimsError {
 }
 
 impl Principal {
-    /// A run's principal; only [`crate::server::ResourceServer`] marks one as a person, from the
-    /// issuer that signed it.
-    pub fn from_claims(claims: Map<String, Value>) -> Result<Self, ClaimsError> {
+    /// The principal `claims` describe, for a caller of the kind its issuer serves.
+    pub fn from_claims(claims: Map<String, Value>, callers: Callers) -> Result<Self, ClaimsError> {
         let subject = claims
             .get("sub")
             .and_then(Value::as_str)
@@ -70,7 +69,7 @@ impl Principal {
             namespace,
             scopes,
             claims,
-            callers: Callers::Runs,
+            callers,
         })
     }
 
@@ -130,14 +129,17 @@ mod tests {
 
     #[test]
     fn a_delegated_token_names_the_human_as_subject_and_the_sandbox_as_presenter() {
-        let p = Principal::from_claims(claims(json!({
-            "sub": "alice",
-            "azp": "run-auth-spike",
-            "namespace": "team-e2e",
-            "scope": "kueue.read  kueue.submit",
-            "act": {"sub": "spiffe://example.crucible/openshell/sandbox/s1",
-                    "act": {"sub": "spiffe://example.crucible/controller"}},
-        })))
+        let p = Principal::from_claims(
+            claims(json!({
+                "sub": "alice",
+                "azp": "run-auth-spike",
+                "namespace": "team-e2e",
+                "scope": "kueue.read  kueue.submit",
+                "act": {"sub": "spiffe://example.crucible/openshell/sandbox/s1",
+                        "act": {"sub": "spiffe://example.crucible/controller"}},
+            })),
+            Callers::Runs,
+        )
         .unwrap();
         assert_eq!(p.subject, "alice");
         assert_eq!(
@@ -162,7 +164,7 @@ mod tests {
 
     #[test]
     fn an_undelegated_token_presents_as_its_subject() {
-        let p = Principal::from_claims(claims(json!({"sub": "alice"}))).unwrap();
+        let p = Principal::from_claims(claims(json!({"sub": "alice"})), Callers::Runs).unwrap();
         assert!(p.actor_chain.is_empty());
         assert_eq!(p.presenter(), "alice");
         assert!(p.scopes.is_empty());
@@ -191,7 +193,7 @@ mod tests {
         ];
         for (input, want) in cases {
             assert_eq!(
-                Principal::from_claims(claims(input.clone())),
+                Principal::from_claims(claims(input.clone()), Callers::Runs),
                 Err(want),
                 "{input}"
             );
@@ -204,13 +206,18 @@ mod tests {
         for i in 0..MAX_ACTOR_DEPTH {
             act = json!({"sub": format!("a{i}"), "act": act});
         }
-        let err = Principal::from_claims(claims(json!({"sub": "s", "act": act}))).unwrap_err();
+        let err = Principal::from_claims(claims(json!({"sub": "s", "act": act})), Callers::Runs)
+            .unwrap_err();
         assert_eq!(err, ClaimsError::ActorDepth);
     }
 
     #[test]
     fn missing_scopes_lists_only_what_is_absent() {
-        let p = Principal::from_claims(claims(json!({"sub": "a", "scope": "kueue.read"}))).unwrap();
+        let p = Principal::from_claims(
+            claims(json!({"sub": "a", "scope": "kueue.read"})),
+            Callers::Runs,
+        )
+        .unwrap();
         let required = ["kueue.read".to_string(), "kueue.submit".to_string()];
         assert_eq!(p.missing_scopes(&required), ["kueue.submit"]);
     }

@@ -89,6 +89,7 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
         );
     let guard = PolicyGuard {
         policy,
+        methods: server::METHODS,
         server: oidc.clone(),
         reviewer,
     };
