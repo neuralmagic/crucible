@@ -55,7 +55,7 @@ async fn spawn_server(context: &str, namespace: &str) -> Server {
             namespace,
             "--sandbox-workdir",
             "/sandbox",
-            "--issuer",
+            "--run-issuer",
             &format!("{0}={0}/protocol/openid-connect/certs", cluster::realm()),
             "--resource",
             &format!("http://localhost:{PORT}/mcp"),

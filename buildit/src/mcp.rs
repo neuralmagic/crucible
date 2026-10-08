@@ -36,8 +36,10 @@ use crate::step::{self, Fetch, Published, Snapshot, Status};
 use crate::task::{self, Progress, TaskRef};
 use crucible_mcp_auth::guard::PolicyGuard;
 use crucible_mcp_auth::policy::ToolPolicy;
-use crucible_mcp_auth::principal::Principal;
-use crucible_mcp_auth::server::{AuthError, ResourceServer, ResourceServerConfig, TrustedIssuer};
+use crucible_mcp_auth::principal::{Callers, Principal};
+use crucible_mcp_auth::server::{
+    AuthError, JwksTls, ResourceServer, ResourceServerConfig, TrustedIssuer,
+};
 
 pub const MCP_PATH: &str = "/mcp";
 
@@ -77,26 +79,35 @@ pub struct McpArgs {
     #[arg(long, env = "MCP_BIND", default_value = "0.0.0.0:8849")]
     pub bind: String,
     /// File of `<token> <sandbox> [<workdir>]` lines, re-read on every request
-    #[arg(long, env = "MCP_TOKENS_FILE", required_unless_present = "issuers")]
+    #[arg(long, env = "MCP_TOKENS_FILE", required_unless_present = "run_issuers")]
     pub tokens_file: Option<PathBuf>,
-    /// Accept access tokens from an OAuth issuer, as `<issuer>=<jwks uri>`, alongside the tokens
-    /// file. Repeat for each issuer (the crucible controller for agents, the realm for people)
+    /// Accept runs' access tokens from an OAuth issuer (the crucible controller), as
+    /// `<issuer>=<jwks uri>`, alongside the tokens file. Repeatable
     #[arg(
-        long = "issuer",
-        env = "MCP_ISSUERS",
+        long = "run-issuer",
+        env = "MCP_RUN_ISSUERS",
         value_delimiter = ',',
-        requires = "resources"
+        value_parser = TrustedIssuer::runs,
+        requires = "resources",
+        requires = "tool_policy"
     )]
-    pub issuers: Vec<TrustedIssuer>,
+    pub run_issuers: Vec<TrustedIssuer>,
     /// This server's canonical MCP URLs; an access token's aud must name one
     #[arg(
         long = "resource",
         env = "MCP_RESOURCES",
         value_delimiter = ',',
-        requires = "issuers"
+        requires = "run_issuers"
     )]
     pub resources: Vec<url::Url>,
-    /// TOML tool policy: per-tool scopes, CEL validate rules, claim-derived argument mutations
+    /// PEM bundle of CAs to trust for issuers' JWKS hosts, beside the platform roots
+    #[arg(long, env = "MCP_JWKS_CA")]
+    pub jwks_ca: Option<PathBuf>,
+    /// Allow plain-http JWKS URIs on non-loopback hosts. Only for a cluster network you trust
+    #[arg(long, env = "MCP_INSECURE_JWKS_HTTP")]
+    pub insecure_jwks_http: bool,
+    /// TOML tool policy: per-method and per-tool scopes, CEL validate and mutate rules. Required
+    /// with --run-issuer; without one, the tokens file decides alone
     #[arg(long, env = "MCP_TOOL_POLICY")]
     pub tool_policy: Option<PathBuf>,
     /// Sandbox workdir for token lines that name none
@@ -136,18 +147,22 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
     let namespace = args
         .namespace
         .unwrap_or_else(|| client.default_namespace().to_string());
-    let oidc = match args.issuers.is_empty() {
+    let oidc = match args.run_issuers.is_empty() {
         true => None,
         false => {
             let config = ResourceServerConfig {
-                issuers: args.issuers,
+                issuers: args.run_issuers,
                 resources: args.resources,
                 required_scopes: vec![SCOPE_READ.to_string()],
                 scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
                 resource_name: Some("buildit".to_string()),
             };
+            let tls = JwksTls {
+                ca_bundle: args.jwks_ca,
+                insecure_http: args.insecure_jwks_http,
+            };
             Some(Arc::new(
-                ResourceServer::new(config).context("building the JWKS client")?,
+                ResourceServer::new(config, &tls).context("building the resource server")?,
             ))
         }
     };
@@ -155,12 +170,10 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading tool policy {}", path.display()))?;
-            Some(
-                ToolPolicy::from_toml(&text)
-                    .with_context(|| format!("loading tool policy {}", path.display()))?,
-            )
+            ToolPolicy::from_toml(&text)
+                .with_context(|| format!("loading tool policy {}", path.display()))?
         }
-        None => None,
+        None => ToolPolicy::allow_all(),
     };
     let broker = Arc::new(Broker {
         client,
@@ -194,11 +207,9 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         .context("serving buildit mcp")
 }
 
-pub fn router(
-    broker: Arc<Broker>,
-    extra_hosts: &[String],
-    policy: Option<ToolPolicy>,
-) -> axum::Router {
+/// The MCP endpoint behind authentication and `policy`. A server that takes only tokens-file
+/// tokens may pass [`ToolPolicy::allow_all`]: the file already names each token's sandbox.
+pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -> axum::Router {
     let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
     hosts.extend(SANDBOX_HOSTS.map(String::from));
     hosts.extend(extra_hosts.iter().map(|h| h.trim().to_string()));
@@ -220,19 +231,18 @@ pub fn router(
             config,
         );
     let oidc = broker.oidc.clone();
-    let mut mcp = axum::Router::new().fallback_service(service);
-    if let Some(policy) = policy {
-        let guard = PolicyGuard {
-            policy,
-            server: oidc.clone(),
-            reviewer: None,
-        };
-        mcp = mcp.layer(axum::middleware::from_fn_with_state(
+    let guard = PolicyGuard {
+        policy,
+        server: oidc.clone(),
+        reviewer: None,
+    };
+    let mcp = axum::Router::new()
+        .fallback_service(service)
+        .layer(axum::middleware::from_fn_with_state(
             Arc::new(guard),
             crucible_mcp_auth::guard::enforce,
-        ));
-    }
-    mcp = mcp.layer(axum::middleware::from_fn_with_state(broker, authenticate));
+        ))
+        .layer(axum::middleware::from_fn_with_state(broker, authenticate));
     let app = axum::Router::new().nest_service(MCP_PATH, mcp);
     match oidc {
         Some(server) => app.merge(crucible_mcp_auth::metadata::router(server)),
@@ -354,8 +364,8 @@ impl Launcher {
 pub enum Refused {
     /// A realm token failed validation, or no token matched while OIDC is on.
     Token(AuthError),
-    /// A valid realm token that names no usable caller.
-    Claims(ClaimError),
+    /// A valid realm token that names no usable caller; why is logged, not returned.
+    Claims,
     /// The tokens-file path's own status.
     Status(StatusCode),
 }
@@ -372,6 +382,8 @@ pub enum ClaimError {
     Subject(String),
     #[error("sandbox {0} has no workdir and BROKER_SANDBOX_WORKDIR is unset")]
     NoWorkdir(String),
+    #[error("buildit serves runs only, not people's tokens")]
+    Person,
 }
 
 impl Caller {
@@ -395,6 +407,7 @@ impl Caller {
                 serde_json::Value::Object(m) => m,
                 _ => serde_json::Map::new(),
             },
+            callers: Callers::Runs,
         }
     }
 }
@@ -693,7 +706,7 @@ impl Broker {
             })?;
             let caller = self.realm_caller(&principal).map_err(|error| {
                 tracing::info!(auth = "oidc", sub = %principal.subject, %error, "token refused");
-                Refused::Claims(error)
+                Refused::Claims
             })?;
             tracing::info!(auth = "oidc", sub = %principal.subject, presenter = principal.presenter(), sandbox = caller.sandbox.as_str(), "caller authenticated");
             return Ok((caller, principal));
@@ -722,8 +735,11 @@ impl Broker {
         match (refused, &self.oidc) {
             (Refused::Token(error), Some(oidc)) => oidc.challenge(headers, &error),
             (Refused::Token(_), None) => StatusCode::UNAUTHORIZED.into_response(),
-            (Refused::Claims(error), _) => {
-                let body = serde_json::json!({"error": "insufficient_scope", "error_description": error.to_string()});
+            (Refused::Claims, _) => {
+                let body = serde_json::json!({
+                    "error": "insufficient_scope",
+                    "error_description": "the access token does not name a sandbox this server serves",
+                });
                 (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
             }
             (Refused::Status(status), _) => status.into_response(),
@@ -732,6 +748,9 @@ impl Broker {
 
     /// The caller a realm token names: its `sandbox` claim, optional `workdir`, and `sub`.
     fn realm_caller(&self, principal: &Principal) -> Result<Caller, ClaimError> {
+        if principal.callers != Callers::Runs {
+            return Err(ClaimError::Person);
+        }
         let raw = principal
             .claims
             .get("sandbox")
@@ -1149,8 +1168,13 @@ impl Broker {
         Ok(fetched)
     }
 
-    // None when the task is unknown to this caller
-    async fn observe(&self, caller: &Caller, t: &TaskRef) -> Result<Option<(Snapshot, View)>> {
+    // None when the task is unknown to this caller; only a caller who may build settles a run
+    async fn observe(
+        &self,
+        caller: &Caller,
+        t: &TaskRef,
+        may_build: bool,
+    ) -> Result<Option<(Snapshot, View)>> {
         let Some(found) = self.found(&caller.sandbox, &t.build).await? else {
             return Ok(None);
         };
@@ -1174,7 +1198,8 @@ impl Broker {
         let Some(mut snap) = step::snapshot(&pod, t.log).await? else {
             return Ok(None);
         };
-        if task::progress(&snap) == Progress::Publishing
+        if may_build
+            && task::progress(&snap) == Progress::Publishing
             && self
                 .settle(caller, &pod, &t.build, t.log, snap.fetch)
                 .await?
@@ -1288,6 +1313,13 @@ fn caller(ctx: &RequestContext<RoleServer>) -> Result<Caller> {
         .and_then(|parts| parts.extensions.get::<Caller>())
         .cloned()
         .ok_or_else(|| anyhow!("request reached a tool without an authenticated caller"))
+}
+
+fn may_build(ctx: &RequestContext<RoleServer>) -> bool {
+    ctx.extensions
+        .get::<Parts>()
+        .and_then(|parts| parts.extensions.get::<Principal>())
+        .is_some_and(|p| p.scopes.iter().any(|s| s == SCOPE_BUILD))
 }
 
 fn wants_task(ctx: &RequestContext<RoleServer>) -> bool {
@@ -1483,7 +1515,7 @@ impl ServerHandler for BuilditMcp {
         let t = task_ref(&request.task_id)?;
         let (snap, view) = self
             .broker
-            .observe(&caller, &t)
+            .observe(&caller, &t, may_build(&ctx))
             .await
             .map_err(internal)?
             .ok_or_else(|| unknown_task(&request.task_id))?;
@@ -1497,6 +1529,12 @@ impl ServerHandler for BuilditMcp {
     ) -> Result<(), McpError> {
         let caller = caller(&ctx).map_err(internal)?;
         let t = task_ref(&request.task_id)?;
+        if !may_build(&ctx) {
+            return Err(McpError::invalid_request(
+                format!("tasks/cancel needs scope {SCOPE_BUILD}"),
+                None,
+            ));
+        }
         self.broker
             .cancel(&caller, &t)
             .await
@@ -1525,6 +1563,8 @@ mod tests {
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crate::step::{State, Status};
+    use crucible_mcp_auth::principal::Callers;
+    use crucible_mcp_auth::server::JwksTls;
 
     fn broker(client: kube::Client, tokens: &Path, local: Option<&Path>) -> Arc<Broker> {
         broker_with_deadline(client, tokens, local, 900)
@@ -1572,9 +1612,16 @@ mod tests {
     }
 
     async fn serve(broker: Arc<Broker>) -> (String, tokio::task::JoinHandle<()>) {
+        serve_with(broker, ToolPolicy::allow_all()).await
+    }
+
+    async fn serve_with(
+        broker: Arc<Broker>,
+        policy: ToolPolicy,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let app = router(broker, &["builds.svc".to_string()], None);
+        let app = router(broker, &["builds.svc".to_string()], policy);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (addr, task)
     }
@@ -1697,6 +1744,7 @@ mod tests {
             issuers: vec![TrustedIssuer {
                 issuer: crucible_mcp_auth::testing::ISSUER.to_string(),
                 jwks_uri: jwks.url.clone(),
+                callers: Callers::Runs,
             }],
             resources: vec![url::Url::parse(RESOURCE).unwrap()],
             required_scopes: vec![SCOPE_READ.to_string()],
@@ -1704,7 +1752,9 @@ mod tests {
             resource_name: Some("buildit".to_string()),
         };
         let broker = Broker {
-            oidc: Some(Arc::new(ResourceServer::new(config).unwrap())),
+            oidc: Some(Arc::new(
+                ResourceServer::new(config, &JwksTls::default()).unwrap(),
+            )),
             ..Arc::into_inner(broker(offline_client(), file, None)).unwrap()
         };
         (jwks, Arc::new(broker))
@@ -1879,7 +1929,7 @@ mod tests {
         let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let app = router(broker, &[], Some(ToolPolicy::from_toml(POLICY).unwrap()));
+        let app = router(broker, &[], ToolPolicy::from_toml(POLICY).unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let token = crucible_mcp_auth::testing::sign("a", &realm_claims());
         let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"build","arguments":{"context":".","timeout_s":7200}}}"#;
@@ -1988,6 +2038,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_only_token_cannot_cancel_a_task_under_the_policy_or_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut claims = realm_claims();
+        claims["scope"] = serde_json::json!("buildit.read");
+        let token = crucible_mcp_auth::testing::sign("a", &claims);
+        let auth = |method: &str| {
+            format!(
+                "Authorization: Bearer {token}\r\nMCP-Protocol-Version: 2026-07-28\r\n\
+                 Mcp-Method: {method}\r\nMcp-Name: build/buildit-1\r\n"
+            )
+        };
+        let body = |method: &str| {
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 2, "method": method,
+                "params": {
+                    "taskId": "build/buildit-1",
+                    "_meta": {
+                        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                        "io.modelcontextprotocol/clientCapabilities": {
+                            "extensions": { "io.modelcontextprotocol/tasks": {} },
+                        },
+                    },
+                },
+            })
+            .to_string()
+        };
+        for (policy, guarded) in [
+            (ToolPolicy::from_toml(POLICY).unwrap(), true),
+            (ToolPolicy::allow_all(), false),
+        ] {
+            let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
+            let (addr, _task) = serve_with(broker, policy).await;
+            let (status, reply) = post(
+                &addr,
+                "127.0.0.1",
+                &auth("tasks/cancel"),
+                &body("tasks/cancel"),
+            )
+            .await;
+            if guarded {
+                assert_eq!(status, 403, "{reply}");
+                assert!(reply.contains("insufficient_scope"), "{reply}");
+            } else {
+                let reply = rpc_body(&reply);
+                assert_eq!(
+                    reply["error"]["message"], "tasks/cancel needs scope buildit.build",
+                    "{reply}"
+                );
+            }
+            let (_, reply) = post(&addr, "127.0.0.1", &auth("tasks/get"), &body("tasks/get")).await;
+            let reply = rpc_body(&reply);
+            assert_ne!(reply["error"]["code"], -32600, "a reader may poll: {reply}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_from_a_people_issuer_is_refused_whatever_its_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwks =
+            crucible_mcp_auth::testing::JwksServer::start(vec![crucible_mcp_auth::testing::jwk(
+                "a",
+            )])
+            .await;
+        let config = ResourceServerConfig {
+            issuers: vec![TrustedIssuer {
+                issuer: crucible_mcp_auth::testing::ISSUER.to_string(),
+                jwks_uri: jwks.url.clone(),
+                callers: Callers::People,
+            }],
+            resources: vec![url::Url::parse(RESOURCE).unwrap()],
+            required_scopes: vec![SCOPE_READ.to_string()],
+            scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
+            resource_name: Some("buildit".to_string()),
+        };
+        let broker = Broker {
+            oidc: Some(Arc::new(
+                ResourceServer::new(config, &JwksTls::default()).unwrap(),
+            )),
+            ..Arc::into_inner(broker(offline_client(), &tokens(dir.path(), ""), None)).unwrap()
+        };
+        let token = crucible_mcp_auth::testing::sign("a", &realm_claims());
+        let refused = broker
+            .authenticate(&bearer_header(&token))
+            .await
+            .unwrap_err();
+        let (status, _) = status_of(broker.respond(&bearer_header(&token), refused)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
     #[test]

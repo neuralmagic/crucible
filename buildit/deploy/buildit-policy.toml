@@ -1,6 +1,12 @@
 # buildit MCP tool policy (--tool-policy). Rules see `claims` (the access token's, or the
 # equivalent built for a tokens-file token) and `args` (the call's arguments). Unlisted tools
-# are denied.
+# are denied, and so are unlisted protocol methods.
+
+[methods."tasks/get"]
+scopes = ["buildit.read"]
+
+[methods."tasks/cancel"]
+scopes = ["buildit.build"]
 
 [tools.status]
 scopes = ["buildit.read"]
