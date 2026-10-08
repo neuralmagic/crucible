@@ -477,7 +477,7 @@ impl Gateway {
         // merged in afterwards by `update_policy_wait` (merge ops are additive, and only network
         // ops exist), so declaring paths cannot disturb egress. `include_workdir` must stay true —
         // it is what makes the agent's own workspace writable.
-        let policy = sandbox_filesystem_policy(read_only_paths);
+        let policy = sandbox_filesystem_policy(read_only_paths, resources.gpus);
         let request = scoped(CreateSandboxRequest {
             spec: Some(SandboxSpec {
                 providers: providers.to_vec(),
@@ -1222,8 +1222,8 @@ fn sandbox_driver_config(
 /// `/proc` and, critically, read-write `/dev/null`. A policy listing only the domain's paths takes
 /// those away and the sandbox breaks before it runs anything — bash cannot initialize without
 /// `/dev/null`, so every tool call fails with a shell that never started.
-fn sandbox_filesystem_policy(read_only_paths: &[String]) -> Option<SandboxPolicy> {
-    if read_only_paths.is_empty() {
+fn sandbox_filesystem_policy(read_only_paths: &[String], gpus: u32) -> Option<SandboxPolicy> {
+    if read_only_paths.is_empty() && gpus == 0 {
         return None;
     }
     let mut policy = openshell_policy::restrictive_default_policy();
@@ -1236,7 +1236,38 @@ fn sandbox_filesystem_policy(read_only_paths: &[String]) -> Option<SandboxPolicy
             filesystem.read_only.push(path.clone());
         }
     }
+    if gpus > 0 {
+        grant_gpu_paths(filesystem);
+    }
     Some(policy)
+}
+
+/// Device nodes take their host index, so a one-GPU sandbox may see only `/dev/nvidia5`.
+const MAX_GPU_DEVICE_INDEX: u32 = 16;
+
+/// The paths openshell's supervisor grants a GPU workload, which its kubernetes driver never
+/// requests. Absent paths are skipped under the default's best-effort landlock compatibility.
+fn grant_gpu_paths(filesystem: &mut FilesystemPolicy) {
+    let read_write = [
+        "/dev/nvidiactl",
+        "/dev/nvidia-uvm",
+        "/dev/nvidia-uvm-tools",
+        "/dev/nvidia-modeset",
+        "/proc",
+    ]
+    .map(String::from)
+    .into_iter()
+    .chain((0..MAX_GPU_DEVICE_INDEX).map(|i| format!("/dev/nvidia{i}")));
+    for path in read_write {
+        filesystem.read_only.retain(|p| *p != path);
+        if !filesystem.read_write.contains(&path) {
+            filesystem.read_write.push(path);
+        }
+    }
+    let persistenced = "/run/nvidia-persistenced".to_string();
+    if !filesystem.read_only.contains(&persistenced) {
+        filesystem.read_only.push(persistenced);
+    }
 }
 
 /// How a supervisor log line was identified as a policy denial. Callers that only need a yes/no
@@ -1674,10 +1705,13 @@ pYBZ
     /// — dropping it would take the agent's own workspace with it.
     #[test]
     fn declared_paths_ride_the_create_request_as_a_static_filesystem_policy() {
-        let policy = sandbox_filesystem_policy(&[
-            "/opt/ai_auto_analyze".to_string(),
-            "/opt/crucible-tools".to_string(),
-        ])
+        let policy = sandbox_filesystem_policy(
+            &[
+                "/opt/ai_auto_analyze".to_string(),
+                "/opt/crucible-tools".to_string(),
+            ],
+            0,
+        )
         .expect("declared paths must produce a policy");
         let fs = policy.filesystem.expect("filesystem half is set");
         assert!(fs.include_workdir, "the workspace must stay writable");
@@ -1712,7 +1746,47 @@ pYBZ
     /// than a crucible-authored one that happens to be empty.
     #[test]
     fn no_declared_paths_sends_no_policy() {
-        assert!(sandbox_filesystem_policy(&[]).is_none());
+        assert!(sandbox_filesystem_policy(&[], 0).is_none());
+    }
+
+    #[test]
+    fn gpu_sandbox_can_open_its_devices() {
+        let policy = sandbox_filesystem_policy(&[], 1).expect("a GPU sandbox carries a policy");
+        let fs = policy.filesystem.expect("filesystem half is set");
+        assert!(fs.include_workdir);
+        for rw in [
+            "/dev/nvidiactl",
+            "/dev/nvidia-uvm",
+            "/dev/nvidia-uvm-tools",
+            "/dev/nvidia-modeset",
+            "/dev/nvidia0",
+            "/dev/nvidia7",
+            "/dev/nvidia15",
+            "/proc",
+            "/dev/null",
+        ] {
+            assert!(
+                fs.read_write.iter().any(|p| p == rw),
+                "{rw}: {:?}",
+                fs.read_write
+            );
+        }
+        assert!(
+            !fs.read_only.iter().any(|p| p == "/proc"),
+            "/proc must not be listed read-only as well: {:?}",
+            fs.read_only
+        );
+        assert!(fs.read_only.iter().any(|p| p == "/run/nvidia-persistenced"));
+        assert!(fs.read_only.iter().any(|p| p == "/usr"));
+        assert!(fs.read_only.len() + fs.read_write.len() <= 256);
+    }
+
+    #[test]
+    fn cpu_sandbox_gets_no_gpu_paths() {
+        let policy = sandbox_filesystem_policy(&["/opt/x".to_string()], 0).expect("policy");
+        let fs = policy.filesystem.expect("filesystem half is set");
+        assert!(!fs.read_write.iter().any(|p| p.starts_with("/dev/nvidia")));
+        assert!(!fs.read_write.iter().any(|p| p == "/proc"));
     }
 
     fn gpu_placement() -> crate::openshell::placement::GpuPlacement {
