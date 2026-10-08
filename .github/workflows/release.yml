@@ -96,3 +96,48 @@ jobs:
           gh release create "$tag" \
             --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
           gh release upload "$tag" dist/* --clobber
+
+  # The macOS desktop app, signed ad hoc: a downloaded copy needs Open Anyway (or
+  # `xattr -d com.apple.quarantine`) on first launch.
+  desktop:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          cache-workspaces: crucible-desktop -> target
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+
+      - name: Build Crucible.app
+        working-directory: crucible-desktop
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || version="0.0.0"
+          bunx @tauri-apps/cli@2.12.1 build --bundles app --config "{\"version\":\"$version\"}"
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          name="Crucible-${tag}-aarch64-apple-darwin"
+          mkdir -p dist
+          ditto -c -k --keepParent crucible-desktop/target/release/bundle/macos/Crucible.app "dist/${name}.zip"
+          ( cd dist && shasum -a 256 "${name}.zip" > "${name}.zip.sha256" )
+          ls -la dist/
+
+      - name: Upload to release
+        if: ${{ github.ref_type == 'tag' || inputs.tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          gh release create "$tag" \
+            --title "$tag" --generate-notes --verify-tag 2>/dev/null || true
+          gh release upload "$tag" dist/* --clobber

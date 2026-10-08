@@ -1,0 +1,23 @@
+[package]
+name = "crucible-desktop"
+version = "0.0.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+tauri = { version = "2.12", features = ["tray-icon", "macos-proxy"] }
+tauri-plugin-notification = "2.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+url = "2"
+clap = { version = "4", features = ["derive", "env"] }
+crux = { path = "../crux" }
+toml = "0.8"
+objc2 = "0.6"

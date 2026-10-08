@@ -1,0 +1,52 @@
+name: Desktop
+
+# Format, lint and test the macOS desktop app (its own Cargo workspace, so ci.yml never builds it).
+# Runs only when the app or this workflow changes: macOS runner minutes are billed.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crucible-desktop/**'
+      - '.github/workflows/desktop.yml'
+  pull_request:
+    paths:
+      - 'crucible-desktop/**'
+      - '.github/workflows/desktop.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+
+jobs:
+  check:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          components: rustfmt, clippy
+          cache-workspaces: crucible-desktop -> target
+
+      - name: fmt
+        working-directory: crucible-desktop
+        run: cargo fmt --check
+
+      - name: clippy
+        working-directory: crucible-desktop
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      - name: test
+        working-directory: crucible-desktop
+        run: cargo test --locked

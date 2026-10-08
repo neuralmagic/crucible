@@ -1,0 +1,151 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Crucible Settings</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fafafa; --panel: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #d2d2d7;
+    --accent: #e66e28; --danger: #c0392b;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #1c1c1e; --panel: #2c2c2e; --fg: #f2f2f7; --muted: #98989d; --line: #3a3a3c; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 24px; background: var(--bg); color: var(--fg); font: 13px -apple-system, system-ui, sans-serif; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 24px 0 8px; }
+  h2:first-child { margin-top: 0; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font-weight: 500; color: var(--muted); padding: 4px 6px; }
+  td { padding: 4px 6px; }
+  input, select { width: 100%; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--line); border-radius: 5px; padding: 5px 7px; }
+  input[type=radio] { width: auto; }
+  button { font: inherit; border: 1px solid var(--line); background: var(--panel); color: var(--fg); border-radius: 5px; padding: 5px 12px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.link { border: 0; background: none; color: var(--danger); padding: 0 4px; }
+  .row { display: grid; grid-template-columns: 140px 1fr; gap: 8px; align-items: center; margin: 6px 0; }
+  .actions { display: flex; gap: 8px; justify-content: flex-end; align-items: center; margin-top: 20px; }
+  #message { flex: 1; color: var(--muted); }
+  #message.error { color: var(--danger); }
+</style>
+</head>
+<body>
+<h2>Profiles</h2>
+<div class="panel">
+  <table>
+    <thead><tr><th>Default</th><th>Name</th><th>UI URL</th><th>API</th><th>Proxy</th><th></th></tr></thead>
+    <tbody id="profiles"></tbody>
+  </table>
+  <button id="add">Add profile</button>
+</div>
+
+<h2>Local controller</h2>
+<div class="panel">
+  <div class="row"><label for="repo">Checkout</label><input id="repo" placeholder="the checkout this app was built in"></div>
+</div>
+
+<h2>Drop a pack on the Dock</h2>
+<div class="panel">
+  <div class="row"><label for="drop-profile">Launch on</label><select id="drop-profile"></select></div>
+  <div class="row"><label for="max-cost">Max cost (USD)</label><input id="max-cost" type="number" min="0.01" step="0.01"></div>
+  <div class="row"><label for="max-time">Max time</label><input id="max-time" placeholder="30m"></div>
+</div>
+
+<div class="actions">
+  <span id="message"></span>
+  <button id="save" class="primary">Save</button>
+</div>
+
+<template id="profile-row">
+  <tr>
+    <td><input type="radio" name="default"></td>
+    <td><input class="name" placeholder="mpp"></td>
+    <td><input class="url" placeholder="https://crucible.example.com"></td>
+    <td><select class="api"><option value="ui">UI URL, no key</option><option value="crux">crux config</option></select></td>
+    <td><input class="proxy" placeholder="socks5://127.0.0.1:1080"></td>
+    <td><button class="link remove" title="Remove">✕</button></td>
+  </tr>
+</template>
+
+<script>
+  const invoke = (cmd, args) => window.__TAURI_INTERNALS__.invoke(cmd, args);
+  const $ = (id) => document.getElementById(id);
+  const rows = $("profiles");
+
+  const addRow = (name = "", profile = { url: "", api: "ui" }, isDefault = false) => {
+    const row = $("profile-row").content.firstElementChild.cloneNode(true);
+    row.querySelector(".name").value = name;
+    row.querySelector(".url").value = profile.url;
+    row.querySelector(".api").value = profile.api ?? "ui";
+    row.querySelector(".proxy").value = profile.proxy ?? "";
+    row.querySelector("input[type=radio]").checked = isDefault;
+    row.querySelector(".remove").onclick = () => { row.remove(); syncDropChoices(); };
+    row.querySelector(".name").oninput = syncDropChoices;
+    rows.append(row);
+  };
+
+  const names = () => [...rows.querySelectorAll(".name")].map((i) => i.value.trim()).filter(Boolean);
+
+  const syncDropChoices = (chosen) => {
+    const select = $("drop-profile");
+    const keep = typeof chosen === "string" ? chosen : select.value;
+    select.replaceChildren(new Option("First local profile", ""), ...names().map((n) => new Option(n, n)));
+    select.value = names().includes(keep) ? keep : "";
+  };
+
+  const collect = () => {
+    const profiles = {};
+    let defaultProfile = null;
+    for (const row of rows.children) {
+      const name = row.querySelector(".name").value.trim();
+      if (!name) continue;
+      const profile = { url: row.querySelector(".url").value.trim(), api: row.querySelector(".api").value };
+      const proxy = row.querySelector(".proxy").value.trim();
+      if (proxy) profile.proxy = proxy;
+      profiles[name] = profile;
+      if (row.querySelector("input[type=radio]").checked) defaultProfile = name;
+    }
+    const settings = {
+      profiles,
+      drop: { max_cost: Number($("max-cost").value), max_time: $("max-time").value.trim() },
+    };
+    if (defaultProfile) settings.default_profile = defaultProfile;
+    if ($("drop-profile").value) settings.drop.profile = $("drop-profile").value;
+    if ($("repo").value.trim()) settings.repo = $("repo").value.trim();
+    return settings;
+  };
+
+  const say = (text, error = false) => {
+    $("message").textContent = text;
+    $("message").className = error ? "error" : "";
+  };
+
+  $("add").onclick = () => addRow();
+  $("save").onclick = async () => {
+    try {
+      await invoke("save_settings", { settings: collect() });
+      say("Saved");
+    } catch (err) {
+      say(String(err), true);
+    }
+  };
+
+  (async () => {
+    try {
+      const settings = await invoke("get_settings");
+      for (const [name, profile] of Object.entries(settings.profiles)) {
+        addRow(name, profile, name === settings.default_profile);
+      }
+      $("max-cost").value = settings.drop.max_cost;
+      $("max-time").value = settings.drop.max_time;
+      $("repo").value = settings.repo ?? "";
+      syncDropChoices(settings.drop.profile ?? "");
+    } catch (err) {
+      say(String(err), true);
+    }
+  })();
+</script>
+</body>
+</html>
