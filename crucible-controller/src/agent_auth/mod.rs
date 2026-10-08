@@ -14,7 +14,9 @@
 //! alone, and the JWKS and metadata documents are public.
 
 pub mod bindings;
+pub mod directory;
 pub mod issuer;
+pub mod placement;
 #[cfg(test)]
 mod testing;
 
@@ -32,9 +34,10 @@ use std::sync::Arc;
 pub struct AgentAuth {
     pub issuer: AgentIssuer,
     pub pool: PgPool,
-    /// The deploy profile whose `[kueue]` table scopes a run's tenant claims, read per request
-    /// like the dispatch path reads it.
+    /// The deploy profile naming the sandbox namespace and, in `[kueue]`, a run's tenant claims;
+    /// read per request like the dispatch path reads it.
     pub deploy_profile: Option<PathBuf>,
+    pub directory: Arc<dyn directory::SandboxDirectory>,
 }
 
 impl AgentAuth {
@@ -42,11 +45,18 @@ impl AgentAuth {
     pub fn from_env(
         pool: PgPool,
         deploy_profile: Option<PathBuf>,
+        clusters: Arc<crate::runs::clusters::ClusterClients>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         use anyhow::Context;
         let Some(cfg) = issuer::AgentIssuerConfig::from_env()? else {
             return Ok(None);
         };
+        let profile_path = deploy_profile
+            .as_deref()
+            .ok_or(placement::PlacementError::NoProfile)?;
+        let profile = crucible::deploy::DeployProfile::load(profile_path)
+            .context("reading the deploy profile for the agent issuer")?;
+        placement::check_key_placement(placement::controller_namespace().as_deref(), &profile)?;
         let http = cfg.svid_http().context("building the SPIRE JWKS client")?;
         let jwks = crucible_mcp_auth::jwks::Jwks::new(http, cfg.svid_jwks_uri.clone());
         tracing::info!(
@@ -60,6 +70,7 @@ impl AgentAuth {
             issuer: AgentIssuer::new(cfg, jwks),
             pool,
             deploy_profile,
+            directory: Arc::new(directory::KubeDirectory(clusters)),
         })))
     }
 }
@@ -84,28 +95,78 @@ struct TokenRequest {
     scope: Option<String>,
 }
 
-/// RFC 6749 §5.2 and RFC 8707 §2 token endpoint errors.
+/// RFC 6749 §5.2 and RFC 8707 §2 token endpoint errors. The detail each carries is logged, never
+/// returned: a caller holding a stolen or forged assertion learns only the error code.
 #[derive(Debug)]
 enum OAuthError {
     InvalidRequest(String),
     InvalidClient(String),
     InvalidGrant(String),
+    UnauthorizedClient(String),
     UnsupportedGrantType(String),
     InvalidScope(String),
     InvalidTarget(String),
     Server(String),
 }
 
+impl OAuthError {
+    fn detail(&self) -> &str {
+        match self {
+            Self::InvalidRequest(d)
+            | Self::InvalidClient(d)
+            | Self::InvalidGrant(d)
+            | Self::UnauthorizedClient(d)
+            | Self::UnsupportedGrantType(d)
+            | Self::InvalidScope(d)
+            | Self::InvalidTarget(d)
+            | Self::Server(d) => d,
+        }
+    }
+}
+
 impl IntoResponse for OAuthError {
     fn into_response(self) -> Response {
         let (status, code, description) = match self {
-            Self::InvalidRequest(d) => (StatusCode::BAD_REQUEST, "invalid_request", d),
-            Self::InvalidClient(d) => (StatusCode::UNAUTHORIZED, "invalid_client", d),
-            Self::InvalidGrant(d) => (StatusCode::BAD_REQUEST, "invalid_grant", d),
-            Self::UnsupportedGrantType(d) => (StatusCode::BAD_REQUEST, "unsupported_grant_type", d),
-            Self::InvalidScope(d) => (StatusCode::BAD_REQUEST, "invalid_scope", d),
-            Self::InvalidTarget(d) => (StatusCode::BAD_REQUEST, "invalid_target", d),
-            Self::Server(d) => (StatusCode::INTERNAL_SERVER_ERROR, "server_error", d),
+            Self::InvalidRequest(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "the token request is malformed",
+            ),
+            Self::InvalidClient(_) => (
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
+                "the client assertion was not accepted",
+            ),
+            Self::InvalidGrant(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "no token can be issued for this sandbox",
+            ),
+            Self::UnauthorizedClient(_) => (
+                StatusCode::BAD_REQUEST,
+                "unauthorized_client",
+                "this deployment issues no agent tokens",
+            ),
+            Self::UnsupportedGrantType(_) => (
+                StatusCode::BAD_REQUEST,
+                "unsupported_grant_type",
+                "only client_credentials is supported",
+            ),
+            Self::InvalidScope(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "a requested scope is not available",
+            ),
+            Self::InvalidTarget(_) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "the requested audience is not available",
+            ),
+            Self::Server(_) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "the token could not be issued",
+            ),
         };
         no_store(
             (
@@ -145,7 +206,7 @@ async fn token(
     match issue(&state, form).await {
         Ok(response) => response,
         Err(error) => {
-            tracing::info!(?error, "agent token refused");
+            tracing::info!(reason = error.detail(), "agent token refused");
             error.into_response()
         }
     }
@@ -156,6 +217,11 @@ async fn issue(
     form: Result<axum::Form<TokenRequest>, FormRejection>,
 ) -> Result<Response, OAuthError> {
     let axum::Form(req) = form.map_err(|e| OAuthError::InvalidRequest(e.body_text()))?;
+    let profile = placement::load_profile(state.deploy_profile.as_deref())
+        .await
+        .map_err(|e| OAuthError::Server(format!("reading the deploy profile: {e:#}")))?;
+    placement::sandbox_namespace(profile.as_ref())
+        .map_err(|e| OAuthError::UnauthorizedClient(e.to_string()))?;
     if req.grant_type != "client_credentials" {
         return Err(OAuthError::UnsupportedGrantType(format!(
             "grant_type {:?} is not client_credentials",
@@ -187,17 +253,14 @@ async fn issue(
             e => OAuthError::InvalidGrant(e.to_string()),
         })?;
     let launcher = issuer::launcher(&run)?;
-    let kueue = crate::runs::workpod::kueue::load_cfg(state.deploy_profile.clone())
-        .await
-        .map_err(|e| OAuthError::Server(format!("reading the deploy profile: {e:#}")))?;
-    let tenant = kueue
-        .as_ref()
-        .and_then(|k| TenantScope::for_run(k, &run.cluster));
+    let kueue = profile.as_ref().and_then(|p| p.kueue.as_ref());
+    let tenant = kueue.and_then(|k| TenantScope::for_run(k, &run.cluster));
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience, tenant.as_ref())?;
     let kube_user = crate::identity::kube_identity::effective(&state.pool, &launcher)
         .await
         .map_err(|e| OAuthError::Server(format!("{e:#}")))?;
-    let required = kueue.as_ref().is_some_and(|k| k.require_kube_user);
+    let required = kueue.is_some_and(|k| k.require_kube_user)
+        && scopes.iter().any(|s| issuer::governed_by_role(s));
     match (&kube_user, required) {
         (None, true) => {
             return Err(GrantError::NoKubeUser {
@@ -278,14 +341,7 @@ mod tests {
 
     async fn harness_with(pool: PgPool, profile_toml: &str) -> Harness {
         let spire = Spire::start().await;
-        let profile = tempfile::tempdir().unwrap();
-        let path = profile.path().join("profile.toml");
-        std::fs::write(&path, profile_toml).unwrap();
-        let state = Arc::new(AgentAuth {
-            issuer: testing::issuer(&spire, &EcKey::generate()),
-            pool,
-            deploy_profile: Some(path),
-        });
+        let (state, profile) = testing::agent_auth(&pool, &spire, profile_toml, &[]);
         Harness {
             spire,
             app: router(state.clone()),
@@ -343,7 +399,13 @@ mod tests {
         (status, cache, serde_json::from_slice(&bytes).unwrap())
     }
 
+    /// A running run with `sandbox` bound, launched by alice, whose Kubernetes username is known.
     async fn bound(pool: &PgPool, sandbox: &str) {
+        bound_unlinked(pool, sandbox).await;
+        link(pool, "alice-k8s").await;
+    }
+
+    async fn bound_unlinked(pool: &PgPool, sandbox: &str) {
         running_run(
             pool,
             "crucible-run-brave-otter",
@@ -451,40 +513,78 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn an_unknown_kubernetes_username_is_omitted_or_refused_as_the_profile_says(
+    async fn an_unknown_kubernetes_username_refuses_kueue_tokens_unless_the_profile_waives_it(
         pool: PgPool,
     ) {
-        bound(&pool, "sbx-1").await;
-        let lenient = harness(pool.clone()).await;
-        let svid = lenient.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&lenient.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
-        assert!(claims_of(&body).get("kube_user").is_none());
-
-        let strict = harness_with(
-            pool.clone(),
-            &format!("{PROFILE}require_kube_user = true\n"),
-        )
-        .await;
+        bound_unlinked(&pool, "sbx-1").await;
+        let strict = harness(pool.clone()).await;
         let svid = strict.spire.svid(&Spire::claims("sbx-1"));
         let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
         assert_eq!(
             (status, body["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("invalid_grant")),
-            "{body}"
+            "required by default: {body}"
         );
-        assert!(
-            body["error_description"]
-                .as_str()
-                .unwrap()
-                .contains("kubernetes username"),
-            "{body}"
+        let (status, _, body) =
+            post(&strict.app, &form(&svid, &[("audience", testing::BUILDIT)])).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a buildit token runs no SubjectAccessReview: {body}"
         );
+        assert!(claims_of(&body).get("kube_user").is_none());
+
+        let lenient = harness_with(
+            pool.clone(),
+            &format!("{PROFILE}require_kube_user = false\n"),
+        )
+        .await;
+        let svid = lenient.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&lenient.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(claims_of(&body).get("kube_user").is_none());
 
         link(&pool, "alice-k8s").await;
+        let svid = strict.spire.svid(&Spire::claims("sbx-1"));
         let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(claims_of(&body)["kube_user"], "alice-k8s");
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_deployment_without_a_sandbox_namespace_issues_nothing(pool: PgPool) {
+        bound(&pool, "sbx-1").await;
+        let unplaced = harness_with(
+            pool,
+            &PROFILE.replace("sandbox_namespace = \"sandboxes\"\n", ""),
+        )
+        .await;
+        let svid = unplaced.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&unplaced.app, &form(&svid, &[])).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("unauthorized_client")),
+            "{body}"
+        );
+        assert!(body.get("access_token").is_none());
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn refusals_describe_nothing_beyond_the_error_code(pool: PgPool) {
+        bound(&pool, "sbx-1").await;
+        let h = harness(pool).await;
+        let forged = testing::sign(&EcKey::generate(), "spire", &Spire::claims("sbx-1"));
+        let (_, _, body) = post(&h.app, &form(&forged, &[])).await;
+        assert_eq!(
+            body,
+            json!({"error": "invalid_client", "error_description": "the client assertion was not accepted"})
+        );
+        let unbound = h.spire.svid(&Spire::claims("sbx-unbound"));
+        let (_, _, body) = post(&h.app, &form(&unbound, &[])).await;
+        assert_eq!(
+            body,
+            json!({"error": "invalid_grant", "error_description": "no token can be issued for this sandbox"})
+        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -700,13 +800,6 @@ mod tests {
         assert_eq!(
             (status, body["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("invalid_grant"))
-        );
-        assert!(
-            body["error_description"]
-                .as_str()
-                .unwrap()
-                .contains("collected"),
-            "{body}"
         );
     }
 

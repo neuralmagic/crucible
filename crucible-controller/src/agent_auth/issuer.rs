@@ -28,6 +28,10 @@ pub const JWT_BEARER: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-be
 
 const JTI_BYTES: usize = 16;
 
+/// The longest a JWT-SVID may live, `exp` minus `iat`. SPIRE issues them for five minutes by
+/// default; a longer-lived assertion is a replayable credential.
+pub const MAX_SVID_LIFETIME_SECS: i64 = 900;
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("{var} is required when CONTROLLER_AGENT_ISSUER is set")]
@@ -167,7 +171,7 @@ impl std::str::FromStr for Audience {
 }
 
 /// Scopes crucible-kueue authorizes by tenant role: granted only as far as the run's role allows.
-fn governed_by_role(scope: &str) -> bool {
+pub(crate) fn governed_by_role(scope: &str) -> bool {
     TenantRole::Submitter.scopes().contains(&scope)
 }
 
@@ -265,6 +269,12 @@ pub enum AssertionError {
     Audience { expected: String, got: Value },
     #[error("assertion sub {sub:?} is not a sandbox under {prefix}")]
     NotASandbox { sub: String, prefix: String },
+    #[error("assertion has no numeric iat")]
+    NoIssuedAt,
+    #[error("assertion iat {iat} is in the future")]
+    IssuedInFuture { iat: i64 },
+    #[error("assertion lives {lifetime}s, past the {MAX_SVID_LIFETIME_SECS}s maximum")]
+    Lifetime { lifetime: i64 },
     #[error(transparent)]
     SandboxId(#[from] SandboxIdError),
 }
@@ -455,6 +465,23 @@ impl AgentIssuer {
                 got: aud,
             });
         }
+        let iat = claims
+            .get("iat")
+            .and_then(Value::as_i64)
+            .ok_or(AssertionError::NoIssuedAt)?;
+        let exp = claims
+            .get("exp")
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX);
+        let now = i64::try_from(jsonwebtoken::get_current_timestamp()).unwrap_or(i64::MAX);
+        let leeway = i64::try_from(crucible_mcp_auth::verify::LEEWAY_SECS).unwrap_or(0);
+        if iat > now.saturating_add(leeway) {
+            return Err(AssertionError::IssuedInFuture { iat });
+        }
+        let lifetime = exp.saturating_sub(iat);
+        if lifetime > MAX_SVID_LIFETIME_SECS {
+            return Err(AssertionError::Lifetime { lifetime });
+        }
         let sub = claims
             .get("sub")
             .and_then(Value::as_str)
@@ -502,10 +529,12 @@ impl AgentIssuer {
             "jti": crucible_contract::artifact::lower_hex(&jti),
             "act": {"sub": grant.sandbox.spiffe_id},
             "run_id": grant.run.pod_name,
-            "sandbox": grant.run.sandbox_name,
             "scope": scope,
         });
         if let Some(map) = claims.as_object_mut() {
+            if let Some(name) = &grant.run.sandbox_name {
+                map.insert("sandbox".into(), json!(name));
+            }
             if let Some(kube_user) = &grant.kube_user {
                 map.insert("kube_user".into(), json!(kube_user));
             }
@@ -655,6 +684,26 @@ mod tests {
                 })),
             ),
             (
+                "no iat",
+                spire.svid(&with(base(), |c| {
+                    c.remove("iat");
+                })),
+            ),
+            (
+                "an iat in the future",
+                spire.svid(&with(base(), |c| {
+                    c.insert("iat".into(), json!(now() + 600));
+                    c.insert("exp".into(), json!(now() + 900));
+                })),
+            ),
+            (
+                "a lifetime past the maximum",
+                spire.svid(&with(base(), |c| {
+                    c.insert("iat".into(), json!(now()));
+                    c.insert("exp".into(), json!(now() + 3600));
+                })),
+            ),
+            (
                 "another issuer",
                 spire.svid(&with(base(), |c| {
                     c.insert("iss".into(), json!("https://oidc-discovery.evil.example"));
@@ -800,7 +849,7 @@ mod tests {
             pod_name: "crucible-run-brave-otter".into(),
             cluster: CLUSTER.into(),
             attributed_to: attributed_to.map(str::to_string),
-            sandbox_name: "ci-0123abcd".into(),
+            sandbox_name: Some("ci-0123abcd".into()),
             workdir: Some("/sandbox/repo".into()),
         }
     }

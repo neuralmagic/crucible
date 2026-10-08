@@ -160,9 +160,10 @@ pub struct KueueCfg {
     /// so the Service is addressed by its fully qualified name.
     #[serde(default = "default_cluster_domain")]
     pub cluster_domain: String,
-    /// Refuse a run's agent token when its launcher has no known Kubernetes username, so every run
-    /// is bound by its launcher's RBAC. Off, such a token carries no `kube_user` claim.
-    #[serde(default)]
+    /// Refuse a run's crucible-kueue-scoped agent token when its launcher has no known Kubernetes
+    /// username, so every run is bound by its launcher's RBAC. Off, such a token carries no
+    /// `kube_user` claim and is limited by its claims alone.
+    #[serde(default = "require_kube_user")]
     pub require_kube_user: bool,
 }
 
@@ -172,6 +173,10 @@ fn hub_cluster() -> String {
 
 fn submitter() -> crucible_contract::kueue::TenantRole {
     crucible_contract::kueue::TenantRole::Submitter
+}
+
+fn require_kube_user() -> bool {
+    true
 }
 
 fn default_token_ttl_secs() -> u64 {

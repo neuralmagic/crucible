@@ -1150,6 +1150,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     let agent_auth = crucible_controller::agent_auth::AgentAuth::from_env(
         db.pool().clone(),
         cfg.deploy_profile.clone(),
+        clusters.clone(),
     )
     .context("configuring the agent token issuer")?;
     let surface = crucible_controller::Surface::bind(
