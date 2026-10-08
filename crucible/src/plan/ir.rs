@@ -6,7 +6,8 @@ use crate::duration::TaskTimeout;
 use crate::plan::param::ParamValue;
 use anyhow::{Context, Result};
 use crucible_contract::decision::{
-    Label, OptionSource, Question, QuestionError, QuestionId, QuestionKind, UNCERTAIN,
+    CompiledQuestion, Label, OptionSource, Question, QuestionError, QuestionId, QuestionKind,
+    UNCERTAIN,
 };
 use crucible_contract::emits::{DeclaredFile, FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
@@ -346,7 +347,7 @@ pub enum TaskKind {
     TopK { k: u32, direction: Direction },
     /// Engine-owned call to a decision model; the output is one typed answer per question.
     Route {
-        questions: BTreeMap<QuestionId, Question>,
+        questions: BTreeMap<QuestionId, CompiledQuestion>,
         decider: Decider,
     },
     /// A capability-owned engine operation.
@@ -1259,7 +1260,7 @@ pub(crate) fn typed_answers<'a>(
     else {
         return None;
     };
-    let asked = questions.get(question)?;
+    let asked = questions.get(question)?.declared()?;
     let source = find(source)?;
     let Declared::Typed(declared) = source.emits.field(question.as_str()) else {
         return None;
@@ -1281,19 +1282,35 @@ fn answerable_types(question: &Question) -> String {
     let labels = format!("labels from {}", labels.join("|"));
     match question.kind {
         QuestionKind::Noul => format!("\"boolean\" or {labels}"),
-        QuestionKind::Choice { .. }
-        | QuestionKind::Score { .. }
-        | QuestionKind::DynamicChoice { .. } => labels,
+        QuestionKind::Choice { .. } | QuestionKind::Score { .. } => labels,
     }
 }
 
+/// An output-decided route's questions as asked. Validation admits a dynamic choice only on a
+/// model-decided route, and refuses one here.
+pub fn declared_questions(
+    task: &TaskName,
+    questions: &BTreeMap<QuestionId, CompiledQuestion>,
+) -> Result<BTreeMap<QuestionId, Question>, PlanError> {
+    questions
+        .iter()
+        .map(|(id, question)| match question {
+            CompiledQuestion::Declared(question) => Ok((id.clone(), question.clone())),
+            CompiledQuestion::Dynamic(dynamic) => Err(PlanError::DynamicOptionsOnOutputRoute {
+                task: task.0.clone(),
+                question: id.to_string(),
+                reference: dynamic.options_from.to_string(),
+            }),
+        })
+        .collect()
+}
+
 impl Plan {
-    /// A dynamic choice's `options_from`: a model-decided route reading a field of an unmapped
-    /// dependency, typed as a list, or for a mapped route as an object keyed by element.
+    /// A dynamic choice's `options_from`: a field of an unmapped dependency, typed as a list, or
+    /// for a mapped route as an object keyed by element.
     fn validate_options_from(
         &self,
         route: &Task,
-        decider: &Decider,
         question: &QuestionId,
         source: &OptionSource,
         index: &BTreeMap<&TaskName, usize>,
@@ -1301,13 +1318,6 @@ impl Plan {
         let task = || route.name.0.clone();
         let question = || question.to_string();
         let reference = || source.to_string();
-        if let Decider::Output { .. } = decider {
-            return Err(PlanError::DynamicOptionsOnOutputRoute {
-                task: task(),
-                question: question(),
-                reference: reference(),
-            });
-        }
         let Some(producer) = route
             .depends_on
             .iter()
@@ -1599,7 +1609,7 @@ impl Plan {
                             error,
                         })?;
                     if let Some(source) = question.options_from() {
-                        self.validate_options_from(t, decider, id, source, &index)?;
+                        self.validate_options_from(t, id, source, &index)?;
                     }
                 }
                 match decider {
@@ -1633,7 +1643,7 @@ impl Plan {
                                 source_task: source.0.clone(),
                             });
                         }
-                        for (id, question) in questions {
+                        for (id, question) in &declared_questions(&t.name, questions)? {
                             if keyed_source {
                                 if let Declared::Typed(declared) = emits.field(id.as_str())
                                     && !declared.is_object()
@@ -2128,7 +2138,7 @@ impl Plan {
                         .as_ref()
                         .is_none_or(|possible| possible.contains(l))
                 })
-                .filter(|l| !listed.contains(l) && !asked.drop.contains(l))
+                .filter(|l| !listed.contains(l) && !asked.drop().contains(l))
                 .map(|l| l.to_string())
                 .collect();
             if !unrouted.is_empty() {
@@ -2346,7 +2356,7 @@ mod tests {
     fn model_route(name: &str, deps: &[&str], drop: &[&str]) -> Task {
         Task {
             task: TaskKind::Route {
-                questions: BTreeMap::from([(qid("area"), area_question(drop))]),
+                questions: BTreeMap::from([(qid("area"), area_question(drop).into())]),
                 decider: Decider::Model {
                     min_confidence: 0.8,
                     files: Vec::new(),
@@ -2360,7 +2370,7 @@ mod tests {
     fn output_route(name: &str, source: &str, drop: &[&str]) -> Task {
         Task {
             task: TaskKind::Route {
-                questions: BTreeMap::from([(qid("area"), area_question(drop))]),
+                questions: BTreeMap::from([(qid("area"), area_question(drop).into())]),
                 decider: Decider::Output {
                     task: source.into(),
                 },
@@ -2419,7 +2429,7 @@ mod tests {
             let TaskKind::Route { questions, decider } = &back.tasks[1].task else {
                 panic!("gate is not a route");
             };
-            assert_eq!(questions[&qid("area")], area_question(&[]));
+            assert_eq!(questions[&qid("area")], area_question(&[]).into());
             assert_eq!(
                 *decider,
                 Decider::Model {
@@ -2506,7 +2516,9 @@ mod tests {
             }
         );
         if let TaskKind::Route { questions, .. } = &mut gate.task {
-            let q = questions.get_mut(&qid("area")).unwrap();
+            let Some(CompiledQuestion::Declared(q)) = questions.get_mut(&qid("area")) else {
+                panic!("area is declared");
+            };
             q.drop.clear();
             q.instructions = String::new();
         }
@@ -3477,7 +3489,8 @@ emits = ["lines"]
                         instructions: "Urgent?".into(),
                         kind: QuestionKind::Noul,
                         drop: Vec::new(),
-                    },
+                    }
+                    .into(),
                 )]),
                 decider: Decider::Output {
                     task: source.into(),
@@ -5079,7 +5092,8 @@ emits = ["lines"]
                                 .collect(),
                         },
                         drop: Vec::new(),
-                    },
+                    }
+                    .into(),
                 )]),
                 decider: Decider::Output {
                     task: "classify".into(),
@@ -5152,21 +5166,19 @@ emits = ["lines"]
         );
     }
 
-    fn package_question(field: &str, drop: &[&str]) -> Question {
-        use crucible_contract::decision::{OptionSource, QuestionKind};
-        Question {
+    fn package_question(field: &str, drop: &[&str]) -> CompiledQuestion {
+        use crucible_contract::decision::{DynamicChoice, OptionSource};
+        CompiledQuestion::Dynamic(DynamicChoice {
             instructions: "Which shipped package does the flaw affect?".into(),
-            kind: QuestionKind::DynamicChoice {
-                options_from: OptionSource {
-                    task: "prepare".into(),
-                    field: field.into(),
-                },
+            options_from: OptionSource {
+                task: "prepare".into(),
+                field: field.into(),
             },
             drop: drop.iter().map(|l| label(l)).collect(),
-        }
+        })
     }
 
-    fn dynamic_route(question: Question) -> Task {
+    fn dynamic_route(question: CompiledQuestion) -> Task {
         Task {
             task: TaskKind::Route {
                 questions: BTreeMap::from([(qid("package"), question)]),

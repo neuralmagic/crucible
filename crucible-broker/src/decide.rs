@@ -14,8 +14,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crucible_contract::decision::{
-    Answer, AskedAs, Decision, Label, NOUL_NO, NOUL_YES, OptionSource, Question, QuestionId,
-    QuestionKind,
+    Answer, AskedAs, Decision, Label, NOUL_NO, NOUL_YES, Question, QuestionId, QuestionKind,
 };
 use crucible_contract::inference::{InferenceBinding, InferenceProtocol};
 use serde::Deserialize;
@@ -37,14 +36,12 @@ impl DecisionApi {
         }
     }
 
-    /// The request asking `questions` about `state`. Refuses a dynamic choice whose options were
-    /// never resolved, since neither API can be asked a choice without them.
     pub fn request_body(
         self,
         model: &str,
         questions: &BTreeMap<QuestionId, Question>,
         state: &Value,
-    ) -> Result<Value, DecideError> {
+    ) -> Value {
         match self {
             DecisionApi::SystemOne => system_one_body(model, questions, state),
             DecisionApi::OpenAi => openai_body(model, questions, state),
@@ -57,12 +54,7 @@ impl DecisionApi {
         match (&question.kind, self) {
             (QuestionKind::Score { .. }, DecisionApi::OpenAi) => Some(AskedAs::Score),
             (QuestionKind::Score { .. }, DecisionApi::SystemOne) => Some(AskedAs::Choice),
-            (
-                QuestionKind::Noul
-                | QuestionKind::Choice { .. }
-                | QuestionKind::DynamicChoice { .. },
-                _,
-            ) => None,
+            (QuestionKind::Noul | QuestionKind::Choice { .. }, _) => None,
         }
     }
 
@@ -143,12 +135,6 @@ impl std::fmt::Display for DecideError {
 
 impl std::error::Error for DecideError {}
 
-fn unresolved(id: &QuestionId, source: &OptionSource) -> DecideError {
-    DecideError::Invalid(format!(
-        "question {id:?} reads its options from {source} and was asked before they were resolved"
-    ))
-}
-
 /// What an API said about one question, before it is checked against the question.
 enum Reply {
     Answered(WireAnswer),
@@ -168,8 +154,8 @@ fn system_one_body(
     model: &str,
     questions: &BTreeMap<QuestionId, Question>,
     state: &Value,
-) -> Result<Value, DecideError> {
-    let questions = questions
+) -> Value {
+    let questions: serde_json::Map<String, Value> = questions
         .iter()
         .map(|(id, q)| {
             let mut body = json!({ "instructions": q.instructions });
@@ -184,14 +170,11 @@ fn system_one_body(
                             .collect(),
                     );
                 }
-                QuestionKind::DynamicChoice { options_from } => {
-                    return Err(unresolved(id, options_from));
-                }
             }
-            Ok((id.as_str().to_owned(), body))
+            (id.as_str().to_owned(), body)
         })
-        .collect::<Result<serde_json::Map<String, Value>, DecideError>>()?;
-    Ok(json!({ "model": model, "state": state, "questions": questions }))
+        .collect();
+    json!({ "model": model, "state": state, "questions": questions })
 }
 
 #[derive(Deserialize)]
@@ -229,19 +212,15 @@ fn system_one_answers(body: &str) -> Result<BTreeMap<String, Reply>, DecideError
         .collect())
 }
 
-fn openai_body(
-    model: &str,
-    questions: &BTreeMap<QuestionId, Question>,
-    state: &Value,
-) -> Result<Value, DecideError> {
-    let questions = questions
+fn openai_body(model: &str, questions: &BTreeMap<QuestionId, Question>, state: &Value) -> Value {
+    let questions: Vec<Value> = questions
         .iter()
         .map(|(id, q)| match &q.kind {
-            QuestionKind::Noul => Ok(json!({
+            QuestionKind::Noul => json!({
                 "type": "predicate",
                 "name": id.as_str(),
                 "instructions": q.instructions,
-            })),
+            }),
             QuestionKind::Choice { options } => {
                 let choices: Vec<Value> = options
                     .iter()
@@ -253,12 +232,12 @@ fn openai_body(
                         choice
                     })
                     .collect();
-                Ok(json!({
+                json!({
                     "type": "choice",
                     "name": id.as_str(),
                     "instructions": q.instructions,
                     "choices": choices,
-                }))
+                })
             }
             QuestionKind::Score { levels } => {
                 let levels: Vec<Value> = levels
@@ -271,17 +250,16 @@ fn openai_body(
                         level
                     })
                     .collect();
-                Ok(json!({
+                json!({
                     "type": "score",
                     "name": id.as_str(),
                     "instructions": q.instructions,
                     "levels": levels,
-                }))
+                })
             }
-            QuestionKind::DynamicChoice { options_from } => Err(unresolved(id, options_from)),
         })
-        .collect::<Result<Vec<Value>, DecideError>>()?;
-    Ok(json!({ "model": model, "input": state.to_string(), "questions": questions }))
+        .collect();
+    json!({ "model": model, "input": state.to_string(), "questions": questions })
 }
 
 #[derive(Deserialize)]
@@ -466,11 +444,10 @@ fn probabilities(
         {
             distribution(probabilities)
         }
-        (QuestionKind::DynamicChoice { options_from }, _) => Err(unresolved(id, options_from)),
         (kind, answer) => {
             let asked = match (kind, asked_as) {
                 (QuestionKind::Noul, _) => "a noul",
-                (QuestionKind::Choice { .. } | QuestionKind::DynamicChoice { .. }, _) => "a choice",
+                (QuestionKind::Choice { .. }, _) => "a choice",
                 (QuestionKind::Score { .. }, Some(AskedAs::Choice)) => "a score asked as a choice",
                 (QuestionKind::Score { .. }, _) => "a score",
             };
@@ -502,7 +479,7 @@ pub fn decide(
         &endpoint.model,
         questions,
         state,
-    )?);
+    ));
     if let Some(key) = &endpoint.api_key {
         request = request.bearer_auth(key);
     }
@@ -682,9 +659,8 @@ mod tests {
 
     #[test]
     fn the_request_carries_state_and_each_question_in_the_api_shape() {
-        let body = DecisionApi::SystemOne
-            .request_body("dgemma", &questions(), &json!({"ticket": "down"}))
-            .unwrap();
+        let body =
+            DecisionApi::SystemOne.request_body("dgemma", &questions(), &json!({"ticket": "down"}));
         assert_eq!(body["model"], "dgemma");
         assert_eq!(body["state"]["ticket"], "down");
         assert_eq!(body["questions"]["urgent"]["type"], "noul");
@@ -789,9 +765,7 @@ mod tests {
         let sent: Value = serde_json::from_str(request.rsplit('\n').next().unwrap()).unwrap();
         assert_eq!(
             sent,
-            DecisionApi::SystemOne
-                .request_body("dgemma", &questions(), &json!({"ticket": "down"}))
-                .unwrap()
+            DecisionApi::SystemOne.request_body("dgemma", &questions(), &json!({"ticket": "down"}))
         );
     }
 
@@ -913,9 +887,7 @@ mod tests {
     #[test]
     fn the_openai_request_names_each_question_and_carries_state_as_text() {
         let state = json!({"ticket": "down"});
-        let body = DecisionApi::OpenAi
-            .request_body("gpt-6-luna", &questions(), &state)
-            .unwrap();
+        let body = DecisionApi::OpenAi.request_body("gpt-6-luna", &questions(), &state);
         assert_eq!(
             body,
             json!({
@@ -1072,9 +1044,11 @@ mod tests {
         let sent: Value = serde_json::from_str(request.rsplit('\n').next().unwrap()).unwrap();
         assert_eq!(
             sent,
-            DecisionApi::OpenAi
-                .request_body("gpt-6-luna", &questions(), &json!({"ticket": "down"}))
-                .unwrap()
+            DecisionApi::OpenAi.request_body(
+                "gpt-6-luna",
+                &questions(),
+                &json!({"ticket": "down"})
+            )
         );
     }
 
@@ -1122,9 +1096,7 @@ mod tests {
 
     #[test]
     fn a_score_is_asked_natively_of_openai_and_as_a_choice_of_system_one() {
-        let openai = DecisionApi::OpenAi
-            .request_body("gpt-6-luna", &risk(), &json!({}))
-            .unwrap();
+        let openai = DecisionApi::OpenAi.request_body("gpt-6-luna", &risk(), &json!({}));
         assert_eq!(
             openai["questions"][0],
             json!({
@@ -1138,9 +1110,7 @@ mod tests {
                 ],
             })
         );
-        let system_one = DecisionApi::SystemOne
-            .request_body("dgemma", &risk(), &json!({}))
-            .unwrap();
+        let system_one = DecisionApi::SystemOne.request_body("dgemma", &risk(), &json!({}));
         assert_eq!(
             system_one["questions"]["risk"],
             json!({
@@ -1234,53 +1204,25 @@ mod tests {
         }
     }
 
-    fn dynamic_question() -> Question {
-        Question {
-            instructions: "Which shipped package?".into(),
-            kind: QuestionKind::DynamicChoice {
-                options_from: OptionSource {
-                    task: "prepare".into(),
-                    field: "packages".into(),
-                },
-            },
-            drop: vec![],
-        }
-    }
-
-    fn resolved_package() -> BTreeMap<QuestionId, Question> {
+    fn package() -> BTreeMap<QuestionId, Question> {
         let options = crucible_contract::decision::dynamic_options(&json!([
             {"value": "p1", "description": "golang.org/x/net 0.17.0"},
             "none",
         ]))
         .unwrap();
-        BTreeMap::from([(qid("package"), dynamic_question().with_options(options))])
+        BTreeMap::from([(
+            qid("package"),
+            Question {
+                instructions: "Which shipped package?".into(),
+                kind: QuestionKind::Choice { options },
+                drop: vec![],
+            },
+        )])
     }
 
     #[test]
-    fn neither_api_is_asked_a_dynamic_choice_whose_options_were_not_resolved() {
-        let questions = BTreeMap::from([(qid("package"), dynamic_question())]);
-        for api in [DecisionApi::SystemOne, DecisionApi::OpenAi] {
-            match api.request_body("m", &questions, &json!({})) {
-                Err(DecideError::Invalid(m)) => assert_eq!(
-                    m,
-                    "question \"package\" reads its options from prepare.packages and was asked \
-                     before they were resolved"
-                ),
-                other => panic!("{other:?}"),
-            }
-        }
-        let body = r#"{"answers":{"package":{"type":"choice","probabilities":{"p1":1.0}}}}"#;
-        match parse_response(DecisionApi::SystemOne, body, &questions, 0.5) {
-            Err(DecideError::Invalid(m)) => assert!(m.contains("before they were resolved"), "{m}"),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn resolved_options_are_sent_as_each_apis_choice() {
-        let openai = DecisionApi::OpenAi
-            .request_body("gpt-6-luna", &resolved_package(), &json!({}))
-            .unwrap();
+    fn options_read_at_run_time_are_sent_as_each_apis_choice() {
+        let openai = DecisionApi::OpenAi.request_body("gpt-6-luna", &package(), &json!({}));
         assert_eq!(
             openai["questions"],
             json!([{
@@ -1291,9 +1233,7 @@ mod tests {
                 ],
             }])
         );
-        let system_one = DecisionApi::SystemOne
-            .request_body("dgemma", &resolved_package(), &json!({}))
-            .unwrap();
+        let system_one = DecisionApi::SystemOne.request_body("dgemma", &package(), &json!({}));
         assert_eq!(system_one["questions"]["package"]["type"], "choice");
         assert_eq!(
             system_one["questions"]["package"]["criteria"],
@@ -1302,7 +1242,7 @@ mod tests {
     }
 
     #[test]
-    fn resolved_options_answer_refuse_and_reject_as_a_declared_choice_does() {
+    fn options_read_at_run_time_answer_refuse_and_reject_as_declared_ones_do() {
         let openai = r#"{"answers":[{"type":"choice","name":"package","probabilities":[{"value":"p1","probability":0.8},{"value":"none","probability":0.2}]}]}"#;
         let system_one =
             r#"{"answers":{"package":{"type":"choice","probabilities":{"p1":0.8,"none":0.2}}}}"#;
@@ -1310,12 +1250,12 @@ mod tests {
             (DecisionApi::OpenAi, openai),
             (DecisionApi::SystemOne, system_one),
         ] {
-            let d = parse_response(api, body, &resolved_package(), 0.5).unwrap();
+            let d = parse_response(api, body, &package(), 0.5).unwrap();
             assert_eq!(d.0[&qid("package")].label, label("p1"));
-            let d = parse_response(api, body, &resolved_package(), 0.9).unwrap();
+            let d = parse_response(api, body, &package(), 0.9).unwrap();
             assert!(d.0[&qid("package")].label.is_uncertain());
             let stray = body.replace("\"none\"", "\"p9\"");
-            match parse_response(api, &stray, &resolved_package(), 0.5) {
+            match parse_response(api, &stray, &package(), 0.5) {
                 Err(DecideError::Invalid(m)) => {
                     assert!(m.contains("undeclared label \"p9\""), "{m}")
                 }
@@ -1323,7 +1263,7 @@ mod tests {
             }
         }
         let refusal = r#"{"answers":[{"type":"refusal","name":"package"}]}"#;
-        let d = parse_response(DecisionApi::OpenAi, refusal, &resolved_package(), 0.5).unwrap();
+        let d = parse_response(DecisionApi::OpenAi, refusal, &package(), 0.5).unwrap();
         assert!(d.0[&qid("package")].label.is_uncertain());
         assert_eq!(d.0[&qid("package")].confidence, 0.0);
     }

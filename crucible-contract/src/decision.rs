@@ -116,10 +116,6 @@ pub enum QuestionKind {
     Score {
         levels: Vec<ChoiceOption>,
     },
-    /// A choice whose options a dependency's output field supplies at run time.
-    DynamicChoice {
-        options_from: OptionSource,
-    },
 }
 
 /// The dependency field a dynamic choice reads its options from.
@@ -132,6 +128,116 @@ pub struct OptionSource {
 impl std::fmt::Display for OptionSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}", self.task, self.field)
+    }
+}
+
+/// A choice whose options a dependency's output field supplies at run time. It declares no
+/// labels, so its drop list may name only `uncertain`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "dynamic_choice")]
+pub struct DynamicChoice {
+    pub instructions: String,
+    pub options_from: OptionSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop: Vec<Label>,
+}
+
+impl DynamicChoice {
+    /// This choice as asked over `options`, which must come from [`dynamic_options`].
+    pub fn asked(&self, options: Vec<ChoiceOption>) -> Question {
+        Question {
+            instructions: self.instructions.clone(),
+            kind: QuestionKind::Choice { options },
+            drop: self.drop.clone(),
+        }
+    }
+}
+
+/// A route question as a compiled plan declares it: asked as written, or a dynamic choice the
+/// engine resolves into a [`Question`] for each decision before asking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum CompiledQuestion {
+    Declared(Question),
+    Dynamic(DynamicChoice),
+}
+
+impl<'de> Deserialize<'de> for CompiledQuestion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = Value::deserialize(deserializer)?;
+        if value.get("type").and_then(Value::as_str) == Some("dynamic_choice") {
+            DynamicChoice::deserialize(value)
+                .map(CompiledQuestion::Dynamic)
+                .map_err(D::Error::custom)
+        } else {
+            Question::deserialize(value)
+                .map(CompiledQuestion::Declared)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
+impl From<Question> for CompiledQuestion {
+    fn from(question: Question) -> Self {
+        CompiledQuestion::Declared(question)
+    }
+}
+
+impl CompiledQuestion {
+    /// The question as written, or `None` for a dynamic choice.
+    pub fn declared(&self) -> Option<&Question> {
+        match self {
+            CompiledQuestion::Declared(question) => Some(question),
+            CompiledQuestion::Dynamic(_) => None,
+        }
+    }
+
+    /// The field a dynamic choice reads its options from; `None` for any other question.
+    pub fn options_from(&self) -> Option<&OptionSource> {
+        match self {
+            CompiledQuestion::Declared(_) => None,
+            CompiledQuestion::Dynamic(dynamic) => Some(&dynamic.options_from),
+        }
+    }
+
+    /// The labels known at compile time, `uncertain` excluded; none for a dynamic choice.
+    pub fn labels(&self) -> Vec<Label> {
+        self.declared().map(Question::labels).unwrap_or_default()
+    }
+
+    pub fn resolves_to(&self, label: &Label) -> bool {
+        label.is_uncertain() || self.labels().contains(label)
+    }
+
+    pub fn instructions(&self) -> &str {
+        match self {
+            CompiledQuestion::Declared(question) => &question.instructions,
+            CompiledQuestion::Dynamic(dynamic) => &dynamic.instructions,
+        }
+    }
+
+    pub fn drop(&self) -> &[Label] {
+        match self {
+            CompiledQuestion::Declared(question) => &question.drop,
+            CompiledQuestion::Dynamic(dynamic) => &dynamic.drop,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), QuestionError> {
+        let dynamic = match self {
+            CompiledQuestion::Declared(question) => return question.validate(),
+            CompiledQuestion::Dynamic(dynamic) => dynamic,
+        };
+        if dynamic.instructions.trim().is_empty() {
+            return Err(QuestionError::EmptyInstructions);
+        }
+        match dynamic.drop.iter().find(|label| !label.is_uncertain()) {
+            Some(label) => Err(QuestionError::UnknownDrop {
+                label: label.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 }
 
@@ -197,33 +303,13 @@ impl std::fmt::Display for QuestionError {
 impl std::error::Error for QuestionError {}
 
 impl Question {
-    /// The labels the model may answer with, in declaration order. Excludes `uncertain`, and is
-    /// empty for a dynamic choice, whose labels arrive at run time.
+    /// The labels the model may answer with, in declaration order. Excludes `uncertain`.
     pub fn labels(&self) -> Vec<Label> {
         match &self.kind {
             QuestionKind::Noul => vec![Label(NOUL_YES.to_owned()), Label(NOUL_NO.to_owned())],
             QuestionKind::Choice { options } | QuestionKind::Score { levels: options } => {
                 options.iter().map(|o| o.label.clone()).collect()
             }
-            QuestionKind::DynamicChoice { .. } => Vec::new(),
-        }
-    }
-
-    /// The field a dynamic choice reads its options from; `None` for any other question.
-    pub fn options_from(&self) -> Option<&OptionSource> {
-        match &self.kind {
-            QuestionKind::DynamicChoice { options_from } => Some(options_from),
-            QuestionKind::Noul | QuestionKind::Choice { .. } | QuestionKind::Score { .. } => None,
-        }
-    }
-
-    /// This dynamic choice asked over `options`, as a declared choice with the same
-    /// instructions and drop list. `options` must come from [`dynamic_options`].
-    pub fn with_options(&self, options: Vec<ChoiceOption>) -> Question {
-        Question {
-            instructions: self.instructions.clone(),
-            kind: QuestionKind::Choice { options },
-            drop: self.drop.clone(),
         }
     }
 
@@ -251,7 +337,6 @@ impl Question {
                     OptionFault::Reserved => QuestionError::ReservedLevel,
                 })?;
             }
-            QuestionKind::DynamicChoice { .. } => {}
         }
         for label in &self.drop {
             if !self.resolves_to(label) {
@@ -944,17 +1029,19 @@ mod tests {
         assert_eq!(back, q);
     }
 
-    fn dynamic(drop: &[&str]) -> Question {
-        Question {
+    fn dynamic_choice(drop: &[&str]) -> DynamicChoice {
+        DynamicChoice {
             instructions: "which package?".into(),
-            kind: QuestionKind::DynamicChoice {
-                options_from: OptionSource {
-                    task: "prepare".into(),
-                    field: "packages".into(),
-                },
+            options_from: OptionSource {
+                task: "prepare".into(),
+                field: "packages".into(),
             },
             drop: drop.iter().map(|l| label(l)).collect(),
         }
+    }
+
+    fn dynamic(drop: &[&str]) -> CompiledQuestion {
+        CompiledQuestion::Dynamic(dynamic_choice(drop))
     }
 
     fn option_labels(options: &[ChoiceOption]) -> Vec<&str> {
@@ -971,7 +1058,11 @@ mod tests {
             q.options_from().map(ToString::to_string).as_deref(),
             Some("prepare.packages")
         );
-        assert_eq!(choice(&["a", "b"]).options_from(), None);
+        assert_eq!(q.declared(), None);
+        let declared = CompiledQuestion::from(choice(&["a", "b"]));
+        assert_eq!(declared.options_from(), None);
+        assert_eq!(declared.labels(), vec![label("a"), label("b")]);
+        assert_eq!(declared.declared(), Some(&choice(&["a", "b"])));
         assert_eq!(q.validate(), Ok(()));
         assert_eq!(dynamic(&["uncertain"]).validate(), Ok(()));
         assert_eq!(
@@ -980,9 +1071,11 @@ mod tests {
                 label: label("none")
             })
         );
+        let mut blank = dynamic_choice(&[]);
+        blank.instructions = " ".into();
         assert_eq!(
-            q.resolve(probs(&[("p1", 1.0)]), 0.5),
-            Err(ResolveError::UndeclaredLabel { label: label("p1") })
+            CompiledQuestion::Dynamic(blank).validate(),
+            Err(QuestionError::EmptyInstructions)
         );
     }
 
@@ -999,14 +1092,26 @@ mod tests {
                 "drop": ["uncertain"],
             })
         );
-        let back: Question = serde_json::from_value(v).unwrap();
+        let back: CompiledQuestion = serde_json::from_value(v).unwrap();
         assert_eq!(back, q);
+        let declared = CompiledQuestion::from(choice(&["a", "b"]));
+        let v = serde_json::to_value(&declared).unwrap();
+        assert_eq!(v, serde_json::to_value(choice(&["a", "b"])).unwrap());
+        assert_eq!(
+            serde_json::from_value::<CompiledQuestion>(v).unwrap(),
+            declared
+        );
+        let missing = serde_json::json!({"instructions": "x", "type": "dynamic_choice"});
+        let error = serde_json::from_value::<CompiledQuestion>(missing).unwrap_err();
+        assert!(error.to_string().contains("options_from"), "{error}");
+        let unknown = serde_json::json!({"instructions": "x", "type": "ranking"});
+        assert!(serde_json::from_value::<CompiledQuestion>(unknown).is_err());
     }
 
     #[test]
-    fn with_options_asks_a_dynamic_choice_as_a_choice_with_its_instructions_and_drop() {
+    fn asked_turns_a_dynamic_choice_into_a_choice_as_a_choice_with_its_instructions_and_drop() {
         let options = dynamic_options(&serde_json::json!(["p1", "none"])).unwrap();
-        let asked = dynamic(&["uncertain"]).with_options(options.clone());
+        let asked = dynamic_choice(&["uncertain"]).asked(options.clone());
         assert_eq!(asked.kind, QuestionKind::Choice { options });
         assert_eq!(asked.instructions, "which package?");
         assert_eq!(asked.drop, vec![Label::uncertain()]);

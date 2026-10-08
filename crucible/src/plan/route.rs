@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use crucible_broker::decide::{DecideError, Endpoint, decide};
 use crucible_contract::TransportCause;
 use crucible_contract::decision::{
-    ChoiceOption, OptionSource, Question, QuestionId, dynamic_options,
+    ChoiceOption, CompiledQuestion, OptionSource, Question, QuestionId, dynamic_options,
 };
 use serde_json::Value;
 
@@ -15,7 +15,7 @@ use crate::plan::ir::{ITEM_INPUT, Join, Task, TaskName};
 pub fn model_attempt(
     endpoint: &Endpoint,
     route: &Task,
-    questions: &BTreeMap<QuestionId, Question>,
+    questions: &BTreeMap<QuestionId, CompiledQuestion>,
     min_confidence: f64,
     inputs: &BTreeMap<TaskName, Value>,
 ) -> Attempt {
@@ -54,22 +54,26 @@ type Resolved = BTreeMap<QuestionId, Vec<ChoiceOption>>;
 /// options its source supplies, and the options each dynamic choice resolved to.
 fn asked_questions(
     route: &Task,
-    questions: &BTreeMap<QuestionId, Question>,
+    questions: &BTreeMap<QuestionId, CompiledQuestion>,
     inputs: &BTreeMap<TaskName, Value>,
 ) -> Result<(BTreeMap<QuestionId, Question>, Resolved), String> {
     let mut asked = BTreeMap::new();
     let mut resolved = BTreeMap::new();
     for (id, question) in questions {
-        let Some(source) = question.options_from() else {
-            asked.insert(id.clone(), question.clone());
-            continue;
+        let question = match question {
+            CompiledQuestion::Declared(question) => {
+                asked.insert(id.clone(), question.clone());
+                continue;
+            }
+            CompiledQuestion::Dynamic(question) => question,
         };
+        let source = &question.options_from;
         let (list, key) = option_list(route, source, inputs)?;
         let options = dynamic_options(list).map_err(|e| match key {
             Some(key) => format!("options {source} for {key:?} {e}"),
             None => format!("options {source} {e}"),
         })?;
-        asked.insert(id.clone(), question.with_options(options.clone()));
+        asked.insert(id.clone(), question.asked(options.clone()));
         resolved.insert(id.clone(), options);
     }
     Ok((asked, resolved))
@@ -127,7 +131,7 @@ mod tests {
     use crucible_contract::decision::{Label, QuestionKind};
     use serde_json::json;
 
-    fn route(extra: &str) -> (Task, BTreeMap<QuestionId, Question>) {
+    fn route(extra: &str) -> (Task, BTreeMap<QuestionId, CompiledQuestion>) {
         let text = format!(
             r#"version = 1
 [budget]
@@ -187,7 +191,7 @@ type = "noul"
         assert_eq!(options[0].description.as_deref(), Some("golang.org/x/net"));
         assert_eq!(asked[&package()].instructions, "Which package?");
         let urgent = QuestionId::new("urgent").unwrap();
-        assert_eq!(asked[&urgent], questions[&urgent]);
+        assert_eq!(Some(&asked[&urgent]), questions[&urgent].declared());
         assert_eq!(resolved.len(), 1);
         assert_eq!(&resolved[&package()], options);
     }

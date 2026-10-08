@@ -22,7 +22,7 @@ use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
     COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
     PARAMS_INPUT, REASON_FIELD, REVISION_INPUT, ReviseLoop, Stage, Task, TaskKind, TaskName,
-    ValidPlan, aligned,
+    ValidPlan, aligned, declared_questions,
 };
 use crate::plan::machine::{
     BlockedReason, PlanEvent, PlanMachine, TaskEvent, TaskMachine, TaskState,
@@ -1083,14 +1083,17 @@ pub fn execute(
                                         } else {
                                             &base
                                         };
-                                        let r = decide_instance(
-                                            questions,
-                                            source,
-                                            key,
-                                            read,
-                                            &per_element,
-                                            node.join,
-                                        );
+                                        let r = match declared_questions(&node.name, questions) {
+                                            Ok(questions) => decide_instance(
+                                                &questions,
+                                                source,
+                                                key,
+                                                read,
+                                                &per_element,
+                                                node.join,
+                                            ),
+                                            Err(e) => measured_failure(e.to_string()),
+                                        };
                                         let event = if r.status == TaskStatus::Pass {
                                             TaskEvent::Passed
                                         } else {
@@ -1311,7 +1314,10 @@ pub fn execute(
                     questions,
                     decider: Decider::Output { task: source },
                 } => {
-                    let decided = decide_from_output(&inputs, questions, source);
+                    let decided = match declared_questions(&t.name, questions) {
+                        Ok(questions) => decide_from_output(&inputs, &questions, source),
+                        Err(e) => measured_failure(e.to_string()),
+                    };
                     let event = if decided.status == TaskStatus::Pass {
                         TaskEvent::Passed
                     } else {
@@ -5027,7 +5033,7 @@ mod tests {
     fn gate(id: &str, asked: Question, required: bool) -> Task {
         Task {
             task: TaskKind::Route {
-                questions: BTreeMap::from([(QuestionId::new(id).unwrap(), asked)]),
+                questions: BTreeMap::from([(QuestionId::new(id).unwrap(), asked.into())]),
                 decider: Decider::Output {
                     task: "classify".into(),
                 },
@@ -9581,7 +9587,7 @@ mod tests {
         };
         over_members(Task {
             task: TaskKind::Route {
-                questions: BTreeMap::from([(QuestionId::new("depth").unwrap(), asked)]),
+                questions: BTreeMap::from([(QuestionId::new("depth").unwrap(), asked.into())]),
                 decider: Decider::Model {
                     min_confidence: 0.5,
                     files: Vec::new(),
@@ -9926,7 +9932,7 @@ mod tests {
         };
         over_members(Task {
             task: TaskKind::Route {
-                questions: BTreeMap::from([(QuestionId::new("reachable").unwrap(), asked)]),
+                questions: BTreeMap::from([(QuestionId::new("reachable").unwrap(), asked.into())]),
                 decider: Decider::Output {
                     task: source.into(),
                 },

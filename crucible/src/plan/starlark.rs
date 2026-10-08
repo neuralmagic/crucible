@@ -39,8 +39,8 @@ use crate::plan::starlark::error::{
 use crate::plan::starlark::values::{SchemaFile, SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 use crucible_contract::decision::{
-    ChoiceOption, IdentError, Label, NOUL_YES, OptionSource, Question, QuestionId, QuestionKind,
-    UNCERTAIN,
+    ChoiceOption, CompiledQuestion, DynamicChoice, IdentError, Label, NOUL_YES, OptionSource,
+    Question, QuestionId, QuestionKind, UNCERTAIN,
 };
 use crucible_contract::emits::{DeclaredFile, FieldType, JsonSchema};
 
@@ -437,7 +437,7 @@ enum Value {
     Session(SessionDecl),
     Workflow(WorkflowCfg),
     /// A `noul(...)`, `choice(...)`, or `score(...)` declaration.
-    Question(Question),
+    Question(CompiledQuestion),
     /// `route.question`, carrying the labels it can resolve to.
     Answer(values::AnswerRef),
     /// `schema_file(path)`.
@@ -773,32 +773,40 @@ fn constructor(
     }
     if matches!(function, "noul" | "choice" | "score") {
         let instructions = take_string(&mut named, "ask")?;
-        let kind = match function {
-            "noul" => QuestionKind::Noul,
-            "choice" => match named.get("options") {
-                Some(Value::Output(output)) => {
-                    let options_from = OptionSource {
-                        task: output.reference.task.0.clone(),
-                        field: output.reference.field.0.clone(),
-                    };
-                    named.remove("options");
-                    QuestionKind::DynamicChoice { options_from }
-                }
-                _ => QuestionKind::Choice {
-                    options: take_described(&mut named, "options")?,
-                },
-            },
-            _ => QuestionKind::Score {
-                levels: take_described(&mut named, "levels")?,
-            },
+        let options_from = match (function, named.get("options")) {
+            ("choice", Some(Value::Output(output))) => Some(OptionSource {
+                task: output.reference.task.0.clone(),
+                field: output.reference.field.0.clone(),
+            }),
+            _ => None,
         };
-        let drop = take_labels(&mut named, "drop")?.unwrap_or_default();
+        let question = match options_from {
+            Some(options_from) => {
+                named.remove("options");
+                CompiledQuestion::Dynamic(DynamicChoice {
+                    instructions,
+                    options_from,
+                    drop: take_labels(&mut named, "drop")?.unwrap_or_default(),
+                })
+            }
+            None => {
+                let kind = match function {
+                    "noul" => QuestionKind::Noul,
+                    "choice" => QuestionKind::Choice {
+                        options: take_described(&mut named, "options")?,
+                    },
+                    _ => QuestionKind::Score {
+                        levels: take_described(&mut named, "levels")?,
+                    },
+                };
+                CompiledQuestion::Declared(Question {
+                    instructions,
+                    kind,
+                    drop: take_labels(&mut named, "drop")?.unwrap_or_default(),
+                })
+            }
+        };
         no_unknown_kwargs(function, &named)?;
-        let question = Question {
-            instructions,
-            kind,
-            drop,
-        };
         question
             .validate()
             .map_err(|error| CompileError::InvalidQuestion { error })?;
@@ -1387,7 +1395,9 @@ fn take_described(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Vec
         .collect()
 }
 
-fn take_questions(named: &mut BTreeMap<String, Value>) -> Result<BTreeMap<QuestionId, Question>> {
+fn take_questions(
+    named: &mut BTreeMap<String, Value>,
+) -> Result<BTreeMap<QuestionId, CompiledQuestion>> {
     let expected = "a dict of question id to noul(...), choice(...), or score(...)";
     let Value::Map(entries) = take_value(named, "questions")? else {
         return Err(wrong_type("questions", expected));
@@ -1436,15 +1446,10 @@ fn take_when(
     if answers.as_ref().is_some_and(Vec::is_empty) {
         return Err(CompileError::EmptyAnswers);
     }
-    let is = match (answers, &asked.asked.kind) {
+    let is = match (answers, asked.asked.declared().map(|q| &q.kind)) {
         (Some(answers), _) => answers,
-        (None, QuestionKind::Noul) => vec![identifier("answers", Label::new(NOUL_YES))?],
-        (
-            None,
-            QuestionKind::Choice { .. }
-            | QuestionKind::Score { .. }
-            | QuestionKind::DynamicChoice { .. },
-        ) => {
+        (None, Some(QuestionKind::Noul)) => vec![identifier("answers", Label::new(NOUL_YES))?],
+        (None, Some(QuestionKind::Choice { .. } | QuestionKind::Score { .. }) | None) => {
             return Err(CompileError::MissingArgument {
                 argument: "answers".to_owned(),
             });
@@ -1528,7 +1533,7 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
                     .is_none_or(|possible| possible.contains(label))
             })
             .filter(|label| !listed_here.is_some_and(|l| l.contains(label)))
-            .filter(|label| !asked.drop.contains(label))
+            .filter(|label| !asked.drop().contains(label))
             .collect();
         let any_option = asked.options_from().is_some();
         if rest.is_empty() && !any_option {
@@ -3294,7 +3299,7 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
             area.labels().iter().map(Label::as_str).collect::<Vec<_>>(),
             ["frontend", "scheduler"]
         );
-        let QuestionKind::Choice { options } = &area.kind else {
+        let Some(QuestionKind::Choice { options }) = area.declared().map(|q| &q.kind) else {
             panic!("area is not a choice");
         };
         assert_eq!(
@@ -3302,8 +3307,10 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
             Some("batching and queueing")
         );
         assert_eq!(
-            questions[&QuestionId::new("urgent").unwrap()].kind,
-            QuestionKind::Noul
+            questions[&QuestionId::new("urgent").unwrap()]
+                .declared()
+                .map(|q| &q.kind),
+            Some(&QuestionKind::Noul)
         );
         let when = |name: &str| {
             tasks
@@ -7145,7 +7152,7 @@ workflow(type = "playbook", tasks = [classify, gate, ship, hold])
             panic!("gate is not a route");
         };
         let risk = &questions[&QuestionId::new("risk").unwrap()];
-        let QuestionKind::Score { levels } = &risk.kind else {
+        let Some(QuestionKind::Score { levels }) = risk.declared().map(|q| &q.kind) else {
             panic!("risk is not a score");
         };
         assert_eq!(
