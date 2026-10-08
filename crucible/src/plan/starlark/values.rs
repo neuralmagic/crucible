@@ -17,7 +17,7 @@ use starlark::values::{
 };
 
 use crate::plan::diag;
-use crucible_contract::decision::{Question, QuestionId};
+use crucible_contract::decision::{CompiledQuestion, QuestionId};
 use crucible_contract::emits::{FieldType, JsonSchema};
 
 use crate::plan::ir::{Declared, Emits, OutputField, OutputRef, Task, TaskKind, TaskName};
@@ -143,13 +143,13 @@ impl<'v> StarlarkValue<'v> for OutputRefValue {}
 
 /// A `noul(...)`, `choice(...)`, or `score(...)` declaration, consumed by `route(questions = ...)`.
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
-pub(crate) struct QuestionValue(#[allocative(skip)] pub(crate) Question);
+pub(crate) struct QuestionValue(#[allocative(skip)] pub(crate) CompiledQuestion);
 
 starlark_simple_value!(QuestionValue);
 
 impl Display for QuestionValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "question({})", self.0.instructions)
+        write!(f, "question({})", self.0.instructions())
     }
 }
 
@@ -161,7 +161,7 @@ impl<'v> StarlarkValue<'v> for QuestionValue {}
 pub(crate) struct AnswerRef {
     pub(crate) task: TaskName,
     pub(crate) question: QuestionId,
-    pub(crate) asked: Question,
+    pub(crate) asked: CompiledQuestion,
 }
 
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]

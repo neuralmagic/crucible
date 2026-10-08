@@ -549,6 +549,11 @@ pub enum CompileError {
         suggestion: Option<String>,
         declared: String,
     },
+    #[error(
+        "{asked} reads its options at run time, so answers may list only \"uncertain\"; use \
+         otherwise = True for the options, and read which one was chosen from the route's output"
+    )]
+    AnswerNamesDynamicOption { asked: String, label: String },
     #[error("missing required argument {argument:?}")]
     MissingArgument { argument: String },
     /// One arm for every scalar-kwarg type check; `expected` completes the sentence.

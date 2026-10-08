@@ -1,0 +1,20 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ROUTE-OPTIONS"
+title = "Dynamic choice options"
+kind = "normative"
+status = "active"
+since = "0.2.0"
+
+[content]
+text = """
+A choice question may name, in place of its options, a field a dependency of the route emits, constructed in the DSL as choice(options = producer.field). Such a choice is dynamic: its options are read at run time, once for each decision, and only the reference reaches the generated TOML. Only a model-decided route may ask a dynamic choice, and validation must reject one on an output-decided route.
+
+The reference must name a field of one of the route's dependencies, and that dependency must not be mapped. For a route that does not declare over, the field is the option list. For a route that declares over, the field is an object keyed by element, as a keyed field is under [[RFC-0001:C-ROUTE-EACH]], and an instance's option list is the entry under its key, read from the producer's output whatever the route's join and keyed. Validation must reject, naming the reference, a reference to a task outside the route's dependencies, to a mapped task, or to a field the producer's emits omit, and, where the emits type the field, a type other than "list" or an array schema for a route that does not declare over, and other than "object" or an object schema for one that does.
+
+An option list must be a JSON array of at most 64 entries, a bound the engine must check before it reads any entry. Each entry is a string, which is the option's label, or an object with a string "value", which is the label, an optional string "description" the model sees, and no other key. Each label must be an identifier other than "uncertain". An entry whose label repeats an earlier entry's is dropped, and the earlier entry is kept with its description. What remains must hold at least two options. An absent field, an absent entry for the key, a value that is not a list, a list over the bound, an entry of another shape, a label that is not an identifier or is "uncertain", and fewer than two options after duplicates are dropped must each fail that decision before the decision model is asked, with a note naming the field, the key where there is one, and the violated bound or entry. Under [[RFC-0001:C-ROUTE-EACH]] such a failure must not change the decision recorded for any other element.
+
+The resolved options are asked in the order the list gives them, exactly as a declared choice's options are under [[RFC-0001:C-ROUTE]], and every rule there for answers, probabilities, min_confidence, and refusals applies to them. The recorded answer must carry, beside what [[RFC-0001:C-ROUTE]] requires, the resolved options under "options", each as its label and, where one was given, its description, whatever the answer, "uncertain" and a refusal included, so the record shows what the model chose among. An answer to any other question must not carry options.
+
+A dynamic choice declares no labels at compile time. A when on one must list no label but "uncertain", and its drop list must name nothing but "uncertain"; validation must reject any other label, saying the question's options arrive at run time. A task may declare otherwise on a dynamic choice. The compiler must expand it to every option the question resolves to, together with "uncertain" when no other task's when lists it and the drop list does not name it, and must write the expansion to the generated TOML as the listed labels and a flag that stands for any option. A when carrying that flag must be satisfied by any resolved label other than "uncertain", and validation must reject the flag on a question that is not a dynamic choice. For label coverage under [[RFC-0001:C-ROUTE]], the options of a routed dynamic choice count as one label, covered only by a when carrying the flag."""

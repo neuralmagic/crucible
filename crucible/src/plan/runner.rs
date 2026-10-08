@@ -214,6 +214,7 @@ impl ShellRunner {
                     };
                 return crate::plan::route::model_attempt(
                     &endpoint,
+                    task,
                     questions,
                     *min_confidence,
                     inputs,

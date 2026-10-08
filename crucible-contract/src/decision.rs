@@ -3,12 +3,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 pub const UNCERTAIN: &str = "uncertain";
 pub const NOUL_YES: &str = "yes";
 pub const NOUL_NO: &str = "no";
 
 const MAX_IDENT_LEN: usize = 64;
+
+/// The most entries a dynamic choice's option list may hold.
+pub const MAX_DYNAMIC_OPTIONS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdentError {
@@ -112,6 +116,129 @@ pub enum QuestionKind {
     Score {
         levels: Vec<ChoiceOption>,
     },
+}
+
+/// The dependency field a dynamic choice reads its options from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OptionSource {
+    pub task: String,
+    pub field: String,
+}
+
+impl std::fmt::Display for OptionSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.task, self.field)
+    }
+}
+
+/// A choice whose options a dependency's output field supplies at run time. It declares no
+/// labels, so its drop list may name only `uncertain`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename = "dynamic_choice")]
+pub struct DynamicChoice {
+    pub instructions: String,
+    pub options_from: OptionSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub drop: Vec<Label>,
+}
+
+impl DynamicChoice {
+    /// This choice as asked over `options`, which must come from [`dynamic_options`].
+    pub fn asked(&self, options: Vec<ChoiceOption>) -> Question {
+        Question {
+            instructions: self.instructions.clone(),
+            kind: QuestionKind::Choice { options },
+            drop: self.drop.clone(),
+        }
+    }
+}
+
+/// A route question as a compiled plan declares it: asked as written, or a dynamic choice the
+/// engine resolves into a [`Question`] for each decision before asking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum CompiledQuestion {
+    Declared(Question),
+    Dynamic(DynamicChoice),
+}
+
+impl<'de> Deserialize<'de> for CompiledQuestion {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = Value::deserialize(deserializer)?;
+        if value.get("type").and_then(Value::as_str) == Some("dynamic_choice") {
+            DynamicChoice::deserialize(value)
+                .map(CompiledQuestion::Dynamic)
+                .map_err(D::Error::custom)
+        } else {
+            Question::deserialize(value)
+                .map(CompiledQuestion::Declared)
+                .map_err(D::Error::custom)
+        }
+    }
+}
+
+impl From<Question> for CompiledQuestion {
+    fn from(question: Question) -> Self {
+        CompiledQuestion::Declared(question)
+    }
+}
+
+impl CompiledQuestion {
+    /// The question as written, or `None` for a dynamic choice.
+    pub fn declared(&self) -> Option<&Question> {
+        match self {
+            CompiledQuestion::Declared(question) => Some(question),
+            CompiledQuestion::Dynamic(_) => None,
+        }
+    }
+
+    /// The field a dynamic choice reads its options from; `None` for any other question.
+    pub fn options_from(&self) -> Option<&OptionSource> {
+        match self {
+            CompiledQuestion::Declared(_) => None,
+            CompiledQuestion::Dynamic(dynamic) => Some(&dynamic.options_from),
+        }
+    }
+
+    /// The labels known at compile time, `uncertain` excluded; none for a dynamic choice.
+    pub fn labels(&self) -> Vec<Label> {
+        self.declared().map(Question::labels).unwrap_or_default()
+    }
+
+    pub fn resolves_to(&self, label: &Label) -> bool {
+        label.is_uncertain() || self.labels().contains(label)
+    }
+
+    pub fn instructions(&self) -> &str {
+        match self {
+            CompiledQuestion::Declared(question) => &question.instructions,
+            CompiledQuestion::Dynamic(dynamic) => &dynamic.instructions,
+        }
+    }
+
+    pub fn drop(&self) -> &[Label] {
+        match self {
+            CompiledQuestion::Declared(question) => &question.drop,
+            CompiledQuestion::Dynamic(dynamic) => &dynamic.drop,
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), QuestionError> {
+        let dynamic = match self {
+            CompiledQuestion::Declared(question) => return question.validate(),
+            CompiledQuestion::Dynamic(dynamic) => dynamic,
+        };
+        if dynamic.instructions.trim().is_empty() {
+            return Err(QuestionError::EmptyInstructions);
+        }
+        match dynamic.drop.iter().find(|label| !label.is_uncertain()) {
+            Some(label) => Err(QuestionError::UnknownDrop {
+                label: label.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +409,7 @@ impl Question {
             probabilities,
             score: None,
             asked_as: None,
+            options: Vec::new(),
         })
     }
 
@@ -325,6 +453,7 @@ impl Question {
             probabilities,
             score: Some(score),
             asked_as: None,
+            options: Vec::new(),
         })
     }
 }
@@ -351,6 +480,128 @@ fn distinct(options: &[ChoiceOption]) -> Result<(), OptionFault> {
         }
     }
     Ok(())
+}
+
+/// Why a dependency's value is not a dynamic choice's option list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OptionsError {
+    NotAList { got: &'static str },
+    TooMany { got: usize },
+    BadEntry { index: usize, got: &'static str },
+    MissingValue { index: usize },
+    UnknownKey { index: usize, key: String },
+    DescriptionNotAString { index: usize },
+    NotALabel { index: usize, error: IdentError },
+    Reserved { index: usize },
+    TooFew { got: usize },
+}
+
+impl std::fmt::Display for OptionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OptionsError::NotAList { got } => write!(f, "is {got}, not a list of options"),
+            OptionsError::TooMany { got } => write!(
+                f,
+                "holds {got} options; a dynamic choice takes at most {MAX_DYNAMIC_OPTIONS}"
+            ),
+            OptionsError::BadEntry { index, got } => write!(
+                f,
+                "option {index} is {got}; an option is a label string or {{value, description}}"
+            ),
+            OptionsError::MissingValue { index } => {
+                write!(f, "option {index} has no string \"value\"")
+            }
+            OptionsError::UnknownKey { index, key } => write!(
+                f,
+                "option {index} has key {key:?}; an option object takes only \"value\" and \"description\""
+            ),
+            OptionsError::DescriptionNotAString { index } => {
+                write!(
+                    f,
+                    "option {index} has a \"description\" that is not a string"
+                )
+            }
+            OptionsError::NotALabel { index, error } => write!(f, "option {index}: {error}"),
+            OptionsError::Reserved { index } => write!(
+                f,
+                "option {index} is {UNCERTAIN:?}, which is reserved for a low-confidence answer"
+            ),
+            OptionsError::TooFew { got } => write!(
+                f,
+                "holds {got} distinct option(s); a choice needs at least two"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OptionsError {}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
+}
+
+/// Read a dynamic choice's option list: at most [`MAX_DYNAMIC_OPTIONS`] entries, each a label
+/// string or `{value, description}`. A label repeated later is dropped in favour of its first
+/// entry, and at least two options must remain.
+pub fn dynamic_options(value: &Value) -> Result<Vec<ChoiceOption>, OptionsError> {
+    let Value::Array(entries) = value else {
+        return Err(OptionsError::NotAList {
+            got: json_kind(value),
+        });
+    };
+    if entries.len() > MAX_DYNAMIC_OPTIONS {
+        return Err(OptionsError::TooMany { got: entries.len() });
+    }
+    let mut options: Vec<ChoiceOption> = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let (value, description) = match entry {
+            Value::String(value) => (value.clone(), None),
+            Value::Object(fields) => {
+                if let Some(key) = fields
+                    .keys()
+                    .find(|key| !matches!(key.as_str(), "value" | "description"))
+                {
+                    return Err(OptionsError::UnknownKey {
+                        index,
+                        key: key.clone(),
+                    });
+                }
+                let Some(Value::String(value)) = fields.get("value") else {
+                    return Err(OptionsError::MissingValue { index });
+                };
+                let description = match fields.get("description") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(description)) => Some(description.clone()),
+                    Some(_) => return Err(OptionsError::DescriptionNotAString { index }),
+                };
+                (value.clone(), description)
+            }
+            other => {
+                return Err(OptionsError::BadEntry {
+                    index,
+                    got: json_kind(other),
+                });
+            }
+        };
+        let label = Label::new(value).map_err(|error| OptionsError::NotALabel { index, error })?;
+        if label.is_uncertain() {
+            return Err(OptionsError::Reserved { index });
+        }
+        if options.iter().all(|o| o.label != label) {
+            options.push(ChoiceOption { label, description });
+        }
+    }
+    if options.len() < 2 {
+        return Err(OptionsError::TooFew { got: options.len() });
+    }
+    Ok(options)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -400,6 +651,9 @@ pub struct Answer {
     /// The form a model-decided score question was put to the decision API in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asked_as: Option<AskedAs>,
+    /// The options a dynamic choice was asked over, as resolved for this decision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<ChoiceOption>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -773,5 +1027,228 @@ mod tests {
         assert_eq!(v["levels"][2]["label"], "high");
         let back: Question = serde_json::from_value(v).unwrap();
         assert_eq!(back, q);
+    }
+
+    fn dynamic_choice(drop: &[&str]) -> DynamicChoice {
+        DynamicChoice {
+            instructions: "which package?".into(),
+            options_from: OptionSource {
+                task: "prepare".into(),
+                field: "packages".into(),
+            },
+            drop: drop.iter().map(|l| label(l)).collect(),
+        }
+    }
+
+    fn dynamic(drop: &[&str]) -> CompiledQuestion {
+        CompiledQuestion::Dynamic(dynamic_choice(drop))
+    }
+
+    fn option_labels(options: &[ChoiceOption]) -> Vec<&str> {
+        options.iter().map(|o| o.label.as_str()).collect()
+    }
+
+    #[test]
+    fn a_dynamic_choice_declares_no_labels_and_resolves_only_to_uncertain() {
+        let q = dynamic(&[]);
+        assert!(q.labels().is_empty());
+        assert!(q.resolves_to(&Label::uncertain()));
+        assert!(!q.resolves_to(&label("p1")));
+        assert_eq!(
+            q.options_from().map(ToString::to_string).as_deref(),
+            Some("prepare.packages")
+        );
+        assert_eq!(q.declared(), None);
+        let declared = CompiledQuestion::from(choice(&["a", "b"]));
+        assert_eq!(declared.options_from(), None);
+        assert_eq!(declared.labels(), vec![label("a"), label("b")]);
+        assert_eq!(declared.declared(), Some(&choice(&["a", "b"])));
+        assert_eq!(q.validate(), Ok(()));
+        assert_eq!(dynamic(&["uncertain"]).validate(), Ok(()));
+        assert_eq!(
+            dynamic(&["none"]).validate(),
+            Err(QuestionError::UnknownDrop {
+                label: label("none")
+            })
+        );
+        let mut blank = dynamic_choice(&[]);
+        blank.instructions = " ".into();
+        assert_eq!(
+            CompiledQuestion::Dynamic(blank).validate(),
+            Err(QuestionError::EmptyInstructions)
+        );
+    }
+
+    #[test]
+    fn a_dynamic_choice_round_trips_with_its_source() {
+        let q = dynamic(&["uncertain"]);
+        let v = serde_json::to_value(&q).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({
+                "instructions": "which package?",
+                "type": "dynamic_choice",
+                "options_from": {"task": "prepare", "field": "packages"},
+                "drop": ["uncertain"],
+            })
+        );
+        let back: CompiledQuestion = serde_json::from_value(v).unwrap();
+        assert_eq!(back, q);
+        let declared = CompiledQuestion::from(choice(&["a", "b"]));
+        let v = serde_json::to_value(&declared).unwrap();
+        assert_eq!(v, serde_json::to_value(choice(&["a", "b"])).unwrap());
+        assert_eq!(
+            serde_json::from_value::<CompiledQuestion>(v).unwrap(),
+            declared
+        );
+        let missing = serde_json::json!({"instructions": "x", "type": "dynamic_choice"});
+        let error = serde_json::from_value::<CompiledQuestion>(missing).unwrap_err();
+        assert!(error.to_string().contains("options_from"), "{error}");
+        let unknown = serde_json::json!({"instructions": "x", "type": "ranking"});
+        assert!(serde_json::from_value::<CompiledQuestion>(unknown).is_err());
+    }
+
+    #[test]
+    fn asked_turns_a_dynamic_choice_into_a_choice_as_a_choice_with_its_instructions_and_drop() {
+        let options = dynamic_options(&serde_json::json!(["p1", "none"])).unwrap();
+        let asked = dynamic_choice(&["uncertain"]).asked(options.clone());
+        assert_eq!(asked.kind, QuestionKind::Choice { options });
+        assert_eq!(asked.instructions, "which package?");
+        assert_eq!(asked.drop, vec![Label::uncertain()]);
+        assert_eq!(asked.validate(), Ok(()));
+        let a = asked
+            .resolve(probs(&[("p1", 0.9), ("none", 0.1)]), 0.5)
+            .unwrap();
+        assert_eq!(a.label, label("p1"));
+    }
+
+    #[test]
+    fn option_lists_take_labels_and_value_description_objects_in_order() {
+        let options = dynamic_options(&serde_json::json!([
+            {"value": "p1", "description": "golang.org/x/net 0.17.0"},
+            "none",
+            {"value": "p2"},
+            {"value": "p3", "description": null},
+        ]))
+        .unwrap();
+        assert_eq!(option_labels(&options), ["p1", "none", "p2", "p3"]);
+        assert_eq!(
+            options[0].description.as_deref(),
+            Some("golang.org/x/net 0.17.0")
+        );
+        assert!(options[1..].iter().all(|o| o.description.is_none()));
+    }
+
+    #[test]
+    fn a_repeated_option_keeps_its_first_entry() {
+        let options = dynamic_options(&serde_json::json!([
+            {"value": "p1", "description": "first"},
+            "none",
+            {"value": "p1", "description": "second"},
+            "none",
+        ]))
+        .unwrap();
+        assert_eq!(option_labels(&options), ["p1", "none"]);
+        assert_eq!(options[0].description.as_deref(), Some("first"));
+        assert_eq!(
+            dynamic_options(&serde_json::json!(["p1", "p1"])),
+            Err(OptionsError::TooFew { got: 1 })
+        );
+    }
+
+    #[test]
+    fn an_option_list_is_bounded_before_any_entry_is_read() {
+        let at_cap: Vec<String> = (0..MAX_DYNAMIC_OPTIONS).map(|i| format!("p{i}")).collect();
+        assert_eq!(
+            dynamic_options(&serde_json::json!(at_cap)).unwrap().len(),
+            MAX_DYNAMIC_OPTIONS
+        );
+        let mut over: Vec<serde_json::Value> = vec![serde_json::json!(1); MAX_DYNAMIC_OPTIONS];
+        over.push(serde_json::json!("p0"));
+        assert_eq!(
+            dynamic_options(&serde_json::Value::Array(over)),
+            Err(OptionsError::TooMany {
+                got: MAX_DYNAMIC_OPTIONS + 1
+            })
+        );
+        assert_eq!(
+            OptionsError::TooMany { got: 65 }.to_string(),
+            "holds 65 options; a dynamic choice takes at most 64"
+        );
+    }
+
+    #[test]
+    fn a_malformed_option_list_is_refused_naming_the_entry() {
+        use serde_json::json;
+        let cases = [
+            (
+                json!({"p1": "x"}),
+                OptionsError::NotAList { got: "an object" },
+            ),
+            (json!(null), OptionsError::NotAList { got: "null" }),
+            (json!([]), OptionsError::TooFew { got: 0 }),
+            (json!(["p1"]), OptionsError::TooFew { got: 1 }),
+            (
+                json!(["p1", 2]),
+                OptionsError::BadEntry {
+                    index: 1,
+                    got: "a number",
+                },
+            ),
+            (
+                json!(["p1", {"description": "x"}]),
+                OptionsError::MissingValue { index: 1 },
+            ),
+            (
+                json!(["p1", {"value": 3}]),
+                OptionsError::MissingValue { index: 1 },
+            ),
+            (
+                json!([{"value": "p1", "desc": "x"}, "none"]),
+                OptionsError::UnknownKey {
+                    index: 0,
+                    key: "desc".into(),
+                },
+            ),
+            (
+                json!([{"value": "p1", "description": 4}, "none"]),
+                OptionsError::DescriptionNotAString { index: 0 },
+            ),
+            (
+                json!(["p1", "uncertain"]),
+                OptionsError::Reserved { index: 1 },
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(dynamic_options(&value), Err(expected), "{value}");
+        }
+        let Err(OptionsError::NotALabel { index, error }) =
+            dynamic_options(&json!(["golang.org/x/net", "none"]))
+        else {
+            panic!("a dotted package name is not a label");
+        };
+        assert_eq!(index, 0);
+        assert_eq!(error.value, "golang.org/x/net");
+        assert_eq!(
+            dynamic_options(&json!(["p1", 2])).unwrap_err().to_string(),
+            "option 1 is a number; an option is a label string or {value, description}"
+        );
+    }
+
+    #[test]
+    fn an_answer_carries_its_options_only_when_it_has_them() {
+        let mut a = choice(&["a", "b"])
+            .resolve(probs(&[("a", 0.25), ("b", 0.75)]), 0.5)
+            .unwrap();
+        assert!(serde_json::to_value(&a).unwrap().get("options").is_none());
+        a.options =
+            dynamic_options(&serde_json::json!([{"value": "a", "description": "A"}, "b"])).unwrap();
+        let v = serde_json::to_value(&a).unwrap();
+        assert_eq!(
+            v["options"],
+            serde_json::json!([{"label": "a", "description": "A"}, {"label": "b"}])
+        );
+        let back: Answer = serde_json::from_value(v).unwrap();
+        assert_eq!(back, a);
     }
 }
