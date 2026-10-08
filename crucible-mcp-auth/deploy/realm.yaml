@@ -227,9 +227,9 @@ spec:
           - basic
           - profile
           - crucible-tenant
-        optionalClientScopes:
           - kueue.read
           - kueue.submit
+        optionalClientScopes:
           - offline_access
       - clientId: run-auth-spike
         name: crucible run auth-spike

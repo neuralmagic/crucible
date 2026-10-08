@@ -14,6 +14,7 @@ set -euo pipefail
 CTX=${CTX:-crucible-system/api-openshift-nm-rdu4-corp-redhat-com:6443/wseaton}
 REALM=crucible
 LOCAL_AUDIENCE=${LOCAL_AUDIENCE:-http://localhost:8850/mcp}
+ROUTE_AUDIENCE=${ROUTE_AUDIENCE:-https://crucible-kueue.apps.openshift.nm.rdu4.corp.redhat.com/mcp}
 # kc forwards stdin into the pod for `-f -`; nothing else may inherit an open one.
 exec </dev/null
 BUILDIT_AUDIENCES=(http://host.openshell.internal:8849/mcp http://localhost:8849/mcp)
@@ -70,8 +71,14 @@ setup() {
   client=$(id_of clients clientId claude-code)
   kc update "clients/$client/default-client-scopes/$basic" -r "$REALM"
 
+  # Claude Code requests only the scope a 401 names (kueue.read), so people get both kueue scopes
+  # by default; RBAC decides what they can do with them.
   for name in kueue.read kueue.submit; do
-    audience "$(id_of client-scopes name "$name")" aud-kueue-local "$LOCAL_AUDIENCE"
+    scope=$(id_of client-scopes name "$name")
+    audience "$scope" aud-kueue-local "$LOCAL_AUDIENCE"
+    audience "$scope" aud-kueue-route "$ROUTE_AUDIENCE"
+    kc delete "clients/$client/optional-client-scopes/$scope" -r "$REALM" 2>/dev/null || true
+    kc update "clients/$client/default-client-scopes/$scope" -r "$REALM"
   done
 
   local spike
