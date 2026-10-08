@@ -134,7 +134,8 @@ async fn seed_run(pool: &sqlx::PgPool) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO runs (run_id, status, pod, attributed_to) VALUES ($1, 'running', $2, 'user:alice')",
+        "INSERT INTO runs (run_id, status, pod, attributed_to, dispatched_by)
+         VALUES ($1, 'running', $2, 'user:alice', 'user:alice')",
     )
     .bind(RUN_ID)
     .bind(RUN_POD)
@@ -173,6 +174,7 @@ async fn serve_controller(env: &Env, profile_dir: &std::path::Path) -> (String, 
 loop_namespace = "crucible-system"
 rig_namespace = "rig"
 service_account = "crucible-spoke"
+sandbox_namespace = "crucible-sandboxes"
 supervisor_image = "registry.example.com/openshell-supervisor:latest"
 [image]
 loop = "registry.example.com/crucible-loop:latest"
@@ -185,6 +187,7 @@ tenant_namespace = "crucible-kueue-tenants"
 workload_namespace = "{}"
 queues = ["{}"]
 record_writers = ["crucible-system/crucible-hub-dispatch"]
+require_kube_user = false
 "#,
             env.namespace, env.queue
         ),
@@ -211,6 +214,11 @@ record_writers = ["crucible-system/crucible-hub-dispatch"]
         issuer: AgentIssuer::new(cfg, jwks),
         pool: pool.clone(),
         deploy_profile: Some(profile),
+        directory: Arc::new(crucible_controller::agent_auth::directory::KubeDirectory(
+            Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
+                None,
+            )),
+        )),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
