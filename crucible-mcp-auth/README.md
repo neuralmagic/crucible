@@ -18,8 +18,10 @@ Status (2026-10-08):
 - **Built and proven on pirate.** Kubernetes RBAC decides tool access through SubjectAccessReview:
   a person acts as themselves, a run as its launcher. One crucible-kueue deployment serves agents,
   tenant tokens and people, and hosts can embed it.
-- **Open.** Sandboxes do not fetch tokens until the gateway wiring lands, and the Claude Code login
-  has not been run end to end by a person yet.
+- **Proven with a person.** From a terminal Claude Code, `wseaton` logged in through OpenShift,
+  and the person-facing crucible-kueue behind its Route checked each call against `wseaton`'s
+  RBAC. It planned and ran a Job that printed `hello from kueue smoketest`.
+- **Open.** Sandboxes do not fetch tokens until the gateway wiring lands.
 
 Operating the stack on pirate (manifests, realm setup, e2e commands) is in
 [deploy/README.md](deploy/README.md).
@@ -297,7 +299,7 @@ sequenceDiagram
     M-->>C: 401 resource_metadata=".../.well-known/oauth-protected-resource/mcp"
     C->>M: GET protected-resource metadata
     M-->>C: authorization_servers = [realm]
-    C->>K: realm OIDC discovery (authServerMetadataUrl)
+    C->>K: realm OIDC discovery
     C->>B: open authorize URL (client_id=claude-code, PKCE, scope)
     B->>K: authorize
     K->>O: broker to openshift-v4
@@ -306,34 +308,24 @@ sequenceDiagram
     K-->>B: redirect to localhost:8765/callback?code=...
     B-->>C: code
     C->>K: token request (code + PKCE verifier)
-    K-->>C: access token (sub, scope, aud, tenant claims)
+    K-->>C: access token (sub, kube_user, scope, aud)
     C->>M: POST /mcp + Bearer
     M-->>C: result
 ```
 
-```json
-{
-  "mcpServers": {
-    "kueue": {
-      "type": "http",
-      "url": "http://localhost:8850/mcp",
-      "oauth": {
-        "clientId": "claude-code",
-        "callbackPort": 8765,
-        "scopes": "openid kueue.read kueue.submit",
-        "authServerMetadataUrl": "https://keycloak.apps.openshift.nm.rdu4.corp.redhat.com/realms/crucible/.well-known/openid-configuration"
-      }
-    }
-  }
-}
+```bash
+claude mcp add --transport http kueue https://crucible-kueue.apps.openshift.nm.rdu4.corp.redhat.com/mcp --client-id claude-code --callback-port 8765
 ```
 
-Claude Code does not step up scopes on a 403 by itself, so request every scope up front. pirate's
-ingress uses a self-signed CA: start Claude Code with `NODE_EXTRA_CA_CERTS` pointing at it, and add
-an `/etc/hosts` entry for the Keycloak host because `*.apps` has no DNS.
+Claude Code follows the 401 to the protected-resource metadata, finds the realm's discovery
+document, and requests the scope the challenge names. `claude-code` grants `kueue.read` and
+`kueue.submit` by default, since Claude Code neither takes an OAuth scope flag nor steps up on a
+403. It sends the RFC 8707 `resource` and `prompt=consent`. On pirate, add an `/etc/hosts` entry for
+the Keycloak and crucible-kueue Routes and start Claude Code with `NODE_EXTRA_CA_CERTS` set to the
+ingress CA. [deploy/README.md](deploy/README.md#people-and-claude-code) has the exact commands.
 
-A person's tenant scope comes from admin-only user attributes set with `deploy/realm-dev.sh grant`.
-That is a stopgap; the next section replaces it with Kubernetes RBAC.
+A person's token carries `kube_user` (their OpenShift username) and no `run_id`, so crucible-kueue
+treats it as a person: no pinned namespace, and every call checked by RBAC as that user.
 
 ## Kubernetes authorization
 
@@ -521,8 +513,7 @@ servers' tests; `e2e` adds the pirate helpers (spike pod, token exchange).
    `providers_v2_enabled`, the `token_grant` provider for each MCP server, and the OIDC flags rendered
    into the server Deployments.
 3. The controller mints `kube_user` (the launcher's Kubernetes username) on run tokens.
-4. Render `--issuer`, `--tool-policy` and `--kube-authz` into the crucible-kueue Deployment with the
-   SubjectAccessReview and Group permissions, and RoleBindings for people's namespaces.
-5. A person runs the Claude Code login end to end.
-6. Response capture in the guard and a per-run event log, then Cedar, then Dogwood (above).
-7. Keycloak TLS in-cluster; sandboxes out of `crucible-system`.
+4. Render the people deployment (`deploy/kueue-people.yaml`) from crucible's deploy profile instead
+   of a script.
+5. Response capture in the guard and a per-run event log, then Cedar, then Dogwood (above).
+6. Keycloak TLS in-cluster; sandboxes out of `crucible-system`.
