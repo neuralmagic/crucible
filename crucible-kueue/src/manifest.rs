@@ -1,6 +1,7 @@
 //! Admission of agent-supplied workload manifests. A manifest is accepted only for an allowlisted
-//! kind, is pinned to the caller's namespace and queue, and is refused outright when any pod
-//! template asks for host access, privilege, or an identity other than the namespace default.
+//! kind, is pinned to the caller's namespace and queue, and every pod template may set only an
+//! allowlisted set of fields: anything that grants host access, privilege, another identity, a
+//! secret, or a scheduling escape from Kueue is refused by not being on the list.
 
 use crate::tenant::{Caller, QueueName};
 use kube::core::ApiResource;
@@ -238,6 +239,7 @@ pub fn normalize(
             meta.insert("namespace".into(), Value::String(ns.to_string()));
         }
     }
+    check_reserved(meta, "/metadata", OBJECT_LABELS)?;
     let labels = object_entry(meta, "labels", "metadata.labels")?;
     set_label(labels, QUEUE_LABEL, queue.as_str())?;
     set_label(labels, MANAGED_LABEL, MANAGED_VALUE)?;
@@ -254,6 +256,7 @@ pub fn normalize(
     }
 
     let mut root = Value::Object(obj);
+    check_kind_escapes(kind, &root)?;
     let mut pod_sets = Vec::new();
     for slot in template_slots(kind, &root)? {
         let template = root
@@ -264,6 +267,11 @@ pub fn normalize(
                 path: slot.pointer.clone(),
             })?;
         let tmeta = object_entry(template, "metadata", &format!("{}/metadata", slot.pointer))?;
+        check_reserved(
+            tmeta,
+            &format!("{}/metadata", slot.pointer),
+            TEMPLATE_LABELS,
+        )?;
         let tlabels = object_entry(
             tmeta,
             "labels",
@@ -443,61 +451,429 @@ fn template_slots(kind: WorkloadKind, root: &Value) -> Result<Vec<TemplateSlot>,
     Ok(slots)
 }
 
-fn check_pod_spec(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestError> {
-    let forbid = |what: &'static str, field: &str| ManifestError::Forbidden {
-        path: format!("{path}/{field}"),
-        what,
+/// Label and annotation domains only this server, Kueue, OpenShell, or SPIRE may set.
+const RESERVED_DOMAINS: [&str; 4] = [
+    "kueue.x-k8s.io",
+    "crucible.dev",
+    "openshell.ai",
+    "spiffe.io",
+];
+/// Reserved labels the object may carry; each is set by the server and conflicts are refused.
+const OBJECT_LABELS: &[&str] = &[QUEUE_LABEL, MANAGED_LABEL, RUN_LABEL, LAUNCHED_BY_LABEL];
+const TEMPLATE_LABELS: &[&str] = &[WORKLOAD_LABEL, RUN_LABEL];
+
+const POD_FIELDS: &[&str] = &[
+    "containers",
+    "initContainers",
+    "restartPolicy",
+    "terminationGracePeriodSeconds",
+    "activeDeadlineSeconds",
+    "dnsPolicy",
+    "dnsConfig",
+    "nodeSelector",
+    "affinity",
+    "topologySpreadConstraints",
+    "securityContext",
+    "volumes",
+    "imagePullSecrets",
+    "hostname",
+    "subdomain",
+    "setHostnameAsFQDN",
+    "enableServiceLinks",
+    "shareProcessNamespace",
+    "hostAliases",
+    "readinessGates",
+    "automountServiceAccountToken",
+];
+const CONTAINER_FIELDS: &[&str] = &[
+    "name",
+    "image",
+    "imagePullPolicy",
+    "command",
+    "args",
+    "workingDir",
+    "env",
+    "envFrom",
+    "ports",
+    "resources",
+    "volumeMounts",
+    "livenessProbe",
+    "readinessProbe",
+    "startupProbe",
+    "lifecycle",
+    "terminationMessagePath",
+    "terminationMessagePolicy",
+    "stdin",
+    "stdinOnce",
+    "tty",
+    "securityContext",
+    "restartPolicy",
+    "resizePolicy",
+];
+const POD_SECURITY_FIELDS: &[&str] = &[
+    "runAsNonRoot",
+    "runAsUser",
+    "runAsGroup",
+    "fsGroup",
+    "fsGroupChangePolicy",
+    "supplementalGroups",
+    "supplementalGroupsPolicy",
+    "seccompProfile",
+    "appArmorProfile",
+];
+const CONTAINER_SECURITY_FIELDS: &[&str] = &[
+    "runAsNonRoot",
+    "runAsUser",
+    "runAsGroup",
+    "readOnlyRootFilesystem",
+    "allowPrivilegeEscalation",
+    "privileged",
+    "capabilities",
+    "seccompProfile",
+    "appArmorProfile",
+    "procMount",
+];
+const VOLUME_SOURCES: &[&str] = &[
+    "emptyDir",
+    "configMap",
+    "persistentVolumeClaim",
+    "downwardAPI",
+    "ephemeral",
+    "projected",
+];
+const PROJECTED_SOURCES: &[&str] = &["configMap", "downwardAPI"];
+const ENV_FIELDS: &[&str] = &["name", "value", "valueFrom"];
+const ENV_SOURCES: &[&str] = &["fieldRef", "resourceFieldRef", "configMapKeyRef"];
+const ENV_FROM_FIELDS: &[&str] = &["configMapRef", "prefix"];
+const PORT_FIELDS: &[&str] = &["containerPort", "name", "protocol"];
+const RESOURCE_FIELDS: &[&str] = &["requests", "limits"];
+const MOUNT_FIELDS: &[&str] = &[
+    "name",
+    "mountPath",
+    "subPath",
+    "subPathExpr",
+    "readOnly",
+    "recursiveReadOnly",
+];
+const DNS_POLICIES: &[&str] = &["ClusterFirst", "Default", "None"];
+const SAFE_PROFILES: &[&str] = &["RuntimeDefault"];
+
+fn forbidden(path: String, what: &'static str) -> ManifestError {
+    ManifestError::Forbidden { path, what }
+}
+
+fn object_at<'a>(v: &'a Value, path: &str) -> Result<&'a Map<String, Value>, ManifestError> {
+    v.as_object().ok_or(ManifestError::Shape {
+        path: path.to_string(),
+        expected: "an object",
+    })
+}
+
+fn array_of<'a>(v: &'a Value, path: &str) -> Result<&'a [Value], ManifestError> {
+    v.as_array().map(Vec::as_slice).ok_or(ManifestError::Shape {
+        path: path.to_string(),
+        expected: "an array",
+    })
+}
+
+fn only_fields(
+    obj: &Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), ManifestError> {
+    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
+        Some(k) => Err(forbidden(
+            format!("{path}/{k}"),
+            "a field outside the allowlist for agent manifests",
+        )),
+        None => Ok(()),
+    }
+}
+
+fn is_reserved(key: &str) -> bool {
+    let Some((domain, _)) = key.split_once('/') else {
+        return false;
     };
-    for field in ["serviceAccountName", "serviceAccount"] {
-        if spec.get(field).is_some_and(|v| !v.is_null()) {
-            return Err(forbid("a non-default service account", field));
-        }
-    }
-    if spec.get("automountServiceAccountToken") == Some(&Value::Bool(true)) {
-        return Err(forbid(
-            "mounting the service account token",
-            "automountServiceAccountToken",
-        ));
-    }
-    for field in ["hostNetwork", "hostPID", "hostIPC"] {
-        if spec.get(field) == Some(&Value::Bool(true)) {
-            return Err(forbid("host namespaces", field));
-        }
-    }
-    if spec.get("nodeName").is_some_and(|v| !v.is_null()) {
-        return Err(forbid("pinning to a node (it bypasses Kueue)", "nodeName"));
-    }
-    if let Some(Value::Array(volumes)) = spec.get("volumes") {
-        for (i, vol) in volumes.iter().enumerate() {
-            if vol.get("hostPath").is_some() {
-                return Err(forbid("hostPath volumes", &format!("volumes/{i}/hostPath")));
-            }
-        }
-    }
-    for list in ["containers", "initContainers", "ephemeralContainers"] {
-        let Some(Value::Array(containers)) = spec.get(list) else {
+    RESERVED_DOMAINS
+        .iter()
+        .any(|d| domain == *d || domain.ends_with(&format!(".{d}")))
+}
+
+/// Refuses reserved labels outside `allowed_labels` and every reserved annotation, so an agent
+/// can neither pick a Kueue priority or pod group nor forge the server's own bookkeeping.
+fn check_reserved(
+    meta: &Map<String, Value>,
+    path: &str,
+    allowed_labels: &[&str],
+) -> Result<(), ManifestError> {
+    for (field, allowed) in [("labels", allowed_labels), ("annotations", &[][..])] {
+        let Some(map) = meta.get(field).filter(|v| !v.is_null()) else {
             continue;
         };
-        for (i, c) in containers.iter().enumerate() {
-            let sc = format!("{list}/{i}/securityContext");
-            if c.pointer("/securityContext/privileged") == Some(&Value::Bool(true)) {
-                return Err(forbid("privileged containers", &format!("{sc}/privileged")));
-            }
-            if c.pointer("/securityContext/allowPrivilegeEscalation") == Some(&Value::Bool(true)) {
-                return Err(forbid(
-                    "privilege escalation",
-                    &format!("{sc}/allowPrivilegeEscalation"),
-                ));
-            }
-            if c.pointer("/securityContext/capabilities/add")
-                .and_then(Value::as_array)
-                .is_some_and(|a| !a.is_empty())
+        let map = object_at(map, &format!("{path}/{field}"))?;
+        if let Some(key) = map
+            .keys()
+            .find(|k| is_reserved(k) && !allowed.contains(&k.as_str()))
+        {
+            return Err(forbidden(
+                format!("{path}/{field}/{key}"),
+                "a label or annotation reserved for the server",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Object-level fields outside the pod templates that would escape admission.
+fn check_kind_escapes(kind: WorkloadKind, root: &Value) -> Result<(), ManifestError> {
+    if kind != WorkloadKind::RayJob {
+        return Ok(());
+    }
+    for (ptr, what) in [
+        (
+            "/spec/clusterSelector",
+            "attaching to an existing RayCluster",
+        ),
+        (
+            "/spec/rayClusterSpec/autoscalerOptions",
+            "autoscaler options (an unchecked sidecar)",
+        ),
+    ] {
+        if root.pointer(ptr).is_some_and(|v| !v.is_null()) {
+            return Err(forbidden(ptr.to_string(), what));
+        }
+    }
+    if root.pointer("/spec/rayClusterSpec/enableInTreeAutoscaling") == Some(&Value::Bool(true)) {
+        return Err(forbidden(
+            "/spec/rayClusterSpec/enableInTreeAutoscaling".into(),
+            "the in-tree autoscaler sidecar",
+        ));
+    }
+    match root
+        .pointer("/spec/rayClusterSpec/headGroupSpec/serviceType")
+        .and_then(Value::as_str)
+    {
+        None | Some("ClusterIP") => Ok(()),
+        Some(_) => Err(forbidden(
+            "/spec/rayClusterSpec/headGroupSpec/serviceType".into(),
+            "exposing the head outside the cluster",
+        )),
+    }
+}
+
+fn check_pod_spec(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestError> {
+    only_fields(spec, POD_FIELDS, path)?;
+    if spec.get("automountServiceAccountToken") == Some(&Value::Bool(true)) {
+        return Err(forbidden(
+            format!("{path}/automountServiceAccountToken"),
+            "mounting the service account token",
+        ));
+    }
+    if let Some(policy) = spec.get("dnsPolicy").and_then(Value::as_str)
+        && !DNS_POLICIES.contains(&policy)
+    {
+        return Err(forbidden(format!("{path}/dnsPolicy"), "this DNS policy"));
+    }
+    if let Some(sc) = spec.get("securityContext") {
+        let sc_path = format!("{path}/securityContext");
+        check_security_context(object_at(sc, &sc_path)?, POD_SECURITY_FIELDS, &sc_path)?;
+    }
+    if let Some(volumes) = spec.get("volumes") {
+        for (i, vol) in array_of(volumes, &format!("{path}/volumes"))?
+            .iter()
+            .enumerate()
+        {
+            check_volume(vol, &format!("{path}/volumes/{i}"))?;
+        }
+    }
+    for list in ["containers", "initContainers"] {
+        let Some(containers) = spec.get(list) else {
+            continue;
+        };
+        for (i, c) in array_of(containers, &format!("{path}/{list}"))?
+            .iter()
+            .enumerate()
+        {
+            check_container(c, &format!("{path}/{list}/{i}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn check_volume(vol: &Value, path: &str) -> Result<(), ManifestError> {
+    let vol = object_at(vol, path)?;
+    let source = vol.keys().find(|k| k.as_str() != "name");
+    match source {
+        Some(k) if VOLUME_SOURCES.contains(&k.as_str()) => {}
+        Some(k) => {
+            return Err(forbidden(format!("{path}/{k}"), "this volume type"));
+        }
+        None => return Ok(()),
+    }
+    if vol.len() > 2 {
+        return Err(ManifestError::Shape {
+            path: path.to_string(),
+            expected: "a name and exactly one volume source",
+        });
+    }
+    if let Some(projected) = vol.get("projected") {
+        let p_path = format!("{path}/projected");
+        let projected = object_at(projected, &p_path)?;
+        if let Some(sources) = projected.get("sources") {
+            for (i, src) in array_of(sources, &format!("{p_path}/sources"))?
+                .iter()
+                .enumerate()
             {
-                return Err(forbid(
-                    "added capabilities",
-                    &format!("{sc}/capabilities/add"),
+                only_fields(
+                    object_at(src, &format!("{p_path}/sources/{i}"))?,
+                    PROJECTED_SOURCES,
+                    &format!("{p_path}/sources/{i}"),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_container(c: &Value, path: &str) -> Result<(), ManifestError> {
+    let c = object_at(c, path)?;
+    only_fields(c, CONTAINER_FIELDS, path)?;
+    if let Some(env) = c.get("env") {
+        for (i, e) in array_of(env, &format!("{path}/env"))?.iter().enumerate() {
+            let e_path = format!("{path}/env/{i}");
+            let e = object_at(e, &e_path)?;
+            only_fields(e, ENV_FIELDS, &e_path)?;
+            if let Some(from) = e.get("valueFrom") {
+                let f_path = format!("{e_path}/valueFrom");
+                only_fields(object_at(from, &f_path)?, ENV_SOURCES, &f_path)?;
+            }
+        }
+    }
+    if let Some(env_from) = c.get("envFrom") {
+        for (i, e) in array_of(env_from, &format!("{path}/envFrom"))?
+            .iter()
+            .enumerate()
+        {
+            let e_path = format!("{path}/envFrom/{i}");
+            only_fields(object_at(e, &e_path)?, ENV_FROM_FIELDS, &e_path)?;
+        }
+    }
+    if let Some(ports) = c.get("ports") {
+        for (i, p) in array_of(ports, &format!("{path}/ports"))?
+            .iter()
+            .enumerate()
+        {
+            let p_path = format!("{path}/ports/{i}");
+            only_fields(object_at(p, &p_path)?, PORT_FIELDS, &p_path)?;
+        }
+    }
+    if let Some(res) = c.get("resources") {
+        let r_path = format!("{path}/resources");
+        only_fields(object_at(res, &r_path)?, RESOURCE_FIELDS, &r_path)?;
+    }
+    if let Some(mounts) = c.get("volumeMounts") {
+        for (i, m) in array_of(mounts, &format!("{path}/volumeMounts"))?
+            .iter()
+            .enumerate()
+        {
+            let m_path = format!("{path}/volumeMounts/{i}");
+            only_fields(object_at(m, &m_path)?, MOUNT_FIELDS, &m_path)?;
+        }
+    }
+    for handler_owner in [
+        "livenessProbe",
+        "readinessProbe",
+        "startupProbe",
+        "lifecycle",
+    ] {
+        if let Some(v) = c.get(handler_owner) {
+            check_no_remote_host(v, &format!("{path}/{handler_owner}"))?;
+        }
+    }
+    if let Some(sc) = c.get("securityContext") {
+        let sc_path = format!("{path}/securityContext");
+        check_security_context(
+            object_at(sc, &sc_path)?,
+            CONTAINER_SECURITY_FIELDS,
+            &sc_path,
+        )?;
+    }
+    Ok(())
+}
+
+/// Probe and lifecycle handlers run from the kubelet; a `host` would aim it at another address.
+fn check_no_remote_host(v: &Value, path: &str) -> Result<(), ManifestError> {
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                let child_path = format!("{path}/{k}");
+                if k == "host" {
+                    return Err(forbidden(
+                        child_path,
+                        "a probe or hook aimed at another host",
+                    ));
+                }
+                check_no_remote_host(child, &child_path)?;
+            }
+            Ok(())
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                check_no_remote_host(item, &format!("{path}/{i}"))?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_security_context(
+    sc: &Map<String, Value>,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), ManifestError> {
+    only_fields(sc, allowed, path)?;
+    let field = |k: &str| format!("{path}/{k}");
+    for (key, what) in [
+        ("privileged", "privileged containers"),
+        ("allowPrivilegeEscalation", "privilege escalation"),
+    ] {
+        if sc.get(key) == Some(&Value::Bool(true)) {
+            return Err(forbidden(field(key), what));
+        }
+    }
+    if sc.get("runAsNonRoot") == Some(&Value::Bool(false)) {
+        return Err(forbidden(field("runAsNonRoot"), "running as root"));
+    }
+    if sc.get("runAsUser").and_then(Value::as_i64) == Some(0) {
+        return Err(forbidden(field("runAsUser"), "running as root"));
+    }
+    if let Some(mount) = sc.get("procMount").and_then(Value::as_str)
+        && mount != "Default"
+    {
+        return Err(forbidden(field("procMount"), "an unmasked /proc"));
+    }
+    for profile in ["seccompProfile", "appArmorProfile"] {
+        if let Some(p) = sc.get(profile) {
+            let kind = p.get("type").and_then(Value::as_str).unwrap_or_default();
+            if !SAFE_PROFILES.contains(&kind) {
+                return Err(forbidden(
+                    field(profile),
+                    "a profile other than RuntimeDefault",
                 ));
             }
+        }
+    }
+    if let Some(caps) = sc.get("capabilities") {
+        let c_path = field("capabilities");
+        let caps = object_at(caps, &c_path)?;
+        only_fields(caps, &["add", "drop"], &c_path)?;
+        if caps
+            .get("add")
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+        {
+            return Err(forbidden(format!("{c_path}/add"), "added capabilities"));
         }
     }
     Ok(())
@@ -956,5 +1332,250 @@ mod tests {
         let a = normalize(job(), &caller(), &queue()).unwrap();
         let b = normalize(job(), &delegated, &queue()).unwrap();
         assert_ne!(a.plan_hash, b.plan_hash);
+    }
+
+    fn refused_with(m: Value, needle: &str) {
+        let err = normalize(m, &caller(), &queue()).unwrap_err();
+        assert!(err.to_string().contains(needle), "{needle}: {err}");
+    }
+
+    #[test]
+    fn pod_fields_outside_the_allowlist_are_refused_with_their_path() {
+        let pod: Vec<(&str, Value)> = vec![
+            (
+                "serviceAccountToken",
+                json!({"volumes": [{"name": "t", "projected": {"sources": [{"serviceAccountToken": {"path": "t"}}]}}]}),
+            ),
+            (
+                "nfs",
+                json!({"volumes": [{"name": "n", "nfs": {"server": "s", "path": "/"}}]}),
+            ),
+            (
+                "csi",
+                json!({"volumes": [{"name": "c", "csi": {"driver": "d"}}]}),
+            ),
+            (
+                "secret",
+                json!({"volumes": [{"name": "s", "secret": {"secretName": "x"}}]}),
+            ),
+            ("runAsUser", json!({"securityContext": {"runAsUser": 0}})),
+            (
+                "runAsNonRoot",
+                json!({"securityContext": {"runAsNonRoot": false}}),
+            ),
+            (
+                "seccompProfile",
+                json!({"securityContext": {"seccompProfile": {"type": "Unconfined"}}}),
+            ),
+            (
+                "seLinuxOptions",
+                json!({"securityContext": {"seLinuxOptions": {"type": "spc_t"}}}),
+            ),
+            (
+                "sysctls",
+                json!({"securityContext": {"sysctls": [{"name": "kernel.x", "value": "1"}]}}),
+            ),
+            ("hostUsers", json!({"hostUsers": false})),
+            ("runtimeClassName", json!({"runtimeClassName": "kata"})),
+            (
+                "tolerations",
+                json!({"tolerations": [{"operator": "Exists"}]}),
+            ),
+            (
+                "priorityClassName",
+                json!({"priorityClassName": "system-node-critical"}),
+            ),
+            (
+                "resourceClaims",
+                json!({"resourceClaims": [{"name": "gpu"}]}),
+            ),
+            (
+                "schedulingGates",
+                json!({"schedulingGates": [{"name": "g"}]}),
+            ),
+            (
+                "ephemeralContainers",
+                json!({"ephemeralContainers": [{"name": "e"}]}),
+            ),
+            ("dnsPolicy", json!({"dnsPolicy": "ClusterFirstWithHostNet"})),
+        ];
+        for (needle, patch) in pod {
+            let mut m = job();
+            for (k, v) in patch.as_object().unwrap() {
+                m["spec"]["template"]["spec"][k] = v.clone();
+            }
+            refused_with(m, needle);
+        }
+        let container: Vec<(&str, Value)> = vec![
+            (
+                "hostPort",
+                json!({"ports": [{"containerPort": 80, "hostPort": 80}]}),
+            ),
+            (
+                "secretKeyRef",
+                json!({"env": [{"name": "T", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}]}),
+            ),
+            (
+                "secretRef",
+                json!({"envFrom": [{"secretRef": {"name": "s"}}]}),
+            ),
+            (
+                "claims",
+                json!({"resources": {"claims": [{"name": "gpu"}]}}),
+            ),
+            (
+                "volumeDevices",
+                json!({"volumeDevices": [{"name": "d", "devicePath": "/dev/x"}]}),
+            ),
+            (
+                "mountPropagation",
+                json!({"volumeMounts": [{"name": "v", "mountPath": "/m", "mountPropagation": "Bidirectional"}]}),
+            ),
+            (
+                "procMount",
+                json!({"securityContext": {"procMount": "Unmasked"}}),
+            ),
+            (
+                "windowsOptions",
+                json!({"securityContext": {"windowsOptions": {"hostProcess": true}}}),
+            ),
+            (
+                "host",
+                json!({"livenessProbe": {"httpGet": {"host": "169.254.169.254", "path": "/", "port": 80}}}),
+            ),
+            (
+                "host",
+                json!({"lifecycle": {"preStop": {"tcpSocket": {"host": "10.0.0.1", "port": 22}}}}),
+            ),
+        ];
+        for (needle, patch) in container {
+            let mut m = job();
+            for (k, v) in patch.as_object().unwrap() {
+                m["spec"]["template"]["spec"]["containers"][0][k] = v.clone();
+            }
+            refused_with(m, needle);
+        }
+    }
+
+    #[test]
+    fn a_hardened_pod_spec_is_accepted() {
+        let mut m = job();
+        m["spec"]["template"]["spec"]["securityContext"] = json!({
+            "runAsNonRoot": true, "runAsUser": 1001, "fsGroup": 1001,
+            "seccompProfile": {"type": "RuntimeDefault"}
+        });
+        m["spec"]["template"]["spec"]["volumes"] = json!([
+            {"name": "scratch", "emptyDir": {}},
+            {"name": "cfg", "configMap": {"name": "settings"}},
+            {"name": "info", "projected": {"sources": [{"downwardAPI": {"items": [{"path": "labels", "fieldRef": {"fieldPath": "metadata.labels"}}]}}]}}
+        ]);
+        let c = &mut m["spec"]["template"]["spec"]["containers"][0];
+        c["securityContext"] = json!({
+            "allowPrivilegeEscalation": false, "readOnlyRootFilesystem": true,
+            "capabilities": {"drop": ["ALL"]}
+        });
+        c["env"] = json!([
+            {"name": "POD", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}},
+            {"name": "MODE", "valueFrom": {"configMapKeyRef": {"name": "settings", "key": "mode"}}}
+        ]);
+        c["ports"] = json!([{"containerPort": 8080, "name": "http"}]);
+        c["readinessProbe"] = json!({"httpGet": {"path": "/healthz", "port": 8080}});
+        c["volumeMounts"] = json!([{"name": "scratch", "mountPath": "/tmp"}]);
+        assert!(normalize(m, &caller(), &queue()).is_ok());
+    }
+
+    #[test]
+    fn reserved_labels_and_annotations_are_refused_on_the_object_and_its_templates() {
+        let cases: Vec<(&str, &str, Value)> = vec![
+            (
+                "/metadata/labels",
+                "kueue.x-k8s.io/priority-class",
+                json!("high"),
+            ),
+            ("/metadata/labels", "crucible.dev/workload", json!("x")),
+            (
+                "/metadata/annotations",
+                "crucible.dev/task-completed",
+                json!("done"),
+            ),
+            (
+                "/metadata/annotations",
+                "crucible.dev/plan-hash",
+                json!("abc"),
+            ),
+            (
+                "/metadata/annotations",
+                "kueue.x-k8s.io/podset-required-topology",
+                json!("rack"),
+            ),
+            (
+                "/spec/template/metadata/labels",
+                "kueue.x-k8s.io/queue-name",
+                json!("gpu"),
+            ),
+            (
+                "/spec/template/metadata/labels",
+                "kueue.x-k8s.io/pod-group-name",
+                json!("g"),
+            ),
+            (
+                "/spec/template/metadata/annotations",
+                "openshell.ai/sandbox-id",
+                json!("s"),
+            ),
+            (
+                "/spec/template/metadata/labels",
+                "workload.spiffe.io/x",
+                json!("y"),
+            ),
+            (
+                "/spec/template/metadata/labels",
+                "evil.crucible.dev/run-id",
+                json!("run-7"),
+            ),
+        ];
+        for (at, key, value) in cases {
+            let mut m = job();
+            m["spec"]["template"]["metadata"] = json!({});
+            let (parent, field) = at.rsplit_once('/').unwrap();
+            m.pointer_mut(parent).unwrap()[field] = json!({ key: value });
+            refused_with(m, key);
+        }
+        let mut ok = job();
+        ok["metadata"]["labels"] = json!({"app.kubernetes.io/name": "train", "team": "a"});
+        ok["spec"]["template"]["metadata"] = json!({"annotations": {"example.com/note": "x"}});
+        assert!(normalize(ok, &caller(), &queue()).is_ok());
+    }
+
+    #[test]
+    fn rayjob_paths_outside_its_pod_templates_cannot_escape_admission() {
+        let ray = || {
+            json!({
+                "apiVersion": "ray.io/v1",
+                "kind": "RayJob",
+                "metadata": {"name": "r"},
+                "spec": {"rayClusterSpec": {
+                    "headGroupSpec": {"template": {"spec": {"containers": [{"name": "h"}]}}}
+                }}
+            })
+        };
+        let mut m = ray();
+        m["spec"]["clusterSelector"] = json!({"ray.io/cluster": "someone-elses"});
+        refused_with(m, "clusterSelector");
+        let mut m = ray();
+        m["spec"]["rayClusterSpec"]["autoscalerOptions"] =
+            json!({"securityContext": {"privileged": true}});
+        refused_with(m, "autoscalerOptions");
+        let mut m = ray();
+        m["spec"]["rayClusterSpec"]["enableInTreeAutoscaling"] = json!(true);
+        refused_with(m, "enableInTreeAutoscaling");
+        let mut m = ray();
+        m["spec"]["rayClusterSpec"]["headGroupSpec"]["serviceType"] = json!("LoadBalancer");
+        refused_with(m, "serviceType");
+        let mut m = ray();
+        m["spec"]["submitterPodTemplate"] =
+            json!({"spec": {"containers": [{"name": "s"}], "hostNetwork": true}});
+        refused_with(m, "hostNetwork");
+        assert!(normalize(ray(), &caller(), &queue()).is_ok());
     }
 }
