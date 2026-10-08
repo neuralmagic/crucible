@@ -51,7 +51,7 @@ Every MCP server trusts both and runs this crate.
 
 ```mermaid
 flowchart LR
-    subgraph sandbox["OpenShell sandbox (crucible-system)"]
+    subgraph sandbox["OpenShell sandbox (sandbox namespace)"]
         agent["agent (workload pod)<br/>holds no credential"]
         sup["supervisor pod<br/>SPIFFE ID per sandbox"]
         agent -->|MCP request, no token| sup
@@ -81,7 +81,7 @@ flowchart LR
 | Component | Role | Where |
 | --- | --- | --- |
 | SPIRE (Zero Trust Workload Identity Manager) | Issues JWT-SVIDs to supervisor pods: `spiffe://<trust domain>/openshell/sandbox/<sandbox-id>` | `zero-trust-workload-identity-manager` |
-| OpenShell supervisor | Fetches the SVID, performs the token grant, injects the bearer on egress | per sandbox, `crucible-system` |
+| OpenShell supervisor | Fetches the SVID, performs the token grant, injects the bearer on egress | per sandbox, the sandbox namespace |
 | Controller token endpoint | Agent issuer: verifies the SVID, maps sandbox to run, mints the token | crucible controller |
 | Keycloak realm `crucible` | Human issuer; also the issuer in the proven spike | its own namespace |
 | `crucible-mcp-auth` | Token validation, RFC 9728 metadata, tool policy | library in each MCP server |
@@ -114,10 +114,29 @@ sequenceDiagram
     S-->>A: result
 ```
 
-**SPIFFE IDs.** A `ClusterSPIFFEID` selects supervisor pods in `crucible-system` by
-`openshell.ai/boundary-role=supervisor` and builds the ID from the annotation
-`openshell.ai/sandbox-id` (`.ai`, not upstream's `.io`). The CSI driver mounts the Workload API
-socket; the sandbox SCC already allows `csi` volumes.
+**SPIFFE IDs.** A `ClusterSPIFFEID` selects supervisor pods in the profile's
+`[cluster] sandbox_namespace` by `openshell.ai/boundary-role=supervisor` and builds the ID from the
+annotation `openshell.ai/sandbox-id` (`.ai`, not upstream's `.io`). Nothing renders it: applying it
+is an operator step, alongside installing SPIRE. Its `namespaceSelector` must name the sandbox
+namespace and nothing else, since any pod it selects can claim a sandbox's identity:
+
+```yaml
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: openshell-sandbox-supervisor
+spec:
+  spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: <sandbox_namespace>
+  podSelector:
+    matchLabels:
+      openshell.ai/boundary-role: supervisor
+  jwtTtl: 5m
+```
+
+The CSI driver mounts the Workload API socket; the sandbox SCC already allows `csi` volumes.
 
 **The token request.** OpenShell's `token_grant` sends `client_credentials` with the SVID as a
 `jwt-bearer` client assertion and no `client_id`. The SVID's audience defaults to the issuer URL
@@ -544,4 +563,4 @@ environment.
 3. The controller mints `kube_user` (the launcher's Kubernetes username) on run tokens.
 4. Render the person-facing deployment from crucible's deploy profile.
 5. Response capture in the guard and a per-run event log, then Cedar, then Dogwood (above).
-6. Keycloak TLS in-cluster; sandboxes out of `crucible-system`.
+6. Keycloak TLS in-cluster; the gateway's driver credential out of pack code's reach.
