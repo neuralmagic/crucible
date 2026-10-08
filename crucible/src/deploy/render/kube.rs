@@ -1608,11 +1608,68 @@ exit $rc
             }]),
         };
 
-        vec![
+        let mut objects = vec![
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(rb),
             SandboxRbacObject::ClusterRole(cr),
             SandboxRbacObject::ClusterRoleBinding(crb),
+        ];
+        objects.extend(self.sandbox_reader_rbac());
+        objects
+    }
+
+    /// get/list on `Sandbox` resources in the sandbox namespace for `cluster.sandbox_readers`,
+    /// the identity the controller resolves a bound sandbox's name with. Nothing when either is
+    /// unset.
+    fn sandbox_reader_rbac(&self) -> Vec<SandboxRbacObject> {
+        let cluster = &self.profile.cluster;
+        let Some(ns) = cluster.sandbox_namespace.as_ref() else {
+            return Vec::new();
+        };
+        if cluster.sandbox_readers.is_empty() {
+            return Vec::new();
+        }
+        let name = "crucible-sandbox-reader".to_string();
+        let role = rbac::Role {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            rules: Some(vec![rbac::PolicyRule {
+                api_groups: Some(vec!["agents.x-k8s.io".to_string()]),
+                resources: Some(vec!["sandboxes".to_string()]),
+                verbs: vec!["get".to_string(), "list".to_string()],
+                ..Default::default()
+            }]),
+        };
+        let binding = rbac::RoleBinding {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                namespace: Some(ns.to_string()),
+                ..Default::default()
+            },
+            role_ref: rbac::RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "Role".to_string(),
+                name,
+            },
+            subjects: Some(
+                cluster
+                    .sandbox_readers
+                    .iter()
+                    .map(|sa| rbac::Subject {
+                        kind: "ServiceAccount".to_string(),
+                        name: sa.name.to_string(),
+                        namespace: Some(sa.namespace.to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        };
+        vec![
+            SandboxRbacObject::Role(role),
+            SandboxRbacObject::RoleBinding(binding),
         ]
     }
 }
@@ -3879,6 +3936,35 @@ mod tests {
             .iter()
             .find(|d| d["kind"] == "NetworkPolicy")
             .expect("netpol");
+        assert!(
+            !moved.contains("crucible-sandbox-reader"),
+            "no readers named, no reader RBAC: {moved}"
+        );
+        let read = render_k8s(&k8s_profile(
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_readers = [\"crucible-control/crucible-controller\"]",
+        ));
+        let read_docs: Vec<serde_json::Value> = read
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let reader = |kind: &str| {
+            read_docs
+                .iter()
+                .find(|d| d["kind"] == kind && d["metadata"]["name"] == "crucible-sandbox-reader")
+                .unwrap_or_else(|| panic!("no reader {kind}: {read}"))
+        };
+        assert_eq!(
+            reader("Role")["metadata"]["namespace"],
+            "crucible-sandboxes"
+        );
+        assert_eq!(
+            reader("Role")["rules"][0]["verbs"],
+            serde_json::json!(["get", "list"])
+        );
+        assert_eq!(
+            reader("RoleBinding")["subjects"][0],
+            serde_json::json!({"kind": "ServiceAccount", "name": "crucible-controller", "namespace": "crucible-control"})
+        );
         for peer in netpol["spec"]["ingress"][0]["from"]
             .as_array()
             .expect("peers")

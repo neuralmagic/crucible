@@ -150,7 +150,8 @@ The engine binds each sandbox it creates by posting its id and workdir to
 `/api/pods/{pod}/sandboxes` with the pod's ingest token, so the drop-box env
 (`CRUCIBLE_INGEST_URL`) must reach the loop pod. The controller reads the sandbox's name from the
 gateway's `Sandbox` resource (`agents.x-k8s.io`) in the sandbox namespace, so its identity on each
-cluster needs `get`/`list` on `sandboxes` there. A sandbox that was never bound, or whose run pod
+cluster needs `get`/`list` on `sandboxes` there; name that identity in `[cluster] sandbox_readers`
+(`namespace/name`) and the loop render grants it. A sandbox that was never bound, or whose run pod
 is no longer running, gets `invalid_grant`.
 
 **`kube_user`.** Tokens carry the dispatcher's Kubernetes username when the controller knows it;

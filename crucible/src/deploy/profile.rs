@@ -339,6 +339,11 @@ pub struct Cluster {
     /// then issues no agent tokens.
     #[serde(default)]
     pub sandbox_namespace: Option<KubeName>,
+    /// Identities (`namespace/name`) granted get/list on OpenShell `Sandbox` resources in
+    /// `sandbox_namespace`: the controller's own identity on this cluster, which reads a bound
+    /// sandbox's name from them.
+    #[serde(default)]
+    pub sandbox_readers: Vec<ServiceAccountRef>,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]
