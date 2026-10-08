@@ -36,7 +36,9 @@ pub struct Options {
     pub registry: Arc<tenant::Registry>,
     /// Accept realm access tokens validated by this resource server.
     pub oidc: Option<Arc<ResourceServer>>,
-    pub policy: Option<ToolPolicy>,
+    /// Decides every MCP request. A server that takes only tenant tokens may pass
+    /// [`ToolPolicy::allow_all`]: their records already pin them.
+    pub policy: ToolPolicy,
     /// Reviews the policy's authorize rules (Kubernetes RBAC). People's tokens are accepted only
     /// with a reviewer and a policy that has authorize rules.
     pub reviewer: Option<Arc<dyn AccessReview>>,
@@ -44,7 +46,7 @@ pub struct Options {
     pub allowed_hosts: Vec<String>,
 }
 
-/// The HTTP app: the MCP endpoint behind authentication and, when given, the tool policy; plus an
+/// The HTTP app: the MCP endpoint behind authentication and the tool policy; plus an
 /// unauthenticated `/healthz` and, with OIDC on, the RFC 9728 protected-resource metadata.
 pub fn router(client: kube::Client, options: Options) -> axum::Router {
     let Options {
@@ -54,7 +56,7 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
         reviewer,
         allowed_hosts,
     } = options;
-    let people = reviewer.is_some() && policy.as_ref().is_some_and(ToolPolicy::authorizes);
+    let people = reviewer.is_some() && policy.authorizes();
     let auth = auth::Auth {
         registry,
         oidc: oidc.clone(),
@@ -69,28 +71,28 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
             config.allowed_hosts.push(host.clone());
         }
     }
+    let task_reviewer = reviewer.clone();
     let service: StreamableHttpService<server::KueueMcp, NeverSessionManager> =
         StreamableHttpService::new(
-            move || Ok(server::KueueMcp::new(client.clone())),
+            move || Ok(server::KueueMcp::new(client.clone(), task_reviewer.clone())),
             Arc::new(NeverSessionManager::default()),
             config,
         );
-    let mut mcp = axum::Router::new().fallback_service(service);
-    if let Some(policy) = policy {
-        let guard = PolicyGuard {
-            policy,
-            server: oidc.clone(),
-            reviewer,
-        };
-        mcp = mcp.layer(axum::middleware::from_fn_with_state(
+    let guard = PolicyGuard {
+        policy,
+        server: oidc.clone(),
+        reviewer,
+    };
+    let mcp = axum::Router::new()
+        .fallback_service(service)
+        .layer(axum::middleware::from_fn_with_state(
             Arc::new(guard),
             crucible_mcp_auth::guard::enforce,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(auth),
+            auth::authenticate,
         ));
-    }
-    mcp = mcp.layer(axum::middleware::from_fn_with_state(
-        Arc::new(auth),
-        auth::authenticate,
-    ));
     let app = axum::Router::new()
         .nest_service(MCP_PATH, mcp)
         .route("/healthz", axum::routing::get(|| async { "ok" }));

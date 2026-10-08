@@ -9,6 +9,15 @@
 #   apiGroups: [kueue.x-k8s.io]  resources: [localqueues]  resourceNames: [<queue>]  verbs: [use]
 #
 # grants a queue. `use` is a verb only this policy asks about.
+#
+# Unlisted protocol methods are refused. The server checks the tasks extension's methods against
+# RBAC itself: `get` on the task's workload to read it, `update` to cancel it.
+
+[methods."tasks/get"]
+scopes = ["kueue.read"]
+
+[methods."tasks/cancel"]
+scopes = ["kueue.submit"]
 
 [tools.whoami]
 scopes = ["kueue.read"]
@@ -91,12 +100,6 @@ message = "you may not read pod logs in this namespace"
 [tools.workload_plan]
 scopes = ["kueue.submit"]
 
-# Records which sandbox submitted the workload. Plan and submit inject the same value, so the
-# plan hash still matches.
-[[tools.workload_plan.mutate]]
-path = "/manifest/metadata/annotations/crucible.dev~1actor"
-value = "has(claims.act) ? claims.act.sub : null"
-
 [[tools.workload_plan.validate]]
 name = "queue-allowed"
 rule = "!has(claims.queues) || size(claims.queues) == 0 || args.queue in claims.queues"
@@ -123,10 +126,6 @@ message = "you may not create this kind of workload in this namespace"
 
 [tools.workload_submit]
 scopes = ["kueue.submit"]
-
-[[tools.workload_submit.mutate]]
-path = "/manifest/metadata/annotations/crucible.dev~1actor"
-value = "has(claims.act) ? claims.act.sub : null"
 
 [[tools.workload_submit.validate]]
 name = "queue-allowed"

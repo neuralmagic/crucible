@@ -78,7 +78,7 @@ role = "viewer"
         crucible_kueue::Options {
             registry: Arc::new(Registry::new(tenants)),
             oidc: None,
-            policy: None,
+            policy: crucible_mcp_auth::policy::ToolPolicy::allow_all(),
             reviewer: None,
             allowed_hosts: Vec::new(),
         },

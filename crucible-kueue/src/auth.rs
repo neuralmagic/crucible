@@ -5,8 +5,8 @@
 //! | Token                    | Identity                                                        |
 //! |--------------------------|-----------------------------------------------------------------|
 //! | tenant token             | pinned to its record's namespace, role, queues                  |
-//! | realm token with run_id  | a run: pinned to its `namespace` claim, `role`, `queues`        |
-//! | realm token, no run_id   | a person: any namespace, decided per call by the policy's access |
+//! | from a run issuer        | a run: pinned to its `namespace` claim, `role`, `queues`        |
+//! | from a people issuer     | a person: any namespace, decided per call by the policy's access |
 //! |                          | checks; accepted only when the server has an access reviewer    |
 //!
 //! The two are told apart by shape: an access token is a compact JWS (three dot-separated
@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use crucible_contract::kueue::TenantRole;
-use crucible_mcp_auth::principal::Principal;
+use crucible_mcp_auth::principal::{Callers, Principal};
 use crucible_mcp_auth::server::{AuthError, ResourceServer, bearer_token};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
@@ -27,8 +27,8 @@ pub struct Auth {
     pub registry: Arc<Registry>,
     /// Accept access tokens from this authorization server. `None` accepts tenant tokens only.
     pub oidc: Option<Arc<ResourceServer>>,
-    /// Accept people's tokens (no `run_id`). Only safe when the tool policy's access checks
-    /// decide every call, so the server sets it exactly when it has an access reviewer.
+    /// Accept people's tokens (from a people issuer). Only safe when the tool policy's access
+    /// checks decide every call, so the server sets it exactly when it has an access reviewer.
     pub people: bool,
 }
 
@@ -44,15 +44,18 @@ pub enum ClaimError {
     Name(#[from] NameError),
     #[error("this server accepts only run tokens: it has no access reviewer for people")]
     People,
+    #[error("a run's token must not come from a people issuer")]
+    RunFromPeopleIssuer,
     #[error("a person's token needs a kube_user claim")]
     NoKubeUser,
 }
 
 impl Identity {
-    /// The identity a realm token carries. A run's token (`run_id`) is pinned to its `namespace`
-    /// claim with its `role` and `queues`. A person's token (no `run_id`) needs `people` and a
-    /// `kube_user` claim; it owns its workloads under its own subject, may name any namespace
-    /// (its `namespace` claim, if any, is the default), and is limited by the access checks.
+    /// The identity an access token carries; its issuer decides which kind. A run's token is
+    /// pinned to its `namespace` claim with its `role` and `queues`, and its presenter (`act.sub`)
+    /// is recorded as the actor. A person's token needs `people` and a `kube_user` claim; it owns
+    /// its workloads under its own subject, may name any namespace (its `namespace` claim, if any,
+    /// is the default), and is limited by the access checks.
     pub fn from_principal(principal: &Principal, people: bool) -> Result<Self, ClaimError> {
         let claim = |key: &'static str| {
             principal
@@ -62,7 +65,10 @@ impl Identity {
                 .ok_or(ClaimError::Missing(key))
         };
         let launched_by = Some(Launcher::parse(&principal.subject)?);
-        if !principal.claims.contains_key("run_id") {
+        if principal.callers == Callers::People {
+            if principal.claims.contains_key("run_id") {
+                return Err(ClaimError::RunFromPeopleIssuer);
+            }
             if !people {
                 return Err(ClaimError::People);
             }
@@ -80,6 +86,7 @@ impl Identity {
                 role: TenantRole::Submitter,
                 queues: Vec::new(),
                 launched_by,
+                actor: None,
             });
         }
         let role = claim("role")?;
@@ -104,6 +111,7 @@ impl Identity {
             role,
             queues,
             launched_by,
+            actor: principal.actor_chain.first().cloned(),
         })
     }
 }
@@ -137,6 +145,7 @@ impl Caller {
             namespace: Some(self.namespace.to_string()),
             scopes,
             claims,
+            callers: Callers::Runs,
         }
     }
 }
@@ -188,7 +197,8 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
                     return refused(
                         StatusCode::FORBIDDEN,
                         "insufficient_scope",
-                        error.to_string(),
+                        "the access token does not identify a run or a person this server serves"
+                            .into(),
                     );
                 }
             }
@@ -240,6 +250,13 @@ mod tests {
         }
     }
 
+    fn person(claims: Value) -> Principal {
+        Principal {
+            callers: Callers::People,
+            ..principal(claims)
+        }
+    }
+
     fn realm_claims() -> Value {
         json!({
             "sub": "alice",
@@ -256,6 +273,33 @@ mod tests {
         let identity = Identity::from_principal(&principal(claims), false)?;
         assert!(identity.pinned);
         Ok(identity.in_namespace(None).unwrap())
+    }
+
+    #[test]
+    fn the_issuer_not_the_claims_decides_person_or_run() {
+        let mut no_run = realm_claims();
+        no_run.as_object_mut().unwrap().remove("run_id");
+        assert!(matches!(
+            Identity::from_principal(&principal(no_run), true),
+            Err(ClaimError::Missing("run_id"))
+        ));
+        let mut run_shaped = person_claims();
+        run_shaped["run_id"] = json!("auth-spike");
+        assert!(matches!(
+            Identity::from_principal(&person(run_shaped), true),
+            Err(ClaimError::RunFromPeopleIssuer)
+        ));
+    }
+
+    #[test]
+    fn a_runs_presenter_is_its_actor_and_a_person_has_none() {
+        let identity = Identity::from_principal(&principal(realm_claims()), false).unwrap();
+        assert_eq!(
+            identity.actor.as_deref(),
+            Some("spiffe://example.crucible/openshell/sandbox/s1")
+        );
+        let identity = Identity::from_principal(&person(person_claims()), true).unwrap();
+        assert_eq!(identity.actor, None);
     }
 
     #[test]
@@ -278,7 +322,7 @@ mod tests {
 
     #[test]
     fn a_persons_token_picks_its_namespace_and_owns_its_workloads_under_its_subject() {
-        let identity = Identity::from_principal(&principal(person_claims()), true).unwrap();
+        let identity = Identity::from_principal(&person(person_claims()), true).unwrap();
         assert!(!identity.pinned);
         assert_eq!(identity.role, TenantRole::Submitter);
         assert!(identity.queues.is_empty());
@@ -296,7 +340,7 @@ mod tests {
 
         let mut with_default = person_claims();
         with_default["namespace"] = json!("team-a");
-        let identity = Identity::from_principal(&principal(with_default), true).unwrap();
+        let identity = Identity::from_principal(&person(with_default), true).unwrap();
         assert_eq!(
             identity.in_namespace(None).unwrap().namespace.as_str(),
             "team-a"
@@ -314,13 +358,13 @@ mod tests {
     #[test]
     fn people_need_a_reviewing_server_and_a_kube_user() {
         assert!(matches!(
-            Identity::from_principal(&principal(person_claims()), false),
+            Identity::from_principal(&person(person_claims()), false),
             Err(ClaimError::People)
         ));
         let mut no_user = person_claims();
         no_user.as_object_mut().unwrap().remove("kube_user");
         assert!(matches!(
-            Identity::from_principal(&principal(no_user), true),
+            Identity::from_principal(&person(no_user), true),
             Err(ClaimError::NoKubeUser)
         ));
     }

@@ -50,18 +50,25 @@ expires_at = 1791500000   # optional, Unix seconds
 
 ### Access tokens
 
-With `--issuer <issuer>=<jwks uri>` (repeatable) and `--resource`, the server also accepts OAuth
-access tokens from each listed issuer, verified against that issuer's own keys: the crucible
-controller for sandboxed agents, the crucible realm for people (a compact JWT is never looked up
-as a tenant token). The token's `run_id`, `namespace`, `role`, and `queues` claims give the same
-scope as a tenant record, and its `sub` (the human the run acts for) is stamped on created
-workloads as `crucible.dev/launched-by`.
-`--tool-policy` adds per-tool scopes and CEL rules over the caller's claims and the call's
-arguments. With `--kube-authz openshift|token` the policy's authorize rules become
-SubjectAccessReviews for any token carrying `kube_user`, and people's tokens (no `run_id`) are
-accepted. Every tool takes an optional `namespace`: run and tenant tokens are pinned to theirs, and
-a person names one per call. Hosts can embed the server with
-`crucible_kueue::router(client, Options { … })`. The shipped policy is
+With `--run-issuer <issuer>=<jwks uri>` (repeatable) and `--resource`, the server also accepts
+OAuth access tokens for runs from each listed issuer (the crucible controller), verified against
+that issuer's own keys; a compact JWT is never looked up as a tenant token. The token's `run_id`,
+`namespace`, `role`, and `queues` claims give the same scope as a tenant record, its `sub` (the
+human the run acts for) is stamped on created workloads as `crucible.dev/launched-by`, and its
+presenter (`act.sub`, the sandbox) as `crucible.dev/actor`. `--person-issuer` (the crucible realm)
+accepts people's tokens, which need `--kube-authz`. The issuer decides which kind a token is, never
+its claims.
+
+Key sets are fetched over https; `--jwks-ca <pem>` adds CAs for the issuers' hosts, and
+`--insecure-jwks-http` allows plain http off loopback for a cluster network you trust.
+
+Any issuer needs `--tool-policy`: per-method and per-tool scopes and CEL rules over the caller's
+claims and the call's arguments, with unlisted methods refused. A server with only tenant tokens
+runs without one. With `--kube-authz openshift|token` the policy's authorize rules become
+SubjectAccessReviews for any token carrying `kube_user`, and the server checks `tasks/get` (`get`)
+and `tasks/cancel` (`update`) on the task's workload the same way. Every tool takes an optional
+`namespace`: run and tenant tokens are pinned to theirs, and a person names one per call. Hosts can
+embed the server with `crucible_kueue::router(client, Options { … })`. The shipped policy is
 [deploy/kueue-policy.toml](deploy/kueue-policy.toml); the auth design and the e2e's configuration
 are in [crucible-mcp-auth](../crucible-mcp-auth/README.md).
 

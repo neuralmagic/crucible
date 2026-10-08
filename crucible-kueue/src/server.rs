@@ -11,6 +11,11 @@ use crate::manifest::{
 use crate::status::{self, Rollup};
 use crate::task::{self, Outcome, TaskRef};
 use crate::tenant::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
+use crucible_contract::kueue::TenantRole;
+use crucible_mcp_auth::guard::AccessReview;
+use crucible_mcp_auth::kube::USER_CLAIM;
+use crucible_mcp_auth::policy::AccessCheck;
+use crucible_mcp_auth::principal::Principal;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
@@ -29,10 +34,14 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 pub const FIELD_MANAGER: &str = "crucible-kueue";
 pub const PLAN_HASH_ANNOTATION: &str = "crucible.dev/plan-hash";
 pub const STOPPED_REPLICAS_ANNOTATION: &str = "crucible.dev/stopped-replicas";
+/// The sandbox that presented the run's token when the workload was planned and submitted.
+pub const ACTOR_ANNOTATION: &str = "crucible.dev/actor";
+const SUBMIT_SCOPE: &str = "kueue.submit";
 const MAX_WORKLOADS_SHOWN: usize = 20;
 const MAX_REPLICAS: i64 = 1000;
 const MAX_LOG_PODS: usize = 4;
@@ -159,12 +168,100 @@ fn parse_task(id: &str) -> Result<TaskRef, McpError> {
     TaskRef::parse(id).ok_or_else(|| McpError::invalid_params(format!("unknown task: {id}"), None))
 }
 
-fn task_caller(ctx: &RequestContext<RoleServer>, task: &TaskRef) -> Result<Caller, McpError> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskAccess {
+    Read,
+    Cancel,
+}
+
+impl TaskAccess {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Read => "tasks/get",
+            Self::Cancel => "tasks/cancel",
+        }
+    }
+}
+
+/// The Kubernetes access a task request needs on the task's object: `get` to read it, `update` to
+/// cancel it.
+fn task_check(t: &TaskRef, c: &Caller, access: TaskAccess) -> AccessCheck {
+    let (verb, rule, message) = match access {
+        TaskAccess::Read => ("get", "task-get", "you may not read this workload"),
+        TaskAccess::Cancel => ("update", "task-cancel", "you may not cancel this workload"),
+    };
+    let group = t
+        .kind
+        .api_version()
+        .rsplit_once('/')
+        .map_or("", |(group, _)| group);
+    AccessCheck {
+        tool: access.method().into(),
+        rule: rule.into(),
+        message: message.into(),
+        group: group.into(),
+        resource: t.kind.plural().into(),
+        subresource: String::new(),
+        verb: verb.into(),
+        namespace: c.namespace.to_string(),
+        name: t.name.clone(),
+    }
+}
+
+fn refused(error: impl std::fmt::Display) -> McpError {
+    McpError::invalid_request(error.to_string(), None)
+}
+
+fn request_parts(ctx: &RequestContext<RoleServer>) -> Result<&http::request::Parts, ToolError> {
     ctx.extensions
         .get::<http::request::Parts>()
         .ok_or(ToolError::NoCaller)
-        .and_then(|parts| caller(parts, task.namespace.as_deref()))
-        .map_err(|e| McpError::invalid_request(e.to_string(), None))
+}
+
+fn principal(parts: &http::request::Parts) -> Result<&Principal, ToolError> {
+    parts
+        .extensions
+        .get::<Principal>()
+        .ok_or(ToolError::NoCaller)
+}
+
+/// Whether `caller` created `obj`: crucible-kueue's managed label and the caller's run label.
+fn owns(caller: &Caller, obj: &DynamicObject) -> bool {
+    let labels = obj.metadata.labels.as_ref();
+    let label = |key: &str| labels.and_then(|l| l.get(key)).map(String::as_str);
+    label(MANAGED_LABEL) == Some(MANAGED_VALUE) && label(RUN_LABEL) == Some(caller.run_id.as_str())
+}
+
+/// Records `actor` on the manifest, or removes whatever the caller put there when it has none.
+fn stamp_actor(manifest: &mut Value, actor: Option<&str>) {
+    let Some(metadata) = manifest.as_object_mut().map(|object| {
+        object
+            .entry("metadata")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()))
+    }) else {
+        return;
+    };
+    let Some(metadata) = metadata.as_object_mut() else {
+        return;
+    };
+    match actor {
+        Some(actor) => {
+            let annotations = metadata
+                .entry("annotations")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(annotations) = annotations.as_object_mut() {
+                annotations.insert(ACTOR_ANNOTATION.into(), Value::String(actor.into()));
+            }
+        }
+        None => {
+            if let Some(annotations) = metadata
+                .get_mut("annotations")
+                .and_then(Value::as_object_mut)
+            {
+                annotations.remove(ACTOR_ANNOTATION);
+            }
+        }
+    }
 }
 
 fn owner_uids(obj: &DynamicObject, pods: &[Pod]) -> Vec<String> {
@@ -195,13 +292,16 @@ fn replicas_of(obj: &DynamicObject) -> i64 {
         .unwrap_or(1)
 }
 
-/// The request's identity acting in `namespace` (its own when `None`).
-fn caller(parts: &http::request::Parts, namespace: Option<&str>) -> Result<Caller, ToolError> {
-    let identity = parts
+fn identity(parts: &http::request::Parts) -> Result<&Identity, ToolError> {
+    parts
         .extensions
         .get::<Identity>()
-        .ok_or(ToolError::NoCaller)?;
-    Ok(identity.in_namespace(namespace)?)
+        .ok_or(ToolError::NoCaller)
+}
+
+/// The request's identity acting in `namespace` (its own when `None`).
+fn caller(parts: &http::request::Parts, namespace: Option<&str>) -> Result<Caller, ToolError> {
+    Ok(identity(parts)?.in_namespace(namespace)?)
 }
 
 fn api_rejection(kind: WorkloadKind, err: kube::Error) -> ToolError {
@@ -312,6 +412,9 @@ pub struct ListArgs {
 #[derive(Clone)]
 pub struct KueueMcp {
     client: kube::Client,
+    /// Decides task requests from tokens carrying a Kubernetes user, as the tool policy's
+    /// authorize rules decide tool calls.
+    reviewer: Option<Arc<dyn AccessReview>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -364,11 +467,63 @@ fn pod_summary(p: &Pod) -> PodSummary {
 }
 
 impl KueueMcp {
-    pub fn new(client: kube::Client) -> Self {
+    pub fn new(client: kube::Client, reviewer: Option<Arc<dyn AccessReview>>) -> Self {
         Self {
             client,
+            reviewer,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The caller a task request acts as, once its token, its role and Kubernetes RBAC on the
+    /// task's object allow `access`. Cancelling also needs the submit scope.
+    async fn task_caller(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        t: &TaskRef,
+        access: TaskAccess,
+    ) -> Result<(Caller, bool), McpError> {
+        let parts = request_parts(ctx).map_err(refused)?;
+        let identity = identity(parts).map_err(refused)?;
+        let principal = principal(parts).map_err(refused)?;
+        let c = identity
+            .in_namespace(t.namespace.as_deref())
+            .map_err(refused)?;
+        let may_submit =
+            c.role == TenantRole::Submitter && principal.scopes.iter().any(|s| s == SUBMIT_SCOPE);
+        if access == TaskAccess::Cancel && !may_submit {
+            return Err(refused(format!(
+                "tasks/cancel needs the submitter role and scope {SUBMIT_SCOPE}"
+            )));
+        }
+        let reviewed = principal.claims.contains_key(USER_CLAIM);
+        if reviewed || !identity.pinned {
+            let Some(reviewer) = &self.reviewer else {
+                return Err(refused(format!(
+                    "{} needs an access reviewer this server does not have",
+                    access.method()
+                )));
+            };
+            let check = task_check(t, &c, access);
+            match reviewer.review(principal, &check).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(sub = %principal.subject, rule = %check.rule, namespace = %check.namespace, name = %check.name, "task request denied");
+                    return Err(refused(format!(
+                        "{} refused by {}: {}",
+                        check.tool, check.rule, check.message
+                    )));
+                }
+                Err(error) => {
+                    tracing::warn!(sub = %principal.subject, rule = %check.rule, %error, "access review failed");
+                    return Err(refused(format!(
+                        "{} refused by {}: the access review failed",
+                        check.tool, check.rule
+                    )));
+                }
+            }
+        }
+        Ok((c, may_submit))
     }
 
     fn dynamic(&self, kind: WorkloadKind, ns: &str) -> Api<DynamicObject> {
@@ -440,10 +595,7 @@ impl KueueMcp {
         name: &str,
     ) -> Result<DynamicObject, ToolError> {
         let obj = self.get_object(caller, kind, name).await?;
-        let labels = obj.metadata.labels.clone().unwrap_or_default();
-        let ours = labels.get(MANAGED_LABEL).map(String::as_str) == Some(MANAGED_VALUE)
-            && labels.get(RUN_LABEL).map(String::as_str) == Some(caller.run_id.as_str());
-        if !ours {
+        if !owns(caller, &obj) {
             return Err(ToolError::NotOwned {
                 kind: kind.kind(),
                 name: name.to_string(),
@@ -785,7 +937,13 @@ impl KueueMcp {
         Ok(())
     }
 
-    async fn detailed_task(&self, c: &Caller, t: &TaskRef) -> Result<DetailedTask, ToolError> {
+    /// The task's state. Only a `writable` request records a completion it observes.
+    async fn detailed_task(
+        &self,
+        c: &Caller,
+        t: &TaskRef,
+        writable: bool,
+    ) -> Result<DetailedTask, ToolError> {
         let report = self.status_report(c, t.kind, &t.name).await?;
         let full = serde_json::to_value(&report.object).map_err(|source| KubeError::Decode {
             what: format!("{} {}", t.kind.kind(), t.name),
@@ -796,6 +954,7 @@ impl KueueMcp {
             failed: false,
             message,
         } = &outcome
+            && writable
             && t.kind.is_scalable()
             && report
                 .object
@@ -1029,7 +1188,9 @@ impl KueueMcp {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
-                let (n, cq) = self.plan(&c, &args.queue, args.manifest).await?;
+                let mut manifest = args.manifest;
+                stamp_actor(&mut manifest, identity(&parts)?.actor.as_deref());
+                let (n, cq) = self.plan(&c, &args.queue, manifest).await?;
                 self.create(&c, &n, true).await?;
                 let totals: BTreeMap<String, String> =
                     n.total_requests().into_iter().map(|(k, v)| (k, v.to_string())).collect();
@@ -1073,11 +1234,12 @@ impl KueueMcp {
             .is_some_and(|c| c.supports_tasks());
         let parts = ctx.extensions.get::<http::request::Parts>();
         let submitted: Result<(Value, Task), ToolError> = async {
-                let c = parts
-                    .ok_or(ToolError::NoCaller)
-                    .and_then(|p| caller(p, args.namespace.as_deref()))?;
+                let parts = parts.ok_or(ToolError::NoCaller)?;
+                let c = caller(parts, args.namespace.as_deref())?;
                 c.require_submitter("workload_submit")?;
-                let (n, _) = self.plan(&c, &args.queue, args.manifest).await?;
+                let mut manifest = args.manifest;
+                stamp_actor(&mut manifest, identity(parts)?.actor.as_deref());
+                let (n, _) = self.plan(&c, &args.queue, manifest).await?;
                 if n.plan_hash != args.plan_hash {
                     return Err(ToolError::HashMismatch {
                         got: args.plan_hash,
@@ -1353,9 +1515,14 @@ impl ServerHandler for KueueMcp {
         request: GetTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
-        let c = task_caller(&ctx, &parse_task(&request.task_id)?)?;
-        let (t, _) = self.task_object(&c, &request.task_id).await?;
-        let detailed = self.detailed_task(&c, &t).await.map_err(internal)?;
+        let t = parse_task(&request.task_id)?;
+        let (c, may_submit) = self.task_caller(&ctx, &t, TaskAccess::Read).await?;
+        let (t, obj) = self.task_object(&c, &request.task_id).await?;
+        let writable = may_submit && owns(&c, &obj);
+        let detailed = self
+            .detailed_task(&c, &t, writable)
+            .await
+            .map_err(internal)?;
         Ok(GetTaskResult::new(detailed))
     }
 
@@ -1364,9 +1531,8 @@ impl ServerHandler for KueueMcp {
         request: CancelTaskParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
-        let c = task_caller(&ctx, &parse_task(&request.task_id)?)?;
-        c.require_submitter("tasks/cancel")
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
+        let t = parse_task(&request.task_id)?;
+        let (c, _) = self.task_caller(&ctx, &t, TaskAccess::Cancel).await?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let r = WorkloadRef {
             namespace: t.namespace.clone(),
@@ -1375,8 +1541,8 @@ impl ServerHandler for KueueMcp {
         };
         self.owned_object(&c, t.kind, &t.name)
             .await
-            .map_err(|e| McpError::invalid_request(e.to_string(), None))?;
-        let current = self.detailed_task(&c, &t).await.map_err(internal)?;
+            .map_err(refused)?;
+        let current = self.detailed_task(&c, &t, true).await.map_err(internal)?;
         if current.status().is_terminal() {
             return Ok(());
         }
@@ -1392,6 +1558,83 @@ impl ServerHandler for KueueMcp {
 #[cfg(test)]
 mod tests {
     use crate::server::*;
+
+    #[test]
+    fn the_actor_is_the_servers_to_stamp() {
+        let mut manifest = json!({"kind": "Job", "metadata": {"name": "j"}});
+        stamp_actor(&mut manifest, Some("spiffe://example.crucible/s1"));
+        assert_eq!(
+            manifest["metadata"]["annotations"][ACTOR_ANNOTATION],
+            "spiffe://example.crucible/s1"
+        );
+
+        let mut forged =
+            json!({"metadata": {"annotations": {ACTOR_ANNOTATION: "spiffe://other", "keep": "x"}}});
+        stamp_actor(&mut forged, Some("spiffe://example.crucible/s1"));
+        assert_eq!(
+            forged["metadata"]["annotations"],
+            json!({ACTOR_ANNOTATION: "spiffe://example.crucible/s1", "keep": "x"})
+        );
+        stamp_actor(&mut forged, None);
+        assert_eq!(forged["metadata"]["annotations"], json!({"keep": "x"}));
+
+        let mut bare = json!({"kind": "Job"});
+        stamp_actor(&mut bare, None);
+        assert_eq!(bare, json!({"kind": "Job", "metadata": {}}));
+        let mut not_an_object = json!([1]);
+        stamp_actor(&mut not_an_object, Some("a"));
+        assert_eq!(not_an_object, json!([1]));
+    }
+
+    #[test]
+    fn task_checks_name_the_tasks_object_and_the_verb_its_method_needs() {
+        let caller = Identity::pinned(Caller {
+            run_id: crate::tenant::RunId::parse("r").unwrap(),
+            namespace: Namespace::parse("team-a").unwrap(),
+            role: TenantRole::Submitter,
+            queues: vec![],
+            launched_by: None,
+        })
+        .in_namespace(None)
+        .unwrap();
+        let shown = |c: AccessCheck| {
+            (
+                c.tool,
+                c.rule,
+                c.group,
+                c.resource,
+                c.verb,
+                c.namespace,
+                c.name,
+            )
+        };
+        let job = TaskRef::parse("team-a/Job/train/u1").unwrap();
+        assert_eq!(
+            shown(task_check(&job, &caller, TaskAccess::Read)),
+            (
+                "tasks/get".into(),
+                "task-get".into(),
+                "batch".into(),
+                "jobs".into(),
+                "get".into(),
+                "team-a".into(),
+                "train".into()
+            )
+        );
+        let set = TaskRef::parse("team-a/LeaderWorkerSet/serve/u2").unwrap();
+        assert_eq!(
+            shown(task_check(&set, &caller, TaskAccess::Cancel)),
+            (
+                "tasks/cancel".into(),
+                "task-cancel".into(),
+                "leaderworkerset.x-k8s.io".into(),
+                "leaderworkersets".into(),
+                "update".into(),
+                "team-a".into(),
+                "serve".into()
+            )
+        );
+    }
 
     #[test]
     fn replies_carry_a_status_tag_and_policy_failures_are_refusals() {

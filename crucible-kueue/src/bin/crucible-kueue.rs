@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
-use crucible_mcp_auth::server::TrustedIssuer;
+use crucible_mcp_auth::policy::ToolPolicy;
+use crucible_mcp_auth::server::{JwksTls, TrustedIssuer};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,24 +29,44 @@ struct Cli {
         value_delimiter = ','
     )]
     allowed_hosts: Vec<String>,
-    /// Accept access tokens from an OAuth issuer, as `<issuer>=<jwks uri>`, alongside tenant
-    /// tokens. Repeat for each issuer (the crucible controller for agents, the realm for people).
+    /// Accept runs' access tokens from an OAuth issuer (the crucible controller), as
+    /// `<issuer>=<jwks uri>`, alongside tenant tokens. Repeatable.
     #[arg(
-        long = "issuer",
-        env = "CRUCIBLE_KUEUE_ISSUERS",
+        long = "run-issuer",
+        env = "CRUCIBLE_KUEUE_RUN_ISSUERS",
         value_delimiter = ',',
-        requires = "resources"
+        value_parser = TrustedIssuer::runs,
+        requires = "resources",
+        requires = "tool_policy"
     )]
-    issuers: Vec<TrustedIssuer>,
+    run_issuers: Vec<TrustedIssuer>,
+    /// Accept people's access tokens from an OAuth issuer (the realm), as `<issuer>=<jwks uri>`.
+    /// Repeatable; needs --kube-authz.
+    #[arg(
+        long = "person-issuer",
+        env = "CRUCIBLE_KUEUE_PERSON_ISSUERS",
+        value_delimiter = ',',
+        value_parser = TrustedIssuer::people,
+        requires = "resources",
+        requires = "kube_authz"
+    )]
+    person_issuers: Vec<TrustedIssuer>,
     /// This server's canonical MCP URLs; an access token's aud must name one.
     #[arg(
         long = "resource",
         env = "CRUCIBLE_KUEUE_RESOURCES",
-        value_delimiter = ',',
-        requires = "issuers"
+        value_delimiter = ','
     )]
     resources: Vec<url::Url>,
-    /// TOML tool policy: per-tool scopes, CEL validate rules, and claim-derived argument mutations.
+    /// PEM bundle of CAs to trust for issuers' JWKS hosts, beside the platform roots.
+    #[arg(long, env = "CRUCIBLE_KUEUE_JWKS_CA")]
+    jwks_ca: Option<PathBuf>,
+    /// Allow plain-http JWKS URIs on non-loopback hosts. Only for a cluster network you trust.
+    #[arg(long, env = "CRUCIBLE_KUEUE_INSECURE_JWKS_HTTP")]
+    insecure_jwks_http: bool,
+    /// TOML tool policy: per-method and per-tool scopes, CEL validate and mutate rules, and
+    /// Kubernetes authorize rules. Required with any issuer; without one, tenant tokens' records
+    /// decide alone.
     #[arg(long, env = "CRUCIBLE_KUEUE_TOOL_POLICY")]
     tool_policy: Option<PathBuf>,
     /// Decide the policy's authorize rules with Kubernetes RBAC (SubjectAccessReview), taking the
@@ -76,8 +97,14 @@ enum KubeAuthz {
 struct NoAuthorizeRules;
 
 #[derive(Debug, thiserror::Error)]
-#[error("no callers: pass --tenants with at least one entry, --tenant-namespace, or --issuer")]
+#[error(
+    "no callers: pass --tenants with at least one entry, --tenant-namespace, --run-issuer or --person-issuer"
+)]
 struct NoTenants;
+
+#[derive(Debug, thiserror::Error)]
+#[error("--resource needs --run-issuer or --person-issuer")]
+struct ResourcesWithoutIssuers;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -109,8 +136,16 @@ async fn main() -> anyhow::Result<()> {
         }
         None => crucible_kueue::tenant::Tenants::default(),
     };
-    if tenants.is_empty() && cli.tenant_namespace.is_none() && cli.issuers.is_empty() {
+    let issuers: Vec<TrustedIssuer> = cli
+        .run_issuers
+        .into_iter()
+        .chain(cli.person_issuers)
+        .collect();
+    if tenants.is_empty() && cli.tenant_namespace.is_none() && issuers.is_empty() {
         return Err(NoTenants.into());
+    }
+    if issuers.is_empty() && !cli.resources.is_empty() {
+        return Err(ResourcesWithoutIssuers.into());
     }
     tracing::info!(tenants = tenants.len(), "static tenants loaded");
     let registry = Arc::new(crucible_kueue::tenant::Registry::new(tenants));
@@ -135,13 +170,16 @@ async fn main() -> anyhow::Result<()> {
             registry.clone(),
         ));
     }
-    let oidc = match cli.issuers.is_empty() {
+    let oidc = match issuers.is_empty() {
         true => None,
         false => {
-            let issuers: Vec<&str> = cli.issuers.iter().map(|t| t.issuer.as_str()).collect();
-            tracing::info!(?issuers, resources = ?cli.resources, "accepting access tokens");
+            let names: Vec<(&str, _)> = issuers
+                .iter()
+                .map(|t| (t.issuer.as_str(), t.callers))
+                .collect();
+            tracing::info!(issuers = ?names, resources = ?cli.resources, "accepting access tokens");
             let config = crucible_mcp_auth::server::ResourceServerConfig {
-                issuers: cli.issuers,
+                issuers,
                 resources: cli.resources,
                 required_scopes: vec![crucible_contract::kueue::SCOPE_READ.to_string()],
                 scopes_supported: vec![
@@ -150,8 +188,12 @@ async fn main() -> anyhow::Result<()> {
                 ],
                 resource_name: Some("crucible-kueue".to_string()),
             };
-            let server = crucible_mcp_auth::server::ResourceServer::new(config)
-                .context("building the JWKS client")?;
+            let tls = JwksTls {
+                ca_bundle: cli.jwks_ca,
+                insecure_http: cli.insecure_jwks_http,
+            };
+            let server = crucible_mcp_auth::server::ResourceServer::new(config, &tls)
+                .context("building the resource server")?;
             Some(Arc::new(server))
         }
     };
@@ -159,16 +201,19 @@ async fn main() -> anyhow::Result<()> {
         Some(path) => {
             let text = std::fs::read_to_string(path)
                 .with_context(|| format!("reading tool policy {}", path.display()))?;
-            let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(&text)
+            let policy = ToolPolicy::from_toml(&text)
                 .with_context(|| format!("loading tool policy {}", path.display()))?;
             tracing::info!(path = %path.display(), "tool policy loaded");
-            Some(policy)
+            policy
         }
-        None => None,
+        None => {
+            tracing::info!("no tool policy: tenant records decide alone");
+            ToolPolicy::allow_all()
+        }
     };
     let reviewer: Option<Arc<dyn crucible_mcp_auth::guard::AccessReview>> = match cli.kube_authz {
         Some(source) => {
-            if !policy.as_ref().is_some_and(|p| p.authorizes()) {
+            if !policy.authorizes() {
                 return Err(NoAuthorizeRules.into());
             }
             let groups = match source {
@@ -210,46 +255,83 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use crucible_mcp_auth::principal::Callers;
+
+    const RESOURCE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
 
     #[test]
-    fn issuers_parse_as_issuer_equals_jwks_uri_and_keep_the_issuer_verbatim() {
+    fn issuers_parse_as_issuer_equals_jwks_uri_and_the_flag_decides_their_callers() {
         let cli = Cli::try_parse_from([
             "crucible-kueue",
-            "--issuer",
+            "--run-issuer",
             "http://crucible-controller.crucible-system.svc:8080=http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json",
-            "--issuer",
-            "https://keycloak.example/realms/crucible=http://keycloak.auth.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1",
+            "--person-issuer",
+            "https://keycloak.example/realms/crucible=https://keycloak.auth.svc:8443/realms/crucible/protocol/openid-connect/certs?x=1",
             "--resource",
-            "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp",
+            RESOURCE,
+            "--tool-policy",
+            "policy.toml",
+            "--kube-authz",
+            "openshift",
         ])
         .unwrap();
-        assert_eq!(
-            cli.issuers
+        let shown = |issuers: &[TrustedIssuer]| {
+            issuers
                 .iter()
-                .map(|t| (t.issuer.as_str(), t.jwks_uri.as_str()))
-                .collect::<Vec<_>>(),
-            [
-                (
-                    "http://crucible-controller.crucible-system.svc:8080",
-                    "http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json"
-                ),
-                (
-                    "https://keycloak.example/realms/crucible",
-                    "http://keycloak.auth.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1"
-                ),
-            ]
+                .map(|t| (t.issuer.clone(), t.jwks_uri.to_string(), t.callers))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            shown(&cli.run_issuers),
+            [(
+                "http://crucible-controller.crucible-system.svc:8080".to_string(),
+                "http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json"
+                    .to_string(),
+                Callers::Runs
+            )]
+        );
+        assert_eq!(
+            shown(&cli.person_issuers),
+            [(
+                "https://keycloak.example/realms/crucible".to_string(),
+                "https://keycloak.auth.svc:8443/realms/crucible/protocol/openid-connect/certs?x=1"
+                    .to_string(),
+                Callers::People
+            )]
         );
     }
 
     #[test]
-    fn issuers_without_resources_are_refused() {
-        assert!(
-            Cli::try_parse_from([
-                "crucible-kueue",
-                "--issuer",
-                "https://a.example=https://a.example/keys"
-            ])
-            .is_err()
-        );
+    fn an_issuer_needs_resources_and_a_policy_and_people_need_kube_authz() {
+        let refused = [
+            vec![
+                "--run-issuer",
+                "https://a.example=https://a.example/keys",
+                "--tool-policy",
+                "p.toml",
+            ],
+            vec![
+                "--run-issuer",
+                "https://a.example=https://a.example/keys",
+                "--resource",
+                RESOURCE,
+            ],
+            vec![
+                "--person-issuer",
+                "https://a.example=https://a.example/keys",
+                "--resource",
+                RESOURCE,
+                "--tool-policy",
+                "p.toml",
+            ],
+            vec!["--kube-authz", "openshift"],
+        ];
+        for args in refused {
+            assert!(
+                Cli::try_parse_from(std::iter::once("crucible-kueue").chain(args.iter().copied()))
+                    .is_err(),
+                "{args:?}"
+            );
+        }
     }
 }

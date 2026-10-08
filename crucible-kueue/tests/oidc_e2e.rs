@@ -26,6 +26,7 @@ use crucible_kueue::tenant::{Registry, Tenants};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::kube::{GroupSource, SubjectAccessReviewer};
 use crucible_mcp_auth::policy::ToolPolicy;
+use crucible_mcp_auth::principal::Callers;
 use crucible_mcp_auth::server::{ResourceServer, ResourceServerConfig, TrustedIssuer};
 use crucible_mcp_auth::testing::cluster;
 use k8s_openapi::api::batch::v1::Job;
@@ -280,6 +281,7 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
             .map(|(issuer, jwks_uri)| TrustedIssuer {
                 issuer: issuer.to_string(),
                 jwks_uri: jwks_uri.clone(),
+                callers: Callers::Runs,
             })
             .collect(),
         resources: vec![Url::parse(RESOURCE).unwrap()],
@@ -299,7 +301,7 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
         crucible_kueue::Options {
             registry: Arc::new(Registry::new(tenants)),
             oidc: Some(Arc::new(server)),
-            policy: Some(policy),
+            policy,
             reviewer: Some(reviewer),
             allowed_hosts: Vec::new(),
         },

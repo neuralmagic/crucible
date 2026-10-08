@@ -163,6 +163,8 @@ pub struct Identity {
     pub role: TenantRole,
     pub queues: Vec<QueueName>,
     pub launched_by: Option<Launcher>,
+    /// The party presenting a run's token (the sandbox's SPIFFE ID), stamped on what it creates.
+    pub actor: Option<String>,
 }
 
 impl Identity {
@@ -175,6 +177,7 @@ impl Identity {
             role: caller.role,
             queues: caller.queues,
             launched_by: caller.launched_by,
+            actor: None,
         }
     }
 
@@ -612,6 +615,7 @@ queues = ["gpu"]
             role: TenantRole::Submitter,
             queues: vec![],
             launched_by: None,
+            actor: None,
         };
         assert!(matches!(
             identity.in_namespace(Some("Not_Valid")),
