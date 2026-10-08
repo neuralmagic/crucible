@@ -19,6 +19,7 @@ pub const PREFIX: &str = "spiffe://example.crucible/openshell/sandbox/";
 pub const KUEUE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
 pub const BUILDIT: &str = "http://host.openshell.internal:8849/mcp";
 pub const CLUSTER: &str = "dev";
+pub const SANDBOX_NAMESPACE: &str = "sandboxes";
 
 pub const PROFILE: &str = r#"
 [cluster]
@@ -26,6 +27,7 @@ loop_namespace = "crucible-system"
 rig_namespace = "rig"
 service_account = "crucible-spoke"
 supervisor_image = "registry.example.com/openshell-supervisor:latest"
+sandbox_namespace = "sandboxes"
 [image]
 loop = "registry.example.com/crucible-loop:latest"
 pull_secret = "quay-pull"
@@ -197,6 +199,9 @@ pub async fn running_run(
         .execute(pool)
         .await
         .unwrap();
+    crate::runs::store::stamp_dispatcher(pool, run_id)
+        .await
+        .unwrap();
 }
 
 pub async fn set_pod_state(
@@ -216,4 +221,52 @@ pub fn binding(id: &str) -> Binding {
         name: format!("ci-{id}"),
         workdir: Some("/sandbox/repo".into()),
     }
+}
+
+/// The cluster API's answer for sandbox ids, as the gateway's `Sandbox` resources in
+/// [`SANDBOX_NAMESPACE`] would give it: `ci-<id>` for every id in `known`, nothing otherwise.
+pub struct StaticDirectory {
+    pub known: Vec<String>,
+}
+
+impl crate::agent_auth::directory::SandboxDirectory for StaticDirectory {
+    fn sandbox_name(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        id: &SandboxId,
+    ) -> crate::daemon::queue::BoxFuture<
+        Result<Option<String>, crate::agent_auth::directory::DirectoryError>,
+    > {
+        let answer = (cluster == CLUSTER
+            && namespace == SANDBOX_NAMESPACE
+            && self.known.iter().any(|k| k == id.as_str()))
+        .then(|| format!("ci-{id}"));
+        Box::pin(async move { Ok(answer) })
+    }
+}
+
+/// The issuer state over `pool`, reading `profile_toml` as its deploy profile, with `known`
+/// sandboxes in the directory. Keep the returned directory alive as long as the state.
+pub fn agent_auth(
+    pool: &sqlx::PgPool,
+    spire: &Spire,
+    profile_toml: &str,
+    known: &[&str],
+) -> (
+    std::sync::Arc<crate::agent_auth::AgentAuth>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("profile.toml");
+    std::fs::write(&path, profile_toml).unwrap();
+    let state = crate::agent_auth::AgentAuth {
+        issuer: issuer(spire, &EcKey::generate()),
+        pool: pool.clone(),
+        deploy_profile: Some(path),
+        directory: std::sync::Arc::new(StaticDirectory {
+            known: known.iter().map(|k| k.to_string()).collect(),
+        }),
+    };
+    (std::sync::Arc::new(state), dir)
 }

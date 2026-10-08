@@ -127,22 +127,48 @@ Spoke clusters, when the controller runs loops elsewhere:
 The controller can act as the OAuth authorization server for sandboxed agents. An OpenShell
 sandbox supervisor posts its SPIRE JWT-SVID to `POST /oauth/token` (client credentials with a
 `jwt-bearer` client assertion, no `client_id`); the controller verifies it against SPIRE's JWKS,
-maps the sandbox to the run whose pod bound it, and returns a 5-minute ES256 access token whose
-`sub` is the person the run is attributed to and whose `act.sub` is the sandbox's SPIFFE ID. It
-also carries `run_id` (the run pod), `sandbox` (the sandbox's name), `workdir` (its workspace path),
-and, for runs on the `[kueue]` cluster, `namespace`, `queues`, and `role`. MCP
+maps the sandbox to the run whose pod bound it, and returns a 5-minute ES256 access token. MCP
 servers verify it against `/.well-known/jwks.json`; `/.well-known/oauth-authorization-server`
 describes the endpoints. All three are served outside the human auth stack.
 
-The engine binds each sandbox it creates by posting its id, name, and workdir to
-`/api/pods/{pod}/sandboxes` with the pod's ingest token, so the drop-box env (`CRUCIBLE_INGEST_URL`) must reach the loop pod. A
-sandbox that was never bound, or whose run pod is no longer running, gets `invalid_grant`.
+The token's `sub` is the person the run was dispatched for: whoever last unparked, bumped, scoped
+or redispatched the issue, else the launch's creator (the owner, for a schedule, watch, or
+webhook). `act.sub` is the sandbox's SPIFFE ID. It also carries `run_id` (the run pod), `sandbox`
+(the sandbox's name), `workdir` (its workspace path), `kube_user` (below) and, for runs on the
+`[kueue]` cluster, `namespace`, `queues`, and `role`. Refusals return only the OAuth error code
+and a fixed description; the reason is logged.
+
+**Sandbox placement.** A sandbox's SPIFFE ID is only as trustworthy as the namespace its supervisor
+runs in, so the controller issues nothing until the deploy profile names
+`[cluster] sandbox_namespace`, which profile load refuses to share with the loop, rig, or
+crucible-kueue namespaces. Scope the sandbox ClusterSPIFFEID to it. The controller refuses to start
+the issuer when its own namespace (`POD_NAMESPACE`), where the signing key Secret is mounted from,
+is any of those namespaces; a controller rendered by `crucible deploy render` runs in the loop
+namespace and so cannot hold the key.
+
+The engine binds each sandbox it creates by posting its id and workdir to
+`/api/pods/{pod}/sandboxes` with the pod's ingest token, so the drop-box env
+(`CRUCIBLE_INGEST_URL`) must reach the loop pod. The controller reads the sandbox's name from the
+gateway's `Sandbox` resource (`agents.x-k8s.io`) in the sandbox namespace, so its identity on each
+cluster needs `get`/`list` on `sandboxes` there; name that identity in `[cluster] sandbox_readers`
+(`namespace/name`) and the loop render grants it. A sandbox that was never bound, or whose run pod
+is no longer running, gets `invalid_grant`.
+
+**`kube_user`.** Tokens carry the dispatcher's Kubernetes username when the controller knows it;
+a server that sees it runs SubjectAccessReview as that user. It is learned from the API server
+(`users/~`): when someone calls the API with a cluster token whose username equals their login
+exactly (filling an empty value only), or when a signed-in person links one with
+`PUT /api/me/kube-user` (`{"cluster_token": "<oc whoami -t>"}`). Another platform administrator
+can override it with `PUT /api/users/{login}/kube-user` (`{"kube_user": "<name>"}`, or `null` to
+clear it); the override is audited on `user:<login>`. `system:` identities are refused. With
+`[kueue] require_kube_user` (default `true`), a token carrying crucible-kueue scopes is refused
+when the username is unknown; other tokens are issued without the claim, logged at warn.
 
 | Variable | Meaning |
 | --- | --- |
 | `CONTROLLER_AGENT_ISSUER` | The issuer identifier, an origin such as `http://crucible-controller.crucible-system.svc.cluster.local:8080`. Unset turns the endpoint off. Supervisors must request their SVID with exactly this audience (`token_grant.jwt_svid_audience`). |
 | `CONTROLLER_AGENT_SIGNING_KEY_FILE` | A PKCS#8 P-256 private key mounted from a Secret. The `kid` is its RFC 7638 thumbprint. |
-| `CONTROLLER_AGENT_SVID_ISSUER` | SPIRE's OIDC discovery issuer, the `iss` of every JWT-SVID. |
+| `CONTROLLER_AGENT_SVID_ISSUER` | SPIRE's OIDC discovery issuer, the `iss` of every JWT-SVID. SVIDs must carry `iat` and live at most 15 minutes. |
 | `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. |
 | `CONTROLLER_AGENT_SVID_CA_FILE` | Optional PEM bundle trusted for that fetch (the service CA for an `https://*.svc` endpoint). |
 | `CONTROLLER_AGENT_SANDBOX_ID_PREFIX` | The SPIFFE ID path every sandbox supervisor's ID sits under, ending in `/`. |

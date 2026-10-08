@@ -453,7 +453,6 @@ async fn try_turn(
     //     without its turn.
     let binding = crucible_contract::sandbox::SandboxBinding {
         sandbox_id,
-        sandbox_name: name.clone(),
         workdir: Some(SandboxLayout::workdir(&basename)),
     };
     if let Some(ingest) = crate::report::ingest_client::IngestConfig::from_env()

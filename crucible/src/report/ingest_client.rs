@@ -535,7 +535,6 @@ mod tests {
     fn binding() -> crucible_contract::sandbox::SandboxBinding {
         crucible_contract::sandbox::SandboxBinding {
             sandbox_id: "sbx-1".into(),
-            sandbox_name: "ci-0123abcd".into(),
             workdir: Some("/sandbox/repo".into()),
         }
     }
@@ -565,9 +564,7 @@ mod tests {
             "{request}"
         );
         assert!(
-            request.ends_with(
-                r#"{"sandbox_id":"sbx-1","sandbox_name":"ci-0123abcd","workdir":"/sandbox/repo"}"#
-            ),
+            request.ends_with(r#"{"sandbox_id":"sbx-1","workdir":"/sandbox/repo"}"#),
             "{request}"
         );
         let _ = std::fs::remove_file(tok);

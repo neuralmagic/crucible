@@ -9,8 +9,6 @@ use serde::{Deserialize, Serialize};
 pub struct SandboxBinding {
     /// The gateway-assigned sandbox id, the last segment of the sandbox supervisor's SPIFFE ID.
     pub sandbox_id: String,
-    /// The sandbox's name, a Kubernetes label value; the `sandbox` claim buildit acts on.
-    pub sandbox_name: String,
     /// The absolute path the workspace is uploaded to inside the sandbox; the `workdir` claim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workdir: Option<String>,

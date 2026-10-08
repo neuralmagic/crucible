@@ -79,7 +79,7 @@ pub async fn apply_pending(db: &Db, store: &OverrideStore, key: &str) -> Result<
     match ov.kind {
         OverrideKind::Park => apply_park(db, key, ov.reason.as_deref(), actor).await,
         OverrideKind::Unpark => {
-            crate::issues::transitions::unpark(
+            let unparked = crate::issues::transitions::unpark(
                 db.pool(),
                 db.events(),
                 key,
@@ -87,6 +87,9 @@ pub async fn apply_pending(db: &Db, store: &OverrideStore, key: &str) -> Result<
                 actor,
             )
             .await?;
+            if unparked && let Some(actor) = actor {
+                crate::issues::store::request_dispatch(db.pool(), key, actor).await?;
+            }
             Ok(())
         }
         OverrideKind::Bump => apply_bump(db, key, ov.priority, ov.reason.as_deref(), actor).await,
@@ -148,6 +151,9 @@ async fn apply_bump(
     };
     if !crate::issues::store::set_priority(db.pool(), key, priority).await? {
         return Ok(());
+    }
+    if let Some(actor) = actor {
+        crate::issues::store::request_dispatch(db.pool(), key, actor).await?;
     }
     let note = format!(
         "priority {} -> {}{}",
@@ -221,6 +227,9 @@ async fn apply_scope_now(
             .by(actor),
         )
         .await?;
+    if let Some(actor) = actor {
+        crate::issues::store::request_dispatch(db.pool(), key, actor).await?;
+    }
     Ok(())
 }
 
@@ -275,6 +284,9 @@ async fn apply_redispatch(
     let mut tx = db.pool().begin().await?;
     if crate::issues::store::claim_issue(&mut *tx, key, from, Status::AwaitingApproval).await? {
         crate::runs::work_pods::set_redispatch(&mut *tx, key, justification).await?;
+        if let Some(actor) = actor {
+            crate::issues::store::request_dispatch(&mut *tx, key, actor).await?;
+        }
         let reason = format!("redispatch: {justification}");
         let ev = Event::now(
             key,
@@ -418,6 +430,79 @@ mod tests {
             Some("priority 0 -> 42: customer escalation")
         );
         assert_eq!(events[0].actor.as_deref(), Some("wren"));
+        Ok(())
+    }
+
+    async fn requested_by(db: &Db, key: &str) -> Option<String> {
+        sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+            .bind(key)
+            .fetch_one(db.pool())
+            .await
+            .expect("issue row")
+    }
+
+    /// An override that takes effect records its actor as who the next run is dispatched for;
+    /// one that changes nothing records nobody.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_applied_override_records_who_asked_for_the_dispatch(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
+        let store = OverrideStore::new();
+        let unpark = |actor: &str| Override {
+            key: IssueKey("owner/repo#1".into()),
+            kind: OverrideKind::Unpark,
+            reason: None,
+            priority: None,
+            actor: Some(actor.into()),
+        };
+        store.stash(unpark("mallory"));
+        apply_pending(&db, &store, "owner/repo#1").await?;
+        assert_eq!(
+            requested_by(&db, "owner/repo#1").await,
+            None,
+            "unparking an issue that is not parked dispatches nothing"
+        );
+
+        crate::issues::transitions::park_and_purge(
+            db.pool(),
+            "owner/repo#1",
+            "sticky",
+            ParkedBy::Human,
+        )
+        .await?;
+        store.stash(unpark(" Bob "));
+        apply_pending(&db, &store, "owner/repo#1").await?;
+        assert_eq!(
+            requested_by(&db, "owner/repo#1").await.as_deref(),
+            Some("user:bob")
+        );
+
+        store.stash(Override {
+            key: IssueKey("owner/repo#1".into()),
+            kind: OverrideKind::Bump,
+            reason: None,
+            priority: Some(5),
+            actor: Some("carol".into()),
+        });
+        apply_pending(&db, &store, "owner/repo#1").await?;
+        assert_eq!(
+            requested_by(&db, "owner/repo#1").await.as_deref(),
+            Some("user:carol")
+        );
+
+        store.stash(Override {
+            key: IssueKey("owner/repo#1".into()),
+            kind: OverrideKind::Bump,
+            reason: None,
+            priority: Some(6),
+            actor: Some("not a login".into()),
+        });
+        apply_pending(&db, &store, "owner/repo#1").await?;
+        assert_eq!(
+            requested_by(&db, "owner/repo#1").await.as_deref(),
+            Some("user:carol"),
+            "a name that is not a login records nothing"
+        );
         Ok(())
     }
 

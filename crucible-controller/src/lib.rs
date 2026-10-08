@@ -278,8 +278,15 @@ impl Surface {
             turn_accounts.spokes,
         ));
         let ingest_state = runs::ingest_drop::IngestState { db, validator };
-        let ingest_router = runs::ingest_drop::router(ingest_state.clone())
-            .merge(agent_auth::bindings::router(ingest_state));
+        let ingest_router = match &agent_auth {
+            Some(agent) => runs::ingest_drop::router(ingest_state.clone()).merge(
+                agent_auth::bindings::router(agent_auth::bindings::BindState {
+                    ingest: ingest_state,
+                    agent: agent.clone(),
+                }),
+            ),
+            None => runs::ingest_drop::router(ingest_state),
+        };
 
         // The OIDC discovery mirror (hub-spoke trust bootstrap): mounted OUTSIDE the bearer layer
         // like `/metrics` — public read-only by design. Disabled (routes 404) unless
