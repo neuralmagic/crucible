@@ -400,9 +400,6 @@ impl BearerGuard {
         }
     }
 
-    /// Whether the cluster-token username names somebody who has signed in through the issuer. In
-    /// proxy mode there are no logins to check against, so every cluster token stays linked and the
-    /// path behaves exactly as it did before native mode existed.
     /// Record that the API server vouched for `user` as the Kubernetes username of the login it
     /// names. Best effort: the request is already authenticated either way.
     async fn learn_kube_user(&self, user: &str) {
@@ -421,6 +418,9 @@ impl BearerGuard {
         }
     }
 
+    /// Whether the cluster-token username names somebody who has signed in through the issuer. In
+    /// proxy mode there are no logins to check against, so every cluster token stays linked and the
+    /// path behaves exactly as it did before native mode existed.
     async fn cluster_token_path(&self, user: &str) -> AuthPath {
         if self.mode() == AuthMode::Proxy {
             return AuthPath::ClusterToken;
