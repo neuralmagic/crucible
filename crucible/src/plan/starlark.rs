@@ -39,7 +39,8 @@ use crate::plan::starlark::error::{
 use crate::plan::starlark::values::{SchemaFile, SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
 use crucible_contract::decision::{
-    ChoiceOption, IdentError, Label, NOUL_YES, Question, QuestionId, QuestionKind, UNCERTAIN,
+    ChoiceOption, IdentError, Label, NOUL_YES, OptionSource, Question, QuestionId, QuestionKind,
+    UNCERTAIN,
 };
 use crucible_contract::emits::{DeclaredFile, FieldType, JsonSchema};
 
@@ -774,8 +775,18 @@ fn constructor(
         let instructions = take_string(&mut named, "ask")?;
         let kind = match function {
             "noul" => QuestionKind::Noul,
-            "choice" => QuestionKind::Choice {
-                options: take_described(&mut named, "options")?,
+            "choice" => match named.get("options") {
+                Some(Value::Output(output)) => {
+                    let options_from = OptionSource {
+                        task: output.reference.task.0.clone(),
+                        field: output.reference.field.0.clone(),
+                    };
+                    named.remove("options");
+                    QuestionKind::DynamicChoice { options_from }
+                }
+                _ => QuestionKind::Choice {
+                    options: take_described(&mut named, "options")?,
+                },
             },
             _ => QuestionKind::Score {
                 levels: take_described(&mut named, "levels")?,
@@ -1419,6 +1430,7 @@ fn take_when(
             task: asked.task,
             question: asked.question,
             is: Vec::new(),
+            any_option: false,
         }));
     }
     if answers.as_ref().is_some_and(Vec::is_empty) {
@@ -1427,12 +1439,25 @@ fn take_when(
     let is = match (answers, &asked.asked.kind) {
         (Some(answers), _) => answers,
         (None, QuestionKind::Noul) => vec![identifier("answers", Label::new(NOUL_YES))?],
-        (None, QuestionKind::Choice { .. } | QuestionKind::Score { .. }) => {
+        (
+            None,
+            QuestionKind::Choice { .. }
+            | QuestionKind::Score { .. }
+            | QuestionKind::DynamicChoice { .. },
+        ) => {
             return Err(CompileError::MissingArgument {
                 argument: "answers".to_owned(),
             });
         }
     };
+    if asked.asked.options_from().is_some()
+        && let Some(label) = is.iter().find(|label| !label.is_uncertain())
+    {
+        return Err(CompileError::AnswerNamesDynamicOption {
+            asked: format!("{}.{}", asked.task, asked.question),
+            label: label.to_string(),
+        });
+    }
     if let Some(label) = is.iter().find(|label| !asked.asked.resolves_to(label)) {
         let declared: Vec<String> = asked
             .asked
@@ -1453,6 +1478,7 @@ fn take_when(
         task: asked.task,
         question: asked.question,
         is,
+        any_option: false,
     }))
 }
 
@@ -1472,7 +1498,7 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
                 .extend(when.is.iter().cloned());
         }
     }
-    let mut expanded: Vec<(usize, Vec<Label>)> = Vec::new();
+    let mut expanded: Vec<(usize, Vec<Label>, bool)> = Vec::new();
     for (index, task) in tasks.iter().enumerate().filter(|(_, task)| pending(task)) {
         let Some(when) = &task.when else { continue };
         let asked = tasks.iter().find_map(|route| match &route.task {
@@ -1504,7 +1530,8 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
             .filter(|label| !listed_here.is_some_and(|l| l.contains(label)))
             .filter(|label| !asked.drop.contains(label))
             .collect();
-        if rest.is_empty() {
+        let any_option = asked.options_from().is_some();
+        if rest.is_empty() && !any_option {
             let error = CompileError::UnreachableOtherwise {
                 task: task.name.0.clone(),
                 asked: format!("{}.{}", when.task, when.question),
@@ -1517,12 +1544,13 @@ fn expand_otherwise(tasks: &mut [Task], state: &CompileState) -> Result<()> {
                 None => error,
             });
         }
-        expanded.push((index, rest));
+        expanded.push((index, rest, any_option));
     }
     drop(context);
-    for (index, rest) in expanded {
+    for (index, rest, any_option) in expanded {
         if let Some(when) = &mut tasks[index].when {
             when.is = rest;
+            when.any_option = any_option;
         }
     }
     Ok(())
@@ -7218,5 +7246,141 @@ workflow(type = "playbook", tasks = [classify, gate, ship, hold])
             err.contains("unknown workflow DSL function \"score\""),
             "{err}"
         );
+    }
+
+    const DYNAMIC_ROUTE: &str = r#"prepare = command(name = "prepare", run = "true", emits = {"members": "list", "facts": "object", "packages": "object"})
+match = route(
+    name = "match",
+    depends_on = [prepare],
+    over = prepare.members,
+    max_fanout = 120,
+    keyed = [prepare.facts],
+    min_confidence = 0.7,
+    questions = {"package": choice(ask = "Which shipped package does the flaw affect?", options = prepare.packages)},
+)
+analyze = agent(name = "analyze", prompt = "p", depends_on = [prepare, match], over = prepare.members, max_fanout = 120, when = match.package, otherwise = True)
+"#;
+
+    #[test]
+    fn a_choice_over_a_dependency_field_compiles_to_a_dynamic_choice_and_otherwise_to_any_option() {
+        let pack = temp_pack("dynamic-choice");
+        let source = format!(
+            "{DYNAMIC_ROUTE}workflow(type = \"playbook\", tasks = [prepare, match, analyze])\n"
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let canonical: serde_json::Value = serde_json::from_str(&compiled.canonical_json).unwrap();
+        let task = |name: &str| {
+            canonical["task"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == name)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(
+            task("match")["questions"]["package"],
+            serde_json::json!({
+                "instructions": "Which shipped package does the flaw affect?",
+                "type": "dynamic_choice",
+                "options_from": {"task": "prepare", "field": "packages"},
+            })
+        );
+        assert_eq!(
+            task("analyze")["when"],
+            serde_json::json!({
+                "task": "match", "question": "package", "is": ["uncertain"], "any_option": true,
+            })
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn otherwise_on_a_dynamic_choice_leaves_uncertain_to_the_task_that_lists_it() {
+        let pack = temp_pack("dynamic-choice-split");
+        let source = format!(
+            "{DYNAMIC_ROUTE}review = agent(name = \"review\", prompt = \"p\", depends_on = [prepare, match], over = prepare.members, max_fanout = 120, when = match.package, answers = \"uncertain\")\nworkflow(type = \"playbook\", tasks = [prepare, match, analyze, review])\n"
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let when = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .and_then(|t| t.when.clone())
+                .expect("a when")
+        };
+        assert!(when("analyze").is.is_empty());
+        assert!(when("analyze").any_option);
+        assert_eq!(when("review").is, [Label::uncertain()]);
+        assert!(!when("review").any_option);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_dynamic_choice_is_refused_where_its_options_cannot_be_read_or_named() {
+        let pack = temp_pack("dynamic-choice-refused");
+        let route = |options: &str, extra: &str| {
+            format!(
+                "p = command(name = \"p\", run = \"true\", emits = {{\"members\": \"list\", \"packages\": \"object\", \"pkgs\": \"list\", \"area\": \"string\"}})\nm = route(name = \"m\", depends_on = [p], {extra}questions = {{\"package\": choice(ask = \"which?\", options = {options})}})\n"
+            )
+        };
+        let cases = [
+            (
+                format!(
+                    "{}a = agent(name = \"a\", prompt = \"x\", depends_on = [p, m], when = m.package, answers = [\"p1\"])\nworkflow(type = \"playbook\", tasks = [p, m, a])\n",
+                    route("p.pkgs", "min_confidence = 0.5, ")
+                ),
+                "reads its options at run time, so answers may list only \"uncertain\"",
+            ),
+            (
+                format!(
+                    "{}a = agent(name = \"a\", prompt = \"x\", depends_on = [p, m], when = m.package)\nworkflow(type = \"playbook\", tasks = [p, m, a])\n",
+                    route("p.pkgs", "min_confidence = 0.5, ")
+                ),
+                "missing required argument \"answers\"",
+            ),
+            (
+                format!(
+                    "{}workflow(type = \"playbook\", tasks = [p, m])\n",
+                    route("p.packages", "min_confidence = 0.5, ")
+                ),
+                "an unmapped route reads its options from a list",
+            ),
+            (
+                format!(
+                    "{}workflow(type = \"playbook\", tasks = [p, m])\n",
+                    route(
+                        "p.pkgs",
+                        "over = p.members, max_fanout = 4, min_confidence = 0.5, "
+                    )
+                ),
+                "a mapped route reads each element's options from an object keyed by element",
+            ),
+            (
+                format!(
+                    "{}workflow(type = \"playbook\", tasks = [p, m])\n",
+                    route("p.pkgs", "source = p, ")
+                ),
+                "needs a decision model",
+            ),
+            (
+                format!(
+                    "{}a = agent(name = \"a\", prompt = \"x\", depends_on = [p, m], when = m.package, answers = \"uncertain\")\nworkflow(type = \"playbook\", tasks = [p, m, a])\n",
+                    route("p.pkgs", "min_confidence = 0.5, ")
+                ),
+                "no task runs on its options",
+            ),
+        ];
+        for (source, needle) in cases {
+            let error =
+                compile_source(&source, &pack.join("workflow.star"), &pack).expect_err(needle);
+            let report = crate::errors::report(&error);
+            assert!(report.contains(needle), "{needle}: {report}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
     }
 }

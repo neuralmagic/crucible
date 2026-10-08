@@ -2695,7 +2695,7 @@ fn not_taken(
                     .and_then(|o| o.get(when.question.as_str()))
                     .and_then(|a| a.get("label"))
                     .and_then(Value::as_str);
-                if !when.is.iter().any(|l| Some(l.as_str()) == label) {
+                if !label.is_some_and(|label| when.admits(label)) {
                     return Some((
                         TaskEvent::ConditionUnmet,
                         format!(
@@ -2792,7 +2792,7 @@ fn instance_gate(
                     .and_then(|o| o.get(when.question.as_str()))
                     .and_then(|a| a.get("label"))
                     .and_then(Value::as_str);
-                if !when.is.iter().any(|l| Some(l.as_str()) == label) {
+                if !label.is_some_and(|label| when.admits(label)) {
                     return not_taken(
                         TaskEvent::ConditionUnmet,
                         format!(
@@ -3114,6 +3114,7 @@ fn decide_from_output(
                 confidence,
                 probabilities,
                 asked_as: None,
+                options: Vec::new(),
             },
         );
     }
@@ -5040,6 +5041,7 @@ mod tests {
             task: "gate".into(),
             question: QuestionId::new(id).unwrap(),
             is: is.iter().map(|l| label(l)).collect(),
+            any_option: false,
         });
         t
     }
@@ -9558,6 +9560,7 @@ mod tests {
             task: route.into(),
             question: QuestionId::new(question).unwrap(),
             is: is.iter().map(|l| label(l)).collect(),
+            any_option: false,
         });
         t
     }
