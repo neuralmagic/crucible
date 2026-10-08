@@ -427,13 +427,15 @@ enum Value {
     External(Vec<values::Segment>),
     /// A dictionary, ordered by key so a rendered prompt is the same on every compile.
     Map(BTreeMap<String, Value>),
+    /// A dictionary in source order, for an argument whose order is part of its meaning.
+    Ordered(Vec<(String, Value)>),
     List(Vec<Value>),
     Task(Box<Task>),
     /// `producer.field`, already checked against the producer's declared emits.
     Output(values::DeclaredOutput),
     Session(SessionDecl),
     Workflow(WorkflowCfg),
-    /// A `noul(...)` or `choice(...)` declaration.
+    /// A `noul(...)`, `choice(...)`, or `score(...)` declaration.
     Question(Question),
     /// `route.question`, carrying the labels it can resolve to.
     Answer(values::AnswerRef),
@@ -538,7 +540,7 @@ const SCORED_FUNCTIONS: &[&str] = &[
 ];
 
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
-const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route"];
+const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route", "score"];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
@@ -576,6 +578,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -604,6 +607,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -626,6 +630,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -649,6 +654,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "stage",
             "over",
             "max_fanout",
+            "keyed",
             "revise",
             "max_rounds",
             "timeout",
@@ -664,6 +670,10 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
             "questions",
             "min_confidence",
             "source",
+            "files",
+            "over",
+            "max_fanout",
+            "keyed",
             "depends_on",
             "required",
             "join",
@@ -674,6 +684,7 @@ fn known_kwargs(function: &str) -> &'static [&'static str] {
         ],
         "noul" => &["ask", "drop"],
         "choice" => &["ask", "options", "drop"],
+        "score" => &["ask", "levels", "drop"],
         "report" => &[
             "name",
             "destination",
@@ -759,14 +770,16 @@ fn constructor(
             .insert(decl.name.clone(), (decl.clone(), at.clone()));
         return Ok(Value::Session(decl));
     }
-    if matches!(function, "noul" | "choice") {
+    if matches!(function, "noul" | "choice" | "score") {
         let instructions = take_string(&mut named, "ask")?;
-        let kind = if function == "noul" {
-            QuestionKind::Noul
-        } else {
-            QuestionKind::Choice {
-                options: take_options(&mut named)?,
-            }
+        let kind = match function {
+            "noul" => QuestionKind::Noul,
+            "choice" => QuestionKind::Choice {
+                options: take_described(&mut named, "options")?,
+            },
+            _ => QuestionKind::Score {
+                levels: take_described(&mut named, "levels")?,
+            },
         };
         let drop = take_labels(&mut named, "drop")?.unwrap_or_default();
         no_unknown_kwargs(function, &named)?;
@@ -874,6 +887,7 @@ fn constructor(
             emits_files: Vec::new(),
             over: None,
             max_fanout: None,
+            keyed: Vec::new(),
             when: None,
             revise: None,
             timeout: None,
@@ -915,6 +929,7 @@ fn constructor(
                 emits_files: Vec::new(),
                 over: None,
                 max_fanout: None,
+                keyed: Vec::new(),
                 revise: None,
                 timeout: None,
                 when: None,
@@ -927,15 +942,22 @@ fn constructor(
             let questions = take_questions(&mut named)?;
             let min_confidence = take_optional_number(&mut named, "min_confidence")?;
             let source = take_optional_task_name(&mut named, "source")?;
+            let files = take_route_files(&mut named)?;
             let (decider, needs) = match (min_confidence, source) {
                 (Some(min_confidence), None) => (
-                    Decider::Model { min_confidence },
-                    crate::plan::ir::NEEDS_SYSTEMONE,
+                    Decider::Model {
+                        min_confidence,
+                        files,
+                    },
+                    crate::plan::ir::NEEDS_DECISION,
                 ),
+                (None, Some(_)) if !files.is_empty() => {
+                    return Err(CompileError::RouteFilesWithSource { task: name.0 });
+                }
                 (None, Some(task)) => (Decider::Output { task }, "any"),
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
             };
-            Task {
+            let task = Task {
                 task: TaskKind::Route { questions, decider },
                 depends_on: take_task_names(&mut named)?,
                 session: None,
@@ -946,15 +968,18 @@ fn constructor(
                 stage: parse_stage(&take_string_default(&mut named, "stage", "iteration")?)?,
                 emits: crate::plan::ir::Emits::default(),
                 emits_files: Vec::new(),
-                over: None,
-                max_fanout: None,
+                over: take_over(&mut named)?,
+                max_fanout: take_optional_fanout(&mut named)?,
+                keyed: take_keyed(&mut named)?,
                 revise: None,
                 timeout: None,
                 when: take_when(&mut named, state, &name)?,
                 name,
                 history: None,
                 repair: 0,
-            }
+            };
+            check_fanout(&task)?;
+            task
         }
         "propose" => {
             let session = take_session(&mut named, state, at)?;
@@ -1201,6 +1226,7 @@ fn dsl_task(
         emits_files: take_emitted_files(named)?,
         over: take_over(named)?,
         max_fanout: take_optional_fanout(named)?,
+        keyed: take_keyed(named)?,
         when,
         revise: take_revise(named)?,
         timeout: take_timeout(named)?,
@@ -1320,39 +1346,38 @@ fn take_labels(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Option
 }
 
 /// `options = ["a", "b"]`, or `options = {"a": "what a means", "b": None}`.
-fn take_options(named: &mut BTreeMap<String, Value>) -> Result<Vec<ChoiceOption>> {
+fn take_described(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Vec<ChoiceOption>> {
     let expected = "a list of labels or a dict of label to description";
-    match take_value(named, "options")? {
+    let entries: Vec<(String, Value)> = match take_value(named, name)? {
         Value::List(items) => items
             .into_iter()
             .map(|item| match item {
-                Value::String(label) => Ok(ChoiceOption {
-                    label: identifier("options", Label::new(label))?,
-                    description: None,
-                }),
-                _ => Err(wrong_type("options", expected)),
+                Value::String(label) => Ok((label, Value::None)),
+                _ => Err(wrong_type(name, expected)),
             })
-            .collect(),
-        Value::Map(entries) => entries
-            .into_iter()
-            .map(|(label, description)| {
-                let description = match description {
-                    Value::None => None,
-                    Value::String(text) => Some(text),
-                    _ => return Err(wrong_type("options", expected)),
-                };
-                Ok(ChoiceOption {
-                    label: identifier("options", Label::new(label))?,
-                    description,
-                })
+            .collect::<Result<_>>()?,
+        Value::Map(entries) => entries.into_iter().collect(),
+        Value::Ordered(entries) => entries,
+        _ => return Err(wrong_type(name, expected)),
+    };
+    entries
+        .into_iter()
+        .map(|(label, description)| {
+            let description = match description {
+                Value::None => None,
+                Value::String(text) => Some(text),
+                _ => return Err(wrong_type(name, expected)),
+            };
+            Ok(ChoiceOption {
+                label: identifier(name, Label::new(label))?,
+                description,
             })
-            .collect(),
-        _ => Err(wrong_type("options", expected)),
-    }
+        })
+        .collect()
 }
 
 fn take_questions(named: &mut BTreeMap<String, Value>) -> Result<BTreeMap<QuestionId, Question>> {
-    let expected = "a dict of question id to noul(...) or choice(...)";
+    let expected = "a dict of question id to noul(...), choice(...), or score(...)";
     let Value::Map(entries) = take_value(named, "questions")? else {
         return Err(wrong_type("questions", expected));
     };
@@ -1402,7 +1427,7 @@ fn take_when(
     let is = match (answers, &asked.asked.kind) {
         (Some(answers), _) => answers,
         (None, QuestionKind::Noul) => vec![identifier("answers", Label::new(NOUL_YES))?],
-        (None, QuestionKind::Choice { .. }) => {
+        (None, QuestionKind::Choice { .. } | QuestionKind::Score { .. }) => {
             return Err(CompileError::MissingArgument {
                 argument: "answers".to_owned(),
             });
@@ -1525,6 +1550,44 @@ fn take_over(named: &mut BTreeMap<String, Value>) -> Result<Option<OutputRef>> {
     }
 }
 
+fn take_keyed(named: &mut BTreeMap<String, Value>) -> Result<Vec<OutputRef>> {
+    let items = match named.remove("keyed") {
+        None | Some(Value::None) => return Ok(Vec::new()),
+        Some(Value::List(items)) => items,
+        Some(single) => vec![single],
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::Output(output) => match output.ty {
+                Some(declared) if !declared.is_object() => Err(CompileError::KeyedNotObject {
+                    reference: output.reference.to_string(),
+                    declared,
+                }),
+                _ => Ok(output.reference),
+            },
+            _ => Err(CompileError::KeyedNotOutputField),
+        })
+        .collect()
+}
+
+fn take_route_files(named: &mut BTreeMap<String, Value>) -> Result<Vec<String>> {
+    let items = match named.remove("files") {
+        None | Some(Value::None) => return Ok(Vec::new()),
+        Some(Value::List(items)) => items,
+        Some(_) => return Err(CompileError::RouteFilesNotList),
+    };
+    items
+        .into_iter()
+        .map(|item| match item {
+            Value::String(path) => safe_relative_path(&path)
+                .map(|relative| relative.display().to_string())
+                .map_err(|_| CompileError::EmitsFileNotRelative { path }),
+            _ => Err(CompileError::RouteFilesNotList),
+        })
+        .collect()
+}
+
 fn take_optional_fanout(named: &mut BTreeMap<String, Value>) -> Result<Option<u32>> {
     match named.remove("max_fanout") {
         None | Some(Value::None) => Ok(None),
@@ -1639,6 +1702,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         emits_files: Vec::new(),
         over: None,
         max_fanout: None,
+        keyed: Vec::new(),
         when: None,
         revise: None,
         timeout: None,
@@ -3186,14 +3250,15 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
         let compiled = compile_source(ROUTED, &pack.join("workflow.star"), &pack).unwrap();
         let tasks = &compiled.workflow.tasks;
         let gate = tasks.iter().find(|t| t.name.0 == "gate").unwrap();
-        assert_eq!(gate.needs, "systemone");
+        assert_eq!(gate.needs, "decision");
         let TaskKind::Route { questions, decider } = &gate.task else {
             panic!("gate is not a route");
         };
         assert_eq!(
             *decider,
             Decider::Model {
-                min_confidence: 0.8
+                min_confidence: 0.8,
+                files: Vec::new(),
             }
         );
         let area = &questions[&QuestionId::new("area").unwrap()];
@@ -4491,10 +4556,15 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
         let pack = temp_pack("kwarg-slices");
         std::fs::create_dir_all(pack.join("skills/demo")).unwrap();
         std::fs::write(pack.join("skills/demo/SKILL.md"), "demo\n").unwrap();
+        std::fs::write(pack.join("r.schema.json"), r#"{"type": "object"}"#).unwrap();
         let cases: &[(&str, &str)] = &[
             (
+                "route",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\nd = agent(name = \"d\", prompt = \"p\", depends_on = [u], over = u.items, max_fanout = 4, emits_files = {\"r.json\": schema_file(\"r.schema.json\")})\ng = route(name = \"g\", min_confidence = 0.5, files = [\"r.json\"], over = u.items, max_fanout = 4, keyed = [u.facts], depends_on = [u, d], questions = {\"q\": noul(ask = \"q?\")}{extra})\nworkflow(type = \"custom\", tasks = [u, d, g], result = g)\n",
+            ),
+            (
                 "agent",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\na = agent(name = \"a\", prompt = \"p\", harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "agent",
@@ -4502,15 +4572,15 @@ workflow(type = \"playbook\", tasks = [classify, gate, fix, rest, now, later])\n
             ),
             (
                 "command",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\nc = command(name = \"c\", run = \"true\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, c], result = c)\n",
             ),
             (
                 "evaluate",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\ne = evaluate(name = \"e\", run = \"true\", threshold = 1, direction = \"higher\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = False, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\"{extra})\nworkflow(type = \"custom\", tasks = [u, e], result = e)\n",
             ),
             (
                 "skill",
-                "u = command(name = \"u\", run = \"true\", emits = [\"items\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
+                "u = command(name = \"u\", run = \"true\", emits = [\"items\", \"facts\"])\na = skill(name = \"a\", skill = \"skills/demo\", args = {\"k\": 1}, harness = \"claude\", model = \"m\", effort = \"high\", sandbox = \"go\", emits = [\"score\"], emits_files = [\"out.txt\"], depends_on = [u], needs = \"any\", required = True, isolated = True, join = \"all\", stage = \"iteration\", over = u.items, max_fanout = 4, keyed = [u.facts], timeout = \"10m\", repair = 1{extra})\nworkflow(type = \"custom\", tasks = [u, a], result = a)\n",
             ),
             (
                 "skill",
@@ -6926,5 +6996,227 @@ workflow(type = "playbook", tasks = [seed, turn, helper, sweep, probe, mapped])
             );
         }
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_playbook_gates_each_tickets_turn_on_a_route_mapped_over_the_same_list() {
+        let pack = temp_pack("route-over");
+        std::fs::write(pack.join("result.json"), r#"{"type": "object"}"#).unwrap();
+        let source = r#"
+prepare = command(name = "prepare", run = "true", emits = {"members": "list", "facts": "object"})
+gate = route(
+    name = "gate",
+    depends_on = [prepare],
+    over = prepare.members,
+    max_fanout = 120,
+    keyed = [prepare.facts],
+    min_confidence = 0.8,
+    questions = {"depth": choice(ask = "How deep?", options = {"settled": "facts settle it", "quick": "a short look", "deep": "a full look"}, drop = ["settled"])},
+)
+quick = agent(name = "quick", prompt = "p", effort = "low", depends_on = [prepare, gate], over = prepare.members, max_fanout = 120, keyed = prepare.facts, when = gate.depth, answers = "quick", emits_files = {"RESULT.json": schema_file("result.json")})
+deep = agent(name = "deep", prompt = "p", effort = "high", depends_on = [prepare, gate], over = prepare.members, max_fanout = 120, when = gate.depth, otherwise = True, emits_files = {"RESULT.json": schema_file("result.json")})
+judge = route(name = "judge", depends_on = [prepare, quick, deep], join = "settled", over = prepare.members, max_fanout = 120, files = ["RESULT.json"], min_confidence = 0.8, questions = {"supported": noul(ask = "Does the evidence support the verdict?", drop = ["yes"])})
+review = agent(name = "review", prompt = "p", depends_on = [prepare, judge], over = prepare.members, max_fanout = 120, when = judge.supported, otherwise = True)
+report = command(name = "report", run = "true", depends_on = [quick, deep, review], join = "settled")
+workflow(type = "playbook", tasks = [prepare, gate, quick, deep, judge, review, report])
+"#;
+        let compiled = compile_source(source, &pack.join("workflow.star"), &pack)
+            .unwrap_or_else(|error| panic!("{}", crate::errors::report(&error)));
+        let task = |name: &str| {
+            compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == name)
+                .expect("the task")
+        };
+        assert_eq!(
+            task("gate").over.as_ref().map(ToString::to_string),
+            Some("prepare.members".to_string())
+        );
+        let keyed: Vec<String> = task("quick")
+            .keyed
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(keyed, ["prepare.facts"]);
+        assert!(task("deep").keyed.is_empty());
+        let TaskKind::Route {
+            decider: Decider::Model { files, .. },
+            ..
+        } = &task("judge").task
+        else {
+            panic!("judge is a model route");
+        };
+        assert_eq!(files, &["RESULT.json"]);
+        let canonical: serde_json::Value = serde_json::from_str(&compiled.canonical_json).unwrap();
+        let gate = canonical["task"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "gate")
+            .unwrap();
+        assert_eq!(
+            gate["keyed"],
+            serde_json::json!([{"task": "prepare", "field": "facts"}])
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn keyed_and_route_files_are_refused_at_the_argument_that_breaks_them() {
+        let pack = temp_pack("keyed-refused");
+        let cases = [
+            (
+                "p = command(name = \"p\", run = \"true\", emits = {\"members\": \"list\", \"facts\": \"list\"})\na = agent(name = \"a\", prompt = \"x\", depends_on = [p], over = p.members, max_fanout = 2, keyed = [p.facts])\nworkflow(type = \"playbook\", tasks = [p, a])\n",
+                "keyed needs an object keyed by element",
+            ),
+            (
+                "p = command(name = \"p\", run = \"true\", emits = [\"members\"])\na = agent(name = \"a\", prompt = \"x\", depends_on = [p], over = p.members, max_fanout = 2, keyed = [\"facts\"])\nworkflow(type = \"playbook\", tasks = [p, a])\n",
+                "\"keyed\" must name declared output fields",
+            ),
+            (
+                "p = command(name = \"p\", run = \"true\", emits = [\"area\"])\ng = route(name = \"g\", source = p, files = [\"R.json\"], depends_on = [p], questions = {\"area\": noul(ask = \"a?\")})\nworkflow(type = \"playbook\", tasks = [p, g])\n",
+                "only a model reads files",
+            ),
+        ];
+        for (source, needle) in cases {
+            let error =
+                compile_source(source, &pack.join("workflow.star"), &pack).expect_err("refused");
+            let report = crate::errors::report(&error);
+            assert!(report.contains(needle), "{report}");
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    const SCORED_ROUTE: &str = r#"classify = command(name = "classify", run = "./classify.sh")
+gate = route(
+    name = "gate",
+    depends_on = [classify],
+    min_confidence = 0.6,
+    questions = {
+        "risk": score(
+            ask = "How risky is the change?",
+            levels = {"low": "cosmetic", "medium": None, "high": "touches the scheduler"},
+            drop = ["uncertain"],
+        ),
+    },
+)
+ship = command(name = "ship", run = "./ship.sh", depends_on = [gate], when = gate.risk, answers = ["low", "medium"])
+hold = command(name = "hold", run = "./hold.sh", depends_on = [gate], when = gate.risk, otherwise = True)
+workflow(type = "playbook", tasks = [classify, gate, ship, hold])
+"#;
+
+    #[test]
+    fn a_score_compiles_with_its_levels_in_the_order_written() {
+        let pack = temp_pack("score");
+        let compiled = compile_source(SCORED_ROUTE, &pack.join("workflow.star"), &pack).unwrap();
+        let tasks = &compiled.workflow.tasks;
+        let gate = tasks.iter().find(|t| t.name.0 == "gate").unwrap();
+        let TaskKind::Route { questions, .. } = &gate.task else {
+            panic!("gate is not a route");
+        };
+        let risk = &questions[&QuestionId::new("risk").unwrap()];
+        let QuestionKind::Score { levels } = &risk.kind else {
+            panic!("risk is not a score");
+        };
+        assert_eq!(
+            levels.iter().map(|l| l.label.as_str()).collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        assert_eq!(levels[1].description, None);
+        assert_eq!(
+            levels[2].description.as_deref(),
+            Some("touches the scheduler")
+        );
+        let hold = tasks.iter().find(|t| t.name.0 == "hold").unwrap();
+        assert_eq!(
+            hold.when.as_ref().map(ToString::to_string).as_deref(),
+            Some("gate.risk in high")
+        );
+
+        let text = toml::to_string(&compiled.workflow).unwrap();
+        assert!(text.contains("type = \"score\""), "{text}");
+        let back: WorkflowCfg = toml::from_str(&text).unwrap();
+        back.validate().unwrap();
+        assert_eq!(toml::to_string(&back).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_score_takes_a_list_of_levels_and_needs_two_of_them() {
+        let pack = temp_pack("score-list");
+        let source = SCORED_ROUTE.replace(
+            "{\"low\": \"cosmetic\", \"medium\": None, \"high\": \"touches the scheduler\"}",
+            "[\"low\", \"medium\", \"high\"]",
+        );
+        let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let gate = compiled
+            .workflow
+            .tasks
+            .iter()
+            .find(|t| t.name.0 == "gate")
+            .unwrap();
+        let TaskKind::Route { questions, .. } = &gate.task else {
+            panic!("gate is not a route");
+        };
+        assert_eq!(
+            questions[&QuestionId::new("risk").unwrap()]
+                .labels()
+                .iter()
+                .map(Label::as_str)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+        let _ = std::fs::remove_dir_all(&pack);
+
+        let err = routed_error(
+            "score-one-level",
+            &SCORED_ROUTE.replace(
+                "{\"low\": \"cosmetic\", \"medium\": None, \"high\": \"touches the scheduler\"}",
+                "[\"low\"]",
+            ),
+        );
+        assert!(err.contains("a score needs at least two levels"), "{err}");
+        let err = routed_error(
+            "score-bad-level",
+            &SCORED_ROUTE.replace("\"medium\": None", "\"medium\": 2"),
+        );
+        assert!(err.contains("levels"), "{err}");
+    }
+
+    #[test]
+    fn a_score_needs_answers_on_its_when() {
+        let err = routed_error(
+            "score-no-answers",
+            &SCORED_ROUTE.replace(
+                "when = gate.risk, answers = [\"low\", \"medium\"]",
+                "when = gate.risk",
+            ),
+        );
+        assert!(
+            err.contains("missing required argument \"answers\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn score_is_a_constructor_in_the_custom_lane_and_unknown_to_autoresearch() {
+        let pack = temp_pack("score-custom");
+        let source = SCORED_ROUTE.replace(
+            "workflow(type = \"playbook\", tasks = [classify, gate, ship, hold])",
+            "workflow(type = \"custom\", tasks = [classify, gate, ship, hold], result = classify)",
+        );
+        compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+        let _ = std::fs::remove_dir_all(&pack);
+
+        let err = routed_error(
+            "score-autoresearch",
+            "q = score(ask = \"How risky?\", levels = [\"low\", \"high\"])\nworkflow([])\n",
+        );
+        assert!(
+            err.contains("unknown workflow DSL function \"score\""),
+            "{err}"
+        );
     }
 }

@@ -405,6 +405,10 @@ dto! {
         pub over: String,
         /// The most instances `over` may produce; 0 when the task is not mapped.
         pub max_fanout: u32,
+        /// `route.question in a|b` when the task runs only on those answers, empty otherwise.
+        pub when: String,
+        /// `producer.field` references each instance receives narrowed to its own entry.
+        pub keyed: Vec<String>,
     }
 }
 
@@ -498,6 +502,9 @@ pub struct RunGraphDto {
     /// the run stored no session or its producer emitted no list: how many instances started is
     /// in `results`, but how many were asked for is only knowable from the producer's payload.
     pub fanout: Vec<FanOutCountDto>,
+    /// What each route decided, read from the session: one row per question per route node and
+    /// per route instance, a mapped route's node tallying its instances.
+    pub decisions: Vec<RouteDecisionDto>,
 }
 
 /// One mapped task against the number of items its producer emitted.
@@ -505,6 +512,23 @@ pub struct RunGraphDto {
 pub struct FanOutCountDto {
     pub task: String,
     pub items: i64,
+    /// Instances the settled node's fold counts as not taken; 0 before it settles.
+    pub not_taken: i64,
+}
+
+/// How a route node or instance resolved one question.
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
+pub struct RouteDecisionDto {
+    pub task: String,
+    pub question: String,
+    /// Each resolved label and how many decisions gave it, in label order.
+    pub labels: Vec<LabelCountDto>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, ToSchema)]
+pub struct LabelCountDto {
+    pub label: String,
+    pub count: i64,
 }
 
 /// Where an output bound came from.

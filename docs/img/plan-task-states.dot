@@ -41,6 +41,7 @@ digraph task {
     Running -> Transport [label="transport cut by budget", color="#8a4b1c", fontcolor="#8a4b1c"];
     Fanout -> Pass [label="instances passed"];
     Fanout -> Fail [label="instances failed", color="#8a4b1c", fontcolor="#8a4b1c"];
+    Fanout -> NotTaken [label="instances not taken", color="#8a4b1c", fontcolor="#8a4b1c"];
     Pending -> Revising [label="rounds started"];
     Revising -> Pass [label="rounds passed"];
     Revising -> Fail [label="rounds failed", color="#8a4b1c", fontcolor="#8a4b1c"];

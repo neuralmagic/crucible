@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ROUTE-SCORE"
+title = "Score questions"
+kind = "normative"
+status = "active"
+since = "0.2.0"
+
+[content]
+text = """
+A question may be a score: an ordered list of at least two distinct levels, lowest first, each an identifier with a description, in the order the author declares them. A score is a third question type beside noul and choice, constructed in the DSL by score() in the lanes that admit route under [[RFC-0001:C-WORKFLOW]]. Its labels are its levels, and every rule [[RFC-0001:C-ROUTE]] states for a choice's options applies to its levels: identifiers, the reserved label "uncertain", when, drop, otherwise, and label coverage. The levels and their order must reach the generated TOML, and nothing a task emits at run time may change them.
+
+A model-decided route asks a score question for a probability per level and must validate the answer as it validates a choice's. The engine must fail the task when every level's probability is 0, and must otherwise normalize the distribution to sum 1. The label is the level with the highest normalized probability, the lowest such level on a tie, and is recorded as "uncertain" when that probability is below min_confidence. The recorded answer must carry, beside the label, confidence, and distribution that [[RFC-0001:C-ROUTE]] requires, a number under "score": (Σ p(i) · i) / (n − 1) over the normalized distribution, for level i of n counted from 0, so that 0 is the lowest level and 1 the highest. The engine must compute the score from the distribution alone and must not read a score or confidence the API reports. The score must be recorded whatever the label, including when the label is "uncertain".
+
+Where the decision API the binding speaks has a native question over ordered levels, the engine must ask a score question as that question, with the levels in their declared order. Where it has none, as the System One API has none, the engine must ask the question as a choice over the levels and resolve it as above. Either way the recorded answer must name the form it was asked in under "asked_as", as "score" or "choice". A response that answers a score question as any type other than the one it was asked as must fail the task.
+
+An output-decided route answers a score question from one level label, read as [[RFC-0001:C-ROUTE]] reads a choice's; the recorded score is that level's position divided by n − 1, and "uncertain" records no score. A source whose emits types the field must type it as a label list within the levels and "uncertain", or as a schema whose bounded values are among them; "boolean" must be rejected."""

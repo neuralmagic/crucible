@@ -283,7 +283,7 @@ pub(super) async fn run_scope_and_transition(
                 agent: crate::playbooks::providers::AgentSelection::from_resolved(
                     dispatch.as_ref(),
                 ),
-                inference_provider: dispatch.map(|d| d.provider),
+                inference: dispatch.iter().map(|d| d.inference()).collect(),
             },
         )
         .await?;

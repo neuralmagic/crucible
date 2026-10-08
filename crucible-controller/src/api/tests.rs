@@ -10609,6 +10609,7 @@ async fn config_providers_lists_enabled_providers_and_the_defaults(pool: PgPool)
             scope_kind: crate::playbooks::providers::DefaultScope::Platform,
             scope_ref: String::new(),
             workload_class: crate::playbooks::providers::WorkloadClass::Autoresearch,
+            role: crate::playbooks::providers::ModelRole::Agent,
             provider_id: "plat-openai".to_string(),
             model: Some("gpt-5.6-sol".to_string()),
             fallback_provider_id: None,
@@ -11440,6 +11441,150 @@ async fn an_admin_sets_a_dispatch_default_with_a_fallback(pool: PgPool) -> Resul
         defaults[0].fallback_provider_id, None,
         "a PUT without a fallback clears the one before it"
     );
+    Ok(())
+}
+
+/// A decision default stands beside the agent default of the same scope and class: each is set,
+/// listed, and cleared under its own role. Only a provider that serves route decisions may be one,
+/// and only for playbooks, the one class that runs route tasks.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_admin_sets_a_decision_default_beside_the_agent_one(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    seed_provider(
+        db.pool(),
+        "openai",
+        crate::playbooks::providers::ProviderKind::OpenAi,
+        true,
+    )
+    .await;
+    seed_provider(
+        db.pool(),
+        "anthropic",
+        crate::playbooks::providers::ProviderKind::Anthropic,
+        true,
+    )
+    .await;
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let put = |body: serde_json::Value| admin_json("PUT", "/api/config/dispatch-defaults", body);
+
+    for body in [
+        serde_json::json!({"scope_kind": "platform", "workload_class": "playbook", "provider": "anthropic"}),
+        serde_json::json!({"scope_kind": "platform", "workload_class": "playbook", "role": "decision", "provider": "openai"}),
+    ] {
+        let res = app.clone().oneshot(put(body.clone())?).await?;
+        assert_eq!(res.status(), StatusCode::OK, "{body}");
+    }
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/config/providers")
+                .header("x-auth-request-user", "wren")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let v = json_of(res).await?;
+    let roles: Vec<(String, String)> = v["defaults"]
+        .as_array()
+        .expect("defaults")
+        .iter()
+        .map(|d| (d["role"].to_string(), d["provider"].to_string()))
+        .collect();
+    assert_eq!(
+        roles,
+        vec![
+            ("\"agent\"".to_string(), "\"anthropic\"".to_string()),
+            ("\"decision\"".to_string(), "\"openai\"".to_string()),
+        ]
+    );
+    let served: Vec<(String, serde_json::Value, serde_json::Value)> = v["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .map(|p| {
+            (
+                p["id"].to_string(),
+                p["roles"].clone(),
+                p["harness"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        served,
+        vec![
+            (
+                "\"anthropic\"".to_string(),
+                serde_json::json!(["agent"]),
+                serde_json::json!("claude")
+            ),
+            (
+                "\"openai\"".to_string(),
+                serde_json::json!(["agent", "decision"]),
+                serde_json::json!("codex")
+            ),
+        ]
+    );
+    let decision = crate::playbooks::providers::resolve_decision(
+        db.pool(),
+        None,
+        crate::playbooks::providers::WorkloadClass::Playbook,
+    )
+    .await?
+    .expect("the decision default resolves");
+    assert_eq!(decision.model, "gpt-6-luna");
+
+    for (bad, why) in [
+        (
+            serde_json::json!({"scope_kind": "platform", "workload_class": "playbook", "role": "decision", "provider": "anthropic"}),
+            "cannot serve the decision role",
+        ),
+        (
+            serde_json::json!({"scope_kind": "platform", "workload_class": "autoresearch", "role": "decision", "provider": "openai"}),
+            "runs no route task",
+        ),
+        (
+            serde_json::json!({"scope_kind": "platform", "workload_class": "playbook", "role": "decision", "provider": "openai", "fallback_provider": "anthropic"}),
+            "fallback_provider \"anthropic\" cannot serve the decision role",
+        ),
+    ] {
+        let res = app.clone().oneshot(put(bad.clone())?).await?;
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        let body = json_of(res).await?;
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(error.contains(why), "{error} lacks {why}");
+    }
+
+    let delete = |query: &str| {
+        HttpRequest::delete(format!("/api/config/dispatch-defaults?{query}"))
+            .header("x-auth-request-user", "wren")
+            .body(Body::empty())
+    };
+    let res = app
+        .clone()
+        .oneshot(delete("scope_kind=platform&workload_class=playbook")?)
+        .await?;
+    assert_eq!(
+        res.status(),
+        StatusCode::NO_CONTENT,
+        "no role clears the agent's"
+    );
+    let left = crate::playbooks::providers::list_defaults(db.pool()).await?;
+    assert_eq!(
+        left.iter().map(|d| d.role).collect::<Vec<_>>(),
+        vec![crate::playbooks::providers::ModelRole::Decision]
+    );
+    let res = app
+        .clone()
+        .oneshot(delete(
+            "scope_kind=platform&workload_class=playbook&role=decision",
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let res = app
+        .oneshot(delete(
+            "scope_kind=platform&workload_class=playbook&role=judge",
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     Ok(())
 }
 

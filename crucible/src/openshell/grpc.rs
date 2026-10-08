@@ -690,10 +690,7 @@ impl Gateway {
         ]);
         let mut client = self.client();
         client
-            .create_provider(scoped(CreateProviderRequest {
-                provider: Some(provider),
-                ..Default::default()
-            }))
+            .create_provider(create_provider_request(provider))
             .await
             .map(|_| ())
             // The token is in the request body, not this message; but keep any surfaced
@@ -718,10 +715,7 @@ impl Gateway {
         provider.r#type = provider_type.to_string();
         let mut client = self.client();
         client
-            .create_provider(scoped(CreateProviderRequest {
-                provider: Some(provider),
-                ..Default::default()
-            }))
+            .create_provider(create_provider_request(provider))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("create_provider({name})")))
@@ -808,10 +802,7 @@ impl Gateway {
         };
         let mut client = self.client();
         client
-            .create_provider(scoped(CreateProviderRequest {
-                provider: Some(provider),
-                ..Default::default()
-            }))
+            .create_provider(create_provider_request(provider))
             .await
             .map(|_| ())
             .map_err(GrpcError::rpc(format!("create_provider({name})")))
@@ -1118,6 +1109,16 @@ fn build_provider(name: &str, cred_key: &str, token: &str) -> Provider {
         config: HashMap::new(),
         ..Default::default()
     }
+}
+
+/// The `CreateProvider` request for `provider`, addressed to the workspace whose imported
+/// profiles define provider types.
+fn create_provider_request(mut provider: Provider) -> CreateProviderRequest {
+    provider.profile_workspace = crucible_broker::workspace::WORKSPACE.to_string();
+    scoped(CreateProviderRequest {
+        provider: Some(provider),
+        ..Default::default()
+    })
 }
 
 /// The import source the gateway records on crucible's profiles.
@@ -2164,6 +2165,36 @@ pYBZ
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
         }
+    }
+
+    #[test]
+    fn create_requests_resolve_the_type_profile_in_the_workspace() {
+        use crucible_broker::workspace::WORKSPACE;
+        use openshell_core::proto::workspace_selector::Selection;
+
+        let mut provider = build_provider("gcp", "TOKEN", "secret");
+        provider.r#type = "google-cloud".to_string();
+        let request = create_provider_request(provider);
+        assert_eq!(
+            request.workspace_scope.and_then(|s| s.selection),
+            Some(Selection::Workspace(WORKSPACE.to_string()))
+        );
+        let provider = request.provider.expect("provider rides the request");
+        assert_eq!(provider.profile_workspace, WORKSPACE);
+        assert_eq!(provider.r#type, "google-cloud");
+        assert_eq!(
+            provider.credentials,
+            HashMap::from([("TOKEN".to_string(), "secret".to_string())])
+        );
+    }
+
+    #[test]
+    fn update_provider_leaves_the_profile_workspace_unset() {
+        assert!(
+            build_provider("gcp", "TOKEN", "secret")
+                .profile_workspace
+                .is_empty()
+        );
     }
 
     #[test]

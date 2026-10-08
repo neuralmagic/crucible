@@ -147,6 +147,17 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         None => crate::runs::model::RunImage::default(),
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
+    let decision = crate::playbooks::providers::resolve_decision(
+        db.pool(),
+        Some(&issue.repo),
+        WorkloadClass::Playbook,
+    )
+    .await?;
+    let inference = dispatch
+        .iter()
+        .map(|d| d.inference())
+        .chain(decision)
+        .collect();
     let exposure =
         crate::launches::store::launch_exposure(db.pool(), &issue.key, &launch).await??;
     let scope = crate::secrets::launch::Scope::playbook(&launch.playbook);
@@ -177,7 +188,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         launcher,
         revision,
         provider: cfg.secret_provider.clone(),
-        inference_provider: dispatch.map(|d| d.provider),
+        inference,
         exposure,
     });
     let opts = crate::runs::workpod::RunRenderOpts::Playbook {

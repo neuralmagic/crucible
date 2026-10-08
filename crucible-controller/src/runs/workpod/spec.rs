@@ -583,25 +583,20 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         });
     }
 
-    // The provider's key, read before anything is written: a turn that cannot pay for the service
+    // The models' keys, read before anything is written: a turn that cannot pay for the service
     // it was pointed at must leave no work-pod row and no pod behind.
-    let delivery = match inputs.inference_provider.as_ref() {
-        None => crate::secrets::deliver::Delivery::default(),
-        Some(provider) => {
-            match crate::secrets::deliver::provider_delivery(
-                db.pool(),
-                cfg.secret_provider.as_ref(),
-                provider,
-            )
-            .await?
-            {
-                Ok(delivery) => delivery,
-                Err(refusal) => {
-                    return Ok(TurnDispatch::Failed {
-                        reason: refusal.to_string(),
-                    });
-                }
-            }
+    let delivery = match crate::secrets::deliver::inference_delivery(
+        db.pool(),
+        cfg.secret_provider.as_ref(),
+        &inputs.inference,
+    )
+    .await?
+    {
+        Ok(delivery) => delivery,
+        Err(refusal) => {
+            return Ok(TurnDispatch::Failed {
+                reason: refusal.to_string(),
+            });
         }
     };
 
@@ -818,8 +813,8 @@ impl TurnSpec for ScopeSpec {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::metrics::Metrics;
+    use crate::runs::workpod::spec::*;
     use crucible_contract::{ArtifactKind, ArtifactRef, Envelope, EnvelopeKind};
     use k8s_openapi::api::core::v1::Pod;
     use std::sync::Mutex;

@@ -56,6 +56,8 @@ const GRAPH = {
       join: 'all' as const,
       emits: [],
       emits_files: [],
+      keyed: [],
+      questions: [],
     },
   ],
   edges: [],
