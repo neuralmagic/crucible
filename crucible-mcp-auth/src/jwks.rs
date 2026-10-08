@@ -1,8 +1,9 @@
 //! The authorization server's signing keys, fetched from its JWKS URI and cached by `kid`.
 //!
 //! A cached key is served until `max_age`; after that the next lookup refetches, and keeps the
-//! old set if the fetch fails. An unknown `kid` (key rotation) refetches at most once per
-//! `min_refetch`, so a flood of tokens with made-up kids cannot hammer the issuer.
+//! old set if the fetch fails. Any fetch, failed or not, waits `min_refetch` after the last
+//! attempt, so a flood of tokens with made-up kids cannot hammer the issuer, and a response larger
+//! than [`MAX_JWKS_BYTES`] is refused unread.
 
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey};
@@ -10,6 +11,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
+
+/// Largest key set accepted.
+pub const MAX_JWKS_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum JwksError {
@@ -20,6 +24,14 @@ pub enum JwksError {
         uri: Url,
         #[source]
         source: reqwest::Error,
+    },
+    #[error("JWKS from {uri} is larger than {MAX_JWKS_BYTES} bytes")]
+    TooLarge { uri: Url },
+    #[error("decoding JWKS from {uri}: {source}")]
+    Decode {
+        uri: Url,
+        #[source]
+        source: serde_json::Error,
     },
 }
 
@@ -35,6 +47,7 @@ pub struct VerificationKey {
 struct Cache {
     keys: HashMap<String, VerificationKey>,
     fetched_at: Option<Instant>,
+    attempted_at: Option<Instant>,
 }
 
 pub struct Jwks {
@@ -76,20 +89,19 @@ impl Jwks {
         if let Some(key) = self.fresh(kid).await {
             return Ok(key);
         }
-        let (stale, fetched_at) = {
+        let (stale, attempted_at) = {
             let cache = self.cache.read().await;
-            (cache.keys.get(kid).cloned(), cache.fetched_at)
+            (cache.keys.get(kid).cloned(), cache.attempted_at)
         };
-        let may_fetch =
-            stale.is_some() || fetched_at.is_none_or(|at| at.elapsed() >= self.min_refetch);
-        if may_fetch {
-            match self.fetch().await {
+        if attempted_at.is_none_or(|at| at.elapsed() >= self.min_refetch) {
+            let fetched = self.fetch().await;
+            let mut cache = self.cache.write().await;
+            cache.attempted_at = Some(Instant::now());
+            match fetched {
                 Ok(keys) => {
                     let found = keys.get(kid).cloned();
-                    *self.cache.write().await = Cache {
-                        keys,
-                        fetched_at: Some(Instant::now()),
-                    };
+                    cache.keys = keys;
+                    cache.fetched_at = cache.attempted_at;
                     if let Some(key) = found {
                         return Ok(key);
                     }
@@ -117,16 +129,33 @@ impl Jwks {
             uri: self.uri.clone(),
             source,
         };
-        let set: JwkSet = self
+        let mut response = self
             .http
             .get(self.uri.clone())
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
-            .map_err(wrap)?
-            .json()
-            .await
             .map_err(wrap)?;
+        let too_large = || JwksError::TooLarge {
+            uri: self.uri.clone(),
+        };
+        if response
+            .content_length()
+            .is_some_and(|n| usize::try_from(n).map_or(true, |n| n > MAX_JWKS_BYTES))
+        {
+            return Err(too_large());
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(wrap)? {
+            if body.len() + chunk.len() > MAX_JWKS_BYTES {
+                return Err(too_large());
+            }
+            body.extend_from_slice(&chunk);
+        }
+        let set: JwkSet = serde_json::from_slice(&body).map_err(|source| JwksError::Decode {
+            uri: self.uri.clone(),
+            source,
+        })?;
         Ok(verification_keys(&set))
     }
 }
@@ -175,5 +204,54 @@ mod tests {
         assert_eq!(kids, ["rsa", "rsa-any-alg"]);
         assert_eq!(keys["rsa"].algorithm, Some(Algorithm::RS256));
         assert_eq!(keys["rsa-any-alg"].algorithm, None);
+    }
+
+    async fn serve(
+        body: Vec<u8>,
+        hits: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        status: u16,
+    ) -> Url {
+        let app = axum::Router::new().route(
+            "/certs",
+            axum::routing::get(move || {
+                let body = body.clone();
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    (http::StatusCode::from_u16(status).unwrap(), body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Url::parse(&format!("http://{addr}/certs")).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_fetch_also_waits_out_the_refetch_interval() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let uri = serve(b"down".to_vec(), hits.clone(), 503).await;
+        let jwks = Jwks::new(reqwest::Client::new(), uri)
+            .with_timing(Duration::from_secs(600), Duration::from_secs(60));
+        for kid in ["a", "b", "c", "d"] {
+            assert!(jwks.key(kid).await.is_err());
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_key_set_is_refused() {
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let huge = format!(
+            "{{\"keys\": [], \"pad\": \"{}\"}}",
+            "x".repeat(MAX_JWKS_BYTES)
+        );
+        let uri = serve(huge.into_bytes(), hits, 200).await;
+        let jwks = Jwks::new(reqwest::Client::new(), uri);
+        assert!(matches!(
+            jwks.key("a").await,
+            Err(JwksError::TooLarge { .. })
+        ));
     }
 }

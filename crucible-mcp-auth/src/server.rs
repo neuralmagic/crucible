@@ -8,12 +8,13 @@
 //! | valid but missing a scope       | 403    | `Bearer error="insufficient_scope", scope=".."`       |
 
 use crate::jwks::Jwks;
-use crate::principal::Principal;
+use crate::principal::{Callers, Principal};
 use crate::verify::{TokenError, Verifier, unverified_issuer};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
+use std::path::PathBuf;
 use std::sync::Arc;
 use url::Url;
 
@@ -24,6 +25,7 @@ pub struct TrustedIssuer {
     pub issuer: String,
     /// Where to fetch the issuer's signing keys.
     pub jwks_uri: Url,
+    pub callers: Callers,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -42,12 +44,10 @@ pub enum TrustedIssuerError {
     },
 }
 
-/// `<issuer>=<jwks uri>`, the issuer kept verbatim. The issuer may not contain `=`; the JWKS URI
-/// may.
-impl std::str::FromStr for TrustedIssuer {
-    type Err = TrustedIssuerError;
-
-    fn from_str(arg: &str) -> Result<Self, Self::Err> {
+impl TrustedIssuer {
+    /// `<issuer>=<jwks uri>` for an issuer of `callers` tokens, the issuer kept verbatim. The
+    /// issuer may not contain `=`; the JWKS URI may.
+    pub fn parse(arg: &str, callers: Callers) -> Result<Self, TrustedIssuerError> {
         let (issuer, jwks_uri) = arg
             .split_once('=')
             .ok_or_else(|| TrustedIssuerError::Shape(arg.to_string()))?;
@@ -62,8 +62,50 @@ impl std::str::FromStr for TrustedIssuer {
         Ok(Self {
             issuer: issuer.to_string(),
             jwks_uri,
+            callers,
         })
     }
+
+    /// [`Self::parse`] for an issuer of run tokens.
+    pub fn runs(arg: &str) -> Result<Self, TrustedIssuerError> {
+        Self::parse(arg, Callers::Runs)
+    }
+
+    /// [`Self::parse`] for an issuer of people's tokens.
+    pub fn people(arg: &str) -> Result<Self, TrustedIssuerError> {
+        Self::parse(arg, Callers::People)
+    }
+}
+
+/// How key sets are fetched. Plain http is accepted only for loopback hosts unless
+/// `insecure_http` is set, since whoever can answer the JWKS fetch can mint accepted tokens.
+#[derive(Debug, Clone, Default)]
+pub struct JwksTls {
+    /// PEM bundle of CAs trusted for JWKS hosts, beside the platform roots.
+    pub ca_bundle: Option<PathBuf>,
+    pub insecure_http: bool,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SetupError {
+    #[error(
+        "JWKS URI {uri} is plain http to a non-loopback host; serve it over https (trusting a private CA with a CA bundle) or allow insecure http explicitly"
+    )]
+    InsecureJwks { uri: Url },
+    #[error("reading the JWKS CA bundle {path}: {source}")]
+    CaRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("the JWKS CA bundle {path} holds no usable certificate: {source}")]
+    CaParse {
+        path: PathBuf,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("building the JWKS client: {0}")]
+    Client(#[source] reqwest::Error),
 }
 
 #[derive(Debug, Clone)]
@@ -97,10 +139,34 @@ pub enum AuthError {
     InsufficientScope { missing: Vec<String> },
 }
 
+impl AuthError {
+    /// What the caller is told. The specific reason is logged, never returned: it can describe the
+    /// server's keys and issuers to whoever probes it.
+    pub fn public_description(&self) -> &'static str {
+        match self {
+            Self::Missing => "a bearer token is required",
+            Self::Unrecognized | Self::Invalid(_) => "the access token is invalid or expired",
+            Self::InsufficientScope { .. } => "the access token lacks a required scope",
+        }
+    }
+}
+
 impl ResourceServer {
-    /// A server fetching each issuer's keys without following redirects.
-    pub fn new(config: ResourceServerConfig) -> Result<Self, reqwest::Error> {
-        let http = jwks_client()?;
+    /// A server fetching each issuer's keys over `tls`, without following redirects.
+    pub fn new(config: ResourceServerConfig, tls: &JwksTls) -> Result<Self, SetupError> {
+        for trusted in &config.issuers {
+            if trusted.jwks_uri.scheme() == "https" || is_loopback(&trusted.jwks_uri) {
+                continue;
+            }
+            if !tls.insecure_http {
+                return Err(SetupError::InsecureJwks {
+                    uri: trusted.jwks_uri.clone(),
+                });
+            }
+            tracing::warn!(issuer = %trusted.issuer, jwks_uri = %trusted.jwks_uri,
+                "fetching signing keys over plain http: anyone on that path can mint accepted tokens");
+        }
+        let http = jwks_client(tls)?;
         Ok(Self::with_jwks(config, |trusted| {
             Jwks::new(http.clone(), trusted.jwks_uri.clone())
         }))
@@ -123,14 +189,17 @@ impl ResourceServer {
     /// Validate a compact JWS access token and return its principal.
     pub async fn validate(&self, token: &str) -> Result<Principal, TokenError> {
         let issuer = unverified_issuer(token)?;
-        let verifier = self
+        let (verifier, trusted) = self
             .verifiers
             .iter()
-            .find(|v| v.issuer() == issuer)
+            .zip(&self.config.issuers)
+            .find(|(v, _)| v.issuer() == issuer)
             .ok_or(TokenError::UnknownIssuer(issuer))?;
         let audiences: Vec<&str> = self.config.resources.iter().map(Url::as_str).collect();
         let claims = verifier.verify(token, &audiences).await?;
-        Ok(Principal::from_claims(claims)?)
+        let mut principal = Principal::from_claims(claims)?;
+        principal.callers = trusted.callers;
+        Ok(principal)
     }
 
     /// The bearer token's principal, with the server-wide scopes checked.
@@ -194,7 +263,7 @@ impl ResourceServer {
         };
         if let Some(code) = code {
             params.push(("error", code.to_string()));
-            params.push(("error_description", error.to_string()));
+            params.push(("error_description", error.public_description().to_string()));
         }
         if let Some(url) = &metadata {
             params.push(("resource_metadata", url.to_string()));
@@ -216,7 +285,7 @@ impl ResourceServer {
         );
         let body = serde_json::json!({
             "error": code.unwrap_or("unauthorized"),
-            "error_description": error.to_string(),
+            "error_description": error.public_description(),
         });
         let mut response = (status, axum::Json(body)).into_response();
         if let Ok(value) = HeaderValue::from_str(&challenge) {
@@ -248,13 +317,37 @@ pub async fn require_bearer(
     }
 }
 
-/// The HTTP client key sets are fetched with: bounded timeouts, no redirects.
-pub fn jwks_client() -> Result<reqwest::Client, reqwest::Error> {
-    reqwest::Client::builder()
+/// The HTTP client key sets are fetched with: bounded timeouts, no redirects, and `tls`'s CA
+/// bundle trusted beside the platform roots.
+pub fn jwks_client(tls: &JwksTls) -> Result<reqwest::Client, SetupError> {
+    let mut builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .timeout(std::time::Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
+        .redirect(reqwest::redirect::Policy::none());
+    if let Some(path) = &tls.ca_bundle {
+        let pem = std::fs::read(path).map_err(|source| SetupError::CaRead {
+            path: path.clone(),
+            source,
+        })?;
+        let certs =
+            reqwest::Certificate::from_pem_bundle(&pem).map_err(|source| SetupError::CaParse {
+                path: path.clone(),
+                source,
+            })?;
+        for cert in certs {
+            builder = builder.add_root_certificate(cert);
+        }
+    }
+    builder.build().map_err(SetupError::Client)
+}
+
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    }
 }
 
 /// The token in `Authorization: Bearer <token>`, scheme matched case-insensitively.
@@ -528,6 +621,7 @@ mod tests {
         cfg.issuers.push(TrustedIssuer {
             issuer: CONTROLLER.to_string(),
             jwks_uri: controller.url.clone(),
+            callers: Callers::Runs,
         });
         ResourceServer::with_jwks(cfg, |t| {
             Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
@@ -606,9 +700,9 @@ mod tests {
 
     #[test]
     fn trusted_issuers_parse_as_issuer_equals_jwks_uri_and_keep_the_issuer_verbatim() {
-        let t: TrustedIssuer = "http://crucible-controller.crucible-system.svc:8080=http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json"
-            .parse()
+        let t = TrustedIssuer::runs("http://crucible-controller.crucible-system.svc:8080=http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json")
             .unwrap();
+        assert_eq!(t.callers, Callers::Runs);
         assert_eq!(
             t.issuer,
             "http://crucible-controller.crucible-system.svc:8080"
@@ -617,16 +711,17 @@ mod tests {
             t.jwks_uri.as_str(),
             "http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json"
         );
-        let q: TrustedIssuer = "https://kc.example/realms/c=http://kc.auth.svc:8080/certs?x=1"
-            .parse()
-            .unwrap();
+        let q =
+            TrustedIssuer::people("https://kc.example/realms/c=http://kc.auth.svc:8080/certs?x=1")
+                .unwrap();
+        assert_eq!(q.callers, Callers::People);
         assert_eq!(q.jwks_uri.as_str(), "http://kc.auth.svc:8080/certs?x=1");
         for bad in [
             "https://a.example",
             "not a url=https://a.example/keys",
             "https://a.example=keys",
         ] {
-            assert!(bad.parse::<TrustedIssuer>().is_err(), "{bad}");
+            assert!(TrustedIssuer::runs(bad).is_err(), "{bad}");
         }
     }
 
@@ -825,5 +920,112 @@ mod tests {
     fn challenge_values_are_quoted_strings() {
         assert_eq!(quoted(r#"a "b" \c"#), r#"a \"b\" \\c"#);
         assert_eq!(quoted("line\nbreak"), "linebreak");
+    }
+
+    fn issuer_with_jwks(jwks: &str) -> ResourceServerConfig {
+        let mut cfg = testing::config(Url::parse("https://keys.example/certs").unwrap());
+        cfg.issuers[0].jwks_uri = Url::parse(jwks).unwrap();
+        cfg
+    }
+
+    #[test]
+    fn jwks_over_plain_http_is_refused_unless_loopback_or_explicitly_insecure() {
+        let remote = issuer_with_jwks("http://keycloak.auth.svc:8080/certs");
+        assert!(matches!(
+            ResourceServer::new(remote.clone(), &JwksTls::default()),
+            Err(SetupError::InsecureJwks { .. })
+        ));
+        let insecure = JwksTls {
+            insecure_http: true,
+            ..JwksTls::default()
+        };
+        assert!(ResourceServer::new(remote, &insecure).is_ok());
+        for loopback in [
+            "http://127.0.0.1:9/certs",
+            "http://localhost:9/certs",
+            "http://[::1]:9/certs",
+        ] {
+            assert!(
+                ResourceServer::new(issuer_with_jwks(loopback), &JwksTls::default()).is_ok(),
+                "{loopback}"
+            );
+        }
+        assert!(
+            ResourceServer::new(
+                issuer_with_jwks("https://keycloak.auth.svc/certs"),
+                &JwksTls::default()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_ca_bundle_must_exist_and_hold_a_certificate() {
+        let missing = JwksTls {
+            ca_bundle: Some("/nonexistent/ca.pem".into()),
+            ..JwksTls::default()
+        };
+        assert!(matches!(
+            jwks_client(&missing),
+            Err(SetupError::CaRead { .. })
+        ));
+        let dir = std::env::temp_dir().join(format!("jwks-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let junk = dir.join("junk.pem");
+        std::fs::write(
+            &junk,
+            "-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let unusable = JwksTls {
+            ca_bundle: Some(junk),
+            ..JwksTls::default()
+        };
+        assert!(matches!(
+            jwks_client(&unusable),
+            Err(SetupError::CaParse { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_issuer_decides_whether_a_token_speaks_for_a_run_or_a_person() {
+        let jwks = JwksServer::start(vec![jwk("a")]).await;
+        let mut cfg = testing::config(jwks.url.clone());
+        cfg.issuers[0].callers = Callers::People;
+        let rs = ResourceServer::with_jwks(cfg, |t| {
+            Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
+        });
+        let p = rs.validate(&sign("a", &run_claims())).await.unwrap();
+        assert_eq!(
+            p.callers,
+            Callers::People,
+            "a run_id claim does not make a person's token a run"
+        );
+    }
+
+    #[tokio::test]
+    async fn challenges_never_say_why_a_token_failed() {
+        let (_jwks, rs) = server_with(vec![jwk("a")]).await;
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("no-such-kid".into());
+        let token =
+            jsonwebtoken::encode(&header, &run_claims(), &testing::signing_key("a")).unwrap();
+        let error = rs.authenticate(&bearer(&token)).await.unwrap_err();
+        let response = rs.challenge(&HeaderMap::new(), &error);
+        let header = response.headers()[header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            header.contains(r#"error_description="the access token is invalid or expired""#),
+            "{header}"
+        );
+        assert!(!header.contains("no-such-kid"), "{header}");
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 1024).await.unwrap()).unwrap();
+        assert_eq!(
+            body["error_description"],
+            "the access token is invalid or expired"
+        );
     }
 }

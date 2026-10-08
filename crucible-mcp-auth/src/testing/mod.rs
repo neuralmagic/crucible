@@ -105,6 +105,7 @@ pub fn config(jwks_uri: Url) -> ResourceServerConfig {
         issuers: vec![TrustedIssuer {
             issuer: ISSUER.to_string(),
             jwks_uri,
+            callers: crate::principal::Callers::Runs,
         }],
         resources: vec![
             Url::parse(RESOURCE_SVC).unwrap(),

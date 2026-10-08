@@ -1,10 +1,13 @@
 //! Middleware that applies a [`ToolPolicy`] to MCP traffic. Runs after authentication: it needs
 //! the [`Principal`] in the request extensions and refuses the request without one.
 //!
-//! `tools/call` bodies are parsed, rewritten by the policy, and re-serialized, so rmcp executes
-//! exactly the arguments the rules saw. The access checks a call's authorize rules produce go to
-//! the guard's [`AccessReview`]; every one must be allowed. `tools/list` responses (JSON or SSE)
-//! have injected parameters removed from each tool's `inputSchema`.
+//! Deny by default: a POST passes only as protocol plumbing (`initialize`, `ping`,
+//! `server/discover`, `notifications/*`, a response to the server), `tools/list`, `tools/call`, or
+//! a method the policy lists, whose scopes it then requires. `tools/call` bodies are parsed,
+//! rewritten by the policy, and re-serialized, so rmcp executes exactly the arguments the rules
+//! saw. The access checks a call's authorize rules produce go to the guard's [`AccessReview`];
+//! every one must be allowed. `tools/list` responses (JSON or SSE) have injected parameters
+//! removed from each tool's `inputSchema`.
 
 use crate::policy::{AccessCheck, Refusal, ToolPolicy};
 use crate::principal::Principal;
@@ -25,6 +28,8 @@ const BODY_LIMIT: usize = 4 * 1024 * 1024;
 
 /// JSON-RPC error code for a call the policy refused (implementation-defined server error range).
 pub const POLICY_REFUSED: i64 = -32001;
+
+const PROTOCOL_METHODS: [&str; 3] = ["initialize", "ping", "server/discover"];
 
 pub type ReviewFuture<'a> = Pin<
     Box<dyn Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
@@ -57,9 +62,7 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
         Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
     let Ok(mut message) = serde_json::from_slice::<Value>(&bytes) else {
-        return next
-            .run(Request::from_parts(parts, Body::from(bytes)))
-            .await;
+        return plain(StatusCode::BAD_REQUEST, "the body is not JSON");
     };
     if message.is_array() {
         return plain(
@@ -85,17 +88,57 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
             parts.headers.remove(header::CONTENT_LENGTH);
             next.run(Request::from_parts(parts, Body::from(body))).await
         }
-        Some("tools/list") if !guard.policy.hides_nothing() => {
+        Some("tools/list") => {
             let response = next
                 .run(Request::from_parts(parts, Body::from(bytes)))
                 .await;
+            if guard.policy.hides_nothing() {
+                return response;
+            }
             hide_injected(&guard.policy, response).await
         }
-        _ => {
+        Some(method)
+            if PROTOCOL_METHODS.contains(&method) || method.starts_with("notifications/") =>
+        {
             next.run(Request::from_parts(parts, Body::from(bytes)))
                 .await
         }
+        Some(method) => {
+            let id = message.get("id").cloned().unwrap_or(Value::Null);
+            let permitted = guard.policy.method_scopes(method).and_then(|required| {
+                let missing: Vec<String> = principal
+                    .missing_scopes(required)
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect();
+                if missing.is_empty() {
+                    Ok(())
+                } else {
+                    Err(Refusal::Scope {
+                        tool: method.to_string(),
+                        missing,
+                    })
+                }
+            });
+            if let Err(refusal) = permitted {
+                tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "method refused");
+                return refuse(&guard, &parts.headers, id, refusal);
+            }
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        None if is_response(&message) => {
+            next.run(Request::from_parts(parts, Body::from(bytes)))
+                .await
+        }
+        None => plain(StatusCode::BAD_REQUEST, "not a JSON-RPC request"),
     }
+}
+
+/// A JSON-RPC response from the client to a server request: an `id` and a `result` or `error`.
+fn is_response(message: &Value) -> bool {
+    message.get("id").is_some()
+        && (message.get("result").is_some() || message.get("error").is_some())
 }
 
 async fn review(
@@ -298,6 +341,10 @@ mod tests {
         rule = "args.queue in claims.queues"
         message = "queue is not in this run's allowlist"
         [tools.whoami]
+        [methods."tasks/get"]
+        scopes = ["kueue.read"]
+        [methods."tasks/cancel"]
+        scopes = ["kueue.submit"]
     "#;
 
     const TOOLS: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
@@ -454,10 +501,7 @@ mod tests {
         );
 
         let without_server = app_scope_error().await;
-        assert_eq!(
-            without_server,
-            "tool workload_plan needs scope kueue.submit"
-        );
+        assert_eq!(without_server, "workload_plan needs scope kueue.submit");
     }
 
     async fn app_scope_error() -> Value {
@@ -558,5 +602,108 @@ mod tests {
             !out.contains("launched_by\":{\"type\":\"string\"}"),
             "{out}"
         );
+    }
+
+    fn rpc(method: &str, params: Value) -> Value {
+        json!({"jsonrpc": "2.0", "id": 9, "method": method, "params": params})
+    }
+
+    #[tokio::test]
+    async fn methods_the_policy_does_not_list_are_refused() {
+        for method in [
+            "resources/read",
+            "prompts/get",
+            "completion/complete",
+            "tasks/list",
+            "logging/setLevel",
+        ] {
+            let app = app(
+                guard(None),
+                Some(principal("kueue.read kueue.submit")),
+                false,
+            );
+            let (status, _, body, _) = post(app, rpc(method, json!({}))).await;
+            assert_eq!(status, StatusCode::OK, "{method}");
+            assert_eq!(body["error"]["code"], POLICY_REFUSED, "{method}: {body}");
+            assert_eq!(
+                body["error"]["message"],
+                format!("method {method} is not permitted by policy")
+            );
+            assert!(
+                body.get("received").is_none(),
+                "{method} reached the server"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listed_methods_need_their_scopes() {
+        let read_only = app(guard(None), Some(principal("kueue.read")), false);
+        let (_, _, got, _) =
+            post(read_only.clone(), rpc("tasks/get", json!({"taskId": "t"}))).await;
+        assert_eq!(got["received"]["method"], "tasks/get");
+        let (_, _, cancel, _) = post(read_only, rpc("tasks/cancel", json!({"taskId": "t"}))).await;
+        assert_eq!(
+            cancel["error"]["message"],
+            "tasks/cancel needs scope kueue.submit"
+        );
+
+        let jwks = JwksServer::start(vec![]).await;
+        let rs = Arc::new(testing::resource_server(
+            &jwks,
+            Duration::from_secs(60),
+            Duration::ZERO,
+        ));
+        let challenged = app(guard(Some(rs)), Some(principal("kueue.read")), false);
+        let (status, headers, _, _) =
+            post(challenged, rpc("tasks/cancel", json!({"taskId": "t"}))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
+        assert!(
+            challenge.ends_with(r#"scope="kueue.submit""#),
+            "{challenge}"
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_plumbing_and_client_responses_pass() {
+        for message in [
+            rpc("initialize", json!({})),
+            rpc("ping", json!({})),
+            rpc("server/discover", json!({})),
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+            json!({"jsonrpc": "2.0", "id": 3, "result": {}}),
+        ] {
+            let app = app(guard(None), Some(principal("")), false);
+            let (_, _, body, _) = post(app, message.clone()).await;
+            assert_eq!(body["received"], message);
+        }
+    }
+
+    #[tokio::test]
+    async fn bodies_that_are_not_json_rpc_requests_are_refused() {
+        let app = app(guard(None), Some(principal("")), false);
+        let (status, _, _, _) = post(app.clone(), json!({"jsonrpc": "2.0", "id": 1})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from("not json"))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn an_allow_all_policy_admits_any_method() {
+        let open = PolicyGuard {
+            policy: ToolPolicy::allow_all(),
+            server: None,
+            reviewer: None,
+        };
+        let app = app(open, Some(principal("")), false);
+        let (_, _, body, _) = post(app, rpc("tasks/cancel", json!({"taskId": "t"}))).await;
+        assert_eq!(body["received"]["method"], "tasks/cancel");
     }
 }

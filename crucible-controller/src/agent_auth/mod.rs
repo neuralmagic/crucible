@@ -378,6 +378,7 @@ mod tests {
                 issuers: vec![crucible_mcp_auth::server::TrustedIssuer {
                     issuer: ISSUER.into(),
                     jwks_uri: jwks,
+                    callers: crucible_mcp_auth::principal::Callers::Runs,
                 }],
                 resources: vec![url::Url::parse(KUEUE).unwrap()],
                 required_scopes: vec!["kueue.read".into()],

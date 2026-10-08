@@ -6,6 +6,16 @@ use std::collections::BTreeSet;
 /// Deepest `act` nesting accepted. Each level is one delegation hop.
 const MAX_ACTOR_DEPTH: usize = 8;
 
+/// Whom an issuer's tokens speak for, fixed by the server's configuration of that issuer and never
+/// by the token's own claims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Callers {
+    /// Delegated runs: tokens name a run and are pinned to its grant.
+    Runs,
+    /// People acting as themselves, limited by their own Kubernetes RBAC.
+    People,
+}
+
 /// Who is calling, derived from a validated token's claims.
 ///
 /// `subject` is on whose behalf the call is made. `actor_chain` is RFC 8693's `act` claim
@@ -21,6 +31,7 @@ pub struct Principal {
     pub scopes: BTreeSet<String>,
     /// Every claim, as policy rules see them under `claims`.
     pub claims: Map<String, Value>,
+    pub callers: Callers,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -36,6 +47,8 @@ pub enum ClaimsError {
 }
 
 impl Principal {
+    /// A run's principal; only [`crate::server::ResourceServer`] marks one as a person, from the
+    /// issuer that signed it.
     pub fn from_claims(claims: Map<String, Value>) -> Result<Self, ClaimsError> {
         let subject = claims
             .get("sub")
@@ -57,6 +70,7 @@ impl Principal {
             namespace,
             scopes,
             claims,
+            callers: Callers::Runs,
         })
     }
 
