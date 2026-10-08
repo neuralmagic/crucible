@@ -24,6 +24,7 @@ pub mod outputs;
 pub mod pack_tree;
 pub mod refine;
 pub mod report;
+pub mod sandbox;
 pub mod scope;
 pub mod session;
 pub mod tier;

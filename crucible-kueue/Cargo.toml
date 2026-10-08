@@ -38,6 +38,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
+aws-lc-rs = "1.18"
+base64 = "0.22"
+crucible-controller = { path = "../crucible-controller" }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
 tower = { version = "0.5", features = ["util"] }

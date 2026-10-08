@@ -18,6 +18,7 @@
 // unit tests (a lib can't otherwise name itself). The migrator path is frozen by the work plan.
 extern crate self as crucible_controller;
 
+pub mod agent_auth;
 pub mod api;
 pub mod authz;
 #[cfg(feature = "autoresearch")]
@@ -160,6 +161,7 @@ impl Surface {
         addr: SocketAddr,
         turn_accounts: config::TurnAccounts,
         secure_session_cookies: bool,
+        agent_auth: Option<Arc<agent_auth::AgentAuth>>,
     ) -> anyhow::Result<Self> {
         let kube_user_auth = identity::kube_user::KubeUserAuth::from_env()
             .context("building the cluster-token bearer check")?;
@@ -273,8 +275,9 @@ impl Surface {
             },
             turn_accounts.spokes,
         ));
-        let ingest_router =
-            runs::ingest_drop::router(runs::ingest_drop::IngestState { db, validator });
+        let ingest_state = runs::ingest_drop::IngestState { db, validator };
+        let ingest_router = runs::ingest_drop::router(ingest_state.clone())
+            .merge(agent_auth::bindings::router(ingest_state));
 
         // The OIDC discovery mirror (hub-spoke trust bootstrap): mounted OUTSIDE the bearer layer
         // like `/metrics` — public read-only by design. Disabled (routes 404) unless
@@ -311,6 +314,10 @@ impl Surface {
             .merge(push_router)
             .merge(mcp_router)
             .merge(oidc_mirror::router(mirror));
+        let router = match agent_auth {
+            Some(state) => router.merge(agent_auth::router(state)),
+            None => router,
+        };
 
         let hooks = match hooks_addr_from_env()? {
             Some(hooks_addr) => {

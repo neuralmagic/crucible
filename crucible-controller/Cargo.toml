@@ -97,12 +97,15 @@ tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "1.8", features = ["server", "macros", "transport-streamable-http-server"] }
 # The tool surface, written once and hosted over either wire.
 crux = { path = "../crux" }
+# Verifies sandbox JWT-SVIDs at the agent token endpoint against SPIRE's JWKS.
+crucible-mcp-auth = { path = "../crucible-mcp-auth" }
 # Building and draining the synthetic requests the MCP host hands its own router.
 http = "1"
 http-body-util = "0.1"
 # Signs the GitHub App's RS256 JWT (github_app.rs) — the credential exchanged for the pack-PR
-# installation token. Already in the workspace tree via oci-client, so this adds no new build.
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+# installation token — and the agent access tokens (agent_auth). The version crucible-mcp-auth
+# verifies with.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # The OIDC relying party: discovery, the authorization-code + PKCE request, the token exchange, and
 # ID token validation against the issuer's JWKS. `default-features = false` drops its bundled
 # reqwest 0.12 — the HTTP calls run on this crate's own reqwest 0.13 client through the

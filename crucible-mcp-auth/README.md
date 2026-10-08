@@ -12,8 +12,9 @@ Status (2026-10-08):
   `sub` = the launcher and `act.sub` = the sandbox. crucible-kueue accepts it, refuses a
   policy-violating call by rule name, and stamps the launcher on the Job it creates.
 - **Built.** This crate, hooked into crucible-kueue and buildit (vendored into this workspace).
-- **Decided.** No per-run Keycloak clients and no dynamic client registration. Agent tokens move to
-  a token endpoint in the crucible controller. Keycloak stays for human logins.
+- **Decided and built.** No per-run Keycloak clients and no dynamic client registration. Agent
+  tokens come from a token endpoint in the crucible controller, proven on pirate with a real SVID;
+  Keycloak stays for human logins.
 - **Proposed.** Authorize queue access with Kubernetes RBAC through SubjectAccessReview.
 - **Open.** Sandboxes do not fetch tokens until the gateway wiring lands, and the Claude Code login
   has not been run end to end by a person yet.
@@ -77,7 +78,7 @@ flowchart LR
 | --- | --- | --- |
 | SPIRE (Zero Trust Workload Identity Manager) | Issues JWT-SVIDs to supervisor pods: `spiffe://pirate.crucible/openshell/sandbox/<sandbox-id>` | `zero-trust-workload-identity-manager` |
 | OpenShell supervisor | Fetches the SVID, performs the token grant, injects the bearer on egress | per sandbox, `crucible-system` |
-| Controller token endpoint | Agent issuer: verifies the SVID, maps sandbox to run, mints the token (in progress) | crucible controller |
+| Controller token endpoint | Agent issuer: verifies the SVID, maps sandbox to run, mints the token | crucible controller |
 | Keycloak realm `crucible` | Human issuer; also the issuer in the proven spike | `rhbk` |
 | `crucible-mcp-auth` | Token validation, RFC 9728 metadata, tool policy | library in each MCP server |
 | crucible-kueue | Kueue workloads in the caller's namespace and queues | `crucible-system` |
@@ -125,14 +126,15 @@ assertion's `iss` selects an identity provider and its `sub` selects the client 
 because SVIDs carry no `jti` the provider sets `supportsClientAssertionReuse`. A tampered SVID gets
 `invalid_client`.
 
-**Direction: the controller token endpoint.** Exact subject matching means one Keycloak client per
-sandbox, created and deleted by the controller. That is too much moving state, so the controller
-answers the same request itself:
+**The controller token endpoint.** Exact subject matching means one Keycloak client per sandbox,
+created and deleted by the controller. That is too much moving state, so the controller answers the
+same request itself:
 
 1. Verify the SVID against SPIRE's keys: one audience, the controller issuer; subject under the
    sandbox trust-domain path.
-2. Map the sandbox ID to its run. The engine reports the ID after `create_sandbox`; the controller
-   checks that the annotated supervisor pod belongs to that run.
+2. Map the sandbox ID to its run. The engine binds the ID, with the sandbox name and workdir, after
+   `create_sandbox`, authenticated by its run pod's own token; a sandbox bound by another pod is
+   refused, and so is one whose run pod is no longer running.
 3. Mint an ES256 token for the requested audience, if allowlisted, with the run's claims. Expiry is
    5 minutes; keys are published at `/.well-known/jwks.json`.
 
@@ -271,7 +273,7 @@ credentials get an equivalent `Principal` so one policy covers both.
 | Caller from a realm token | `namespace`, `role`, `queues`; `run_id`, else the subject | `sandbox`, optional `workdir`; refused without a sandbox |
 | Launcher stamp | label `crucible.dev/launched-by` on workloads, server-owned | same label on builder pods |
 | Shipped policy | [deploy/kueue-policy.toml](../crucible-kueue/deploy/kueue-policy.toml): read and submit scopes, queue allowlist, actor annotation, replica cap | [deploy/buildit-policy.toml](../buildit/deploy/buildit-policy.toml): read and build scopes, build and run timeout caps |
-| Flags | `--oidc-issuer --oidc-jwks-uri --resource --tool-policy` | the same, plus the tokens file becomes optional |
+| Flags | `--issuer <issuer>=<jwks uri>` (repeatable) `--resource --tool-policy` | the same, plus the tokens file becomes optional |
 
 A unit test in each server fails if a tool is missing from its shipped policy, so a new tool
 cannot ship silently denied.
@@ -406,7 +408,7 @@ rules:
 | this crate, 47 unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting |
 | crucible-kueue, 70 unit tests | claims to caller, person tokens, tenant principals, launched-by label, shipped policy coverage |
 | buildit, 60 unit tests | realm and tokens-file callers, refusals, challenges, launched-by label, a policy refusal over HTTP |
-| `crucible-kueue/tests/oidc_e2e.rs` (pirate) | spike SVID to Keycloak token to crucible-kueue: rule refusal, actor annotation, launched-by label, tenant tokens under the same policy, tampered SVID refused |
+| `crucible-kueue/tests/oidc_e2e.rs` (pirate) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused, tenant tokens under the same policy |
 | `buildit/tests/oidc_e2e.rs` (pirate) | the `buildit mcp` binary with a realm token: challenge, metadata, authenticated status, policy refusal |
 
 The `testing` feature exposes real RSA keys, a loopback JWKS server and token minting for other
@@ -414,7 +416,7 @@ servers' tests; `e2e` adds the pirate helpers (spike pod, token exchange).
 
 ## Next steps
 
-1. Controller token endpoint (in progress in another session).
+1. Deploy the controller token endpoint (`CONTROLLER_AGENT_*` env, signing-key Secret).
 2. Gateway wiring: `provider_spiffe_workload_api_socket_path` in crucible's `gateway_toml()`,
    `providers_v2_enabled`, the `token_grant` provider for each MCP server, and the OIDC flags rendered
    into the server Deployments.

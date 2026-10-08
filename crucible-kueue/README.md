@@ -50,10 +50,12 @@ expires_at = 1791500000   # optional, Unix seconds
 
 ### Access tokens
 
-With `--oidc-issuer`, `--oidc-jwks-uri`, and `--resource`, the server also accepts OAuth access
-tokens from the crucible realm (a compact JWT is never looked up as a tenant token). The token's
-`run_id`, `namespace`, `role`, and `queues` claims give the same scope as a tenant record, and its
-`sub` (the human the run acts for) is stamped on created workloads as `crucible.dev/launched-by`.
+With `--issuer <issuer>=<jwks uri>` (repeatable) and `--resource`, the server also accepts OAuth
+access tokens from each listed issuer, verified against that issuer's own keys: the crucible
+controller for sandboxed agents, the crucible realm for people (a compact JWT is never looked up
+as a tenant token). The token's `run_id`, `namespace`, `role`, and `queues` claims give the same
+scope as a tenant record, and its `sub` (the human the run acts for) is stamped on created
+workloads as `crucible.dev/launched-by`.
 `--tool-policy` adds per-tool scopes and CEL rules over the caller's claims and the call's
 arguments. The shipped policy is [deploy/kueue-policy.toml](deploy/kueue-policy.toml); realm setup and the e2e are in
 [crucible-mcp-auth/deploy](../crucible-mcp-auth/deploy/README.md).

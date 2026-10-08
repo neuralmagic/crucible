@@ -122,6 +122,38 @@ Spoke clusters, when the controller runs loops elsewhere:
   runs there as a CronJob and posts to the hub's push endpoint under a bearer the hub lists in
   `CONTROLLER_PUSH_TOKENS`.
 
+## Agent tokens
+
+The controller can act as the OAuth authorization server for sandboxed agents. An OpenShell
+sandbox supervisor posts its SPIRE JWT-SVID to `POST /oauth/token` (client credentials with a
+`jwt-bearer` client assertion, no `client_id`); the controller verifies it against SPIRE's JWKS,
+maps the sandbox to the run whose pod bound it, and returns a 5-minute ES256 access token whose
+`sub` is the person the run is attributed to and whose `act.sub` is the sandbox's SPIFFE ID. MCP
+servers verify it against `/.well-known/jwks.json`; `/.well-known/oauth-authorization-server`
+describes the endpoints. All three are served outside the human auth stack.
+
+The engine binds each sandbox it creates by posting its id to `/api/pods/{pod}/sandboxes` with
+the pod's ingest token, so the drop-box env (`CRUCIBLE_INGEST_URL`) must reach the loop pod. A
+sandbox that was never bound, or whose run pod is no longer running, gets `invalid_grant`.
+
+| Variable | Meaning |
+| --- | --- |
+| `CONTROLLER_AGENT_ISSUER` | The issuer identifier, an origin such as `http://crucible-controller.tms.svc.cluster.local:8080`. Unset turns the endpoint off. Supervisors must request their SVID with exactly this audience (`token_grant.jwt_svid_audience`). |
+| `CONTROLLER_AGENT_SIGNING_KEY_FILE` | A PKCS#8 P-256 private key mounted from a Secret. The `kid` is its RFC 7638 thumbprint. |
+| `CONTROLLER_AGENT_SVID_ISSUER` | SPIRE's OIDC discovery issuer, the `iss` of every JWT-SVID. |
+| `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. |
+| `CONTROLLER_AGENT_SVID_CA_FILE` | Optional PEM bundle trusted for that fetch (the service CA for an `https://*.svc` endpoint). |
+| `CONTROLLER_AGENT_SANDBOX_ID_PREFIX` | The SPIFFE ID path every sandbox supervisor's ID sits under, ending in `/`. |
+| `CONTROLLER_AGENT_AUDIENCES` | Comma-separated MCP resource URLs a token may be issued for; anything else is `invalid_target`. |
+
+The deploy profile's `[kueue]` table supplies the `namespace`, `queues`, and `role` claims (and
+so the grantable scopes) for runs on its cluster.
+
+```bash
+openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out agent-signing.pem
+oc create secret generic crucible-agent-signing-key --from-file=agent-signing.pem
+```
+
 ## Observability
 
 - `/metrics` serves Prometheus text on the API port.

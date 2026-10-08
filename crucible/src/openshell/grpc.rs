@@ -441,6 +441,7 @@ impl Gateway {
     }
 
     /// Create the sandbox and wait for it to reach `Ready`, deleting it if either step fails.
+    /// Returns the gateway-assigned sandbox id.
     /// `--no-auto-providers` is expressed by passing exactly the providers we manage (the gateway
     /// attaches only those). Labels ride the create request; the image lands on the template. No
     /// boot command is run, the sandbox stays up for a later [`Gateway::exec`], so the old
@@ -454,7 +455,7 @@ impl Gateway {
         labels: &[(String, String)],
         read_only_paths: &[String],
         resources: &crate::manifest::SandboxResources,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let driver_config = sandbox_driver_config(
             &env_json("CRUCIBLE_SANDBOX_HOST_ALIASES")?.unwrap_or_default(),
             &env_json(crate::openshell::placement::GPU_PLACEMENT_ENV)?.unwrap_or_default(),
@@ -496,7 +497,19 @@ impl Gateway {
         });
         let mut client = self.client();
         let created = match client.create_sandbox(request).await {
-            Ok(_) => self.wait_ready(name).await,
+            Ok(response) => match response
+                .into_inner()
+                .sandbox
+                .and_then(|s| s.metadata)
+                .map(|m| m.id)
+                .filter(|id| !id.is_empty())
+            {
+                Some(id) => self.wait_ready(name).await.map(|()| id),
+                None => Err(GrpcError::NoSandboxId {
+                    name: name.to_string(),
+                }
+                .into()),
+            },
             Err(s) => Err(GrpcError::rpc(format!("create_sandbox({name})"))(s).into()),
         };
         if created.is_err()
@@ -1450,6 +1463,8 @@ pub enum GrpcError {
     },
     #[error("sandbox '{name}' entered the error phase during provisioning")]
     SandboxErrorPhase { name: String },
+    #[error("create_sandbox({name}) returned no sandbox id")]
+    NoSandboxId { name: String },
     #[error("sandbox '{name}' {stage}")]
     SandboxNotReady { name: String, stage: ReadyStage },
     #[error("sandbox '{name}' still exists {seconds}s after delete")]
@@ -2845,7 +2860,7 @@ pYBZ
 
     #[derive(Clone)]
     struct FakeGateway {
-        create: Result<(), tonic::Code>,
+        create: Result<&'static str, tonic::Code>,
         phase: SandboxPhase,
         deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
@@ -2906,7 +2921,20 @@ pYBZ
                         unary(
                             Unary(move |_: tonic::Request<CreateSandboxRequest>| async move {
                                 create
-                                    .map(|()| tonic::Response::new(SandboxResponse::default()))
+                                    .map(|id| {
+                                        tonic::Response::new(SandboxResponse {
+                                            sandbox: Some(Sandbox {
+                                                metadata: Some(
+                                                    openshell_core::proto::datamodel::v1::ObjectMeta {
+                                                        id: id.to_string(),
+                                                        ..Default::default()
+                                                    },
+                                                ),
+                                                ..Sandbox::default()
+                                            }),
+                                            ..SandboxResponse::default()
+                                        })
+                                    })
                                     .map_err(|code| tonic::Status::new(code, "create refused"))
                             }),
                             req,
@@ -2961,9 +2989,9 @@ pYBZ
     /// Drive `Gateway::create_sandbox` against a real gRPC server on a loopback port and return
     /// the create's outcome plus every name the server was asked to delete.
     fn create_against(
-        create: Result<(), tonic::Code>,
+        create: Result<&'static str, tonic::Code>,
         phase: SandboxPhase,
-    ) -> (Result<()>, Vec<String>) {
+    ) -> (Result<String>, Vec<String>) {
         let _guard = crate::test_support::env_lock();
         let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let fake = FakeGateway {
@@ -3004,7 +3032,7 @@ pYBZ
 
     #[test]
     fn a_sandbox_that_reaches_error_is_deleted() {
-        let (result, deleted) = create_against(Ok(()), SandboxPhase::Error);
+        let (result, deleted) = create_against(Ok("sbx-1"), SandboxPhase::Error);
         let err = result.expect_err("an Error-phase sandbox must fail the create");
         assert!(
             matches!(
@@ -3024,9 +3052,23 @@ pYBZ
     }
 
     #[test]
-    fn a_ready_sandbox_is_kept() {
-        let (result, deleted) = create_against(Ok(()), SandboxPhase::Ready);
-        assert!(result.is_ok(), "{:?}", result.err());
+    fn a_ready_sandbox_is_kept_and_its_id_returned() {
+        let (result, deleted) = create_against(Ok("sbx-1"), SandboxPhase::Ready);
+        assert_eq!(result.unwrap(), "sbx-1");
         assert!(deleted.is_empty(), "{deleted:?}");
+    }
+
+    #[test]
+    fn a_create_answered_without_an_id_is_refused_and_deleted() {
+        let (result, deleted) = create_against(Ok(""), SandboxPhase::Ready);
+        let err = result.expect_err("a sandbox with no id cannot be bound to its run");
+        assert!(
+            matches!(
+                err.downcast_ref::<GrpcError>(),
+                Some(GrpcError::NoSandboxId { name }) if name == "ci-leak"
+            ),
+            "{err:#}"
+        );
+        assert_eq!(deleted, ["ci-leak"]);
     }
 }

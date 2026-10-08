@@ -67,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         addr,
         crucible_controller::config::TurnAccounts::default(),
         cfg.session_secure_cookies,
+        None,
     )
     .await?;
     Err(surface.serve().await.into())

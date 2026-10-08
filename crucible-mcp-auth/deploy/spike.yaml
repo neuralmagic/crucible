@@ -1,8 +1,9 @@
 # Auth spike: a pod with the same SPIFFE ID shape as a sandbox supervisor
 # (spiffe://pirate.crucible/openshell/sandbox/auth-spike) that fetches one JWT-SVID with the
-# audience OpenShell's token grant would request (the realm issuer) and prints it. The token is
-# then posted to Keycloak as a client_credentials client_assertion, exactly as the supervisor
-# does. Delete and re-apply to mint a fresh one (JWT-SVIDs live 5m).
+# audience OpenShell's token grant would request and prints it. The manifest names the realm
+# issuer; the e2e helpers substitute the crucible controller's issuer when exchanging at the
+# controller. The token is then posted as a client_credentials client_assertion, exactly as the
+# supervisor does. Delete and re-apply to mint a fresh one (JWT-SVIDs live 5m).
 apiVersion: v1
 kind: Pod
 metadata:

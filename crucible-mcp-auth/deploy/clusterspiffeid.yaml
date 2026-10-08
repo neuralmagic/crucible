@@ -4,7 +4,7 @@
 #
 #   spiffe://pirate.crucible/openshell/sandbox/<sandbox-id>
 #
-# The crucible controller pins a per-run Keycloak client to exactly this subject.
+# The crucible controller issues agent tokens to this subject once its run pod binds the sandbox id.
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
 metadata:

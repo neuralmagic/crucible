@@ -101,7 +101,7 @@ async fn a_sandbox_token_drives_buildit_under_the_shipped_policy() {
     let context = var("BUILDIT_E2E_CONTEXT");
     let namespace = var("BUILDIT_E2E_NAMESPACE");
     let kube = kube_client(&context).await;
-    let token = cluster::access_token(&cluster::realm_http(cluster::ingress_ip()), &kube).await;
+    let token = cluster::access_token(&cluster::routes_http(cluster::ingress_ip()), &kube).await;
     let _server = spawn_server(&context, &namespace).await;
     let url = format!("http://localhost:{PORT}/mcp");
 

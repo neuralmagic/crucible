@@ -564,25 +564,58 @@ where
         let Path((pod, kind)) = Path::<(String, String)>::from_request_parts(parts, state)
             .await
             .map_err(|e| e.into_response())?;
+        authorize(parts, state, &pod).await.map_err(|r| *r)?;
+        Ok(IngestAuth { pod, kind })
+    }
+}
 
-        let token = bearer(parts)
-            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing bearer token").into_response())?;
+/// A request from a run pod on `/api/pods/{pod}/...`, authenticated by the same pod-bound token
+/// as [`IngestAuth`].
+pub struct PodAuth {
+    pub(crate) pod: String,
+}
 
-        let validator = std::sync::Arc::<IngestValidator>::from_ref(state);
-        match validator.validate(&token, &pod).await {
-            Ok(()) => Ok(IngestAuth { pod, kind }),
-            Err(IngestReject::Unauthorized(reason)) => {
-                tracing::warn!(pod, reason = reason.as_str(), "ingest token rejected");
-                Err((StatusCode::UNAUTHORIZED, reason.as_str()).into_response())
-            }
-            Err(IngestReject::Unavailable(msg)) => {
-                tracing::warn!(pod, error = %msg, "ingest TokenReview unavailable — failing closed");
-                Err((
+impl<S> FromRequestParts<S> for PodAuth
+where
+    std::sync::Arc<IngestValidator>: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(pod) = Path::<String>::from_request_parts(parts, state)
+            .await
+            .map_err(|e| e.into_response())?;
+        authorize(parts, state, &pod).await.map_err(|r| *r)?;
+        Ok(PodAuth { pod })
+    }
+}
+
+async fn authorize<S>(parts: &Parts, state: &S, pod: &str) -> Result<(), Box<Response>>
+where
+    std::sync::Arc<IngestValidator>: FromRef<S>,
+{
+    let token = bearer(parts).ok_or_else(|| {
+        Box::new((StatusCode::UNAUTHORIZED, "missing bearer token").into_response())
+    })?;
+    let validator = std::sync::Arc::<IngestValidator>::from_ref(state);
+    match validator.validate(&token, pod).await {
+        Ok(()) => Ok(()),
+        Err(IngestReject::Unauthorized(reason)) => {
+            tracing::warn!(pod, reason = reason.as_str(), "ingest token rejected");
+            Err(Box::new(
+                (StatusCode::UNAUTHORIZED, reason.as_str()).into_response(),
+            ))
+        }
+        Err(IngestReject::Unavailable(msg)) => {
+            tracing::warn!(pod, error = %msg, "ingest TokenReview unavailable — failing closed");
+            Err(Box::new(
+                (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "token validation unavailable",
                 )
-                    .into_response())
-            }
+                    .into_response(),
+            ))
         }
     }
 }
@@ -600,7 +633,7 @@ fn bearer(parts: &Parts) -> Option<String> {
 }
 
 #[cfg(test)]
-mod test_harness {
+pub(crate) mod test_harness {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;

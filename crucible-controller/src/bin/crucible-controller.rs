@@ -1147,11 +1147,17 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     )
     .with_vault(serve_vault);
     let images_refresh = serve_state.images_refresh();
+    let agent_auth = crucible_controller::agent_auth::AgentAuth::from_env(
+        db.pool().clone(),
+        cfg.deploy_profile.clone(),
+    )
+    .context("configuring the agent token issuer")?;
     let surface = crucible_controller::Surface::bind(
         serve_state,
         serve_addr,
         serve_turn_accounts,
         serve_secure_cookies,
+        agent_auth,
     )
     .await?;
     let mut serving = tokio::spawn(surface.serve());

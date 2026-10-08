@@ -436,16 +436,30 @@ async fn try_turn(
     if kueue.is_some() {
         providers.push(provider::KUEUE_PROVIDER_NAME.to_string());
     }
-    gw.create_sandbox(
-        &name,
-        args.sandbox_image.as_deref(),
-        &providers,
-        &labels,
-        &args.openshell.read_only_paths,
-        &args.sandbox_resources,
-    )
-    .await
-    .context("creating the openshell sandbox")?;
+    let sandbox_id = gw
+        .create_sandbox(
+            &name,
+            args.sandbox_image.as_deref(),
+            &providers,
+            &labels,
+            &args.openshell.read_only_paths,
+            &args.sandbox_resources,
+        )
+        .await
+        .context("creating the openshell sandbox")?;
+
+    // 3a. Bind the sandbox to this run at the controller, which issues the sandbox's agent tokens
+    //     only once it is bound. A failed bind leaves the sandbox without tokens, not the run
+    //     without its turn.
+    if let Some(ingest) = crate::report::ingest_client::IngestConfig::from_env()
+        && let Err(e) = crate::report::ingest_client::bind_sandbox(&ingest, &sandbox_id).await
+    {
+        let ev = AgentEvent::Raw {
+            text: format!("sandbox bind failed (its agent token requests will be refused): {e:#}"),
+            stream: RawStream::Stderr,
+        };
+        sink("", RawStream::Stderr, Some(&ev));
+    }
 
     // 3b. Hand the broker this turn's boundary: a fresh token at `<storage>/turn-token`. The
     //     broker's per-turn candidate budget resets when the value changes. Best-effort, on a

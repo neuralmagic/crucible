@@ -163,6 +163,77 @@ fn deliver(cfg: &IngestConfig, kind: ArtifactKind, bytes: &[u8]) -> bool {
     false
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum BindError {
+    #[error("building the sandbox bind client: {0}")]
+    Client(#[source] reqwest::Error),
+    #[error("reading ingest token {}: {source}", path.display())]
+    Token {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "binding sandbox {sandbox_id} to pod {pod} failed after {MAX_ATTEMPTS} attempts: {last}"
+    )]
+    Refused {
+        sandbox_id: String,
+        pod: String,
+        last: String,
+    },
+}
+
+/// Bind a sandbox this pod just created to its run at the controller, which issues agent tokens
+/// only to bound sandboxes. Retried like an artifact POST; the error names the last failure.
+pub(crate) async fn bind_sandbox(cfg: &IngestConfig, sandbox_id: &str) -> Result<(), BindError> {
+    let client = reqwest::Client::builder()
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .map_err(BindError::Client)?;
+    let url = format!(
+        "{}{}",
+        cfg.base_url,
+        crucible_contract::sandbox::binding_path(&cfg.pod)
+    );
+    let body = crucible_contract::sandbox::SandboxBinding {
+        sandbox_id: sandbox_id.to_string(),
+    };
+    let mut last = String::new();
+    for attempt in 1..=MAX_ATTEMPTS {
+        let token = tokio::fs::read_to_string(&cfg.token_path)
+            .await
+            .map_err(|source| BindError::Token {
+                path: cfg.token_path.clone(),
+                source,
+            })?;
+        match client
+            .post(&url)
+            .bearer_auth(token.trim())
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => return Ok(()),
+            Ok(r) => {
+                let status = r.status();
+                last = format!(
+                    "HTTP {status}: {}",
+                    r.text().await.unwrap_or_default().trim()
+                );
+            }
+            Err(e) => last = e.to_string(),
+        }
+        if attempt < MAX_ATTEMPTS {
+            tokio::time::sleep(BACKOFF * attempt).await;
+        }
+    }
+    Err(BindError::Refused {
+        sandbox_id: sandbox_id.to_string(),
+        pod: cfg.pod.clone(),
+        last,
+    })
+}
+
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
@@ -418,5 +489,87 @@ mod tests {
             .read_to_string(&mut out)
             .expect("gunzip");
         assert_eq!(out, ndjson);
+    }
+
+    /// A one-route stand-in for the controller's bind endpoint on loopback: answers every request
+    /// with `status` and hands back what it received.
+    async fn bind_endpoint(
+        status: &'static str,
+    ) -> (String, tokio::sync::mpsc::UnboundedReceiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (mut conn, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let request = loop {
+                    let n = conn.read(&mut chunk).await.unwrap();
+                    buf.extend_from_slice(&chunk[..n]);
+                    let text = String::from_utf8_lossy(&buf).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .map(|v| v.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= len || n == 0 {
+                            break text;
+                        }
+                    }
+                };
+                tx.send(request).unwrap();
+                let reply =
+                    format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                conn.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    fn token_file(name: &str) -> PathBuf {
+        let tok =
+            std::env::temp_dir().join(format!("crucible-bind-tok-{name}-{}", std::process::id()));
+        std::fs::write(&tok, "pod-token\n").expect("write token");
+        tok
+    }
+
+    #[tokio::test]
+    async fn binding_posts_the_sandbox_id_with_the_pod_token() {
+        let (base, mut seen) = bind_endpoint("204 No Content").await;
+        let tok = token_file("ok");
+        let cfg = IngestConfig::new(base, "crucible-run-a", tok.clone());
+        bind_sandbox(&cfg, "sbx-1").await.unwrap();
+        let request = seen.recv().await.unwrap();
+        assert!(
+            request.starts_with("POST /api/pods/crucible-run-a/sandboxes HTTP/1.1"),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer pod-token\r\n"),
+            "{request}"
+        );
+        assert!(request.ends_with(r#"{"sandbox_id":"sbx-1"}"#), "{request}");
+        let _ = std::fs::remove_file(tok);
+    }
+
+    #[tokio::test]
+    async fn a_refused_bind_is_retried_then_reported() {
+        let (base, mut seen) = bind_endpoint("409 Conflict").await;
+        let tok = token_file("refused");
+        let cfg = IngestConfig::new(base, "crucible-run-a", tok.clone());
+        let err = bind_sandbox(&cfg, "sbx-1").await.unwrap_err();
+        assert!(err.to_string().contains("HTTP 409"), "{err:#}");
+        for _ in 0..MAX_ATTEMPTS {
+            seen.recv().await.unwrap();
+        }
+        let _ = std::fs::remove_file(tok);
     }
 }

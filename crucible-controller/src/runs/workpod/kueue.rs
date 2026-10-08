@@ -71,8 +71,13 @@ pub struct RunScope<'a> {
 /// The deploy profile's `[kueue]` table, `None` when the controller has no profile or the profile
 /// has no table.
 pub async fn profile_cfg(cfg: &crate::config::ControllerCfg) -> anyhow::Result<Option<KueueCfg>> {
+    load_cfg(cfg.deploy_profile.clone()).await
+}
+
+/// The `[kueue]` table of the deploy profile at `path`, `None` without a profile or table.
+pub async fn load_cfg(path: Option<std::path::PathBuf>) -> anyhow::Result<Option<KueueCfg>> {
     use anyhow::Context;
-    let Some(path) = cfg.deploy_profile.clone() else {
+    let Some(path) = path else {
         return Ok(None);
     };
     tokio::task::spawn_blocking(move || {
