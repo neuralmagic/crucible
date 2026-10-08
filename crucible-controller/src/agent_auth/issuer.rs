@@ -301,10 +301,12 @@ pub enum GrantError {
          link it with PUT /api/me/kube-user or have an administrator set it"
     )]
     NoKubeUser { launcher: String },
-    #[error("run {run_id} is attributed to {attributed_to:?}, not a person, so it has no launcher")]
+    #[error(
+        "run {run_id} was dispatched for {dispatched_by:?}, not a person, so it has no launcher"
+    )]
     NoLauncher {
         run_id: String,
-        attributed_to: Option<String>,
+        dispatched_by: Option<String>,
     },
 }
 
@@ -327,16 +329,16 @@ impl TenantScope {
     }
 }
 
-/// The launcher a run's token acts for: the login of the person the run is attributed to.
+/// The launcher a run's token acts for: the login of the person the run was dispatched for.
 pub fn launcher(run: &BoundRun) -> Result<String, GrantError> {
-    run.attributed_to
+    run.dispatched_by
         .as_deref()
         .and_then(|p| p.strip_prefix("user:"))
         .filter(|login| !login.is_empty())
         .map(str::to_string)
         .ok_or_else(|| GrantError::NoLauncher {
             run_id: run.run_id.clone(),
-            attributed_to: run.attributed_to.clone(),
+            dispatched_by: run.dispatched_by.clone(),
         })
 }
 
@@ -843,19 +845,19 @@ mod tests {
         assert_eq!(TenantScope::for_run(&kueue, "hub"), None);
     }
 
-    fn run(attributed_to: Option<&str>) -> BoundRun {
+    fn run(dispatched_by: Option<&str>) -> BoundRun {
         BoundRun {
             run_id: "playbook_kueue-e2e_01a1-1791474738".into(),
             pod_name: "crucible-run-brave-otter".into(),
             cluster: CLUSTER.into(),
-            attributed_to: attributed_to.map(str::to_string),
+            dispatched_by: dispatched_by.map(str::to_string),
             sandbox_name: Some("ci-0123abcd".into()),
             workdir: Some("/sandbox/repo".into()),
         }
     }
 
     #[test]
-    fn the_launcher_is_the_person_the_run_is_attributed_to() {
+    fn the_launcher_is_the_person_the_run_was_dispatched_for() {
         assert_eq!(launcher(&run(Some("user:alice"))).unwrap(), "alice");
         for unattributed in [
             None,

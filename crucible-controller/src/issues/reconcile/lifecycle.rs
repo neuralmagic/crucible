@@ -246,6 +246,7 @@ async fn launch_approved_run(
         )
         .await?;
         crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
+        crate::runs::store::stamp_dispatcher(&mut *tx, &run_id).await?;
         crate::runs::names::set(&mut *tx, &run_id, &name).await?;
         let ev = Event::now(
             &issue.key,

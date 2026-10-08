@@ -1679,6 +1679,21 @@ pub(crate) async fn funnel_counts(ex: impl PgExecutor<'_>) -> Result<FunnelCount
     })
 }
 
+/// Record that `actor` (a login) asked for `key`'s next dispatch, so the run it gets is dispatched
+/// for them. A name that is not login-shaped records nothing.
+pub async fn request_dispatch(ex: impl PgExecutor<'_>, key: &str, actor: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE issues SET dispatch_requested_by = 'user:' || lower(trim($2))
+          WHERE key = $1 AND trim($2) ~ '^[A-Za-z0-9._@-]+$'",
+    )
+    .bind(key)
+    .bind(actor)
+    .execute(ex)
+    .await
+    .context("recording who asked for a dispatch")?;
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;

@@ -551,6 +551,119 @@ mod tests {
         assert_eq!(claims_of(&body)["kube_user"], "alice-k8s");
     }
 
+    /// alice launched the issue; bob unparks it. The run that follows was dispatched for bob, so
+    /// its token names bob and carries bob's Kubernetes username, never alice's.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_run_another_user_redispatched_acts_for_that_user(pool: PgPool) {
+        use crate::daemon::queue::{IssueKey, Override, OverrideKind, OverrideSink, WorkQueue};
+        let key = "owner/repo#1";
+        let db = crate::Db::new(pool.clone());
+        crate::issues::store::upsert_issue(
+            &pool,
+            &crate::NewIssue {
+                key: key.to_string(),
+                repo: "owner/repo".to_string(),
+                priority: 0,
+                evidence_url: None,
+                title: None,
+                author: None,
+                body: None,
+                labels: Vec::new(),
+                upstream_updated_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::issues::transitions::park_and_purge(
+            &pool,
+            key,
+            "stuck",
+            crate::model::ParkedBy::Human,
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(crate::daemon::overrides::OverrideStore::new());
+        crate::daemon::overrides::QueueOverrideSink::new(store.clone(), WorkQueue::new()).submit(
+            Override {
+                key: IssueKey(key.into()),
+                kind: OverrideKind::Unpark,
+                reason: None,
+                priority: None,
+                actor: Some("Bob".into()),
+            },
+        );
+        crate::daemon::overrides::apply_pending(&db, &store, key)
+            .await
+            .unwrap();
+
+        crate::runs::work_pods::insert_work_pod(
+            &pool,
+            &crate::runs::workpod::NewWorkPod {
+                pod_name: "crucible-run-again".into(),
+                kind: "run".into(),
+                issue_key: Some(key.into()),
+                state: WorkPodState::Running,
+                cost_tag: "run".into(),
+                cluster: testing::CLUSTER.into(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::runs::store::insert_run(
+            &pool,
+            &crate::NewRun {
+                run_id: "run-again".into(),
+                scope: None,
+                issue: Some(key.into()),
+                identity_digest: None,
+                status: "running".into(),
+                pod: Some("crucible-run-again".into()),
+                session_uri: None,
+                best_score: None,
+                cost_usd: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET attributed_to = 'user:alice' WHERE run_id = 'run-again'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        crate::runs::store::stamp_dispatcher(&pool, "run-again")
+            .await
+            .unwrap();
+        bindings::bind(&pool, "crucible-run-again", &testing::binding("sbx-1"))
+            .await
+            .unwrap();
+        link(&pool, "alice-k8s").await;
+        crate::identity::oidc::users::record_login(
+            &pool,
+            "sub-bob",
+            "bob",
+            None,
+            jiff::Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        crate::identity::kube_identity::learn(
+            &pool,
+            "bob",
+            &crate::identity::kube_identity::KubeUser::parse("bob-k8s").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let h = harness(pool).await;
+        let svid = h.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = claims_of(&body);
+        assert_eq!(
+            (claims["sub"].as_str(), claims["kube_user"].as_str()),
+            (Some("bob"), Some("bob-k8s"))
+        );
+    }
+
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_deployment_without_a_sandbox_namespace_issues_nothing(pool: PgPool) {
         bound(&pool, "sbx-1").await;

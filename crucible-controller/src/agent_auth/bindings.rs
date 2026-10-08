@@ -234,8 +234,8 @@ pub struct BoundRun {
     /// label value's 63 characters).
     pub pod_name: String,
     pub cluster: String,
-    /// The owner principal the run's spend is attributed to (`user:<login>` for a person).
-    pub attributed_to: Option<String>,
+    /// The principal the run was dispatched for (`user:<login>` for a person).
+    pub dispatched_by: Option<String>,
     /// `None` for a sandbox bound before names were recorded.
     pub sandbox_name: Option<String>,
     pub workdir: Option<String>,
@@ -263,7 +263,7 @@ pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, Res
         Option<String>,
     );
     let row: Option<Row> = sqlx::query_as(
-        "SELECT s.run_id, s.pod_name, w.state, w.cluster, r.attributed_to, s.sandbox_name, s.workdir
+        "SELECT s.run_id, s.pod_name, w.state, w.cluster, r.dispatched_by, s.sandbox_name, s.workdir
          FROM run_sandboxes s
          JOIN work_pods w ON w.pod_name = s.pod_name
          JOIN runs r ON r.run_id = s.run_id
@@ -272,7 +272,7 @@ pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, Res
     .bind(sandbox.as_str())
     .fetch_optional(pool)
     .await?;
-    let (run_id, pod_name, state, cluster, attributed_to, sandbox_name, workdir) =
+    let (run_id, pod_name, state, cluster, dispatched_by, sandbox_name, workdir) =
         row.ok_or_else(|| ResolveError::Unbound(sandbox.clone()))?;
     if state != WorkPodState::Running {
         return Err(ResolveError::Ended { run_id, state });
@@ -281,7 +281,7 @@ pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, Res
         run_id,
         pod_name,
         cluster,
-        attributed_to,
+        dispatched_by,
         sandbox_name,
         workdir,
     })

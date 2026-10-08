@@ -199,6 +199,9 @@ pub async fn running_run(
         .execute(pool)
         .await
         .unwrap();
+    crate::runs::store::stamp_dispatcher(pool, run_id)
+        .await
+        .unwrap();
 }
 
 pub async fn set_pod_state(
