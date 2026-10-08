@@ -6,6 +6,7 @@
 //! RPC server-side (there is no local child to signal). Boot and file upload/download stay on the
 //! CLI, see [`crate::openshell::gateway`] and `openshell::run`.
 
+use crate::openshell::gateway::GatewayAccess;
 use anyhow::{Context, Result};
 use crucible_broker::workspace::scoped;
 use openshell_core::auth::EdgeAuthInterceptor;
@@ -221,28 +222,14 @@ pub(crate) fn mtls_dir() -> Result<PathBuf> {
         .join("mtls"))
 }
 
-/// The gateway URL: a gateway pod's when the controller named one, else this pod's own, on the
-/// fixed bind port. TLS+mTLS either way.
-fn server_url() -> String {
-    std::env::var(crate::openshell::gateway::GATEWAY_URL_ENV)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| format!("https://localhost:{GATEWAY_PORT}"))
-}
-
-#[cfg(test)]
-pub(crate) fn server_url_for_tests() -> String {
-    server_url()
-}
-
 /// Build a lazily-connecting mTLS channel from the gateway's local certs. Lazy means no I/O,
 /// but `connect_lazy` still must run inside a tokio runtime context: the hyper executor it
 /// registers spawns tasks via the ambient handle and panics without one, must run inside the
 /// engine runtime context (the turn's `block_on` or a test runtime). Fails only when the certs
 /// are unreadable (e.g. the gateway has not generated them yet, the health probe treats that as
 /// "not up").
-fn build_channel() -> Result<Channel> {
-    let dir = mtls_dir()?;
+fn build_channel(access: &GatewayAccess) -> Result<Channel> {
+    let dir = access.tls_dir()?;
     let ca = std::fs::read(dir.join("ca.crt"))
         .with_context(|| format!("reading gateway CA cert in {}", dir.display()))?;
     let cert = std::fs::read(dir.join("tls.crt"))
@@ -252,7 +239,7 @@ fn build_channel() -> Result<Channel> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca))
         .identity(Identity::from_pem(cert, key));
-    let endpoint = Endpoint::from_shared(server_url())
+    let endpoint = Endpoint::from_shared(access.endpoint())
         .context("parsing gateway endpoint URL")?
         .connect_timeout(Duration::from_secs(10))
         .tls_config(tls)
@@ -283,8 +270,8 @@ impl HealthProbe {
     /// Build a probe, or `None` when the gateway certs are not present yet (nothing to probe).
     /// Must be called within a tokio runtime context, `build_channel`'s `connect_lazy` registers
     /// the hyper executor on the ambient runtime.
-    pub fn new() -> Option<Self> {
-        let channel = build_channel().ok()?;
+    pub fn new(access: &GatewayAccess) -> Option<Self> {
+        let channel = build_channel(access).ok()?;
         Some(Self { channel })
     }
 
@@ -430,8 +417,8 @@ impl Gateway {
     /// booted and registered it, so the certs exist). Must be called within a tokio runtime
     /// context, `build_channel`'s `connect_lazy` registers the hyper executor on the ambient
     /// runtime.
-    pub fn connect() -> Result<Self> {
-        let channel = build_channel()?;
+    pub fn connect(access: &GatewayAccess) -> Result<Self> {
+        let channel = build_channel(access)?;
         Ok(Self { channel })
     }
 
@@ -1759,7 +1746,9 @@ pYBZ
             .enable_all()
             .build()
             .unwrap();
-        let (probe, gateway) = rt.block_on(async { (HealthProbe::new(), Gateway::connect()) });
+        let access = GatewayAccess::Local;
+        let (probe, gateway) =
+            rt.block_on(async { (HealthProbe::new(&access), Gateway::connect(&access)) });
 
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
