@@ -67,7 +67,7 @@ pub use metrics::Metrics;
 pub use model::{ParkedBy, Status};
 pub use runs::model::{NewCandidate, NewRun, Run};
 pub use runs::workpod::{
-    KubePodDispatcher, PodDispatcher, RunRenderOpts, WorkPodState, install_contracts,
+    KubePodDispatcher, PodDispatcher, RunDocs, RunRenderOpts, WorkPodState, install_contracts,
     install_dispatcher, reconcile_on_startup, render_run_docs, reset_contracts, reset_dispatcher,
     run_pod_name, stamp_run_pod,
 };

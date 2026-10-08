@@ -60,8 +60,12 @@ struct RunPodRender {
 }
 
 impl RunPodRender {
-    fn render(self) -> Result<(Pod, Option<ConfigMap>)> {
-        let (mut pod, cm) = render_run_docs(
+    fn render(self) -> Result<RunDocs> {
+        let RunDocs {
+            mut pod,
+            pack,
+            sandbox_ports,
+        } = render_run_docs(
             &self.pack,
             &self.profile,
             &self.pod_name,
@@ -69,7 +73,7 @@ impl RunPodRender {
             self.inputs,
             self.digests,
         )?;
-        check_delivered_tree(cm.as_ref(), &self.pack_digest)?;
+        check_delivered_tree(pack.as_ref(), &self.pack_digest)?;
         stamp_run_pod(
             &mut pod,
             &self.pod_name,
@@ -93,7 +97,11 @@ impl RunPodRender {
             stamp_git_identity(&mut pod, who);
         }
         crate::secrets::deliver::stamp(&mut pod, &self.secret_name, &self.delivery);
-        Ok((pod, cm))
+        Ok(RunDocs {
+            pod,
+            pack,
+            sandbox_ports,
+        })
     }
 }
 
@@ -238,7 +246,7 @@ pub fn render_run_docs(
     opts: &RunRenderOpts,
     inputs: RunInputs,
     digests: Option<Arc<dyn DigestResolver>>,
-) -> Result<(Pod, Option<ConfigMap>)> {
+) -> Result<RunDocs> {
     let manifest = pack_out.join("crucible.toml");
     let yaml = render_yaml(
         &manifest,
@@ -288,13 +296,24 @@ fn check_delivered_tree(cm: Option<&ConfigMap>, expected: &TreeDigest) -> Result
     Ok(())
 }
 
-/// Pull the `Pod` and (optional) `ConfigMap` documents out of a (possibly multi-doc) rendered
-/// manifest — the loop pod, its RBAC/NetworkPolicy, and, under pack delivery, the pack ConfigMap. A
-/// baked-domain render carries no ConfigMap, so `None` is the backward-compatible case. The Pod is
-/// required; its absence is a render bug.
-fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
+/// What the controller takes from a loop-run render.
+#[derive(Debug)]
+pub struct RunDocs {
+    pub pod: Pod,
+    /// The pack ConfigMap, under pack delivery.
+    pub pack: Option<ConfigMap>,
+    /// The ports the loop pod's NetworkPolicy admits sandbox traffic on.
+    pub sandbox_ports: Vec<u16>,
+}
+
+/// Pull the `Pod`, (optional) `ConfigMap`, and the loop NetworkPolicy's ingress ports out of a
+/// (possibly multi-doc) rendered manifest — the loop pod, its RBAC/NetworkPolicy, and, under pack
+/// delivery, the pack ConfigMap. A baked-domain render carries no ConfigMap, so `None` is the
+/// backward-compatible case. The Pod is required; its absence is a render bug.
+fn extract_run_docs(yaml: &str) -> Result<RunDocs> {
     let mut pod = None;
     let mut cm = None;
+    let mut sandbox_ports = Vec::new();
     for doc in serde_norway::Deserializer::from_str(yaml) {
         let value = serde_norway::Value::deserialize(doc).context("parsing a rendered YAML doc")?;
         match value.get("kind").and_then(|k| k.as_str()) {
@@ -310,11 +329,42 @@ fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
                         .context("decoding the rendered pack ConfigMap")?,
                 );
             }
+            Some("NetworkPolicy") => {
+                let policy = serde_norway::from_value::<
+                    k8s_openapi::api::networking::v1::NetworkPolicy,
+                >(value)
+                .context("decoding the rendered loop NetworkPolicy")?;
+                sandbox_ports.extend(ingress_ports(&policy)?);
+            }
             _ => {}
         }
     }
     let pod = pod.context("the rendered manifest contained no Pod document")?;
-    Ok((pod, cm))
+    sandbox_ports.sort_unstable();
+    sandbox_ports.dedup();
+    Ok(RunDocs {
+        pod,
+        pack: cm,
+        sandbox_ports,
+    })
+}
+
+fn ingress_ports(policy: &k8s_openapi::api::networking::v1::NetworkPolicy) -> Result<Vec<u16>> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    policy
+        .spec
+        .iter()
+        .flat_map(|s| s.ingress.iter().flatten())
+        .flat_map(|rule| rule.ports.iter().flatten())
+        .filter_map(|p| p.port.as_ref())
+        .map(|port| match port {
+            IntOrString::Int(n) => u16::try_from(*n)
+                .with_context(|| format!("the loop NetworkPolicy admits port {n}, out of range")),
+            IntOrString::String(name) => {
+                bail!("the loop NetworkPolicy admits the named port {name:?}; only numbered ports are served")
+            }
+        })
+        .collect()
 }
 
 /// Stamp the controller-owned metadata onto the rendered pack ConfigMap so it is GC'd, selectable, and
@@ -332,7 +382,7 @@ fn stamp_run_configmap(cm: &mut ConfigMap, pod: &Pod, issue_key: &str) {
 /// cascade-GC'ing the pack ConfigMap with the pod. `None` when the pod has no name/UID yet (a fake
 /// dispatcher that doesn't stamp a UID) — the CM is still created, just not cascade-owned, and the
 /// managed-by selector keeps it sweepable.
-fn owner_reference_to_pod(pod: &Pod) -> Option<OwnerReference> {
+pub(crate) fn owner_reference_to_pod(pod: &Pod) -> Option<OwnerReference> {
     let name = pod.metadata.name.clone().filter(|s| !s.is_empty())?;
     let uid = pod.metadata.uid.clone().filter(|s| !s.is_empty())?;
     Some(OwnerReference {
@@ -587,6 +637,11 @@ pub async fn dispatch_run(
         "dispatch_run needs a deploy profile: set CONTROLLER_DEPLOY_PROFILE (or --deploy-profile) \
          to the profile the loop-pod render reads",
     )?;
+    let loaded = crate::agent_auth::placement::load_profile(Some(&profile)).await?;
+    let kueue_cfg = loaded.as_ref().and_then(|p| p.kueue.as_ref());
+    let isolated = loaded
+        .as_ref()
+        .filter(|p| crucible::deploy::render::gateway::isolated(p));
 
     let targets: Vec<crate::runs::contract::DispatchTarget> =
         crate::runs::contract::profile_target(&profile)
@@ -737,7 +792,7 @@ pub async fn dispatch_run(
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
     }
     // The crucible-kueue grant: its token joins the run Secret, its record is created with the pod.
-    let kueue_record = match crate::runs::workpod::kueue::profile_cfg(cfg).await? {
+    let kueue_record = match kueue_cfg {
         Some(kueue) => {
             let scope = crate::runs::workpod::kueue::RunScope {
                 cluster: &cluster,
@@ -747,7 +802,7 @@ pub async fn dispatch_run(
                 max_time_secs: opts.max_time_secs(),
             };
             let token = crate::runs::workpod::kueue::Token::mint()?;
-            match crate::runs::workpod::kueue::grant(&kueue, &scope, token)? {
+            match crate::runs::workpod::kueue::grant(kueue, &scope, token)? {
                 Some(grant) => {
                     delivery.merge(grant.delivery).map_err(|e| {
                         anyhow::anyhow!("folding the crucible-kueue grant into the run's: {e}")
@@ -784,6 +839,30 @@ pub async fn dispatch_run(
     let namespace = dispatcher
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
+    // An isolated gateway's Service address goes into its server certificate, and the loop pod's
+    // client material into the run Secret, so both precede the render.
+    let mut gateway = None;
+    let reserved: Result<()> = match isolated {
+        Some(gateway_profile) => {
+            match crate::runs::workpod::gateway::RunGateway::reserve(
+                dispatcher.as_ref(),
+                &cluster,
+                gateway_profile,
+                &pod_name,
+            )
+            .await
+            {
+                Ok(reserved) => delivery
+                    .merge(reserved.loop_delivery())
+                    .map(|()| gateway = Some(reserved))
+                    .map_err(|e| {
+                        anyhow::anyhow!("folding the gateway client material into the run's: {e}")
+                    }),
+                Err(e) => Err(e),
+            }
+        }
+        None => Ok(()),
+    };
     let job = RunPodRender {
         pack: pack.path().to_path_buf(),
         pack_digest: pack.digest().clone(),
@@ -804,9 +883,12 @@ pub async fn dispatch_run(
     };
     // The render reads the pack and pins images, so it stays on a blocking thread; the pod + CM
     // creates are plain async kube calls awaited here.
-    let rendered = tokio::task::spawn_blocking(move || job.render())
-        .await
-        .context("joining the loop-run render task")?;
+    let rendered = match reserved {
+        Ok(()) => tokio::task::spawn_blocking(move || job.render())
+            .await
+            .context("joining the loop-run render task")?,
+        Err(e) => Err(e),
+    };
     let rendered = match (&kueue_record, rendered) {
         (Some((ns, record)), Ok(docs)) => dispatcher
             .create_configmap(&cluster, ns, record.clone())
@@ -821,7 +903,11 @@ pub async fn dispatch_run(
     // CM owner-ref'd to the pod means k8s cascade-GCs it whenever the pod is deleted, so no delete site
     // needs to know the CM exists.
     let created = match rendered {
-        Ok((mut pod, cm)) => {
+        Ok(RunDocs {
+            mut pod,
+            pack: cm,
+            sandbox_ports,
+        }) => {
             // Pin the run pod's image(s) to the digests the pack's builds produced, so the measurement
             // can never run on a stale or half-built image. A no-op for a build-free pack (empty map)
             // — the static manifest image stands.
@@ -864,14 +950,29 @@ pub async fn dispatch_run(
                             .await
                             .context("creating the run Secret")?;
                     }
-                    if let Some(mut cm) = cm {
-                        stamp_run_configmap(&mut cm, &created_pod, &issue_for_cm);
-                        dispatcher
-                            .create_configmap(&cluster, &namespace, cm)
-                            .await
-                            .context("creating the pack ConfigMap")
-                    } else {
-                        Ok(())
+                    let pack_created = match cm {
+                        Some(mut cm) => {
+                            stamp_run_configmap(&mut cm, &created_pod, &issue_for_cm);
+                            dispatcher
+                                .create_configmap(&cluster, &namespace, cm)
+                                .await
+                                .context("creating the pack ConfigMap")
+                        }
+                        None => Ok(()),
+                    };
+                    match (pack_created, gateway.as_ref()) {
+                        (Ok(()), Some(gateway)) => {
+                            gateway
+                                .start(
+                                    dispatcher.as_ref(),
+                                    &cluster,
+                                    &namespace,
+                                    &created_pod,
+                                    &sandbox_ports,
+                                )
+                                .await
+                        }
+                        (created, _) => created,
                     }
                 }
                 Err(e) => Err(e),
@@ -900,6 +1001,21 @@ pub async fn dispatch_run(
                     error = format!("{cleanup:#}"),
                     record = record_name,
                     "a failed launch left its crucible-kueue tenant record; it expires on its own"
+                );
+            }
+            if let Some(profile) = isolated
+                && let Err(cleanup) = crate::runs::workpod::gateway::teardown(
+                    dispatcher.as_ref(),
+                    &cluster,
+                    profile,
+                    &pod_name,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = format!("{cleanup:#}"),
+                    pod_name,
+                    "a failed launch left its gateway; the gateway sweep removes it"
                 );
             }
             // Retain a failed-to-launch row with the real reason (swept after retention), then let the
@@ -957,7 +1073,7 @@ pub async fn collect_run_pod(
     db: &Db,
     dispatcher: &dyn PodDispatcher,
     hub_namespace: &str,
-    kueue: Option<&crucible::deploy::profile::KueueCfg>,
+    profile: Option<&crucible::deploy::DeployProfile>,
     pod_name: &str,
     disposition: RunDisposition,
 ) -> Result<()> {
@@ -980,7 +1096,21 @@ pub async fn collect_run_pod(
     {
         let _ = dispatcher.delete(&row.cluster, &ns, pod_name).await;
     }
-    if let Some(kueue) = kueue.filter(|k| k.cluster == row.cluster) {
+    if let Some(profile) = profile.filter(|p| crucible::deploy::render::gateway::isolated(p))
+        && let Err(e) =
+            crate::runs::workpod::gateway::teardown(dispatcher, &row.cluster, profile, pod_name)
+                .await
+    {
+        tracing::warn!(
+            error = format!("{e:#}"),
+            pod_name,
+            "deleting the run's gateway failed; the gateway sweep removes it"
+        );
+    }
+    if let Some(kueue) = profile
+        .and_then(|p| p.kueue.as_ref())
+        .filter(|k| k.cluster == row.cluster)
+    {
         let record = crucible_contract::kueue::record_name(pod_name);
         if let Err(e) = dispatcher
             .delete_configmap(&row.cluster, kueue.tenant_namespace.as_str(), &record)

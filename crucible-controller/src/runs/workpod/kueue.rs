@@ -68,25 +68,6 @@ pub struct RunScope<'a> {
     pub max_time_secs: Option<u64>,
 }
 
-/// The deploy profile's `[kueue]` table, `None` when the controller has no profile or the profile
-/// has no table.
-pub async fn profile_cfg(cfg: &crate::config::ControllerCfg) -> anyhow::Result<Option<KueueCfg>> {
-    load_cfg(cfg.deploy_profile.clone()).await
-}
-
-/// The `[kueue]` table of the deploy profile at `path`, `None` without a profile or table.
-pub async fn load_cfg(path: Option<std::path::PathBuf>) -> anyhow::Result<Option<KueueCfg>> {
-    use anyhow::Context;
-    let Some(path) = path else {
-        return Ok(None);
-    };
-    tokio::task::spawn_blocking(move || {
-        crucible::deploy::DeployProfile::load(&path).map(|profile| profile.kueue)
-    })
-    .await
-    .context("joining the deploy profile read")?
-}
-
 /// The grant for a run dispatched onto `run.cluster`, or `None` when the server runs elsewhere.
 pub fn grant(
     cfg: &KueueCfg,

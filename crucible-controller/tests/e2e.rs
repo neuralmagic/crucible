@@ -1207,7 +1207,9 @@ async fn kube_dispatcher_creates_a_stamped_run_pod_live() -> Result<()> {
     let cm_name_for_render = cm_name.clone();
     let (rendered, cm) = tokio::task::spawn_blocking(
         move || -> Result<(Pod, Option<k8s_openapi::api::core::v1::ConfigMap>)> {
-            let (mut pod, cm) = crucible_controller::render_run_docs(
+            let crucible_controller::RunDocs {
+                mut pod, pack: cm, ..
+            } = crucible_controller::render_run_docs(
                 &pack_out,
                 &profile,
                 &cm_name_for_render,

@@ -154,6 +154,32 @@ cluster needs `get`/`list` on `sandboxes` there; name that identity in `[cluster
 (`namespace/name`) and the loop render grants it. A sandbox that was never bound, or whose run pod
 is no longer running, gets `invalid_grant`.
 
+**Isolated gateways.** Under `sandbox_driver = "kubernetes"` with `[cluster] sandbox_namespace`
+set, a run's OpenShell gateway does not run in the loop pod. The loop render creates the
+`crucible-openshell-gateway` ServiceAccount in the sandbox namespace and binds the sandbox rights
+(Sandboxes, pods, secrets) to it alone; the loop service account gets no verbs there, so pack code
+cannot create the pods the SVID trust rests on. For each run the controller creates, in the sandbox
+namespace, a gateway Service, a server TLS Secret, the supervisors' client TLS Secret, a
+NetworkPolicy admitting only that run's loop pod and supervisors to the gateway port, and the
+gateway pod running as that account; and in the loop namespace a Service selecting the loop pod
+that sandboxes reach the broker, collector, and MCP servers through. The controller mints a CA per
+run, issues the server certificate for the gateway Service's ClusterIP and client certificates for
+the loop pod and supervisors, and keeps no copy. The loop pod's client material arrives through the
+run Secret. Collection deletes the run's gateway objects by label, and a sweep on the discovery
+tick deletes any whose run pod is no longer running. The controller's identity on each such
+cluster needs `pods`, `services`, `secrets`, and `networkpolicies` create/list/delete in the
+sandbox namespace, and `services` create in the loop namespace.
+
+Grounded-rank and scope turns still run their gateway in-pod, so a profile that isolates gateways
+refuses to render them. AWS web-identity env is not carried to the gateway pod. Pack code holds its
+run's gateway client certificate, so it can still create sandboxes for its own run with the
+`driver_config` pod fields the engine allows (`node_selector`, `tolerations`, `host_aliases`,
+`runtime_class_name`); resource admission keeps PVCs and priority classes to those labelled
+`openshell.ai/sandbox-attachable=true`. The pinned OpenShell (3441f91) predates v0.1.2: supervisors
+are separate pods, and nothing here depends on the sidecar supervisor topology or other v0.1.2
+features. Nothing owns the Sandboxes a gateway creates, so a gateway that dies mid-run leaves its
+Sandboxes behind.
+
 **`kube_user`.** Tokens carry the dispatcher's Kubernetes username when the controller knows it;
 a server that sees it runs SubjectAccessReview as that user. It is learned from the API server
 (`users/~`): when someone calls the API with a cluster token whose username equals their login

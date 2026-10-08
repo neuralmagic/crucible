@@ -3187,7 +3187,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
         Default::default(),
         None,
     )?
-    .0;
+    .pod;
     let with_the_registry = render_run_docs(
         &pack,
         &profile,
@@ -3200,7 +3200,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
         Default::default(),
         None,
     )?
-    .0;
+    .pod;
     assert_eq!(
         with_the_registry, before_the_registry,
         "an unresolved dispatch renders the pre-registry pod"
@@ -5898,10 +5898,7 @@ async fn collecting_a_run_deletes_its_tenant_record_only_on_the_kueue_cluster(
     pool: sqlx::PgPool,
 ) -> Result<()> {
     let tmp = tempfile::tempdir()?;
-    let profile = kueue_profile(tmp.path());
-    let kueue = crucible::deploy::DeployProfile::load(&profile)?
-        .kueue
-        .expect("[kueue]");
+    let profile = crucible::deploy::DeployProfile::load(&kueue_profile(tmp.path()))?;
     let db = Db::new(pool);
     for (pod, cluster) in [
         ("crucible-run-here", "hub"),
@@ -5930,7 +5927,7 @@ async fn collecting_a_run_deletes_its_tenant_record_only_on_the_kueue_cluster(
             &db,
             &dispatcher,
             "autoresearch",
-            Some(&kueue),
+            Some(&profile),
             pod,
             RunDisposition::Finished,
         )
@@ -5953,6 +5950,613 @@ async fn collecting_a_run_deletes_its_tenant_record_only_on_the_kueue_cluster(
             "crucible-kueue-tenants".to_string(),
             "kueue-tenant-crucible-run-here".to_string()
         )]
+    );
+    Ok(())
+}
+
+/// Every kube object the isolated-gateway tests see, in order.
+#[derive(Debug, Clone)]
+enum GatewayEvent {
+    Service {
+        namespace: String,
+        service: Box<k8s_openapi::api::core::v1::Service>,
+    },
+    Pod {
+        namespace: String,
+        pod: Box<Pod>,
+    },
+    Secret {
+        namespace: String,
+        secret: Box<k8s_openapi::api::core::v1::Secret>,
+    },
+    ConfigMap {
+        namespace: String,
+    },
+    NetworkPolicy {
+        namespace: String,
+        policy: Box<k8s_openapi::api::networking::v1::NetworkPolicy>,
+    },
+    DeleteSelected {
+        namespace: String,
+        selector: String,
+    },
+}
+
+/// A cluster boundary that records every create, hands out ClusterIPs from `172.30.0.10` up, and
+/// answers the gateway sweep's listing with `gateways`.
+#[derive(Default)]
+struct GatewayDispatcher {
+    events: Arc<Mutex<Vec<GatewayEvent>>>,
+    fail_network_policy: bool,
+    gateways: std::collections::BTreeSet<String>,
+}
+
+impl GatewayDispatcher {
+    fn push(&self, event: GatewayEvent) {
+        self.events.lock().expect("lock").push(event);
+    }
+
+    fn events(&self) -> Vec<GatewayEvent> {
+        self.events.lock().expect("lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl PodDispatcher for GatewayDispatcher {
+    async fn create(&self, _cluster: &str, ns: &str, mut pod: Pod) -> Result<Pod> {
+        pod.metadata.uid = Some(format!(
+            "uid-{}",
+            pod.metadata.name.clone().unwrap_or_default()
+        ));
+        self.push(GatewayEvent::Pod {
+            namespace: ns.to_string(),
+            pod: Box::new(pod.clone()),
+        });
+        Ok(pod)
+    }
+    async fn create_configmap(&self, _cluster: &str, ns: &str, _cm: ConfigMap) -> Result<()> {
+        self.push(GatewayEvent::ConfigMap {
+            namespace: ns.to_string(),
+        });
+        Ok(())
+    }
+    async fn create_secret(
+        &self,
+        _cluster: &str,
+        ns: &str,
+        secret: k8s_openapi::api::core::v1::Secret,
+    ) -> Result<()> {
+        self.push(GatewayEvent::Secret {
+            namespace: ns.to_string(),
+            secret: Box::new(secret),
+        });
+        Ok(())
+    }
+    async fn create_service(
+        &self,
+        _cluster: &str,
+        ns: &str,
+        mut service: k8s_openapi::api::core::v1::Service,
+    ) -> Result<k8s_openapi::api::core::v1::Service> {
+        let assigned = self
+            .events()
+            .iter()
+            .filter(|e| matches!(e, GatewayEvent::Service { .. }))
+            .count();
+        service.spec.get_or_insert_with(Default::default).cluster_ip =
+            Some(format!("172.30.0.{}", 10 + assigned));
+        self.push(GatewayEvent::Service {
+            namespace: ns.to_string(),
+            service: Box::new(service.clone()),
+        });
+        Ok(service)
+    }
+    async fn create_network_policy(
+        &self,
+        _cluster: &str,
+        ns: &str,
+        policy: k8s_openapi::api::networking::v1::NetworkPolicy,
+    ) -> Result<()> {
+        if self.fail_network_policy {
+            anyhow::bail!("the API server refused the NetworkPolicy");
+        }
+        self.push(GatewayEvent::NetworkPolicy {
+            namespace: ns.to_string(),
+            policy: Box::new(policy),
+        });
+        Ok(())
+    }
+    async fn delete_selected(&self, _cluster: &str, ns: &str, selector: &str) -> Result<()> {
+        self.push(GatewayEvent::DeleteSelected {
+            namespace: ns.to_string(),
+            selector: selector.to_string(),
+        });
+        Ok(())
+    }
+    async fn selected_label_values(
+        &self,
+        _cluster: &str,
+        ns: &str,
+        selector: &str,
+        label: &str,
+    ) -> Result<std::collections::BTreeSet<String>> {
+        assert_eq!(ns, "sandboxes");
+        assert_eq!(
+            selector,
+            crucible::deploy::render::gateway::gateway_selector()
+        );
+        assert_eq!(label, crucible::deploy::render::gateway::GATEWAY_FOR_LABEL);
+        Ok(self.gateways.clone())
+    }
+    async fn await_terminal(
+        &self,
+        _cluster: &str,
+        _ns: &str,
+        _n: &str,
+        _t: Duration,
+    ) -> Result<TerminalState> {
+        Ok(TerminalState {
+            phase: TurnPhase::Succeeded,
+            message: None,
+        })
+    }
+    async fn logs(&self, _cluster: &str, _ns: &str, _n: &str) -> Result<String> {
+        Ok(String::new())
+    }
+    async fn delete(&self, _cluster: &str, _ns: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The default profile, written under `dir/shared` so it can sit beside [`isolated_profile`].
+fn shared_profile(dir: &Path) -> std::path::PathBuf {
+    let dir = dir.join("shared");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    crate::testing::fixtures::write_deploy_profile(&dir)
+}
+
+fn isolated_profile(dir: &Path) -> std::path::PathBuf {
+    let path = crate::testing::fixtures::write_deploy_profile(dir);
+    let text = std::fs::read_to_string(&path).expect("profile").replacen(
+        "[cluster]\n",
+        "[cluster]\nsandbox_driver = \"kubernetes\"\nsandbox_namespace = \"sandboxes\"\n",
+        1,
+    );
+    std::fs::write(&path, text).expect("profile");
+    path
+}
+
+async fn dispatch_isolated(
+    db: &Db,
+    tmp: &Path,
+    profile: &Path,
+    dispatcher: Arc<GatewayDispatcher>,
+) -> Result<RunAdmission> {
+    let cfg = pod_cfg(profile, "img");
+    dispatch_run(
+        db,
+        &cfg,
+        dispatcher,
+        "owner/repo#7",
+        "owner_repo_7-42",
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp)),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
+        None,
+    )
+    .await
+}
+
+fn string_data<'a>(secret: &'a k8s_openapi::api::core::v1::Secret, key: &str) -> &'a str {
+    secret
+        .string_data
+        .as_ref()
+        .and_then(|d| d.get(key))
+        .map(String::as_str)
+        .unwrap_or_else(|| panic!("{key} in {:?}", secret.metadata.name))
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    use crucible::deploy::render::gateway as render;
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let profile = isolated_profile(tmp.path());
+    let dispatcher = Arc::new(GatewayDispatcher::default());
+    let out = dispatch_isolated(&db, tmp.path(), &profile, dispatcher.clone()).await?;
+    let RunAdmission::Launched { pod_name, .. } = out else {
+        panic!("expected a launch, got {out:?}");
+    };
+    let events = dispatcher.events();
+    let kinds: Vec<(&str, &str)> = events
+        .iter()
+        .map(|e| match e {
+            GatewayEvent::Service { namespace, .. } => ("service", namespace.as_str()),
+            GatewayEvent::Pod { namespace, .. } => ("pod", namespace.as_str()),
+            GatewayEvent::Secret { namespace, .. } => ("secret", namespace.as_str()),
+            GatewayEvent::ConfigMap { namespace } => ("configmap", namespace.as_str()),
+            GatewayEvent::NetworkPolicy { namespace, .. } => ("networkpolicy", namespace.as_str()),
+            GatewayEvent::DeleteSelected { namespace, .. } => ("delete", namespace.as_str()),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("service", "sandboxes"),
+            ("pod", "autoresearch"),
+            ("secret", "autoresearch"),
+            ("configmap", "autoresearch"),
+            ("service", "autoresearch"),
+            ("secret", "sandboxes"),
+            ("secret", "sandboxes"),
+            ("networkpolicy", "sandboxes"),
+            ("pod", "sandboxes"),
+        ],
+        "the NetworkPolicy precedes the gateway pod, and nothing is torn down"
+    );
+
+    let pods: Vec<&Pod> = events
+        .iter()
+        .filter_map(|e| match e {
+            GatewayEvent::Pod { pod, .. } => Some(pod.as_ref()),
+            _ => None,
+        })
+        .collect();
+    let (loop_pod, gateway_pod) = (pods[0], pods[1]);
+    assert_eq!(loop_pod.metadata.name.as_deref(), Some(pod_name.as_str()));
+    let loop_spec = loop_pod.spec.as_ref().expect("spec");
+    let loop_container = &loop_spec.containers[0];
+    let loop_env = |name: &str| {
+        loop_container
+            .env
+            .iter()
+            .flatten()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value.clone())
+    };
+    assert_eq!(
+        loop_env(crucible::openshell::gateway::GATEWAY_URL_ENV).as_deref(),
+        Some("https://172.30.0.10:17670")
+    );
+    assert_eq!(
+        loop_env(crucible::openshell::gateway::GATEWAY_CLIENT_TLS_DIR_ENV).as_deref(),
+        Some(render::CLIENT_TLS_DIR)
+    );
+    let mounted: Vec<&str> = loop_container
+        .volume_mounts
+        .iter()
+        .flatten()
+        .map(|m| m.mount_path.as_str())
+        .filter(|p| p.starts_with(render::CLIENT_TLS_DIR))
+        .collect();
+    assert_eq!(mounted.len(), 3, "{mounted:?}");
+
+    let secrets: Vec<(&str, &k8s_openapi::api::core::v1::Secret)> = events
+        .iter()
+        .filter_map(|e| match e {
+            GatewayEvent::Secret { namespace, secret } => {
+                Some((namespace.as_str(), secret.as_ref()))
+            }
+            _ => None,
+        })
+        .collect();
+    let run_secret = secrets[0].1;
+    let ca = string_data(run_secret, "openshell-gateway-ca.crt");
+    let loop_cert = string_data(run_secret, "openshell-gateway-tls.crt");
+    let names = render::GatewayNames::for_run_pod(&pod_name);
+    let server = secrets
+        .iter()
+        .find(|(_, s)| s.metadata.name.as_deref() == Some(names.server_secret.as_str()))
+        .expect("the server Secret")
+        .1;
+    let client = secrets
+        .iter()
+        .find(|(_, s)| s.metadata.name.as_deref() == Some(names.client_secret.as_str()))
+        .expect("the supervisor client Secret")
+        .1;
+    for sandbox_secret in [server, client] {
+        assert_eq!(string_data(sandbox_secret, "ca.crt"), ca, "one CA per run");
+        assert_ne!(string_data(sandbox_secret, "tls.crt"), loop_cert);
+        assert_eq!(
+            sandbox_secret
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get(render::GATEWAY_FOR_LABEL))
+                .map(String::as_str),
+            Some(pod_name.as_str())
+        );
+    }
+
+    let loop_service = events
+        .iter()
+        .find_map(|e| match e {
+            GatewayEvent::Service { namespace, service } if namespace == "autoresearch" => {
+                Some(service.as_ref())
+            }
+            _ => None,
+        })
+        .expect("the loop Service");
+    let owner = loop_service
+        .metadata
+        .owner_references
+        .as_ref()
+        .and_then(|o| o.first())
+        .expect("owned by the loop pod");
+    assert_eq!(owner.uid, format!("uid-{pod_name}"));
+    let run_label = loop_pod
+        .metadata
+        .labels
+        .as_ref()
+        .and_then(|l| l.get(render::RUN_LABEL))
+        .expect("run label");
+    let policy = events
+        .iter()
+        .find_map(|e| match e {
+            GatewayEvent::NetworkPolicy { policy, .. } => Some(policy.as_ref()),
+            _ => None,
+        })
+        .expect("the gateway NetworkPolicy");
+    let admitted_runs: Vec<&String> = policy
+        .spec
+        .iter()
+        .flat_map(|s| s.ingress.iter().flatten())
+        .flat_map(|r| r.from.iter().flatten())
+        .filter_map(|peer| {
+            peer.pod_selector
+                .as_ref()?
+                .match_labels
+                .as_ref()?
+                .get(render::RUN_LABEL)
+        })
+        .collect();
+    assert_eq!(admitted_runs, [run_label], "only this run's loop pod");
+    let loop_service_spec = loop_service.spec.as_ref().expect("spec");
+    assert_eq!(
+        loop_service_spec
+            .selector
+            .as_ref()
+            .and_then(|s| s.get(render::RUN_LABEL)),
+        Some(run_label)
+    );
+    let ports: Vec<i32> = loop_service_spec
+        .ports
+        .iter()
+        .flatten()
+        .map(|p| p.port)
+        .collect();
+    assert!(!ports.is_empty());
+    assert!(
+        !ports.contains(&i32::from(crucible::openshell::grpc::GATEWAY_PORT)),
+        "the loop pod serves no gateway: {ports:?}"
+    );
+
+    assert_eq!(
+        gateway_pod
+            .spec
+            .as_ref()
+            .and_then(|s| s.service_account_name.as_deref()),
+        Some(render::GATEWAY_SERVICE_ACCOUNT)
+    );
+    let gateway_env = |name: &str| {
+        gateway_pod.spec.as_ref().expect("spec").containers[0]
+            .env
+            .iter()
+            .flatten()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value.clone())
+    };
+    assert_eq!(
+        gateway_env(crucible::openshell::gateway::SERVE_HOST_IP_ENV).as_deref(),
+        Some("172.30.0.11"),
+        "sandboxes reach the loop pod through the loop Service"
+    );
+    assert_eq!(
+        gateway_env(crucible::openshell::gateway::SERVE_CLIENT_TLS_SECRET_ENV).as_deref(),
+        Some(names.client_secret.as_str())
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_gateway_that_fails_to_start_is_torn_down_with_the_launch(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let profile = isolated_profile(tmp.path());
+    let dispatcher = Arc::new(GatewayDispatcher {
+        fail_network_policy: true,
+        ..Default::default()
+    });
+    let result = dispatch_isolated(&db, tmp.path(), &profile, dispatcher.clone()).await;
+    let err = result.expect_err("the launch fails");
+    assert!(format!("{err:#}").contains("NetworkPolicy"), "{err:#}");
+    let events = dispatcher.events();
+    let loop_pod = events
+        .iter()
+        .find_map(|e| match e {
+            GatewayEvent::Pod { namespace, pod } if namespace == "autoresearch" => {
+                pod.metadata.name.clone()
+            }
+            _ => None,
+        })
+        .expect("the loop pod");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, GatewayEvent::Pod { namespace, .. } if namespace == "sandboxes")),
+        "no gateway pod without its NetworkPolicy"
+    );
+    let Some(GatewayEvent::DeleteSelected {
+        namespace,
+        selector,
+    }) = events.last()
+    else {
+        panic!("expected a teardown last: {events:?}");
+    };
+    assert_eq!(namespace, "sandboxes");
+    assert_eq!(
+        *selector,
+        crucible::deploy::render::gateway::run_gateway_selector(&loop_pod)
+    );
+    let row = crate::runs::work_pods::get_work_pod(db.pool(), &loop_pod)
+        .await?
+        .expect("row");
+    assert_eq!(row.state, WorkPodState::Failed);
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_profile_without_a_sandbox_namespace_runs_its_gateway_in_the_loop_pod(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+    let dispatcher = Arc::new(GatewayDispatcher::default());
+    dispatch_isolated(&db, tmp.path(), &profile, dispatcher.clone()).await?;
+    let events = dispatcher.events();
+    assert!(
+        events.iter().all(|e| matches!(
+            e,
+            GatewayEvent::Pod { namespace, .. } | GatewayEvent::ConfigMap { namespace }
+                if namespace == "autoresearch"
+        )),
+        "{events:?}"
+    );
+    let loop_pod = events
+        .iter()
+        .find_map(|e| match e {
+            GatewayEvent::Pod { pod, .. } => Some(pod),
+            _ => None,
+        })
+        .expect("the loop pod");
+    assert!(
+        !loop_pod.spec.as_ref().expect("spec").containers[0]
+            .env
+            .iter()
+            .flatten()
+            .any(|e| e.name == crucible::openshell::gateway::GATEWAY_URL_ENV)
+    );
+    Ok(())
+}
+
+async fn insert_run_pod(db: &Db, pod: &str, state: WorkPodState) -> Result<()> {
+    crate::runs::work_pods::insert_work_pod(
+        db.pool(),
+        &NewWorkPod {
+            pod_name: pod.to_string(),
+            kind: WorkKind::Run.label_value().to_string(),
+            issue_key: Some("owner/repo#7".to_string()),
+            state,
+            cost_tag: WorkKind::Run.cost_tag().to_string(),
+            cluster: "hub".to_string(),
+        },
+    )
+    .await
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn collecting_an_isolated_run_deletes_its_gateway(pool: sqlx::PgPool) -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let isolated = crucible::deploy::DeployProfile::load(&isolated_profile(tmp.path()))?;
+    let shared = crucible::deploy::DeployProfile::load(&shared_profile(tmp.path()))?;
+    insert_run_pod(&db, "crucible-run-iso", WorkPodState::Running).await?;
+    insert_run_pod(&db, "crucible-run-shared", WorkPodState::Running).await?;
+    let dispatcher = GatewayDispatcher::default();
+    collect_run_pod(
+        &db,
+        &dispatcher,
+        "autoresearch",
+        Some(&isolated),
+        "crucible-run-iso",
+        RunDisposition::Finished,
+    )
+    .await?;
+    collect_run_pod(
+        &db,
+        &dispatcher,
+        "autoresearch",
+        Some(&shared),
+        "crucible-run-shared",
+        RunDisposition::Finished,
+    )
+    .await?;
+    let deleted: Vec<(String, String)> = dispatcher
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            GatewayEvent::DeleteSelected {
+                namespace,
+                selector,
+            } => Some((namespace, selector)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deleted,
+        [(
+            "sandboxes".to_string(),
+            crucible::deploy::render::gateway::run_gateway_selector("crucible-run-iso")
+        )]
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn the_gateway_sweep_removes_gateways_whose_run_pod_is_not_running(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let profile = isolated_profile(tmp.path());
+    insert_run_pod(&db, "crucible-run-live", WorkPodState::Running).await?;
+    insert_run_pod(&db, "crucible-run-done", WorkPodState::Collected).await?;
+    insert_run_pod(&db, "crucible-run-failed", WorkPodState::Failed).await?;
+    let dispatcher = GatewayDispatcher {
+        gateways: [
+            "crucible-run-live",
+            "crucible-run-done",
+            "crucible-run-failed",
+            "crucible-run-unknown",
+        ]
+        .map(String::from)
+        .into(),
+        ..Default::default()
+    };
+    crate::runs::workpod::gateway::sweep_orphan_gateways(&db, &dispatcher, Some(&profile)).await;
+    let deleted: Vec<String> = dispatcher
+        .events()
+        .into_iter()
+        .filter_map(|e| match e {
+            GatewayEvent::DeleteSelected { selector, .. } => Some(selector),
+            _ => None,
+        })
+        .collect();
+    let selector = crucible::deploy::render::gateway::run_gateway_selector;
+    assert_eq!(
+        deleted,
+        [
+            selector("crucible-run-done"),
+            selector("crucible-run-failed"),
+            selector("crucible-run-unknown"),
+        ]
+    );
+
+    let shared = shared_profile(tmp.path());
+    let untouched = GatewayDispatcher::default();
+    crate::runs::workpod::gateway::sweep_orphan_gateways(&db, &untouched, Some(&shared)).await;
+    assert!(
+        untouched.events().is_empty(),
+        "a profile without isolation sweeps nothing"
     );
     Ok(())
 }

@@ -87,6 +87,8 @@ rustls = "0.23"
 # The TLS listener behind the redemption Route's reencrypt hop (`tls.rs`). rustls' own async
 # adapter; already in the tree at this version via kube's rustls stack, so it adds no new build.
 tokio-rustls = { version = "0.26", default-features = false }
+# Mints each isolated run gateway's CA, server, and client certificates.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # Triage's GitHub client (async — crucible/src/scope.rs's `goal_from_issue` is the sync sibling).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # The MCP host answers its own API calls by calling the api router as a `tower::Service` — the
