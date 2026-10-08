@@ -124,7 +124,9 @@ impl From<GrantError> for OAuthError {
                 Self::InvalidTarget(e.to_string())
             }
             GrantError::Scope { .. } => Self::InvalidScope(e.to_string()),
-            GrantError::NoLauncher { .. } => Self::InvalidGrant(e.to_string()),
+            GrantError::NoLauncher { .. } | GrantError::NoKubeUser { .. } => {
+                Self::InvalidGrant(e.to_string())
+            }
         }
     }
 }
@@ -192,9 +194,29 @@ async fn issue(
         .as_ref()
         .and_then(|k| TenantScope::for_run(k, &run.cluster));
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience, tenant.as_ref())?;
+    let kube_user = crate::identity::kube_identity::effective(&state.pool, &launcher)
+        .await
+        .map_err(|e| OAuthError::Server(format!("{e:#}")))?;
+    let required = kueue.as_ref().is_some_and(|k| k.require_kube_user);
+    match (&kube_user, required) {
+        (None, true) => {
+            return Err(GrantError::NoKubeUser {
+                launcher: launcher.clone(),
+            }
+            .into());
+        }
+        (None, false) => tracing::warn!(
+            launcher,
+            sandbox = %sandbox.id,
+            reason = "launcher has no known kubernetes username",
+            "agent token minted without kube_user; the run is limited by its claims alone"
+        ),
+        (Some(_), _) => {}
+    }
     let grant = AgentGrant {
         sandbox,
         launcher,
+        kube_user: kube_user.map(|k| k.as_str().to_string()),
         run,
         audience: audience.resource.clone(),
         scopes,
@@ -208,6 +230,7 @@ async fn issue(
         sandbox = %grant.sandbox.id,
         run_id = grant.run.run_id,
         sub = grant.launcher,
+        kube_user = grant.kube_user.as_deref(),
         aud = grant.audience,
         scope = minted.scope,
         "agent token issued"
@@ -250,10 +273,14 @@ mod tests {
     }
 
     async fn harness(pool: PgPool) -> Harness {
+        harness_with(pool, PROFILE).await
+    }
+
+    async fn harness_with(pool: PgPool, profile_toml: &str) -> Harness {
         let spire = Spire::start().await;
         let profile = tempfile::tempdir().unwrap();
         let path = profile.path().join("profile.toml");
-        std::fs::write(&path, PROFILE).unwrap();
+        std::fs::write(&path, profile_toml).unwrap();
         let state = Arc::new(AgentAuth {
             issuer: testing::issuer(&spire, &EcKey::generate()),
             pool,
@@ -371,6 +398,93 @@ mod tests {
         assert_eq!(principal.claims["role"], "submitter");
         assert_eq!(principal.claims["sandbox"], "ci-sbx-1");
         assert_eq!(principal.claims["workdir"], "/sandbox/repo");
+    }
+
+    fn claims_of(body: &Value) -> Value {
+        use base64::Engine;
+        let payload = body["access_token"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .nth(1)
+            .unwrap();
+        serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    async fn link(pool: &PgPool, kube_user: &str) {
+        crate::identity::oidc::users::record_login(
+            pool,
+            "sub-weaton",
+            "weaton",
+            None,
+            jiff::Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        crate::identity::kube_identity::learn(
+            pool,
+            "weaton",
+            &crate::identity::kube_identity::KubeUser::parse(kube_user).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_launcher_with_a_known_kubernetes_username_gets_kube_user(pool: PgPool) {
+        bound(&pool, "sbx-1").await;
+        link(&pool, "wseaton").await;
+        let h = harness(pool).await;
+        let svid = h.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = claims_of(&body);
+        assert_eq!(
+            (claims["sub"].as_str(), claims["kube_user"].as_str()),
+            (Some("weaton"), Some("wseaton"))
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_unknown_kubernetes_username_is_omitted_or_refused_as_the_profile_says(
+        pool: PgPool,
+    ) {
+        bound(&pool, "sbx-1").await;
+        let lenient = harness(pool.clone()).await;
+        let svid = lenient.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&lenient.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(claims_of(&body).get("kube_user").is_none());
+
+        let strict = harness_with(
+            pool.clone(),
+            &format!("{PROFILE}require_kube_user = true\n"),
+        )
+        .await;
+        let svid = strict.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            "{body}"
+        );
+        assert!(
+            body["error_description"]
+                .as_str()
+                .unwrap()
+                .contains("kubernetes username"),
+            "{body}"
+        );
+
+        link(&pool, "wseaton").await;
+        let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(claims_of(&body)["kube_user"], "wseaton");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

@@ -160,6 +160,10 @@ pub struct KueueCfg {
     /// so the Service is addressed by its fully qualified name.
     #[serde(default = "default_cluster_domain")]
     pub cluster_domain: String,
+    /// Refuse a run's agent token when its launcher has no known Kubernetes username, so every run
+    /// is bound by its launcher's RBAC. Off, such a token carries no `kube_user` claim.
+    #[serde(default)]
+    pub require_kube_user: bool,
 }
 
 fn hub_cluster() -> String {

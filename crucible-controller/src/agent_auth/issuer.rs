@@ -286,6 +286,11 @@ pub enum GrantError {
         requested: String,
         grantable: Vec<String>,
     },
+    #[error(
+        "launcher {launcher} has no known kubernetes username and this deployment requires one; \
+         link it with PUT /api/me/kube-user or have an administrator set it"
+    )]
+    NoKubeUser { launcher: String },
     #[error("run {run_id} is attributed to {attributed_to:?}, not a person, so it has no launcher")]
     NoLauncher {
         run_id: String,
@@ -364,6 +369,8 @@ pub fn granted_scopes(
 pub struct AgentGrant {
     pub sandbox: Sandbox,
     pub launcher: String,
+    /// The launcher's Kubernetes username, for the `kube_user` claim.
+    pub kube_user: Option<String>,
     pub run: BoundRun,
     pub audience: String,
     pub scopes: Vec<String>,
@@ -499,6 +506,9 @@ impl AgentIssuer {
             "scope": scope,
         });
         if let Some(map) = claims.as_object_mut() {
+            if let Some(kube_user) = &grant.kube_user {
+                map.insert("kube_user".into(), json!(kube_user));
+            }
             if let Some(workdir) = &grant.run.workdir {
                 map.insert("workdir".into(), json!(workdir));
             }
@@ -821,6 +831,7 @@ mod tests {
                 id: crate::agent_auth::bindings::SandboxId::parse("sbx-1").unwrap(),
             },
             launcher: "weaton".into(),
+            kube_user: Some("wseaton".into()),
             run: run(Some("user:weaton")),
             audience: KUEUE.into(),
             scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
@@ -861,6 +872,7 @@ mod tests {
             json!({
                 "iss": ISSUER,
                 "sub": "weaton",
+                "kube_user": "wseaton",
                 "aud": KUEUE,
                 "iat": at,
                 "nbf": at,
@@ -883,12 +895,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_token_gets_its_own_id_and_no_tenant_claims_without_a_tenant() {
+    async fn every_token_gets_its_own_id_and_omits_tenant_and_kube_user_claims_it_lacks() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
+        let unlinked = AgentGrant {
+            kube_user: None,
+            ..grant(None)
+        };
         let a = verified(
             &issuer,
-            &issuer.mint(&grant(None), now()).unwrap().access_token,
+            &issuer.mint(&unlinked, now()).unwrap().access_token,
         )
         .await;
         let b = verified(
@@ -897,7 +913,7 @@ mod tests {
         )
         .await;
         assert_ne!(a["jti"], b["jti"]);
-        for key in ["namespace", "queues", "role"] {
+        for key in ["namespace", "queues", "role", "kube_user"] {
             assert!(!a.contains_key(key), "{key}");
         }
     }

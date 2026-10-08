@@ -114,6 +114,7 @@ pub(crate) fn human_router(
     auth: HumanAuth,
     ui: spa::Source,
 ) -> axum::Router {
+    let link = axum::Extension(auth.guard.clone());
     let both = identity::auth::HumanOrKeyGuard {
         guard: auth.guard,
         pool: state.db.pool().clone(),
@@ -125,6 +126,7 @@ pub(crate) fn human_router(
             identity::auth::require_auth_or_api_key,
         ))
         .merge(identity::oidc::routes::router(auth.routes))
+        .layer(link)
         .layer(identity::session::layer(store, secure_cookies))
 }
 

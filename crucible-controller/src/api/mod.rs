@@ -40,6 +40,9 @@ pub(crate) mod tests;
         crate::identity::api::keys::list_keys,
         crate::identity::api::keys::mint_key,
         crate::identity::api::keys::revoke_key,
+        crate::identity::api::kube_user::get_my_kube_user,
+        crate::identity::api::kube_user::link_my_kube_user,
+        crate::identity::api::kube_user::override_kube_user,
         system::get_access,
         crate::identity::api::prefs::get_prefs,
         crate::identity::api::prefs::put_prefs,
@@ -198,6 +201,9 @@ pub(crate) mod tests;
         crate::identity::auth::Role,
         system::AccessDto,
         crate::identity::api::prefs::PrefsDto,
+        crate::identity::api::kube_user::KubeUserDto,
+        crate::identity::api::kube_user::LinkBody,
+        crate::identity::api::kube_user::OverrideBody,
         crate::identity::api::prefs::EditorPrefsDto,
         crate::identity::api::prefs::PickerPrefsDto,
         dto::Overview,
@@ -427,6 +433,11 @@ pub fn router(state: ApiState) -> Router {
             crate::identity::api::keys::mint_key
         ))
         .routes(routes!(crate::identity::api::keys::revoke_key))
+        .routes(routes!(
+            crate::identity::api::kube_user::get_my_kube_user,
+            crate::identity::api::kube_user::link_my_kube_user
+        ))
+        .routes(routes!(crate::identity::api::kube_user::override_kube_user))
         .routes(routes!(system::get_access))
         .routes(routes!(system::overview))
         .routes(routes!(dto::funnel))
