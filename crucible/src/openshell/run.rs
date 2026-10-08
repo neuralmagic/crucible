@@ -451,8 +451,13 @@ async fn try_turn(
     // 3a. Bind the sandbox to this run at the controller, which issues the sandbox's agent tokens
     //     only once it is bound. A failed bind leaves the sandbox without tokens, not the run
     //     without its turn.
+    let binding = crucible_contract::sandbox::SandboxBinding {
+        sandbox_id,
+        sandbox_name: name.clone(),
+        workdir: Some(SandboxLayout::workdir(&basename)),
+    };
     if let Some(ingest) = crate::report::ingest_client::IngestConfig::from_env()
-        && let Err(e) = crate::report::ingest_client::bind_sandbox(&ingest, &sandbox_id).await
+        && let Err(e) = crate::report::ingest_client::bind_sandbox(&ingest, &binding).await
     {
         let ev = AgentEvent::Raw {
             text: format!("sandbox bind failed (its agent token requests will be refused): {e:#}"),

@@ -53,7 +53,7 @@ impl AgentAuth {
             issuer = cfg.issuer.as_str(),
             kid = cfg.signing_key.kid(),
             svid_issuer = cfg.svid_issuer,
-            audiences = ?cfg.audiences,
+            audiences = ?cfg.audiences.iter().map(|a| a.resource.as_str()).collect::<Vec<_>>(),
             "issuing agent access tokens"
         );
         Ok(Some(Arc::new(Self {
@@ -191,12 +191,12 @@ async fn issue(
     let tenant = kueue
         .as_ref()
         .and_then(|k| TenantScope::for_run(k, &run.cluster));
-    let scopes = issuer::granted_scopes(req.scope.as_deref(), tenant.as_ref())?;
+    let scopes = issuer::granted_scopes(req.scope.as_deref(), audience, tenant.as_ref())?;
     let grant = AgentGrant {
         sandbox,
         launcher,
         run,
-        audience,
+        audience: audience.resource.clone(),
         scopes,
         tenant,
     };
@@ -324,13 +324,9 @@ mod tests {
             Some("user:weaton"),
         )
         .await;
-        bindings::bind(
-            pool,
-            "crucible-run-brave-otter",
-            &bindings::SandboxId::parse(sandbox).unwrap(),
-        )
-        .await
-        .unwrap();
+        bindings::bind(pool, "crucible-run-brave-otter", &testing::binding(sandbox))
+            .await
+            .unwrap();
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -373,6 +369,48 @@ mod tests {
         assert_eq!(principal.claims["run_id"], "crucible-run-brave-otter");
         assert_eq!(principal.claims["queues"], json!(["crucible-e2e"]));
         assert_eq!(principal.claims["role"], "submitter");
+        assert_eq!(principal.claims["sandbox"], "ci-sbx-1");
+        assert_eq!(principal.claims["workdir"], "/sandbox/repo");
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_buildit_token_carries_buildits_scopes_and_the_sandbox(pool: PgPool) {
+        bound(&pool, "sbx-1").await;
+        let h = harness(pool).await;
+        let svid = h.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&h.app, &form(&svid, &[("audience", testing::BUILDIT)])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["scope"], "buildit.read buildit.build");
+        let payload = body["access_token"]
+            .as_str()
+            .unwrap()
+            .split('.')
+            .nth(1)
+            .unwrap();
+        use base64::Engine;
+        let claims: Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(payload)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["aud"], testing::BUILDIT);
+        assert_eq!(claims["sandbox"], "ci-sbx-1");
+        assert_eq!(claims["workdir"], "/sandbox/repo");
+
+        let (status, _, body) = post(
+            &h.app,
+            &form(
+                &svid,
+                &[("audience", testing::BUILDIT), ("scope", "kueue.read")],
+            ),
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_scope")),
+            "a kueue scope is not grantable for buildit"
+        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -401,13 +439,9 @@ mod tests {
             Some("team:platform-administrators"),
         )
         .await;
-        bindings::bind(
-            &pool,
-            "crucible-run-team",
-            &bindings::SandboxId::parse("sbx-team").unwrap(),
-        )
-        .await
-        .unwrap();
+        bindings::bind(&pool, "crucible-run-team", &testing::binding("sbx-team"))
+            .await
+            .unwrap();
         let h = harness(pool).await;
         let good = h.spire.svid(&Spire::claims("sbx-1"));
         let svid = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {

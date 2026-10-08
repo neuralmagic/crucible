@@ -2,6 +2,7 @@
 //! discovery provider, SVIDs shaped like a sandbox supervisor's, and a running run pod to bind
 //! sandboxes to.
 
+use crate::agent_auth::bindings::{Binding, SandboxId};
 use crate::agent_auth::issuer::{
     AgentIssuer, AgentIssuerConfig, IssuerUrl, SandboxIdPrefix, SigningKey,
 };
@@ -16,6 +17,7 @@ pub const ISSUER: &str = "http://crucible-controller.tms.svc:8080";
 pub const SVID_ISSUER: &str = "https://oidc-discovery.apps.example";
 pub const PREFIX: &str = "spiffe://pirate.crucible/openshell/sandbox/";
 pub const KUEUE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
+pub const BUILDIT: &str = "http://host.openshell.internal:8849/mcp";
 pub const CLUSTER: &str = "pirate";
 
 pub const PROFILE: &str = r#"
@@ -137,7 +139,12 @@ pub fn config(spire: &Spire, signing: &EcKey) -> AgentIssuerConfig {
         svid_jwks_uri: spire.jwks_uri.clone(),
         svid_ca: None,
         sandbox_prefix: SandboxIdPrefix::parse(PREFIX).unwrap(),
-        audiences: vec![KUEUE.to_string()],
+        audiences: vec![
+            format!("{KUEUE}=kueue.read kueue.submit").parse().unwrap(),
+            format!("{BUILDIT}=buildit.read buildit.build")
+                .parse()
+                .unwrap(),
+        ],
     }
 }
 
@@ -200,4 +207,13 @@ pub async fn set_pod_state(
     crate::runs::work_pods::set_work_pod_state(pool, pod, state, None, None)
         .await
         .unwrap();
+}
+
+/// A binding for sandbox `id`, named `ci-<id>`, its workspace at `/sandbox/repo`.
+pub fn binding(id: &str) -> Binding {
+    Binding {
+        id: SandboxId::parse(id).unwrap(),
+        name: format!("ci-{id}"),
+        workdir: Some("/sandbox/repo".into()),
+    }
 }

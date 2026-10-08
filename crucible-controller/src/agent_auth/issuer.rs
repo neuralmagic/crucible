@@ -139,6 +139,38 @@ impl fmt::Debug for SigningKey {
     }
 }
 
+/// An MCP resource a token may be minted for, and the scopes a token for it may carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Audience {
+    /// The resource URL, compared to the requested `audience` as an exact string.
+    pub resource: String,
+    pub scopes: Vec<String>,
+}
+
+/// `<resource url>=<scope> <scope> ...`; a bare URL grants no scopes.
+impl std::str::FromStr for Audience {
+    type Err = ConfigError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (resource, scopes) = raw.split_once('=').unwrap_or((raw, ""));
+        let resource = resource.trim();
+        Url::parse(resource).map_err(|source| ConfigError::Url {
+            var: "CONTROLLER_AGENT_AUDIENCES",
+            value: resource.to_string(),
+            source,
+        })?;
+        Ok(Self {
+            resource: resource.to_string(),
+            scopes: scopes.split_whitespace().map(str::to_string).collect(),
+        })
+    }
+}
+
+/// Scopes crucible-kueue authorizes by tenant role: granted only as far as the run's role allows.
+fn governed_by_role(scope: &str) -> bool {
+    TenantRole::Submitter.scopes().contains(&scope)
+}
+
 #[derive(Debug)]
 pub struct AgentIssuerConfig {
     pub issuer: IssuerUrl,
@@ -150,8 +182,8 @@ pub struct AgentIssuerConfig {
     /// service CA for an in-cluster `https://*.svc` endpoint).
     pub svid_ca: Option<Vec<u8>>,
     pub sandbox_prefix: SandboxIdPrefix,
-    /// The MCP resource URLs a token may be minted for, compared as exact strings.
-    pub audiences: Vec<String>,
+    /// The MCP resources a token may be minted for.
+    pub audiences: Vec<Audience>,
 }
 
 impl AgentIssuerConfig {
@@ -182,19 +214,12 @@ impl AgentIssuerConfig {
             value: jwks_raw,
             source,
         })?;
-        let audiences: Vec<String> = need("CONTROLLER_AGENT_AUDIENCES")?
+        let audiences: Vec<Audience> = need("CONTROLLER_AGENT_AUDIENCES")?
             .split(',')
             .map(str::trim)
             .filter(|a| !a.is_empty())
-            .map(str::to_string)
-            .collect();
-        for audience in &audiences {
-            Url::parse(audience).map_err(|source| ConfigError::Url {
-                var: "CONTROLLER_AGENT_AUDIENCES",
-                value: audience.clone(),
-                source,
-            })?;
-        }
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
         if audiences.is_empty() {
             return Err(ConfigError::NoAudiences);
         }
@@ -254,7 +279,9 @@ pub enum GrantError {
         requested: String,
         allowed: Vec<String>,
     },
-    #[error("scope {requested:?} is not grantable; the run may hold {grantable:?}")]
+    #[error(
+        "scope {requested:?} is not grantable for this audience; the run may hold {grantable:?}"
+    )]
     Scope {
         requested: String,
         grantable: Vec<String>,
@@ -298,15 +325,22 @@ pub fn launcher(run: &BoundRun) -> Result<String, GrantError> {
         })
 }
 
-/// The scopes to grant: all the run's role allows when none is requested, else exactly the
-/// requested ones, each of which the role must allow.
+/// The scopes to grant for `audience`: those it lists, with crucible-kueue's narrowed to what the
+/// run's role allows. All of them when none is requested, else exactly the requested ones, each of
+/// which must be grantable.
 pub fn granted_scopes(
     requested: Option<&str>,
+    audience: &Audience,
     tenant: Option<&TenantScope>,
 ) -> Result<Vec<String>, GrantError> {
-    let grantable: Vec<String> = tenant
-        .map(|t| t.role.scopes().iter().map(|s| s.to_string()).collect())
-        .unwrap_or_default();
+    let grantable: Vec<String> = audience
+        .scopes
+        .iter()
+        .filter(|s| {
+            !governed_by_role(s) || tenant.is_some_and(|t| t.role.scopes().contains(&s.as_str()))
+        })
+        .cloned()
+        .collect();
     let Some(requested) = requested.filter(|r| !r.trim().is_empty()) else {
         return Ok(grantable);
     };
@@ -370,7 +404,7 @@ pub struct AuthorizationServerMetadata {
     pub response_types_supported: Vec<&'static str>,
     pub token_endpoint_auth_methods_supported: Vec<&'static str>,
     pub token_endpoint_auth_signing_alg_values_supported: Vec<Algorithm>,
-    pub scopes_supported: Vec<&'static str>,
+    pub scopes_supported: Vec<String>,
 }
 
 pub struct AgentIssuer {
@@ -378,7 +412,7 @@ pub struct AgentIssuer {
     key: SigningKey,
     svids: Verifier,
     sandbox_prefix: SandboxIdPrefix,
-    audiences: Vec<String>,
+    audiences: Vec<Audience>,
 }
 
 impl AgentIssuer {
@@ -432,20 +466,18 @@ impl AgentIssuer {
     }
 
     /// The requested audience, when it is an allowlisted MCP resource.
-    pub fn audience(&self, requested: Option<&str>) -> Result<String, GrantError> {
-        let requested =
-            requested
-                .filter(|r| !r.is_empty())
-                .ok_or_else(|| GrantError::NoAudience {
-                    allowed: self.audiences.clone(),
-                })?;
-        match self.audiences.iter().find(|a| *a == requested) {
-            Some(a) => Ok(a.clone()),
-            None => Err(GrantError::Audience {
+    pub fn audience(&self, requested: Option<&str>) -> Result<&Audience, GrantError> {
+        let allowed = || self.audiences.iter().map(|a| a.resource.clone()).collect();
+        let requested = requested
+            .filter(|r| !r.is_empty())
+            .ok_or_else(|| GrantError::NoAudience { allowed: allowed() })?;
+        self.audiences
+            .iter()
+            .find(|a| a.resource == requested)
+            .ok_or_else(|| GrantError::Audience {
                 requested: requested.to_string(),
-                allowed: self.audiences.clone(),
-            }),
-        }
+                allowed: allowed(),
+            })
     }
 
     /// Sign `grant` as an access token issued at `now` (Unix seconds).
@@ -463,12 +495,18 @@ impl AgentIssuer {
             "jti": crucible_contract::artifact::lower_hex(&jti),
             "act": {"sub": grant.sandbox.spiffe_id},
             "run_id": grant.run.pod_name,
+            "sandbox": grant.run.sandbox_name,
             "scope": scope,
         });
-        if let (Some(tenant), Some(map)) = (&grant.tenant, claims.as_object_mut()) {
-            map.insert("namespace".into(), json!(tenant.namespace));
-            map.insert("queues".into(), json!(tenant.queues));
-            map.insert("role".into(), json!(tenant.role));
+        if let Some(map) = claims.as_object_mut() {
+            if let Some(workdir) = &grant.run.workdir {
+                map.insert("workdir".into(), json!(workdir));
+            }
+            if let Some(tenant) = &grant.tenant {
+                map.insert("namespace".into(), json!(tenant.namespace));
+                map.insert("queues".into(), json!(tenant.queues));
+                map.insert("role".into(), json!(tenant.role));
+            }
         }
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(self.key.kid.clone());
@@ -496,10 +534,14 @@ impl AgentIssuer {
             token_endpoint_auth_methods_supported: vec!["private_key_jwt"],
             token_endpoint_auth_signing_alg_values_supported:
                 crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec(),
-            scopes_supported: vec![
-                crucible_contract::kueue::SCOPE_READ,
-                crucible_contract::kueue::SCOPE_SUBMIT,
-            ],
+            scopes_supported: self.audiences.iter().fold(Vec::new(), |mut all, a| {
+                for scope in &a.scopes {
+                    if !all.contains(scope) {
+                        all.push(scope.clone());
+                    }
+                }
+                all
+            }),
         }
     }
 }
@@ -508,7 +550,7 @@ impl AgentIssuer {
 mod tests {
     use crate::agent_auth::issuer::*;
     use crate::agent_auth::testing::{
-        self, CLUSTER, EcKey, ISSUER, KUEUE, PREFIX, PROFILE, Spire, now, serve_jwks,
+        self, BUILDIT, CLUSTER, EcKey, ISSUER, KUEUE, PREFIX, PROFILE, Spire, now, serve_jwks,
     };
     use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
     use std::collections::HashMap;
@@ -648,7 +690,11 @@ mod tests {
     async fn only_an_allowlisted_audience_is_granted() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
-        assert_eq!(issuer.audience(Some(KUEUE)).unwrap(), KUEUE);
+        assert_eq!(issuer.audience(Some(KUEUE)).unwrap().resource, KUEUE);
+        assert_eq!(
+            issuer.audience(Some(BUILDIT)).unwrap().scopes,
+            ["buildit.read", "buildit.build"]
+        );
         assert!(matches!(
             issuer.audience(None),
             Err(GrantError::NoAudience { .. })
@@ -671,32 +717,58 @@ mod tests {
         }
     }
 
+    fn kueue() -> Audience {
+        format!("{KUEUE}=kueue.read kueue.submit").parse().unwrap()
+    }
+
+    fn buildit() -> Audience {
+        format!("{BUILDIT}=buildit.read buildit.build")
+            .parse()
+            .unwrap()
+    }
+
     #[test]
-    fn scopes_narrow_to_what_the_runs_role_grants() {
+    fn scopes_narrow_to_the_audience_and_kueue_scopes_to_the_runs_role() {
         let submitter = tenant(TenantRole::Submitter);
         let viewer = tenant(TenantRole::Viewer);
         assert_eq!(
-            granted_scopes(None, Some(&submitter)).unwrap(),
+            granted_scopes(None, &kueue(), Some(&submitter)).unwrap(),
             [SCOPE_READ, SCOPE_SUBMIT]
         );
         assert_eq!(
-            granted_scopes(Some(""), Some(&viewer)).unwrap(),
+            granted_scopes(Some(""), &kueue(), Some(&viewer)).unwrap(),
             [SCOPE_READ]
         );
         assert_eq!(
-            granted_scopes(Some("kueue.read kueue.read"), Some(&submitter)).unwrap(),
+            granted_scopes(Some("kueue.read kueue.read"), &kueue(), Some(&submitter)).unwrap(),
             [SCOPE_READ]
         );
         assert_eq!(
-            granted_scopes(Some("kueue.submit"), Some(&viewer)),
+            granted_scopes(Some("kueue.submit"), &kueue(), Some(&viewer)),
             Err(GrantError::Scope {
                 requested: SCOPE_SUBMIT.into(),
                 grantable: vec![SCOPE_READ.into()]
             })
         );
-        assert!(granted_scopes(Some("kueue.admin"), Some(&submitter)).is_err());
-        assert!(granted_scopes(None, None).unwrap().is_empty());
-        assert!(granted_scopes(Some("kueue.read"), None).is_err());
+        assert!(granted_scopes(Some("kueue.admin"), &kueue(), Some(&submitter)).is_err());
+        assert!(granted_scopes(None, &kueue(), None).unwrap().is_empty());
+        assert!(granted_scopes(Some("kueue.read"), &kueue(), None).is_err());
+        assert_eq!(
+            granted_scopes(None, &buildit(), None).unwrap(),
+            ["buildit.read", "buildit.build"],
+            "scopes outside crucible-kueue's need no tenant"
+        );
+        assert!(
+            granted_scopes(Some("kueue.read"), &buildit(), Some(&submitter)).is_err(),
+            "a scope another audience lists is not grantable here"
+        );
+        let bare: Audience = KUEUE.parse().unwrap();
+        assert!(bare.scopes.is_empty());
+        assert!(
+            granted_scopes(None, &bare, Some(&submitter))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -718,6 +790,8 @@ mod tests {
             pod_name: "crucible-run-brave-otter".into(),
             cluster: CLUSTER.into(),
             attributed_to: attributed_to.map(str::to_string),
+            sandbox_name: "ci-0123abcd".into(),
+            workdir: Some("/sandbox/repo".into()),
         }
     }
 
@@ -793,6 +867,8 @@ mod tests {
                 "exp": at + TOKEN_TTL_SECS,
                 "act": {"sub": format!("{PREFIX}sbx-1")},
                 "run_id": "crucible-run-brave-otter",
+                "sandbox": "ci-0123abcd",
+                "workdir": "/sandbox/repo",
                 "scope": "kueue.read kueue.submit",
                 "namespace": "crucible-kueue-e2e",
                 "queues": ["crucible-e2e"],
@@ -855,6 +931,15 @@ mod tests {
         assert_eq!(doc["jwks_uri"], format!("{ISSUER}/.well-known/jwks.json"));
         assert_eq!(doc["grant_types_supported"], json!(["client_credentials"]));
         assert_eq!(
+            doc["scopes_supported"],
+            json!([
+                "kueue.read",
+                "kueue.submit",
+                "buildit.read",
+                "buildit.build"
+            ])
+        );
+        assert_eq!(
             doc["token_endpoint_auth_methods_supported"],
             json!(["private_key_jwt"])
         );
@@ -891,7 +976,10 @@ mod tests {
                 "https://spire-spiffe-oidc-discovery-provider.ztwim.svc/keys".into(),
             ),
             ("CONTROLLER_AGENT_SANDBOX_ID_PREFIX", PREFIX.into()),
-            ("CONTROLLER_AGENT_AUDIENCES", format!("{KUEUE}, ")),
+            (
+                "CONTROLLER_AGENT_AUDIENCES",
+                format!("{KUEUE}=kueue.read kueue.submit, {BUILDIT}=buildit.read buildit.build,"),
+            ),
         ])
     }
 
@@ -906,7 +994,19 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.issuer.as_str(), ISSUER, "the trailing slash is dropped");
-        assert_eq!(cfg.audiences, [KUEUE]);
+        assert_eq!(
+            cfg.audiences,
+            [
+                Audience {
+                    resource: KUEUE.into(),
+                    scopes: vec!["kueue.read".into(), "kueue.submit".into()],
+                },
+                Audience {
+                    resource: BUILDIT.into(),
+                    scopes: vec!["buildit.read".into(), "buildit.build".into()],
+                },
+            ]
+        );
         assert!(cfg.svid_ca.is_none());
 
         assert!(
@@ -932,7 +1032,7 @@ mod tests {
             );
         }
 
-        let bad: [(&'static str, &str); 7] = [
+        let bad: [(&'static str, &str); 8] = [
             (
                 "CONTROLLER_AGENT_ISSUER",
                 "http://controller.svc:8080/oauth",
@@ -948,6 +1048,7 @@ mod tests {
                 "https://pirate.crucible/openshell/sandbox/",
             ),
             ("CONTROLLER_AGENT_AUDIENCES", " , "),
+            ("CONTROLLER_AGENT_AUDIENCES", "not a url=kueue.read"),
             (
                 "CONTROLLER_AGENT_SIGNING_KEY_FILE",
                 "/nonexistent/signing.pem",

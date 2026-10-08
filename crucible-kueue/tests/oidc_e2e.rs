@@ -17,7 +17,7 @@
 
 use base64::Engine;
 use crucible_contract::kueue::token_digest;
-use crucible_controller::agent_auth::bindings::{self, SandboxId};
+use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
 use crucible_controller::agent_auth::issuer::{
     AgentIssuer, AgentIssuerConfig, IssuerUrl, SandboxIdPrefix, SigningKey,
 };
@@ -44,6 +44,8 @@ type Client = RunningService<RoleClient, ClientConfig>;
 /// The issuer identifier sandboxes request SVIDs for: the controller's in-cluster Service URL.
 const CONTROLLER: &str = "http://crucible-controller.crucible-system.svc.cluster.local:8080";
 const RESOURCE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
+const SANDBOX_NAME: &str = "ci-0123456789abcdef";
+const WORKDIR: &str = "/sandbox/repo";
 const RUN_POD: &str = "crucible-run-oidc-e2e";
 const RUN_ID: &str = "playbook_oidc-e2e_auth-spike";
 const TENANT_TOKEN: &str = "oidc-e2e-tenant-token";
@@ -139,9 +141,12 @@ async fn seed_run(pool: &sqlx::PgPool) {
     .execute(pool)
     .await
     .unwrap();
-    let run = bindings::bind(pool, RUN_POD, &SandboxId::parse(&sandbox()).unwrap())
-        .await
-        .unwrap();
+    let binding = Binding {
+        id: SandboxId::parse(&sandbox()).unwrap(),
+        name: SANDBOX_NAME.to_string(),
+        workdir: Some(WORKDIR.to_string()),
+    };
+    let run = bindings::bind(pool, RUN_POD, &binding).await.unwrap();
     assert_eq!(run, RUN_ID);
 }
 
@@ -192,7 +197,11 @@ record_writers = ["crucible-system/crucible-hub-dispatch"]
         svid_jwks_uri: Url::parse(&format!("{}/keys", cluster::spire())).unwrap(),
         svid_ca: None,
         sandbox_prefix: SandboxIdPrefix::parse(&sandbox_prefix()).unwrap(),
-        audiences: vec![RESOURCE.to_string()],
+        audiences: vec![
+            format!("{RESOURCE}=kueue.read kueue.submit")
+                .parse()
+                .unwrap(),
+        ],
     };
     let jwks = Jwks::new(
         cluster::routes_http(cluster::ingress_ip()),
@@ -231,7 +240,17 @@ async fn access_token(controller: &str, svid: &str) -> String {
     );
     assert_eq!(body["token_type"], "Bearer");
     assert_eq!(body["scope"], "kueue.read kueue.submit");
-    body["access_token"].as_str().unwrap().to_string()
+    let token = body["access_token"].as_str().unwrap().to_string();
+    let payload = token.split('.').nth(1).unwrap();
+    let claims: Value = serde_json::from_slice(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(claims["sandbox"], SANDBOX_NAME);
+    assert_eq!(claims["workdir"], WORKDIR);
+    token
 }
 
 async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String {

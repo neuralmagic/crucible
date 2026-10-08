@@ -47,6 +47,67 @@ impl std::fmt::Display for SandboxId {
     }
 }
 
+/// What a run pod binds: the sandbox's id, its name, and where its workspace sits inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    pub id: SandboxId,
+    /// A Kubernetes label value, the `sandbox` claim.
+    pub name: String,
+    /// An absolute, normal path, the `workdir` claim.
+    pub workdir: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum BindingError {
+    #[error(transparent)]
+    Id(#[from] SandboxIdError),
+    #[error(
+        "sandbox name {0:?} is not a label value: at most 63 characters of [A-Za-z0-9._-], \
+         alphanumeric at both ends"
+    )]
+    Name(String),
+    #[error("sandbox workdir {0:?} is not an absolute, normal path")]
+    Workdir(String),
+}
+
+impl TryFrom<&SandboxBinding> for Binding {
+    type Error = BindingError;
+
+    fn try_from(wire: &SandboxBinding) -> Result<Self, Self::Error> {
+        let id = SandboxId::parse(&wire.sandbox_id)?;
+        let name = &wire.sandbox_name;
+        let bytes = name.as_bytes();
+        let label = name.len() <= 63
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        if !label {
+            return Err(BindingError::Name(name.clone()));
+        }
+        let workdir = match &wire.workdir {
+            None => None,
+            Some(raw) => {
+                let rest = raw.trim_end_matches('/');
+                let normal = rest.starts_with('/')
+                    && rest.len() <= 4096
+                    && rest[1..].split('/').all(|p| !matches!(p, "" | "." | ".."))
+                    && !raw.chars().any(|c| c.is_whitespace() || c.is_control());
+                if !normal {
+                    return Err(BindingError::Workdir(raw.clone()));
+                }
+                Some(rest.to_string())
+            }
+        };
+        Ok(Self {
+            id,
+            name: name.clone(),
+            workdir,
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
     #[error("pod {0} has no work-pod row")]
@@ -67,9 +128,10 @@ impl From<sqlx::Error> for BindError {
     }
 }
 
-/// Bind `sandbox` to the run `pod` is executing. Rebinding to the same pod is a no-op; a sandbox
-/// already bound elsewhere is refused. Returns the run id.
-pub async fn bind(pool: &PgPool, pod: &str, sandbox: &SandboxId) -> Result<String, BindError> {
+/// Bind a sandbox to the run `pod` is executing. Rebinding from the same pod refreshes the name
+/// and workdir; a sandbox already bound elsewhere is refused. Returns the run id.
+pub async fn bind(pool: &PgPool, pod: &str, binding: &Binding) -> Result<String, BindError> {
+    let sandbox = &binding.id;
     let row = crate::runs::work_pods::get_work_pod(pool, pod)
         .await
         .map_err(BindError::Db)?
@@ -87,14 +149,19 @@ pub async fn bind(pool: &PgPool, pod: &str, sandbox: &SandboxId) -> Result<Strin
             .await?
             .ok_or_else(|| BindError::NoRun(pod.to_string()))?;
     let bound: Option<String> = sqlx::query_scalar(
-        "INSERT INTO run_sandboxes (sandbox_id, run_id, pod_name, bound_at)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (sandbox_id) DO UPDATE SET bound_at = excluded.bound_at
+        "INSERT INTO run_sandboxes (sandbox_id, sandbox_name, workdir, run_id, pod_name, bound_at)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (sandbox_id) DO UPDATE SET
+             sandbox_name = excluded.sandbox_name,
+             workdir = excluded.workdir,
+             bound_at = excluded.bound_at
            WHERE run_sandboxes.pod_name = excluded.pod_name
              AND run_sandboxes.run_id = excluded.run_id
          RETURNING run_id",
     )
     .bind(sandbox.as_str())
+    .bind(&binding.name)
+    .bind(binding.workdir.as_deref())
     .bind(&run_id)
     .bind(pod)
     .bind(crate::clock::now_rfc3339())
@@ -124,6 +191,8 @@ pub struct BoundRun {
     pub cluster: String,
     /// The owner principal the run's spend is attributed to (`user:<login>` for a person).
     pub attributed_to: Option<String>,
+    pub sandbox_name: String,
+    pub workdir: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -138,8 +207,17 @@ pub enum ResolveError {
 
 /// The live run `sandbox` is bound to. A run whose pod is anything but running is refused.
 pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, ResolveError> {
-    let row: Option<(String, String, WorkPodState, String, Option<String>)> = sqlx::query_as(
-        "SELECT s.run_id, s.pod_name, w.state, w.cluster, r.attributed_to
+    type Row = (
+        String,
+        String,
+        WorkPodState,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+    );
+    let row: Option<Row> = sqlx::query_as(
+        "SELECT s.run_id, s.pod_name, w.state, w.cluster, r.attributed_to, s.sandbox_name, s.workdir
          FROM run_sandboxes s
          JOIN work_pods w ON w.pod_name = s.pod_name
          JOIN runs r ON r.run_id = s.run_id
@@ -148,7 +226,7 @@ pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, Res
     .bind(sandbox.as_str())
     .fetch_optional(pool)
     .await?;
-    let (run_id, pod_name, state, cluster, attributed_to) =
+    let (run_id, pod_name, state, cluster, attributed_to, sandbox_name, workdir) =
         row.ok_or_else(|| ResolveError::Unbound(sandbox.clone()))?;
     if state != WorkPodState::Running {
         return Err(ResolveError::Ended { run_id, state });
@@ -158,6 +236,8 @@ pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, Res
         pod_name,
         cluster,
         attributed_to,
+        sandbox_name,
+        workdir,
     })
 }
 
@@ -182,13 +262,14 @@ async fn bind_sandbox(
         Ok(Json(binding)) => binding,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, e.body_text()),
     };
-    let sandbox = match SandboxId::parse(&binding.sandbox_id) {
-        Ok(id) => id,
+    let binding = match Binding::try_from(&binding) {
+        Ok(b) => b,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    match bind(state.db.pool(), &auth.pod, &sandbox).await {
+    let sandbox = &binding.id;
+    match bind(state.db.pool(), &auth.pod, &binding).await {
         Ok(run_id) => {
-            tracing::info!(pod = %auth.pod, run_id, sandbox = %sandbox, "sandbox bound");
+            tracing::info!(pod = %auth.pod, run_id, sandbox = %sandbox, name = binding.name, "sandbox bound");
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e @ (BindError::UnknownPod(_) | BindError::NoRun(_))) => {
@@ -221,6 +302,65 @@ mod tests {
         SandboxId::parse(id).unwrap()
     }
 
+    fn binding(id: &str) -> Binding {
+        Binding {
+            id: sandbox(id),
+            name: format!("ci-{id}"),
+            workdir: Some("/sandbox/repo".into()),
+        }
+    }
+
+    fn wire(id: &str, name: &str, workdir: Option<&str>) -> SandboxBinding {
+        SandboxBinding {
+            sandbox_id: id.into(),
+            sandbox_name: name.into(),
+            workdir: workdir.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_binding_carries_a_label_value_name_and_a_normal_absolute_workdir() {
+        assert_eq!(
+            Binding::try_from(&wire("sbx-1", "ci-0123abcd", Some("/sandbox/repo/"))).unwrap(),
+            Binding {
+                id: sandbox("sbx-1"),
+                name: "ci-0123abcd".into(),
+                workdir: Some("/sandbox/repo".into()),
+            }
+        );
+        assert_eq!(
+            Binding::try_from(&wire("sbx-1", "ci-0123abcd", None))
+                .unwrap()
+                .workdir,
+            None
+        );
+        for name in ["", "-ci", "ci-", "ci/x", "ci x", &"a".repeat(64)] {
+            assert_eq!(
+                Binding::try_from(&wire("sbx-1", name, None)),
+                Err(BindingError::Name(name.to_string())),
+                "{name:?}"
+            );
+        }
+        for workdir in [
+            "sandbox/repo",
+            "/sandbox/../etc",
+            "/sandbox//repo",
+            "/sandbox/./repo",
+            "/sand box",
+            "/",
+        ] {
+            assert_eq!(
+                Binding::try_from(&wire("sbx-1", "ci-1", Some(workdir))),
+                Err(BindingError::Workdir(workdir.to_string())),
+                "{workdir:?}"
+            );
+        }
+        assert!(matches!(
+            Binding::try_from(&wire("a/b", "ci-1", None)),
+            Err(BindingError::Id(_))
+        ));
+    }
+
     #[test]
     fn sandbox_ids_are_one_path_segment_of_safe_characters() {
         for ok in [
@@ -239,19 +379,33 @@ mod tests {
     async fn a_bound_sandbox_resolves_to_its_running_run(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
         assert_eq!(
-            bind(&pool, "crucible-run-a", &sandbox("sbx-1"))
+            bind(&pool, "crucible-run-a", &binding("sbx-1"))
                 .await
                 .unwrap(),
             "run-a"
         );
         assert_eq!(
-            bind(&pool, "crucible-run-a", &sandbox("sbx-1"))
+            bind(&pool, "crucible-run-a", &binding("sbx-1"))
                 .await
                 .unwrap(),
             "run-a",
             "rebinding from the same pod is a no-op"
         );
-        bind(&pool, "crucible-run-a", &sandbox("sbx-2"))
+        let renamed = Binding {
+            name: "ci-renamed".into(),
+            workdir: None,
+            ..binding("sbx-1")
+        };
+        bind(&pool, "crucible-run-a", &renamed).await.unwrap();
+        let rebound = resolve(&pool, &sandbox("sbx-1")).await.unwrap();
+        assert_eq!(
+            (rebound.sandbox_name.as_str(), rebound.workdir),
+            ("ci-renamed", None)
+        );
+        bind(&pool, "crucible-run-a", &binding("sbx-1"))
+            .await
+            .unwrap();
+        bind(&pool, "crucible-run-a", &binding("sbx-2"))
             .await
             .unwrap();
         for id in ["sbx-1", "sbx-2"] {
@@ -262,6 +416,8 @@ mod tests {
                     pod_name: "crucible-run-a".into(),
                     cluster: CLUSTER.into(),
                     attributed_to: Some("user:weaton".into()),
+                    sandbox_name: format!("ci-{id}"),
+                    workdir: Some("/sandbox/repo".into()),
                 }
             );
         }
@@ -271,10 +427,10 @@ mod tests {
     async fn a_sandbox_bound_by_one_pod_cannot_be_claimed_by_another(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
         running_run(&pool, "crucible-run-b", "run-b", Some("user:mallory")).await;
-        bind(&pool, "crucible-run-a", &sandbox("sbx-1"))
+        bind(&pool, "crucible-run-a", &binding("sbx-1"))
             .await
             .unwrap();
-        match bind(&pool, "crucible-run-b", &sandbox("sbx-1")).await {
+        match bind(&pool, "crucible-run-b", &binding("sbx-1")).await {
             Err(BindError::Taken { holder, .. }) => assert_eq!(holder, "crucible-run-a"),
             other => panic!("{other:?}"),
         }
@@ -287,13 +443,13 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn only_a_running_pod_with_a_run_binds(pool: PgPool) {
         assert!(matches!(
-            bind(&pool, "crucible-run-ghost", &sandbox("sbx-1")).await,
+            bind(&pool, "crucible-run-ghost", &binding("sbx-1")).await,
             Err(BindError::UnknownPod(_))
         ));
         running_run(&pool, "crucible-run-a", "run-a", None).await;
         set_pod_state(&pool, "crucible-run-a", WorkPodState::Collected).await;
         assert!(matches!(
-            bind(&pool, "crucible-run-a", &sandbox("sbx-1")).await,
+            bind(&pool, "crucible-run-a", &binding("sbx-1")).await,
             Err(BindError::NotRunning {
                 state: WorkPodState::Collected,
                 ..
@@ -313,7 +469,7 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(
-            bind(&pool, "crucible-run-norun", &sandbox("sbx-1")).await,
+            bind(&pool, "crucible-run-norun", &binding("sbx-1")).await,
             Err(BindError::NoRun(_))
         ));
     }
@@ -325,7 +481,7 @@ mod tests {
             Err(ResolveError::Unbound(_))
         ));
         running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
-        bind(&pool, "crucible-run-a", &sandbox("sbx-1"))
+        bind(&pool, "crucible-run-a", &binding("sbx-1"))
             .await
             .unwrap();
         for ended in [
@@ -404,10 +560,8 @@ mod tests {
     async fn the_route_binds_for_the_pod_its_token_is_bound_to(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
         running_run(&pool, "crucible-run-b", "run-b", Some("user:weaton")).await;
-        let body = serde_json::to_string(&SandboxBinding {
-            sandbox_id: "sbx-1".into(),
-        })
-        .unwrap();
+        let body =
+            serde_json::to_string(&wire("sbx-1", "ci-0123abcd", Some("/sandbox/repo"))).unwrap();
 
         let (status, text) =
             post(app(pool.clone(), "crucible-run-a"), "crucible-run-b", &body).await;
@@ -431,8 +585,10 @@ mod tests {
         );
 
         for bad in [
-            r#"{"sandbox_id": "a/b"}"#,
-            r#"{"sandbox_id": "sbx-2", "run_id": "run-b"}"#,
+            r#"{"sandbox_id": "a/b", "sandbox_name": "ci-1"}"#,
+            r#"{"sandbox_id": "sbx-2"}"#,
+            r#"{"sandbox_id": "sbx-2", "sandbox_name": "ci-1", "workdir": "relative"}"#,
+            r#"{"sandbox_id": "sbx-2", "sandbox_name": "ci-1", "run_id": "run-b"}"#,
             "not json",
         ] {
             let (status, text) =

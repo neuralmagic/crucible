@@ -128,12 +128,14 @@ The controller can act as the OAuth authorization server for sandboxed agents. A
 sandbox supervisor posts its SPIRE JWT-SVID to `POST /oauth/token` (client credentials with a
 `jwt-bearer` client assertion, no `client_id`); the controller verifies it against SPIRE's JWKS,
 maps the sandbox to the run whose pod bound it, and returns a 5-minute ES256 access token whose
-`sub` is the person the run is attributed to and whose `act.sub` is the sandbox's SPIFFE ID. MCP
+`sub` is the person the run is attributed to and whose `act.sub` is the sandbox's SPIFFE ID. It
+also carries `run_id` (the run pod), `sandbox` (the sandbox's name), `workdir` (its workspace path),
+and, for runs on the `[kueue]` cluster, `namespace`, `queues`, and `role`. MCP
 servers verify it against `/.well-known/jwks.json`; `/.well-known/oauth-authorization-server`
 describes the endpoints. All three are served outside the human auth stack.
 
-The engine binds each sandbox it creates by posting its id to `/api/pods/{pod}/sandboxes` with
-the pod's ingest token, so the drop-box env (`CRUCIBLE_INGEST_URL`) must reach the loop pod. A
+The engine binds each sandbox it creates by posting its id, name, and workdir to
+`/api/pods/{pod}/sandboxes` with the pod's ingest token, so the drop-box env (`CRUCIBLE_INGEST_URL`) must reach the loop pod. A
 sandbox that was never bound, or whose run pod is no longer running, gets `invalid_grant`.
 
 | Variable | Meaning |
@@ -144,10 +146,14 @@ sandbox that was never bound, or whose run pod is no longer running, gets `inval
 | `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. |
 | `CONTROLLER_AGENT_SVID_CA_FILE` | Optional PEM bundle trusted for that fetch (the service CA for an `https://*.svc` endpoint). |
 | `CONTROLLER_AGENT_SANDBOX_ID_PREFIX` | The SPIFFE ID path every sandbox supervisor's ID sits under, ending in `/`. |
-| `CONTROLLER_AGENT_AUDIENCES` | Comma-separated MCP resource URLs a token may be issued for; anything else is `invalid_target`. |
+| `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
 
-The deploy profile's `[kueue]` table supplies the `namespace`, `queues`, and `role` claims (and
-so the grantable scopes) for runs on its cluster.
+The deploy profile's `[kueue]` table supplies the `namespace`, `queues`, and `role` claims for runs
+on its cluster, and the role caps the `kueue.*` scopes; a run elsewhere gets none. On pirate:
+
+```bash
+CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,http://host.openshell.internal:8849/mcp=buildit.read buildit.build"
+```
 
 ```bash
 openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt -out agent-signing.pem

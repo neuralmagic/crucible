@@ -185,7 +185,10 @@ pub(crate) enum BindError {
 
 /// Bind a sandbox this pod just created to its run at the controller, which issues agent tokens
 /// only to bound sandboxes. Retried like an artifact POST; the error names the last failure.
-pub(crate) async fn bind_sandbox(cfg: &IngestConfig, sandbox_id: &str) -> Result<(), BindError> {
+pub(crate) async fn bind_sandbox(
+    cfg: &IngestConfig,
+    binding: &crucible_contract::sandbox::SandboxBinding,
+) -> Result<(), BindError> {
     let client = reqwest::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -195,9 +198,6 @@ pub(crate) async fn bind_sandbox(cfg: &IngestConfig, sandbox_id: &str) -> Result
         cfg.base_url,
         crucible_contract::sandbox::binding_path(&cfg.pod)
     );
-    let body = crucible_contract::sandbox::SandboxBinding {
-        sandbox_id: sandbox_id.to_string(),
-    };
     let mut last = String::new();
     for attempt in 1..=MAX_ATTEMPTS {
         let token = tokio::fs::read_to_string(&cfg.token_path)
@@ -209,7 +209,7 @@ pub(crate) async fn bind_sandbox(cfg: &IngestConfig, sandbox_id: &str) -> Result
         match client
             .post(&url)
             .bearer_auth(token.trim())
-            .json(&body)
+            .json(binding)
             .send()
             .await
         {
@@ -228,7 +228,7 @@ pub(crate) async fn bind_sandbox(cfg: &IngestConfig, sandbox_id: &str) -> Result
         }
     }
     Err(BindError::Refused {
-        sandbox_id: sandbox_id.to_string(),
+        sandbox_id: binding.sandbox_id.clone(),
         pod: cfg.pod.clone(),
         last,
     })
@@ -532,6 +532,14 @@ mod tests {
         (format!("http://{addr}"), rx)
     }
 
+    fn binding() -> crucible_contract::sandbox::SandboxBinding {
+        crucible_contract::sandbox::SandboxBinding {
+            sandbox_id: "sbx-1".into(),
+            sandbox_name: "ci-0123abcd".into(),
+            workdir: Some("/sandbox/repo".into()),
+        }
+    }
+
     fn token_file(name: &str) -> PathBuf {
         let tok =
             std::env::temp_dir().join(format!("crucible-bind-tok-{name}-{}", std::process::id()));
@@ -544,7 +552,7 @@ mod tests {
         let (base, mut seen) = bind_endpoint("204 No Content").await;
         let tok = token_file("ok");
         let cfg = IngestConfig::new(base, "crucible-run-a", tok.clone());
-        bind_sandbox(&cfg, "sbx-1").await.unwrap();
+        bind_sandbox(&cfg, &binding()).await.unwrap();
         let request = seen.recv().await.unwrap();
         assert!(
             request.starts_with("POST /api/pods/crucible-run-a/sandboxes HTTP/1.1"),
@@ -556,7 +564,12 @@ mod tests {
                 .contains("authorization: bearer pod-token\r\n"),
             "{request}"
         );
-        assert!(request.ends_with(r#"{"sandbox_id":"sbx-1"}"#), "{request}");
+        assert!(
+            request.ends_with(
+                r#"{"sandbox_id":"sbx-1","sandbox_name":"ci-0123abcd","workdir":"/sandbox/repo"}"#
+            ),
+            "{request}"
+        );
         let _ = std::fs::remove_file(tok);
     }
 
@@ -565,7 +578,7 @@ mod tests {
         let (base, mut seen) = bind_endpoint("409 Conflict").await;
         let tok = token_file("refused");
         let cfg = IngestConfig::new(base, "crucible-run-a", tok.clone());
-        let err = bind_sandbox(&cfg, "sbx-1").await.unwrap_err();
+        let err = bind_sandbox(&cfg, &binding()).await.unwrap_err();
         assert!(err.to_string().contains("HTTP 409"), "{err:#}");
         for _ in 0..MAX_ATTEMPTS {
             seen.recv().await.unwrap();
