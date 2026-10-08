@@ -333,9 +333,16 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 deploy::render_controller_cmd(&args.profile, &opts)
             };
         }
+        if args.kueue {
+            return if apply {
+                deploy::apply_kueue_cmd(&args.profile, &opts)
+            } else {
+                deploy::render_kueue_cmd(&args.profile, &opts)
+            };
+        }
         let manifest = args
             .manifest
-            .context("--manifest is required unless --controller is set")?;
+            .context("--manifest is required unless --controller or --kueue is set")?;
         return if apply {
             deploy::apply_cmd(&manifest, &args.profile, &opts)
         } else {

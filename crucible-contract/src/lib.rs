@@ -16,6 +16,7 @@ pub mod history;
 pub mod identity;
 pub mod inference;
 pub mod json;
+pub mod kueue;
 pub mod link;
 pub mod markers;
 pub mod mcp;

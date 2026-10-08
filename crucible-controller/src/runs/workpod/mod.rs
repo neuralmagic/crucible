@@ -32,6 +32,7 @@ mod core;
 mod dispatcher;
 mod globals;
 mod kube_dispatcher;
+pub(crate) mod kueue;
 mod markers;
 pub(crate) mod retry;
 mod run;

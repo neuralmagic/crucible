@@ -48,6 +48,154 @@ pub struct DeployProfile {
     /// (`clusters.toml` beside the profile); a local block overrides the fleet file on conflict.
     #[serde(default)]
     pub clusters: BTreeMap<String, ClusterEntry>,
+    /// The crucible-kueue MCP server: where it runs, and the scope each run's token gets.
+    #[serde(default)]
+    pub kueue: Option<KueueCfg>,
+}
+
+/// A Kubernetes object or namespace name: a DNS-1123 label.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct KubeName(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0:?} is not a DNS-1123 label (lowercase alphanumerics and '-', 1-63 chars)")]
+pub struct NotKubeName(String);
+
+impl TryFrom<String> for KubeName {
+    type Error = NotKubeName;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let ok = (1..=63).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !value.starts_with('-')
+            && !value.ends_with('-');
+        match ok {
+            true => Ok(Self(value)),
+            false => Err(NotKubeName(value)),
+        }
+    }
+}
+
+impl KubeName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for KubeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A ServiceAccount, written `namespace/name`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ServiceAccountRef {
+    pub namespace: KubeName,
+    pub name: KubeName,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceAccountRefError {
+    #[error("service account {0:?} is not written namespace/name")]
+    Shape(String),
+    #[error("service account {whole:?}: {source}")]
+    Name {
+        whole: String,
+        #[source]
+        source: NotKubeName,
+    },
+}
+
+impl TryFrom<String> for ServiceAccountRef {
+    type Error = ServiceAccountRefError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let Some((ns, name)) = value.split_once('/') else {
+            return Err(ServiceAccountRefError::Shape(value));
+        };
+        let name_err = |source| ServiceAccountRefError::Name {
+            whole: value.clone(),
+            source,
+        };
+        Ok(Self {
+            namespace: KubeName::try_from(ns.to_string()).map_err(name_err)?,
+            name: KubeName::try_from(name.to_string()).map_err(name_err)?,
+        })
+    }
+}
+
+/// The `[kueue]` table. The controller mints a token for every run it dispatches onto `cluster`,
+/// scoped to `workload_namespace`, `role`, and `queues`, and records its digest in
+/// `tenant_namespace`, which must be a namespace no loop pod or pack can write ConfigMaps in.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KueueCfg {
+    /// The server image, a tag the renderer resolves to `@sha256:…`.
+    pub image: String,
+    /// The dispatch cluster the server runs on: `hub` or a spoke name.
+    #[serde(default = "hub_cluster")]
+    pub cluster: String,
+    /// Namespace of the server's Deployment, Service, and ServiceAccount.
+    pub namespace: KubeName,
+    /// Namespace of the controller-written tenant records.
+    pub tenant_namespace: KubeName,
+    /// The one namespace each run's token may act in.
+    pub workload_namespace: KubeName,
+    /// LocalQueues a run may submit to; empty means every LocalQueue in `workload_namespace`.
+    #[serde(default)]
+    pub queues: Vec<KubeName>,
+    #[serde(default = "submitter")]
+    pub role: crucible_contract::kueue::TenantRole,
+    /// The controller's dispatch identity on `cluster`, the only writers of tenant records.
+    pub record_writers: Vec<ServiceAccountRef>,
+    /// How long a token authenticates when the run states no wall-clock ceiling.
+    #[serde(default = "default_token_ttl_secs")]
+    pub token_ttl_secs: u64,
+    /// The cluster's DNS domain. The sandbox proxy resolves names without the pod's search list,
+    /// so the Service is addressed by its fully qualified name.
+    #[serde(default = "default_cluster_domain")]
+    pub cluster_domain: String,
+}
+
+fn hub_cluster() -> String {
+    "hub".to_string()
+}
+
+fn submitter() -> crucible_contract::kueue::TenantRole {
+    crucible_contract::kueue::TenantRole::Submitter
+}
+
+fn default_token_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_cluster_domain() -> String {
+    "cluster.local".to_string()
+}
+
+impl KueueCfg {
+    pub const SERVICE_NAME: &str = "crucible-kueue";
+    pub const PORT: u16 = 8850;
+
+    /// The Service DNS name sandboxes reach the server at, and the Host the server accepts.
+    pub fn service_host(&self) -> String {
+        format!(
+            "{}.{}.svc.{}",
+            Self::SERVICE_NAME,
+            self.namespace,
+            self.cluster_domain
+        )
+    }
+
+    /// The MCP endpoint URL handed to the loop pod.
+    pub fn url(&self) -> String {
+        format!("http://{}:{}/mcp", self.service_host(), Self::PORT)
+    }
 }
 
 /// Per-cluster substrate facts for the codegen measure jobs: the namespace/queue/PVCs/ceiling the

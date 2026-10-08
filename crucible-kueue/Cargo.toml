@@ -1,0 +1,39 @@
+[package]
+name = "crucible-kueue"
+description = "MCP server that lets sandboxed agents submit and watch Kueue workloads in their own namespace."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "crucible-kueue"
+path = "src/bin/crucible-kueue.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+clap.workspace = true
+crucible-contract = { path = "../crucible-contract" }
+futures-util = "0.3"
+hex = "0.4"
+http = "1"
+k8s-openapi.workspace = true
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls"] }
+kube_quantity = "0.9"
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+rustls = "0.23"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["signal", "sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }

@@ -1,0 +1,31 @@
+# Deploy profile for the crucible-kueue e2e on pirate: loop pods and sandboxes in
+# crucible-system as the hub's dispatch identity, the server beside them, Jobs in
+# crucible-kueue-e2e through LocalQueue crucible-e2e.
+[cluster]
+loop_namespace   = "crucible-system"
+rig_namespace    = "crucible-system"
+service_account  = "crucible-crucible-controller"
+supervisor_image = "@SUPERVISOR_IMAGE@"
+sandbox_driver   = "kubernetes"
+
+[image]
+loop        = "@LOOP_IMAGE@"
+pull_secret = "quay-wseaton-pull"
+
+# Claude through EnMaaS on the Anthropic Messages API; the key is a Secret on the cluster.
+[env]
+ANTHROPIC_BASE_URL = "https://api.enmaas.devshift.net"
+
+[[secret_env]]
+name   = "ANTHROPIC_API_KEY"
+secret = "crucible-enmaas"
+key    = "api-key"
+
+[kueue]
+image              = "@KUEUE_IMAGE@"
+cluster            = "pirate"
+namespace          = "crucible-system"
+tenant_namespace   = "crucible-kueue-tenants"
+workload_namespace = "crucible-kueue-e2e"
+queues             = ["crucible-e2e"]
+record_writers     = ["crucible-system/crucible-hub-dispatch"]

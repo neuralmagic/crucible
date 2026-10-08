@@ -14,10 +14,10 @@ use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
     DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderProfileRequest,
     GetProviderRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
-    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, NetworkBinary,
-    NetworkCredentialBinding, NetworkEndpoint, NetworkEnforcementMode, NetworkPolicyRule,
-    NetworkTlsMode, PolicyMergeOperation, PolicyStatus, Provider,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
+    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, McpOptions,
+    NetworkAccessPreset, NetworkBinary, NetworkCredentialBinding, NetworkEndpoint,
+    NetworkEnforcementMode, NetworkPolicyRule, NetworkTlsMode, PolicyMergeOperation, PolicyStatus,
+    Provider, ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
     ProviderProfileImportItem, ResourceRequirements, RotateProviderCredentialRequest,
     SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     ServiceStatus, UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
@@ -1513,8 +1513,10 @@ pub enum EndpointProblem {
     PortRange,
     #[error("access must be read-only, read-write, or full")]
     Access,
-    #[error("protocol must be rest, websocket, or sql")]
+    #[error("protocol must be rest, websocket, sql, or mcp")]
     Protocol,
+    #[error("an mcp endpoint's access must be full (every known MCP method) or omitted")]
+    McpAccess,
     #[error("enforcement must be enforce or audit")]
     Enforcement,
     #[error("cannot set enforcement without a protocol")]
@@ -1546,7 +1548,7 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
     let enforcement = parts.get(4).copied().unwrap_or("").trim();
     let access_preset = openshell_policy::network_access_preset_from_str(access)
         .ok_or_else(|| reject(EndpointProblem::Access))?;
-    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
+    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql" | "mcp") {
         return Err(reject(EndpointProblem::Protocol));
     }
     let enforcement_mode = openshell_policy::network_enforcement_mode_from_str(enforcement)
@@ -1554,6 +1556,19 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
     if enforcement_mode != NetworkEnforcementMode::Unspecified && protocol.is_empty() {
         return Err(reject(EndpointProblem::EnforcementWithoutProtocol));
     }
+    // OpenShell rejects an MCP method wildcard, so `full` on an MCP endpoint is its
+    // method-profile switch rather than the generic `*` access preset.
+    let (access_preset, mcp) = match (protocol, access_preset) {
+        ("mcp", NetworkAccessPreset::Full | NetworkAccessPreset::Unspecified) => (
+            NetworkAccessPreset::Unspecified,
+            Some(McpOptions {
+                allow_all_known_mcp_methods: Some(true),
+                ..McpOptions::default()
+            }),
+        ),
+        ("mcp", _) => return Err(reject(EndpointProblem::McpAccess)),
+        (_, preset) => (preset, None),
+    };
     Ok(NetworkEndpoint {
         host: host.to_string(),
         port,
@@ -1561,6 +1576,7 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
         protocol: protocol.to_string(),
         enforcement: enforcement_mode.into(),
         access: access_preset.into(),
+        mcp,
         ..NetworkEndpoint::default()
     })
 }
@@ -1935,6 +1951,78 @@ pYBZ
         assert!(parse_endpoint_spec("host:443:full:ftp").is_err());
         // enforcement without a protocol segment is rejected.
         assert!(parse_endpoint_spec("host:443:full::enforce").is_err());
+    }
+
+    #[test]
+    fn an_mcp_endpoint_with_full_access_allows_every_known_mcp_method() {
+        for spec in ["svc.ns.svc:8850:full:mcp", "svc.ns.svc:8850::mcp"] {
+            let ep = parse_endpoint_spec(spec).unwrap();
+            assert_eq!(ep.protocol, "mcp");
+            assert_eq!(ep.access(), NetworkAccessPreset::Unspecified);
+            assert_eq!(
+                ep.mcp.as_ref().and_then(|m| m.allow_all_known_mcp_methods),
+                Some(true)
+            );
+        }
+    }
+
+    #[test]
+    fn an_mcp_endpoint_refuses_a_partial_access_preset() {
+        for access in ["read-only", "read-write"] {
+            let err = parse_endpoint_spec(&format!("h:8850:{access}:mcp")).unwrap_err();
+            assert!(matches!(err.problem, EndpointProblem::McpAccess), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_bound_mcp_endpoint_keeps_its_protocol_and_passes_openshell_policy_validation() {
+        let binding = EndpointCredentialBinding {
+            host: "crucible-kueue.crucible-system.svc.cluster.local".to_string(),
+            port: 8850,
+            provider: "crucible-kueue".to_string(),
+        };
+        let ops = build_merge_operations(
+            &["/usr/local/bin/claude".to_string()],
+            &["crucible-kueue.crucible-system.svc.cluster.local:8850:full:mcp".to_string()],
+            std::slice::from_ref(&binding),
+        )
+        .unwrap();
+        let Some(MergeOp::AddRule(add)) = &ops[0].operation else {
+            panic!("expected an add-rule op");
+        };
+        let rule = add.rule.clone().unwrap();
+        let ep = &rule.endpoints[0];
+        assert_eq!(ep.protocol, "mcp");
+        assert_eq!(
+            ep.credential_binding.as_ref().map(|b| b.provider.as_str()),
+            Some("crucible-kueue")
+        );
+        let merged = openshell_policy::merge_policy(
+            openshell_policy::restrictive_default_policy(),
+            &[openshell_policy::PolicyMergeOp::AddRule {
+                rule_name: add.rule_name.clone(),
+                rule,
+            }],
+        )
+        .unwrap();
+        openshell_policy::validate_sandbox_policy(&merged.policy).unwrap();
+        let merged_ep = merged
+            .policy
+            .network_policies
+            .values()
+            .flat_map(|r| r.endpoints.iter())
+            .find(|e| e.port == 8850)
+            .expect("the kueue endpoint survives the merge");
+        assert_eq!(merged_ep.protocol, "mcp");
+        assert_eq!(
+            merged_ep
+                .mcp
+                .as_ref()
+                .and_then(|m| m.allow_all_known_mcp_methods),
+            Some(true),
+            "{merged_ep:?}"
+        );
+        assert!(merged_ep.credential_binding.is_some(), "{merged_ep:?}");
     }
 
     #[test]

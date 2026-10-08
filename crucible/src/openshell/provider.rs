@@ -310,31 +310,61 @@ pub const BROKER_PROVIDER_NAME: &str = "crucible-broker";
 /// The custom (crucible-imported) profile id backing [`BROKER_PROVIDER_NAME`].
 pub const BROKER_PROFILE_ID: &str = "crucible-broker";
 
-/// The credential env key the profile declares; also the placeholder key the sandbox's
-/// `.mcp.json` header resolves through.
+/// The credential env key the profile declares; the gateway issues the sandbox its placeholder
+/// under this name.
 pub const BROKER_CRED_KEY: &str = "BROKER_TOKEN";
-
-/// The placeholder the sandbox sends in place of the broker token.
-pub fn broker_token_placeholder() -> String {
-    format!(
-        "{}{}",
-        openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
-        BROKER_CRED_KEY
-    )
-}
 
 /// The endpointless `crucible-broker` profile: one required bearer credential, no endpoints, no
 /// refresh (the token is per-run static).
 pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
+    bearer_profile(
+        BROKER_PROFILE_ID,
+        "Crucible broker",
+        "Per-run bearer token for the loop-pod provisioning broker",
+        "Broker bearer token",
+        BROKER_CRED_KEY,
+    )
+}
+
+/// The static provider carrying the run's crucible-kueue bearer token. Like the broker's, its
+/// profile is endpointless and the policy endpoint's `credential_binding` is the boundary: the
+/// sandbox holds only the placeholder, resolved at egress for the crucible-kueue Service alone.
+pub const KUEUE_PROVIDER_NAME: &str = "crucible-kueue";
+
+/// The custom profile id backing [`KUEUE_PROVIDER_NAME`].
+pub const KUEUE_PROFILE_ID: &str = "crucible-kueue";
+
+/// The credential env key [`kueue_profile`] declares; the gateway issues the sandbox its
+/// placeholder under this name.
+pub const KUEUE_CRED_KEY: &str = "KUEUE_TOKEN";
+
+/// The endpointless `crucible-kueue` profile: one required per-run bearer credential.
+pub fn kueue_profile() -> openshell_core::proto::ProviderProfile {
+    bearer_profile(
+        KUEUE_PROFILE_ID,
+        "Crucible Kueue",
+        "Per-run bearer token for the crucible-kueue MCP server",
+        "crucible-kueue bearer token",
+        KUEUE_CRED_KEY,
+    )
+}
+
+fn bearer_profile(
+    id: &str,
+    display_name: &str,
+    description: &str,
+    credential_description: &str,
+    env_var: &str,
+) -> openshell_core::proto::ProviderProfile {
     openshell_core::proto::ProviderProfile {
-        id: BROKER_PROFILE_ID.to_string(),
-        display_name: "Crucible broker".to_string(),
-        description: "Per-run bearer token for the loop-pod provisioning broker".to_string(),
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        description: description.to_string(),
         category: openshell_core::proto::ProviderProfileCategory::Agent as i32,
         credentials: vec![openshell_core::proto::ProviderProfileCredential {
             name: "token".to_string(),
-            description: "Broker bearer token".to_string(),
-            env_vars: vec![BROKER_CRED_KEY.to_string()],
+            description: credential_description.to_string(),
+            env_vars: vec![env_var.to_string()],
             required: true,
             ..Default::default()
         }],
@@ -501,6 +531,29 @@ mod tests {
         assert_eq!(PROVIDER_NAME, "ci-gcp");
         assert_eq!(PROVIDER_TYPE, "google-cloud");
         assert_eq!(CRED_KEY, "GCP_ADC_ACCESS_TOKEN");
+    }
+
+    #[test]
+    fn the_broker_and_kueue_profiles_are_endpointless_bearer_credentials_on_their_own_keys() {
+        for (profile, id, key) in [
+            (broker_profile(), BROKER_PROFILE_ID, BROKER_CRED_KEY),
+            (kueue_profile(), KUEUE_PROFILE_ID, KUEUE_CRED_KEY),
+        ] {
+            assert_eq!(profile.id, id);
+            assert!(
+                profile.endpoints.is_empty(),
+                "the policy's credential_binding is the boundary"
+            );
+            let [credential] = profile.credentials.as_slice() else {
+                panic!("one credential: {:?}", profile.credentials);
+            };
+            assert_eq!(credential.env_vars, vec![key.to_string()]);
+            assert!(credential.required);
+        }
+        assert_eq!(
+            broker_profile().credentials[0].description,
+            "Broker bearer token"
+        );
     }
 
     #[test]

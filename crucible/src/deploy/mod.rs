@@ -10,6 +10,7 @@
 //! naming that one target (see [`render::RenderInput::from_manifest`]).
 
 mod controller;
+pub mod kueue;
 pub mod profile;
 mod render;
 
@@ -117,6 +118,20 @@ pub fn render_turn_cmd(profile_path: &Path, opts: &render::TurnOpts) -> Result<(
     let yaml = render_turn(&profile, opts)?;
     print!("{yaml}");
     Ok(())
+}
+
+/// Emit the crucible-kueue server's YAML, rendered from the profile's `[kueue]` table.
+pub fn render_kueue_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+    let profile = DeployProfile::load(profile_path)?;
+    print!("{}", kueue::render(&profile, opts)?);
+    Ok(())
+}
+
+/// Render the crucible-kueue server then server-side apply it.
+pub fn apply_kueue_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+    let profile = DeployProfile::load(profile_path)?;
+    let yaml = kueue::render(&profile, opts)?;
+    forge::kube::apply_yaml(&yaml).context("applying the rendered crucible-kueue deployment")
 }
 
 /// Render the controller then server-side apply it (same emit-vs-apply split as the run's `deploy apply`).

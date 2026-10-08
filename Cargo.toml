@@ -8,6 +8,7 @@ members = [
     "forge",
     "crucible-controller",
     "crux",
+    "crucible-kueue",
     "capability",
     "xtask",
 ]
@@ -56,6 +57,10 @@ croner = "3"
 jsonschema = { version = "0.50", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
 url = "2"
+# One Kubernetes client and API pin for every crate that talks to a cluster, so the engine,
+# controller, forge, and crucible-kueue never link two kube stacks. Members add features.
+kube = { version = "4.0", default-features = false }
+k8s-openapi = { version = "0.28", features = ["v1_32"] }
 percent-encoding = "2"
 
 [profile.release]

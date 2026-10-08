@@ -145,6 +145,14 @@ impl RunRenderOpts {
         }
     }
 
+    /// The run's wall-clock ceiling in seconds, when it states one.
+    pub(crate) fn max_time_secs(&self) -> Option<u64> {
+        match self {
+            RunRenderOpts::Loop { .. } => None,
+            RunRenderOpts::Playbook { max_time, .. } => Some(max_time.secs()),
+        }
+    }
+
     /// The harness + model this run renders with, whichever kind it is.
     pub(crate) fn agent(&self) -> &AgentSelection {
         match self {
@@ -728,6 +736,29 @@ pub async fn dispatch_run(
             .merge(extra)
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
     }
+    // The crucible-kueue grant: its token joins the run Secret, its record is created with the pod.
+    let kueue_record = match crate::runs::workpod::kueue::profile_cfg(cfg).await? {
+        Some(kueue) => {
+            let scope = crate::runs::workpod::kueue::RunScope {
+                cluster: &cluster,
+                run_id,
+                pod_name: &pod_name,
+                now: crate::clock::unix_secs(),
+                max_time_secs: opts.max_time_secs(),
+            };
+            let token = crate::runs::workpod::kueue::Token::mint()?;
+            match crate::runs::workpod::kueue::grant(&kueue, &scope, token)? {
+                Some(grant) => {
+                    delivery.merge(grant.delivery).map_err(|e| {
+                        anyhow::anyhow!("folding the crucible-kueue grant into the run's: {e}")
+                    })?;
+                    Some((grant.tenant_namespace, grant.record))
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
     // A run pushing as the App has to have the identity, so a failed resolve fails the dispatch.
     // Everywhere else it is a default, and a failure degrades to the pack's own.
     let git_identity = match cfg.github_app.as_ref() {
@@ -776,6 +807,14 @@ pub async fn dispatch_run(
     let rendered = tokio::task::spawn_blocking(move || job.render())
         .await
         .context("joining the loop-run render task")?;
+    let rendered = match (&kueue_record, rendered) {
+        (Some((ns, record)), Ok(docs)) => dispatcher
+            .create_configmap(&cluster, ns, record.clone())
+            .await
+            .context("creating the run's crucible-kueue tenant record")
+            .map(|()| docs),
+        (_, rendered) => rendered,
+    };
     let issue_for_cm = issue_key.to_string();
     // Create the pod FIRST (so its UID exists to owner-ref the CM to), then the CM. A pack pod waits
     // in ContainerCreating on its init-container's ConfigMap mount until the CM lands a beat later; the
@@ -853,6 +892,16 @@ pub async fn dispatch_run(
             })
         }
         Err(e) => {
+            if let Some((ns, record)) = &kueue_record
+                && let Some(record_name) = record.metadata.name.as_deref()
+                && let Err(cleanup) = dispatcher.delete_configmap(&cluster, ns, record_name).await
+            {
+                tracing::warn!(
+                    error = format!("{cleanup:#}"),
+                    record = record_name,
+                    "a failed launch left its crucible-kueue tenant record; it expires on its own"
+                );
+            }
             // Retain a failed-to-launch row with the real reason (swept after retention), then let the
             // reconcile see the error and retry the issue from `awaiting-approval`.
             let reason = format!("{e:#}");
@@ -908,6 +957,7 @@ pub async fn collect_run_pod(
     db: &Db,
     dispatcher: &dyn PodDispatcher,
     hub_namespace: &str,
+    kueue: Option<&crucible::deploy::profile::KueueCfg>,
     pod_name: &str,
     disposition: RunDisposition,
 ) -> Result<()> {
@@ -929,6 +979,19 @@ pub async fn collect_run_pod(
         crate::runs::workpod::row_namespace(dispatcher, &row.cluster, hub_namespace).await
     {
         let _ = dispatcher.delete(&row.cluster, &ns, pod_name).await;
+    }
+    if let Some(kueue) = kueue.filter(|k| k.cluster == row.cluster) {
+        let record = crucible_contract::kueue::record_name(pod_name);
+        if let Err(e) = dispatcher
+            .delete_configmap(&row.cluster, kueue.tenant_namespace.as_str(), &record)
+            .await
+        {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                record,
+                "deleting the run's crucible-kueue tenant record failed; it expires on its own"
+            );
+        }
     }
     Ok(())
 }

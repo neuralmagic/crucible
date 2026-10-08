@@ -435,8 +435,8 @@ pub(crate) struct RenderTurnArgs {
 #[derive(clap::Args)]
 pub(crate) struct DeployArgs {
     /// The domain manifest (composite or single-domain), the run: components, broker, judge, world,
-    /// `[deploy]` targets. Required unless `--controller` is set (the controller has no per-run
-    /// manifest; it renders from the profile's `[controller]` table alone).
+    /// `[deploy]` targets. Required unless `--controller` or `--kueue` is set (those have no per-run
+    /// manifest; they render from the profile's `[controller]` or `[kueue]` table alone).
     #[arg(long)]
     pub manifest: Option<PathBuf>,
     /// The per-cluster deploy profile (the environment: namespaces, secrets, resources, loop image).
@@ -459,6 +459,10 @@ pub(crate) struct DeployArgs {
     /// projected from the profile's `[controller]` table, no `--manifest` needed.
     #[arg(long)]
     pub controller: bool,
+    /// Render the crucible-kueue MCP server (Deployment, Service, ServiceAccount, RBAC, tenants
+    /// namespace) from the profile's `[kueue]` table, no `--manifest` needed.
+    #[arg(long, conflicts_with = "controller")]
+    pub kueue: bool,
     /// Pack delivery: the manifest is a controller-drafted PACK on the state PVC, not a domain baked
     /// into the loop image. Emit a ConfigMap carrying the pack files and stage it (init-container →
     /// emptyDir) at the in-pod domain path, so `crucible run` finds the manifest. Set by the

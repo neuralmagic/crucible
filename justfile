@@ -174,6 +174,13 @@ kind-e2e:
 revise-loop-e2e:
     scripts/revise-loop-e2e.sh
 
+# End-to-end proof that a sandboxed agent run submits a Kueue Job through crucible-kueue: a local
+# controller dispatches e2e/kueue/pack onto pirate and the script checks the Job on the cluster.
+# Images come from Containerfile.runtime-selfcontained and Containerfile.kueue built from this
+# checkout. KEEP=1 leaves the controller state and the Job.
+kueue-e2e context loop_image kueue_image:
+    CONTEXT={{context}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} scripts/kueue-e2e.sh
+
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
 # the full production submit/stream/parse path and print the typed result JSON. `cluster` is a
 # [clusters.<name>] entry in the deploy profile; pass `context` to run it against a local

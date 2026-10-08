@@ -73,8 +73,8 @@ jsonschema.workspace = true
 url = "2"
 # The daemon's pod watch (lane D only — no other crate needs the async kube client;
 # `forge::kube` is the sync, block_on-wrapped client the rest of the engine uses).
-kube = { version = "4.0", default-features = false, features = ["client", "runtime", "rustls-tls"] }
-k8s-openapi = { version = "0.28", features = ["v1_32"] }
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi.workspace = true
 futures-util = "0.3"
 # Parse the rendered loop-pod YAML in the kube launch path (the maintained serde_yaml fork the
 # `crucible`/`forge` deploy renderers already use) so the launcher can stamp the issue-key

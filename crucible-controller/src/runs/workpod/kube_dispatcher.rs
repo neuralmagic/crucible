@@ -37,8 +37,21 @@ impl PodDispatcher for KubePodDispatcher {
         let api: kube::Api<ConfigMap> = kube::Api::namespaced(client, namespace);
         api.create(&kube::api::PostParams::default(), &cm)
             .await
-            .context("creating the pack ConfigMap")?;
+            .with_context(|| {
+                let name = cm.metadata.name.as_deref().unwrap_or_default();
+                format!("creating ConfigMap {namespace}/{name}")
+            })?;
         Ok(())
+    }
+
+    async fn delete_configmap(&self, cluster: &str, namespace: &str, name: &str) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        let api: kube::Api<ConfigMap> = kube::Api::namespaced(client, namespace);
+        match api.delete(name, &kube::api::DeleteParams::default()).await {
+            Ok(_) => Ok(()),
+            Err(kube::Error::Api(s)) if s.code == 404 => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("deleting ConfigMap {namespace}/{name}")),
+        }
     }
 
     async fn create_secret(

@@ -1,0 +1,12 @@
+# The crucible-kueue e2e pack: one sandboxed agent turn that submits a Job through the
+# `kueue` MCP server the controller granted this run, and waits for it to finish.
+[agent]
+backend       = "openshell"
+harness       = "claude"
+model         = "claude-sonnet-5"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-go-cgo-cc@sha256:33cc058e97a0f9fded61d6c2a4584cc189854a0c6e0576215e8f6c0ba2a44628"
+goal          = "Submit a Kueue Job through the kueue MCP server and confirm it succeeded."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

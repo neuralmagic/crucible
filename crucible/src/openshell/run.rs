@@ -385,11 +385,19 @@ async fn try_turn(
     //     token never enters the sandbox and a leaked placeholder resolves nowhere else.
     let broker_provider = match args.broker_token.as_deref() {
         Some(token) if args.broker.enabled => {
-            ensure_broker_provider(&gw, token).await?;
+            ensure_static_provider(&gw, &StaticProvider::broker(), token).await?;
             true
         }
         _ => false,
     };
+
+    // 2d. The run's crucible-kueue grant, minted by the controller: the same placeholder
+    //     hardening as the broker token, bound to the crucible-kueue Service endpoint.
+    let kueue = crate::openshell::kueue::KueueAccess::from_env()
+        .context("reading the run's crucible-kueue grant")?;
+    if let Some(k) = &kueue {
+        ensure_static_provider(&gw, &StaticProvider::kueue(), k.token()).await?;
+    }
 
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
     //    turn killed mid-create, or whose cleanup delete failed, leaves the name behind, and a
@@ -424,6 +432,9 @@ async fn try_turn(
     }
     if broker_provider {
         providers.push(provider::BROKER_PROVIDER_NAME.to_string());
+    }
+    if kueue.is_some() {
+        providers.push(provider::KUEUE_PROVIDER_NAME.to_string());
     }
     gw.create_sandbox(
         &name,
@@ -567,6 +578,13 @@ async fn try_turn(
             })
             .into_iter()
             .collect();
+        if let Some(k) = &kueue {
+            let ep = k.egress_endpoint();
+            if !endpoints.contains(&ep) {
+                endpoints.push(ep);
+            }
+            credential_bindings.push(k.credential_binding());
+        }
         if auth == AuthProvider::Vertex {
             credential_bindings.extend(policy::VERTEX_CREDENTIAL_HOSTS.iter().map(|host| {
                 grpc::EndpointCredentialBinding {
@@ -647,9 +665,15 @@ async fn try_turn(
         //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
         //     a fresh token naming this sandbox and its workdir.
         let seed_token = if broker_provider {
-            Some(provider::broker_token_placeholder())
+            Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
         } else {
             args.broker_token.clone()
+        };
+        let kueue_placeholder = match &kueue {
+            Some(_) => {
+                Some(issued_placeholder(&gw, &name, provider::KUEUE_CRED_KEY, &cancel).await?)
+            }
+            None => None,
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -669,6 +693,13 @@ async fn try_turn(
             url,
             token: Some(token),
         }));
+        if let Some(k) = &kueue {
+            servers.push(McpServer {
+                name: crate::openshell::kueue::MCP_SERVER_NAME,
+                url: k.url(),
+                token: kueue_placeholder.as_deref(),
+            });
+        }
         let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;
@@ -887,30 +918,86 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     }
 }
 
-/// Import the endpointless broker profile and set this run's token on the `crucible-broker`
-/// provider, update-or-create like the Vertex provider: the token changes every run, the
-/// provider object survives across runs on a shared gateway.
-async fn ensure_broker_provider(gw: &Gateway, token: &str) -> Result<()> {
-    gw.ensure_provider_profile(provider::broker_profile())
+#[derive(Debug, thiserror::Error)]
+pub enum IssuedPlaceholderError {
+    #[error(
+        "the gateway issued no {key} placeholder to sandbox {sandbox}; an endpoint-bound \
+         credential resolves only through the placeholder issued to the workload"
+    )]
+    Missing { key: &'static str, sandbox: String },
+}
+
+/// The placeholder the gateway issued the sandbox for provider credential `key`. Endpoint-bound
+/// credentials resolve only through this revision-scoped value, never the canonical
+/// `openshell:resolve:env:<key>` form, so seeded configs must carry what the workload was given.
+async fn issued_placeholder(
+    gw: &Gateway,
+    sandbox: &str,
+    key: &'static str,
+    cancel: &CancellationToken,
+) -> Result<String> {
+    let command = vec!["printenv".to_string(), key.to_string()];
+    let mut issued: Option<String> = None;
+    gw.exec(sandbox, &command, cancel, |line| {
+        let value = line.trim();
+        if issued.is_none() && value.starts_with(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC)
+        {
+            issued = Some(value.to_string());
+        }
+    })
+    .await
+    .with_context(|| format!("reading the {key} placeholder issued to sandbox {sandbox}"))?;
+    issued.ok_or_else(|| {
+        IssuedPlaceholderError::Missing {
+            key,
+            sandbox: sandbox.to_string(),
+        }
+        .into()
+    })
+}
+
+/// An endpointless static-credential provider: its profile, its provider name, and the credential
+/// key its placeholder resolves through.
+struct StaticProvider {
+    profile: openshell_core::proto::ProviderProfile,
+    name: &'static str,
+    cred_key: &'static str,
+}
+
+impl StaticProvider {
+    fn broker() -> Self {
+        Self {
+            profile: provider::broker_profile(),
+            name: provider::BROKER_PROVIDER_NAME,
+            cred_key: provider::BROKER_CRED_KEY,
+        }
+    }
+
+    fn kueue() -> Self {
+        Self {
+            profile: provider::kueue_profile(),
+            name: provider::KUEUE_PROVIDER_NAME,
+            cred_key: provider::KUEUE_CRED_KEY,
+        }
+    }
+}
+
+/// Import the endpointless profile and set this run's token on the provider, update-or-create like
+/// the Vertex provider: the token changes every run, the provider object survives across runs on a
+/// shared gateway.
+async fn ensure_static_provider(gw: &Gateway, p: &StaticProvider, token: &str) -> Result<()> {
+    let profile_id = p.profile.id.clone();
+    gw.ensure_provider_profile(p.profile.clone())
         .await
-        .context("importing the broker provider profile")?;
-    if gw.provider_exists(provider::BROKER_PROVIDER_NAME).await {
-        gw.update_provider(
-            provider::BROKER_PROVIDER_NAME,
-            provider::BROKER_CRED_KEY,
-            token,
-        )
-        .await
-        .context("updating the broker provider token")
+        .with_context(|| format!("importing the {} provider profile", p.name))?;
+    if gw.provider_exists(p.name).await {
+        gw.update_provider(p.name, p.cred_key, token)
+            .await
+            .with_context(|| format!("updating the {} provider token", p.name))
     } else {
-        gw.create_static_provider(
-            provider::BROKER_PROVIDER_NAME,
-            provider::BROKER_CRED_KEY,
-            token,
-            provider::BROKER_PROFILE_ID,
-        )
-        .await
-        .context("creating the broker provider")
+        gw.create_static_provider(p.name, p.cred_key, token, &profile_id)
+            .await
+            .with_context(|| format!("creating the {} provider", p.name))
     }
 }
 

@@ -1382,7 +1382,7 @@ dependencies = [
  "antlr4rust",
  "chrono",
  "lazy_static",
- "nom",
+ "nom 7.1.3",
  "pastey",
  "regex",
  "serde",
@@ -1894,7 +1894,7 @@ dependencies = [
  "opentelemetry-otlp 0.32.0",
  "opentelemetry_sdk 0.32.1",
  "reqwest 0.13.4",
- "rmcp 3.1.2",
+ "rmcp 3.5.1",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -2022,6 +2022,32 @@ dependencies = [
  "reqwest 0.13.4",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "crucible-kueue"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "crucible-contract",
+ "futures-util",
+ "hex",
+ "http 1.4.2",
+ "k8s-openapi",
+ "kube",
+ "kube_quantity",
+ "rmcp 3.5.1",
+ "rustls 0.23.45",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2852,7 +2878,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "74fef4569247a5f429d9156b9d0a2599914385dd189c539334c625d8099d90ab"
 dependencies = [
  "futures-core",
- "nom",
+ "nom 7.1.3",
  "pin-project-lite",
 ]
 
@@ -4465,6 +4491,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kube_quantity"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a5006102fbd11aa86b196a0c76bda5e2ae0cd71d4c9126c9b8bdfe7c7b7a7158"
+dependencies = [
+ "k8s-openapi",
+ "nom 8.0.0",
+ "rust_decimal",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4991,6 +5029,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "nonempty"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5153,7 +5200,7 @@ version = "5.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "51e219e79014df21a225b1860a479e2dcd7cbd9130f4defd4bd0e191ea31d67d"
 dependencies = [
- "base64 0.21.7",
+ "base64 0.22.1",
  "chrono",
  "getrandom 0.2.17",
  "http 1.4.2",
@@ -6791,9 +6838,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp"
-version = "3.1.2"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8dddc5b1924b9a59fba420166160ca2c4663a4e01803e52eda33070f56d63c8"
+checksum = "ab5023804cbe0304cbe06197ac16e645a0a0d0ffa2953bf735c15c2fa0213350"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6803,10 +6850,12 @@ dependencies = [
  "http 1.4.2",
  "http-body 1.0.1",
  "http-body-util",
+ "indexmap 2.14.0",
  "pastey",
  "pin-project-lite",
  "rand 0.10.1",
- "rmcp-macros 3.1.2",
+ "reqwest 0.13.4",
+ "rmcp-macros 3.5.1",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -6835,9 +6884,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "3.1.2"
+version = "3.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6898e24cd16342b59bfa8a53c2c04b9cf62fc8a2cfea57b9c038b09984bfc521"
+checksum = "a1da498700030856ba63114bceefa30ba21f5e278cb975e5b9de3529fe842b40"
 dependencies = [
  "darling 0.24.0",
  "proc-macro2",
@@ -6947,6 +6996,23 @@ checksum = "42ffa149f6aa81b58a5b3011d01a857c4ed12c7a732d2c51947a4c7c692185f0"
 dependencies = [
  "sha2 0.11.0",
  "walkdir",
+]
+
+[[package]]
+name = "rust_decimal"
+version = "1.43.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7653272e75dcac41dc199fbea6f5797633994fafd339943c06c9af16bf29cd3a"
+dependencies = [
+ "arrayvec 0.7.8",
+ "borsh",
+ "bytes",
+ "num-traits",
+ "rand 0.8.8",
+ "rand 0.9.4",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -7364,7 +7430,7 @@ checksum = "5897b4c3faadadd35fdb6689f015641f3bc481d5adaaac56231ea15aeb243db3"
 dependencies = [
  "ahash",
  "annotate-snippets 0.12.5",
- "base64 0.21.7",
+ "base64 0.22.1",
  "encoding_rs_io",
  "getrandom 0.3.4",
  "granit-parser",
@@ -9133,7 +9199,7 @@ dependencies = [
  "clap",
  "keyring",
  "reqwest 0.13.4",
- "rmcp 3.1.2",
+ "rmcp 3.5.1",
  "serde",
  "serde_json",
  "tokio",
@@ -9479,6 +9545,7 @@ dependencies = [
  "cfg-if",
  "once_cell",
  "rustversion",
+ "serde",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
 ]
