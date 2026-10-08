@@ -225,43 +225,23 @@ fn principal(parts: &http::request::Parts) -> Result<&Principal, ToolError> {
         .ok_or(ToolError::NoCaller)
 }
 
+/// The annotations only the server writes: the plan hash and, for a run, the sandbox that acted.
+fn stamp(object: &mut DynamicObject, plan_hash: &str, actor: Option<&str>) {
+    let annotations = object
+        .metadata
+        .annotations
+        .get_or_insert_with(BTreeMap::new);
+    annotations.insert(PLAN_HASH_ANNOTATION.into(), plan_hash.into());
+    if let Some(actor) = actor {
+        annotations.insert(ACTOR_ANNOTATION.into(), actor.into());
+    }
+}
+
 /// Whether `caller` created `obj`: crucible-kueue's managed label and the caller's run label.
 fn owns(caller: &Caller, obj: &DynamicObject) -> bool {
     let labels = obj.metadata.labels.as_ref();
     let label = |key: &str| labels.and_then(|l| l.get(key)).map(String::as_str);
     label(MANAGED_LABEL) == Some(MANAGED_VALUE) && label(RUN_LABEL) == Some(caller.run_id.as_str())
-}
-
-/// Records `actor` on the manifest, or removes whatever the caller put there when it has none.
-fn stamp_actor(manifest: &mut Value, actor: Option<&str>) {
-    let Some(metadata) = manifest.as_object_mut().map(|object| {
-        object
-            .entry("metadata")
-            .or_insert_with(|| Value::Object(serde_json::Map::new()))
-    }) else {
-        return;
-    };
-    let Some(metadata) = metadata.as_object_mut() else {
-        return;
-    };
-    match actor {
-        Some(actor) => {
-            let annotations = metadata
-                .entry("annotations")
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            if let Some(annotations) = annotations.as_object_mut() {
-                annotations.insert(ACTOR_ANNOTATION.into(), Value::String(actor.into()));
-            }
-        }
-        None => {
-            if let Some(annotations) = metadata
-                .get_mut("annotations")
-                .and_then(Value::as_object_mut)
-            {
-                annotations.remove(ACTOR_ANNOTATION);
-            }
-        }
-    }
 }
 
 fn owner_uids(obj: &DynamicObject, pods: &[Pod]) -> Vec<String> {
@@ -690,6 +670,7 @@ impl KueueMcp {
         &self,
         caller: &Caller,
         n: &Normalized,
+        actor: Option<&str>,
         dry_run: bool,
     ) -> Result<DynamicObject, ToolError> {
         let mut object: DynamicObject =
@@ -697,11 +678,7 @@ impl KueueMcp {
                 what: format!("normalized {}", n.kind.kind()),
                 source,
             })?;
-        object
-            .metadata
-            .annotations
-            .get_or_insert_with(BTreeMap::new)
-            .insert(PLAN_HASH_ANNOTATION.into(), n.plan_hash.clone());
+        stamp(&mut object, &n.plan_hash, actor);
         let pp = PostParams {
             dry_run,
             field_manager: Some(FIELD_MANAGER.into()),
@@ -1188,10 +1165,9 @@ impl KueueMcp {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
-                let mut manifest = args.manifest;
-                stamp_actor(&mut manifest, identity(&parts)?.actor.as_deref());
-                let (n, cq) = self.plan(&c, &args.queue, manifest).await?;
-                self.create(&c, &n, true).await?;
+                let actor = identity(&parts)?.actor.as_deref();
+                let (n, cq) = self.plan(&c, &args.queue, args.manifest).await?;
+                self.create(&c, &n, actor, true).await?;
                 let totals: BTreeMap<String, String> =
                     n.total_requests().into_iter().map(|(k, v)| (k, v.to_string())).collect();
                 let pod_sets: Vec<Value> = n
@@ -1237,16 +1213,15 @@ impl KueueMcp {
                 let parts = parts.ok_or(ToolError::NoCaller)?;
                 let c = caller(parts, args.namespace.as_deref())?;
                 c.require_submitter("workload_submit")?;
-                let mut manifest = args.manifest;
-                stamp_actor(&mut manifest, identity(parts)?.actor.as_deref());
-                let (n, _) = self.plan(&c, &args.queue, manifest).await?;
+                let actor = identity(parts)?.actor.as_deref();
+                let (n, _) = self.plan(&c, &args.queue, args.manifest).await?;
                 if n.plan_hash != args.plan_hash {
                     return Err(ToolError::HashMismatch {
                         got: args.plan_hash,
                         want: n.plan_hash,
                     });
                 }
-                match self.create(&c, &n, false).await {
+                match self.create(&c, &n, actor, false).await {
                     Ok(obj) => {
                         tracing::info!(kind = n.kind.kind(), name = %n.name, namespace = %c.namespace, run = %c.run_id, "workload submitted");
                         let task = new_task(&c.namespace, n.kind, &n.name, &obj);
@@ -1560,30 +1535,36 @@ mod tests {
     use crate::server::*;
 
     #[test]
-    fn the_actor_is_the_servers_to_stamp() {
-        let mut manifest = json!({"kind": "Job", "metadata": {"name": "j"}});
-        stamp_actor(&mut manifest, Some("spiffe://example.crucible/s1"));
+    fn the_server_stamps_the_plan_hash_and_a_runs_actor() {
+        let object = || -> DynamicObject {
+            serde_json::from_value(json!({
+                "apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "j", "annotations": {"keep": "x"}},
+            }))
+            .unwrap()
+        };
+        let mut run = object();
+        stamp(&mut run, "h1", Some("spiffe://example.crucible/s1"));
         assert_eq!(
-            manifest["metadata"]["annotations"][ACTOR_ANNOTATION],
-            "spiffe://example.crucible/s1"
+            run.metadata.annotations.unwrap(),
+            BTreeMap::from([
+                ("keep".to_string(), "x".to_string()),
+                (PLAN_HASH_ANNOTATION.to_string(), "h1".to_string()),
+                (
+                    ACTOR_ANNOTATION.to_string(),
+                    "spiffe://example.crucible/s1".to_string()
+                ),
+            ])
         );
-
-        let mut forged =
-            json!({"metadata": {"annotations": {ACTOR_ANNOTATION: "spiffe://other", "keep": "x"}}});
-        stamp_actor(&mut forged, Some("spiffe://example.crucible/s1"));
-        assert_eq!(
-            forged["metadata"]["annotations"],
-            json!({ACTOR_ANNOTATION: "spiffe://example.crucible/s1", "keep": "x"})
+        let mut person = object();
+        stamp(&mut person, "h1", None);
+        assert!(
+            !person
+                .metadata
+                .annotations
+                .unwrap()
+                .contains_key(ACTOR_ANNOTATION)
         );
-        stamp_actor(&mut forged, None);
-        assert_eq!(forged["metadata"]["annotations"], json!({"keep": "x"}));
-
-        let mut bare = json!({"kind": "Job"});
-        stamp_actor(&mut bare, None);
-        assert_eq!(bare, json!({"kind": "Job", "metadata": {}}));
-        let mut not_an_object = json!([1]);
-        stamp_actor(&mut not_an_object, Some("a"));
-        assert_eq!(not_an_object, json!([1]));
     }
 
     #[test]

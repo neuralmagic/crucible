@@ -341,7 +341,7 @@ fn job(name: &str) -> Value {
     json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
-        "metadata": {"name": name, "annotations": {"crucible.dev/actor": "forged-by-the-agent"}},
+        "metadata": {"name": name},
         "spec": {
             "backoffLimit": 0,
             "ttlSecondsAfterFinished": 300,
@@ -422,6 +422,23 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
         "the refusal names the rule: {refusal}"
     );
 
+    let mut forged = job(&name);
+    forged["metadata"]["annotations"] = json!({"crucible.dev/actor": "forged-by-the-agent"});
+    let refused = call(
+        &client,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": forged}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert!(
+        refused["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("reserved for the server")),
+        "an agent cannot set the actor annotation: {refused}"
+    );
+
     let plan = call(
         &client,
         "workload_plan",
@@ -463,7 +480,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
     assert_eq!(
         annotations.get("crucible.dev/actor").map(String::as_str),
         Some(cluster::spiffe_id().as_str()),
-        "the policy replaced the agent's forged actor with the token's act.sub"
+        "the server stamps the token's act.sub as the actor"
     );
 
     collect_run(&pool).await;
