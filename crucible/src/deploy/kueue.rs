@@ -37,6 +37,7 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
         Ok(())
     };
     push("tenants Namespace", yaml(&tenant_namespace(cfg)))?;
+    push("workload Namespace", yaml(&workload_namespace(cfg)))?;
     push("ServiceAccount", yaml(&service_account(cfg)))?;
     push("Deployment", yaml(&deployment(cfg, &image, pull_secret)))?;
     push("Service", yaml(&service(cfg)))?;
@@ -110,6 +111,19 @@ fn role_ref(kind: &str, name: &str) -> rbac::RoleRef {
 fn tenant_namespace(cfg: &KueueCfg) -> core::Namespace {
     core::Namespace {
         metadata: meta(cfg.tenant_namespace.as_str(), None),
+        ..Default::default()
+    }
+}
+
+/// Where agents' workloads run, under Pod Security `restricted`.
+fn workload_namespace(cfg: &KueueCfg) -> core::Namespace {
+    let mut metadata = meta(cfg.workload_namespace.as_str(), None);
+    metadata.labels.get_or_insert_with(BTreeMap::new).insert(
+        "pod-security.kubernetes.io/enforce".to_string(),
+        "restricted".to_string(),
+    );
+    core::Namespace {
+        metadata,
         ..Default::default()
     }
 }
@@ -427,6 +441,16 @@ mod tests {
         );
         find(&docs, "ServiceAccount", "crucible-kueue");
         find(&docs, "Namespace", "crucible-kueue-tenants");
+    }
+
+    #[test]
+    fn the_workload_namespace_enforces_restricted_pod_security() {
+        let docs = docs(PROFILE);
+        let ns = find(&docs, "Namespace", "crucible-kueue-e2e");
+        assert_eq!(
+            ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"],
+            "restricted"
+        );
     }
 
     #[test]
