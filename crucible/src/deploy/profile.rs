@@ -328,6 +328,12 @@ pub struct Cluster {
     /// pod the loop SA's token creates.
     #[serde(default)]
     pub sandbox_service_account: Option<String>,
+    /// Namespace OpenShell sandbox and supervisor pods run in. It must be one no loop pod or pack
+    /// can create pods in: a pod there carrying another sandbox's id annotation would be issued
+    /// that sandbox's SPIFFE ID. Unset puts sandboxes in `loop_namespace`, and the controller
+    /// then issues no agent tokens.
+    #[serde(default)]
+    pub sandbox_namespace: Option<KubeName>,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]
@@ -512,6 +518,13 @@ impl Cluster {
         }
     }
 
+    /// The namespace sandbox and supervisor pods run in: `sandbox_namespace`, else the loop's.
+    pub fn sandbox_namespace(&self) -> &str {
+        self.sandbox_namespace
+            .as_ref()
+            .map_or(self.loop_namespace.as_str(), KubeName::as_str)
+    }
+
     /// The service account sandbox pods run as: `sandbox_service_account`, else the loop's.
     pub fn sandbox_service_account(&self) -> &str {
         self.sandbox_service_account
@@ -671,11 +684,64 @@ pub struct Secrets {
     pub push_authfile: Option<String>,
 }
 
+/// Two profile fields that must name different namespaces name the same one.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{first} and {second} are both {namespace:?}; they must be different namespaces")]
+pub struct NamespaceOverlap {
+    pub first: &'static str,
+    pub second: &'static str,
+    pub namespace: String,
+}
+
 impl DeployProfile {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading deploy profile {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing deploy profile {}", path.display()))
+        let profile: Self = toml::from_str(&text)
+            .with_context(|| format!("parsing deploy profile {}", path.display()))?;
+        profile
+            .check_namespaces()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        Ok(profile)
+    }
+
+    /// Refuse namespaces that must be separate trust domains but coincide: the crucible-kueue
+    /// tenant records and workloads, and the sandbox namespace, each apart from where loop pods,
+    /// rigs, and the crucible-kueue server run, and from each other.
+    pub fn check_namespaces(&self) -> Result<(), NamespaceOverlap> {
+        let mut guarded: Vec<(&'static str, &str)> = Vec::new();
+        let mut hosts: Vec<(&'static str, &str)> = vec![
+            (
+                "cluster.loop_namespace",
+                self.cluster.loop_namespace.as_str(),
+            ),
+            ("cluster.rig_namespace", self.cluster.rig_namespace.as_str()),
+        ];
+        if let Some(kueue) = &self.kueue {
+            hosts.push(("kueue.namespace", kueue.namespace.as_str()));
+            guarded.push(("kueue.tenant_namespace", kueue.tenant_namespace.as_str()));
+            guarded.push((
+                "kueue.workload_namespace",
+                kueue.workload_namespace.as_str(),
+            ));
+        }
+        if let Some(sandbox) = &self.cluster.sandbox_namespace {
+            guarded.push(("cluster.sandbox_namespace", sandbox.as_str()));
+        }
+        for (i, &(first, ns)) in guarded.iter().enumerate() {
+            let clash = hosts
+                .iter()
+                .chain(guarded[i + 1..].iter())
+                .find(|(_, other)| *other == ns);
+            if let Some(&(second, _)) = clash {
+                return Err(NamespaceOverlap {
+                    first,
+                    second,
+                    namespace: ns.to_string(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Load the profile and fold in the fleet file's `[clusters.<name>]` entries. The fleet file
@@ -1028,5 +1094,127 @@ mod tests {
         );
         let p: DeployProfile = toml::from_str(&text).expect("parses");
         assert!(p.measure_cluster().expect("valid").is_some());
+    }
+
+    fn kueue_profile(cluster_extra: &str, kueue_extra: &str) -> DeployProfile {
+        toml::from_str(&format!(
+            r#"
+            [cluster]
+            loop_namespace = "loops"
+            rig_namespace = "rig"
+            service_account = "crucible-spoke"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            {cluster_extra}
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "pull"
+            [kueue]
+            image = "registry.example.com/crucible-kueue:latest"
+            namespace = "kueue-server"
+            record_writers = ["loops/crucible-hub-dispatch"]
+            {kueue_extra}
+            "#
+        ))
+        .expect("profile parses")
+    }
+
+    #[test]
+    fn separate_namespaces_pass_the_overlap_check() {
+        kueue_profile(
+            r#"sandbox_namespace = "sandboxes""#,
+            r#"tenant_namespace = "tenants"
+               workload_namespace = "workloads""#,
+        )
+        .check_namespaces()
+        .expect("all distinct");
+    }
+
+    #[test]
+    fn a_guarded_namespace_shared_with_another_is_refused_naming_both_fields() {
+        let cases = [
+            (
+                "",
+                "tenant_namespace = \"loops\"\nworkload_namespace = \"w\"",
+                ("kueue.tenant_namespace", "cluster.loop_namespace", "loops"),
+            ),
+            (
+                "",
+                "tenant_namespace = \"rig\"\nworkload_namespace = \"w\"",
+                ("kueue.tenant_namespace", "cluster.rig_namespace", "rig"),
+            ),
+            (
+                "",
+                "tenant_namespace = \"kueue-server\"\nworkload_namespace = \"w\"",
+                ("kueue.tenant_namespace", "kueue.namespace", "kueue-server"),
+            ),
+            (
+                "",
+                "tenant_namespace = \"t\"\nworkload_namespace = \"loops\"",
+                (
+                    "kueue.workload_namespace",
+                    "cluster.loop_namespace",
+                    "loops",
+                ),
+            ),
+            (
+                "",
+                "tenant_namespace = \"same\"\nworkload_namespace = \"same\"",
+                ("kueue.tenant_namespace", "kueue.workload_namespace", "same"),
+            ),
+            (
+                "sandbox_namespace = \"loops\"",
+                "tenant_namespace = \"t\"\nworkload_namespace = \"w\"",
+                (
+                    "cluster.sandbox_namespace",
+                    "cluster.loop_namespace",
+                    "loops",
+                ),
+            ),
+            (
+                "sandbox_namespace = \"w\"",
+                "tenant_namespace = \"t\"\nworkload_namespace = \"w\"",
+                ("kueue.workload_namespace", "cluster.sandbox_namespace", "w"),
+            ),
+        ];
+        for (cluster, kueue, (first, second, ns)) in cases {
+            assert_eq!(
+                kueue_profile(cluster, kueue).check_namespaces(),
+                Err(NamespaceOverlap {
+                    first,
+                    second,
+                    namespace: ns.to_string(),
+                }),
+                "{cluster} / {kueue}"
+            );
+        }
+    }
+
+    #[test]
+    fn loading_a_profile_runs_the_overlap_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [cluster]
+            loop_namespace = "loops"
+            rig_namespace = "rig"
+            service_account = "crucible-spoke"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            sandbox_namespace = "rig"
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "pull"
+            "#,
+        )
+        .expect("write");
+        let Err(err) = DeployProfile::load(&path) else {
+            panic!("a sandbox namespace equal to the rig namespace loaded");
+        };
+        assert!(
+            err.chain()
+                .any(|e| e.downcast_ref::<NamespaceOverlap>().is_some()),
+            "{err:#}"
+        );
     }
 }
