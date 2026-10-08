@@ -3137,7 +3137,6 @@ pYBZ
             cpu: Some(crate::manifest::Quantity::try_from("2".to_string()).unwrap()),
             memory: Some(crate::manifest::Quantity::try_from("4Gi".to_string()).unwrap()),
             node_selector: BTreeMap::from([("pool".to_string(), "gpu".to_string())]),
-            ..Default::default()
         };
         let gpu = crate::openshell::placement::GpuPlacement {
             node_selector: BTreeMap::from([(

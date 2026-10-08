@@ -12,7 +12,7 @@
 mod controller;
 pub mod kueue;
 pub mod profile;
-mod render;
+pub mod render;
 
 pub use profile::DeployProfile;
 pub use render::{
