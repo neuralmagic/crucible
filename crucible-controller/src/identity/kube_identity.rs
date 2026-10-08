@@ -56,19 +56,19 @@ impl KubeIdentity {
     }
 }
 
-/// Record what the API server said `login` is. Writes only on change. Returns whether `login` has
-/// a row.
+/// Record what the API server said a cluster-token caller is, on the row whose login is exactly
+/// that username, and only when the row holds no username yet: a passive sighting never replaces
+/// a link or an earlier sighting. Returns whether a row with that login exists.
 pub async fn learn(pool: &PgPool, login: &str, user: &KubeUser) -> anyhow::Result<bool> {
-    let login = login.trim().to_lowercase();
     let row: Option<bool> = sqlx::query_scalar(
         "WITH target AS (SELECT sub FROM users WHERE login = $1),
-              changed AS (
+              filled AS (
                 UPDATE users SET kube_user = $2, updated_at = $3
-                 WHERE login = $1 AND kube_user IS DISTINCT FROM $2
+                 WHERE login = $1 AND kube_user IS NULL
                 RETURNING 1)
          SELECT true FROM target",
     )
-    .bind(&login)
+    .bind(login)
     .bind(user.as_str())
     .bind(crate::clock::now_rfc3339())
     .fetch_optional(pool)
@@ -77,7 +77,7 @@ pub async fn learn(pool: &PgPool, login: &str, user: &KubeUser) -> anyhow::Resul
     Ok(row.is_some())
 }
 
-/// [`learn`] for the row of issuer subject `sub`.
+/// Record the username a signed-in person linked, replacing whatever was learned before.
 pub async fn learn_for_sub(pool: &PgPool, sub: &str, user: &KubeUser) -> anyhow::Result<bool> {
     let updated = sqlx::query("UPDATE users SET kube_user = $2, updated_at = $3 WHERE sub = $1")
         .bind(sub)
@@ -197,10 +197,21 @@ mod tests {
             None,
             "nothing learned yet"
         );
-        assert!(learn(&pool, "Alice ", &user("alice-k8s")).await.unwrap());
+        assert!(
+            !learn(&pool, "Alice", &user("Alice")).await.unwrap(),
+            "the username must equal the login exactly"
+        );
+        assert_eq!(effective(&pool, "alice").await.unwrap(), None);
+        assert!(learn(&pool, "alice", &user("alice-k8s")).await.unwrap());
         assert_eq!(
             effective(&pool, "alice").await.unwrap(),
             Some(user("alice-k8s"))
+        );
+        learn(&pool, "alice", &user("alice-other")).await.unwrap();
+        assert_eq!(
+            effective(&pool, "alice").await.unwrap(),
+            Some(user("alice-k8s")),
+            "a later sighting never replaces the first"
         );
 
         assert!(
@@ -219,17 +230,10 @@ mod tests {
             effective(&pool, "alice").await.unwrap(),
             Some(user("alice-admin"))
         );
-        learn(&pool, "alice", &user("alice-k8s2")).await.unwrap();
-        assert_eq!(
-            effective(&pool, "alice").await.unwrap(),
-            Some(user("alice-admin")),
-            "a later learn never displaces the override"
-        );
-
         assert!(set_override(&pool, "alice", None).await.unwrap());
         assert_eq!(
             effective(&pool, "alice").await.unwrap(),
-            Some(user("alice-k8s2"))
+            Some(user("alice-k8s"))
         );
         assert!(
             !set_override(&pool, "nobody", Some(&user("x")))
@@ -239,7 +243,9 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn linking_by_subject_lands_on_that_subjects_row(pool: PgPool) {
+    async fn linking_by_subject_lands_on_that_subjects_row_and_a_sighting_never_replaces_it(
+        pool: PgPool,
+    ) {
         signed_in(&pool, "sub-alice", "alice").await;
         assert!(
             learn_for_sub(&pool, "sub-alice", &user("alice-k8s"))
@@ -258,6 +264,16 @@ mod tests {
                 .unwrap()
                 .effective(),
             Some("alice-k8s")
+        );
+        learn(&pool, "alice", &user("alice")).await.unwrap();
+        assert_eq!(
+            get_for_sub(&pool, "sub-alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .effective(),
+            Some("alice-k8s"),
+            "a cluster token for login alice does not replace the linked username"
         );
     }
 

@@ -159,7 +159,7 @@ pub(crate) async fn link_my_kube_user(
     responses(
         (status = 200, description = "The override is set (or cleared with null)", body = KubeUserDto),
         (status = 400, description = "Not a username a person may act as", body = ErrorBody),
-        (status = 403, description = "Caller is not a platform administrator", body = ErrorBody),
+        (status = 403, description = "Caller is not a platform administrator, or names themselves", body = ErrorBody),
         (status = 404, description = "No user has this login", body = ErrorBody)
     )
 )]
@@ -170,6 +170,12 @@ pub(crate) async fn override_kube_user(
     Path(login): Path<String>,
     Json(body): Json<OverrideBody>,
 ) -> Result<Response, AppError> {
+    let caller = identity.as_deref().map(|c| c.trim().to_lowercase());
+    if caller.as_deref() == Some(login.trim().to_lowercase().as_str()) {
+        return Ok(forbidden(
+            "an administrator cannot set their own kubernetes username; another administrator must",
+        ));
+    }
     let user = match body.kube_user.as_deref().map(KubeUser::parse).transpose() {
         Ok(u) => u,
         Err(e) => return Ok(bad_request(e.to_string())),
@@ -177,6 +183,24 @@ pub(crate) async fn override_kube_user(
     if !kube_identity::set_override(state.db.pool(), &login, user.as_ref()).await? {
         return Ok(not_found(format!("no user has login {login}")));
     }
+    let note = match &user {
+        Some(u) => format!("kubernetes username override set to {}", u.as_str()),
+        None => "kubernetes username override cleared".to_string(),
+    };
+    state
+        .db
+        .events()
+        .append(
+            &crate::event_log::Event::now(
+                &format!("user:{}", login.trim().to_lowercase()),
+                "kube-user",
+                "kube-user",
+                Some(&note),
+                None,
+            )
+            .by(identity.as_deref()),
+        )
+        .await?;
     tracing::info!(
         login,
         kube_user = user.as_ref().map(KubeUser::as_str),
@@ -405,6 +429,25 @@ mod tests {
         assert_eq!(
             got,
             json!({"kube_user": "alice-k8s", "learned": null, "override": "alice-k8s"})
+        );
+
+        let (status, _) = send(
+            admin().await,
+            "PUT",
+            "/api/users/admin/kube-user",
+            Some(json!({"kube_user": "admin-k8s"})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "not even an administrator overrides themselves"
+        );
+        let audit = crate::event_log::export_string(&pool).await.unwrap();
+        assert!(
+            audit.contains("user:alice")
+                && audit.contains("kubernetes username override set to alice-k8s"),
+            "{audit}"
         );
 
         let (status, _) = send(admin().await, "PUT", "/api/users/nobody/kube-user", body).await;
