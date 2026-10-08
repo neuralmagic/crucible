@@ -180,12 +180,15 @@ validation, challenges and metadata live here. Handlers get a typed `Principal` 
 extensions rmcp already forwards.
 
 ```rust
-let server = Arc::new(ResourceServer::new(ResourceServerConfig {
-    issuer, jwks_uri, resources, required_scopes, scopes_supported, resource_name,
-})?);
+let issuers = vec![TrustedIssuer::runs("<issuer>=<jwks uri>")?];
+let server = Arc::new(ResourceServer::new(
+    ResourceServerConfig { issuers, resources, required_scopes, scopes_supported, resource_name },
+    &JwksTls::default(),
+)?);
+let guard = PolicyGuard { policy, server: Some(server.clone()), reviewer: None };
 let mcp = Router::new()
     .fallback_service(streamable_http_service)
-    .layer(from_fn_with_state(Arc::new(PolicyGuard { policy, server: Some(server.clone()) }), guard::enforce))
+    .layer(from_fn_with_state(Arc::new(guard), guard::enforce))
     .layer(from_fn_with_state(server.clone(), server::require_bearer));
 let app = Router::new().nest_service("/mcp", mcp).merge(metadata::router(server));
 ```
@@ -195,23 +198,29 @@ write their own authentication middleware around `ResourceServer::authenticate` 
 
 **Validation** (`jsonwebtoken` 11 on aws-lc):
 
-- `iss` equals the configured issuer; `aud` names one of the server's canonical URLs.
+- `iss` equals a configured issuer; `aud` names one of the server's canonical URLs. Each issuer
+  is configured for runs or for people, and that, not the token's claims, decides which kind of
+  caller a token is (`Principal::callers`).
 - `exp`, `iss`, `aud`, `sub` required; `nbf` checked; 30 seconds of clock skew.
 - Only RS, PS, ES and EdDSA. HS and `none` are refused before key lookup, so a public key can never
   be used as a shared secret.
 - A key that declares `alg` refuses tokens signed with any other algorithm.
 - Server-wide required scopes are checked after the signature.
 
-**Key cache.** Keys are cached by `kid` for 10 minutes. An unknown `kid` refetches at most once per
-30 seconds, so made-up kids cannot hammer the issuer. During an issuer outage cached keys keep
-working and new ones fail closed.
+**Key cache.** Keys are cached by `kid` for 10 minutes. Fetches, failed or not, happen at most once
+per 30 seconds, so made-up kids or a failing issuer cannot turn requests into fetches. During an
+issuer outage cached keys keep working and new ones fail closed. A key set over 256 KiB is refused.
+
+**Key transport.** Whoever answers the JWKS fetch can mint accepted tokens, so `ResourceServer::new`
+refuses a plain-http JWKS URI unless its host is loopback or `JwksTls::insecure_http` is set.
+`JwksTls::ca_bundle` adds a PEM bundle of CAs (an in-cluster service CA) to the platform roots.
 
 **Challenges** (MCP 2026-07-28, RFC 6750):
 
 | Case | Status | `WWW-Authenticate` |
 | --- | --- | --- |
 | no bearer token | 401 | `Bearer resource_metadata="...", scope="..."` |
-| bad signature, issuer, audience or expiry | 401 | `Bearer error="invalid_token", error_description="...", resource_metadata="..."` |
+| bad signature, issuer, audience or expiry | 401 | `Bearer error="invalid_token", error_description="the access token is invalid or expired", resource_metadata="..."` |
 | valid but missing a scope | 403 | `Bearer error="insufficient_scope", scope="<missing>"` |
 
 **RFC 9728 metadata** is served at `/.well-known/oauth-protected-resource` and at the path-inserted
@@ -219,8 +228,10 @@ working and new ones fail closed.
 configured list by `Host` and never copied from it.
 
 **Principal.** `subject` (`sub`), `actor_chain` (`act`, flattened, at most 8 deep), `client_id`
-(`azp`), `namespace`, `scopes`, and every claim for policy rules. `presenter()` is the party holding
-the token: the first actor, else the subject.
+(`azp`), `namespace`, `scopes`, `callers` (from the issuer), and every claim for policy rules.
+`presenter()` is the party holding the token: the first actor, else the subject.
+
+Challenges and refusal bodies carry fixed descriptions; why a token failed goes only to the log.
 
 ## Tool policy
 
@@ -277,8 +288,15 @@ credentials get an equivalent `Principal` so one policy covers both.
 | Older credential | tenant tokens (static file, controller-written records) | tokens file, one line per sandbox |
 | Caller from a realm token | `namespace`, `role`, `queues`; `run_id`, else the subject | `sandbox`, optional `workdir`; refused without a sandbox |
 | Launcher stamp | label `crucible.dev/launched-by` on workloads, server-owned | same label on builder pods |
-| Shipped policy | [kueue-policy.toml](../crucible-kueue/deploy/kueue-policy.toml): read and submit scopes, queue allowlist, actor annotation, replica cap | [deploy/buildit-policy.toml](../buildit/deploy/buildit-policy.toml): read and build scopes, build and run timeout caps |
-| Flags | `--issuer <issuer>=<jwks uri>` (repeatable) `--resource --tool-policy` | the same, plus the tokens file becomes optional |
+| Actor stamp | annotation `crucible.dev/actor` (the token's presenter), set by the server | none |
+| Tasks extension | `tasks/get` needs RBAC `get` on the workload, `tasks/cancel` `update` plus `kueue.submit` | `tasks/cancel` needs `buildit.build`; a reader's poll never publishes a run's files |
+| Shipped policy | [kueue-policy.toml](../crucible-kueue/deploy/kueue-policy.toml): read and submit scopes, queue allowlist, replica cap | [deploy/buildit-policy.toml](../buildit/deploy/buildit-policy.toml): read and build scopes, build and run timeout caps |
+| Flags | `--run-issuer` and `--person-issuer <issuer>=<jwks uri>` (repeatable), `--resource`, `--tool-policy`, `--jwks-ca`, `--insecure-jwks-http` | `--run-issuer` only (no people), the rest the same; the tokens file becomes optional |
+
+With any issuer the policy is required; a server with only its older credential runs with
+`ToolPolicy::allow_all()`. Policies list protocol methods as well as tools: `initialize`, `ping`,
+`server/discover`, notifications and `tools/list` always pass, `tools/call` goes through the tool
+rules, and any other method needs a `[methods."<method>"]` entry with its scopes or is refused.
 
 A unit test in each server fails if a tool is missing from its shipped policy, so a new tool
 cannot ship silently denied.
@@ -324,15 +342,16 @@ document, and requests the scope the challenge names. `claude-code` grants `kueu
 403. It sends the RFC 8707 `resource` and `prompt=consent`. When the cluster's ingress uses a
 private CA, start Claude Code with `NODE_EXTRA_CA_CERTS` pointing at it.
 
-The person-facing server is a crucible-kueue with only the realm as issuer, the shipped policy,
+The person-facing server is a crucible-kueue with only the realm as `--person-issuer`, the shipped policy,
 `--kube-authz openshift`, and a Route. Its service account needs `create` on
 `subjectaccessreviews`, `list` on `groups.user.openshift.io`, and the workload verbs in each
 namespace that holds a LocalQueue. No realm attributes are needed: RBAC on the person decides.
 `claude-code` grants both kueue scopes by default. Only the OpenShift login creates users, and it
 re-syncs usernames, so `kube_user` can be trusted.
 
-A person's token carries `kube_user` (their OpenShift username) and no `run_id`, so crucible-kueue
-treats it as a person: no pinned namespace, and every call checked by RBAC as that user.
+A person's token carries `kube_user` (their OpenShift username) and comes from a people issuer, so
+crucible-kueue treats it as a person: no pinned namespace, and every call checked by RBAC as that
+user. A people issuer's token that carries `run_id` is refused.
 
 ## Kubernetes authorization
 
@@ -487,12 +506,14 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
 
 ## Security notes
 
-- **Pod creation in `crucible-system` is the trust root.** Pack tasks hold `edit` there and could
-  create a pod with a forged `openshell.ai/sandbox-id` annotation and receive that SVID. The
-  controller's sandbox-to-run check limits the damage; sandboxes should move to a namespace packs
-  cannot write.
-- **In-cluster Keycloak traffic is plain HTTP** (keys and token endpoint). Enable Keycloak TLS with
-  a service-CA certificate.
+- **Pod creation where sandboxes run is the trust root.** Whoever can create a pod there can set a
+  forged `openshell.ai/sandbox-id` annotation and receive that sandbox's SVID. The controller's
+  sandbox-to-run check does not help: the forged SVID names a sandbox the ledger binds to a real
+  run, so the controller mints that run's token. The ClusterSPIFFEID must select only a dedicated
+  sandbox namespace that nothing but the sandbox gateway can create pods in, and pack tasks must not
+  hold `edit` there. The kueue workload namespace is rendered with Pod Security `restricted`.
+- **JWKS over https.** Serve Keycloak's in-cluster endpoint with a service-CA certificate and pass
+  that CA with `--jwks-ca`; plain http needs `--insecure-jwks-http` off loopback.
 - **Keycloak is a dependency** for human logins, and for agents until the controller endpoint lands.
   Tokens last 5 minutes.
 - **Policy is fail-closed**: unlisted tools, evaluation errors and non-boolean results refuse, and a
