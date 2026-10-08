@@ -3459,6 +3459,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/providers/{id}",
         "/api/keys",
         "/api/keys/{id}",
+        "/api/me/kube-user",
+        "/api/users/{login}/kube-user",
         "/api/version",
         "/api/images",
         "/api/images/refresh",
