@@ -163,7 +163,7 @@ mod tests {
 
     #[test]
     fn a_person_may_act_as_any_username_but_a_system_identity() {
-        for ok in ["wseaton", "kube:admin", "weaton@redhat.com", "b64:AbC="] {
+        for ok in ["alice-k8s", "kube:admin", "alice@example.com", "b64:AbC="] {
             assert_eq!(KubeUser::parse(ok).unwrap().as_str(), ok);
         }
         for system in [
@@ -186,50 +186,50 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_learned_username_applies_until_an_override_replaces_it(pool: PgPool) {
         assert!(
-            !learn(&pool, "weaton", &user("wseaton")).await.unwrap(),
+            !learn(&pool, "alice", &user("alice-k8s")).await.unwrap(),
             "no row yet"
         );
-        assert_eq!(effective(&pool, "weaton").await.unwrap(), None);
+        assert_eq!(effective(&pool, "alice").await.unwrap(), None);
 
-        signed_in(&pool, "sub-weaton", "weaton").await;
+        signed_in(&pool, "sub-alice", "alice").await;
         assert_eq!(
-            effective(&pool, "weaton").await.unwrap(),
+            effective(&pool, "alice").await.unwrap(),
             None,
             "nothing learned yet"
         );
-        assert!(learn(&pool, "Weaton ", &user("wseaton")).await.unwrap());
+        assert!(learn(&pool, "Alice ", &user("alice-k8s")).await.unwrap());
         assert_eq!(
-            effective(&pool, "weaton").await.unwrap(),
-            Some(user("wseaton"))
+            effective(&pool, "alice").await.unwrap(),
+            Some(user("alice-k8s"))
         );
 
         assert!(
-            set_override(&pool, "weaton", Some(&user("weaton-admin")))
+            set_override(&pool, "alice", Some(&user("alice-admin")))
                 .await
                 .unwrap()
         );
         assert_eq!(
-            get(&pool, "weaton").await.unwrap(),
+            get(&pool, "alice").await.unwrap(),
             Some(KubeIdentity {
-                learned: Some("wseaton".into()),
-                r#override: Some("weaton-admin".into()),
+                learned: Some("alice-k8s".into()),
+                r#override: Some("alice-admin".into()),
             })
         );
         assert_eq!(
-            effective(&pool, "weaton").await.unwrap(),
-            Some(user("weaton-admin"))
+            effective(&pool, "alice").await.unwrap(),
+            Some(user("alice-admin"))
         );
-        learn(&pool, "weaton", &user("wseaton2")).await.unwrap();
+        learn(&pool, "alice", &user("alice-k8s2")).await.unwrap();
         assert_eq!(
-            effective(&pool, "weaton").await.unwrap(),
-            Some(user("weaton-admin")),
+            effective(&pool, "alice").await.unwrap(),
+            Some(user("alice-admin")),
             "a later learn never displaces the override"
         );
 
-        assert!(set_override(&pool, "weaton", None).await.unwrap());
+        assert!(set_override(&pool, "alice", None).await.unwrap());
         assert_eq!(
-            effective(&pool, "weaton").await.unwrap(),
-            Some(user("wseaton2"))
+            effective(&pool, "alice").await.unwrap(),
+            Some(user("alice-k8s2"))
         );
         assert!(
             !set_override(&pool, "nobody", Some(&user("x")))
@@ -240,34 +240,34 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn linking_by_subject_lands_on_that_subjects_row(pool: PgPool) {
-        signed_in(&pool, "sub-weaton", "weaton").await;
+        signed_in(&pool, "sub-alice", "alice").await;
         assert!(
-            learn_for_sub(&pool, "sub-weaton", &user("wseaton"))
+            learn_for_sub(&pool, "sub-alice", &user("alice-k8s"))
                 .await
                 .unwrap()
         );
         assert!(
-            !learn_for_sub(&pool, "sub-ghost", &user("wseaton"))
+            !learn_for_sub(&pool, "sub-ghost", &user("alice-k8s"))
                 .await
                 .unwrap()
         );
         assert_eq!(
-            get_for_sub(&pool, "sub-weaton")
+            get_for_sub(&pool, "sub-alice")
                 .await
                 .unwrap()
                 .unwrap()
                 .effective(),
-            Some("wseaton")
+            Some("alice-k8s")
         );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_stored_system_identity_is_an_error_not_a_claim(pool: PgPool) {
-        signed_in(&pool, "sub-weaton", "weaton").await;
-        sqlx::query("UPDATE users SET kube_user = 'system:admin' WHERE login = 'weaton'")
+        signed_in(&pool, "sub-alice", "alice").await;
+        sqlx::query("UPDATE users SET kube_user = 'system:admin' WHERE login = 'alice'")
             .execute(&pool)
             .await
             .unwrap();
-        assert!(effective(&pool, "weaton").await.is_err());
+        assert!(effective(&pool, "alice").await.is_err());
     }
 }

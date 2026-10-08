@@ -377,7 +377,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_bound_sandbox_resolves_to_its_running_run(pool: PgPool) {
-        running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
+        running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         assert_eq!(
             bind(&pool, "crucible-run-a", &binding("sbx-1"))
                 .await
@@ -415,7 +415,7 @@ mod tests {
                     run_id: "run-a".into(),
                     pod_name: "crucible-run-a".into(),
                     cluster: CLUSTER.into(),
-                    attributed_to: Some("user:weaton".into()),
+                    attributed_to: Some("user:alice".into()),
                     sandbox_name: format!("ci-{id}"),
                     workdir: Some("/sandbox/repo".into()),
                 }
@@ -425,7 +425,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_sandbox_bound_by_one_pod_cannot_be_claimed_by_another(pool: PgPool) {
-        running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
+        running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         running_run(&pool, "crucible-run-b", "run-b", Some("user:mallory")).await;
         bind(&pool, "crucible-run-a", &binding("sbx-1"))
             .await
@@ -480,7 +480,7 @@ mod tests {
             resolve(&pool, &sandbox("sbx-1")).await,
             Err(ResolveError::Unbound(_))
         ));
-        running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
+        running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         bind(&pool, "crucible-run-a", &binding("sbx-1"))
             .await
             .unwrap();
@@ -558,8 +558,8 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_route_binds_for_the_pod_its_token_is_bound_to(pool: PgPool) {
-        running_run(&pool, "crucible-run-a", "run-a", Some("user:weaton")).await;
-        running_run(&pool, "crucible-run-b", "run-b", Some("user:weaton")).await;
+        running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
+        running_run(&pool, "crucible-run-b", "run-b", Some("user:alice")).await;
         let body =
             serde_json::to_string(&wire("sbx-1", "ci-0123abcd", Some("/sandbox/repo"))).unwrap();
 

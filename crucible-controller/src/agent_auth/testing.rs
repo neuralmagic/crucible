@@ -15,10 +15,10 @@ use url::Url;
 
 pub const ISSUER: &str = "http://crucible-controller.tms.svc:8080";
 pub const SVID_ISSUER: &str = "https://oidc-discovery.apps.example";
-pub const PREFIX: &str = "spiffe://pirate.crucible/openshell/sandbox/";
+pub const PREFIX: &str = "spiffe://example.crucible/openshell/sandbox/";
 pub const KUEUE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
 pub const BUILDIT: &str = "http://host.openshell.internal:8849/mcp";
-pub const CLUSTER: &str = "pirate";
+pub const CLUSTER: &str = "dev";
 
 pub const PROFILE: &str = r#"
 [cluster]
@@ -31,7 +31,7 @@ loop = "registry.example.com/crucible-loop:latest"
 pull_secret = "quay-pull"
 [kueue]
 image = "registry.example.com/crucible-kueue:latest"
-cluster = "pirate"
+cluster = "dev"
 namespace = "crucible-system"
 tenant_namespace = "crucible-kueue-tenants"
 workload_namespace = "crucible-kueue-e2e"

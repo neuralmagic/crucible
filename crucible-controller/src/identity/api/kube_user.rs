@@ -207,14 +207,14 @@ mod tests {
         fn submit(&self, _ov: crate::daemon::queue::Override) {}
     }
 
-    /// A stand-in API server: `sha256~mine` belongs to wseaton, `sha256~admin` to system:admin.
+    /// A stand-in API server: `sha256~mine` belongs to alice-k8s, `sha256~admin` to system:admin.
     async fn users_tilde() -> crate::identity::kube_user::KubeUserAuth {
         let app = axum::Router::new().route(
             "/apis/user.openshift.io/v1/users/~",
             axum::routing::get(|headers: axum::http::HeaderMap| async move {
                 match headers.get("authorization").and_then(|v| v.to_str().ok()) {
                     Some("Bearer sha256~mine") => {
-                        (StatusCode::OK, r#"{"metadata":{"name":"wseaton"}}"#)
+                        (StatusCode::OK, r#"{"metadata":{"name":"alice-k8s"}}"#)
                     }
                     Some("Bearer sha256~admin") => {
                         (StatusCode::OK, r#"{"metadata":{"name":"system:admin"}}"#)
@@ -292,8 +292,8 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_person_links_the_username_the_api_server_names(pool: PgPool) {
-        signed_in(&pool, "sub-weaton", "weaton").await;
-        let me = || app(&pool, "weaton", Some("sub-weaton"), AuthPath::Session);
+        signed_in(&pool, "sub-alice", "alice").await;
+        let me = || app(&pool, "alice", Some("sub-alice"), AuthPath::Session);
         assert_eq!(
             send(me().await, "GET", "/api/me/kube-user", None).await,
             (
@@ -311,15 +311,15 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             body,
-            json!({"kube_user": "wseaton", "learned": "wseaton", "override": null})
+            json!({"kube_user": "alice-k8s", "learned": "alice-k8s", "override": null})
         );
         assert_eq!(
-            crate::identity::kube_identity::effective(&pool, "weaton")
+            crate::identity::kube_identity::effective(&pool, "alice")
                 .await
                 .unwrap()
                 .unwrap()
                 .as_str(),
-            "wseaton"
+            "alice-k8s"
         );
     }
 
@@ -327,9 +327,9 @@ mod tests {
     async fn linking_refuses_bad_tokens_system_identities_keys_and_subjectless_callers(
         pool: PgPool,
     ) {
-        signed_in(&pool, "sub-weaton", "weaton").await;
+        signed_in(&pool, "sub-alice", "alice").await;
         let put = |token: &str| Some(json!({"cluster_token": token}));
-        let session = || app(&pool, "weaton", Some("sub-weaton"), AuthPath::Session);
+        let session = || app(&pool, "alice", Some("sub-alice"), AuthPath::Session);
         let cases = [
             (
                 "a token the API server refuses",
@@ -345,13 +345,13 @@ mod tests {
             ),
             (
                 "an api key",
-                app(&pool, "weaton", Some("sub-weaton"), AuthPath::ApiKey).await,
+                app(&pool, "alice", Some("sub-alice"), AuthPath::ApiKey).await,
                 put("sha256~mine"),
                 StatusCode::FORBIDDEN,
             ),
             (
                 "no issuer subject",
-                app(&pool, "weaton", None, AuthPath::Edge).await,
+                app(&pool, "alice", None, AuthPath::Edge).await,
                 put("sha256~mine"),
                 StatusCode::FORBIDDEN,
             ),
@@ -367,7 +367,7 @@ mod tests {
             assert_eq!(status, want, "{what}: {body}");
         }
         assert_eq!(
-            crate::identity::kube_identity::effective(&pool, "weaton")
+            crate::identity::kube_identity::effective(&pool, "alice")
                 .await
                 .unwrap(),
             None,
@@ -377,13 +377,13 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn only_an_administrator_overrides_and_the_override_wins(pool: PgPool) {
-        signed_in(&pool, "sub-weaton", "weaton").await;
+        signed_in(&pool, "sub-alice", "alice").await;
         signed_in(&pool, "sub-admin", "admin").await;
-        let body = Some(json!({"kube_user": "wseaton"}));
+        let body = Some(json!({"kube_user": "alice-k8s"}));
         let (status, _) = send(
-            app(&pool, "weaton", Some("sub-weaton"), AuthPath::Session).await,
+            app(&pool, "alice", Some("sub-alice"), AuthPath::Session).await,
             "PUT",
-            "/api/users/weaton/kube-user",
+            "/api/users/alice/kube-user",
             body.clone(),
         )
         .await;
@@ -397,14 +397,14 @@ mod tests {
         let (status, got) = send(
             admin().await,
             "PUT",
-            "/api/users/weaton/kube-user",
+            "/api/users/alice/kube-user",
             body.clone(),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{got}");
         assert_eq!(
             got,
-            json!({"kube_user": "wseaton", "learned": null, "override": "wseaton"})
+            json!({"kube_user": "alice-k8s", "learned": null, "override": "alice-k8s"})
         );
 
         let (status, _) = send(admin().await, "PUT", "/api/users/nobody/kube-user", body).await;
@@ -412,7 +412,7 @@ mod tests {
         let (status, _) = send(
             admin().await,
             "PUT",
-            "/api/users/weaton/kube-user",
+            "/api/users/alice/kube-user",
             Some(json!({"kube_user": "system:serviceaccount:x:y"})),
         )
         .await;
@@ -420,7 +420,7 @@ mod tests {
         let (status, got) = send(
             admin().await,
             "PUT",
-            "/api/users/weaton/kube-user",
+            "/api/users/alice/kube-user",
             Some(json!({"kube_user": null})),
         )
         .await;

@@ -348,7 +348,7 @@ mod tests {
             pool,
             "crucible-run-brave-otter",
             "run-1",
-            Some("user:weaton"),
+            Some("user:alice"),
         )
         .await;
         bindings::bind(pool, "crucible-run-brave-otter", &testing::binding(sandbox))
@@ -390,7 +390,7 @@ mod tests {
             .validate(body["access_token"].as_str().unwrap())
             .await
             .unwrap();
-        assert_eq!(principal.subject, "weaton");
+        assert_eq!(principal.subject, "alice");
         assert_eq!(principal.presenter(), format!("{PREFIX}sbx-1"));
         assert_eq!(principal.namespace.as_deref(), Some("crucible-kueue-e2e"));
         assert_eq!(principal.claims["run_id"], "crucible-run-brave-otter");
@@ -419,8 +419,8 @@ mod tests {
     async fn link(pool: &PgPool, kube_user: &str) {
         crate::identity::oidc::users::record_login(
             pool,
-            "sub-weaton",
-            "weaton",
+            "sub-alice",
+            "alice",
             None,
             jiff::Timestamp::now(),
         )
@@ -428,7 +428,7 @@ mod tests {
         .unwrap();
         crate::identity::kube_identity::learn(
             pool,
-            "weaton",
+            "alice",
             &crate::identity::kube_identity::KubeUser::parse(kube_user).unwrap(),
         )
         .await
@@ -438,7 +438,7 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_launcher_with_a_known_kubernetes_username_gets_kube_user(pool: PgPool) {
         bound(&pool, "sbx-1").await;
-        link(&pool, "wseaton").await;
+        link(&pool, "alice-k8s").await;
         let h = harness(pool).await;
         let svid = h.spire.svid(&Spire::claims("sbx-1"));
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
@@ -446,7 +446,7 @@ mod tests {
         let claims = claims_of(&body);
         assert_eq!(
             (claims["sub"].as_str(), claims["kube_user"].as_str()),
-            (Some("weaton"), Some("wseaton"))
+            (Some("alice"), Some("alice-k8s"))
         );
     }
 
@@ -481,10 +481,10 @@ mod tests {
             "{body}"
         );
 
-        link(&pool, "wseaton").await;
+        link(&pool, "alice-k8s").await;
         let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(claims_of(&body)["kube_user"], "wseaton");
+        assert_eq!(claims_of(&body)["kube_user"], "alice-k8s");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

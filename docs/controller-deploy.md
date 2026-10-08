@@ -149,7 +149,7 @@ sandbox that was never bound, or whose run pod is no longer running, gets `inval
 | `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
 
 The deploy profile's `[kueue]` table supplies the `namespace`, `queues`, and `role` claims for runs
-on its cluster, and the role caps the `kueue.*` scopes; a run elsewhere gets none. On pirate:
+on its cluster, and the role caps the `kueue.*` scopes; a run elsewhere gets none. For example:
 
 ```bash
 CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,http://host.openshell.internal:8849/mcp=buildit.read buildit.build"

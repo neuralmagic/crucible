@@ -632,7 +632,7 @@ mod tests {
                 spire.svid(&with(base(), |c| {
                     c.insert(
                         "sub".into(),
-                        json!("spiffe://pirate.crucible/ns/rhbk/sa/default"),
+                        json!("spiffe://example.crucible/ns/team-e2e/sa/default"),
                     );
                 })),
             ),
@@ -807,12 +807,12 @@ mod tests {
 
     #[test]
     fn the_launcher_is_the_person_the_run_is_attributed_to() {
-        assert_eq!(launcher(&run(Some("user:weaton"))).unwrap(), "weaton");
+        assert_eq!(launcher(&run(Some("user:alice"))).unwrap(), "alice");
         for unattributed in [
             None,
             Some("team:platform-administrators"),
             Some("user:"),
-            Some("weaton"),
+            Some("alice"),
         ] {
             assert!(
                 matches!(
@@ -830,9 +830,9 @@ mod tests {
                 spiffe_id: format!("{PREFIX}sbx-1"),
                 id: crate::agent_auth::bindings::SandboxId::parse("sbx-1").unwrap(),
             },
-            launcher: "weaton".into(),
-            kube_user: Some("wseaton".into()),
-            run: run(Some("user:weaton")),
+            launcher: "alice".into(),
+            kube_user: Some("alice-k8s".into()),
+            run: run(Some("user:alice")),
             audience: KUEUE.into(),
             scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
             tenant,
@@ -871,8 +871,8 @@ mod tests {
             Value::Object(claims),
             json!({
                 "iss": ISSUER,
-                "sub": "weaton",
-                "kube_user": "wseaton",
+                "sub": "alice",
+                "kube_user": "alice-k8s",
                 "aud": KUEUE,
                 "iat": at,
                 "nbf": at,
@@ -1054,14 +1054,14 @@ mod tests {
                 "http://controller.svc:8080/oauth",
             ),
             ("CONTROLLER_AGENT_ISSUER", "http://controller.svc:8080/?x=1"),
-            ("CONTROLLER_AGENT_ISSUER", "spiffe://pirate.crucible"),
+            ("CONTROLLER_AGENT_ISSUER", "spiffe://example.crucible"),
             (
                 "CONTROLLER_AGENT_SANDBOX_ID_PREFIX",
-                "spiffe://pirate.crucible/openshell/sandbox",
+                "spiffe://example.crucible/openshell/sandbox",
             ),
             (
                 "CONTROLLER_AGENT_SANDBOX_ID_PREFIX",
-                "https://pirate.crucible/openshell/sandbox/",
+                "https://example.crucible/openshell/sandbox/",
             ),
             ("CONTROLLER_AGENT_AUDIENCES", " , "),
             ("CONTROLLER_AGENT_AUDIENCES", "not a url=kueue.read"),
