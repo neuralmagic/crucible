@@ -19,7 +19,7 @@
 use crate::deploy::profile::DeployProfile;
 use crate::openshell::gateway::{
     GATEWAY_CLIENT_TLS_DIR_ENV, GATEWAY_URL_ENV, SANDBOX_RUNTIME_IMAGE_ENV,
-    SERVE_CLIENT_TLS_SECRET_ENV, SERVE_GRPC_ENDPOINT_ENV, SERVE_HOST_IP_ENV,
+    SERVE_CLIENT_TLS_SECRET_ENV, SERVE_GATEWAY_ID_ENV, SERVE_GRPC_ENDPOINT_ENV, SERVE_HOST_IP_ENV,
     SERVE_SERVER_TLS_DIR_ENV, SUPERVISOR_IMAGE_ENV,
 };
 use crate::openshell::grpc::GATEWAY_PORT;
@@ -41,6 +41,9 @@ const ROLE_VALUE: &str = "openshell-gateway";
 pub const RUN_LABEL: &str = "crucible/run";
 /// The label the OpenShell driver puts on supervisor pods.
 const SUPERVISOR_COMPONENT: (&str, &str) = ("openshell.ai/component", "supervisor");
+/// The label the OpenShell driver stamps, from its own config, on every supervisor pod and
+/// Sandbox it creates. Sandbox SPIFFE IDs are derived from it.
+pub const GATEWAY_ID_LABEL: &str = "openshell.ai/gateway-id";
 
 const SERVER_TLS_DIR: &str = "/etc/crucible/gateway-server-tls";
 /// Where the loop pod finds its gateway client material (delivered through the run Secret).
@@ -66,6 +69,9 @@ pub struct GatewayNames {
     pub server_secret: String,
     /// The client material the driver mounts into supervisors.
     pub client_secret: String,
+    /// The gateway's OpenShell id: the [`GATEWAY_ID_LABEL`] on everything it creates, and the
+    /// `gateway/<id>` segment of its sandboxes' SPIFFE IDs.
+    pub gateway_id: String,
 }
 
 impl GatewayNames {
@@ -76,6 +82,7 @@ impl GatewayNames {
             loop_service: label_safe(run_pod),
             server_secret: format!("{run_pod}-gw-tls"),
             client_secret: format!("{run_pod}-gw-client"),
+            gateway_id: label_safe(run_pod),
         }
     }
 }
@@ -104,6 +111,11 @@ pub fn gateway_selector() -> String {
 /// Selects the gateway objects of the run whose pod is `run_pod`.
 pub fn run_gateway_selector(run_pod: &str) -> String {
     format!("{},{GATEWAY_FOR_LABEL}={run_pod}", gateway_selector())
+}
+
+/// Selects what the gateway with `names` created: its Sandboxes and supervisor pods.
+pub fn gateway_created_selector(names: &GatewayNames) -> String {
+    format!("{GATEWAY_ID_LABEL}={}", names.gateway_id)
 }
 
 fn sandbox_namespace(profile: &DeployProfile) -> String {
@@ -232,6 +244,7 @@ pub fn gateway_pod(
         plain(SERVE_HOST_IP_ENV, addresses.loop_service.to_string()),
         plain(SERVE_CLIENT_TLS_SECRET_ENV, names.client_secret.clone()),
         plain(SERVE_SERVER_TLS_DIR_ENV, SERVER_TLS_DIR.to_string()),
+        plain(SERVE_GATEWAY_ID_ENV, names.gateway_id.clone()),
     ]);
     let container = core::Container {
         name: "gateway".to_string(),
@@ -311,8 +324,7 @@ pub fn gateway_pod(
     }
 }
 
-/// Admit only this run's loop pod and the sandbox namespace's supervisors to the gateway's API
-/// port. A supervisor of another run is turned away by the per-run CA anyway.
+/// Admit only this run's loop pod and the supervisors this gateway created to its API port.
 pub fn gateway_network_policy(
     profile: &DeployProfile,
     names: &GatewayNames,
@@ -357,10 +369,13 @@ pub fn gateway_network_policy(
                     },
                     networking::NetworkPolicyPeer {
                         pod_selector: Some(LabelSelector {
-                            match_labels: Some(BTreeMap::from([(
-                                SUPERVISOR_COMPONENT.0.to_string(),
-                                SUPERVISOR_COMPONENT.1.to_string(),
-                            )])),
+                            match_labels: Some(BTreeMap::from([
+                                (
+                                    SUPERVISOR_COMPONENT.0.to_string(),
+                                    SUPERVISOR_COMPONENT.1.to_string(),
+                                ),
+                                (GATEWAY_ID_LABEL.to_string(), names.gateway_id.clone()),
+                            ])),
                             ..Default::default()
                         }),
                         ..Default::default()
@@ -523,6 +538,11 @@ mod tests {
         assert_eq!(names.loop_service, "crucible-run-brave-otter");
         assert_eq!(names.server_secret, "crucible-run-brave-otter-gw-tls");
         assert_eq!(names.client_secret, "crucible-run-brave-otter-gw-client");
+        assert_eq!(names.gateway_id, "crucible-run-brave-otter");
+        assert_eq!(
+            gateway_created_selector(&names),
+            "openshell.ai/gateway-id=crucible-run-brave-otter"
+        );
         let long = GatewayNames::for_run_pod(&format!("crucible-run-{}", "x".repeat(60)));
         assert!(
             long.gateway.len() <= 63 && long.gateway.starts_with("gw-"),
@@ -530,6 +550,7 @@ mod tests {
             long.gateway
         );
         assert!(long.loop_service.len() <= 63, "{}", long.loop_service);
+        assert!(long.gateway_id.len() <= 63, "{}", long.gateway_id);
         assert_ne!(
             GatewayNames::for_run_pod(&format!("crucible-run-{}", "x".repeat(60))).gateway,
             GatewayNames::for_run_pod(&format!("crucible-run-{}", "y".repeat(60))).gateway
@@ -613,6 +634,7 @@ mod tests {
             env[SERVE_CLIENT_TLS_SECRET_ENV].as_deref(),
             Some("crucible-run-a-gw-client")
         );
+        assert_eq!(env[SERVE_GATEWAY_ID_ENV].as_deref(), Some("crucible-run-a"));
         let volumes = spec.volumes.expect("volumes");
         assert_eq!(
             volumes[0]
@@ -649,7 +671,10 @@ mod tests {
                     "namespaceSelector": {"matchLabels": {"kubernetes.io/metadata.name": "loops"}},
                     "podSelector": {"matchLabels": {"crucible/run": "run-a"}}
                 },
-                {"podSelector": {"matchLabels": {"openshell.ai/component": "supervisor"}}}
+                {"podSelector": {"matchLabels": {
+                    "openshell.ai/component": "supervisor",
+                    "openshell.ai/gateway-id": "crucible-run-a"
+                }}}
             ])
         );
     }

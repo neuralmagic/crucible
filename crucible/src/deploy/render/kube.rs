@@ -1638,8 +1638,9 @@ exit $rc
     }
 
     /// get/list on `Sandbox` resources in the sandbox namespace for `cluster.sandbox_readers`,
-    /// the identity the controller resolves a bound sandbox's name with. Nothing when either is
-    /// unset.
+    /// the identity the controller resolves a bound sandbox's name with; under isolated gateways
+    /// also what it starts, adopts, and tears down each run's gateway with. Nothing when either
+    /// is unset.
     fn sandbox_reader_rbac(&self) -> Vec<SandboxRbacObject> {
         let cluster = &self.profile.cluster;
         let Some(ns) = cluster.sandbox_namespace.as_ref() else {
@@ -1648,33 +1649,69 @@ exit $rc
         if cluster.sandbox_readers.is_empty() {
             return Vec::new();
         }
-        let name = "crucible-sandbox-reader".to_string();
+        let rule = |group: &str, resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
+            api_groups: Some(vec![group.to_string()]),
+            resources: Some(resources.iter().map(|r| r.to_string()).collect()),
+            verbs: verbs.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
+        };
+        let isolated = crate::deploy::render::gateway::isolated(self.profile);
+        let mut sandbox_rules = vec![match isolated {
+            true => rule(
+                "agents.x-k8s.io",
+                &["sandboxes"],
+                &["get", "list", "patch", "delete"],
+            ),
+            false => rule("agents.x-k8s.io", &["sandboxes"], &["get", "list"]),
+        }];
+        if isolated {
+            sandbox_rules.extend([
+                rule("", &["pods"], &["get", "list", "create", "delete"]),
+                rule("", &["services", "secrets"], &["list", "create", "delete"]),
+                rule(
+                    "networking.k8s.io",
+                    &["networkpolicies"],
+                    &["list", "create", "delete"],
+                ),
+            ]);
+        }
+        let mut objects = self.reader_grant("crucible-sandbox-reader", ns.as_str(), sandbox_rules);
+        if isolated {
+            objects.extend(self.reader_grant(
+                "crucible-gateway-loop-services",
+                &cluster.loop_namespace,
+                vec![rule("", &["services"], &["list", "create", "delete"])],
+            ));
+        }
+        objects
+    }
+
+    /// A Role named `name` in `namespace` with `rules`, bound to `cluster.sandbox_readers`.
+    fn reader_grant(
+        &self,
+        name: &str,
+        namespace: &str,
+        rules: Vec<rbac::PolicyRule>,
+    ) -> Vec<SandboxRbacObject> {
+        let meta = || ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        };
         let role = rbac::Role {
-            metadata: ObjectMeta {
-                name: Some(name.clone()),
-                namespace: Some(ns.to_string()),
-                ..Default::default()
-            },
-            rules: Some(vec![rbac::PolicyRule {
-                api_groups: Some(vec!["agents.x-k8s.io".to_string()]),
-                resources: Some(vec!["sandboxes".to_string()]),
-                verbs: vec!["get".to_string(), "list".to_string()],
-                ..Default::default()
-            }]),
+            metadata: meta(),
+            rules: Some(rules),
         };
         let binding = rbac::RoleBinding {
-            metadata: ObjectMeta {
-                name: Some(name.clone()),
-                namespace: Some(ns.to_string()),
-                ..Default::default()
-            },
+            metadata: meta(),
             role_ref: rbac::RoleRef {
                 api_group: "rbac.authorization.k8s.io".to_string(),
                 kind: "Role".to_string(),
-                name,
+                name: name.to_string(),
             },
             subjects: Some(
-                cluster
+                self.profile
+                    .cluster
                     .sandbox_readers
                     .iter()
                     .map(|sa| rbac::Subject {
@@ -3966,6 +4003,60 @@ mod tests {
         );
     }
 
+    /// The controller's signing key Secret sits in the controller's own namespace, the one its
+    /// identity in `sandbox_readers` lives in. Nothing the loop render emits may let the loop SA
+    /// read Secrets there, or anywhere through a cluster-wide grant.
+    #[test]
+    fn the_loop_sa_is_never_granted_secrets_in_the_controller_namespace() {
+        for extra in [
+            "",
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_readers = [\"crucible-control/crucible-controller\"]",
+        ] {
+            let yaml = render_k8s(&k8s_profile(extra));
+            let docs: Vec<serde_json::Value> = yaml
+                .split("\n---\n")
+                .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+                .collect();
+            let names_loop_sa = |d: &serde_json::Value| {
+                d["subjects"].as_array().into_iter().flatten().any(|s| {
+                    s["name"] == "autoresearch-publisher" && s["namespace"] == "autoresearch"
+                })
+            };
+            let role_grants_secrets = |kind: &str, name: &serde_json::Value| {
+                docs.iter()
+                    .filter(|d| d["kind"] == kind && d["metadata"]["name"] == *name)
+                    .flat_map(|d| d["rules"].as_array().cloned().unwrap_or_default())
+                    .any(|rule| {
+                        rule["resources"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|r| r == "secrets" || r == "*")
+                    })
+            };
+            for d in docs.iter().filter(|d| names_loop_sa(d)) {
+                let kind = d["kind"].as_str().unwrap_or_default();
+                let role_kind = d["roleRef"]["kind"].as_str().unwrap_or_default();
+                let role = &d["roleRef"]["name"];
+                assert_ne!(
+                    d["metadata"]["namespace"], "crucible-control",
+                    "a binding for the loop SA in the controller namespace: {d}"
+                );
+                if kind == "ClusterRoleBinding" || role_kind == "ClusterRole" {
+                    assert!(
+                        !role_grants_secrets("ClusterRole", role),
+                        "a cluster role bound to the loop SA reaches Secrets: {d}"
+                    );
+                    assert!(
+                        !matches!(role.as_str(), Some("admin" | "edit" | "cluster-admin"))
+                            || d["metadata"]["namespace"] == "rig",
+                        "a built-in role bound to the loop SA outside the rig namespace: {d}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_sandbox_namespace_moves_the_sandboxes_and_their_rbac() {
         let default = render_k8s(&k8s_profile(""));
@@ -4034,8 +4125,25 @@ mod tests {
             "crucible-sandboxes"
         );
         assert_eq!(
-            reader("Role")["rules"][0]["verbs"],
-            serde_json::json!(["get", "list"])
+            reader("Role")["rules"],
+            serde_json::json!([
+                {"apiGroups": ["agents.x-k8s.io"], "resources": ["sandboxes"], "verbs": ["get", "list", "patch", "delete"]},
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "create", "delete"]},
+                {"apiGroups": [""], "resources": ["services", "secrets"], "verbs": ["list", "create", "delete"]},
+                {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["list", "create", "delete"]}
+            ]),
+            "the controller starts and tears down each run's gateway there"
+        );
+        let loop_services = read_docs
+            .iter()
+            .find(|d| {
+                d["kind"] == "Role" && d["metadata"]["name"] == "crucible-gateway-loop-services"
+            })
+            .unwrap_or_else(|| panic!("no loop Service Role: {read}"));
+        assert_eq!(loop_services["metadata"]["namespace"], "autoresearch");
+        assert_eq!(
+            loop_services["rules"],
+            serde_json::json!([{"apiGroups": [""], "resources": ["services"], "verbs": ["list", "create", "delete"]}])
         );
         assert_eq!(
             reader("RoleBinding")["subjects"][0],
