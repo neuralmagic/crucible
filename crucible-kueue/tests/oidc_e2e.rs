@@ -15,7 +15,7 @@ use crucible_kueue::auth::Auth;
 use crucible_kueue::tenant::{Registry, Tenants};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::policy::ToolPolicy;
-use crucible_mcp_auth::server::{ResourceServer, ResourceServerConfig};
+use crucible_mcp_auth::server::{ResourceServer, ResourceServerConfig, TrustedIssuer};
 use crucible_mcp_auth::testing::cluster;
 use k8s_openapi::api::batch::v1::Job;
 use kube::api::Api;
@@ -68,20 +68,22 @@ async fn serve(env: &Env, kube: kube::Client) -> String {
     ))
     .unwrap();
     let config = ResourceServerConfig {
-        issuer: Url::parse(cluster::REALM).unwrap(),
-        jwks_uri: Url::parse(&format!("{}/protocol/openid-connect/certs", cluster::REALM)).unwrap(),
+        issuers: vec![TrustedIssuer {
+            issuer: cluster::REALM.to_string(),
+            jwks_uri: Url::parse(&format!("{}/protocol/openid-connect/certs", cluster::REALM))
+                .unwrap(),
+        }],
         resources: vec![Url::parse(RESOURCE).unwrap()],
         required_scopes: vec!["kueue.read".into()],
         scopes_supported: vec!["kueue.read".into(), "kueue.submit".into()],
         resource_name: Some("crucible-kueue".into()),
     };
-    let jwks = Jwks::new(
-        cluster::realm_http(cluster::ingress_ip()),
-        config.jwks_uri.clone(),
-    );
+    let http = cluster::realm_http(cluster::ingress_ip());
     let auth = Auth {
         registry: Arc::new(Registry::new(tenants)),
-        oidc: Some(Arc::new(ResourceServer::with_jwks(config, jwks))),
+        oidc: Some(Arc::new(ResourceServer::with_jwks(config, |t| {
+            Jwks::new(http.clone(), t.jwks_uri.clone())
+        }))),
     };
     let policy = ToolPolicy::from_toml(include_str!("../deploy/kueue-policy.toml")).unwrap();
     let app = crucible_kueue::router(kube, auth, Some(policy), &[]);

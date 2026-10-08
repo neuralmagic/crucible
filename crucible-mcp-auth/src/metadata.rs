@@ -17,7 +17,7 @@ pub const WELL_KNOWN: &str = "/.well-known/oauth-protected-resource";
 #[derive(Debug, Serialize, PartialEq)]
 pub struct ProtectedResourceMetadata {
     pub resource: Url,
-    pub authorization_servers: Vec<Url>,
+    pub authorization_servers: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub scopes_supported: Vec<String>,
     pub bearer_methods_supported: Vec<&'static str>,
@@ -30,7 +30,7 @@ impl ResourceServer {
         let config = self.config();
         ProtectedResourceMetadata {
             resource: resource.clone(),
-            authorization_servers: vec![config.issuer.clone()],
+            authorization_servers: config.issuers.iter().map(|t| t.issuer.clone()).collect(),
             scopes_supported: config.scopes_supported.clone(),
             bearer_methods_supported: vec!["header"],
             resource_name: config.resource_name.clone(),

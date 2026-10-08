@@ -37,7 +37,7 @@ use crate::task::{self, Progress, TaskRef};
 use crucible_mcp_auth::guard::PolicyGuard;
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::principal::Principal;
-use crucible_mcp_auth::server::{AuthError, ResourceServer, ResourceServerConfig};
+use crucible_mcp_auth::server::{AuthError, ResourceServer, ResourceServerConfig, TrustedIssuer};
 
 pub const MCP_PATH: &str = "/mcp";
 
@@ -77,20 +77,23 @@ pub struct McpArgs {
     #[arg(long, env = "MCP_BIND", default_value = "0.0.0.0:8849")]
     pub bind: String,
     /// File of `<token> <sandbox> [<workdir>]` lines, re-read on every request
-    #[arg(long, env = "MCP_TOKENS_FILE", required_unless_present = "oidc_issuer")]
+    #[arg(long, env = "MCP_TOKENS_FILE", required_unless_present = "issuers")]
     pub tokens_file: Option<PathBuf>,
-    /// Accept access tokens from this OAuth issuer (the crucible realm), alongside the tokens file
-    #[arg(long, env = "MCP_OIDC_ISSUER", requires_all = ["oidc_jwks_uri", "resources"])]
-    pub oidc_issuer: Option<url::Url>,
-    /// The issuer's JWKS endpoint
-    #[arg(long, env = "MCP_OIDC_JWKS_URI", requires = "oidc_issuer")]
-    pub oidc_jwks_uri: Option<url::Url>,
+    /// Accept access tokens from an OAuth issuer, as `<issuer>=<jwks uri>`, alongside the tokens
+    /// file. Repeat for each issuer (the crucible controller for agents, the realm for people)
+    #[arg(
+        long = "issuer",
+        env = "MCP_ISSUERS",
+        value_delimiter = ',',
+        requires = "resources"
+    )]
+    pub issuers: Vec<TrustedIssuer>,
     /// This server's canonical MCP URLs; an access token's aud must name one
     #[arg(
         long = "resource",
         env = "MCP_RESOURCES",
         value_delimiter = ',',
-        requires = "oidc_issuer"
+        requires = "issuers"
     )]
     pub resources: Vec<url::Url>,
     /// TOML tool policy: per-tool scopes, CEL validate rules, claim-derived argument mutations
@@ -133,11 +136,11 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
     let namespace = args
         .namespace
         .unwrap_or_else(|| client.default_namespace().to_string());
-    let oidc = match (args.oidc_issuer, args.oidc_jwks_uri) {
-        (Some(issuer), Some(jwks_uri)) => {
+    let oidc = match args.issuers.is_empty() {
+        true => None,
+        false => {
             let config = ResourceServerConfig {
-                issuer,
-                jwks_uri,
+                issuers: args.issuers,
                 resources: args.resources,
                 required_scopes: vec![SCOPE_READ.to_string()],
                 scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
@@ -147,7 +150,6 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
                 ResourceServer::new(config).context("building the JWKS client")?,
             ))
         }
-        _ => None,
     };
     let policy = match &args.tool_policy {
         Some(path) => {
@@ -1518,7 +1520,7 @@ mod tests {
     use crate::mcp::{
         Broker, BuildId, BuildParams, BuilditMcp, Caller, Launcher, LogsParams, MCP_PATH, PodView,
         ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, StatusCode,
-        TokenLine, ToolPolicy, bud_argv, build_limit, parse_tokens, router, unpack,
+        TokenLine, ToolPolicy, TrustedIssuer, bud_argv, build_limit, parse_tokens, router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crate::step::{State, Status};
@@ -1691,8 +1693,10 @@ mod tests {
             )])
             .await;
         let config = ResourceServerConfig {
-            issuer: url::Url::parse(crucible_mcp_auth::testing::ISSUER).unwrap(),
-            jwks_uri: jwks.url.clone(),
+            issuers: vec![TrustedIssuer {
+                issuer: crucible_mcp_auth::testing::ISSUER.to_string(),
+                jwks_uri: jwks.url.clone(),
+            }],
             resources: vec![url::Url::parse(RESOURCE).unwrap()],
             required_scopes: vec![SCOPE_READ.to_string()],
             scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],

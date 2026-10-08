@@ -7,26 +7,69 @@
 //! | bad signature / iss / aud / exp | 401    | `Bearer error="invalid_token", resource_metadata=".."` |
 //! | valid but missing a scope       | 403    | `Bearer error="insufficient_scope", scope=".."`       |
 
-use crate::jwks::{Jwks, JwksError};
-use crate::principal::{ClaimsError, Principal};
+use crate::jwks::Jwks;
+use crate::principal::Principal;
+use crate::verify::{TokenError, Verifier, unverified_issuer};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use http::{HeaderMap, HeaderValue, StatusCode, header};
-use jsonwebtoken::{Algorithm, Validation};
-use serde_json::{Map, Value};
 use std::sync::Arc;
 use url::Url;
 
-/// Clock skew tolerated on `exp` and `nbf`.
-const LEEWAY_SECS: u64 = 30;
+/// An authorization server whose access tokens this server accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedIssuer {
+    /// Tokens must carry exactly this `iss`.
+    pub issuer: String,
+    /// Where to fetch the issuer's signing keys.
+    pub jwks_uri: Url,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum TrustedIssuerError {
+    #[error("issuer {0:?} is not <issuer>=<jwks uri>")]
+    Shape(String),
+    #[error("issuer {issuer:?} is not a URL: {source}")]
+    Issuer {
+        issuer: String,
+        source: url::ParseError,
+    },
+    #[error("JWKS URI {uri:?} is not a URL: {source}")]
+    Jwks {
+        uri: String,
+        source: url::ParseError,
+    },
+}
+
+/// `<issuer>=<jwks uri>`, the issuer kept verbatim. The issuer may not contain `=`; the JWKS URI
+/// may.
+impl std::str::FromStr for TrustedIssuer {
+    type Err = TrustedIssuerError;
+
+    fn from_str(arg: &str) -> Result<Self, Self::Err> {
+        let (issuer, jwks_uri) = arg
+            .split_once('=')
+            .ok_or_else(|| TrustedIssuerError::Shape(arg.to_string()))?;
+        Url::parse(issuer).map_err(|source| TrustedIssuerError::Issuer {
+            issuer: issuer.to_string(),
+            source,
+        })?;
+        let jwks_uri = Url::parse(jwks_uri).map_err(|source| TrustedIssuerError::Jwks {
+            uri: jwks_uri.to_string(),
+            source,
+        })?;
+        Ok(Self {
+            issuer: issuer.to_string(),
+            jwks_uri,
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ResourceServerConfig {
-    /// The authorization server's issuer identifier; tokens must carry exactly this `iss`.
-    pub issuer: Url,
-    /// Where to fetch the issuer's signing keys.
-    pub jwks_uri: Url,
+    /// Each issuer is verified against its own JWKS; a token's `iss` picks which.
+    pub issuers: Vec<TrustedIssuer>,
     /// This server's canonical URIs (RFC 8707 resource indicators), one per way clients reach
     /// it (Service DNS, Route). A token must name at least one in `aud`.
     pub resources: Vec<Url>,
@@ -39,25 +82,7 @@ pub struct ResourceServerConfig {
 
 pub struct ResourceServer {
     config: ResourceServerConfig,
-    jwks: Jwks,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum TokenError {
-    #[error("malformed token: {0}")]
-    Malformed(jsonwebtoken::errors::Error),
-    #[error("token header has no kid")]
-    NoKid,
-    #[error("algorithm {0:?} is not accepted")]
-    Algorithm(Algorithm),
-    #[error("token algorithm {token:?} differs from its key's {key:?}")]
-    AlgorithmMismatch { token: Algorithm, key: Algorithm },
-    #[error(transparent)]
-    Key(#[from] JwksError),
-    #[error("token rejected: {0}")]
-    Rejected(jsonwebtoken::errors::Error),
-    #[error(transparent)]
-    Claims(#[from] ClaimsError),
+    verifiers: Vec<Verifier>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -72,32 +97,23 @@ pub enum AuthError {
     InsufficientScope { missing: Vec<String> },
 }
 
-const ACCEPTED_ALGORITHMS: &[Algorithm] = &[
-    Algorithm::RS256,
-    Algorithm::RS384,
-    Algorithm::RS512,
-    Algorithm::PS256,
-    Algorithm::PS384,
-    Algorithm::PS512,
-    Algorithm::ES256,
-    Algorithm::ES384,
-    Algorithm::EdDSA,
-];
-
 impl ResourceServer {
-    /// A server fetching keys from `config.jwks_uri` without following redirects.
+    /// A server fetching each issuer's keys without following redirects.
     pub fn new(config: ResourceServerConfig) -> Result<Self, reqwest::Error> {
-        let http = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let jwks = Jwks::new(http, config.jwks_uri.clone());
-        Ok(Self { config, jwks })
+        let http = jwks_client()?;
+        Ok(Self::with_jwks(config, |trusted| {
+            Jwks::new(http.clone(), trusted.jwks_uri.clone())
+        }))
     }
 
-    pub fn with_jwks(config: ResourceServerConfig, jwks: Jwks) -> Self {
-        Self { config, jwks }
+    /// A server whose key sets `jwks` builds, one per configured issuer.
+    pub fn with_jwks(config: ResourceServerConfig, jwks: impl Fn(&TrustedIssuer) -> Jwks) -> Self {
+        let verifiers = config
+            .issuers
+            .iter()
+            .map(|trusted| Verifier::new(trusted.issuer.clone(), jwks(trusted)))
+            .collect();
+        Self { config, verifiers }
     }
 
     pub fn config(&self) -> &ResourceServerConfig {
@@ -106,30 +122,15 @@ impl ResourceServer {
 
     /// Validate a compact JWS access token and return its principal.
     pub async fn validate(&self, token: &str) -> Result<Principal, TokenError> {
-        let header = jsonwebtoken::decode_header(token).map_err(TokenError::Malformed)?;
-        if !ACCEPTED_ALGORITHMS.contains(&header.alg) {
-            return Err(TokenError::Algorithm(header.alg));
-        }
-        let kid = header.kid.ok_or(TokenError::NoKid)?;
-        let key = self.jwks.key(&kid).await?;
-        if let Some(key_alg) = key.algorithm
-            && key_alg != header.alg
-        {
-            return Err(TokenError::AlgorithmMismatch {
-                token: header.alg,
-                key: key_alg,
-            });
-        }
-        let mut validation = Validation::new(header.alg);
-        validation.leeway = LEEWAY_SECS;
-        validation.validate_nbf = true;
-        validation.set_issuer(&[self.config.issuer.as_str()]);
+        let issuer = unverified_issuer(token)?;
+        let verifier = self
+            .verifiers
+            .iter()
+            .find(|v| v.issuer() == issuer)
+            .ok_or(TokenError::UnknownIssuer(issuer))?;
         let audiences: Vec<&str> = self.config.resources.iter().map(Url::as_str).collect();
-        validation.set_audience(&audiences);
-        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
-        let data = jsonwebtoken::decode::<Map<String, Value>>(token, &key.key, &validation)
-            .map_err(TokenError::Rejected)?;
-        Ok(Principal::from_claims(data.claims)?)
+        let claims = verifier.verify(token, &audiences).await?;
+        Ok(Principal::from_claims(claims)?)
     }
 
     /// The bearer token's principal, with the server-wide scopes checked.
@@ -247,6 +248,15 @@ pub async fn require_bearer(
     }
 }
 
+/// The HTTP client key sets are fetched with: bounded timeouts, no redirects.
+pub fn jwks_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
 /// The token in `Authorization: Bearer <token>`, scheme matched case-insensitively.
 pub fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
@@ -277,11 +287,13 @@ fn quoted(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::jwks::JwksError;
     use crate::server::*;
     use crate::testing::{self, JwksServer, jwk, run_claims, sign};
     use axum::body::{Body, to_bytes};
-    use jsonwebtoken::{EncodingKey, Header};
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
     use serde_json::json;
+    use serde_json::{Map, Value};
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -509,6 +521,77 @@ mod tests {
         );
     }
 
+    const CONTROLLER: &str = "http://crucible-controller.tms.svc:8080";
+
+    fn realm_and_controller(realm: &JwksServer, controller: &JwksServer) -> ResourceServer {
+        let mut cfg = testing::config(realm.url.clone());
+        cfg.issuers.push(TrustedIssuer {
+            issuer: CONTROLLER.to_string(),
+            jwks_uri: controller.url.clone(),
+        });
+        ResourceServer::with_jwks(cfg, |t| {
+            Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
+        })
+    }
+
+    fn from_controller() -> Value {
+        with(run_claims(), |c| {
+            c.insert("iss".into(), json!(CONTROLLER));
+        })
+    }
+
+    #[tokio::test]
+    async fn each_issuer_is_verified_against_its_own_keys() {
+        let realm = JwksServer::start(vec![jwk("a")]).await;
+        let controller = JwksServer::start(vec![jwk("b")]).await;
+        let rs = realm_and_controller(&realm, &controller);
+        rs.validate(&sign("a", &run_claims())).await.unwrap();
+        let agent = rs.validate(&sign("b", &from_controller())).await.unwrap();
+        assert_eq!(agent.claims["iss"], CONTROLLER);
+        for (what, token) in [
+            ("realm key, controller iss", sign("a", &from_controller())),
+            ("controller key, realm iss", sign("b", &run_claims())),
+        ] {
+            let err = rs.validate(&token).await.unwrap_err();
+            assert!(
+                matches!(err, TokenError::Key(JwksError::UnknownKid(_))),
+                "{what}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_untrusted_issuer_is_refused_before_any_key_lookup() {
+        let realm = JwksServer::start(vec![jwk("a")]).await;
+        let controller = JwksServer::start(vec![jwk("b")]).await;
+        let rs = realm_and_controller(&realm, &controller);
+        let claims = with(run_claims(), |c| {
+            c.insert("iss".into(), json!("https://evil.example"));
+        });
+        let err = rs.validate(&sign("a", &claims)).await.unwrap_err();
+        assert!(
+            matches!(&err, TokenError::UnknownIssuer(iss) if iss == "https://evil.example"),
+            "{err}"
+        );
+        let no_iss = with(run_claims(), |c| {
+            c.remove("iss");
+        });
+        assert!(rs.validate(&sign("a", &no_iss)).await.is_err());
+        assert_eq!(realm.fetches() + controller.fetches(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_metadata_names_every_trusted_issuer() {
+        let realm = JwksServer::start(vec![]).await;
+        let controller = JwksServer::start(vec![]).await;
+        let rs = realm_and_controller(&realm, &controller);
+        let resource = Url::parse(testing::RESOURCE_SVC).unwrap();
+        assert_eq!(
+            rs.metadata(&resource).authorization_servers,
+            [testing::ISSUER, CONTROLLER]
+        );
+    }
+
     #[tokio::test]
     async fn server_wide_scopes_are_enforced() {
         let (_jwks, rs) = server_with(vec![jwk("a")]).await;
@@ -518,6 +601,29 @@ mod tests {
         match rs.authenticate(&bearer(&sign("a", &claims))).await {
             Err(AuthError::InsufficientScope { missing }) => assert_eq!(missing, ["kueue.read"]),
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn trusted_issuers_parse_as_issuer_equals_jwks_uri_and_keep_the_issuer_verbatim() {
+        let t: TrustedIssuer = "http://crucible-controller.tms.svc:8080=http://crucible-controller.tms.svc:8080/.well-known/jwks.json"
+            .parse()
+            .unwrap();
+        assert_eq!(t.issuer, "http://crucible-controller.tms.svc:8080");
+        assert_eq!(
+            t.jwks_uri.as_str(),
+            "http://crucible-controller.tms.svc:8080/.well-known/jwks.json"
+        );
+        let q: TrustedIssuer = "https://kc.example/realms/c=http://kc.rhbk.svc:8080/certs?x=1"
+            .parse()
+            .unwrap();
+        assert_eq!(q.jwks_uri.as_str(), "http://kc.rhbk.svc:8080/certs?x=1");
+        for bad in [
+            "https://a.example",
+            "not a url=https://a.example/keys",
+            "https://a.example=keys",
+        ] {
+            assert!(bad.parse::<TrustedIssuer>().is_err(), "{bad}");
         }
     }
 

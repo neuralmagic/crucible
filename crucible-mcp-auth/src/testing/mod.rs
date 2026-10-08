@@ -1,7 +1,7 @@
 //! Test fixtures: two real RSA keys and a JWKS endpoint on loopback whose key set tests swap.
 
 use crate::jwks::Jwks;
-use crate::server::{ResourceServer, ResourceServerConfig};
+use crate::server::{ResourceServer, ResourceServerConfig, TrustedIssuer};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -102,8 +102,10 @@ impl JwksServer {
 
 pub fn config(jwks_uri: Url) -> ResourceServerConfig {
     ResourceServerConfig {
-        issuer: Url::parse(ISSUER).unwrap(),
-        jwks_uri,
+        issuers: vec![TrustedIssuer {
+            issuer: ISSUER.to_string(),
+            jwks_uri,
+        }],
         resources: vec![
             Url::parse(RESOURCE_SVC).unwrap(),
             Url::parse(RESOURCE_ROUTE).unwrap(),
@@ -119,10 +121,10 @@ pub fn resource_server(
     max_age: Duration,
     min_refetch: Duration,
 ) -> ResourceServer {
-    let cfg = config(jwks.url.clone());
-    let fetcher =
-        Jwks::new(reqwest::Client::new(), cfg.jwks_uri.clone()).with_timing(max_age, min_refetch);
-    ResourceServer::with_jwks(cfg, fetcher)
+    ResourceServer::with_jwks(config(jwks.url.clone()), |trusted| {
+        Jwks::new(reqwest::Client::new(), trusted.jwks_uri.clone())
+            .with_timing(max_age, min_refetch)
+    })
 }
 
 /// pirate cluster e2e: the spike pod and the realm token exchange.

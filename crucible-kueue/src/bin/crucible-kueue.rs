@@ -1,5 +1,6 @@
 use anyhow::Context;
 use clap::Parser;
+use crucible_mcp_auth::server::TrustedIssuer;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,18 +28,21 @@ struct Cli {
         value_delimiter = ','
     )]
     allowed_hosts: Vec<String>,
-    /// Accept access tokens from this OAuth issuer (the crucible realm), alongside tenant tokens.
-    #[arg(long, env = "CRUCIBLE_KUEUE_OIDC_ISSUER", requires_all = ["oidc_jwks_uri", "resources"])]
-    oidc_issuer: Option<url::Url>,
-    /// The issuer's JWKS endpoint, e.g. the in-cluster Keycloak Service.
-    #[arg(long, env = "CRUCIBLE_KUEUE_OIDC_JWKS_URI", requires = "oidc_issuer")]
-    oidc_jwks_uri: Option<url::Url>,
+    /// Accept access tokens from an OAuth issuer, as `<issuer>=<jwks uri>`, alongside tenant
+    /// tokens. Repeat for each issuer (the crucible controller for agents, the realm for people).
+    #[arg(
+        long = "issuer",
+        env = "CRUCIBLE_KUEUE_ISSUERS",
+        value_delimiter = ',',
+        requires = "resources"
+    )]
+    issuers: Vec<TrustedIssuer>,
     /// This server's canonical MCP URLs; an access token's aud must name one.
     #[arg(
         long = "resource",
         env = "CRUCIBLE_KUEUE_RESOURCES",
         value_delimiter = ',',
-        requires = "oidc_issuer"
+        requires = "issuers"
     )]
     resources: Vec<url::Url>,
     /// TOML tool policy: per-tool scopes, CEL validate rules, and claim-derived argument mutations.
@@ -50,7 +54,7 @@ struct Cli {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("no callers: pass --tenants with at least one entry, --tenant-namespace, or --oidc-issuer")]
+#[error("no callers: pass --tenants with at least one entry, --tenant-namespace, or --issuer")]
 struct NoTenants;
 
 #[tokio::main]
@@ -83,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
         }
         None => crucible_kueue::tenant::Tenants::default(),
     };
-    if tenants.is_empty() && cli.tenant_namespace.is_none() && cli.oidc_issuer.is_none() {
+    if tenants.is_empty() && cli.tenant_namespace.is_none() && cli.issuers.is_empty() {
         return Err(NoTenants.into());
     }
     tracing::info!(tenants = tenants.len(), "static tenants loaded");
@@ -109,17 +113,18 @@ async fn main() -> anyhow::Result<()> {
             registry.clone(),
         ));
     }
-    let oidc = match (cli.oidc_issuer, cli.oidc_jwks_uri) {
-        (Some(issuer), Some(jwks_uri)) => {
-            tracing::info!(%issuer, resources = ?cli.resources, "accepting realm access tokens");
+    let oidc = match cli.issuers.is_empty() {
+        true => None,
+        false => {
+            let issuers: Vec<&str> = cli.issuers.iter().map(|t| t.issuer.as_str()).collect();
+            tracing::info!(?issuers, resources = ?cli.resources, "accepting access tokens");
             let config = crucible_mcp_auth::server::ResourceServerConfig {
-                issuer,
-                jwks_uri,
+                issuers: cli.issuers,
                 resources: cli.resources,
-                required_scopes: vec![crucible_kueue::auth::SCOPE_READ.to_string()],
+                required_scopes: vec![crucible_contract::kueue::SCOPE_READ.to_string()],
                 scopes_supported: vec![
-                    crucible_kueue::auth::SCOPE_READ.to_string(),
-                    crucible_kueue::auth::SCOPE_SUBMIT.to_string(),
+                    crucible_contract::kueue::SCOPE_READ.to_string(),
+                    crucible_contract::kueue::SCOPE_SUBMIT.to_string(),
                 ],
                 resource_name: Some("crucible-kueue".to_string()),
             };
@@ -127,7 +132,6 @@ async fn main() -> anyhow::Result<()> {
                 .context("building the JWKS client")?;
             Some(Arc::new(server))
         }
-        _ => None,
     };
     let policy = match &cli.tool_policy {
         Some(path) => {
@@ -152,4 +156,51 @@ async fn main() -> anyhow::Result<()> {
         })
         .await
         .context("serving http")
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    #[test]
+    fn issuers_parse_as_issuer_equals_jwks_uri_and_keep_the_issuer_verbatim() {
+        let cli = Cli::try_parse_from([
+            "crucible-kueue",
+            "--issuer",
+            "http://crucible-controller.tms.svc:8080=http://crucible-controller.tms.svc:8080/.well-known/jwks.json",
+            "--issuer",
+            "https://keycloak.example/realms/crucible=http://keycloak.rhbk.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1",
+            "--resource",
+            "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.issuers
+                .iter()
+                .map(|t| (t.issuer.as_str(), t.jwks_uri.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "http://crucible-controller.tms.svc:8080",
+                    "http://crucible-controller.tms.svc:8080/.well-known/jwks.json"
+                ),
+                (
+                    "https://keycloak.example/realms/crucible",
+                    "http://keycloak.rhbk.svc:8080/realms/crucible/protocol/openid-connect/certs?x=1"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn issuers_without_resources_are_refused() {
+        assert!(
+            Cli::try_parse_from([
+                "crucible-kueue",
+                "--issuer",
+                "https://a.example=https://a.example/keys"
+            ])
+            .is_err()
+        );
+    }
 }

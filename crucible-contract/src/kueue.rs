@@ -19,6 +19,12 @@ pub const ENV_KUEUE_URL: &str = "CRUCIBLE_KUEUE_URL";
 /// Loop-pod env carrying the run's raw bearer token, projected from the run Secret.
 pub const ENV_KUEUE_TOKEN: &str = "CRUCIBLE_KUEUE_TOKEN";
 
+/// OAuth scope to read queues, hardware, and workloads.
+pub const SCOPE_READ: &str = "kueue.read";
+
+/// OAuth scope to submit, stop, resume, and delete workloads.
+pub const SCOPE_SUBMIT: &str = "kueue.submit";
+
 /// What a token may do inside its namespace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -27,6 +33,16 @@ pub enum TenantRole {
     Viewer,
     /// Viewer plus submit, stop, resume, and delete of workloads this server created.
     Submitter,
+}
+
+impl TenantRole {
+    /// The OAuth scopes the role grants.
+    pub fn scopes(self) -> &'static [&'static str] {
+        match self {
+            Self::Viewer => &[SCOPE_READ],
+            Self::Submitter => &[SCOPE_READ, SCOPE_SUBMIT],
+        }
+    }
 }
 
 /// One bearer token's scope. The server validates every name before the record can authenticate.

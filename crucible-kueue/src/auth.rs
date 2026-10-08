@@ -16,11 +16,6 @@ use crucible_mcp_auth::server::{AuthError, ResourceServer, bearer_token};
 use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
-/// Scope that lets a token read queues and workloads.
-pub const SCOPE_READ: &str = "kueue.read";
-/// Scope that lets a token submit and control workloads.
-pub const SCOPE_SUBMIT: &str = "kueue.submit";
-
 pub struct Auth {
     pub registry: Arc<Registry>,
     /// Accept access tokens from this authorization server. `None` accepts tenant tokens only.
@@ -81,10 +76,7 @@ impl Caller {
     /// The principal a tenant token stands for, with claims shaped like a realm token's so one
     /// tool policy covers both. Its scopes follow the tenant role.
     pub fn tenant_principal(&self) -> Principal {
-        let scope = match self.role {
-            TenantRole::Viewer => SCOPE_READ.to_string(),
-            TenantRole::Submitter => format!("{SCOPE_READ} {SCOPE_SUBMIT}"),
-        };
+        let scope = self.role.scopes().join(" ");
         let subject = format!("tenant:{}", self.run_id);
         let scopes = scope.split(' ').map(str::to_string).collect();
         let mut claims = Map::new();

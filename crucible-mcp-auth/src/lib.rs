@@ -19,3 +19,4 @@ pub mod server;
 /// crate.
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
+pub mod verify;
