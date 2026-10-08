@@ -103,6 +103,10 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         );
     }
 
+    if let Some(Cmd::OpenshellGateway) = cli.command {
+        return crate::openshell::gateway::serve();
+    }
+
     if let Some(Cmd::Ps { namespace, json }) = cli.command {
         return crate::cli::ps::run(namespace.as_deref(), json);
     }

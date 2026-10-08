@@ -221,9 +221,18 @@ pub(crate) fn mtls_dir() -> Result<PathBuf> {
         .join("mtls"))
 }
 
-/// The gateway URL. Local, TLS+mTLS, on the fixed bind port.
+/// The gateway URL: a gateway pod's when the controller named one, else this pod's own, on the
+/// fixed bind port. TLS+mTLS either way.
 fn server_url() -> String {
-    format!("https://localhost:{GATEWAY_PORT}")
+    std::env::var(crate::openshell::gateway::GATEWAY_URL_ENV)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| format!("https://localhost:{GATEWAY_PORT}"))
+}
+
+#[cfg(test)]
+pub(crate) fn server_url_for_tests() -> String {
+    server_url()
 }
 
 /// Build a lazily-connecting mTLS channel from the gateway's local certs. Lazy means no I/O,
@@ -1219,6 +1228,7 @@ fn sandbox_driver_config(
     if kubernetes.is_empty() {
         return Ok(None);
     }
+    check_driver_config(&kubernetes)?;
     let wrapped = serde_json::Map::from_iter([(
         "kubernetes".to_string(),
         serde_json::Value::Object(kubernetes),
@@ -1226,6 +1236,54 @@ fn sandbox_driver_config(
     Ok(Some(openshell_core::proto_struct::json_object_to_struct(
         wrapped,
     )?))
+}
+
+/// The `driver_config` fields crucible may send: placement and the agent container's resources.
+/// Volumes, volume mounts, and priority classes never leave this process, whoever asks.
+const DRIVER_CONFIG_POD_FIELDS: &[&str] = &[
+    "host_aliases",
+    "node_selector",
+    "tolerations",
+    "runtime_class_name",
+];
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("driver_config field {0} is not one crucible sends")]
+pub struct DriverConfigFieldRefused(pub String);
+
+/// Refuse a kubernetes `driver_config` holding anything outside [`DRIVER_CONFIG_POD_FIELDS`] and
+/// `containers.agent.resources`.
+fn check_driver_config(
+    kubernetes: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), DriverConfigFieldRefused> {
+    let refuse = |path: String| Err(DriverConfigFieldRefused(path));
+    for (key, value) in kubernetes {
+        match (key.as_str(), value) {
+            ("pod", serde_json::Value::Object(pod)) => {
+                if let Some(field) = pod
+                    .keys()
+                    .find(|f| !DRIVER_CONFIG_POD_FIELDS.contains(&f.as_str()))
+                {
+                    return refuse(format!("pod.{field}"));
+                }
+            }
+            ("containers", serde_json::Value::Object(containers)) => {
+                for (name, container) in containers {
+                    let fields = container.as_object().map(|c| c.keys().collect::<Vec<_>>());
+                    match (name.as_str(), fields) {
+                        ("agent", Some(fields)) => {
+                            if let Some(field) = fields.into_iter().find(|f| *f != "resources") {
+                                return refuse(format!("containers.agent.{field}"));
+                            }
+                        }
+                        _ => return refuse(format!("containers.{name}")),
+                    }
+                }
+            }
+            (other, _) => return refuse(other.to_string()),
+        }
+    }
+    Ok(())
 }
 
 /// The domain's declared paths ADDED to openshell's restrictive default, or `None` when it declared
@@ -3070,5 +3128,76 @@ pYBZ
             "{err:#}"
         );
         assert_eq!(deleted, ["ci-leak"]);
+    }
+
+    #[test]
+    fn driver_config_carries_only_placement_and_agent_resources() {
+        let resources = crate::manifest::SandboxResources {
+            gpus: 1,
+            cpu: Some(crate::manifest::Quantity::try_from("2".to_string()).unwrap()),
+            memory: Some(crate::manifest::Quantity::try_from("4Gi".to_string()).unwrap()),
+            node_selector: BTreeMap::from([("pool".to_string(), "gpu".to_string())]),
+            ..Default::default()
+        };
+        let gpu = crate::openshell::placement::GpuPlacement {
+            node_selector: BTreeMap::from([(
+                "nvidia.com/gpu.present".to_string(),
+                "true".to_string(),
+            )]),
+            tolerations: vec![k8s_openapi::api::core::v1::Toleration {
+                key: Some("nvidia.com/gpu".into()),
+                operator: Some("Exists".into()),
+                ..Default::default()
+            }],
+            runtime_class_name: Some("nvidia".into()),
+        };
+        let aliases = BTreeMap::from([("svc.example".to_string(), "10.0.0.9".to_string())]);
+        let built = sandbox_driver_config(&aliases, &gpu, &resources)
+            .unwrap()
+            .expect("a config");
+        let json = openshell_core::proto_struct::struct_to_json_object(&built);
+        let kubernetes = json["kubernetes"].as_object().expect("kubernetes table");
+        check_driver_config(kubernetes)
+            .expect("everything crucible builds passes its own allowlist");
+        assert_eq!(
+            kubernetes["pod"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            [
+                "host_aliases",
+                "node_selector",
+                "runtime_class_name",
+                "tolerations"
+            ]
+        );
+    }
+
+    #[test]
+    fn driver_config_volumes_mounts_and_priority_classes_are_refused() {
+        let cases = [
+            (serde_json::json!({"volumes": []}), "volumes"),
+            (
+                serde_json::json!({"pod": {"priority_class_name": "x"}}),
+                "pod.priority_class_name",
+            ),
+            (
+                serde_json::json!({"containers": {"agent": {"volume_mounts": []}}}),
+                "containers.agent.volume_mounts",
+            ),
+            (
+                serde_json::json!({"containers": {"sidecar": {}}}),
+                "containers.sidecar",
+            ),
+        ];
+        for (config, field) in cases {
+            let map = config.as_object().unwrap().clone();
+            assert_eq!(
+                check_driver_config(&map),
+                Err(DriverConfigFieldRefused(field.to_string())),
+                "{config}"
+            );
+        }
     }
 }

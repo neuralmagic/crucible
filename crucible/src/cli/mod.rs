@@ -41,6 +41,10 @@ pub(crate) struct Cli {
 /// Subcommands that aren't the default loop run.
 #[derive(clap::Subcommand)]
 pub(crate) enum Cmd {
+    /// Run as a per-run OpenShell gateway pod's entrypoint: the controller creates that pod and
+    /// supplies its config through the environment.
+    #[command(hide = true)]
+    OpenshellGateway,
     /// Scaffold a minimal `crucible.toml` + measure stub in the current directory (or `--dir`):
     /// the bring-your-own-repo on-ramp, dropping crucible onto a repo like a justfile. Refuses
     /// to overwrite existing files.
