@@ -96,6 +96,16 @@ fn gateway_labels(names: &GatewayNames) -> BTreeMap<String, String> {
     ])
 }
 
+/// Selects every run's gateway objects.
+pub fn gateway_selector() -> String {
+    format!("{ROLE_LABEL}={ROLE_VALUE}")
+}
+
+/// Selects the gateway objects of the run whose pod is `run_pod`.
+pub fn run_gateway_selector(run_pod: &str) -> String {
+    format!("{},{GATEWAY_FOR_LABEL}={run_pod}", gateway_selector())
+}
+
 fn sandbox_namespace(profile: &DeployProfile) -> String {
     profile.cluster.sandbox_namespace().to_string()
 }
@@ -172,11 +182,16 @@ pub struct GatewayAddresses {
 
 impl GatewayAddresses {
     pub fn url(&self) -> String {
-        format!(
-            "https://{}",
-            std::net::SocketAddr::new(self.gateway, GATEWAY_PORT)
-        )
+        gateway_url(self.gateway)
     }
+}
+
+/// The endpoint the loop pod and supervisors dial: the gateway Service's ClusterIP.
+pub fn gateway_url(gateway: IpAddr) -> String {
+    format!(
+        "https://{}",
+        std::net::SocketAddr::new(gateway, GATEWAY_PORT)
+    )
 }
 
 /// The loop pod env the gateway reads its driver config from.
@@ -358,12 +373,46 @@ pub fn gateway_network_policy(
     }
 }
 
-/// The loop pod env pointing the engine at its gateway pod.
-pub fn loop_pod_env(addresses: GatewayAddresses) -> Vec<core::EnvVar> {
+/// PEM material for one end of a run's gateway mTLS: the run CA, a certificate it issued, and that
+/// certificate's key.
+#[derive(Clone, Copy)]
+pub struct TlsMaterial<'a> {
+    pub ca: &'a str,
+    pub cert: &'a str,
+    pub key: &'a str,
+}
+
+/// A gateway TLS Secret in the sandbox namespace under the `ca.crt`/`tls.crt`/`tls.key` keys the
+/// gateway's server TLS dir and the driver's supervisor mount both read.
+pub fn gateway_tls_secret(
+    profile: &DeployProfile,
+    names: &GatewayNames,
+    name: &str,
+    material: TlsMaterial<'_>,
+) -> core::Secret {
+    core::Secret {
+        metadata: ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(sandbox_namespace(profile)),
+            labels: Some(gateway_labels(names)),
+            ..Default::default()
+        },
+        type_: Some("Opaque".to_string()),
+        string_data: Some(BTreeMap::from([
+            ("ca.crt".to_string(), material.ca.to_string()),
+            ("tls.crt".to_string(), material.cert.to_string()),
+            ("tls.key".to_string(), material.key.to_string()),
+        ])),
+        ..Default::default()
+    }
+}
+
+/// The loop pod env pointing the engine at the gateway behind `gateway`.
+pub fn loop_pod_env(gateway: IpAddr) -> Vec<core::EnvVar> {
     vec![
         core::EnvVar {
             name: GATEWAY_URL_ENV.to_string(),
-            value: Some(addresses.url()),
+            value: Some(gateway_url(gateway)),
             value_from: None,
         },
         core::EnvVar {
@@ -607,10 +656,55 @@ mod tests {
 
     #[test]
     fn the_loop_pod_is_pointed_at_its_gateway_and_client_material() {
-        let env = loop_pod_env(addresses());
+        let env = loop_pod_env(addresses().gateway);
         assert_eq!(env[0].name, GATEWAY_URL_ENV);
         assert_eq!(env[0].value.as_deref(), Some("https://172.30.1.9:17670"));
         assert_eq!(env[1].name, GATEWAY_CLIENT_TLS_DIR_ENV);
         assert_eq!(env[1].value.as_deref(), Some(CLIENT_TLS_DIR));
+    }
+
+    #[test]
+    fn tls_secrets_carry_the_keys_the_gateway_and_driver_read_and_the_run_labels() {
+        let p = isolated_profile();
+        let names = GatewayNames::for_run_pod("crucible-run-a");
+        let secret = gateway_tls_secret(
+            &p,
+            &names,
+            &names.client_secret,
+            TlsMaterial {
+                ca: "CA",
+                cert: "CERT",
+                key: "KEY",
+            },
+        );
+        assert_eq!(
+            secret.metadata.name.as_deref(),
+            Some("crucible-run-a-gw-client")
+        );
+        assert_eq!(secret.metadata.namespace.as_deref(), Some("sandboxes"));
+        let data = secret.string_data.expect("string data");
+        assert_eq!(data.get("ca.crt").map(String::as_str), Some("CA"));
+        assert_eq!(data.get("tls.crt").map(String::as_str), Some("CERT"));
+        assert_eq!(data.get("tls.key").map(String::as_str), Some("KEY"));
+        let labels = secret.metadata.labels.expect("labels");
+        assert_eq!(
+            labels.get(GATEWAY_FOR_LABEL).map(String::as_str),
+            Some("crucible-run-a")
+        );
+    }
+
+    #[test]
+    fn the_selectors_match_every_gateway_object_and_one_runs() {
+        let names = GatewayNames::for_run_pod("crucible-run-a");
+        let labels = gateway_labels(&names);
+        let matches = |selector: String| {
+            selector.split(',').all(|term| {
+                let (k, v) = term.split_once('=').expect("equality term");
+                labels.get(k).map(String::as_str) == Some(v)
+            })
+        };
+        assert!(matches(gateway_selector()));
+        assert!(matches(run_gateway_selector("crucible-run-a")));
+        assert!(!matches(run_gateway_selector("crucible-run-b")));
     }
 }
