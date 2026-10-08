@@ -15,14 +15,14 @@ pub const RESOURCE_SVC: &str = "http://kueue.crucible-system.svc.cluster.local:8
 pub const RESOURCE_ROUTE: &str = "https://kueue.apps.example/mcp";
 
 pub fn jwk(name: &str) -> Value {
-    let all: Value = serde_json::from_str(include_str!("../testdata/jwks.json")).unwrap();
+    let all: Value = serde_json::from_str(include_str!("../../testdata/jwks.json")).unwrap();
     all[name].clone()
 }
 
 pub fn signing_key(name: &str) -> EncodingKey {
     let pem = match name {
-        "a" => include_str!("../testdata/rsa-a.pem"),
-        "b" => include_str!("../testdata/rsa-b.pem"),
+        "a" => include_str!("../../testdata/rsa-a.pem"),
+        "b" => include_str!("../../testdata/rsa-b.pem"),
         other => panic!("no key {other}"),
     };
     EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap()
@@ -124,3 +124,7 @@ pub fn resource_server(
         Jwks::new(reqwest::Client::new(), cfg.jwks_uri.clone()).with_timing(max_age, min_refetch);
     ResourceServer::with_jwks(cfg, fetcher)
 }
+
+/// pirate cluster e2e: the spike pod and the realm token exchange.
+#[cfg(feature = "e2e")]
+pub mod cluster;

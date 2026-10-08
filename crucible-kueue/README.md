@@ -55,7 +55,8 @@ tokens from the crucible realm (a compact JWT is never looked up as a tenant tok
 `run_id`, `namespace`, `role`, and `queues` claims give the same scope as a tenant record, and its
 `sub` (the human the run acts for) is stamped on created workloads as `crucible.dev/launched-by`.
 `--tool-policy` adds per-tool scopes and CEL rules over the caller's claims and the call's
-arguments. Realm setup, the shipped policy, and the e2e are in [deploy/auth](deploy/auth/README.md).
+arguments. The shipped policy is [deploy/kueue-policy.toml](deploy/kueue-policy.toml); realm setup and the e2e are in
+[crucible-mcp-auth/deploy](../crucible-mcp-auth/deploy/README.md).
 
 ## Deploy
 

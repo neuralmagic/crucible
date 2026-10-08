@@ -20,7 +20,7 @@ spec:
       openshell.ai/boundary-role: supervisor
   jwtTtl: 5m
 ---
-# Same ID shape for the auth spike pod in `rhbk` (deploy/auth/spike.yaml), so the SVID -> Keycloak
+# Same ID shape for the auth spike pod in `rhbk` (spike.yaml), so the SVID -> Keycloak
 # exchange can be proven without launching a crucible run.
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID

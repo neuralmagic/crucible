@@ -24,13 +24,13 @@ bearer only on egress to the bound MCP endpoint.
 | `keycloak.yaml` | rhbk | Postgres, Keycloak, edge Route |
 | `realm.yaml` | rhbk | Realm import (IdPs, scopes, `claude-code`, the `run-auth-spike` client) |
 | `spike.yaml` | rhbk | Pod that fetches one JWT-SVID shaped like a supervisor's |
-| `kueue-policy.toml` | - | crucible-kueue tool policy (`--tool-policy`) |
+| `realm-dev.sh` | rhbk | Live realm changes an import cannot make; `grant` sets a person's tenant scope |
 | `apply.sh` | - | Applies all of the above in order; safe to re-run |
 
 ## Apply
 
 ```bash
-crucible-kueue/deploy/auth/apply.sh
+crucible-mcp-auth/deploy/apply.sh
 ```
 
 `realm.yaml` is a `KeycloakRealmImport`, which only creates a realm that does not exist; changes
@@ -57,7 +57,7 @@ crucible-kueue \
   --oidc-issuer https://keycloak.apps.openshift.nm.rdu4.corp.redhat.com/realms/crucible \
   --oidc-jwks-uri http://keycloak-service.rhbk.svc.cluster.local:8080/realms/crucible/protocol/openid-connect/certs \
   --resource http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp \
-  --tool-policy /etc/crucible-kueue/kueue-policy.toml \
+  --tool-policy /etc/crucible-kueue/kueue-policy.toml   # crucible-kueue/deploy/kueue-policy.toml \
   --tenant-namespace crucible-kueue-tenants
 ```
 
@@ -120,4 +120,4 @@ cargo test -p crucible-kueue --test oidc_e2e -- --ignored --nocapture
 ```
 
 The e2e recreates `spike.yaml`, exchanges its JWT-SVID at the realm exactly as the supervisor
-does, and drives crucible-kueue on loopback with the resulting token and `kueue-policy.toml`.
+does, and drives crucible-kueue on loopback with the resulting token and its shipped policy.

@@ -39,6 +39,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
-serde_norway = "0.9"
+crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
 tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }

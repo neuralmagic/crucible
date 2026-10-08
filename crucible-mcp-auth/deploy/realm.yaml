@@ -139,6 +139,32 @@ spec:
               included.custom.audience: https://crucible-kueue.apps.openshift.nm.rdu4.corp.redhat.com/mcp
               access.token.claim: "true"
               id.token.claim: "false"
+      - name: buildit.read
+        protocol: openid-connect
+        attributes:
+          include.in.token.scope: "true"
+          display.on.consent.screen: "false"
+        protocolMappers:
+          - name: aud-buildit-sandbox
+            protocol: openid-connect
+            protocolMapper: oidc-audience-mapper
+            config:
+              included.custom.audience: http://host.openshell.internal:8849/mcp
+              access.token.claim: "true"
+              id.token.claim: "false"
+      - name: buildit.build
+        protocol: openid-connect
+        attributes:
+          include.in.token.scope: "true"
+          display.on.consent.screen: "false"
+        protocolMappers:
+          - name: aud-buildit-sandbox
+            protocol: openid-connect
+            protocolMapper: oidc-audience-mapper
+            config:
+              included.custom.audience: http://host.openshell.internal:8849/mcp
+              access.token.claim: "true"
+              id.token.claim: "false"
       - name: crucible-tenant
         description: Tenant claims for humans, from user attributes set by an operator.
         protocol: openid-connect
@@ -211,6 +237,8 @@ spec:
         defaultClientScopes:
           - kueue.read
           - kueue.submit
+          - buildit.read
+          - buildit.build
         optionalClientScopes: []
         protocolMappers:
           - name: sub
@@ -228,6 +256,14 @@ spec:
               claim.name: act
               claim.value: '{"sub":"spiffe://pirate.crucible/openshell/sandbox/auth-spike"}'
               jsonType.label: JSON
+              access.token.claim: "true"
+          - name: sandbox
+            protocol: openid-connect
+            protocolMapper: oidc-hardcoded-claim-mapper
+            config:
+              claim.name: sandbox
+              claim.value: auth-spike
+              jsonType.label: String
               access.token.claim: "true"
           - name: run_id
             protocol: openid-connect

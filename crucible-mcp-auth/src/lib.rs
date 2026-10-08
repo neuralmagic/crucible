@@ -15,5 +15,7 @@ pub mod metadata;
 pub mod policy;
 pub mod principal;
 pub mod server;
-#[cfg(test)]
-mod testing;
+/// Real keys, a loopback JWKS endpoint, and token minting for tests of servers built on this
+/// crate.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;

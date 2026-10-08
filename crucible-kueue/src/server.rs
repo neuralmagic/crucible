@@ -1424,7 +1424,7 @@ mod tests {
     #[test]
     fn the_shipped_tool_policy_covers_every_tool_and_injects_nothing_into_schemas() {
         let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(include_str!(
-            "../deploy/auth/kueue-policy.toml"
+            "../deploy/kueue-policy.toml"
         ))
         .unwrap();
         for tool in KueueMcp::tool_router().list_all() {

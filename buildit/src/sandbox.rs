@@ -13,16 +13,21 @@ pub const RESULTS_DIR: &str = ".buildit";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxName(String);
 
+/// A Kubernetes label value: at most 63 characters of alphanumerics, `-`, `_`, `.`, alphanumeric
+/// at both ends.
+pub fn is_label_value(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    raw.len() <= 63
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 impl SandboxName {
     pub fn parse(raw: &str) -> Result<Self> {
-        let bytes = raw.as_bytes();
-        let ok = raw.len() <= 63
-            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
-            && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
-            && bytes
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
-        if !ok {
+        if !is_label_value(raw) {
             bail!("invalid sandbox name {raw:?}");
         }
         Ok(Self(raw.to_string()))

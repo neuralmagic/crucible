@@ -1,0 +1,28 @@
+# buildit MCP tool policy (--tool-policy). Rules see `claims` (the access token's, or the
+# equivalent built for a tokens-file token) and `args` (the call's arguments). Unlisted tools
+# are denied.
+
+[tools.status]
+scopes = ["buildit.read"]
+
+[tools.logs]
+scopes = ["buildit.read"]
+
+[tools.build]
+scopes = ["buildit.build"]
+
+[[tools.build.validate]]
+name = "build-timeout-cap"
+rule = "!has(args.timeout_s) || args.timeout_s <= 3600"
+message = "a build may run at most 3600 seconds"
+
+[tools.run]
+scopes = ["buildit.build"]
+
+[[tools.run.validate]]
+name = "run-timeout-cap"
+rule = "!has(args.timeout_s) || args.timeout_s <= 1800"
+message = "a run may take at most 1800 seconds"
+
+[tools.clean]
+scopes = ["buildit.build"]

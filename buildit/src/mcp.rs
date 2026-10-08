@@ -31,9 +31,13 @@ use serde::{Deserialize, Serialize};
 use crate::backend::{Backend, PodOpts, Resources};
 use crate::logs::{LOG_DIR, Log, LogName, MAX_READ, Page, Query};
 use crate::pod::BuilderPod;
-use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace};
+use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace, is_label_value};
 use crate::step::{self, Fetch, Published, Snapshot, Status};
 use crate::task::{self, Progress, TaskRef};
+use crucible_mcp_auth::guard::PolicyGuard;
+use crucible_mcp_auth::policy::ToolPolicy;
+use crucible_mcp_auth::principal::Principal;
+use crucible_mcp_auth::server::{AuthError, ResourceServer, ResourceServerConfig};
 
 pub const MCP_PATH: &str = "/mcp";
 
@@ -43,6 +47,13 @@ const LABEL_MANAGED_BY: &str = "buildit.dev/managed-by";
 const MANAGED_BY: &str = "mcp";
 const LABEL_SANDBOX: &str = "buildit.dev/sandbox";
 const LABEL_BUILD_ID: &str = "buildit.dev/build-id";
+/// The person a realm token acted for, on every builder pod it starts.
+const LABEL_LAUNCHED_BY: &str = "crucible.dev/launched-by";
+
+/// Scope that lets a token read build status and logs.
+pub const SCOPE_READ: &str = "buildit.read";
+/// Scope that lets a token build, run, and clean.
+pub const SCOPE_BUILD: &str = "buildit.build";
 
 const POD_READY: Duration = Duration::from_secs(180);
 const DEFAULT_BUILD_TIMEOUT_S: u64 = 1800;
@@ -66,8 +77,25 @@ pub struct McpArgs {
     #[arg(long, env = "MCP_BIND", default_value = "0.0.0.0:8849")]
     pub bind: String,
     /// File of `<token> <sandbox> [<workdir>]` lines, re-read on every request
-    #[arg(long, env = "MCP_TOKENS_FILE")]
-    pub tokens_file: PathBuf,
+    #[arg(long, env = "MCP_TOKENS_FILE", required_unless_present = "oidc_issuer")]
+    pub tokens_file: Option<PathBuf>,
+    /// Accept access tokens from this OAuth issuer (the crucible realm), alongside the tokens file
+    #[arg(long, env = "MCP_OIDC_ISSUER", requires_all = ["oidc_jwks_uri", "resources"])]
+    pub oidc_issuer: Option<url::Url>,
+    /// The issuer's JWKS endpoint
+    #[arg(long, env = "MCP_OIDC_JWKS_URI", requires = "oidc_issuer")]
+    pub oidc_jwks_uri: Option<url::Url>,
+    /// This server's canonical MCP URLs; an access token's aud must name one
+    #[arg(
+        long = "resource",
+        env = "MCP_RESOURCES",
+        value_delimiter = ',',
+        requires = "oidc_issuer"
+    )]
+    pub resources: Vec<url::Url>,
+    /// TOML tool policy: per-tool scopes, CEL validate rules, claim-derived argument mutations
+    #[arg(long, env = "MCP_TOOL_POLICY")]
+    pub tool_policy: Option<PathBuf>,
     /// Sandbox workdir for token lines that name none
     #[arg(long, env = "BROKER_SANDBOX_WORKDIR")]
     pub sandbox_workdir: Option<String>,
@@ -105,10 +133,38 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
     let namespace = args
         .namespace
         .unwrap_or_else(|| client.default_namespace().to_string());
+    let oidc = match (args.oidc_issuer, args.oidc_jwks_uri) {
+        (Some(issuer), Some(jwks_uri)) => {
+            let config = ResourceServerConfig {
+                issuer,
+                jwks_uri,
+                resources: args.resources,
+                required_scopes: vec![SCOPE_READ.to_string()],
+                scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
+                resource_name: Some("buildit".to_string()),
+            };
+            Some(Arc::new(
+                ResourceServer::new(config).context("building the JWKS client")?,
+            ))
+        }
+        _ => None,
+    };
+    let policy = match &args.tool_policy {
+        Some(path) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("reading tool policy {}", path.display()))?;
+            Some(
+                ToolPolicy::from_toml(&text)
+                    .with_context(|| format!("loading tool policy {}", path.display()))?,
+            )
+        }
+        None => None,
+    };
     let broker = Arc::new(Broker {
         client,
         namespace,
         tokens_file: args.tokens_file,
+        oidc,
         default_workdir: args
             .sandbox_workdir
             .as_deref()
@@ -131,12 +187,16 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         args.bind,
         broker.namespace
     );
-    axum::serve(listener, router(broker, &args.allowed_hosts))
+    axum::serve(listener, router(broker, &args.allowed_hosts, policy))
         .await
         .context("serving buildit mcp")
 }
 
-pub fn router(broker: Arc<Broker>, extra_hosts: &[String]) -> axum::Router {
+pub fn router(
+    broker: Arc<Broker>,
+    extra_hosts: &[String],
+    policy: Option<ToolPolicy>,
+) -> axum::Router {
     let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
     hosts.extend(SANDBOX_HOSTS.map(String::from));
     hosts.extend(extra_hosts.iter().map(|h| h.trim().to_string()));
@@ -157,19 +217,39 @@ pub fn router(broker: Arc<Broker>, extra_hosts: &[String]) -> axum::Router {
             Arc::new(NeverSessionManager::default()),
             config,
         );
-    axum::Router::new()
-        .nest_service(MCP_PATH, service)
-        .layer(axum::middleware::from_fn_with_state(broker, authenticate))
+    let oidc = broker.oidc.clone();
+    let mut mcp = axum::Router::new().fallback_service(service);
+    if let Some(policy) = policy {
+        let guard = PolicyGuard {
+            policy,
+            server: oidc.clone(),
+        };
+        mcp = mcp.layer(axum::middleware::from_fn_with_state(
+            Arc::new(guard),
+            crucible_mcp_auth::guard::enforce,
+        ));
+    }
+    mcp = mcp.layer(axum::middleware::from_fn_with_state(broker, authenticate));
+    let app = axum::Router::new().nest_service(MCP_PATH, mcp);
+    match oidc {
+        Some(server) => app.merge(crucible_mcp_auth::metadata::router(server)),
+        None => app,
+    }
 }
 
 async fn authenticate(State(broker): State<Arc<Broker>>, mut req: Request, next: Next) -> Response {
-    match broker.caller(req.headers()).await {
-        Ok(caller) => {
+    match broker.authenticate(req.headers()).await {
+        Ok((caller, principal)) => {
             req.extensions_mut().insert(caller);
+            req.extensions_mut().insert(principal);
             next.run(req).await
         }
-        Err(status) => status.into_response(),
+        Err(refused) => broker.respond(req.headers(), refused),
     }
+}
+
+fn is_jwt(token: &str) -> bool {
+    token.split('.').count() == 3
 }
 
 fn bearer(headers: &HeaderMap) -> Option<&str> {
@@ -248,12 +328,79 @@ impl BuildId {
 pub struct Caller {
     pub sandbox: SandboxName,
     pub workspace: Workspace,
+    /// The person a realm token acts for; tokens-file callers carry none.
+    pub launched_by: Option<Launcher>,
+}
+
+/// A realm token's `sub`, kept as a label value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Launcher(String);
+
+impl Launcher {
+    pub fn parse(raw: &str) -> Option<Self> {
+        is_label_value(raw).then(|| Self(raw.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Why a request was not authenticated.
+#[derive(Debug)]
+pub enum Refused {
+    /// A realm token failed validation, or no token matched while OIDC is on.
+    Token(AuthError),
+    /// A valid realm token that names no usable caller.
+    Claims(ClaimError),
+    /// The tokens-file path's own status.
+    Status(StatusCode),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ClaimError {
+    #[error("token names no sandbox: claim sandbox is missing or not a string")]
+    NoSandbox,
+    #[error("token claim sandbox {0:?} is not a sandbox name")]
+    Sandbox(String),
+    #[error("token claim workdir {0:?} is not an absolute, normal path")]
+    Workdir(String),
+    #[error("token subject {0:?} is not a label value")]
+    Subject(String),
+    #[error("sandbox {0} has no workdir and BROKER_SANDBOX_WORKDIR is unset")]
+    NoWorkdir(String),
+}
+
+impl Caller {
+    /// The principal a tokens-file caller stands for, claims shaped like a realm token's so one
+    /// tool policy covers both.
+    pub fn token_file_principal(&self) -> Principal {
+        let subject = format!("sandbox:{}", self.sandbox.as_str());
+        let scope = format!("{SCOPE_READ} {SCOPE_BUILD}");
+        let claims = serde_json::json!({
+            "sub": subject,
+            "sandbox": self.sandbox.as_str(),
+            "scope": scope,
+        });
+        Principal {
+            subject,
+            actor_chain: Vec::new(),
+            client_id: None,
+            namespace: None,
+            scopes: [SCOPE_READ, SCOPE_BUILD].map(String::from).into(),
+            claims: match claims {
+                serde_json::Value::Object(m) => m,
+                _ => serde_json::Map::new(),
+            },
+        }
+    }
 }
 
 pub struct Broker {
     client: kube::Client,
     namespace: String,
-    tokens_file: PathBuf,
+    tokens_file: Option<PathBuf>,
+    oidc: Option<Arc<ResourceServer>>,
     default_workdir: Option<SandboxDir>,
     local_workdir: Option<PathBuf>,
     resources: Resources,
@@ -531,14 +678,103 @@ fn unpack(tar: &[u8], dest: &Path) -> Result<Vec<String>> {
 }
 
 impl Broker {
+    /// A realm access token when OIDC is on and the bearer is a JWT, otherwise a tokens-file
+    /// token. A JWT never falls back to the tokens file.
+    async fn authenticate(&self, headers: &HeaderMap) -> Result<(Caller, Principal), Refused> {
+        if let (Some(oidc), Some(token)) = (&self.oidc, bearer(headers))
+            && is_jwt(token)
+        {
+            let principal = oidc.authenticate(headers).await.map_err(|error| {
+                tracing::info!(auth = "oidc", %error, "token refused");
+                Refused::Token(error)
+            })?;
+            let caller = self.realm_caller(&principal).map_err(|error| {
+                tracing::info!(auth = "oidc", sub = %principal.subject, %error, "token refused");
+                Refused::Claims(error)
+            })?;
+            tracing::info!(auth = "oidc", sub = %principal.subject, presenter = principal.presenter(), sandbox = caller.sandbox.as_str(), "caller authenticated");
+            return Ok((caller, principal));
+        }
+        match self.caller(headers).await {
+            Ok(caller) => {
+                tracing::debug!(
+                    auth = "token-file",
+                    sandbox = caller.sandbox.as_str(),
+                    "caller authenticated"
+                );
+                let principal = caller.token_file_principal();
+                Ok((caller, principal))
+            }
+            Err(StatusCode::UNAUTHORIZED) if self.oidc.is_some() => {
+                Err(Refused::Token(match bearer(headers) {
+                    None => AuthError::Missing,
+                    Some(_) => AuthError::Unrecognized,
+                }))
+            }
+            Err(status) => Err(Refused::Status(status)),
+        }
+    }
+
+    fn respond(&self, headers: &HeaderMap, refused: Refused) -> Response {
+        match (refused, &self.oidc) {
+            (Refused::Token(error), Some(oidc)) => oidc.challenge(headers, &error),
+            (Refused::Token(_), None) => StatusCode::UNAUTHORIZED.into_response(),
+            (Refused::Claims(error), _) => {
+                let body = serde_json::json!({"error": "insufficient_scope", "error_description": error.to_string()});
+                (StatusCode::FORBIDDEN, axum::Json(body)).into_response()
+            }
+            (Refused::Status(status), _) => status.into_response(),
+        }
+    }
+
+    /// The caller a realm token names: its `sandbox` claim, optional `workdir`, and `sub`.
+    fn realm_caller(&self, principal: &Principal) -> Result<Caller, ClaimError> {
+        let raw = principal
+            .claims
+            .get("sandbox")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(ClaimError::NoSandbox)?;
+        let sandbox = SandboxName::parse(raw).map_err(|_| ClaimError::Sandbox(raw.to_string()))?;
+        let workdir = match principal
+            .claims
+            .get("workdir")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(w) => Some(SandboxDir::parse(w).map_err(|_| ClaimError::Workdir(w.to_string()))?),
+            None => None,
+        };
+        let workspace = self
+            .workspace(workdir)
+            .ok_or_else(|| ClaimError::NoWorkdir(sandbox.as_str().to_string()))?;
+        let launched_by = Launcher::parse(&principal.subject)
+            .ok_or_else(|| ClaimError::Subject(principal.subject.clone()))?;
+        Ok(Caller {
+            sandbox,
+            workspace,
+            launched_by: Some(launched_by),
+        })
+    }
+
+    fn workspace(&self, workdir: Option<SandboxDir>) -> Option<Workspace> {
+        match (
+            &self.local_workdir,
+            workdir.or(self.default_workdir.clone()),
+        ) {
+            (Some(dir), _) => Some(Workspace::Local { dir: dir.clone() }),
+            (None, Some(workdir)) => Some(Workspace::Openshell { workdir }),
+            (None, None) => None,
+        }
+    }
+
     async fn caller(&self, headers: &HeaderMap) -> Result<Caller, StatusCode> {
         let token = bearer(headers).ok_or(StatusCode::UNAUTHORIZED)?;
-        let lines = tokio::fs::read_to_string(&self.tokens_file)
+        let tokens_file = self.tokens_file.as_ref().ok_or(StatusCode::UNAUTHORIZED)?;
+        let lines = tokio::fs::read_to_string(tokens_file)
             .await
             .context("reading the token file")
             .and_then(|text| parse_tokens(&text))
             .map_err(|e| {
-                tracing::error!("{}: {e:#}", self.tokens_file.display());
+                tracing::error!("{}: {e:#}", tokens_file.display());
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
         let line = lines
@@ -551,23 +787,17 @@ impl Broker {
                 }
             })
             .ok_or(StatusCode::UNAUTHORIZED)?;
-        let workspace = match (
-            &self.local_workdir,
-            line.workdir.or(self.default_workdir.clone()),
-        ) {
-            (Some(dir), _) => Workspace::Local { dir: dir.clone() },
-            (None, Some(workdir)) => Workspace::Openshell { workdir },
-            (None, None) => {
-                tracing::error!(
-                    "sandbox {} has no workdir and BROKER_SANDBOX_WORKDIR is unset",
-                    line.sandbox.as_str()
-                );
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
+        let Some(workspace) = self.workspace(line.workdir) else {
+            tracing::error!(
+                "sandbox {} has no workdir and BROKER_SANDBOX_WORKDIR is unset",
+                line.sandbox.as_str()
+            );
+            return Err(StatusCode::INTERNAL_SERVER_ERROR);
         };
         Ok(Caller {
             sandbox: line.sandbox,
             workspace,
+            launched_by: None,
         })
     }
 
@@ -625,7 +855,7 @@ impl Broker {
         }
     }
 
-    fn builder_pod(&self, sandbox: &SandboxName, id: &BuildId) -> Result<Pod> {
+    fn builder_pod(&self, caller: &Caller, id: &BuildId) -> Result<Pod> {
         let opts = PodOpts {
             idle_nodes: &[],
             resources: &self.resources,
@@ -633,14 +863,18 @@ impl Broker {
             node: None,
         };
         let mut pod = Backend::Buildah.pod_spec(&id.0, &self.namespace, &opts)?;
-        pod.metadata.labels.get_or_insert_default().extend(
+        let labels = pod.metadata.labels.get_or_insert_default();
+        labels.extend(
             [
                 (LABEL_MANAGED_BY, MANAGED_BY),
-                (LABEL_SANDBOX, sandbox.as_str()),
+                (LABEL_SANDBOX, caller.sandbox.as_str()),
                 (LABEL_BUILD_ID, &id.0),
             ]
             .map(|(k, v)| (k.to_string(), v.to_string())),
         );
+        if let Some(launcher) = &caller.launched_by {
+            labels.insert(LABEL_LAUNCHED_BY.to_string(), launcher.as_str().to_string());
+        }
         let spec = pod.spec.get_or_insert_default();
         spec.active_deadline_seconds = Some(self.deadline_secs);
         spec.automount_service_account_token = Some(false);
@@ -702,7 +936,7 @@ impl Broker {
         let pod = BuilderPod::create_from(
             self.client.clone(),
             &self.namespace,
-            &self.builder_pod(&caller.sandbox, &id)?,
+            &self.builder_pod(caller, &id)?,
         )
         .await?;
         let built = async {
@@ -1282,8 +1516,9 @@ mod tests {
     use k8s_openapi::api::core::v1::Pod;
 
     use crate::mcp::{
-        Broker, BuildId, BuildParams, Caller, LogsParams, MCP_PATH, PodView, TokenLine, bud_argv,
-        build_limit, parse_tokens, router, unpack,
+        Broker, BuildId, BuildParams, BuilditMcp, Caller, Launcher, LogsParams, MCP_PATH, PodView,
+        ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, StatusCode,
+        TokenLine, ToolPolicy, bud_argv, build_limit, parse_tokens, router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crate::step::{State, Status};
@@ -1301,7 +1536,8 @@ mod tests {
         Arc::new(Broker {
             namespace: client.default_namespace().to_string(),
             client,
-            tokens_file: tokens.to_path_buf(),
+            tokens_file: Some(tokens.to_path_buf()),
+            oidc: None,
             default_workdir: Some(SandboxDir::parse("/sandbox/default").unwrap()),
             local_workdir: local.map(Path::to_path_buf),
             resources: Resources::default(),
@@ -1309,6 +1545,16 @@ mod tests {
             max_builds: 4,
             node_arch: None,
         })
+    }
+
+    fn sandbox_caller(sandbox: &str) -> Caller {
+        Caller {
+            sandbox: SandboxName::parse(sandbox).unwrap(),
+            workspace: Workspace::Openshell {
+                workdir: SandboxDir::parse("/sandbox/default").unwrap(),
+            },
+            launched_by: None,
+        }
     }
 
     fn offline_client() -> kube::Client {
@@ -1325,7 +1571,7 @@ mod tests {
     async fn serve(broker: Arc<Broker>) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let app = router(broker, &["builds.svc".to_string()]);
+        let app = router(broker, &["builds.svc".to_string()], None);
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (addr, task)
     }
@@ -1368,6 +1614,7 @@ mod tests {
             workspace: Workspace::Openshell {
                 workdir: SandboxDir::parse(workdir).unwrap(),
             },
+            launched_by: None,
         };
         let a = [
             ("authorization", "Bearer tok-a"),
@@ -1423,6 +1670,226 @@ mod tests {
         sock.read_to_string(&mut out).await.unwrap();
         let status = out.split_whitespace().nth(1).unwrap().parse().unwrap();
         (status, out)
+    }
+
+    const RESOURCE: &str = "http://host.openshell.internal:8849/mcp";
+    const POLICY: &str = include_str!("../deploy/buildit-policy.toml");
+
+    fn realm_claims() -> serde_json::Value {
+        let mut claims = crucible_mcp_auth::testing::run_claims();
+        claims["aud"] = serde_json::json!([RESOURCE]);
+        claims["scope"] = serde_json::json!("buildit.read buildit.build");
+        claims["sandbox"] = serde_json::json!("ci-0123456789abcdef");
+        claims["workdir"] = serde_json::json!("/sandbox/repo");
+        claims
+    }
+
+    async fn realm_broker(file: &Path) -> (crucible_mcp_auth::testing::JwksServer, Arc<Broker>) {
+        let jwks =
+            crucible_mcp_auth::testing::JwksServer::start(vec![crucible_mcp_auth::testing::jwk(
+                "a",
+            )])
+            .await;
+        let config = ResourceServerConfig {
+            issuer: url::Url::parse(crucible_mcp_auth::testing::ISSUER).unwrap(),
+            jwks_uri: jwks.url.clone(),
+            resources: vec![url::Url::parse(RESOURCE).unwrap()],
+            required_scopes: vec![SCOPE_READ.to_string()],
+            scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
+            resource_name: Some("buildit".to_string()),
+        };
+        let broker = Broker {
+            oidc: Some(Arc::new(ResourceServer::new(config).unwrap())),
+            ..Arc::into_inner(broker(offline_client(), file, None)).unwrap()
+        };
+        (jwks, Arc::new(broker))
+    }
+
+    fn bearer_header(token: &str) -> axum::http::HeaderMap {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        h
+    }
+
+    async fn status_of(r: Response) -> (StatusCode, String) {
+        let status = r.status();
+        let challenge = r
+            .headers()
+            .get(axum::http::header::WWW_AUTHENTICATE)
+            .map(|v| v.to_str().unwrap().to_string())
+            .unwrap_or_default();
+        (status, challenge)
+    }
+
+    #[tokio::test]
+    async fn a_realm_token_names_its_sandbox_workdir_and_launcher() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
+        let token = crucible_mcp_auth::testing::sign("a", &realm_claims());
+        let (caller, principal) = broker.authenticate(&bearer_header(&token)).await.unwrap();
+        assert_eq!(caller.sandbox.as_str(), "ci-0123456789abcdef");
+        assert_eq!(
+            caller.workspace,
+            Workspace::Openshell {
+                workdir: SandboxDir::parse("/sandbox/repo").unwrap()
+            }
+        );
+        assert_eq!(
+            caller.launched_by.as_ref().map(Launcher::as_str),
+            Some("weaton")
+        );
+        assert_eq!(
+            principal.presenter(),
+            "spiffe://pirate.crucible/openshell/sandbox/auth-spike"
+        );
+        let pod = broker
+            .builder_pod(&caller, &BuildId::parse("buildit-1").unwrap())
+            .unwrap();
+        assert_eq!(
+            pod.metadata.labels.unwrap()["crucible.dev/launched-by"],
+            "weaton"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_realm_token_without_workdir_uses_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
+        let mut claims = realm_claims();
+        claims.as_object_mut().unwrap().remove("workdir");
+        let token = crucible_mcp_auth::testing::sign("a", &claims);
+        let (caller, _) = broker.authenticate(&bearer_header(&token)).await.unwrap();
+        assert_eq!(
+            caller.workspace,
+            Workspace::Openshell {
+                workdir: SandboxDir::parse("/sandbox/default").unwrap()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn realm_tokens_without_a_usable_sandbox_or_subject_are_forbidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
+        let cases = [
+            ("sandbox", None),
+            ("sandbox", Some(serde_json::json!("not a name"))),
+            ("workdir", Some(serde_json::json!("relative/path"))),
+            ("sub", Some(serde_json::json!("weaton@example.com"))),
+        ];
+        for (key, value) in cases {
+            let mut claims = realm_claims();
+            let map = claims.as_object_mut().unwrap();
+            match &value {
+                Some(v) => map.insert(key.into(), v.clone()),
+                None => map.remove(key),
+            };
+            let token = crucible_mcp_auth::testing::sign("a", &claims);
+            let refused = broker
+                .authenticate(&bearer_header(&token))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                status_of(broker.respond(&bearer_header(&token), refused))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{key} = {value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bad_or_missing_tokens_get_the_mcp_challenge_when_oidc_is_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
+        let missing = broker
+            .authenticate(&axum::http::HeaderMap::new())
+            .await
+            .unwrap_err();
+        let missing = broker.respond(&axum::http::HeaderMap::new(), missing);
+        let (status, challenge) = status_of(missing).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert!(
+            challenge.contains(r#"resource_metadata="http://host.openshell.internal:8849/.well-known/oauth-protected-resource/mcp""#),
+            "{challenge}"
+        );
+        let mut expired = realm_claims();
+        expired["exp"] = serde_json::json!(crucible_mcp_auth::testing::now() - 300);
+        for token in [
+            crucible_mcp_auth::testing::sign("a", &expired),
+            "unknown-opaque".to_string(),
+        ] {
+            let refused = broker
+                .authenticate(&bearer_header(&token))
+                .await
+                .unwrap_err();
+            let (status, challenge) =
+                status_of(broker.respond(&bearer_header(&token), refused)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+            assert!(
+                challenge.contains(r#"error="invalid_token""#),
+                "{challenge}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tokens_file_callers_keep_working_and_a_jwt_never_falls_back_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let jwt_shaped = "a.b.c";
+        let file = tokens(
+            dir.path(),
+            &format!("tok-a sb-a /sandbox/a\n{jwt_shaped} sb-b\n"),
+        );
+        let (_jwks, broker) = realm_broker(&file).await;
+        let (caller, principal) = broker.authenticate(&bearer_header("tok-a")).await.unwrap();
+        assert_eq!(caller.sandbox.as_str(), "sb-a");
+        assert_eq!(caller.launched_by, None);
+        assert_eq!(principal.subject, "sandbox:sb-a");
+        assert_eq!(principal.claims["sandbox"], "sb-a");
+        assert!(principal.scopes.contains(SCOPE_BUILD));
+        let refused = broker
+            .authenticate(&bearer_header(jwt_shaped))
+            .await
+            .unwrap_err();
+        let refused = broker.respond(&bearer_header(jwt_shaped), refused);
+        assert_eq!(status_of(refused).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn the_shipped_policy_covers_every_tool() {
+        let policy = ToolPolicy::from_toml(POLICY).unwrap();
+        for tool in BuilditMcp::tool_router().list_all() {
+            assert_eq!(policy.scopes(&tool.name).unwrap().len(), 1, "{}", tool.name);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_policy_refuses_an_over_long_build_before_it_reaches_buildit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let app = router(broker, &[], Some(ToolPolicy::from_toml(POLICY).unwrap()));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let token = crucible_mcp_auth::testing::sign("a", &realm_claims());
+        let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"build","arguments":{"context":".","timeout_s":7200}}}"#;
+        let (status, reply) = post(
+            &addr,
+            "host.openshell.internal",
+            &format!("Authorization: Bearer {token}\r\n"),
+            call,
+        )
+        .await;
+        assert_eq!(status, 200, "{reply}");
+        assert!(reply.contains("build-timeout-cap"), "{reply}");
+        assert!(reply.contains(r#""code":-32001"#), "{reply}");
+        let (status, metadata) = post(&addr, "host.openshell.internal", "", "").await;
+        assert_eq!(status, 401, "{metadata}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1727,12 +2194,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let broker = broker(offline_client(), &tokens(dir.path(), ""), None);
         let id = BuildId::parse("buildit-1").unwrap();
-        let pod = broker
-            .builder_pod(&SandboxName::parse("sb-a").unwrap(), &id)
-            .unwrap();
+        let pod = broker.builder_pod(&sandbox_caller("sb-a"), &id).unwrap();
         let labels = pod.metadata.labels.unwrap();
         assert_eq!(labels["buildit.dev/sandbox"], "sb-a");
         assert_eq!(labels["buildit.dev/build-id"], "buildit-1");
+        assert!(!labels.contains_key("crucible.dev/launched-by"));
         let spec = pod.spec.unwrap();
         assert_eq!(spec.automount_service_account_token, Some(false));
         assert_eq!(spec.enable_service_links, Some(false));
@@ -1757,7 +2223,7 @@ mod tests {
     #[tokio::test]
     async fn builder_pods_pin_the_node_arch_only_when_asked() {
         let dir = tempfile::tempdir().unwrap();
-        let sandbox = SandboxName::parse("sb-a").unwrap();
+        let sandbox = sandbox_caller("sb-a");
         let id = BuildId::parse("buildit-1").unwrap();
         let unpinned = broker(offline_client(), &tokens(dir.path(), ""), None)
             .builder_pod(&sandbox, &id)

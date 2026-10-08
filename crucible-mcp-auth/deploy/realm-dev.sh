@@ -4,14 +4,18 @@
 # the pod. Idempotent.
 #
 #   realm-dev.sh setup
-#       basic scope (sub) on claude-code, the local-dev audience on kueue.read/kueue.submit, and
-#       user attributes editable by admins only (a person must not set their own queues).
+#       basic scope (sub) on claude-code, the local-dev audience on kueue.read/kueue.submit, the
+#       buildit scopes on run-auth-spike with its sandbox claim, and user attributes editable by
+#       admins only (a person must not set their own queues).
 #   realm-dev.sh grant <username> <namespace> <viewer|submitter> [queue...]
 #       tenant scope for a person who has logged in once through OpenShift.
 set -euo pipefail
 CTX=${CTX:-crucible-system/api-openshift-nm-rdu4-corp-redhat-com:6443/wseaton}
 REALM=crucible
 LOCAL_AUDIENCE=${LOCAL_AUDIENCE:-http://localhost:8850/mcp}
+# kc forwards stdin into the pod for `-f -`; nothing else may inherit an open one.
+exec </dev/null
+BUILDIT_AUDIENCES=(http://host.openshell.internal:8849/mcp http://localhost:8849/mcp)
 
 kc() {
   oc --context "$CTX" -n rhbk exec -i keycloak-0 -- /bin/bash -c '
@@ -27,6 +31,26 @@ id_of() { # <collection> <field> <value>
 
 mapper_names() { # <client-scope id>
   kc get "client-scopes/$1/protocol-mappers/models" -r "$REALM" | jq -r '.[].name'
+}
+
+scope_id() { # <name>: the client scope's id, created if missing
+  local id
+  id=$(id_of client-scopes name "$1")
+  if [ -z "$id" ]; then
+    kc create client-scopes -r "$REALM" -s name="$1" -s protocol=openid-connect \
+      -s 'attributes."include.in.token.scope"=true' -s 'attributes."display.on.consent.screen"=false' >&2
+    id=$(id_of client-scopes name "$1")
+  fi
+  echo "$id"
+}
+
+audience() { # <client-scope id> <mapper name> <audience>
+  if ! mapper_names "$1" | grep -qx "$2"; then
+    kc create "client-scopes/$1/protocol-mappers/models" -r "$REALM" -s name="$2" \
+      -s protocol=openid-connect -s protocolMapper=oidc-audience-mapper \
+      -s "config.\"included.custom.audience\"=$3" \
+      -s 'config."access.token.claim"=true' -s 'config."id.token.claim"=false'
+  fi
 }
 
 setup() {
@@ -46,14 +70,23 @@ setup() {
   kc update "clients/$client/default-client-scopes/$basic" -r "$REALM"
 
   for name in kueue.read kueue.submit; do
-    scope=$(id_of client-scopes name "$name")
-    if ! mapper_names "$scope" | grep -qx aud-kueue-local; then
-      kc create "client-scopes/$scope/protocol-mappers/models" -r "$REALM" -s name=aud-kueue-local \
-        -s protocol=openid-connect -s protocolMapper=oidc-audience-mapper \
-        -s "config.\"included.custom.audience\"=$LOCAL_AUDIENCE" \
-        -s 'config."access.token.claim"=true' -s 'config."id.token.claim"=false'
-    fi
+    audience "$(id_of client-scopes name "$name")" aud-kueue-local "$LOCAL_AUDIENCE"
   done
+
+  local spike
+  spike=$(id_of clients clientId run-auth-spike)
+  for name in buildit.read buildit.build; do
+    scope=$(scope_id "$name")
+    audience "$scope" aud-buildit-sandbox "${BUILDIT_AUDIENCES[0]}"
+    audience "$scope" aud-buildit-local "${BUILDIT_AUDIENCES[1]}"
+    kc update "clients/$spike/default-client-scopes/$scope" -r "$REALM"
+  done
+  if ! kc get "clients/$spike/protocol-mappers/models" -r "$REALM" | jq -r '.[].name' | grep -qx sandbox; then
+    kc create "clients/$spike/protocol-mappers/models" -r "$REALM" -s name=sandbox \
+      -s protocol=openid-connect -s protocolMapper=oidc-hardcoded-claim-mapper \
+      -s config.\"claim.name\"=sandbox -s config.\"claim.value\"=auth-spike \
+      -s 'config."jsonType.label"=String' -s 'config."access.token.claim"=true'
+  fi
 
   kc get users/profile -r "$REALM" | jq '.unmanagedAttributePolicy = "ADMIN_EDIT"' |
     kc update users/profile -r "$REALM" -f -

@@ -15,6 +15,7 @@ anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 base64 = "0.22.1"
 clap.workspace = true
+crucible-mcp-auth = { path = "../crucible-mcp-auth" }
 flate2 = "1.1.9"
 futures-util = "0.3.32"
 ignore = "0.4.27"
@@ -30,10 +31,14 @@ serde_norway = "0.9.42"
 sha2 = "0.11.0"
 tar = "0.4.46"
 tempfile = "3.27.0"
+thiserror.workspace = true
 tokio = { workspace = true, features = ["signal", "io-std", "fs"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+url.workspace = true
 
 
 [dev-dependencies]
+crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }

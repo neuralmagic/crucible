@@ -20,6 +20,13 @@ tokio = { workspace = true, features = ["sync"] }
 toml = "0.8"
 tracing = "0.1"
 url = { workspace = true, features = ["serde"] }
+k8s-openapi = { workspace = true, optional = true }
+kube = { workspace = true, features = ["client", "rustls-tls"], optional = true }
+serde_norway = { version = "0.9", optional = true }
+
+[features]
+testing = ["jsonwebtoken/use_pem"]
+e2e = ["testing", "dep:k8s-openapi", "dep:kube", "dep:serde_norway", "reqwest/form"]
 
 [dev-dependencies]
 base64 = "0.22"
