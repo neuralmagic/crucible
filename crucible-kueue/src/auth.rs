@@ -40,8 +40,9 @@ pub enum ClaimError {
 }
 
 impl Caller {
-    /// The tenant scope a realm token carries in its `run_id`, `namespace`, `role`, and
-    /// `queues` claims, acting for the token's subject.
+    /// The tenant scope a realm token carries in its `namespace`, `role`, and `queues` claims,
+    /// acting for the token's subject. A run's token names its run in `run_id`; a person's token
+    /// has none and owns its workloads under its own subject.
     pub fn from_principal(principal: &Principal) -> Result<Self, ClaimError> {
         let claim = |key: &'static str| {
             principal
@@ -66,7 +67,10 @@ impl Caller {
             Some(_) => return Err(ClaimError::Queues),
         };
         Ok(Self {
-            run_id: RunId::parse(claim("run_id")?)?,
+            run_id: match principal.claims.get("run_id") {
+                None => RunId::parse(&principal.subject)?,
+                Some(_) => RunId::parse(claim("run_id")?)?,
+            },
             namespace: Namespace::parse(claim("namespace")?)?,
             role,
             queues,
@@ -230,6 +234,21 @@ mod tests {
     }
 
     #[test]
+    fn a_persons_token_owns_its_workloads_under_its_subject() {
+        let mut claims = realm_claims();
+        let map = claims.as_object_mut().unwrap();
+        map.remove("run_id");
+        map.remove("act");
+        map.insert("sub".into(), json!("3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90"));
+        let c = Caller::from_principal(&principal(claims)).unwrap();
+        assert_eq!(c.run_id.as_str(), "3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90");
+        assert_eq!(
+            c.launched_by.unwrap().as_str(),
+            "3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90"
+        );
+    }
+
+    #[test]
     fn absent_queues_mean_every_queue() {
         let mut claims = realm_claims();
         claims.as_object_mut().unwrap().remove("queues");
@@ -244,7 +263,7 @@ mod tests {
     #[test]
     fn a_token_without_valid_tenant_claims_is_refused() {
         let cases = [
-            ("run_id", None),
+            ("run_id", Some(json!(7))),
             ("namespace", None),
             ("role", None),
             ("role", Some(json!("admin"))),
