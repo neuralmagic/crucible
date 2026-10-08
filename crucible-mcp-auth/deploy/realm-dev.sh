@@ -5,8 +5,9 @@
 #
 #   realm-dev.sh setup
 #       basic scope (sub) on claude-code, the local-dev audience on kueue.read/kueue.submit, the
-#       buildit scopes on run-auth-spike with its sandbox claim, and user attributes editable by
-#       admins only (a person must not set their own queues).
+#       buildit scopes on run-auth-spike with its sandbox claim, kube_user on claude-code (the
+#       OpenShift username) and on run-auth-spike (crucible-e2e-sar), the OpenShift login re-syncing
+#       usernames with no first-login edit, and user attributes editable by admins only.
 #   realm-dev.sh grant <username> <namespace> <viewer|submitter> [queue...]
 #       tenant scope for a person who has logged in once through OpenShift.
 set -euo pipefail
@@ -20,9 +21,9 @@ BUILDIT_AUDIENCES=(http://host.openshell.internal:8849/mcp http://localhost:8849
 kc() {
   oc --context "$CTX" -n rhbk exec -i keycloak-0 -- /bin/bash -c '
     K=/opt/keycloak/bin/kcadm.sh
-    $K config credentials --config /tmp/kcadm.config --server http://localhost:8080 --realm master \
+    $K config credentials --config /tmp/kcadm.$$.config --server http://localhost:8080 --realm master \
       --user "$KC_BOOTSTRAP_ADMIN_USERNAME" --password "$KC_BOOTSTRAP_ADMIN_PASSWORD" >/dev/null
-    exec $K "$@" --config /tmp/kcadm.config' kc "$@"
+    exec $K "$@" --config /tmp/kcadm.$$.config' kc "$@"
 }
 
 id_of() { # <collection> <field> <value>
@@ -87,6 +88,29 @@ setup() {
       -s config.\"claim.name\"=sandbox -s config.\"claim.value\"=auth-spike \
       -s 'config."jsonType.label"=String' -s 'config."access.token.claim"=true'
   fi
+
+  local cc_mappers
+  cc_mappers=$(kc get "clients/$client/protocol-mappers/models" -r "$REALM" | jq -r '.[].name')
+  if ! grep -qx kube_user <<<"$cc_mappers"; then
+    kc create "clients/$client/protocol-mappers/models" -r "$REALM" -s name=kube_user \
+      -s protocol=openid-connect -s protocolMapper=oidc-usermodel-property-mapper \
+      -s config.\"user.attribute\"=username -s config.\"claim.name\"=kube_user \
+      -s 'config."jsonType.label"=String' -s 'config."access.token.claim"=true'
+  fi
+  if ! kc get "clients/$spike/protocol-mappers/models" -r "$REALM" | jq -r '.[].name' | grep -qx kube_user; then
+    kc create "clients/$spike/protocol-mappers/models" -r "$REALM" -s name=kube_user \
+      -s protocol=openid-connect -s protocolMapper=oidc-hardcoded-claim-mapper \
+      -s config.\"claim.name\"=kube_user -s config.\"claim.value\"=crucible-e2e-sar \
+      -s 'config."jsonType.label"=String' -s 'config."access.token.claim"=true'
+  fi
+  kc get identity-provider/instances/openshift-v4 -r "$REALM" |
+    jq '.config.syncMode = "FORCE"' |
+    kc update identity-provider/instances/openshift-v4 -r "$REALM" -f -
+  local review
+  review=$(kc get "authentication/flows/first%20broker%20login/executions" -r "$REALM" |
+    jq -r '.[] | select(.providerId == "idp-review-profile") | .authenticationConfig')
+  kc update "authentication/config/$review" -r "$REALM" \
+    -s 'config."update.profile.on.first.login"=off'
 
   kc get users/profile -r "$REALM" | jq '.unmanagedAttributePolicy = "ADMIN_EDIT"' |
     kc update users/profile -r "$REALM" -f -

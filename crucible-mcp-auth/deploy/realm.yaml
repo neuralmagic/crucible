@@ -50,6 +50,9 @@ spec:
           authorizationUrl: https://oidc-discovery.apps.openshift.nm.rdu4.corp.redhat.com/unused
           tokenUrl: https://oidc-discovery.apps.openshift.nm.rdu4.corp.redhat.com/unused
           syncMode: IMPORT
+      # Users exist only through this login, with their OpenShift name as username, re-synced on
+      # every login. kube_user is that name. realm-dev.sh also turns off the first broker login's
+      # profile review, which would let a person edit it (an import cannot reach that config).
       - alias: openshift-v4
         providerId: openshift-v4
         enabled: true
@@ -59,7 +62,7 @@ spec:
           clientId: keycloak-crucible
           clientSecret: ${OPENSHIFT_OAUTH_CLIENT_SECRET}
           defaultScope: user:info
-          syncMode: IMPORT
+          syncMode: FORCE
     clientScopes:
       # Defining any client scope in an import replaces Keycloak's built-in set, so the two the
       # claude-code client relies on are restated here.
@@ -211,6 +214,15 @@ spec:
         attributes:
           pkce.code.challenge.method: S256
           post.logout.redirect.uris: "+"
+        protocolMappers:
+          - name: kube_user
+            protocol: openid-connect
+            protocolMapper: oidc-usermodel-property-mapper
+            config:
+              user.attribute: username
+              claim.name: kube_user
+              jsonType.label: String
+              access.token.claim: "true"
         defaultClientScopes:
           - basic
           - profile
@@ -256,6 +268,14 @@ spec:
               claim.name: act
               claim.value: '{"sub":"spiffe://pirate.crucible/openshell/sandbox/auth-spike"}'
               jsonType.label: JSON
+              access.token.claim: "true"
+          - name: kube_user
+            protocol: openid-connect
+            protocolMapper: oidc-hardcoded-claim-mapper
+            config:
+              claim.name: kube_user
+              claim.value: crucible-e2e-sar
+              jsonType.label: String
               access.token.claim: "true"
           - name: sandbox
             protocol: openid-connect

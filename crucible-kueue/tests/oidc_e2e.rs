@@ -14,6 +14,8 @@
 //!   CRUCIBLE_KUEUE_E2E_DATABASE_URL=postgres://postgres@localhost:55432/crucible_oidc_e2e \
 //!   cargo test -p crucible-kueue --test oidc_e2e -- --ignored --nocapture --test-threads=1
 //! INGRESS_IP pins the `*.apps` Route hosts when they have no DNS.
+//! The realm's run-auth-spike client carries kube_user crucible-e2e-sar, whose only rights are
+//! crucible-mcp-auth/deploy/sar-e2e-rbac.yaml (Jobs on the queue, no Deployments).
 
 use base64::Engine;
 use crucible_contract::kueue::token_digest;
@@ -24,6 +26,7 @@ use crucible_controller::agent_auth::issuer::{
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
 use crucible_kueue::tenant::{Registry, Tenants};
 use crucible_mcp_auth::jwks::Jwks;
+use crucible_mcp_auth::kube::{GroupSource, SubjectAccessReviewer};
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::server::{ResourceServer, ResourceServerConfig, TrustedIssuer};
 use crucible_mcp_auth::testing::cluster;
@@ -254,13 +257,17 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
     let http = cluster::routes_http(cluster::ingress_ip());
     let server = ResourceServer::with_jwks(config, |t| Jwks::new(http.clone(), t.jwks_uri.clone()));
     let policy = ToolPolicy::from_toml(include_str!("../deploy/kueue-policy.toml")).unwrap();
+    let reviewer = Arc::new(SubjectAccessReviewer::new(
+        kube.clone(),
+        GroupSource::OpenShift,
+    ));
     let app = crucible_kueue::router(
         kube,
         crucible_kueue::Options {
             registry: Arc::new(Registry::new(tenants)),
             oidc: Some(Arc::new(server)),
             policy: Some(policy),
-            reviewer: None,
+            reviewer: Some(reviewer),
             allowed_hosts: Vec::new(),
         },
     );
@@ -478,4 +485,58 @@ async fn tenant_tokens_keep_working_beside_access_tokens_under_the_same_policy()
         refusal.contains("Insufficient scope"),
         "the 403 step-up challenge: {refusal}"
     );
+}
+
+fn deployment(name: &str) -> Value {
+    json!({
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {"name": name},
+        "spec": {
+            "replicas": 1,
+            "selector": {"matchLabels": {"app": name}},
+            "template": {
+                "metadata": {"labels": {"app": name}},
+                "spec": {"containers": [{
+                    "name": "main",
+                    "image": IMAGE,
+                    "command": ["sleep", "60"],
+                    "resources": {"requests": {"cpu": "100m", "memory": "64Mi"}, "limits": {"memory": "64Mi"}}
+                }]}
+            }
+        }
+    })
+}
+
+#[tokio::test]
+#[ignore = "needs pirate's SPIRE + Keycloak; see the module docs"]
+async fn kubernetes_rbac_decides_what_the_launcher_may_create() {
+    let env = env();
+    let kube = kube_client(&env).await;
+    let token = cluster::access_token(&cluster::routes_http(cluster::ingress_ip()), &kube).await;
+    let url = serve_kueue(&env, kube, "http://127.0.0.1:1").await;
+    let client = connect(&url, &token).await;
+
+    let name = format!("oidc-e2e-sar-{}", std::process::id());
+    let refused = call(
+        &client,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": deployment(&name)}),
+    )
+    .await;
+    let refusal = refused.expect_err("crucible-e2e-sar has no RBAC to create Deployments");
+    assert!(
+        refusal.contains("workload-create"),
+        "the refusal names the rule: {refusal}"
+    );
+
+    let elsewhere = call(&client, "queues_list", json!({"namespace": "kube-system"})).await;
+    let pinned = elsewhere.expect_err("a run's token cannot leave its namespace");
+    assert!(
+        pinned.contains("kube-system") || pinned.contains("queues-list"),
+        "{pinned}"
+    );
+
+    let listed = call(&client, "queues_list", json!({})).await.unwrap();
+    assert!(listed.to_string().contains(&env.queue), "{listed}");
 }
