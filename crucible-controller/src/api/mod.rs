@@ -155,6 +155,9 @@ pub(crate) mod tests;
         crate::secrets::api::get_secret,
         crate::secrets::api::delete_secret,
         crate::secrets::api::rotate_secret,
+        crate::decisions::list_decisions,
+        crate::decisions::get_decision,
+        crate::decisions::answer_decision,
         crate::secrets::api::transfer_secret,
         crate::secrets::api::bind_secret,
         crate::secrets::api::unbind_secret,
@@ -614,6 +617,9 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(crate::secrets::api::bind_secret))
         .routes(routes!(crate::secrets::api::unbind_secret))
         .routes(routes!(crate::secrets::api::list_secret_audit))
+        .routes(routes!(crate::decisions::list_decisions))
+        .routes(routes!(crate::decisions::get_decision))
+        .routes(routes!(crate::decisions::answer_decision))
         .routes(routes!(
             crate::authz::api::list_teams,
             crate::authz::api::create_team

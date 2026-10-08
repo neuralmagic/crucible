@@ -101,6 +101,8 @@ pub enum RejectReason {
     NoUidClaim,
     /// The token's pod-uid claim is not the UID recorded for this pod.
     UidMismatch,
+    /// A `local-` pod's bearer is not the credential minted for that local run.
+    LocalToken,
 }
 
 impl RejectReason {
@@ -114,6 +116,7 @@ impl RejectReason {
             RejectReason::PodMismatch => "token is bound to a different pod",
             RejectReason::NoUidClaim => "token carries no bound-pod UID claim",
             RejectReason::UidMismatch => "token is bound to a pod with a different UID",
+            RejectReason::LocalToken => "token is not the credential minted for this local run",
         }
     }
 }
@@ -314,6 +317,22 @@ impl IngestValidator {
         }
     }
 
+    /// A validator with no cluster boundary over a live ledger: local run tokens validate, every pod
+    /// token fails closed. Test-only.
+    #[cfg(test)]
+    pub(crate) fn local_only(ledger: PgPool) -> Self {
+        IngestValidator {
+            ledger: Some(ledger),
+            ..IngestValidator::unavailable(
+                crucible_contract::INGEST_TOKEN_AUDIENCE,
+                ExpectedServiceAccount {
+                    namespace: "crucible".into(),
+                    name: None,
+                },
+            )
+        }
+    }
+
     /// A validator with no cluster boundary: every validation fails closed with 503. Test-only,
     /// as the production path always uses [`ClusterKube`].
     #[cfg(test)]
@@ -410,7 +429,10 @@ impl IngestValidator {
     /// `work_pods` ledger recorded for it. `Ok(())` means the POST is authorized; `Err` carries
     /// whether the caller should answer 401 (definitively rejected) or 503 (kube unreachable —
     /// fail closed).
-    async fn validate(&self, token: &str, pod: &str) -> Result<(), IngestReject> {
+    pub(crate) async fn validate(&self, token: &str, pod: &str) -> Result<(), IngestReject> {
+        if pod.starts_with(LOCAL_POD_PREFIX) {
+            return self.local(token, pod).await;
+        }
         let (cluster, uid) = self.ledger_pod(pod).await?;
         self.check(
             token,
@@ -421,6 +443,24 @@ impl IngestValidator {
             &cluster,
         )
         .await
+    }
+
+    /// A local run has no service account: its bearer is checked against the digest minted at spawn.
+    async fn local(&self, token: &str, pod: &str) -> Result<(), IngestReject> {
+        let pool = self
+            .ledger
+            .as_ref()
+            .ok_or_else(|| IngestReject::Unavailable("no ledger for local run tokens".into()))?;
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT token_sha256 FROM local_run_tokens WHERE pod = $1")
+                .bind(pod)
+                .fetch_optional(pool)
+                .await
+                .map_err(|e| IngestReject::Unavailable(e.to_string()))?;
+        match stored {
+            Some(want) if !token.is_empty() && token_digest(token) == want => Ok(()),
+            _ => Err(IngestReject::Unauthorized(RejectReason::LocalToken)),
+        }
     }
 
     /// One validation: cache, TokenReview against `cluster`, then the accept/reject matrix.
@@ -544,6 +584,77 @@ fn check_service_account(
         return Err(RejectReason::ServiceAccount);
     }
     Ok(())
+}
+
+/// The pod name a local run presents: `local-<run id>`.
+pub(crate) const LOCAL_POD_PREFIX: &str = "local-";
+
+fn token_digest(token: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(token.as_bytes()))
+}
+
+/// Mint a local run's ingest credential, keeping only its digest. Returns the pod name the run
+/// presents and the bearer it presents with it.
+pub(crate) async fn mint_local_token(
+    pool: &PgPool,
+    run_id: &str,
+) -> anyhow::Result<(String, String)> {
+    let bytes: [u8; 32] = rand::random();
+    let token: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let pod = format!("{LOCAL_POD_PREFIX}{run_id}");
+    sqlx::query(
+        "INSERT INTO local_run_tokens (pod, run_id, token_sha256) VALUES ($1, $2, $3) \
+         ON CONFLICT (pod) DO UPDATE SET token_sha256 = EXCLUDED.token_sha256",
+    )
+    .bind(&pod)
+    .bind(run_id)
+    .bind(token_digest(&token))
+    .execute(pool)
+    .await?;
+    Ok((pod, token))
+}
+
+/// An authenticated request on any `/api/pods/{pod}/...` route: the verified pod.
+pub(crate) struct PodAuth {
+    pub(crate) pod: String,
+}
+
+impl<S> FromRequestParts<S> for PodAuth
+where
+    std::sync::Arc<IngestValidator>: FromRef<S>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Path(params) =
+            Path::<std::collections::HashMap<String, String>>::from_request_parts(parts, state)
+                .await
+                .map_err(|e| e.into_response())?;
+        let pod = params
+            .get("pod")
+            .cloned()
+            .ok_or_else(|| (StatusCode::NOT_FOUND, "no pod segment").into_response())?;
+        let token = bearer(parts)
+            .ok_or_else(|| (StatusCode::UNAUTHORIZED, "missing bearer token").into_response())?;
+        let validator = std::sync::Arc::<IngestValidator>::from_ref(state);
+        match validator.validate(&token, &pod).await {
+            Ok(()) => Ok(PodAuth { pod }),
+            Err(IngestReject::Unauthorized(reason)) => {
+                tracing::warn!(pod, reason = reason.as_str(), "ingest token rejected");
+                Err((StatusCode::UNAUTHORIZED, reason.as_str()).into_response())
+            }
+            Err(IngestReject::Unavailable(msg)) => {
+                tracing::warn!(pod, error = %msg, "ingest validation unavailable, failing closed");
+                Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "token validation unavailable",
+                )
+                    .into_response())
+            }
+        }
+    }
 }
 
 /// The authenticated ingest request: the verified pod (== the token's bound pod == the `{pod}` path

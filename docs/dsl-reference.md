@@ -276,6 +276,9 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `questions` | `dict[str, question]` | Question id to `noul()`, `choice()`, or `score()`. `gate.<id>` names one for `when`. |
 | `min_confidence` | `number` | A decision model answers, through the broker's `decision` capability. An answer whose probability is below this, in (0, 1], is recorded as `"uncertain"`. Exactly one of `min_confidence` and `source`. |
 | `source` | `task` | A dependency's output answers instead: it emits one declared label (or a boolean, for a noul) under each question id. Deterministic, free, and needs no capability. Any other value fails the route. When the dependency types its emits, each question's field must be typed with labels the question answers, or `"boolean"` for a noul. |
+| `human` | `bool` | True: a person allowed to approve the run answers, from the controller UI, after seeing the dependencies' declared outputs and files. Needs the `human` capability. Tasks that do not depend on the route keep running while it waits. |
+| `review` | `path` | With `human`: a Markdown template in the pack, rendered over the evidence (`inputs`, `run`, `gated`) and shown above it. Every inserted value is escaped. |
+| `timeout` | `duration` | With `human`: how long the request stays open, from when it opens; the run's wall-clock ceiling by default. An unanswered request records every question as `"uncertain"`. |
 | `files` | `list[str]` | Declared JSON files of dependencies the model reads, under `files` in its state, by dependency and path. Each must be declared by a dependency with a `schema_file(...)`. Not with `source`. |
 | `over` | `producer.field` | Decide once per item. A task mapped over the same list reads each item's answer with `when`; one mapped over another list, or not mapped, cannot. |
 | `max_fanout` | `int` | Instance cap for `over`, within the engine's ceiling of 256. |
@@ -305,7 +308,18 @@ A one-of-N question for `route()`.
 | --- | --- | --- |
 | `ask` | `str` | What to decide. |
 | `options` | `list[str] \| dict[str, str \| None]` | At least two distinct identifier labels, optionally each with a description the model sees. `"uncertain"` is reserved. |
+| `multiple` | `bool` | Take one or more labels. Only a `human = True` route asks it; a `when` runs if any listed label was chosen. |
 | `drop` | `str \| list[str]` | Answers that deliberately lead nowhere, so no `when` has to list them. |
+
+### `pick()`
+
+A question for a `human = True` route whose options are a list a dependency produced. The route's output holds the picked values under the question id, so `over = gate.question` fans out over them. No `when` routes on it.
+
+| Argument | Type | Purpose |
+| --- | --- | --- |
+| `ask` | `str` | What to pick. |
+| `source` | `producer.field` | A list of strings in the output of a task the route depends on, read when the route opens its request. |
+| `multiple` | `bool` | Take one or more values rather than one. |
 
 ### `score()`
 

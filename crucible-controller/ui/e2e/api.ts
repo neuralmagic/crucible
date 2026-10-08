@@ -1122,6 +1122,7 @@ export const ROUTES: Record<string, Json> = {
     },
   ],
   '/api/autopilot': { enabled: true, changed_at: '2026-08-20T07:00:00Z', changed_by: 'wren', reason: null },
+  '/api/decisions': { open: [] },
   '/api/approvals': {
     awaiting_approval: [],
     pending_imports: [

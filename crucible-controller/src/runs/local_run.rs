@@ -231,6 +231,7 @@ pub async fn start(
         "FORGE_STORAGE_ROOT".to_string(),
         forge_root(&dir).to_string_lossy().into_owned(),
     ));
+    env.extend(ingest_env(db, cfg, run_id, &dir).await?);
     let child = tokio::process::Command::new(&bin)
         .args(&argv)
         .current_dir(&pack)
@@ -397,6 +398,47 @@ async fn open_engine_log(dir: &Path) -> Option<Arc<Mutex<tokio::fs::File>>> {
             None
         }
     }
+}
+
+/// Where a local run reaches the controller that spawned it when no public URL is configured: the
+/// controller's default loopback bind.
+const LOCAL_CONTROLLER_URL: &str = "http://127.0.0.1:8870";
+
+/// The ingest surface a local run reaches its own controller on: a credential minted for this run,
+/// written beside its state where only the user can read it, and the `local-` pod name it presents.
+async fn ingest_env(
+    db: &Db,
+    cfg: &ControllerCfg,
+    run_id: &str,
+    dir: &std::path::Path,
+) -> Result<Vec<(String, String)>> {
+    let (pod, token) = crate::runs::ingest_auth::mint_local_token(db.pool(), run_id).await?;
+    let path = dir.join("ingest.token");
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        f.write_all(token.as_bytes())?;
+    }
+    Ok(vec![
+        (
+            crucible_contract::ENV_INGEST_URL.to_string(),
+            cfg.public_url
+                .clone()
+                .unwrap_or_else(|| LOCAL_CONTROLLER_URL.to_string()),
+        ),
+        (
+            crucible_contract::ENV_INGEST_TOKEN_PATH.to_string(),
+            path.to_string_lossy().into_owned(),
+        ),
+        (crucible_contract::ENV_POD_NAME.to_string(), pod),
+    ])
 }
 
 /// Read one of the child's pipes to EOF, logging every line, mirroring it into the run's engine

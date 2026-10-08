@@ -53,6 +53,7 @@ added = [
     "schema_file(): a field may declare a JSON Schema (2020-12) read from the pack; its content is compiled into the plan and consumers read its top-level type (C-WORKFLOW)",
     "repair = N on agent tasks: a passing turn whose output breaks its declaration resumes the same conversation with the masked notes, within the attempt's deadline and the run's budget (C-WORKFLOW)",
     "schema-typed fields meet each consumer exactly: string items for over, numeric enums for scores, bounded answers for routes; a when label a typed source can never give is refused (C-WORKFLOW)",
+    "a route may be human-decided: needs = \"human\", governed by RFC-0002 (C-ROUTE); session log gains decision_wait (C-WIRE)",
     "a route may map over a list and decide each element on its own; a task reads a dependency mapped over the same list per element, a when on a mapped route is read per element, and an instance not taken does not fail its fan-out (C-ROUTE-EACH)",
     "keyed: a mapped task may narrow an object field of an unmapped dependency to its own element's entry, and the admitted-plan event carries it (C-ROUTE-EACH)",
     "score questions: ordered levels answered by a per-level distribution and recorded with an engine-computed expected position; asked natively where the decision API has an ordered question and as a choice where it has none (C-ROUTE-SCORE)",

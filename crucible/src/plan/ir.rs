@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use crucible_contract::decision::{
     Label, Question, QuestionError, QuestionId, QuestionKind, UNCERTAIN,
 };
+use crucible_contract::decision_request::DECISION_KEY;
 use crucible_contract::emits::{DeclaredFile, FieldType, FieldTypeError};
 use serde::{Deserialize, Serialize};
 
@@ -418,6 +419,12 @@ pub enum Decider {
     },
     /// A dependency's output, which carries one declared label per question id.
     Output { task: TaskName },
+    /// A person allowed to approve the run, answering a decision request the run opens.
+    Human {
+        /// A pack template rendered into the review shown above the evidence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        review: Option<String>,
+    },
 }
 
 /// Run a task only when one question of a route it depends on resolved to a listed label.
@@ -455,6 +462,9 @@ fn reads_keyed_source<'a>(route: &Task, lookup: impl Fn(&TaskName) -> Option<&'a
 
 /// The capability a model-decided route task needs.
 pub const NEEDS_DECISION: &str = "decision";
+
+/// The capability a human-decided route task needs: an orchestrator that takes answers.
+pub const NEEDS_HUMAN: &str = "human";
 
 fn default_needs() -> String {
     "any".to_string()
@@ -850,10 +860,13 @@ pub enum PlanError {
     },
     #[error("route task {task:?}: min_confidence must be in (0, 1], got {got}")]
     MinConfidenceOutOfRange { task: String, got: f64 },
-    #[error(
-        "model-decided route task {task:?} must declare needs = \"{NEEDS_DECISION}\", got {got:?}"
-    )]
-    RouteNeeds { task: String, got: String },
+    #[error("{decider}-decided route task {task:?} must declare needs = \"{want}\", got {got:?}")]
+    RouteNeeds {
+        task: String,
+        decider: &'static str,
+        want: &'static str,
+        got: String,
+    },
     #[error(
         "route task {task:?} decides from {source_task:?}, which is not one of its dependencies"
     )]
@@ -981,6 +994,70 @@ pub enum PlanError {
         source_task: String,
         question: String,
         declared: Box<FieldType>,
+    },
+    #[error(
+        "human-decided route task {task:?} declares `over`; a person answers one request per \
+         route, not one per element"
+    )]
+    HumanRouteWithOver { task: String },
+    #[error(
+        "human-decided route task {task:?} declares question {question:?}; the route files its \
+         answer record under that key"
+    )]
+    ReservedQuestion { task: String, question: String },
+    #[error("route task {task:?}, question {question:?}: only a person answers a {what} question")]
+    HumanOnlyQuestion {
+        task: String,
+        question: String,
+        what: &'static str,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, but does not depend on \
+         its producer"
+    )]
+    PickNotADependency {
+        task: String,
+        question: String,
+        field: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which its producer's \
+         emits omits"
+    )]
+    PickFieldOmitted {
+        task: String,
+        question: String,
+        field: String,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which is declared \
+         {declared}; a pick needs a list of strings"
+    )]
+    PickNotAList {
+        task: String,
+        question: String,
+        field: String,
+        declared: Box<FieldType>,
+    },
+    #[error(
+        "route task {task:?}, question {question:?} picks from {field}, which is declared \
+         {declared}, but {why}; a pick needs a list of strings"
+    )]
+    PickItemsNotStrings {
+        task: String,
+        question: String,
+        field: String,
+        declared: Box<FieldType>,
+        why: String,
+    },
+    #[error(
+        "task {task:?}: when names {route}.{question}, a pick question; a pick has no labels to \
+         route on"
+    )]
+    WhenOnPick {
+        task: String,
+        route: String,
+        question: String,
     },
     #[error("task {task:?}: when names {route:?}, which is not one of its dependencies")]
     WhenNotADependency { task: String, route: String },
@@ -1190,7 +1267,9 @@ fn answerable_types(question: &Question) -> String {
     let labels = format!("labels from {}", labels.join("|"));
     match question.kind {
         QuestionKind::Noul => format!("\"boolean\" or {labels}"),
-        QuestionKind::Choice { .. } | QuestionKind::Score { .. } => labels,
+        QuestionKind::Choice { .. } | QuestionKind::Score { .. } | QuestionKind::Pick { .. } => {
+            labels
+        }
     }
 }
 
@@ -1353,7 +1432,13 @@ impl Plan {
             if t.timeout.is_some()
                 && !matches!(
                     t.task,
-                    TaskKind::Agent { .. } | TaskKind::Command { .. } | TaskKind::Evaluate { .. }
+                    TaskKind::Agent { .. }
+                        | TaskKind::Command { .. }
+                        | TaskKind::Evaluate { .. }
+                        | TaskKind::Route {
+                            decider: Decider::Human { .. },
+                            ..
+                        }
                 )
             {
                 return Err(PlanError::TimeoutOnUntimedTask {
@@ -1435,6 +1520,66 @@ impl Plan {
                             question: id.to_string(),
                             error,
                         })?;
+                    let human = matches!(decider, Decider::Human { .. });
+                    if human && id.as_str() == DECISION_KEY {
+                        return Err(PlanError::ReservedQuestion {
+                            task: task(),
+                            question: id.to_string(),
+                        });
+                    }
+                    if let Some(what) = match &question.kind {
+                        QuestionKind::Pick { .. } => Some("pick"),
+                        QuestionKind::Choice { multiple: true, .. } => Some("multiple choice"),
+                        _ => None,
+                    }
+                    .filter(|_| !human)
+                    {
+                        return Err(PlanError::HumanOnlyQuestion {
+                            task: task(),
+                            question: id.to_string(),
+                            what,
+                        });
+                    }
+                    if let Some(source) = question.pick_source() {
+                        let reference = format!("{}.{}", source.task, source.field);
+                        let producer = TaskName(source.task.clone());
+                        if !t.depends_on.contains(&producer) {
+                            return Err(PlanError::PickNotADependency {
+                                task: task(),
+                                question: id.to_string(),
+                                field: reference,
+                            });
+                        }
+                        match self.tasks[index[&producer]].emits.field(&source.field) {
+                            Declared::Unchecked | Declared::Untyped => {}
+                            Declared::Typed(declared) if declared.is_list() => {
+                                if let Some(why) = declared.item_refusal() {
+                                    return Err(PlanError::PickItemsNotStrings {
+                                        task: task(),
+                                        question: id.to_string(),
+                                        field: reference,
+                                        declared: Box::new(declared.clone()),
+                                        why,
+                                    });
+                                }
+                            }
+                            Declared::Omitted => {
+                                return Err(PlanError::PickFieldOmitted {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    field: reference,
+                                });
+                            }
+                            Declared::Typed(declared) => {
+                                return Err(PlanError::PickNotAList {
+                                    task: task(),
+                                    question: id.to_string(),
+                                    field: reference,
+                                    declared: Box::new(declared.clone()),
+                                });
+                            }
+                        }
+                    }
                 }
                 match decider {
                     Decider::Model { min_confidence, .. } => {
@@ -1447,8 +1592,23 @@ impl Plan {
                         if t.needs != NEEDS_DECISION {
                             return Err(PlanError::RouteNeeds {
                                 task: task(),
+                                decider: "model",
+                                want: NEEDS_DECISION,
                                 got: t.needs.clone(),
                             });
+                        }
+                    }
+                    Decider::Human { .. } => {
+                        if t.needs != NEEDS_HUMAN {
+                            return Err(PlanError::RouteNeeds {
+                                task: task(),
+                                decider: "human",
+                                want: NEEDS_HUMAN,
+                                got: t.needs.clone(),
+                            });
+                        }
+                        if t.over.is_some() {
+                            return Err(PlanError::HumanRouteWithOver { task: task() });
                         }
                     }
                     Decider::Output { task: source } => {
@@ -1586,6 +1746,13 @@ impl Plan {
                         declared: questions.keys().map(ToString::to_string).collect(),
                     });
                 };
+                if asked.pick_source().is_some() {
+                    return Err(PlanError::WhenOnPick {
+                        task: task(),
+                        route: route(),
+                        question: question(),
+                    });
+                }
                 if when.is.is_empty() {
                     return Err(PlanError::WhenWithoutLabels {
                         task: task(),
@@ -2150,6 +2317,7 @@ mod tests {
                         description: None,
                     })
                     .collect(),
+                multiple: false,
             },
             drop: drop.iter().map(|l| label(l)).collect(),
         }
@@ -2366,6 +2534,8 @@ mod tests {
             plan(vec![gate]).validate().unwrap_err(),
             PlanError::RouteNeeds {
                 task: "gate".into(),
+                decider: "model",
+                want: NEEDS_DECISION,
                 got: "any".into()
             }
         );
@@ -2375,6 +2545,261 @@ mod tests {
         ])
         .validate()
         .unwrap();
+    }
+
+    #[test]
+    fn a_human_route_must_need_human() {
+        let mut gate = model_route("gate", &[], &[]);
+        if let TaskKind::Route { decider, .. } = &mut gate.task {
+            *decider = Decider::Human { review: None };
+        }
+        gate.needs = NEEDS_DECISION.into();
+        assert_eq!(
+            plan(vec![gate.clone()]).validate().unwrap_err(),
+            PlanError::RouteNeeds {
+                task: "gate".into(),
+                decider: "human",
+                want: NEEDS_HUMAN,
+                got: NEEDS_DECISION.into()
+            }
+        );
+        gate.needs = NEEDS_HUMAN.into();
+        plan(vec![gate]).validate().unwrap();
+    }
+
+    #[test]
+    fn a_human_route_round_trips_through_toml_with_its_review() {
+        let decider = Decider::Human {
+            review: Some("reviews/gate.md.j2".into()),
+        };
+        let text = toml::to_string(&decider).unwrap();
+        assert_eq!(toml::from_str::<Decider>(&text).unwrap(), decider);
+        let bare = toml::to_string(&Decider::Human { review: None }).unwrap();
+        assert!(!bare.contains("review"), "{bare}");
+    }
+
+    fn human_route(name: &str, deps: &[&str], questions: &[(&str, Question)]) -> Task {
+        Task {
+            task: TaskKind::Route {
+                questions: questions
+                    .iter()
+                    .map(|(id, q)| (qid(id), q.clone()))
+                    .collect(),
+                decider: Decider::Human { review: None },
+            },
+            needs: NEEDS_HUMAN.into(),
+            ..agent(name, deps)
+        }
+    }
+
+    fn pick_question(task: &str, field: &str, multiple: bool) -> Question {
+        Question {
+            instructions: "which?".into(),
+            kind: QuestionKind::Pick {
+                source: crucible_contract::decision::PickSource {
+                    task: task.into(),
+                    field: field.into(),
+                },
+                multiple,
+            },
+            drop: Vec::new(),
+        }
+    }
+
+    fn multiple_area() -> Question {
+        let mut q = area_question(&[]);
+        if let QuestionKind::Choice { multiple, .. } = &mut q.kind {
+            *multiple = true;
+        }
+        q
+    }
+
+    #[test]
+    fn only_a_human_route_takes_a_pick_or_a_multiple_choice() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        for (question, what) in [
+            (pick_question("scan", "nodes", false), "pick"),
+            (multiple_area(), "multiple choice"),
+        ] {
+            let mut gate = model_route("gate", &["scan"], &[]);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                questions.insert(qid("area"), question.clone());
+            }
+            assert_eq!(
+                plan(vec![scan.clone(), gate]).validate().unwrap_err(),
+                PlanError::HumanOnlyQuestion {
+                    task: "gate".into(),
+                    question: "area".into(),
+                    what,
+                }
+            );
+            let mut gate = output_route("gate", "scan", &[]);
+            if let TaskKind::Route { questions, .. } = &mut gate.task {
+                questions.insert(qid("area"), question.clone());
+            }
+            assert!(matches!(
+                plan(vec![scan.clone(), gate]).validate().unwrap_err(),
+                PlanError::HumanOnlyQuestion { .. }
+            ));
+            let gate = human_route("gate", &["scan"], &[("area", question)]);
+            let routed = on(
+                agent("go", &["gate"]),
+                "gate",
+                "area",
+                &["frontend", "scheduler", "uncertain"],
+            );
+            let tasks = if what == "pick" {
+                vec![scan.clone(), gate]
+            } else {
+                vec![scan.clone(), gate, routed]
+            };
+            plan(tasks).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_human_route_may_not_map_over_a_list() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("items", FieldType::List)]);
+        let mut gate = human_route("gate", &["scan"], &[("area", area_question(&[]))]);
+        gate.over = Some(OutputRef {
+            task: "scan".into(),
+            field: OutputField("items".into()),
+        });
+        gate.max_fanout = Some(4);
+        assert_eq!(
+            plan(vec![scan, gate]).validate().unwrap_err(),
+            PlanError::HumanRouteWithOver {
+                task: "gate".into()
+            }
+        );
+    }
+
+    #[test]
+    fn a_human_route_may_not_ask_a_question_named_decision() {
+        let gate = human_route("gate", &[], &[("decision", area_question(&[]))]);
+        assert_eq!(
+            plan(vec![gate]).validate().unwrap_err(),
+            PlanError::ReservedQuestion {
+                task: "gate".into(),
+                question: "decision".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pick_reads_a_list_of_strings_from_a_dependency() {
+        let gate = |deps: &[&str]| {
+            human_route(
+                "gate",
+                deps,
+                &[("nodes", pick_question("scan", "nodes", true))],
+            )
+        };
+        let scan = |emits: Emits| Task {
+            emits,
+            ..agent("scan", &[])
+        };
+        assert!(matches!(
+            plan(vec![scan(Emits::default()), gate(&[])])
+                .validate()
+                .unwrap_err(),
+            PlanError::PickNotADependency { .. }
+        ));
+        assert!(matches!(
+            plan(vec![scan(fields(&["other"])), gate(&["scan"])])
+                .validate()
+                .unwrap_err(),
+            PlanError::PickFieldOmitted { .. }
+        ));
+        assert!(matches!(
+            plan(vec![
+                scan(typed(&[("nodes", FieldType::String)])),
+                gate(&["scan"])
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::PickNotAList { .. }
+        ));
+        let numbers = crucible_contract::emits::JsonSchema::new(
+            serde_json::json!({"type": "array", "items": {"type": "integer"}}),
+        )
+        .unwrap();
+        assert!(matches!(
+            plan(vec![
+                scan(typed(&[("nodes", FieldType::Schema(numbers))])),
+                gate(&["scan"])
+            ])
+            .validate()
+            .unwrap_err(),
+            PlanError::PickItemsNotStrings { .. }
+        ));
+        for emits in [
+            Emits::default(),
+            fields(&["nodes"]),
+            typed(&[("nodes", FieldType::List)]),
+        ] {
+            plan(vec![scan(emits), gate(&["scan"])]).validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn no_when_routes_on_a_pick() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        let gate = human_route(
+            "gate",
+            &["scan"],
+            &[("nodes", pick_question("scan", "nodes", false))],
+        );
+        let go = on(agent("go", &["gate"]), "gate", "nodes", &["uncertain"]);
+        assert_eq!(
+            plan(vec![scan, gate, go]).validate().unwrap_err(),
+            PlanError::WhenOnPick {
+                task: "go".into(),
+                route: "gate".into(),
+                question: "nodes".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_pick_question_round_trips_through_toml() {
+        let mut scan = agent("scan", &[]);
+        scan.emits = typed(&[("nodes", FieldType::List)]);
+        let gate = human_route(
+            "gate",
+            &["scan"],
+            &[
+                ("nodes", pick_question("scan", "nodes", true)),
+                ("area", multiple_area()),
+            ],
+        );
+        let original = plan(vec![
+            scan,
+            gate,
+            on(
+                agent("go", &["gate"]),
+                "gate",
+                "area",
+                &["frontend", "scheduler", "uncertain"],
+            ),
+        ]);
+        let text = toml::to_string(&original).unwrap();
+        assert!(text.contains("multiple = true"), "{text}");
+        let back = Plan::from_toml_str(&text).unwrap();
+        let (
+            TaskKind::Route { questions: got, .. },
+            TaskKind::Route {
+                questions: want, ..
+            },
+        ) = (&back.tasks[1].task, &original.tasks[1].task)
+        else {
+            panic!("gate is not a route");
+        };
+        assert_eq!(got, want);
+        back.validate().unwrap();
     }
 
     #[test]
