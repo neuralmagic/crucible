@@ -13,8 +13,6 @@ use crate::manifest::{
 };
 use crate::status::{self, Rollup};
 use crate::task::{self, Outcome, TaskRef};
-use crucible_contract::kueue::SCOPE_SUBMIT;
-use crucible_mcp_auth::principal::Principal;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
@@ -172,13 +170,6 @@ fn refused(error: impl std::fmt::Display) -> McpError {
 fn request_parts(ctx: &RequestContext<RoleServer>) -> Result<&http::request::Parts, ToolError> {
     ctx.extensions
         .get::<http::request::Parts>()
-        .ok_or(ToolError::NoCaller)
-}
-
-fn principal(parts: &http::request::Parts) -> Result<&Principal, ToolError> {
-    parts
-        .extensions
-        .get::<Principal>()
         .ok_or(ToolError::NoCaller)
 }
 
@@ -410,20 +401,17 @@ impl KueueMcp {
         }
     }
 
-    /// The caller a task request acts as, and whether it may submit (and so record what it
-    /// observes). The guard has already checked the method's scope and RBAC on the task's object.
+    /// The caller a task request acts as. The guard has already checked the method's scope and
+    /// RBAC on the task's object.
     fn task_caller(
         &self,
         ctx: &RequestContext<RoleServer>,
         t: &TaskRef,
-    ) -> Result<(Caller, bool), McpError> {
-        let parts = request_parts(ctx).map_err(refused)?;
-        let principal = principal(parts).map_err(refused)?;
-        let c = identity(parts)
+    ) -> Result<Caller, McpError> {
+        identity(request_parts(ctx).map_err(refused)?)
             .map_err(refused)?
             .in_namespace(t.namespace.as_deref())
-            .map_err(refused)?;
-        Ok((c, principal.scopes.contains(SCOPE_SUBMIT)))
+            .map_err(refused)
     }
 
     fn dynamic(&self, kind: WorkloadKind, ns: &str) -> Api<DynamicObject> {
@@ -760,11 +748,13 @@ impl KueueMcp {
             .flat_map(|w| w.status.conditions.iter())
             .filter_map(|c| c.last_transition_time.clone())
             .max();
+        let readiness = (!kind.is_batch()).then(|| status::readiness(&obj.data, &rollup));
         let body = json!({
             "kind": kind,
             "name": name,
             "admission": kind.admission(),
             "phase": rollup,
+            "readiness": readiness,
             "queue_position": positions,
             "workloads": wls.iter().take(MAX_WORKLOADS_SHOWN).map(|w| json!({
                 "name": w.metadata.name,
@@ -833,39 +823,14 @@ impl KueueMcp {
         Ok(())
     }
 
-    /// The task's state. Only a `writable` request records a completion it observes.
-    async fn detailed_task(
-        &self,
-        c: &Caller,
-        t: &TaskRef,
-        writable: bool,
-    ) -> Result<DetailedTask, ToolError> {
+    /// A batch workload's task state.
+    async fn detailed_task(&self, c: &Caller, t: &TaskRef) -> Result<DetailedTask, ToolError> {
         let report = self.status_report(c, t.kind, &t.name).await?;
         let full = serde_json::to_value(&report.object).map_err(|source| KubeError::Decode {
             what: format!("{} {}", t.kind.kind(), t.name),
             source,
         })?;
-        let mut outcome = task::outcome(t.kind, &full, &report.rollup);
-        if let Outcome::Completed {
-            failed: false,
-            message,
-        } = &outcome
-            && writable
-            && t.kind.is_scalable()
-            && report
-                .object
-                .metadata
-                .annotations
-                .as_ref()
-                .is_none_or(|a| !a.contains_key(task::COMPLETED_ANNOTATION))
-        {
-            self.annotate(c, t.kind, &t.name, task::COMPLETED_ANNOTATION, message)
-                .await?;
-            outcome = Outcome::Completed {
-                failed: false,
-                message: message.clone(),
-            };
-        }
+        let outcome = task::outcome(&full, &report.rollup);
         let created = report
             .object
             .metadata
@@ -1122,7 +1087,7 @@ impl KueueMcp {
             .client_capabilities()
             .is_some_and(|c| c.supports_tasks());
         let parts = ctx.extensions.get::<http::request::Parts>();
-        let submitted: Result<(Value, Task), ToolError> = async {
+        let submitted: Result<(Value, Option<Task>), ToolError> = async {
                 let parts = parts.ok_or(ToolError::NoCaller)?;
                 let c = caller(parts, args.namespace.as_deref())?;
                 let actor = identity(parts)?.actor.as_deref();
@@ -1136,8 +1101,8 @@ impl KueueMcp {
                 match self.create(&c, &n, actor, false).await {
                     Ok(obj) => {
                         tracing::info!(kind = n.kind.kind(), name = %n.name, namespace = %c.namespace, run = %c.run_id, "workload submitted");
-                        let task = new_task(&c.namespace, n.kind, &n.name, &obj);
-                        Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.task_id, "submitted": true}), task))
+                        let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &obj));
+                        Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "submitted": true}), task))
                     }
                     Err(ToolError::Rejected { .. }) if self.get_object(&c, n.kind, &n.name).await.is_ok() => {
                         let existing = self.owned_object(&c, n.kind, &n.name).await?;
@@ -1155,15 +1120,17 @@ impl KueueMcp {
                                 existing: hash,
                             });
                         }
-                        let task = new_task(&c.namespace, n.kind, &n.name, &existing);
-                        Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.task_id, "submitted": false, "note": "already submitted with this plan"}), task))
+                        let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &existing));
+                        Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "submitted": false, "note": "already submitted with this plan"}), task))
                     }
                     Err(e) => Err(e),
                 }
             }
             .await;
         match submitted {
-            Ok((_, task)) if wants_task => CallToolResponse::Task(CreateTaskResult::new(task)),
+            Ok((_, Some(task))) if wants_task => {
+                CallToolResponse::Task(CreateTaskResult::new(task))
+            }
             Ok((body, _)) => {
                 CallToolResult::success(vec![ContentBlock::text(reply(Ok(body)))]).into()
             }
@@ -1391,7 +1358,7 @@ impl KueueMcp {
 impl ServerHandler for KueueMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tasks().build()).with_instructions(
-            "Submit and watch Kueue workloads in this run's namespace. Flow: queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> poll workload_status (or tasks/get when the client speaks the tasks extension) -> workload_logs. Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.",
+            "Submit and watch Kueue workloads. Flow: queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> poll workload_status (or, for a Job or RayJob, tasks/get when the client speaks the tasks extension) -> workload_logs. Deployments, StatefulSets and LeaderWorkerSets are not tasks: workload_status reports their readiness. Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.",
         )
     }
 
@@ -1401,13 +1368,9 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let t = parse_task(&request.task_id)?;
-        let (c, may_submit) = self.task_caller(&ctx, &t)?;
-        let (t, obj) = self.task_object(&c, &request.task_id).await?;
-        let writable = may_submit && owns(&c, &obj);
-        let detailed = self
-            .detailed_task(&c, &t, writable)
-            .await
-            .map_err(internal)?;
+        let c = self.task_caller(&ctx, &t)?;
+        let (t, _) = self.task_object(&c, &request.task_id).await?;
+        let detailed = self.detailed_task(&c, &t).await.map_err(internal)?;
         Ok(GetTaskResult::new(detailed))
     }
 
@@ -1417,7 +1380,7 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let t = parse_task(&request.task_id)?;
-        let (c, _) = self.task_caller(&ctx, &t)?;
+        let c = self.task_caller(&ctx, &t)?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let r = WorkloadRef {
             namespace: t.namespace.clone(),
@@ -1427,7 +1390,7 @@ impl ServerHandler for KueueMcp {
         self.owned_object(&c, t.kind, &t.name)
             .await
             .map_err(refused)?;
-        let current = self.detailed_task(&c, &t, true).await.map_err(internal)?;
+        let current = self.detailed_task(&c, &t).await.map_err(internal)?;
         if current.status().is_terminal() {
             return Ok(());
         }
@@ -1445,7 +1408,7 @@ mod tests {
     use crate::access::KueueRules;
     use crate::server::*;
     use crucible_mcp_auth::access::{AccessRules, Call};
-    use crucible_mcp_auth::principal::Callers;
+    use crucible_mcp_auth::principal::{Callers, Principal};
 
     #[test]
     fn the_server_stamps_the_plan_hash_and_a_runs_actor() {

@@ -2,6 +2,7 @@
 
 use crate::kueue::{Workload, condition, is_true};
 use serde::Serialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -95,6 +96,34 @@ impl Phase {
     }
 }
 
+/// Whether a serving workload (Deployment, StatefulSet, LeaderWorkerSet) is up: every wanted
+/// replica ready and every Workload admitted. Scaled to zero is never ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Readiness {
+    pub ready: bool,
+    pub replicas: i64,
+    pub ready_replicas: i64,
+}
+
+/// `object` is the workload's body (`spec`, `status`).
+pub fn readiness(object: &Value, rollup: &Rollup) -> Readiness {
+    let replicas = object
+        .pointer("/spec/replicas")
+        .and_then(Value::as_i64)
+        .unwrap_or(1);
+    let ready_replicas = object
+        .pointer("/status/readyReplicas")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Readiness {
+        ready: replicas > 0
+            && ready_replicas >= replicas
+            && rollup.headline.phase == Phase::Admitted,
+        replicas,
+        ready_replicas,
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Rollup {
     #[serde(flatten)]
@@ -142,6 +171,50 @@ mod tests {
     use crate::kueue::Workload;
     use crate::status::*;
     use serde_json::json;
+
+    fn readiness_of(object: serde_json::Value, phase: Phase) -> Readiness {
+        let rollup = Rollup {
+            headline: PhaseReport {
+                phase,
+                reason: String::new(),
+                message: String::new(),
+            },
+            counts: BTreeMap::new(),
+        };
+        readiness(&object, &rollup)
+    }
+
+    #[test]
+    fn a_serving_workload_is_ready_once_every_replica_is_ready_and_admitted() {
+        let partly = serde_json::json!({"spec": {"replicas": 3}, "status": {"readyReplicas": 2}});
+        let fully = serde_json::json!({"spec": {"replicas": 3}, "status": {"readyReplicas": 3}});
+        assert_eq!(
+            readiness_of(partly, Phase::Admitted),
+            Readiness {
+                ready: false,
+                replicas: 3,
+                ready_replicas: 2
+            }
+        );
+        assert!(readiness_of(fully.clone(), Phase::Admitted).ready);
+        assert!(!readiness_of(fully, Phase::Pending).ready);
+        assert!(
+            !readiness_of(
+                serde_json::json!({"spec": {"replicas": 0}}),
+                Phase::Admitted
+            )
+            .ready
+        );
+        assert_eq!(
+            readiness_of(serde_json::json!({}), Phase::Admitted),
+            Readiness {
+                ready: false,
+                replicas: 1,
+                ready_replicas: 0
+            },
+            "replicas default to one like the apps API"
+        );
+    }
 
     fn wl(conditions: serde_json::Value, active: Option<bool>) -> Workload {
         serde_json::from_value(json!({

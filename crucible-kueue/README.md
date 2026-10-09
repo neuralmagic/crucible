@@ -18,12 +18,15 @@ Deployments and StatefulSets to zero and back.
 ## Tasks
 
 The server implements the MCP tasks extension (`io.modelcontextprotocol/tasks`, protocol
-2026-07-28). When a request declares the extension in `_meta`, `workload_submit` returns a task
-with id `<Kind>/<name>/<uid>`; `tasks/get` derives its state from the cluster on every call and
-`tasks/cancel` stops the workload. Batch tasks complete when Kueue finishes the Workload (a failed
-run completes with `isError: true`); serving tasks complete once every replica is admitted and
-ready, and stay complete afterwards. Clients without the extension get a synchronous reply that
-still carries `task_id`, and poll `workload_status`.
+2026-07-28) for batch kinds. When a request declares the extension in `_meta`, submitting a Job or
+RayJob returns a task with id `<namespace>/<Kind>/<name>/<uid>`; `tasks/get` derives its state from
+the cluster on every call and `tasks/cancel` stops the workload. A task completes when Kueue
+finishes the Workload (a failed run completes with `isError: true`). Clients without the extension
+get a synchronous reply that still carries `task_id`, and poll `workload_status`.
+
+Deployments, StatefulSets and LeaderWorkerSets serve until stopped, so they are never tasks: their
+submission is answered synchronously, and `workload_status` reports `readiness` (`ready` once every
+wanted replica is ready and admitted, never when scaled to zero).
 
 ## Tokens
 

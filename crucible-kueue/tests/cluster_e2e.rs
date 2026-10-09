@@ -754,20 +754,42 @@ async fn a_tasks_client_gets_a_task_and_polls_a_job_to_completion() {
 
 #[tokio::test]
 #[ignore = "needs a cluster with Kueue; see the module docs"]
-async fn a_deployment_task_completes_once_ready_and_stays_complete_after_scale_down() {
+async fn a_deployment_is_no_task_and_reports_readiness_until_stopped() {
     let env = env();
-    let run = unique("e2e-task-deploy");
+    let run = unique("e2e-ready-deploy");
     let url = serve(&env).await;
     let agent = connect_with_tasks(&url, &submitter(&env, &run)).await;
-    let name = unique("ck-e2e-task-deploy");
+    let name = unique("ck-e2e-ready-deploy");
+    let manifest = serving("Deployment", &name, 2);
 
-    let id = submit_task(&agent, &env.queue, &serving("Deployment", &name, 2)).await;
-    let done = poll_task(&agent, &id, Duration::from_secs(240)).await;
-    let (is_error, body) = completed_body(&done);
-    assert!(!is_error);
+    let plan = call(
+        &agent,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": manifest}),
+    )
+    .await;
+    assert_eq!(plan["status"], "ok", "{plan:#}");
+    let Value::Object(args) =
+        json!({"queue": env.queue, "manifest": manifest, "plan_hash": plan["plan_hash"]})
+    else {
+        unreachable!()
+    };
+    let submitted = agent
+        .call_tool_once(CallToolRequestParams::new("workload_submit").with_arguments(args))
+        .await
+        .unwrap();
+    assert!(
+        matches!(submitted, CallToolResponse::Complete(_)),
+        "a Deployment is answered synchronously even to a tasks client: {submitted:?}"
+    );
+
+    let up = wait_until(&agent, "Deployment", &name, Duration::from_secs(240), |s| {
+        s["readiness"]["ready"] == true
+    })
+    .await;
     assert_eq!(
-        body["message"], "2/2 replicas admitted and ready",
-        "{body:#}"
+        up["readiness"],
+        json!({"ready": true, "replicas": 2, "ready_replicas": 2})
     );
 
     let stopped = call(
@@ -777,8 +799,10 @@ async fn a_deployment_task_completes_once_ready_and_stays_complete_after_scale_d
     )
     .await;
     assert_eq!(stopped["status"], "ok", "{stopped:#}");
-    let after = poll_task(&agent, &id, Duration::from_secs(5)).await;
-    assert_eq!(after.status(), TaskStatus::Completed);
+    wait_until(&agent, "Deployment", &name, Duration::from_secs(60), |s| {
+        s["readiness"]["ready"] == false
+    })
+    .await;
 
     let deleted = call(
         &agent,

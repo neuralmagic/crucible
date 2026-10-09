@@ -58,6 +58,12 @@ impl WorkloadKind {
 
     /// Kinds whose stop and resume scale `spec.replicas` to zero and back, since Kueue gives
     /// them no single Workload to deactivate.
+    /// Runs to completion (Job, RayJob), so a submission is an MCP task. The other kinds serve
+    /// until stopped and report readiness instead.
+    pub fn is_batch(self) -> bool {
+        matches!(self, Self::Job | Self::RayJob)
+    }
+
     pub fn is_scalable(self) -> bool {
         matches!(self, Self::Deployment | Self::StatefulSet)
     }
