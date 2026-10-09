@@ -80,7 +80,7 @@ flowchart LR
 
 | Component | Role | Where |
 | --- | --- | --- |
-| SPIRE (Zero Trust Workload Identity Manager) | Issues JWT-SVIDs to supervisor pods: `spiffe://<trust domain>/openshell/sandbox/<sandbox-id>` | `zero-trust-workload-identity-manager` |
+| SPIRE (Zero Trust Workload Identity Manager) | Issues JWT-SVIDs to supervisor pods: `spiffe://<trust domain>/openshell/gateway/<gateway-id>/sandbox/<sandbox-id>` | `zero-trust-workload-identity-manager` |
 | OpenShell supervisor | Fetches the SVID, performs the token grant, injects the bearer on egress | per sandbox, the sandbox namespace |
 | Controller token endpoint | Agent issuer: verifies the SVID, maps sandbox to run, mints the token | crucible controller |
 | Keycloak realm `crucible` | Human issuer; also the issuer in the proven spike | its own namespace |
@@ -104,7 +104,7 @@ sequenceDiagram
     participant M as MCP server
     A->>S: tools/call (no Authorization header)
     S->>W: FetchJWTSVID(aud = issuer)
-    W-->>S: JWT-SVID, sub = spiffe://<trust domain>/openshell/sandbox/<id>
+    W-->>S: JWT-SVID, sub = spiffe://<trust domain>/openshell/gateway/<gw>/sandbox/<id>
     S->>T: POST grant_type=client_credentials<br/>client_assertion_type=jwt-bearer, client_assertion=SVID
     T->>T: verify SVID, map sandbox -> run, check audience allowlist
     T-->>S: access_token (sub=launcher, act.sub=SPIFFE ID, aud, run claims), expires_in=300
@@ -115,9 +115,12 @@ sequenceDiagram
 ```
 
 **SPIFFE IDs.** A `ClusterSPIFFEID` selects supervisor pods in the profile's
-`[cluster] sandbox_namespace` by `openshell.ai/boundary-role=supervisor` and builds the ID from the
-annotation `openshell.ai/sandbox-id` (`.ai`, not upstream's `.io`). Nothing renders it: applying it
-is an operator step, alongside installing SPIRE. Its `namespaceSelector` must name the sandbox
+`[cluster] sandbox_namespace` by `openshell.ai/boundary-role=supervisor` and builds the ID from two
+values the run's OpenShell gateway sets on every supervisor it creates: the label
+`openshell.ai/gateway-id` (the run pod's name) and the annotation `openshell.ai/sandbox-id` (`.ai`,
+not upstream's `.io`). The controller issues a token only when the ID's gateway is the run that
+bound the sandbox, so a sandbox id alone cannot be replayed from another run. Nothing renders the
+`ClusterSPIFFEID`: applying it is an operator step, alongside installing SPIRE. Its `namespaceSelector` must name the sandbox
 namespace and nothing else, since any pod it selects can claim a sandbox's identity:
 
 ```yaml
@@ -126,7 +129,7 @@ kind: ClusterSPIFFEID
 metadata:
   name: openshell-sandbox-supervisor
 spec:
-  spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
+  spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/gateway/{{ index .PodMeta.Labels "openshell.ai/gateway-id" }}/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
   namespaceSelector:
     matchLabels:
       kubernetes.io/metadata.name: <sandbox_namespace>
@@ -175,7 +178,7 @@ the run claims.
 | --- | --- | --- | --- |
 | `iss` | controller issuer (the realm in the spike) | Keycloak realm | which keys verify it |
 | `sub` | the launcher's login | the person's realm user ID | `crucible.dev/launched-by`, policy |
-| `act.sub` | `spiffe://<trust domain>/openshell/sandbox/<id>` | absent | audit, `crucible.dev/actor` |
+| `act.sub` | `spiffe://<trust domain>/openshell/gateway/<gateway-id>/sandbox/<id>` | absent | audit, `crucible.dev/actor` |
 | `aud` | the MCP servers the run may call | the servers the requested scopes name | one must be this server |
 | `scope` | `kueue.read kueue.submit buildit.read buildit.build` | what Claude Code requested | per-tool checks |
 | `run_id` | run pod name | absent; the subject owns its workloads | ownership labels |
