@@ -438,8 +438,12 @@ fn stopped(surface: &'static str, served: std::io::Result<()>) -> SurfaceStopped
 /// The one migration set, referenced by every `#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]`.
 /// One shared static MIGRATOR avoids re-expanding the migration set's proc-macro at every call
 /// site, which is slow and easy to get subtly wrong across duplicates. Never re-run
-/// `sqlx::migrate!()` elsewhere.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
+/// `sqlx::migrate!()` elsewhere. Migrations the database has applied but this build does not know
+/// are ignored.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate::Migrator {
+    ignore_missing: true,
+    ..sqlx::migrate!()
+};
 
 /// The applied schema version (the highest migration), for `crucible-controller db verify`.
 pub async fn schema_version(pool: &sqlx::PgPool) -> anyhow::Result<i64> {

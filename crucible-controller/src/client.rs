@@ -511,6 +511,19 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_ledger_migrated_by_a_newer_controller_still_opens(pool: PgPool) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO _sqlx_migrations
+                 (version, description, success, checksum, execution_time)
+             VALUES (99999999999999, 'from a newer controller', true, '\\x00', 1)",
+        )
+        .execute(&pool)
+        .await?;
+        crate::MIGRATOR.run(&pool).await?;
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn upsert_then_get_round_trips(pool: PgPool) -> Result<()> {
         let db = Db::new(pool);
         crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#1")).await?;
