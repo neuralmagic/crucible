@@ -68,10 +68,13 @@ impl AgentAuth {
                 audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
                 "issuing access tokens to people"
             );
-            people::People::new(
+            let people = people::People::new(
                 config,
                 Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
-            )
+                pool.clone(),
+            );
+            people::grants::spawn_sweep(people.grants.clone());
+            people
         });
         tracing::info!(
             issuer = cfg.issuer.as_str(),

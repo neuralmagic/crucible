@@ -219,7 +219,7 @@ pub(crate) async fn decide_consent(
         challenge: r.challenge.clone(),
         expires_at: now.saturating_add(CODE_TTL_SECS),
     };
-    match issued.grants.issue_code(grant, now).await {
+    match issued.grants.issue_code(&grant).await {
         Ok(code) => {
             tracing::info!(login, resource = r.resource, "authorization code issued");
             Ok(send_back(r.redirect.with(&[
@@ -229,8 +229,8 @@ pub(crate) async fn decide_consent(
             ])))
         }
         Err(e) => {
-            tracing::warn!(reason = %e, "authorization code refused");
-            Ok(unavailable("too many outstanding approvals; retry shortly"))
+            tracing::error!(error = %e, "storing an authorization code");
+            Ok(unavailable("the approval could not be stored; retry"))
         }
     }
 }

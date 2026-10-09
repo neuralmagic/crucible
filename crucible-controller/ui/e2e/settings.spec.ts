@@ -68,3 +68,13 @@ test.describe('cluster identities', () => {
     await expect(page.getByTestId('cluster-link-outcome')).toHaveText('The link did not complete. Start it again.');
   });
 });
+
+test('signing out MCP clients ends every approval at once', async ({ page }) => {
+  await settings(page);
+  const list = page.getByTestId('mcp-sign-ins');
+  await expect(list).toContainText('http://localhost:8851/mcp');
+  await page.getByRole('button', { name: 'Sign out MCP clients' }).click();
+  await expect(page.getByText(/^Signed out 1 MCP client\./)).toBeVisible();
+  await expect(page.getByText('No MCP client is signed in.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Sign out MCP clients' })).toBeDisabled();
+});

@@ -5,4 +5,5 @@ pub(crate) mod consent;
 pub(crate) mod credentials;
 pub(crate) mod keys;
 pub(crate) mod kube_user;
+pub(crate) mod mcp_sign_ins;
 pub(crate) mod prefs;

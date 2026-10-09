@@ -1218,6 +1218,14 @@ export async function stubApi(page: Page): Promise<void> {
   let team = { ...TEAMS[0] };
   let policySets = POLICY_SETS.map((set) => ({ ...set }));
   let identities = CLUSTER_IDENTITIES.map((identity) => ({ ...identity }));
+  let signIns = [
+    {
+      resource: 'http://localhost:8851/mcp',
+      cluster: 'pirate',
+      approved_at: '2026-10-09T10:00:00Z',
+      last_used_at: '2026-10-09T11:00:00Z',
+    },
+  ];
   const linked = (cluster: string, source: string) => {
     identities = identities.map((i) =>
       i.cluster === cluster
@@ -1305,6 +1313,14 @@ export async function stubApi(page: Page): Promise<void> {
         const sep = back.includes('?') ? '&' : '?';
         const authorize_url = `${new URL(route.request().url()).origin}${back}${sep}linked=${identity[1]}`;
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ authorize_url }) });
+      }
+      if (path === '/api/me/mcp-sign-ins' && route.request().method() === 'GET') {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ enabled: true, sign_ins: signIns }) });
+      }
+      if (path === '/api/me/mcp-sign-ins' && route.request().method() === 'DELETE') {
+        const revoked = signIns.length;
+        signIns = [];
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ revoked }) });
       }
       // The consent page: one parked request for pirate, decided once.
       if (path === '/api/oauth/consent' && route.request().method() === 'GET') {

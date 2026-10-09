@@ -1046,4 +1046,25 @@ openshift = ["pirate"]
             StatusCode::NOT_FOUND
         );
     }
+
+    /// Without people OAuth there is nothing to sign out, and the page is told so.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn mcp_sign_ins_are_off_without_people_oauth(pool: PgPool) {
+        let h = harness(pool).await;
+        let listed = h
+            .send(AuthPath::Session, "GET", "/api/me/mcp-sign-ins", None, None)
+            .await;
+        assert_eq!(listed.status, StatusCode::OK);
+        assert_eq!(listed.body, json!({"enabled": false, "sign_ins": []}));
+        let out = h
+            .send(
+                AuthPath::Session,
+                "DELETE",
+                "/api/me/mcp-sign-ins",
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(out.status, StatusCode::NOT_FOUND);
+    }
 }

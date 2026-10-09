@@ -27,6 +27,7 @@ import {
 import { TextField, NumberInputField, CheckField, FormActions } from './formControls';
 import { clusterIdentitiesShown, linkOutcome, sortIdentities } from './clusterIdentitiesView';
 import { ClusterIdentityRow } from './ClusterIdentityRow';
+import { mcpSignInsShown, signedOutMessage } from './mcpSignInsView';
 
 const TONE: Record<CredentialState, StatusTone> = {
   absent: 'grey',
@@ -279,6 +280,65 @@ function ClusterIdentities() {
   );
 }
 
+/// The MCP clients signed in through this controller, and the switch that ends every approval.
+function McpSignIns() {
+  const qc = useQueryClient();
+  const signIns = $api.useQuery('get', '/api/me/mcp-sign-ins');
+  const signOut = $api.useMutation('delete', '/api/me/mcp-sign-ins');
+  const [outcome, setOutcome] = useState<string | null>(null);
+  if (signIns.isError) {
+    return <Empty title="MCP sign-ins unavailable" description={formatError(signIns.error)} />;
+  }
+  if (signIns.isPending) return <LoadingBlock label="Loading MCP sign-ins" />;
+  if (!mcpSignInsShown(signIns.data)) return null;
+  const live = signIns.data.sign_ins;
+  return (
+    <Section>
+      <SectionHeader
+        title="MCP clients"
+        note="tools on your machines that signed in here for a token to an MCP server"
+      />
+      <SectionBody>
+        {live.length === 0 ? (
+          <p className="m-0 text-body text-ink-3">No MCP client is signed in.</p>
+        ) : (
+          <dl data-testid="mcp-sign-ins" className="m-0 grid grid-cols-[1fr_max-content_max-content] gap-x-6 gap-y-1.5 font-mono text-data">
+            {live.map((s) => (
+              <div key={`${s.resource} ${s.approved_at}`} className="contents">
+                <dt className="text-ink">{s.resource}</dt>
+                <dd className="m-0 text-ink-2">{s.cluster}</dd>
+                <dd className="m-0 text-ink-3">last used {s.last_used_at}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {outcome !== null && <p className="mt-2 text-body text-ink-2">{outcome}</p>}
+        {signOut.isError && <p className="mt-2 text-body text-red">{formatError(signOut.error)}</p>}
+        <div className="mt-3">
+          <Button
+            className="uppercase"
+            variant="filled"
+            disabled={live.length === 0 || signOut.isPending}
+            onClick={() => {
+              signOut.mutate(
+                {},
+                {
+                  onSuccess: (result) => {
+                    setOutcome(signedOutMessage(result.revoked));
+                    void qc.invalidateQueries();
+                  },
+                },
+              );
+            }}
+          >
+            {signOut.isPending ? 'Signing out…' : 'Sign out MCP clients'}
+          </Button>
+        </div>
+      </SectionBody>
+    </Section>
+  );
+}
+
 function Memberships() {
   const whoami = $api.useQuery('get', '/api/whoami');
   if (whoami.isError) {
@@ -324,6 +384,7 @@ export function SettingsPage() {
       />
       <Memberships />
       <ClusterIdentities />
+      <McpSignIns />
       <OfflineCredential />
       <ApiKeys />
     </>

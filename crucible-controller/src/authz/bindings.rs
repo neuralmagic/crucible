@@ -793,6 +793,14 @@ pub static BINDINGS: &[Binding] = &[
         Route,
     ),
     bind("GET", "/api/oauth/consent", R::UserPrefs, V::Read, Route),
+    bind("GET", "/api/me/mcp-sign-ins", R::UserPrefs, V::Read, Route),
+    bind(
+        "DELETE",
+        "/api/me/mcp-sign-ins",
+        R::UserPrefs,
+        V::Update,
+        Route,
+    ),
     bind("POST", "/api/oauth/consent", R::UserPrefs, V::Update, Route),
     bind(
         "GET",

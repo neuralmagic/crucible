@@ -299,3 +299,14 @@ linked offers Link (and the paste box where the cluster has no OAuth) right ther
 lands back on the same page. Allow and Deny are a JSON call that returns the client's
 `http://localhost|127.0.0.1|[::1]:<port>/callback` URL with a code or an error; the page navigates to
 it. A request answers once, and only from the browser and person that started it.
+
+### People's tokens and refresh
+
+Access tokens last 15 minutes. Codes and refresh tokens live in Postgres, keyed by the SHA-256 of
+the secret, so every replica honours them and a restart signs nobody out. A refresh token is spent
+on use and the next one returned; presenting a spent one again revokes the whole approval. An
+approval dies after 14 days without a refresh or 90 days after it was granted. Every refresh reads
+the person again: a deleted account, one whose stored credential the identity provider refused,
+or a cluster username that was unlinked ends the approval, and a relink shows up in the next token.
+Settings → MCP clients lists the live approvals and signs every client out at once. Expired codes
+and approvals are swept hourly.

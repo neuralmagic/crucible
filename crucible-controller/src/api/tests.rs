@@ -3465,6 +3465,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/me/cluster-identities/{cluster}/link",
         "/oauth/cluster-link/{cluster}/callback",
         "/api/oauth/consent",
+        "/api/me/mcp-sign-ins",
         "/api/users/{login}/kube-user",
         "/api/version",
         "/api/images",

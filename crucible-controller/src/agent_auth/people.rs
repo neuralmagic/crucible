@@ -2,18 +2,21 @@
 //! pre-registered public client, `claude-code`, on top of the controller's own browser login.
 //!
 //! ```text
-//!  Claude Code ──GET /oauth/authorize──▶ session? ──no──▶ /auth/login?rd=… ──▶ upstream OIDC
-//!                                          │yes ◀───────────────────────────────────┘
-//!                                          ▼
-//!                       consent page (links the cluster username when none is known)
-//!  browser ──POST /oauth/authorize──▶ code: single use, 60 s, bound to client, redirect,
-//!                                      challenge, resource and login
-//!          ◀── 302 http://localhost:<port>/callback?code&state&iss
-//!  Claude Code ──POST /oauth/token (code, verifier)──▶ ES256: sub=login, aud=resource, kube_user
+//!  MCP client ──GET /oauth/authorize──▶ session? ──no──▶ /auth/login?rd=… ──▶ upstream OIDC
+//!                                         │yes ◀───────────────────────────────────┘
+//!                                         ▼
+//!                       303 /consent?id=… (SPA: links the cluster username when none is known)
+//!  browser ──POST /api/oauth/consent──▶ code: single use, 60 s, bound to client, redirect,
+//!                                        challenge, resource and login
+//!          ◀── {redirect_url: http://localhost:<port>/callback?code&state&iss}
+//!  MCP client ──POST /oauth/token (code, verifier)──▶ ES256: sub=login, aud=resource, kube_user
+//!             ──POST /oauth/token (refresh_token)──▶ rotated; reuse revokes the approval
 //! ```
 //!
-//! Codes and refresh tokens live in this process's memory: a restart signs every client out, and a
-//! second replica would not honour the first's codes.
+//! Codes and refresh tokens live in Postgres ([`grants`]), so any replica redeems what another
+//! issued. Every refresh re-reads the person and their cluster username.
+
+pub mod grants;
 
 use crate::agent_auth::AgentAuth;
 use crate::agent_auth::issuer::{AgentIssuer, MintError, token_id};
@@ -29,10 +32,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use sqlx::PgPool;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tower_sessions::Session;
 use url::Url;
 
@@ -40,13 +42,9 @@ pub const CLIENT_ID: &str = "claude-code";
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const CODE_TTL_SECS: u64 = 60;
 pub const ACCESS_TTL_SECS: u64 = 900;
-/// A refresh token's lifetime, counted from the approval and not extended by rotation.
-pub const REFRESH_TTL_SECS: u64 = 8 * 3600;
-const MAX_GRANTS: usize = 10_000;
 pub(crate) const PENDING_KEY: &str = "oauth.pending";
 /// The SPA page a parked authorization request is shown on.
 pub const CONSENT_PATH: &str = "/consent";
-const SECRET_BYTES: usize = 32;
 const MAX_STATE_LEN: usize = 1024;
 /// OIDC scopes a client may ask for out of habit; they grant nothing here.
 const IGNORED_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access"];
@@ -250,7 +248,7 @@ impl Approved {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeGrant {
     pub approved: Approved,
     pub redirect: LoopbackRedirect,
@@ -258,108 +256,19 @@ pub struct CodeGrant {
     pub expires_at: u64,
 }
 
-#[derive(Debug, Clone)]
-struct RefreshGrant {
-    approved: Approved,
-    expires_at: u64,
-}
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum GrantError {
-    #[error("the code or refresh token is unknown or already used")]
-    Unknown,
-    #[error("the code or refresh token expired")]
-    Expired,
-    #[error("too many outstanding grants")]
-    Full,
-    #[error("drawing random bytes failed")]
-    Random,
-}
-
-/// Outstanding codes and refresh tokens, keyed by the SHA-256 of the secret so the secrets
-/// themselves are never held.
-#[derive(Default)]
-pub struct Grants {
-    codes: Mutex<HashMap<[u8; 32], CodeGrant>>,
-    refresh: Mutex<HashMap<[u8; 32], RefreshGrant>>,
-}
-
-fn new_secret() -> Result<(String, [u8; 32]), GrantError> {
-    let mut bytes = [0u8; SECRET_BYTES];
-    aws_lc_rs::rand::fill(&mut bytes).map_err(|_| GrantError::Random)?;
-    let secret = URL_SAFE_NO_PAD.encode(bytes);
-    let key = Sha256::digest(secret.as_bytes()).into();
-    Ok((secret, key))
-}
-
-fn key_of(secret: &str) -> [u8; 32] {
-    Sha256::digest(secret.as_bytes()).into()
-}
-
-impl Grants {
-    pub async fn issue_code(&self, grant: CodeGrant, now: u64) -> Result<String, GrantError> {
-        let (code, key) = new_secret()?;
-        let mut codes = self.codes.lock().await;
-        codes.retain(|_, g| g.expires_at > now);
-        if codes.len() >= MAX_GRANTS {
-            return Err(GrantError::Full);
-        }
-        codes.insert(key, grant);
-        Ok(code)
-    }
-
-    /// The code's grant, removed whether or not it is still valid: a code works at most once.
-    pub async fn take_code(&self, code: &str, now: u64) -> Result<CodeGrant, GrantError> {
-        let grant = self
-            .codes
-            .lock()
-            .await
-            .remove(&key_of(code))
-            .ok_or(GrantError::Unknown)?;
-        match grant.expires_at > now {
-            true => Ok(grant),
-            false => Err(GrantError::Expired),
-        }
-    }
-
-    async fn issue_refresh(&self, grant: RefreshGrant, now: u64) -> Result<String, GrantError> {
-        let (token, key) = new_secret()?;
-        let mut refresh = self.refresh.lock().await;
-        refresh.retain(|_, g| g.expires_at > now);
-        if refresh.len() >= MAX_GRANTS {
-            return Err(GrantError::Full);
-        }
-        refresh.insert(key, grant);
-        Ok(token)
-    }
-
-    async fn take_refresh(&self, token: &str, now: u64) -> Result<RefreshGrant, GrantError> {
-        let grant = self
-            .refresh
-            .lock()
-            .await
-            .remove(&key_of(token))
-            .ok_or(GrantError::Unknown)?;
-        match grant.expires_at > now {
-            true => Ok(grant),
-            false => Err(GrantError::Expired),
-        }
-    }
-}
-
 /// The people half of the issuer: its audiences, outstanding grants, and the clusters that review
 /// the tokens people link their usernames with.
 pub struct People {
     pub config: PeopleConfig,
-    pub grants: Grants,
+    pub grants: grants::Grants,
     pub reviewer: Arc<dyn ClusterReviewer>,
 }
 
 impl People {
-    pub fn new(config: PeopleConfig, reviewer: Arc<dyn ClusterReviewer>) -> Self {
+    pub fn new(config: PeopleConfig, reviewer: Arc<dyn ClusterReviewer>, pool: PgPool) -> Self {
         Self {
             config,
-            grants: Grants::default(),
+            grants: grants::Grants::new(pool),
             reviewer,
         }
     }
@@ -797,11 +706,12 @@ fn same_resource(requested: Option<&str>, granted: &str) -> Result<(), TokenErro
     }
 }
 
-impl From<GrantError> for TokenError {
-    fn from(e: GrantError) -> Self {
+impl From<grants::GrantError> for TokenError {
+    fn from(e: grants::GrantError) -> Self {
+        use grants::GrantError as G;
         match e {
-            GrantError::Unknown | GrantError::Expired => Self::InvalidGrant(e.to_string()),
-            GrantError::Full | GrantError::Random => Self::Server(e.to_string()),
+            G::Unknown | G::Expired | G::Reused | G::Revoked => Self::InvalidGrant(e.to_string()),
+            G::Random | G::Clock(_) | G::Store(_) => Self::Server(format!("{e:#}")),
         }
     }
 }
@@ -827,17 +737,20 @@ pub(crate) async fn redeem_code(
         .verify(&req.code_verifier)
         .map_err(|e| TokenError::InvalidGrant(e.to_string()))?;
     same_resource(req.resource.as_deref(), &grant.approved.resource)?;
-    issue(
-        auth,
-        people,
-        grant.approved,
-        now,
-        now.saturating_add(REFRESH_TTL_SECS),
-    )
-    .await
+    let approved = grant.approved;
+    let (access_token, kube_user) = access(auth, people, &approved, now).await?;
+    let refresh_token = people.grants.start_family(&approved, now).await?;
+    Ok(token_response(
+        &approved,
+        &kube_user,
+        access_token,
+        refresh_token,
+    ))
 }
 
-/// `grant_type=refresh_token`, rotating: the presented token is spent and a new one returned.
+/// `grant_type=refresh_token`, rotating: the presented token is spent and the next one returned.
+/// The person is read again, so a deleted or refused account, a narrowed approval, or a changed
+/// cluster username takes effect here; any of those revokes the approval.
 pub(crate) async fn redeem_refresh(
     auth: &AgentAuth,
     people: &People,
@@ -846,14 +759,18 @@ pub(crate) async fn redeem_refresh(
 ) -> Result<Response, TokenError> {
     let req: RefreshRequest = parse(fields)?;
     client(&req.client_id)?;
-    let grant = people.grants.take_refresh(&req.refresh_token, now).await?;
-    same_resource(req.resource.as_deref(), &grant.approved.resource)?;
+    let (family, next) = people.grants.rotate(&req.refresh_token, now).await?;
+    let refused = |why: String| async move {
+        if let Err(e) = people.grants.revoke(&family.id, now).await {
+            tracing::warn!(error = %e, "revoking a refused approval");
+        }
+        Err(TokenError::InvalidGrant(why))
+    };
+    same_resource(req.resource.as_deref(), &family.resource)?;
     if let Some(scope) = req.scope.as_deref() {
         let wider: Vec<&str> = scope
             .split_whitespace()
-            .filter(|s| {
-                !IGNORED_SCOPES.contains(s) && !grant.approved.scopes.iter().any(|g| g == s)
-            })
+            .filter(|s| !IGNORED_SCOPES.contains(s) && !family.scopes.iter().any(|g| g == s))
             .collect();
         if !wider.is_empty() {
             return Err(TokenError::InvalidGrant(format!(
@@ -861,23 +778,65 @@ pub(crate) async fn redeem_refresh(
             )));
         }
     }
-    issue(auth, people, grant.approved, now, grant.expires_at).await
+    let person = still_allowed(&auth.pool, &family.sub)
+        .await
+        .map_err(|e| TokenError::Server(format!("{e:#}")))?;
+    let Some((login, email)) = person else {
+        return refused("the person behind this approval may no longer sign in".into()).await;
+    };
+    let approved = Approved {
+        sub: family.sub.clone(),
+        login,
+        email,
+        resource: family.resource.clone(),
+        cluster: family.cluster.clone(),
+        scopes: family.scopes.clone(),
+    };
+    let (access_token, kube_user) = match access(auth, people, &approved, now).await {
+        Ok(minted) => minted,
+        Err(TokenError::InvalidGrant(why) | TokenError::InvalidTarget(why)) => {
+            return refused(why).await;
+        }
+        Err(e) => return Err(e),
+    };
+    Ok(token_response(&approved, &kube_user, access_token, next))
 }
 
-async fn issue(
+/// The login and email of a person who may still sign in: their row exists and the identity
+/// provider has not refused their stored credential, the condition that downgrades a session.
+async fn still_allowed(
+    pool: &PgPool,
+    sub: &str,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    use anyhow::Context;
+    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT u.login, u.email, c.last_error FROM users u
+           LEFT JOIN user_credentials c ON c.sub = u.sub
+          WHERE u.sub = $1",
+    )
+    .bind(sub)
+    .fetch_optional(pool)
+    .await
+    .context("reading the person behind an approval")?;
+    Ok(row
+        .filter(|(_, _, refused)| refused.is_none())
+        .map(|(login, email, _)| (login, email)))
+}
+
+/// An access token for `approved`, with the cluster username it carries.
+async fn access(
     auth: &AgentAuth,
     people: &People,
-    approved: Approved,
+    approved: &Approved,
     now: u64,
-    refresh_expires_at: u64,
-) -> Result<Response, TokenError> {
+) -> Result<(String, KubeUser), TokenError> {
     if people.config.audience(&approved.resource).is_none() {
         return Err(TokenError::InvalidTarget(format!(
             "resource {:?} is no longer configured",
             approved.resource
         )));
     }
-    let kube_user = match kube_user(auth, &approved)
+    let kube_user = match kube_user(auth, approved)
         .await
         .map_err(|e| TokenError::Server(format!("{e:#}")))?
     {
@@ -890,18 +849,17 @@ async fn issue(
         }
         ClusterUser::Unavailable(why) => return Err(TokenError::InvalidGrant(why)),
     };
-    let access_token = mint(&auth.issuer, &approved, &kube_user, now)
+    let access_token = mint(&auth.issuer, approved, &kube_user, now)
         .map_err(|e| TokenError::Server(e.to_string()))?;
-    let refresh_token = people
-        .grants
-        .issue_refresh(
-            RefreshGrant {
-                approved: approved.clone(),
-                expires_at: refresh_expires_at,
-            },
-            now,
-        )
-        .await?;
+    Ok((access_token, kube_user))
+}
+
+fn token_response(
+    approved: &Approved,
+    kube_user: &KubeUser,
+    access_token: String,
+    refresh_token: String,
+) -> Response {
     tracing::info!(
         sub = approved.login,
         kube_user = kube_user.as_str(),
@@ -920,7 +878,7 @@ async fn issue(
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(response)
+    response
 }
 
 #[cfg(test)]
@@ -933,6 +891,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use sqlx::PgPool;
+    use std::collections::HashMap;
     use tower::ServiceExt;
 
     const PIRATE_KUEUE: &str = "https://crucible-kueue.apps.pirate.example/mcp";
@@ -1204,49 +1163,6 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_code_works_once_and_not_after_it_expires() {
-        let grants = Grants::default();
-        let code = grants.issue_code(code_grant(160), 100).await.unwrap();
-        assert!(code.len() >= 43);
-        assert_eq!(
-            grants.take_code(&code, 110).await.unwrap().approved.login,
-            "weaton"
-        );
-        assert_eq!(
-            grants.take_code(&code, 110).await.unwrap_err(),
-            GrantError::Unknown
-        );
-        let code = grants.issue_code(code_grant(160), 100).await.unwrap();
-        assert_eq!(
-            grants.take_code(&code, 160).await.unwrap_err(),
-            GrantError::Expired
-        );
-        assert_eq!(
-            grants.take_code(&code, 110).await.unwrap_err(),
-            GrantError::Unknown,
-            "an expired code is spent too"
-        );
-        assert_eq!(
-            grants.take_code("nope", 110).await.unwrap_err(),
-            GrantError::Unknown
-        );
-    }
-
-    #[tokio::test]
-    async fn expired_codes_are_pruned_and_the_store_is_bounded() {
-        let grants = Grants::default();
-        for _ in 0..MAX_GRANTS {
-            grants.issue_code(code_grant(150), 100).await.unwrap();
-        }
-        assert_eq!(
-            grants.issue_code(code_grant(150), 100).await.unwrap_err(),
-            GrantError::Full
-        );
-        grants.issue_code(code_grant(300), 200).await.unwrap();
-        assert_eq!(grants.codes.lock().await.len(), 1);
-    }
-
     #[test]
     fn a_claim_rule_takes_the_login_or_email_with_its_prefix() {
         let person = approved(PIRATE_KUEUE, "c1");
@@ -1341,6 +1257,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
                 ("pirate", "sha256~pirate", "wseaton"),
                 ("mpp", "sha256~mpp", "weaton"),
             ])),
+            pool.clone(),
         ));
         let auth = Arc::new(auth);
         crate::identity::oidc::users::record_login(
@@ -1831,7 +1748,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let now = crate::clock::unix_secs();
         people
             .grants
-            .issue_code(code_grant(now + CODE_TTL_SECS), now)
+            .issue_code(&code_grant(now + CODE_TTL_SECS))
             .await
             .unwrap()
     }
@@ -1934,27 +1851,46 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         );
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn refresh_tokens_rotate_and_never_widen(pool: PgPool) {
-        let h = harness(&pool).await;
-        let code = issued_code(&h, &pool).await;
-        let (_, first) = token(
-            &h.app,
+    async fn code_exchange(app: &axum::Router, code: &str) -> (StatusCode, Value) {
+        token(
+            app,
             &[
                 ("grant_type", "authorization_code"),
-                ("code", &code),
+                ("code", code),
                 ("redirect_uri", REDIRECT),
                 ("client_id", CLIENT_ID),
                 ("code_verifier", VERIFIER),
             ],
         )
-        .await;
-        let refresh = first["refresh_token"].as_str().unwrap().to_string();
+        .await
+    }
+
+    async fn refreshed(app: &axum::Router, refresh: &Value) -> (StatusCode, Value) {
+        token(
+            app,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh.as_str().unwrap()),
+                ("client_id", CLIENT_ID),
+            ],
+        )
+        .await
+    }
+
+    fn refused(reply: &(StatusCode, Value)) -> bool {
+        reply.0 == StatusCode::BAD_REQUEST && reply.1["error"] == "invalid_grant"
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn refresh_tokens_rotate_and_never_widen(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (_, first) = code_exchange(&h.app, &code).await;
         let (status, second) = token(
             &h.app,
             &[
                 ("grant_type", "refresh_token"),
-                ("refresh_token", &refresh),
+                ("refresh_token", first["refresh_token"].as_str().unwrap()),
                 ("client_id", CLIENT_ID),
                 ("resource", PIRATE_KUEUE),
             ],
@@ -1968,20 +1904,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             PIRATE_KUEUE,
         );
         assert_eq!(claims["kube_user"], "wseaton");
-        let (status, body) = token(
-            &h.app,
-            &[
-                ("grant_type", "refresh_token"),
-                ("refresh_token", &refresh),
-                ("client_id", CLIENT_ID),
-            ],
-        )
-        .await;
-        assert_eq!(
-            (status, body["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
-        );
-        let (status, body) = token(
+        let wider = token(
             &h.app,
             &[
                 ("grant_type", "refresh_token"),
@@ -1991,10 +1914,146 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             ],
         )
         .await;
-        assert_eq!(
-            (status, body["error"].as_str()),
-            (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        assert!(refused(&wider), "{wider:?}");
+    }
+
+    /// A spent refresh token presented again revokes its approval: the latest token dies too.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_reused_refresh_token_revokes_the_whole_approval(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (_, first) = code_exchange(&h.app, &code).await;
+        let (status, second) = refreshed(&h.app, &first["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert!(refused(&refreshed(&h.app, &first["refresh_token"]).await));
+        assert!(
+            refused(&refreshed(&h.app, &second["refresh_token"]).await),
+            "the live token went with the approval"
         );
+    }
+
+    /// Two replicas share nothing but the database: a code from one redeems on the other, and the
+    /// refresh token that returns rotates on the first.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_code_or_refresh_token_from_one_replica_redeems_on_another(pool: PgPool) {
+        let a = harness(&pool).await;
+        let b = harness(&pool).await;
+        let code = issued_code(&a, &pool).await;
+        let (status, on_b) = code_exchange(&b.app, &code).await;
+        assert_eq!(status, StatusCode::OK, "{on_b}");
+        let claims = claims_of(
+            &b.auth,
+            on_b["access_token"].as_str().unwrap(),
+            PIRATE_KUEUE,
+        );
+        assert_eq!(claims["kube_user"], "wseaton");
+        let (status, on_a) = refreshed(&a.app, &on_b["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "{on_a}");
+        assert!(
+            refused(&code_exchange(&a.app, &code).await),
+            "a code works once across replicas"
+        );
+    }
+
+    /// The username is read again on every refresh: a relink shows up in the next token, and an
+    /// unlink refuses the refresh and ends the approval.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_relink_or_unlink_takes_effect_on_the_next_refresh(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (_, first) = code_exchange(&h.app, &code).await;
+        crate::identity::kube_links::link(
+            &pool,
+            &Clusters::with(&[("pirate", "t2", "wseaton-next")]),
+            SUB,
+            "pirate",
+            "t2",
+            LinkSource::OpenshiftOauth,
+        )
+        .await
+        .unwrap();
+        let (status, second) = refreshed(&h.app, &first["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let claims = claims_of(
+            &h.auth,
+            second["access_token"].as_str().unwrap(),
+            PIRATE_KUEUE,
+        );
+        assert_eq!(claims["kube_user"], "wseaton-next");
+        assert!(
+            crate::identity::kube_links::unlink(&pool, SUB, "pirate")
+                .await
+                .unwrap()
+        );
+        let unlinked = refreshed(&h.app, &second["refresh_token"]).await;
+        assert!(refused(&unlinked), "{unlinked:?}");
+        let live: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM people_grants WHERE sub = $1 AND revoked_at IS NULL",
+        )
+        .bind(SUB)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 0, "the approval is revoked");
+    }
+
+    /// A person the identity provider has refused, or one who is gone, refreshes nothing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refused_or_deleted_person_refreshes_nothing(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (_, first) = code_exchange(&h.app, &code).await;
+        sqlx::query(
+            "INSERT INTO user_credentials (sub, token_cipher, key_id, last_error, failures,
+                                           created_at, updated_at)
+             VALUES ($1, 'sealed', 'k1', 'invalid_grant: account disabled', 1, '', '')",
+        )
+        .bind(SUB)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(refused(&refreshed(&h.app, &first["refresh_token"]).await));
+
+        let code = issued_code(&h, &pool).await;
+        let (_, other) = code_exchange(&h.app, &code).await;
+        sqlx::query("DELETE FROM users WHERE sub = $1")
+            .bind(SUB)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(refused(&refreshed(&h.app, &other["refresh_token"]).await));
+    }
+
+    /// Settings lists the person's live approvals and signs every client out at once.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn signing_out_mcp_clients_ends_every_approval(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (_, first) = code_exchange(&h.app, &code).await;
+        let listed = send(&h.app, get("/api/me/mcp-sign-ins", None)).await;
+        assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+        let listed: Value = serde_json::from_str(&listed.body).unwrap();
+        assert_eq!(listed["enabled"], true);
+        assert_eq!(listed["sign_ins"][0]["resource"], PIRATE_KUEUE);
+        assert_eq!(listed["sign_ins"][0]["cluster"], "pirate");
+        let out = send(
+            &h.app,
+            Request::delete("/api/me/mcp-sign-ins")
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(out.status, StatusCode::OK, "{}", out.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out.body).unwrap()["revoked"],
+            1
+        );
+        assert!(refused(&refreshed(&h.app, &first["refresh_token"]).await));
+        let listed: Value =
+            serde_json::from_str(&send(&h.app, get("/api/me/mcp-sign-ins", None)).await.body)
+                .unwrap();
+        assert_eq!(listed["sign_ins"], json!([]));
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
