@@ -197,8 +197,9 @@ cluster the hub only receives pushes from is refused, since the hub cannot creat
 there.
 
 For the controller's identity, `sandbox_readers` is granted: `sandboxes` get/list/patch/delete;
-`pods` get/list/create/delete; `services`, `secrets` and `networkpolicies` list/create/delete in
-the sandbox namespace; and `services` list/create/delete in the loop namespace.
+`pods` get/list/create/delete and `pods/finalizers` update (the gateway's Secrets block its
+pod's deletion); `services`, `secrets` and `networkpolicies` list/create/delete in the sandbox
+namespace; and `services` list/create/delete in the loop namespace.
 
 Grounded-rank and scope turns get a gateway of their own the same way, with certificates valid for
 the turn's deadline; a failed launch tears it down, and the gateway sweep removes it once the

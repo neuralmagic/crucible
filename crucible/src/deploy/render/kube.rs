@@ -1667,6 +1667,7 @@ exit $rc
         if isolated {
             sandbox_rules.extend([
                 rule("", &["pods"], &["get", "list", "create", "delete"]),
+                rule("", &["pods/finalizers"], &["update"]),
                 rule("", &["services", "secrets"], &["list", "create", "delete"]),
                 rule(
                     "networking.k8s.io",
@@ -4151,6 +4152,7 @@ mod tests {
             serde_json::json!([
                 {"apiGroups": ["agents.x-k8s.io"], "resources": ["sandboxes"], "verbs": ["get", "list", "patch", "delete"]},
                 {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "create", "delete"]},
+                {"apiGroups": [""], "resources": ["pods/finalizers"], "verbs": ["update"]},
                 {"apiGroups": [""], "resources": ["services", "secrets"], "verbs": ["list", "create", "delete"]},
                 {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["list", "create", "delete"]}
             ]),
