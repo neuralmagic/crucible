@@ -18,9 +18,9 @@
 
 use crate::deploy::profile::DeployProfile;
 use crate::openshell::gateway::{
-    GATEWAY_CLIENT_TLS_DIR_ENV, GATEWAY_URL_ENV, SANDBOX_RUNTIME_IMAGE_ENV,
-    SERVE_CLIENT_TLS_SECRET_ENV, SERVE_GATEWAY_ID_ENV, SERVE_GRPC_ENDPOINT_ENV, SERVE_HOST_IP_ENV,
-    SERVE_SERVER_TLS_DIR_ENV, SUPERVISOR_IMAGE_ENV,
+    AWS_SANDBOX_ROLE_ENV, AWS_WEB_IDENTITY_TOKEN_PATH, GATEWAY_CLIENT_TLS_DIR_ENV, GATEWAY_URL_ENV,
+    SANDBOX_RUNTIME_IMAGE_ENV, SERVE_CLIENT_TLS_SECRET_ENV, SERVE_GATEWAY_ID_ENV,
+    SERVE_GRPC_ENDPOINT_ENV, SERVE_HOST_IP_ENV, SERVE_SERVER_TLS_DIR_ENV, SUPERVISOR_IMAGE_ENV,
 };
 use crate::openshell::grpc::GATEWAY_PORT;
 use k8s_openapi::api::core::v1 as core;
@@ -209,6 +209,7 @@ pub fn gateway_url(gateway: IpAddr) -> String {
 /// The loop pod env the gateway reads its driver config from.
 fn forwarded(name: &str) -> bool {
     name.starts_with("CRUCIBLE_SANDBOX_")
+        || name == AWS_SANDBOX_ROLE_ENV
         || name == SUPERVISOR_IMAGE_ENV
         || name == SANDBOX_RUNTIME_IMAGE_ENV
         || name == "OTEL_EXPORTER_OTLP_ENDPOINT"
@@ -217,7 +218,9 @@ fn forwarded(name: &str) -> bool {
 
 /// The gateway pod for the run whose rendered loop pod is `loop_pod`: the loop image, running
 /// `crucible openshell-gateway` as [`GATEWAY_SERVICE_ACCOUNT`], with the loop pod's driver env, the
-/// per-run addresses, and the server TLS Secret mounted.
+/// per-run addresses, and the server TLS Secret mounted. When the loop pod names a sandbox AWS
+/// role, the pod also gets its own STS-audienced service account token for it, so that role's
+/// trust policy names [`GATEWAY_SERVICE_ACCOUNT`] in the sandbox namespace.
 pub fn gateway_pod(
     profile: &DeployProfile,
     names: &GatewayNames,
@@ -246,6 +249,64 @@ pub fn gateway_pod(
         plain(SERVE_SERVER_TLS_DIR_ENV, SERVER_TLS_DIR.to_string()),
         plain(SERVE_GATEWAY_ID_ENV, names.gateway_id.clone()),
     ]);
+    let mut mounts = vec![
+        core::VolumeMount {
+            name: "server-tls".to_string(),
+            mount_path: SERVER_TLS_DIR.to_string(),
+            read_only: Some(true),
+            ..Default::default()
+        },
+        core::VolumeMount {
+            name: "home".to_string(),
+            mount_path: GATEWAY_HOME.to_string(),
+            ..Default::default()
+        },
+    ];
+    let mut volumes = vec![
+        core::Volume {
+            name: "server-tls".to_string(),
+            secret: Some(core::SecretVolumeSource {
+                secret_name: Some(names.server_secret.clone()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        core::Volume {
+            name: "home".to_string(),
+            empty_dir: Some(core::EmptyDirVolumeSource::default()),
+            ..Default::default()
+        },
+    ];
+    if env.iter().any(|e| e.name == AWS_SANDBOX_ROLE_ENV) {
+        let token = std::path::Path::new(AWS_WEB_IDENTITY_TOKEN_PATH);
+        mounts.push(core::VolumeMount {
+            name: "aws-token".to_string(),
+            mount_path: token
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
+            read_only: Some(true),
+            ..Default::default()
+        });
+        volumes.push(core::Volume {
+            name: "aws-token".to_string(),
+            projected: Some(core::ProjectedVolumeSource {
+                sources: Some(vec![core::VolumeProjection {
+                    service_account_token: Some(core::ServiceAccountTokenProjection {
+                        audience: Some("sts.amazonaws.com".to_string()),
+                        expiration_seconds: Some(3600),
+                        path: token
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+    }
     let container = core::Container {
         name: "gateway".to_string(),
         image: loop_container.and_then(|c| c.image.clone()),
@@ -274,19 +335,7 @@ pub fn gateway_pod(
             }),
             ..Default::default()
         }),
-        volume_mounts: Some(vec![
-            core::VolumeMount {
-                name: "server-tls".to_string(),
-                mount_path: SERVER_TLS_DIR.to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            },
-            core::VolumeMount {
-                name: "home".to_string(),
-                mount_path: GATEWAY_HOME.to_string(),
-                ..Default::default()
-            },
-        ]),
+        volume_mounts: Some(mounts),
         ..Default::default()
     };
     core::Pod {
@@ -303,21 +352,7 @@ pub fn gateway_pod(
             node_selector: loop_spec.and_then(|s| s.node_selector.clone()),
             affinity: loop_spec.and_then(|s| s.affinity.clone()),
             containers: vec![container],
-            volumes: Some(vec![
-                core::Volume {
-                    name: "server-tls".to_string(),
-                    secret: Some(core::SecretVolumeSource {
-                        secret_name: Some(names.server_secret.clone()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                core::Volume {
-                    name: "home".to_string(),
-                    empty_dir: Some(core::EmptyDirVolumeSource::default()),
-                    ..Default::default()
-                },
-            ]),
+            volumes: Some(volumes),
             ..Default::default()
         }),
         ..Default::default()
@@ -646,6 +681,64 @@ mod tests {
         let sc = c.security_context.clone().expect("security context");
         assert_eq!(sc.allow_privilege_escalation, Some(false));
         assert_eq!(sc.run_as_non_root, Some(true));
+    }
+
+    #[test]
+    fn a_sandbox_aws_role_gives_the_gateway_pod_its_own_sts_token() {
+        let p = isolated_profile();
+        let names = GatewayNames::for_run_pod("crucible-run-a");
+        let without = gateway_pod(&p, &names, &loop_pod(), addresses());
+        let has_token = |pod: &core::Pod| {
+            pod.spec
+                .as_ref()
+                .and_then(|s| s.volumes.as_ref())
+                .is_some_and(|v| v.iter().any(|v| v.name == "aws-token"))
+        };
+        assert!(!has_token(&without), "no role, no token");
+
+        let mut with_role = loop_pod();
+        with_role.spec.as_mut().expect("spec").containers[0]
+            .env
+            .as_mut()
+            .expect("env")
+            .push(core::EnvVar {
+                name: AWS_SANDBOX_ROLE_ENV.into(),
+                value: Some("arn:aws:iam::1:role/sandbox-ro".into()),
+                value_from: None,
+            });
+        let pod = gateway_pod(&p, &names, &with_role, addresses());
+        assert!(has_token(&pod));
+        let spec = pod.spec.expect("spec");
+        let token = spec
+            .volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == "aws-token")
+            .and_then(|v| v.projected.as_ref())
+            .and_then(|p| p.sources.as_ref())
+            .and_then(|s| s.first())
+            .and_then(|s| s.service_account_token.clone())
+            .expect("a projected token");
+        assert_eq!(token.audience.as_deref(), Some("sts.amazonaws.com"));
+        let container = &spec.containers[0];
+        let mount = container
+            .volume_mounts
+            .iter()
+            .flatten()
+            .find(|m| m.name == "aws-token")
+            .expect("mounted");
+        assert_eq!(
+            format!("{}/{}", mount.mount_path, token.path),
+            AWS_WEB_IDENTITY_TOKEN_PATH
+        );
+        assert!(
+            container
+                .env
+                .iter()
+                .flatten()
+                .any(|e| e.name == AWS_SANDBOX_ROLE_ENV),
+            "the role is forwarded for the gateway to assume"
+        );
     }
 
     #[test]

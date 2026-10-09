@@ -809,6 +809,7 @@ pub fn serve() -> Result<()> {
         .into());
     }
     let mut gw = Command::new("openshell-gateway");
+    apply_gateway_aws_env(&mut gw, aws_sandbox_role().as_deref());
     gw.args(serve_args())
         .env("OPENSHELL_LOCAL_TLS_DIR", &local_dir)
         .env("OPENSHELL_TLS_CERT", server_tls.join("tls.crt"))
