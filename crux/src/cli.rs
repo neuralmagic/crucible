@@ -152,6 +152,43 @@ enum Command {
         json: bool,
     },
 
+    /// Registered inference providers: kind, harness, default model, secret, owner, endpoint.
+    Providers {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Register a provider from a JSON body (`POST /api/providers`).
+    ProviderCreate {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Replace a provider's registration from a JSON body (`PUT /api/providers/<id>`).
+    ProviderUpdate {
+        id: String,
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
+    /// Deregister a provider and every default naming it. Refused while issues or schedules pin
+    /// it; `provider-update` with `"enabled": false` retires one that work still names.
+    ProviderDelete {
+        id: String,
+    },
+
+    /// The provider each scope's unpinned dispatches take, per workload class, and its fallback.
+    DispatchDefaults {
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Set one dispatch default from a JSON body (`PUT /api/config/dispatch-defaults`). Admin only.
+    DispatchDefaultSet {
+        #[arg(long)]
+        file: std::path::PathBuf,
+    },
+
     /// Check a transform's CEL from a JSON body (`filter`, `dedupe`, `derive`) the way a save
     /// does. Prints `ok`, or fails with one `field:line:col: message` per refusal.
     WebhookCheck {
@@ -492,6 +529,23 @@ enum Command {
         json: bool,
     },
 
+    /// Register a secret. The value is read from piped stdin, never from an argument or a
+    /// terminal: `pbpaste | crux secret-create NAME --kind opaque`. Prints metadata, never the value.
+    SecretCreate {
+        /// The name a pack's `[[secret]] name` refers to. Unique per owner.
+        name: String,
+        #[arg(long, value_enum)]
+        kind: ops::SecretKind,
+        /// Omit for `broker-only`: the run gets it, the agent in the sandbox does not.
+        #[arg(long, value_enum)]
+        visibility: Option<ops::Visibility>,
+        /// `user:<login>` or a `group:` in your claims. Omit to own it yourself.
+        #[arg(long)]
+        owner: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Bind a secret to a draft, playbook, repo, or domain, so a run at that scope receives it.
     /// One scope flag and one projection flag.
     SecretBind {
@@ -661,6 +715,12 @@ pub async fn run() -> Result<()> {
             limit,
             json,
         } => ops::webhook_deliveries(&client, &id, before.as_deref(), limit, json).await?,
+        Command::Providers { json } => ops::providers(&client, json).await?,
+        Command::ProviderCreate { file } => ops::provider_create(&client, &file).await?,
+        Command::ProviderUpdate { id, file } => ops::provider_update(&client, &id, &file).await?,
+        Command::ProviderDelete { id } => ops::provider_delete(&client, &id).await?,
+        Command::DispatchDefaults { json } => ops::dispatch_defaults(&client, json).await?,
+        Command::DispatchDefaultSet { file } => ops::dispatch_default_set(&client, &file).await?,
         Command::WebhookCheck { file } => ops::webhook_check(&client, &file).await?,
         Command::WebhookPresets => ops::webhook_presets(&client).await?,
         Command::WebhookCreate { file } => ops::webhook_create(&client, &file).await?,
@@ -828,6 +888,28 @@ pub async fn run() -> Result<()> {
             json,
         } => ops::draft_push(&client, &draft_id, &dir, base_version, json).await?,
         Command::Secrets { json } => ops::secrets(&client, json).await?,
+        Command::SecretCreate {
+            name,
+            kind,
+            visibility,
+            owner,
+            json,
+        } => {
+            let stdin = std::io::stdin();
+            let value = read_secret_value(&stdin, std::io::IsTerminal::is_terminal(&stdin))?;
+            ops::secret_create(
+                &client,
+                ops::SecretCreate {
+                    name: &name,
+                    kind,
+                    visibility,
+                    owner: owner.as_deref(),
+                    value,
+                },
+                json,
+            )
+            .await?
+        }
         Command::SecretBind {
             secret_id,
             playbook,
@@ -915,6 +997,20 @@ pub async fn run() -> Result<()> {
     };
     println!("{}", out.trim_end());
     Ok(())
+}
+
+/// A secret value arrives on piped stdin only. A terminal would echo it as it is typed.
+fn read_secret_value(mut input: impl Read, terminal: bool) -> Result<ops::SecretValue> {
+    if terminal {
+        bail!(
+            "pipe the secret value on stdin, e.g. `pbpaste | crux secret-create NAME --kind opaque`"
+        );
+    }
+    let mut raw = String::new();
+    input
+        .read_to_string(&mut raw)
+        .context("reading the secret value from stdin")?;
+    ops::SecretValue::new(raw)
 }
 
 /// `--body -` reads stdin, `--body PATH` reads a file, `--body-text` is inline.
@@ -1056,6 +1152,74 @@ mod tests {
         assert!(
             Cli::try_parse_from(["crux", "run-log", "r1", "--interval", "2"]).is_err(),
             "--interval means nothing without --follow"
+        );
+    }
+
+    #[test]
+    fn secret_create_takes_no_value_argument() {
+        let cli = Cli::try_parse_from([
+            "crux",
+            "secret-create",
+            "bugwatch-label-token",
+            "--kind",
+            "opaque",
+            "--visibility",
+            "broker-only",
+        ])
+        .expect("parses");
+        match cli.command {
+            Command::SecretCreate {
+                name,
+                kind,
+                visibility,
+                owner,
+                ..
+            } => {
+                assert_eq!(name, "bugwatch-label-token");
+                assert_eq!(kind, ops::SecretKind::Opaque);
+                assert_eq!(visibility, Some(ops::Visibility::BrokerOnly));
+                assert_eq!(owner, None);
+            }
+            _ => panic!("expected secret-create"),
+        }
+        for bad in [
+            vec![
+                "crux",
+                "secret-create",
+                "n",
+                "--kind",
+                "opaque",
+                "--value",
+                "x",
+            ],
+            vec![
+                "crux",
+                "secret-create",
+                "n",
+                "--kind",
+                "opaque",
+                "ghp_positional",
+            ],
+            vec!["crux", "secret-create", "n", "--kind", "password"],
+            vec!["crux", "secret-create", "n"],
+        ] {
+            assert!(Cli::try_parse_from(&bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn a_secret_value_comes_from_a_pipe_and_never_a_terminal() {
+        assert!(read_secret_value("ghp_abc\n".as_bytes(), false).is_ok());
+        let refused = read_secret_value("ghp_abc\n".as_bytes(), true)
+            .err()
+            .expect("a terminal is refused");
+        assert!(
+            refused.to_string().contains("pipe the secret value"),
+            "{refused}"
+        );
+        assert!(
+            read_secret_value("".as_bytes(), false).is_err(),
+            "empty is refused"
         );
     }
 

@@ -384,6 +384,10 @@ impl Client {
         self.get("/api/secrets").await
     }
 
+    pub async fn create_secret<T: DeserializeOwned>(&self, body: &serde_json::Value) -> Result<T> {
+        self.post("/api/secrets", Some(body)).await
+    }
+
     pub async fn bind_secret<T: DeserializeOwned>(
         &self,
         secret_id: &str,
