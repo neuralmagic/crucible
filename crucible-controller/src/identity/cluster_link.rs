@@ -170,7 +170,8 @@ pub struct ClusterLinks {
 
 impl ClusterLinks {
     /// The flow the deploy profile's `[cluster_link]` table configures, with each cluster's secret
-    /// under `CONTROLLER_CLUSTER_LINK_SECRETS`. `None` without the table.
+    /// under `CONTROLLER_CLUSTER_LINK_SECRETS`. `None` without the table, or when the profile cannot
+    /// be read (logged at warn).
     pub fn from_env(
         profile: Option<&std::path::Path>,
         clusters: Arc<ClusterClients>,
@@ -179,8 +180,17 @@ impl ClusterLinks {
         let Some(path) = profile else {
             return Ok(None);
         };
-        let profile = crucible::deploy::DeployProfile::load(path)
-            .context("reading the deploy profile for cluster links")?;
+        let profile = match crucible::deploy::DeployProfile::load(path) {
+            Ok(profile) => profile,
+            Err(error) => {
+                tracing::warn!(
+                    profile = %path.display(),
+                    error = format!("{error:#}"),
+                    "cluster links off: the deploy profile could not be read"
+                );
+                return Ok(None);
+            }
+        };
         let Some(table) = profile.cluster_link.as_ref() else {
             return Ok(None);
         };
@@ -639,6 +649,26 @@ mod tests {
     use crate::identity::cluster_link::*;
     use crucible_contract::cluster_link::DEFAULT_CLIENT_ID;
     use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn an_unreadable_profile_leaves_cluster_links_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let clusters = Arc::new(ClusterClients::new(None));
+        let missing = dir.path().join("absent.toml");
+        assert!(
+            ClusterLinks::from_env(Some(&missing), clusters.clone())
+                .unwrap()
+                .is_none()
+        );
+        let broken = dir.path().join("broken.toml");
+        std::fs::write(&broken, "[cluster\nnot toml").unwrap();
+        assert!(
+            ClusterLinks::from_env(Some(&broken), clusters.clone())
+                .unwrap()
+                .is_none()
+        );
+        assert!(ClusterLinks::from_env(None, clusters).unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn a_link_redeems_the_code_the_cluster_issued_for_this_browser() {
