@@ -47,7 +47,7 @@ pub enum ConfigError {
          so its metadata sits at /.well-known/oauth-authorization-server"
     )]
     IssuerShape(String),
-    #[error("CONTROLLER_AGENT_SANDBOX_ID_PREFIX {0:?} must be a spiffe:// URI ending in /")]
+    #[error("CONTROLLER_AGENT_GATEWAY_PREFIX {0:?} must be a spiffe:// URI ending in /")]
     Prefix(String),
     #[error("CONTROLLER_AGENT_AUDIENCES names no MCP resource")]
     NoAudiences,
@@ -96,12 +96,14 @@ impl IssuerUrl {
     }
 }
 
-/// The SPIFFE ID path under which every sandbox supervisor's ID sits, ending in `/`; the rest of
-/// the ID is the sandbox id.
+/// The SPIFFE ID path under which every sandbox supervisor's ID sits, ending in `/`, such as
+/// `spiffe://<trust domain>/openshell/gateway/`. The rest of the ID is
+/// `<gateway id>/sandbox/<sandbox id>`, both read from labels the gateway that created the
+/// supervisor pod stamped.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxIdPrefix(String);
+pub struct GatewayPrefix(String);
 
-impl SandboxIdPrefix {
+impl GatewayPrefix {
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
         match raw.starts_with("spiffe://") && raw.ends_with('/') && raw.len() > "spiffe://".len() {
             true => Ok(Self(raw.to_string())),
@@ -185,7 +187,7 @@ pub struct AgentIssuerConfig {
     /// A PEM bundle trusted for the SVID JWKS fetch on top of the system roots (OpenShift's
     /// service CA for an in-cluster `https://*.svc` endpoint).
     pub svid_ca: Option<Vec<u8>>,
-    pub sandbox_prefix: SandboxIdPrefix,
+    pub gateway_prefix: GatewayPrefix,
     /// The MCP resources a token may be minted for.
     pub audiences: Vec<Audience>,
 }
@@ -233,7 +235,7 @@ impl AgentIssuerConfig {
             svid_issuer: need("CONTROLLER_AGENT_SVID_ISSUER")?,
             svid_jwks_uri,
             svid_ca: get("CONTROLLER_AGENT_SVID_CA_FILE").map(read).transpose()?,
-            sandbox_prefix: SandboxIdPrefix::parse(&need("CONTROLLER_AGENT_SANDBOX_ID_PREFIX")?)?,
+            gateway_prefix: GatewayPrefix::parse(&need("CONTROLLER_AGENT_GATEWAY_PREFIX")?)?,
             audiences,
         }))
     }
@@ -258,7 +260,49 @@ impl AgentIssuerConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     pub spiffe_id: String,
+    /// The gateway that created the supervisor's pod.
+    pub gateway: GatewayId,
     pub id: SandboxId,
+}
+
+/// An OpenShell gateway id: a DNS-1123 label, the `openshell.ai/gateway-id` label value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayId(String);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("gateway id {0:?} is not a DNS-1123 label")]
+pub struct GatewayIdError(pub String);
+
+impl GatewayId {
+    pub fn parse(raw: &str) -> Result<Self, GatewayIdError> {
+        let bytes = raw.as_bytes();
+        let valid = !raw.is_empty()
+            && raw.len() <= 63
+            && bytes
+                .iter()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-')
+            && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+            && bytes.last().is_some_and(u8::is_ascii_alphanumeric);
+        match valid {
+            true => Ok(Self(raw.to_string())),
+            false => Err(GatewayIdError(raw.to_string())),
+        }
+    }
+
+    /// The gateway the controller starts for the run whose pod is `run_pod`.
+    pub fn of_run_pod(run_pod: &str) -> Self {
+        Self(crucible::deploy::render::gateway::GatewayNames::for_run_pod(run_pod).gateway_id)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for GatewayId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -267,8 +311,10 @@ pub enum AssertionError {
     Token(#[from] TokenError),
     #[error("assertion aud must be exactly [{expected:?}], got {got}")]
     Audience { expected: String, got: Value },
-    #[error("assertion sub {sub:?} is not a sandbox under {prefix}")]
+    #[error("assertion sub {sub:?} is not <gateway>/sandbox/<id> under {prefix}")]
     NotASandbox { sub: String, prefix: String },
+    #[error(transparent)]
+    GatewayId(#[from] GatewayIdError),
     #[error("assertion has no numeric iat")]
     NoIssuedAt,
     #[error("assertion iat {iat} is in the future")]
@@ -430,7 +476,7 @@ pub struct AgentIssuer {
     issuer: IssuerUrl,
     key: SigningKey,
     svids: Verifier,
-    sandbox_prefix: SandboxIdPrefix,
+    gateway_prefix: GatewayPrefix,
     audiences: Vec<Audience>,
 }
 
@@ -440,7 +486,7 @@ impl AgentIssuer {
             svids: Verifier::new(cfg.svid_issuer, svid_jwks),
             issuer: cfg.issuer,
             key: cfg.signing_key,
-            sandbox_prefix: cfg.sandbox_prefix,
+            gateway_prefix: cfg.gateway_prefix,
             audiences: cfg.audiences,
         }
     }
@@ -450,8 +496,8 @@ impl AgentIssuer {
     }
 
     /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against SPIRE's
-    /// keys, carry exactly one `aud` equal to this issuer, and name a SPIFFE ID under the
-    /// sandbox prefix.
+    /// keys, carry exactly one `aud` equal to this issuer, and name a SPIFFE ID
+    /// `<gateway prefix><gateway id>/sandbox/<sandbox id>`.
     pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
         let issuer = self.issuer.as_str();
         let claims = self.svids.verify(assertion, &[issuer]).await?;
@@ -490,14 +536,16 @@ impl AgentIssuer {
             .unwrap_or_default();
         let not_a_sandbox = || AssertionError::NotASandbox {
             sub: sub.to_string(),
-            prefix: self.sandbox_prefix.0.clone(),
+            prefix: self.gateway_prefix.0.clone(),
         };
-        let rest = sub
-            .strip_prefix(self.sandbox_prefix.0.as_str())
+        let (gateway, id) = sub
+            .strip_prefix(self.gateway_prefix.0.as_str())
+            .and_then(|rest| rest.split_once("/sandbox/"))
             .ok_or_else(not_a_sandbox)?;
         Ok(Sandbox {
             spiffe_id: sub.to_string(),
-            id: SandboxId::parse(rest)?,
+            gateway: GatewayId::parse(gateway)?,
+            id: SandboxId::parse(id)?,
         })
     }
 
@@ -591,7 +639,7 @@ impl AgentIssuer {
 mod tests {
     use crate::agent_auth::issuer::*;
     use crate::agent_auth::testing::{
-        self, BUILDIT, CLUSTER, EcKey, ISSUER, KUEUE, PREFIX, PROFILE, Spire, now, serve_jwks,
+        self, BUILDIT, CLUSTER, EcKey, ISSUER, KUEUE, POD, PREFIX, PROFILE, Spire, now, serve_jwks,
     };
     use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
     use std::collections::HashMap;
@@ -612,7 +660,8 @@ mod tests {
             }));
             let sandbox = issuer.sandbox(&svid).await.unwrap();
             assert_eq!(sandbox.id.as_str(), "sbx-1", "aud {aud}");
-            assert_eq!(sandbox.spiffe_id, format!("{PREFIX}sbx-1"));
+            assert_eq!(sandbox.gateway.as_str(), POD);
+            assert_eq!(sandbox.spiffe_id, format!("{PREFIX}{POD}/sandbox/sbx-1"));
         }
     }
 
@@ -668,9 +717,33 @@ mod tests {
                 })),
             ),
             (
-                "a nested path under the prefix",
+                "a nested path under the sandbox",
                 spire.svid(&with(base(), |c| {
-                    c.insert("sub".into(), json!(format!("{PREFIX}sbx-1/extra")));
+                    c.insert(
+                        "sub".into(),
+                        json!(format!("{PREFIX}{POD}/sandbox/sbx-1/extra")),
+                    );
+                })),
+            ),
+            (
+                "no gateway segment",
+                spire.svid(&with(base(), |c| {
+                    c.insert("sub".into(), json!(format!("{PREFIX}sbx-1")));
+                })),
+            ),
+            (
+                "a gateway id that is not a label",
+                spire.svid(&with(base(), |c| {
+                    c.insert(
+                        "sub".into(),
+                        json!(format!("{PREFIX}Gateway_A/sandbox/sbx-1")),
+                    );
+                })),
+            ),
+            (
+                "an empty gateway id",
+                spire.svid(&with(base(), |c| {
+                    c.insert("sub".into(), json!(format!("{PREFIX}/sandbox/sbx-1")));
                 })),
             ),
             (
@@ -878,7 +951,8 @@ mod tests {
     fn grant(tenant: Option<TenantScope>) -> AgentGrant {
         AgentGrant {
             sandbox: Sandbox {
-                spiffe_id: format!("{PREFIX}sbx-1"),
+                spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
+                gateway: GatewayId::of_run_pod(POD),
                 id: crate::agent_auth::bindings::SandboxId::parse("sbx-1").unwrap(),
             },
             launcher: "alice".into(),
@@ -928,7 +1002,7 @@ mod tests {
                 "iat": at,
                 "nbf": at,
                 "exp": at + TOKEN_TTL_SECS,
-                "act": {"sub": format!("{PREFIX}sbx-1")},
+                "act": {"sub": format!("{PREFIX}{POD}/sandbox/sbx-1")},
                 "run_id": "crucible-run-brave-otter",
                 "sandbox": "ci-0123abcd",
                 "workdir": "/sandbox/repo",
@@ -942,7 +1016,10 @@ mod tests {
             verified(&issuer, &minted.access_token).await,
         )
         .unwrap();
-        assert_eq!(principal.presenter(), format!("{PREFIX}sbx-1"));
+        assert_eq!(
+            principal.presenter(),
+            format!("{PREFIX}{POD}/sandbox/sbx-1")
+        );
     }
 
     #[tokio::test]
@@ -1042,7 +1119,7 @@ mod tests {
                 "CONTROLLER_AGENT_SVID_JWKS_URI",
                 "https://spire-spiffe-oidc-discovery-provider.ztwim.svc/keys".into(),
             ),
-            ("CONTROLLER_AGENT_SANDBOX_ID_PREFIX", PREFIX.into()),
+            ("CONTROLLER_AGENT_GATEWAY_PREFIX", PREFIX.into()),
             (
                 "CONTROLLER_AGENT_AUDIENCES",
                 format!("{KUEUE}=kueue.read kueue.submit, {BUILDIT}=buildit.read buildit.build,"),
@@ -1085,7 +1162,7 @@ mod tests {
             "CONTROLLER_AGENT_SIGNING_KEY_FILE",
             "CONTROLLER_AGENT_SVID_ISSUER",
             "CONTROLLER_AGENT_SVID_JWKS_URI",
-            "CONTROLLER_AGENT_SANDBOX_ID_PREFIX",
+            "CONTROLLER_AGENT_GATEWAY_PREFIX",
             "CONTROLLER_AGENT_AUDIENCES",
         ] {
             let mut partial = vars.clone();
@@ -1107,12 +1184,12 @@ mod tests {
             ("CONTROLLER_AGENT_ISSUER", "http://controller.svc:8080/?x=1"),
             ("CONTROLLER_AGENT_ISSUER", "spiffe://example.crucible"),
             (
-                "CONTROLLER_AGENT_SANDBOX_ID_PREFIX",
-                "spiffe://example.crucible/openshell/sandbox",
+                "CONTROLLER_AGENT_GATEWAY_PREFIX",
+                "spiffe://example.crucible/openshell/gateway",
             ),
             (
-                "CONTROLLER_AGENT_SANDBOX_ID_PREFIX",
-                "https://example.crucible/openshell/sandbox/",
+                "CONTROLLER_AGENT_GATEWAY_PREFIX",
+                "https://example.crucible/openshell/gateway/",
             ),
             ("CONTROLLER_AGENT_AUDIENCES", " , "),
             ("CONTROLLER_AGENT_AUDIENCES", "not a url=kueue.read"),

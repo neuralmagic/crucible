@@ -19,7 +19,7 @@ use base64::Engine;
 use crucible_contract::kueue::token_digest;
 use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
 use crucible_controller::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, IssuerUrl, SandboxIdPrefix, SigningKey,
+    AgentIssuer, AgentIssuerConfig, GatewayPrefix, IssuerUrl, SigningKey,
 };
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
 use crucible_kueue::tenant::{Registry, Tenants};
@@ -47,23 +47,32 @@ const CONTROLLER: &str = "http://crucible-controller.crucible-system.svc.cluster
 const RESOURCE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
 const SANDBOX_NAME: &str = "ci-0123456789abcdef";
 const WORKDIR: &str = "/sandbox/repo";
-const RUN_POD: &str = "crucible-run-oidc-e2e";
 const RUN_ID: &str = "playbook_oidc-e2e_auth-spike";
 const TENANT_TOKEN: &str = "oidc-e2e-tenant-token";
 const IMAGE: &str = "registry.access.redhat.com/ubi9/ubi-minimal:latest";
 
-/// The spike's SPIFFE ID split at its last segment: the trust-domain path every sandbox ID sits
-/// under, and the spike's own sandbox ID.
-fn sandbox_prefix() -> String {
+/// The spike's SPIFFE ID, `<prefix><gateway id>/sandbox/<sandbox id>`, split into its parts.
+fn spiffe_parts() -> (String, String, String) {
     let id = cluster::spiffe_id();
-    let cut = id.rfind('/').map_or(0, |i| i + 1);
-    id[..cut].to_string()
+    let cut = id.find("/gateway/").expect("a gateway-keyed SPIFFE ID") + "/gateway/".len();
+    let (prefix, rest) = id.split_at(cut);
+    let (gateway, sandbox) = rest
+        .split_once("/sandbox/")
+        .expect("<gateway id>/sandbox/<sandbox id>");
+    (prefix.to_string(), gateway.to_string(), sandbox.to_string())
+}
+
+fn gateway_prefix() -> String {
+    spiffe_parts().0
+}
+
+/// The run pod the spike stands in for: a run's gateway id is its pod's name.
+fn run_pod() -> String {
+    spiffe_parts().1
 }
 
 fn sandbox() -> String {
-    let id = cluster::spiffe_id();
-    let cut = id.rfind('/').map_or(0, |i| i + 1);
-    id[cut..].to_string()
+    spiffe_parts().2
 }
 
 struct Env {
@@ -121,7 +130,7 @@ async fn seed_run(pool: &sqlx::PgPool) {
     ] {
         sqlx::query(sql)
             .bind(sandbox())
-            .bind(RUN_POD)
+            .bind(run_pod())
             .execute(pool)
             .await
             .unwrap();
@@ -130,7 +139,7 @@ async fn seed_run(pool: &sqlx::PgPool) {
         "INSERT INTO work_pods (pod_name, kind, state, cost_tag, created_at, updated_at, cluster)
          VALUES ($1, 'run', 'running', 'run', now()::text, now()::text, 'dev')",
     )
-    .bind(RUN_POD)
+    .bind(run_pod())
     .execute(pool)
     .await
     .unwrap();
@@ -139,7 +148,7 @@ async fn seed_run(pool: &sqlx::PgPool) {
          VALUES ($1, 'running', $2, 'user:alice', 'user:alice')",
     )
     .bind(RUN_ID)
-    .bind(RUN_POD)
+    .bind(run_pod())
     .execute(pool)
     .await
     .unwrap();
@@ -148,13 +157,13 @@ async fn seed_run(pool: &sqlx::PgPool) {
         name: SANDBOX_NAME.to_string(),
         workdir: Some(WORKDIR.to_string()),
     };
-    let run = bindings::bind(pool, RUN_POD, &binding).await.unwrap();
+    let run = bindings::bind(pool, &run_pod(), &binding).await.unwrap();
     assert_eq!(run, RUN_ID);
 }
 
 async fn collect_run(pool: &sqlx::PgPool) {
     sqlx::query("UPDATE work_pods SET state = 'collected' WHERE pod_name = $1")
-        .bind(RUN_POD)
+        .bind(run_pod())
         .execute(pool)
         .await
         .unwrap();
@@ -200,7 +209,7 @@ require_kube_user = false
         svid_issuer: cluster::spire(),
         svid_jwks_uri: Url::parse(&format!("{}/keys", cluster::spire())).unwrap(),
         svid_ca: None,
-        sandbox_prefix: SandboxIdPrefix::parse(&sandbox_prefix()).unwrap(),
+        gateway_prefix: GatewayPrefix::parse(&gateway_prefix()).unwrap(),
         audiences: vec![
             format!("{RESOURCE}=kueue.read kueue.submit")
                 .parse()
@@ -412,7 +421,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
 
     let client = connect(&url, &token).await;
     let me = call(&client, "whoami", json!({})).await.unwrap();
-    assert_eq!(me["run_id"], RUN_POD);
+    assert_eq!(me["run_id"], run_pod());
     assert_eq!(me["namespace"], env.namespace);
     assert_eq!(me["launched_by"], "alice");
     assert_eq!(me["queues"], json!([env.queue]));
@@ -483,7 +492,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
     );
     assert_eq!(
         labels.get("crucible.dev/run-id").map(String::as_str),
-        Some(RUN_POD)
+        Some(run_pod().as_str())
     );
     assert_eq!(
         annotations.get("crucible.dev/actor").map(String::as_str),

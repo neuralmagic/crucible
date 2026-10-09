@@ -367,14 +367,17 @@ async fn bind_sandbox(
     let name = match state
         .agent
         .directory
-        .sandbox_name(&row.cluster, &namespace, &request.id)
+        .sandbox_name(&row.cluster, &namespace, &request.id, &auth.pod)
         .await
     {
         Ok(Some(name)) => name,
         Ok(None) => {
             return refuse(
                 StatusCode::NOT_FOUND,
-                format!("no Sandbox with id {} in {namespace}", request.id),
+                format!(
+                    "no Sandbox with id {} in {namespace} created by this run's gateway",
+                    request.id
+                ),
             );
         }
         Err(e @ DirectoryError::Unreachable { .. }) => {
@@ -391,6 +394,14 @@ async fn bind_sandbox(
     match bind(pool, &auth.pod, &binding).await {
         Ok(run_id) => {
             tracing::info!(pod = %auth.pod, run_id, sandbox = %sandbox, name = binding.name, "sandbox bound");
+            if let Err(e) = state
+                .agent
+                .directory
+                .adopt(&row.cluster, &namespace, sandbox, &auth.pod)
+                .await
+            {
+                tracing::warn!(pod = %auth.pod, sandbox = %sandbox, reason = %e, "the bound sandbox could not be owned by its gateway pod; teardown deletes it by label");
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Err(e @ (BindError::UnknownPod(_) | BindError::NoRun(_))) => {
@@ -667,13 +678,17 @@ mod tests {
     }
 
     /// The bind route with the real TokenReview validator over a cluster boundary that vouches for
-    /// `token_pod`'s token, and a directory that knows `known` sandboxes.
+    /// `token_pod`'s token, and a directory that knows `known` `(run pod, sandbox id)` pairs.
     async fn app(
         pool: PgPool,
         token_pod: &str,
         profile: &str,
-        known: &[&str],
-    ) -> (axum::Router, tempfile::TempDir) {
+        known: &[(&str, &str)],
+    ) -> (
+        axum::Router,
+        tempfile::TempDir,
+        Arc<crate::agent_auth::testing::StaticDirectory>,
+    ) {
         let clusters = Arc::new(FakeClusters {
             namespaces: HashMap::from([(CLUSTER.to_string(), "crucible-system".to_string())]),
             statuses: HashMap::from([
@@ -693,7 +708,7 @@ mod tests {
             BTreeMap::from([(CLUSTER.to_string(), "crucible-spoke".to_string())]),
         ));
         let spire = Spire::start().await;
-        let (agent, dir) = testing::agent_auth(&pool, &spire, profile, known);
+        let (agent, dir, directory) = testing::agent_auth(&pool, &spire, profile, known);
         let state = BindState {
             ingest: IngestState {
                 db: crate::Db::new(pool),
@@ -701,7 +716,7 @@ mod tests {
             },
             agent,
         };
-        (router(state), dir)
+        (router(state), dir, directory)
     }
 
     async fn post(app: axum::Router, pod: &str, body: &str) -> (StatusCode, String) {
@@ -722,7 +737,13 @@ mod tests {
         running_run(&pool, "crucible-run-b", "run-b", Some("user:alice")).await;
         let body = serde_json::to_string(&wire("sbx-1", Some("/sandbox/repo"))).unwrap();
 
-        let (a_token, _d1) = app(pool.clone(), "crucible-run-a", PROFILE, &["sbx-1"]).await;
+        let (a_token, _d1, a_directory) = app(
+            pool.clone(),
+            "crucible-run-a",
+            PROFILE,
+            &[("crucible-run-a", "sbx-1")],
+        )
+        .await;
         let (status, text) = post(a_token.clone(), "crucible-run-b", &body).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
 
@@ -734,10 +755,39 @@ mod tests {
             ("run-a", Some("ci-sbx-1")),
             "the name came from the cluster, not the request"
         );
+        assert_eq!(
+            *a_directory.adopted.lock().unwrap(),
+            [("crucible-run-a".to_string(), "sbx-1".to_string())],
+            "the bound Sandbox is owned by run-a's gateway pod"
+        );
 
-        let (b_token, _d2) = app(pool.clone(), "crucible-run-b", PROFILE, &["sbx-1"]).await;
-        let (status, text) = post(b_token, "crucible-run-b", &body).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{text}");
+        let (b_token, _d2, _) = app(
+            pool.clone(),
+            "crucible-run-b",
+            PROFILE,
+            &[("crucible-run-a", "sbx-1")],
+        )
+        .await;
+        let (status, text) = post(b_token.clone(), "crucible-run-b", &body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "run-b's gateway did not create sbx-1: {text}"
+        );
+
+        let (both, _d3, _) = app(
+            pool.clone(),
+            "crucible-run-b",
+            PROFILE,
+            &[("crucible-run-a", "sbx-1"), ("crucible-run-b", "sbx-1")],
+        )
+        .await;
+        let (status, text) = post(both, "crucible-run-b", &body).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "already bound to run-a: {text}"
+        );
 
         let unknown = serde_json::to_string(&wire("sbx-nowhere", None)).unwrap();
         let (status, text) = post(a_token.clone(), "crucible-run-a", &unknown).await;
@@ -762,7 +812,13 @@ mod tests {
     async fn the_route_binds_nothing_without_a_declared_sandbox_namespace(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         let unplaced = PROFILE.replace("sandbox_namespace = \"sandboxes\"\n", "");
-        let (app, _d) = app(pool.clone(), "crucible-run-a", &unplaced, &["sbx-1"]).await;
+        let (app, _d, _) = app(
+            pool.clone(),
+            "crucible-run-a",
+            &unplaced,
+            &[("crucible-run-a", "sbx-1")],
+        )
+        .await;
         let body = serde_json::to_string(&wire("sbx-1", None)).unwrap();
         let (status, text) = post(app, "crucible-run-a", &body).await;
         assert_eq!(status, StatusCode::CONFLICT, "{text}");

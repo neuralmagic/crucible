@@ -1,7 +1,8 @@
 //! Where agent tokens may be minted from. A sandbox's SPIFFE ID is only as trustworthy as the
 //! namespace its supervisor pod runs in: anyone who can create a pod there can claim any sandbox's
 //! id. So the controller mints nothing until the deploy profile names a dedicated sandbox
-//! namespace, and refuses to hold the signing key in a namespace pack code shares.
+//! namespace that only per-run gateway pods create pods in, and refuses to hold the signing key in
+//! a namespace pack code shares.
 
 use crucible::deploy::DeployProfile;
 use crucible::deploy::profile::KubeName;
@@ -17,6 +18,12 @@ pub enum PlacementError {
          namespace no loop pod or pack can create pods in"
     )]
     NoSandboxNamespace,
+    #[error(
+        "the deploy profile does not run each run's gateway in its own pod (sandbox_driver = \
+         \"kubernetes\" with a sandbox_namespace); agent tokens need supervisor pods only a run's \
+         own gateway could have created"
+    )]
+    SharedGateway,
     #[error(
         "agent tokens need a deploy profile (CONTROLLER_DEPLOY_PROFILE) to check sandbox placement"
     )]
@@ -36,15 +43,20 @@ pub enum PlacementError {
     },
 }
 
-/// The sandbox namespace agent tokens may vouch for. Profile load has already refused one that
-/// coincides with the loop, rig, or crucible-kueue namespaces.
+/// The sandbox namespace agent tokens may vouch for, under a profile that isolates each run's
+/// gateway. Profile load has already refused one that coincides with the loop, rig, or
+/// crucible-kueue namespaces.
 pub fn sandbox_namespace(profile: Option<&DeployProfile>) -> Result<&KubeName, PlacementError> {
-    profile
-        .ok_or(PlacementError::NoProfile)?
+    let profile = profile.ok_or(PlacementError::NoProfile)?;
+    let namespace = profile
         .cluster
         .sandbox_namespace
         .as_ref()
-        .ok_or(PlacementError::NoSandboxNamespace)
+        .ok_or(PlacementError::NoSandboxNamespace)?;
+    match crucible::deploy::render::gateway::isolated(profile) {
+        true => Ok(namespace),
+        false => Err(PlacementError::SharedGateway),
+    }
 }
 
 /// Refuse a controller whose namespace (where its signing key Secret is mounted from) is one pack
@@ -132,6 +144,12 @@ mod tests {
         assert_eq!(
             sandbox_namespace(Some(&profile(PROFILE))).map(|ns| ns.as_str()),
             Ok("sandboxes")
+        );
+        let in_pod = profile(&PROFILE.replace("sandbox_driver = \"kubernetes\"\n", ""));
+        assert_eq!(
+            sandbox_namespace(Some(&in_pod)),
+            Err(PlacementError::SharedGateway),
+            "a gateway in the loop pod can be made to create any gateway's supervisors"
         );
     }
 

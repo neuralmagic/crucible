@@ -4,7 +4,7 @@
 
 use crate::agent_auth::bindings::{Binding, SandboxId};
 use crate::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, IssuerUrl, SandboxIdPrefix, SigningKey,
+    AgentIssuer, AgentIssuerConfig, GatewayPrefix, IssuerUrl, SigningKey,
 };
 use base64::Engine;
 use crucible_mcp_auth::jwks::Jwks;
@@ -15,7 +15,9 @@ use url::Url;
 
 pub const ISSUER: &str = "http://crucible-controller.tms.svc:8080";
 pub const SVID_ISSUER: &str = "https://oidc-discovery.apps.example";
-pub const PREFIX: &str = "spiffe://example.crucible/openshell/sandbox/";
+pub const PREFIX: &str = "spiffe://example.crucible/openshell/gateway/";
+/// The run pod most tests bind their sandboxes to; its gateway created those sandboxes.
+pub const POD: &str = "crucible-run-brave-otter";
 pub const KUEUE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
 pub const BUILDIT: &str = "http://host.openshell.internal:8849/mcp";
 pub const CLUSTER: &str = "dev";
@@ -27,6 +29,7 @@ loop_namespace = "crucible-system"
 rig_namespace = "rig"
 service_account = "crucible-spoke"
 supervisor_image = "registry.example.com/openshell-supervisor:latest"
+sandbox_driver = "kubernetes"
 sandbox_namespace = "sandboxes"
 [image]
 loop = "registry.example.com/crucible-loop:latest"
@@ -111,12 +114,20 @@ impl Spire {
         Self { key, jwks_uri }
     }
 
-    /// A JWT-SVID's claims for `sandbox`, fetched with the controller as audience.
+    /// A JWT-SVID's claims for `sandbox`, created by [`POD`]'s gateway, fetched with the
+    /// controller as audience.
     pub fn claims(sandbox: &str) -> Value {
+        Self::claims_from(POD, sandbox)
+    }
+
+    /// A JWT-SVID's claims for `sandbox`, created by the gateway of the run whose pod is
+    /// `run_pod`.
+    pub fn claims_from(run_pod: &str, sandbox: &str) -> Value {
+        let gateway = crate::agent_auth::issuer::GatewayId::of_run_pod(run_pod);
         json!({
             "iss": SVID_ISSUER,
             "aud": [ISSUER],
-            "sub": format!("{PREFIX}{sandbox}"),
+            "sub": format!("{PREFIX}{gateway}/sandbox/{sandbox}"),
             "iat": now(),
             "exp": now() + 300,
         })
@@ -140,7 +151,7 @@ pub fn config(spire: &Spire, signing: &EcKey) -> AgentIssuerConfig {
         svid_issuer: SVID_ISSUER.to_string(),
         svid_jwks_uri: spire.jwks_uri.clone(),
         svid_ca: None,
-        sandbox_prefix: SandboxIdPrefix::parse(PREFIX).unwrap(),
+        gateway_prefix: GatewayPrefix::parse(PREFIX).unwrap(),
         audiences: vec![
             format!("{KUEUE}=kueue.read kueue.submit").parse().unwrap(),
             format!("{BUILDIT}=buildit.read buildit.build")
@@ -223,10 +234,12 @@ pub fn binding(id: &str) -> Binding {
     }
 }
 
-/// The cluster API's answer for sandbox ids, as the gateway's `Sandbox` resources in
-/// [`SANDBOX_NAMESPACE`] would give it: `ci-<id>` for every id in `known`, nothing otherwise.
+/// The cluster API's answer for sandbox ids, as the gateways' `Sandbox` resources in
+/// [`SANDBOX_NAMESPACE`] would give it: `ci-<id>` for every `(run pod, id)` in `known`, whose run's
+/// gateway created it, nothing otherwise. Records every adoption.
 pub struct StaticDirectory {
-    pub known: Vec<String>,
+    pub known: Vec<(String, String)>,
+    pub adopted: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl crate::agent_auth::directory::SandboxDirectory for StaticDirectory {
@@ -235,38 +248,63 @@ impl crate::agent_auth::directory::SandboxDirectory for StaticDirectory {
         cluster: &str,
         namespace: &str,
         id: &SandboxId,
+        run_pod: &str,
     ) -> crate::daemon::queue::BoxFuture<
         Result<Option<String>, crate::agent_auth::directory::DirectoryError>,
     > {
         let answer = (cluster == CLUSTER
             && namespace == SANDBOX_NAMESPACE
-            && self.known.iter().any(|k| k == id.as_str()))
+            && self
+                .known
+                .iter()
+                .any(|(pod, k)| pod == run_pod && k == id.as_str()))
         .then(|| format!("ci-{id}"));
         Box::pin(async move { Ok(answer) })
+    }
+
+    fn adopt(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        id: &SandboxId,
+        run_pod: &str,
+    ) -> crate::daemon::queue::BoxFuture<Result<(), crate::agent_auth::directory::DirectoryError>>
+    {
+        if let Ok(mut adopted) = self.adopted.lock() {
+            adopted.push((run_pod.to_string(), id.to_string()));
+        }
+        Box::pin(async move { Ok(()) })
     }
 }
 
 /// The issuer state over `pool`, reading `profile_toml` as its deploy profile, with `known`
-/// sandboxes in the directory. Keep the returned directory alive as long as the state.
+/// `(run pod, sandbox id)` pairs in the directory. Keep the returned directory alive as long as
+/// the state.
 pub fn agent_auth(
     pool: &sqlx::PgPool,
     spire: &Spire,
     profile_toml: &str,
-    known: &[&str],
+    known: &[(&str, &str)],
 ) -> (
     std::sync::Arc<crate::agent_auth::AgentAuth>,
     tempfile::TempDir,
+    std::sync::Arc<StaticDirectory>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("profile.toml");
     std::fs::write(&path, profile_toml).unwrap();
+    let directory = std::sync::Arc::new(StaticDirectory {
+        known: known
+            .iter()
+            .map(|(pod, id)| (pod.to_string(), id.to_string()))
+            .collect(),
+        adopted: Default::default(),
+    });
     let state = crate::agent_auth::AgentAuth {
         issuer: issuer(spire, &EcKey::generate()),
         pool: pool.clone(),
         deploy_profile: Some(path),
-        directory: std::sync::Arc::new(StaticDirectory {
-            known: known.iter().map(|k| k.to_string()).collect(),
-        }),
+        directory: directory.clone(),
     };
-    (std::sync::Arc::new(state), dir)
+    (std::sync::Arc::new(state), dir, directory)
 }

@@ -138,47 +138,64 @@ webhook). `act.sub` is the sandbox's SPIFFE ID. It also carries `run_id` (the ru
 `[kueue]` cluster, `namespace`, `queues`, and `role`. Refusals return only the OAuth error code
 and a fixed description; the reason is logged.
 
-**Sandbox placement.** A sandbox's SPIFFE ID is only as trustworthy as the namespace its supervisor
-runs in, so the controller issues nothing until the deploy profile names
-`[cluster] sandbox_namespace`, which profile load refuses to share with the loop, rig, or
-crucible-kueue namespaces. Scope the sandbox ClusterSPIFFEID to it. The controller refuses to start
-the issuer when its own namespace (`POD_NAMESPACE`), where the signing key Secret is mounted from,
-is any of those namespaces; a controller rendered by `crucible deploy render` runs in the loop
-namespace and so cannot hold the key.
+**Sandbox placement.** A sandbox's SPIFFE ID is only as trustworthy as whoever can create pods
+where its supervisor runs, so the controller issues nothing until the deploy profile runs each
+run's gateway in its own pod: `sandbox_driver = "kubernetes"` with `[cluster] sandbox_namespace`,
+which profile load refuses to share with the loop, rig, or crucible-kueue namespaces. The
+controller refuses to start the issuer when its own namespace (`POD_NAMESPACE`), where the signing
+key Secret is mounted from, is any of those namespaces; a controller rendered by
+`crucible deploy render` runs in the loop namespace and so cannot hold the key.
+
+**Gateway identity.** Each run's gateway has its own OpenShell gateway id, the run pod's name. The
+gateway stamps it as `openshell.ai/gateway-id` on every supervisor pod and Sandbox it creates, from
+its own config, and `driver_config` cannot set labels or annotations. Scope the sandbox
+ClusterSPIFFEID to the sandbox namespace and build the ID from that label and the supervisor's
+`openshell.ai/sandbox-id` annotation:
+
+```yaml
+spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/gateway/{{ index .PodMeta.Labels "openshell.ai/gateway-id" }}/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
+```
+
+`CONTROLLER_AGENT_GATEWAY_PREFIX` is everything before the gateway id
+(`spiffe://<trust domain>/openshell/gateway/`).
 
 The engine binds each sandbox it creates by posting its id and workdir to
 `/api/pods/{pod}/sandboxes` with the pod's ingest token, so the drop-box env
-(`CRUCIBLE_INGEST_URL`) must reach the loop pod. The controller reads the sandbox's name from the
-gateway's `Sandbox` resource (`agents.x-k8s.io`) in the sandbox namespace, so its identity on each
-cluster needs `get`/`list` on `sandboxes` there; name that identity in `[cluster] sandbox_readers`
-(`namespace/name`) and the loop render grants it. A sandbox that was never bound, or whose run pod
-is no longer running, gets `invalid_grant`.
+(`CRUCIBLE_INGEST_URL`) must reach the loop pod. The controller binds only a `Sandbox` resource
+(`agents.x-k8s.io`) in the sandbox namespace carrying that id and the run's gateway id, reads the
+sandbox's name from it, and owner-references it to the gateway pod. At token issue it refuses an
+SVID whose gateway id is not the bound run's. Name the controller's identity on each cluster in
+`[cluster] sandbox_readers` (`namespace/name`) and the loop render grants what it needs (below). A
+sandbox that was never bound, whose run pod is no longer running, or whose SVID names another
+run's gateway gets `invalid_grant`.
 
-**Isolated gateways.** Under `sandbox_driver = "kubernetes"` with `[cluster] sandbox_namespace`
-set, a run's OpenShell gateway does not run in the loop pod. The loop render creates the
-`crucible-openshell-gateway` ServiceAccount in the sandbox namespace and binds the sandbox rights
-(Sandboxes, pods, secrets) to it alone; the loop service account gets no verbs there, so pack code
-cannot create the pods the SVID trust rests on. For each run the controller creates, in the sandbox
-namespace, a gateway Service, a server TLS Secret, the supervisors' client TLS Secret, a
-NetworkPolicy admitting only that run's loop pod and supervisors to the gateway port, and the
-gateway pod running as that account; and in the loop namespace a Service selecting the loop pod
-that sandboxes reach the broker, collector, and MCP servers through. The controller mints a CA per
-run, issues the server certificate for the gateway Service's ClusterIP and client certificates for
-the loop pod and supervisors, and keeps no copy. The loop pod's client material arrives through the
-run Secret. Collection deletes the run's gateway objects by label, and a sweep on the discovery
-tick deletes any whose run pod is no longer running. The controller's identity on each such
-cluster needs `pods`, `services`, `secrets`, and `networkpolicies` create/list/delete in the
-sandbox namespace, and `services` create in the loop namespace.
+**Isolated gateways.** A run's OpenShell gateway does not run in the loop pod. The loop render
+creates the `crucible-openshell-gateway` ServiceAccount in the sandbox namespace and binds the
+sandbox rights (Sandboxes, pods, secrets) to it alone; the loop service account gets no verbs
+there. For each run the controller first creates the gateway Service in the sandbox namespace and
+mints a CA, a server certificate for that Service's ClusterIP, and client certificates for the loop
+pod and the supervisors, valid for the run's deadline plus a day (30 days without one); it keeps
+no copy of the CA key. The loop pod's client material and the gateway URL arrive through the run
+Secret. Before the loop pod it creates a loop Service (the sandboxes' `host.openshell.internal`),
+a NetworkPolicy admitting only that run's loop pod and its own supervisors to the gateway port, the
+gateway pod, and the server and supervisor TLS Secrets owned by that pod. Collection deletes the
+gateway's Sandboxes and supervisors, the loop Service, then the gateway's own objects; a sweep on
+the discovery tick does the same for any gateway whose run pod is no longer running. Dispatch to a
+cluster the hub only receives pushes from is refused, since the hub cannot create the gateway
+there.
+
+For the controller's identity, `sandbox_readers` is granted: `sandboxes` get/list/patch/delete;
+`pods` get/list/create/delete; `services`, `secrets` and `networkpolicies` list/create/delete in
+the sandbox namespace; and `services` list/create/delete in the loop namespace.
 
 Grounded-rank and scope turns still run their gateway in-pod, so a profile that isolates gateways
 refuses to render them. AWS web-identity env is not carried to the gateway pod. Pack code holds its
 run's gateway client certificate, so it can still create sandboxes for its own run with the
-`driver_config` pod fields the engine allows (`node_selector`, `tolerations`, `host_aliases`,
-`runtime_class_name`); resource admission keeps PVCs and priority classes to those labelled
-`openshell.ai/sandbox-attachable=true`. The pinned OpenShell (3441f91) predates v0.1.2: supervisors
-are separate pods, and nothing here depends on the sidecar supervisor topology or other v0.1.2
-features. Nothing owns the Sandboxes a gateway creates, so a gateway that dies mid-run leaves its
-Sandboxes behind.
+`driver_config` pod fields the gateway accepts (`node_selector`, `tolerations`, `host_aliases`,
+`runtime_class_name`, `priority_class_name`, PVC volumes); resource admission keeps PVCs and
+priority classes to those labelled `openshell.ai/sandbox-attachable=true`, and those sandboxes
+carry its own gateway id. The pinned OpenShell (3441f91) predates v0.1.2: supervisors are separate
+pods, and nothing here depends on the sidecar supervisor topology or other v0.1.2 features.
 
 **`kube_user`.** Tokens carry the dispatcher's Kubernetes username when the controller knows it;
 a server that sees it runs SubjectAccessReview as that user. It is learned from the API server
@@ -197,7 +214,7 @@ when the username is unknown; other tokens are issued without the claim, logged 
 | `CONTROLLER_AGENT_SVID_ISSUER` | SPIRE's OIDC discovery issuer, the `iss` of every JWT-SVID. SVIDs must carry `iat` and live at most 15 minutes. |
 | `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. |
 | `CONTROLLER_AGENT_SVID_CA_FILE` | Optional PEM bundle trusted for that fetch (the service CA for an `https://*.svc` endpoint). |
-| `CONTROLLER_AGENT_SANDBOX_ID_PREFIX` | The SPIFFE ID path every sandbox supervisor's ID sits under, ending in `/`. |
+| `CONTROLLER_AGENT_GATEWAY_PREFIX` | The SPIFFE ID path before the gateway id, ending in `/`: `spiffe://<trust domain>/openshell/gateway/`. Supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`. |
 | `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
 
 The deploy profile's `[kueue]` table supplies the `namespace`, `queues`, and `role` claims for runs

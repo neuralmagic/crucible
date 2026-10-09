@@ -252,6 +252,13 @@ async fn issue(
             bindings::ResolveError::Db(_) => OAuthError::Server(format!("{e:#}")),
             e => OAuthError::InvalidGrant(e.to_string()),
         })?;
+    let expected = issuer::GatewayId::of_run_pod(&run.pod_name);
+    if sandbox.gateway != expected {
+        return Err(OAuthError::InvalidGrant(format!(
+            "sandbox {} was created by gateway {}, not {expected}, the gateway of run pod {}",
+            sandbox.id, sandbox.gateway, run.pod_name
+        )));
+    }
     let launcher = issuer::launcher(&run)?;
     let kueue = profile.as_ref().and_then(|p| p.kueue.as_ref());
     let tenant = kueue.and_then(|k| TenantScope::for_run(k, &run.cluster));
@@ -320,7 +327,7 @@ async fn metadata(State(state): State<Arc<AgentAuth>>) -> Response {
 #[cfg(test)]
 mod tests {
     use crate::agent_auth::testing::{
-        self, EcKey, ISSUER, KUEUE, PREFIX, PROFILE, Spire, now, running_run, serve_jwks,
+        self, EcKey, ISSUER, KUEUE, POD, PREFIX, PROFILE, Spire, now, running_run, serve_jwks,
         set_pod_state,
     };
     use crate::agent_auth::*;
@@ -341,7 +348,7 @@ mod tests {
 
     async fn harness_with(pool: PgPool, profile_toml: &str) -> Harness {
         let spire = Spire::start().await;
-        let (state, profile) = testing::agent_auth(&pool, &spire, profile_toml, &[]);
+        let (state, profile, _) = testing::agent_auth(&pool, &spire, profile_toml, &[]);
         Harness {
             spire,
             app: router(state.clone()),
@@ -454,7 +461,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(principal.subject, "alice");
-        assert_eq!(principal.presenter(), format!("{PREFIX}sbx-1"));
+        assert_eq!(
+            principal.presenter(),
+            format!("{PREFIX}{POD}/sandbox/sbx-1")
+        );
         assert_eq!(principal.namespace.as_deref(), Some("crucible-kueue-e2e"));
         assert_eq!(principal.claims["run_id"], "crucible-run-brave-otter");
         assert_eq!(principal.claims["queues"], json!(["crucible-e2e"]));
@@ -655,7 +665,9 @@ mod tests {
         .unwrap();
 
         let h = harness(pool).await;
-        let svid = h.spire.svid(&Spire::claims("sbx-1"));
+        let svid = h
+            .spire
+            .svid(&Spire::claims_from("crucible-run-again", "sbx-1"));
         let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let claims = claims_of(&body);
@@ -838,9 +850,37 @@ mod tests {
             ),
             (
                 "a run with no person behind it",
-                form(&h.spire.svid(&Spire::claims("sbx-team")), &[]),
+                form(
+                    &h.spire
+                        .svid(&Spire::claims_from("crucible-run-team", "sbx-team")),
+                    &[],
+                ),
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
+            ),
+            (
+                "a bound sandbox id claimed by a supervisor another run's gateway created",
+                form(
+                    &h.spire
+                        .svid(&Spire::claims_from("crucible-run-team", "sbx-1")),
+                    &[],
+                ),
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+            ),
+            (
+                "an SVID without a gateway segment",
+                form(
+                    &svid(&|c| {
+                        c.insert(
+                            "sub".into(),
+                            json!("spiffe://example.crucible/openshell/sandbox/sbx-1"),
+                        );
+                    }),
+                    &[],
+                ),
+                StatusCode::UNAUTHORIZED,
+                "invalid_client",
             ),
             (
                 "an audience off the allowlist",
