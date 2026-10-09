@@ -18,6 +18,7 @@ use axum::http::StatusCode;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use crucible_contract::kueue::TenantRole;
+use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::principal::{Callers, Principal};
 use crucible_mcp_auth::server::{AuthError, ResourceServer, bearer_token};
 use serde_json::{Map, Value, json};
@@ -53,7 +54,8 @@ pub enum ClaimError {
 impl Identity {
     /// The identity an access token carries; its issuer decides which kind. A run's token is
     /// pinned to its `namespace` claim with its `role` and `queues`, and its presenter (`act.sub`)
-    /// is recorded as the actor. A person's token needs `people` and a `kube_user` claim; it owns
+    /// is recorded as the actor. Without `role` it submits if it carries `kube_user`, its
+    /// launcher's RBAC deciding what it may do; without `queues` it may use every queue. A person's token needs `people` and a `kube_user` claim; it owns
     /// its workloads under its own subject, may name any namespace (its `namespace` claim, if any,
     /// is the default), and is limited by the access checks.
     pub fn from_principal(principal: &Principal, people: bool) -> Result<Self, ClaimError> {
@@ -89,9 +91,16 @@ impl Identity {
                 actor: None,
             });
         }
-        let role = claim("role")?;
-        let role = serde_json::from_value::<TenantRole>(json!(role))
-            .map_err(|_| ClaimError::Role(role.to_string()))?;
+        let role = match principal.claims.get("role") {
+            None | Some(Value::Null) if principal.claims.contains_key(USER_CLAIM) => {
+                TenantRole::Submitter
+            }
+            _ => {
+                let role = claim("role")?;
+                serde_json::from_value::<TenantRole>(json!(role))
+                    .map_err(|_| ClaimError::Role(role.to_string()))?
+            }
+        };
         let queues = match principal.claims.get("queues") {
             None | Some(Value::Null) => Vec::new(),
             Some(Value::Array(items)) => items
@@ -366,6 +375,24 @@ mod tests {
         assert!(matches!(
             Identity::from_principal(&person(no_user), true),
             Err(ClaimError::NoKubeUser)
+        ));
+    }
+
+    #[test]
+    fn a_run_without_role_or_queues_submits_under_its_launchers_rbac() {
+        let mut claims = realm_claims();
+        let map = claims.as_object_mut().unwrap();
+        map.remove("role");
+        map.remove("queues");
+        map.insert("kube_user".into(), json!("alice"));
+        let c = run_caller(claims.clone()).unwrap();
+        assert_eq!(c.role, TenantRole::Submitter);
+        assert!(c.queues.is_empty());
+
+        claims.as_object_mut().unwrap().remove("kube_user");
+        assert!(matches!(
+            Identity::from_principal(&principal(claims), false),
+            Err(ClaimError::Missing("role"))
         ));
     }
 
