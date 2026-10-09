@@ -51,6 +51,10 @@ pub struct DeployProfile {
     /// The crucible-kueue MCP server: where it runs, and the scope each run's token gets.
     #[serde(default)]
     pub kueue: Option<KueueCfg>,
+    /// The controller's OpenShift OAuth client, through which people link their username on a
+    /// cluster without pasting a token.
+    #[serde(default)]
+    pub cluster_link: Option<ClusterLinkCfg>,
 }
 
 /// A Kubernetes object or namespace name: a DNS-1123 label.
@@ -159,8 +163,11 @@ pub struct KueueCfg {
     pub cluster_domain: String,
 }
 
+/// The dispatch name of the controller's own cluster.
+pub const HUB_CLUSTER: &str = "hub";
+
 fn hub_cluster() -> String {
-    "hub".to_string()
+    HUB_CLUSTER.to_string()
 }
 
 fn default_cluster_domain() -> String {
@@ -215,6 +222,31 @@ impl KubeAuthz {
             Self::Token => "token",
         }
     }
+}
+
+/// The `[cluster_link]` table: one `OAuthClient` per cluster in `openshift`, whose only redirect is
+/// the controller's callback for that cluster.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterLinkCfg {
+    /// The controller's URL as people's browsers reach it.
+    pub external_url: String,
+    /// The `OAuthClient` name, the controller's client id on every cluster.
+    #[serde(default = "cluster_link_client_id")]
+    pub client_id: KubeName,
+    /// Clusters whose OAuth server links people: `hub` or `[clusters.<name>]` entries.
+    pub openshift: Vec<KubeName>,
+    /// Lifetime of the access token a link redeems. The controller drops it after one review.
+    #[serde(default = "cluster_link_token_age")]
+    pub access_token_max_age_secs: u32,
+}
+
+fn cluster_link_client_id() -> KubeName {
+    KubeName(crucible_contract::cluster_link::DEFAULT_CLIENT_ID.to_string())
+}
+
+fn cluster_link_token_age() -> u32 {
+    300
 }
 
 /// Per-cluster substrate facts for the codegen measure jobs: the namespace/queue/PVCs/ceiling the

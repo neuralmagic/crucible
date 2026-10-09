@@ -439,8 +439,9 @@ pub(crate) struct RenderTurnArgs {
 #[derive(clap::Args)]
 pub(crate) struct DeployArgs {
     /// The domain manifest (composite or single-domain), the run: components, broker, judge, world,
-    /// `[deploy]` targets. Required unless `--controller` or `--kueue` is set (those have no per-run
-    /// manifest; they render from the profile's `[controller]` or `[kueue]` table alone).
+    /// `[deploy]` targets. Required unless `--controller`, `--kueue` or `--cluster-link` is set (those have no
+    /// per-run manifest; they render from the profile's `[controller]`, `[kueue]` or
+    /// `[cluster_link]` table alone).
     #[arg(long)]
     pub manifest: Option<PathBuf>,
     /// The per-cluster deploy profile (the environment: namespaces, secrets, resources, loop image).
@@ -467,6 +468,11 @@ pub(crate) struct DeployArgs {
     /// namespace) from the profile's `[kueue]` table, no `--manifest` needed.
     #[arg(long, conflicts_with = "controller")]
     pub kueue: bool,
+    /// Render the controller's OpenShift `OAuthClient` for this cluster from the profile's
+    /// `[cluster_link]` table, no `--manifest` needed. Render only: it is cluster-scoped on that
+    /// cluster, so apply it there yourself.
+    #[arg(long, value_name = "CLUSTER", conflicts_with_all = ["controller", "kueue"])]
+    pub cluster_link: Option<String>,
     /// Pack delivery: the manifest is a controller-drafted PACK on the state PVC, not a domain baked
     /// into the loop image. Emit a ConfigMap carrying the pack files and stage it (init-container →
     /// emptyDir) at the in-pod domain path, so `crucible run` finds the manifest. Set by the

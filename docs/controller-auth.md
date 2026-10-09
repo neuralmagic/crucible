@@ -210,3 +210,55 @@ successor nor outlive its own revocation.
 Every refusal on the bearer path names what to do next: no header, not a key, not this
 controller's key, expired, or revoked. `crux whoami` answering `credential: bearer (anonymous)`
 means the string in the header does not start with `crk_`.
+
+## Cluster identities
+
+MCP servers that check Kubernetes permissions (SubjectAccessReview) need to know who a person is on
+the cluster they run on. Settings → Cluster identities lists every cluster the deployment knows, the
+rule that cluster uses, and the caller's username there. A cluster whose usernames follow the SSO
+login shows the resolved name read-only. A `link` cluster shows a Link, Relink and Unlink control.
+
+### Linking through an OpenShift cluster's OAuth server
+
+The controller registers as a confidential `OAuthClient` on each cluster listed in the profile's
+`[cluster_link]` table. Link sends the browser to that cluster's authorize endpoint (read from
+`/.well-known/oauth-authorization-server` on its API server) with PKCE and a state bound to the
+person's session. The callback redeems the code for a `user:info` token, the cluster names its
+owner, the username is recorded, and the token is dropped. Nothing about the token is stored or
+logged.
+
+```toml
+[cluster_link]
+external_url = "https://crucible.apps.hub.example.com"
+openshift = ["pirate"]
+# client_id = "crucible-controller"
+# access_token_max_age_secs = 300
+```
+
+Render the client for one cluster, then create it there with a fresh secret, and give the same
+secret to the controller under the cluster's name:
+
+```sh
+crucible deploy render --profile profile.toml --cluster-link pirate > oauthclient-pirate.yaml
+secret=$(openssl rand -hex 32)
+oc --context pirate apply -f oauthclient-pirate.yaml
+oc --context pirate patch oauthclient crucible-controller --type merge -p "{\"secret\":\"$secret\"}"
+oc --context hub -n crucible-system create secret generic crucible-cluster-link \
+  --from-literal=pirate="$secret" --dry-run=client -o yaml | oc --context hub apply -f -
+```
+
+`OAuthClient` is cluster-scoped, so creating it needs cluster-admin on that cluster.
+
+| Variable | Meaning |
+| --- | --- |
+| `CONTROLLER_CLUSTER_LINK_URL` | The controller's URL as browsers reach it; the redirect is `<url>/oauth/cluster-link/<cluster>/callback`. |
+| `CONTROLLER_CLUSTER_LINK_SECRETS` | A directory holding one file per cluster, named for it, containing that cluster's client secret (mount the `crucible-cluster-link` Secret here). A cluster with no file offers the paste fallback only. |
+| `CONTROLLER_CLUSTER_LINK_CLIENT_ID` | The `OAuthClient` name; default `crucible-controller`. |
+
+The controller reaches the cluster's token endpoint (its `oauth-openshift` route) directly, not
+through the cluster's `proxy_url`.
+
+### Pasting a token
+
+A `link` cluster without OAuth takes a pasted `oc whoami -t` or an OIDC ID token the cluster's API
+server accepts. The cluster's TokenReview names the owner; the token is dropped the same way.

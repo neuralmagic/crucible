@@ -8,6 +8,7 @@
 pub mod admission;
 pub mod artifact;
 pub mod ask;
+pub mod cluster_link;
 pub mod decision;
 pub mod emits;
 pub mod envelope;

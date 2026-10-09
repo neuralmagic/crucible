@@ -337,6 +337,17 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 deploy::render_controller_cmd(&args.profile, &opts)
             };
         }
+        if let Some(cluster) = &args.cluster_link {
+            anyhow::ensure!(
+                !apply,
+                "--cluster-link renders an object for another cluster; apply it there yourself"
+            );
+            return deploy::render_cluster_link_cmd(
+                &args.profile,
+                args.clusters.as_deref(),
+                cluster,
+            );
+        }
         if args.kueue {
             return if apply {
                 deploy::apply_kueue_cmd(&args.profile, &opts)
@@ -344,9 +355,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 deploy::render_kueue_cmd(&args.profile, &opts)
             };
         }
-        let manifest = args
-            .manifest
-            .context("--manifest is required unless --controller or --kueue is set")?;
+        let manifest = args.manifest.context(
+            "--manifest is required unless --controller, --kueue or --cluster-link is set",
+        )?;
         return if apply {
             deploy::apply_cmd(&manifest, &args.profile, &opts)
         } else {

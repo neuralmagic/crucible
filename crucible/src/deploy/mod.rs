@@ -9,6 +9,7 @@
 //! a single domain is a degenerate composite of one component, so it needs its own `[deploy]` block
 //! naming that one target (see [`render::RenderInput::from_manifest`]).
 
+pub mod cluster_link;
 mod controller;
 pub mod kueue;
 pub mod profile;
@@ -132,6 +133,18 @@ pub fn apply_kueue_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
     let profile = DeployProfile::load(profile_path)?;
     let yaml = kueue::render(&profile, opts)?;
     forge::kube::apply_yaml(&yaml).context("applying the rendered crucible-kueue deployment")
+}
+
+/// Emit the controller's `OAuthClient` for `cluster`, from the profile's `[cluster_link]` table. It
+/// is cluster-scoped on `cluster`, so it is never applied from here.
+pub fn render_cluster_link_cmd(
+    profile_path: &Path,
+    clusters_file: Option<&Path>,
+    cluster: &str,
+) -> Result<()> {
+    let profile = DeployProfile::load_with_fleet(profile_path, clusters_file)?;
+    print!("{}", cluster_link::render(&profile, cluster)?);
+    Ok(())
 }
 
 /// Render the controller then server-side apply it (same emit-vs-apply split as the run's `deploy apply`).
