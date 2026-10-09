@@ -344,8 +344,8 @@ pub fn kueue_token_grant_profile(
     svid_audience: &str,
 ) -> openshell_core::proto::ProviderProfile {
     use openshell_core::proto::{
-        NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
-        ProviderProfileCredential,
+        McpOptions, NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCategory, ProviderProfileCredential,
     };
     ProviderProfile {
         id: KUEUE_GRANT_PROFILE_ID.to_string(),
@@ -356,6 +356,7 @@ pub fn kueue_token_grant_profile(
             name: "token".to_string(),
             description: "Agent access token for crucible-kueue".to_string(),
             auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
             token_grant: Some(ProviderCredentialTokenGrant {
                 token_endpoint: token_endpoint.to_string(),
                 audience: url.to_string(),
@@ -372,6 +373,10 @@ pub fn kueue_token_grant_profile(
             host: host.to_string(),
             port: u32::from(port),
             protocol: "mcp".to_string(),
+            mcp: Some(McpOptions {
+                allow_all_known_mcp_methods: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }],
         ..Default::default()

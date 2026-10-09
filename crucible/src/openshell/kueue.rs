@@ -185,6 +185,15 @@ mod tests {
         assert_eq!(grant.jwt_svid_audience, ISSUER);
         assert_eq!(grant.audience, URL, "the token is for this server");
         assert_eq!(profile.credentials[0].auth_style, "bearer");
+        assert_eq!(profile.credentials[0].header_name, "authorization");
+        assert_eq!(
+            endpoint
+                .mcp
+                .as_ref()
+                .and_then(|m| m.allow_all_known_mcp_methods),
+            Some(true),
+            "every known MCP method, as the sandbox policy's full:mcp entry allows"
+        );
         assert!(profile.credentials[0].env_vars.is_empty(), "no placeholder");
     }
 
