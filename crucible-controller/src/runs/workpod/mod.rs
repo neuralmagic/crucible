@@ -31,7 +31,7 @@
 
 mod core;
 mod dispatcher;
-mod gateway;
+pub mod gateway;
 mod globals;
 mod kube_dispatcher;
 pub(crate) mod kueue;

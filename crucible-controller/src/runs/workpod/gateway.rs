@@ -171,7 +171,7 @@ fn cluster_ip(service: &Service) -> Result<IpAddr> {
 }
 
 /// A run's gateway between its Service's creation and its pod's.
-pub(crate) struct RunGateway<'a> {
+pub struct RunGateway<'a> {
     profile: &'a DeployProfile,
     names: GatewayNames,
     gateway_ip: IpAddr,
@@ -181,7 +181,7 @@ pub(crate) struct RunGateway<'a> {
 impl<'a> RunGateway<'a> {
     /// Create the gateway Service for `run_pod` and mint the run's TLS for its address, valid for
     /// the run's `max_time_secs` plus slack.
-    pub(crate) async fn reserve(
+    pub async fn reserve(
         dispatcher: &dyn PodDispatcher,
         cluster: &str,
         profile: &'a DeployProfile,
@@ -205,6 +205,20 @@ impl<'a> RunGateway<'a> {
             gateway_ip,
             tls,
         })
+    }
+
+    /// The URL the loop pod dials.
+    pub fn url(&self) -> String {
+        render::gateway_url(self.gateway_ip)
+    }
+
+    /// The loop pod's client material: the run CA, its certificate, and its key.
+    pub fn loop_client_tls(&self) -> TlsMaterial<'_> {
+        TlsMaterial {
+            ca: &self.tls.ca,
+            cert: &self.tls.loop_client.cert,
+            key: &self.tls.loop_client.key,
+        }
     }
 
     /// The loop pod's share: its client material as files under [`render::CLIENT_TLS_DIR`] and the
@@ -239,7 +253,7 @@ impl<'a> RunGateway<'a> {
     /// Start the gateway for the rendered `loop_pod`, ahead of creating it so the gateway boots
     /// while the loop pod schedules: the loop Service sandboxes reach the loop pod through on
     /// `sandbox_ports`, the NetworkPolicy, the gateway pod, then the TLS Secrets owned by it.
-    pub(crate) async fn start(
+    pub async fn start(
         &self,
         dispatcher: &dyn PodDispatcher,
         cluster: &str,
@@ -320,7 +334,7 @@ impl<'a> RunGateway<'a> {
 /// Delete everything the gateway of the run whose pod is `run_pod` created and was created with:
 /// its Sandboxes and their supervisors, the loop Service in `loop_namespace`, then its own pod,
 /// Service, Secrets, and NetworkPolicy, which the sweep finds a half-finished teardown by.
-pub(crate) async fn teardown(
+pub async fn teardown(
     dispatcher: &dyn PodDispatcher,
     cluster: &str,
     profile: &DeployProfile,

@@ -220,3 +220,35 @@ route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
 # Remove the deployment and free its GPU.
 route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
     kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found
+
+# Prepare a cluster for the gateway isolation e2e (crucible-kueue/tests/gateway_e2e.rs): the
+# profile's loop and sandbox namespaces, its pull secret copied from `pull_from`, the loop and
+# sandbox service accounts (the sandbox one bound to `scc_role`, the ClusterRole granting the
+# sandbox SCC), and the gateway RBAC the profile renders.
+gateway-e2e-setup context profile manifest pull_from scc_role:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kc() { oc --context "{{context}}" "$@"; }
+    read -r loop_ns sandbox_ns loop_sa sandbox_sa pull < <(python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); k = c["cluster"]; print(k["loop_namespace"], k["sandbox_namespace"], k["service_account"], k["sandbox_service_account"], c["image"]["pull_secret"])' "{{profile}}")
+    for ns in "$loop_ns" "$sandbox_ns"; do
+        kc create namespace "$ns" --dry-run=client -o yaml | kc apply -f -
+        kc get secret "$pull" -n "{{pull_from}}" -o json \
+            | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.managedFields)' \
+            | kc apply -n "$ns" -f -
+    done
+    kc create serviceaccount "$loop_sa" -n "$loop_ns" --dry-run=client -o yaml | kc apply -f -
+    kc create serviceaccount "$sandbox_sa" -n "$sandbox_ns" --dry-run=client -o yaml | kc apply -f -
+    kc create rolebinding "$sandbox_sa-scc" -n "$sandbox_ns" --clusterrole "{{scc_role}}" \
+        --serviceaccount "$sandbox_ns:$sandbox_sa" --dry-run=client -o yaml | kc apply -f -
+    cargo run -q -p crucible -- deploy render --manifest "{{manifest}}" --profile "{{profile}}" --no-pin \
+        | yq 'select(.kind != "Pod" and .kind != "NetworkPolicy")' | kc apply -f -
+
+# Remove what gateway-e2e-setup created: both namespaces and the rendered cluster-scoped RBAC.
+gateway-e2e-teardown context profile manifest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kc() { oc --context "{{context}}" "$@"; }
+    cargo run -q -p crucible -- deploy render --manifest "{{manifest}}" --profile "{{profile}}" --no-pin \
+        | yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")' | kc delete --ignore-not-found -f -
+    read -r loop_ns sandbox_ns < <(python3 -c 'import sys, tomllib; k = tomllib.load(open(sys.argv[1], "rb"))["cluster"]; print(k["loop_namespace"], k["sandbox_namespace"])' "{{profile}}")
+    kc delete namespace "$loop_ns" "$sandbox_ns" --ignore-not-found

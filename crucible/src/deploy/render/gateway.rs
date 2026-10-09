@@ -324,7 +324,6 @@ pub fn gateway_pod(
         }]),
         security_context: Some(core::SecurityContext {
             allow_privilege_escalation: Some(false),
-            run_as_non_root: Some(true),
             capabilities: Some(core::Capabilities {
                 drop: Some(vec!["ALL".to_string()]),
                 ..Default::default()
@@ -680,7 +679,10 @@ mod tests {
         );
         let sc = c.security_context.clone().expect("security context");
         assert_eq!(sc.allow_privilege_escalation, Some(false));
-        assert_eq!(sc.run_as_non_root, Some(true));
+        assert_eq!(
+            sc.run_as_non_root, None,
+            "the UID is the SCC's to assign, as for the loop pod: the image's user is root by name"
+        );
     }
 
     #[test]
