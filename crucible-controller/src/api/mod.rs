@@ -48,6 +48,8 @@ pub(crate) mod tests;
         crate::identity::api::cluster_identities::unlink,
         crate::identity::api::cluster_identities::start_oauth_link,
         crate::identity::api::cluster_identities::oauth_link_callback,
+        crate::identity::api::consent::get_consent,
+        crate::identity::api::consent::decide_consent,
         system::get_access,
         crate::identity::api::prefs::get_prefs,
         crate::identity::api::prefs::put_prefs,
@@ -211,6 +213,11 @@ pub(crate) mod tests;
         crate::identity::api::cluster_identities::ClaimDto,
         crate::identity::api::cluster_identities::IdentitySourceDto,
         crate::identity::api::cluster_identities::LinkStartDto,
+        crate::identity::api::cluster_identities::LinkStartBody,
+        crate::identity::api::consent::ConsentDto,
+        crate::identity::api::consent::DecisionBody,
+        crate::identity::api::consent::DecisionDto,
+        crate::identity::api::consent::Verdict,
         crate::identity::api::kube_user::KubeUserDto,
         crate::identity::api::kube_user::LinkBody,
         crate::identity::api::kube_user::OverrideBody,
@@ -460,6 +467,10 @@ pub fn router(state: ApiState) -> Router {
         ))
         .routes(routes!(
             crate::identity::api::cluster_identities::oauth_link_callback
+        ))
+        .routes(routes!(
+            crate::identity::api::consent::get_consent,
+            crate::identity::api::consent::decide_consent
         ))
         .routes(routes!(system::get_access))
         .routes(routes!(system::overview))

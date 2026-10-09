@@ -792,6 +792,8 @@ pub static BINDINGS: &[Binding] = &[
         V::Update,
         Route,
     ),
+    bind("GET", "/api/oauth/consent", R::UserPrefs, V::Read, Route),
+    bind("POST", "/api/oauth/consent", R::UserPrefs, V::Update, Route),
     bind(
         "GET",
         "/oauth/cluster-link/{cluster}/callback",

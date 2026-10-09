@@ -1199,6 +1199,16 @@ export const CLUSTER_IDENTITIES = [
   },
 ];
 
+export const CONSENT_ID = 'c0ffee';
+
+const CONSENT = {
+  id: CONSENT_ID,
+  client_id: 'claude-code',
+  resource: 'http://localhost:8851/mcp',
+  scopes: ['kueue.read', 'kueue.submit'],
+  login: 'wren',
+};
+
 /** The token a stand-in cluster accepts for wren on any `link` cluster. */
 export const GOOD_CLUSTER_TOKEN = 'sha256~wren';
 
@@ -1287,8 +1297,37 @@ export async function stubApi(page: Page): Promise<void> {
       const identity = /^\/api\/me\/cluster-identities\/([^/]+)(\/link)?$/.exec(path);
       if (identity !== null && identity[2] === '/link' && route.request().method() === 'POST') {
         linked(identity[1], 'openshift-oauth');
-        const authorize_url = `${new URL(route.request().url()).origin}/settings?linked=${identity[1]}`;
+        const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
+        const back =
+          typeof sent === 'object' && sent !== null && 'return_to' in sent && typeof sent.return_to === 'string'
+            ? sent.return_to
+            : '/settings';
+        const sep = back.includes('?') ? '&' : '?';
+        const authorize_url = `${new URL(route.request().url()).origin}${back}${sep}linked=${identity[1]}`;
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ authorize_url }) });
+      }
+      // The consent page: one parked request for pirate, decided once.
+      if (path === '/api/oauth/consent' && route.request().method() === 'GET') {
+        const id = new URL(route.request().url()).searchParams.get('id');
+        if (id !== CONSENT_ID) {
+          const body = JSON.stringify({ error: 'no authorization request is waiting under this id' });
+          return route.fulfill({ status: 404, contentType: 'application/json', body });
+        }
+        const body = JSON.stringify({ ...CONSENT, identity: identities.find((i) => i.cluster === 'pirate') });
+        return route.fulfill({ status: 200, contentType: 'application/json', body });
+      }
+      if (path === '/api/oauth/consent' && route.request().method() === 'POST') {
+        const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
+        const decision = typeof sent === 'object' && sent !== null && 'decision' in sent ? sent.decision : null;
+        const pirate = identities.find((i) => i.cluster === 'pirate');
+        if (decision === 'approve' && !pirate?.kube_user) {
+          const body = JSON.stringify({ error: 'link your username on pirate first' });
+          return route.fulfill({ status: 409, contentType: 'application/json', body });
+        }
+        const origin = new URL(route.request().url()).origin;
+        const redirect_url =
+          decision === 'approve' ? `${origin}/client-callback?code=c1&state=st` : `${origin}/client-callback?error=access_denied&state=st`;
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ redirect_url }) });
       }
       if (identity !== null && route.request().method() === 'PUT') {
         const sent: unknown = JSON.parse(route.request().postData() ?? '{}');

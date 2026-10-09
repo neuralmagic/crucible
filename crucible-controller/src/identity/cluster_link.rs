@@ -113,6 +113,9 @@ pub struct PendingLink {
     pkce_verifier: String,
     token_endpoint: String,
     started_at: jiff::Timestamp,
+    /// The in-app page the callback lands on; Settings when `None`.
+    #[serde(default)]
+    pub return_to: Option<String>,
 }
 
 impl std::fmt::Debug for PendingLink {
@@ -241,6 +244,7 @@ impl ClusterLinks {
                 pkce_verifier: verifier.secret().clone(),
                 token_endpoint: metadata.token_endpoint,
                 started_at: now,
+                return_to: None,
             },
         ))
     }

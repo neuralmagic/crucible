@@ -11,9 +11,9 @@
 #     --client-id claude-code --callback-port 8765
 #   claude mcp add --transport http kueue-waldorf http://localhost:8852/mcp \
 #     --client-id claude-code --callback-port 8765
-#   claude, /mcp, authenticate both. pirate needs a link first: Settings -> Cluster identities
-#   (OpenShift sign-in when PIRATE_LINK_SECRET is set, else paste `oc whoami -t`), or paste on the
-#   consent page. waldorf needs nothing: its username is the SSO email.
+#   claude, /mcp, authenticate both. pirate needs a link first, offered on the consent page (and on
+#   Settings -> Cluster identities): OpenShift sign-in when PIRATE_LINK_SECRET is set, else paste
+#   `oc whoami -t`. waldorf needs nothing: its username is the SSO email.
 #
 # PIRATE_LINK_SECRET=<file> turns on the OpenShift sign-in for pirate. It must hold the secret of
 # an OAuthClient on pirate rendered for this controller:

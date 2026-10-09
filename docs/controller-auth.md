@@ -285,5 +285,17 @@ server accepts. The cluster's TokenReview names the owner; the token is dropped 
 | `POST /api/me/cluster-identities/{cluster}/link` | Start the OAuth link; browser sessions only. |
 | `GET /oauth/cluster-link/{cluster}/callback` | The cluster's redirect; lands on `/settings?linked=` or `?link_error=`. |
 | `DELETE /api/me/cluster-identities/{cluster}` | Unlink. |
+| `GET /api/oauth/consent?id=` | The authorization request parked on the session, for the consent page. |
+| `POST /api/oauth/consent` | Approve or deny it; answers the client's loopback redirect to navigate to. |
 
 API keys can read but never link or unlink.
+
+### The consent page
+
+`GET /oauth/authorize` from an MCP client (Claude Code, pi) parks the request on the browser session
+and sends the browser to `/consent?id=…` in the controller UI. The page shows the client, server,
+scopes and login, and the person's username on the server's cluster. A `link` cluster nobody has
+linked offers Link (and the paste box where the cluster has no OAuth) right there, and the sign-in
+lands back on the same page. Allow and Deny are a JSON call that returns the client's
+`http://localhost|127.0.0.1|[::1]:<port>/callback` URL with a code or an error; the page navigates to
+it. A request answers once, and only from the browser and person that started it.

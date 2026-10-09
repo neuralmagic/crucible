@@ -14,7 +14,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use forge::fleet::{ClusterIdentity, SsoClaim};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tower_sessions::Session;
 use utoipa::ToSchema;
 
@@ -66,6 +66,41 @@ pub struct ClusterIdentityDto {
     pub linked_at: Option<String>,
 }
 
+/// An in-app path a finished link lands on: absolute, same-origin, and short.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, ToSchema)]
+#[serde(try_from = "String")]
+#[schema(value_type = String)]
+pub struct ReturnTo(String);
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("return_to {0:?} is not a same-origin path like /consent?id=...")]
+pub struct NotSameOrigin(String);
+
+impl TryFrom<String> for ReturnTo {
+    type Error = NotSameOrigin;
+
+    fn try_from(raw: String) -> Result<Self, Self::Error> {
+        let ok = raw.starts_with('/')
+            && !raw.starts_with("//")
+            && raw.len() <= 2048
+            && !raw.contains('#')
+            && !raw
+                .chars()
+                .any(|c| c == '\\' || c.is_control() || c.is_whitespace());
+        match ok {
+            true => Ok(Self(raw)),
+            false => Err(NotSameOrigin(raw)),
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LinkStartBody {
+    /// Where the callback sends the browser afterwards; Settings when absent.
+    pub return_to: Option<ReturnTo>,
+}
+
 /// Where to send the browser to link a cluster through its OAuth server.
 #[derive(Debug, Serialize, ToSchema, PartialEq, Eq)]
 pub struct LinkStartDto {
@@ -99,7 +134,7 @@ impl From<Source> for IdentitySourceDto {
 }
 
 /// The login and email the caller's `users` row recorded, `None` without one.
-async fn person_row(
+pub(crate) async fn person_row(
     pool: &sqlx::PgPool,
     sub: &str,
 ) -> anyhow::Result<Option<(String, Option<String>)>> {
@@ -111,7 +146,7 @@ async fn person_row(
 }
 
 /// Every cluster the deploy profile knows, with its rule. Without a profile only the hub, as `link`.
-async fn rules(state: &ApiState) -> anyhow::Result<Vec<(String, ClusterIdentity)>> {
+pub(crate) async fn rules(state: &ApiState) -> anyhow::Result<Vec<(String, ClusterIdentity)>> {
     let profile = cluster_identity::load_profile(state.deploy_profile.as_deref()).await?;
     Ok(match profile {
         Some(p) => p
@@ -126,7 +161,7 @@ async fn rules(state: &ApiState) -> anyhow::Result<Vec<(String, ClusterIdentity)
     })
 }
 
-async fn identity_of(
+pub(crate) async fn identity_of(
     state: &ApiState,
     cluster: &str,
     rule: &ClusterIdentity,
@@ -339,6 +374,7 @@ fn browser_only() -> Response {
 #[utoipa::path(
     post,
     path = "/api/me/cluster-identities/{cluster}/link",
+    request_body = LinkStartBody,
     params(("cluster" = String, Path, description = "The cluster to sign in to")),
     responses(
         (status = 200, description = "Send the browser here; the cluster sends it back to the callback", body = LinkStartDto),
@@ -354,6 +390,7 @@ pub(crate) async fn start_oauth_link(
     path: AuthPath,
     session: Session,
     Path(cluster): Path<String>,
+    Json(body): Json<LinkStartBody>,
 ) -> Result<Response, AppError> {
     if path != AuthPath::Session {
         return Ok(browser_only());
@@ -367,7 +404,7 @@ pub(crate) async fn start_oauth_link(
             "this controller links no cluster through OAuth; paste a token instead",
         ));
     };
-    let (url, pending) = match links
+    let (url, mut pending) = match links
         .start(&target.sub, &cluster, jiff::Timestamp::now())
         .await
     {
@@ -380,6 +417,7 @@ pub(crate) async fn start_oauth_link(
             return Ok(unavailable(e.to_string()));
         }
     };
+    pending.return_to = body.return_to.map(|r| r.0);
     crate::identity::session::start_cluster_link(&session, &pending)
         .await
         .context("parking the cluster link")?;
@@ -389,11 +427,13 @@ pub(crate) async fn start_oauth_link(
     .into_response())
 }
 
-fn back_to_settings(outcome: &[(&str, &str)]) -> Response {
+fn land(page: Option<&str>, outcome: &[(&str, &str)]) -> Response {
+    let page = page.unwrap_or("/settings");
     let query = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(outcome)
         .finish();
-    Redirect::to(&format!("/settings?{query}")).into_response()
+    let sep = if page.contains('?') { '&' } else { '?' };
+    Redirect::to(&format!("{page}{sep}{query}")).into_response()
 }
 
 #[utoipa::path(
@@ -414,9 +454,11 @@ pub(crate) async fn oauth_link_callback(
     let pending = crate::identity::session::take_cluster_link(&session)
         .await
         .context("reading the parked cluster link")?;
+    let return_to = pending.as_ref().and_then(|p| p.return_to.clone());
+    let page = return_to.as_deref();
     let failed = |e: LinkFlowError| {
         tracing::info!(cluster, reason = %e, "cluster link refused");
-        Ok(back_to_settings(&[("link_error", e.code())]))
+        Ok(land(page, &[("link_error", e.code())]))
     };
     let (Some(sub), Some(links)) = (subject.as_deref(), state.cluster_links.as_ref()) else {
         return failed(LinkFlowError::NoFlow);
@@ -439,7 +481,7 @@ pub(crate) async fn oauth_link_callback(
     .await;
     drop(token);
     match linked {
-        Ok(_) => Ok(back_to_settings(&[("linked", &cluster)])),
+        Ok(_) => Ok(land(page, &[("linked", &cluster)])),
         Err(LinkError::Store(e)) => Err(e.into()),
         Err(LinkError::Unreachable { cluster, detail }) => {
             tracing::warn!(
@@ -447,11 +489,11 @@ pub(crate) async fn oauth_link_callback(
                 error = detail,
                 "reviewing a cluster link failed closed"
             );
-            Ok(back_to_settings(&[("link_error", "unavailable")]))
+            Ok(land(page, &[("link_error", "unavailable")]))
         }
         Err(e) => {
             tracing::info!(cluster, reason = %e, "cluster link review refused");
-            Ok(back_to_settings(&[("link_error", "review")]))
+            Ok(land(page, &[("link_error", "review")]))
         }
     }
 }
@@ -655,13 +697,17 @@ openshift = ["pirate"]
         /// Start a pirate link in a fresh browser session and sign in at the cluster: the
         /// session cookie and the callback query the cluster sent the browser back with.
         async fn signed_in_at_pirate(&self) -> (String, String) {
+            self.signed_in_at_pirate_from(json!({})).await
+        }
+
+        async fn signed_in_at_pirate_from(&self, body: Value) -> (String, String) {
             let started = self
                 .send(
                     AuthPath::Session,
                     "POST",
                     "/api/me/cluster-identities/pirate/link",
                     None,
-                    None,
+                    Some(body),
                 )
                 .await;
             assert_eq!(started.status, StatusCode::OK, "{}", started.body);
@@ -689,7 +735,9 @@ openshift = ["pirate"]
 
         async fn start(&self, path: AuthPath, cluster: &str) -> StatusCode {
             let uri = format!("/api/me/cluster-identities/{cluster}/link");
-            self.send(path, "POST", &uri, None, None).await.status
+            self.send(path, "POST", &uri, None, Some(json!({})))
+                .await
+                .status
         }
 
         async fn callback(&self, cluster: &str, cookie: &str, query: &str) -> Reply {
@@ -910,5 +958,48 @@ openshift = ["pirate"]
         assert_eq!(ids["hub"]["kube_user"], "alice-admin");
         assert_eq!(ids["hub"]["source"], "override");
         assert_eq!(ids["waldorf"]["source"], "rule");
+    }
+
+    /// Linking from the consent page lands back on it, with the outcome appended.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_link_started_elsewhere_lands_back_where_it_started(pool: PgPool) {
+        let h = harness(pool).await;
+        let (cookie, query) = h
+            .signed_in_at_pirate_from(json!({"return_to": "/consent?id=abc"}))
+            .await;
+        let done = h.callback("pirate", &cookie, &query).await;
+        assert_eq!(
+            done.location.as_deref(),
+            Some("/consent?id=abc&linked=pirate")
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_return_path_off_this_origin_is_refused(pool: PgPool) {
+        let h = harness(pool).await;
+        for bad in [
+            "//evil.example/x",
+            "https://evil.example/",
+            "/\\evil.example",
+            "settings",
+            "/a b",
+            "/x#frag",
+        ] {
+            let reply = h
+                .send(
+                    AuthPath::Session,
+                    "POST",
+                    "/api/me/cluster-identities/pirate/link",
+                    None,
+                    Some(json!({"return_to": bad})),
+                )
+                .await;
+            assert_eq!(
+                reply.status,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{bad}: {}",
+                reply.body
+            );
+        }
     }
 }

@@ -150,6 +150,8 @@ pub struct ApiState {
     pub(crate) reviewer: Arc<dyn crate::identity::kube_links::ClusterReviewer>,
     /// Linking through a cluster's OpenShift OAuth server; `None` without a `[cluster_link]` table.
     pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
+    /// The issuer whose people grant the consent page decides; `None` when it serves no people.
+    pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
 }
 
 impl ApiState {
@@ -204,6 +206,7 @@ impl ApiState {
             )),
             reviewer: Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
             cluster_links: None,
+            people_issuer: None,
             deploy_profile: cfg.deploy_profile.clone(),
             clusters,
             control_port: cfg.control_port,
@@ -278,6 +281,12 @@ impl ApiState {
         self
     }
 
+    /// Attach the issuer the consent page's decision mints codes from.
+    pub fn with_people_issuer(mut self, issuer: Option<Arc<crate::agent_auth::AgentAuth>>) -> Self {
+        self.people_issuer = issuer.filter(|i| i.people.is_some());
+        self
+    }
+
     /// Attach the hub's Vault client. Built by the binary (the client reads its own environment
     /// and can fail), so assembling the state itself stays infallible.
     pub fn with_vault(mut self, vault: Option<Arc<crate::secrets::vault::VaultClient>>) -> Self {
@@ -333,6 +342,7 @@ impl ApiState {
             )),
             reviewer: Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
             cluster_links: None,
+            people_issuer: None,
             deploy_profile: None,
             clusters,
             control_port: 7777,

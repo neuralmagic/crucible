@@ -20,9 +20,8 @@ use crate::agent_auth::issuer::{AgentIssuer, MintError, token_id};
 use crate::identity::api_key::constant_time_eq;
 use crate::identity::cluster_identity::{self, Person, Resolution};
 use crate::identity::kube_identity::KubeUser;
-use crate::identity::kube_links::{self, ClusterReviewer, LinkError, LinkSource};
-use crate::identity::session::NativeClaims;
-use axum::extract::{Form, Query, State};
+use crate::identity::kube_links::ClusterReviewer;
+use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use base64::Engine;
@@ -44,7 +43,9 @@ pub const ACCESS_TTL_SECS: u64 = 900;
 /// A refresh token's lifetime, counted from the approval and not extended by rotation.
 pub const REFRESH_TTL_SECS: u64 = 8 * 3600;
 const MAX_GRANTS: usize = 10_000;
-const PENDING_KEY: &str = "oauth.pending";
+pub(crate) const PENDING_KEY: &str = "oauth.pending";
+/// The SPA page a parked authorization request is shown on.
+pub const CONSENT_PATH: &str = "/consent";
 const SECRET_BYTES: usize = 32;
 const MAX_STATE_LEN: usize = 1024;
 /// OIDC scopes a client may ask for out of habit; they grant nothing here.
@@ -174,7 +175,7 @@ impl LoopbackRedirect {
         &self.0
     }
 
-    fn with(&self, params: &[(&str, &str)]) -> String {
+    pub(crate) fn with(&self, params: &[(&str, &str)]) -> String {
         match Url::parse(&self.0) {
             Ok(mut url) => {
                 url.query_pairs_mut().extend_pairs(params);
@@ -543,11 +544,12 @@ pub fn validate(
     })
 }
 
+/// An authorization request waiting on the person's decision, parked on their session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Pending {
-    id: String,
-    sub: String,
-    request: AuthorizeRequest,
+pub(crate) struct Pending {
+    pub(crate) id: String,
+    pub(crate) sub: String,
+    pub(crate) request: AuthorizeRequest,
 }
 
 fn escape(raw: &str) -> String {
@@ -567,10 +569,16 @@ fn escape(raw: &str) -> String {
 
 fn page(status: StatusCode, title: &str, body: &str) -> Response {
     let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{t}</title>\
-         <style>body{{font-family:system-ui,sans-serif;max-width:40rem;margin:3rem auto;padding:0 1rem}}\
-         textarea{{width:100%;font-family:monospace}}button{{margin-right:.5rem}}\
-         .err{{color:#b00020}}</style></head><body><h1>{t}</h1>{body}</body></html>",
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{t}</title>\
+         <style>:root{{color-scheme:light dark;--ink:#151515;--ink-3:#6a6e73;--line:#d2d2d2;\
+         --bg:#fff;--red:#c9190b}}@media (prefers-color-scheme:dark){{:root{{--ink:#e0e0e0;\
+         --ink-3:#a3a3a3;--line:#3c3f42;--bg:#151515;--red:#f0561d}}}}\
+         body{{background:var(--bg);color:var(--ink);font:15px/1.5 \"Red Hat Text\",system-ui,sans-serif;\
+         max-width:40rem;margin:4rem auto;padding:0 1rem}}h1{{font:600 1.25rem \"Red Hat Display\",\
+         system-ui,sans-serif;border-bottom:1px solid var(--line);padding-bottom:.5rem}}\
+         .err{{color:var(--red)}}a{{color:inherit}}</style></head><body><h1>{t}</h1>{body}\
+         <p style=\"color:var(--ink-3)\"><a href=\"/\">Back to the controller</a></p></body></html>",
         t = escape(title),
     );
     let mut response = (status, Html(html)).into_response();
@@ -578,7 +586,9 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response {
     headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"),
+        HeaderValue::from_static(
+            "default-src 'none'; style-src 'unsafe-inline'; form-action 'none'; frame-ancestors 'none'",
+        ),
     );
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
@@ -607,46 +617,6 @@ fn redirect_error(
     Redirect::to(&redirect.with(&params)).into_response()
 }
 
-fn consent_page(
-    pending: &Pending,
-    login: &str,
-    kube_user: &ClusterUser,
-    error: Option<&str>,
-) -> Response {
-    let r = &pending.request;
-    let identity = match kube_user {
-        ClusterUser::Unavailable(why) => format!("<p class=\"err\">{}</p>", escape(why)),
-        ClusterUser::Known(user) => format!(
-            "<p>On cluster <b>{}</b> it acts as Kubernetes user <b>{}</b>, limited by that user's RBAC.</p>",
-            escape(&r.cluster),
-            escape(user.as_str())
-        ),
-        ClusterUser::Unlinked => format!(
-            "<p>No Kubernetes username is known for you on cluster <b>{c}</b>. Link it from \
-             <a href=\"/settings\" target=\"_blank\">Settings</a> by signing in to {c}, then \
-             retry; or paste a token for {c} (<code>oc whoami -t</code>, or the ID token your \
-             kubeconfig's OIDC login uses). The cluster names its owner and the token is not \
-             kept.</p><textarea name=\"cluster_token\" rows=\"2\" autocomplete=\"off\"></textarea>",
-            c = escape(&r.cluster)
-        ),
-    };
-    let error = error
-        .map(|e| format!("<p class=\"err\">{}</p>", escape(e)))
-        .unwrap_or_default();
-    let body = format!(
-        "{error}<p>Claude Code asks to call <b>{resource}</b> as <b>{login}</b> with scopes \
-         <code>{scopes}</code>.</p><form method=\"post\" action=\"{AUTHORIZE_PATH}\">{identity}\
-         <input type=\"hidden\" name=\"id\" value=\"{id}\">\
-         <p><button name=\"decision\" value=\"approve\">Allow</button>\
-         <button name=\"decision\" value=\"deny\">Deny</button></p></form>",
-        resource = escape(&r.resource),
-        login = escape(login),
-        scopes = escape(&r.scopes.join(" ")),
-        id = escape(&pending.id),
-    );
-    page(StatusCode::OK, "Allow Claude Code?", &body)
-}
-
 fn session_failure(e: impl std::fmt::Display) -> Response {
     tracing::error!(error = %e, "oauth authorize session store");
     page(
@@ -667,7 +637,7 @@ async fn signed_in(
 
 pub fn router(state: Arc<AgentAuth>) -> axum::Router {
     axum::Router::new()
-        .route(AUTHORIZE_PATH, axum::routing::get(authorize).post(decide))
+        .route(AUTHORIZE_PATH, axum::routing::get(authorize))
         .with_state(state)
 }
 
@@ -722,152 +692,10 @@ async fn authorize(
         sub: claims.sub.clone(),
         request,
     };
-    show_consent(&auth, &session, pending, &claims, None).await
-}
-
-async fn show_consent(
-    auth: &AgentAuth,
-    session: &Session,
-    pending: Pending,
-    claims: &NativeClaims,
-    error: Option<&str>,
-) -> Response {
-    let approved = approved(&pending, claims);
-    let kube_user = match kube_user(auth, &approved).await {
-        Ok(user) => user,
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "resolving a person's kubernetes username");
-            return refused_page("the controller could not resolve your kubernetes username");
-        }
-    };
     if let Err(e) = session.insert(PENDING_KEY, &pending).await {
         return session_failure(e);
     }
-    consent_page(&pending, &claims.login, &kube_user, error)
-}
-
-fn approved(pending: &Pending, claims: &NativeClaims) -> Approved {
-    Approved {
-        sub: pending.sub.clone(),
-        login: claims.login.clone(),
-        email: claims.email.clone(),
-        resource: pending.request.resource.clone(),
-        cluster: pending.request.cluster.clone(),
-        scopes: pending.request.scopes.clone(),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Decision {
-    id: String,
-    decision: String,
-    cluster_token: Option<String>,
-}
-
-async fn decide(
-    State(auth): State<Arc<AgentAuth>>,
-    session: Session,
-    Form(form): Form<Decision>,
-) -> Response {
-    let Some(people) = auth.people.as_ref() else {
-        return refused_page("this controller issues no tokens to people");
-    };
-    let issuer = auth.issuer.issuer().as_str();
-    let claims = match signed_in(&session).await {
-        Ok(Some(claims)) => claims,
-        Ok(None) => return refused_page("sign in again, then retry from Claude Code"),
-        Err(e) => return session_failure(e),
-    };
-    let pending: Option<Pending> = match session.remove(PENDING_KEY).await {
-        Ok(p) => p,
-        Err(e) => return session_failure(e),
-    };
-    let Some(pending) = pending
-        .filter(|p| constant_time_eq(p.id.as_bytes(), form.id.as_bytes()) && p.sub == claims.sub)
-    else {
-        return refused_page("this approval is no longer pending; retry from Claude Code");
-    };
-    let r = pending.request.clone();
-    if form.decision != "approve" {
-        return redirect_error(
-            &r.redirect,
-            Some(&r.state),
-            issuer,
-            "access_denied",
-            "the person declined",
-        );
-    }
-    if let Some(token) = form
-        .cluster_token
-        .as_deref()
-        .filter(|t| !t.trim().is_empty())
-    {
-        match kube_links::link(
-            &auth.pool,
-            people.reviewer.as_ref(),
-            &claims.sub,
-            &r.cluster,
-            token,
-            LinkSource::TokenReview,
-        )
-        .await
-        {
-            Ok(_) => {}
-            Err(LinkError::Store(e)) => {
-                tracing::error!(error = %format!("{e:#}"), "storing a kubernetes identity link");
-                return refused_page("the link could not be stored");
-            }
-            Err(e) => {
-                tracing::info!(reason = %e, cluster = r.cluster, "kubernetes identity link refused");
-                return show_consent(&auth, &session, pending, &claims, Some(&e.to_string())).await;
-            }
-        }
-    }
-    let approved = approved(&pending, &claims);
-    match kube_user(&auth, &approved).await {
-        Ok(ClusterUser::Known(_)) => {}
-        Ok(ClusterUser::Unlinked) => {
-            let why = format!("link your username on {} first", r.cluster);
-            return show_consent(&auth, &session, pending, &claims, Some(&why)).await;
-        }
-        Ok(ClusterUser::Unavailable(why)) => return refused_page(&why),
-        Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "resolving a person's kubernetes username");
-            return refused_page("the controller could not resolve your kubernetes username");
-        }
-    }
-    let now = crate::clock::unix_secs();
-    let grant = CodeGrant {
-        approved,
-        redirect: r.redirect.clone(),
-        challenge: r.challenge.clone(),
-        expires_at: now.saturating_add(CODE_TTL_SECS),
-    };
-    match people.grants.issue_code(grant, now).await {
-        Ok(code) => {
-            tracing::info!(
-                login = claims.login,
-                resource = r.resource,
-                "authorization code issued"
-            );
-            Redirect::to(
-                &r.redirect
-                    .with(&[("code", &code), ("state", &r.state), ("iss", issuer)]),
-            )
-            .into_response()
-        }
-        Err(e) => {
-            tracing::warn!(reason = %e, "authorization code refused");
-            redirect_error(
-                &r.redirect,
-                Some(&r.state),
-                issuer,
-                "temporarily_unavailable",
-                "retry shortly",
-            )
-        }
-    }
+    Redirect::to(&format!("{CONSENT_PATH}?id={}", pending.id)).into_response()
 }
 
 /// RFC 6749 §5.2 errors from the people grants. The detail is logged, never returned.
@@ -1099,7 +927,9 @@ async fn issue(
 mod tests {
     use crate::agent_auth::people::*;
     use crate::agent_auth::testing::{self, ISSUER, Spire};
+    use crate::identity::kube_links::LinkSource;
     use crate::identity::kube_links::testing::Clusters;
+    use crate::identity::session::NativeClaims;
     use axum::body::Body;
     use axum::http::Request;
     use sqlx::PgPool;
@@ -1468,6 +1298,7 @@ mod tests {
     struct Harness {
         auth: Arc<AgentAuth>,
         app: axum::Router,
+        _profile: tempfile::TempDir,
     }
 
     async fn test_login(session: Session) -> StatusCode {
@@ -1512,18 +1343,63 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             ])),
         ));
         let auth = Arc::new(auth);
+        crate::identity::oidc::users::record_login(
+            pool,
+            SUB,
+            "weaton",
+            Some("weaton@redhat.com"),
+            jiff::Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile.toml");
+        std::fs::write(&path, &profile).unwrap();
+        let api_state = crate::api::state::ApiState {
+            deploy_profile: Some(path),
+            people_issuer: Some(auth.clone()),
+            ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
+        };
+        let signed_in = crate::identity::session::Resolved {
+            user: Some("weaton".into()),
+            groups: Vec::new(),
+            sub: Some(SUB.into()),
+            source: crate::identity::session::IdentitySource::Native,
+        };
+        let api = crate::api::router(api_state).layer(axum::middleware::from_fn(
+            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
+                let signed_in = signed_in.clone();
+                async move {
+                    req.extensions_mut()
+                        .insert(crate::identity::auth::AuthPath::Session);
+                    req.extensions_mut().insert(signed_in);
+                    next.run(req).await
+                }
+            },
+        ));
         let store = crate::identity::session::store(pool).await.unwrap();
         let app = router(auth.clone())
             .merge(crate::agent_auth::router(auth.clone()))
+            .merge(api)
             .route("/test/login", axum::routing::get(test_login))
             .layer(crate::identity::session::layer(store, false));
-        Harness { auth, app }
+        Harness {
+            auth,
+            app,
+            _profile: dir,
+        }
+    }
+
+    struct NoSink;
+    impl crate::daemon::queue::OverrideSink for NoSink {
+        fn submit(&self, _ov: crate::daemon::queue::Override) {}
     }
 
     struct Reply {
         status: StatusCode,
         location: Option<String>,
         cookie: Option<String>,
+        headers: axum::http::HeaderMap,
         body: String,
     }
 
@@ -1537,6 +1413,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let location = header(header::LOCATION);
         let cookie = header(header::SET_COOKIE).map(|c| c.split(';').next().unwrap().to_string());
         let status = res.status();
+        let headers = res.headers().clone();
         let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
             .await
             .unwrap();
@@ -1544,6 +1421,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             status,
             location,
             cookie,
+            headers,
             body: String::from_utf8(bytes.to_vec()).unwrap(),
         }
     }
@@ -1579,9 +1457,46 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             .collect()
     }
 
-    fn pending_id(page: &str) -> String {
-        let at = page.find("name=\"id\" value=\"").unwrap() + "name=\"id\" value=\"".len();
-        page[at..].split('"').next().unwrap().to_string()
+    /// Follow an authorization request to the consent page it parks, returning the pending id.
+    async fn consent_id(app: &axum::Router, uri: &str, cookie: &str) -> String {
+        let parked = send(app, get(uri, Some(cookie))).await;
+        assert_eq!(parked.status, StatusCode::SEE_OTHER, "{}", parked.body);
+        let location = parked.location.unwrap();
+        location
+            .strip_prefix(&format!("{CONSENT_PATH}?id="))
+            .unwrap_or_else(|| panic!("not the consent page: {location}"))
+            .to_string()
+    }
+
+    fn post_json(uri: &str, cookie: Option<&str>, body: Value) -> Request<Body> {
+        let mut req = Request::post(uri).header(header::CONTENT_TYPE, "application/json");
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    }
+
+    async fn decide_as(app: &axum::Router, cookie: Option<&str>, id: &str, verdict: &str) -> Reply {
+        send(
+            app,
+            post_json(
+                "/api/oauth/consent",
+                cookie,
+                json!({"id": id, "decision": verdict}),
+            ),
+        )
+        .await
+    }
+
+    /// The loopback URL a decision sends the browser to.
+    fn redirect_of(reply: &Reply) -> String {
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        body["redirect_url"].as_str().unwrap().to_string()
+    }
+
+    fn link_pirate() -> Clusters {
+        Clusters::with(&[("pirate", "sha256~pirate", "wseaton")])
     }
 
     fn claims_of(auth: &AgentAuth, token: &str, aud: &str) -> Map<String, Value> {
@@ -1628,75 +1543,45 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         );
 
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
-        let consent = send(&h.app, get(&uri, Some(&cookie))).await;
-        assert_eq!(consent.status, StatusCode::OK);
-        assert!(
-            consent.body.contains("name=\"cluster_token\""),
-            "no link yet: {}",
-            consent.body
-        );
-        assert!(consent.body.contains(PIRATE_KUEUE));
-        let id = pending_id(&consent.body);
+        let id = consent_id(&h.app, &uri, &cookie).await;
 
-        let wrong_cluster = send(
-            &h.app,
-            post(
-                AUTHORIZE_PATH,
-                Some(&cookie),
-                &pairs(&[
-                    ("id", &id),
-                    ("decision", "approve"),
-                    ("cluster_token", "sha256~mpp"),
-                ]),
-            ),
-        )
-        .await;
-        assert_eq!(wrong_cluster.status, StatusCode::OK);
+        let unlinked = decide_as(&h.app, Some(&cookie), &id, "approve").await;
+        assert_eq!(unlinked.status, StatusCode::CONFLICT);
         assert!(
-            wrong_cluster.body.contains("did not accept"),
+            unlinked.body.contains("link your username on pirate first"),
             "{}",
-            wrong_cluster.body
+            unlinked.body
         );
-        assert_eq!(
-            crate::identity::kube_links::get(&pool, SUB, "pirate")
-                .await
-                .unwrap(),
-            None
-        );
-
-        let approved = send(
-            &h.app,
-            post(
-                AUTHORIZE_PATH,
-                Some(&cookie),
-                &pairs(&[
-                    ("id", &id),
-                    ("decision", "approve"),
-                    ("cluster_token", "sha256~pirate"),
-                ]),
-            ),
+        crate::identity::kube_links::link(
+            &pool,
+            &link_pirate(),
+            SUB,
+            "pirate",
+            "sha256~pirate",
+            LinkSource::OpenshiftOauth,
         )
-        .await;
-        assert_eq!(approved.status, StatusCode::SEE_OTHER, "{}", approved.body);
-        let location = approved.location.unwrap();
+        .await
+        .unwrap();
+
+        let approved = decide_as(&h.app, Some(&cookie), &id, "approve").await;
+        assert_eq!(
+            approved
+                .headers
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap()),
+            Some("no-store")
+        );
+        let location = redirect_of(&approved);
         assert!(location.starts_with(&format!("{REDIRECT}?")), "{location}");
         let q = query_of(&location);
         assert_eq!(q["state"], "st-1");
         assert_eq!(q["iss"], ISSUER);
         let code = q["code"].clone();
 
-        let replayed = send(
-            &h.app,
-            post(
-                AUTHORIZE_PATH,
-                Some(&cookie),
-                &pairs(&[("id", &id), ("decision", "approve")]),
-            ),
-        )
-        .await;
+        let replayed = decide_as(&h.app, Some(&cookie), &id, "approve").await;
         assert_eq!(
             replayed.status,
-            StatusCode::BAD_REQUEST,
+            StatusCode::CONFLICT,
             "an approval is spent once"
         );
 
@@ -1755,23 +1640,9 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     async fn a_cluster_whose_users_are_logins_needs_no_link(pool: PgPool) {
         let h = harness(&pool).await;
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
-        let consent = send(
-            &h.app,
-            get(&authorize_uri(&[("resource", MPP_KUEUE)]), Some(&cookie)),
-        )
-        .await;
-        assert!(!consent.body.contains("cluster_token"), "{}", consent.body);
-        assert!(consent.body.contains("Kubernetes user <b>weaton</b>"));
-        let approved = send(
-            &h.app,
-            post(
-                AUTHORIZE_PATH,
-                Some(&cookie),
-                &pairs(&[("id", &pending_id(&consent.body)), ("decision", "approve")]),
-            ),
-        )
-        .await;
-        let code = query_of(&approved.location.unwrap())["code"].clone();
+        let id = consent_id(&h.app, &authorize_uri(&[("resource", MPP_KUEUE)]), &cookie).await;
+        let approved = decide_as(&h.app, Some(&cookie), &id, "approve").await;
+        let code = query_of(&redirect_of(&approved))["code"].clone();
         let (status, body) = token(
             &h.app,
             &[
@@ -1795,31 +1666,14 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     ) {
         let h = harness(&pool).await;
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
-        let consent = send(
+        let id = consent_id(
             &h.app,
-            get(
-                &authorize_uri(&[("resource", WALDORF_KUEUE)]),
-                Some(&cookie),
-            ),
+            &authorize_uri(&[("resource", WALDORF_KUEUE)]),
+            &cookie,
         )
         .await;
-        assert!(
-            consent
-                .body
-                .contains("Kubernetes user <b>oidc:weaton@redhat.com</b>"),
-            "{}",
-            consent.body
-        );
-        let approved = send(
-            &h.app,
-            post(
-                AUTHORIZE_PATH,
-                Some(&cookie),
-                &pairs(&[("id", &pending_id(&consent.body)), ("decision", "approve")]),
-            ),
-        )
-        .await;
-        let code = query_of(&approved.location.unwrap())["code"].clone();
+        let approved = decide_as(&h.app, Some(&cookie), &id, "approve").await;
+        let code = query_of(&redirect_of(&approved))["code"].clone();
         let (status, body) = token(
             &h.app,
             &[
@@ -1840,17 +1694,17 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         assert_eq!(claims["kube_user"], "oidc:weaton@redhat.com");
         assert_eq!(claims["kube_cluster"], "waldorf");
 
-        let unlisted = send(
+        let id = consent_id(
             &h.app,
-            get(
-                &authorize_uri(&[("resource", "https://unlisted.example/mcp")]),
-                Some(&cookie),
-            ),
+            &authorize_uri(&[("resource", "https://unlisted.example/mcp")]),
+            &cookie,
         )
         .await;
-        assert!(
-            unlisted.body.contains("name=\"cluster_token\""),
-            "{}",
+        let unlisted = decide_as(&h.app, Some(&cookie), &id, "approve").await;
+        assert_eq!(
+            unlisted.status,
+            StatusCode::CONFLICT,
+            "a cluster the profile does not list is link: {}",
             unlisted.body
         );
     }
@@ -1859,56 +1713,107 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     async fn an_unlinked_person_cannot_approve_and_a_denial_goes_back_to_the_client(pool: PgPool) {
         let h = harness(&pool).await;
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
-        let consent = send(&h.app, get(&authorize_uri(&[]), Some(&cookie))).await;
-        let id = pending_id(&consent.body);
-        let unlinked = send(
+        let id = consent_id(&h.app, &authorize_uri(&[]), &cookie).await;
+        let unlinked = decide_as(&h.app, Some(&cookie), &id, "approve").await;
+        assert_eq!(unlinked.status, StatusCode::CONFLICT);
+        let forged = decide_as(&h.app, Some(&cookie), "0000", "approve").await;
+        assert_eq!(
+            forged.status,
+            StatusCode::CONFLICT,
+            "a forged id spends the approval"
+        );
+        let spent = decide_as(&h.app, Some(&cookie), &id, "deny").await;
+        assert_eq!(spent.status, StatusCode::CONFLICT);
+
+        let id = consent_id(&h.app, &authorize_uri(&[]), &cookie).await;
+        let q = query_of(&redirect_of(
+            &decide_as(&h.app, Some(&cookie), &id, "deny").await,
+        ));
+        assert_eq!(q["error"], "access_denied");
+        assert_eq!(q["state"], "st-1");
+        assert!(!q.contains_key("code"));
+
+        let id = consent_id(&h.app, &authorize_uri(&[]), &cookie).await;
+        let other_browser = decide_as(&h.app, None, &id, "approve").await;
+        assert_eq!(
+            other_browser.status,
+            StatusCode::CONFLICT,
+            "the request is parked on the browser that started it"
+        );
+        let as_form = send(
             &h.app,
             post(
-                AUTHORIZE_PATH,
+                "/api/oauth/consent",
                 Some(&cookie),
                 &pairs(&[("id", &id), ("decision", "approve")]),
-            ),
-        )
-        .await;
-        assert_eq!(unlinked.status, StatusCode::OK);
-        assert!(unlinked.body.contains("link your username on pirate first"));
-        let forged = send(
-            &h.app,
-            post(
-                AUTHORIZE_PATH,
-                Some(&cookie),
-                &pairs(&[("id", "0000"), ("decision", "approve")]),
             ),
         )
         .await;
         assert_eq!(
-            forged.status,
-            StatusCode::BAD_REQUEST,
-            "a forged id spends the approval"
+            as_form.status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a cross-site form cannot decide"
         );
-        let consent = send(&h.app, get(&authorize_uri(&[]), Some(&cookie))).await;
-        let denied = send(
+    }
+
+    /// The consent page reads what the browser parked and who the person would be on the
+    /// resource's cluster, with the link it needs when there is nobody yet.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn the_consent_page_reads_the_parked_request_and_the_cluster_identity(pool: PgPool) {
+        let h = harness(&pool).await;
+        let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
+        let read = |id: String| {
+            let app = h.app.clone();
+            let cookie = cookie.clone();
+            async move {
+                send(
+                    &app,
+                    get(&format!("/api/oauth/consent?id={id}"), Some(&cookie)),
+                )
+                .await
+            }
+        };
+        let id = consent_id(&h.app, &authorize_uri(&[]), &cookie).await;
+        let consent = read(id.clone()).await;
+        assert_eq!(consent.status, StatusCode::OK, "{}", consent.body);
+        let body: Value = serde_json::from_str(&consent.body).unwrap();
+        assert_eq!(body["client_id"], CLIENT_ID);
+        assert_eq!(body["resource"], PIRATE_KUEUE);
+        assert_eq!(body["scopes"], json!(["kueue.read", "kueue.submit"]));
+        assert_eq!(body["login"], "weaton");
+        assert_eq!(
+            body["identity"],
+            json!({"cluster": "pirate", "rule": {"kind": "link", "oauth": false},
+                   "kube_user": null, "source": null, "linked_at": null})
+        );
+        assert_eq!(read("0000".into()).await.status, StatusCode::NOT_FOUND);
+
+        let id = consent_id(
             &h.app,
-            post(
-                AUTHORIZE_PATH,
-                Some(&cookie),
-                &pairs(&[("id", &pending_id(&consent.body)), ("decision", "deny")]),
-            ),
+            &authorize_uri(&[("resource", WALDORF_KUEUE)]),
+            &cookie,
         )
         .await;
-        let q = query_of(&denied.location.unwrap());
-        assert_eq!(q["error"], "access_denied");
-        assert_eq!(q["state"], "st-1");
-        let no_session = send(
-            &h.app,
-            post(
-                AUTHORIZE_PATH,
-                None,
-                &pairs(&[("id", &id), ("decision", "approve")]),
-            ),
-        )
-        .await;
-        assert_eq!(no_session.status, StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&read(id).await.body).unwrap();
+        assert_eq!(body["identity"]["kube_user"], "oidc:weaton@redhat.com");
+        assert_eq!(body["identity"]["source"], "rule");
+    }
+
+    /// Error pages carry no form, so nothing they render can post anywhere.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refused_request_renders_a_page_that_posts_nowhere(pool: PgPool) {
+        let h = harness(&pool).await;
+        let refused = send(&h.app, get(&authorize_uri(&[("client_id", "other")]), None)).await;
+        assert_eq!(refused.status, StatusCode::BAD_REQUEST);
+        let csp = refused
+            .headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("form-action 'none'"), "{csp}");
+        assert!(!refused.body.contains("<form"), "{}", refused.body);
     }
 
     async fn issued_code(h: &Harness, pool: &PgPool) -> String {

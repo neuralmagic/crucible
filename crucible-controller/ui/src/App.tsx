@@ -69,6 +69,7 @@ const PolicyPage = page(() => import('./pages/PolicyPage'), 'PolicyPage');
 const SecretsPage = page(() => import('./pages/SecretsPage'), 'SecretsPage');
 const ProvidersPage = page(() => import('./pages/ProvidersPage'), 'ProvidersPage');
 const SettingsPage = page(() => import('./pages/SettingsPage'), 'SettingsPage');
+const ConsentPage = page(() => import('./pages/ConsentPage'), 'ConsentPage');
 const TeamsPage = page(() => import('./pages/TeamsPage'), 'TeamsPage');
 const TeamDetailPage = page(() => import('./pages/TeamDetailPage'), 'TeamDetailPage');
 // Explore carries the DuckDB-WASM bundle (multi-MB of wasm).
@@ -485,6 +486,7 @@ export function App() {
             <Route path="/secrets" element={<SecretsPage />} />
             <Route path="/providers" element={<ProvidersPage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            <Route path="/consent" element={<ConsentPage />} />
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/teams/:slug" element={<TeamDetailPage />} />
             <Route path="/admin" element={<AdminPage />} />

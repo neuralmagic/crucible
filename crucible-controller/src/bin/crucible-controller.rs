@@ -1134,6 +1134,12 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         }
     }
     let daemon_policy = policy.clone();
+    let agent_auth = crucible_controller::agent_auth::AgentAuth::from_env(
+        db.pool().clone(),
+        cfg.deploy_profile.clone(),
+        clusters.clone(),
+    )
+    .context("configuring the agent token issuer")?;
     let serve_state = crucible_controller::api::state::ApiState::new(
         db.clone(),
         serve_sink,
@@ -1153,14 +1159,9 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         )
         .context("configuring cluster identity links")?
         .map(std::sync::Arc::new),
-    );
-    let images_refresh = serve_state.images_refresh();
-    let agent_auth = crucible_controller::agent_auth::AgentAuth::from_env(
-        db.pool().clone(),
-        cfg.deploy_profile.clone(),
-        clusters.clone(),
     )
-    .context("configuring the agent token issuer")?;
+    .with_people_issuer(agent_auth.clone());
+    let images_refresh = serve_state.images_refresh();
     let surface = crucible_controller::Surface::bind(
         serve_state,
         serve_addr,
