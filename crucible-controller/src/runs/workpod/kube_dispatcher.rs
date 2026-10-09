@@ -113,6 +113,40 @@ impl PodDispatcher for KubePodDispatcher {
         delete_selected_of::<Secret>(&client, namespace, selector).await
     }
 
+    async fn delete_sandboxes(&self, cluster: &str, namespace: &str, selector: &str) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        for version in crate::agent_auth::directory::SANDBOX_VERSIONS {
+            let api = crate::agent_auth::directory::sandbox_api(&client, namespace, version);
+            let found = match api
+                .list_metadata(&kube::api::ListParams::default().labels(selector))
+                .await
+            {
+                Ok(found) => found,
+                Err(kube::Error::Api(s)) if s.code == 404 => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("listing Sandboxes in {namespace} matching {selector}")
+                    });
+                }
+            };
+            for name in found.items.into_iter().filter_map(|o| o.metadata.name) {
+                match api
+                    .delete(&name, &kube::api::DeleteParams::background())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(kube::Error::Api(s)) if s.code == 404 => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("deleting Sandbox {namespace}/{name}"));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+
     async fn selected_label_values(
         &self,
         cluster: &str,

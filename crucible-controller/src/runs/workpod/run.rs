@@ -692,6 +692,12 @@ pub async fn dispatch_run(
     };
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
+    if isolated.is_some() && crate::runs::cluster_push::PushTokens::from_env()?.pushes_for(&cluster)
+    {
+        return Err(
+            crate::runs::workpod::gateway::DispatchError::PushOnlyCluster { cluster }.into(),
+        );
+    }
     // The inference document and the models' keys, resolved and read before the row insert so a
     // refusal leaves no work-pod row behind; a variable the scope's own bindings also claim is
     // refused the same way once both are known.
@@ -849,6 +855,7 @@ pub async fn dispatch_run(
                 &cluster,
                 gateway_profile,
                 &pod_name,
+                opts.max_time_secs(),
             )
             .await
             {
@@ -915,11 +922,28 @@ pub async fn dispatch_run(
             // Inject this dispatch's W3C trace context so the loop pod's engine re-roots its `run`
             // span under it (a no-op when the controller isn't exporting spans).
             crate::runs::workpod::trace::inject_dispatch_context(&mut pod);
-            match dispatcher
-                .create(&cluster, &namespace, pod)
-                .await
-                .context("creating the loop-run pod")
-            {
+            let gateway_started = match gateway.as_ref() {
+                Some(gateway) => {
+                    gateway
+                        .start(
+                            dispatcher.as_ref(),
+                            &cluster,
+                            &namespace,
+                            &pod,
+                            &sandbox_ports,
+                        )
+                        .await
+                }
+                None => Ok(()),
+            };
+            let loop_pod_created = match gateway_started {
+                Ok(()) => dispatcher
+                    .create(&cluster, &namespace, pod)
+                    .await
+                    .context("creating the loop-run pod"),
+                Err(e) => Err(e),
+            };
+            match loop_pod_created {
                 Ok(created_pod) => {
                     if let Some(uid) = created_pod
                         .metadata
@@ -950,29 +974,14 @@ pub async fn dispatch_run(
                             .await
                             .context("creating the run Secret")?;
                     }
-                    let pack_created = match cm {
-                        Some(mut cm) => {
-                            stamp_run_configmap(&mut cm, &created_pod, &issue_for_cm);
-                            dispatcher
-                                .create_configmap(&cluster, &namespace, cm)
-                                .await
-                                .context("creating the pack ConfigMap")
-                        }
-                        None => Ok(()),
-                    };
-                    match (pack_created, gateway.as_ref()) {
-                        (Ok(()), Some(gateway)) => {
-                            gateway
-                                .start(
-                                    dispatcher.as_ref(),
-                                    &cluster,
-                                    &namespace,
-                                    &created_pod,
-                                    &sandbox_ports,
-                                )
-                                .await
-                        }
-                        (created, _) => created,
+                    if let Some(mut cm) = cm {
+                        stamp_run_configmap(&mut cm, &created_pod, &issue_for_cm);
+                        dispatcher
+                            .create_configmap(&cluster, &namespace, cm)
+                            .await
+                            .context("creating the pack ConfigMap")
+                    } else {
+                        Ok(())
                     }
                 }
                 Err(e) => Err(e),
@@ -1009,6 +1018,7 @@ pub async fn dispatch_run(
                     &cluster,
                     profile,
                     &pod_name,
+                    &namespace,
                 )
                 .await
             {
@@ -1091,14 +1101,14 @@ pub async fn collect_run_pod(
         None,
     )
     .await?;
-    if let Some(ns) =
-        crate::runs::workpod::row_namespace(dispatcher, &row.cluster, hub_namespace).await
-    {
-        let _ = dispatcher.delete(&row.cluster, &ns, pod_name).await;
+    let ns = crate::runs::workpod::row_namespace(dispatcher, &row.cluster, hub_namespace).await;
+    if let Some(ns) = ns.as_deref() {
+        let _ = dispatcher.delete(&row.cluster, ns, pod_name).await;
     }
     if let Some(profile) = profile.filter(|p| crucible::deploy::render::gateway::isolated(p))
+        && let Some(ns) = ns.as_deref()
         && let Err(e) =
-            crate::runs::workpod::gateway::teardown(dispatcher, &row.cluster, profile, pod_name)
+            crate::runs::workpod::gateway::teardown(dispatcher, &row.cluster, profile, pod_name, ns)
                 .await
     {
         tracing::warn!(

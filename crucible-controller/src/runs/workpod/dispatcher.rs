@@ -85,6 +85,16 @@ pub trait PodDispatcher: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    /// Delete the OpenShell `Sandbox` resources in `namespace` that match the label `selector`.
+    /// Nothing matching is success. The default no-ops.
+    async fn delete_sandboxes(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _selector: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// The values of `label` on the Pods, Services, Secrets, and NetworkPolicies in `namespace`
     /// that match the label `selector`. The default finds none.
     async fn selected_label_values(

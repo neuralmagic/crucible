@@ -5980,6 +5980,10 @@ enum GatewayEvent {
         namespace: String,
         selector: String,
     },
+    DeleteSandboxes {
+        namespace: String,
+        selector: String,
+    },
 }
 
 /// A cluster boundary that records every create, hands out ClusterIPs from `172.30.0.10` up, and
@@ -6068,6 +6072,13 @@ impl PodDispatcher for GatewayDispatcher {
     }
     async fn delete_selected(&self, _cluster: &str, ns: &str, selector: &str) -> Result<()> {
         self.push(GatewayEvent::DeleteSelected {
+            namespace: ns.to_string(),
+            selector: selector.to_string(),
+        });
+        Ok(())
+    }
+    async fn delete_sandboxes(&self, _cluster: &str, ns: &str, selector: &str) -> Result<()> {
+        self.push(GatewayEvent::DeleteSandboxes {
             namespace: ns.to_string(),
             selector: selector.to_string(),
         });
@@ -6180,23 +6191,25 @@ async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
             GatewayEvent::Secret { namespace, .. } => ("secret", namespace.as_str()),
             GatewayEvent::ConfigMap { namespace } => ("configmap", namespace.as_str()),
             GatewayEvent::NetworkPolicy { namespace, .. } => ("networkpolicy", namespace.as_str()),
-            GatewayEvent::DeleteSelected { namespace, .. } => ("delete", namespace.as_str()),
+            GatewayEvent::DeleteSelected { namespace, .. }
+            | GatewayEvent::DeleteSandboxes { namespace, .. } => ("delete", namespace.as_str()),
         })
         .collect();
     assert_eq!(
         kinds,
         [
             ("service", "sandboxes"),
+            ("service", "autoresearch"),
+            ("networkpolicy", "sandboxes"),
+            ("pod", "sandboxes"),
+            ("secret", "sandboxes"),
+            ("secret", "sandboxes"),
             ("pod", "autoresearch"),
             ("secret", "autoresearch"),
             ("configmap", "autoresearch"),
-            ("service", "autoresearch"),
-            ("secret", "sandboxes"),
-            ("secret", "sandboxes"),
-            ("networkpolicy", "sandboxes"),
-            ("pod", "sandboxes"),
         ],
-        "the NetworkPolicy precedes the gateway pod, and nothing is torn down"
+        "the gateway starts before the loop pod, its NetworkPolicy before it, and nothing is \
+         torn down"
     );
 
     let pods: Vec<&Pod> = events
@@ -6206,7 +6219,7 @@ async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
             _ => None,
         })
         .collect();
-    let (loop_pod, gateway_pod) = (pods[0], pods[1]);
+    let (gateway_pod, loop_pod) = (pods[0], pods[1]);
     assert_eq!(loop_pod.metadata.name.as_deref(), Some(pod_name.as_str()));
     let loop_spec = loop_pod.spec.as_ref().expect("spec");
     let loop_container = &loop_spec.containers[0];
@@ -6244,7 +6257,11 @@ async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
             _ => None,
         })
         .collect();
-    let run_secret = secrets[0].1;
+    let run_secret = secrets
+        .iter()
+        .find(|(ns, _)| *ns == "autoresearch")
+        .expect("the run Secret")
+        .1;
     let ca = string_data(run_secret, "openshell-gateway-ca.crt");
     let loop_cert = string_data(run_secret, "openshell-gateway-tls.crt");
     let names = render::GatewayNames::for_run_pod(&pod_name);
@@ -6258,8 +6275,19 @@ async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
         .find(|(_, s)| s.metadata.name.as_deref() == Some(names.client_secret.as_str()))
         .expect("the supervisor client Secret")
         .1;
+    let gateway_uid = gateway_pod.metadata.uid.clone().expect("gateway uid");
     for sandbox_secret in [server, client] {
         assert_eq!(string_data(sandbox_secret, "ca.crt"), ca, "one CA per run");
+        assert_eq!(
+            sandbox_secret
+                .metadata
+                .owner_references
+                .as_ref()
+                .and_then(|o| o.first())
+                .map(|o| o.uid.as_str()),
+            Some(gateway_uid.as_str()),
+            "deleting the gateway pod collects its Secrets"
+        );
         assert_ne!(string_data(sandbox_secret, "tls.crt"), loop_cert);
         assert_eq!(
             sandbox_secret
@@ -6281,13 +6309,6 @@ async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
             _ => None,
         })
         .expect("the loop Service");
-    let owner = loop_service
-        .metadata
-        .owner_references
-        .as_ref()
-        .and_then(|o| o.first())
-        .expect("owned by the loop pod");
-    assert_eq!(owner.uid, format!("uid-{pod_name}"));
     let run_label = loop_pod
         .metadata
         .labels
@@ -6359,6 +6380,10 @@ async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
         gateway_env(crucible::openshell::gateway::SERVE_CLIENT_TLS_SECRET_ENV).as_deref(),
         Some(names.client_secret.as_str())
     );
+    assert_eq!(
+        gateway_env(crucible::openshell::gateway::SERVE_GATEWAY_ID_ENV).as_deref(),
+        Some(names.gateway_id.as_str())
+    );
     Ok(())
 }
 
@@ -6381,29 +6406,46 @@ async fn a_gateway_that_fails_to_start_is_torn_down_with_the_launch(
     let loop_pod = events
         .iter()
         .find_map(|e| match e {
-            GatewayEvent::Pod { namespace, pod } if namespace == "autoresearch" => {
-                pod.metadata.name.clone()
-            }
+            GatewayEvent::Service { namespace, service } if namespace == "sandboxes" => service
+                .metadata
+                .labels
+                .as_ref()?
+                .get(crucible::deploy::render::gateway::GATEWAY_FOR_LABEL)
+                .cloned(),
             _ => None,
         })
-        .expect("the loop pod");
+        .expect("the gateway Service names its run pod");
     assert!(
-        !events
-            .iter()
-            .any(|e| matches!(e, GatewayEvent::Pod { namespace, .. } if namespace == "sandboxes")),
-        "no gateway pod without its NetworkPolicy"
+        !events.iter().any(|e| matches!(e, GatewayEvent::Pod { .. })),
+        "neither a gateway pod without its NetworkPolicy nor a loop pod without its gateway: \
+         {events:?}"
     );
-    let Some(GatewayEvent::DeleteSelected {
-        namespace,
-        selector,
-    }) = events.last()
-    else {
-        panic!("expected a teardown last: {events:?}");
-    };
-    assert_eq!(namespace, "sandboxes");
+    let names = crucible::deploy::render::gateway::GatewayNames::for_run_pod(&loop_pod);
+    let created = crucible::deploy::render::gateway::gateway_created_selector(&names);
+    let own = crucible::deploy::render::gateway::run_gateway_selector(&loop_pod);
+    let teardown: Vec<(&str, &str, &str)> = events
+        .iter()
+        .filter_map(|e| match e {
+            GatewayEvent::DeleteSandboxes {
+                namespace,
+                selector,
+            } => Some(("sandboxes", namespace.as_str(), selector.as_str())),
+            GatewayEvent::DeleteSelected {
+                namespace,
+                selector,
+            } => Some(("objects", namespace.as_str(), selector.as_str())),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        *selector,
-        crucible::deploy::render::gateway::run_gateway_selector(&loop_pod)
+        teardown,
+        [
+            ("sandboxes", "sandboxes", created.as_str()),
+            ("objects", "sandboxes", created.as_str()),
+            ("objects", "autoresearch", own.as_str()),
+            ("objects", "sandboxes", own.as_str()),
+        ],
+        "what the gateway made goes first, its own objects last"
     );
     let row = crate::runs::work_pods::get_work_pod(db.pool(), &loop_pod)
         .await?
@@ -6501,12 +6543,23 @@ async fn collecting_an_isolated_run_deletes_its_gateway(pool: sqlx::PgPool) -> R
             _ => None,
         })
         .collect();
+    let own = crucible::deploy::render::gateway::run_gateway_selector("crucible-run-iso");
+    let created = crucible::deploy::render::gateway::gateway_created_selector(
+        &crucible::deploy::render::gateway::GatewayNames::for_run_pod("crucible-run-iso"),
+    );
     assert_eq!(
         deleted,
-        [(
-            "sandboxes".to_string(),
-            crucible::deploy::render::gateway::run_gateway_selector("crucible-run-iso")
-        )]
+        [
+            ("sandboxes".to_string(), created),
+            ("autoresearch".to_string(), own.clone()),
+            ("sandboxes".to_string(), own),
+        ]
+    );
+    assert!(
+        dispatcher.events().iter().any(
+            |e| matches!(e, GatewayEvent::DeleteSandboxes { namespace, .. } if namespace == "sandboxes")
+        ),
+        "the isolated run's Sandboxes go with it"
     );
     Ok(())
 }
@@ -6532,12 +6585,22 @@ async fn the_gateway_sweep_removes_gateways_whose_run_pod_is_not_running(
         .into(),
         ..Default::default()
     };
-    crate::runs::workpod::gateway::sweep_orphan_gateways(&db, &dispatcher, Some(&profile)).await;
+    crate::runs::workpod::gateway::sweep_orphan_gateways(
+        &db,
+        &dispatcher,
+        Some(&profile),
+        "autoresearch",
+    )
+    .await;
+    let gateways = crucible::deploy::render::gateway::gateway_selector();
     let deleted: Vec<String> = dispatcher
         .events()
         .into_iter()
         .filter_map(|e| match e {
-            GatewayEvent::DeleteSelected { selector, .. } => Some(selector),
+            GatewayEvent::DeleteSelected {
+                namespace,
+                selector,
+            } if namespace == "sandboxes" && selector.starts_with(&gateways) => Some(selector),
             _ => None,
         })
         .collect();
@@ -6553,10 +6616,52 @@ async fn the_gateway_sweep_removes_gateways_whose_run_pod_is_not_running(
 
     let shared = shared_profile(tmp.path());
     let untouched = GatewayDispatcher::default();
-    crate::runs::workpod::gateway::sweep_orphan_gateways(&db, &untouched, Some(&shared)).await;
+    crate::runs::workpod::gateway::sweep_orphan_gateways(
+        &db,
+        &untouched,
+        Some(&shared),
+        "autoresearch",
+    )
+    .await;
     assert!(
         untouched.events().is_empty(),
         "a profile without isolation sweeps nothing"
+    );
+    Ok(())
+}
+
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_isolated_dispatch_to_a_push_only_cluster_is_refused_before_anything_is_created(
+    pool: sqlx::PgPool,
+) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let db = Db::new(pool);
+    let profile = isolated_profile(tmp.path());
+    let cluster = pod_cfg(&profile, "img").dispatch_cluster;
+    unsafe {
+        std::env::set_var("CONTROLLER_PUSH_TOKENS", format!("{cluster}=push-token"));
+    }
+    let dispatcher = Arc::new(GatewayDispatcher::default());
+    let result = dispatch_isolated(&db, tmp.path(), &profile, dispatcher.clone()).await;
+    unsafe {
+        std::env::remove_var("CONTROLLER_PUSH_TOKENS");
+    }
+    let err = result.expect_err("refused");
+    assert!(
+        matches!(
+            err.downcast_ref::<crate::runs::workpod::gateway::DispatchError>(),
+            Some(crate::runs::workpod::gateway::DispatchError::PushOnlyCluster { cluster: c })
+                if *c == cluster
+        ),
+        "{err:#}"
+    );
+    assert!(dispatcher.events().is_empty(), "{:?}", dispatcher.events());
+    assert!(
+        crate::runs::work_pods::work_pods_in_states(db.pool(), &[WorkPodState::Running])
+            .await?
+            .is_empty(),
+        "no work pod row for a dispatch that cannot start"
     );
     Ok(())
 }

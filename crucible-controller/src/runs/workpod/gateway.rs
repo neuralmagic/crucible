@@ -2,18 +2,20 @@
 //! gateways ([`render::isolated`]). The controller owns its lifecycle:
 //!
 //! ```text
-//!  dispatch_run                                         collect_run_pod / sweep
-//!  ──────────────────────────────────────────────────   ───────────────────────
-//!  reserve   gateway Service → ClusterIP → mint TLS     teardown: delete every
-//!            (loop client material joins the run         object labelled for the
-//!             Secret before the loop pod renders)        run in the sandbox ns
-//!  start     loop Service (owned by the loop pod),
-//!            TLS Secrets, NetworkPolicy, gateway pod
+//!  dispatch_run                                          collect_run_pod / sweep
+//!  ───────────────────────────────────────────────────   ─────────────────────────────
+//!  reserve   gateway Service → ClusterIP → mint TLS      teardown, in order:
+//!            (loop client material joins the run          Sandboxes and supervisors the
+//!             Secret before the loop pod renders)         gateway created (gateway-id),
+//!  start     loop Service, NetworkPolicy, gateway pod,    the loop Service, then the
+//!            TLS Secrets owned by the gateway pod         gateway's own objects last
+//!  then      the loop pod
 //! ```
 //!
 //! Nothing in the sandbox namespace can be owner-referenced to the loop pod across namespaces, so
-//! collection deletes the run's gateway objects by label and the startup sweep removes any whose run
-//! pod is no longer running.
+//! collection deletes the run's gateway by label and a sweep on the discovery tick removes any
+//! whose run pod is no longer running. The gateway's own objects go last, so a teardown that fails
+//! halfway leaves the label the sweep finds it by.
 
 use crate::runs::workpod::*;
 use anyhow::{Context, Result};
@@ -28,13 +30,26 @@ use rcgen::{
 };
 use std::net::IpAddr;
 
-/// How long a run's gateway certificates stay valid, from the day before they are minted.
-const VALIDITY_DAYS: i64 = 30;
+/// How long a run's gateway certificates stay valid past its deadline, from the day before they
+/// are minted.
+const VALIDITY_SLACK_DAYS: i64 = 1;
+/// The validity of a run that states no deadline.
+const UNBOUNDED_VALIDITY_DAYS: i64 = 30;
 
 /// The run Secret keys the loop pod's gateway client material is delivered under.
 const CA_KEY: &str = "openshell-gateway-ca.crt";
 const CERT_KEY: &str = "openshell-gateway-tls.crt";
 const KEY_KEY: &str = "openshell-gateway-tls.key";
+
+#[derive(Debug, thiserror::Error)]
+pub enum DispatchError {
+    #[error(
+        "cluster {cluster} reports to the hub by push, so the hub cannot reach its API to start \
+         the run's gateway; a profile that isolates gateways can only dispatch to clusters the \
+         hub reaches directly"
+    )]
+    PushOnlyCluster { cluster: String },
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayTlsError {
@@ -60,10 +75,25 @@ pub(crate) struct GatewayTls {
     pub supervisor_client: Leaf,
 }
 
+/// The days a run's certificates must outlive minting: its deadline rounded up plus slack, or a
+/// fixed span for a run with none.
+pub(crate) fn validity_days(max_time_secs: Option<u64>) -> i64 {
+    match max_time_secs {
+        Some(secs) => i64::try_from(secs.div_ceil(86_400))
+            .unwrap_or(UNBOUNDED_VALIDITY_DAYS)
+            .saturating_add(VALIDITY_SLACK_DAYS),
+        None => UNBOUNDED_VALIDITY_DAYS,
+    }
+}
+
 impl GatewayTls {
-    pub(crate) fn mint(gateway: IpAddr, today: jiff::civil::Date) -> Result<Self, GatewayTlsError> {
+    pub(crate) fn mint(
+        gateway: IpAddr,
+        today: jiff::civil::Date,
+        valid_days: i64,
+    ) -> Result<Self, GatewayTlsError> {
         let not_before = today.checked_sub(jiff::Span::new().days(1))?;
-        let not_after = today.checked_add(jiff::Span::new().days(VALIDITY_DAYS))?;
+        let not_after = today.checked_add(jiff::Span::new().days(valid_days))?;
         let midnight = |d: jiff::civil::Date| {
             rcgen::date_time_ymd(
                 i32::from(d.year()),
@@ -149,12 +179,14 @@ pub(crate) struct RunGateway<'a> {
 }
 
 impl<'a> RunGateway<'a> {
-    /// Create the gateway Service for `run_pod` and mint the run's TLS for its address.
+    /// Create the gateway Service for `run_pod` and mint the run's TLS for its address, valid for
+    /// the run's `max_time_secs` plus slack.
     pub(crate) async fn reserve(
         dispatcher: &dyn PodDispatcher,
         cluster: &str,
         profile: &'a DeployProfile,
         run_pod: &str,
+        max_time_secs: Option<u64>,
     ) -> Result<Self> {
         let names = GatewayNames::for_run_pod(run_pod);
         let service = dispatcher
@@ -166,7 +198,7 @@ impl<'a> RunGateway<'a> {
             .await
             .context("creating the run's gateway Service")?;
         let gateway_ip = cluster_ip(&service)?;
-        let tls = GatewayTls::mint(gateway_ip, today())?;
+        let tls = GatewayTls::mint(gateway_ip, today(), validity_days(max_time_secs))?;
         Ok(Self {
             profile,
             names,
@@ -204,8 +236,9 @@ impl<'a> RunGateway<'a> {
         }
     }
 
-    /// Start the gateway for the created `loop_pod`: the loop Service its sandboxes reach it
-    /// through on `sandbox_ports`, the TLS Secrets, the NetworkPolicy, then the gateway pod.
+    /// Start the gateway for the rendered `loop_pod`, ahead of creating it so the gateway boots
+    /// while the loop pod schedules: the loop Service sandboxes reach the loop pod through on
+    /// `sandbox_ports`, the NetworkPolicy, the gateway pod, then the TLS Secrets owned by it.
     pub(crate) async fn start(
         &self,
         dispatcher: &dyn PodDispatcher,
@@ -222,8 +255,6 @@ impl<'a> RunGateway<'a> {
             .with_context(|| format!("the loop pod carries no {RUN_LABEL} label"))?;
         let mut loop_service = render::loop_service(self.profile, &self.names, run, sandbox_ports);
         loop_service.metadata.namespace = Some(loop_namespace.to_string());
-        loop_service.metadata.owner_references =
-            crate::runs::workpod::run::owner_reference_to_pod(loop_pod).map(|o| vec![o]);
         let loop_service = dispatcher
             .create_service(cluster, loop_namespace, loop_service)
             .await
@@ -234,8 +265,26 @@ impl<'a> RunGateway<'a> {
         };
 
         let ns = self.profile.cluster.sandbox_namespace().to_string();
+        dispatcher
+            .create_network_policy(
+                cluster,
+                &ns,
+                render::gateway_network_policy(self.profile, &self.names, run),
+            )
+            .await
+            .context("creating the gateway's NetworkPolicy")?;
+        let gateway_pod = dispatcher
+            .create(
+                cluster,
+                &ns,
+                render::gateway_pod(self.profile, &self.names, loop_pod, addresses),
+            )
+            .await
+            .context("creating the gateway pod")?;
+        let owner = crate::runs::workpod::run::owner_reference_to_pod(&gateway_pod)
+            .context("the gateway pod create response carried no UID to own its Secrets")?;
         let secret = |name: &str, leaf: &Leaf| {
-            render::gateway_tls_secret(
+            let mut secret = render::gateway_tls_secret(
                 self.profile,
                 &self.names,
                 name,
@@ -244,7 +293,9 @@ impl<'a> RunGateway<'a> {
                     cert: &leaf.cert,
                     key: &leaf.key,
                 },
-            )
+            );
+            secret.metadata.owner_references = Some(vec![owner.clone()]);
+            secret
         };
         dispatcher
             .create_secret(
@@ -262,41 +313,41 @@ impl<'a> RunGateway<'a> {
             )
             .await
             .context("creating the supervisors' gateway client Secret")?;
-        dispatcher
-            .create_network_policy(
-                cluster,
-                &ns,
-                render::gateway_network_policy(self.profile, &self.names, run),
-            )
-            .await
-            .context("creating the gateway's NetworkPolicy")?;
-        dispatcher
-            .create(
-                cluster,
-                &ns,
-                render::gateway_pod(self.profile, &self.names, loop_pod, addresses),
-            )
-            .await
-            .context("creating the gateway pod")?;
         Ok(())
     }
 }
 
-/// Delete every gateway object of the run whose pod is `run_pod`.
+/// Delete everything the gateway of the run whose pod is `run_pod` created and was created with:
+/// its Sandboxes and their supervisors, the loop Service in `loop_namespace`, then its own pod,
+/// Service, Secrets, and NetworkPolicy, which the sweep finds a half-finished teardown by.
 pub(crate) async fn teardown(
     dispatcher: &dyn PodDispatcher,
     cluster: &str,
     profile: &DeployProfile,
     run_pod: &str,
+    loop_namespace: &str,
 ) -> Result<()> {
+    let names = GatewayNames::for_run_pod(run_pod);
+    let sandbox_ns = profile.cluster.sandbox_namespace();
+    let created = render::gateway_created_selector(&names);
+    let own = render::run_gateway_selector(run_pod);
+    let context = || format!("deleting the gateway of {run_pod}");
     dispatcher
-        .delete_selected(
-            cluster,
-            profile.cluster.sandbox_namespace(),
-            &render::run_gateway_selector(run_pod),
-        )
+        .delete_sandboxes(cluster, sandbox_ns, &created)
         .await
-        .with_context(|| format!("deleting the gateway of {run_pod}"))
+        .with_context(context)?;
+    dispatcher
+        .delete_selected(cluster, sandbox_ns, &created)
+        .await
+        .with_context(context)?;
+    dispatcher
+        .delete_selected(cluster, loop_namespace, &own)
+        .await
+        .with_context(context)?;
+    dispatcher
+        .delete_selected(cluster, sandbox_ns, &own)
+        .await
+        .with_context(context)
 }
 
 /// A [`crate::daemon::queue::DiscoverySource`] that runs [`sweep_orphan_gateways`] on the daemon's
@@ -305,11 +356,20 @@ pub(crate) async fn teardown(
 pub(crate) struct GatewaySweep {
     db: crate::client::Db,
     profile: Option<std::path::PathBuf>,
+    hub_namespace: String,
 }
 
 impl GatewaySweep {
-    pub(crate) fn new(db: crate::client::Db, profile: Option<std::path::PathBuf>) -> Self {
-        Self { db, profile }
+    pub(crate) fn new(
+        db: crate::client::Db,
+        profile: Option<std::path::PathBuf>,
+        hub_namespace: String,
+    ) -> Self {
+        Self {
+            db,
+            profile,
+            hub_namespace,
+        }
     }
 }
 
@@ -320,8 +380,15 @@ impl crate::daemon::queue::DiscoverySource for GatewaySweep {
     ) -> crate::daemon::queue::BoxFuture<Result<()>> {
         let db = self.db.clone();
         let profile = self.profile.clone();
+        let hub_namespace = self.hub_namespace.clone();
         Box::pin(async move {
-            sweep_orphan_gateways(&db, active_dispatcher().as_ref(), profile.as_deref()).await;
+            sweep_orphan_gateways(
+                &db,
+                active_dispatcher().as_ref(),
+                profile.as_deref(),
+                &hub_namespace,
+            )
+            .await;
             Ok(())
         })
     }
@@ -334,6 +401,7 @@ pub(crate) async fn sweep_orphan_gateways(
     db: &crate::client::Db,
     dispatcher: &dyn PodDispatcher,
     profile_path: Option<&std::path::Path>,
+    hub_namespace: &str,
 ) {
     let profile = match crate::agent_auth::placement::load_profile(profile_path).await {
         Ok(Some(profile)) if render::isolated(&profile) => profile,
@@ -358,6 +426,11 @@ pub(crate) async fn sweep_orphan_gateways(
     };
     let ns = profile.cluster.sandbox_namespace().to_string();
     for cluster in clusters {
+        let Some(loop_namespace) =
+            crate::runs::workpod::row_namespace(dispatcher, &cluster, hub_namespace).await
+        else {
+            continue;
+        };
         let runs = match dispatcher
             .selected_label_values(
                 &cluster,
@@ -392,7 +465,7 @@ pub(crate) async fn sweep_orphan_gateways(
             if live {
                 continue;
             }
-            match teardown(dispatcher, &cluster, &profile, &run_pod).await {
+            match teardown(dispatcher, &cluster, &profile, &run_pod, &loop_namespace).await {
                 Ok(()) => tracing::info!(
                     cluster,
                     run_pod,
@@ -418,6 +491,7 @@ mod tests {
         let tls = GatewayTls::mint(
             "172.30.4.2".parse().expect("ip"),
             jiff::civil::date(2026, 10, 8),
+            validity_days(None),
         )
         .expect("mint");
         assert!(tls.ca.starts_with("-----BEGIN CERTIFICATE-----"));
@@ -427,6 +501,14 @@ mod tests {
         }
         assert_ne!(tls.server.key, tls.loop_client.key);
         assert_ne!(tls.loop_client.key, tls.supervisor_client.key);
+    }
+
+    #[test]
+    fn certificates_outlive_the_runs_deadline_by_a_day() {
+        assert_eq!(validity_days(Some(3_600)), 2, "an hour rounds up to a day");
+        assert_eq!(validity_days(Some(86_400)), 2);
+        assert_eq!(validity_days(Some(86_401)), 3);
+        assert_eq!(validity_days(None), UNBOUNDED_VALIDITY_DAYS);
     }
 
     use rustls::pki_types::pem::PemObject;
@@ -497,7 +579,7 @@ mod tests {
     }
 
     fn mint_for(ip: &str) -> GatewayTls {
-        GatewayTls::mint(ip.parse().expect("ip"), today()).expect("mint")
+        GatewayTls::mint(ip.parse().expect("ip"), today(), validity_days(None)).expect("mint")
     }
 
     #[tokio::test]

@@ -179,6 +179,7 @@ pub fn assemble(
         Arc::new(crate::runs::workpod::GatewaySweep::new(
             db.clone(),
             cfg.deploy_profile.clone(),
+            cfg.pod_namespace.clone(),
         )),
     ];
     #[cfg(feature = "autoresearch")]
