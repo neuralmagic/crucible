@@ -1,17 +1,19 @@
 //! OAuth 2.1 resource-server support for MCP servers built on rmcp's Streamable HTTP service.
 //!
 //! ```text
-//!   request ─▶ bearer (ResourceServer)            ─▶ policy (ToolPolicy)                 ─▶ rmcp
-//!              validate JWT: iss, aud, exp, sig       tools/call: scopes, strip + mutate,
-//!              Principal into extensions              validate; tools/list: hide injected
-//!              401 / 403 + RFC 9728 challenge         params from inputSchema
+//!   request ─▶ bearer (ResourceServer)        ─▶ guard (PolicyGuard)                       ─▶ rmcp
+//!              validate JWT: iss, aud, exp, sig   the server's AccessRules: scopes;
+//!              Principal into extensions          ToolPolicy: strip + mutate, validate;
+//!              401 / 403 + RFC 9728 challenge     AccessRules checks, each reviewed;
+//!                                                 tools/list: hide injected params
 //! ```
 //!
 //! [`metadata::router`] serves the RFC 9728 protected-resource document the challenge points at.
 
+pub mod access;
 pub mod guard;
 pub mod jwks;
-/// Kubernetes RBAC (SubjectAccessReview) as the authority for authorize rules.
+/// Kubernetes RBAC (SubjectAccessReview) as the authority for access checks.
 #[cfg(feature = "kube")]
 pub mod kube;
 pub mod metadata;

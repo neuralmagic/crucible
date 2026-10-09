@@ -1,42 +1,28 @@
-//! Claims-based tool policy: per-tool scope requirements, CEL `validate` rules, and `mutate` rules
-//! that set server-owned argument paths from the caller's claims.
+//! Claims-based tool policy: CEL `validate` rules over a call's arguments, and `mutate` rules that
+//! set server-owned argument paths from the caller's claims. Which tools exist, the scopes each
+//! needs and the Kubernetes access each needs are the server's, declared in code
+//! ([`crate::access::AccessRules`]); a tool the policy does not name runs without rules.
 //!
 //! ```toml
-//! unlisted = "deny"            # tools with no [tools.<name>] table: "deny" (default) or "allow"
-//!
-//! [tools.workload_plan]
-//! scopes = ["kueue.submit"]
-//!
 //! [[tools.workload_plan.mutate]]
-//! path = "/manifest/metadata/annotations/crucible.dev~1actor"    # RFC 6901 JSON Pointer
-//! value = "has(claims.act) ? claims.act.sub : null"            # null leaves the path absent
+//! path = "/manifest/metadata/annotations/example.dev~1owner"    # RFC 6901 JSON Pointer
+//! value = "claims.sub"
 //!
 //! [[tools.workload_plan.mutate]]
 //! path = "/namespace"
 //! value = "claims.namespace"
 //! when = "has(claims.namespace)"                                # otherwise the client's value stands
 //!
-//! [[tools.workload_plan.validate]]
-//! name = "queue-allowed"
-//! rule = "size(claims.queues) == 0 || args.queue in claims.queues"
-//! message = "queue is not in this run's allowlist"
-//!
-//! [[tools.workload_plan.authorize]]                             # a SubjectAccessReview
-//! name = "queue-use"
-//! when = "has(claims.kube_user)"
-//! group = "'kueue.x-k8s.io'"
-//! resource = "'localqueues'"
-//! verb = "'use'"
-//! namespace = "args.namespace"
-//! object = "args.queue"
-//! message = "you may not use this queue"
+//! [[tools.workload_scale.validate]]
+//! name = "replica-cap"
+//! rule = "args.replicas <= 8"
+//! message = "at most 8 replicas"
 //! ```
 //!
-//! A `tools/call` is processed as: scopes; every `when` evaluated over `claims` and the client's
-//! `args`; the paths of the mutates that apply stripped from the client's arguments; each of those
-//! mutates evaluated (over `claims` and the stripped `args`) and set; each validate evaluated over
-//! the final `args`; then each authorize that applies resolved into an [`AccessCheck`] for the
-//! caller to review. Anything other than a `true` validate result, including an evaluation error,
+//! A `tools/call` is processed as: every `when` evaluated over `claims` and the client's `args`;
+//! the paths of the mutates that apply stripped from the client's arguments; each of those mutates
+//! evaluated (over `claims` and the stripped `args`) and set; then each validate evaluated over the
+//! final `args`. Anything other than a `true` validate result, including an evaluation error,
 //! refuses the call and names the rule. Unconditional mutate paths are removed from the
 //! `inputSchema` that `tools/list` advertises; conditional ones stay, since some callers set them.
 
@@ -74,9 +60,9 @@ pub enum Refusal {
     NoToolName,
     #[error("tool {tool}: arguments must be an object")]
     Arguments { tool: String },
-    #[error("tool {tool} is not permitted by policy")]
+    #[error("tool {tool} is not permitted")]
     Unlisted { tool: String },
-    #[error("method {method} is not permitted by policy")]
+    #[error("method {method} is not permitted")]
     Method { method: String },
     #[error("{tool} needs scope {}", missing.join(" "))]
     Scope { tool: String, missing: Vec<String> },
@@ -92,13 +78,13 @@ pub enum Refusal {
         rule: String,
         error: String,
     },
-    #[error("tool {tool} refused by policy rule {rule}: {message}")]
+    #[error("{tool} refused by access check {rule}: {message}")]
     Denied {
         tool: String,
         rule: String,
         message: String,
     },
-    #[error("tool {tool} refused: access check {rule} could not be made: {error}")]
+    #[error("{tool} refused: access check {rule} could not be made: {error}")]
     ReviewError {
         tool: String,
         rule: String,
@@ -112,19 +98,9 @@ pub enum Refusal {
     },
 }
 
-#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum Unlisted {
-    #[default]
-    Deny,
-    Allow,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
-    #[serde(default)]
-    unlisted: Unlisted,
     #[serde(default)]
     tools: BTreeMap<String, ToolFile>,
 }
@@ -133,13 +109,9 @@ struct PolicyFile {
 #[serde(deny_unknown_fields)]
 struct ToolFile {
     #[serde(default)]
-    scopes: Vec<String>,
-    #[serde(default)]
     validate: Vec<ValidateFile>,
     #[serde(default)]
     mutate: Vec<MutateFile>,
-    #[serde(default)]
-    authorize: Vec<AuthorizeFile>,
 }
 
 #[derive(Deserialize)]
@@ -159,27 +131,6 @@ struct MutateFile {
     when: Option<String>,
 }
 
-/// Every field but `name` and `message` is a CEL expression over `claims` and `args`; a string
-/// literal is written quoted, `"'batch'"`.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct AuthorizeFile {
-    name: String,
-    message: String,
-    #[serde(default)]
-    when: Option<String>,
-    #[serde(default)]
-    group: Option<String>,
-    resource: String,
-    #[serde(default)]
-    subresource: Option<String>,
-    verb: String,
-    #[serde(default)]
-    namespace: Option<String>,
-    #[serde(default)]
-    object: Option<String>,
-}
-
 struct Validate {
     name: String,
     message: String,
@@ -193,102 +144,36 @@ struct Mutate {
     when: Option<Program>,
 }
 
-struct Authorize {
-    name: String,
-    message: String,
-    when: Option<Program>,
-    group: Option<Program>,
-    resource: Program,
-    subresource: Option<Program>,
-    verb: Program,
-    namespace: Option<Program>,
-    object: Option<Program>,
-}
-
-/// One resolved authorize rule: the SubjectAccessReview resource attributes to ask about the
-/// caller. Who the caller is in Kubernetes terms is the reviewer's business.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct AccessCheck {
-    pub tool: String,
-    pub rule: String,
-    pub message: String,
-    pub group: String,
-    pub resource: String,
-    pub subresource: String,
-    pub verb: String,
-    pub namespace: String,
-    pub name: String,
-}
-
-#[derive(Default)]
 struct ToolRules {
-    scopes: Vec<String>,
     validate: Vec<Validate>,
     mutate: Vec<Mutate>,
-    authorize: Vec<Authorize>,
 }
 
+/// Validate and mutate rules per tool. The default has none.
+#[derive(Default)]
 pub struct ToolPolicy {
-    unlisted: Unlisted,
     tools: BTreeMap<String, ToolRules>,
 }
 
 impl ToolPolicy {
-    /// A policy that admits every tool unchanged.
-    pub fn allow_all() -> Self {
-        Self {
-            unlisted: Unlisted::Allow,
-            tools: BTreeMap::new(),
-        }
-    }
-
     pub fn from_toml(text: &str) -> Result<Self, PolicyError> {
         let file: PolicyFile = toml::from_str(text)?;
         let mut tools = BTreeMap::new();
         for (tool, rules) in file.tools {
             tools.insert(tool.clone(), compile_tool(&tool, rules)?);
         }
-        Ok(Self {
-            unlisted: file.unlisted,
-            tools,
-        })
+        Ok(Self { tools })
     }
 
-    /// Scope requirement for `tool`, or the refusal for an unlisted tool under `deny`.
-    pub fn scopes(&self, tool: &str) -> Result<&[String], Refusal> {
-        match (self.tools.get(tool), self.unlisted) {
-            (Some(rules), _) => Ok(&rules.scopes),
-            (None, Unlisted::Allow) => Ok(&[]),
-            (None, Unlisted::Deny) => Err(Refusal::Unlisted {
-                tool: tool.to_string(),
-            }),
-        }
-    }
-
-    /// Apply `tool`'s rules to `args` for a caller with `claims` and `scopes`, returning the
-    /// access checks its authorize rules require. Every check must be reviewed and allowed before
-    /// the call proceeds.
+    /// Apply `tool`'s mutate and validate rules to `args` for a caller with `claims`.
     pub fn apply(
         &self,
         tool: &str,
         args: &mut Map<String, Value>,
         claims: &Map<String, Value>,
-        scopes: &std::collections::BTreeSet<String>,
-    ) -> Result<Vec<AccessCheck>, Refusal> {
-        let required = self.scopes(tool)?;
-        let missing: Vec<String> = required
-            .iter()
-            .filter(|s| !scopes.contains(*s))
-            .cloned()
-            .collect();
-        if !missing.is_empty() {
-            return Err(Refusal::Scope {
-                tool: tool.to_string(),
-                missing,
-            });
-        }
+    ) -> Result<(), Refusal> {
         let Some(rules) = self.tools.get(tool) else {
-            return Ok(Vec::new());
+            return Ok(());
         };
         let rule_error = |rule: &str, error: String| Refusal::RuleError {
             tool: tool.to_string(),
@@ -337,43 +222,7 @@ impl ToolPolicy {
                 Err(error) => return Err(rule_error(&v.name, error)),
             }
         }
-        let mut checks = Vec::new();
-        for a in &rules.authorize {
-            let applies = match &a.when {
-                Some(when) => evaluate_bool(when, &claims_value, &final_args)
-                    .map_err(|error| rule_error(&a.name, error))?,
-                None => true,
-            };
-            if !applies {
-                continue;
-            }
-            let field = |program: &Option<Program>| -> Result<String, Refusal> {
-                match program {
-                    Some(p) => evaluate_string(p, &claims_value, &final_args)
-                        .map(Option::unwrap_or_default)
-                        .map_err(|error| rule_error(&a.name, error)),
-                    None => Ok(String::new()),
-                }
-            };
-            let required = |program: &Program, what: &str| -> Result<String, Refusal> {
-                evaluate_string(program, &claims_value, &final_args)
-                    .map_err(|error| rule_error(&a.name, error))?
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| rule_error(&a.name, format!("{what} evaluated to nothing")))
-            };
-            checks.push(AccessCheck {
-                tool: tool.to_string(),
-                rule: a.name.clone(),
-                message: a.message.clone(),
-                group: field(&a.group)?,
-                resource: required(&a.resource, "resource")?,
-                subresource: field(&a.subresource)?,
-                verb: required(&a.verb, "verb")?,
-                namespace: field(&a.namespace)?,
-                name: field(&a.object)?,
-            });
-        }
-        Ok(checks)
+        Ok(())
     }
 
     /// Remove every mutate path from `tool`'s advertised `inputSchema`: the property, and its
@@ -392,11 +241,6 @@ impl ToolPolicy {
         self.tools
             .values()
             .all(|r| r.mutate.iter().all(|m| m.when.is_some()))
-    }
-
-    /// True if any tool has authorize rules, so the caller needs an access reviewer.
-    pub fn authorizes(&self) -> bool {
-        self.tools.values().any(|r| !r.authorize.is_empty())
     }
 }
 
@@ -445,34 +289,7 @@ fn compile_tool(tool: &str, rules: ToolFile) -> Result<ToolRules, PolicyError> {
             segments,
         });
     }
-    let mut authorize = Vec::new();
-    for a in rules.authorize {
-        if !names.insert(a.name.clone()) {
-            return Err(PolicyError::DuplicateRule {
-                tool: tool.to_string(),
-                rule: a.name,
-            });
-        }
-        let optional =
-            |source: &Option<String>| source.as_deref().map(|s| compile(&a.name, s)).transpose();
-        authorize.push(Authorize {
-            when: optional(&a.when)?,
-            group: optional(&a.group)?,
-            resource: compile(&a.name, &a.resource)?,
-            subresource: optional(&a.subresource)?,
-            verb: compile(&a.name, &a.verb)?,
-            namespace: optional(&a.namespace)?,
-            object: optional(&a.object)?,
-            name: a.name,
-            message: a.message,
-        });
-    }
-    Ok(ToolRules {
-        scopes: rules.scopes,
-        validate,
-        mutate,
-        authorize,
-    })
+    Ok(ToolRules { validate, mutate })
 }
 
 /// RFC 6901: `/a/b~1c` -> `["a", "b/c"]`. The empty pointer (the whole document) is refused.
@@ -558,19 +375,6 @@ fn evaluate_bool(program: &Program, claims: &cel::Value, args: &Value) -> Result
     }
 }
 
-/// A string result, or `None` for null.
-fn evaluate_string(
-    program: &Program,
-    claims: &cel::Value,
-    args: &Value,
-) -> Result<Option<String>, String> {
-    match evaluate(program, claims, args)? {
-        cel::Value::String(s) => Ok(Some(s.to_string())),
-        cel::Value::Null => Ok(None),
-        other => Err(format!("evaluated to {other:?}, not a string")),
-    }
-}
-
 fn evaluate(program: &Program, claims: &cel::Value, args: &Value) -> Result<cel::Value, String> {
     let args = cel_value(args)?;
     let mut context = Context::default();
@@ -619,11 +423,9 @@ impl Serialize for CelJson<'_> {
 mod tests {
     use crate::policy::*;
     use serde_json::json;
-    use std::collections::BTreeSet;
 
     const POLICY: &str = r#"
         [tools.workload_plan]
-        scopes = ["kueue.submit"]
 
         [[tools.workload_plan.mutate]]
         path = "/manifest/metadata/annotations/crucible.dev~1actor"
@@ -667,10 +469,6 @@ mod tests {
         }))
     }
 
-    fn scopes(s: &[&str]) -> BTreeSet<String> {
-        s.iter().map(|s| s.to_string()).collect()
-    }
-
     fn plan_args() -> Map<String, Value> {
         obj(
             json!({"queue": "crucible-e2e", "manifest": {"kind": "Job", "metadata": {"name": "j"}}}),
@@ -687,14 +485,7 @@ mod tests {
     fn mutations_set_server_owned_paths_from_claims() {
         let policy = ToolPolicy::from_toml(POLICY).unwrap();
         let mut args = plan_args();
-        policy
-            .apply(
-                "workload_plan",
-                &mut args,
-                &claims(),
-                &scopes(&["kueue.submit"]),
-            )
-            .unwrap();
+        policy.apply("workload_plan", &mut args, &claims()).unwrap();
         assert_eq!(
             Value::Object(args),
             json!({
@@ -720,14 +511,7 @@ mod tests {
                 "annotations".into(),
                 json!({"crucible.dev/actor": "forged", "keep": "me"}),
             );
-        policy
-            .apply(
-                "workload_plan",
-                &mut args,
-                &claims(),
-                &scopes(&["kueue.submit"]),
-            )
-            .unwrap();
+        policy.apply("workload_plan", &mut args, &claims()).unwrap();
         assert_eq!(args["launched_by"], "alice");
         assert_eq!(
             args["manifest"]["metadata"]["annotations"],
@@ -749,12 +533,7 @@ mod tests {
                 json!({"crucible.dev/actor": "forged"}),
             );
         policy
-            .apply(
-                "workload_plan",
-                &mut args,
-                &undelegated,
-                &scopes(&["kueue.submit"]),
-            )
+            .apply("workload_plan", &mut args, &undelegated)
             .unwrap();
         assert_eq!(args["manifest"]["metadata"]["annotations"], json!({}));
     }
@@ -765,12 +544,7 @@ mod tests {
         let mut args = plan_args();
         args.insert("queue".into(), json!("someone-elses-queue"));
         let err = policy
-            .apply(
-                "workload_plan",
-                &mut args,
-                &claims(),
-                &scopes(&["kueue.submit"]),
-            )
+            .apply("workload_plan", &mut args, &claims())
             .unwrap_err();
         assert_eq!(
             err,
@@ -791,7 +565,7 @@ mod tests {
         let policy = ToolPolicy::from_toml(POLICY).unwrap();
         let ok = |n: Value| {
             let mut args = obj(json!({"kind": "Deployment", "name": "d", "replicas": n}));
-            policy.apply("workload_scale", &mut args, &claims(), &scopes(&[]))
+            policy.apply("workload_scale", &mut args, &claims())
         };
         ok(json!(8)).unwrap();
         ok(json!(0)).unwrap();
@@ -803,7 +577,7 @@ mod tests {
         let policy = ToolPolicy::from_toml(POLICY).unwrap();
         let mut no_replicas = obj(json!({"kind": "Deployment", "name": "d"}));
         let err = policy
-            .apply("workload_scale", &mut no_replicas, &claims(), &scopes(&[]))
+            .apply("workload_scale", &mut no_replicas, &claims())
             .unwrap_err();
         assert!(
             matches!(&err, Refusal::RuleError { rule, .. } if rule == "replica-cap"),
@@ -818,9 +592,7 @@ mod tests {
         "#;
         let policy = ToolPolicy::from_toml(text).unwrap();
         let mut args = obj(json!({"x": "yes"}));
-        let err = policy
-            .apply("t", &mut args, &claims(), &scopes(&[]))
-            .unwrap_err();
+        let err = policy.apply("t", &mut args, &claims()).unwrap_err();
         assert!(
             matches!(&err, Refusal::RuleError { error, .. } if error.contains("not a bool")),
             "{err}"
@@ -834,12 +606,7 @@ mod tests {
             json!({"queue": "crucible-e2e", "manifest": {"metadata": ["not", "an", "object"]}}),
         );
         let err = policy
-            .apply(
-                "workload_plan",
-                &mut args,
-                &claims(),
-                &scopes(&["kueue.submit"]),
-            )
+            .apply("workload_plan", &mut args, &claims())
             .unwrap_err();
         assert!(
             matches!(&err, Refusal::Mutate { path, .. } if path == "/manifest/metadata/annotations/crucible.dev~1actor"),
@@ -856,55 +623,11 @@ mod tests {
         "#;
         let policy = ToolPolicy::from_toml(text).unwrap();
         let mut args = obj(json!({"owner": "client"}));
-        let err = policy
-            .apply("t", &mut args, &claims(), &scopes(&[]))
-            .unwrap_err();
+        let err = policy.apply("t", &mut args, &claims()).unwrap_err();
         assert!(
             matches!(&err, Refusal::Mutate { path, .. } if path == "/owner"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn per_tool_scopes_are_required() {
-        let policy = ToolPolicy::from_toml(POLICY).unwrap();
-        let mut args = plan_args();
-        let err = policy
-            .apply(
-                "workload_plan",
-                &mut args,
-                &claims(),
-                &scopes(&["kueue.read"]),
-            )
-            .unwrap_err();
-        assert_eq!(
-            err,
-            Refusal::Scope {
-                tool: "workload_plan".into(),
-                missing: vec!["kueue.submit".into()],
-            }
-        );
-    }
-
-    #[test]
-    fn unlisted_tools_are_denied_by_default_and_allowed_on_request() {
-        let deny = ToolPolicy::from_toml(POLICY).unwrap();
-        let mut args = Map::new();
-        assert_eq!(
-            deny.apply("workload_delete", &mut args, &claims(), &scopes(&[])),
-            Err(Refusal::Unlisted {
-                tool: "workload_delete".into()
-            })
-        );
-        deny.apply("whoami", &mut args, &claims(), &scopes(&[]))
-            .unwrap();
-
-        let allow = ToolPolicy::from_toml("unlisted = \"allow\"").unwrap();
-        let mut args = obj(json!({"any": 1}));
-        allow
-            .apply("workload_delete", &mut args, &claims(), &scopes(&[]))
-            .unwrap();
-        assert_eq!(args, obj(json!({"any": 1})));
     }
 
     #[test]
@@ -950,14 +673,19 @@ mod tests {
         policy.hide_injected("not_in_policy", &mut schema);
         assert_eq!(schema, original);
         assert!(!policy.hides_nothing());
-        assert!(ToolPolicy::allow_all().hides_nothing());
+        assert!(ToolPolicy::default().hides_nothing());
     }
 
     #[test]
     fn bad_policy_files_fail_at_load() {
         let cases = [
             ("unknown key", "[tools.t]\nscope = []"),
-            ("bad unlisted", "unlisted = \"maybe\""),
+            ("unlisted", "unlisted = \"allow\""),
+            ("scopes", "[tools.t]\nscopes = [\"kueue.read\"]"),
+            (
+                "authorize",
+                "[[tools.t.authorize]]\nname = \"r\"\nresource = \"'pods'\"\nverb = \"'get'\"\nmessage = \"m\"",
+            ),
             (
                 "bad cel",
                 "[[tools.t.validate]]\nname = \"r\"\nrule = \"args.(\"\nmessage = \"m\"",
@@ -994,154 +722,23 @@ mod tests {
         assert_eq!(parse_pointer("/~01"), Some(vec!["~1".to_string()]));
     }
 
-    const AUTHZ: &str = r#"
+    const CONDITIONAL: &str = r#"
         [[tools.plan.mutate]]
         path = "/namespace"
         value = "claims.namespace"
         when = "has(claims.namespace)"
-
-        [[tools.plan.authorize]]
-        name = "queue-use"
-        when = "has(claims.kube_user)"
-        group = "'kueue.x-k8s.io'"
-        resource = "'localqueues'"
-        verb = "'use'"
-        namespace = "args.namespace"
-        object = "args.queue"
-        message = "you may not use this queue"
-
-        [[tools.plan.authorize]]
-        name = "kind-create"
-        when = "has(claims.kube_user)"
-        group = "{'Job': 'batch'}[args.kind]"
-        resource = "{'Job': 'jobs'}[args.kind]"
-        verb = "'create'"
-        namespace = "args.namespace"
-        message = "you may not create this"
     "#;
 
     #[test]
-    fn authorize_rules_resolve_into_access_checks_over_the_final_arguments() {
-        let policy = ToolPolicy::from_toml(AUTHZ).unwrap();
-        assert!(policy.authorizes());
-        let person = obj(json!({"sub": "p", "kube_user": "alice"}));
-        let mut args = obj(json!({"namespace": "team-b", "queue": "gpu", "kind": "Job"}));
-        let checks = policy
-            .apply("plan", &mut args, &person, &scopes(&[]))
-            .unwrap();
-        assert_eq!(
-            checks,
-            [
-                AccessCheck {
-                    tool: "plan".into(),
-                    rule: "queue-use".into(),
-                    message: "you may not use this queue".into(),
-                    group: "kueue.x-k8s.io".into(),
-                    resource: "localqueues".into(),
-                    subresource: String::new(),
-                    verb: "use".into(),
-                    namespace: "team-b".into(),
-                    name: "gpu".into(),
-                },
-                AccessCheck {
-                    tool: "plan".into(),
-                    rule: "kind-create".into(),
-                    message: "you may not create this".into(),
-                    group: "batch".into(),
-                    resource: "jobs".into(),
-                    subresource: String::new(),
-                    verb: "create".into(),
-                    namespace: "team-b".into(),
-                    name: String::new(),
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn a_pinned_caller_cannot_steer_the_checked_namespace() {
-        let policy = ToolPolicy::from_toml(AUTHZ).unwrap();
-        let run = obj(json!({"sub": "alice", "kube_user": "alice", "namespace": "team-a"}));
-        let mut args = obj(json!({"namespace": "team-b", "queue": "gpu", "kind": "Job"}));
-        let checks = policy.apply("plan", &mut args, &run, &scopes(&[])).unwrap();
-        assert_eq!(args["namespace"], "team-a");
-        assert!(checks.iter().all(|c| c.namespace == "team-a"));
-    }
-
-    #[test]
-    fn rules_whose_condition_is_false_are_skipped() {
-        let policy = ToolPolicy::from_toml(AUTHZ).unwrap();
-        let tenant = obj(json!({"sub": "tenant:r", "namespace": "team-a"}));
-        let mut args = obj(json!({"queue": "gpu", "kind": "Job"}));
-        assert!(
-            policy
-                .apply("plan", &mut args, &tenant, &scopes(&[]))
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn an_unresolvable_check_refuses_the_call() {
-        let policy = ToolPolicy::from_toml(AUTHZ).unwrap();
-        let person = obj(json!({"sub": "p", "kube_user": "alice"}));
-        let mut unknown_kind = obj(json!({"namespace": "team-b", "queue": "gpu", "kind": "Pod"}));
-        let err = policy
-            .apply("plan", &mut unknown_kind, &person, &scopes(&[]))
-            .unwrap_err();
-        assert!(
-            matches!(&err, Refusal::RuleError { rule, .. } if rule == "kind-create"),
-            "{err}"
-        );
-
-        let empty_verb = r#"
-            [[tools.t.authorize]]
-            name = "r"
-            resource = "'pods'"
-            verb = "''"
-            message = "m"
-        "#;
-        let policy = ToolPolicy::from_toml(empty_verb).unwrap();
-        let err = policy
-            .apply("t", &mut Map::new(), &person, &scopes(&[]))
-            .unwrap_err();
-        assert!(
-            matches!(&err, Refusal::RuleError { error, .. } if error.contains("verb")),
-            "{err}"
-        );
-    }
-
-    #[test]
     fn conditional_mutations_keep_the_clients_value_and_stay_in_the_schema() {
-        let policy = ToolPolicy::from_toml(AUTHZ).unwrap();
+        let policy = ToolPolicy::from_toml(CONDITIONAL).unwrap();
         let person = obj(json!({"sub": "p", "kube_user": "alice"}));
         let mut args = obj(json!({"namespace": "team-b", "queue": "gpu", "kind": "Job"}));
-        policy
-            .apply("plan", &mut args, &person, &scopes(&[]))
-            .unwrap();
+        policy.apply("plan", &mut args, &person).unwrap();
         assert_eq!(args["namespace"], "team-b");
         let mut schema = obj(json!({"type": "object", "properties": {"namespace": {}}}));
         policy.hide_injected("plan", &mut schema);
         assert!(schema["properties"].get("namespace").is_some());
         assert!(policy.hides_nothing());
-    }
-
-    #[test]
-    fn authorize_rule_names_share_the_validate_namespace() {
-        let text = r#"
-            [[tools.t.validate]]
-            name = "r"
-            rule = "true"
-            message = "m"
-            [[tools.t.authorize]]
-            name = "r"
-            resource = "'pods'"
-            verb = "'get'"
-            message = "m"
-        "#;
-        assert!(matches!(
-            ToolPolicy::from_toml(text),
-            Err(PolicyError::DuplicateRule { .. })
-        ));
     }
 }

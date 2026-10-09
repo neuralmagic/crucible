@@ -1,4 +1,4 @@
-//! Kubernetes RBAC as the authority for authorize rules: each [`AccessCheck`] becomes a
+//! Kubernetes RBAC as the authority for access checks: each [`AccessCheck`] becomes a
 //! SubjectAccessReview for the caller's Kubernetes identity, and the API server decides.
 //!
 //! ```text
@@ -11,8 +11,7 @@
 //! That account needs `create` on `subjectaccessreviews` and, for OpenShift groups, `list` on
 //! `groups.user.openshift.io`.
 
-use crate::guard::{AccessReview, ReviewFuture};
-use crate::policy::AccessCheck;
+use crate::access::{AccessCheck, AccessReview, ReviewFuture};
 use crate::principal::Principal;
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,

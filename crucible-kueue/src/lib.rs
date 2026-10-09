@@ -2,6 +2,7 @@
 //! Kueue workloads. It holds the Kubernetes credentials; agents hold only a per-run bearer token
 //! or an access token from the crucible realm.
 
+pub mod access;
 pub mod auth;
 pub mod hardware;
 pub mod kueue;
@@ -13,7 +14,8 @@ pub mod status;
 pub mod task;
 pub mod tenant;
 
-use crucible_mcp_auth::guard::{AccessReview, PolicyGuard};
+use crucible_mcp_auth::access::AccessReview;
+use crucible_mcp_auth::guard::PolicyGuard;
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::server::ResourceServer;
 use rmcp::transport::streamable_http_server::{
@@ -36,11 +38,11 @@ pub struct Options {
     pub registry: Arc<tenant::Registry>,
     /// Accept realm access tokens validated by this resource server.
     pub oidc: Option<Arc<ResourceServer>>,
-    /// Decides every MCP request. A server that takes only tenant tokens may pass
-    /// [`ToolPolicy::allow_all`]: their records already pin them.
+    /// Mutate and validate rules for tool arguments; [`ToolPolicy::default`] has none. Which
+    /// calls exist, their scopes and their access checks are [`access::KueueRules`].
     pub policy: ToolPolicy,
-    /// Reviews the policy's authorize rules (Kubernetes RBAC). People's tokens are accepted only
-    /// with a reviewer and a policy that has authorize rules.
+    /// Reviews access checks (Kubernetes RBAC) for callers carrying a Kubernetes user. People's
+    /// tokens are accepted only with a reviewer.
     pub reviewer: Option<Arc<dyn AccessReview>>,
     /// Host header values to accept besides loopback, e.g. the Service DNS name.
     pub allowed_hosts: Vec<String>,
@@ -48,7 +50,7 @@ pub struct Options {
     pub kueue: kueue::KueueVersion,
 }
 
-/// The HTTP app: the MCP endpoint behind authentication and the tool policy; plus an
+/// The HTTP app: the MCP endpoint behind authentication and the guard; plus an
 /// unauthenticated `/healthz` and, with OIDC on, the RFC 9728 protected-resource metadata.
 pub fn router(client: kube::Client, options: Options) -> axum::Router {
     let Options {
@@ -59,7 +61,7 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
         allowed_hosts,
         kueue,
     } = options;
-    let people = reviewer.is_some() && policy.authorizes();
+    let people = reviewer.is_some();
     let auth = auth::Auth {
         registry,
         oidc: oidc.clone(),
@@ -74,22 +76,15 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
             config.allowed_hosts.push(host.clone());
         }
     }
-    let task_reviewer = reviewer.clone();
     let service: StreamableHttpService<server::KueueMcp, NeverSessionManager> =
         StreamableHttpService::new(
-            move || {
-                Ok(server::KueueMcp::new(
-                    client.clone(),
-                    task_reviewer.clone(),
-                    kueue,
-                ))
-            },
+            move || Ok(server::KueueMcp::new(client.clone(), kueue)),
             Arc::new(NeverSessionManager::default()),
             config,
         );
     let guard = PolicyGuard {
+        rules: Arc::new(access::KueueRules),
         policy,
-        methods: server::METHODS,
         server: oidc.clone(),
         reviewer,
     };

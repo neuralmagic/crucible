@@ -1,15 +1,16 @@
-//! Middleware that applies a [`ToolPolicy`] to MCP traffic. Runs after authentication: it needs
-//! the [`Principal`] in the request extensions and refuses the request without one.
+//! Middleware that decides MCP requests. Runs after authentication: it needs the [`Principal`]
+//! in the request extensions and refuses the request without one.
 //!
-//! Deny by default: a POST passes only as protocol plumbing (`initialize`, `ping`,
-//! `server/discover`, `notifications/*`, a response to the server), `tools/list`, `tools/call`, or
-//! a method the policy lists, whose scopes it then requires. `tools/call` bodies are parsed,
-//! rewritten by the policy, and re-serialized, so rmcp executes exactly the arguments the rules
-//! saw. The access checks a call's authorize rules produce go to the guard's [`AccessReview`];
-//! every one must be allowed. `tools/list` responses (JSON or SSE) have injected parameters
-//! removed from each tool's `inputSchema`.
+//! Deny by default: a POST passes as protocol plumbing (`initialize`, `ping`, `server/discover`,
+//! `notifications/*`, a response to the server), as `tools/list`, or as a tool call or method the
+//! server's [`AccessRules`] serve. For those: the rules' scopes, then (tools only) the
+//! [`ToolPolicy`]'s mutate and validate rules, then the rules' access checks, each of which the
+//! [`AccessReview`] must allow. The request is forwarded as the guard parsed and rewrote it, so the
+//! server executes exactly what was decided on. `tools/list` responses (JSON or SSE) have injected
+//! parameters removed from each tool's `inputSchema`.
 
-use crate::policy::{AccessCheck, Refusal, ToolPolicy};
+use crate::access::{AccessCheck, AccessReview, AccessRules, Call};
+use crate::policy::{Refusal, ToolPolicy};
 use crate::principal::Principal;
 use crate::server::{AuthError, ResourceServer};
 use axum::body::{Body, to_bytes};
@@ -18,9 +19,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http::{Method, StatusCode, header};
-use serde_json::{Value, json};
-use std::future::Future;
-use std::pin::Pin;
+use serde_json::{Map, Value, json};
 use std::sync::Arc;
 
 /// Largest request or `tools/list` response body the guard buffers.
@@ -31,31 +30,14 @@ pub const POLICY_REFUSED: i64 = -32001;
 
 const PROTOCOL_METHODS: [&str; 3] = ["initialize", "ping", "server/discover"];
 
-pub type ReviewFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
->;
-
-/// Decides an [`AccessCheck`] for a principal: `Ok(true)` allows, `Ok(false)` denies, an error
-/// refuses the call too.
-pub trait AccessReview: Send + Sync {
-    fn review<'a>(&'a self, principal: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a>;
-}
-
-/// A JSON-RPC method a server serves beyond `tools/*` and the protocol's own, with the scopes a
-/// call needs.
-#[derive(Debug, Clone, Copy)]
-pub struct MethodScopes {
-    pub method: &'static str,
-    pub scopes: &'static [&'static str],
-}
-
 pub struct PolicyGuard {
+    /// The server's tools and methods, their scopes and access checks.
+    pub rules: Arc<dyn AccessRules>,
+    /// Mutate and validate rules for tool arguments.
     pub policy: ToolPolicy,
-    /// The only other methods that pass; the rest are refused.
-    pub methods: &'static [MethodScopes],
-    /// When set, a missing per-tool scope answers with this server's 403 step-up challenge.
+    /// When set, a missing scope answers with this server's 403 step-up challenge.
     pub server: Option<Arc<ResourceServer>>,
-    /// Reviews authorize rules' checks. A call that needs one without a reviewer is refused.
+    /// Reviews access checks. A call that needs one without a reviewer is refused.
     pub reviewer: Option<Arc<dyn AccessReview>>,
 }
 
@@ -80,19 +62,11 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
             "JSON-RPC batches are not supported",
         );
     }
-    let hide = match message.get("method").and_then(Value::as_str) {
-        Some("tools/call") => {
-            let id = message.get("id").cloned().unwrap_or(Value::Null);
-            let decided = match apply(&guard.policy, &mut message, &principal) {
-                Ok(checks) => review(guard.reviewer.as_deref(), &principal, &checks).await,
-                Err(refusal) => Err(refusal),
-            };
-            if let Err(refusal) = decided {
-                tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "tool call refused");
-                return refuse(&guard, &parts.headers, id, refusal);
-            }
-            false
-        }
+    let method = message
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let hide = match method.as_deref() {
         Some("tools/list") => !guard.policy.hides_nothing(),
         Some(method)
             if PROTOCOL_METHODS.contains(&method) || method.starts_with("notifications/") =>
@@ -101,29 +75,8 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
         }
         Some(method) => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
-            let permitted = match guard.methods.iter().find(|m| m.method == method) {
-                None => Err(Refusal::Method {
-                    method: method.to_string(),
-                }),
-                Some(listed) => {
-                    let missing: Vec<String> = listed
-                        .scopes
-                        .iter()
-                        .filter(|s| !principal.scopes.contains(**s))
-                        .map(|s| s.to_string())
-                        .collect();
-                    if missing.is_empty() {
-                        Ok(())
-                    } else {
-                        Err(Refusal::Scope {
-                            tool: method.to_string(),
-                            missing,
-                        })
-                    }
-                }
-            };
-            if let Err(refusal) = permitted {
-                tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "method refused");
+            if let Err(refusal) = decide(&guard, &mut message, &principal, method).await {
+                tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "request refused");
                 return refuse(&guard, &parts.headers, id, refusal);
             }
             false
@@ -183,11 +136,53 @@ async fn review(
     Ok(())
 }
 
-fn apply(
-    policy: &ToolPolicy,
+/// Scopes, then (for a tool call) the policy's rules, then the access checks.
+async fn decide(
+    guard: &PolicyGuard,
     message: &mut Value,
     principal: &Principal,
-) -> Result<Vec<AccessCheck>, Refusal> {
+    method: &str,
+) -> Result<(), Refusal> {
+    let checks = if method == "tools/call" {
+        let (tool, args) = tool_call(message)?;
+        require(
+            principal,
+            &tool,
+            guard.rules.scopes(&Call::Tool { name: &tool, args })?,
+        )?;
+        guard.policy.apply(&tool, args, &principal.claims)?;
+        guard
+            .rules
+            .checks(&Call::Tool { name: &tool, args }, principal)?
+    } else {
+        let params = message.get("params").unwrap_or(&Value::Null);
+        let call = Call::Method {
+            name: method,
+            params,
+        };
+        require(principal, method, guard.rules.scopes(&call)?)?;
+        guard.rules.checks(&call, principal)?
+    };
+    review(guard.reviewer.as_deref(), principal, &checks).await
+}
+
+fn require(principal: &Principal, call: &str, scopes: &[&str]) -> Result<(), Refusal> {
+    let missing: Vec<String> = scopes
+        .iter()
+        .filter(|s| !principal.scopes.contains(**s))
+        .map(|s| s.to_string())
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Refusal::Scope {
+        tool: call.to_string(),
+        missing,
+    })
+}
+
+/// The tool a `tools/call` names and its arguments, an empty object when absent.
+fn tool_call(message: &mut Value) -> Result<(String, &mut Map<String, Value>), Refusal> {
     let params = message
         .get_mut("params")
         .and_then(Value::as_object_mut)
@@ -199,14 +194,14 @@ fn apply(
         .to_string();
     let arguments = params
         .entry("arguments")
-        .or_insert_with(|| Value::Object(Default::default()));
+        .or_insert_with(|| Value::Object(Map::new()));
     if arguments.is_null() {
-        *arguments = Value::Object(Default::default());
+        *arguments = Value::Object(Map::new());
     }
-    let Some(args) = arguments.as_object_mut() else {
-        return Err(Refusal::Arguments { tool });
-    };
-    policy.apply(&tool, args, &principal.claims, &principal.scopes)
+    match arguments.as_object_mut() {
+        Some(args) => Ok((tool, args)),
+        None => Err(Refusal::Arguments { tool }),
+    }
 }
 
 fn refuse(guard: &PolicyGuard, headers: &http::HeaderMap, id: Value, refusal: Refusal) -> Response {
@@ -332,6 +327,7 @@ fn rewrite_sse(policy: &ToolPolicy, bytes: &Bytes) -> Option<Vec<u8>> {
 
 #[cfg(test)]
 mod tests {
+    use crate::access::ReviewFuture;
     use crate::guard::*;
     use crate::principal::Callers;
     use crate::testing::{self, JwksServer};
@@ -340,8 +336,6 @@ mod tests {
     use tower::ServiceExt;
 
     const POLICY: &str = r#"
-        [tools.workload_plan]
-        scopes = ["kueue.submit"]
         [[tools.workload_plan.mutate]]
         path = "/launched_by"
         value = "claims.sub"
@@ -349,19 +343,94 @@ mod tests {
         name = "queue-allowed"
         rule = "args.queue in claims.queues"
         message = "queue is not in this run's allowlist"
-        [tools.whoami]
     "#;
 
-    const METHODS: &[MethodScopes] = &[
-        MethodScopes {
-            method: "tasks/get",
-            scopes: &["kueue.read"],
-        },
-        MethodScopes {
-            method: "tasks/cancel",
-            scopes: &["kueue.submit"],
-        },
-    ];
+    /// Serves workload_plan (kueue.submit), whoami, tasks/get (kueue.read) and tasks/cancel
+    /// (kueue.submit). A caller with kube_user needs `use` on the planned queue, in the namespace
+    /// the arguments name, and `update` on a cancelled task.
+    struct Rules;
+
+    impl AccessRules for Rules {
+        fn scopes(&self, call: &Call<'_>) -> Result<&'static [&'static str], Refusal> {
+            match call {
+                Call::Tool {
+                    name: "workload_plan",
+                    ..
+                }
+                | Call::Method {
+                    name: "tasks/cancel",
+                    ..
+                } => Ok(&["kueue.submit"]),
+                Call::Tool { name: "whoami", .. } => Ok(&[]),
+                Call::Method {
+                    name: "tasks/get", ..
+                } => Ok(&["kueue.read"]),
+                other => Err(other.unserved()),
+            }
+        }
+
+        fn checks(
+            &self,
+            call: &Call<'_>,
+            principal: &Principal,
+        ) -> Result<Vec<AccessCheck>, Refusal> {
+            if !principal.claims.contains_key("kube_user") {
+                return Ok(Vec::new());
+            }
+            let check = |verb: &str, resource: &str, namespace: &str, name: &str| AccessCheck {
+                tool: call.name().to_string(),
+                rule: format!("{resource}-{verb}"),
+                message: format!("you may not {verb} this"),
+                group: "kueue.x-k8s.io".into(),
+                resource: resource.into(),
+                subresource: String::new(),
+                verb: verb.into(),
+                namespace: namespace.into(),
+                name: name.into(),
+            };
+            let text = |v: &Value, key: &str| v[key].as_str().unwrap_or_default().to_string();
+            Ok(match call {
+                Call::Tool {
+                    name: "workload_plan",
+                    args,
+                } => {
+                    let args = Value::Object((*args).clone());
+                    vec![check(
+                        "use",
+                        "localqueues",
+                        &text(&args, "namespace"),
+                        &text(&args, "queue"),
+                    )]
+                }
+                Call::Method {
+                    name: "tasks/cancel",
+                    params,
+                } => vec![check("update", "workloads", "", &text(params, "taskId"))],
+                _ => Vec::new(),
+            })
+        }
+    }
+
+    /// Allows exactly the checks whose verb is in `verbs`; any other check fails to be made when
+    /// `broken`, and is denied otherwise.
+    struct Verbs {
+        verbs: &'static [&'static str],
+        broken: bool,
+    }
+
+    impl AccessReview for Verbs {
+        fn review<'a>(&'a self, _: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a> {
+            let allowed = self.verbs.contains(&check.verb.as_str());
+            let broken = self.broken;
+            Box::pin(async move {
+                match (allowed, broken) {
+                    (true, _) => Ok(true),
+                    (false, true) => Err("the API server is unreachable".into()),
+                    (false, false) => Ok(false),
+                }
+            })
+        }
+    }
 
     const TOOLS: &str = r#"{"jsonrpc":"2.0","id":2,"result":{"tools":[
         {"name":"workload_plan","inputSchema":{"type":"object","properties":{"queue":{"type":"string"},"launched_by":{"type":"string"}},"required":["queue","launched_by"]}},
@@ -420,8 +489,8 @@ mod tests {
 
     fn guard(server: Option<Arc<ResourceServer>>) -> PolicyGuard {
         PolicyGuard {
+            rules: Arc::new(Rules),
             policy: ToolPolicy::from_toml(POLICY).unwrap(),
-            methods: METHODS,
             server,
             reviewer: None,
         }
@@ -635,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn methods_the_policy_does_not_list_are_refused() {
+    async fn methods_the_server_does_not_serve_are_refused() {
         for method in [
             "resources/read",
             "prompts/get",
@@ -653,7 +722,7 @@ mod tests {
             assert_eq!(body["error"]["code"], POLICY_REFUSED, "{method}: {body}");
             assert_eq!(
                 body["error"]["message"],
-                format!("method {method} is not permitted by policy")
+                format!("method {method} is not permitted")
             );
             assert!(
                 body.get("received").is_none(),
@@ -746,30 +815,132 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn methods_come_from_the_servers_list_whatever_the_policy() {
-        let open = |methods| PolicyGuard {
-            policy: ToolPolicy::allow_all(),
-            methods,
+    async fn tools_come_from_the_servers_rules_whatever_the_policy() {
+        let open = PolicyGuard {
+            rules: Arc::new(Rules),
+            policy: ToolPolicy::default(),
             server: None,
             reviewer: None,
         };
-        let app_with = |methods| app(open(methods), Some(principal("kueue.read")), false);
-        let (_, _, body, _) = post(app_with(&[]), rpc("tasks/get", json!({"taskId": "t"}))).await;
+        let app = app(open, Some(principal("kueue.submit")), false);
+        let (_, _, body, _) = post(app.clone(), call("workload_delete", json!({}))).await;
         assert_eq!(
-            body["error"]["message"], "method tasks/get is not permitted by policy",
+            body["error"]["message"], "tool workload_delete is not permitted",
             "{body}"
         );
+        let (_, _, body, _) = post(app, call("workload_plan", json!({"queue": "q"}))).await;
+        assert_eq!(
+            body["received"]["params"]["arguments"],
+            json!({"queue": "q"}),
+            "no policy, no mutation: {body}"
+        );
+    }
+
+    fn kube_user(scope: &str) -> Principal {
+        let mut claims = testing::run_claims();
+        claims["scope"] = json!(scope);
+        claims["kube_user"] = json!("alice");
+        match claims {
+            Value::Object(m) => Principal::from_claims(m, Callers::Runs).unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
+    fn reviewed(verbs: &'static [&'static str], broken: bool) -> PolicyGuard {
+        PolicyGuard {
+            reviewer: Some(Arc::new(Verbs { verbs, broken })),
+            ..guard(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn every_access_check_must_be_allowed_by_the_reviewer() {
+        let plan = || {
+            call(
+                "workload_plan",
+                json!({"queue": "crucible-e2e", "namespace": "team-a"}),
+            )
+        };
+        let allowed = app(
+            reviewed(&["use"], false),
+            Some(kube_user("kueue.submit")),
+            false,
+        );
+        let (_, _, body, _) = post(allowed, plan()).await;
+        assert_eq!(
+            body["received"]["params"]["name"], "workload_plan",
+            "{body}"
+        );
+
+        let denied = app(reviewed(&[], false), Some(kube_user("kueue.submit")), false);
+        let (_, _, body, _) = post(denied, plan()).await;
+        assert_eq!(
+            body["error"]["message"],
+            "workload_plan refused by access check localqueues-use: you may not use this"
+        );
+
+        let broken = app(reviewed(&[], true), Some(kube_user("kueue.submit")), false);
+        let (_, _, body, _) = post(broken, plan()).await;
+        assert_eq!(
+            body["error"]["message"],
+            "workload_plan refused: access check localqueues-use could not be made: the API server is unreachable"
+        );
+
+        let cancel = app(
+            reviewed(&["use"], false),
+            Some(kube_user("kueue.submit")),
+            false,
+        );
+        let (_, _, body, _) = post(cancel, rpc("tasks/cancel", json!({"taskId": "t"}))).await;
+        assert_eq!(
+            body["error"]["message"],
+            "tasks/cancel refused by access check workloads-update: you may not update this"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_needing_checks_without_a_reviewer_is_refused() {
+        let app = app(guard(None), Some(kube_user("kueue.submit")), false);
         let (_, _, body, _) =
-            post(app_with(METHODS), rpc("tasks/get", json!({"taskId": "t"}))).await;
-        assert_eq!(body["received"]["method"], "tasks/get", "{body}");
-        let (_, _, body, _) = post(
-            app_with(METHODS),
-            rpc("tasks/cancel", json!({"taskId": "t"})),
+            post(app, call("workload_plan", json!({"queue": "crucible-e2e"}))).await;
+        assert_eq!(
+            body["error"]["message"],
+            "workload_plan refused: access check localqueues-use could not be made: this server has no access reviewer"
+        );
+    }
+
+    #[tokio::test]
+    async fn checks_see_the_arguments_after_the_policy_ran() {
+        let policy = r#"
+            [[tools.workload_plan.mutate]]
+            path = "/namespace"
+            value = "claims.namespace"
+        "#;
+        struct Recorder(std::sync::Mutex<Vec<String>>);
+        impl AccessReview for Recorder {
+            fn review<'a>(&'a self, _: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a> {
+                if let Ok(mut seen) = self.0.lock() {
+                    seen.push(check.namespace.clone());
+                }
+                Box::pin(async { Ok(true) })
+            }
+        }
+        let recorder = Arc::new(Recorder(std::sync::Mutex::new(Vec::new())));
+        let pinned = PolicyGuard {
+            rules: Arc::new(Rules),
+            policy: ToolPolicy::from_toml(policy).unwrap(),
+            server: None,
+            reviewer: Some(recorder.clone()),
+        };
+        let app = app(pinned, Some(kube_user("kueue.submit")), false);
+        post(
+            app,
+            call(
+                "workload_plan",
+                json!({"queue": "q", "namespace": "elsewhere"}),
+            ),
         )
         .await;
-        assert_eq!(
-            body["error"]["message"], "tasks/cancel needs scope kueue.submit",
-            "{body}"
-        );
+        assert_eq!(*recorder.0.lock().unwrap(), ["team-e2e"]);
     }
 }

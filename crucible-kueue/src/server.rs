@@ -14,10 +14,7 @@ use crate::status::{self, Rollup};
 use crate::task::{self, Outcome, TaskRef};
 use crate::tenant::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
 use crucible_contract::kueue::TenantRole;
-use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
-use crucible_mcp_auth::guard::{AccessReview, MethodScopes};
-use crucible_mcp_auth::kube::USER_CLAIM;
-use crucible_mcp_auth::policy::AccessCheck;
+use crucible_contract::kueue::SCOPE_SUBMIT;
 use crucible_mcp_auth::principal::Principal;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
@@ -37,24 +34,12 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 pub const FIELD_MANAGER: &str = "crucible-kueue";
 pub const PLAN_HASH_ANNOTATION: &str = "crucible.dev/plan-hash";
 pub const STOPPED_REPLICAS_ANNOTATION: &str = "crucible.dev/stopped-replicas";
 /// The sandbox that presented the run's token when the workload was planned and submitted.
 pub const ACTOR_ANNOTATION: &str = "crucible.dev/actor";
-/// The tasks extension's methods and the scopes each needs. The guard admits no other method.
-pub const METHODS: &[MethodScopes] = &[
-    MethodScopes {
-        method: "tasks/get",
-        scopes: &[SCOPE_READ],
-    },
-    MethodScopes {
-        method: "tasks/cancel",
-        scopes: &[SCOPE_SUBMIT],
-    },
-];
 const MAX_WORKLOADS_SHOWN: usize = 20;
 const MAX_REPLICAS: i64 = 1000;
 const MAX_LOG_PODS: usize = 4;
@@ -179,46 +164,6 @@ fn new_task(namespace: &Namespace, kind: WorkloadKind, name: &str, obj: &Dynamic
 
 fn parse_task(id: &str) -> Result<TaskRef, McpError> {
     TaskRef::parse(id).ok_or_else(|| McpError::invalid_params(format!("unknown task: {id}"), None))
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TaskAccess {
-    Read,
-    Cancel,
-}
-
-impl TaskAccess {
-    fn method(self) -> &'static str {
-        match self {
-            Self::Read => "tasks/get",
-            Self::Cancel => "tasks/cancel",
-        }
-    }
-}
-
-/// The Kubernetes access a task request needs on the task's object: `get` to read it, `update` to
-/// cancel it.
-fn task_check(t: &TaskRef, c: &Caller, access: TaskAccess) -> AccessCheck {
-    let (verb, rule, message) = match access {
-        TaskAccess::Read => ("get", "task-get", "you may not read this workload"),
-        TaskAccess::Cancel => ("update", "task-cancel", "you may not cancel this workload"),
-    };
-    let group = t
-        .kind
-        .api_version()
-        .rsplit_once('/')
-        .map_or("", |(group, _)| group);
-    AccessCheck {
-        tool: access.method().into(),
-        rule: rule.into(),
-        message: message.into(),
-        group: group.into(),
-        resource: t.kind.plural().into(),
-        subresource: String::new(),
-        verb: verb.into(),
-        namespace: c.namespace.to_string(),
-        name: t.name.clone(),
-    }
 }
 
 fn refused(error: impl std::fmt::Display) -> McpError {
@@ -405,9 +350,6 @@ pub struct ListArgs {
 #[derive(Clone)]
 pub struct KueueMcp {
     client: kube::Client,
-    /// Decides task requests from tokens carrying a Kubernetes user, as the tool policy's
-    /// authorize rules decide tool calls.
-    reviewer: Option<Arc<dyn AccessReview>>,
     kueue: KueueVersion,
     tool_router: ToolRouter<Self>,
 }
@@ -461,64 +403,33 @@ fn pod_summary(p: &Pod) -> PodSummary {
 }
 
 impl KueueMcp {
-    pub fn new(
-        client: kube::Client,
-        reviewer: Option<Arc<dyn AccessReview>>,
-        kueue: KueueVersion,
-    ) -> Self {
+    pub fn new(client: kube::Client, kueue: KueueVersion) -> Self {
         Self {
             client,
-            reviewer,
             kueue,
             tool_router: Self::tool_router(),
         }
     }
 
-    /// The caller a task request acts as, once its token, its role and Kubernetes RBAC on the
-    /// task's object allow `access`. Cancelling also needs the submit scope.
-    async fn task_caller(
+    /// The caller a task request acts as, and whether it may submit (and so record what it
+    /// observes). The guard has already checked the method's scope and, for a Kubernetes user,
+    /// RBAC on the task's object; cancelling also needs the submitter role.
+    fn task_caller(
         &self,
         ctx: &RequestContext<RoleServer>,
         t: &TaskRef,
-        access: TaskAccess,
+        cancel: bool,
     ) -> Result<(Caller, bool), McpError> {
         let parts = request_parts(ctx).map_err(refused)?;
-        let identity = identity(parts).map_err(refused)?;
         let principal = principal(parts).map_err(refused)?;
-        let c = identity
+        let c = identity(parts)
+            .map_err(refused)?
             .in_namespace(t.namespace.as_deref())
             .map_err(refused)?;
-        if access == TaskAccess::Cancel && c.role != TenantRole::Submitter {
+        if cancel && c.role != TenantRole::Submitter {
             return Err(refused("tasks/cancel needs the submitter role"));
         }
         let may_submit = c.role == TenantRole::Submitter && principal.scopes.contains(SCOPE_SUBMIT);
-        let reviewed = principal.claims.contains_key(USER_CLAIM);
-        if reviewed || !identity.pinned {
-            let Some(reviewer) = &self.reviewer else {
-                return Err(refused(format!(
-                    "{} needs an access reviewer this server does not have",
-                    access.method()
-                )));
-            };
-            let check = task_check(t, &c, access);
-            match reviewer.review(principal, &check).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    tracing::info!(sub = %principal.subject, rule = %check.rule, namespace = %check.namespace, name = %check.name, "task request denied");
-                    return Err(refused(format!(
-                        "{} refused by {}: {}",
-                        check.tool, check.rule, check.message
-                    )));
-                }
-                Err(error) => {
-                    tracing::warn!(sub = %principal.subject, rule = %check.rule, %error, "access review failed");
-                    return Err(refused(format!(
-                        "{} refused by {}: the access review failed",
-                        check.tool, check.rule
-                    )));
-                }
-            }
-        }
         Ok((c, may_submit))
     }
 
@@ -1512,7 +1423,7 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let t = parse_task(&request.task_id)?;
-        let (c, may_submit) = self.task_caller(&ctx, &t, TaskAccess::Read).await?;
+        let (c, may_submit) = self.task_caller(&ctx, &t, false)?;
         let (t, obj) = self.task_object(&c, &request.task_id).await?;
         let writable = may_submit && owns(&c, &obj);
         let detailed = self
@@ -1528,7 +1439,7 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let t = parse_task(&request.task_id)?;
-        let (c, _) = self.task_caller(&ctx, &t, TaskAccess::Cancel).await?;
+        let (c, _) = self.task_caller(&ctx, &t, true)?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let r = WorkloadRef {
             namespace: t.namespace.clone(),
@@ -1553,7 +1464,10 @@ impl ServerHandler for KueueMcp {
 
 #[cfg(test)]
 mod tests {
+    use crate::access::KueueRules;
     use crate::server::*;
+    use crucible_mcp_auth::access::{AccessRules, Call};
+    use crucible_mcp_auth::principal::Callers;
 
     #[test]
     fn the_server_stamps_the_plan_hash_and_a_runs_actor() {
@@ -1585,56 +1499,6 @@ mod tests {
                 .annotations
                 .unwrap()
                 .contains_key(ACTOR_ANNOTATION)
-        );
-    }
-
-    #[test]
-    fn task_checks_name_the_tasks_object_and_the_verb_its_method_needs() {
-        let caller = Identity::pinned(Caller {
-            run_id: crate::tenant::RunId::parse("r").unwrap(),
-            namespace: Namespace::parse("team-a").unwrap(),
-            role: TenantRole::Submitter,
-            queues: vec![],
-            launched_by: None,
-        })
-        .in_namespace(None)
-        .unwrap();
-        let shown = |c: AccessCheck| {
-            (
-                c.tool,
-                c.rule,
-                c.group,
-                c.resource,
-                c.verb,
-                c.namespace,
-                c.name,
-            )
-        };
-        let job = TaskRef::parse("team-a/Job/train/u1").unwrap();
-        assert_eq!(
-            shown(task_check(&job, &caller, TaskAccess::Read)),
-            (
-                "tasks/get".into(),
-                "task-get".into(),
-                "batch".into(),
-                "jobs".into(),
-                "get".into(),
-                "team-a".into(),
-                "train".into()
-            )
-        );
-        let set = TaskRef::parse("team-a/LeaderWorkerSet/serve/u2").unwrap();
-        assert_eq!(
-            shown(task_check(&set, &caller, TaskAccess::Cancel)),
-            (
-                "tasks/cancel".into(),
-                "task-cancel".into(),
-                "leaderworkerset.x-k8s.io".into(),
-                "leaderworkersets".into(),
-                "update".into(),
-                "team-a".into(),
-                "serve".into()
-            )
         );
     }
 
@@ -1713,16 +1577,20 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_tool_policy_covers_every_tool_and_injects_nothing_into_schemas() {
+    fn every_tool_has_a_scope_and_the_shipped_policy_injects_nothing_into_schemas() {
         let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(include_str!(
             "../deploy/kueue-policy.toml"
         ))
         .unwrap();
         for tool in KueueMcp::tool_router().list_all() {
-            let scopes = policy.scopes(&tool.name).unwrap();
+            let args = sample_args(&tool.name);
+            let call = Call::Tool {
+                name: &tool.name,
+                args: &args,
+            };
             assert_eq!(
-                scopes.len(),
-                1,
+                KueueRules.scopes(&call).map(<[_]>::len),
+                Ok(1),
                 "{} needs exactly one kueue scope",
                 tool.name
             );
@@ -1759,29 +1627,26 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_policy_reviews_every_persons_call_but_whoami() {
-        let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(include_str!(
-            "../deploy/kueue-policy.toml"
-        ))
-        .unwrap();
+    fn every_persons_call_but_whoami_is_checked_in_the_named_namespace() {
         let person = match json!({"sub": "p", "kube_user": "alice", "scope": "kueue.read kueue.submit"})
         {
-            Value::Object(m) => m,
+            Value::Object(m) => Principal::from_claims(m, Callers::People).unwrap(),
             _ => unreachable!(),
         };
-        let scopes = ["kueue.read", "kueue.submit"].map(String::from).into();
         for tool in KueueMcp::tool_router().list_all() {
-            let mut args = sample_args(&tool.name);
-            let checks = policy
-                .apply(&tool.name, &mut args, &person, &scopes)
-                .unwrap();
+            let args = sample_args(&tool.name);
+            let call = Call::Tool {
+                name: &tool.name,
+                args: &args,
+            };
+            let checks = KueueRules.checks(&call, &person).unwrap();
             if tool.name == "whoami" {
                 assert!(checks.is_empty());
                 continue;
             }
             assert!(
                 !checks.is_empty(),
-                "{} is not reviewed for people",
+                "{} is not checked for people",
                 tool.name
             );
             assert!(
@@ -1789,49 +1654,6 @@ mod tests {
                 "{}: {checks:?}",
                 tool.name
             );
-        }
-        let mut plan = sample_args("workload_plan");
-        let checks = policy
-            .apply("workload_plan", &mut plan, &person, &scopes)
-            .unwrap();
-        let summary: Vec<_> = checks
-            .iter()
-            .map(|c| {
-                (
-                    c.verb.as_str(),
-                    c.group.as_str(),
-                    c.resource.as_str(),
-                    c.name.as_str(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            summary,
-            [
-                ("use", "kueue.x-k8s.io", "localqueues", "gpu"),
-                ("create", "batch", "jobs", "")
-            ]
-        );
-    }
-
-    #[test]
-    fn the_shipped_policy_leaves_tenant_tokens_to_their_record() {
-        let policy = crucible_mcp_auth::policy::ToolPolicy::from_toml(include_str!(
-            "../deploy/kueue-policy.toml"
-        ))
-        .unwrap();
-        let tenant = match json!({"sub": "tenant:r", "namespace": "team-b", "queues": [], "scope": "kueue.read kueue.submit"})
-        {
-            Value::Object(m) => m,
-            _ => unreachable!(),
-        };
-        let scopes = ["kueue.read", "kueue.submit"].map(String::from).into();
-        for tool in KueueMcp::tool_router().list_all() {
-            let mut args = sample_args(&tool.name);
-            let checks = policy
-                .apply(&tool.name, &mut args, &tenant, &scopes)
-                .unwrap();
-            assert!(checks.is_empty(), "{}", tool.name);
         }
     }
 

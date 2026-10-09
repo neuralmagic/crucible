@@ -36,8 +36,7 @@ struct Cli {
         env = "CRUCIBLE_KUEUE_RUN_ISSUERS",
         value_delimiter = ',',
         value_parser = TrustedIssuer::runs,
-        requires = "resources",
-        requires = "tool_policy"
+        requires = "resources"
     )]
     run_issuers: Vec<TrustedIssuer>,
     /// Accept people's access tokens from an OAuth issuer (the realm), as `<issuer>=<jwks uri>`.
@@ -64,20 +63,14 @@ struct Cli {
     /// Allow plain-http JWKS URIs on non-loopback hosts. Only for a cluster network you trust.
     #[arg(long, env = "CRUCIBLE_KUEUE_INSECURE_JWKS_HTTP")]
     insecure_jwks_http: bool,
-    /// TOML tool policy: per-method and per-tool scopes, CEL validate and mutate rules, and
-    /// Kubernetes authorize rules. Required with any issuer; without one, tenant tokens' records
-    /// decide alone.
+    /// TOML tool policy: CEL validate and mutate rules over tool arguments. Optional: the scopes
+    /// and Kubernetes access each call needs are the server's own.
     #[arg(long, env = "CRUCIBLE_KUEUE_TOOL_POLICY")]
     tool_policy: Option<PathBuf>,
-    /// Decide the policy's authorize rules with Kubernetes RBAC (SubjectAccessReview), taking the
-    /// caller's groups from OpenShift Group objects or the token's kube_groups claim. Turns on
-    /// people's tokens; needs a policy with authorize rules.
-    #[arg(
-        long,
-        env = "CRUCIBLE_KUEUE_KUBE_AUTHZ",
-        value_enum,
-        requires = "tool_policy"
-    )]
+    /// Decide access checks for callers carrying kube_user with Kubernetes RBAC
+    /// (SubjectAccessReview), taking the caller's groups from OpenShift Group objects or the
+    /// token's kube_groups claim. Turns on people's tokens.
+    #[arg(long, env = "CRUCIBLE_KUEUE_KUBE_AUTHZ", value_enum)]
     kube_authz: Option<KubeAuthz>,
     /// Read a token from stdin, print its SHA-256 digest for the tenants file, and exit.
     #[arg(long, exclusive = true)]
@@ -89,12 +82,6 @@ enum KubeAuthz {
     Openshift,
     Token,
 }
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "--kube-authz needs a tool policy with authorize rules; without them no call would be checked"
-)]
-struct NoAuthorizeRules;
 
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -210,23 +197,17 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(path = %path.display(), "tool policy loaded");
             policy
         }
-        None => {
-            tracing::info!("no tool policy: tenant records decide alone");
-            ToolPolicy::allow_all()
-        }
+        None => ToolPolicy::default(),
     };
-    let reviewer: Option<Arc<dyn crucible_mcp_auth::guard::AccessReview>> = match cli.kube_authz {
+    let reviewer: Option<Arc<dyn crucible_mcp_auth::access::AccessReview>> = match cli.kube_authz {
         Some(source) => {
-            if !policy.authorizes() {
-                return Err(NoAuthorizeRules.into());
-            }
             let groups = match source {
                 KubeAuthz::Openshift => crucible_mcp_auth::kube::GroupSource::OpenShift,
                 KubeAuthz::Token => crucible_mcp_auth::kube::GroupSource::Token,
             };
             tracing::info!(
                 ?groups,
-                "authorize rules decided by SubjectAccessReview; people's tokens accepted"
+                "access checks decided by SubjectAccessReview; people's tokens accepted"
             );
             Some(Arc::new(
                 crucible_mcp_auth::kube::SubjectAccessReviewer::new(client.clone(), groups),
@@ -307,29 +288,15 @@ mod tests {
     }
 
     #[test]
-    fn an_issuer_needs_resources_and_a_policy_and_people_need_kube_authz() {
+    fn an_issuer_needs_resources_and_people_need_kube_authz() {
         let refused = [
-            vec![
-                "--run-issuer",
-                "https://a.example=https://a.example/keys",
-                "--tool-policy",
-                "p.toml",
-            ],
-            vec![
-                "--run-issuer",
-                "https://a.example=https://a.example/keys",
-                "--resource",
-                RESOURCE,
-            ],
+            vec!["--run-issuer", "https://a.example=https://a.example/keys"],
             vec![
                 "--person-issuer",
                 "https://a.example=https://a.example/keys",
                 "--resource",
                 RESOURCE,
-                "--tool-policy",
-                "p.toml",
             ],
-            vec!["--kube-authz", "openshift"],
         ];
         for args in refused {
             assert!(
@@ -338,5 +305,13 @@ mod tests {
                 "{args:?}"
             );
         }
+        Cli::try_parse_from([
+            "crucible-kueue",
+            "--run-issuer",
+            "https://a.example=https://a.example/keys",
+            "--resource",
+            RESOURCE,
+        ])
+        .unwrap();
     }
 }

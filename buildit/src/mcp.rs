@@ -34,7 +34,9 @@ use crate::pod::BuilderPod;
 use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace, is_label_value};
 use crate::step::{self, Fetch, Published, Snapshot, Status};
 use crate::task::{self, Progress, TaskRef};
-use crucible_mcp_auth::guard::{MethodScopes, PolicyGuard};
+use crucible_mcp_auth::access::{AccessCheck, AccessRules, Call};
+use crucible_mcp_auth::guard::PolicyGuard;
+use crucible_mcp_auth::policy::Refusal;
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::principal::{Callers, Principal};
 use crucible_mcp_auth::server::{
@@ -88,8 +90,7 @@ pub struct McpArgs {
         env = "MCP_RUN_ISSUERS",
         value_delimiter = ',',
         value_parser = TrustedIssuer::runs,
-        requires = "resources",
-        requires = "tool_policy"
+        requires = "resources"
     )]
     pub run_issuers: Vec<TrustedIssuer>,
     /// This server's canonical MCP URLs; an access token's aud must name one
@@ -173,7 +174,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
             ToolPolicy::from_toml(&text)
                 .with_context(|| format!("loading tool policy {}", path.display()))?
         }
-        None => ToolPolicy::allow_all(),
+        None => ToolPolicy::default(),
     };
     let broker = Arc::new(Broker {
         client,
@@ -207,8 +208,8 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         .context("serving buildit mcp")
 }
 
-/// The MCP endpoint behind authentication and `policy`. A server that takes only tokens-file
-/// tokens may pass [`ToolPolicy::allow_all`]: the file already names each token's sandbox.
+/// The MCP endpoint behind authentication and the guard: [`BuilditRules`] decide which calls
+/// exist and their scopes, and `policy` adds validate and mutate rules.
 pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -> axum::Router {
     let mut hosts = StreamableHttpServerConfig::default().allowed_hosts;
     hosts.extend(SANDBOX_HOSTS.map(String::from));
@@ -233,7 +234,7 @@ pub fn router(broker: Arc<Broker>, extra_hosts: &[String], policy: ToolPolicy) -
     let oidc = broker.oidc.clone();
     let guard = PolicyGuard {
         policy,
-        methods: METHODS,
+        rules: Arc::new(BuilditRules),
         server: oidc.clone(),
         reviewer: None,
     };
@@ -1316,17 +1317,31 @@ fn caller(ctx: &RequestContext<RoleServer>) -> Result<Caller> {
         .ok_or_else(|| anyhow!("request reached a tool without an authenticated caller"))
 }
 
-/// The tasks extension's methods and the scopes each needs. The guard admits no other method.
-pub const METHODS: &[MethodScopes] = &[
-    MethodScopes {
-        method: "tasks/get",
-        scopes: &[SCOPE_READ],
-    },
-    MethodScopes {
-        method: "tasks/cancel",
-        scopes: &[SCOPE_BUILD],
-    },
-];
+/// Every tool and method buildit serves and the scope each needs; the guard refuses anything
+/// else. Builds run in buildit's own namespace under the sandbox's identity, so there are no
+/// Kubernetes access checks.
+pub struct BuilditRules;
+
+impl AccessRules for BuilditRules {
+    fn scopes(&self, call: &Call<'_>) -> Result<&'static [&'static str], Refusal> {
+        match call {
+            Call::Tool { name, .. } => match *name {
+                "status" | "logs" => Ok(&[SCOPE_READ]),
+                "build" | "run" | "clean" => Ok(&[SCOPE_BUILD]),
+                _ => Err(call.unserved()),
+            },
+            Call::Method { name, .. } => match *name {
+                "tasks/get" => Ok(&[SCOPE_READ]),
+                "tasks/cancel" => Ok(&[SCOPE_BUILD]),
+                _ => Err(call.unserved()),
+            },
+        }
+    }
+
+    fn checks(&self, _: &Call<'_>, _: &Principal) -> Result<Vec<AccessCheck>, Refusal> {
+        Ok(Vec::new())
+    }
+}
 
 fn may_build(ctx: &RequestContext<RoleServer>) -> bool {
     ctx.extensions
@@ -1564,12 +1579,14 @@ mod tests {
     use k8s_openapi::api::core::v1::Pod;
 
     use crate::mcp::{
-        Broker, BuildId, BuildParams, BuilditMcp, Caller, Launcher, LogsParams, MCP_PATH, PodView,
-        ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, StatusCode,
-        TokenLine, ToolPolicy, TrustedIssuer, bud_argv, build_limit, parse_tokens, router, unpack,
+        Broker, BuildId, BuildParams, BuilditMcp, BuilditRules, Caller, Launcher, LogsParams,
+        MCP_PATH, PodView, ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ,
+        StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bud_argv, build_limit, parse_tokens,
+        router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crate::step::{State, Status};
+    use crucible_mcp_auth::access::{AccessRules, Call};
     use crucible_mcp_auth::principal::Callers;
     use crucible_mcp_auth::server::JwksTls;
 
@@ -1619,7 +1636,7 @@ mod tests {
     }
 
     async fn serve(broker: Arc<Broker>) -> (String, tokio::task::JoinHandle<()>) {
-        serve_with(broker, ToolPolicy::allow_all()).await
+        serve_with(broker, ToolPolicy::default()).await
     }
 
     async fn serve_with(
@@ -1923,10 +1940,20 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_policy_covers_every_tool() {
-        let policy = ToolPolicy::from_toml(POLICY).unwrap();
+    fn every_tool_has_a_scope_and_the_shipped_policy_loads() {
+        ToolPolicy::from_toml(POLICY).unwrap();
+        let args = serde_json::Map::new();
         for tool in BuilditMcp::tool_router().list_all() {
-            assert_eq!(policy.scopes(&tool.name).unwrap().len(), 1, "{}", tool.name);
+            let call = Call::Tool {
+                name: &tool.name,
+                args: &args,
+            };
+            assert_eq!(
+                BuilditRules.scopes(&call).map(<[_]>::len),
+                Ok(1),
+                "{}",
+                tool.name
+            );
         }
     }
 
@@ -2076,7 +2103,7 @@ mod tests {
         };
         for policy in [
             ToolPolicy::from_toml(POLICY).unwrap(),
-            ToolPolicy::allow_all(),
+            ToolPolicy::default(),
         ] {
             let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
             let (addr, _task) = serve_with(broker, policy).await;

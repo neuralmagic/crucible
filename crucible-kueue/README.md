@@ -62,14 +62,14 @@ its claims.
 Key sets are fetched over https; `--jwks-ca <pem>` adds CAs for the issuers' hosts, and
 `--insecure-jwks-http` allows plain http off loopback for a cluster network you trust.
 
-Any issuer needs `--tool-policy`: per-tool scopes and CEL rules over the caller's claims and the
-call's arguments. Protocol methods beyond the tools are limited to the tasks extension's, whose
-scopes the server declares (`server::METHODS`). A server with only tenant tokens
-runs without one. With `--kube-authz openshift|token` the policy's authorize rules become
-SubjectAccessReviews for any token carrying `kube_user`, and the server checks `tasks/get` (`get`)
-and `tasks/cancel` (`update`) on the task's workload the same way. Every tool takes an optional
-`namespace`: run and tenant tokens are pinned to theirs, and a person names one per call. Hosts can
-embed the server with `crucible_kueue::router(client, Options { … })`. The shipped policy is
+Every tool and the tasks extension's two methods are declared in
+[src/access.rs](src/access.rs) with the scope each needs and, for a token carrying `kube_user`,
+the SubjectAccessReviews each needs; anything else is refused. `--kube-authz openshift|token`
+decides those reviews and turns on people's tokens; without it a call that needs a review is
+refused. `--tool-policy` optionally adds CEL validate and mutate rules over tool arguments. Every
+tool takes an optional `namespace`: run and tenant tokens are pinned to theirs, and a person names
+one per call. Hosts can embed the server with `crucible_kueue::router(client, Options { … })`. The
+shipped policy is
 [deploy/kueue-policy.toml](deploy/kueue-policy.toml); the auth design and the e2e's configuration
 are in [crucible-mcp-auth](../crucible-mcp-auth/README.md).
 

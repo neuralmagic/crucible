@@ -255,48 +255,47 @@ configured list by `Host` and never copied from it.
 
 Challenges and refusal bodies carry fixed descriptions; why a token failed goes only to the log.
 
-## Tool policy
+## Access rules and the tool policy
 
-A TOML file decides, per tool, which scopes a call needs, which argument paths the server owns, and
-which CEL rules the arguments must pass. It runs before rmcp sees the call; anything other than a
-`true` rule refuses it and names the rule.
+Each server declares in code, by implementing `access::AccessRules`, every tool and method it
+serves: the scopes a call needs and the Kubernetes access checks it needs for a given caller. A
+call it does not describe is refused, so a new tool cannot ship unchecked. A TOML policy, optional,
+adds CEL rules over a tool's arguments: `mutate` sets server-owned argument paths from the caller's
+claims, `validate` refuses arguments outside a bound. The guard runs before rmcp sees the request:
 
 ```mermaid
 flowchart TD
-    req["tools/call body"] --> listed{"tool listed?"}
-    listed -- "no, unlisted = deny" --> deny1["refuse: not permitted"]
-    listed -- yes --> scopes{"token has the tool's scopes?"}
+    req["tools/call or other method"] --> served{"the server's AccessRules<br/>serve it?"}
+    served -- no --> deny1["refuse: not permitted"]
+    served -- yes --> scopes{"token has its scopes?"}
     scopes -- no --> step["403 insufficient_scope<br/>(step-up challenge)"]
-    scopes -- yes --> strip["strip every mutate path<br/>from client arguments"]
+    scopes -- yes --> strip["tools: strip every mutate path<br/>from client arguments"]
     strip --> mutate["mutate: CEL over claims + args<br/>set at JSON Pointer; null leaves absent"]
     mutate -- "evaluation error" --> deny2["refuse, naming the path"]
     mutate --> validate{"every validate rule<br/>returns true?"}
     validate -- "false, error or non-bool" --> deny3["JSON-RPC -32001<br/>naming the rule"]
-    validate -- yes --> reser["re-serialize body"] --> rmcp["rmcp runs the tool<br/>with exactly these arguments"]
+    validate -- yes --> checks["AccessRules checks over the final arguments"]
+    checks --> review{"the reviewer allows<br/>every check?"}
+    review -- "no, or no reviewer" --> deny4["JSON-RPC -32001<br/>naming the check"]
+    review -- yes --> reser["re-serialize body"] --> rmcp["rmcp runs exactly<br/>what was decided on"]
 ```
 
-On `tools/list`, mutate paths are removed from each tool's `inputSchema` (the property and its
-`required` entry), for JSON and SSE responses alike.
+`initialize`, `ping`, `server/discover`, notifications, client responses and `tools/list` always
+pass. On `tools/list`, unconditional mutate paths are removed from each tool's `inputSchema` (the
+property and its `required` entry), for JSON and SSE responses alike.
 
 The CEL engine is the `cel` crate 0.15, one workspace pin shared with the controller's webhook
 transforms. JSON integers reach CEL as `int`, so `args.replicas <= 8` compares like with like. The
-policy loads at startup; a rule that does not compile stops the server.
+policy loads at startup; a rule that does not compile, or a key the format does not know (such as
+the old `scopes`, `authorize` or `unlisted`), stops the server.
 
 From crucible-kueue's shipped policy:
 
 ```toml
-[tools.workload_plan]
-scopes = ["kueue.submit"]
-
-# Plan and submit inject the same value, so the plan hash still matches.
-[[tools.workload_plan.mutate]]
-path = "/manifest/metadata/annotations/crucible.dev~1actor"
-value = "has(claims.act) ? claims.act.sub : null"
-
-[[tools.workload_plan.validate]]
-name = "queue-allowed"
-rule = "!has(claims.queues) || size(claims.queues) == 0 || args.queue in claims.queues"
-message = "the queue is not in this run's allowlist"
+[[tools.workload_scale.validate]]
+name = "replica-cap"
+rule = "args.replicas >= 0 && args.replicas <= 8"
+message = "replicas must be between 0 and 8"
 ```
 
 ## Servers
@@ -312,17 +311,12 @@ credentials get an equivalent `Principal` so one policy covers both.
 | Launcher stamp | label `crucible.dev/launched-by` on workloads, server-owned | same label on builder pods |
 | Actor stamp | annotation `crucible.dev/actor` (the token's presenter), set by the server | none |
 | Tasks extension | `tasks/get` needs RBAC `get` on the workload, `tasks/cancel` `update` plus `kueue.submit` | `tasks/cancel` needs `buildit.build`; a reader's poll never publishes a run's files |
-| Shipped policy | [kueue-policy.toml](../crucible-kueue/deploy/kueue-policy.toml): read and submit scopes, queue allowlist, replica cap | [deploy/buildit-policy.toml](../buildit/deploy/buildit-policy.toml): read and build scopes, build and run timeout caps |
-| Flags | `--run-issuer` and `--person-issuer <issuer>=<jwks uri>` (repeatable), `--resource`, `--tool-policy`, `--jwks-ca`, `--insecure-jwks-http` | `--run-issuer` only (no people), the rest the same; the tokens file becomes optional |
+| Access rules | `crucible-kueue/src/access.rs`: read and submit scopes, a SubjectAccessReview for each tool but `whoami` and for both task methods | `BuilditRules`: read and build scopes, no Kubernetes checks |
+| Shipped policy | [kueue-policy.toml](../crucible-kueue/deploy/kueue-policy.toml): queue allowlist, replica cap | [deploy/buildit-policy.toml](../buildit/deploy/buildit-policy.toml): build and run timeout caps |
+| Flags | `--run-issuer` and `--person-issuer <issuer>=<jwks uri>` (repeatable), `--resource`, `--tool-policy` (optional), `--kube-authz`, `--jwks-ca`, `--insecure-jwks-http` | `--run-issuer` only (no people), the rest the same; the tokens file becomes optional |
 
-With any issuer the policy is required; a server with only its older credential runs with
-`ToolPolicy::allow_all()`. The policy covers tools only. `initialize`, `ping`, `server/discover`,
-notifications and `tools/list` always pass, `tools/call` goes through the tool rules, and any other
-method passes only if the server lists it in `PolicyGuard::methods` (its `MethodScopes`, declared in
-code) and the token has that method's scopes. Both servers list `tasks/get` and `tasks/cancel`.
-
-A unit test in each server fails if a tool is missing from its shipped policy, so a new tool
-cannot ship silently denied.
+A unit test in each server fails if one of its tools has no scope in its access rules, so a new
+tool cannot ship silently refused.
 
 ## People: Claude Code
 
@@ -390,7 +384,7 @@ sequenceDiagram
     participant A as Kubernetes API
     participant K as crucible-kueue
     C->>G: tools/call workload_plan {namespace, queue, manifest}
-    G->>G: scopes, mutate, validate, resolve authorize rules
+    G->>G: scopes, mutate, validate, resolve access checks
     G->>R: checks: use localqueues/gpu, create jobs.batch (in team-b)
     R->>A: SubjectAccessReview as kube_user + groups
     alt every check allowed
@@ -403,20 +397,12 @@ sequenceDiagram
     end
 ```
 
-```toml
-[[tools.workload_plan.authorize]]
-name = "queue-use"
-when = "has(claims.kube_user)"          # people, and runs acting as their launcher
-group = "'kueue.x-k8s.io'"
-resource = "'localqueues'"
-verb = "'use'"
-namespace = "has(args.namespace) ? args.namespace : (has(claims.namespace) ? claims.namespace : '')"
-object = "args.queue"
-message = "you may not submit to this queue"
-```
+For a caller carrying `kube_user` (people, and runs acting as their launcher), crucible-kueue's
+access rules ask, for `workload_plan`: `use` on `kueue.x-k8s.io/localqueues/<queue>` and `create`
+on the manifest's kind, in the call's `namespace` argument or else the token's `namespace` claim.
 
 ```yaml
-# Granting a person or group a queue is ordinary RBAC; `use` is a verb only the policy asks about.
+# Granting a person or group a queue is ordinary RBAC; `use` is a verb only crucible-kueue asks about.
 - apiGroups: [kueue.x-k8s.io]
   resources: [localqueues]
   resourceNames: [crucible-e2e]
@@ -432,7 +418,7 @@ their launcher's username from the controller, so a run can only use queues its 
 
 **Which namespace.** Every crucible-kueue tool takes an optional `namespace`. Runs and tenant tokens
 are pinned to theirs, and naming another is refused. A person names any namespace, with an
-optional default from a claim, and the authorize rules decide. Task ids carry the namespace.
+optional default from a claim, and the access checks decide. Task ids carry the namespace.
 
 **One deployment.** A single crucible-kueue serves all three callers:
 
@@ -442,9 +428,9 @@ optional default from a claim, and the authorize rules decide. Task ids carry th
 | Older run | tenant token | pinned to its record | the record |
 | Person (Claude Code) | Keycloak, `kube_user` | any namespace they name | RBAC as themselves |
 
-People's tokens are accepted only when the server has a reviewer (`--kube-authz openshift|token`)
-and a policy with authorize rules, so a misconfiguration cannot let a person act unchecked. The
-shipped policy checks every tool but `whoami`, and a unit test fails if a new tool goes unchecked.
+People's tokens are accepted only when the server has a reviewer (`--kube-authz openshift|token`),
+and a call that needs checks is refused without one, so a misconfiguration cannot let a person act
+unchecked. Every tool but `whoami` is checked, and a unit test fails if a new tool goes unchecked.
 
 **Embedding.** `crucible_kueue::router(client, Options { registry, oidc, policy, reviewer,
 allowed_hosts })` builds the whole app, so a host such as the controller can mount it next to its
@@ -539,8 +525,9 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
   that CA with `--jwks-ca`; plain http needs `--insecure-jwks-http` off loopback.
 - **Keycloak is a dependency** for human logins, and for agents until the controller endpoint lands.
   Tokens last 5 minutes.
-- **Policy is fail-closed**: unlisted tools, evaluation errors and non-boolean results refuse, and a
-  rule that does not compile stops the server.
+- **Fail-closed**: calls a server's access rules do not serve, checks that cannot be resolved or
+  made, evaluation errors and non-boolean results refuse, and a policy rule that does not compile
+  stops the server.
 - **Server-owned values** (launcher label, injected arguments) are stripped from client input, and a
   JWT never falls back to a static-token lookup.
 
@@ -548,7 +535,7 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
 
 | Suite | What it proves |
 | --- | --- |
-| this crate, unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting, authorize rules and `when`, Kubernetes identity and SubjectAccessReview requests |
+| this crate, unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting, access rules and review (allowed, denied, failed, no reviewer, checks over the final arguments), Kubernetes identity and SubjectAccessReview requests |
 | crucible-kueue, unit tests | claims to identity, pinned and per-call namespaces, person tokens, tenant principals, launched-by label, every tool but `whoami` reviewed for people, namespaced task ids |
 | buildit, 60 unit tests | realm and tokens-file callers, refusals, challenges, launched-by label, a policy refusal over HTTP |
 | `crucible-kueue/tests/oidc_e2e.rs` (cluster) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused, tenant tokens under the same policy; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), a run pinned to its namespace |

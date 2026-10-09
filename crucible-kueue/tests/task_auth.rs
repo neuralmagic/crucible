@@ -142,7 +142,7 @@ async fn cancelling_needs_the_submit_scope_whatever_the_policy_and_the_submitter
     let read_only = run_token(|c| {
         c.insert("scope".into(), json!("kueue.read"));
     });
-    for policy in [shipped_policy(), ToolPolicy::allow_all()] {
+    for policy in [shipped_policy(), ToolPolicy::default()] {
         let url = serve(&jwks, policy).await;
         let client = connect(&url, &read_only).await;
         let refused = cancel(&client, OWN_TASK).await;
