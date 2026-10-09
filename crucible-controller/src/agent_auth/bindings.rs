@@ -147,8 +147,9 @@ impl From<sqlx::Error> for BindError {
 }
 
 /// Bind a sandbox to the run `pod` is executing. Rebinding from the same pod refreshes the name
-/// and workdir, and a name the same pod bound to an earlier sandbox moves to this one; a sandbox
-/// or a name bound by another pod is refused. Returns the run id.
+/// and workdir, and a name the same pod bound to an earlier sandbox moves to this one, as does a
+/// name a finished run's pod held. A sandbox bound by another pod, or a name another running pod
+/// on the same cluster holds, is refused. Returns the run id.
 pub async fn bind(pool: &PgPool, pod: &str, binding: &Binding) -> Result<String, BindError> {
     let sandbox = &binding.id;
     let row = crate::runs::work_pods::get_work_pod(pool, pod)
@@ -168,29 +169,30 @@ pub async fn bind(pool: &PgPool, pod: &str, binding: &Binding) -> Result<String,
             .await?
             .ok_or_else(|| BindError::NoRun(pod.to_string()))?;
     let mut tx = pool.begin().await?;
-    let named: Option<(String, String)> = sqlx::query_as(
-        "SELECT sandbox_id, pod_name FROM run_sandboxes
-          WHERE sandbox_name = $1 AND sandbox_id <> $2
-          FOR UPDATE",
+    let named: Vec<(String, String, bool)> = sqlx::query_as(
+        "SELECT rs.sandbox_id, rs.pod_name, COALESCE(wp.state = 'running', false)
+           FROM run_sandboxes rs
+           LEFT JOIN work_pods wp ON wp.pod_name = rs.pod_name
+          WHERE rs.sandbox_name = $1 AND rs.sandbox_id <> $2
+            AND (wp.cluster IS NULL OR wp.cluster = $3)
+          FOR UPDATE OF rs",
     )
     .bind(&binding.name)
     .bind(sandbox.as_str())
-    .fetch_optional(&mut *tx)
+    .bind(&row.cluster)
+    .fetch_all(&mut *tx)
     .await?;
-    match named {
-        Some((_, holder)) if holder != pod => {
+    for (other, holder, live) in named {
+        if live && holder != pod {
             return Err(BindError::NameTaken {
                 name: binding.name.clone(),
                 holder,
             });
         }
-        Some((stale, _)) => {
-            sqlx::query("DELETE FROM run_sandboxes WHERE sandbox_id = $1")
-                .bind(stale)
-                .execute(&mut *tx)
-                .await?;
-        }
-        None => {}
+        sqlx::query("DELETE FROM run_sandboxes WHERE sandbox_id = $1")
+            .bind(other)
+            .execute(&mut *tx)
+            .await?;
     }
     let bound: Option<String> = sqlx::query_scalar(
         "INSERT INTO run_sandboxes (sandbox_id, sandbox_name, workdir, run_id, pod_name, bound_at)
@@ -581,6 +583,53 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+
+        set_pod_state(&pool, "crucible-run-a", WorkPodState::Collected).await;
+        bind(&pool, "crucible-run-b", &named("other", "ci-ws"))
+            .await
+            .expect("a finished run's name is free again");
+        assert_eq!(
+            resolve(&pool, &sandbox("other")).await.unwrap().run_id,
+            "run-b"
+        );
+
+        crate::runs::work_pods::insert_work_pod(
+            &pool,
+            &crate::runs::workpod::NewWorkPod {
+                pod_name: "crucible-run-c".into(),
+                kind: "run".into(),
+                issue_key: None,
+                state: WorkPodState::Running,
+                cost_tag: "run".into(),
+                cluster: "elsewhere".into(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::runs::store::insert_run(
+            &pool,
+            &crate::NewRun {
+                run_id: "run-c".into(),
+                scope: None,
+                issue: None,
+                identity_digest: None,
+                status: "running".into(),
+                pod: Some("crucible-run-c".into()),
+                session_uri: None,
+                best_score: None,
+                cost_usd: None,
+            },
+        )
+        .await
+        .unwrap();
+        bind(&pool, "crucible-run-c", &named("there", "ci-ws"))
+            .await
+            .expect("the same name on another cluster is another sandbox");
+        assert_eq!(
+            resolve(&pool, &sandbox("other")).await.unwrap().run_id,
+            "run-b",
+            "and run-b keeps its own"
+        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
