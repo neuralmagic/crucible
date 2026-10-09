@@ -377,10 +377,9 @@ pub enum ClusterUser {
 /// The username `approved` acts as on its cluster, by the rule the deploy profile declares for it.
 /// A cluster the profile does not list is `link`.
 pub async fn kube_user(auth: &AgentAuth, approved: &Approved) -> anyhow::Result<ClusterUser> {
-    let profile = cluster_identity::load_profile(auth.deploy_profile.as_deref()).await?;
-    let rule = profile
-        .as_ref()
-        .and_then(|p| p.cluster_identity(&approved.cluster))
+    let rule = auth
+        .profile
+        .cluster_identity(&approved.cluster)
         .cloned()
         .unwrap_or_default();
     let resolved =
@@ -1469,7 +1468,6 @@ mod tests {
     struct Harness {
         auth: Arc<AgentAuth>,
         app: axum::Router,
-        _profile: tempfile::TempDir,
     }
 
     async fn test_login(session: Session) -> StatusCode {
@@ -1502,7 +1500,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
 "#,
             testing::PROFILE
         );
-        let (base, dir) = testing::agent_auth(pool, &spire, &profile, &[]);
+        let (base, _) = testing::agent_auth(pool, &spire, &profile, &[]);
         let Ok(mut auth) = Arc::try_unwrap(base) else {
             panic!("the harness holds the only reference");
         };
@@ -1519,11 +1517,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             .merge(crate::agent_auth::router(auth.clone()))
             .route("/test/login", axum::routing::get(test_login))
             .layer(crate::identity::session::layer(store, false));
-        Harness {
-            auth,
-            app,
-            _profile: dir,
-        }
+        Harness { auth, app }
     }
 
     struct Reply {
