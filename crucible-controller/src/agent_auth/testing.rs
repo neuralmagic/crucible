@@ -309,6 +309,7 @@ pub fn agent_auth(
         pool: pool.clone(),
         profile,
         directory: directory.clone(),
+        people: None,
     };
     (std::sync::Arc::new(state), directory)
 }

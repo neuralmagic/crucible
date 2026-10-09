@@ -18,6 +18,7 @@
 pub mod bindings;
 pub mod directory;
 pub mod issuer;
+pub mod people;
 pub mod placement;
 pub mod spire;
 #[cfg(test)]
@@ -41,6 +42,8 @@ pub struct AgentAuth {
     /// namespace, read once at startup.
     pub profile: crucible::deploy::DeployProfile,
     pub directory: Arc<dyn directory::SandboxDirectory>,
+    /// The authorization code grant for people, when `CONTROLLER_PEOPLE_AUDIENCES` is set.
+    pub people: Option<people::People>,
 }
 
 impl AgentAuth {
@@ -60,6 +63,16 @@ impl AgentAuth {
         let profile = crucible::deploy::DeployProfile::load(profile_path)
             .context("reading the deploy profile for the agent issuer")?;
         placement::check_key_placement(placement::controller_namespace().as_deref(), &profile)?;
+        let people = people::PeopleConfig::from_env()?.map(|config| {
+            tracing::info!(
+                audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
+                "issuing access tokens to people"
+            );
+            people::People::new(
+                config,
+                Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
+            )
+        });
         tracing::info!(
             issuer = cfg.issuer.as_str(),
             kid = cfg.signing_key.kid(),
@@ -78,6 +91,7 @@ impl AgentAuth {
             pool,
             profile,
             directory: Arc::new(directory::KubeDirectory(clusters)),
+            people,
         })))
     }
 }
@@ -175,14 +189,19 @@ impl IntoResponse for OAuthError {
                 "the token could not be issued",
             ),
         };
-        no_store(
-            (
-                status,
-                Json(serde_json::json!({"error": code, "error_description": description})),
-            )
-                .into_response(),
-        )
+        oauth_error(status, code, description)
     }
+}
+
+/// An RFC 6749 §5.2 error body, never cached.
+pub(crate) fn oauth_error(status: StatusCode, code: &str, description: &str) -> Response {
+    no_store(
+        (
+            status,
+            Json(serde_json::json!({"error": code, "error_description": description})),
+        )
+            .into_response(),
+    )
 }
 
 impl From<GrantError> for OAuthError {
@@ -208,9 +227,39 @@ fn no_store(mut response: Response) -> Response {
 
 async fn token(
     State(state): State<Arc<AgentAuth>>,
-    form: Result<axum::Form<TokenRequest>, FormRejection>,
+    form: Result<axum::Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
-    match issue(&state, form).await {
+    let fields = match form
+        .map_err(|e| e.body_text())
+        .and_then(|axum::Form(pairs)| people::single_valued(pairs))
+    {
+        Ok(fields) => fields,
+        Err(why) => {
+            tracing::info!(reason = why, "token request refused");
+            return OAuthError::InvalidRequest(why).into_response();
+        }
+    };
+    let grant_type = fields.get("grant_type").and_then(serde_json::Value::as_str);
+    let people_grant = match (grant_type, state.people.as_ref()) {
+        (Some("authorization_code"), Some(p)) => Some((p, true)),
+        (Some("refresh_token"), Some(p)) => Some((p, false)),
+        _ => None,
+    };
+    if let Some((people, code)) = people_grant {
+        let now = crate::clock::unix_secs();
+        let result = match code {
+            true => people::redeem_code(&state, people, fields, now).await,
+            false => people::redeem_refresh(&state, people, fields, now).await,
+        };
+        return match result {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::info!(reason = error.detail(), "person token refused");
+                error.into_response()
+            }
+        };
+    }
+    match issue(&state, fields).await {
         Ok(response) => response,
         Err(error) => {
             tracing::info!(reason = error.detail(), "agent token refused");
@@ -221,9 +270,10 @@ async fn token(
 
 async fn issue(
     state: &AgentAuth,
-    form: Result<axum::Form<TokenRequest>, FormRejection>,
+    fields: serde_json::Map<String, serde_json::Value>,
 ) -> Result<Response, OAuthError> {
-    let axum::Form(req) = form.map_err(|e| OAuthError::InvalidRequest(e.body_text()))?;
+    let req: TokenRequest = serde_json::from_value(serde_json::Value::Object(fields))
+        .map_err(|e| OAuthError::InvalidRequest(e.to_string()))?;
     let profile = &state.profile;
     placement::sandbox_namespace(Some(profile))
         .map_err(|e| OAuthError::UnauthorizedClient(e.to_string()))?;
@@ -332,7 +382,12 @@ async fn jwks(State(state): State<Arc<AgentAuth>>) -> Response {
 }
 
 async fn metadata(State(state): State<Arc<AgentAuth>>) -> Response {
-    Json(state.issuer.metadata()).into_response()
+    Json(
+        state
+            .issuer
+            .metadata(state.people.as_ref().map(|p| &p.config)),
+    )
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1006,7 +1061,7 @@ mod tests {
         );
         assert_eq!(
             get(issuer::METADATA_PATH).await,
-            serde_json::to_value(h.state.issuer.metadata()).unwrap()
+            serde_json::to_value(h.state.issuer.metadata(None)).unwrap()
         );
     }
 }

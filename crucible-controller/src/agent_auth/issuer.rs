@@ -561,13 +561,26 @@ pub enum MintError {
 #[derive(Debug, Serialize, PartialEq)]
 pub struct AuthorizationServerMetadata {
     pub issuer: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authorization_endpoint: Option<String>,
     pub token_endpoint: String,
     pub jwks_uri: String,
     pub grant_types_supported: Vec<&'static str>,
     pub response_types_supported: Vec<&'static str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub code_challenge_methods_supported: Vec<&'static str>,
     pub token_endpoint_auth_methods_supported: Vec<&'static str>,
     pub token_endpoint_auth_signing_alg_values_supported: Vec<Algorithm>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub authorization_response_iss_parameter_supported: bool,
     pub scopes_supported: Vec<String>,
+}
+
+/// A fresh random `jti`.
+pub fn token_id() -> Result<String, MintError> {
+    let mut jti = [0u8; JTI_BYTES];
+    aws_lc_rs::rand::fill(&mut jti).map_err(|_| MintError::Random)?;
+    Ok(crucible_contract::artifact::lower_hex(&jti))
 }
 
 pub struct AgentIssuer {
@@ -689,10 +702,16 @@ impl AgentIssuer {
             })
     }
 
+    /// Sign `claims` with the issuer's key.
+    pub fn sign(&self, claims: &Value) -> Result<String, MintError> {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(self.key.kid.clone());
+        Ok(jsonwebtoken::encode(&header, claims, &self.key.key)?)
+    }
+
     /// Sign `grant` as an access token issued at `now` (Unix seconds).
     pub fn mint(&self, grant: &AgentGrant, now: u64) -> Result<Minted, MintError> {
-        let mut jti = [0u8; JTI_BYTES];
-        aws_lc_rs::rand::fill(&mut jti).map_err(|_| MintError::Random)?;
+        let jti = token_id()?;
         let scope = grant.scopes.join(" ");
         let mut claims = json!({
             "iss": self.issuer.as_str(),
@@ -720,9 +739,7 @@ impl AgentIssuer {
                 map.insert("namespace".into(), json!(namespace));
             }
         }
-        let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some(self.key.kid.clone());
-        let access_token = jsonwebtoken::encode(&header, &claims, &self.key.key)?;
+        let access_token = self.sign(&claims)?;
         Ok(Minted {
             access_token,
             expires_in: self.ttl.secs(),
@@ -740,25 +757,53 @@ impl AgentIssuer {
         }
     }
 
-    pub fn metadata(&self) -> AuthorizationServerMetadata {
-        AuthorizationServerMetadata {
+    /// The metadata document; `people` adds the authorization code grant for people's clients.
+    pub fn metadata(
+        &self,
+        people: Option<&crate::agent_auth::people::PeopleConfig>,
+    ) -> AuthorizationServerMetadata {
+        let mut scopes_supported = Vec::new();
+        let people_scopes = people
+            .into_iter()
+            .flat_map(|p| p.audiences.iter().flat_map(|a| a.scopes.iter()));
+        for scope in self
+            .audiences
+            .iter()
+            .flat_map(|a| a.scopes.iter())
+            .chain(people_scopes)
+        {
+            if !scopes_supported.contains(scope) {
+                scopes_supported.push(scope.clone());
+            }
+        }
+        let mut metadata = AuthorizationServerMetadata {
             issuer: self.issuer.as_str().to_string(),
+            authorization_endpoint: None,
             token_endpoint: self.issuer.endpoint(TOKEN_PATH),
             jwks_uri: self.issuer.endpoint(JWKS_PATH),
             grant_types_supported: vec!["client_credentials"],
             response_types_supported: Vec::new(),
+            code_challenge_methods_supported: Vec::new(),
             token_endpoint_auth_methods_supported: vec!["private_key_jwt"],
             token_endpoint_auth_signing_alg_values_supported:
                 crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec(),
-            scopes_supported: self.audiences.iter().fold(Vec::new(), |mut all, a| {
-                for scope in &a.scopes {
-                    if !all.contains(scope) {
-                        all.push(scope.clone());
-                    }
-                }
-                all
-            }),
+            authorization_response_iss_parameter_supported: false,
+            scopes_supported,
+        };
+        if people.is_some() {
+            metadata.authorization_endpoint = Some(
+                self.issuer
+                    .endpoint(crate::agent_auth::people::AUTHORIZE_PATH),
+            );
+            metadata
+                .grant_types_supported
+                .extend(["authorization_code", "refresh_token"]);
+            metadata.response_types_supported.push("code");
+            metadata.code_challenge_methods_supported.push("S256");
+            metadata.token_endpoint_auth_methods_supported.push("none");
+            metadata.authorization_response_iss_parameter_supported = true;
         }
+        metadata
     }
 }
 
@@ -1283,7 +1328,7 @@ mod tests {
     async fn the_metadata_points_at_the_issuers_own_endpoints() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
-        let doc = serde_json::to_value(issuer.metadata()).unwrap();
+        let doc = serde_json::to_value(issuer.metadata(None)).unwrap();
         assert_eq!(doc["issuer"], ISSUER);
         assert_eq!(doc["token_endpoint"], format!("{ISSUER}/oauth/token"));
         assert_eq!(doc["jwks_uri"], format!("{ISSUER}/.well-known/jwks.json"));

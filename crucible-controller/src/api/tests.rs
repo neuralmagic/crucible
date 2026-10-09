@@ -3460,6 +3460,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/keys",
         "/api/keys/{id}",
         "/api/me/kube-user",
+        "/api/me/kube-users",
+        "/api/me/kube-users/{cluster}",
         "/api/users/{login}/kube-user",
         "/api/version",
         "/api/images",
@@ -5735,6 +5737,7 @@ async fn app_with_sessions(db: Db, pool: PgPool) -> Router {
                 credential_keys: None,
                 proxy_prefix: "/oauth2".to_string(),
             },
+            issuer: None,
         },
         crate::spa::Source::Embedded,
     )

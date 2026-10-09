@@ -97,6 +97,8 @@ use std::sync::Arc;
 pub(crate) struct HumanAuth {
     pub(crate) guard: Arc<identity::auth::BearerGuard>,
     pub(crate) routes: identity::oidc::routes::AuthState,
+    /// The issuer whose `/oauth/authorize` rides the browser session, when it serves people.
+    pub(crate) issuer: Option<Arc<agent_auth::AgentAuth>>,
 }
 
 /// The human surface: API + SPA behind the auth guard, the `/auth/*` login routes beside it, and
@@ -119,13 +121,18 @@ pub(crate) fn human_router(
         guard: auth.guard,
         pool: state.db.pool().clone(),
     };
-    api::router(state)
+    let router = api::router(state)
         .merge(spa::router(ui))
         .layer(axum::middleware::from_fn_with_state(
             both,
             identity::auth::require_auth_or_api_key,
         ))
-        .merge(identity::oidc::routes::router(auth.routes))
+        .merge(identity::oidc::routes::router(auth.routes));
+    let router = match auth.issuer.filter(|i| i.people.is_some()) {
+        Some(issuer) => router.merge(agent_auth::people::router(issuer)),
+        None => router,
+    };
+    router
         .layer(link)
         .layer(identity::session::layer(store, secure_cookies))
 }
@@ -246,6 +253,7 @@ impl Surface {
                     proxy_prefix: std::env::var("CONTROLLER_PROXY_PREFIX")
                         .unwrap_or_else(|_| "/oauth2".to_string()),
                 },
+                issuer: agent_auth.clone(),
             },
             spa::Source::from_env(),
         );
