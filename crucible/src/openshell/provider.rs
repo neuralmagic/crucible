@@ -349,6 +349,55 @@ pub fn kueue_profile() -> openshell_core::proto::ProviderProfile {
     )
 }
 
+/// The custom profile id backing [`KUEUE_PROVIDER_NAME`] under a token grant.
+pub const KUEUE_GRANT_PROFILE_ID: &str = "crucible-kueue-grant";
+
+/// The token-grant `crucible-kueue` profile: one dynamic credential the supervisor obtains from the
+/// controller's `token_endpoint` with a JWT-SVID for `svid_audience`, requesting a token whose
+/// audience is the server's `url`, and injects as a bearer header on traffic to `host:port` alone.
+/// It holds no secret and gives the sandbox no placeholder.
+pub fn kueue_token_grant_profile(
+    host: &str,
+    port: u16,
+    url: &str,
+    token_endpoint: &str,
+    svid_audience: &str,
+) -> openshell_core::proto::ProviderProfile {
+    use openshell_core::proto::{
+        NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
+        ProviderProfileCredential,
+    };
+    ProviderProfile {
+        id: KUEUE_GRANT_PROFILE_ID.to_string(),
+        display_name: "Crucible Kueue (agent token)".to_string(),
+        description: "crucible-kueue access with controller-issued agent tokens".to_string(),
+        category: ProviderProfileCategory::Agent as i32,
+        credentials: vec![ProviderProfileCredential {
+            name: "token".to_string(),
+            description: "Agent access token for crucible-kueue".to_string(),
+            auth_style: "bearer".to_string(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: token_endpoint.to_string(),
+                audience: url.to_string(),
+                jwt_svid_audience: svid_audience.to_string(),
+                scopes: vec![
+                    crucible_contract::kueue::SCOPE_READ.to_string(),
+                    crucible_contract::kueue::SCOPE_SUBMIT.to_string(),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        endpoints: vec![NetworkEndpoint {
+            host: host.to_string(),
+            port: u32::from(port),
+            protocol: "mcp".to_string(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
 fn bearer_profile(
     id: &str,
     display_name: &str,

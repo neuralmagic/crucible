@@ -14,6 +14,13 @@ pub struct SandboxBinding {
     pub workdir: Option<String>,
 }
 
+/// The controller's agent token endpoint, which sandbox supervisors exchange their JWT-SVIDs at
+/// for tokens to the run's MCP servers.
+pub const ENV_AGENT_TOKEN_ENDPOINT: &str = "CRUCIBLE_AGENT_TOKEN_ENDPOINT";
+
+/// The audience supervisors request their JWT-SVIDs for: the controller's issuer identifier.
+pub const ENV_AGENT_SVID_AUDIENCE: &str = "CRUCIBLE_AGENT_SVID_AUDIENCE";
+
 /// The bind endpoint for `pod`, relative to the controller's ingest base URL.
 pub fn binding_path(pod: &str) -> String {
     format!("/api/pods/{pod}/sandboxes")

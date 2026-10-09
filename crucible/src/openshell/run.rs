@@ -397,7 +397,13 @@ async fn try_turn(
     let kueue = crate::openshell::kueue::KueueAccess::from_env()
         .context("reading the run's crucible-kueue grant")?;
     if let Some(k) = &kueue {
-        ensure_static_provider(&gw, &StaticProvider::kueue(), k.token()).await?;
+        match (k.credential(), k.token_grant_profile()) {
+            (crate::openshell::kueue::KueueCredential::Static(token), _) => {
+                ensure_static_provider(&gw, &StaticProvider::kueue(), token).await?;
+            }
+            (_, Some(profile)) => ensure_token_grant_provider(&gw, profile).await?,
+            (_, None) => {}
+        }
     }
 
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
@@ -602,7 +608,7 @@ async fn try_turn(
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
-            credential_bindings.push(k.credential_binding());
+            credential_bindings.extend(k.credential_binding());
         }
         if auth == AuthProvider::Vertex {
             credential_bindings.extend(policy::VERTEX_CREDENTIAL_HOSTS.iter().map(|host| {
@@ -688,11 +694,11 @@ async fn try_turn(
         } else {
             args.broker_token.clone()
         };
-        let kueue_placeholder = match &kueue {
-            Some(_) => {
+        let kueue_placeholder = match kueue.as_ref().map(|k| k.credential()) {
+            Some(crate::openshell::kueue::KueueCredential::Static(_)) => {
                 Some(issued_placeholder(&gw, &name, provider::KUEUE_CRED_KEY, &cancel).await?)
             }
-            None => None,
+            _ => None,
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -1018,6 +1024,25 @@ async fn ensure_static_provider(gw: &Gateway, p: &StaticProvider, token: &str) -
             .await
             .with_context(|| format!("creating the {} provider", p.name))
     }
+}
+
+/// Import the token-grant `crucible-kueue` profile and create its provider, which holds no secret:
+/// the supervisor obtains each token itself. A provider already registered under the name on this
+/// gateway is left as it is.
+async fn ensure_token_grant_provider(
+    gw: &Gateway,
+    profile: openshell_core::proto::ProviderProfile,
+) -> Result<()> {
+    let profile_id = profile.id.clone();
+    gw.ensure_provider_profile(profile)
+        .await
+        .context("importing the crucible-kueue token-grant profile")?;
+    if !gw.provider_exists(provider::KUEUE_PROVIDER_NAME).await {
+        gw.create_minted_provider(provider::KUEUE_PROVIDER_NAME, &profile_id)
+            .await
+            .context("creating the crucible-kueue token-grant provider")?;
+    }
+    Ok(())
 }
 
 /// Idempotent AWS provider setup: import the `aws-s3` profile, create the provider if absent,
