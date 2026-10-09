@@ -685,12 +685,11 @@ async fn try_turn(
         //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
         //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
         //     a fresh token naming this sandbox and its workdir.
-        let seed_token = match (broker_provider, broker_placeholder(kueue.is_some())) {
-            (true, BrokerPlaceholder::Issued) => {
-                Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
-            }
-            (true, BrokerPlaceholder::Canonical) => Some(provider::broker_token_placeholder()),
-            (false, _) => args.broker_token.clone(),
+        let seed_token = if broker_provider {
+            let issued = issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await;
+            Some(broker_seed(issued))
+        } else {
+            args.broker_token.clone()
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -956,10 +955,8 @@ async fn issued_placeholder(
     let command = vec!["printenv".to_string(), key.to_string()];
     let mut issued: Option<String> = None;
     gw.exec(sandbox, &command, cancel, |line| {
-        let value = line.trim();
-        if issued.is_none() && value.starts_with(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC)
-        {
-            issued = Some(value.to_string());
+        if issued.is_none() {
+            issued = placeholder_in(line);
         }
     })
     .await
@@ -984,21 +981,21 @@ fn binds_sandboxes(
         .and(ingest)
 }
 
-/// How the sandbox's `.mcp.json` names the broker token.
-#[derive(Debug, PartialEq, Eq)]
-enum BrokerPlaceholder {
-    /// [`provider::broker_token_placeholder`].
-    Canonical,
-    /// The placeholder the gateway issued the workload, read from the sandbox.
-    Issued,
+/// A line of `printenv` output that is a gateway-issued placeholder.
+fn placeholder_in(line: &str) -> Option<String> {
+    let value = line.trim();
+    value
+        .starts_with(openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC)
+        .then(|| value.to_string())
 }
 
-/// The issued placeholder only alongside a token grant; otherwise the canonical one.
-fn broker_placeholder(token_grant: bool) -> BrokerPlaceholder {
-    match token_grant {
-        true => BrokerPlaceholder::Issued,
-        false => BrokerPlaceholder::Canonical,
-    }
+/// The broker token `.mcp.json` carries: the placeholder the gateway issued the sandbox, or
+/// [`provider::broker_token_placeholder`] when it cannot be read.
+fn broker_seed(issued: Result<String>) -> String {
+    issued.unwrap_or_else(|e| {
+        tracing::warn!(error = %format!("{e:#}"), "using the canonical broker placeholder");
+        provider::broker_token_placeholder()
+    })
 }
 
 /// An endpointless static-credential provider: its profile, its provider name, and the credential
@@ -1808,17 +1805,41 @@ mod tests {
     }
 
     #[test]
-    fn the_broker_placeholder_reads_the_sandbox_only_alongside_a_token_grant() {
-        use crate::openshell::run::{BrokerPlaceholder, broker_placeholder};
-        assert_eq!(broker_placeholder(false), BrokerPlaceholder::Canonical);
-        assert_eq!(broker_placeholder(true), BrokerPlaceholder::Issued);
+    fn the_broker_seed_is_the_issued_placeholder_or_else_the_canonical_one() {
+        use crate::openshell::run::broker_seed;
+        let prefix = openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC;
+        let canonical = crate::openshell::provider::broker_token_placeholder();
+        assert_eq!(canonical, format!("{prefix}BROKER_TOKEN"));
+        let issued = format!("{prefix}BROKER_TOKEN__rev:42");
+        assert_eq!(broker_seed(Ok(issued.clone())), issued);
         assert_eq!(
-            crate::openshell::provider::broker_token_placeholder(),
-            format!(
-                "{}BROKER_TOKEN",
-                openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC
-            )
+            broker_seed(Err(
+                std::io::Error::from(std::io::ErrorKind::NotFound).into()
+            )),
+            canonical,
+            "a sandbox without printenv"
         );
+        let missing = IssuedPlaceholderError::Missing {
+            key: "BROKER_TOKEN",
+            sandbox: "ci-1".into(),
+        };
+        assert_eq!(
+            broker_seed(Err(missing.into())),
+            canonical,
+            "a gateway that issued no placeholder"
+        );
+    }
+
+    #[test]
+    fn only_a_prefixed_line_is_an_issued_placeholder() {
+        use crate::openshell::run::placeholder_in;
+        let prefix = openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC;
+        assert_eq!(
+            placeholder_in(&format!("  {prefix}BROKER_TOKEN__rev:7\n")),
+            Some(format!("{prefix}BROKER_TOKEN__rev:7"))
+        );
+        assert_eq!(placeholder_in(""), None);
+        assert_eq!(placeholder_in("plain-token-value"), None);
     }
 
     use super::*;
