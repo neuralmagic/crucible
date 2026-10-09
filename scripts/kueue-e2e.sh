@@ -14,8 +14,8 @@
 #   - the agent's whoami reported the same run and kube_user;
 #   - no kueue token rode the loop pod's env, its Secrets, or any log.
 #
-# The launch is made with the caller's own cluster token, so the controller learns the launcher's
-# Kubernetes user from it. crucible-system's crucible-kueue Deployment and ClusterRole are saved
+# The launch is made with the caller's own cluster token, and the launcher's Kubernetes user is
+# seeded in the controller's ledger as a sign-in would record it. crucible-system's crucible-kueue Deployment and ClusterRole are saved
 # first and restored on exit.
 #
 # Needs kubectl, jq, openssl, cargo, and on the cluster: Kueue, OpenShift's Zero Trust Workload
@@ -43,7 +43,6 @@ SANDBOX_NS=crucible-sandboxes
 WORKLOAD_NS=crucible-kueue-e2e
 SPIRE_NS=zero-trust-workload-identity-manager
 SPIRE_DISCOVERY=spire-spiffe-oidc-discovery-provider:443
-PORT=${PORT:-8890}
 JOB=kueue-e2e-hello
 TIMEOUT_SECS=${TIMEOUT_SECS:-1800}
 
@@ -65,6 +64,7 @@ cleanup() {
     [ -f "$WORK/rendered.yaml" ] && yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")' \
         "$WORK/rendered.yaml" | kc delete --ignore-not-found -f - >/dev/null 2>&1 || true
     kc -n "$SPIRE_NS" delete role,rolebinding crucible-kueue-e2e-spire-keys --ignore-not-found >/dev/null || true
+    kc delete clusterrolebinding crucible-kueue-e2e-auth-delegator --ignore-not-found >/dev/null || true
     kc delete namespace "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" --ignore-not-found --wait=false >/dev/null || true
     if [ -s "$WORK/kueue-saved.yaml" ]; then
         kc replace -f "$WORK/kueue-saved.yaml" >/dev/null && log "restored crucible-system's crucible-kueue"
@@ -181,9 +181,15 @@ kc -n "$CTL_NS" rollout status deploy/postgres --timeout=300s >/dev/null
 kc -n "$CTL_NS" rollout status deploy/crucible-controller --timeout=600s >/dev/null \
     || fail "the controller never became ready: $(kc -n "$CTL_NS" logs deploy/crucible-controller --tail=20)"
 
-kubectl --context "$CONTEXT" -n "$CTL_NS" port-forward svc/crucible-controller "$PORT:8080" \
+kubectl --context "$CONTEXT" -n "$CTL_NS" port-forward svc/crucible-controller :8080 \
     > "$WORK/forward.log" 2>&1 &
 FORWARD_PID=$!
+for _ in $(seq 30); do
+    PORT=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) .*/\1/p' "$WORK/forward.log" | head -1)
+    [ -n "$PORT" ] && break
+    sleep 1
+done
+[ -n "$PORT" ] || fail "the port-forward to the controller never listened: $(cat "$WORK/forward.log")"
 printf 'url = "http://127.0.0.1:%s"\n' "$PORT" > "$WORK/crux.toml"
 crux() { env -u CONTROLLER_URL CONTROLLER_API_TOKEN="$TOKEN" "$BIN/crux" "$@" --config "$WORK/crux.toml"; }
 for _ in $(seq 30); do
@@ -191,6 +197,11 @@ for _ in $(seq 30); do
     sleep 2
 done
 crux whoami | grep -q "$LAUNCHER" || fail "the controller does not see the launch as $LAUNCHER: $(crux whoami)"
+NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+kc -n "$CTL_NS" exec deploy/postgres -- psql -q -U crucible -d crucible -v ON_ERROR_STOP=1 -c \
+    "INSERT INTO users (sub, login, last_login, created_at, updated_at, kube_user)
+     VALUES ('e2e:$LAUNCHER', '$LAUNCHER', '$NOW', '$NOW', '$NOW', '$LAUNCHER')
+     ON CONFLICT (login) DO UPDATE SET kube_user = EXCLUDED.kube_user" >/dev/null
 
 log "launching e2e/kueue/pack"
 crux draft-create kueue-e2e --description "crucible-kueue e2e" >/dev/null

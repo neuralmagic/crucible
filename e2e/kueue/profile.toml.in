@@ -13,6 +13,8 @@ supervisor_image        = "@SUPERVISOR_IMAGE@"
 sandbox_driver          = "kubernetes"
 # The images are linux/amd64; the script lists every node of another architecture here.
 avoid_nodes             = [@AVOID_NODES@]
+# The drop-box each run binds its sandboxes through; the controller issues tokens only to bound ones.
+ingest_url              = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
 
 [image]
 loop        = "@LOOP_IMAGE@"
