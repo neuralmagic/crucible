@@ -227,6 +227,7 @@ fn no_store(mut response: Response) -> Response {
 
 async fn token(
     State(state): State<Arc<AgentAuth>>,
+    headers: axum::http::HeaderMap,
     form: Result<axum::Form<Vec<(String, String)>>, FormRejection>,
 ) -> Response {
     let fields = match form
@@ -262,7 +263,11 @@ async fn token(
     match issue(&state, fields).await {
         Ok(response) => response,
         Err(error) => {
-            tracing::info!(reason = error.detail(), "agent token refused");
+            let user_agent = headers
+                .get(header::USER_AGENT)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            tracing::info!(reason = error.detail(), user_agent, "agent token refused");
             error.into_response()
         }
     }
