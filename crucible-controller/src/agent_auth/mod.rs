@@ -308,6 +308,7 @@ async fn issue(
         .map_err(|e| OAuthError::Server(e.to_string()))?;
     tracing::info!(
         sandbox = %grant.sandbox.id,
+        spiffe_id = grant.sandbox.spiffe_id,
         run_id = grant.run.run_id,
         sub = grant.launcher,
         kube_user = grant.kube_user.as_deref(),
