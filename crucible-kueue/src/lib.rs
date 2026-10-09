@@ -44,6 +44,8 @@ pub struct Options {
     pub reviewer: Option<Arc<dyn AccessReview>>,
     /// Host header values to accept besides loopback, e.g. the Service DNS name.
     pub allowed_hosts: Vec<String>,
+    /// The Kueue API version the cluster serves; see [`kueue::KueueVersion::discover`].
+    pub kueue: kueue::KueueVersion,
 }
 
 /// The HTTP app: the MCP endpoint behind authentication and the tool policy; plus an
@@ -55,6 +57,7 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
         policy,
         reviewer,
         allowed_hosts,
+        kueue,
     } = options;
     let people = reviewer.is_some() && policy.authorizes();
     let auth = auth::Auth {
@@ -74,7 +77,13 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
     let task_reviewer = reviewer.clone();
     let service: StreamableHttpService<server::KueueMcp, NeverSessionManager> =
         StreamableHttpService::new(
-            move || Ok(server::KueueMcp::new(client.clone(), task_reviewer.clone())),
+            move || {
+                Ok(server::KueueMcp::new(
+                    client.clone(),
+                    task_reviewer.clone(),
+                    kueue,
+                ))
+            },
             Arc::new(NeverSessionManager::default()),
             config,
         );

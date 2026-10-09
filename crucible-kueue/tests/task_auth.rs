@@ -59,6 +59,7 @@ async fn serve(jwks: &JwksServer, policy: ToolPolicy) -> String {
             oidc: Some(Arc::new(server)),
             policy,
             reviewer: None,
+            kueue: crucible_kueue::kueue::KueueVersion::default(),
             allowed_hosts: Vec::new(),
         },
     );

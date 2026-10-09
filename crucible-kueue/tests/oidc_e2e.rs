@@ -317,6 +317,9 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
         kube.clone(),
         GroupSource::OpenShift,
     ));
+    let kueue_version = crucible_kueue::kueue::KueueVersion::discover(&kube)
+        .await
+        .unwrap();
     let app = crucible_kueue::router(
         kube,
         crucible_kueue::Options {
@@ -324,6 +327,7 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
             oidc: Some(Arc::new(server)),
             policy,
             reviewer: Some(reviewer),
+            kueue: kueue_version,
             allowed_hosts: Vec::new(),
         },
     );

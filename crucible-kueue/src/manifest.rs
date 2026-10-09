@@ -256,7 +256,7 @@ pub fn normalize(
     }
 
     let mut root = Value::Object(obj);
-    check_kind_escapes(kind, &root)?;
+    check_object_fields(kind, &root)?;
     let mut pod_sets = Vec::new();
     for slot in template_slots(kind, &root)? {
         let template = root
@@ -290,6 +290,9 @@ pub fn normalize(
         });
     }
 
+    if matches!(kind, WorkloadKind::Deployment | WorkloadKind::StatefulSet) {
+        pin_selector(&mut root, &name, caller.run_id.as_str())?;
+    }
     let object = root;
     let plan_hash = plan_hash(&object);
     Ok(Normalized {
@@ -536,7 +539,6 @@ const CONTAINER_SECURITY_FIELDS: &[&str] = &[
 const VOLUME_SOURCES: &[&str] = &[
     "emptyDir",
     "configMap",
-    "persistentVolumeClaim",
     "downwardAPI",
     "ephemeral",
     "projected",
@@ -624,41 +626,214 @@ fn check_reserved(
     Ok(())
 }
 
-/// Object-level fields outside the pod templates that would escape admission.
-fn check_kind_escapes(kind: WorkloadKind, root: &Value) -> Result<(), ManifestError> {
-    if kind != WorkloadKind::RayJob {
+const TOP_FIELDS: &[&str] = &["apiVersion", "kind", "metadata", "spec"];
+const JOB_SPEC: &[&str] = &[
+    "template",
+    "parallelism",
+    "completions",
+    "completionMode",
+    "backoffLimit",
+    "backoffLimitPerIndex",
+    "maxFailedIndexes",
+    "activeDeadlineSeconds",
+    "ttlSecondsAfterFinished",
+    "podFailurePolicy",
+    "successPolicy",
+    "podReplacementPolicy",
+    "suspend",
+];
+const DEPLOYMENT_SPEC: &[&str] = &[
+    "replicas",
+    "selector",
+    "template",
+    "strategy",
+    "minReadySeconds",
+    "revisionHistoryLimit",
+    "progressDeadlineSeconds",
+    "paused",
+];
+const STATEFULSET_SPEC: &[&str] = &[
+    "replicas",
+    "selector",
+    "template",
+    "serviceName",
+    "podManagementPolicy",
+    "updateStrategy",
+    "revisionHistoryLimit",
+    "minReadySeconds",
+    "persistentVolumeClaimRetentionPolicy",
+    "ordinals",
+    "volumeClaimTemplates",
+];
+const LWS_SPEC: &[&str] = &[
+    "replicas",
+    "leaderWorkerTemplate",
+    "rolloutStrategy",
+    "startupPolicy",
+    "networkConfig",
+];
+const LWS_TEMPLATE: &[&str] = &[
+    "size",
+    "leaderTemplate",
+    "workerTemplate",
+    "restartPolicy",
+    "subGroupPolicy",
+    "volumeClaimTemplates",
+];
+const RAYJOB_SPEC: &[&str] = &[
+    "entrypoint",
+    "entrypointNumCpus",
+    "entrypointNumGpus",
+    "entrypointResources",
+    "runtimeEnvYAML",
+    "jobId",
+    "shutdownAfterJobFinishes",
+    "ttlSecondsAfterFinished",
+    "activeDeadlineSeconds",
+    "backoffLimit",
+    "rayClusterSpec",
+    "submitterPodTemplate",
+    "submitterConfig",
+    "submissionMode",
+    "suspend",
+    "deletionStrategy",
+];
+const RAYCLUSTER_SPEC: &[&str] = &[
+    "rayVersion",
+    "headGroupSpec",
+    "workerGroupSpecs",
+    "enableInTreeAutoscaling",
+    "suspend",
+];
+const RAY_HEAD: &[&str] = &["template", "rayStartParams", "serviceType"];
+const RAY_WORKER: &[&str] = &[
+    "groupName",
+    "replicas",
+    "minReplicas",
+    "maxReplicas",
+    "numOfHosts",
+    "rayStartParams",
+    "template",
+    "scaleStrategy",
+    "idleTimeoutSeconds",
+    "suspend",
+];
+const PVC_TEMPLATE: &[&str] = &["metadata", "spec"];
+const PVC_SPEC: &[&str] = &["accessModes", "resources", "volumeMode"];
+
+/// Object-level fields outside the pod templates. Each kind's spec is allowlisted, so fields that
+/// hand the object to another controller (`managedBy`, `clusterSelector`), adopt foreign pods,
+/// or provision storage from another claim or class never reach the cluster.
+fn check_object_fields(kind: WorkloadKind, root: &Value) -> Result<(), ManifestError> {
+    let top = object_at(root, "")?;
+    only_fields(top, TOP_FIELDS, "")?;
+    let Some(spec) = top.get("spec") else {
         return Ok(());
-    }
-    for (ptr, what) in [
-        (
-            "/spec/clusterSelector",
-            "attaching to an existing RayCluster",
-        ),
-        (
-            "/spec/rayClusterSpec/autoscalerOptions",
-            "autoscaler options (an unchecked sidecar)",
-        ),
-    ] {
-        if root.pointer(ptr).is_some_and(|v| !v.is_null()) {
-            return Err(forbidden(ptr.to_string(), what));
+    };
+    let spec = object_at(spec, "/spec")?;
+    match kind {
+        WorkloadKind::Job => only_fields(spec, JOB_SPEC, "/spec"),
+        WorkloadKind::Deployment => only_fields(spec, DEPLOYMENT_SPEC, "/spec"),
+        WorkloadKind::StatefulSet => {
+            only_fields(spec, STATEFULSET_SPEC, "/spec")?;
+            check_claim_templates(spec, "/spec")
         }
+        WorkloadKind::LeaderWorkerSet => {
+            only_fields(spec, LWS_SPEC, "/spec")?;
+            if let Some(t) = spec.get("leaderWorkerTemplate") {
+                let path = "/spec/leaderWorkerTemplate";
+                let t = object_at(t, path)?;
+                only_fields(t, LWS_TEMPLATE, path)?;
+                check_claim_templates(t, path)?;
+            }
+            Ok(())
+        }
+        WorkloadKind::RayJob => check_rayjob(spec),
     }
-    if root.pointer("/spec/rayClusterSpec/enableInTreeAutoscaling") == Some(&Value::Bool(true)) {
+}
+
+fn check_rayjob(spec: &Map<String, Value>) -> Result<(), ManifestError> {
+    only_fields(spec, RAYJOB_SPEC, "/spec")?;
+    let Some(cluster) = spec.get("rayClusterSpec") else {
+        return Ok(());
+    };
+    let path = "/spec/rayClusterSpec";
+    let cluster = object_at(cluster, path)?;
+    only_fields(cluster, RAYCLUSTER_SPEC, path)?;
+    if cluster.get("enableInTreeAutoscaling") == Some(&Value::Bool(true)) {
         return Err(forbidden(
-            "/spec/rayClusterSpec/enableInTreeAutoscaling".into(),
+            format!("{path}/enableInTreeAutoscaling"),
             "the in-tree autoscaler sidecar",
         ));
     }
-    match root
-        .pointer("/spec/rayClusterSpec/headGroupSpec/serviceType")
-        .and_then(Value::as_str)
-    {
-        None | Some("ClusterIP") => Ok(()),
-        Some(_) => Err(forbidden(
-            "/spec/rayClusterSpec/headGroupSpec/serviceType".into(),
-            "exposing the head outside the cluster",
-        )),
+    if let Some(head) = cluster.get("headGroupSpec") {
+        let h_path = format!("{path}/headGroupSpec");
+        let head = object_at(head, &h_path)?;
+        only_fields(head, RAY_HEAD, &h_path)?;
+        if let Some(service) = head.get("serviceType").and_then(Value::as_str)
+            && service != "ClusterIP"
+        {
+            return Err(forbidden(
+                format!("{h_path}/serviceType"),
+                "exposing the head outside the cluster",
+            ));
+        }
     }
+    if let Some(groups) = cluster.get("workerGroupSpecs") {
+        let g_path = format!("{path}/workerGroupSpecs");
+        for (i, g) in array_of(groups, &g_path)?.iter().enumerate() {
+            let w_path = format!("{g_path}/{i}");
+            only_fields(object_at(g, &w_path)?, RAY_WORKER, &w_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_claim_templates(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestError> {
+    let Some(templates) = spec.get("volumeClaimTemplates") else {
+        return Ok(());
+    };
+    let t_path = format!("{path}/volumeClaimTemplates");
+    for (i, t) in array_of(templates, &t_path)?.iter().enumerate() {
+        check_claim_template(t, &format!("{t_path}/{i}"))?;
+    }
+    Ok(())
+}
+
+/// A claim the workload provisions: default storage class only, empty, never cloned from or
+/// bound to an existing volume.
+fn check_claim_template(t: &Value, path: &str) -> Result<(), ManifestError> {
+    let t = object_at(t, path)?;
+    only_fields(t, PVC_TEMPLATE, path)?;
+    if let Some(meta) = t.get("metadata") {
+        check_reserved(
+            object_at(meta, &format!("{path}/metadata"))?,
+            &format!("{path}/metadata"),
+            &[],
+        )?;
+    }
+    if let Some(spec) = t.get("spec") {
+        let s_path = format!("{path}/spec");
+        only_fields(object_at(spec, &s_path)?, PVC_SPEC, &s_path)?;
+    }
+    Ok(())
+}
+
+/// Pins a Deployment or StatefulSet selector to the server-set template labels, so its
+/// controller can only adopt pods this object created.
+fn pin_selector(root: &mut Value, name: &str, run: &str) -> Result<(), ManifestError> {
+    let Some(spec) = root.get_mut("spec").and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    let selector = object_entry(spec, "selector", "/spec/selector")?;
+    only_fields(
+        selector,
+        &["matchLabels", "matchExpressions"],
+        "/spec/selector",
+    )?;
+    let labels = object_entry(selector, "matchLabels", "/spec/selector/matchLabels")?;
+    set_label(labels, WORKLOAD_LABEL, name)?;
+    set_label(labels, RUN_LABEL, run)
 }
 
 fn check_pod_spec(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestError> {
@@ -715,6 +890,14 @@ fn check_volume(vol: &Value, path: &str) -> Result<(), ManifestError> {
             path: path.to_string(),
             expected: "a name and exactly one volume source",
         });
+    }
+    if let Some(ephemeral) = vol.get("ephemeral") {
+        let e_path = format!("{path}/ephemeral");
+        let ephemeral = object_at(ephemeral, &e_path)?;
+        only_fields(ephemeral, &["volumeClaimTemplate"], &e_path)?;
+        if let Some(template) = ephemeral.get("volumeClaimTemplate") {
+            check_claim_template(template, &format!("{e_path}/volumeClaimTemplate"))?;
+        }
     }
     if let Some(projected) = vol.get("projected") {
         let p_path = format!("{path}/projected");
@@ -1577,5 +1760,131 @@ mod tests {
             json!({"spec": {"containers": [{"name": "s"}], "hostNetwork": true}});
         refused_with(m, "hostNetwork");
         assert!(normalize(ray(), &caller(), &queue()).is_ok());
+    }
+
+    fn statefulset() -> Value {
+        json!({
+            "apiVersion": "apps/v1",
+            "kind": "StatefulSet",
+            "metadata": {"name": "db"},
+            "spec": {
+                "selector": {"matchLabels": {"app": "db"}},
+                "template": {"metadata": {"labels": {"app": "db"}}, "spec": {"containers": [{"name": "d"}]}},
+                "volumeClaimTemplates": [{
+                    "metadata": {"name": "data"},
+                    "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
+                }]
+            }
+        })
+    }
+
+    #[test]
+    fn object_fields_outside_each_kinds_allowlist_are_refused() {
+        let mut m = job();
+        m["spec"]["managedBy"] = json!("kueue.x-k8s.io/multikueue");
+        refused_with(m, "managedBy");
+        let mut m = job();
+        m["spec"]["manualSelector"] = json!(true);
+        refused_with(m, "manualSelector");
+        let mut m = job();
+        m["extra"] = json!({});
+        refused_with(m, "/extra");
+        for (needle, field, value) in [
+            ("storageClassName", "storageClassName", json!("fast-local")),
+            (
+                "dataSource",
+                "dataSource",
+                json!({"kind": "PersistentVolumeClaim", "name": "victim"}),
+            ),
+            (
+                "dataSourceRef",
+                "dataSourceRef",
+                json!({"kind": "PersistentVolumeClaim", "name": "victim"}),
+            ),
+            ("volumeName", "volumeName", json!("pv-victim")),
+            ("selector", "selector", json!({"matchLabels": {"app": "x"}})),
+        ] {
+            let mut m = statefulset();
+            m["spec"]["volumeClaimTemplates"][0]["spec"][field] = value;
+            refused_with(m, needle);
+        }
+        let mut m = statefulset();
+        m["spec"]["volumeClaimTemplates"][0]["metadata"]["labels"] =
+            json!({"crucible.dev/run-id": "other"});
+        refused_with(m, "crucible.dev/run-id");
+        let lws = json!({
+            "apiVersion": "leaderworkerset.x-k8s.io/v1",
+            "kind": "LeaderWorkerSet",
+            "metadata": {"name": "l"},
+            "spec": {"leaderWorkerTemplate": {
+                "workerTemplate": {"spec": {"containers": [{"name": "w"}]}},
+                "volumeClaimTemplates": [{"metadata": {"name": "c"}, "spec": {"dataSource": {"kind": "VolumeSnapshot", "name": "s"}}}]
+            }}
+        });
+        refused_with(lws, "dataSource");
+        let ray = |patch: Value| {
+            let mut m = json!({
+                "apiVersion": "ray.io/v1",
+                "kind": "RayJob",
+                "metadata": {"name": "r"},
+                "spec": {"rayClusterSpec": {"headGroupSpec": {"template": {"spec": {"containers": [{"name": "h"}]}}}}}
+            });
+            for (ptr, v) in patch.as_object().unwrap() {
+                let (parent, field) = ptr.rsplit_once('/').unwrap();
+                m.pointer_mut(parent).unwrap()[field] = v.clone();
+            }
+            m
+        };
+        refused_with(ray(json!({"/spec/managedBy": "x"})), "managedBy");
+        refused_with(
+            ray(
+                json!({"/spec/rayClusterSpec/headGroupSpec/headService": {"spec": {"type": "NodePort"}}}),
+            ),
+            "headService",
+        );
+        refused_with(
+            ray(json!({"/spec/rayClusterSpec/headGroupSpec/enableIngress": true})),
+            "enableIngress",
+        );
+        refused_with(
+            ray(json!({"/spec/rayClusterSpec/gcsFaultToleranceOptions": {"redisAddress": "r"}})),
+            "gcsFaultToleranceOptions",
+        );
+    }
+
+    #[test]
+    fn pod_volumes_cannot_mount_or_clone_existing_claims() {
+        let mut m = job();
+        m["spec"]["template"]["spec"]["volumes"] =
+            json!([{"name": "v", "persistentVolumeClaim": {"claimName": "another-runs-data"}}]);
+        refused_with(m, "persistentVolumeClaim");
+        let mut m = job();
+        m["spec"]["template"]["spec"]["volumes"] = json!([{"name": "v", "ephemeral": {"volumeClaimTemplate": {
+            "spec": {"accessModes": ["ReadWriteOnce"], "storageClassName": "x", "resources": {"requests": {"storage": "1Gi"}}}
+        }}}]);
+        refused_with(m, "storageClassName");
+        let mut m = job();
+        m["spec"]["template"]["spec"]["volumes"] = json!([{"name": "v", "ephemeral": {"volumeClaimTemplate": {
+            "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
+        }}}]);
+        assert!(normalize(m, &caller(), &queue()).is_ok());
+    }
+
+    #[test]
+    fn deployment_and_statefulset_selectors_are_pinned_to_the_server_labels() {
+        let n = normalize(statefulset(), &caller(), &queue()).unwrap();
+        let sel = n.object.pointer("/spec/selector/matchLabels").unwrap();
+        assert_eq!(sel["app"], "db");
+        assert_eq!(sel["crucible.dev/workload"], "db");
+        assert_eq!(sel["crucible.dev/run-id"], "run-7");
+        let mut m = statefulset();
+        m["spec"]["selector"]["matchLabels"]["crucible.dev/run-id"] = json!("another-run");
+        assert!(matches!(
+            normalize(m, &caller(), &queue()),
+            Err(ManifestError::LabelConflict { .. })
+        ));
+        let mut m = statefulset();
+        m["spec"]["selector"]["matchFields"] = json!([]);
+        refused_with(m, "matchFields");
     }
 }

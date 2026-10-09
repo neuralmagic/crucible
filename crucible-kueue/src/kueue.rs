@@ -1,5 +1,5 @@
-//! Read models for the `kueue.x-k8s.io/v1beta2` objects the tools report on, and the quota-fit
-//! estimate. Only the fields the tools use are modeled; unknown fields are ignored so a newer
+//! Read models for the `kueue.x-k8s.io` objects the tools report on, at `v1beta2` or `v1beta1`
+//! (whichever the cluster serves), and the quota-fit estimate. Only the fields the tools use are modeled; unknown fields are ignored so a newer
 //! Kueue does not break deserialization.
 
 use kube::api::{Api, DynamicObject, ListParams};
@@ -11,7 +11,77 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 
 pub const GROUP: &str = "kueue.x-k8s.io";
-pub const VERSION: &str = "v1beta2";
+
+/// The Kueue API version a cluster serves. Kueue 0.15 introduced `v1beta2`; older releases serve
+/// only `v1beta1`, whose read models differ in field names the models alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KueueVersion {
+    V1beta1,
+    #[default]
+    V1beta2,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApiGroup {
+    versions: Vec<GroupVersion>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupVersion {
+    version: String,
+}
+
+impl KueueVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::V1beta1 => "v1beta1",
+            Self::V1beta2 => "v1beta2",
+        }
+    }
+
+    /// The newest version this server understands among those the cluster serves.
+    pub fn pick(served: &[String]) -> Option<Self> {
+        [Self::V1beta2, Self::V1beta1]
+            .into_iter()
+            .find(|v| served.iter().any(|s| s == v.as_str()))
+    }
+
+    pub async fn discover(client: &kube::Client) -> Result<Self, KubeError> {
+        let what = format!("API group {GROUP}");
+        let req = http::Request::get(format!("/apis/{GROUP}"))
+            .body(Vec::new())
+            .map_err(|e| KubeError::api("get", what.clone(), kube::Error::HttpError(e)))?;
+        let group: ApiGroup = client
+            .request(req)
+            .await
+            .map_err(|source| KubeError::api("get", what, source))?;
+        let served: Vec<String> = group.versions.into_iter().map(|v| v.version).collect();
+        Self::pick(&served).ok_or(KubeError::UnsupportedVersion { served })
+    }
+
+    pub fn resource(self, kind: &str, plural: &str) -> ApiResource {
+        ApiResource {
+            group: GROUP.into(),
+            version: self.as_str().into(),
+            api_version: format!("{GROUP}/{}", self.as_str()),
+            kind: kind.into(),
+            plural: plural.into(),
+        }
+    }
+
+    pub fn local_queues(self) -> ApiResource {
+        self.resource("LocalQueue", "localqueues")
+    }
+    pub fn cluster_queues(self) -> ApiResource {
+        self.resource("ClusterQueue", "clusterqueues")
+    }
+    pub fn resource_flavors(self) -> ApiResource {
+        self.resource("ResourceFlavor", "resourceflavors")
+    }
+    pub fn workloads(self) -> ApiResource {
+        self.resource("Workload", "workloads")
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum KubeError {
@@ -22,6 +92,8 @@ pub enum KubeError {
         #[source]
         source: Box<kube::Error>,
     },
+    #[error("the cluster serves {GROUP} {served:?}; this server understands v1beta2 and v1beta1")]
+    UnsupportedVersion { served: Vec<String> },
     #[error("decoding {what}: {source}")]
     Decode {
         what: String,
@@ -42,29 +114,6 @@ impl KubeError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Api { source, .. } if matches!(source.as_ref(), kube::Error::Api(s) if s.code == 404))
     }
-}
-
-pub fn resource(kind: &str, plural: &str) -> ApiResource {
-    ApiResource {
-        group: GROUP.into(),
-        version: VERSION.into(),
-        api_version: format!("{GROUP}/{VERSION}"),
-        kind: kind.into(),
-        plural: plural.into(),
-    }
-}
-
-pub fn local_queues() -> ApiResource {
-    resource("LocalQueue", "localqueues")
-}
-pub fn cluster_queues() -> ApiResource {
-    resource("ClusterQueue", "clusterqueues")
-}
-pub fn resource_flavors() -> ApiResource {
-    resource("ResourceFlavor", "resourceflavors")
-}
-pub fn workloads() -> ApiResource {
-    resource("Workload", "workloads")
 }
 
 fn decode<T: DeserializeOwned>(obj: DynamicObject, what: &str) -> Result<T, KubeError> {
@@ -186,6 +235,7 @@ pub struct ClusterQueue {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ClusterQueueSpec {
+    #[serde(alias = "cohort")]
     pub cohort_name: Option<String>,
     pub queueing_strategy: Option<String>,
     pub stop_policy: Option<String>,
@@ -306,12 +356,14 @@ struct PendingWorkloadsSummary {
 /// Queue order from Kueue's visibility API for one LocalQueue.
 pub async fn pending_in_local_queue(
     client: &kube::Client,
+    version: KueueVersion,
     namespace: &str,
     queue: &str,
     limit: u32,
 ) -> Result<Vec<PendingWorkload>, KubeError> {
     let path = format!(
-        "/apis/visibility.{GROUP}/{VERSION}/namespaces/{namespace}/localqueues/{queue}/pendingworkloads?limit={limit}"
+        "/apis/visibility.{GROUP}/{}/namespaces/{namespace}/localqueues/{queue}/pendingworkloads?limit={limit}",
+        version.as_str()
     );
     let what = format!("pending workloads of LocalQueue {namespace}/{queue}");
     let req = http::Request::get(path)
@@ -592,5 +644,33 @@ mod tests {
         }];
         assert!(is_true(&c, "Admitted"));
         assert!(!is_true(&c, "Finished"));
+    }
+
+    #[test]
+    fn the_newest_understood_kueue_version_is_picked() {
+        let served = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            KueueVersion::pick(&served(&["v1beta2", "v1beta1"])),
+            Some(KueueVersion::V1beta2)
+        );
+        assert_eq!(
+            KueueVersion::pick(&served(&["v1beta1", "v1alpha1"])),
+            Some(KueueVersion::V1beta1)
+        );
+        assert_eq!(KueueVersion::pick(&served(&["v1alpha1"])), None);
+        assert_eq!(
+            KueueVersion::V1beta1.workloads().api_version,
+            "kueue.x-k8s.io/v1beta1"
+        );
+    }
+
+    #[test]
+    fn a_v1beta1_cluster_queue_reads_its_cohort() {
+        let q: ClusterQueue = serde_json::from_value(json!({
+            "metadata": {"name": "q"},
+            "spec": {"cohort": "pool", "resourceGroups": []}
+        }))
+        .unwrap();
+        assert_eq!(q.spec.cohort_name.as_deref(), Some("pool"));
     }
 }
