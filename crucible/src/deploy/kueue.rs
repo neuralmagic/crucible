@@ -100,10 +100,12 @@ fn role_ref(kind: &str, name: &str) -> rbac::RoleRef {
 /// Where agents' workloads run, under Pod Security `restricted`.
 fn workload_namespace(cfg: &KueueCfg) -> core::Namespace {
     let mut metadata = meta(cfg.workload_namespace.as_str(), None);
-    metadata.labels.get_or_insert_with(BTreeMap::new).insert(
+    let labels = metadata.labels.get_or_insert_with(BTreeMap::new);
+    labels.insert(
         "pod-security.kubernetes.io/enforce".to_string(),
         "restricted".to_string(),
     );
+    labels.insert(KUEUE_MANAGED_LABEL.to_string(), "true".to_string());
     core::Namespace {
         metadata,
         ..Default::default()
@@ -239,6 +241,8 @@ fn service(cfg: &KueueCfg) -> core::Service {
 }
 
 const KUEUE_GROUP: &str = "kueue.x-k8s.io";
+/// The label the Red Hat build of Kueue manages a namespace's workloads under.
+const KUEUE_MANAGED_LABEL: &str = "kueue.openshift.io/managed";
 const VISIBILITY_GROUP: &str = "visibility.kueue.x-k8s.io";
 const WORKLOAD_VERBS: &[&str] = &["create", "get", "list", "patch", "delete"];
 
@@ -454,12 +458,16 @@ mod tests {
     }
 
     #[test]
-    fn the_workload_namespace_enforces_restricted_pod_security() {
+    fn the_workload_namespace_enforces_restricted_pod_security_and_opts_into_kueue() {
         let docs = docs(PROFILE);
         let ns = find(&docs, "Namespace", "crucible-kueue-e2e");
         assert_eq!(
             ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"],
             "restricted"
+        );
+        assert_eq!(
+            ns["metadata"]["labels"]["kueue.openshift.io/managed"], "true",
+            "OpenShift's Kueue admits workloads only in namespaces carrying it"
         );
     }
 
