@@ -51,6 +51,14 @@ pub enum ConfigError {
     Prefix(String),
     #[error("CONTROLLER_AGENT_AUDIENCES names no MCP resource")]
     NoAudiences,
+    #[error(
+        "CONTROLLER_AGENT_SVID_JWKS_URI {0} is plain http to a non-loopback host; whoever answers \
+         that fetch can mint agent tokens. Serve it over https (trusting a private CA with \
+         CONTROLLER_AGENT_SVID_CA_FILE) or set CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP=true"
+    )]
+    InsecureJwks(Url),
+    #[error("CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP {0:?} is not true or false")]
+    InsecureFlag(String),
     #[error("reading {path}: {source}")]
     Read {
         path: String,
@@ -220,6 +228,18 @@ impl AgentIssuerConfig {
             value: jwks_raw,
             source,
         })?;
+        let insecure_http = match get("CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP").as_deref() {
+            None | Some("false") => false,
+            Some("true") => true,
+            Some(other) => return Err(ConfigError::InsecureFlag(other.to_string())),
+        };
+        if svid_jwks_uri.scheme() != "https" && !is_loopback(&svid_jwks_uri) {
+            if !insecure_http {
+                return Err(ConfigError::InsecureJwks(svid_jwks_uri));
+            }
+            tracing::warn!(jwks_uri = %svid_jwks_uri,
+                "fetching SPIRE's keys over plain http: anyone on that path can mint agent tokens");
+        }
         let audiences: Vec<Audience> = need("CONTROLLER_AGENT_AUDIENCES")?
             .split(',')
             .map(str::trim)
@@ -253,6 +273,15 @@ impl AgentIssuerConfig {
             }
         }
         builder.build()
+    }
+}
+
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
     }
 }
 
@@ -1206,5 +1235,46 @@ mod tests {
                 "{var}={value}"
             );
         }
+    }
+
+    #[test]
+    fn spires_keys_are_fetched_over_https_unless_loopback_or_explicitly_insecure() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("signing.pem");
+        std::fs::write(&key_file, EcKey::generate().pem()).unwrap();
+        let with = |uri: &str, insecure: Option<&str>| {
+            let mut vars = env(&key_file);
+            vars.insert("CONTROLLER_AGENT_SVID_JWKS_URI", uri.to_string());
+            if let Some(flag) = insecure {
+                vars.insert("CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP", flag.to_string());
+            }
+            AgentIssuerConfig::from_lookup(lookup(&vars))
+        };
+        let plain = "http://spire-oidc.spire.svc/keys";
+        assert!(matches!(
+            with(plain, None),
+            Err(ConfigError::InsecureJwks(uri)) if uri.as_str() == plain
+        ));
+        assert!(matches!(
+            with(plain, Some("false")),
+            Err(ConfigError::InsecureJwks(_))
+        ));
+        assert!(with(plain, Some("true")).unwrap().is_some());
+        assert!(matches!(
+            with(plain, Some("yes")),
+            Err(ConfigError::InsecureFlag(_))
+        ));
+        for loopback in [
+            "http://127.0.0.1:8443/keys",
+            "http://localhost/keys",
+            "http://[::1]/keys",
+        ] {
+            assert!(with(loopback, None).unwrap().is_some(), "{loopback}");
+        }
+        assert!(
+            with("https://spire-oidc.spire.svc/keys", None)
+                .unwrap()
+                .is_some()
+        );
     }
 }

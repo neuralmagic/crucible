@@ -212,8 +212,9 @@ when the username is unknown; other tokens are issued without the claim, logged 
 | `CONTROLLER_AGENT_ISSUER` | The issuer identifier, an origin such as `http://crucible-controller.crucible-system.svc.cluster.local:8080`. Unset turns the endpoint off. Supervisors must request their SVID with exactly this audience (`token_grant.jwt_svid_audience`). |
 | `CONTROLLER_AGENT_SIGNING_KEY_FILE` | A PKCS#8 P-256 private key mounted from a Secret. The `kid` is its RFC 7638 thumbprint. |
 | `CONTROLLER_AGENT_SVID_ISSUER` | SPIRE's OIDC discovery issuer, the `iss` of every JWT-SVID. SVIDs must carry `iat` and live at most 15 minutes. |
-| `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. |
+| `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. It must be `https://` unless its host is loopback, since whoever answers that fetch can mint agent tokens. |
 | `CONTROLLER_AGENT_SVID_CA_FILE` | Optional PEM bundle trusted for that fetch (the service CA for an `https://*.svc` endpoint). |
+| `CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP` | `true` accepts a plain-http JWKS URI on a non-loopback host, logged at warn. Default `false`. |
 | `CONTROLLER_AGENT_GATEWAY_PREFIX` | The SPIFFE ID path before the gateway id, ending in `/`: `spiffe://<trust domain>/openshell/gateway/`. Supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`. |
 | `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
 
