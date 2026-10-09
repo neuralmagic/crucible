@@ -188,6 +188,10 @@ mod tests {
         assert_eq!(profile.credentials[0].auth_style, "bearer");
         assert_eq!(profile.credentials[0].header_name, "authorization");
         assert_eq!(endpoint.protocol, "rest", "as the sandbox policy's entry");
+        assert_eq!(
+            endpoint.access,
+            openshell_core::proto::NetworkAccessPreset::Full as i32
+        );
         assert!(profile.credentials[0].env_vars.is_empty(), "no placeholder");
     }
 
