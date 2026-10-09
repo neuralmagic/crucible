@@ -1,4 +1,5 @@
-//! The authorization server's signing keys, fetched from its JWKS URI and cached by `kid`.
+//! An issuer's signing keys, fetched from a [`KeySource`] (its JWKS URI over https, or anything
+//! else that yields a JWK Set) and cached by `kid`.
 //!
 //! A cached key is served until `max_age`; after that the next lookup refetches, and keeps the
 //! old set if the fetch fails. Any fetch, failed or not, waits `min_refetch` after the last
@@ -8,6 +9,9 @@
 use jsonwebtoken::jwk::{AlgorithmParameters, JwkSet, PublicKeyUse};
 use jsonwebtoken::{Algorithm, DecodingKey};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 use url::Url;
@@ -16,22 +20,87 @@ use url::Url;
 pub const MAX_JWKS_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
+pub enum KeySourceError {
+    #[error("the key set is larger than {limit} bytes")]
+    TooLarge { limit: usize },
+    #[error(transparent)]
+    Fetch(Box<dyn std::error::Error + Send + Sync>),
+}
+
+pub type FetchFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<u8>, KeySourceError>> + Send + 'a>>;
+
+/// Where a JWK Set comes from. [`Jwks`] caches, throttles, size-checks and decodes what it
+/// returns.
+pub trait KeySource: Send + Sync {
+    /// The key set's JSON. A source should stop reading past `limit` bytes and return
+    /// [`KeySourceError::TooLarge`]; a longer body is refused either way.
+    fn fetch(&self, limit: usize) -> FetchFuture<'_>;
+
+    /// Where the keys come from, for errors and logs.
+    fn describe(&self) -> String;
+}
+
+/// A JWKS URI fetched over HTTP.
+pub struct HttpSource {
+    http: reqwest::Client,
+    uri: Url,
+}
+
+impl HttpSource {
+    pub fn new(http: reqwest::Client, uri: Url) -> Self {
+        Self { http, uri }
+    }
+}
+
+impl KeySource for HttpSource {
+    fn fetch(&self, limit: usize) -> FetchFuture<'_> {
+        Box::pin(async move {
+            let wrap = |e: reqwest::Error| KeySourceError::Fetch(Box::new(e));
+            let mut response = self
+                .http
+                .get(self.uri.clone())
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(wrap)?;
+            if response
+                .content_length()
+                .is_some_and(|n| usize::try_from(n).map_or(true, |n| n > limit))
+            {
+                return Err(KeySourceError::TooLarge { limit });
+            }
+            let mut body = Vec::new();
+            while let Some(chunk) = response.chunk().await.map_err(wrap)? {
+                if body.len() + chunk.len() > limit {
+                    return Err(KeySourceError::TooLarge { limit });
+                }
+                body.extend_from_slice(&chunk);
+            }
+            Ok(body)
+        })
+    }
+
+    fn describe(&self) -> String {
+        self.uri.to_string()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
 pub enum JwksError {
     #[error("no signing key with kid {0:?}")]
     UnknownKid(String),
-    #[error("fetching JWKS from {uri}: {source}")]
+    #[error("fetching JWKS from {source_name}: {error}")]
     Fetch {
-        uri: Url,
+        source_name: String,
         #[source]
-        source: reqwest::Error,
+        error: KeySourceError,
     },
-    #[error("JWKS from {uri} is larger than {MAX_JWKS_BYTES} bytes")]
-    TooLarge { uri: Url },
-    #[error("decoding JWKS from {uri}: {source}")]
+    #[error("decoding JWKS from {source_name}: {error}")]
     Decode {
-        uri: Url,
+        source_name: String,
         #[source]
-        source: serde_json::Error,
+        error: serde_json::Error,
     },
 }
 
@@ -51,8 +120,7 @@ struct Cache {
 }
 
 pub struct Jwks {
-    http: reqwest::Client,
-    uri: Url,
+    source: Arc<dyn KeySource>,
     max_age: Duration,
     min_refetch: Duration,
     cache: RwLock<Cache>,
@@ -60,10 +128,14 @@ pub struct Jwks {
 }
 
 impl Jwks {
+    /// Keys from the JWKS at `uri`.
     pub fn new(http: reqwest::Client, uri: Url) -> Self {
+        Self::from_source(Arc::new(HttpSource::new(http, uri)))
+    }
+
+    pub fn from_source(source: Arc<dyn KeySource>) -> Self {
         Self {
-            http,
-            uri,
+            source,
             max_age: Duration::from_secs(600),
             min_refetch: Duration::from_secs(30),
             cache: RwLock::new(Cache::default()),
@@ -75,10 +147,6 @@ impl Jwks {
         self.max_age = max_age;
         self.min_refetch = min_refetch;
         self
-    }
-
-    pub fn uri(&self) -> &Url {
-        &self.uri
     }
 
     pub async fn key(&self, kid: &str) -> Result<VerificationKey, JwksError> {
@@ -125,36 +193,21 @@ impl Jwks {
     }
 
     async fn fetch(&self) -> Result<HashMap<String, VerificationKey>, JwksError> {
-        let wrap = |source| JwksError::Fetch {
-            uri: self.uri.clone(),
-            source,
-        };
-        let mut response = self
-            .http
-            .get(self.uri.clone())
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(wrap)?;
-        let too_large = || JwksError::TooLarge {
-            uri: self.uri.clone(),
-        };
-        if response
-            .content_length()
-            .is_some_and(|n| usize::try_from(n).map_or(true, |n| n > MAX_JWKS_BYTES))
-        {
-            return Err(too_large());
+        let source_name = || self.source.describe();
+        let fetched = self.source.fetch(MAX_JWKS_BYTES).await;
+        let body = match fetched {
+            Ok(body) if body.len() > MAX_JWKS_BYTES => Err(KeySourceError::TooLarge {
+                limit: MAX_JWKS_BYTES,
+            }),
+            other => other,
         }
-        let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(wrap)? {
-            if body.len() + chunk.len() > MAX_JWKS_BYTES {
-                return Err(too_large());
-            }
-            body.extend_from_slice(&chunk);
-        }
-        let set: JwkSet = serde_json::from_slice(&body).map_err(|source| JwksError::Decode {
-            uri: self.uri.clone(),
-            source,
+        .map_err(|error| JwksError::Fetch {
+            source_name: source_name(),
+            error,
+        })?;
+        let set: JwkSet = serde_json::from_slice(&body).map_err(|error| JwksError::Decode {
+            source_name: source_name(),
+            error,
         })?;
         Ok(verification_keys(&set))
     }
@@ -251,7 +304,80 @@ mod tests {
         let jwks = Jwks::new(reqwest::Client::new(), uri);
         assert!(matches!(
             jwks.key("a").await,
-            Err(JwksError::TooLarge { .. })
+            Err(JwksError::Fetch {
+                error: KeySourceError::TooLarge { .. },
+                ..
+            })
+        ));
+    }
+
+    /// Serves `body` (or fails) from memory, counting fetches; ignores the size limit.
+    struct Fixed {
+        body: Option<Vec<u8>>,
+        fetches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KeySource for Fixed {
+        fn fetch(&self, _: usize) -> FetchFuture<'_> {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = self.body.clone();
+            Box::pin(async move {
+                body.ok_or_else(|| KeySourceError::Fetch("the proxy is unreachable".into()))
+            })
+        }
+
+        fn describe(&self) -> String {
+            "fixed".into()
+        }
+    }
+
+    fn fixed(body: Option<Vec<u8>>) -> Arc<Fixed> {
+        Arc::new(Fixed {
+            body,
+            fetches: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    #[tokio::test]
+    async fn any_key_source_gets_the_same_cache_throttle_and_limits() {
+        let key_set = json!({"keys": [crate::testing::jwk("a")]});
+        let source = fixed(Some(serde_json::to_vec(&key_set).unwrap()));
+        let jwks = Jwks::from_source(source.clone());
+        assert!(jwks.key("key-a").await.is_ok());
+        assert!(jwks.key("key-a").await.is_ok());
+        assert!(matches!(
+            jwks.key("made-up").await,
+            Err(JwksError::UnknownKid(_))
+        ));
+        assert_eq!(
+            source.fetches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "cached keys and an unknown kid inside the refetch interval cost no fetch"
+        );
+
+        let failing = fixed(None);
+        let Err(err) = Jwks::from_source(failing).key("key-a").await else {
+            panic!("a failing source yields no key")
+        };
+        assert_eq!(
+            err.to_string(),
+            "fetching JWKS from fixed: the proxy is unreachable"
+        );
+
+        let huge = fixed(Some(vec![b' '; MAX_JWKS_BYTES + 1]));
+        assert!(matches!(
+            Jwks::from_source(huge).key("key-a").await,
+            Err(JwksError::Fetch {
+                error: KeySourceError::TooLarge { .. },
+                ..
+            })
+        ));
+
+        let garbage = fixed(Some(b"not json".to_vec()));
+        assert!(matches!(
+            Jwks::from_source(garbage).key("key-a").await,
+            Err(JwksError::Decode { .. })
         ));
     }
 }
