@@ -5154,6 +5154,16 @@ async fn approve_scenario_stamps_approved_at(pool: PgPool) -> Result<()> {
     let events = db.events().read_for_key("scenario:approve-1").await?;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].actor.as_deref(), Some("wren"));
+    let requested: Option<String> =
+        sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+            .bind("scenario:approve-1")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(
+        requested.as_deref(),
+        Some("user:wren"),
+        "the approval's dispatch acts for the approver"
+    );
     Ok(())
 }
 

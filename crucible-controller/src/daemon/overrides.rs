@@ -88,7 +88,7 @@ pub async fn apply_pending(db: &Db, store: &OverrideStore, key: &str) -> Result<
             )
             .await?;
             if unparked && let Some(actor) = actor {
-                crate::issues::store::request_dispatch(db.pool(), key, actor).await?;
+                request_dispatch(db.pool(), key, actor).await?;
             }
             Ok(())
         }
@@ -101,6 +101,19 @@ pub async fn apply_pending(db: &Db, store: &OverrideStore, key: &str) -> Result<
             apply_redispatch(db, key, justification, actor).await
         }
     }
+}
+
+/// Record `actor` as who `key`'s next dispatch acts for, warning when the name is not a login and
+/// the dispatch falls back to the run's owner.
+async fn request_dispatch(ex: impl sqlx::PgExecutor<'_>, key: &str, actor: &str) -> Result<()> {
+    if !crate::issues::store::request_dispatch(ex, key, actor).await? {
+        tracing::warn!(
+            issue_key = key,
+            actor,
+            "the override's actor is not a login; its dispatch acts for the run's owner"
+        );
+    }
+    Ok(())
 }
 
 /// A human park: force `status → parked` with `parked_by = human` from
@@ -151,9 +164,6 @@ async fn apply_bump(
     };
     if !crate::issues::store::set_priority(db.pool(), key, priority).await? {
         return Ok(());
-    }
-    if let Some(actor) = actor {
-        crate::issues::store::request_dispatch(db.pool(), key, actor).await?;
     }
     let note = format!(
         "priority {} -> {}{}",
@@ -228,7 +238,7 @@ async fn apply_scope_now(
         )
         .await?;
     if let Some(actor) = actor {
-        crate::issues::store::request_dispatch(db.pool(), key, actor).await?;
+        request_dispatch(db.pool(), key, actor).await?;
     }
     Ok(())
 }
@@ -285,7 +295,7 @@ async fn apply_redispatch(
     if crate::issues::store::claim_issue(&mut *tx, key, from, Status::AwaitingApproval).await? {
         crate::runs::work_pods::set_redispatch(&mut *tx, key, justification).await?;
         if let Some(actor) = actor {
-            crate::issues::store::request_dispatch(&mut *tx, key, actor).await?;
+            request_dispatch(&mut *tx, key, actor).await?;
         }
         let reason = format!("redispatch: {justification}");
         let ev = Event::now(
@@ -487,21 +497,174 @@ mod tests {
         apply_pending(&db, &store, "owner/repo#1").await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
-            Some("user:carol")
+            Some("user:bob"),
+            "a priority bump causes no dispatch, so it records nobody"
         );
 
+        crate::issues::transitions::park_and_purge(
+            db.pool(),
+            "owner/repo#1",
+            "again",
+            ParkedBy::Human,
+        )
+        .await?;
+        store.stash(unpark("system:serviceaccount:ops:release-bot"));
+        apply_pending(&db, &store, "owner/repo#1").await?;
+        assert_eq!(
+            requested_by(&db, "owner/repo#1").await,
+            None,
+            "a name that is not a login clears the earlier request, so the dispatch acts for the \
+             owner rather than for bob"
+        );
+        Ok(())
+    }
+
+    /// Insert a run of `key` attributed to `owner` and stamp its dispatcher, as a launch does.
+    async fn stamped_run(db: &Db, key: &str, run_id: &str, owner: &str) -> Result<Option<String>> {
+        crate::runs::store::insert_run(
+            db.pool(),
+            &crate::NewRun {
+                run_id: run_id.into(),
+                scope: None,
+                issue: Some(key.into()),
+                identity_digest: None,
+                status: "running".into(),
+                pod: None,
+                session_uri: None,
+                best_score: None,
+                cost_usd: None,
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE runs SET attributed_to = $2 WHERE run_id = $1")
+            .bind(run_id)
+            .bind(owner)
+            .execute(db.pool())
+            .await?;
+        crate::runs::store::stamp_dispatcher(db.pool(), run_id).await?;
+        Ok(
+            sqlx::query_scalar("SELECT dispatched_by FROM runs WHERE run_id = $1")
+                .bind(run_id)
+                .fetch_one(db.pool())
+                .await?,
+        )
+    }
+
+    /// A request applies to exactly the dispatch it asked for: the run it gets acts for the
+    /// requester and consumes it, and the next run (a schedule firing, an auto-dispatch) acts
+    /// for its owner again.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_dispatch_request_is_consumed_by_the_run_it_gets(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
+        assert_eq!(
+            stamped_run(&db, "owner/repo#1", "run-1", "user:owner")
+                .await?
+                .as_deref(),
+            Some("user:owner"),
+            "with nobody asking, a run acts for its owner"
+        );
+        crate::issues::store::request_dispatch(db.pool(), "owner/repo#1", "Bob").await?;
+        assert_eq!(
+            stamped_run(&db, "owner/repo#1", "run-2", "user:owner")
+                .await?
+                .as_deref(),
+            Some("user:bob")
+        );
+        assert_eq!(
+            requested_by(&db, "owner/repo#1").await,
+            None,
+            "the stamp consumed the request"
+        );
+        assert_eq!(
+            stamped_run(&db, "owner/repo#1", "run-3", "user:owner")
+                .await?
+                .as_deref(),
+            Some("user:owner"),
+            "a later schedule-fired run acts for the owner, not for bob"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_redispatch_acts_for_whoever_asked_for_it(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        seed_finished_with_approval(&db, "owner/repo#1", Status::Done).await?;
+        let store = OverrideStore::new();
         store.stash(Override {
             key: IssueKey("owner/repo#1".into()),
-            kind: OverrideKind::Bump,
+            kind: OverrideKind::Redispatch {
+                justification: "another pass".into(),
+            },
             reason: None,
-            priority: Some(6),
-            actor: Some("not a login".into()),
+            priority: None,
+            actor: Some("Dana".into()),
         });
         apply_pending(&db, &store, "owner/repo#1").await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
-            Some("user:carol"),
-            "a name that is not a login records nothing"
+            Some("user:dana")
+        );
+        assert_eq!(
+            stamped_run(&db, "owner/repo#1", "run-again", "user:alice")
+                .await?
+                .as_deref(),
+            Some("user:dana")
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_declined_redispatch_records_nobody(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
+        let store = OverrideStore::new();
+        store.stash(Override {
+            key: IssueKey("owner/repo#1".into()),
+            kind: OverrideKind::Redispatch {
+                justification: "not finished".into(),
+            },
+            reason: None,
+            priority: None,
+            actor: Some("dana".into()),
+        });
+        apply_pending(&db, &store, "owner/repo#1").await?;
+        assert_eq!(requested_by(&db, "owner/repo#1").await, None);
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_scope_now_acts_for_whoever_asked_for_it(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
+        crate::issues::transitions::park_and_purge(
+            db.pool(),
+            "owner/repo#1",
+            "waiting",
+            ParkedBy::Human,
+        )
+        .await?;
+        let store = OverrideStore::new();
+        store.stash(Override {
+            key: IssueKey("owner/repo#1".into()),
+            kind: OverrideKind::ScopeNow {
+                justification: "customer escalation".into(),
+                max_cost: None,
+            },
+            reason: None,
+            priority: None,
+            actor: Some("erin".into()),
+        });
+        apply_pending(&db, &store, "owner/repo#1").await?;
+        assert_eq!(
+            requested_by(&db, "owner/repo#1").await.as_deref(),
+            Some("user:erin")
+        );
+        assert_eq!(
+            stamped_run(&db, "owner/repo#1", "run-scoped", "user:owner")
+                .await?
+                .as_deref(),
+            Some("user:erin")
         );
         Ok(())
     }

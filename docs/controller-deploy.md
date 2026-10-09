@@ -131,9 +131,11 @@ maps the sandbox to the run whose pod bound it, and returns a 5-minute ES256 acc
 servers verify it against `/.well-known/jwks.json`; `/.well-known/oauth-authorization-server`
 describes the endpoints. All three are served outside the human auth stack.
 
-The token's `sub` is the person the run was dispatched for: whoever last unparked, bumped, scoped
-or redispatched the issue, else the launch's creator (the owner, for a schedule, watch, or
-webhook). `act.sub` is the sandbox's SPIFFE ID. It also carries `run_id` (the run pod), `sandbox`
+The token's `sub` is the person the run was dispatched for: whoever unparked, scoped,
+redispatched, or approved (in the UI) the issue for that dispatch, else the launch's creator (the
+owner, for a schedule, watch, or webhook). The request is consumed by the run it gets, so later
+runs act for the owner again. An override by an actor that is not a login records nobody.
+`act.sub` is the sandbox's SPIFFE ID. It also carries `run_id` (the run pod), `sandbox`
 (the sandbox's name), `workdir` (its workspace path), `kube_user` (below) and, for runs on the
 `[kueue]` cluster, `namespace`, `queues`, and `role`. Refusals return only the OAuth error code
 and a fixed description; the reason is logged.
