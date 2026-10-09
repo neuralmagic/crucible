@@ -38,6 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 [dev-dependencies]
 aws-lc-rs = "1.18"
 base64 = "0.22"
+crucible = { path = "../crucible", default-features = false }
 crucible-controller = { path = "../crucible-controller" }
 jiff.workspace = true
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }

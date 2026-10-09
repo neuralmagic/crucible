@@ -11,10 +11,12 @@
 //!   CRUCIBLE_GATEWAY_E2E_KUBECONFIG=<kubeconfig whose current context's namespace is the loop
 //!     namespace> CRUCIBLE_GATEWAY_E2E_CLUSTER=<the profile's [kueue] cluster>
 //!   CRUCIBLE_GATEWAY_E2E_PROFILE=<isolated deploy profile> CRUCIBLE_GATEWAY_E2E_DATABASE_URL=<url>
-//!   CRUCIBLE_GATEWAY_E2E_SPIRE_AGENT_IMAGE=<spire-agent image> \
+//!   CRUCIBLE_GATEWAY_E2E_SPIRE_AGENT_IMAGE=<spire-agent image>
+//!   CRUCIBLE_GATEWAY_E2E_KUBE_USER=<Kubernetes user the run's launcher acts as> \
 //!   cargo test -p crucible-kueue --test gateway_e2e -- --ignored --nocapture --test-threads=1
 
 use base64::Engine;
+use crucible::deploy::DeployProfile;
 use crucible_controller::PodDispatcher;
 use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
 use crucible_controller::agent_auth::directory::{KubeDirectory, SandboxDirectory};
@@ -24,7 +26,6 @@ use crucible_controller::agent_auth::issuer::{
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
 use crucible_controller::runs::clusters::ClusterClients;
 use crucible_controller::runs::workpod::gateway::{RunGateway, teardown};
-use crucible_kueue::tenant::{Registry, Tenants};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::principal::Callers;
@@ -63,6 +64,7 @@ struct Env {
     profile: std::path::PathBuf,
     database_url: String,
     spire_agent_image: String,
+    kube_user: String,
 }
 
 fn env() -> Env {
@@ -75,6 +77,7 @@ fn env() -> Env {
         profile: var("CRUCIBLE_GATEWAY_E2E_PROFILE").into(),
         database_url: var("CRUCIBLE_GATEWAY_E2E_DATABASE_URL"),
         spire_agent_image: var("CRUCIBLE_GATEWAY_E2E_SPIRE_AGENT_IMAGE"),
+        kube_user: var("CRUCIBLE_GATEWAY_E2E_KUBE_USER"),
     }
 }
 
@@ -139,13 +142,15 @@ async fn seed_run(pool: &sqlx::PgPool, cluster: &str, pod: &str, run_id: &str) {
 /// gateway, and the run's gateway client material. It registers the gateway with the OpenShell
 /// CLI and creates one sandbox through it.
 fn loop_pod(
-    profile: &Value,
+    profile: &DeployProfile,
     namespace: &str,
     image: &str,
     gateway_url: &str,
     client_secret: &str,
 ) -> Pod {
-    let cluster = &profile["cluster"];
+    let cluster = &profile.cluster;
+    let sandbox_ns = cluster.sandbox_namespace.as_ref().unwrap().as_str();
+    let pull_secret = profile.image.pull_secret.as_str();
     let script = r#"set -eu
 export HOME=/tmp/home XDG_CONFIG_HOME=/tmp/home/.config
 mkdir -p /tmp/tls/client "$XDG_CONFIG_HOME"
@@ -172,7 +177,7 @@ sleep 1800
         "spec": {
             "restartPolicy": "Never",
             "automountServiceAccountToken": false,
-            "imagePullSecrets": [{"name": profile["image"]["pull_secret"]}],
+            "imagePullSecrets": [{"name": pull_secret}],
             "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
             "containers": [{
                 "name": "loop",
@@ -181,24 +186,18 @@ sleep 1800
                 "env": [
                     env("GATEWAY_URL", gateway_url),
                     env("SANDBOX_IMAGE", SANDBOX_IMAGE),
-                    env("CRUCIBLE_SANDBOX_NAMESPACE", cluster["sandbox_namespace"].as_str().unwrap()),
+                    env("CRUCIBLE_SANDBOX_NAMESPACE", sandbox_ns),
                     env(
                         "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT",
-                        cluster["sandbox_service_account"].as_str().unwrap(),
+                        cluster.sandbox_service_account.as_deref().unwrap(),
                     ),
                     env("CRUCIBLE_SANDBOX_DEFAULT_IMAGE", SANDBOX_IMAGE),
-                    env(
-                        "CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS",
-                        profile["image"]["pull_secret"].as_str().unwrap(),
-                    ),
+                    env("CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS", pull_secret),
                     env(
                         "CRUCIBLE_SANDBOX_SPIFFE_SOCKET",
-                        cluster["sandbox_spiffe_socket"].as_str().unwrap(),
+                        cluster.sandbox_spiffe_socket.as_deref().unwrap(),
                     ),
-                    env(
-                        "OPENSHELL_SUPERVISOR_IMAGE",
-                        cluster["supervisor_image"].as_str().unwrap(),
-                    ),
+                    env("OPENSHELL_SUPERVISOR_IMAGE", &cluster.supervisor_image),
                 ],
                 "securityContext": {
                     "allowPrivilegeEscalation": false,
@@ -433,8 +432,7 @@ async fn serve_kueue(kube: kube::Client, controller: &str) -> String {
     let app = crucible_kueue::router(
         kube,
         crucible_kueue::Options {
-            registry: Arc::new(Registry::new(Tenants::from_toml("").unwrap())),
-            oidc: Some(Arc::new(server)),
+            oidc: Arc::new(server),
             policy,
             reviewer: None,
             kueue: kueue_version,
@@ -503,15 +501,12 @@ async fn cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let (clusters, kube) = clusters(&env, dir.path()).await;
     let dispatcher = crucible_controller::KubePodDispatcher::new(clusters);
-    let profile_value: Value = toml_to_json(&std::fs::read_to_string(&env.profile).unwrap());
     let profile = crucible_controller::agent_auth::placement::load_profile(Some(&env.profile))
         .await
         .unwrap()
         .unwrap();
-    let loop_ns = profile_value["cluster"]["loop_namespace"].as_str().unwrap();
-    let sandbox_ns = profile_value["cluster"]["sandbox_namespace"]
-        .as_str()
-        .unwrap();
+    let loop_ns = profile.cluster.loop_namespace.as_str();
+    let sandbox_ns = profile.cluster.sandbox_namespace.as_ref().unwrap().as_str();
     let loop_pods: Api<Pod> = Api::namespaced(kube.clone(), loop_ns);
     let secrets: Api<Secret> = Api::namespaced(kube.clone(), loop_ns);
     for pod in [RUN_POD, "gateway-e2e-impostor"] {
@@ -531,24 +526,35 @@ async fn scenario() {
     let dir = tempfile::tempdir().unwrap();
     let (clusters, kube) = clusters(&env, dir.path()).await;
     let dispatcher = crucible_controller::KubePodDispatcher::new(clusters.clone());
-    let profile_value: Value = toml_to_json(&std::fs::read_to_string(&env.profile).unwrap());
     let profile = crucible_controller::agent_auth::placement::load_profile(Some(&env.profile))
         .await
         .unwrap()
         .unwrap();
-    let loop_ns = profile_value["cluster"]["loop_namespace"].as_str().unwrap();
-    let sandbox_ns = profile_value["cluster"]["sandbox_namespace"]
-        .as_str()
-        .unwrap();
-    let loop_sa = profile_value["cluster"]["service_account"]
-        .as_str()
-        .unwrap();
-    let image = profile_value["image"]["loop"].as_str().unwrap();
+    let loop_ns = profile.cluster.loop_namespace.as_str();
+    let sandbox_ns = profile.cluster.sandbox_namespace.as_ref().unwrap().as_str();
+    let loop_sa = profile.cluster.service_account.as_str();
+    let image = profile.image.loop_image.as_str();
 
     let pool = crucible_controller::connect(&env.database_url)
         .await
         .unwrap();
     seed_run(&pool, &env.cluster, RUN_POD, RUN_ID).await;
+    crucible_controller::identity::oidc::users::record_login(
+        &pool,
+        "sub-alice",
+        "alice",
+        None,
+        jiff::Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    crucible_controller::identity::kube_identity::learn(
+        &pool,
+        "alice",
+        &crucible_controller::identity::kube_identity::KubeUser::parse(&env.kube_user).unwrap(),
+    )
+    .await
+    .unwrap();
 
     assert!(
         !can_create_pods(
@@ -597,13 +603,7 @@ async fn scenario() {
         )
         .await
         .unwrap();
-    let stand_in = loop_pod(
-        &profile_value,
-        loop_ns,
-        image,
-        &gateway.url(),
-        &client_secret,
-    );
+    let stand_in = loop_pod(&profile, loop_ns, image, &gateway.url(), &client_secret);
     gateway
         .start(&dispatcher, &env.cluster, loop_ns, &stand_in, &[8849])
         .await
@@ -703,6 +703,7 @@ async fn scenario() {
     assert_eq!(issued["act"]["sub"], spiffe_id);
     assert_eq!(issued["run_id"], RUN_POD);
     assert_eq!(issued["sandbox"], name);
+    assert_eq!(issued["kube_user"], env.kube_user);
 
     let kueue = serve_kueue(kube.clone(), &controller).await;
     let me = whoami(&kueue, &token).await;
@@ -823,9 +824,4 @@ async fn gone(kube: &kube::Client, sandbox_ns: &str, loop_ns: &str) {
         },
     )
     .await;
-}
-
-fn toml_to_json(text: &str) -> Value {
-    let parsed: toml::Value = toml::from_str(text).unwrap();
-    serde_json::to_value(parsed).unwrap()
 }
