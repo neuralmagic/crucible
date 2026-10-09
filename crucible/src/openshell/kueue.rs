@@ -94,9 +94,10 @@ impl KueueAccess {
         &self.url
     }
 
-    /// The sandbox egress entry: MCP-inspected, every known MCP method allowed.
+    /// The sandbox egress entry: HTTP-inspected, so the supervisor injects the token, with every
+    /// request allowed. crucible-kueue decides each call itself.
     pub fn egress_endpoint(&self) -> String {
-        format!("{}:{}:full:mcp", self.host, self.port)
+        format!("{}:{}:full:rest", self.host, self.port)
     }
 
     /// The token-grant provider profile for this server. Its endpoint binds the injected token to
@@ -168,7 +169,7 @@ mod tests {
         let a = access(URL).unwrap().unwrap();
         assert_eq!(
             a.egress_endpoint(),
-            "crucible-kueue.crucible-system.svc.cluster.local:8850:full:mcp"
+            "crucible-kueue.crucible-system.svc.cluster.local:8850:full:rest"
         );
         let profile = a.token_grant_profile();
         assert_eq!(profile.id, provider::KUEUE_GRANT_PROFILE_ID);
@@ -186,21 +187,14 @@ mod tests {
         assert_eq!(grant.audience, URL, "the token is for this server");
         assert_eq!(profile.credentials[0].auth_style, "bearer");
         assert_eq!(profile.credentials[0].header_name, "authorization");
-        assert_eq!(
-            endpoint
-                .mcp
-                .as_ref()
-                .and_then(|m| m.allow_all_known_mcp_methods),
-            Some(true),
-            "every known MCP method, as the sandbox policy's full:mcp entry allows"
-        );
+        assert_eq!(endpoint.protocol, "rest", "as the sandbox policy's entry");
         assert!(profile.credentials[0].env_vars.is_empty(), "no placeholder");
     }
 
     #[test]
     fn a_url_without_a_port_takes_the_scheme_default() {
         let a = access("https://kueue.example.com/mcp").unwrap().unwrap();
-        assert_eq!(a.egress_endpoint(), "kueue.example.com:443:full:mcp");
+        assert_eq!(a.egress_endpoint(), "kueue.example.com:443:full:rest");
     }
 
     #[test]

@@ -1584,10 +1584,10 @@ pub enum EndpointProblem {
 }
 
 /// The MCP protocol revisions a `full` MCP endpoint accepts: every one the pinned OpenShell knows.
-pub const MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
+const MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
 
 /// An MCP endpoint that allows every known method, under any of [`MCP_PROTOCOL_VERSIONS`].
-pub fn full_mcp() -> McpOptions {
+fn full_mcp() -> McpOptions {
     McpOptions {
         allow_all_known_mcp_methods: Some(true),
         versions: MCP_PROTOCOL_VERSIONS

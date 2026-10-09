@@ -381,8 +381,7 @@ pub fn kueue_token_grant_profile(
         endpoints: vec![NetworkEndpoint {
             host: host.to_string(),
             port: u32::from(port),
-            protocol: "mcp".to_string(),
-            mcp: Some(crate::openshell::grpc::full_mcp()),
+            protocol: "rest".to_string(),
             ..Default::default()
         }],
         ..Default::default()
