@@ -13,7 +13,10 @@ Submittable kinds: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1 L
 apps/v1 Deployment, apps/v1 StatefulSet. Kueue admits a Deployment pod by pod (it can run
 partially admitted and scale freely) and everything else all or nothing; a StatefulSet scales only
 to or from zero. Stop/resume deactivates the Kueue Workload for batch kinds and scales
-Deployments and StatefulSets to zero and back.
+Deployments and StatefulSets to zero and back. A Job or RayJob that sets no
+`activeDeadlineSeconds` gets 24 hours, and one that sets no `ttlSecondsAfterFinished` is deleted an
+hour after it finishes (a RayJob only when `shutdownAfterJobFinishes` is true, the only case
+KubeRay accepts a TTL).
 
 ## Tasks
 

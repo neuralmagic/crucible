@@ -191,6 +191,26 @@ impl Normalized {
     }
 }
 
+/// A batch workload runs at most this long unless its manifest says otherwise.
+pub const DEFAULT_ACTIVE_DEADLINE_SECONDS: i64 = 24 * 60 * 60;
+/// A finished batch workload is deleted this long after it finishes unless its manifest says
+/// otherwise.
+pub const DEFAULT_TTL_SECONDS_AFTER_FINISHED: i64 = 60 * 60;
+
+/// Bounds a batch workload's lifetime where its manifest does not: an active deadline, and a TTL
+/// after it finishes. A RayJob honors a TTL only when it shuts its cluster down after the job, and
+/// KubeRay refuses one otherwise, so it gets the TTL only then.
+fn default_lifetimes(spec: &mut Map<String, Value>, kind: WorkloadKind) {
+    spec.entry("activeDeadlineSeconds")
+        .or_insert_with(|| Value::from(DEFAULT_ACTIVE_DEADLINE_SECONDS));
+    let ttl_applies = kind == WorkloadKind::Job
+        || spec.get("shutdownAfterJobFinishes") == Some(&Value::Bool(true));
+    if ttl_applies {
+        spec.entry("ttlSecondsAfterFinished")
+            .or_insert_with(|| Value::from(DEFAULT_TTL_SECONDS_AFTER_FINISHED));
+    }
+}
+
 pub fn normalize(
     manifest: Value,
     caller: &Caller,
@@ -254,6 +274,9 @@ pub fn normalize(
 
     if kind == WorkloadKind::Job {
         object_entry(&mut obj, "spec", "spec")?.insert("suspend".into(), Value::Bool(true));
+    }
+    if kind.is_batch() {
+        default_lifetimes(object_entry(&mut obj, "spec", "spec")?, kind);
     }
 
     let mut root = Value::Object(obj);
@@ -1216,6 +1239,71 @@ mod tests {
             o.pointer("/spec/template/spec/automountServiceAccountToken"),
             Some(&json!(false))
         );
+    }
+
+    #[test]
+    fn batch_workloads_get_a_default_deadline_and_ttl_unless_they_set_their_own() {
+        let n = normalize(job(), &caller(), &queue()).unwrap();
+        assert_eq!(
+            n.object.pointer("/spec/activeDeadlineSeconds"),
+            Some(&json!(DEFAULT_ACTIVE_DEADLINE_SECONDS))
+        );
+        assert_eq!(
+            n.object.pointer("/spec/ttlSecondsAfterFinished"),
+            Some(&json!(DEFAULT_TTL_SECONDS_AFTER_FINISHED))
+        );
+
+        let mut own = job();
+        own["spec"]["activeDeadlineSeconds"] = json!(600);
+        own["spec"]["ttlSecondsAfterFinished"] = json!(0);
+        let n = normalize(own, &caller(), &queue()).unwrap();
+        assert_eq!(
+            n.object.pointer("/spec/activeDeadlineSeconds"),
+            Some(&json!(600))
+        );
+        assert_eq!(
+            n.object.pointer("/spec/ttlSecondsAfterFinished"),
+            Some(&json!(0))
+        );
+
+        let ray = |shutdown: Option<bool>| {
+            let mut m = json!({
+                "apiVersion": "ray.io/v1",
+                "kind": "RayJob",
+                "metadata": {"name": "r"},
+                "spec": {"rayClusterSpec": {
+                    "headGroupSpec": {"template": {"spec": {"containers": [{"name": "h"}]}}}
+                }}
+            });
+            if let Some(shutdown) = shutdown {
+                m["spec"]["shutdownAfterJobFinishes"] = json!(shutdown);
+            }
+            normalize(m, &caller(), &queue()).unwrap().object
+        };
+        for kept_cluster in [ray(None), ray(Some(false))] {
+            assert_eq!(
+                kept_cluster.pointer("/spec/activeDeadlineSeconds"),
+                Some(&json!(DEFAULT_ACTIVE_DEADLINE_SECONDS))
+            );
+            assert_eq!(kept_cluster.pointer("/spec/ttlSecondsAfterFinished"), None);
+        }
+        assert_eq!(
+            ray(Some(true)).pointer("/spec/ttlSecondsAfterFinished"),
+            Some(&json!(DEFAULT_TTL_SECONDS_AFTER_FINISHED))
+        );
+    }
+
+    #[test]
+    fn serving_workloads_get_no_lifetime_defaults() {
+        let deployment = json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "d"},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "c"}]}}}
+        });
+        let n = normalize(deployment, &caller(), &queue()).unwrap();
+        assert_eq!(n.object.pointer("/spec/activeDeadlineSeconds"), None);
+        assert_eq!(n.object.pointer("/spec/ttlSecondsAfterFinished"), None);
     }
 
     #[test]
