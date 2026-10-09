@@ -1583,6 +1583,21 @@ pub enum EndpointProblem {
     EnforcementWithoutProtocol,
 }
 
+/// The MCP protocol revisions a `full` MCP endpoint accepts: every one the pinned OpenShell knows.
+pub const MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// An MCP endpoint that allows every known method, under any of [`MCP_PROTOCOL_VERSIONS`].
+pub fn full_mcp() -> McpOptions {
+    McpOptions {
+        allow_all_known_mcp_methods: Some(true),
+        versions: MCP_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        ..McpOptions::default()
+    }
+}
+
 fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError> {
     let reject = |problem| EndpointSpecError {
         spec: spec.to_owned(),
@@ -1619,13 +1634,9 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
     // OpenShell rejects an MCP method wildcard, so `full` on an MCP endpoint is its
     // method-profile switch rather than the generic `*` access preset.
     let (access_preset, mcp) = match (protocol, access_preset) {
-        ("mcp", NetworkAccessPreset::Full | NetworkAccessPreset::Unspecified) => (
-            NetworkAccessPreset::Unspecified,
-            Some(McpOptions {
-                allow_all_known_mcp_methods: Some(true),
-                ..McpOptions::default()
-            }),
-        ),
+        ("mcp", NetworkAccessPreset::Full | NetworkAccessPreset::Unspecified) => {
+            (NetworkAccessPreset::Unspecified, Some(full_mcp()))
+        }
         ("mcp", _) => return Err(reject(EndpointProblem::McpAccess)),
         (_, preset) => (preset, None),
     };
@@ -2024,6 +2035,11 @@ pYBZ
             assert_eq!(
                 ep.mcp.as_ref().and_then(|m| m.allow_all_known_mcp_methods),
                 Some(true)
+            );
+            assert_eq!(
+                ep.mcp.as_ref().map(|m| m.versions.clone()),
+                Some(MCP_PROTOCOL_VERSIONS.map(String::from).to_vec()),
+                "older MCP clients negotiate 2025-03-26"
             );
         }
     }

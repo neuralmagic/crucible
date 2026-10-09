@@ -344,8 +344,8 @@ pub fn kueue_token_grant_profile(
     svid_audience: &str,
 ) -> openshell_core::proto::ProviderProfile {
     use openshell_core::proto::{
-        McpOptions, NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCategory, ProviderProfileCredential,
+        NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile, ProviderProfileCategory,
+        ProviderProfileCredential,
     };
     ProviderProfile {
         id: KUEUE_GRANT_PROFILE_ID.to_string(),
@@ -373,10 +373,7 @@ pub fn kueue_token_grant_profile(
             host: host.to_string(),
             port: u32::from(port),
             protocol: "mcp".to_string(),
-            mcp: Some(McpOptions {
-                allow_all_known_mcp_methods: Some(true),
-                ..Default::default()
-            }),
+            mcp: Some(crate::openshell::grpc::full_mcp()),
             ..Default::default()
         }],
         ..Default::default()
