@@ -618,6 +618,15 @@ pub struct ControllerCfg {
     /// comments. Unset ⇒ comments omit the link.
     #[arg(long = "public-url", env = "CONTROLLER_PUBLIC_URL")]
     pub public_url: Option<String>,
+    /// The agent token issuer identifier, the same `CONTROLLER_AGENT_ISSUER` the issuer serves
+    /// under. Runs on the `[kueue]` cluster get it as their sandboxes' SVID audience, and its token
+    /// endpoint for their token grants.
+    #[arg(long = "agent-issuer", env = "CONTROLLER_AGENT_ISSUER")]
+    pub agent_issuer: Option<String>,
+    /// Where sandbox supervisors reach the agent token endpoint when not at the issuer itself, for
+    /// a spoke that reaches the controller through a route.
+    #[arg(long = "agent-token-endpoint", env = "CONTROLLER_AGENT_TOKEN_ENDPOINT")]
+    pub agent_token_endpoint: Option<String>,
     /// The externally reachable base URL of the webhook delivery surface (e.g.
     /// `https://hooks.crucible.example.com`). A created webhook's delivery URL is built on it;
     /// unset ⇒ the API returns the delivery path alone.

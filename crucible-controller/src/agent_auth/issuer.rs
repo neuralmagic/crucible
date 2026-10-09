@@ -106,7 +106,7 @@ impl IssuerUrl {
         &self.0
     }
 
-    fn endpoint(&self, path: &str) -> String {
+    pub fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.0)
     }
 }

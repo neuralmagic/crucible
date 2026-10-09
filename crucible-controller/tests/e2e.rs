@@ -600,6 +600,8 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         jira_email: None,
         jira_api_token: None,
         public_url: None,
+        agent_issuer: None,
+        agent_token_endpoint: None,
         hooks_public_url: None,
         jira_emission_project: None,
         jira_emission_epic_type_id: None,

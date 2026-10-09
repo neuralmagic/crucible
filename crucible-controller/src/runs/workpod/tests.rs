@@ -5635,23 +5635,18 @@ async fn a_run_pod_carries_its_id_and_its_display_name(pool: sqlx::PgPool) -> Re
 /// Every kube object the crucible-kueue dispatch tests see, in order.
 #[derive(Debug, Clone)]
 enum KueueEvent {
-    ConfigMap { namespace: String, cm: ConfigMap },
+    ConfigMap { namespace: String },
     Pod(Box<Pod>),
-    Secret(k8s_openapi::api::core::v1::Secret),
-    DeleteConfigMap { namespace: String, name: String },
+    Secret(Box<k8s_openapi::api::core::v1::Secret>),
 }
 
 struct KueueDispatcher {
     events: Arc<Mutex<Vec<KueueEvent>>>,
-    fail_pod_create: bool,
 }
 
 #[async_trait::async_trait]
 impl PodDispatcher for KueueDispatcher {
     async fn create(&self, _cluster: &str, _ns: &str, mut pod: Pod) -> Result<Pod> {
-        if self.fail_pod_create {
-            anyhow::bail!("admission webhook denied the pod");
-        }
         pod.metadata.uid = Some("pod-uid-123".to_string());
         self.events
             .lock()
@@ -5659,23 +5654,12 @@ impl PodDispatcher for KueueDispatcher {
             .push(KueueEvent::Pod(Box::new(pod.clone())));
         Ok(pod)
     }
-    async fn create_configmap(&self, _cluster: &str, ns: &str, cm: ConfigMap) -> Result<()> {
+    async fn create_configmap(&self, _cluster: &str, ns: &str, _cm: ConfigMap) -> Result<()> {
         self.events
             .lock()
             .expect("lock")
             .push(KueueEvent::ConfigMap {
                 namespace: ns.to_string(),
-                cm,
-            });
-        Ok(())
-    }
-    async fn delete_configmap(&self, _cluster: &str, ns: &str, name: &str) -> Result<()> {
-        self.events
-            .lock()
-            .expect("lock")
-            .push(KueueEvent::DeleteConfigMap {
-                namespace: ns.to_string(),
-                name: name.to_string(),
             });
         Ok(())
     }
@@ -5688,7 +5672,7 @@ impl PodDispatcher for KueueDispatcher {
         self.events
             .lock()
             .expect("lock")
-            .push(KueueEvent::Secret(secret));
+            .push(KueueEvent::Secret(Box::new(secret)));
         Ok(())
     }
     async fn await_terminal(
@@ -5722,6 +5706,8 @@ queues = ["crucible-e2e"]
 record_writers = ["autoresearch/crucible-controller"]
 "#;
 
+const AGENT_ISSUER: &str = "http://crucible-controller.autoresearch.svc:8080";
+
 fn kueue_profile(dir: &Path) -> std::path::PathBuf {
     let path = crate::testing::fixtures::write_deploy_profile(dir);
     let mut text = std::fs::read_to_string(&path).expect("profile");
@@ -5730,19 +5716,28 @@ fn kueue_profile(dir: &Path) -> std::path::PathBuf {
     path
 }
 
-async fn dispatch_with_kueue(
-    db: &Db,
-    tmp: &Path,
-    fail_pod_create: bool,
-) -> (Result<RunAdmission>, Vec<KueueEvent>) {
+/// Dispatch a loop run onto the `[kueue]` cluster, the controller issuing agent tokens when
+/// `issuer` names one; every kube object the dispatch created, in order.
+async fn dispatch_with_kueue(db: &Db, tmp: &Path, issuer: Option<&str>) -> Vec<KueueEvent> {
     let profile = kueue_profile(tmp);
-    let cfg = pod_cfg(&profile, "img");
+    let profile_arg = profile.to_string_lossy().to_string();
+    let mut args = vec![
+        "ctl",
+        "--deploy-profile",
+        profile_arg.as_str(),
+        "--render-no-pin",
+        "--grounded-sandbox-image",
+        "img",
+    ];
+    if let Some(issuer) = issuer {
+        args.extend(["--agent-issuer", issuer]);
+    }
+    let cfg = crate::testing::cfg_from_args(args);
     let events = Arc::new(Mutex::new(Vec::new()));
     let dispatcher = Arc::new(KueueDispatcher {
         events: events.clone(),
-        fail_pod_create,
     });
-    let result = dispatch_run(
+    dispatch_run(
         db,
         &cfg,
         dispatcher,
@@ -5754,202 +5749,87 @@ async fn dispatch_with_kueue(
         RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
         None,
     )
-    .await;
-    let events = events.lock().expect("lock").clone();
-    (result, events)
+    .await
+    .expect("dispatch");
+    events.lock().expect("lock").clone()
 }
 
-/// The record lands in the tenants namespace before the pod exists, carries the token's digest,
-/// and the token itself appears only in the run Secret, projected into the pod by reference.
+fn loop_env(events: &[KueueEvent]) -> Vec<EnvVar> {
+    events
+        .iter()
+        .find_map(|e| match e {
+            KueueEvent::Pod(pod) => pod.spec.as_ref()?.containers.first()?.env.clone(),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// A run on the `[kueue]` cluster gets the server's URL and the controller's token endpoint as
+/// plain env, for its sandboxes' token grants. No token is minted, no record is written, and
+/// nothing about crucible-kueue reaches the run Secret.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_dispatch_onto_the_kueue_cluster_records_a_tenant_and_delivers_the_token_by_secret(
+async fn a_dispatch_onto_the_kueue_cluster_hands_the_loop_pod_the_token_endpoint_and_no_secret(
     pool: sqlx::PgPool,
 ) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir()?;
     let db = Db::new(pool);
-    let (result, events) = dispatch_with_kueue(&db, tmp.path(), false).await;
-    result?;
-
-    let record_at = events
-        .iter()
-        .position(|e| {
-            matches!(e, KueueEvent::ConfigMap { namespace, .. } if namespace == "crucible-kueue-tenants")
-        })
-        .expect("a tenant record");
-    let pod_at = events
-        .iter()
-        .position(|e| matches!(e, KueueEvent::Pod(_)))
-        .expect("a pod");
-    assert!(
-        record_at < pod_at,
-        "the record must exist before the pod can use the token"
-    );
-
-    let KueueEvent::ConfigMap { cm: record, .. } = &events[record_at] else {
-        unreachable!()
+    let events = dispatch_with_kueue(&db, tmp.path(), Some(AGENT_ISSUER)).await;
+    let env = loop_env(&events);
+    let value = |name: &str| {
+        env.iter()
+            .find(|e| e.name == name)
+            .and_then(|e| e.value.as_deref())
     };
-    let KueueEvent::Pod(pod) = &events[pod_at] else {
-        unreachable!()
-    };
-    let pod_name = pod.metadata.name.as_deref().expect("named pod");
     assert_eq!(
-        record.metadata.name.as_deref(),
-        Some(crucible_contract::kueue::record_name(pod_name).as_str())
-    );
-    let tenant: crucible_contract::kueue::TenantRecord = serde_json::from_str(
-        &record.data.as_ref().expect("data")[crucible_contract::kueue::TENANT_RECORD_KEY],
-    )?;
-    assert_eq!(tenant.run_id, pod_name);
-    assert_eq!(tenant.namespace, "crucible-kueue-e2e");
-    assert_eq!(tenant.queues, ["crucible-e2e"]);
-    assert!(tenant.expires_at.is_some());
-
-    let secret = events
-        .iter()
-        .find_map(|e| match e {
-            KueueEvent::Secret(s) => Some(s),
-            _ => None,
-        })
-        .expect("the run Secret");
-    let token = secret
-        .string_data
-        .as_ref()
-        .and_then(|d| d.get(crucible_contract::kueue::ENV_KUEUE_TOKEN))
-        .expect("the token in the run Secret");
-    assert_eq!(
-        crucible_contract::kueue::token_digest(token),
-        tenant.token_sha256
-    );
-    for e in &events {
-        if let KueueEvent::Pod(_) | KueueEvent::ConfigMap { .. } = e {
-            let doc = format!("{e:?}");
-            assert!(!doc.contains(token.as_str()), "the token leaked: {doc}");
-        }
-    }
-
-    let env = pod
-        .spec
-        .as_ref()
-        .and_then(|s| s.containers.first())
-        .and_then(|c| c.env.as_ref())
-        .expect("env");
-    let token_var = env
-        .iter()
-        .find(|v| v.name == crucible_contract::kueue::ENV_KUEUE_TOKEN)
-        .expect("the token projection");
-    assert!(token_var.value.is_none(), "a reference, never a value");
-    assert!(
-        token_var
-            .value_from
-            .as_ref()
-            .and_then(|f| f.secret_key_ref.as_ref())
-            .is_some()
-    );
-    let url = env
-        .iter()
-        .find(|v| v.name == crucible_contract::kueue::ENV_KUEUE_URL)
-        .and_then(|v| v.value.as_deref());
-    assert_eq!(
-        url,
+        value(crucible_contract::kueue::ENV_KUEUE_URL),
         Some("http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp")
     );
-    let visible = env
-        .iter()
-        .find(|v| v.name == "CRUCIBLE_AGENT_VISIBLE_ENV")
-        .and_then(|v| v.value.clone())
-        .unwrap_or_default();
+    assert_eq!(
+        value(crucible_contract::sandbox::ENV_AGENT_TOKEN_ENDPOINT),
+        Some("http://crucible-controller.autoresearch.svc:8080/oauth/token")
+    );
+    assert_eq!(
+        value(crucible_contract::sandbox::ENV_AGENT_SVID_AUDIENCE),
+        Some(AGENT_ISSUER)
+    );
     assert!(
-        !visible.contains(crucible_contract::kueue::ENV_KUEUE_TOKEN),
-        "the loop must never relay the raw token into the sandbox: {visible}"
+        !env.iter()
+            .any(|e| e.name == crucible_contract::kueue::ENV_KUEUE_TOKEN),
+        "no static token"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            KueueEvent::ConfigMap { namespace } if namespace == "crucible-kueue-tenants"
+        )),
+        "no tenant record: {events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(
+            e,
+            KueueEvent::Secret(secret) if secret
+                .string_data
+                .as_ref()
+                .is_some_and(|d| d.contains_key(crucible_contract::kueue::ENV_KUEUE_TOKEN))
+        )),
+        "nothing for crucible-kueue rides the run Secret"
     );
     Ok(())
 }
 
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_failed_launch_deletes_the_tenant_record_it_created(pool: sqlx::PgPool) -> Result<()> {
+async fn without_agent_tokens_a_run_gets_no_crucible_kueue_access(
+    pool: sqlx::PgPool,
+) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir()?;
     let db = Db::new(pool);
-    let (result, events) = dispatch_with_kueue(&db, tmp.path(), true).await;
-    assert!(result.is_err());
-    let created = events
-        .iter()
-        .find_map(|e| match e {
-            KueueEvent::ConfigMap { namespace, cm } if namespace == "crucible-kueue-tenants" => {
-                cm.metadata.name.clone()
-            }
-            _ => None,
-        })
-        .expect("a tenant record");
+    let env = loop_env(&dispatch_with_kueue(&db, tmp.path(), None).await);
     assert!(
-        events.iter().any(|e| matches!(
-            e,
-            KueueEvent::DeleteConfigMap { namespace, name }
-                if namespace == "crucible-kueue-tenants" && *name == created
-        )),
-        "{events:?}"
-    );
-    Ok(())
-}
-
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn collecting_a_run_deletes_its_tenant_record_only_on_the_kueue_cluster(
-    pool: sqlx::PgPool,
-) -> Result<()> {
-    let tmp = tempfile::tempdir()?;
-    let profile = crucible::deploy::DeployProfile::load(&kueue_profile(tmp.path()))?;
-    let db = Db::new(pool);
-    for (pod, cluster) in [
-        ("crucible-run-here", "hub"),
-        ("crucible-run-there", "wharf"),
-    ] {
-        crate::runs::work_pods::insert_work_pod(
-            db.pool(),
-            &NewWorkPod {
-                pod_name: pod.to_string(),
-                kind: WorkKind::Run.label_value().to_string(),
-                issue_key: Some("owner/repo#7".to_string()),
-                state: WorkPodState::Running,
-                cost_tag: WorkKind::Run.cost_tag().to_string(),
-                cluster: cluster.to_string(),
-            },
-        )
-        .await?;
-    }
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let dispatcher = KueueDispatcher {
-        events: events.clone(),
-        fail_pod_create: false,
-    };
-    for pod in ["crucible-run-here", "crucible-run-there"] {
-        collect_run_pod(
-            &db,
-            &dispatcher,
-            "autoresearch",
-            Some(&profile),
-            pod,
-            RunDisposition::Finished,
-        )
-        .await?;
-    }
-    let deleted: Vec<(String, String)> = events
-        .lock()
-        .expect("lock")
-        .iter()
-        .filter_map(|e| match e {
-            KueueEvent::DeleteConfigMap { namespace, name } => {
-                Some((namespace.clone(), name.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        deleted,
-        [(
-            "crucible-kueue-tenants".to_string(),
-            "kueue-tenant-crucible-run-here".to_string()
-        )]
+        !env.iter().any(|e| e.name.starts_with("CRUCIBLE_KUEUE_")
+            || e.name.starts_with("CRUCIBLE_AGENT_")),
+        "{env:?}"
     );
     Ok(())
 }

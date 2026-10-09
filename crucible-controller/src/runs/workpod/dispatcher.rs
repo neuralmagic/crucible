@@ -45,11 +45,6 @@ pub trait PodDispatcher: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
-    /// Delete a ConfigMap the dispatcher created outside the pod's ownership (a run's crucible-kueue
-    /// tenant record). A missing object is success. The default no-ops, like [`Self::create_configmap`].
-    async fn delete_configmap(&self, _cluster: &str, _namespace: &str, _name: &str) -> Result<()> {
-        Ok(())
-    }
     /// Create the run's Secret (the bound values a pod mounts, see [`ADR-0036`]). Same shape as
     /// [`Self::create_configmap`]: created after the pod so it can be owner-referenced to it, and
     /// collected by the cluster when the pod goes.
