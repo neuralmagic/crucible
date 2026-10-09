@@ -56,6 +56,11 @@ pub enum ConfigError {
     #[error("CONTROLLER_AGENT_SPIRE names no cluster's SPIRE")]
     NoSpire,
     #[error(
+        "CONTROLLER_AGENT_ISSUER is set but neither CONTROLLER_AGENT_SPIRE (agent tokens) nor \
+         CONTROLLER_PEOPLE_AUDIENCES (people's tokens) says whom it issues to"
+    )]
+    NoRecipients,
+    #[error(
         "CONTROLLER_AGENT_SPIRE entry {0:?} is not \
          <cluster>=<svid issuer> <gateway prefix> <namespace>/<service>:<port>"
     )]
@@ -298,7 +303,10 @@ pub struct AgentIssuerConfig {
 
 impl AgentIssuerConfig {
     /// The issuer's configuration from `CONTROLLER_AGENT_*`, `None` when
-    /// `CONTROLLER_AGENT_ISSUER` is unset. A partial configuration is an error.
+    /// `CONTROLLER_AGENT_ISSUER` is unset. A partial configuration is an error. Without
+    /// `CONTROLLER_AGENT_SPIRE` the issuer mints no agent tokens and serves people only. The
+    /// signing key is `CONTROLLER_AGENT_SIGNING_KEY` (PEM) or the file
+    /// `CONTROLLER_AGENT_SIGNING_KEY_FILE` names.
     pub fn from_env() -> Result<Option<Self>, ConfigError> {
         Self::from_lookup(|var| std::env::var(var).ok())
     }
@@ -316,7 +324,15 @@ impl AgentIssuerConfig {
             SigningKey::from_pem(&read(path.clone())?)
                 .map_err(|source| ConfigError::Key { path, source })
         };
-        let signing_key = load_key(need("CONTROLLER_AGENT_SIGNING_KEY_FILE")?)?;
+        let signing_key = match get("CONTROLLER_AGENT_SIGNING_KEY") {
+            Some(pem) => {
+                SigningKey::from_pem(pem.as_bytes()).map_err(|source| ConfigError::Key {
+                    path: "CONTROLLER_AGENT_SIGNING_KEY".into(),
+                    source,
+                })?
+            }
+            None => load_key(need("CONTROLLER_AGENT_SIGNING_KEY_FILE")?)?,
+        };
         let previous_key = get("CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE")
             .map(load_key)
             .transpose()?;
@@ -324,15 +340,21 @@ impl AgentIssuerConfig {
             .map(|raw| raw.parse())
             .transpose()?
             .unwrap_or_default();
-        let spire: Vec<ClusterSpire> = need("CONTROLLER_AGENT_SPIRE")?
-            .split(',')
-            .map(str::trim)
-            .filter(|e| !e.is_empty())
-            .map(str::parse)
-            .collect::<Result<_, _>>()?;
-        if spire.is_empty() {
-            return Err(ConfigError::NoSpire);
-        }
+        let spire: Vec<ClusterSpire> = match get("CONTROLLER_AGENT_SPIRE") {
+            None => Vec::new(),
+            Some(raw) => {
+                let spire: Vec<ClusterSpire> = raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|e| !e.is_empty())
+                    .map(str::parse)
+                    .collect::<Result<_, _>>()?;
+                if spire.is_empty() {
+                    return Err(ConfigError::NoSpire);
+                }
+                spire
+            }
+        };
         let mut seen = std::collections::BTreeSet::new();
         for entry in &spire {
             for key in [&entry.cluster, &entry.svid_issuer] {
@@ -341,13 +363,16 @@ impl AgentIssuerConfig {
                 }
             }
         }
-        let audiences: Vec<Audience> = need("CONTROLLER_AGENT_AUDIENCES")?
-            .split(',')
-            .map(str::trim)
-            .filter(|a| !a.is_empty())
-            .map(str::parse)
-            .collect::<Result<_, _>>()?;
-        if audiences.is_empty() {
+        let audiences: Vec<Audience> = match spire.is_empty() {
+            true => Vec::new(),
+            false => need("CONTROLLER_AGENT_AUDIENCES")?
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::parse)
+                .collect::<Result<_, _>>()?,
+        };
+        if !spire.is_empty() && audiences.is_empty() {
             return Err(ConfigError::NoAudiences);
         }
         Ok(Some(Self {
@@ -626,6 +651,11 @@ impl AgentIssuer {
         &self.issuer
     }
 
+    /// Whether any cluster's SPIRE is trusted, and so whether agent tokens are minted at all.
+    pub fn serves_agents(&self) -> bool {
+        !self.spire.is_empty()
+    }
+
     /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against the keys
     /// of the cluster SPIRE its `iss` names, carry exactly one `aud` equal to this issuer, and
     /// name a SPIFFE ID `<that cluster's gateway prefix><gateway id>/sandbox/<sandbox id>`.
@@ -781,15 +811,22 @@ impl AgentIssuer {
             authorization_endpoint: None,
             token_endpoint: self.issuer.endpoint(TOKEN_PATH),
             jwks_uri: self.issuer.endpoint(JWKS_PATH),
-            grant_types_supported: vec!["client_credentials"],
+            grant_types_supported: Vec::new(),
             response_types_supported: Vec::new(),
             code_challenge_methods_supported: Vec::new(),
-            token_endpoint_auth_methods_supported: vec!["private_key_jwt"],
-            token_endpoint_auth_signing_alg_values_supported:
-                crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec(),
+            token_endpoint_auth_methods_supported: Vec::new(),
+            token_endpoint_auth_signing_alg_values_supported: Vec::new(),
             authorization_response_iss_parameter_supported: false,
             scopes_supported,
         };
+        if self.serves_agents() {
+            metadata.grant_types_supported.push("client_credentials");
+            metadata
+                .token_endpoint_auth_methods_supported
+                .push("private_key_jwt");
+            metadata.token_endpoint_auth_signing_alg_values_supported =
+                crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec();
+        }
         if people.is_some() {
             metadata.authorization_endpoint = Some(
                 self.issuer
@@ -1444,7 +1481,6 @@ mod tests {
 
         for missing in [
             "CONTROLLER_AGENT_SIGNING_KEY_FILE",
-            "CONTROLLER_AGENT_SPIRE",
             "CONTROLLER_AGENT_AUDIENCES",
         ] {
             let mut partial = vars.clone();
@@ -1528,5 +1564,43 @@ mod tests {
                 "{var}={value}"
             );
         }
+    }
+
+    /// Without SPIRE the issuer serves people only: no agent audiences are needed, the key may come
+    /// inline, and the metadata advertises no client_credentials grant.
+    #[test]
+    fn an_issuer_without_spire_serves_people_only() {
+        let key = EcKey::generate();
+        let vars = HashMap::from([
+            ("CONTROLLER_AGENT_ISSUER", ISSUER.to_string()),
+            ("CONTROLLER_AGENT_SIGNING_KEY", key.pem()),
+        ]);
+        let cfg = AgentIssuerConfig::from_lookup(lookup(&vars))
+            .unwrap()
+            .unwrap();
+        assert!(cfg.spire.is_empty() && cfg.audiences.is_empty());
+        let issuer = AgentIssuer::new(cfg, |_: &ClusterSpire| -> crucible_mcp_auth::jwks::Jwks {
+            panic!("no SPIRE to read keys from")
+        });
+        assert!(!issuer.serves_agents());
+        let people = crate::agent_auth::people::PeopleConfig::from_lookup(Some(format!(
+            "pirate:{KUEUE}=kueue.read"
+        )))
+        .unwrap()
+        .unwrap();
+        let doc = issuer.metadata(Some(&people));
+        assert_eq!(
+            doc.grant_types_supported,
+            ["authorization_code", "refresh_token"]
+        );
+        assert_eq!(doc.token_endpoint_auth_methods_supported, ["none"]);
+        assert!(issuer.metadata(None).grant_types_supported.is_empty());
+
+        let mut bad = vars.clone();
+        bad.insert("CONTROLLER_AGENT_SIGNING_KEY", "not a key".into());
+        assert!(matches!(
+            AgentIssuerConfig::from_lookup(lookup(&bad)),
+            Err(ConfigError::Key { .. })
+        ));
     }
 }

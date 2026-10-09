@@ -65,10 +65,20 @@ pub fn check_key_placement(
     controller_namespace: Option<&str>,
     profile: &DeployProfile,
 ) -> Result<(), PlacementError> {
+    sandbox_namespace(Some(profile))?;
+    check_key_exposure(controller_namespace, profile)
+}
+
+/// Refuse a controller whose namespace is one loop pods, rigs, sandboxes or crucible-kueue run in.
+/// The people-only issuer needs this and not [`check_key_placement`]'s sandbox isolation, since
+/// it vouches for no sandbox.
+pub fn check_key_exposure(
+    controller_namespace: Option<&str>,
+    profile: &DeployProfile,
+) -> Result<(), PlacementError> {
     let namespace = controller_namespace
         .filter(|ns| !ns.is_empty())
         .ok_or(PlacementError::UnknownControllerNamespace)?;
-    sandbox_namespace(Some(profile))?;
     let mut shared = vec![
         (
             "cluster.loop_namespace",

@@ -62,7 +62,11 @@ impl AgentAuth {
             .ok_or(placement::PlacementError::NoProfile)?;
         let profile = crucible::deploy::DeployProfile::load(profile_path)
             .context("reading the deploy profile for the agent issuer")?;
-        placement::check_key_placement(placement::controller_namespace().as_deref(), &profile)?;
+        let namespace = placement::controller_namespace();
+        match cfg.spire.is_empty() {
+            false => placement::check_key_placement(namespace.as_deref(), &profile)?,
+            true => placement::check_key_exposure(namespace.as_deref(), &profile)?,
+        }
         let people = people::PeopleConfig::from_env()?.map(|config| {
             tracing::info!(
                 audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
@@ -73,6 +77,9 @@ impl AgentAuth {
             people::grants::spawn_sweep(people.grants.clone());
             people
         });
+        if cfg.spire.is_empty() && people.is_none() {
+            return Err(issuer::ConfigError::NoRecipients.into());
+        }
         tracing::info!(
             issuer = cfg.issuer.as_str(),
             kid = cfg.signing_key.kid(),
@@ -279,6 +286,12 @@ async fn issue(
 ) -> Result<Response, OAuthError> {
     let req: TokenRequest = serde_json::from_value(serde_json::Value::Object(fields))
         .map_err(|e| OAuthError::InvalidRequest(e.to_string()))?;
+    if !state.issuer.serves_agents() {
+        return Err(OAuthError::UnsupportedGrantType(format!(
+            "grant_type {:?}: this controller issues tokens to people only",
+            req.grant_type
+        )));
+    }
     let profile = &state.profile;
     placement::sandbox_namespace(Some(profile))
         .map_err(|e| OAuthError::UnauthorizedClient(e.to_string()))?;
