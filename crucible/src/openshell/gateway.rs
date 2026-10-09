@@ -607,26 +607,30 @@ pub fn generate_certs_args(tls_dir: &str, pod_ip: Option<IpAddr>) -> Vec<String>
     args
 }
 
-/// `openshell gateway add https://localhost:<port> --local --name ci`.
-pub fn register_args(port: u16) -> Vec<String> {
+/// The in-pod gateway's endpoint.
+fn local_endpoint(port: u16) -> String {
+    format!("https://localhost:{port}")
+}
+
+/// `openshell gateway add <endpoint> --local --name ci`.
+pub fn register_args(endpoint: &str) -> Vec<String> {
     vec![
         "gateway".into(),
         "add".into(),
-        format!("https://localhost:{port}"),
+        endpoint.into(),
         "--local".into(),
         "--name".into(),
         GATEWAY_NAME.into(),
     ]
 }
 
-fn registration_matches(body: &[u8], port: u16) -> bool {
+fn registration_matches(body: &[u8], endpoint: &str) -> bool {
     let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(body) else {
         return false;
     };
-    let endpoint = format!("https://localhost:{port}");
     rows.iter().any(|row| {
         row.get("name").and_then(serde_json::Value::as_str) == Some(GATEWAY_NAME)
-            && row.get("endpoint").and_then(serde_json::Value::as_str) == Some(endpoint.as_str())
+            && row.get("endpoint").and_then(serde_json::Value::as_str) == Some(endpoint)
             && row.get("type").and_then(serde_json::Value::as_str) == Some("local")
             && row.get("auth").and_then(serde_json::Value::as_str) == Some("mtls")
     })
@@ -663,13 +667,94 @@ fn gateway_listening(port: u16) -> bool {
     .is_ok()
 }
 
-fn registration_exists(port: u16) -> bool {
+fn registration_exists(endpoint: &str) -> bool {
     Command::new("openshell")
         .args(["gateway", "list", "--output", "json"])
         .output()
         .ok()
         .filter(|output| output.status.success())
-        .is_some_and(|output| registration_matches(&output.stdout, port))
+        .is_some_and(|output| registration_matches(&output.stdout, endpoint))
+}
+
+/// Register the CLI's gateway at `endpoint` with the client material in `tls_dir` (`ca.crt`,
+/// `client/tls.crt`, `client/tls.key`), retrying while the gateway comes up. `gateway add` copies
+/// that material and refuses an existing name, so a registration whose copy no longer matches is
+/// removed and made again. Returns the CLI's last complaint when it never registers.
+fn register_cli(endpoint: &str, tls_dir: &Path) -> Result<Result<(), String>> {
+    let current = registration_exists(endpoint)
+        && mtls_dir().is_ok_and(|dir| client_certs_match(&dir, tls_dir));
+    if current {
+        return Ok(Ok(()));
+    }
+    let listed = Command::new("openshell")
+        .args(["gateway", "list", "--output", "json"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| registered_name(&output.stdout));
+    if listed {
+        let removed = Command::new("openshell")
+            .args(["gateway", "remove", GATEWAY_NAME])
+            .output()
+            .context("exec openshell gateway remove")?;
+        if !removed.status.success() {
+            return Err(GatewayError::RemoveRegistrationFailed {
+                name: GATEWAY_NAME,
+                stderr: String::from_utf8_lossy(&removed.stderr).trim().to_owned(),
+            }
+            .into());
+        }
+    }
+    let mut last = String::new();
+    let registered = wait_for(Duration::from_secs(30), || {
+        match Command::new("openshell")
+            .args(register_args(endpoint))
+            .env("OPENSHELL_LOCAL_TLS_DIR", tls_dir)
+            .output()
+        {
+            Ok(o) if o.status.success() => true,
+            Ok(o) => {
+                last = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                false
+            }
+            Err(e) => {
+                last = e.to_string();
+                false
+            }
+        }
+    });
+    Ok(match registered {
+        true => Ok(()),
+        false => Err(last),
+    })
+}
+
+fn registered_name(body: &[u8]) -> bool {
+    serde_json::from_slice::<Vec<serde_json::Value>>(body).is_ok_and(|rows| {
+        rows.iter()
+            .any(|row| row.get("name").and_then(serde_json::Value::as_str) == Some(GATEWAY_NAME))
+    })
+}
+
+/// Lay a gateway pod's client material (`ca.crt`, `tls.crt`, `tls.key`, as its Secret mounts it)
+/// out the way `gateway add` reads it, under `staged`.
+fn stage_client_tls(mounted: &Path, staged: &Path) -> Result<()> {
+    let client = staged.join("client");
+    std::fs::create_dir_all(&client).with_context(|| format!("creating {}", client.display()))?;
+    for (from, to) in [
+        ("ca.crt", staged.join("ca.crt")),
+        ("tls.crt", client.join("tls.crt")),
+        ("tls.key", client.join("tls.key")),
+    ] {
+        std::fs::copy(mounted.join(from), &to).with_context(|| {
+            format!(
+                "copying {} to {}",
+                mounted.join(from).display(),
+                to.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// The Podman API socket path. An explicit `OPENSHELL_PODMAN_SOCKET` names a socket managed
@@ -751,15 +836,20 @@ async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
         }
         None => false,
     };
+    let pod_log = || format!("(the gateway runs in its own pod at {endpoint}; see that pod's log)");
     if !healthy {
         return Err(GatewayError::HealthTimeout {
             last_status: format!("no healthy answer from {endpoint}"),
-            log_tail: format!(
-                "(the gateway runs in its own pod at {endpoint}; see that pod's log)"
-            ),
+            log_tail: pod_log(),
         }
         .into());
     }
+    let staged = state_dir()?.join("remote-tls");
+    stage_client_tls(&access.tls_dir()?, &staged)?;
+    register_cli(endpoint, &staged)?.map_err(|last| GatewayError::RegisterTimeout {
+        last,
+        log_tail: pod_log(),
+    })?;
     Ok(())
 }
 
@@ -963,40 +1053,7 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
     // 5. register, retrying until the gateway is listening; 6. wait healthy. `gateway add`
     //    copies the client material out of `tls_dir` and refuses an existing name, so a
     //    registration whose copy no longer matches is removed and made again.
-    let mut last = String::new();
-    let current = registration_exists(GATEWAY_PORT)
-        && mtls_dir().is_ok_and(|dir| client_certs_match(&dir, &tls_dir));
-    if !current && registration_exists(GATEWAY_PORT) {
-        let removed = Command::new("openshell")
-            .args(["gateway", "remove", GATEWAY_NAME])
-            .output()
-            .context("exec openshell gateway remove")?;
-        if !removed.status.success() {
-            return Err(GatewayError::RemoveRegistrationFailed {
-                name: GATEWAY_NAME,
-                stderr: String::from_utf8_lossy(&removed.stderr).trim().to_owned(),
-            }
-            .into());
-        }
-    }
-    let registered = current
-        || wait_for(Duration::from_secs(30), || {
-            match Command::new("openshell")
-                .args(register_args(GATEWAY_PORT))
-                .output()
-            {
-                Ok(o) if o.status.success() => true,
-                Ok(o) => {
-                    last = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                    false
-                }
-                Err(e) => {
-                    last = e.to_string();
-                    false
-                }
-            }
-        });
-    if !registered {
+    if let Err(last) = register_cli(&local_endpoint(GATEWAY_PORT), &tls_dir)? {
         return Err(GatewayError::RegisterTimeout {
             last,
             log_tail: tail_gateway_log(&log_path),
@@ -1690,7 +1747,7 @@ mod tests {
     #[test]
     fn register_targets_local_named_gateway() {
         assert_eq!(
-            register_args(17670),
+            register_args(&local_endpoint(17670)),
             [
                 "gateway",
                 "add",
@@ -1703,13 +1760,43 @@ mod tests {
     }
 
     #[test]
+    fn a_gateway_pods_mounted_client_material_is_staged_where_gateway_add_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounted = dir.path().join("mounted");
+        std::fs::create_dir_all(&mounted).unwrap();
+        for (name, body) in [("ca.crt", "ca"), ("tls.crt", "cert"), ("tls.key", "key")] {
+            std::fs::write(mounted.join(name), body).unwrap();
+        }
+        let staged = dir.path().join("staged");
+        stage_client_tls(&mounted, &staged).unwrap();
+        assert_eq!(std::fs::read_to_string(staged.join("ca.crt")).unwrap(), "ca");
+        assert_eq!(
+            std::fs::read_to_string(staged.join("client/tls.crt")).unwrap(),
+            "cert"
+        );
+        assert_eq!(
+            std::fs::read_to_string(staged.join("client/tls.key")).unwrap(),
+            "key"
+        );
+        assert!(
+            client_certs_match(&mounted, &staged),
+            "a registration copied from the staged material is current"
+        );
+        std::fs::remove_file(mounted.join("tls.key")).unwrap();
+        assert!(stage_client_tls(&mounted, &staged).is_err());
+    }
+
+    #[test]
     fn exact_existing_registration_is_idempotent_but_wrong_endpoint_is_not() {
         let exact =
             br#"[{"name":"ci","endpoint":"https://localhost:17670","type":"local","auth":"mtls"}]"#;
-        assert!(registration_matches(exact, 17670));
+        assert!(registration_matches(exact, &local_endpoint(17670)));
         let wrong = br#"[{"name":"ci","endpoint":"https://remote.example:17670","type":"local","auth":"mtls"}]"#;
-        assert!(!registration_matches(wrong, 17670));
-        assert!(!registration_matches(b"not json", 17670));
+        assert!(!registration_matches(wrong, &local_endpoint(17670)));
+        assert!(registration_matches(wrong, "https://remote.example:17670"));
+        assert!(!registration_matches(b"not json", &local_endpoint(17670)));
+        assert!(registered_name(wrong));
+        assert!(!registered_name(br#"[{"name":"other"}]"#));
     }
 
     #[test]
