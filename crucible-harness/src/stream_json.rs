@@ -265,6 +265,7 @@ impl StreamJsonParser {
                 subagent,
                 input,
                 result: None,
+                failed: false,
             });
             self.tool_json.clear();
             return;
@@ -305,6 +306,7 @@ impl StreamJsonParser {
                     subagent: false,
                     input: None,
                     result: Some(truncate_chars(&text, TOOL_IO_LIMIT)),
+                    failed,
                 });
             } else if failed {
                 let reason = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -314,6 +316,7 @@ impl StreamJsonParser {
                     subagent: false,
                     input: None,
                     result: None,
+                    failed: true,
                 });
             }
         }
@@ -670,8 +673,10 @@ mod tests {
                     subagent,
                     input,
                     result,
+                    failed,
                 },
             ] => {
+                assert!(!failed, "a call is not a failure until its result says so");
                 assert_eq!(name, "Edit");
                 assert_eq!(summary, "p.go: snap := x");
                 assert!(!subagent);

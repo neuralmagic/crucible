@@ -2,6 +2,7 @@
 
 use crate::agent::event::{AgentEvent, RawStream, Tokens, cost_of};
 use crate::agent::harness::StreamDecoder;
+use crate::agent::tool_chain::{StopReason, ToolChain};
 use crate::args::Args;
 use crucible_contract::TransportCause;
 
@@ -21,6 +22,9 @@ pub enum TurnFailure {
     /// The turn was killed at its deadline. The agent ran; it ran out of time.
     #[error("{}", .0.note())]
     DeadlineExceeded(crucible::deadline::Deadline),
+    /// A `[[agent.tool_plugins]]` guard stopped the turn.
+    #[error(transparent)]
+    Stopped(StopReason),
 }
 
 impl TurnFailure {
@@ -30,6 +34,7 @@ impl TurnFailure {
             TurnFailure::Spawn(_) => TransportCause::Agent,
             TurnFailure::Orchestration { cause, .. } => *cause,
             TurnFailure::DeadlineExceeded(_) => TransportCause::Agent,
+            TurnFailure::Stopped(_) => TransportCause::Agent,
         }
     }
 }
@@ -118,6 +123,14 @@ pub(crate) fn tool_io_full(args: &Args) -> bool {
         .unwrap_or(false)
 }
 
+/// What a drained agent stream amounted to: its cost signals, and the tool chain stop that cut it
+/// short.
+pub(crate) struct PumpEnd {
+    pub(crate) cost: f64,
+    pub(crate) best_tokens: Option<Tokens>,
+    pub(crate) stopped: Option<StopReason>,
+}
+
 /// The decoder-driving core of an agent stdout pump: one [`StreamDecoder`] plus the
 /// turn's running (max authoritative cost, largest token sample). Pure and sync, no I/O. Each
 /// complete stdout line is [`push`](StreamPump::push)ed in; the local-child path feeds it off a
@@ -126,17 +139,27 @@ pub(crate) fn tool_io_full(args: &Args) -> bool {
 /// exact same accounting + sink dispatch from any line source (BufReader or gRPC stream).
 pub(crate) struct StreamPump {
     decoder: Box<dyn StreamDecoder>,
+    chain_decoder: Option<Box<dyn StreamDecoder>>,
     cost: f64,
     best_tokens: Option<Tokens>,
+    chain: ToolChain,
 }
 
 impl StreamPump {
-    /// A fresh pump over the harness's `decoder` (see `Backend::decoder`).
-    pub(crate) fn new(decoder: Box<dyn StreamDecoder>) -> Self {
+    /// A fresh pump over the harness's `decoder` (see `Backend::decoder`), its events run through
+    /// `chain`. `chain_decoder` decodes the same lines with full tool IO for the chain when
+    /// `decoder` is compact; `None` hands the chain `decoder`'s own events.
+    pub(crate) fn new(
+        decoder: Box<dyn StreamDecoder>,
+        chain_decoder: Option<Box<dyn StreamDecoder>>,
+        chain: ToolChain,
+    ) -> Self {
         Self {
             decoder,
+            chain_decoder,
             cost: 0.0,
             best_tokens: None,
+            chain,
         }
     }
 
@@ -149,19 +172,82 @@ impl StreamPump {
         json: bool,
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) {
-        for ev in self.decoder.push(line) {
-            account(&ev, &mut self.cost, &mut self.best_tokens);
+        let events = self.decoder.push(line);
+        for ev in &events {
+            account(ev, &mut self.cost, &mut self.best_tokens);
             if json {
-                sink(line, RawStream::Stdout, Some(&ev));
-            } else if let Some(human) = human_line(&ev) {
-                sink(&human, RawStream::Stdout, Some(&ev));
+                sink(line, RawStream::Stdout, Some(ev));
+            } else if let Some(human) = human_line(ev) {
+                sink(&human, RawStream::Stdout, Some(ev));
+            }
+        }
+        let chain_events = match &mut self.chain_decoder {
+            Some(decoder) => decoder.push(line),
+            None => events,
+        };
+        for ev in &chain_events {
+            if let Some(reason) = self.chain.observe(ev) {
+                emit(&stop_event(reason), sink);
             }
         }
     }
 
-    /// The turn's (max authoritative cost, largest token sample) once the stream ends.
-    pub(crate) fn finish(self) -> (f64, Option<Tokens>) {
-        (self.cost, self.best_tokens)
+    /// The tool chain stop this stream has hit, if any; the caller ends the agent on it.
+    pub(crate) fn stopped(&self) -> Option<&StopReason> {
+        self.chain.stopped()
+    }
+
+    /// The turn's max authoritative cost, largest token sample, and chain stop once the stream
+    /// ends, after the chain's end-of-turn reports reach `sink`.
+    pub(crate) fn finish(
+        self,
+        sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
+    ) -> PumpEnd {
+        report_chain(&self.chain, sink);
+        PumpEnd {
+            cost: self.cost,
+            best_tokens: self.best_tokens,
+            stopped: self.chain.into_stopped(),
+        }
+    }
+}
+
+/// Send each of `chain`'s end-of-turn reports to `sink` as a `Log` event.
+pub(crate) fn report_chain(
+    chain: &ToolChain,
+    sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
+) {
+    for (label, value) in chain.reports() {
+        tracing::info!(label, report = %value, "tool chain report");
+        emit(
+            &AgentEvent::Log {
+                level: "info".into(),
+                label: label.into(),
+                value: Some(value.to_string()),
+            },
+            sink,
+        );
+    }
+}
+
+fn emit(ev: &AgentEvent, sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>)) {
+    let human = human_line(ev).unwrap_or_default();
+    sink(&human, RawStream::Stderr, Some(ev));
+}
+
+/// The run-log event for a tool chain stop.
+pub(crate) fn stop_event(reason: &StopReason) -> AgentEvent {
+    AgentEvent::Error {
+        error_type: "tool_plugin".into(),
+        message: reason.to_string(),
+    }
+}
+
+/// The turn a chain stop leaves, or a completed one.
+pub(crate) fn ended_turn(cost: f64, stopped: Option<StopReason>) -> TurnOutcome {
+    match stopped {
+        Some(reason) => TurnOutcome::failed(cost, TurnFailure::Stopped(reason)),
+        None => TurnOutcome::completed(cost),
     }
 }
 
@@ -211,13 +297,202 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
             error_type,
             message,
         } => Some(format!("\u{274c} Error: {error_type}: {message}")),
+        AgentEvent::Log {
+            label,
+            value: Some(value),
+            ..
+        } if label.starts_with("tool_") => Some(format!("\u{1f9e9} {label}: {value}")),
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crucible_contract::event::AgentEvent;
+    use crate::agent::tool_chain::{StopReason, ToolChain, Wedged};
+    use crate::agent::turn::{PumpEnd, StreamPump};
+    use crate::manifest::ToolPluginSpec;
+    use crucible_contract::event::{AgentEvent, RawStream};
+    use crucible_harness::StreamJsonParser;
+    use std::num::NonZeroUsize;
+
+    /// One Claude `stream-json` tool call, and its result when `result` is given, as the CLI emits them.
+    fn claude_call(id: usize, command: &str, result: Option<(&str, bool)>) -> Vec<String> {
+        let input = serde_json::json!({ "command": command }).to_string();
+        let mut lines = vec![
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"tool_use","id":format!("toolu_{id}"),"name":"Bash"}}}).to_string(),
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":input}}}).to_string(),
+            serde_json::json!({"type":"stream_event","event":{"type":"content_block_stop"}}).to_string(),
+        ];
+        if let Some((text, is_error)) = result {
+            lines.push(serde_json::json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":format!("toolu_{id}"),"is_error":is_error,"content":text}]}}).to_string());
+        }
+        lines
+    }
+
+    fn limit(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+
+    /// Drives `lines` through the real Claude decoder and a pump, stopping at the first wedge.
+    fn pump(lines: &[String], tool_io: bool, n: usize) -> (PumpEnd, usize, Vec<AgentEvent>) {
+        let decoder = Box::new(StreamJsonParser::default().with_tool_io(tool_io));
+        let mut pump = StreamPump::new(decoder, None, guard(n));
+        let mut events = Vec::new();
+        let mut read = 0;
+        for line in lines {
+            pump.push(
+                line,
+                true,
+                &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| events.extend(ev.cloned()),
+            );
+            read += 1;
+            if pump.stopped().is_some() {
+                break;
+            }
+        }
+        let end = pump.finish(&mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
+            events.extend(ev.cloned())
+        });
+        (end, read, events)
+    }
+
+    fn guard(n: usize) -> ToolChain {
+        ToolChain::new(&[ToolPluginSpec::RepeatGuard { limit: limit(n) }])
+    }
+
+    fn wedged(end: PumpEnd) -> Option<Wedged> {
+        end.stopped.map(|StopReason::Wedged(wedged)| wedged)
+    }
+
+    #[test]
+    fn the_chain_reads_full_results_while_the_run_log_stays_compact() {
+        let polls: Vec<String> = (0..40)
+            .flat_map(|i| {
+                let status = format!("{}% built", i * 2);
+                claude_call(i, "buildit status b-1", Some((status.as_str(), false)))
+            })
+            .collect();
+        let run = |lines: &[String]| {
+            let mut pump = StreamPump::new(
+                Box::new(StreamJsonParser::default()),
+                Some(Box::new(StreamJsonParser::default().with_tool_io(true))),
+                ToolChain::new(&crate::manifest::default_chain()),
+            );
+            let mut logged = Vec::new();
+            let mut sink =
+                |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| logged.extend(ev.cloned());
+            for line in lines {
+                pump.push(line, true, &mut sink);
+            }
+            (pump.finish(&mut sink), logged)
+        };
+        let (end, logged) = run(&polls);
+        assert!(
+            end.stopped.is_none(),
+            "a poll whose answer changes is progress"
+        );
+        assert!(
+            logged.iter().all(|ev| !matches!(
+                ev,
+                AgentEvent::Tool {
+                    result: Some(_),
+                    ..
+                }
+            )),
+            "the compact log carries no tool results"
+        );
+        let same: Vec<String> = (0..40)
+            .flat_map(|i| claude_call(i, "buildit status b-1", Some(("0% built", false))))
+            .collect();
+        assert!(matches!(run(&same).0.stopped, Some(StopReason::Wedged(_))));
+    }
+
+    #[test]
+    fn the_same_command_issued_limit_times_in_a_row_wedges_the_turn() {
+        let command = "go list -deps ./cmd/server 2>&1 | tail -2";
+        let lines: Vec<String> = (0..40)
+            .flat_map(|i| claude_call(i, command, None))
+            .collect();
+        let (end, read, events) = pump(&lines, false, 25);
+        assert_eq!(
+            wedged(end),
+            Some(Wedged {
+                calls: vec![format!("Bash `$ {command}`")],
+                repeats: 25,
+            })
+        );
+        assert_eq!(read, 25 * 3, "the pump stops at the 25th call");
+        assert!(events.iter().any(|ev| matches!(
+            ev,
+            AgentEvent::Error { error_type, message }
+                if error_type == "tool_plugin" && message.contains("repeated 25 times in a row")
+        )));
+    }
+
+    #[test]
+    fn one_call_short_of_the_limit_is_not_a_wedge() {
+        let lines: Vec<String> = (0..24).flat_map(|i| claude_call(i, "make", None)).collect();
+        assert_eq!(wedged(pump(&lines, false, 25).0), None);
+    }
+
+    #[test]
+    fn a_different_call_restarts_the_count() {
+        let mut lines: Vec<String> = (0..20).flat_map(|i| claude_call(i, "make", None)).collect();
+        lines.extend(claude_call(20, "make test", None));
+        lines.extend((21..41).flat_map(|i| claude_call(i, "make", None)));
+        assert_eq!(wedged(pump(&lines, false, 25).0), None);
+    }
+
+    #[test]
+    fn a_command_that_fails_the_same_way_every_time_wedges_through_its_failure_lines() {
+        let lines: Vec<String> = (0..30)
+            .flat_map(|i| claude_call(i, "./run.sh", Some(("permission denied", true))))
+            .collect();
+        let (end, _, _) = pump(&lines, false, 25);
+        let wedged = wedged(end).unwrap();
+        assert_eq!(
+            wedged.calls,
+            ["Bash `$ ./run.sh`"],
+            "the call, not its failure line, is reported"
+        );
+    }
+
+    #[test]
+    fn polling_whose_answer_changes_is_progress_under_full_tool_io() {
+        let lines: Vec<String> = (0..60)
+            .flat_map(|i| {
+                let status = format!("build {}% done", i * 100 / 60);
+                claude_call(i, "buildit status b-1", Some((status.as_str(), false)))
+            })
+            .collect();
+        assert_eq!(wedged(pump(&lines, true, 25).0), None);
+    }
+
+    #[test]
+    fn polling_that_gets_the_same_answer_every_time_is_a_wedge_under_full_tool_io() {
+        let lines: Vec<String> = (0..30)
+            .flat_map(|i| claude_call(i, "cat /tmp/deps.json", Some(("{}", false))))
+            .collect();
+        assert!(wedged(pump(&lines, true, 25).0).is_some());
+    }
+
+    #[test]
+    fn a_wedge_is_reported_once() {
+        let lines: Vec<String> = (0..80).flat_map(|i| claude_call(i, "ls", None)).collect();
+        let decoder = Box::new(StreamJsonParser::default());
+        let mut pump = StreamPump::new(decoder, None, guard(3));
+        let mut errors = 0;
+        for line in &lines {
+            pump.push(
+                line,
+                true,
+                &mut |_l: &str, _s: RawStream, ev: Option<&AgentEvent>| {
+                    errors += usize::from(matches!(ev, Some(AgentEvent::Error { .. })));
+                },
+            );
+        }
+        assert_eq!(errors, 1);
+    }
 
     #[test]
     fn tool_lines_scrub_credentials_from_the_summary() {
@@ -228,6 +503,7 @@ mod tests {
             subagent: false,
             input: None,
             result: None,
+            failed: false,
         };
         let line = crate::agent::turn::human_line(&ev).unwrap();
         assert_eq!(

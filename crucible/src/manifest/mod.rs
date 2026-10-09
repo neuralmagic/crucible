@@ -17,6 +17,7 @@ mod resources;
 mod search;
 mod secret;
 mod selftest;
+mod tool_plugins;
 mod wiring;
 mod world;
 
@@ -36,6 +37,7 @@ pub use resources::{Quantity, QuantityError, SandboxResources};
 pub use search::SearchCfg;
 pub use secret::{SecretDecl, SecretError, SecretKind};
 pub use selftest::SelftestCfg;
+pub use tool_plugins::{DEFAULT_REPEAT_LIMIT, ToolPluginSpec, default_chain};
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
@@ -756,6 +758,10 @@ pub struct AgentCfg {
     /// that sandbox instead of the defaults above.
     #[serde(default)]
     pub sandbox: BTreeMap<String, SandboxProfile>,
+    /// The `[[agent.tool_plugins]]` chain every turn's tool events run through, in order. Absent
+    /// runs [`default_chain`]; an empty list runs none.
+    #[serde(default)]
+    pub tool_plugins: Option<Vec<ToolPluginSpec>>,
 }
 
 /// The env vars the engine writes for the model's own credential on every turn.

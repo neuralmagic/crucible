@@ -107,6 +107,10 @@ pub(crate) struct Args {
     /// The `[mcp]` keys the turn about to run reaches. No CLI flag.
     #[arg(skip)]
     pub mcp_scope: Vec<String>,
+    /// The tool plugin chain (from `[[agent.tool_plugins]]`); `None` runs the default chain. No
+    /// CLI flag.
+    #[arg(skip)]
+    pub tool_plugins: Option<Vec<manifest::ToolPluginSpec>>,
     /// The named sandboxes a task may run in (from `[agent.sandbox]`). No CLI flag.
     #[arg(skip)]
     pub sandboxes: std::collections::BTreeMap<String, manifest::SandboxProfile>,

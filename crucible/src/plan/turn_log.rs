@@ -319,6 +319,7 @@ mod tests {
                 subagent: false,
                 input: None,
                 result: None,
+                failed: false,
             },
             at(t0, 3),
         );
@@ -439,6 +440,7 @@ mod tests {
                 subagent: false,
                 input: None,
                 result: None,
+                failed: false,
             },
             at(t0, 130),
         );
