@@ -1,63 +1,35 @@
 //! The run's crucible-kueue access as the loop pod receives it from the controller: the server's
-//! MCP URL and how the sandbox authenticates to it. Under a token grant the sandbox's supervisor
-//! exchanges its JWT-SVID at the controller's token endpoint and injects the access token on egress
-//! to the server alone; under a static grant the raw per-run bearer token goes only to the
-//! gateway's provider store and the sandbox sees a placeholder resolved for the server alone.
+//! MCP URL and the controller's token endpoint. The sandbox's supervisor exchanges its JWT-SVID at
+//! that endpoint and injects the access token on egress to the server alone, so no token reaches
+//! the loop pod or the sandbox.
 
-use crate::openshell::grpc::EndpointCredentialBinding;
 use crate::openshell::provider;
-use crucible_contract::kueue::{ENV_KUEUE_TOKEN, ENV_KUEUE_URL};
+use crucible_contract::kueue::ENV_KUEUE_URL;
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
-use std::fmt;
 
 /// The `.mcp.json` server name the agent sees the crucible-kueue tools under.
 pub const MCP_SERVER_NAME: &str = "kueue";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KueueAccessError {
-    #[error("{set} is set but {missing} is not; the controller sets both or neither")]
+    #[error("{set} is set but {missing} is not; the controller sets all three or none")]
     Partial {
         set: &'static str,
         missing: &'static str,
     },
-    #[error(
-        "both {ENV_KUEUE_TOKEN} and {ENV_AGENT_TOKEN_ENDPOINT} are set; the controller grants one \
-         way or the other"
-    )]
-    Ambiguous,
     #[error("{ENV_KUEUE_URL} {url:?} is not an http(s) URL with a host: {reason}")]
     Url { url: String, reason: String },
 }
 
-/// How the sandbox authenticates to crucible-kueue.
-pub enum KueueCredential {
-    /// The run's static bearer token.
-    Static(String),
-    /// A token the supervisor obtains from `endpoint` with a JWT-SVID for `svid_audience`.
-    TokenGrant {
-        endpoint: String,
-        svid_audience: String,
-    },
-}
-
+#[derive(Debug)]
 pub struct KueueAccess {
     url: String,
     host: String,
     port: u16,
-    credential: KueueCredential,
-}
-
-impl fmt::Debug for KueueAccess {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let credential = match &self.credential {
-            KueueCredential::Static(_) => "static <redacted>".to_string(),
-            KueueCredential::TokenGrant { endpoint, .. } => format!("token grant at {endpoint}"),
-        };
-        f.debug_struct("KueueAccess")
-            .field("url", &self.url)
-            .field("credential", &credential)
-            .finish()
-    }
+    /// The controller's token endpoint.
+    endpoint: String,
+    /// The audience the supervisor requests its JWT-SVID for: the controller's issuer.
+    svid_audience: String,
 }
 
 impl KueueAccess {
@@ -66,7 +38,6 @@ impl KueueAccess {
         let var = |k| std::env::var(k).ok().filter(|v| !v.is_empty());
         Self::from_values(
             var(ENV_KUEUE_URL),
-            var(ENV_KUEUE_TOKEN),
             var(ENV_AGENT_TOKEN_ENDPOINT),
             var(ENV_AGENT_SVID_AUDIENCE),
         )
@@ -74,35 +45,25 @@ impl KueueAccess {
 
     fn from_values(
         url: Option<String>,
-        token: Option<String>,
         endpoint: Option<String>,
         svid_audience: Option<String>,
     ) -> Result<Option<Self>, KueueAccessError> {
-        let partial = |set, missing| Err(KueueAccessError::Partial { set, missing });
-        let grant = match (endpoint, svid_audience) {
-            (Some(endpoint), Some(svid_audience)) => Some(KueueCredential::TokenGrant {
-                endpoint,
-                svid_audience,
-            }),
-            (Some(_), None) => return partial(ENV_AGENT_TOKEN_ENDPOINT, ENV_AGENT_SVID_AUDIENCE),
-            (None, Some(_)) => return partial(ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT),
-            (None, None) => None,
-        };
-        let credential = match (token, grant) {
-            (Some(_), Some(_)) => return Err(KueueAccessError::Ambiguous),
-            (Some(token), None) => Some(KueueCredential::Static(token)),
-            (None, grant) => grant,
-        };
-        let (url, credential) = match (url, credential) {
-            (None, None) => return Ok(None),
-            (Some(_), None) => return partial(ENV_KUEUE_URL, ENV_KUEUE_TOKEN),
-            (None, Some(KueueCredential::Static(_))) => {
-                return partial(ENV_KUEUE_TOKEN, ENV_KUEUE_URL);
+        let (url, endpoint, svid_audience) = match (url, endpoint, svid_audience) {
+            (None, None, None) => return Ok(None),
+            (Some(u), Some(e), Some(a)) => (u, e, a),
+            (u, e, a) => {
+                let named = [
+                    (ENV_KUEUE_URL, u.is_some()),
+                    (ENV_AGENT_TOKEN_ENDPOINT, e.is_some()),
+                    (ENV_AGENT_SVID_AUDIENCE, a.is_some()),
+                ];
+                let set = named.iter().find(|(_, s)| *s).map(|(n, _)| *n);
+                let missing = named.iter().find(|(_, s)| !*s).map(|(n, _)| *n);
+                return match (set, missing) {
+                    (Some(set), Some(missing)) => Err(KueueAccessError::Partial { set, missing }),
+                    _ => Ok(None),
+                };
             }
-            (None, Some(KueueCredential::TokenGrant { .. })) => {
-                return partial(ENV_AGENT_TOKEN_ENDPOINT, ENV_KUEUE_URL);
-            }
-            (Some(url), Some(credential)) => (url, credential),
         };
         let bad = |reason: &str| KueueAccessError::Url {
             url: url.clone(),
@@ -124,7 +85,8 @@ impl KueueAccess {
             url,
             host,
             port,
-            credential,
+            endpoint,
+            svid_audience,
         }))
     }
 
@@ -132,40 +94,21 @@ impl KueueAccess {
         &self.url
     }
 
-    pub fn credential(&self) -> &KueueCredential {
-        &self.credential
-    }
-
     /// The sandbox egress entry: MCP-inspected, every known MCP method allowed.
     pub fn egress_endpoint(&self) -> String {
         format!("{}:{}:full:mcp", self.host, self.port)
     }
 
-    /// Binds a static grant's placeholder to the server's endpoint and nowhere else. A token grant
-    /// is bound by its profile's endpoint instead, so it needs none.
-    pub fn credential_binding(&self) -> Option<EndpointCredentialBinding> {
-        matches!(self.credential, KueueCredential::Static(_)).then(|| EndpointCredentialBinding {
-            host: self.host.clone(),
-            port: u32::from(self.port),
-            provider: provider::KUEUE_PROVIDER_NAME.to_string(),
-        })
-    }
-
-    /// The token-grant provider profile for this server, `None` for a static grant.
-    pub fn token_grant_profile(&self) -> Option<openshell_core::proto::ProviderProfile> {
-        match &self.credential {
-            KueueCredential::Static(_) => None,
-            KueueCredential::TokenGrant {
-                endpoint,
-                svid_audience,
-            } => Some(provider::kueue_token_grant_profile(
-                &self.host,
-                self.port,
-                &self.url,
-                endpoint,
-                svid_audience,
-            )),
-        }
+    /// The token-grant provider profile for this server. Its endpoint binds the injected token to
+    /// the server alone.
+    pub fn token_grant_profile(&self) -> openshell_core::proto::ProviderProfile {
+        provider::kueue_token_grant_profile(
+            &self.host,
+            self.port,
+            &self.url,
+            &self.endpoint,
+            &self.svid_audience,
+        )
     }
 }
 
@@ -179,81 +122,55 @@ mod tests {
 
     fn values(
         url: Option<&str>,
-        token: Option<&str>,
         endpoint: Option<&str>,
         audience: Option<&str>,
     ) -> Result<Option<KueueAccess>, KueueAccessError> {
         let own = |v: Option<&str>| v.map(str::to_string);
-        KueueAccess::from_values(own(url), own(token), own(endpoint), own(audience))
+        KueueAccess::from_values(own(url), own(endpoint), own(audience))
     }
 
     fn access(url: &str) -> Result<Option<KueueAccess>, KueueAccessError> {
-        values(Some(url), Some("tok"), None, None)
+        values(Some(url), Some(ENDPOINT), Some(ISSUER))
     }
 
     #[test]
-    fn no_env_means_no_grant() {
-        assert!(values(None, None, None, None).unwrap().is_none());
+    fn no_env_means_no_access() {
+        assert!(values(None, None, None).unwrap().is_none());
     }
 
     #[test]
-    fn half_a_grant_is_refused_naming_the_missing_variable() {
+    fn partial_access_is_refused_naming_a_missing_variable() {
         assert_eq!(
-            values(Some(URL), None, None, None).unwrap_err(),
+            values(Some(URL), None, None).unwrap_err(),
             KueueAccessError::Partial {
                 set: ENV_KUEUE_URL,
-                missing: ENV_KUEUE_TOKEN
+                missing: ENV_AGENT_TOKEN_ENDPOINT
             }
         );
-        assert!(
-            values(None, Some("t"), None, None)
-                .unwrap_err()
-                .to_string()
-                .contains(ENV_KUEUE_URL)
-        );
         assert_eq!(
-            values(Some(URL), None, Some(ENDPOINT), None).unwrap_err(),
+            values(Some(URL), Some(ENDPOINT), None).unwrap_err(),
             KueueAccessError::Partial {
-                set: ENV_AGENT_TOKEN_ENDPOINT,
+                set: ENV_KUEUE_URL,
                 missing: ENV_AGENT_SVID_AUDIENCE
             }
         );
         assert_eq!(
-            values(None, None, Some(ENDPOINT), Some(ISSUER)).unwrap_err(),
+            values(None, Some(ENDPOINT), Some(ISSUER)).unwrap_err(),
             KueueAccessError::Partial {
                 set: ENV_AGENT_TOKEN_ENDPOINT,
                 missing: ENV_KUEUE_URL
             }
         );
-        assert_eq!(
-            values(Some(URL), Some("t"), Some(ENDPOINT), Some(ISSUER)).unwrap_err(),
-            KueueAccessError::Ambiguous
-        );
     }
 
     #[test]
-    fn the_service_url_becomes_an_mcp_egress_entry_bound_to_the_kueue_provider() {
+    fn the_token_grant_is_bound_to_the_server_and_holds_no_secret() {
         let a = access(URL).unwrap().unwrap();
         assert_eq!(
             a.egress_endpoint(),
             "crucible-kueue.crucible-system.svc.cluster.local:8850:full:mcp"
         );
-        let b = a
-            .credential_binding()
-            .expect("a static grant binds its placeholder");
-        assert_eq!(b.host, "crucible-kueue.crucible-system.svc.cluster.local");
-        assert_eq!(b.port, 8850);
-        assert_eq!(b.provider, "crucible-kueue");
-        assert!(a.token_grant_profile().is_none());
-    }
-
-    #[test]
-    fn a_token_grant_binds_through_its_profile_and_holds_no_secret() {
-        let a = values(Some(URL), None, Some(ENDPOINT), Some(ISSUER))
-            .unwrap()
-            .unwrap();
-        assert!(a.credential_binding().is_none());
-        let profile = a.token_grant_profile().expect("a token-grant profile");
+        let profile = a.token_grant_profile();
         assert_eq!(profile.id, provider::KUEUE_GRANT_PROFILE_ID);
         let endpoint = &profile.endpoints[0];
         assert_eq!(
@@ -269,8 +186,6 @@ mod tests {
         assert_eq!(grant.audience, URL, "the token is for this server");
         assert_eq!(profile.credentials[0].auth_style, "bearer");
         assert!(profile.credentials[0].env_vars.is_empty(), "no placeholder");
-        let shown = format!("{a:?}");
-        assert!(shown.contains("token grant"), "{shown}");
     }
 
     #[test]
@@ -289,13 +204,5 @@ mod tests {
             access("not a url"),
             Err(KueueAccessError::Url { .. })
         ));
-    }
-
-    #[test]
-    fn debug_never_prints_the_token() {
-        let a = access("http://h:1/mcp").unwrap().unwrap();
-        let shown = format!("{a:?}");
-        assert!(!shown.contains("tok\""), "{shown}");
-        assert!(shown.contains("<redacted>"));
     }
 }

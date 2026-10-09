@@ -392,18 +392,12 @@ async fn try_turn(
         _ => false,
     };
 
-    // 2d. The run's crucible-kueue grant, minted by the controller: the same placeholder
-    //     hardening as the broker token, bound to the crucible-kueue Service endpoint.
+    // 2d. The run's crucible-kueue access: a token-grant provider whose tokens the sandbox's
+    //     supervisor obtains from the controller and injects on traffic to the server alone.
     let kueue = crate::openshell::kueue::KueueAccess::from_env()
-        .context("reading the run's crucible-kueue grant")?;
+        .context("reading the run's crucible-kueue access")?;
     if let Some(k) = &kueue {
-        match (k.credential(), k.token_grant_profile()) {
-            (crate::openshell::kueue::KueueCredential::Static(token), _) => {
-                ensure_static_provider(&gw, &StaticProvider::kueue(), token).await?;
-            }
-            (_, Some(profile)) => ensure_token_grant_provider(&gw, profile).await?,
-            (_, None) => {}
-        }
+        ensure_token_grant_provider(&gw, k.token_grant_profile()).await?;
     }
 
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
@@ -608,7 +602,6 @@ async fn try_turn(
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
-            credential_bindings.extend(k.credential_binding());
         }
         if auth == AuthProvider::Vertex {
             credential_bindings.extend(policy::VERTEX_CREDENTIAL_HOSTS.iter().map(|host| {
@@ -694,12 +687,6 @@ async fn try_turn(
         } else {
             args.broker_token.clone()
         };
-        let kueue_placeholder = match kueue.as_ref().map(|k| k.credential()) {
-            Some(crate::openshell::kueue::KueueCredential::Static(_)) => {
-                Some(issued_placeholder(&gw, &name, provider::KUEUE_CRED_KEY, &cancel).await?)
-            }
-            _ => None,
-        };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
             &name,
@@ -722,7 +709,7 @@ async fn try_turn(
             servers.push(McpServer {
                 name: crate::openshell::kueue::MCP_SERVER_NAME,
                 url: k.url(),
-                token: kueue_placeholder.as_deref(),
+                token: None,
             });
         }
         let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
@@ -995,14 +982,6 @@ impl StaticProvider {
             profile: provider::broker_profile(),
             name: provider::BROKER_PROVIDER_NAME,
             cred_key: provider::BROKER_CRED_KEY,
-        }
-    }
-
-    fn kueue() -> Self {
-        Self {
-            profile: provider::kueue_profile(),
-            name: provider::KUEUE_PROVIDER_NAME,
-            cred_key: provider::KUEUE_CRED_KEY,
         }
     }
 }

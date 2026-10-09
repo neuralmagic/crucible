@@ -326,30 +326,10 @@ pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
     )
 }
 
-/// The static provider carrying the run's crucible-kueue bearer token. Like the broker's, its
-/// profile is endpointless and the policy endpoint's `credential_binding` is the boundary: the
-/// sandbox holds only the placeholder, resolved at egress for the crucible-kueue Service alone.
+/// The provider carrying the sandbox's crucible-kueue access.
 pub const KUEUE_PROVIDER_NAME: &str = "crucible-kueue";
 
 /// The custom profile id backing [`KUEUE_PROVIDER_NAME`].
-pub const KUEUE_PROFILE_ID: &str = "crucible-kueue";
-
-/// The credential env key [`kueue_profile`] declares; the gateway issues the sandbox its
-/// placeholder under this name.
-pub const KUEUE_CRED_KEY: &str = "KUEUE_TOKEN";
-
-/// The endpointless `crucible-kueue` profile: one required per-run bearer credential.
-pub fn kueue_profile() -> openshell_core::proto::ProviderProfile {
-    bearer_profile(
-        KUEUE_PROFILE_ID,
-        "Crucible Kueue",
-        "Per-run bearer token for the crucible-kueue MCP server",
-        "crucible-kueue bearer token",
-        KUEUE_CRED_KEY,
-    )
-}
-
-/// The custom profile id backing [`KUEUE_PROVIDER_NAME`] under a token grant.
 pub const KUEUE_GRANT_PROFILE_ID: &str = "crucible-kueue-grant";
 
 /// The token-grant `crucible-kueue` profile: one dynamic credential the supervisor obtains from the
@@ -583,22 +563,18 @@ mod tests {
     }
 
     #[test]
-    fn the_broker_and_kueue_profiles_are_endpointless_bearer_credentials_on_their_own_keys() {
-        for (profile, id, key) in [
-            (broker_profile(), BROKER_PROFILE_ID, BROKER_CRED_KEY),
-            (kueue_profile(), KUEUE_PROFILE_ID, KUEUE_CRED_KEY),
-        ] {
-            assert_eq!(profile.id, id);
-            assert!(
-                profile.endpoints.is_empty(),
-                "the policy's credential_binding is the boundary"
-            );
-            let [credential] = profile.credentials.as_slice() else {
-                panic!("one credential: {:?}", profile.credentials);
-            };
-            assert_eq!(credential.env_vars, vec![key.to_string()]);
-            assert!(credential.required);
-        }
+    fn the_broker_profile_is_an_endpointless_bearer_credential_on_its_own_key() {
+        let profile = broker_profile();
+        assert_eq!(profile.id, BROKER_PROFILE_ID);
+        assert!(
+            profile.endpoints.is_empty(),
+            "the policy's credential_binding is the boundary"
+        );
+        let [credential] = profile.credentials.as_slice() else {
+            panic!("one credential: {:?}", profile.credentials);
+        };
+        assert_eq!(credential.env_vars, vec![BROKER_CRED_KEY.to_string()]);
+        assert!(credential.required);
         assert_eq!(
             broker_profile().credentials[0].description,
             "Broker bearer token"

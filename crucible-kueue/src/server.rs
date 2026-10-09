@@ -877,7 +877,9 @@ impl KueueMcp {
 
 #[tool_router]
 impl KueueMcp {
-    #[tool(description = "Who this token acts as: its run, launcher, and default namespace.")]
+    #[tool(
+        description = "Who this token acts as: its run, launcher, Kubernetes user, and default namespace."
+    )]
     async fn whoami(
         &self,
         Extension(parts): Extension<http::request::Parts>,
@@ -888,6 +890,7 @@ impl KueueMcp {
                 "run_id": c.run_id.as_str(),
                 "namespace": c.namespace.as_str(),
                 "launched_by": c.launched_by.as_str(),
+                "kube_user": c.kube_user,
                 "submittable_kinds": WorkloadKind::ALL.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
             })
         }))

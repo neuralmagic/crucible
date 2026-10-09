@@ -1191,6 +1191,7 @@ mod tests {
             run_id: RunId::parse("run-7").unwrap(),
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: Launcher::parse("alice").unwrap(),
+            kube_user: "alice-k8s".into(),
         }
     }
 

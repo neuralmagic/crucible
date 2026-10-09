@@ -5792,10 +5792,13 @@ async fn a_dispatch_onto_the_kueue_cluster_hands_the_loop_pod_the_token_endpoint
         value(crucible_contract::sandbox::ENV_AGENT_SVID_AUDIENCE),
         Some(AGENT_ISSUER)
     );
-    assert!(
-        !env.iter()
-            .any(|e| e.name == crucible_contract::kueue::ENV_KUEUE_TOKEN),
-        "no static token"
+    assert_eq!(
+        env.iter()
+            .filter(|e| e.name.contains("KUEUE"))
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        [crucible_contract::kueue::ENV_KUEUE_URL],
+        "the server's URL and no token"
     );
     assert!(
         !events.iter().any(|e| matches!(
@@ -5810,7 +5813,7 @@ async fn a_dispatch_onto_the_kueue_cluster_hands_the_loop_pod_the_token_endpoint
             KueueEvent::Secret(secret) if secret
                 .string_data
                 .as_ref()
-                .is_some_and(|d| d.contains_key(crucible_contract::kueue::ENV_KUEUE_TOKEN))
+                .is_some_and(|d| d.keys().any(|k| k.contains("KUEUE")))
         )),
         "nothing for crucible-kueue rides the run Secret"
     );

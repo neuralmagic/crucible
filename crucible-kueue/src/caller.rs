@@ -132,6 +132,8 @@ pub struct Identity {
     pub namespace: Option<Namespace>,
     /// The human the request acts for, stamped on everything it creates.
     pub launched_by: Launcher,
+    /// The Kubernetes user the request's access checks run as.
+    pub kube_user: String,
     /// The party presenting a run's token (the sandbox's SPIFFE ID), stamped on what it creates.
     pub actor: Option<String>,
 }
@@ -148,6 +150,7 @@ impl Identity {
             run_id: self.run_id.clone(),
             namespace,
             launched_by: self.launched_by.clone(),
+            kube_user: self.kube_user.clone(),
         })
     }
 }
@@ -158,6 +161,7 @@ pub struct Caller {
     pub run_id: RunId,
     pub namespace: Namespace,
     pub launched_by: Launcher,
+    pub kube_user: String,
 }
 
 #[cfg(test)]
@@ -170,6 +174,7 @@ mod tests {
             run_id: RunId::parse("r").unwrap(),
             namespace: Some(Namespace::parse("team-a").unwrap()),
             launched_by: Launcher::parse("alice").unwrap(),
+            kube_user: "alice-k8s".into(),
             actor: None,
         };
         assert_eq!(

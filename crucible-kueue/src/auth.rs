@@ -62,6 +62,7 @@ impl Identity {
         if !principal.claims.contains_key(USER_CLAIM) {
             return Err(ClaimError::NoKubeUser);
         }
+        let kube_user = claim(USER_CLAIM)?.to_string();
         let namespace = match principal.claims.get("namespace") {
             None | Some(Value::Null) => None,
             Some(_) => Some(Namespace::parse(claim("namespace")?)?),
@@ -77,6 +78,7 @@ impl Identity {
             run_id,
             namespace,
             launched_by: Launcher::parse(&principal.subject)?,
+            kube_user,
             actor,
         })
     }
@@ -190,6 +192,7 @@ mod tests {
         assert_eq!(c.run_id.as_str(), "auth-spike");
         assert_eq!(c.namespace.as_str(), "team-e2e");
         assert_eq!(c.launched_by, Launcher::parse("alice").unwrap());
+        assert_eq!(c.kube_user, "alice");
         assert_eq!(
             identity
                 .in_namespace(Some("team-b"))
