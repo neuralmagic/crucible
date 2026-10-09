@@ -456,8 +456,11 @@ async fn try_turn(
         sandbox_id,
         workdir: Some(SandboxLayout::workdir(&basename)),
     };
-    if let Some(ingest) = crate::report::ingest_client::IngestConfig::from_env()
-        && let Err(e) = crate::report::ingest_client::bind_sandbox(&ingest, &binding).await
+    let agent_tokens = std::env::var(crucible_contract::sandbox::ENV_AGENT_TOKEN_ENDPOINT).ok();
+    if let Some(ingest) = binds_sandboxes(
+        agent_tokens.as_deref(),
+        crate::report::ingest_client::IngestConfig::from_env(),
+    ) && let Err(e) = crate::report::ingest_client::bind_sandbox(&ingest, &binding).await
     {
         let ev = AgentEvent::Raw {
             text: format!("sandbox bind failed (its agent token requests will be refused): {e:#}"),
@@ -682,10 +685,12 @@ async fn try_turn(
         //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
         //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
         //     a fresh token naming this sandbox and its workdir.
-        let seed_token = if broker_provider {
-            Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
-        } else {
-            args.broker_token.clone()
+        let seed_token = match (broker_provider, broker_placeholder(kueue.is_some())) {
+            (true, BrokerPlaceholder::Issued) => {
+                Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
+            }
+            (true, BrokerPlaceholder::Canonical) => Some(provider::broker_token_placeholder()),
+            (false, _) => args.broker_token.clone(),
         };
         let tokens = crate::control::mcp::grant_all(
             mcp.iter().map(|(s, _)| *s),
@@ -966,6 +971,34 @@ async fn issued_placeholder(
         }
         .into()
     })
+}
+
+/// Where to bind this turn's sandbox: the controller's ingest, and only when the controller issues
+/// agent tokens (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`), since nothing reads a binding otherwise.
+fn binds_sandboxes(
+    agent_token_endpoint: Option<&str>,
+    ingest: Option<crate::report::ingest_client::IngestConfig>,
+) -> Option<crate::report::ingest_client::IngestConfig> {
+    agent_token_endpoint
+        .filter(|endpoint| !endpoint.trim().is_empty())
+        .and(ingest)
+}
+
+/// How the sandbox's `.mcp.json` names the broker token.
+#[derive(Debug, PartialEq, Eq)]
+enum BrokerPlaceholder {
+    /// [`provider::broker_token_placeholder`].
+    Canonical,
+    /// The placeholder the gateway issued the workload, read from the sandbox.
+    Issued,
+}
+
+/// The issued placeholder only alongside a token grant; otherwise the canonical one.
+fn broker_placeholder(token_grant: bool) -> BrokerPlaceholder {
+    match token_grant {
+        true => BrokerPlaceholder::Issued,
+        false => BrokerPlaceholder::Canonical,
+    }
 }
 
 /// An endpointless static-credential provider: its profile, its provider name, and the credential
@@ -1754,6 +1787,40 @@ fn relay_keys(keys: &[&str], env: &mut Vec<(String, String)>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sandbox_is_bound_only_where_the_controller_issues_agent_tokens() {
+        use crate::openshell::run::binds_sandboxes;
+        let ingest = || {
+            crate::report::ingest_client::IngestConfig::new(
+                "http://crucible-controller.ns.svc:8080",
+                "crucible-run-a",
+                std::path::PathBuf::from("/var/run/secrets/crucible-ingest/token"),
+            )
+        };
+        let endpoint = "http://crucible-controller.ns.svc:8080/oauth/token";
+        assert!(binds_sandboxes(Some(endpoint), Some(ingest())).is_some());
+        assert!(
+            binds_sandboxes(None, Some(ingest())).is_none(),
+            "a controller without the agent issuer serves no bind route"
+        );
+        assert!(binds_sandboxes(Some(" "), Some(ingest())).is_none());
+        assert!(binds_sandboxes(Some(endpoint), None).is_none());
+    }
+
+    #[test]
+    fn the_broker_placeholder_reads_the_sandbox_only_alongside_a_token_grant() {
+        use crate::openshell::run::{BrokerPlaceholder, broker_placeholder};
+        assert_eq!(broker_placeholder(false), BrokerPlaceholder::Canonical);
+        assert_eq!(broker_placeholder(true), BrokerPlaceholder::Issued);
+        assert_eq!(
+            crate::openshell::provider::broker_token_placeholder(),
+            format!(
+                "{}BROKER_TOKEN",
+                openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC
+            )
+        );
+    }
+
     use super::*;
 
     #[test]

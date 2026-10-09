@@ -314,6 +314,15 @@ pub const BROKER_PROFILE_ID: &str = "crucible-broker";
 /// under this name.
 pub const BROKER_CRED_KEY: &str = "BROKER_TOKEN";
 
+/// The placeholder the sandbox sends in place of the broker token.
+pub fn broker_token_placeholder() -> String {
+    format!(
+        "{}{}",
+        openshell_core::secrets::PLACEHOLDER_PREFIX_PUBLIC,
+        BROKER_CRED_KEY
+    )
+}
+
 /// The endpointless `crucible-broker` profile: one required bearer credential, no endpoints, no
 /// refresh (the token is per-run static).
 pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
