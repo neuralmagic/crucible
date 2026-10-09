@@ -1376,6 +1376,7 @@ pub(crate) async fn dispatch_grounded_rank(
         &cluster,
         &namespace,
         &delivery,
+        GROUNDED_RANK_TIMEOUT,
     )
     .await?
     {

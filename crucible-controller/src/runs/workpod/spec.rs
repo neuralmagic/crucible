@@ -385,7 +385,10 @@ async fn fail_turn(
     Ok(CasResult::Won)
 }
 
-/// `spawn_blocking(render + stamp)` then `dispatcher.create`. The OUTER `Result` is the
+/// `spawn_blocking(render + stamp)` then `dispatcher.create`. Under isolated gateways the turn gets
+/// its own gateway pod first, exactly as a run does, with certificates valid for `deadline`; it is
+/// torn down here when the launch fails, and by the gateway sweep once the turn's row closes. The
+/// OUTER `Result` is the
 /// `spawn_blocking` `JoinError` ALONE — the caller `?`-propagates it out (row stays `Running` for
 /// the startup sweep, never CAS-failed). The INNER `Result<(), LaunchFailure>` is render-or-create:
 /// a render error carries no added context (`LaunchFailure::RenderFailed`); a create error carries
@@ -407,7 +410,57 @@ pub(crate) async fn spawn_turn_pod(
     cluster: &str,
     ns: &str,
     delivery: &crate::secrets::deliver::Delivery,
+    deadline: Duration,
 ) -> Result<Result<(), LaunchFailure>> {
+    let isolated = match crate::agent_auth::placement::load_profile(Some(profile)).await {
+        Ok(loaded) => loaded.filter(crucible::deploy::render::gateway::isolated),
+        Err(e) => return Ok(Err(LaunchFailure::RenderFailed(format!("{e:#}")))),
+    };
+    let gateway_failed = async |detail: String| {
+        if let Some(gateway_profile) = isolated.as_ref()
+            && let Err(e) = crate::runs::workpod::gateway::teardown(
+                d,
+                cluster,
+                gateway_profile,
+                &spec.pod_name,
+                ns,
+            )
+            .await
+        {
+            tracing::warn!(pod_name = %spec.pod_name, error = format!("{e:#}"), "a failed turn launch left its gateway; the gateway sweep removes it");
+        }
+        Err(LaunchFailure::PodCreateFailed { pod_noun, detail })
+    };
+    let mut delivery = delivery.clone();
+    let gateway = match isolated.as_ref() {
+        None => None,
+        Some(gateway_profile) => {
+            match crate::runs::workpod::gateway::RunGateway::reserve(
+                d,
+                cluster,
+                gateway_profile,
+                &spec.pod_name,
+                Some(deadline.as_secs()),
+            )
+            .await
+            {
+                Ok(gateway) => match delivery.merge(gateway.loop_delivery()) {
+                    Ok(()) => Some(gateway),
+                    Err(e) => {
+                        return Ok(gateway_failed(format!(
+                            "folding the gateway client material into the turn's: {e}"
+                        ))
+                        .await);
+                    }
+                },
+                Err(e) => {
+                    return Ok(
+                        gateway_failed(format!("reserving the turn's gateway: {e:#}")).await,
+                    );
+                }
+            }
+        }
+    };
     let owner = owner_reference_from_env();
     let spec_cl = spec.clone();
     let profile = profile.to_path_buf();
@@ -429,15 +482,34 @@ pub(crate) async fn spawn_turn_pod(
             // Inject the dispatching span's W3C trace context so the turn pod's engine re-roots its
             // scope/rank span under it (a no-op when the controller isn't exporting spans).
             crate::runs::workpod::trace::inject_dispatch_context(&mut pod);
-            match d.create(cluster, ns, pod).await {
+            if let Some(gateway) = gateway.as_ref()
+                && let Err(e) = gateway
+                    .start(
+                        d,
+                        cluster,
+                        ns,
+                        &pod,
+                        &[crucible::openshell::gateway::OTEL_COLLECTOR_PORT],
+                    )
+                    .await
+            {
+                return Ok(gateway_failed(format!("starting the turn's gateway: {e:#}")).await);
+            }
+            let created = match d.create(cluster, ns, pod).await {
                 Ok(created) => {
-                    create_turn_secret(d, cluster, ns, &secret_name, delivery, &created, pod_noun)
+                    create_turn_secret(d, cluster, ns, &secret_name, &delivery, &created, pod_noun)
                         .await
                 }
                 Err(e) => Err(LaunchFailure::PodCreateFailed {
                     pod_noun,
                     detail: format!("{e:#}"),
                 }),
+            };
+            match created {
+                Err(LaunchFailure::PodCreateFailed { detail, .. }) if gateway.is_some() => {
+                    gateway_failed(detail).await
+                }
+                created => created,
             }
         }
         Err(e) => Err(LaunchFailure::RenderFailed(format!("{e:#}"))),
@@ -624,6 +696,7 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         &cluster,
         &ns,
         &delivery,
+        spec.deadline(cfg),
     )
     .await?
     {

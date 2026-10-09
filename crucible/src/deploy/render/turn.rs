@@ -18,14 +18,6 @@ pub struct UnknownTurnKind {
     got: String,
 }
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "turn pods run their OpenShell gateway in-pod as the loop service account, which a profile \
-     with `[cluster] sandbox_namespace` under the kubernetes driver grants nothing in that \
-     namespace; turns are not supported with isolated gateways"
-)]
-pub struct TurnUnderIsolatedGateway;
-
 /// Where the init container clones the repo and where the turn container reads it.
 const CHECKOUT_DIR: &str = "/checkout";
 /// The `emptyDir` both containers share, carrying the checkout between them.
@@ -302,11 +294,30 @@ fn checked_git_ref(r: &str) -> Result<&str, BadRepoRef> {
     Ok(r)
 }
 
+/// The turn pod's labels. Under isolated gateways it also names its run, which its gateway's
+/// NetworkPolicy admits it by.
+fn turn_labels(profile: &DeployProfile, opts: &TurnOpts) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::from([
+        (
+            crucible_contract::MANAGED_BY_KEY.to_string(),
+            crucible_contract::MANAGED_BY_VALUE.to_string(),
+        ),
+        (
+            "crucible.io/work-kind".to_string(),
+            opts.kind.label_value().to_string(),
+        ),
+    ]);
+    if crate::deploy::render::gateway::isolated(profile) {
+        labels.insert(
+            crate::deploy::render::gateway::RUN_LABEL.to_string(),
+            opts.name.clone(),
+        );
+    }
+    labels
+}
+
 #[tracing::instrument(skip_all, fields(turn_kind = ?opts.kind, issue = %opts.issue, pinned = opts.digests.is_some()), err)]
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
-    if crate::deploy::render::gateway::isolated(profile) {
-        return Err(TurnUnderIsolatedGateway.into());
-    }
     let image = pin_image(
         opts.digests.as_deref(),
         "loop image",
@@ -620,16 +631,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
                 "sidecar.istio.io/inject".to_string(),
                 "false".to_string(),
             )])),
-            labels: Some(BTreeMap::from([
-                (
-                    crucible_contract::MANAGED_BY_KEY.to_string(),
-                    crucible_contract::MANAGED_BY_VALUE.to_string(),
-                ),
-                (
-                    "crucible.io/work-kind".to_string(),
-                    opts.kind.label_value().to_string(),
-                ),
-            ])),
+            labels: Some(turn_labels(profile, opts)),
             ..Default::default()
         },
         spec: Some(core::PodSpec {
@@ -874,58 +876,49 @@ mod tests {
     }
 
     #[test]
-    fn a_turn_is_refused_under_an_isolated_gateway_profile() {
-        let profile: DeployProfile = toml::from_str(
-            r#"
-            [cluster]
-            loop_namespace = "autoresearch"
-            rig_namespace = "rig"
-            service_account = "autoresearch-publisher"
-            supervisor_image = "registry.example.com/openshell-supervisor:latest"
-            sandbox_driver = "kubernetes"
-            sandbox_namespace = "sandboxes"
-            [image]
-            loop = "ghcr.io/neuralmagic/crucible:latest"
-            pull_secret = "example-pull-secret"
-        "#,
-        )
-        .expect("profile parses");
-        let err = render_turn(
-            &profile,
-            &TurnOpts {
-                kind: TurnKind::Rank,
-                name: "crucible-turn-owner-repo-42-abcd".to_string(),
-                issue: "owner/repo#42".to_string(),
-                goal_text: None,
-                repo_url: "https://github.com/owner/repo.git".to_string(),
-                repo_ref: None,
-                sandbox_image: "registry.example.com/epp-sandbox:latest".to_string(),
-                max_cost: 5.0,
-                digests: None,
-                tier: None,
-                gaming_refine_rounds: 1,
-                skip_gaming_review: false,
-                authoritative: false,
-                harness: None,
-                model: None,
-                pack_path: None,
-            },
-        )
-        .expect_err("refused");
+    fn an_isolated_turn_pod_names_its_run_for_its_gateways_network_policy() {
+        let render = |extra: &str| {
+            let profile: DeployProfile = toml::from_str(&format!(
+                r#"
+                [cluster]
+                loop_namespace = "autoresearch"
+                rig_namespace = "rig"
+                service_account = "autoresearch-publisher"
+                supervisor_image = "registry.example.com/openshell-supervisor:latest"
+                sandbox_driver = "kubernetes"
+                {extra}
+                [image]
+                loop = "ghcr.io/neuralmagic/crucible:latest"
+                pull_secret = "example-pull-secret"
+            "#
+            ))
+            .expect("profile parses");
+            let yaml = render_turn(
+                &profile,
+                &TurnOpts::new(
+                    TurnKind::Rank,
+                    "crucible-turn-owner-repo-42-abcd",
+                    "owner/repo#42",
+                    "https://github.com/owner/repo.git",
+                    "registry.example.com/epp-sandbox:latest",
+                ),
+            )
+            .expect("render turn");
+            pod_of(&yaml).metadata.labels.expect("labels")
+        };
+        let isolated = render(r#"sandbox_namespace = "sandboxes""#);
+        assert_eq!(
+            isolated
+                .get(crate::deploy::render::gateway::RUN_LABEL)
+                .map(String::as_str),
+            Some("crucible-turn-owner-repo-42-abcd")
+        );
         assert!(
-            err.downcast_ref::<TurnUnderIsolatedGateway>().is_some(),
-            "{err:#}"
+            !render("").contains_key(crate::deploy::render::gateway::RUN_LABEL),
+            "an in-pod gateway needs no run label"
         );
     }
 
-    /// Under `sandbox_driver = "kubernetes"` a turn pod must thread the same `--compute-driver`
-    /// flag and `CRUCIBLE_SANDBOX_*` env the loop pod's wrapper gets (`kube.rs`'s
-    /// `kubernetes_sandbox_env`), without it the turn's `rank-grounded`/`scope --propose`
-    /// subcommand synthesizes a fresh `Args` that defaults to the podman driver regardless of the
-    /// profile, and the gateway resolves the sandbox image through the nested-podman/authfile path
-    /// (wrong credential) instead of the kubelet's `imagePullSecrets`. It must also automount the SA
-    /// token, the in-pod gateway calls the API server directly for Sandbox CRs and has no mounted
-    /// kubeconfig to fall back on, so without the token it never becomes healthy.
     #[test]
     fn turn_pod_under_kubernetes_driver_threads_the_flag_and_sandbox_env() {
         let profile: DeployProfile = toml::from_str(

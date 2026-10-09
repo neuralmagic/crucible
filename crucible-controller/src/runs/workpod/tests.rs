@@ -6665,3 +6665,99 @@ async fn an_isolated_dispatch_to_a_push_only_cluster_is_refused_before_anything_
     );
     Ok(())
 }
+
+/// A turn under isolated gateways gets its own gateway exactly as a run does: started before the
+/// turn pod, which is pointed at it, carries its client material in its Secret, and names its run
+/// for the gateway's NetworkPolicy.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_isolated_turn_gets_its_own_gateway(pool: sqlx::PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let profile = isolated_profile(tmp.path());
+    let db = Db::new(pool);
+    let cfg = pod_cfg(&profile, "img");
+    let dispatcher = Arc::new(GatewayDispatcher::default());
+    let out = dispatch_scope(
+        &db,
+        &cfg,
+        dispatcher.clone(),
+        "owner/repo#7",
+        "owner/repo",
+        8.0,
+        TurnInputs {
+            tier: Some(Tier::T1),
+            ..TurnInputs::default()
+        },
+    )
+    .await?;
+    assert!(matches!(out, ScopeOutcome::Launched), "{out:?}");
+    let events = dispatcher.events();
+    let kinds: Vec<(&str, &str)> = events
+        .iter()
+        .map(|e| match e {
+            GatewayEvent::Service { namespace, .. } => ("service", namespace.as_str()),
+            GatewayEvent::Pod { namespace, .. } => ("pod", namespace.as_str()),
+            GatewayEvent::Secret { namespace, .. } => ("secret", namespace.as_str()),
+            GatewayEvent::ConfigMap { namespace } => ("configmap", namespace.as_str()),
+            GatewayEvent::NetworkPolicy { namespace, .. } => ("networkpolicy", namespace.as_str()),
+            GatewayEvent::DeleteSelected { namespace, .. }
+            | GatewayEvent::DeleteSandboxes { namespace, .. } => ("delete", namespace.as_str()),
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ("service", "sandboxes"),
+            ("service", "autoresearch"),
+            ("networkpolicy", "sandboxes"),
+            ("pod", "sandboxes"),
+            ("secret", "sandboxes"),
+            ("secret", "sandboxes"),
+            ("pod", "autoresearch"),
+            ("secret", "autoresearch"),
+        ]
+    );
+    let turn = events
+        .iter()
+        .find_map(|e| match e {
+            GatewayEvent::Pod { namespace, pod } if namespace == "autoresearch" => Some(pod),
+            _ => None,
+        })
+        .expect("the turn pod");
+    let turn_name = turn.metadata.name.clone().expect("named");
+    assert_eq!(
+        turn.metadata
+            .labels
+            .as_ref()
+            .and_then(|l| l.get(crucible::deploy::render::gateway::RUN_LABEL)),
+        Some(&turn_name)
+    );
+    let env = turn.spec.as_ref().expect("spec").containers[0]
+        .env
+        .clone()
+        .unwrap_or_default();
+    assert_eq!(
+        env.iter()
+            .find(|e| e.name == crucible::openshell::gateway::GATEWAY_URL_ENV)
+            .and_then(|e| e.value.as_deref()),
+        Some("https://172.30.0.10:17670")
+    );
+    let turn_secret = events
+        .iter()
+        .find_map(|e| match e {
+            GatewayEvent::Secret { namespace, secret } if namespace == "autoresearch" => {
+                Some(secret)
+            }
+            _ => None,
+        })
+        .expect("the turn Secret");
+    assert!(
+        turn_secret
+            .string_data
+            .as_ref()
+            .is_some_and(|d| d.contains_key("openshell-gateway-tls.key")),
+        "the turn's gateway client key rides its Secret"
+    );
+    Ok(())
+}
