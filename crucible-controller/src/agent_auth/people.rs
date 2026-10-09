@@ -17,17 +17,16 @@
 
 use crate::agent_auth::AgentAuth;
 use crate::agent_auth::issuer::{AgentIssuer, MintError, token_id};
-use crate::agent_auth::placement;
 use crate::identity::api_key::constant_time_eq;
+use crate::identity::cluster_identity::{self, Person, Resolution};
 use crate::identity::kube_identity::KubeUser;
-use crate::identity::kube_links::{self, ClusterReviewer, LinkError};
+use crate::identity::kube_links::{self, ClusterReviewer, LinkError, LinkSource};
 use crate::identity::session::NativeClaims;
 use axum::extract::{Form, Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use forge::fleet::{ClaimIdentity, ClusterIdentity, SsoClaim};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -240,6 +239,16 @@ pub struct Approved {
     pub scopes: Vec<String>,
 }
 
+impl Approved {
+    pub fn person(&self) -> Person<'_> {
+        Person {
+            sub: &self.sub,
+            login: &self.login,
+            email: self.email.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CodeGrant {
     pub approved: Approved,
@@ -365,42 +374,28 @@ pub enum ClusterUser {
     Unavailable(String),
 }
 
-/// The username a `{ claim, prefix }` rule gives `approved`.
-pub fn from_claim(rule: &ClaimIdentity, approved: &Approved) -> ClusterUser {
-    let (name, value) = match rule.claim {
-        SsoClaim::Login => ("login", Some(approved.login.as_str())),
-        SsoClaim::Email => ("email", approved.email.as_deref()),
-    };
-    let Some(value) = value.filter(|v| !v.is_empty()) else {
-        return ClusterUser::Unavailable(format!(
-            "cluster {} takes usernames from the {name} claim, which your login did not carry",
-            approved.cluster
-        ));
-    };
-    match KubeUser::parse(&format!("{}{value}", rule.prefix)) {
-        Ok(user) => ClusterUser::Known(user),
-        Err(e) => ClusterUser::Unavailable(e.to_string()),
-    }
-}
-
 /// The username `approved` acts as on its cluster, by the rule the deploy profile declares for it.
 /// A cluster the profile does not list is `link`.
 pub async fn kube_user(auth: &AgentAuth, approved: &Approved) -> anyhow::Result<ClusterUser> {
-    let profile = placement::load_profile(auth.deploy_profile.as_deref()).await?;
+    let profile = cluster_identity::load_profile(auth.deploy_profile.as_deref()).await?;
     let rule = profile
         .as_ref()
-        .and_then(|p| p.clusters.get(&approved.cluster))
-        .map(|c| c.identity.clone())
+        .and_then(|p| p.cluster_identity(&approved.cluster))
+        .cloned()
         .unwrap_or_default();
-    Ok(match rule {
-        ClusterIdentity::Claim(rule) => from_claim(&rule, approved),
-        ClusterIdentity::Link => {
-            match kube_links::get(&auth.pool, &approved.sub, &approved.cluster).await? {
-                Some(user) => ClusterUser::Known(user),
-                None => ClusterUser::Unlinked,
-            }
+    let resolved =
+        cluster_identity::resolve(&auth.pool, &approved.cluster, &rule, approved.person()).await?;
+    Ok(ClusterUser::from(resolved))
+}
+
+impl From<Resolution> for ClusterUser {
+    fn from(resolved: Resolution) -> Self {
+        match resolved {
+            Resolution::Known { user, .. } => Self::Known(user),
+            Resolution::Unlinked => Self::Unlinked,
+            Resolution::Unavailable(why) => Self::Unavailable(why),
         }
-    })
+    }
 }
 
 /// A person's access token for `approved`, acting as `kube_user`.
@@ -628,9 +623,11 @@ fn consent_page(
             escape(user.as_str())
         ),
         ClusterUser::Unlinked => format!(
-            "<p>No Kubernetes username is known for you on cluster <b>{c}</b>. Paste a token for {c} \
-             (<code>oc whoami -t</code>, or the ID token your kubeconfig's OIDC login uses); the \
-             cluster names its owner and the token is not kept.</p><textarea name=\"cluster_token\" rows=\"2\" autocomplete=\"off\"></textarea>",
+            "<p>No Kubernetes username is known for you on cluster <b>{c}</b>. Link it from \
+             <a href=\"/settings\" target=\"_blank\">Settings</a> by signing in to {c}, then \
+             retry; or paste a token for {c} (<code>oc whoami -t</code>, or the ID token your \
+             kubeconfig's OIDC login uses). The cluster names its owner and the token is not \
+             kept.</p><textarea name=\"cluster_token\" rows=\"2\" autocomplete=\"off\"></textarea>",
             c = escape(&r.cluster)
         ),
     };
@@ -663,11 +660,10 @@ fn session_failure(e: impl std::fmt::Display) -> Response {
 /// The signed-in person, `None` without a native session or with one whose groups refresh failed.
 async fn signed_in(
     session: &Session,
-) -> Result<Option<crate::identity::session::NativeClaims>, Response> {
+) -> Result<Option<crate::identity::session::NativeClaims>, tower_sessions::session::Error> {
     crate::identity::session::native_claims(session)
         .await
         .map(|c| c.filter(|c| !c.downgraded))
-        .map_err(session_failure)
 }
 
 pub fn router(state: Arc<AgentAuth>) -> axum::Router {
@@ -716,7 +712,7 @@ async fn authorize(
                 percent_encoding::utf8_percent_encode(here, percent_encoding::NON_ALPHANUMERIC);
             return Redirect::to(&format!("/auth/login?rd={rd}")).into_response();
         }
-        Err(response) => return response,
+        Err(e) => return session_failure(e),
     };
     let mut id = [0u8; 16];
     if aws_lc_rs::rand::fill(&mut id).is_err() {
@@ -782,7 +778,7 @@ async fn decide(
     let claims = match signed_in(&session).await {
         Ok(Some(claims)) => claims,
         Ok(None) => return refused_page("sign in again, then retry from Claude Code"),
-        Err(response) => return response,
+        Err(e) => return session_failure(e),
     };
     let pending: Option<Pending> = match session.remove(PENDING_KEY).await {
         Ok(p) => p,
@@ -814,6 +810,7 @@ async fn decide(
             &claims.sub,
             &r.cluster,
             token,
+            LinkSource::TokenReview,
         )
         .await
         {
@@ -1424,44 +1421,47 @@ mod tests {
     #[test]
     fn a_claim_rule_takes_the_login_or_email_with_its_prefix() {
         let person = approved(PIRATE_KUEUE, "c1");
-        let rule = |claim, prefix: &str| ClaimIdentity {
+        let rule = |claim, prefix: &str| forge::fleet::ClaimIdentity {
             claim,
             prefix: prefix.into(),
         };
         let known = |u: &str| ClusterUser::Known(KubeUser::parse(u).unwrap());
+        let from_claim = |rule: &forge::fleet::ClaimIdentity, a: &Approved| {
+            ClusterUser::from(cluster_identity::from_claim(rule, &a.cluster, a.person()))
+        };
         assert_eq!(
-            from_claim(&rule(SsoClaim::Login, ""), &person),
+            from_claim(&rule(forge::fleet::SsoClaim::Login, ""), &person),
             known("weaton")
         );
         assert_eq!(
-            from_claim(&rule(SsoClaim::Email, ""), &person),
+            from_claim(&rule(forge::fleet::SsoClaim::Email, ""), &person),
             known("weaton@redhat.com")
         );
         assert_eq!(
-            from_claim(&rule(SsoClaim::Email, "oidc:"), &person),
+            from_claim(&rule(forge::fleet::SsoClaim::Email, "oidc:"), &person),
             known("oidc:weaton@redhat.com")
         );
         assert_eq!(
-            from_claim(&rule(SsoClaim::Login, "sso#"), &person),
+            from_claim(&rule(forge::fleet::SsoClaim::Login, "sso#"), &person),
             known("sso#weaton")
         );
         for email in [None, Some(String::new())] {
             let mut no_email = person.clone();
             no_email.email = email;
             assert!(matches!(
-                from_claim(&rule(SsoClaim::Email, ""), &no_email),
+                from_claim(&rule(forge::fleet::SsoClaim::Email, ""), &no_email),
                 ClusterUser::Unavailable(why) if why.contains("email claim")
             ));
         }
         assert!(
             matches!(
-                from_claim(&rule(SsoClaim::Login, "system:"), &person),
+                from_claim(&rule(forge::fleet::SsoClaim::Login, "system:"), &person),
                 ClusterUser::Unavailable(_)
             ),
             "a prefix cannot turn a login into a system identity"
         );
         assert!(matches!(
-            from_claim(&rule(SsoClaim::Login, "a b:"), &person),
+            from_claim(&rule(forge::fleet::SsoClaim::Login, "a b:"), &person),
             ClusterUser::Unavailable(_)
         ));
     }
@@ -1924,6 +1924,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             SUB,
             "pirate",
             "t",
+            LinkSource::TokenReview,
         )
         .await
         .unwrap();

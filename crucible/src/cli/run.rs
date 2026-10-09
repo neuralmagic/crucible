@@ -338,10 +338,9 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             };
         }
         if let Some(cluster) = &args.cluster_link {
-            anyhow::ensure!(
-                !apply,
-                "--cluster-link renders an object for another cluster; apply it there yourself"
-            );
+            if apply {
+                return Err(deploy::cluster_link::ClusterLinkError::NoApply.into());
+            }
             return deploy::render_cluster_link_cmd(
                 &args.profile,
                 args.clusters.as_deref(),

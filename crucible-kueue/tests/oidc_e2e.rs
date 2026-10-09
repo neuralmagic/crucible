@@ -247,6 +247,7 @@ kube_authz = "openshift"
         )
     };
     let state = Arc::new(AgentAuth {
+        people: None,
         issuer: AgentIssuer::new(cfg, keys),
         pool: pool.clone(),
         profile: crucible_controller::agent_auth::placement::load_profile(Some(&profile))

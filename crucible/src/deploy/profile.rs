@@ -9,7 +9,7 @@
 
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
-use forge::fleet::{ClusterEntry, FleetFile};
+use forge::fleet::{ClusterEntry, ClusterIdentity, FleetFile};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -466,6 +466,10 @@ pub struct Cluster {
     /// only to GPU sandboxes. Takes effect under `sandbox_driver = "kubernetes"`.
     #[serde(default)]
     pub gpu_sandbox: crate::openshell::placement::GpuPlacement,
+    /// Where a person's Kubernetes username on this, the hub cluster, comes from. Spokes declare
+    /// theirs on `[clusters.<name>]`.
+    #[serde(default)]
+    pub identity: ClusterIdentity,
 }
 
 /// `[cluster].host_aliases`, checked against the rules the kubernetes driver applies to a
@@ -799,6 +803,26 @@ impl DeployProfile {
             }
         }
         Ok(())
+    }
+
+    /// The identity rule of `cluster`: the hub's from `[cluster]`, a spoke's from its
+    /// `[clusters.<name>]` entry. `None` for a cluster the profile does not know.
+    pub fn cluster_identity(&self, cluster: &str) -> Option<&ClusterIdentity> {
+        match cluster {
+            HUB_CLUSTER => Some(&self.cluster.identity),
+            spoke => self.clusters.get(spoke).map(|entry| &entry.identity),
+        }
+    }
+
+    /// Every cluster the profile knows with its identity rule: the hub, then spokes by name.
+    pub fn cluster_identities(&self) -> Vec<(&str, &ClusterIdentity)> {
+        std::iter::once((HUB_CLUSTER, &self.cluster.identity))
+            .chain(
+                self.clusters
+                    .iter()
+                    .map(|(name, entry)| (name.as_str(), &entry.identity)),
+            )
+            .collect()
     }
 
     /// Load the profile and fold in the fleet file's `[clusters.<name>]` entries. The fleet file

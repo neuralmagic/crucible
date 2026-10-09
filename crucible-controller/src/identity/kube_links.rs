@@ -1,13 +1,14 @@
 //! The Kubernetes username a person acts as on each cluster, minted into people's access tokens as
 //! `kube_user` for MCP servers on that cluster.
 //!
-//! A row is only ever that cluster's own TokenReview answer for a token the person presented. The
-//! token is reviewed and dropped, never stored or logged; a token another cluster minted does not
-//! authenticate here, so it cannot link this cluster.
+//! A row is only ever that cluster's own TokenReview answer for a token the person presented, typed
+//! or redeemed through the cluster's OAuth server. The token is reviewed and dropped, never stored
+//! or logged; a token another cluster minted does not authenticate here, so it cannot link this
+//! cluster. The hub's link is also the username agent tokens for the person's runs carry.
 
 use crate::daemon::queue::BoxFuture;
 use crate::identity::kube_identity::{KubeUser, KubeUserError};
-use crate::runs::clusters::ClusterClients;
+use crate::runs::clusters::{ClusterClients, HUB_CLUSTER};
 use anyhow::Context;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
 use kube::Api;
@@ -18,22 +19,38 @@ use std::sync::Arc;
 /// How a link was proven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkSource {
+    /// A token the person pasted.
     TokenReview,
+    /// A token the cluster's OAuth server issued to the controller for the person.
+    OpenshiftOauth,
 }
 
 impl LinkSource {
     fn as_str(self) -> &'static str {
         match self {
             Self::TokenReview => "token-review",
+            Self::OpenshiftOauth => "openshift-oauth",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, UnknownLinkSource> {
+        match raw {
+            "token-review" => Ok(Self::TokenReview),
+            "openshift-oauth" => Ok(Self::OpenshiftOauth),
+            other => Err(UnknownLinkSource(other.to_string())),
         }
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("stored link source {0:?} is not token-review or openshift-oauth")]
+pub struct UnknownLinkSource(String);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Link {
     pub cluster: String,
-    pub kube_user: String,
-    pub source: String,
+    pub kube_user: KubeUser,
+    pub source: LinkSource,
     pub linked_at: String,
 }
 
@@ -94,6 +111,7 @@ pub async fn link(
     sub: &str,
     cluster: &str,
     token: &str,
+    source: LinkSource,
 ) -> Result<KubeUser, LinkError> {
     let status = reviewer
         .review(cluster, token.trim().to_string())
@@ -115,11 +133,12 @@ pub async fn link(
             cluster: cluster.to_string(),
         })?;
     let user = KubeUser::parse(&username)?;
-    upsert(pool, sub, cluster, &user, LinkSource::TokenReview).await?;
+    upsert(pool, sub, cluster, &user, source).await?;
     tracing::info!(
         sub,
         cluster,
         kube_user = user.as_str(),
+        source = source.as_str(),
         "kubernetes username linked"
     );
     Ok(user)
@@ -132,6 +151,8 @@ async fn upsert(
     user: &KubeUser,
     source: LinkSource,
 ) -> anyhow::Result<()> {
+    let now = crate::clock::now_rfc3339();
+    let mut tx = pool.begin().await.context("opening the link write")?;
     sqlx::query(
         "INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
          VALUES ($1, $2, $3, $4, $5)
@@ -143,11 +164,49 @@ async fn upsert(
     .bind(cluster)
     .bind(user.as_str())
     .bind(source.as_str())
-    .bind(crate::clock::now_rfc3339())
-    .execute(pool)
+    .bind(&now)
+    .execute(&mut *tx)
     .await
     .context("recording a kubernetes identity link")?;
-    Ok(())
+    if cluster == HUB_CLUSTER {
+        sqlx::query("UPDATE users SET kube_user = $2, updated_at = $3 WHERE sub = $1")
+            .bind(sub)
+            .bind(user.as_str())
+            .bind(&now)
+            .execute(&mut *tx)
+            .await
+            .context("recording the hub username agent tokens carry")?;
+    }
+    tx.commit().await.context("committing the link write")
+}
+
+/// Forget `sub`'s username on `cluster`. Returns whether there was one. An administrator's
+/// override is not a link and stays.
+pub async fn unlink(pool: &PgPool, sub: &str, cluster: &str) -> anyhow::Result<bool> {
+    let mut tx = pool.begin().await.context("opening the unlink write")?;
+    let removed = sqlx::query("DELETE FROM kube_identity_links WHERE sub = $1 AND cluster = $2")
+        .bind(sub)
+        .bind(cluster)
+        .execute(&mut *tx)
+        .await
+        .context("removing a kubernetes identity link")?
+        .rows_affected()
+        > 0;
+    let mut learned = false;
+    if cluster == HUB_CLUSTER {
+        learned = sqlx::query(
+            "UPDATE users SET kube_user = NULL, updated_at = $2 WHERE sub = $1 AND kube_user IS NOT NULL",
+        )
+        .bind(sub)
+        .bind(crate::clock::now_rfc3339())
+        .execute(&mut *tx)
+        .await
+        .context("clearing the hub username agent tokens carry")?
+        .rows_affected()
+            > 0;
+    }
+    tx.commit().await.context("committing the unlink")?;
+    Ok(removed || learned)
 }
 
 /// `sub`'s username on `cluster`. A stored value that no longer parses is an error.
@@ -165,6 +224,7 @@ pub async fn get(pool: &PgPool, sub: &str, cluster: &str) -> anyhow::Result<Opti
         .context("a stored kubernetes identity link no longer parses")
 }
 
+/// Every link `sub` holds, by cluster. A stored row that no longer parses is an error.
 pub async fn list(pool: &PgPool, sub: &str) -> anyhow::Result<Vec<Link>> {
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT cluster, kube_user, source, linked_at FROM kube_identity_links
@@ -174,15 +234,17 @@ pub async fn list(pool: &PgPool, sub: &str) -> anyhow::Result<Vec<Link>> {
     .fetch_all(pool)
     .await
     .context("listing kubernetes identity links")?;
-    Ok(rows
-        .into_iter()
-        .map(|(cluster, kube_user, source, linked_at)| Link {
-            cluster,
-            kube_user,
-            source,
-            linked_at,
+    rows.into_iter()
+        .map(|(cluster, kube_user, source, linked_at)| {
+            Ok(Link {
+                kube_user: KubeUser::parse(&kube_user)
+                    .with_context(|| format!("the stored link for cluster {cluster}"))?,
+                source: LinkSource::parse(&source)?,
+                cluster,
+                linked_at,
+            })
         })
-        .collect())
+        .collect()
 }
 
 #[cfg(test)]
@@ -250,9 +312,16 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_reviewed_token_records_the_username_the_cluster_named(pool: PgPool) {
         let clusters = Clusters::with(&[("pirate", "sha256~pirate", "wseaton")]);
-        let user = link(&pool, &clusters, "sub-1", "pirate", " sha256~pirate\n")
-            .await
-            .unwrap();
+        let user = link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "pirate",
+            " sha256~pirate\n",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap();
         assert_eq!(user.as_str(), "wseaton");
         assert_eq!(
             get(&pool, "sub-1", "pirate").await.unwrap(),
@@ -260,7 +329,7 @@ mod tests {
         );
         let links = list(&pool, "sub-1").await.unwrap();
         assert_eq!(links.len(), 1);
-        assert_eq!(links[0].source, "token-review");
+        assert_eq!(links[0].source, LinkSource::TokenReview);
         let stored: Vec<String> = sqlx::query_scalar(
             "SELECT concat_ws(' ', sub, cluster, kube_user, source) FROM kube_identity_links",
         )
@@ -279,9 +348,16 @@ mod tests {
             ("pirate", "sha256~pirate", "wseaton"),
             ("mpp", "sha256~mpp", "weaton"),
         ]);
-        let err = link(&pool, &clusters, "sub-1", "pirate", "sha256~mpp")
-            .await
-            .unwrap_err();
+        let err = link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "pirate",
+            "sha256~mpp",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, LinkError::NotAuthenticated { .. }), "{err}");
         assert_eq!(get(&pool, "sub-1", "pirate").await.unwrap(), None);
     }
@@ -293,17 +369,31 @@ mod tests {
             "sa-token",
             "system:serviceaccount:crucible-system:crucible-kueue",
         )]);
-        let err = link(&pool, &clusters, "sub-1", "pirate", "sa-token")
-            .await
-            .unwrap_err();
+        let err = link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "pirate",
+            "sa-token",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, LinkError::User(KubeUserError::System(_))),
             "{err}"
         );
         clusters.down.push("pirate".into());
-        let err = link(&pool, &clusters, "sub-1", "pirate", "sa-token")
-            .await
-            .unwrap_err();
+        let err = link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "pirate",
+            "sa-token",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, LinkError::Unreachable { .. }), "{err}");
         assert_eq!(get(&pool, "sub-1", "pirate").await.unwrap(), None);
     }
@@ -315,18 +405,41 @@ mod tests {
             ("pirate", "t2", "wseaton2"),
             ("mpp", "t3", "weaton"),
         ]);
-        link(&pool, &clusters, "sub-1", "pirate", "t1")
-            .await
-            .unwrap();
-        link(&pool, &clusters, "sub-1", "mpp", "t3").await.unwrap();
-        link(&pool, &clusters, "sub-1", "pirate", "t2")
-            .await
-            .unwrap();
+        link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "pirate",
+            "t1",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap();
+        link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "mpp",
+            "t3",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap();
+        link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "pirate",
+            "t2",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap();
         let links: Vec<(String, String)> = list(&pool, "sub-1")
             .await
             .unwrap()
             .into_iter()
-            .map(|l| (l.cluster, l.kube_user))
+            .map(|l| (l.cluster, l.kube_user.as_str().to_string()))
             .collect();
         assert_eq!(
             links,
@@ -334,6 +447,102 @@ mod tests {
                 ("mpp".to_string(), "weaton".to_string()),
                 ("pirate".to_string(), "wseaton2".to_string())
             ]
+        );
+    }
+
+    async fn signed_in(pool: &PgPool, sub: &str, login: &str) {
+        crate::identity::oidc::users::record_login(pool, sub, login, None, jiff::Timestamp::now())
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn unlinking_forgets_one_cluster_and_keeps_the_others(pool: PgPool) {
+        let clusters = Clusters::with(&[("pirate", "t1", "wseaton"), ("mpp", "t2", "weaton")]);
+        link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "pirate",
+            "t1",
+            LinkSource::OpenshiftOauth,
+        )
+        .await
+        .unwrap();
+        link(
+            &pool,
+            &clusters,
+            "sub-1",
+            "mpp",
+            "t2",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap();
+        assert!(unlink(&pool, "sub-1", "pirate").await.unwrap());
+        assert!(
+            !unlink(&pool, "sub-1", "pirate").await.unwrap(),
+            "nothing left to unlink"
+        );
+        assert_eq!(get(&pool, "sub-1", "pirate").await.unwrap(), None);
+        let left = list(&pool, "sub-1").await.unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].cluster, "mpp");
+        assert_eq!(left[0].source, LinkSource::TokenReview);
+    }
+
+    /// Agent tokens for a person's runs read the hub username off the user row, so a hub link and
+    /// unlink move it too, and an administrator's override survives both.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn the_hub_link_is_the_username_agent_tokens_carry(pool: PgPool) {
+        signed_in(&pool, "sub-alice", "alice").await;
+        let clusters = Clusters::with(&[("hub", "t1", "alice-k8s")]);
+        link(
+            &pool,
+            &clusters,
+            "sub-alice",
+            "hub",
+            "t1",
+            LinkSource::OpenshiftOauth,
+        )
+        .await
+        .unwrap();
+        let effective = || crate::identity::kube_identity::effective(&pool, "alice");
+        assert_eq!(effective().await.unwrap().unwrap().as_str(), "alice-k8s");
+        crate::identity::kube_identity::set_override(
+            &pool,
+            "alice",
+            Some(&KubeUser::parse("alice-admin").unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(unlink(&pool, "sub-alice", "hub").await.unwrap());
+        assert_eq!(effective().await.unwrap().unwrap().as_str(), "alice-admin");
+        crate::identity::kube_identity::set_override(&pool, "alice", None)
+            .await
+            .unwrap();
+        assert_eq!(effective().await.unwrap(), None);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_spoke_link_leaves_the_hub_username_alone(pool: PgPool) {
+        signed_in(&pool, "sub-alice", "alice").await;
+        let clusters = Clusters::with(&[("pirate", "t1", "wseaton")]);
+        link(
+            &pool,
+            &clusters,
+            "sub-alice",
+            "pirate",
+            "t1",
+            LinkSource::TokenReview,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::identity::kube_identity::effective(&pool, "alice")
+                .await
+                .unwrap(),
+            None
         );
     }
 }

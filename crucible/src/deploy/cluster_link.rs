@@ -6,6 +6,7 @@
 use crate::deploy::profile::{ClusterLinkCfg, DeployProfile, KubeName};
 use anyhow::{Context, Result};
 use crucible_contract::cluster_link::{ExternalUrl, SCOPE};
+use forge::fleet::ClusterIdentity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -26,6 +27,13 @@ pub enum ClusterLinkError {
         "[cluster_link].openshift lists {cluster:?}, which is neither `hub` nor a [clusters.<name>] entry"
     )]
     UnknownCluster { cluster: String },
+    #[error(
+        "[cluster_link].openshift lists {cluster:?}, whose usernames come from the SSO login; \
+         only an `identity = \"link\"` cluster links"
+    )]
+    NotLinkCluster { cluster: String },
+    #[error("--cluster-link renders an object for another cluster; apply it there yourself")]
+    NoApply,
 }
 
 #[derive(Serialize)]
@@ -90,14 +98,15 @@ fn listed<'a>(
             cluster: cluster.to_string(),
             listed: cfg.openshift.iter().map(KubeName::to_string).collect(),
         })?;
-    let known = name.as_str() == crate::deploy::profile::HUB_CLUSTER
-        || profile.clusters.contains_key(name.as_str());
-    if !known {
-        return Err(ClusterLinkError::UnknownCluster {
+    match profile.cluster_identity(name.as_str()) {
+        None => Err(ClusterLinkError::UnknownCluster {
             cluster: name.to_string(),
-        });
+        }),
+        Some(ClusterIdentity::Claim(_)) => Err(ClusterLinkError::NotLinkCluster {
+            cluster: name.to_string(),
+        }),
+        Some(ClusterIdentity::Link) => Ok(name),
     }
-    Ok(name)
 }
 
 #[cfg(test)]
@@ -117,9 +126,10 @@ mod tests {
         kubeconfig_secret = "pirate-kubeconfig"
         [clusters.waldorf]
         kubeconfig_secret = "waldorf-kubeconfig"
+        identity = { claim = "email" }
         [cluster_link]
         external_url = "https://crucible.apps.hub.example.com"
-        openshift = ["pirate", "hub", "gone"]
+        openshift = ["pirate", "hub", "gone", "waldorf"]
     "#;
 
     fn profile(text: &str) -> DeployProfile {
@@ -176,12 +186,17 @@ mod tests {
     #[test]
     fn a_cluster_the_table_does_not_list_or_the_fleet_does_not_know_is_refused() {
         let p = profile(PROFILE);
-        let err = render(&p, "waldorf").unwrap_err();
+        let err = render(&p, "mpp").unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::NotListed {
-                cluster: "waldorf".into(),
-                listed: vec!["pirate".into(), "hub".into(), "gone".into()]
+                cluster: "mpp".into(),
+                listed: vec![
+                    "pirate".into(),
+                    "hub".into(),
+                    "gone".into(),
+                    "waldorf".into()
+                ]
             })
         );
         let err = render(&p, "gone").unwrap_err();
@@ -189,6 +204,17 @@ mod tests {
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::UnknownCluster {
                 cluster: "gone".into()
+            })
+        );
+    }
+
+    #[test]
+    fn a_cluster_whose_usernames_follow_the_sso_login_gets_no_oauth_client() {
+        let err = render(&profile(PROFILE), "waldorf").unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ClusterLinkError>(),
+            Some(&ClusterLinkError::NotLinkCluster {
+                cluster: "waldorf".into()
             })
         );
     }
