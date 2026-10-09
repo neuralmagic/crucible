@@ -5,8 +5,9 @@
 //! `tool_execution_start`/`tool_execution_end`, `turn_end`, `agent_end`). Every model request is
 //! one assistant message whose `message_end` carries the authoritative content blocks and that
 //! request's usage, so text, thinking, and token samples come from `message_end`; tool events come
-//! from `tool_execution_end`, which carries the result and the error flag; and the terminal
-//! `agent_end` closes the turn as a [`AgentEvent::Result`]. Pi prices usage from its own model
+//! from `tool_execution_end`, which carries the result and the error flag. `agent_end` only closes
+//! one low-level run (an automatic retry or overflow recovery can follow it), so the terminal
+//! `agent_settled` closes the turn as a [`AgentEvent::Result`]. Pi prices usage from its own model
 //! table, which is zero for a custom provider, so a zero total falls back to the pricing function
 //! the owner installs. Lines with an unmodeled `type`, and non-JSON lines, pass through as
 //! [`AgentEvent::Raw`] so a viewer never loses output to schema drift.
@@ -102,32 +103,60 @@ impl PiJsonParser {
                 }
             }
             Some("tool_execution_end") => self.tool_end(&msg, &mut out),
-            Some("agent_end") => out.push(AgentEvent::Result {
-                subtype: if self.error.is_some() {
-                    "error"
-                } else {
-                    "success"
+            Some("auto_retry_end") => {
+                if msg.get("success").and_then(Value::as_bool) == Some(true) {
+                    self.error = None;
+                } else if self.error.is_none() {
+                    let detail = str_field(&msg, "finalError");
+                    self.error = Some(if detail.is_empty() {
+                        "automatic retry failed".to_string()
+                    } else {
+                        detail
+                    });
                 }
-                .to_string(),
-                is_error: self.error.is_some(),
-                turns: self.messages,
-                cost_usd: self.cost(),
-                error: self.error.clone(),
-            }),
+            }
+            Some("compaction_end") => {
+                if msg.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                    self.error = None;
+                }
+            }
+            Some("agent_settled") => {
+                if msg.get("aborted").and_then(Value::as_bool) == Some(true) && self.error.is_none()
+                {
+                    self.error = Some("aborted".to_string());
+                }
+                out.push(self.result());
+            }
             Some(
                 "agent_start"
+                | "agent_end"
                 | "turn_start"
                 | "turn_end"
                 | "message_start"
                 | "message_update"
                 | "tool_execution_update"
                 | "queue_update"
-                | "compaction_start"
-                | "compaction_end",
+                | "compaction_start",
             ) => {}
             _ => out.push(raw(line)),
         }
         out
+    }
+
+    /// The turn's terminal event: an error when one stayed latched through the last retry.
+    fn result(&self) -> AgentEvent {
+        AgentEvent::Result {
+            subtype: if self.error.is_some() {
+                "error"
+            } else {
+                "success"
+            }
+            .to_string(),
+            is_error: self.error.is_some(),
+            turns: self.messages,
+            cost_usd: self.cost(),
+            error: self.error.clone(),
+        }
     }
 
     /// One completed assistant message: its blocks in order, then this request's usage folded
@@ -275,7 +304,7 @@ fn raw(line: &str) -> AgentEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::pi_json::*;
 
     /// Pricing stand-in: $1/MTok in, $10/MTok out, cached reads a tenth of input.
     fn price(_model: &str, t: &Tokens) -> f64 {
@@ -408,7 +437,8 @@ mod tests {
             &[
                 r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":100,"output":10,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}},"stopReason":"toolUse"}}"#,
                 r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":200,"output":20,"cacheRead":0,"cacheWrite":0,"cost":{"total":0.5}},"stopReason":"stop"}}"#,
-                r#"{"type":"agent_end","messages":[]}"#,
+                r#"{"type":"agent_end","messages":[],"willRetry":false}"#,
+                r#"{"type":"agent_settled","aborted":false}"#,
             ],
         );
         match &ev[..] {
@@ -444,7 +474,8 @@ mod tests {
     fn an_error_stop_makes_the_result_an_error() {
         let ev = run(&[
             r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}},"stopReason":"error","errorMessage":"No API key for provider: anthropic"}}"#,
-            r#"{"type":"agent_end","messages":[]}"#,
+            r#"{"type":"agent_end","messages":[],"willRetry":false}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
         ]);
         match &ev[..] {
             [
@@ -468,6 +499,107 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    const ERROR_STOP: &str = r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":5,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}},"stopReason":"error","errorMessage":"529 overloaded"}}"#;
+    const OK_STOP: &str = r#"{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":5,"output":1,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}},"stopReason":"stop"}}"#;
+
+    fn results(ev: &[AgentEvent]) -> Vec<(bool, Option<String>, u32)> {
+        ev.iter()
+            .filter_map(|e| match e {
+                AgentEvent::Result {
+                    is_error,
+                    error,
+                    turns,
+                    ..
+                } => Some((*is_error, error.clone(), *turns)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `agent_end` closes one low-level run, which an automatic retry follows; only
+    /// `agent_settled` closes the turn, and a retry that succeeds clears the failed attempt's error.
+    #[test]
+    fn a_successful_retry_settles_once_as_success() {
+        let ev = run(&[
+            ERROR_STOP,
+            r#"{"type":"agent_end","messages":[],"willRetry":false}"#,
+            r#"{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":2000,"errorMessage":"529 overloaded"}"#,
+            r#"{"type":"agent_start"}"#,
+            OK_STOP,
+            r#"{"type":"auto_retry_end","success":true,"attempt":2}"#,
+            r#"{"type":"agent_end","messages":[],"willRetry":false}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
+        ]);
+        assert_eq!(results(&ev), [(false, None, 2)]);
+        assert!(
+            ev.iter().any(
+                |e| matches!(e, AgentEvent::Error { message, .. } if message == "529 overloaded")
+            ),
+            "the failed attempt is still reported as it happened"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_retry_settles_as_its_final_error() {
+        let ev = run(&[
+            r#"{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"529 overloaded after 3 attempts"}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
+        ]);
+        assert_eq!(
+            results(&ev),
+            [(true, Some("529 overloaded after 3 attempts".to_string()), 0)]
+        );
+
+        let ev = run(&[
+            r#"{"type":"auto_retry_end","success":false,"attempt":3}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
+        ]);
+        assert_eq!(
+            results(&ev),
+            [(true, Some("automatic retry failed".to_string()), 0)]
+        );
+    }
+
+    /// Overflow recovery: the overflowing request errors, compaction succeeds with
+    /// `willRetry`, and the retried prompt finishes.
+    #[test]
+    fn overflow_recovery_clears_the_overflow_error() {
+        let ev = run(&[
+            ERROR_STOP,
+            r#"{"type":"agent_end","messages":[],"willRetry":true}"#,
+            r#"{"type":"compaction_start","reason":"overflow"}"#,
+            r#"{"type":"compaction_end","reason":"overflow","result":{},"aborted":false,"willRetry":true}"#,
+            OK_STOP,
+            r#"{"type":"agent_settled","aborted":false}"#,
+        ]);
+        assert_eq!(results(&ev), [(false, None, 2)]);
+
+        let ev = run(&[
+            ERROR_STOP,
+            r#"{"type":"compaction_end","reason":"overflow","aborted":false,"willRetry":false,"errorMessage":"too big"}"#,
+            r#"{"type":"agent_settled","aborted":false}"#,
+        ]);
+        assert_eq!(
+            results(&ev),
+            [(true, Some("529 overloaded".to_string()), 1)]
+        );
+    }
+
+    #[test]
+    fn an_aborted_settle_is_an_error() {
+        let ev = run(&[OK_STOP, r#"{"type":"agent_settled","aborted":true}"#]);
+        assert_eq!(results(&ev), [(true, Some("aborted".to_string()), 1)]);
+    }
+
+    #[test]
+    fn agent_end_alone_does_not_close_the_turn() {
+        let ev = run(&[
+            OK_STOP,
+            r#"{"type":"agent_end","messages":[],"willRetry":false}"#,
+        ]);
+        assert!(results(&ev).is_empty(), "{ev:?}");
     }
 
     #[test]
@@ -495,8 +627,8 @@ mod tests {
         }
     }
 
-    /// Golden test against a real `pi --mode json --print` capture (paths redacted) against a
-    /// scripted chat-completions endpoint: `echo hi` through bash, `hello.txt` through write, then
+    /// Golden test against a real pi 1.1.0 `--mode json --print` capture (paths redacted) against
+    /// a scripted chat-completions endpoint: `echo hi` through bash, `hello.txt` through write, then
     /// the closing sentence.
     #[test]
     fn golden_hello_capture() {
@@ -545,6 +677,70 @@ mod tests {
                 assert!(!*is_error);
                 assert_eq!(*turns, 3);
                 assert!(*cost_usd > 0.0, "the estimate stamped a cost");
+            }
+            other => panic!("unexpected event sequence from the capture: {other:?}"),
+        }
+    }
+
+    /// Golden test against a real pi 1.1.0 capture with `--tools +codemode` and one streamable-HTTP
+    /// MCP server behind a bearer, against a scripted chat-completions endpoint: a codemode script
+    /// calls `mcp__vuln__lookup`, then the closing sentence. The nested MCP call finishes inside
+    /// the script, so its tool event lands before the codemode tool's own.
+    #[test]
+    fn golden_codemode_mcp_capture() {
+        let fixture = include_str!("testdata/pi_json_codemode.jsonl");
+        let ev = run_with(
+            PiJsonParser::new("qwen-3-8-27b").with_tool_io(true),
+            &fixture.lines().collect::<Vec<_>>(),
+        );
+        match &ev[..] {
+            [
+                AgentEvent::Init { .. },
+                AgentEvent::Tokens(t1),
+                AgentEvent::Tool {
+                    name: nested,
+                    result: nested_result,
+                    ..
+                },
+                AgentEvent::Tool {
+                    name: script,
+                    input: script_input,
+                    result: script_result,
+                    ..
+                },
+                AgentEvent::Text { delta },
+                AgentEvent::Tokens(t2),
+                AgentEvent::Result {
+                    is_error, turns, ..
+                },
+            ] => {
+                assert_eq!((t1.input, t1.output), (100, 10));
+                assert_eq!(nested, "mcp__vuln__lookup");
+                assert_eq!(
+                    nested_result.as_deref(),
+                    Some("CVE-2026-0001: golang.org/x/net < 0.38.0")
+                );
+                assert_eq!(script, "codemode");
+                assert!(
+                    script_input.as_ref().is_some_and(|i| i["code"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("tools.mcp__vuln__lookup"))),
+                    "{script_input:?}"
+                );
+                assert!(
+                    script_result
+                        .as_deref()
+                        .is_some_and(|r| r.starts_with("Script completed")
+                            && r.contains("golang.org/x/net < 0.38.0")),
+                    "{script_result:?}"
+                );
+                assert_eq!(
+                    delta,
+                    "CVE-2026-0001 affects golang.org/x/net below 0.38.0."
+                );
+                assert_eq!((t2.input, t2.output, t2.total), (300, 30, 330));
+                assert!(!*is_error);
+                assert_eq!(*turns, 2);
             }
             other => panic!("unexpected event sequence from the capture: {other:?}"),
         }
