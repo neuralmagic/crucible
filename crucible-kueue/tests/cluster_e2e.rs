@@ -4,7 +4,11 @@
 //! Run with:
 //!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=<ns> \
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> cargo test --test cluster_e2e -- --ignored --nocapture
-//! The namespace must carry the label Kueue's ClusterQueue selects on and hold the LocalQueue.
+//!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<user the tokens act as>
+//! The namespace must carry the label Kueue's ClusterQueue selects on and hold the LocalQueue. The
+//! tokens act as CRUCIBLE_KUEUE_E2E_KUBE_USER, decided by SubjectAccessReview: it needs `use` on the
+//! LocalQueue and the workload verbs the tests exercise in the namespace, and the context's identity
+//! needs `create` on subjectaccessreviews.
 
 use crucible_mcp_auth::testing::{self, JwksServer};
 use rmcp::ServiceExt;
@@ -28,6 +32,7 @@ struct Env {
     context: String,
     namespace: String,
     queue: String,
+    kube_user: String,
 }
 
 fn env() -> Env {
@@ -38,6 +43,7 @@ fn env() -> Env {
         context: var("CRUCIBLE_KUEUE_E2E_CONTEXT"),
         namespace: var("CRUCIBLE_KUEUE_E2E_NAMESPACE"),
         queue: var("CRUCIBLE_KUEUE_E2E_QUEUE"),
+        kube_user: var("CRUCIBLE_KUEUE_E2E_KUBE_USER"),
     }
 }
 
@@ -56,12 +62,16 @@ async fn serve(env: &Env) -> String {
     let kueue_version = crucible_kueue::kueue::KueueVersion::discover(&client)
         .await
         .unwrap();
+    let reviewer = Arc::new(crucible_mcp_auth::kube::SubjectAccessReviewer::new(
+        client.clone(),
+        crucible_mcp_auth::kube::GroupSource::Token,
+    ));
     let app = crucible_kueue::router(
         client,
         crucible_kueue::Options {
             oidc: Arc::new(oidc),
             policy: crucible_mcp_auth::policy::ToolPolicy::default(),
-            reviewer: None,
+            reviewer: Some(reviewer),
             kueue: kueue_version,
             allowed_hosts: Vec::new(),
         },
@@ -72,24 +82,23 @@ async fn serve(env: &Env) -> String {
     format!("http://{addr}{}", crucible_kueue::MCP_PATH)
 }
 
-fn run_token(env: &Env, run: &str, role: &str, scope: &str) -> String {
+fn run_token(env: &Env, run: &str, scope: &str) -> String {
     let mut claims = testing::run_claims();
     claims["run_id"] = json!(run);
     claims["namespace"] = json!(env.namespace);
-    claims["role"] = json!(role);
-    claims["queues"] = json!([env.queue]);
+    claims["kube_user"] = json!(env.kube_user);
     claims["scope"] = json!(scope);
     testing::sign("a", &claims)
 }
 
-/// A run's token that may submit to the e2e queue in the e2e namespace.
+/// A run's token that may submit, acting as the e2e user.
 fn submitter(env: &Env, run: &str) -> String {
-    run_token(env, run, "submitter", "kueue.read kueue.submit")
+    run_token(env, run, "kueue.read kueue.submit")
 }
 
 /// A token that may only read, for another run in the same namespace.
 fn viewer(env: &Env, run: &str) -> String {
-    run_token(env, &format!("{run}-viewer"), "viewer", "kueue.read")
+    run_token(env, &format!("{run}-viewer"), "kueue.read")
 }
 
 async fn connect(url: &str, token: &str) -> Result<Client, String> {

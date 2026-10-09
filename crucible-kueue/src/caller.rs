@@ -1,8 +1,7 @@
 //! Caller identity: who a request comes from ([`Identity`], from its access token in
-//! [`crate::auth`]) and who it acts as in one namespace ([`Caller`]). Nothing a tool receives in its
-//! arguments can widen that scope.
+//! [`crate::auth`]) and who it acts as in one namespace ([`Caller`]). What it may do there is
+//! Kubernetes RBAC's to decide, for the user the token names.
 
-use crucible_contract::kueue::TenantRole;
 use std::fmt;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -118,68 +117,36 @@ impl Launcher {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum Refusal {
-    #[error("this token is bound to namespace {pinned:?}, not {requested:?}")]
-    NamespacePinned { pinned: String, requested: String },
     #[error("name a namespace: this token has no default one")]
     NamespaceRequired,
     #[error(transparent)]
     Namespace(NameError),
-    #[error("role {role:?} may not call {tool}; it needs the submitter role")]
-    Role {
-        role: TenantRole,
-        tool: &'static str,
-    },
-    #[error("local queue {queue:?} is not in this run's allowlist {allowed:?}")]
-    Queue { queue: String, allowed: Vec<String> },
 }
 
-/// Who a request comes from, before it names a namespace. A run's or tenant's identity is pinned
-/// to one namespace; a person's picks one per call (authorized by the tool policy's access checks)
-/// and may have a default.
+/// Who a request comes from, before it names a namespace: a run (acting for its launcher) or a
+/// person. Either may name any namespace per call, its token's `namespace` claim being the
+/// default; the access checks decide whether it may act there.
 #[derive(Debug, Clone)]
 pub struct Identity {
     pub run_id: RunId,
     pub namespace: Option<Namespace>,
-    pub pinned: bool,
-    pub role: TenantRole,
-    pub queues: Vec<QueueName>,
-    pub launched_by: Option<Launcher>,
+    /// The human the request acts for, stamped on everything it creates.
+    pub launched_by: Launcher,
     /// The party presenting a run's token (the sandbox's SPIFFE ID), stamped on what it creates.
     pub actor: Option<String>,
 }
 
 impl Identity {
-    /// A caller fixed to `caller`'s namespace.
-    pub fn pinned(caller: Caller) -> Self {
-        Self {
-            run_id: caller.run_id,
-            namespace: Some(caller.namespace),
-            pinned: true,
-            role: caller.role,
-            queues: caller.queues,
-            launched_by: caller.launched_by,
-            actor: None,
-        }
-    }
-
-    /// The caller acting in `requested`, or in its own namespace when none is named.
+    /// The caller acting in `requested`, or in its default namespace when none is named.
     pub fn in_namespace(&self, requested: Option<&str>) -> Result<Caller, Refusal> {
-        let namespace = match (requested, &self.namespace, self.pinned) {
-            (None, Some(own), _) => own.clone(),
-            (None, None, _) => return Err(Refusal::NamespaceRequired),
-            (Some(r), Some(own), true) if r != own.as_str() => {
-                return Err(Refusal::NamespacePinned {
-                    pinned: own.to_string(),
-                    requested: r.to_string(),
-                });
-            }
-            (Some(r), _, _) => Namespace::parse(r).map_err(Refusal::Namespace)?,
+        let namespace = match (requested, &self.namespace) {
+            (Some(r), _) => Namespace::parse(r).map_err(Refusal::Namespace)?,
+            (None, Some(default)) => default.clone(),
+            (None, None) => return Err(Refusal::NamespaceRequired),
         };
         Ok(Caller {
             run_id: self.run_id.clone(),
             namespace,
-            role: self.role,
-            queues: self.queues.clone(),
             launched_by: self.launched_by.clone(),
         })
     }
@@ -190,34 +157,7 @@ impl Identity {
 pub struct Caller {
     pub run_id: RunId,
     pub namespace: Namespace,
-    pub role: TenantRole,
-    /// Empty means every LocalQueue in the namespace.
-    pub queues: Vec<QueueName>,
-    /// The human a delegated token acts for, stamped on everything this caller creates. Static
-    /// tenant tokens carry no launcher.
-    pub launched_by: Option<Launcher>,
-}
-
-impl Caller {
-    pub fn require_submitter(&self, tool: &'static str) -> Result<(), Refusal> {
-        match self.role {
-            TenantRole::Submitter => Ok(()),
-            TenantRole::Viewer => Err(Refusal::Role {
-                role: self.role,
-                tool,
-            }),
-        }
-    }
-
-    pub fn authorize_queue(&self, queue: &QueueName) -> Result<(), Refusal> {
-        if self.queues.is_empty() || self.queues.contains(queue) {
-            return Ok(());
-        }
-        Err(Refusal::Queue {
-            queue: queue.to_string(),
-            allowed: self.queues.iter().map(ToString::to_string).collect(),
-        })
-    }
+    pub launched_by: Launcher,
 }
 
 #[cfg(test)]
@@ -225,92 +165,33 @@ mod tests {
     use crate::caller::*;
 
     #[test]
-    fn a_viewer_cannot_submit_and_the_refusal_names_the_tool() {
-        let caller = Caller {
+    fn an_identity_acts_in_the_named_namespace_or_its_default() {
+        let mut identity = Identity {
             run_id: RunId::parse("r").unwrap(),
-            namespace: Namespace::parse("ns").unwrap(),
-            role: TenantRole::Viewer,
-            queues: vec![],
-            launched_by: None,
+            namespace: Some(Namespace::parse("team-a").unwrap()),
+            launched_by: Launcher::parse("alice").unwrap(),
+            actor: None,
         };
-        let err = caller.require_submitter("workload_submit").unwrap_err();
-        assert!(err.to_string().contains("workload_submit"));
-    }
-
-    #[test]
-    fn a_pinned_identity_acts_only_in_its_own_namespace() {
-        let identity = Identity::pinned(Caller {
-            run_id: RunId::parse("r").unwrap(),
-            namespace: Namespace::parse("team-a").unwrap(),
-            role: TenantRole::Submitter,
-            queues: vec![],
-            launched_by: None,
-        });
         assert_eq!(
             identity.in_namespace(None).unwrap().namespace.as_str(),
             "team-a"
         );
         assert_eq!(
             identity
-                .in_namespace(Some("team-a"))
+                .in_namespace(Some("team-b"))
                 .unwrap()
                 .namespace
                 .as_str(),
-            "team-a"
+            "team-b"
         );
-        assert_eq!(
-            identity.in_namespace(Some("team-b")).unwrap_err(),
-            Refusal::NamespacePinned {
-                pinned: "team-a".into(),
-                requested: "team-b".into()
-            }
-        );
-    }
-
-    #[test]
-    fn an_unpinned_identity_still_needs_a_valid_namespace() {
-        let identity = Identity {
-            run_id: RunId::parse("p").unwrap(),
-            namespace: None,
-            pinned: false,
-            role: TenantRole::Submitter,
-            queues: vec![],
-            launched_by: None,
-            actor: None,
-        };
         assert!(matches!(
             identity.in_namespace(Some("Not_Valid")),
             Err(Refusal::Namespace(_))
         ));
+        identity.namespace = None;
         assert_eq!(
             identity.in_namespace(None).unwrap_err(),
             Refusal::NamespaceRequired
-        );
-    }
-
-    #[test]
-    fn the_queue_allowlist_is_enforced_and_empty_means_any() {
-        let mut caller = Caller {
-            run_id: RunId::parse("r").unwrap(),
-            namespace: Namespace::parse("ns").unwrap(),
-            role: TenantRole::Submitter,
-            queues: vec![QueueName::parse("gpu").unwrap()],
-            launched_by: None,
-        };
-        assert!(
-            caller
-                .authorize_queue(&QueueName::parse("gpu").unwrap())
-                .is_ok()
-        );
-        let err = caller
-            .authorize_queue(&QueueName::parse("cpu").unwrap())
-            .unwrap_err();
-        assert!(err.to_string().contains("\"cpu\""));
-        caller.queues.clear();
-        assert!(
-            caller
-                .authorize_queue(&QueueName::parse("cpu").unwrap())
-                .is_ok()
         );
     }
 

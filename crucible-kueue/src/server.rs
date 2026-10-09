@@ -14,7 +14,6 @@ use crate::manifest::{
 use crate::status::{self, Rollup};
 use crate::task::{self, Outcome, TaskRef};
 use crucible_contract::kueue::SCOPE_SUBMIT;
-use crucible_contract::kueue::TenantRole;
 use crucible_mcp_auth::principal::Principal;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
@@ -412,13 +411,11 @@ impl KueueMcp {
     }
 
     /// The caller a task request acts as, and whether it may submit (and so record what it
-    /// observes). The guard has already checked the method's scope and, for a Kubernetes user,
-    /// RBAC on the task's object; cancelling also needs the submitter role.
+    /// observes). The guard has already checked the method's scope and RBAC on the task's object.
     fn task_caller(
         &self,
         ctx: &RequestContext<RoleServer>,
         t: &TaskRef,
-        cancel: bool,
     ) -> Result<(Caller, bool), McpError> {
         let parts = request_parts(ctx).map_err(refused)?;
         let principal = principal(parts).map_err(refused)?;
@@ -426,11 +423,7 @@ impl KueueMcp {
             .map_err(refused)?
             .in_namespace(t.namespace.as_deref())
             .map_err(refused)?;
-        if cancel && c.role != TenantRole::Submitter {
-            return Err(refused("tasks/cancel needs the submitter role"));
-        }
-        let may_submit = c.role == TenantRole::Submitter && principal.scopes.contains(SCOPE_SUBMIT);
-        Ok((c, may_submit))
+        Ok((c, principal.scopes.contains(SCOPE_SUBMIT)))
     }
 
     fn dynamic(&self, kind: WorkloadKind, ns: &str) -> Api<DynamicObject> {
@@ -439,7 +432,6 @@ impl KueueMcp {
 
     async fn local_queue(&self, caller: &Caller, queue: &str) -> Result<LocalQueue, ToolError> {
         let queue = QueueName::parse(queue)?;
-        caller.authorize_queue(&queue)?;
         let ns = caller.namespace.as_str();
         kueue::get::<LocalQueue>(
             &self.client,
@@ -698,11 +690,6 @@ impl KueueMcp {
         r: &WorkloadRef,
         active: bool,
     ) -> Result<Value, ToolError> {
-        caller.require_submitter(if active {
-            "workload_resume"
-        } else {
-            "workload_stop"
-        })?;
         let obj = self.owned_object(caller, r.kind, &r.name).await?;
         if r.kind.is_scalable() {
             return self.scale_active(caller, r, &obj, active).await;
@@ -925,7 +912,7 @@ impl KueueMcp {
 
 #[tool_router]
 impl KueueMcp {
-    #[tool(description = "The namespace, role, and queue allowlist this token is bound to.")]
+    #[tool(description = "Who this token acts as: its run, launcher, and default namespace.")]
     async fn whoami(
         &self,
         Extension(parts): Extension<http::request::Parts>,
@@ -935,16 +922,14 @@ impl KueueMcp {
             json!({
                 "run_id": c.run_id.as_str(),
                 "namespace": c.namespace.as_str(),
-                "role": c.role,
-                "queues": c.queues.iter().map(QueueName::as_str).collect::<Vec<_>>(),
-                "launched_by": c.launched_by.as_ref().map(|l| l.as_str()),
+                "launched_by": c.launched_by.as_str(),
                 "submittable_kinds": WorkloadKind::ALL.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
             })
         }))
     }
 
     #[tool(
-        description = "LocalQueues this run may use, with their ClusterQueue and pending/admitted counts."
+        description = "LocalQueues in the namespace, with their ClusterQueue and pending/admitted counts."
     )]
     async fn queues_list(
         &self,
@@ -963,10 +948,6 @@ impl KueueMcp {
                 .await?;
                 let rows: Vec<Value> = all
                     .into_iter()
-                    .filter(|q| {
-                        QueueName::parse(&q.metadata.name)
-                            .is_ok_and(|n| c.authorize_queue(&n).is_ok())
-                    })
                     .map(|q| {
                         json!({
                             "queue": q.metadata.name,
@@ -1144,7 +1125,6 @@ impl KueueMcp {
         let submitted: Result<(Value, Task), ToolError> = async {
                 let parts = parts.ok_or(ToolError::NoCaller)?;
                 let c = caller(parts, args.namespace.as_deref())?;
-                c.require_submitter("workload_submit")?;
                 let actor = identity(parts)?.actor.as_deref();
                 let (n, _) = self.plan(&c, &args.queue, args.manifest).await?;
                 if n.plan_hash != args.plan_hash {
@@ -1327,7 +1307,6 @@ impl KueueMcp {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
-                c.require_submitter("workload_scale")?;
                 if !args.kind.is_scalable() {
                     return Err(ToolError::NotScalable {
                         kind: args.kind.kind(),
@@ -1395,7 +1374,6 @@ impl KueueMcp {
         reply(
             async {
                 let c = caller(&parts, r.namespace.as_deref())?;
-                c.require_submitter("workload_delete")?;
                 self.owned_object(&c, r.kind, &r.name).await?;
                 self.dynamic(r.kind, c.namespace.as_str())
                     .delete(&r.name, &DeleteParams::background())
@@ -1423,7 +1401,7 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let t = parse_task(&request.task_id)?;
-        let (c, may_submit) = self.task_caller(&ctx, &t, false)?;
+        let (c, may_submit) = self.task_caller(&ctx, &t)?;
         let (t, obj) = self.task_object(&c, &request.task_id).await?;
         let writable = may_submit && owns(&c, &obj);
         let detailed = self
@@ -1439,7 +1417,7 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let t = parse_task(&request.task_id)?;
-        let (c, _) = self.task_caller(&ctx, &t, true)?;
+        let (c, _) = self.task_caller(&ctx, &t)?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let r = WorkloadRef {
             namespace: t.namespace.clone(),

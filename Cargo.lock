@@ -2134,6 +2134,7 @@ dependencies = [
  "crucible-mcp-auth",
  "hex",
  "http 1.4.2",
+ "jiff",
  "k8s-openapi",
  "kube",
  "kube_quantity",

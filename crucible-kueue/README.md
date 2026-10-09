@@ -1,9 +1,9 @@
 # crucible-kueue
 
 MCP server (rmcp, streamable HTTP, stateless) that lets agents in OpenShell sandboxes submit and
-watch Kueue workloads. The server holds the Kubernetes credentials. An agent holds a bearer token
-whose SHA-256 is registered to one namespace, a role (`viewer` or `submitter`), and a LocalQueue
-allowlist. ADR-0066 records the design.
+watch Kueue workloads. The server holds the Kubernetes credentials. A caller holds an access token
+naming the Kubernetes user it acts as (a run's launcher, or a person), and that user's RBAC
+decides every call.
 
 Tools: `whoami`, `queues_list`, `queue_describe`, `hardware_describe`, `workload_plan`,
 `workload_submit`, `workload_status`, `workload_list`, `workload_logs`, `workload_stop`,
@@ -31,10 +31,11 @@ Every caller presents an OAuth access token; there are no static or per-run tena
 `--run-issuer <issuer>=<jwks uri>` (repeatable) trusts an issuer of runs' tokens (the crucible
 controller), `--person-issuer` one of people's tokens (the crucible realm, which needs
 `--kube-authz`), and `--resource` names this server's canonical URLs, one of which a token's `aud`
-must name. The issuer decides which kind a token is, never its claims. A run's `run_id`,
-`namespace`, `role`, and `queues` claims scope it; its `sub` (the human the run acts for) is stamped
-on created workloads as `crucible.dev/launched-by`, and its presenter (`act.sub`, the sandbox) as
-`crucible.dev/actor`.
+must name. The issuer decides which kind a token is, never its claims. Every token needs
+`kube_user`; its `namespace` claim, if any, is only the default namespace. A run's `run_id` owns
+what it creates, its `sub` (the human the run acts for) is stamped on created workloads as
+`crucible.dev/launched-by`, and its presenter (`act.sub`, the sandbox) as `crucible.dev/actor`.
+`role` and `queues` claims are ignored.
 
 Key sets are fetched over https; `--jwks-ca <pem>` adds CAs for the issuers' hosts, and
 `--insecure-jwks-http` allows plain http off loopback for a cluster network you trust.
@@ -44,8 +45,7 @@ Every tool and the tasks extension's two methods are declared in
 the SubjectAccessReviews each needs; anything else is refused. `--kube-authz openshift|token`
 decides those reviews and turns on people's tokens; without it a call that needs a review is
 refused. `--tool-policy` optionally adds CEL validate and mutate rules over tool arguments. Every
-tool takes an optional `namespace`: a run's token is pinned to its own, and a person names
-one per call. Hosts can embed the server with `crucible_kueue::router(client, Options { … })`. The
+tool takes an optional `namespace`, defaulting to the token's `namespace` claim. Hosts can embed the server with `crucible_kueue::router(client, Options { … })`. The
 shipped policy is
 [deploy/kueue-policy.toml](deploy/kueue-policy.toml); the auth design and the e2e's configuration
 are in [crucible-mcp-auth](../crucible-mcp-auth/README.md).

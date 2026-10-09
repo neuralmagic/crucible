@@ -244,12 +244,7 @@ pub fn normalize(
     set_label(labels, QUEUE_LABEL, queue.as_str())?;
     set_label(labels, MANAGED_LABEL, MANAGED_VALUE)?;
     set_label(labels, RUN_LABEL, caller.run_id.as_str())?;
-    match &caller.launched_by {
-        Some(launcher) => set_label(labels, LAUNCHED_BY_LABEL, launcher.as_str())?,
-        None => {
-            labels.remove(LAUNCHED_BY_LABEL);
-        }
-    }
+    set_label(labels, LAUNCHED_BY_LABEL, caller.launched_by.as_str())?;
 
     if kind == WorkloadKind::Job {
         object_entry(&mut obj, "spec", "spec")?.insert("suspend".into(), Value::Bool(true));
@@ -1158,18 +1153,15 @@ fn object_entry<'a>(
 
 #[cfg(test)]
 mod tests {
-    use crate::caller::{Namespace, QueueName, RunId};
+    use crate::caller::{Launcher, Namespace, QueueName, RunId};
     use crate::manifest::*;
-    use crucible_contract::kueue::TenantRole;
     use serde_json::json;
 
     fn caller() -> Caller {
         Caller {
             run_id: RunId::parse("run-7").unwrap(),
             namespace: Namespace::parse("team-a").unwrap(),
-            role: TenantRole::Submitter,
-            queues: vec![],
-            launched_by: None,
+            launched_by: Launcher::parse("alice").unwrap(),
         }
     }
 
@@ -1480,8 +1472,7 @@ mod tests {
 
     #[test]
     fn a_delegated_callers_launcher_is_stamped_and_cannot_be_overridden() {
-        let mut delegated = caller();
-        delegated.launched_by = Some(crate::caller::Launcher::parse("alice").unwrap());
+        let delegated = caller();
         let n = normalize(job(), &delegated, &queue()).unwrap();
         assert_eq!(
             n.object
@@ -1497,21 +1488,9 @@ mod tests {
     }
 
     #[test]
-    fn a_tenant_token_caller_cannot_claim_a_launcher() {
-        let mut forged = job();
-        forged["metadata"]["labels"] = json!({"crucible.dev/launched-by": "alice"});
-        let n = normalize(forged, &caller(), &queue()).unwrap();
-        assert_eq!(
-            n.object
-                .pointer("/metadata/labels/crucible.dev~1launched-by"),
-            None
-        );
-    }
-
-    #[test]
     fn the_launcher_is_part_of_the_plan_hash() {
         let mut delegated = caller();
-        delegated.launched_by = Some(crate::caller::Launcher::parse("alice").unwrap());
+        delegated.launched_by = Launcher::parse("bob").unwrap();
         let a = normalize(job(), &caller(), &queue()).unwrap();
         let b = normalize(job(), &delegated, &queue()).unwrap();
         assert_ne!(a.plan_hash, b.plan_hash);

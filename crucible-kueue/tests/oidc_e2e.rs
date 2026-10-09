@@ -12,8 +12,9 @@
 //!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=<namespace> \
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> CRUCIBLE_KUEUE_E2E_DATABASE_URL=<postgres url> \
 //!   cargo test -p crucible-kueue --test oidc_e2e -- --ignored --nocapture --test-threads=1
-//! The RBAC test needs the realm's spike client to carry a kube_user whose only rights are Jobs on
-//! that queue (no Deployments).
+//!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<the launcher's Kubernetes user>
+//! The launcher's user needs `use` on that LocalQueue and Jobs in that namespace, and no
+//! Deployments; the realm's spike client carries the same user for the RBAC test.
 
 use base64::Engine;
 use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
@@ -77,6 +78,7 @@ struct Env {
     namespace: String,
     queue: String,
     database_url: String,
+    kube_user: String,
 }
 
 fn env() -> Env {
@@ -87,6 +89,7 @@ fn env() -> Env {
         namespace: var("CRUCIBLE_KUEUE_E2E_NAMESPACE"),
         queue: var("CRUCIBLE_KUEUE_E2E_QUEUE"),
         database_url: var("CRUCIBLE_KUEUE_E2E_DATABASE_URL"),
+        kube_user: var("CRUCIBLE_KUEUE_E2E_KUBE_USER"),
     }
 }
 
@@ -117,9 +120,26 @@ fn signing_key_pem() -> String {
     )
 }
 
-/// The run the spike's sandbox belongs to: a running run pod on the `dev` cluster,
-/// with the sandbox bound through the controller's own bind path.
-async fn seed_run(pool: &sqlx::PgPool) {
+/// The run the spike's sandbox belongs to: a running run pod on the `dev` cluster, launched by
+/// alice (whose Kubernetes user is `kube_user`), with the sandbox bound through the controller's
+/// own bind path.
+async fn seed_run(pool: &sqlx::PgPool, kube_user: &str) {
+    crucible_controller::identity::oidc::users::record_login(
+        pool,
+        "sub-alice",
+        "alice",
+        None,
+        jiff::Timestamp::now(),
+    )
+    .await
+    .unwrap();
+    crucible_controller::identity::kube_identity::learn(
+        pool,
+        "alice",
+        &crucible_controller::identity::kube_identity::KubeUser::parse(kube_user).unwrap(),
+    )
+    .await
+    .unwrap();
     for sql in [
         "DELETE FROM run_sandboxes WHERE sandbox_id = $1 OR pod_name = $2",
         "DELETE FROM runs WHERE pod = $2",
@@ -171,7 +191,7 @@ async fn serve_controller(env: &Env, profile_dir: &std::path::Path) -> (String, 
     let pool = crucible_controller::connect(&env.database_url)
         .await
         .unwrap();
-    seed_run(&pool).await;
+    seed_run(&pool, &env.kube_user).await;
     let profile = profile_dir.join("profile.toml");
     std::fs::write(
         &profile,
@@ -195,7 +215,7 @@ tenant_namespace = "crucible-kueue-tenants"
 workload_namespace = "{}"
 queues = ["{}"]
 record_writers = ["crucible-system/crucible-hub-dispatch"]
-require_kube_user = false
+require_kube_user = true
 "#,
             env.namespace, env.queue
         ),
@@ -422,7 +442,6 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
     assert_eq!(me["run_id"], run_pod());
     assert_eq!(me["namespace"], env.namespace);
     assert_eq!(me["launched_by"], "alice");
-    assert_eq!(me["queues"], json!([env.queue]));
 
     let name = format!("oidc-e2e-{}", std::process::id());
     let refused = call(
@@ -431,10 +450,10 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
         json!({"queue": "not-my-queue", "manifest": job(&name)}),
     )
     .await;
-    let refusal = refused.expect_err("a queue outside the token's claims must be refused");
+    let refusal = refused.expect_err("a queue the launcher may not use must be refused");
     assert!(
-        refusal.contains("queue-allowed"),
-        "the refusal names the rule: {refusal}"
+        refusal.contains("queue-use"),
+        "the refusal names the check: {refusal}"
     );
 
     let mut forged = job(&name);
@@ -575,11 +594,8 @@ async fn kubernetes_rbac_decides_what_the_launcher_may_create() {
     );
 
     let elsewhere = call(&client, "queues_list", json!({"namespace": "kube-system"})).await;
-    let pinned = elsewhere.expect_err("a run's token cannot leave its namespace");
-    assert!(
-        pinned.contains("kube-system") || pinned.contains("queues-list"),
-        "{pinned}"
-    );
+    let refusal = elsewhere.expect_err("the launcher may not list queues in kube-system");
+    assert!(refusal.contains("queues-list"), "{refusal}");
 
     let listed = call(&client, "queues_list", json!({})).await.unwrap();
     assert!(listed.to_string().contains(&env.queue), "{listed}");
