@@ -259,6 +259,9 @@ pub(crate) async fn list_my_cluster_identities(
     State(state): State<ApiState>,
     subject: Subject,
 ) -> Result<Response, AppError> {
+    if !offered(&state) {
+        return Ok(Json(Vec::<ClusterIdentityDto>::new()).into_response());
+    }
     let Some(sub) = subject.as_deref() else {
         return Ok(no_subject());
     };
@@ -275,6 +278,16 @@ pub(crate) async fn list_my_cluster_identities(
         out.push(identity_of(&state, &cluster, &rule, person).await?);
     }
     Ok(Json(out).into_response())
+}
+
+/// Whether this controller links cluster usernames at all: it serves people's tokens, or links
+/// clusters through OAuth. Without either, the list is empty and the writes are not served.
+fn offered(state: &ApiState) -> bool {
+    state.people_issuer.is_some() || state.cluster_links.is_some()
+}
+
+fn not_offered() -> Response {
+    not_found("this controller links no cluster usernames")
 }
 
 fn link_refused(e: LinkError) -> Result<Response, AppError> {
@@ -313,6 +326,9 @@ pub(crate) async fn link_by_token(
     Path(cluster): Path<String>,
     Json(body): Json<LinkBody>,
 ) -> Result<Response, AppError> {
+    if !offered(&state) {
+        return Ok(not_offered());
+    }
     if path == AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -353,6 +369,9 @@ pub(crate) async fn unlink(
     path: AuthPath,
     Path(cluster): Path<String>,
 ) -> Result<Response, AppError> {
+    if !offered(&state) {
+        return Ok(not_offered());
+    }
     if path == AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -392,6 +411,9 @@ pub(crate) async fn start_oauth_link(
     Path(cluster): Path<String>,
     Json(body): Json<LinkStartBody>,
 ) -> Result<Response, AppError> {
+    if !offered(&state) {
+        return Ok(not_offered());
+    }
     if path != AuthPath::Session {
         return Ok(browser_only());
     }
@@ -1001,5 +1023,27 @@ openshift = ["pirate"]
                 reply.body
             );
         }
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn without_people_oauth_or_cluster_links_nothing_is_offered(pool: PgPool) {
+        let mut h = harness(pool).await;
+        h.state.cluster_links = None;
+        assert!(h.state.people_issuer.is_none());
+        assert!(h.identities().await.is_empty(), "the list is empty");
+        assert_eq!(
+            h.put_token(AuthPath::Session, "pirate", "sha256~pasted")
+                .await
+                .status,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            h.unlink(AuthPath::Session, "pirate").await,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            h.start(AuthPath::Session, "pirate").await,
+            StatusCode::NOT_FOUND
+        );
     }
 }

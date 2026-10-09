@@ -132,3 +132,8 @@ export function linkOutcome(search: URLSearchParams): LinkOutcome | null {
     message: LINK_ERRORS[error] ?? 'The link did not complete. Start it again.',
   };
 }
+
+/** The section shows when the controller links any cluster, or to report a link just made. */
+export function clusterIdentitiesShown(identities: readonly unknown[], hasOutcome: boolean): boolean {
+  return identities.length > 0 || hasOutcome;
+}

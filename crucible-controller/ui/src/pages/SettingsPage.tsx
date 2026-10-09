@@ -25,7 +25,7 @@ import {
   type KeyState,
 } from './settingsView';
 import { TextField, NumberInputField, CheckField, FormActions } from './formControls';
-import { linkOutcome, sortIdentities } from './clusterIdentitiesView';
+import { clusterIdentitiesShown, linkOutcome, sortIdentities } from './clusterIdentitiesView';
 import { ClusterIdentityRow } from './ClusterIdentityRow';
 
 const TONE: Record<CredentialState, StatusTone> = {
@@ -245,6 +245,9 @@ function ClusterIdentities() {
   }
   if (identities.isPending) {
     return <LoadingBlock label="Loading cluster identities" />;
+  }
+  if (!clusterIdentitiesShown(identities.data, outcome !== null)) {
+    return null;
   }
   const readOnly = Boolean(whoami.data?.impersonation);
   return (

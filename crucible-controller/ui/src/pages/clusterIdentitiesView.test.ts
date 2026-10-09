@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  clusterIdentitiesShown,
   identityView,
   linkOutcome,
   ruleLabel,
@@ -143,5 +144,16 @@ describe('linkOutcome', () => {
 
   it('is nothing when the page was not reached from a callback', () => {
     expect(linkOutcome(new URLSearchParams(''))).toBeNull();
+  });
+});
+
+describe('clusterIdentitiesShown', () => {
+  it('hides the section where the controller links no cluster', () => {
+    expect(clusterIdentitiesShown([], false)).toBe(false);
+  });
+
+  it('shows the clusters, or the outcome of a link just made', () => {
+    expect(clusterIdentitiesShown([linkCluster()], false)).toBe(true);
+    expect(clusterIdentitiesShown([], true)).toBe(true);
   });
 });
