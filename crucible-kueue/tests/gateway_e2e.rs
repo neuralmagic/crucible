@@ -392,6 +392,7 @@ async fn serve_controller(
     let keys =
         |entry: &ClusterSpire| Jwks::from_source(Arc::new(ProxyKeys::new(clusters.clone(), entry)));
     let state = Arc::new(AgentAuth {
+        people: None,
         issuer: AgentIssuer::new(cfg, keys),
         pool: pool.clone(),
         profile: crucible_controller::agent_auth::placement::load_profile(Some(&env.profile))

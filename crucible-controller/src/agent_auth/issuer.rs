@@ -720,7 +720,7 @@ impl AgentIssuer {
             "iat": now,
             "nbf": now,
             "exp": now.saturating_add(self.ttl.secs()),
-            "jti": crucible_contract::artifact::lower_hex(&jti),
+            "jti": jti,
             "act": {"sub": grant.sandbox.spiffe_id},
             "run_id": grant.run.pod_name,
             "scope": scope,

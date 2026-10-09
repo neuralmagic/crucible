@@ -116,9 +116,7 @@ EOF
         CONTROLLER_ADMINS=weaton \
         CONTROLLER_AGENT_ISSUER="$CONTROLLER" \
         CONTROLLER_AGENT_SIGNING_KEY_FILE="$WORK/signing.pem" \
-        CONTROLLER_AGENT_SVID_ISSUER=https://oidc-discovery.invalid \
-        CONTROLLER_AGENT_SVID_JWKS_URI=https://oidc-discovery.invalid/keys \
-        CONTROLLER_AGENT_GATEWAY_PREFIX=spiffe://pirate.crucible/openshell/gateway/ \
+        CONTROLLER_AGENT_SPIRE="pirate=https://oidc-discovery.invalid spiffe://pirate.crucible/openshell/gateway/ spire/oidc:443" \
         CONTROLLER_AGENT_AUDIENCES="$KUEUE=kueue.read kueue.submit" \
         CONTROLLER_PEOPLE_AUDIENCES="pirate:$KUEUE=kueue.read kueue.submit,waldorf:$KUEUE_WALDORF=kueue.read kueue.submit" \
         CONTROLLER_CLUSTER_LINK_SECRETS="$WORK/links" \

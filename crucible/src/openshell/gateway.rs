@@ -1769,7 +1769,10 @@ mod tests {
         }
         let staged = dir.path().join("staged");
         stage_client_tls(&mounted, &staged).unwrap();
-        assert_eq!(std::fs::read_to_string(staged.join("ca.crt")).unwrap(), "ca");
+        assert_eq!(
+            std::fs::read_to_string(staged.join("ca.crt")).unwrap(),
+            "ca"
+        );
         assert_eq!(
             std::fs::read_to_string(staged.join("client/tls.crt")).unwrap(),
             "cert"
