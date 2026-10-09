@@ -83,7 +83,8 @@ A minimal set of objects:
 
 - a **ServiceAccount** for the controller, with a **Role** in the loop namespace bound to it:
   `pods` get/list/watch/create/delete and `pods/log` get (dispatch, the watch, and the log
-  relay), `configmaps` and `secrets` create/delete (the pack ConfigMap and the delivered
+  relay), `pods/finalizers` update (the pod's ConfigMap and Secret block its deletion, which
+  OpenShift's owner-reference admission checks), `configmaps` and `secrets` create/delete (the pack ConfigMap and the delivered
   run secrets, both owner-referenced to the pod), and `leases` get/create/update/patch for
   leader election;
 - a **Secret** for `CONTROLLER_API_TOKEN` and one for `GITHUB_TOKEN`, referenced by env;

@@ -33,4 +33,5 @@ cluster credentials.
    5 minutes.
 5. Call `workload_logs` for the Job.
 
-Finish with one line: `RESULT <succeeded|failed|timeout> <the log line>`.
+Finish with two lines: `WHOAMI <the whoami reply, as one line of JSON, exactly as the tool
+returned it>`, then `RESULT <succeeded|failed|timeout> <the log line>`.

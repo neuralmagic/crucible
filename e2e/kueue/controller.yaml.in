@@ -1,0 +1,197 @@
+# The e2e's controller: Postgres and the controller in @CTL_NS@, apart from the loop namespace so
+# its agent signing key sits where no loop pod can read it. Secrets and the profile ConfigMap are
+# created by scripts/kueue-e2e.sh.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: @CTL_NS@
+  labels:
+    crucible.dev/purpose: e2e
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: @LOOP_NS@
+  labels:
+    crucible.dev/purpose: e2e
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: crucible-controller
+  namespace: @CTL_NS@
+---
+# Dispatch, the pod watch and log relay, and the run's pack and Secret in the loop namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: crucible-controller
+  namespace: @LOOP_NS@
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: admin
+subjects:
+  - kind: ServiceAccount
+    name: crucible-controller
+    namespace: @CTL_NS@
+---
+# The run's pack and Secret are owner-referenced to the loop pod with blockOwnerDeletion.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: crucible-controller-pod-finalizers
+  namespace: @LOOP_NS@
+rules:
+  - apiGroups: [""]
+    resources: [pods/finalizers]
+    verbs: [update]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: crucible-controller-pod-finalizers
+  namespace: @LOOP_NS@
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: crucible-controller-pod-finalizers
+subjects:
+  - kind: ServiceAccount
+    name: crucible-controller
+    namespace: @CTL_NS@
+---
+# SPIRE's JWT authorities, read through the API server's Service proxy.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: crucible-kueue-e2e-spire-keys
+  namespace: @SPIRE_NS@
+rules:
+  - apiGroups: [""]
+    resources: [services/proxy]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: crucible-kueue-e2e-spire-keys
+  namespace: @SPIRE_NS@
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: crucible-kueue-e2e-spire-keys
+subjects:
+  - kind: ServiceAccount
+    name: crucible-controller
+    namespace: @CTL_NS@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: @CTL_NS@
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      containers:
+        - name: postgres
+          image: quay.io/sclorg/postgresql-16-c9s:latest
+          env:
+            - {name: POSTGRESQL_USER, value: crucible}
+            - {name: POSTGRESQL_PASSWORD, value: crucible}
+            - {name: POSTGRESQL_DATABASE, value: crucible}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: [pg_isready, -h, 127.0.0.1]}
+            periodSeconds: 3
+          volumeMounts: [{name: data, mountPath: /var/lib/pgsql/data}]
+      volumes: [{name: data, emptyDir: {}}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: @CTL_NS@
+spec:
+  selector: {app: postgres}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: crucible-controller
+  namespace: @CTL_NS@
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: crucible-controller}
+  template:
+    metadata:
+      labels: {app: crucible-controller}
+    spec:
+      serviceAccountName: crucible-controller
+      imagePullSecrets: [{name: @PULL_SECRET@}]
+      containers:
+        - name: controller
+          image: @CONTROLLER_IMAGE@
+          args: [autopilot]
+          env:
+            - {name: DATABASE_URL, value: "postgres://crucible:crucible@postgres:5432/crucible"}
+            - {name: CONTROLLER_API_ADDR, value: "0.0.0.0:8080"}
+            - name: CONTROLLER_API_TOKEN
+              valueFrom: {secretKeyRef: {name: crucible-controller, key: api-token}}
+            - {name: CONTROLLER_PUBLIC_URL, value: "@ISSUER@"}
+            - {name: CONTROLLER_HOOKS_ADDR, value: "127.0.0.1:8081"}
+            - {name: CONTROLLER_HOOKS_PUBLIC_URL, value: "http://127.0.0.1:8081"}
+            - {name: CONTROLLER_WEBHOOK_KEY_FILE, value: /etc/crucible/keys/webhook.key}
+            - {name: CONTROLLER_ADMINS, value: "@LAUNCHER@"}
+            - {name: CONTROLLER_AUTH_MODE, value: proxy}
+            - {name: CONTROLLER_KUBE_USER_AUTH, value: "true"}
+            - {name: CONTROLLER_SESSION_SECURE, value: "false"}
+            - {name: CONTROLLER_LEADER_ELECTION, value: "off"}
+            - {name: CONTROLLER_PLAYBOOK_EXECUTOR, value: pod}
+            - {name: CONTROLLER_SCOPE_EXECUTOR, value: disabled}
+            - {name: CONTROLLER_POD_NAMESPACE, value: "@LOOP_NS@"}
+            - {name: CONTROLLER_DEPLOY_PROFILE, value: /etc/crucible/profile/profile.toml}
+            - {name: CONTROLLER_RENDER_NO_PIN, value: "true"}
+            - {name: CONTROLLER_STATE_DIR, value: /var/lib/crucible/state}
+            - {name: CONTROLLER_SCRATCH_DIR, value: /var/lib/crucible/scratch}
+            - {name: CONTROLLER_AGENT_ISSUER, value: "@ISSUER@"}
+            - {name: CONTROLLER_AGENT_SIGNING_KEY_FILE, value: /etc/crucible/keys/agent-signing.pem}
+            - {name: CONTROLLER_AGENT_SPIRE, value: "@AGENT_SPIRE@"}
+            - {name: CONTROLLER_AGENT_AUDIENCES, value: "@KUEUE_URL@=kueue.read kueue.submit"}
+            - {name: REGISTRY_AUTH_FILE, value: /etc/crucible/registry/.dockerconfigjson}
+            - {name: RUST_LOG, value: info}
+          ports: [{containerPort: 8080, name: api}]
+          readinessProbe:
+            httpGet: {path: /.well-known/jwks.json, port: api}
+            periodSeconds: 5
+          volumeMounts:
+            - {name: keys, mountPath: /etc/crucible/keys, readOnly: true}
+            - {name: profile, mountPath: /etc/crucible/profile, readOnly: true}
+            - {name: registry, mountPath: /etc/crucible/registry, readOnly: true}
+            - {name: work, mountPath: /var/lib/crucible}
+      volumes:
+        - name: keys
+          secret: {secretName: crucible-controller}
+        - name: profile
+          configMap: {name: crucible-controller-profile}
+        - name: registry
+          secret: {secretName: @PULL_SECRET@}
+        - name: work
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: crucible-controller
+  namespace: @CTL_NS@
+spec:
+  selector: {app: crucible-controller}
+  ports: [{port: 8080, targetPort: api, name: api}]

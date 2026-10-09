@@ -1,16 +1,20 @@
-# Deploy profile for the crucible-kueue e2e on pirate: loop pods and sandboxes in
-# crucible-system as the hub's dispatch identity, the server beside them, Jobs in
-# crucible-kueue-e2e through LocalQueue crucible-e2e.
+# Deploy profile for the crucible-kueue e2e: a controller in @CTL_NS@ dispatches loop pods into
+# @LOOP_NS@, each run's gateway and sandboxes live in crucible-sandboxes, and the server in
+# crucible-system takes Jobs in crucible-kueue-e2e through LocalQueue crucible-e2e.
 [cluster]
-loop_namespace   = "crucible-system"
-rig_namespace    = "crucible-system"
-service_account  = "crucible-crucible-controller"
-supervisor_image = "@SUPERVISOR_IMAGE@"
-sandbox_driver   = "kubernetes"
+loop_namespace          = "@LOOP_NS@"
+rig_namespace           = "@LOOP_NS@"
+service_account         = "crucible-kueue-e2e-loop"
+sandbox_service_account = "crucible-sandbox"
+sandbox_namespace       = "crucible-sandboxes"
+sandbox_readers         = ["@CTL_NS@/crucible-controller"]
+sandbox_spiffe_socket   = "/spiffe-workload-api/spire-agent.sock"
+supervisor_image        = "@SUPERVISOR_IMAGE@"
+sandbox_driver          = "kubernetes"
 
 [image]
 loop        = "@LOOP_IMAGE@"
-pull_secret = "quay-wseaton-pull"
+pull_secret = "@PULL_SECRET@"
 
 # Claude through EnMaaS on the Anthropic Messages API; the key is a Secret on the cluster.
 [env]
@@ -23,9 +27,8 @@ key    = "api-key"
 
 [kueue]
 image              = "@KUEUE_IMAGE@"
-cluster            = "pirate"
+cluster            = "hub"
 namespace          = "crucible-system"
-tenant_namespace   = "crucible-kueue-tenants"
 workload_namespace = "crucible-kueue-e2e"
-queues             = ["crucible-e2e"]
-record_writers     = ["crucible-system/crucible-hub-dispatch"]
+run_issuer         = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
+kube_authz         = "openshift"
