@@ -2,8 +2,9 @@
 //! client asks for which resource and scopes, and who the caller would act as on its cluster), and
 //! the decision that answers it with the client's loopback redirect.
 
+use crate::agent_auth::people::directory::ClusterUser;
 use crate::agent_auth::people::{
-    self, Approved, CLIENT_ID, CODE_TTL_SECS, ClusterUser, CodeGrant, PENDING_KEY, Pending,
+    Approved, CLIENT_ID, CODE_TTL_SECS, CodeGrant, PENDING_KEY, Pending,
 };
 use crate::api::dto::{bad_request, conflict, forbidden, not_found, unavailable};
 use crate::api::state::{ApiState, AppError, ErrorBody, Json};
@@ -198,7 +199,7 @@ pub(crate) async fn decide_consent(
         cluster: r.cluster.clone(),
         scopes: r.scopes.clone(),
     };
-    match people::kube_user(auth, &approved).await? {
+    match issued.links.kube_user(&approved).await? {
         ClusterUser::Known(_) => {}
         ClusterUser::Unlinked => {
             session

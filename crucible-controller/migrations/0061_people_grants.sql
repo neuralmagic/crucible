@@ -1,8 +1,9 @@
 -- 0061_people_grants.sql — people's OAuth authorization codes and refresh tokens, shared by every
--- controller replica. Each secret is stored only as the SHA-256 of its text.
+-- controller replica. Each secret is stored only as the SHA-256 of its text. The tables reference
+-- nothing outside themselves; a subject that may no longer sign in is refused at refresh.
 CREATE TABLE people_codes (
     key        BYTEA PRIMARY KEY,
-    sub        TEXT NOT NULL REFERENCES users(sub) ON DELETE CASCADE,
+    sub        TEXT NOT NULL,
     grant_json JSONB NOT NULL,
     expires_at BIGINT NOT NULL
 );
@@ -10,7 +11,7 @@ CREATE TABLE people_codes (
 -- One row per approval: the refresh token family a code starts.
 CREATE TABLE people_grants (
     id           TEXT PRIMARY KEY,
-    sub          TEXT NOT NULL REFERENCES users(sub) ON DELETE CASCADE,
+    sub          TEXT NOT NULL,
     resource     TEXT NOT NULL,
     cluster      TEXT NOT NULL,
     scopes       JSONB NOT NULL,
@@ -19,6 +20,7 @@ CREATE TABLE people_grants (
     revoked_at   BIGINT
 );
 CREATE INDEX people_grants_sub ON people_grants (sub);
+CREATE INDEX people_codes_sub ON people_codes (sub);
 
 -- Every refresh token a family issued. A used token stays until its family goes, so presenting it
 -- again is recognised as reuse.

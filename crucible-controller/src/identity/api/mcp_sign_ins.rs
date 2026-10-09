@@ -105,7 +105,7 @@ pub(crate) async fn sign_out_mcp_clients(
     };
     let revoked = people
         .grants
-        .revoke_all(sub, crate::clock::unix_secs())
+        .revoke_subject(sub, crate::clock::unix_secs())
         .await
         .map_err(anyhow::Error::from)?;
     tracing::info!(sub, revoked, "mcp clients signed out");

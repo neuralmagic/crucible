@@ -193,6 +193,22 @@ mod tests {
             from_claim(&system, "mpp", ALICE),
             Resolution::Unavailable(_)
         ));
+        let spaced = ClaimIdentity {
+            claim: SsoClaim::Login,
+            prefix: "a b:".into(),
+        };
+        assert!(matches!(
+            from_claim(&spaced, "mpp", ALICE),
+            Resolution::Unavailable(_)
+        ));
+        let empty = Person {
+            email: Some(""),
+            ..ALICE
+        };
+        assert!(matches!(
+            from_claim(&rule, "waldorf", empty),
+            Resolution::Unavailable(_)
+        ));
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

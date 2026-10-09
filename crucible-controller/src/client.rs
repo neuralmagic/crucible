@@ -474,7 +474,7 @@ mod tests {
             ),
             (
                 "0061_people_grants.sql",
-                "f2b12d18e2abfab771556334849321de28b862869e243b9dcd2897b9d27c4aee",
+                "8e45f258ba380d2b5059e708ee0aba742dfe51dd22c8fc755d01bab0060aef94",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");

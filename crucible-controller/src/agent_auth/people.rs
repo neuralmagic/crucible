@@ -16,14 +16,12 @@
 //! Codes and refresh tokens live in Postgres ([`grants`]), so any replica redeems what another
 //! issued. Every refresh re-reads the person and their cluster username.
 
+pub mod directory;
 pub mod grants;
 
 use crate::agent_auth::AgentAuth;
 use crate::agent_auth::issuer::{AgentIssuer, MintError, token_id};
 use crate::identity::api_key::constant_time_eq;
-use crate::identity::cluster_identity::{self, Person, Resolution};
-use crate::identity::kube_identity::KubeUser;
-use crate::identity::kube_links::ClusterReviewer;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
@@ -32,7 +30,6 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tower_sessions::Session;
@@ -41,6 +38,7 @@ use url::Url;
 pub const CLIENT_ID: &str = "claude-code";
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const CODE_TTL_SECS: u64 = 60;
+/// An access token's lifetime unless `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` says otherwise.
 pub const ACCESS_TTL_SECS: u64 = 900;
 pub(crate) const PENDING_KEY: &str = "oauth.pending";
 /// The SPA page a parked authorization request is shown on.
@@ -67,6 +65,10 @@ pub enum PeopleConfigError {
     Duplicate(String),
     #[error("CONTROLLER_PEOPLE_AUDIENCES is set but lists no audience")]
     Empty,
+    #[error(
+        "CONTROLLER_PEOPLE_ACCESS_TTL_SECS {0:?} is not a whole number of seconds from 1 to 3600"
+    )]
+    AccessTtl(String),
 }
 
 /// `<cluster>:<resource url>=<scope> <scope> ...`
@@ -102,12 +104,26 @@ impl std::str::FromStr for PersonAudience {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeopleConfig {
     pub audiences: Vec<PersonAudience>,
+    pub access_ttl_secs: u64,
 }
 
 impl PeopleConfig {
     /// `CONTROLLER_PEOPLE_AUDIENCES`, comma separated; `None` when unset.
     pub fn from_env() -> Result<Option<Self>, PeopleConfigError> {
-        Self::from_lookup(std::env::var("CONTROLLER_PEOPLE_AUDIENCES").ok())
+        let Some(mut config) =
+            Self::from_lookup(std::env::var("CONTROLLER_PEOPLE_AUDIENCES").ok())?
+        else {
+            return Ok(None);
+        };
+        if let Ok(raw) = std::env::var("CONTROLLER_PEOPLE_ACCESS_TTL_SECS") {
+            config.access_ttl_secs = raw
+                .trim()
+                .parse()
+                .ok()
+                .filter(|s| (1..=3600).contains(s))
+                .ok_or(PeopleConfigError::AccessTtl(raw))?;
+        }
+        Ok(Some(config))
     }
 
     pub fn from_lookup(raw: Option<String>) -> Result<Option<Self>, PeopleConfigError> {
@@ -125,7 +141,10 @@ impl PeopleConfig {
         if audiences.is_empty() {
             return Err(PeopleConfigError::Empty);
         }
-        Ok(Some(Self { audiences }))
+        Ok(Some(Self {
+            audiences,
+            access_ttl_secs: ACCESS_TTL_SECS,
+        }))
     }
 
     pub fn audience(&self, resource: &str) -> Option<&PersonAudience> {
@@ -238,16 +257,6 @@ pub struct Approved {
     pub scopes: Vec<String>,
 }
 
-impl Approved {
-    pub fn person(&self) -> Person<'_> {
-        Person {
-            sub: &self.sub,
-            login: &self.login,
-            email: self.email.as_deref(),
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeGrant {
     pub approved: Approved,
@@ -256,63 +265,21 @@ pub struct CodeGrant {
     pub expires_at: u64,
 }
 
-/// The people half of the issuer: its audiences, outstanding grants, and the clusters that review
-/// the tokens people link their usernames with.
+/// The people half of the issuer: its audiences, where grants live, and what it asks its host.
 pub struct People {
     pub config: PeopleConfig,
-    pub grants: grants::Grants,
-    pub reviewer: Arc<dyn ClusterReviewer>,
-}
-
-impl People {
-    pub fn new(config: PeopleConfig, reviewer: Arc<dyn ClusterReviewer>, pool: PgPool) -> Self {
-        Self {
-            config,
-            grants: grants::Grants::new(pool),
-            reviewer,
-        }
-    }
-}
-
-/// Who a person is on a cluster, or why that is not known yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClusterUser {
-    Known(KubeUser),
-    /// The cluster's rule is `link` and the person has not linked.
-    Unlinked,
-    /// The cluster's rule names a claim this login did not carry, or one that is no username.
-    Unavailable(String),
-}
-
-/// The username `approved` acts as on its cluster, by the rule the deploy profile declares for it.
-/// A cluster the profile does not list is `link`.
-pub async fn kube_user(auth: &AgentAuth, approved: &Approved) -> anyhow::Result<ClusterUser> {
-    let rule = auth
-        .profile
-        .cluster_identity(&approved.cluster)
-        .cloned()
-        .unwrap_or_default();
-    let resolved =
-        cluster_identity::resolve(&auth.pool, &approved.cluster, &rule, approved.person()).await?;
-    Ok(ClusterUser::from(resolved))
-}
-
-impl From<Resolution> for ClusterUser {
-    fn from(resolved: Resolution) -> Self {
-        match resolved {
-            Resolution::Known { user, .. } => Self::Known(user),
-            Resolution::Unlinked => Self::Unlinked,
-            Resolution::Unavailable(why) => Self::Unavailable(why),
-        }
-    }
+    pub grants: Arc<dyn grants::GrantStore>,
+    pub subjects: Arc<dyn directory::SubjectDirectory>,
+    pub links: Arc<dyn directory::LinkDirectory>,
 }
 
 /// A person's access token for `approved`, acting as `kube_user`.
 pub fn mint(
     issuer: &AgentIssuer,
     approved: &Approved,
-    kube_user: &KubeUser,
+    kube_user: &str,
     now: u64,
+    ttl_secs: u64,
 ) -> Result<String, MintError> {
     issuer.sign(&json!({
         "iss": issuer.issuer().as_str(),
@@ -321,10 +288,10 @@ pub fn mint(
         "azp": CLIENT_ID,
         "iat": now,
         "nbf": now,
-        "exp": now.saturating_add(ACCESS_TTL_SECS),
+        "exp": now.saturating_add(ttl_secs),
         "jti": token_id()?,
         "scope": approved.scopes.join(" "),
-        "kube_user": kube_user.as_str(),
+        "kube_user": kube_user,
         "kube_cluster": approved.cluster,
     }))
 }
@@ -725,7 +692,7 @@ pub(crate) async fn redeem_code(
 ) -> Result<Response, TokenError> {
     let req: CodeRequest = parse(fields)?;
     client(&req.client_id)?;
-    let grant = people.grants.take_code(&req.code, now).await?;
+    let grant = people.grants.redeem_code(&req.code, now).await?;
     if grant.redirect.as_str() != req.redirect_uri {
         return Err(TokenError::InvalidGrant(format!(
             "redirect_uri {:?} is not the one the code was issued to",
@@ -739,12 +706,13 @@ pub(crate) async fn redeem_code(
     same_resource(req.resource.as_deref(), &grant.approved.resource)?;
     let approved = grant.approved;
     let (access_token, kube_user) = access(auth, people, &approved, now).await?;
-    let refresh_token = people.grants.start_family(&approved, now).await?;
+    let refresh_token = people.grants.issue_refresh(&approved, now).await?;
     Ok(token_response(
         &approved,
         &kube_user,
         access_token,
         refresh_token,
+        people.config.access_ttl_secs,
     ))
 }
 
@@ -759,9 +727,12 @@ pub(crate) async fn redeem_refresh(
 ) -> Result<Response, TokenError> {
     let req: RefreshRequest = parse(fields)?;
     client(&req.client_id)?;
-    let (family, next) = people.grants.rotate(&req.refresh_token, now).await?;
+    let (family, next) = people
+        .grants
+        .rotate_refresh(&req.refresh_token, now)
+        .await?;
     let refused = |why: String| async move {
-        if let Err(e) = people.grants.revoke(&family.id, now).await {
+        if let Err(e) = people.grants.revoke_family(&family.id, now).await {
             tracing::warn!(error = %e, "revoking a refused approval");
         }
         Err(TokenError::InvalidGrant(why))
@@ -778,10 +749,12 @@ pub(crate) async fn redeem_refresh(
             )));
         }
     }
-    let person = still_allowed(&auth.pool, &family.sub)
+    let person = people
+        .subjects
+        .allowed(&family.sub)
         .await
         .map_err(|e| TokenError::Server(format!("{e:#}")))?;
-    let Some((login, email)) = person else {
+    let Some(directory::Allowed { login, email }) = person else {
         return refused("the person behind this approval may no longer sign in".into()).await;
     };
     let approved = Approved {
@@ -799,28 +772,13 @@ pub(crate) async fn redeem_refresh(
         }
         Err(e) => return Err(e),
     };
-    Ok(token_response(&approved, &kube_user, access_token, next))
-}
-
-/// The login and email of a person who may still sign in: their row exists and the identity
-/// provider has not refused their stored credential, the condition that downgrades a session.
-async fn still_allowed(
-    pool: &PgPool,
-    sub: &str,
-) -> anyhow::Result<Option<(String, Option<String>)>> {
-    use anyhow::Context;
-    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT u.login, u.email, c.last_error FROM users u
-           LEFT JOIN user_credentials c ON c.sub = u.sub
-          WHERE u.sub = $1",
-    )
-    .bind(sub)
-    .fetch_optional(pool)
-    .await
-    .context("reading the person behind an approval")?;
-    Ok(row
-        .filter(|(_, _, refused)| refused.is_none())
-        .map(|(login, email, _)| (login, email)))
+    Ok(token_response(
+        &approved,
+        &kube_user,
+        access_token,
+        next,
+        people.config.access_ttl_secs,
+    ))
 }
 
 /// An access token for `approved`, with the cluster username it carries.
@@ -829,40 +787,49 @@ async fn access(
     people: &People,
     approved: &Approved,
     now: u64,
-) -> Result<(String, KubeUser), TokenError> {
+) -> Result<(String, String), TokenError> {
     if people.config.audience(&approved.resource).is_none() {
         return Err(TokenError::InvalidTarget(format!(
             "resource {:?} is no longer configured",
             approved.resource
         )));
     }
-    let kube_user = match kube_user(auth, approved)
+    let kube_user = match people
+        .links
+        .kube_user(approved)
         .await
         .map_err(|e| TokenError::Server(format!("{e:#}")))?
     {
-        ClusterUser::Known(user) => user,
-        ClusterUser::Unlinked => {
+        directory::ClusterUser::Known(user) => user,
+        directory::ClusterUser::Unlinked => {
             return Err(TokenError::InvalidGrant(format!(
                 "{} has no kubernetes username on {}",
                 approved.login, approved.cluster
             )));
         }
-        ClusterUser::Unavailable(why) => return Err(TokenError::InvalidGrant(why)),
+        directory::ClusterUser::Unavailable(why) => return Err(TokenError::InvalidGrant(why)),
     };
-    let access_token = mint(&auth.issuer, approved, &kube_user, now)
-        .map_err(|e| TokenError::Server(e.to_string()))?;
+    let access_token = mint(
+        &auth.issuer,
+        approved,
+        &kube_user,
+        now,
+        people.config.access_ttl_secs,
+    )
+    .map_err(|e| TokenError::Server(e.to_string()))?;
     Ok((access_token, kube_user))
 }
 
 fn token_response(
     approved: &Approved,
-    kube_user: &KubeUser,
+    kube_user: &str,
     access_token: String,
     refresh_token: String,
+    ttl_secs: u64,
 ) -> Response {
     tracing::info!(
         sub = approved.login,
-        kube_user = kube_user.as_str(),
+        kube_user,
         cluster = approved.cluster,
         aud = approved.resource,
         "person token issued"
@@ -870,7 +837,7 @@ fn token_response(
     let mut response = axum::Json(json!({
         "access_token": access_token,
         "token_type": "Bearer",
-        "expires_in": ACCESS_TTL_SECS,
+        "expires_in": ttl_secs,
         "scope": approved.scopes.join(" "),
         "refresh_token": refresh_token,
     }))
@@ -1163,54 +1130,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_claim_rule_takes_the_login_or_email_with_its_prefix() {
-        let person = approved(PIRATE_KUEUE, "c1");
-        let rule = |claim, prefix: &str| forge::fleet::ClaimIdentity {
-            claim,
-            prefix: prefix.into(),
-        };
-        let known = |u: &str| ClusterUser::Known(KubeUser::parse(u).unwrap());
-        let from_claim = |rule: &forge::fleet::ClaimIdentity, a: &Approved| {
-            ClusterUser::from(cluster_identity::from_claim(rule, &a.cluster, a.person()))
-        };
-        assert_eq!(
-            from_claim(&rule(forge::fleet::SsoClaim::Login, ""), &person),
-            known("weaton")
-        );
-        assert_eq!(
-            from_claim(&rule(forge::fleet::SsoClaim::Email, ""), &person),
-            known("weaton@redhat.com")
-        );
-        assert_eq!(
-            from_claim(&rule(forge::fleet::SsoClaim::Email, "oidc:"), &person),
-            known("oidc:weaton@redhat.com")
-        );
-        assert_eq!(
-            from_claim(&rule(forge::fleet::SsoClaim::Login, "sso#"), &person),
-            known("sso#weaton")
-        );
-        for email in [None, Some(String::new())] {
-            let mut no_email = person.clone();
-            no_email.email = email;
-            assert!(matches!(
-                from_claim(&rule(forge::fleet::SsoClaim::Email, ""), &no_email),
-                ClusterUser::Unavailable(why) if why.contains("email claim")
-            ));
-        }
-        assert!(
-            matches!(
-                from_claim(&rule(forge::fleet::SsoClaim::Login, "system:"), &person),
-                ClusterUser::Unavailable(_)
-            ),
-            "a prefix cannot turn a login into a system identity"
-        );
-        assert!(matches!(
-            from_claim(&rule(forge::fleet::SsoClaim::Login, "a b:"), &person),
-            ClusterUser::Unavailable(_)
-        ));
-    }
-
     struct Harness {
         auth: Arc<AgentAuth>,
         app: axum::Router,
@@ -1251,13 +1170,11 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let Ok(mut auth) = Arc::try_unwrap(base) else {
             panic!("the harness holds the only reference");
         };
-        auth.people = Some(People::new(
+        let loaded: crucible::deploy::DeployProfile = toml::from_str(&profile).unwrap();
+        auth.people = Some(crate::identity::people_directory::people(
             config(),
-            Arc::new(Clusters::with(&[
-                ("pirate", "sha256~pirate", "wseaton"),
-                ("mpp", "sha256~mpp", "weaton"),
-            ])),
             pool.clone(),
+            &loaded,
         ));
         let auth = Arc::new(auth);
         crate::identity::oidc::users::record_login(

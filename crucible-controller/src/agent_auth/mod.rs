@@ -66,13 +66,10 @@ impl AgentAuth {
         let people = people::PeopleConfig::from_env()?.map(|config| {
             tracing::info!(
                 audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
+                access_ttl_secs = config.access_ttl_secs,
                 "issuing access tokens to people"
             );
-            let people = people::People::new(
-                config,
-                Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
-                pool.clone(),
-            );
+            let people = crate::identity::people_directory::people(config, pool.clone(), &profile);
             people::grants::spawn_sweep(people.grants.clone());
             people
         });
