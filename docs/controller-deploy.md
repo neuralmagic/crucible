@@ -140,7 +140,10 @@ person. The request is consumed by the run it gets, so later
 runs act for the owner again. An override by an actor that is not a login records nobody.
 `act.sub` is the sandbox's SPIFFE ID. It also carries `run_id` (the run pod), `sandbox`
 (the sandbox's name), `workdir` (its workspace path), `kube_user` (below) and, for runs on the
-`[kueue]` cluster, `namespace`, `queues`, and `role`. Refusals return only the OAuth error code
+`[kueue]` cluster, `namespace` (crucible-kueue's default namespace for the run's workloads). Claims
+name who is calling and for which run; what that identity may do is the resource server's to
+decide (crucible-kueue runs SubjectAccessReview as `kube_user`). Refusals return only the OAuth
+error code
 and a fixed description; the reason is logged.
 
 **Sandbox placement.** A sandbox's SPIFFE ID is only as trustworthy as whoever can create pods
@@ -233,8 +236,8 @@ when the username is unknown; other tokens are issued without the claim, logged 
 | `CONTROLLER_AGENT_GATEWAY_PREFIX` | The SPIFFE ID path before the gateway id, ending in `/`: `spiffe://<trust domain>/openshell/gateway/`. Supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`. |
 | `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
 
-The deploy profile's `[kueue]` table supplies the `namespace`, `queues`, and `role` claims for runs
-on its cluster, and the role caps the `kueue.*` scopes; a run elsewhere gets none. For example:
+The deploy profile's `[kueue] workload_namespace` is the `namespace` claim for runs on its cluster;
+a run elsewhere gets none. A token's scopes are what its audience lists here. For example:
 
 ```bash
 CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,http://host.openshell.internal:8849/mcp=buildit.read buildit.build"

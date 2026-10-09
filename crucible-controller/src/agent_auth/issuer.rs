@@ -6,7 +6,7 @@
 
 use crate::agent_auth::bindings::{BoundRun, SandboxId, SandboxIdError};
 use crucible::deploy::profile::KueueCfg;
-use crucible_contract::kueue::TenantRole;
+use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::verify::{TokenError, Verifier};
 use jsonwebtoken::jwk::{Jwk, JwkSet, PublicKeyUse, ThumbprintHash};
@@ -180,9 +180,9 @@ impl std::str::FromStr for Audience {
     }
 }
 
-/// Scopes crucible-kueue authorizes by tenant role: granted only as far as the run's role allows.
-pub(crate) fn governed_by_role(scope: &str) -> bool {
-    TenantRole::Submitter.scopes().contains(&scope)
+/// Whether `scope` is one of crucible-kueue's, which it authorizes as the token's `kube_user`.
+pub(crate) fn is_kueue_scope(scope: &str) -> bool {
+    [SCOPE_READ, SCOPE_SUBMIT].contains(&scope)
 }
 
 #[derive(Debug)]
@@ -385,23 +385,10 @@ pub enum GrantError {
     },
 }
 
-/// The tenant claims crucible-kueue authorizes on, from the deploy profile's `[kueue]` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantScope {
-    pub namespace: String,
-    pub queues: Vec<String>,
-    pub role: TenantRole,
-}
-
-impl TenantScope {
-    /// The scope a run dispatched onto `cluster` holds, `None` when crucible-kueue runs elsewhere.
-    pub fn for_run(kueue: &KueueCfg, cluster: &str) -> Option<Self> {
-        (kueue.cluster == cluster).then(|| Self {
-            namespace: kueue.workload_namespace.to_string(),
-            queues: kueue.queues.iter().map(ToString::to_string).collect(),
-            role: kueue.role,
-        })
-    }
+/// The `namespace` claim, crucible-kueue's default namespace for a run's workloads: the deploy
+/// profile's `[kueue] workload_namespace` for a run on that table's cluster, `None` elsewhere.
+pub fn default_namespace(kueue: &KueueCfg, cluster: &str) -> Option<String> {
+    (kueue.cluster == cluster).then(|| kueue.workload_namespace.to_string())
 }
 
 /// The launcher a run's token acts for: the login of the person the run was dispatched for.
@@ -417,22 +404,14 @@ pub fn launcher(run: &BoundRun) -> Result<String, GrantError> {
         })
 }
 
-/// The scopes to grant for `audience`: those it lists, with crucible-kueue's narrowed to what the
-/// run's role allows. All of them when none is requested, else exactly the requested ones, each of
-/// which must be grantable.
+/// The scopes to grant for `audience`: all it lists when none is requested, else exactly the
+/// requested ones, each of which it must list. What a scope lets the caller do is the resource
+/// server's to decide, from the token's identity.
 pub fn granted_scopes(
     requested: Option<&str>,
     audience: &Audience,
-    tenant: Option<&TenantScope>,
 ) -> Result<Vec<String>, GrantError> {
-    let grantable: Vec<String> = audience
-        .scopes
-        .iter()
-        .filter(|s| {
-            !governed_by_role(s) || tenant.is_some_and(|t| t.role.scopes().contains(&s.as_str()))
-        })
-        .cloned()
-        .collect();
+    let grantable = audience.scopes.clone();
     let Some(requested) = requested.filter(|r| !r.trim().is_empty()) else {
         return Ok(grantable);
     };
@@ -461,7 +440,8 @@ pub struct AgentGrant {
     pub run: BoundRun,
     pub audience: String,
     pub scopes: Vec<String>,
-    pub tenant: Option<TenantScope>,
+    /// The `namespace` claim, see [`default_namespace`].
+    pub namespace: Option<String>,
 }
 
 /// A minted token. Never printed.
@@ -620,10 +600,8 @@ impl AgentIssuer {
             if let Some(workdir) = &grant.run.workdir {
                 map.insert("workdir".into(), json!(workdir));
             }
-            if let Some(tenant) = &grant.tenant {
-                map.insert("namespace".into(), json!(tenant.namespace));
-                map.insert("queues".into(), json!(tenant.queues));
-                map.insert("role".into(), json!(tenant.role));
+            if let Some(namespace) = &grant.namespace {
+                map.insert("namespace".into(), json!(namespace));
             }
         }
         let mut header = Header::new(Algorithm::ES256);
@@ -872,14 +850,6 @@ mod tests {
         ));
     }
 
-    fn tenant(role: TenantRole) -> TenantScope {
-        TenantScope {
-            namespace: "crucible-kueue-e2e".into(),
-            queues: vec!["crucible-e2e".into()],
-            role,
-        }
-    }
-
     fn kueue() -> Audience {
         format!("{KUEUE}=kueue.read kueue.submit").parse().unwrap()
     }
@@ -891,60 +861,50 @@ mod tests {
     }
 
     #[test]
-    fn scopes_narrow_to_the_audience_and_kueue_scopes_to_the_runs_role() {
-        let submitter = tenant(TenantRole::Submitter);
-        let viewer = tenant(TenantRole::Viewer);
+    fn scopes_narrow_to_what_the_audience_lists() {
         assert_eq!(
-            granted_scopes(None, &kueue(), Some(&submitter)).unwrap(),
+            granted_scopes(None, &kueue()).unwrap(),
             [SCOPE_READ, SCOPE_SUBMIT]
         );
         assert_eq!(
-            granted_scopes(Some(""), &kueue(), Some(&viewer)).unwrap(),
+            granted_scopes(Some(""), &kueue()).unwrap(),
+            [SCOPE_READ, SCOPE_SUBMIT]
+        );
+        assert_eq!(
+            granted_scopes(Some("kueue.read kueue.read"), &kueue()).unwrap(),
             [SCOPE_READ]
         );
         assert_eq!(
-            granted_scopes(Some("kueue.read kueue.read"), &kueue(), Some(&submitter)).unwrap(),
-            [SCOPE_READ]
-        );
-        assert_eq!(
-            granted_scopes(Some("kueue.submit"), &kueue(), Some(&viewer)),
+            granted_scopes(Some("kueue.admin"), &kueue()),
             Err(GrantError::Scope {
-                requested: SCOPE_SUBMIT.into(),
-                grantable: vec![SCOPE_READ.into()]
+                requested: "kueue.admin".into(),
+                grantable: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()]
             })
         );
-        assert!(granted_scopes(Some("kueue.admin"), &kueue(), Some(&submitter)).is_err());
-        assert!(granted_scopes(None, &kueue(), None).unwrap().is_empty());
-        assert!(granted_scopes(Some("kueue.read"), &kueue(), None).is_err());
         assert_eq!(
-            granted_scopes(None, &buildit(), None).unwrap(),
-            ["buildit.read", "buildit.build"],
-            "scopes outside crucible-kueue's need no tenant"
+            granted_scopes(None, &buildit()).unwrap(),
+            ["buildit.read", "buildit.build"]
         );
         assert!(
-            granted_scopes(Some("kueue.read"), &buildit(), Some(&submitter)).is_err(),
+            granted_scopes(Some("kueue.read"), &buildit()).is_err(),
             "a scope another audience lists is not grantable here"
         );
         let bare: Audience = KUEUE.parse().unwrap();
-        assert!(bare.scopes.is_empty());
-        assert!(
-            granted_scopes(None, &bare, Some(&submitter))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(granted_scopes(None, &bare).unwrap().is_empty());
+        assert!(is_kueue_scope(SCOPE_SUBMIT) && !is_kueue_scope("buildit.build"));
     }
 
     #[test]
-    fn tenant_scope_comes_from_the_profile_only_on_its_cluster() {
+    fn the_default_namespace_comes_from_the_profile_only_on_its_cluster() {
         let kueue = toml::from_str::<crucible::deploy::DeployProfile>(PROFILE)
             .unwrap()
             .kueue
             .unwrap();
         assert_eq!(
-            TenantScope::for_run(&kueue, CLUSTER),
-            Some(tenant(TenantRole::Submitter))
+            default_namespace(&kueue, CLUSTER).as_deref(),
+            Some("crucible-kueue-e2e")
         );
-        assert_eq!(TenantScope::for_run(&kueue, "hub"), None);
+        assert_eq!(default_namespace(&kueue, "hub"), None);
     }
 
     fn run(dispatched_by: Option<&str>) -> BoundRun {
@@ -977,7 +937,7 @@ mod tests {
         }
     }
 
-    fn grant(tenant: Option<TenantScope>) -> AgentGrant {
+    fn grant(namespace: Option<&str>) -> AgentGrant {
         AgentGrant {
             sandbox: Sandbox {
                 spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
@@ -989,7 +949,7 @@ mod tests {
             run: run(Some("user:alice")),
             audience: KUEUE.into(),
             scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
-            tenant,
+            namespace: namespace.map(str::to_string),
         }
     }
 
@@ -1006,13 +966,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_minted_token_carries_the_delegation_and_tenant_claims_and_verifies() {
+    async fn a_minted_token_carries_identity_claims_only_and_verifies() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
         let at = now();
-        let minted = issuer
-            .mint(&grant(Some(tenant(TenantRole::Submitter))), at)
-            .unwrap();
+        let minted = issuer.mint(&grant(Some("crucible-kueue-e2e")), at).unwrap();
         assert_eq!(minted.expires_in, TOKEN_TTL_SECS);
         assert_eq!(minted.scope, "kueue.read kueue.submit");
         let header = jsonwebtoken::decode_header(&minted.access_token).unwrap();
@@ -1037,8 +995,6 @@ mod tests {
                 "workdir": "/sandbox/repo",
                 "scope": "kueue.read kueue.submit",
                 "namespace": "crucible-kueue-e2e",
-                "queues": ["crucible-e2e"],
-                "role": "submitter",
             })
         );
         let principal = crucible_mcp_auth::principal::Principal::from_claims(
@@ -1053,7 +1009,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_token_gets_its_own_id_and_omits_tenant_and_kube_user_claims_it_lacks() {
+    async fn every_token_gets_its_own_id_and_omits_the_namespace_and_kube_user_it_lacks() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
         let unlinked = AgentGrant {

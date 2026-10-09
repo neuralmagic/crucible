@@ -20,7 +20,7 @@ pub mod placement;
 #[cfg(test)]
 mod testing;
 
-use crate::agent_auth::issuer::{AgentGrant, AgentIssuer, AssertionError, GrantError, TenantScope};
+use crate::agent_auth::issuer::{AgentGrant, AgentIssuer, AssertionError, GrantError};
 use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::FormRejection;
@@ -259,13 +259,13 @@ async fn issue(
     }
     let launcher = issuer::launcher(&run)?;
     let kueue = profile.kueue.as_ref();
-    let tenant = kueue.and_then(|k| TenantScope::for_run(k, &run.cluster));
-    let scopes = issuer::granted_scopes(req.scope.as_deref(), audience, tenant.as_ref())?;
+    let namespace = kueue.and_then(|k| issuer::default_namespace(k, &run.cluster));
+    let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
     let kube_user = crate::identity::kube_identity::effective(&state.pool, &launcher)
         .await
         .map_err(|e| OAuthError::Server(format!("{e:#}")))?;
     let required = kueue.is_some_and(|k| k.require_kube_user)
-        && scopes.iter().any(|s| issuer::governed_by_role(s));
+        && scopes.iter().any(|s| issuer::is_kueue_scope(s));
     match (&kube_user, required) {
         (None, true) => {
             return Err(GrantError::NoKubeUser {
@@ -288,7 +288,7 @@ async fn issue(
         run,
         audience: audience.resource.clone(),
         scopes,
-        tenant,
+        namespace,
     };
     let minted = state
         .issuer
@@ -463,8 +463,12 @@ mod tests {
         );
         assert_eq!(principal.namespace.as_deref(), Some("crucible-kueue-e2e"));
         assert_eq!(principal.claims["run_id"], "crucible-run-brave-otter");
-        assert_eq!(principal.claims["queues"], json!(["crucible-e2e"]));
-        assert_eq!(principal.claims["role"], "submitter");
+        for gone in ["queues", "role"] {
+            assert!(
+                principal.claims.get(gone).is_none(),
+                "{gone}: claims name the caller, never what it may do"
+            );
+        }
         assert_eq!(principal.claims["sandbox"], "ci-sbx-1");
         assert_eq!(principal.claims["workdir"], "/sandbox/repo");
     }
