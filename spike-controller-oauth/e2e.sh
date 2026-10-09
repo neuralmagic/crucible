@@ -66,6 +66,7 @@ up() {
 loop_namespace    = "crucible-system"
 rig_namespace     = "crucible-system"
 sandbox_namespace = "crucible-sandboxes"
+sandbox_driver    = "kubernetes"
 service_account   = "crucible-crucible-controller"
 supervisor_image  = "ghcr.io/neuralmagic/openshell-supervisor:latest"
 
@@ -117,7 +118,7 @@ EOF
         CONTROLLER_AGENT_SIGNING_KEY_FILE="$WORK/signing.pem" \
         CONTROLLER_AGENT_SVID_ISSUER=https://oidc-discovery.invalid \
         CONTROLLER_AGENT_SVID_JWKS_URI=https://oidc-discovery.invalid/keys \
-        CONTROLLER_AGENT_SANDBOX_ID_PREFIX=spiffe://pirate.crucible/openshell/sandbox/ \
+        CONTROLLER_AGENT_GATEWAY_PREFIX=spiffe://pirate.crucible/openshell/gateway/ \
         CONTROLLER_AGENT_AUDIENCES="$KUEUE=kueue.read kueue.submit" \
         CONTROLLER_PEOPLE_AUDIENCES="pirate:$KUEUE=kueue.read kueue.submit,waldorf:$KUEUE_WALDORF=kueue.read kueue.submit" \
         CONTROLLER_CLUSTER_LINK_SECRETS="$WORK/links" \

@@ -52,7 +52,21 @@ No `run_id`, `act`, `namespace` or `role`, so crucible-kueue treats it as a pers
 
 ## Live evidence
 
-TODO
+2026-10-09, branch `cluster-identity` on auth-stack @ 1a686a7, Keycloak stand-in for SSO (login
+`weaton`, email `weaton@redhat.com`), driven by `spike-controller-oauth/drive.sh` after
+`spike-controller-oauth/e2e.sh up`:
+
+| Leg | Result |
+| --- | --- |
+| pirate (`identity = "link"`), :8851 | consent showed `link`, unlinked; pasted `oc whoami -t` linked `wseaton` via pirate's TokenReview; token `kube_user=wseaton`, `kube_cluster=pirate`, `aud=:8851`; `whoami` and `queues_list` answered as that user |
+| waldorf (`identity = { claim = "email" }`), :8852 | no link needed; token `kube_user=weaton@redhat.com`, `kube_cluster=waldorf`; `queues_list` on waldorf (Kueue v1beta1) listed `crucible-measure` |
+| pirate token on waldorf's kueue | 401 `invalid_token` (audience) |
+| waldorf token on pirate's kueue | 401 |
+| pirate `oc whoami -t` through waldorf's TokenReview | not authenticated (`token not accepted by any provider`) |
+
+Not shown live: an RBAC denial. `wseaton` on pirate and `weaton@redhat.com` on waldorf may list
+LocalQueues and create Jobs in every namespace tried. The OpenShift sign-in link was not exercised
+(no `OAuthClient` on pirate yet).
 
 ## Fleet sketch (not built)
 
