@@ -113,6 +113,7 @@ jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # reqwest 0.12 — the HTTP calls run on this crate's own reqwest 0.13 client through the
 # `AsyncHttpClient` closure in `oidc::http_client`, so no second http/tls generation enters the tree.
 openidconnect = { version = "4", default-features = false }
+oauth2 = { version = "5", default-features = false }
 # The HTTP API (lane F): default features give the Json/Form extractors the frozen routes need
 # (API clients POST JSON, the ingest drop-box POSTs urlencoded).
 axum = "0.8"

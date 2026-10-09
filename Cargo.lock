@@ -2022,6 +2022,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tar",
+ "thiserror 2.0.18",
  "url",
 ]
 
@@ -2061,6 +2062,7 @@ dependencies = [
  "mime_guess",
  "moka",
  "nix 0.31.3",
+ "oauth2",
  "oci-client",
  "openidconnect",
  "opentelemetry 0.31.0",
