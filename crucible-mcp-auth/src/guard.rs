@@ -70,7 +70,7 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
             "JSON-RPC batches are not supported",
         );
     }
-    match message.get("method").and_then(Value::as_str) {
+    let hide = match message.get("method").and_then(Value::as_str) {
         Some("tools/call") => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             let decided = match apply(&guard.policy, &mut message, &principal) {
@@ -81,27 +81,13 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
                 tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "tool call refused");
                 return refuse(&guard, &parts.headers, id, refusal);
             }
-            let body = match serde_json::to_vec(&message) {
-                Ok(b) => b,
-                Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "re-encoding the call"),
-            };
-            parts.headers.remove(header::CONTENT_LENGTH);
-            next.run(Request::from_parts(parts, Body::from(body))).await
+            false
         }
-        Some("tools/list") => {
-            let response = next
-                .run(Request::from_parts(parts, Body::from(bytes)))
-                .await;
-            if guard.policy.hides_nothing() {
-                return response;
-            }
-            hide_injected(&guard.policy, response).await
-        }
+        Some("tools/list") => !guard.policy.hides_nothing(),
         Some(method)
             if PROTOCOL_METHODS.contains(&method) || method.starts_with("notifications/") =>
         {
-            next.run(Request::from_parts(parts, Body::from(bytes)))
-                .await
+            false
         }
         Some(method) => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
@@ -124,15 +110,21 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
                 tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "method refused");
                 return refuse(&guard, &parts.headers, id, refusal);
             }
-            next.run(Request::from_parts(parts, Body::from(bytes)))
-                .await
+            false
         }
-        None if is_response(&message) => {
-            next.run(Request::from_parts(parts, Body::from(bytes)))
-                .await
-        }
-        None => plain(StatusCode::BAD_REQUEST, "not a JSON-RPC request"),
+        None if is_response(&message) => false,
+        None => return plain(StatusCode::BAD_REQUEST, "not a JSON-RPC request"),
+    };
+    let body = match serde_json::to_vec(&message) {
+        Ok(b) => b,
+        Err(_) => return plain(StatusCode::INTERNAL_SERVER_ERROR, "re-encoding the request"),
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    let response = next.run(Request::from_parts(parts, Body::from(body))).await;
+    if hide {
+        return hide_injected(&guard.policy, response).await;
     }
+    response
 }
 
 /// A JSON-RPC response from the client to a server request: an `id` and a `result` or `error`.
@@ -360,7 +352,8 @@ mod tests {
         }
     }
 
-    /// The guard in front of a downstream that echoes the JSON-RPC body it received, or answers
+    /// The guard in front of a downstream that echoes the JSON-RPC body it received (parsed, and
+    /// as the raw text in `raw`), or answers
     /// `tools/list` with TOOLS (as SSE when `sse`).
     fn app(guard: PolicyGuard, principal: Option<Principal>, sse: bool) -> axum::Router {
         let downstream = axum::routing::post(move |body: Bytes| async move {
@@ -379,7 +372,8 @@ mod tests {
                 };
                 return ([(header::CONTENT_TYPE, ct)], body).into_response();
             }
-            axum::Json(json!({"received": message})).into_response()
+            let raw = String::from_utf8_lossy(&body).into_owned();
+            axum::Json(json!({"received": message, "raw": raw})).into_response()
         });
         axum::Router::new()
             .route("/mcp", downstream)
@@ -409,12 +403,19 @@ mod tests {
     }
 
     async fn post(app: axum::Router, body: Value) -> (StatusCode, http::HeaderMap, Value, String) {
+        post_raw(app, &serde_json::to_string(&body).unwrap()).await
+    }
+
+    async fn post_raw(
+        app: axum::Router,
+        body: &str,
+    ) -> (StatusCode, http::HeaderMap, Value, String) {
         let req = Request::builder()
             .method("POST")
             .uri("/mcp")
             .header(header::HOST, "kueue.apps.example")
             .header(header::CONTENT_TYPE, "application/json")
-            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .body(Body::from(body.to_string()))
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         let (parts, body) = res.into_parts();
@@ -634,6 +635,30 @@ mod tests {
                 "{method} reached the server"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn the_server_receives_the_request_the_guard_decided_on_whatever_its_duplicate_keys() {
+        let read_only = || app(guard(None), Some(principal("kueue.read")), false);
+        let smuggled = r#"{"jsonrpc":"2.0","id":9,"method":"tasks/cancel","method":"tasks/get","params":{"taskId":"t"}}"#;
+        let (status, _, body, _) = post_raw(read_only(), smuggled).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let raw = body["raw"].as_str().unwrap();
+        assert!(raw.contains("tasks/get"), "{raw}");
+        assert!(!raw.contains("tasks/cancel"), "{raw}");
+
+        let refused_tool = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"workload_plan","name":"whoami","arguments":{}}}"#;
+        let (_, _, body, _) = post_raw(read_only(), refused_tool).await;
+        let raw = body["raw"].as_str().unwrap();
+        assert!(raw.contains("whoami"), "{raw}");
+        assert!(!raw.contains("workload_plan"), "{raw}");
+
+        let response = r#"{"jsonrpc":"2.0","id":3,"result":{},"result":{"ok":true}}"#;
+        let (_, _, body, _) = post_raw(read_only(), response).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(body["raw"].as_str().unwrap()).unwrap(),
+            json!({"jsonrpc": "2.0", "id": 3, "result": {"ok": true}})
+        );
     }
 
     #[tokio::test]
