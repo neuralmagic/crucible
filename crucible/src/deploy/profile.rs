@@ -341,9 +341,15 @@ pub struct Cluster {
     pub sandbox_namespace: Option<KubeName>,
     /// Identities (`namespace/name`) granted get/list on OpenShell `Sandbox` resources in
     /// `sandbox_namespace`: the controller's own identity on this cluster, which reads a bound
-    /// sandbox's name from them.
+    /// sandbox's name from them and, under isolated gateways, starts and tears down each run's
+    /// gateway there.
     #[serde(default)]
     pub sandbox_readers: Vec<ServiceAccountRef>,
+    /// The SPIFFE Workload API socket path the OpenShell driver mounts (`csi.spiffe.io`) into
+    /// supervisor pods, so supervisors can fetch the JWT-SVIDs they exchange for agent tokens.
+    /// Unset mounts none.
+    #[serde(default)]
+    pub sandbox_spiffe_socket: Option<String>,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]

@@ -1914,6 +1914,12 @@ pub(super) fn kubernetes_sandbox_env(
             placement,
         ));
     }
+    if let Some(socket) = &profile.cluster.sandbox_spiffe_socket {
+        env.push(plain(
+            crate::openshell::gateway::SANDBOX_SPIFFE_SOCKET_ENV,
+            socket.clone(),
+        ));
+    }
     Ok(env)
 }
 
@@ -4055,6 +4061,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_spiffe_socket_reaches_the_gateway_only_when_the_profile_names_one() {
+        let without = render_k8s(&k8s_profile(""));
+        assert_eq!(
+            loop_pod_env(&without, "CRUCIBLE_SANDBOX_SPIFFE_SOCKET"),
+            None
+        );
+        let with = render_k8s(&k8s_profile(
+            r#"sandbox_spiffe_socket = "/spiffe-workload-api/spire-agent.sock""#,
+        ));
+        assert_eq!(
+            loop_pod_env(&with, "CRUCIBLE_SANDBOX_SPIFFE_SOCKET").as_deref(),
+            Some("/spiffe-workload-api/spire-agent.sock")
+        );
     }
 
     #[test]

@@ -354,6 +354,9 @@ pub struct KubernetesDriverConfig {
     /// it creates, and scopes its own lookups by.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gateway_id: Option<String>,
+    /// The SPIFFE Workload API socket the driver mounts into supervisor pods.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_spiffe_workload_api_socket_path: Option<String>,
 }
 
 impl KubernetesDriverConfig {
@@ -399,6 +402,8 @@ pub const SERVE_GRPC_ENDPOINT_ENV: &str = "CRUCIBLE_GATEWAY_GRPC_ENDPOINT";
 pub const SERVE_HOST_IP_ENV: &str = "CRUCIBLE_GATEWAY_HOST_IP";
 /// The run's gateway id, which supervisor SPIFFE IDs are derived from.
 pub const SERVE_GATEWAY_ID_ENV: &str = "CRUCIBLE_GATEWAY_ID";
+/// The SPIFFE Workload API socket path supervisors get (`[cluster] sandbox_spiffe_socket`).
+pub const SANDBOX_SPIFFE_SOCKET_ENV: &str = "CRUCIBLE_SANDBOX_SPIFFE_SOCKET";
 pub const SERVE_CLIENT_TLS_SECRET_ENV: &str = "CRUCIBLE_GATEWAY_CLIENT_TLS_SECRET";
 pub const SERVE_SERVER_TLS_DIR_ENV: &str = "CRUCIBLE_GATEWAY_SERVER_TLS_DIR";
 
@@ -518,6 +523,11 @@ pub fn gateway_toml(
                 && !id.is_empty()
             {
                 cfg.gateway_id = Some(id);
+            }
+            if let Ok(socket) = std::env::var(SANDBOX_SPIFFE_SOCKET_ENV)
+                && !socket.is_empty()
+            {
+                cfg.provider_spiffe_workload_api_socket_path = Some(socket);
             }
             if let Ok(secrets) = std::env::var("CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS") {
                 let v: Vec<String> = secrets
@@ -1929,6 +1939,35 @@ mod tests {
             Some("crucible-run-a-gw-client")
         );
         assert_eq!(k8s["gateway_id"].as_str(), Some("crucible-run-a"));
+        assert!(
+            k8s.get("provider_spiffe_workload_api_socket_path")
+                .is_none(),
+            "no socket configured, none mounted"
+        );
+        unsafe {
+            std::env::set_var(
+                SANDBOX_SPIFFE_SOCKET_ENV,
+                "/spiffe-workload-api/spire-agent.sock",
+            );
+        }
+        let with_socket = gateway_toml(
+            17670,
+            ComputeDriver::Kubernetes,
+            &DriverImages::default(),
+            None,
+            Some(&dial_back),
+            "crucible-run-a-gw-client",
+        )
+        .unwrap();
+        unsafe {
+            std::env::remove_var(SANDBOX_SPIFFE_SOCKET_ENV);
+        }
+        let parsed: toml::Value = toml::from_str(&with_socket).unwrap();
+        assert_eq!(
+            parsed["openshell"]["drivers"]["kubernetes"]["provider_spiffe_workload_api_socket_path"]
+                .as_str(),
+            Some("/spiffe-workload-api/spire-agent.sock")
+        );
         clear_remote_env();
         let local = gateway_toml(
             17670,
