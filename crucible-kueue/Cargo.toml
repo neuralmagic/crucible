@@ -19,11 +19,10 @@ axum = { version = "0.8", default-features = false, features = ["http1", "tokio"
 clap.workspace = true
 crucible-contract = { path = "../crucible-contract" }
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["kube"] }
-futures-util = "0.3"
 hex = "0.4"
 http = "1"
 k8s-openapi.workspace = true
-kube = { workspace = true, features = ["client", "runtime", "rustls-tls"] }
+kube = { workspace = true, features = ["client", "rustls-tls"] }
 kube_quantity = "0.9"
 rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
 rustls = "0.23"
@@ -31,8 +30,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 thiserror.workspace = true
-tokio = { workspace = true, features = ["signal", "sync"] }
-toml = "0.8"
+tokio = { workspace = true, features = ["signal"] }
 url.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

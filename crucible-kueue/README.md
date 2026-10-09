@@ -27,37 +27,14 @@ still carries `task_id`, and poll `workload_status`.
 
 ## Tokens
 
-Two sources, checked in this order:
-
-- `--tenants <file>`: a static TOML file the operator writes.
-- `--tenant-namespace <ns>`: ConfigMaps labelled `crucible.dev/kueue-tenant=true`, each holding
-  one JSON record under `tenant.json`. The controller writes one per run it dispatches onto the
-  server's cluster and deletes it when the run is collected. Only the controller may write
-  ConfigMaps in that namespace.
-
-```toml
-# tenants.toml
-[[tenant]]
-run_id = "run-123"
-token_sha256 = "<sha256 hex of the bearer token>"
-namespace = "team-a"
-role = "submitter"
-queues = ["crucible-e2e"]
-expires_at = 1791500000   # optional, Unix seconds
-```
-
-`echo -n <token> | crucible-kueue --digest` prints a token's digest.
-
-### Access tokens
-
-With `--run-issuer <issuer>=<jwks uri>` (repeatable) and `--resource`, the server also accepts
-OAuth access tokens for runs from each listed issuer (the crucible controller), verified against
-that issuer's own keys; a compact JWT is never looked up as a tenant token. The token's `run_id`,
-`namespace`, `role`, and `queues` claims give the same scope as a tenant record, its `sub` (the
-human the run acts for) is stamped on created workloads as `crucible.dev/launched-by`, and its
-presenter (`act.sub`, the sandbox) as `crucible.dev/actor`. `--person-issuer` (the crucible realm)
-accepts people's tokens, which need `--kube-authz`. The issuer decides which kind a token is, never
-its claims.
+Every caller presents an OAuth access token; there are no static or per-run tenant tokens.
+`--run-issuer <issuer>=<jwks uri>` (repeatable) trusts an issuer of runs' tokens (the crucible
+controller), `--person-issuer` one of people's tokens (the crucible realm, which needs
+`--kube-authz`), and `--resource` names this server's canonical URLs, one of which a token's `aud`
+must name. The issuer decides which kind a token is, never its claims. A run's `run_id`,
+`namespace`, `role`, and `queues` claims scope it; its `sub` (the human the run acts for) is stamped
+on created workloads as `crucible.dev/launched-by`, and its presenter (`act.sub`, the sandbox) as
+`crucible.dev/actor`.
 
 Key sets are fetched over https; `--jwks-ca <pem>` adds CAs for the issuers' hosts, and
 `--insecure-jwks-http` allows plain http off loopback for a cluster network you trust.
@@ -67,7 +44,7 @@ Every tool and the tasks extension's two methods are declared in
 the SubjectAccessReviews each needs; anything else is refused. `--kube-authz openshift|token`
 decides those reviews and turns on people's tokens; without it a call that needs a review is
 refused. `--tool-policy` optionally adds CEL validate and mutate rules over tool arguments. Every
-tool takes an optional `namespace`: run and tenant tokens are pinned to theirs, and a person names
+tool takes an optional `namespace`: a run's token is pinned to its own, and a person names
 one per call. Hosts can embed the server with `crucible_kueue::router(client, Options { … })`. The
 shipped policy is
 [deploy/kueue-policy.toml](deploy/kueue-policy.toml); the auth design and the e2e's configuration
@@ -75,8 +52,7 @@ are in [crucible-mcp-auth](../crucible-mcp-auth/README.md).
 
 ## Deploy
 
-The deploy profile's `[kueue]` table renders the Deployment, Service, ServiceAccount, the
-tenants namespace, and RBAC:
+The deploy profile's `[kueue]` table renders the Deployment, Service, ServiceAccount, and RBAC:
 
 ```bash
 crucible deploy render --kueue --profile <profile.toml>
@@ -87,8 +63,7 @@ The server's identity gets get/list on `clusterqueues`, `resourceflavors`, and `
 cluster-wide; in the workload namespace only, get/list on `localqueues`, get/list/patch on
 `workloads`, get/list on `localqueues/pendingworkloads` in `visibility.kueue.x-k8s.io`,
 create/get/list/patch/delete on each submittable kind under its own API group, and get/list on pods, `pods/log`, and
-events; get/list/watch on ConfigMaps in the tenants namespace. `--allowed-host` is set to the
-Service DNS name. The image is `Containerfile.kueue` at the repository root.
+events. `--allowed-host` is set to the Service DNS name. The image is `Containerfile.kueue` at the repository root.
 
 ## Test
 

@@ -16,8 +16,8 @@ Status (2026-10-08):
   tokens come from a token endpoint in the crucible controller, proven with a real SVID;
   Keycloak stays for human logins.
 - **Built and proven on a cluster.** Kubernetes RBAC decides tool access through SubjectAccessReview:
-  a person acts as themselves, a run as its launcher. One crucible-kueue deployment serves agents,
-  tenant tokens and people, and hosts can embed it.
+  a person acts as themselves, a run as its launcher. One crucible-kueue deployment serves agents
+  and people, and hosts can embed it.
 - **Proven with a person.** From a terminal Claude Code, a person logged in through OpenShift,
   and the person-facing crucible-kueue behind its Route checked each call against their RBAC. It planned and ran a Job that printed `hello from kueue smoketest`.
 - **Open.** Sandboxes do not fetch tokens until the gateway wiring lands.
@@ -215,8 +215,9 @@ let mcp = Router::new()
 let app = Router::new().nest_service("/mcp", mcp).merge(metadata::router(server));
 ```
 
-Servers that also accept another credential (crucible-kueue's tenant tokens, buildit's tokens file)
-write their own authentication middleware around `ResourceServer::authenticate` and `challenge`.
+Servers write their own authentication middleware around `ResourceServer::authenticate` and
+`challenge` when they turn a principal into their own caller type (crucible-kueue) or also accept
+another credential (buildit's tokens file).
 
 **Validation** (`jsonwebtoken` 11 on aws-lc):
 
@@ -300,13 +301,13 @@ message = "replicas must be between 0 and 8"
 
 ## Servers
 
-Both servers accept a realm token or their older credential side by side, told apart by shape (a
-compact JWT is never looked up as a static token), and log `auth=oidc` or the other source. Older
-credentials get an equivalent `Principal` so one policy covers both.
+crucible-kueue accepts access tokens only. buildit also accepts its older tokens file, told apart by
+shape (a compact JWT is never looked up as a static token); a tokens-file caller gets an equivalent
+`Principal` so one policy covers both.
 
 | | crucible-kueue | buildit |
 | --- | --- | --- |
-| Older credential | tenant tokens (static file, controller-written records) | tokens file, one line per sandbox |
+| Other credential | none | tokens file, one line per sandbox |
 | Caller from a realm token | `namespace`, `role`, `queues`; `run_id`, else the subject | `sandbox`, optional `workdir`; refused without a sandbox |
 | Launcher stamp | label `crucible.dev/launched-by` on workloads, server-owned | same label on builder pods |
 | Actor stamp | annotation `crucible.dev/actor` (the token's presenter), set by the server | none |
@@ -416,16 +417,15 @@ added. People get `kube_user` from their username, which only the OpenShift logi
 (registration and username edits off, re-synced on every login, first-login review off). Runs get
 their launcher's username from the controller, so a run can only use queues its human could.
 
-**Which namespace.** Every crucible-kueue tool takes an optional `namespace`. Runs and tenant tokens
-are pinned to theirs, and naming another is refused. A person names any namespace, with an
+**Which namespace.** Every crucible-kueue tool takes an optional `namespace`. A run's token is
+pinned to its own, and naming another is refused. A person names any namespace, with an
 optional default from a claim, and the access checks decide. Task ids carry the namespace.
 
-**One deployment.** A single crucible-kueue serves all three callers:
+**One deployment.** A single crucible-kueue serves both kinds of caller:
 
 | Caller | Token | Identity | Decided by |
 | --- | --- | --- | --- |
 | Sandboxed agent | controller-issued, `run_id` + `act.sub` | pinned to the run's namespace and queues | the run's grant, then RBAC as the launcher |
-| Older run | tenant token | pinned to its record | the record |
 | Person (Claude Code) | Keycloak, `kube_user` | any namespace they name | RBAC as themselves |
 
 People's tokens are accepted only when the server has a reviewer (`--kube-authz openshift|token`),
@@ -536,9 +536,9 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
 | Suite | What it proves |
 | --- | --- |
 | this crate, unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting, access rules and review (allowed, denied, failed, no reviewer, checks over the final arguments), Kubernetes identity and SubjectAccessReview requests |
-| crucible-kueue, unit tests | claims to identity, pinned and per-call namespaces, person tokens, tenant principals, launched-by label, every tool but `whoami` reviewed for people, namespaced task ids |
+| crucible-kueue, unit tests | claims to identity, pinned and per-call namespaces, person tokens, JWT-only authentication, launched-by label, every tool but `whoami` reviewed for people, namespaced task ids |
 | buildit, 60 unit tests | realm and tokens-file callers, refusals, challenges, launched-by label, a policy refusal over HTTP |
-| `crucible-kueue/tests/oidc_e2e.rs` (cluster) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused, tenant tokens under the same policy; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), a run pinned to its namespace |
+| `crucible-kueue/tests/oidc_e2e.rs` (cluster) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), a run pinned to its namespace |
 | `buildit/tests/oidc_e2e.rs` (cluster) | the `buildit mcp` binary with a realm token: challenge, metadata, authenticated status, policy refusal |
 
 The `testing` feature exposes real RSA keys, a loopback JWKS server and token minting for other

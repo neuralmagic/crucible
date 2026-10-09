@@ -1,5 +1,5 @@
-# crucible-kueue tool policy (--tool-policy, optional). Rules see `claims` (the access token's, or
-# the equivalent built for a tenant token) and `args` (the call's arguments).
+# crucible-kueue tool policy (--tool-policy, optional). Rules see `claims` (the access token's)
+# and `args` (the call's arguments).
 #
 # The tools, the scope each needs, and the Kubernetes access each needs are the server's own
 # (crucible-kueue/src/access.rs). For a token carrying kube_user (a person, or a run acting as its

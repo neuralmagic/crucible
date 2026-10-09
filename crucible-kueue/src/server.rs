@@ -2,6 +2,7 @@
 //! request and acts only inside that caller's namespace; mutations additionally require the
 //! submitter role and, past submit, an object this server created for the same run.
 
+use crate::caller::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
 use crate::hardware;
 use crate::kueue::{
     self, ClusterQueue, KubeError, KueueVersion, LocalQueue, ResourceFlavor, Workload,
@@ -12,9 +13,8 @@ use crate::manifest::{
 };
 use crate::status::{self, Rollup};
 use crate::task::{self, Outcome, TaskRef};
-use crate::tenant::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
-use crucible_contract::kueue::TenantRole;
 use crucible_contract::kueue::SCOPE_SUBMIT;
+use crucible_contract::kueue::TenantRole;
 use crucible_mcp_auth::principal::Principal;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{

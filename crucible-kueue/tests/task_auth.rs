@@ -2,8 +2,6 @@
 //! client whose API server never answers: a request the server refuses fails with its refusal,
 //! one it lets through fails only when it reaches Kubernetes.
 
-use crucible_contract::kueue::token_digest;
-use crucible_kueue::tenant::{Registry, Tenants};
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::principal::Callers;
 use crucible_mcp_auth::server::{ResourceServer, TrustedIssuer};
@@ -22,7 +20,6 @@ use std::time::Duration;
 type Client = RunningService<RoleClient, ClientConfig>;
 
 const PEOPLE: &str = "https://people.example/realms/crucible";
-const VIEWER_TOKEN: &str = "task-auth-viewer";
 const OWN_TASK: &str = "team-e2e/Job/train/0b6f2c1e";
 const FOREIGN_TASK: &str = "team-b/Job/train/0b6f2c1e";
 
@@ -30,15 +27,6 @@ fn unreachable_kube() -> kube::Client {
     crucible_kueue::install_tls_provider();
     let config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
     kube::Client::try_from(config).unwrap()
-}
-
-fn registry() -> Arc<Registry> {
-    let tenants = Tenants::from_toml(&format!(
-        "[[tenant]]\nrun_id = \"viewer-run\"\ntoken_sha256 = \"{}\"\nnamespace = \"team-e2e\"\nrole = \"viewer\"\n",
-        token_digest(VIEWER_TOKEN)
-    ))
-    .unwrap();
-    Arc::new(Registry::new(tenants))
 }
 
 async fn serve(jwks: &JwksServer, policy: ToolPolicy) -> String {
@@ -55,8 +43,7 @@ async fn serve(jwks: &JwksServer, policy: ToolPolicy) -> String {
     let app = crucible_kueue::router(
         unreachable_kube(),
         crucible_kueue::Options {
-            registry: registry(),
-            oidc: Some(Arc::new(server)),
+            oidc: Arc::new(server),
             policy,
             reviewer: None,
             kueue: crucible_kueue::kueue::KueueVersion::default(),
@@ -149,9 +136,6 @@ async fn cancelling_needs_the_submit_scope_whatever_the_policy_and_the_submitter
         assert!(refused.contains("Insufficient scope"), "{refused}");
         let read = get(&client, OWN_TASK).await;
         assert!(reached_kubernetes(&read), "{read}");
-        let viewer = connect(&url, VIEWER_TOKEN).await;
-        let refused = cancel(&viewer, OWN_TASK).await;
-        assert!(refused.contains("Insufficient scope"), "{refused}");
     }
 
     let url = serve(&jwks, shipped_policy()).await;

@@ -16,13 +16,11 @@
 //! that queue (no Deployments).
 
 use base64::Engine;
-use crucible_contract::kueue::token_digest;
 use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
 use crucible_controller::agent_auth::issuer::{
     AgentIssuer, AgentIssuerConfig, GatewayPrefix, IssuerUrl, SigningKey,
 };
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
-use crucible_kueue::tenant::{Registry, Tenants};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::kube::{GroupSource, SubjectAccessReviewer};
 use crucible_mcp_auth::policy::ToolPolicy;
@@ -48,7 +46,6 @@ const RESOURCE: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:
 const SANDBOX_NAME: &str = "ci-0123456789abcdef";
 const WORKDIR: &str = "/sandbox/repo";
 const RUN_ID: &str = "playbook_oidc-e2e_auth-spike";
-const TENANT_TOKEN: &str = "oidc-e2e-tenant-token";
 const IMAGE: &str = "registry.access.redhat.com/ubi9/ubi-minimal:latest";
 
 /// The spike's SPIFFE ID, `<prefix><gateway id>/sandbox/<sandbox id>`, split into its parts.
@@ -275,13 +272,7 @@ async fn access_token(controller: &str, svid: &str) -> String {
     token
 }
 
-async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String {
-    let tenants = Tenants::from_toml(&format!(
-        "[[tenant]]\nrun_id = \"oidc-e2e-tenant\"\ntoken_sha256 = \"{}\"\nnamespace = \"{}\"\nrole = \"viewer\"\n",
-        token_digest(TENANT_TOKEN),
-        env.namespace
-    ))
-    .unwrap();
+async fn serve_kueue(kube: kube::Client, controller: &str) -> String {
     let jwks_uris = [
         (
             CONTROLLER,
@@ -323,8 +314,7 @@ async fn serve_kueue(env: &Env, kube: kube::Client, controller: &str) -> String 
     let app = crucible_kueue::router(
         kube,
         crucible_kueue::Options {
-            registry: Arc::new(Registry::new(tenants)),
-            oidc: Some(Arc::new(server)),
+            oidc: Arc::new(server),
             policy,
             reviewer: Some(reviewer),
             kueue: kueue_version,
@@ -392,7 +382,7 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
     let (controller, pool) = serve_controller(&env, profile.path()).await;
     let svid = cluster::fresh_svid_for(&kube, CONTROLLER).await;
     let token = access_token(&controller, &svid).await;
-    let url = serve_kueue(&env, kube.clone(), &controller).await;
+    let url = serve_kueue(kube.clone(), &controller).await;
 
     let raw = reqwest::Client::new();
     let unauthenticated = raw.post(&url).json(&json!({})).send().await.unwrap();
@@ -541,29 +531,6 @@ async fn a_tampered_svid_or_a_foreign_audience_gets_no_token() {
     assert_eq!(body["error"], "invalid_target", "{body}");
 }
 
-#[tokio::test]
-#[ignore = "needs a cluster's SPIRE and a Postgres; see the module docs"]
-async fn tenant_tokens_keep_working_beside_access_tokens_under_the_same_policy() {
-    let env = env();
-    let kube = kube_client(&env).await;
-    let url = serve_kueue(&env, kube, "http://127.0.0.1:1").await;
-    let client = connect(&url, TENANT_TOKEN).await;
-    let me = call(&client, "whoami", json!({})).await.unwrap();
-    assert_eq!(me["run_id"], "oidc-e2e-tenant");
-    assert_eq!(me["launched_by"], Value::Null);
-    let refused = call(
-        &client,
-        "workload_plan",
-        json!({"queue": env.queue, "manifest": job("never")}),
-    )
-    .await;
-    let refusal = refused.expect_err("a viewer's tenant token lacks kueue.submit");
-    assert!(
-        refusal.contains("Insufficient scope"),
-        "the 403 step-up challenge: {refusal}"
-    );
-}
-
 fn deployment(name: &str) -> Value {
     json!({
         "apiVersion": "apps/v1",
@@ -591,7 +558,7 @@ async fn kubernetes_rbac_decides_what_the_launcher_may_create() {
     let env = env();
     let kube = kube_client(&env).await;
     let token = cluster::access_token(&cluster::routes_http(cluster::ingress_ip()), &kube).await;
-    let url = serve_kueue(&env, kube, "http://127.0.0.1:1").await;
+    let url = serve_kueue(kube, "http://127.0.0.1:1").await;
     let client = connect(&url, &token).await;
 
     let name = format!("oidc-e2e-sar-{}", std::process::id());

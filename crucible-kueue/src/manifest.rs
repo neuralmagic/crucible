@@ -3,7 +3,7 @@
 //! allowlisted set of fields: anything that grants host access, privilege, another identity, a
 //! secret, or a scheduling escape from Kueue is refused by not being on the list.
 
-use crate::tenant::{Caller, QueueName};
+use crate::caller::{Caller, QueueName};
 use kube::core::ApiResource;
 use kube_quantity::ParsedQuantity;
 use rmcp::schemars;
@@ -224,7 +224,7 @@ pub fn normalize(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    if crate::tenant::Namespace::parse(&name).is_err() {
+    if crate::caller::Namespace::parse(&name).is_err() {
         return Err(ManifestError::Name(name));
     }
     let ns = caller.namespace.as_str();
@@ -1158,8 +1158,8 @@ fn object_entry<'a>(
 
 #[cfg(test)]
 mod tests {
+    use crate::caller::{Namespace, QueueName, RunId};
     use crate::manifest::*;
-    use crate::tenant::{Namespace, QueueName, RunId};
     use crucible_contract::kueue::TenantRole;
     use serde_json::json;
 
@@ -1481,7 +1481,7 @@ mod tests {
     #[test]
     fn a_delegated_callers_launcher_is_stamped_and_cannot_be_overridden() {
         let mut delegated = caller();
-        delegated.launched_by = Some(crate::tenant::Launcher::parse("alice").unwrap());
+        delegated.launched_by = Some(crate::caller::Launcher::parse("alice").unwrap());
         let n = normalize(job(), &delegated, &queue()).unwrap();
         assert_eq!(
             n.object
@@ -1511,7 +1511,7 @@ mod tests {
     #[test]
     fn the_launcher_is_part_of_the_plan_hash() {
         let mut delegated = caller();
-        delegated.launched_by = Some(crate::tenant::Launcher::parse("alice").unwrap());
+        delegated.launched_by = Some(crate::caller::Launcher::parse("alice").unwrap());
         let a = normalize(job(), &caller(), &queue()).unwrap();
         let b = normalize(job(), &delegated, &queue()).unwrap();
         assert_ne!(a.plan_hash, b.plan_hash);

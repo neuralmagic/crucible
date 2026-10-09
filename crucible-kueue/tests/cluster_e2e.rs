@@ -6,8 +6,7 @@
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> cargo test --test cluster_e2e -- --ignored --nocapture
 //! The namespace must carry the label Kueue's ClusterQueue selects on and hold the LocalQueue.
 
-use crucible_contract::kueue::token_digest;
-use crucible_kueue::tenant::{Registry, Tenants};
+use crucible_mcp_auth::testing::{self, JwksServer};
 use rmcp::ServiceExt;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, ClientCapabilities,
@@ -23,8 +22,6 @@ use std::time::{Duration, Instant};
 
 type Client = RunningService<RoleClient, ClientConfig>;
 
-const SUBMITTER: &str = "e2e-submitter-token";
-const VIEWER: &str = "e2e-viewer-token";
 const IMAGE: &str = "registry.access.redhat.com/ubi9/ubi-minimal:latest";
 
 struct Env {
@@ -44,28 +41,11 @@ fn env() -> Env {
     }
 }
 
-async fn serve(env: &Env, run_id: &str) -> String {
-    let tenants = Tenants::from_toml(&format!(
-        r#"
-[[tenant]]
-run_id = "{run_id}"
-token_sha256 = "{}"
-namespace = "{ns}"
-role = "submitter"
-queues = ["{q}"]
-
-[[tenant]]
-run_id = "{run_id}-viewer"
-token_sha256 = "{}"
-namespace = "{ns}"
-role = "viewer"
-"#,
-        token_digest(SUBMITTER),
-        token_digest(VIEWER),
-        ns = env.namespace,
-        q = env.queue,
-    ))
-    .unwrap();
+/// The server on loopback, trusting a loopback issuer whose run tokens [`submitter`] and
+/// [`viewer`] mint.
+async fn serve(env: &Env) -> String {
+    let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
+    let oidc = testing::resource_server(&jwks, Duration::from_secs(300), Duration::from_secs(1));
     crucible_kueue::install_tls_provider();
     let options = kube::config::KubeConfigOptions {
         context: Some(env.context.clone()),
@@ -79,8 +59,7 @@ role = "viewer"
     let app = crucible_kueue::router(
         client,
         crucible_kueue::Options {
-            registry: Arc::new(Registry::new(tenants)),
-            oidc: None,
+            oidc: Arc::new(oidc),
             policy: crucible_mcp_auth::policy::ToolPolicy::default(),
             reviewer: None,
             kueue: kueue_version,
@@ -91,6 +70,26 @@ role = "viewer"
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await });
     format!("http://{addr}{}", crucible_kueue::MCP_PATH)
+}
+
+fn run_token(env: &Env, run: &str, role: &str, scope: &str) -> String {
+    let mut claims = testing::run_claims();
+    claims["run_id"] = json!(run);
+    claims["namespace"] = json!(env.namespace);
+    claims["role"] = json!(role);
+    claims["queues"] = json!([env.queue]);
+    claims["scope"] = json!(scope);
+    testing::sign("a", &claims)
+}
+
+/// A run's token that may submit to the e2e queue in the e2e namespace.
+fn submitter(env: &Env, run: &str) -> String {
+    run_token(env, run, "submitter", "kueue.read kueue.submit")
+}
+
+/// A token that may only read, for another run in the same namespace.
+fn viewer(env: &Env, run: &str) -> String {
+    run_token(env, &format!("{run}-viewer"), "viewer", "kueue.read")
 }
 
 async fn connect(url: &str, token: &str) -> Result<Client, String> {
@@ -332,14 +331,14 @@ fn unique(prefix: &str) -> String {
 async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
     let env = env();
     let run = unique("e2e");
-    let url = serve(&env, &run).await;
+    let url = serve(&env).await;
 
     assert!(
         connect(&url, "wrong-token").await.is_err(),
         "an unknown token must not get a session"
     );
 
-    let agent = connect(&url, SUBMITTER).await.unwrap();
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
     let tools: Vec<String> = agent
         .list_all_tools()
         .await
@@ -416,14 +415,19 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
     .await;
     assert_eq!(tampered["status"], "refused", "{tampered:#}");
 
-    let viewer = connect(&url, VIEWER).await.unwrap();
-    let as_viewer = call(
-        &viewer,
-        "workload_submit",
-        json!({"queue": env.queue, "manifest": manifest, "plan_hash": hash}),
-    )
-    .await;
-    assert_eq!(as_viewer["status"], "refused", "{as_viewer:#}");
+    let viewer = connect(&url, &viewer(&env, &run)).await.unwrap();
+    let Value::Object(submit_args) =
+        json!({"queue": env.queue, "manifest": manifest, "plan_hash": hash})
+    else {
+        unreachable!()
+    };
+    let as_viewer = viewer
+        .call_tool(CallToolRequestParams::new("workload_submit").with_arguments(submit_args))
+        .await;
+    assert!(
+        as_viewer.is_err(),
+        "a read-only token cannot submit: {as_viewer:?}"
+    );
 
     let submitted = call(
         &agent,
@@ -497,8 +501,8 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
 async fn an_agent_stops_and_resumes_a_running_job() {
     let env = env();
     let run = unique("e2e-stop");
-    let url = serve(&env, &run).await;
-    let agent = connect(&url, SUBMITTER).await.unwrap();
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
 
     let name = unique("ck-e2e-stop");
     let manifest = job(&name, "sleep 600");
@@ -536,7 +540,7 @@ async fn an_agent_stops_and_resumes_a_running_job() {
     assert_eq!(resumed["status"], "ok", "{resumed:#}");
     wait_for_phase(&agent, &name, &["admitted"], Duration::from_secs(180)).await;
 
-    let other_run = connect(&serve(&env, "someone-else").await, SUBMITTER)
+    let other_run = connect(&serve(&env).await, &submitter(&env, "someone-else"))
         .await
         .unwrap();
     let foreign_stop = call(
@@ -584,8 +588,9 @@ async fn an_agent_stops_and_resumes_a_running_job() {
 #[ignore = "needs a cluster with Kueue; see the module docs"]
 async fn a_deployment_is_admitted_pod_by_pod_and_scales_stops_and_resumes() {
     let env = env();
-    let url = serve(&env, &unique("e2e-deploy")).await;
-    let agent = connect(&url, SUBMITTER).await.unwrap();
+    let run = unique("e2e-deploy");
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
     let name = unique("ck-e2e-deploy");
     let r = json!({"kind": "Deployment", "name": name});
 
@@ -639,8 +644,9 @@ async fn a_deployment_is_admitted_pod_by_pod_and_scales_stops_and_resumes() {
 #[ignore = "needs a cluster with Kueue; see the module docs"]
 async fn a_statefulset_is_admitted_as_one_group_and_stops_by_scaling_to_zero() {
     let env = env();
-    let url = serve(&env, &unique("e2e-sts")).await;
-    let agent = connect(&url, SUBMITTER).await.unwrap();
+    let run = unique("e2e-sts");
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
     let name = unique("ck-e2e-sts");
     let r = json!({"kind": "StatefulSet", "name": name});
 
@@ -694,8 +700,9 @@ async fn a_statefulset_is_admitted_as_one_group_and_stops_by_scaling_to_zero() {
 #[ignore = "needs a cluster with Kueue; see the module docs"]
 async fn a_tasks_client_gets_a_task_and_polls_a_job_to_completion() {
     let env = env();
-    let url = serve(&env, &unique("e2e-task")).await;
-    let agent = connect_with_tasks(&url, SUBMITTER).await;
+    let run = unique("e2e-task");
+    let url = serve(&env).await;
+    let agent = connect_with_tasks(&url, &submitter(&env, &run)).await;
 
     let name = unique("ck-e2e-task");
     let id = submit_task(
@@ -740,8 +747,9 @@ async fn a_tasks_client_gets_a_task_and_polls_a_job_to_completion() {
 #[ignore = "needs a cluster with Kueue; see the module docs"]
 async fn a_deployment_task_completes_once_ready_and_stays_complete_after_scale_down() {
     let env = env();
-    let url = serve(&env, &unique("e2e-task-deploy")).await;
-    let agent = connect_with_tasks(&url, SUBMITTER).await;
+    let run = unique("e2e-task-deploy");
+    let url = serve(&env).await;
+    let agent = connect_with_tasks(&url, &submitter(&env, &run)).await;
     let name = unique("ck-e2e-task-deploy");
 
     let id = submit_task(&agent, &env.queue, &serving("Deployment", &name, 2)).await;
@@ -776,14 +784,15 @@ async fn a_deployment_task_completes_once_ready_and_stays_complete_after_scale_d
 #[ignore = "needs a cluster with Kueue; see the module docs"]
 async fn cancelling_a_task_stops_the_job_and_unknown_tasks_are_errors() {
     let env = env();
-    let url = serve(&env, &unique("e2e-task-cancel")).await;
-    let agent = connect_with_tasks(&url, SUBMITTER).await;
+    let run = unique("e2e-task-cancel");
+    let url = serve(&env).await;
+    let agent = connect_with_tasks(&url, &submitter(&env, &run)).await;
     let name = unique("ck-e2e-task-cancel");
 
     let id = submit_task(&agent, &env.queue, &job(&name, "sleep 600")).await;
     wait_for_phase(&agent, &name, &["admitted"], Duration::from_secs(180)).await;
 
-    let viewer = connect_with_tasks(&url, VIEWER).await;
+    let viewer = connect_with_tasks(&url, &viewer(&env, &run)).await;
     assert!(
         viewer
             .peer()
@@ -819,7 +828,7 @@ async fn cancelling_a_task_stops_the_job_and_unknown_tasks_are_errors() {
         );
     }
 
-    let other_run = connect_with_tasks(&serve(&env, "someone-else").await, SUBMITTER).await;
+    let other_run = connect_with_tasks(&serve(&env).await, &submitter(&env, "someone-else")).await;
     assert!(
         other_run
             .peer()

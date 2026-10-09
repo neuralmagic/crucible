@@ -1,18 +1,14 @@
-//! Request authentication: an OAuth access token from the crucible realm, or a registered tenant
-//! token. Either way the request leaves with an [`Identity`] (what the tools resolve into a
-//! [`Caller`] per call) and a [`Principal`] (what the tool policy's rules see) in its extensions.
+//! Request authentication: an OAuth access token from a trusted issuer. The request leaves with
+//! an [`Identity`] (what the tools resolve into a [`crate::caller::Caller`] per call) and a [`Principal`] (what
+//! the guard's rules see) in its extensions.
 //!
 //! | Token                    | Identity                                                        |
 //! |--------------------------|-----------------------------------------------------------------|
-//! | tenant token             | pinned to its record's namespace, role, queues                  |
 //! | from a run issuer        | a run: pinned to its `namespace` claim, `role`, `queues`        |
-//! | from a people issuer     | a person: any namespace, decided per call by the policy's access |
-//! |                          | checks; accepted only when the server has an access reviewer    |
-//!
-//! The two are told apart by shape: an access token is a compact JWS (three dot-separated
-//! parts), a tenant token is opaque hex. A JWT never falls back to the tenant registry.
+//! | from a people issuer     | a person: any namespace, decided per call by the access checks; |
+//! |                          | accepted only when the server has an access reviewer            |
 
-use crate::tenant::{Caller, Identity, Launcher, NameError, Namespace, QueueName, Registry, RunId};
+use crate::caller::{Identity, Launcher, NameError, Namespace, QueueName, RunId};
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -20,14 +16,12 @@ use axum::response::{IntoResponse, Response};
 use crucible_contract::kueue::TenantRole;
 use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::principal::{Callers, Principal};
-use crucible_mcp_auth::server::{AuthError, ResourceServer, bearer_token};
-use serde_json::{Map, Value, json};
+use crucible_mcp_auth::server::ResourceServer;
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 pub struct Auth {
-    pub registry: Arc<Registry>,
-    /// Accept access tokens from this authorization server. `None` accepts tenant tokens only.
-    pub oidc: Option<Arc<ResourceServer>>,
+    pub oidc: Arc<ResourceServer>,
     /// Accept people's tokens (from a people issuer). Only safe when the tool policy's access
     /// checks decide every call, so the server sets it exactly when it has an access reviewer.
     pub people: bool,
@@ -125,50 +119,6 @@ impl Identity {
     }
 }
 
-impl Caller {
-    /// The principal a tenant token stands for, with claims shaped like a realm token's so one
-    /// tool policy covers both. Its scopes follow the tenant role.
-    pub fn tenant_principal(&self) -> Principal {
-        let scope = self.role.scopes().join(" ");
-        let subject = format!("tenant:{}", self.run_id);
-        let scopes = scope.split(' ').map(str::to_string).collect();
-        let mut claims = Map::new();
-        claims.insert("sub".into(), json!(subject));
-        claims.insert("run_id".into(), json!(self.run_id.as_str()));
-        claims.insert("namespace".into(), json!(self.namespace.as_str()));
-        claims.insert("role".into(), json!(self.role));
-        claims.insert(
-            "queues".into(),
-            json!(
-                self.queues
-                    .iter()
-                    .map(QueueName::as_str)
-                    .collect::<Vec<_>>()
-            ),
-        );
-        claims.insert("scope".into(), json!(scope));
-        Principal {
-            subject,
-            actor_chain: Vec::new(),
-            client_id: None,
-            namespace: Some(self.namespace.to_string()),
-            scopes,
-            claims,
-            callers: Callers::Runs,
-        }
-    }
-}
-
-fn is_jwt(token: &str) -> bool {
-    token.split('.').count() == 3
-}
-
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
 fn refused(status: StatusCode, error: &str, description: String) -> Response {
     (
         status,
@@ -177,61 +127,28 @@ fn refused(status: StatusCode, error: &str, description: String) -> Response {
         .into_response()
 }
 
-/// Middleware: authenticate the bearer token and attach [`Caller`] and [`Principal`].
+/// Middleware: authenticate the bearer token and attach [`Identity`] and [`Principal`].
 pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next: Next) -> Response {
     let headers = req.headers();
-    let Some(token) = bearer_token(headers) else {
-        return match &auth.oidc {
-            Some(oidc) => oidc.challenge(headers, &AuthError::Missing),
-            None => refused(
-                StatusCode::UNAUTHORIZED,
-                "unauthorized",
-                "missing bearer token".into(),
-            ),
-        };
-    };
-    let (identity, principal, via) = match (&auth.oidc, is_jwt(token)) {
-        (Some(oidc), true) => {
-            let principal = match oidc.authenticate(headers).await {
-                Ok(p) => p,
-                Err(error) => {
-                    tracing::info!(auth = "oidc", %error, "token refused");
-                    return oidc.challenge(headers, &error);
-                }
-            };
-            match Identity::from_principal(&principal, auth.people) {
-                Ok(identity) => (identity, principal, "oidc"),
-                Err(error) => {
-                    tracing::info!(auth = "oidc", sub = %principal.subject, %error, "token carries no tenant scope");
-                    return refused(
-                        StatusCode::FORBIDDEN,
-                        "insufficient_scope",
-                        "the access token does not identify a run or a person this server serves"
-                            .into(),
-                    );
-                }
-            }
+    let principal = match auth.oidc.authenticate(headers).await {
+        Ok(p) => p,
+        Err(error) => {
+            tracing::info!(%error, "token refused");
+            return auth.oidc.challenge(headers, &error);
         }
-        _ => match auth.registry.authenticate(token, unix_now()).await {
-            Some(caller) => {
-                let principal = caller.tenant_principal();
-                (Identity::pinned(caller), principal, "tenant-token")
-            }
-            None => {
-                tracing::info!(auth = "tenant-token", "unknown bearer token");
-                return match &auth.oidc {
-                    Some(oidc) => oidc.challenge(headers, &AuthError::Unrecognized),
-                    None => refused(
-                        StatusCode::UNAUTHORIZED,
-                        "unauthorized",
-                        "missing or unknown bearer token".into(),
-                    ),
-                };
-            }
-        },
+    };
+    let identity = match Identity::from_principal(&principal, auth.people) {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::info!(sub = %principal.subject, %error, "token identifies no caller this server serves");
+            return refused(
+                StatusCode::FORBIDDEN,
+                "insufficient_scope",
+                "the access token does not identify a run or a person this server serves".into(),
+            );
+        }
     };
     tracing::info!(
-        auth = via,
         sub = %principal.subject,
         presenter = principal.presenter(),
         run = %identity.run_id,
@@ -247,9 +164,8 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
 #[cfg(test)]
 mod tests {
     use crate::auth::*;
-    use crate::tenant::Tenants;
+    use crate::caller::Caller;
     use axum::body::{Body, to_bytes};
-    use crucible_contract::kueue::token_digest;
     use tower::ServiceExt;
 
     fn principal(claims: Value) -> Principal {
@@ -337,7 +253,7 @@ mod tests {
         assert!(identity.queues.is_empty());
         assert!(matches!(
             identity.in_namespace(None),
-            Err(crate::tenant::Refusal::NamespaceRequired)
+            Err(crate::caller::Refusal::NamespaceRequired)
         ));
         let c = identity.in_namespace(Some("team-b")).unwrap();
         assert_eq!(c.namespace.as_str(), "team-b");
@@ -429,37 +345,22 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_tenant_token_principal_carries_the_same_claim_shape() {
-        let tenants = Tenants::from_toml(&format!(
-            "[[tenant]]\nrun_id = \"run-1\"\ntoken_sha256 = \"{}\"\nnamespace = \"team-a\"\nrole = \"viewer\"\nqueues = [\"gpu\"]\n",
-            token_digest("t")
-        ))
-        .unwrap();
-        let registry = Registry::new(tenants);
-        let caller = registry.authenticate("t", 0).await.unwrap();
-        let p = caller.tenant_principal();
-        assert_eq!(p.subject, "tenant:run-1");
-        assert_eq!(p.namespace.as_deref(), Some("team-a"));
-        assert_eq!(
-            p.scopes.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["kueue.read"]
+    async fn app() -> (crucible_mcp_auth::testing::JwksServer, axum::Router) {
+        let jwks =
+            crucible_mcp_auth::testing::JwksServer::start(vec![crucible_mcp_auth::testing::jwk(
+                "a",
+            )])
+            .await;
+        let oidc = crucible_mcp_auth::testing::resource_server(
+            &jwks,
+            std::time::Duration::from_secs(300),
+            std::time::Duration::from_secs(1),
         );
-        assert_eq!(
-            Value::Object(p.claims.clone()),
-            json!({"sub": "tenant:run-1", "run_id": "run-1", "namespace": "team-a", "role": "viewer",
-                   "queues": ["gpu"], "scope": "kueue.read"})
-        );
-        assert_eq!(caller.launched_by, None);
-    }
-
-    fn app(registry: Registry) -> axum::Router {
         let auth = Auth {
-            registry: Arc::new(registry),
-            oidc: None,
+            oidc: Arc::new(oidc),
             people: false,
         };
-        axum::Router::new()
+        let app = axum::Router::new()
             .route(
                 "/mcp",
                 axum::routing::post(|req: Request| async move {
@@ -476,11 +377,15 @@ mod tests {
             .layer(axum::middleware::from_fn_with_state(
                 Arc::new(auth),
                 authenticate,
-            ))
+            ));
+        (jwks, app)
     }
 
     async fn post(app: axum::Router, authorization: Option<&str>) -> (StatusCode, String) {
-        let mut req = Request::builder().method("POST").uri("/mcp");
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(axum::http::header::HOST, "kueue.apps.example");
         if let Some(a) = authorization {
             req = req.header(axum::http::header::AUTHORIZATION, a);
         }
@@ -491,36 +396,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_tokens_authenticate_without_oidc() {
-        let tenant = |token: &str| {
-            Tenants::from_toml(&format!(
-                "[[tenant]]\nrun_id = \"run-1\"\ntoken_sha256 = \"{}\"\nnamespace = \"team-a\"\nrole = \"submitter\"\n",
-                token_digest(token)
-            ))
-            .unwrap()
-        };
+    async fn a_run_token_authenticates_and_anything_else_is_challenged() {
+        let (_jwks, app) = app().await;
+        let token =
+            crucible_mcp_auth::testing::sign("a", &crucible_mcp_auth::testing::run_claims());
         assert_eq!(
-            post(app(Registry::new(tenant("opaque"))), Some("Bearer opaque")).await,
-            (StatusCode::OK, "run-1 tenant:run-1".into())
+            post(app.clone(), Some(&format!("Bearer {token}"))).await,
+            (StatusCode::OK, "auth-spike alice".into())
         );
-        let (status, _) = post(app(Registry::new(tenant("a.b.c"))), Some("Bearer a.b.c")).await;
+        for authorization in [None, Some("Bearer opaque-tenant-token"), Some("Basic nope")] {
+            assert_eq!(
+                post(app.clone(), authorization).await.0,
+                StatusCode::UNAUTHORIZED,
+                "{authorization:?}"
+            );
+        }
+        let foreign =
+            crucible_mcp_auth::testing::sign("b", &crucible_mcp_auth::testing::run_claims());
         assert_eq!(
-            status,
-            StatusCode::OK,
-            "without OIDC a JWT-shaped tenant token still authenticates"
-        );
-    }
-
-    #[tokio::test]
-    async fn missing_and_unknown_tokens_are_unauthorized() {
-        let app = app(Registry::new(Tenants::default()));
-        assert_eq!(post(app.clone(), None).await.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            post(app.clone(), Some("Bearer nope")).await.0,
-            StatusCode::UNAUTHORIZED
-        );
-        assert_eq!(
-            post(app, Some("Basic nope")).await.0,
+            post(app, Some(&format!("Bearer {foreign}"))).await.0,
             StatusCode::UNAUTHORIZED
         );
     }
