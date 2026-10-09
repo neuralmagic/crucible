@@ -346,26 +346,11 @@ async fn bind_sandbox(
             );
         }
     };
-    let profile =
-        match crate::agent_auth::placement::load_profile(state.agent.deploy_profile.as_deref())
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(
-                    error = format!("{e:#}"),
-                    "sandbox bind could not read the deploy profile"
-                );
-                return refuse(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "reading the deploy profile failed",
-                );
-            }
+    let namespace =
+        match crate::agent_auth::placement::sandbox_namespace(Some(&state.agent.profile)) {
+            Ok(ns) => ns.to_string(),
+            Err(e) => return refuse(StatusCode::CONFLICT, e.to_string()),
         };
-    let namespace = match crate::agent_auth::placement::sandbox_namespace(profile.as_ref()) {
-        Ok(ns) => ns.to_string(),
-        Err(e) => return refuse(StatusCode::CONFLICT, e.to_string()),
-    };
     let name = match state
         .agent
         .directory
@@ -735,7 +720,6 @@ mod tests {
         known: &[(&str, &str)],
     ) -> (
         axum::Router,
-        tempfile::TempDir,
         Arc<crate::agent_auth::testing::StaticDirectory>,
     ) {
         let clusters = Arc::new(FakeClusters {
@@ -757,7 +741,7 @@ mod tests {
             BTreeMap::from([(CLUSTER.to_string(), "crucible-spoke".to_string())]),
         ));
         let spire = Spire::start().await;
-        let (agent, dir, directory) = testing::agent_auth(&pool, &spire, profile, known);
+        let (agent, directory) = testing::agent_auth(&pool, &spire, profile, known);
         let state = BindState {
             ingest: IngestState {
                 db: crate::Db::new(pool),
@@ -765,7 +749,7 @@ mod tests {
             },
             agent,
         };
-        (router(state), dir, directory)
+        (router(state), directory)
     }
 
     async fn post(app: axum::Router, pod: &str, body: &str) -> (StatusCode, String) {
@@ -786,7 +770,7 @@ mod tests {
         running_run(&pool, "crucible-run-b", "run-b", Some("user:alice")).await;
         let body = serde_json::to_string(&wire("sbx-1", Some("/sandbox/repo"))).unwrap();
 
-        let (a_token, _d1, a_directory) = app(
+        let (a_token, a_directory) = app(
             pool.clone(),
             "crucible-run-a",
             PROFILE,
@@ -810,7 +794,7 @@ mod tests {
             "the bound Sandbox is owned by run-a's gateway pod"
         );
 
-        let (b_token, _d2, _) = app(
+        let (b_token, _) = app(
             pool.clone(),
             "crucible-run-b",
             PROFILE,
@@ -824,7 +808,7 @@ mod tests {
             "run-b's gateway did not create sbx-1: {text}"
         );
 
-        let (both, _d3, _) = app(
+        let (both, _) = app(
             pool.clone(),
             "crucible-run-b",
             PROFILE,
@@ -861,7 +845,7 @@ mod tests {
     async fn the_route_binds_nothing_without_a_declared_sandbox_namespace(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         let unplaced = PROFILE.replace("sandbox_namespace = \"sandboxes\"\n", "");
-        let (app, _d, _) = app(
+        let (app, _) = app(
             pool.clone(),
             "crucible-run-a",
             &unplaced,

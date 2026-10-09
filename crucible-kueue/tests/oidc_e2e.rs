@@ -184,6 +184,7 @@ async fn serve_controller(env: &Env, profile_dir: &std::path::Path) -> (String, 
 loop_namespace = "crucible-system"
 rig_namespace = "rig"
 service_account = "crucible-spoke"
+sandbox_driver = "kubernetes"
 sandbox_namespace = "crucible-sandboxes"
 supervisor_image = "registry.example.com/openshell-supervisor:latest"
 [image]
@@ -223,7 +224,10 @@ require_kube_user = false
     let state = Arc::new(AgentAuth {
         issuer: AgentIssuer::new(cfg, jwks),
         pool: pool.clone(),
-        deploy_profile: Some(profile),
+        profile: crucible_controller::agent_auth::placement::load_profile(Some(&profile))
+            .await
+            .unwrap()
+            .unwrap(),
         directory: Arc::new(crucible_controller::agent_auth::directory::KubeDirectory(
             Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
                 None,

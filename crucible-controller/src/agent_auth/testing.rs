@@ -277,9 +277,8 @@ impl crate::agent_auth::directory::SandboxDirectory for StaticDirectory {
     }
 }
 
-/// The issuer state over `pool`, reading `profile_toml` as its deploy profile, with `known`
-/// `(run pod, sandbox id)` pairs in the directory. Keep the returned directory alive as long as
-/// the state.
+/// The issuer state over `pool` with `profile_toml` as its deploy profile and `known`
+/// `(run pod, sandbox id)` pairs in the directory, which is returned for inspection.
 pub fn agent_auth(
     pool: &sqlx::PgPool,
     spire: &Spire,
@@ -287,12 +286,12 @@ pub fn agent_auth(
     known: &[(&str, &str)],
 ) -> (
     std::sync::Arc<crate::agent_auth::AgentAuth>,
-    tempfile::TempDir,
     std::sync::Arc<StaticDirectory>,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("profile.toml");
     std::fs::write(&path, profile_toml).unwrap();
+    let profile = crucible::deploy::DeployProfile::load(&path).unwrap();
     let directory = std::sync::Arc::new(StaticDirectory {
         known: known
             .iter()
@@ -303,8 +302,8 @@ pub fn agent_auth(
     let state = crate::agent_auth::AgentAuth {
         issuer: issuer(spire, &EcKey::generate()),
         pool: pool.clone(),
-        deploy_profile: Some(path),
+        profile,
         directory: directory.clone(),
     };
-    (std::sync::Arc::new(state), dir, directory)
+    (std::sync::Arc::new(state), directory)
 }

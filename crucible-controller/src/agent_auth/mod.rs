@@ -34,9 +34,9 @@ use std::sync::Arc;
 pub struct AgentAuth {
     pub issuer: AgentIssuer,
     pub pool: PgPool,
-    /// The deploy profile naming the sandbox namespace and, in `[kueue]`, a run's tenant claims;
-    /// read per request like the dispatch path reads it.
-    pub deploy_profile: Option<PathBuf>,
+    /// The deploy profile naming the sandbox namespace and, in `[kueue]`, a run's tenant claims,
+    /// read once at startup.
+    pub profile: crucible::deploy::DeployProfile,
     pub directory: Arc<dyn directory::SandboxDirectory>,
 }
 
@@ -69,7 +69,7 @@ impl AgentAuth {
         Ok(Some(Arc::new(Self {
             issuer: AgentIssuer::new(cfg, jwks),
             pool,
-            deploy_profile,
+            profile,
             directory: Arc::new(directory::KubeDirectory(clusters)),
         })))
     }
@@ -217,10 +217,8 @@ async fn issue(
     form: Result<axum::Form<TokenRequest>, FormRejection>,
 ) -> Result<Response, OAuthError> {
     let axum::Form(req) = form.map_err(|e| OAuthError::InvalidRequest(e.body_text()))?;
-    let profile = placement::load_profile(state.deploy_profile.as_deref())
-        .await
-        .map_err(|e| OAuthError::Server(format!("reading the deploy profile: {e:#}")))?;
-    placement::sandbox_namespace(profile.as_ref())
+    let profile = &state.profile;
+    placement::sandbox_namespace(Some(profile))
         .map_err(|e| OAuthError::UnauthorizedClient(e.to_string()))?;
     if req.grant_type != "client_credentials" {
         return Err(OAuthError::UnsupportedGrantType(format!(
@@ -260,7 +258,7 @@ async fn issue(
         )));
     }
     let launcher = issuer::launcher(&run)?;
-    let kueue = profile.as_ref().and_then(|p| p.kueue.as_ref());
+    let kueue = profile.kueue.as_ref();
     let tenant = kueue.and_then(|k| TenantScope::for_run(k, &run.cluster));
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience, tenant.as_ref())?;
     let kube_user = crate::identity::kube_identity::effective(&state.pool, &launcher)
@@ -339,7 +337,6 @@ mod tests {
         spire: Spire,
         app: axum::Router,
         state: Arc<AgentAuth>,
-        _profile: tempfile::TempDir,
     }
 
     async fn harness(pool: PgPool) -> Harness {
@@ -348,12 +345,11 @@ mod tests {
 
     async fn harness_with(pool: PgPool, profile_toml: &str) -> Harness {
         let spire = Spire::start().await;
-        let (state, profile, _) = testing::agent_auth(&pool, &spire, profile_toml, &[]);
+        let (state, _) = testing::agent_auth(&pool, &spire, profile_toml, &[]);
         Harness {
             spire,
             app: router(state.clone()),
             state,
-            _profile: profile,
         }
     }
 
