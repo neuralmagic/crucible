@@ -38,10 +38,9 @@ pull_secret = "quay-pull"
 image = "registry.example.com/crucible-kueue:latest"
 cluster = "dev"
 namespace = "crucible-system"
-tenant_namespace = "crucible-kueue-tenants"
 workload_namespace = "crucible-kueue-e2e"
-queues = ["crucible-e2e"]
-record_writers = ["crucible-system/crucible-hub-dispatch"]
+run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
+kube_authz = "openshift"
 "#;
 
 pub fn now() -> u64 {

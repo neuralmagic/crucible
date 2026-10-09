@@ -211,13 +211,11 @@ pull_secret = "quay-pull"
 image = "registry.example.com/crucible-kueue:latest"
 cluster = "dev"
 namespace = "crucible-system"
-tenant_namespace = "crucible-kueue-tenants"
 workload_namespace = "{}"
-queues = ["{}"]
-record_writers = ["crucible-system/crucible-hub-dispatch"]
-require_kube_user = true
+run_issuer = "{CONTROLLER}"
+kube_authz = "openshift"
 "#,
-            env.namespace, env.queue
+            env.namespace
         ),
     )
     .unwrap();

@@ -85,7 +85,6 @@ pub fn check_key_placement(
     ];
     if let Some(kueue) = &profile.kueue {
         shared.push(("kueue.namespace", kueue.namespace.as_str()));
-        shared.push(("kueue.tenant_namespace", kueue.tenant_namespace.as_str()));
         shared.push((
             "kueue.workload_namespace",
             kueue.workload_namespace.as_str(),
@@ -169,7 +168,6 @@ mod tests {
             ("crucible-system", "cluster.loop_namespace"),
             ("rig", "cluster.rig_namespace"),
             ("sandboxes", "cluster.sandbox_namespace"),
-            ("crucible-kueue-tenants", "kueue.tenant_namespace"),
             ("crucible-kueue-e2e", "kueue.workload_namespace"),
         ] {
             assert_eq!(

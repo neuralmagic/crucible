@@ -221,9 +221,9 @@ a server that sees it runs SubjectAccessReview as that user. It is learned from 
 exactly (filling an empty value only), or when a signed-in person links one with
 `PUT /api/me/kube-user` (`{"cluster_token": "<oc whoami -t>"}`). Another platform administrator
 can override it with `PUT /api/users/{login}/kube-user` (`{"kube_user": "<name>"}`, or `null` to
-clear it); the override is audited on `user:<login>`. `system:` identities are refused. With
-`[kueue] require_kube_user` (default `true`), a token carrying crucible-kueue scopes is refused
-when the username is unknown; other tokens are issued without the claim, logged at warn.
+clear it); the override is audited on `user:<login>`. `system:` identities are refused. crucible-kueue
+acts only as a token's `kube_user`, so a token carrying crucible-kueue scopes is refused when the
+username is unknown; other tokens are issued without the claim, logged at warn.
 
 | Variable | Meaning |
 | --- | --- |
@@ -246,7 +246,11 @@ them, so each sandbox's supervisor obtains its own token and injects it on traff
 alone; no token is minted per run and nothing is recorded.
 
 The deploy profile's `[kueue] workload_namespace` is the `namespace` claim for runs on its cluster;
-a run elsewhere gets none. A token's scopes are what its audience lists here. For example:
+a run elsewhere gets none. `[kueue] run_issuer` must equal `CONTROLLER_AGENT_ISSUER`: the rendered
+server trusts runs' tokens from it, fetching keys from `<run_issuer>/.well-known/jwks.json` unless
+`run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).
+`kube_authz` (`openshift` or `token`) is where the server takes a caller's groups for its
+SubjectAccessReviews. A token's scopes are what its audience lists here. For example:
 
 ```bash
 CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,http://host.openshell.internal:8849/mcp=buildit.read buildit.build"

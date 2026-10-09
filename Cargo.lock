@@ -2129,6 +2129,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "clap",
+ "crucible",
  "crucible-contract",
  "crucible-controller",
  "crucible-mcp-auth",

@@ -69,7 +69,11 @@ The server's identity gets get/list on `clusterqueues`, `resourceflavors`, and `
 cluster-wide; in the workload namespace only, get/list on `localqueues`, get/list/patch on
 `workloads`, get/list on `localqueues/pendingworkloads` in `visibility.kueue.x-k8s.io`,
 create/get/list/patch/delete on each submittable kind under its own API group, and get/list on pods, `pods/log`, and
-events. `--allowed-host` is set to the Service DNS name. The image is `Containerfile.kueue` at the repository root.
+events; cluster-wide it may also create `subjectaccessreviews` and, with `kube_authz = "openshift"`,
+list `groups.user.openshift.io`. The server trusts runs' tokens from `run_issuer` (the controller's
+`CONTROLLER_AGENT_ISSUER`) with keys from `run_jwks_uri` (default the issuer's
+`/.well-known/jwks.json`; a plain-http URI adds `--insecure-jwks-http`), and its `--resource` is
+its Service URL. `--allowed-host` is set to the Service DNS name. The image is `Containerfile.kueue` at the repository root.
 
 ## Test
 

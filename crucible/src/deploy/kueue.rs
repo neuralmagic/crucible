@@ -1,9 +1,9 @@
 //! Render the crucible-kueue MCP server from the profile's `[kueue]` table: its ServiceAccount,
-//! Deployment, and Service in `namespace`, the tenants namespace, and the RBAC that confines it.
-//! Namespaced workload verbs are bound only in `workload_namespace`; the tenants namespace grants
-//! the server read and only `record_writers` write.
+//! Deployment, and Service in `namespace`, and the RBAC that confines it. Namespaced workload verbs
+//! are bound only in `workload_namespace`; cluster-wide it reads queues and nodes and reviews its
+//! callers' access.
 
-use crate::deploy::profile::{DeployProfile, KueueCfg};
+use crate::deploy::profile::{DeployProfile, KubeAuthz, KueueCfg};
 use crate::deploy::render::{RenderOpts, pin_image};
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1 as apps;
@@ -22,7 +22,7 @@ const APP_LABEL: &str = "app.kubernetes.io/name";
 #[derive(Debug, thiserror::Error)]
 #[error(
     "rendering crucible-kueue needs a [kueue] table in the deploy profile (image, namespace, \
-     tenant_namespace, workload_namespace, record_writers)"
+     workload_namespace, run_issuer, kube_authz)"
 )]
 pub struct MissingKueueTable;
 
@@ -36,28 +36,17 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
         docs.push(doc.with_context(|| format!("serializing the crucible-kueue {what}"))?);
         Ok(())
     };
-    push("tenants Namespace", yaml(&tenant_namespace(cfg)))?;
     push("workload Namespace", yaml(&workload_namespace(cfg)))?;
     push("ServiceAccount", yaml(&service_account(cfg)))?;
-    push("Deployment", yaml(&deployment(cfg, &image, pull_secret)))?;
+    push("Deployment", yaml(&deployment(cfg, &image, pull_secret)?))?;
     push("Service", yaml(&service(cfg)))?;
-    push("cluster ClusterRole", yaml(&cluster_role()))?;
+    push("cluster ClusterRole", yaml(&cluster_role(cfg.kube_authz)))?;
     push(
         "cluster ClusterRoleBinding",
         yaml(&cluster_role_binding(cfg)),
     )?;
     push("workload ClusterRole", yaml(&workload_cluster_role()))?;
     push("workload RoleBinding", yaml(&workload_binding(cfg)))?;
-    push("tenant reader Role", yaml(&record_reader_role(cfg)))?;
-    push(
-        "tenant reader RoleBinding",
-        yaml(&record_reader_binding(cfg)),
-    )?;
-    push("tenant writer Role", yaml(&record_writer_role(cfg)))?;
-    push(
-        "tenant writer RoleBinding",
-        yaml(&record_writer_binding(cfg)),
-    )?;
     Ok(docs.join("---\n"))
 }
 
@@ -108,13 +97,6 @@ fn role_ref(kind: &str, name: &str) -> rbac::RoleRef {
     }
 }
 
-fn tenant_namespace(cfg: &KueueCfg) -> core::Namespace {
-    core::Namespace {
-        metadata: meta(cfg.tenant_namespace.as_str(), None),
-        ..Default::default()
-    }
-}
-
 /// Where agents' workloads run, under Pod Security `restricted`.
 fn workload_namespace(cfg: &KueueCfg) -> core::Namespace {
     let mut metadata = meta(cfg.workload_namespace.as_str(), None);
@@ -136,7 +118,29 @@ fn service_account(cfg: &KueueCfg) -> core::ServiceAccount {
     }
 }
 
-fn deployment(cfg: &KueueCfg, image: &str, pull_secret: &str) -> apps::Deployment {
+fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
+    let jwks = cfg
+        .run_jwks_uri()
+        .with_context(|| format!("deriving the key set URI of {}", cfg.run_issuer))?;
+    let mut args = vec![
+        "--bind".to_string(),
+        format!("0.0.0.0:{}", KueueCfg::PORT),
+        "--allowed-host".to_string(),
+        cfg.service_host(),
+        "--run-issuer".to_string(),
+        format!("{}={jwks}", cfg.run_issuer),
+        "--resource".to_string(),
+        cfg.url(),
+        "--kube-authz".to_string(),
+        cfg.kube_authz.as_str().to_string(),
+    ];
+    if jwks.scheme() == "http" {
+        args.push("--insecure-jwks-http".to_string());
+    }
+    Ok(args)
+}
+
+fn deployment(cfg: &KueueCfg, image: &str, pull_secret: &str) -> Result<apps::Deployment> {
     let probe = |initial: i32| core::Probe {
         http_get: Some(core::HTTPGetAction {
             path: Some("/healthz".to_string()),
@@ -156,14 +160,7 @@ fn deployment(cfg: &KueueCfg, image: &str, pull_secret: &str) -> apps::Deploymen
         name: NAME.to_string(),
         image: Some(image.to_string()),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        args: Some(vec![
-            "--bind".to_string(),
-            format!("0.0.0.0:{}", KueueCfg::PORT),
-            "--tenant-namespace".to_string(),
-            cfg.tenant_namespace.to_string(),
-            "--allowed-host".to_string(),
-            cfg.service_host(),
-        ]),
+        args: Some(args(cfg)?),
         env: Some(vec![env("RUST_LOG", "info".to_string())]),
         ports: Some(vec![core::ContainerPort {
             name: Some(PORT_NAME.to_string()),
@@ -195,7 +192,7 @@ fn deployment(cfg: &KueueCfg, image: &str, pull_secret: &str) -> apps::Deploymen
         }),
         ..Default::default()
     };
-    apps::Deployment {
+    Ok(apps::Deployment {
         metadata: meta(NAME, Some(cfg.namespace.as_str())),
         spec: Some(apps::DeploymentSpec {
             replicas: Some(1),
@@ -220,7 +217,7 @@ fn deployment(cfg: &KueueCfg, image: &str, pull_secret: &str) -> apps::Deploymen
             ..Default::default()
         }),
         ..Default::default()
-    }
+    })
 }
 
 fn service(cfg: &KueueCfg) -> core::Service {
@@ -245,18 +242,28 @@ const KUEUE_GROUP: &str = "kueue.x-k8s.io";
 const VISIBILITY_GROUP: &str = "visibility.kueue.x-k8s.io";
 const WORKLOAD_VERBS: &[&str] = &["create", "get", "list", "patch", "delete"];
 
-/// Cluster-scoped reads: queue capacity and hardware are cluster facts.
-fn cluster_role() -> rbac::ClusterRole {
+/// Cluster-scoped reads (queue capacity and hardware are cluster facts) and the reviews that
+/// decide each caller's access as its `kube_user`.
+fn cluster_role(authz: KubeAuthz) -> rbac::ClusterRole {
+    let mut rules = vec![
+        rule(
+            &[KUEUE_GROUP],
+            &["clusterqueues", "resourceflavors"],
+            &["get", "list"],
+        ),
+        rule(&[""], &["nodes"], &["get", "list"]),
+        rule(
+            &["authorization.k8s.io"],
+            &["subjectaccessreviews"],
+            &["create"],
+        ),
+    ];
+    if authz == KubeAuthz::Openshift {
+        rules.push(rule(&["user.openshift.io"], &["groups"], &["list"]));
+    }
     rbac::ClusterRole {
         metadata: meta(format!("{NAME}-cluster"), None),
-        rules: Some(vec![
-            rule(
-                &[KUEUE_GROUP],
-                &["clusterqueues", "resourceflavors"],
-                &["get", "list"],
-            ),
-            rule(&[""], &["nodes"], &["get", "list"]),
-        ]),
+        rules: Some(rules),
         ..Default::default()
     }
 }
@@ -306,66 +313,6 @@ fn workload_binding(cfg: &KueueCfg) -> rbac::RoleBinding {
     }
 }
 
-fn record_reader_role(cfg: &KueueCfg) -> rbac::Role {
-    rbac::Role {
-        metadata: meta(
-            format!("{NAME}-records-read"),
-            Some(cfg.tenant_namespace.as_str()),
-        ),
-        rules: Some(vec![rule(
-            &[""],
-            &["configmaps"],
-            &["get", "list", "watch"],
-        )]),
-    }
-}
-
-fn record_reader_binding(cfg: &KueueCfg) -> rbac::RoleBinding {
-    rbac::RoleBinding {
-        metadata: meta(
-            format!("{NAME}-records-read"),
-            Some(cfg.tenant_namespace.as_str()),
-        ),
-        role_ref: role_ref("Role", &format!("{NAME}-records-read")),
-        subjects: Some(vec![server_subject(cfg)]),
-    }
-}
-
-fn record_writer_role(cfg: &KueueCfg) -> rbac::Role {
-    rbac::Role {
-        metadata: meta(
-            format!("{NAME}-records-write"),
-            Some(cfg.tenant_namespace.as_str()),
-        ),
-        rules: Some(vec![rule(
-            &[""],
-            &["configmaps"],
-            &["create", "get", "list", "delete"],
-        )]),
-    }
-}
-
-fn record_writer_binding(cfg: &KueueCfg) -> rbac::RoleBinding {
-    rbac::RoleBinding {
-        metadata: meta(
-            format!("{NAME}-records-write"),
-            Some(cfg.tenant_namespace.as_str()),
-        ),
-        role_ref: role_ref("Role", &format!("{NAME}-records-write")),
-        subjects: Some(
-            cfg.record_writers
-                .iter()
-                .map(|sa| rbac::Subject {
-                    kind: "ServiceAccount".to_string(),
-                    name: sa.name.to_string(),
-                    namespace: Some(sa.namespace.to_string()),
-                    ..Default::default()
-                })
-                .collect(),
-        ),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crate::deploy::kueue::*;
@@ -384,10 +331,9 @@ mod tests {
         image = "registry.example.com/crucible-kueue:latest"
         cluster = "pirate"
         namespace = "crucible-system"
-        tenant_namespace = "crucible-kueue-tenants"
         workload_namespace = "crucible-kueue-e2e"
-        queues = ["crucible-e2e"]
-        record_writers = ["crucible-system/crucible-hub-dispatch"]
+        run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
+        kube_authz = "openshift"
     "#;
 
     fn profile(text: &str) -> DeployProfile {
@@ -407,26 +353,36 @@ mod tests {
             .unwrap_or_else(|| panic!("no {kind} {name}"))
     }
 
-    #[test]
-    fn the_server_accepts_its_service_dns_name_and_watches_the_tenants_namespace() {
-        let docs = docs(PROFILE);
-        let deploy = find(&docs, "Deployment", "crucible-kueue");
-        assert_eq!(deploy["metadata"]["namespace"], "crucible-system");
-        let args: Vec<&str> = deploy["spec"]["template"]["spec"]["containers"][0]["args"]
+    fn args(docs: &[serde_json::Value]) -> Vec<String> {
+        find(docs, "Deployment", "crucible-kueue")["spec"]["template"]["spec"]["containers"][0]
+            ["args"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|a| a.as_str().unwrap())
-            .collect();
+            .map(|a| a.as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn the_server_trusts_the_controllers_run_tokens_for_its_own_service_url() {
+        let docs = docs(PROFILE);
+        let deploy = find(&docs, "Deployment", "crucible-kueue");
+        assert_eq!(deploy["metadata"]["namespace"], "crucible-system");
         assert_eq!(
-            args,
+            args(&docs),
             [
                 "--bind",
                 "0.0.0.0:8850",
-                "--tenant-namespace",
-                "crucible-kueue-tenants",
                 "--allowed-host",
                 "crucible-kueue.crucible-system.svc.cluster.local",
+                "--run-issuer",
+                "http://crucible-controller.crucible-system.svc.cluster.local:8080=\
+                 http://crucible-controller.crucible-system.svc.cluster.local:8080/.well-known/jwks.json",
+                "--resource",
+                "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp",
+                "--kube-authz",
+                "openshift",
+                "--insecure-jwks-http",
             ]
         );
         assert_eq!(
@@ -440,7 +396,61 @@ mod tests {
             deploy["spec"]["template"]["metadata"]["labels"]
         );
         find(&docs, "ServiceAccount", "crucible-kueue");
-        find(&docs, "Namespace", "crucible-kueue-tenants");
+        assert_eq!(
+            docs.iter()
+                .filter(|d| d["kind"] == "Namespace")
+                .map(|d| d["metadata"]["name"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["crucible-kueue-e2e"]
+        );
+    }
+
+    #[test]
+    fn an_https_key_set_named_in_the_profile_needs_no_insecure_flag() {
+        let text = PROFILE.replace(
+            "kube_authz",
+            "run_jwks_uri = \"https://controller.example/.well-known/jwks.json\"\n        kube_authz",
+        );
+        let args = args(&docs(&text));
+        assert!(
+            args.contains(
+                &"http://crucible-controller.crucible-system.svc.cluster.local:8080=\
+              https://controller.example/.well-known/jwks.json"
+                    .to_string()
+            )
+        );
+        assert!(
+            !args.contains(&"--insecure-jwks-http".to_string()),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn the_server_reviews_access_and_reads_openshift_groups_only_when_told_to() {
+        let rules = |text: &str| {
+            let docs = docs(text);
+            find(&docs, "ClusterRole", "crucible-kueue-cluster")["rules"].clone()
+        };
+        let review = serde_json::json!({
+            "apiGroups": ["authorization.k8s.io"],
+            "resources": ["subjectaccessreviews"],
+            "verbs": ["create"],
+        });
+        let groups = serde_json::json!({
+            "apiGroups": ["user.openshift.io"],
+            "resources": ["groups"],
+            "verbs": ["list"],
+        });
+        let openshift = rules(PROFILE);
+        let openshift = openshift.as_array().unwrap();
+        assert!(openshift.contains(&review) && openshift.contains(&groups));
+        let token = rules(&PROFILE.replace("\"openshift\"", "\"token\""));
+        let token = token.as_array().unwrap();
+        assert!(token.contains(&review) && !token.contains(&groups));
+        assert!(
+            args(&docs(&PROFILE.replace("\"openshift\"", "\"token\"")))
+                .contains(&"token".to_string())
+        );
     }
 
     #[test]
@@ -465,13 +475,14 @@ mod tests {
             "workload verbs must never be bound cluster-wide"
         );
         let cluster = find(&docs, "ClusterRole", "crucible-kueue-cluster");
-        let verbs: Vec<&serde_json::Value> = cluster["rules"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .flat_map(|r| r["verbs"].as_array().unwrap())
-            .collect();
-        assert!(verbs.iter().all(|v| *v == "get" || *v == "list"));
+        for rule in cluster["rules"].as_array().unwrap() {
+            let verbs = rule["verbs"].as_array().unwrap();
+            assert!(
+                verbs.iter().all(|v| *v == "get" || *v == "list")
+                    || rule["resources"] == serde_json::json!(["subjectaccessreviews"]),
+                "cluster-wide, the server only reads and reviews: {rule}"
+            );
+        }
     }
 
     #[test]
@@ -517,22 +528,6 @@ mod tests {
     }
 
     #[test]
-    fn only_record_writers_may_write_tenant_records_and_the_server_only_reads_them() {
-        let docs = docs(PROFILE);
-        let writers = find(&docs, "RoleBinding", "crucible-kueue-records-write");
-        assert_eq!(writers["metadata"]["namespace"], "crucible-kueue-tenants");
-        assert_eq!(writers["subjects"][0]["name"], "crucible-hub-dispatch");
-        assert_eq!(writers["subjects"][0]["namespace"], "crucible-system");
-        let reader = find(&docs, "Role", "crucible-kueue-records-read");
-        assert_eq!(
-            reader["rules"][0]["verbs"],
-            serde_json::json!(["get", "list", "watch"])
-        );
-        let readers = find(&docs, "RoleBinding", "crucible-kueue-records-read");
-        assert_eq!(readers["subjects"][0]["name"], "crucible-kueue");
-    }
-
-    #[test]
     fn a_profile_without_kueue_refuses_to_render() {
         let without = PROFILE.split("[kueue]").next().unwrap();
         let err = render(&profile(without), &RenderOpts::default()).unwrap_err();
@@ -546,21 +541,19 @@ mod tests {
             .err()
             .expect("refused");
         assert!(err.to_string().contains("Not_A_Namespace"), "{err}");
-        let bad_sa = PROFILE.replace("crucible-system/crucible-hub-dispatch", "crucible-hub");
-        let err = toml::from_str::<DeployProfile>(&bad_sa)
+        let bad_authz = PROFILE.replace("\"openshift\"", "\"ldap\"");
+        let err = toml::from_str::<DeployProfile>(&bad_authz)
             .err()
             .expect("refused");
-        assert!(err.to_string().contains("namespace/name"), "{err}");
+        assert!(err.to_string().contains("ldap"), "{err}");
     }
 
     #[test]
-    fn defaults_scope_a_run_as_submitter_on_the_hub_for_a_day() {
+    fn the_server_defaults_to_the_hub() {
         let cfg = profile(PROFILE.replace("cluster = \"pirate\"\n", "").as_str())
             .kueue
             .unwrap();
         assert_eq!(cfg.cluster, "hub");
-        assert_eq!(cfg.role, crucible_contract::kueue::TenantRole::Submitter);
-        assert_eq!(cfg.token_ttl_secs, 86_400);
         assert_eq!(
             cfg.url(),
             "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp"
@@ -570,8 +563,8 @@ mod tests {
     #[test]
     fn the_service_host_follows_the_cluster_domain() {
         let text = PROFILE.replace(
-            "record_writers",
-            "cluster_domain = \"corp.example\"\n        record_writers",
+            "kube_authz",
+            "cluster_domain = \"corp.example\"\n        kube_authz",
         );
         let cfg = profile(&text).kueue.unwrap();
         assert_eq!(

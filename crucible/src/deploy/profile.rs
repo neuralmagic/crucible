@@ -129,9 +129,8 @@ impl TryFrom<String> for ServiceAccountRef {
     }
 }
 
-/// The `[kueue]` table. The controller mints a token for every run it dispatches onto `cluster`,
-/// scoped to `workload_namespace`, `role`, and `queues`, and records its digest in
-/// `tenant_namespace`, which must be a namespace no loop pod or pack can write ConfigMaps in.
+/// The `[kueue]` table. The server on `cluster` accepts runs' tokens from the controller's agent
+/// issuer and acts for each as its `kube_user`, as Kubernetes RBAC decides.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KueueCfg {
@@ -142,45 +141,26 @@ pub struct KueueCfg {
     pub cluster: String,
     /// Namespace of the server's Deployment, Service, and ServiceAccount.
     pub namespace: KubeName,
-    /// Namespace of the controller-written tenant records.
-    pub tenant_namespace: KubeName,
-    /// The one namespace each run's token may act in.
+    /// The namespace a run's token names as its default, and the only one where the server's own
+    /// account holds workload verbs.
     pub workload_namespace: KubeName,
-    /// LocalQueues a run may submit to; empty means every LocalQueue in `workload_namespace`.
+    /// The controller's agent token issuer (`CONTROLLER_AGENT_ISSUER`), compared exactly with a
+    /// token's `iss`.
+    pub run_issuer: String,
+    /// Where the server fetches the issuer's keys. Default `<run_issuer>/.well-known/jwks.json`;
+    /// a server that cannot reach the issuer's own address names a route here.
     #[serde(default)]
-    pub queues: Vec<KubeName>,
-    #[serde(default = "submitter")]
-    pub role: crucible_contract::kueue::TenantRole,
-    /// The controller's dispatch identity on `cluster`, the only writers of tenant records.
-    pub record_writers: Vec<ServiceAccountRef>,
-    /// How long a token authenticates when the run states no wall-clock ceiling.
-    #[serde(default = "default_token_ttl_secs")]
-    pub token_ttl_secs: u64,
+    pub run_jwks_uri: Option<url::Url>,
+    /// Where the server takes a caller's groups from for its SubjectAccessReviews.
+    pub kube_authz: KubeAuthz,
     /// The cluster's DNS domain. The sandbox proxy resolves names without the pod's search list,
     /// so the Service is addressed by its fully qualified name.
     #[serde(default = "default_cluster_domain")]
     pub cluster_domain: String,
-    /// Refuse a run's crucible-kueue-scoped agent token when its launcher has no known Kubernetes
-    /// username, so every run is bound by its launcher's RBAC. Off, such a token carries no
-    /// `kube_user` claim and is limited by its claims alone.
-    #[serde(default = "require_kube_user")]
-    pub require_kube_user: bool,
 }
 
 fn hub_cluster() -> String {
     "hub".to_string()
-}
-
-fn submitter() -> crucible_contract::kueue::TenantRole {
-    crucible_contract::kueue::TenantRole::Submitter
-}
-
-fn require_kube_user() -> bool {
-    true
-}
-
-fn default_token_ttl_secs() -> u64 {
-    24 * 60 * 60
 }
 
 fn default_cluster_domain() -> String {
@@ -204,6 +184,36 @@ impl KueueCfg {
     /// The MCP endpoint URL handed to the loop pod.
     pub fn url(&self) -> String {
         format!("http://{}:{}/mcp", self.service_host(), Self::PORT)
+    }
+
+    /// The issuer's key set URI: `run_jwks_uri`, or the issuer's own.
+    pub fn run_jwks_uri(&self) -> Result<url::Url, url::ParseError> {
+        match &self.run_jwks_uri {
+            Some(uri) => Ok(uri.clone()),
+            None => url::Url::parse(&format!(
+                "{}/.well-known/jwks.json",
+                self.run_issuer.trim_end_matches('/')
+            )),
+        }
+    }
+}
+
+/// The source of a caller's groups for crucible-kueue's SubjectAccessReviews (`--kube-authz`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KubeAuthz {
+    /// OpenShift Group objects.
+    Openshift,
+    /// The token's `kube_groups` claim.
+    Token,
+}
+
+impl KubeAuthz {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Openshift => "openshift",
+            Self::Token => "token",
+        }
     }
 }
 
@@ -722,8 +732,8 @@ impl DeployProfile {
     }
 
     /// Refuse namespaces that must be separate trust domains but coincide: the crucible-kueue
-    /// tenant records and workloads, and the sandbox namespace, each apart from where loop pods,
-    /// rigs, and the crucible-kueue server run, and from each other.
+    /// workload namespace and the sandbox namespace, each apart from where loop pods, rigs, and
+    /// the crucible-kueue server run, and from each other.
     pub fn check_namespaces(&self) -> Result<(), NamespaceOverlap> {
         let mut guarded: Vec<(&'static str, &str)> = Vec::new();
         let mut hosts: Vec<(&'static str, &str)> = vec![
@@ -735,7 +745,6 @@ impl DeployProfile {
         ];
         if let Some(kueue) = &self.kueue {
             hosts.push(("kueue.namespace", kueue.namespace.as_str()));
-            guarded.push(("kueue.tenant_namespace", kueue.tenant_namespace.as_str()));
             guarded.push((
                 "kueue.workload_namespace",
                 kueue.workload_namespace.as_str(),
@@ -1127,7 +1136,8 @@ mod tests {
             [kueue]
             image = "registry.example.com/crucible-kueue:latest"
             namespace = "kueue-server"
-            record_writers = ["loops/crucible-hub-dispatch"]
+            run_issuer = "http://crucible-controller.loops.svc:8080"
+            kube_authz = "openshift"
             {kueue_extra}
             "#
         ))
@@ -1138,8 +1148,7 @@ mod tests {
     fn separate_namespaces_pass_the_overlap_check() {
         kueue_profile(
             r#"sandbox_namespace = "sandboxes""#,
-            r#"tenant_namespace = "tenants"
-               workload_namespace = "workloads""#,
+            r#"workload_namespace = "workloads""#,
         )
         .check_namespaces()
         .expect("all distinct");
@@ -1150,22 +1159,7 @@ mod tests {
         let cases = [
             (
                 "",
-                "tenant_namespace = \"loops\"\nworkload_namespace = \"w\"",
-                ("kueue.tenant_namespace", "cluster.loop_namespace", "loops"),
-            ),
-            (
-                "",
-                "tenant_namespace = \"rig\"\nworkload_namespace = \"w\"",
-                ("kueue.tenant_namespace", "cluster.rig_namespace", "rig"),
-            ),
-            (
-                "",
-                "tenant_namespace = \"kueue-server\"\nworkload_namespace = \"w\"",
-                ("kueue.tenant_namespace", "kueue.namespace", "kueue-server"),
-            ),
-            (
-                "",
-                "tenant_namespace = \"t\"\nworkload_namespace = \"loops\"",
+                "workload_namespace = \"loops\"",
                 (
                     "kueue.workload_namespace",
                     "cluster.loop_namespace",
@@ -1174,12 +1168,21 @@ mod tests {
             ),
             (
                 "",
-                "tenant_namespace = \"same\"\nworkload_namespace = \"same\"",
-                ("kueue.tenant_namespace", "kueue.workload_namespace", "same"),
+                "workload_namespace = \"rig\"",
+                ("kueue.workload_namespace", "cluster.rig_namespace", "rig"),
+            ),
+            (
+                "",
+                "workload_namespace = \"kueue-server\"",
+                (
+                    "kueue.workload_namespace",
+                    "kueue.namespace",
+                    "kueue-server",
+                ),
             ),
             (
                 "sandbox_namespace = \"loops\"",
-                "tenant_namespace = \"t\"\nworkload_namespace = \"w\"",
+                "workload_namespace = \"w\"",
                 (
                     "cluster.sandbox_namespace",
                     "cluster.loop_namespace",
@@ -1188,7 +1191,7 @@ mod tests {
             ),
             (
                 "sandbox_namespace = \"w\"",
-                "tenant_namespace = \"t\"\nworkload_namespace = \"w\"",
+                "workload_namespace = \"w\"",
                 ("kueue.workload_namespace", "cluster.sandbox_namespace", "w"),
             ),
         ];

@@ -76,7 +76,7 @@ tokio-util = "0.7"
 jiff = { version = "0.2", features = ["serde"] }
 # Turn-trace span hints: parse a candidate URL to scrub `user:pass@` userinfo without hand-rolling
 # authority slicing.
-url = "2"
+url = { version = "2", features = ["serde"] }
 # Host-side temp staging: the 0600 upload files (env/prompt/mcp/cred) and the scratch dir the
 # sandbox transcript downloads into, both auto-unlinked on drop instead of a hand-rolled guard.
 tempfile = "3"

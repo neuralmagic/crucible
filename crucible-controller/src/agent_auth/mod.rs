@@ -264,22 +264,19 @@ async fn issue(
     let kube_user = crate::identity::kube_identity::effective(&state.pool, &launcher)
         .await
         .map_err(|e| OAuthError::Server(format!("{e:#}")))?;
-    let required = kueue.is_some_and(|k| k.require_kube_user)
-        && scopes.iter().any(|s| issuer::is_kueue_scope(s));
-    match (&kube_user, required) {
-        (None, true) => {
+    if kube_user.is_none() {
+        if scopes.iter().any(|s| issuer::is_kueue_scope(s)) {
             return Err(GrantError::NoKubeUser {
                 launcher: launcher.clone(),
             }
             .into());
         }
-        (None, false) => tracing::warn!(
+        tracing::warn!(
             launcher,
             sandbox = %sandbox.id,
             reason = "launcher has no known kubernetes username",
-            "agent token minted without kube_user; the run is limited by its claims alone"
-        ),
-        (Some(_), _) => {}
+            "agent token minted without kube_user"
+        );
     }
     let grant = AgentGrant {
         sandbox,
@@ -524,7 +521,7 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn an_unknown_kubernetes_username_refuses_kueue_tokens_unless_the_profile_waives_it(
+    async fn an_unknown_kubernetes_username_refuses_kueue_tokens_and_only_kueue_tokens(
         pool: PgPool,
     ) {
         bound_unlinked(&pool, "sbx-1").await;
@@ -534,7 +531,7 @@ mod tests {
         assert_eq!(
             (status, body["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("invalid_grant")),
-            "required by default: {body}"
+            "{body}"
         );
         let (status, _, body) =
             post(&strict.app, &form(&svid, &[("audience", testing::BUILDIT)])).await;
@@ -543,16 +540,6 @@ mod tests {
             StatusCode::OK,
             "a buildit token runs no SubjectAccessReview: {body}"
         );
-        assert!(claims_of(&body).get("kube_user").is_none());
-
-        let lenient = harness_with(
-            pool.clone(),
-            &format!("{PROFILE}require_kube_user = false\n"),
-        )
-        .await;
-        let svid = lenient.spire.svid(&Spire::claims("sbx-1"));
-        let (status, _, body) = post(&lenient.app, &form(&svid, &[])).await;
-        assert_eq!(status, StatusCode::OK, "{body}");
         assert!(claims_of(&body).get("kube_user").is_none());
 
         link(&pool, "alice-k8s").await;
