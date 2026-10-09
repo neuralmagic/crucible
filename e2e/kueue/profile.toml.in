@@ -11,6 +11,8 @@ sandbox_readers         = ["@CTL_NS@/crucible-controller"]
 sandbox_spiffe_socket   = "/spiffe-workload-api/spire-agent.sock"
 supervisor_image        = "@SUPERVISOR_IMAGE@"
 sandbox_driver          = "kubernetes"
+# The images are linux/amd64; the script lists every node of another architecture here.
+avoid_nodes             = [@AVOID_NODES@]
 
 [image]
 loop        = "@LOOP_IMAGE@"

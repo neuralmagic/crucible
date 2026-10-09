@@ -809,10 +809,17 @@ pub async fn ensure_running(
     access: &GatewayAccess,
 ) -> Result<Option<String>> {
     let _boot = BOOT.lock().await;
-    if !is_running(access).await {
-        match access {
-            GatewayAccess::Local => boot(driver, &DriverImages::from_env()).await?,
-            GatewayAccess::Remote { endpoint, .. } => await_remote(access, endpoint).await?,
+    match access {
+        GatewayAccess::Local => {
+            if !is_running(access).await {
+                boot(driver, &DriverImages::from_env()).await?;
+            }
+        }
+        GatewayAccess::Remote { endpoint, .. } => {
+            if !is_running(access).await {
+                await_remote(access, endpoint).await?;
+            }
+            register_remote(access, endpoint)?;
         }
     }
     check_gateway_version(access).await
@@ -836,19 +843,27 @@ async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
         }
         None => false,
     };
-    let pod_log = || format!("(the gateway runs in its own pod at {endpoint}; see that pod's log)");
     if !healthy {
         return Err(GatewayError::HealthTimeout {
             last_status: format!("no healthy answer from {endpoint}"),
-            log_tail: pod_log(),
+            log_tail: remote_log_hint(endpoint),
         }
         .into());
     }
+    Ok(())
+}
+
+fn remote_log_hint(endpoint: &str) -> String {
+    format!("(the gateway runs in its own pod at {endpoint}; see that pod's log)")
+}
+
+/// Register the CLI with a gateway running in its own pod, whose client material is mounted.
+fn register_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
     let staged = state_dir()?.join("remote-tls");
     stage_client_tls(&access.tls_dir()?, &staged)?;
     register_cli(endpoint, &staged)?.map_err(|last| GatewayError::RegisterTimeout {
         last,
-        log_tail: pod_log(),
+        log_tail: remote_log_hint(endpoint),
     })?;
     Ok(())
 }

@@ -87,6 +87,7 @@ TRUST_DOMAIN=$(kc get zerotrustworkloadidentitymanager cluster -o jsonpath='{.sp
 SVID_ISSUER=$(kc get spireoidcdiscoveryprovider cluster -o jsonpath='{.spec.jwtIssuer}')
 [ -n "$TRUST_DOMAIN" ] && [ -n "$SVID_ISSUER" ] || fail "no SPIRE trust domain or JWT issuer on the cluster"
 GATEWAY_PREFIX="spiffe://$TRUST_DOMAIN/openshell/gateway/"
+AVOID_NODES=$(kc get nodes -l 'kubernetes.io/arch!=amd64' -o json | jq -r '[.items[].metadata.name | "\"\(.)\""] | join(", ")')
 ISSUER="http://crucible-controller.$CTL_NS.svc.cluster.local:8080"
 KUEUE_URL="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp"
 log "launching as $LAUNCHER; SVIDs from $SVID_ISSUER under $GATEWAY_PREFIX"
@@ -98,7 +99,7 @@ fill() {
         -e "s|@CONTROLLER_IMAGE@|$CONTROLLER_IMAGE|g" -e "s|@SUPERVISOR_IMAGE@|$SUPERVISOR_IMAGE|g" \
         -e "s|@PULL_SECRET@|$PULL_SECRET|g" -e "s|@CTL_NS@|$CTL_NS|g" -e "s|@LOOP_NS@|$LOOP_NS|g" \
         -e "s|@SPIRE_NS@|$SPIRE_NS|g" -e "s|@ISSUER@|$ISSUER|g" -e "s|@KUEUE_URL@|$KUEUE_URL|g" \
-        -e "s|@LAUNCHER@|$LAUNCHER|g" \
+        -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
         -e "s|@AGENT_SPIRE@|hub=$SVID_ISSUER $GATEWAY_PREFIX $SPIRE_NS/$SPIRE_DISCOVERY|g" "$1"
 }
 fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
