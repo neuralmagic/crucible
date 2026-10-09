@@ -27,7 +27,8 @@
 #
 # LOOP_IMAGE is Containerfile.runtime-selfcontained built from this checkout, CONTROLLER_IMAGE is
 # Containerfile.controller-selfcontained on top of it, KUEUE_IMAGE is Containerfile.kueue.
-# SANDBOX_SCC_ROLE names a ClusterRole to bind the sandbox account to, where the cluster needs one.
+# SANDBOX_SCC_ROLE and LOOP_SCC_ROLE name ClusterRoles to bind the sandbox and loop accounts to,
+# where the cluster needs them (an SCC giving the loop pod a writable home, on OpenShift).
 # KEEP=1 leaves everything behind.
 set -euo pipefail
 
@@ -148,6 +149,10 @@ KUBECONFIG
 kc -n "$LOOP_NS" create configmap autoresearch-kubeconfig --from-file=kubeconfig="$WORK/kubeconfig" \
     --dry-run=client -o yaml | kc apply -f - >/dev/null
 kc -n "$SANDBOX_NS" create serviceaccount crucible-sandbox --dry-run=client -o yaml | kc apply -f - >/dev/null
+if [ -n "${LOOP_SCC_ROLE:-}" ]; then
+    kc -n "$LOOP_NS" create rolebinding crucible-kueue-e2e-loop-scc --clusterrole "$LOOP_SCC_ROLE" \
+        --serviceaccount "$LOOP_NS:crucible-kueue-e2e-loop" --dry-run=client -o yaml | kc apply -f - >/dev/null
+fi
 if [ -n "${SANDBOX_SCC_ROLE:-}" ]; then
     kc -n "$SANDBOX_NS" create rolebinding crucible-sandbox-scc --clusterrole "$SANDBOX_SCC_ROLE" \
         --serviceaccount "$SANDBOX_NS:crucible-sandbox" --dry-run=client -o yaml | kc apply -f - >/dev/null
