@@ -4,8 +4,10 @@
 //!
 //! ```text
 //!  run pod ──POST /api/pods/{pod}/sandboxes (pod-bound SA token)──▶ run_sandboxes
-//!  supervisor ──POST /oauth/token, client_assertion=<JWT-SVID>──▶ verify SVID (SPIRE JWKS)
+//!  supervisor ──POST /oauth/token, client_assertion=<JWT-SVID>──▶ verify SVID (its cluster's
+//!                                                                   SPIRE, via the API server)
 //!                                                                   resolve sandbox → live run
+//!                                                                   on that same cluster
 //!                                                    ◀── ES256 token: sub=launcher, act.sub=SVID
 //!  MCP server ──GET /.well-known/jwks.json──▶ verifies the token
 //! ```
@@ -17,6 +19,7 @@ pub mod bindings;
 pub mod directory;
 pub mod issuer;
 pub mod placement;
+pub mod spire;
 #[cfg(test)]
 mod testing;
 
@@ -34,8 +37,8 @@ use std::sync::Arc;
 pub struct AgentAuth {
     pub issuer: AgentIssuer,
     pub pool: PgPool,
-    /// The deploy profile naming the sandbox namespace and, in `[kueue]`, a run's tenant claims,
-    /// read once at startup.
+    /// The deploy profile naming the sandbox namespace and, in `[kueue]`, a run's default
+    /// namespace, read once at startup.
     pub profile: crucible::deploy::DeployProfile,
     pub directory: Arc<dyn directory::SandboxDirectory>,
 }
@@ -57,17 +60,21 @@ impl AgentAuth {
         let profile = crucible::deploy::DeployProfile::load(profile_path)
             .context("reading the deploy profile for the agent issuer")?;
         placement::check_key_placement(placement::controller_namespace().as_deref(), &profile)?;
-        let http = cfg.svid_http().context("building the SPIRE JWKS client")?;
-        let jwks = crucible_mcp_auth::jwks::Jwks::new(http, cfg.svid_jwks_uri.clone());
         tracing::info!(
             issuer = cfg.issuer.as_str(),
             kid = cfg.signing_key.kid(),
-            svid_issuer = cfg.svid_issuer,
+            spire = ?cfg.spire.iter().map(|s| (s.cluster.as_str(), s.svid_issuer.as_str())).collect::<Vec<_>>(),
             audiences = ?cfg.audiences.iter().map(|a| a.resource.as_str()).collect::<Vec<_>>(),
             "issuing agent access tokens"
         );
+        let keys = |entry: &issuer::ClusterSpire| {
+            crucible_mcp_auth::jwks::Jwks::from_source(Arc::new(spire::ProxyKeys::new(
+                clusters.clone(),
+                entry,
+            )))
+        };
         Ok(Some(Arc::new(Self {
-            issuer: AgentIssuer::new(cfg, jwks),
+            issuer: AgentIssuer::new(cfg, keys),
             pool,
             profile,
             directory: Arc::new(directory::KubeDirectory(clusters)),
@@ -185,9 +192,9 @@ impl From<GrantError> for OAuthError {
                 Self::InvalidTarget(e.to_string())
             }
             GrantError::Scope { .. } => Self::InvalidScope(e.to_string()),
-            GrantError::NoLauncher { .. } | GrantError::NoKubeUser { .. } => {
-                Self::InvalidGrant(e.to_string())
-            }
+            GrantError::NoLauncher { .. }
+            | GrantError::NoKubeUser { .. }
+            | GrantError::WrongCluster { .. } => Self::InvalidGrant(e.to_string()),
         }
     }
 }
@@ -250,6 +257,14 @@ async fn issue(
             bindings::ResolveError::Db(_) => OAuthError::Server(format!("{e:#}")),
             e => OAuthError::InvalidGrant(e.to_string()),
         })?;
+    if run.cluster != sandbox.cluster {
+        return Err(GrantError::WrongCluster {
+            sandbox: sandbox.id.to_string(),
+            spire: sandbox.cluster.clone(),
+            run: run.cluster.clone(),
+        }
+        .into());
+    }
     let expected = issuer::GatewayId::of_run_pod(&run.pod_name);
     if sandbox.gateway != expected {
         return Err(OAuthError::InvalidGrant(format!(
@@ -941,6 +956,25 @@ mod tests {
         assert_eq!(
             (status, body["error"].as_str()),
             (StatusCode::BAD_REQUEST, Some("invalid_grant"))
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_run_on_another_cluster_than_the_svids_spire_gets_no_token(pool: PgPool) {
+        bound(&pool, "sbx-1").await;
+        let h = harness(pool.clone()).await;
+        let svid = h.spire.svid(&Spire::claims("sbx-1"));
+        assert_eq!(post(&h.app, &form(&svid, &[])).await.0, StatusCode::OK);
+        sqlx::query("UPDATE work_pods SET cluster = 'elsewhere' WHERE pod_name = $1")
+            .bind(POD)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            "{body}"
         );
     }
 

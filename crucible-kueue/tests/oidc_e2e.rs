@@ -19,7 +19,7 @@
 use base64::Engine;
 use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
 use crucible_controller::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, GatewayPrefix, IssuerUrl, SigningKey,
+    AgentIssuer, AgentIssuerConfig, IssuerUrl, SigningKey,
 };
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
 use crucible_mcp_auth::jwks::Jwks;
@@ -224,22 +224,30 @@ kube_authz = "openshift"
         signing_key: SigningKey::from_pem(signing_key_pem().as_bytes()).unwrap(),
         previous_key: None,
         token_ttl: Default::default(),
-        svid_issuer: cluster::spire(),
-        svid_jwks_uri: Url::parse(&format!("{}/keys", cluster::spire())).unwrap(),
-        svid_ca: None,
-        gateway_prefix: GatewayPrefix::parse(&gateway_prefix()).unwrap(),
+        spire: vec![
+            format!(
+                "dev={} {} spire/oidc-discovery:443",
+                cluster::spire(),
+                gateway_prefix()
+            )
+            .parse()
+            .unwrap(),
+        ],
         audiences: vec![
             format!("{RESOURCE}=kueue.read kueue.submit")
                 .parse()
                 .unwrap(),
         ],
     };
-    let jwks = Jwks::new(
-        cluster::routes_http(cluster::ingress_ip()),
-        cfg.svid_jwks_uri.clone(),
-    );
+    let jwks_uri = Url::parse(&format!("{}/keys", cluster::spire())).unwrap();
+    let keys = |_: &_| {
+        Jwks::new(
+            cluster::routes_http(cluster::ingress_ip()),
+            jwks_uri.clone(),
+        )
+    };
     let state = Arc::new(AgentAuth {
-        issuer: AgentIssuer::new(cfg, jwks),
+        issuer: AgentIssuer::new(cfg, keys),
         pool: pool.clone(),
         profile: crucible_controller::agent_auth::placement::load_profile(Some(&profile))
             .await

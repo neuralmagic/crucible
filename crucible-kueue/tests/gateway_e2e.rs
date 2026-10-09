@@ -12,6 +12,8 @@
 //!     namespace> CRUCIBLE_GATEWAY_E2E_CLUSTER=<the profile's [kueue] cluster>
 //!   CRUCIBLE_GATEWAY_E2E_PROFILE=<isolated deploy profile> CRUCIBLE_GATEWAY_E2E_DATABASE_URL=<url>
 //!   CRUCIBLE_GATEWAY_E2E_SPIRE_AGENT_IMAGE=<spire-agent image>
+//!   CRUCIBLE_GATEWAY_E2E_SPIRE_DISCOVERY=<namespace>/<service>:<port> of SPIRE's OIDC discovery
+//!     provider, whose keys the controller reads through the API server's Service proxy
 //!   CRUCIBLE_GATEWAY_E2E_KUBE_USER=<Kubernetes user the run's launcher acts as> \
 //!   cargo test -p crucible-kueue --test gateway_e2e -- --ignored --nocapture --test-threads=1
 
@@ -21,8 +23,9 @@ use crucible_controller::PodDispatcher;
 use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
 use crucible_controller::agent_auth::directory::{KubeDirectory, SandboxDirectory};
 use crucible_controller::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, GatewayPrefix, IssuerUrl, SigningKey,
+    AgentIssuer, AgentIssuerConfig, ClusterSpire, IssuerUrl, SigningKey,
 };
+use crucible_controller::agent_auth::spire::ProxyKeys;
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
 use crucible_controller::runs::clusters::ClusterClients;
 use crucible_controller::runs::workpod::gateway::{RunGateway, teardown};
@@ -64,6 +67,7 @@ struct Env {
     profile: std::path::PathBuf,
     database_url: String,
     spire_agent_image: String,
+    spire_discovery: String,
     kube_user: String,
 }
 
@@ -77,6 +81,7 @@ fn env() -> Env {
         profile: var("CRUCIBLE_GATEWAY_E2E_PROFILE").into(),
         database_url: var("CRUCIBLE_GATEWAY_E2E_DATABASE_URL"),
         spire_agent_image: var("CRUCIBLE_GATEWAY_E2E_SPIRE_AGENT_IMAGE"),
+        spire_discovery: var("CRUCIBLE_GATEWAY_E2E_SPIRE_DISCOVERY"),
         kube_user: var("CRUCIBLE_GATEWAY_E2E_KUBE_USER"),
     }
 }
@@ -360,33 +365,36 @@ fn claims(token: &str) -> Value {
 
 async fn serve_controller(
     pool: &sqlx::PgPool,
-    profile: &std::path::Path,
+    env: &Env,
     gateway_prefix: &str,
     clusters: Arc<ClusterClients>,
 ) -> String {
+    let spire: ClusterSpire = format!(
+        "{}={} {gateway_prefix} {}",
+        env.cluster,
+        cluster::spire(),
+        env.spire_discovery
+    )
+    .parse()
+    .unwrap();
     let cfg = AgentIssuerConfig {
         issuer: IssuerUrl::parse(CONTROLLER).unwrap(),
         signing_key: SigningKey::from_pem(signing_key_pem().as_bytes()).unwrap(),
         previous_key: None,
         token_ttl: Default::default(),
-        svid_issuer: cluster::spire(),
-        svid_jwks_uri: Url::parse(&format!("{}/keys", cluster::spire())).unwrap(),
-        svid_ca: None,
-        gateway_prefix: GatewayPrefix::parse(gateway_prefix).unwrap(),
+        spire: vec![spire],
         audiences: vec![
             format!("{RESOURCE}=kueue.read kueue.submit")
                 .parse()
                 .unwrap(),
         ],
     };
-    let jwks = Jwks::new(
-        cluster::routes_http(cluster::ingress_ip()),
-        cfg.svid_jwks_uri.clone(),
-    );
+    let keys =
+        |entry: &ClusterSpire| Jwks::from_source(Arc::new(ProxyKeys::new(clusters.clone(), entry)));
     let state = Arc::new(AgentAuth {
-        issuer: AgentIssuer::new(cfg, jwks),
+        issuer: AgentIssuer::new(cfg, keys),
         pool: pool.clone(),
-        profile: crucible_controller::agent_auth::placement::load_profile(Some(profile))
+        profile: crucible_controller::agent_auth::placement::load_profile(Some(&env.profile))
             .await
             .unwrap()
             .unwrap(),
@@ -649,7 +657,7 @@ async fn scenario() {
     assert!(spiffe_id.ends_with(&suffix), "{spiffe_id}");
     let gateway_prefix = spiffe_id.trim_end_matches(&format!("{RUN_POD}/sandbox/{sandbox_id}"));
 
-    let controller = serve_controller(&pool, &env.profile, gateway_prefix, clusters.clone()).await;
+    let controller = serve_controller(&pool, &env, gateway_prefix, clusters.clone()).await;
     let directory = KubeDirectory(clusters.clone());
     let id = SandboxId::parse(&sandbox_id).unwrap();
     let name = directory

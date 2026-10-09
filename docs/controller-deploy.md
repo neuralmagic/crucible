@@ -164,8 +164,12 @@ ClusterSPIFFEID to the sandbox namespace and build the ID from that label and th
 spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/gateway/{{ index .PodMeta.Labels "openshell.ai/gateway-id" }}/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
 ```
 
-`CONTROLLER_AGENT_GATEWAY_PREFIX` is everything before the gateway id
-(`spiffe://<trust domain>/openshell/gateway/`).
+Each cluster's `CONTROLLER_AGENT_SPIRE` entry names its gateway prefix, everything before the
+gateway id (`spiffe://<trust domain>/openshell/gateway/`). The controller reads that SPIRE's
+keys from its OIDC discovery provider through the cluster's API server Service proxy, with the
+same client it dispatches with, so its identity on each cluster needs `get` on `services/proxy`
+in SPIRE's namespace. The `iss` of an SVID picks the cluster whose keys verify it, and a token is
+issued only when the sandbox's run is on that cluster.
 
 The engine binds each sandbox it creates by posting its id and workdir to
 `/api/pods/{pod}/sandboxes` with the pod's ingest token, so the drop-box env
@@ -232,11 +236,7 @@ username is unknown; other tokens are issued without the claim, logged at warn.
 | `CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE` | Optional: the key before a rotation. It is published in the JWKS beside the current key, so tokens it signed keep verifying until they expire; nothing new is signed with it. Rotate by moving the current key here and mounting a new one, then drop this after one token lifetime. |
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | Agent token lifetime, 900 to 1800 seconds. Default 900. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | Where sandbox supervisors reach the token endpoint when not at the issuer itself (a spoke reaching the controller through a route). Default `<issuer>/oauth/token`. |
-| `CONTROLLER_AGENT_SVID_ISSUER` | SPIRE's OIDC discovery issuer, the `iss` of every JWT-SVID. SVIDs must carry `iat` and live at most 15 minutes. |
-| `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. It must be `https://` unless its host is loopback, since whoever answers that fetch can mint agent tokens. |
-| `CONTROLLER_AGENT_SVID_CA_FILE` | Optional PEM bundle trusted for that fetch (the service CA for an `https://*.svc` endpoint). |
-| `CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP` | `true` accepts a plain-http JWKS URI on a non-loopback host, logged at warn. Default `false`. |
-| `CONTROLLER_AGENT_GATEWAY_PREFIX` | The SPIFFE ID path before the gateway id, ending in `/`: `spiffe://<trust domain>/openshell/gateway/`. Supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`. |
+| `CONTROLLER_AGENT_SPIRE` | Comma-separated `<cluster>=<svid issuer> <gateway prefix> <namespace>/<service>:<port>` entries, one per cluster hosting isolated gateways (`hub` for the controller's own): the `iss` of that SPIRE's JWT-SVIDs, its gateway prefix (`spiffe://<trust domain>/openshell/gateway/`; supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`), and its OIDC discovery provider Service, whose `/keys` is read through that cluster's API server. Each cluster and each issuer appears once. SVIDs must carry `iat` and live at most 15 minutes. |
 | `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
 
 A run dispatched onto the `[kueue]` cluster gets the server's URL (`CRUCIBLE_KUEUE_URL`), the

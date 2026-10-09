@@ -4,7 +4,7 @@
 
 use crate::agent_auth::bindings::{Binding, SandboxId};
 use crate::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, GatewayPrefix, IssuerUrl, SigningKey,
+    AgentIssuer, AgentIssuerConfig, ClusterSpire, IssuerUrl, SigningKey,
 };
 use base64::Engine;
 use crucible_mcp_auth::jwks::Jwks;
@@ -143,16 +143,13 @@ pub fn sign(key: &EcKey, kid: &str, claims: &Value) -> String {
     jsonwebtoken::encode(&header, claims, &key.encoding()).unwrap()
 }
 
-pub fn config(spire: &Spire, signing: &EcKey) -> AgentIssuerConfig {
+pub fn config(signing: &EcKey) -> AgentIssuerConfig {
     AgentIssuerConfig {
         issuer: IssuerUrl::parse(ISSUER).unwrap(),
         signing_key: SigningKey::from_pem(signing.pem().as_bytes()).unwrap(),
         previous_key: None,
         token_ttl: Default::default(),
-        svid_issuer: SVID_ISSUER.to_string(),
-        svid_jwks_uri: spire.jwks_uri.clone(),
-        svid_ca: None,
-        gateway_prefix: GatewayPrefix::parse(PREFIX).unwrap(),
+        spire: vec![cluster_spire()],
         audiences: vec![
             format!("{KUEUE}=kueue.read kueue.submit").parse().unwrap(),
             format!("{BUILDIT}=buildit.read buildit.build")
@@ -162,11 +159,18 @@ pub fn config(spire: &Spire, signing: &EcKey) -> AgentIssuerConfig {
     }
 }
 
+/// [`CLUSTER`]'s SPIRE, issuing as [`SVID_ISSUER`] under [`PREFIX`].
+pub fn cluster_spire() -> ClusterSpire {
+    format!("{CLUSTER}={SVID_ISSUER} {PREFIX} spire/oidc-discovery:443")
+        .parse()
+        .unwrap()
+}
+
+/// An issuer trusting [`CLUSTER`]'s SPIRE, whose keys `spire` serves.
 pub fn issuer(spire: &Spire, signing: &EcKey) -> AgentIssuer {
-    AgentIssuer::new(
-        config(spire, signing),
-        Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone()),
-    )
+    AgentIssuer::new(config(signing), |_| {
+        Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+    })
 }
 
 /// A running run pod on [`CLUSTER`] with its run row, attributed to `attributed_to`.

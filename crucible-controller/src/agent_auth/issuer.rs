@@ -1,14 +1,14 @@
 //! Agent access tokens. The controller verifies a sandbox supervisor's SPIRE JWT-SVID, and for a
 //! sandbox bound to a live run mints a short-lived ES256 token naming the run's launcher as `sub`
 //! and the sandbox as `act.sub`. Nothing in the request beyond the verified SVID, the audience
-//! (checked against an allowlist), and the scope (narrowed to what the run's role grants) reaches
-//! the claims.
+//! (checked against an allowlist), and the scope (narrowed to what the audience lists) reaches the
+//! claims.
 
 use crate::agent_auth::bindings::{BoundRun, SandboxId, SandboxIdError};
-use crucible::deploy::profile::KueueCfg;
+use crucible::deploy::profile::{KubeName, KueueCfg};
 use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
 use crucible_mcp_auth::jwks::Jwks;
-use crucible_mcp_auth::verify::{TokenError, Verifier};
+use crucible_mcp_auth::verify::{TokenError, Verifier, unverified_issuer};
 use jsonwebtoken::jwk::{Jwk, JwkSet, PublicKeyUse, ThumbprintHash};
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
@@ -49,18 +49,19 @@ pub enum ConfigError {
          so its metadata sits at /.well-known/oauth-authorization-server"
     )]
     IssuerShape(String),
-    #[error("CONTROLLER_AGENT_GATEWAY_PREFIX {0:?} must be a spiffe:// URI ending in /")]
+    #[error("gateway prefix {0:?} must be a spiffe:// URI ending in /")]
     Prefix(String),
     #[error("CONTROLLER_AGENT_AUDIENCES names no MCP resource")]
     NoAudiences,
+    #[error("CONTROLLER_AGENT_SPIRE names no cluster's SPIRE")]
+    NoSpire,
     #[error(
-        "CONTROLLER_AGENT_SVID_JWKS_URI {0} is plain http to a non-loopback host; whoever answers \
-         that fetch can mint agent tokens. Serve it over https (trusting a private CA with \
-         CONTROLLER_AGENT_SVID_CA_FILE) or set CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP=true"
+        "CONTROLLER_AGENT_SPIRE entry {0:?} is not \
+         <cluster>=<svid issuer> <gateway prefix> <namespace>/<service>:<port>"
     )]
-    InsecureJwks(Url),
-    #[error("CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP {0:?} is not true or false")]
-    InsecureFlag(String),
+    SpireEntry(String),
+    #[error("CONTROLLER_AGENT_SPIRE names {0:?} twice; each cluster and each SVID issuer once")]
+    SpireTwice(String),
     #[error(
         "CONTROLLER_AGENT_TOKEN_TTL_SECS {0:?} is not a number of seconds from \
          {MIN_TOKEN_TTL_SECS} to {MAX_TOKEN_TTL_SECS}"
@@ -160,6 +161,67 @@ impl fmt::Debug for SigningKey {
     }
 }
 
+/// A cluster's SPIRE OIDC discovery provider Service. Its key set is read through that cluster's
+/// API server Service proxy with the controller's own client for the cluster, so it needs no
+/// route of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveryService {
+    pub namespace: KubeName,
+    pub name: KubeName,
+    pub port: u16,
+}
+
+impl DiscoveryService {
+    /// The API server path of the provider's JWKS.
+    pub fn keys_path(&self) -> String {
+        format!(
+            "/api/v1/namespaces/{}/services/https:{}:{}/proxy/keys",
+            self.namespace, self.name, self.port
+        )
+    }
+}
+
+/// One cluster's SPIRE, trusted for the SVIDs of sandboxes whose runs it hosts:
+/// `<cluster>=<svid issuer> <gateway prefix> <namespace>/<service>:<port>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterSpire {
+    pub cluster: String,
+    /// The `iss` of its JWT-SVIDs, compared as an exact string.
+    pub svid_issuer: String,
+    /// `spiffe://<its trust domain>/openshell/gateway/`.
+    pub gateway_prefix: GatewayPrefix,
+    pub discovery: DiscoveryService,
+}
+
+impl std::str::FromStr for ClusterSpire {
+    type Err = ConfigError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let bad = || ConfigError::SpireEntry(raw.to_string());
+        let (cluster, rest) = raw.split_once('=').ok_or_else(bad)?;
+        let [issuer, prefix, service] = rest.split_whitespace().collect::<Vec<_>>()[..] else {
+            return Err(bad());
+        };
+        let (namespace, name_port) = service.split_once('/').ok_or_else(bad)?;
+        let (name, port) = name_port.split_once(':').ok_or_else(bad)?;
+        let kube_name = |v: &str| KubeName::try_from(v.to_string()).map_err(|_| bad());
+        let cluster = cluster.trim();
+        if cluster.is_empty() || issuer.is_empty() {
+            return Err(bad());
+        }
+        Ok(Self {
+            cluster: cluster.to_string(),
+            svid_issuer: issuer.to_string(),
+            gateway_prefix: GatewayPrefix::parse(prefix)?,
+            discovery: DiscoveryService {
+                namespace: kube_name(namespace)?,
+                name: kube_name(name)?,
+                port: port.parse().map_err(|_| bad())?,
+            },
+        })
+    }
+}
+
 /// An MCP resource a token may be minted for, and the scopes a token for it may carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Audience {
@@ -228,13 +290,8 @@ pub struct AgentIssuerConfig {
     /// it signed verify until they expire.
     pub previous_key: Option<SigningKey>,
     pub token_ttl: TokenTtl,
-    /// SPIRE's OIDC discovery issuer: the `iss` of every JWT-SVID.
-    pub svid_issuer: String,
-    pub svid_jwks_uri: Url,
-    /// A PEM bundle trusted for the SVID JWKS fetch on top of the system roots (OpenShift's
-    /// service CA for an in-cluster `https://*.svc` endpoint).
-    pub svid_ca: Option<Vec<u8>>,
-    pub gateway_prefix: GatewayPrefix,
+    /// Each cluster's SPIRE, by cluster and by SVID issuer unique.
+    pub spire: Vec<ClusterSpire>,
     /// The MCP resources a token may be minted for.
     pub audiences: Vec<Audience>,
 }
@@ -267,23 +324,22 @@ impl AgentIssuerConfig {
             .map(|raw| raw.parse())
             .transpose()?
             .unwrap_or_default();
-        let jwks_raw = need("CONTROLLER_AGENT_SVID_JWKS_URI")?;
-        let svid_jwks_uri = Url::parse(&jwks_raw).map_err(|source| ConfigError::Url {
-            var: "CONTROLLER_AGENT_SVID_JWKS_URI",
-            value: jwks_raw,
-            source,
-        })?;
-        let insecure_http = match get("CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP").as_deref() {
-            None | Some("false") => false,
-            Some("true") => true,
-            Some(other) => return Err(ConfigError::InsecureFlag(other.to_string())),
-        };
-        if svid_jwks_uri.scheme() != "https" && !is_loopback(&svid_jwks_uri) {
-            if !insecure_http {
-                return Err(ConfigError::InsecureJwks(svid_jwks_uri));
+        let spire: Vec<ClusterSpire> = need("CONTROLLER_AGENT_SPIRE")?
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(str::parse)
+            .collect::<Result<_, _>>()?;
+        if spire.is_empty() {
+            return Err(ConfigError::NoSpire);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &spire {
+            for key in [&entry.cluster, &entry.svid_issuer] {
+                if !seen.insert(key.as_str()) {
+                    return Err(ConfigError::SpireTwice(key.clone()));
+                }
             }
-            tracing::warn!(jwks_uri = %svid_jwks_uri,
-                "fetching SPIRE's keys over plain http: anyone on that path can mint agent tokens");
         }
         let audiences: Vec<Audience> = need("CONTROLLER_AGENT_AUDIENCES")?
             .split(',')
@@ -299,36 +355,9 @@ impl AgentIssuerConfig {
             signing_key,
             previous_key,
             token_ttl,
-            svid_issuer: need("CONTROLLER_AGENT_SVID_ISSUER")?,
-            svid_jwks_uri,
-            svid_ca: get("CONTROLLER_AGENT_SVID_CA_FILE").map(read).transpose()?,
-            gateway_prefix: GatewayPrefix::parse(&need("CONTROLLER_AGENT_GATEWAY_PREFIX")?)?,
+            spire,
             audiences,
         }))
-    }
-
-    /// The client the SVID JWKS is fetched with: bounded timeouts, no redirects, plus the
-    /// configured CA bundle.
-    pub fn svid_http(&self) -> Result<reqwest::Client, reqwest::Error> {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .timeout(std::time::Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none());
-        if let Some(pem) = &self.svid_ca {
-            for cert in reqwest::Certificate::from_pem_bundle(pem)? {
-                builder = builder.add_root_certificate(cert);
-            }
-        }
-        builder.build()
-    }
-}
-
-fn is_loopback(url: &Url) -> bool {
-    match url.host() {
-        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-        None => false,
     }
 }
 
@@ -336,6 +365,8 @@ fn is_loopback(url: &Url) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sandbox {
     pub spiffe_id: String,
+    /// The cluster whose SPIRE issued the SVID.
+    pub cluster: String,
     /// The gateway that created the supervisor's pod.
     pub gateway: GatewayId,
     pub id: SandboxId,
@@ -385,6 +416,8 @@ impl fmt::Display for GatewayId {
 pub enum AssertionError {
     #[error(transparent)]
     Token(#[from] TokenError),
+    #[error("assertion iss {0:?} is no trusted cluster's SPIRE")]
+    UnknownSpire(String),
     #[error("assertion aud must be exactly [{expected:?}], got {got}")]
     Audience { expected: String, got: Value },
     #[error("assertion sub {sub:?} is not <gateway>/sandbox/<id> under {prefix}")]
@@ -423,6 +456,15 @@ pub enum GrantError {
          link it with PUT /api/me/kube-user or have an administrator set it"
     )]
     NoKubeUser { launcher: String },
+    #[error(
+        "the SVID comes from cluster {spire}'s SPIRE, but sandbox {sandbox} is bound to a run on \
+         {run}"
+    )]
+    WrongCluster {
+        sandbox: String,
+        spire: String,
+        run: String,
+    },
     #[error(
         "run {run_id} was dispatched for {dispatched_by:?}, not a person, so it has no launcher"
     )]
@@ -533,20 +575,36 @@ pub struct AgentIssuer {
     key: SigningKey,
     previous_key: Option<SigningKey>,
     ttl: TokenTtl,
-    svids: Verifier,
-    gateway_prefix: GatewayPrefix,
+    spire: Vec<TrustedSpire>,
     audiences: Vec<Audience>,
 }
 
+struct TrustedSpire {
+    cluster: String,
+    svid_issuer: String,
+    gateway_prefix: GatewayPrefix,
+    svids: Verifier,
+}
+
 impl AgentIssuer {
-    pub fn new(cfg: AgentIssuerConfig, svid_jwks: Jwks) -> Self {
+    /// `keys` gives each cluster's SPIRE key set.
+    pub fn new(cfg: AgentIssuerConfig, keys: impl Fn(&ClusterSpire) -> Jwks) -> Self {
+        let spire = cfg
+            .spire
+            .iter()
+            .map(|entry| TrustedSpire {
+                cluster: entry.cluster.clone(),
+                svid_issuer: entry.svid_issuer.clone(),
+                gateway_prefix: entry.gateway_prefix.clone(),
+                svids: Verifier::new(entry.svid_issuer.clone(), keys(entry)),
+            })
+            .collect();
         Self {
-            svids: Verifier::new(cfg.svid_issuer, svid_jwks),
+            spire,
             issuer: cfg.issuer,
             key: cfg.signing_key,
             previous_key: cfg.previous_key,
             ttl: cfg.token_ttl,
-            gateway_prefix: cfg.gateway_prefix,
             audiences: cfg.audiences,
         }
     }
@@ -555,12 +613,18 @@ impl AgentIssuer {
         &self.issuer
     }
 
-    /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against SPIRE's
-    /// keys, carry exactly one `aud` equal to this issuer, and name a SPIFFE ID
-    /// `<gateway prefix><gateway id>/sandbox/<sandbox id>`.
+    /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against the keys
+    /// of the cluster SPIRE its `iss` names, carry exactly one `aud` equal to this issuer, and
+    /// name a SPIFFE ID `<that cluster's gateway prefix><gateway id>/sandbox/<sandbox id>`.
     pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
         let issuer = self.issuer.as_str();
-        let claims = self.svids.verify(assertion, &[issuer]).await?;
+        let claimed = unverified_issuer(assertion)?;
+        let spire = self
+            .spire
+            .iter()
+            .find(|s| s.svid_issuer == claimed)
+            .ok_or(AssertionError::UnknownSpire(claimed))?;
+        let claims = spire.svids.verify(assertion, &[issuer]).await?;
         let aud = claims.get("aud").cloned().unwrap_or(Value::Null);
         let single = match &aud {
             Value::String(a) => a == issuer,
@@ -596,14 +660,15 @@ impl AgentIssuer {
             .unwrap_or_default();
         let not_a_sandbox = || AssertionError::NotASandbox {
             sub: sub.to_string(),
-            prefix: self.gateway_prefix.0.clone(),
+            prefix: spire.gateway_prefix.0.clone(),
         };
         let (gateway, id) = sub
-            .strip_prefix(self.gateway_prefix.0.as_str())
+            .strip_prefix(spire.gateway_prefix.0.as_str())
             .and_then(|rest| rest.split_once("/sandbox/"))
             .ok_or_else(not_a_sandbox)?;
         Ok(Sandbox {
             spiffe_id: sub.to_string(),
+            cluster: spire.cluster.clone(),
             gateway: GatewayId::parse(gateway)?,
             id: SandboxId::parse(id)?,
         })
@@ -724,7 +789,60 @@ mod tests {
             assert_eq!(sandbox.id.as_str(), "sbx-1", "aud {aud}");
             assert_eq!(sandbox.gateway.as_str(), POD);
             assert_eq!(sandbox.spiffe_id, format!("{PREFIX}{POD}/sandbox/sbx-1"));
+            assert_eq!(sandbox.cluster, CLUSTER);
         }
+    }
+
+    #[tokio::test]
+    async fn each_svid_verifies_only_against_the_spire_its_issuer_names() {
+        let hub = Spire::start().await;
+        let spoke = Spire::start().await;
+        let spoke_issuer = "https://oidc-discovery.spoke.example";
+        let spoke_prefix = "spiffe://spoke.example/openshell/gateway/";
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.spire.push(
+            format!("spoke={spoke_issuer} {spoke_prefix} spire/oidc-discovery:443")
+                .parse()
+                .unwrap(),
+        );
+        let issuer = AgentIssuer::new(cfg, |entry| {
+            let uri = match entry.cluster.as_str() {
+                "spoke" => spoke.jwks_uri.clone(),
+                _ => hub.jwks_uri.clone(),
+            };
+            Jwks::new(reqwest::Client::new(), uri)
+        });
+        let from_spoke = |sub: String| {
+            with(Spire::claims("sbx-1"), |c| {
+                c.insert("iss".into(), json!(spoke_issuer));
+                c.insert("sub".into(), json!(sub));
+            })
+        };
+        let own = from_spoke(format!("{spoke_prefix}{POD}/sandbox/sbx-1"));
+        let sandbox = issuer.sandbox(&spoke.svid(&own)).await.unwrap();
+        assert_eq!(sandbox.cluster, "spoke");
+        assert!(
+            matches!(
+                issuer.sandbox(&hub.svid(&own)).await,
+                Err(AssertionError::Token(_))
+            ),
+            "the hub's key does not verify an SVID claiming the spoke's issuer"
+        );
+        let hub_domain = from_spoke(format!("{PREFIX}{POD}/sandbox/sbx-1"));
+        assert!(
+            matches!(
+                issuer.sandbox(&spoke.svid(&hub_domain)).await,
+                Err(AssertionError::NotASandbox { .. })
+            ),
+            "the spoke's SPIRE speaks only for its own trust domain"
+        );
+        let unknown = with(Spire::claims("sbx-1"), |c| {
+            c.insert("iss".into(), json!("https://oidc-discovery.evil.example"));
+        });
+        assert!(matches!(
+            issuer.sandbox(&hub.svid(&unknown)).await,
+            Err(AssertionError::UnknownSpire(iss)) if iss == "https://oidc-discovery.evil.example"
+        ));
     }
 
     #[tokio::test]
@@ -996,6 +1114,7 @@ mod tests {
         AgentGrant {
             sandbox: Sandbox {
                 spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
+                cluster: CLUSTER.into(),
                 gateway: GatewayId::of_run_pod(POD),
                 id: crate::agent_auth::bindings::SandboxId::parse("sbx-1").unwrap(),
             },
@@ -1094,12 +1213,11 @@ mod tests {
         let new = EcKey::generate();
         let before = testing::issuer(&spire, &old);
         let token = before.mint(&grant(None), now()).unwrap().access_token;
-        let mut cfg = testing::config(&spire, &new);
+        let mut cfg = testing::config(&new);
         cfg.previous_key = Some(SigningKey::from_pem(old.pem().as_bytes()).unwrap());
-        let after = AgentIssuer::new(
-            cfg,
-            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone()),
-        );
+        let after = AgentIssuer::new(cfg, |_| {
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
         let kids: Vec<_> = after
             .jwks()
             .keys
@@ -1122,12 +1240,11 @@ mod tests {
             "new tokens are signed with the current key"
         );
         assert_eq!(after.jwks().keys.len(), 2);
-        let mut same = testing::config(&spire, &new);
+        let mut same = testing::config(&new);
         same.previous_key = Some(SigningKey::from_pem(new.pem().as_bytes()).unwrap());
-        let unrotated = AgentIssuer::new(
-            same,
-            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone()),
-        );
+        let unrotated = AgentIssuer::new(same, |_| {
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
         assert_eq!(unrotated.jwks().keys.len(), 1, "one key is published once");
     }
 
@@ -1211,12 +1328,15 @@ mod tests {
                 "CONTROLLER_AGENT_SIGNING_KEY_FILE",
                 key_file.display().to_string(),
             ),
-            ("CONTROLLER_AGENT_SVID_ISSUER", testing::SVID_ISSUER.into()),
             (
-                "CONTROLLER_AGENT_SVID_JWKS_URI",
-                "https://spire-spiffe-oidc-discovery-provider.ztwim.svc/keys".into(),
+                "CONTROLLER_AGENT_SPIRE",
+                format!(
+                    "{CLUSTER}={} {PREFIX} spire/oidc-discovery:443, \
+                     spoke=https://oidc.spoke.example spiffe://spoke.example/openshell/gateway/ \
+                     spire-system/spire-oidc:8443,",
+                    testing::SVID_ISSUER
+                ),
             ),
-            ("CONTROLLER_AGENT_GATEWAY_PREFIX", PREFIX.into()),
             (
                 "CONTROLLER_AGENT_AUDIENCES",
                 format!("{KUEUE}=kueue.read kueue.submit, {BUILDIT}=buildit.read buildit.build,"),
@@ -1248,7 +1368,29 @@ mod tests {
                 },
             ]
         );
-        assert!(cfg.svid_ca.is_none());
+        assert_eq!(
+            cfg.spire,
+            [
+                testing::cluster_spire(),
+                ClusterSpire {
+                    cluster: "spoke".into(),
+                    svid_issuer: "https://oidc.spoke.example".into(),
+                    gateway_prefix: GatewayPrefix::parse(
+                        "spiffe://spoke.example/openshell/gateway/"
+                    )
+                    .unwrap(),
+                    discovery: DiscoveryService {
+                        namespace: KubeName::try_from("spire-system".to_string()).unwrap(),
+                        name: KubeName::try_from("spire-oidc".to_string()).unwrap(),
+                        port: 8443,
+                    },
+                },
+            ]
+        );
+        assert_eq!(
+            cfg.spire[1].discovery.keys_path(),
+            "/api/v1/namespaces/spire-system/services/https:spire-oidc:8443/proxy/keys"
+        );
 
         assert!(
             AgentIssuerConfig::from_lookup(|_| None).unwrap().is_none(),
@@ -1257,9 +1399,7 @@ mod tests {
 
         for missing in [
             "CONTROLLER_AGENT_SIGNING_KEY_FILE",
-            "CONTROLLER_AGENT_SVID_ISSUER",
-            "CONTROLLER_AGENT_SVID_JWKS_URI",
-            "CONTROLLER_AGENT_GATEWAY_PREFIX",
+            "CONTROLLER_AGENT_SPIRE",
             "CONTROLLER_AGENT_AUDIENCES",
         ] {
             let mut partial = vars.clone();
@@ -1273,28 +1413,68 @@ mod tests {
             );
         }
 
-        let bad: [(&'static str, &str); 8] = [
+        let spire = |entry: &str| format!("{CLUSTER}={entry}");
+        let twice = format!(
+            "{},{}",
+            spire(&format!("{} {PREFIX} spire/oidc:443", testing::SVID_ISSUER)),
+            spire(&format!("https://other.example {PREFIX} spire/oidc:443"))
+        );
+        let same_issuer = format!(
+            "{},other={} {PREFIX} spire/oidc:443",
+            spire(&format!("{} {PREFIX} spire/oidc:443", testing::SVID_ISSUER)),
+            testing::SVID_ISSUER
+        );
+        let bad: Vec<(&'static str, String)> = vec![
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(
+                    "https://oidc.example spiffe://example.crucible/openshell/gateway spire/oidc:443",
+                ),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(
+                    "https://oidc.example https://example.crucible/openshell/gateway/ spire/oidc:443",
+                ),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX}")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX} spire/oidc")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX} spire/oidc:https")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                spire(&format!("https://oidc.example {PREFIX} Spire_NS/oidc:443")),
+            ),
+            (
+                "CONTROLLER_AGENT_SPIRE",
+                format!("https://oidc.example {PREFIX} spire/oidc:443"),
+            ),
+            ("CONTROLLER_AGENT_SPIRE", " , ".to_string()),
+            ("CONTROLLER_AGENT_SPIRE", twice),
+            ("CONTROLLER_AGENT_SPIRE", same_issuer),
+        ];
+        let bad = bad.iter().map(|(v, s)| (*v, s.as_str())).chain([
             (
                 "CONTROLLER_AGENT_ISSUER",
                 "http://controller.svc:8080/oauth",
             ),
             ("CONTROLLER_AGENT_ISSUER", "http://controller.svc:8080/?x=1"),
             ("CONTROLLER_AGENT_ISSUER", "spiffe://example.crucible"),
-            (
-                "CONTROLLER_AGENT_GATEWAY_PREFIX",
-                "spiffe://example.crucible/openshell/gateway",
-            ),
-            (
-                "CONTROLLER_AGENT_GATEWAY_PREFIX",
-                "https://example.crucible/openshell/gateway/",
-            ),
             ("CONTROLLER_AGENT_AUDIENCES", " , "),
             ("CONTROLLER_AGENT_AUDIENCES", "not a url=kueue.read"),
             (
                 "CONTROLLER_AGENT_SIGNING_KEY_FILE",
                 "/nonexistent/signing.pem",
             ),
-        ];
+        ]);
         for (var, value) in bad {
             let mut broken = vars.clone();
             broken.insert(var, value.to_string());
@@ -1303,46 +1483,5 @@ mod tests {
                 "{var}={value}"
             );
         }
-    }
-
-    #[test]
-    fn spires_keys_are_fetched_over_https_unless_loopback_or_explicitly_insecure() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_file = dir.path().join("signing.pem");
-        std::fs::write(&key_file, EcKey::generate().pem()).unwrap();
-        let with = |uri: &str, insecure: Option<&str>| {
-            let mut vars = env(&key_file);
-            vars.insert("CONTROLLER_AGENT_SVID_JWKS_URI", uri.to_string());
-            if let Some(flag) = insecure {
-                vars.insert("CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP", flag.to_string());
-            }
-            AgentIssuerConfig::from_lookup(lookup(&vars))
-        };
-        let plain = "http://spire-oidc.spire.svc/keys";
-        assert!(matches!(
-            with(plain, None),
-            Err(ConfigError::InsecureJwks(uri)) if uri.as_str() == plain
-        ));
-        assert!(matches!(
-            with(plain, Some("false")),
-            Err(ConfigError::InsecureJwks(_))
-        ));
-        assert!(with(plain, Some("true")).unwrap().is_some());
-        assert!(matches!(
-            with(plain, Some("yes")),
-            Err(ConfigError::InsecureFlag(_))
-        ));
-        for loopback in [
-            "http://127.0.0.1:8443/keys",
-            "http://localhost/keys",
-            "http://[::1]/keys",
-        ] {
-            assert!(with(loopback, None).unwrap().is_some(), "{loopback}");
-        }
-        assert!(
-            with("https://spire-oidc.spire.svc/keys", None)
-                .unwrap()
-                .is_some()
-        );
     }
 }
