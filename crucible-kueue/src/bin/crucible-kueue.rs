@@ -162,6 +162,10 @@ async fn main() -> anyhow::Result<()> {
             .context("inferring kube config")?,
     };
     let client = kube::Client::try_from(config).context("building kube client")?;
+    let kueue = crucible_kueue::kueue::KueueVersion::discover(&client)
+        .await
+        .context("discovering the cluster's Kueue API version")?;
+    tracing::info!(version = kueue.as_str(), "kueue api");
     if let Some(namespace) = cli.tenant_namespace.clone() {
         tracing::info!(namespace, "watching tenant records");
         tokio::spawn(crucible_kueue::records::watch(
@@ -238,6 +242,7 @@ async fn main() -> anyhow::Result<()> {
             policy,
             reviewer,
             allowed_hosts: cli.allowed_hosts,
+            kueue,
         },
     );
     let listener = tokio::net::TcpListener::bind(&cli.bind)

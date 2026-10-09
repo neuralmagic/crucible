@@ -73,6 +73,9 @@ role = "viewer"
     };
     let config = kube::Config::from_kubeconfig(&options).await.unwrap();
     let client = kube::Client::try_from(config).unwrap();
+    let kueue_version = crucible_kueue::kueue::KueueVersion::discover(&client)
+        .await
+        .unwrap();
     let app = crucible_kueue::router(
         client,
         crucible_kueue::Options {
@@ -80,6 +83,7 @@ role = "viewer"
             oidc: None,
             policy: crucible_mcp_auth::policy::ToolPolicy::allow_all(),
             reviewer: None,
+            kueue: kueue_version,
             allowed_hosts: Vec::new(),
         },
     );

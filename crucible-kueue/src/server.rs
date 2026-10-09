@@ -3,7 +3,9 @@
 //! submitter role and, past submit, an object this server created for the same run.
 
 use crate::hardware;
-use crate::kueue::{self, ClusterQueue, KubeError, LocalQueue, ResourceFlavor, Workload};
+use crate::kueue::{
+    self, ClusterQueue, KubeError, KueueVersion, LocalQueue, ResourceFlavor, Workload,
+};
 use crate::manifest::{
     self, MANAGED_LABEL, MANAGED_VALUE, ManifestError, Normalized, RUN_LABEL, WORKLOAD_LABEL,
     WorkloadKind,
@@ -395,6 +397,7 @@ pub struct KueueMcp {
     /// Decides task requests from tokens carrying a Kubernetes user, as the tool policy's
     /// authorize rules decide tool calls.
     reviewer: Option<Arc<dyn AccessReview>>,
+    kueue: KueueVersion,
     tool_router: ToolRouter<Self>,
 }
 
@@ -447,10 +450,15 @@ fn pod_summary(p: &Pod) -> PodSummary {
 }
 
 impl KueueMcp {
-    pub fn new(client: kube::Client, reviewer: Option<Arc<dyn AccessReview>>) -> Self {
+    pub fn new(
+        client: kube::Client,
+        reviewer: Option<Arc<dyn AccessReview>>,
+        kueue: KueueVersion,
+    ) -> Self {
         Self {
             client,
             reviewer,
+            kueue,
             tool_router: Self::tool_router(),
         }
     }
@@ -516,7 +524,7 @@ impl KueueMcp {
         let ns = caller.namespace.as_str();
         kueue::get::<LocalQueue>(
             &self.client,
-            &kueue::local_queues(),
+            &self.kueue.local_queues(),
             Some(ns),
             queue.as_str(),
         )
@@ -537,7 +545,7 @@ impl KueueMcp {
     async fn cluster_queue(&self, lq: &LocalQueue) -> Result<ClusterQueue, ToolError> {
         Ok(kueue::get(
             &self.client,
-            &kueue::cluster_queues(),
+            &self.kueue.cluster_queues(),
             None,
             &lq.spec.cluster_queue,
         )
@@ -588,7 +596,7 @@ impl KueueMcp {
     async fn namespace_workloads(&self, ns: &str) -> Result<Vec<Workload>, ToolError> {
         Ok(kueue::list(
             &self.client,
-            &kueue::workloads(),
+            &self.kueue.workloads(),
             Some(ns),
             &ListParams::default(),
         )
@@ -793,7 +801,7 @@ impl KueueMcp {
                 namespace: ns.to_string(),
             })?;
         let api: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), ns, &kueue::workloads());
+            Api::namespaced_with(self.client.clone(), ns, &self.kueue.workloads());
         api.patch(
             &wl.metadata.name,
             &PatchParams::default(),
@@ -824,9 +832,14 @@ impl KueueMcp {
             .collect();
         let mut positions = Vec::new();
         if let Some(first) = pending.first() {
-            let line =
-                kueue::pending_in_local_queue(&self.client, ns, &first.spec.queue_name, 1000)
-                    .await?;
+            let line = kueue::pending_in_local_queue(
+                &self.client,
+                self.kueue,
+                ns,
+                &first.spec.queue_name,
+                1000,
+            )
+            .await?;
             for w in &pending {
                 if let Some(p) = line.iter().find(|p| p.metadata.name == w.metadata.name) {
                     positions.push(json!({"workload": w.metadata.name, "in_local_queue": p.position_in_local_queue, "in_cluster_queue": p.position_in_cluster_queue}));
@@ -1024,7 +1037,7 @@ impl KueueMcp {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 let all: Vec<LocalQueue> = kueue::list(
                     &self.client,
-                    &kueue::local_queues(),
+                    &self.kueue.local_queues(),
                     Some(c.namespace.as_str()),
                     &ListParams::default(),
                 )
@@ -1100,7 +1113,7 @@ impl KueueMcp {
                         })
                     })
                     .collect();
-                let pending = kueue::pending_in_local_queue(&self.client, c.namespace.as_str(), &lq.metadata.name, 50).await?;
+                let pending = kueue::pending_in_local_queue(&self.client, self.kueue, c.namespace.as_str(), &lq.metadata.name, 50).await?;
                 Ok(json!({
                     "queue": lq.metadata.name,
                     "cluster_queue": cq.metadata.name,
@@ -1144,7 +1157,7 @@ impl KueueMcp {
                 let mut flavors = Vec::new();
                 for group in &cq.spec.resource_groups {
                     for f in &group.flavors {
-                        let rf: ResourceFlavor = kueue::get(&self.client, &kueue::resource_flavors(), None, &f.name).await?;
+                        let rf: ResourceFlavor = kueue::get(&self.client, &self.kueue.resource_flavors(), None, &f.name).await?;
                         flavors.push(hardware::describe(&rf, &group.covered_resources, &nodes));
                     }
                 }
