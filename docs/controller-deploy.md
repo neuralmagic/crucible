@@ -132,8 +132,11 @@ servers verify it against `/.well-known/jwks.json`; `/.well-known/oauth-authoriz
 describes the endpoints. All three are served outside the human auth stack.
 
 The token's `sub` is the person the run was dispatched for: whoever unparked, scoped,
-redispatched, or approved (in the UI) the issue for that dispatch, else the launch's creator (the
-owner, for a schedule, watch, or webhook). The request is consumed by the run it gets, so later
+redispatched, or approved the issue for that dispatch, else the launch's creator (the owner, for
+a schedule, watch, or webhook). A GitHub review approval counts only when an operator paired the
+reviewer's GitHub login with a crucible login in `CONTROLLER_GITHUB_LOGINS`
+(`<github login>=<crucible login>`, comma-separated); equal names are never assumed to be the same
+person. The request is consumed by the run it gets, so later
 runs act for the owner again. An override by an actor that is not a login records nobody.
 `act.sub` is the sandbox's SPIFFE ID. It also carries `run_id` (the run pod), `sandbox`
 (the sandbox's name), `workdir` (its workspace path), `kube_user` (below) and, for runs on the
@@ -190,8 +193,18 @@ For the controller's identity, `sandbox_readers` is granted: `sandboxes` get/lis
 `pods` get/list/create/delete; `services`, `secrets` and `networkpolicies` list/create/delete in
 the sandbox namespace; and `services` list/create/delete in the loop namespace.
 
-Grounded-rank and scope turns still run their gateway in-pod, so a profile that isolates gateways
-refuses to render them. AWS web-identity env is not carried to the gateway pod. Pack code holds its
+Grounded-rank and scope turns get a gateway of their own the same way, with certificates valid for
+the turn's deadline; a failed launch tears it down, and the gateway sweep removes it once the
+turn's row closes. Turn sandboxes are never bound, so they get no agent tokens.
+
+Supervisors get the SPIFFE Workload API (the `csi.spiffe.io` driver) only when the profile names
+`[cluster] sandbox_spiffe_socket`, for example `/spiffe-workload-api/spire-agent.sock`.
+
+With `[cluster] aws_sandbox_role_arn`, the gateway pod assumes that role with an STS-audienced
+token for its own service account, as the in-pod gateway does with the loop pod's, so the role's
+trust policy must allow `system:serviceaccount:<sandbox namespace>:crucible-openshell-gateway`.
+
+Pack code holds its
 run's gateway client certificate, so it can still create sandboxes for its own run with the
 `driver_config` pod fields the gateway accepts (`node_selector`, `tolerations`, `host_aliases`,
 `runtime_class_name`, `priority_class_name`, PVC volumes); resource admission keeps PVCs and
