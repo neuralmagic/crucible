@@ -247,14 +247,15 @@ until crux playbook-runs --json | jq -e '.[0].status | IN("done", "parked", "fai
     [ $SECONDS -lt $deadline ] || fail "the run did not finish"
     sleep 10
 done
-crux run-log "$RUN" --json > "$WORK/run-log.json" 2>/dev/null || kc -n "$LOOP_NS" logs "$POD" > "$WORK/run-log.json"
+CRUN=$(crux runs --json | jq -r '.[0].run_id')
+crux run-log "$CRUN" > "$WORK/run-log.json"
 kc -n "$CTL_NS" logs deploy/crucible-controller | sed 's/\x1b\[[0-9;]*m//g' > "$WORK/controller.log"
 
 log "checking the controller issued the run's token to its supervisor"
-issued=$(grep 'agent token issued' "$WORK/controller.log" | grep -E "run_id=\"?$RUN\"?( |$)" | head -1)
+issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" | head -1)
 [ -n "$issued" ] || fail "the controller issued no agent token for run $RUN"
 grep -qE "kube_user=\"?$LAUNCHER\"?( |$)" <<<"$issued" || fail "the token was not for kube_user $LAUNCHER: $issued"
-grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}[a-z0-9-]+/sandbox/" <<<"$issued" \
+grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}$RUN/sandbox/" <<<"$issued" \
     || fail "the token went to no supervisor under $GATEWAY_PREFIX: $issued"
 log "issued: $issued"
 
@@ -264,15 +265,16 @@ import json, sys
 text = open(sys.argv[1]).read()
 decoder = json.JSONDecoder()
 for _ in range(3):
-    at = text.rfind("WHOAMI")
-    while at != -1:
-        start = text.find("{", at)
-        try:
-            found, _ = decoder.raw_decode(text, start)
-            print(json.dumps(found))
-            sys.exit(0)
-        except ValueError:
-            at = text.rfind("WHOAMI", 0, at)
+    for marker in ("WHOAMI", '"whoami":'):
+        at = text.rfind(marker)
+        while at != -1:
+            start = text.find("{", at)
+            try:
+                found, _ = decoder.raw_decode(text, start)
+                print(json.dumps(found))
+                sys.exit(0)
+            except ValueError:
+                at = text.rfind(marker, 0, at)
     text = text.encode().decode("unicode_escape")
 EOF
 )
