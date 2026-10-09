@@ -16,8 +16,10 @@ use serde_json::{Value, json};
 use std::fmt;
 use url::Url;
 
-/// Lifetime of a minted access token.
-pub const TOKEN_TTL_SECS: u64 = 300;
+/// The bounds of a minted access token's lifetime: long enough that a sandbox fetches one per
+/// task rather than per call, short enough that a leaked one expires within the task.
+pub const MIN_TOKEN_TTL_SECS: u64 = 15 * 60;
+pub const MAX_TOKEN_TTL_SECS: u64 = 30 * 60;
 
 pub const TOKEN_PATH: &str = "/oauth/token";
 pub const JWKS_PATH: &str = "/.well-known/jwks.json";
@@ -59,6 +61,11 @@ pub enum ConfigError {
     InsecureJwks(Url),
     #[error("CONTROLLER_AGENT_SVID_JWKS_INSECURE_HTTP {0:?} is not true or false")]
     InsecureFlag(String),
+    #[error(
+        "CONTROLLER_AGENT_TOKEN_TTL_SECS {0:?} is not a number of seconds from \
+         {MIN_TOKEN_TTL_SECS} to {MAX_TOKEN_TTL_SECS}"
+    )]
+    Ttl(String),
     #[error("reading {path}: {source}")]
     Read {
         path: String,
@@ -185,10 +192,42 @@ pub(crate) fn is_kueue_scope(scope: &str) -> bool {
     [SCOPE_READ, SCOPE_SUBMIT].contains(&scope)
 }
 
+/// A minted token's lifetime, within [`MIN_TOKEN_TTL_SECS`]..=[`MAX_TOKEN_TTL_SECS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenTtl(u64);
+
+impl TokenTtl {
+    pub fn secs(self) -> u64 {
+        self.0
+    }
+}
+
+impl Default for TokenTtl {
+    fn default() -> Self {
+        Self(MIN_TOKEN_TTL_SECS)
+    }
+}
+
+impl std::str::FromStr for TokenTtl {
+    type Err = ConfigError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw.trim().parse::<u64>() {
+            Ok(secs) if (MIN_TOKEN_TTL_SECS..=MAX_TOKEN_TTL_SECS).contains(&secs) => Ok(Self(secs)),
+            _ => Err(ConfigError::Ttl(raw.to_string())),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct AgentIssuerConfig {
     pub issuer: IssuerUrl,
+    /// The key tokens are signed with.
     pub signing_key: SigningKey,
+    /// The key tokens were signed with before a rotation, still published in the JWKS so tokens
+    /// it signed verify until they expire.
+    pub previous_key: Option<SigningKey>,
+    pub token_ttl: TokenTtl,
     /// SPIRE's OIDC discovery issuer: the `iss` of every JWT-SVID.
     pub svid_issuer: String,
     pub svid_jwks_uri: Url,
@@ -216,12 +255,18 @@ impl AgentIssuerConfig {
         let read = |path: String| {
             std::fs::read(&path).map_err(|source| ConfigError::Read { path, source })
         };
-        let key_path = need("CONTROLLER_AGENT_SIGNING_KEY_FILE")?;
-        let signing_key =
-            SigningKey::from_pem(&read(key_path.clone())?).map_err(|source| ConfigError::Key {
-                path: key_path,
-                source,
-            })?;
+        let load_key = |path: String| {
+            SigningKey::from_pem(&read(path.clone())?)
+                .map_err(|source| ConfigError::Key { path, source })
+        };
+        let signing_key = load_key(need("CONTROLLER_AGENT_SIGNING_KEY_FILE")?)?;
+        let previous_key = get("CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE")
+            .map(load_key)
+            .transpose()?;
+        let token_ttl = get("CONTROLLER_AGENT_TOKEN_TTL_SECS")
+            .map(|raw| raw.parse())
+            .transpose()?
+            .unwrap_or_default();
         let jwks_raw = need("CONTROLLER_AGENT_SVID_JWKS_URI")?;
         let svid_jwks_uri = Url::parse(&jwks_raw).map_err(|source| ConfigError::Url {
             var: "CONTROLLER_AGENT_SVID_JWKS_URI",
@@ -252,6 +297,8 @@ impl AgentIssuerConfig {
         Ok(Some(Self {
             issuer: IssuerUrl::parse(&issuer)?,
             signing_key,
+            previous_key,
+            token_ttl,
             svid_issuer: need("CONTROLLER_AGENT_SVID_ISSUER")?,
             svid_jwks_uri,
             svid_ca: get("CONTROLLER_AGENT_SVID_CA_FILE").map(read).transpose()?,
@@ -484,6 +531,8 @@ pub struct AuthorizationServerMetadata {
 pub struct AgentIssuer {
     issuer: IssuerUrl,
     key: SigningKey,
+    previous_key: Option<SigningKey>,
+    ttl: TokenTtl,
     svids: Verifier,
     gateway_prefix: GatewayPrefix,
     audiences: Vec<Audience>,
@@ -495,6 +544,8 @@ impl AgentIssuer {
             svids: Verifier::new(cfg.svid_issuer, svid_jwks),
             issuer: cfg.issuer,
             key: cfg.signing_key,
+            previous_key: cfg.previous_key,
+            ttl: cfg.token_ttl,
             gateway_prefix: cfg.gateway_prefix,
             audiences: cfg.audiences,
         }
@@ -584,7 +635,7 @@ impl AgentIssuer {
             "aud": grant.audience,
             "iat": now,
             "nbf": now,
-            "exp": now.saturating_add(TOKEN_TTL_SECS),
+            "exp": now.saturating_add(self.ttl.secs()),
             "jti": crucible_contract::artifact::lower_hex(&jti),
             "act": {"sub": grant.sandbox.spiffe_id},
             "run_id": grant.run.pod_name,
@@ -609,14 +660,18 @@ impl AgentIssuer {
         let access_token = jsonwebtoken::encode(&header, &claims, &self.key.key)?;
         Ok(Minted {
             access_token,
-            expires_in: TOKEN_TTL_SECS,
+            expires_in: self.ttl.secs(),
             scope,
         })
     }
 
+    /// The current key, then the previous one while it is configured.
     pub fn jwks(&self) -> JwkSet {
         JwkSet {
-            keys: vec![self.key.public.clone()],
+            keys: std::iter::once(&self.key)
+                .chain(self.previous_key.iter().filter(|k| k.kid != self.key.kid))
+                .map(|k| k.public.clone())
+                .collect(),
         }
     }
 
@@ -971,7 +1026,7 @@ mod tests {
         let issuer = testing::issuer(&spire, &EcKey::generate());
         let at = now();
         let minted = issuer.mint(&grant(Some("crucible-kueue-e2e")), at).unwrap();
-        assert_eq!(minted.expires_in, TOKEN_TTL_SECS);
+        assert_eq!(minted.expires_in, MIN_TOKEN_TTL_SECS);
         assert_eq!(minted.scope, "kueue.read kueue.submit");
         let header = jsonwebtoken::decode_header(&minted.access_token).unwrap();
         assert_eq!(header.alg, Algorithm::ES256);
@@ -988,7 +1043,7 @@ mod tests {
                 "aud": KUEUE,
                 "iat": at,
                 "nbf": at,
-                "exp": at + TOKEN_TTL_SECS,
+                "exp": at + MIN_TOKEN_TTL_SECS,
                 "act": {"sub": format!("{PREFIX}{POD}/sandbox/sbx-1")},
                 "run_id": "crucible-run-brave-otter",
                 "sandbox": "ci-0123abcd",
@@ -1029,6 +1084,62 @@ mod tests {
         assert_ne!(a["jti"], b["jti"]);
         for key in ["namespace", "queues", "role", "kube_user"] {
             assert!(!a.contains_key(key), "{key}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rotation_keeps_tokens_from_the_previous_key_verifying_until_they_expire() {
+        let spire = Spire::start().await;
+        let old = EcKey::generate();
+        let new = EcKey::generate();
+        let before = testing::issuer(&spire, &old);
+        let token = before.mint(&grant(None), now()).unwrap().access_token;
+        let mut cfg = testing::config(&spire, &new);
+        cfg.previous_key = Some(SigningKey::from_pem(old.pem().as_bytes()).unwrap());
+        let after = AgentIssuer::new(
+            cfg,
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone()),
+        );
+        let kids: Vec<_> = after
+            .jwks()
+            .keys
+            .iter()
+            .filter_map(|k| k.common.key_id.clone())
+            .collect();
+        assert_eq!(
+            kids,
+            [after.key.kid().to_string(), before.key.kid().to_string()]
+        );
+        let issued = verified(&after, &token).await;
+        assert_eq!(
+            issued["sub"], "alice",
+            "signed by the previous key, published still"
+        );
+        let fresh = after.mint(&grant(None), now()).unwrap().access_token;
+        assert_eq!(
+            jsonwebtoken::decode_header(&fresh).unwrap().kid.as_deref(),
+            Some(after.key.kid()),
+            "new tokens are signed with the current key"
+        );
+        assert_eq!(after.jwks().keys.len(), 2);
+        let mut same = testing::config(&spire, &new);
+        same.previous_key = Some(SigningKey::from_pem(new.pem().as_bytes()).unwrap());
+        let unrotated = AgentIssuer::new(
+            same,
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone()),
+        );
+        assert_eq!(unrotated.jwks().keys.len(), 1, "one key is published once");
+    }
+
+    #[test]
+    fn the_token_lifetime_is_fifteen_to_thirty_minutes() {
+        assert_eq!(TokenTtl::default().secs(), 900);
+        assert_eq!("1800".parse::<TokenTtl>().unwrap().secs(), 1800);
+        for bad in ["899", "1801", "300", "soon", ""] {
+            assert!(
+                matches!(bad.parse::<TokenTtl>(), Err(ConfigError::Ttl(_))),
+                "{bad}"
+            );
         }
     }
 

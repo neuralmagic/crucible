@@ -434,7 +434,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(cache.as_deref(), Some("no-store"));
         assert_eq!(body["token_type"], "Bearer");
-        assert_eq!(body["expires_in"], issuer::TOKEN_TTL_SECS);
+        assert_eq!(body["expires_in"], issuer::MIN_TOKEN_TTL_SECS);
         assert_eq!(body["scope"], "kueue.read kueue.submit");
 
         let jwks = serve_jwks(h.state.issuer.jwks()).await;

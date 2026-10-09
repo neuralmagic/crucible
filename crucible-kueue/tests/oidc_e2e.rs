@@ -224,6 +224,8 @@ require_kube_user = true
     let cfg = AgentIssuerConfig {
         issuer: IssuerUrl::parse(CONTROLLER).unwrap(),
         signing_key: SigningKey::from_pem(signing_key_pem().as_bytes()).unwrap(),
+        previous_key: None,
+        token_ttl: Default::default(),
         svid_issuer: cluster::spire(),
         svid_jwks_uri: Url::parse(&format!("{}/keys", cluster::spire())).unwrap(),
         svid_ca: None,

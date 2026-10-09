@@ -148,6 +148,8 @@ pub fn config(spire: &Spire, signing: &EcKey) -> AgentIssuerConfig {
     AgentIssuerConfig {
         issuer: IssuerUrl::parse(ISSUER).unwrap(),
         signing_key: SigningKey::from_pem(signing.pem().as_bytes()).unwrap(),
+        previous_key: None,
+        token_ttl: Default::default(),
         svid_issuer: SVID_ISSUER.to_string(),
         svid_jwks_uri: spire.jwks_uri.clone(),
         svid_ca: None,

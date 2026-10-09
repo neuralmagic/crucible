@@ -127,7 +127,7 @@ Spoke clusters, when the controller runs loops elsewhere:
 The controller can act as the OAuth authorization server for sandboxed agents. An OpenShell
 sandbox supervisor posts its SPIRE JWT-SVID to `POST /oauth/token` (client credentials with a
 `jwt-bearer` client assertion, no `client_id`); the controller verifies it against SPIRE's JWKS,
-maps the sandbox to the run whose pod bound it, and returns a 5-minute ES256 access token. MCP
+maps the sandbox to the run whose pod bound it, and returns an ES256 access token living 15 to 30 minutes. MCP
 servers verify it against `/.well-known/jwks.json`; `/.well-known/oauth-authorization-server`
 describes the endpoints. All three are served outside the human auth stack.
 
@@ -229,6 +229,8 @@ when the username is unknown; other tokens are issued without the claim, logged 
 | --- | --- |
 | `CONTROLLER_AGENT_ISSUER` | The issuer identifier, an origin such as `http://crucible-controller.crucible-system.svc.cluster.local:8080`. Unset turns the endpoint off. Supervisors must request their SVID with exactly this audience (`token_grant.jwt_svid_audience`). |
 | `CONTROLLER_AGENT_SIGNING_KEY_FILE` | A PKCS#8 P-256 private key mounted from a Secret. The `kid` is its RFC 7638 thumbprint. |
+| `CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE` | Optional: the key before a rotation. It is published in the JWKS beside the current key, so tokens it signed keep verifying until they expire; nothing new is signed with it. Rotate by moving the current key here and mounting a new one, then drop this after one token lifetime. |
+| `CONTROLLER_AGENT_TOKEN_TTL_SECS` | Agent token lifetime, 900 to 1800 seconds. Default 900. |
 | `CONTROLLER_AGENT_SVID_ISSUER` | SPIRE's OIDC discovery issuer, the `iss` of every JWT-SVID. SVIDs must carry `iat` and live at most 15 minutes. |
 | `CONTROLLER_AGENT_SVID_JWKS_URI` | SPIRE's JWKS, usually the in-cluster discovery provider Service. It must be `https://` unless its host is loopback, since whoever answers that fetch can mint agent tokens. |
 | `CONTROLLER_AGENT_SVID_CA_FILE` | Optional PEM bundle trusted for that fetch (the service CA for an `https://*.svc` endpoint). |
