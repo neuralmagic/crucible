@@ -708,6 +708,7 @@ pub(crate) async fn redeem_code(
     let (access_token, kube_user) = access(auth, people, &approved, now).await?;
     let refresh_token = people.grants.issue_refresh(&approved, now).await?;
     Ok(token_response(
+        "authorization_code",
         &approved,
         &kube_user,
         access_token,
@@ -773,6 +774,7 @@ pub(crate) async fn redeem_refresh(
         Err(e) => return Err(e),
     };
     Ok(token_response(
+        "refresh_token",
         &approved,
         &kube_user,
         access_token,
@@ -821,6 +823,7 @@ async fn access(
 }
 
 fn token_response(
+    grant: &'static str,
     approved: &Approved,
     kube_user: &str,
     access_token: String,
@@ -828,6 +831,7 @@ fn token_response(
     ttl_secs: u64,
 ) -> Response {
     tracing::info!(
+        grant,
         sub = approved.login,
         kube_user,
         cluster = approved.cluster,
