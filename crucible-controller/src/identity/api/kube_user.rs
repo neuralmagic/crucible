@@ -9,7 +9,6 @@ use crate::api::dto::{bad_request, forbidden, not_found};
 use crate::api::state::{ApiState, AppError, ErrorBody, Json};
 use crate::identity::auth::{AuthPath, BearerGuard, Subject};
 use crate::identity::kube_identity::{self, KubeIdentity, KubeUser};
-use crate::identity::kube_links;
 use crate::identity::kube_user::LookupError;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -53,11 +52,11 @@ pub struct OverrideBody {
     pub kube_user: Option<String>,
 }
 
-fn no_subject() -> Response {
+pub(crate) fn no_subject() -> Response {
     forbidden("this credential names no issuer subject, so it has no user row to link")
 }
 
-fn not_from_a_key() -> Response {
+pub(crate) fn not_from_a_key() -> Response {
     forbidden("api keys cannot change their owner's kubernetes username; sign in to link one")
 }
 
@@ -214,103 +213,6 @@ pub(crate) async fn override_kube_user(
         r#override: user.map(|u| u.as_str().to_string()),
     })))
     .into_response())
-}
-
-/// A person's Kubernetes username on one cluster.
-#[derive(Debug, Serialize, ToSchema, PartialEq)]
-pub struct KubeLinkDto {
-    pub cluster: String,
-    pub kube_user: String,
-    /// How the link was proven: `token-review`.
-    pub source: String,
-    pub linked_at: String,
-}
-
-impl From<kube_links::Link> for KubeLinkDto {
-    fn from(l: kube_links::Link) -> Self {
-        Self {
-            cluster: l.cluster,
-            kube_user: l.kube_user,
-            source: l.source,
-            linked_at: l.linked_at,
-        }
-    }
-}
-
-#[utoipa::path(
-    get,
-    path = "/api/me/kube-users",
-    responses(
-        (status = 200, description = "The caller's Kubernetes username on each linked cluster", body = [KubeLinkDto]),
-        (status = 403, description = "The caller has no issuer subject", body = ErrorBody)
-    )
-)]
-pub(crate) async fn list_my_kube_links(
-    State(state): State<ApiState>,
-    subject: Subject,
-) -> Result<Response, AppError> {
-    let Some(sub) = subject.as_deref() else {
-        return Ok(no_subject());
-    };
-    let links = kube_links::list(state.db.pool(), sub).await?;
-    Ok(Json(links.into_iter().map(KubeLinkDto::from).collect::<Vec<_>>()).into_response())
-}
-
-#[utoipa::path(
-    put,
-    path = "/api/me/kube-users/{cluster}",
-    request_body = LinkBody,
-    params(("cluster" = String, Path, description = "The cluster the token was issued by")),
-    responses(
-        (status = 200, description = "The cluster's TokenReview named the token's owner; it is now the caller's username there", body = KubeLinkDto),
-        (status = 400, description = "The cluster refused the token, or it names a system identity", body = ErrorBody),
-        (status = 403, description = "The caller has no issuer subject, or presented an api key", body = ErrorBody),
-        (status = 503, description = "The cluster could not be asked", body = ErrorBody)
-    )
-)]
-pub(crate) async fn link_my_kube_user_on(
-    State(state): State<ApiState>,
-    subject: Subject,
-    path: AuthPath,
-    Path(cluster): Path<String>,
-    Json(body): Json<LinkBody>,
-) -> Result<Response, AppError> {
-    if path == AuthPath::ApiKey {
-        return Ok(not_from_a_key());
-    }
-    let Some(sub) = subject.as_deref() else {
-        return Ok(no_subject());
-    };
-    let reviewer = kube_links::KubeReviewer(state.clusters.clone());
-    match kube_links::link(
-        state.db.pool(),
-        &reviewer,
-        sub,
-        &cluster,
-        &body.cluster_token,
-    )
-    .await
-    {
-        Ok(_) => {}
-        Err(kube_links::LinkError::Unreachable { cluster, detail }) => {
-            tracing::warn!(
-                cluster,
-                error = detail,
-                "linking a kubernetes username failed closed"
-            );
-            return Ok(unavailable("the cluster could not verify the token; retry"));
-        }
-        Err(kube_links::LinkError::Store(e)) => return Err(e.into()),
-        Err(e) => return Ok(bad_request(e.to_string())),
-    }
-    let link = kube_links::list(state.db.pool(), sub)
-        .await?
-        .into_iter()
-        .find(|l| l.cluster == cluster);
-    match link {
-        Some(link) => Ok(Json(KubeLinkDto::from(link)).into_response()),
-        None => Ok(not_found(format!("no link recorded for cluster {cluster}"))),
-    }
 }
 
 #[cfg(test)]

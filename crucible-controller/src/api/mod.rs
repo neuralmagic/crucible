@@ -43,8 +43,11 @@ pub(crate) mod tests;
         crate::identity::api::kube_user::get_my_kube_user,
         crate::identity::api::kube_user::link_my_kube_user,
         crate::identity::api::kube_user::override_kube_user,
-        crate::identity::api::kube_user::list_my_kube_links,
-        crate::identity::api::kube_user::link_my_kube_user_on,
+        crate::identity::api::cluster_identities::list_my_cluster_identities,
+        crate::identity::api::cluster_identities::link_by_token,
+        crate::identity::api::cluster_identities::unlink,
+        crate::identity::api::cluster_identities::start_oauth_link,
+        crate::identity::api::cluster_identities::oauth_link_callback,
         system::get_access,
         crate::identity::api::prefs::get_prefs,
         crate::identity::api::prefs::put_prefs,
@@ -211,7 +214,6 @@ pub(crate) mod tests;
         crate::identity::api::kube_user::KubeUserDto,
         crate::identity::api::kube_user::LinkBody,
         crate::identity::api::kube_user::OverrideBody,
-        crate::identity::api::kube_user::KubeLinkDto,
         crate::identity::api::prefs::EditorPrefsDto,
         crate::identity::api::prefs::PickerPrefsDto,
         dto::Overview,
@@ -446,9 +448,18 @@ pub fn router(state: ApiState) -> Router {
             crate::identity::api::kube_user::link_my_kube_user
         ))
         .routes(routes!(crate::identity::api::kube_user::override_kube_user))
-        .routes(routes!(crate::identity::api::kube_user::list_my_kube_links))
         .routes(routes!(
-            crate::identity::api::kube_user::link_my_kube_user_on
+            crate::identity::api::cluster_identities::list_my_cluster_identities
+        ))
+        .routes(routes!(
+            crate::identity::api::cluster_identities::link_by_token,
+            crate::identity::api::cluster_identities::unlink
+        ))
+        .routes(routes!(
+            crate::identity::api::cluster_identities::start_oauth_link
+        ))
+        .routes(routes!(
+            crate::identity::api::cluster_identities::oauth_link_callback
         ))
         .routes(routes!(system::get_access))
         .routes(routes!(system::overview))

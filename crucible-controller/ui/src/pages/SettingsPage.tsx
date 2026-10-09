@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
 import { viaLabel } from '../ownerContext';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   Button,
   Empty,
@@ -24,7 +24,14 @@ import {
   type CredentialState,
   type KeyState,
 } from './settingsView';
-import { TextField, NumberInputField, CheckField, FormActions } from './formControls';
+import { TextField, NumberInputField, CheckField, FormActions, BareTextInput } from './formControls';
+import {
+  identityView,
+  linkOutcome,
+  sortIdentities,
+  type ClusterIdentityDto,
+  type IdentityState,
+} from './clusterIdentitiesView';
 
 const TONE: Record<CredentialState, StatusTone> = {
   absent: 'grey',
@@ -232,6 +239,159 @@ function ApiKeys() {
   );
 }
 
+const IDENTITY_TONE: Record<IdentityState, StatusTone> = {
+  resolved: 'green',
+  linked: 'green',
+  unlinked: 'amber',
+  override: 'grey',
+};
+
+/// One cluster: who the person is there, and, on a link cluster, the controls that prove or forget
+/// it. A pasted token lives only in this row's state until it is sent, and is cleared either way.
+function IdentityRow({ identity, readOnly }: { identity: ClusterIdentityDto; readOnly: boolean }) {
+  const qc = useQueryClient();
+  const start = $api.useMutation('post', '/api/me/cluster-identities/{cluster}/link');
+  const paste = $api.useMutation('put', '/api/me/cluster-identities/{cluster}');
+  const unlink = $api.useMutation('delete', '/api/me/cluster-identities/{cluster}');
+  const [pasting, setPasting] = useState(false);
+  const [token, setToken] = useState('');
+  const view = identityView(identity);
+  const path = { params: { path: { cluster: identity.cluster } } };
+  const failure = start.error ?? paste.error ?? unlink.error;
+  const busy = start.isPending || paste.isPending || unlink.isPending;
+
+  return (
+    <div
+      data-testid={`cluster-identity-${identity.cluster}`}
+      className="flex items-start justify-between gap-4 border-t border-line py-3"
+    >
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="font-mono text-data text-ink-1">{identity.cluster}</span>
+          <Status status={view.headline} tone={IDENTITY_TONE[view.state]} pulse={false} />
+          <span className="text-body text-ink-3">{view.rule}</span>
+        </div>
+        <p className="mt-1 font-mono text-data text-ink-2" data-testid="kube-user">
+          {view.username}
+        </p>
+        <p className="mt-1 text-body text-ink-3">{view.detail}</p>
+        {pasting && (
+          <form
+            className="mt-2 flex items-center gap-2"
+            onSubmit={(event) => {
+              event.preventDefault();
+              const sent = token.trim();
+              setToken('');
+              paste.mutate(
+                { ...path, body: { cluster_token: sent } },
+                {
+                  onSuccess: () => {
+                    setPasting(false);
+                    void qc.invalidateQueries();
+                  },
+                },
+              );
+            }}
+          >
+            <BareTextInput
+              id={`cluster-token-${identity.cluster}`}
+              type="password"
+              mono
+              value={token}
+              onChange={setToken}
+              placeholder="oc whoami -t, or an OIDC ID token"
+              aria-label={`Token for ${identity.cluster}`}
+            />
+            <Button type="submit" variant="filled" className="uppercase" disabled={token.trim() === '' || busy}>
+              {paste.isPending ? 'Checking…' : 'Link'}
+            </Button>
+          </form>
+        )}
+        {failure && <p className="mt-1 text-body text-red">{formatError(failure)}</p>}
+      </div>
+      {!readOnly && (
+        <div className="flex shrink-0 gap-2">
+          {view.link?.method === 'oauth' && (
+            <Button
+              className="uppercase"
+              variant="filled"
+              disabled={busy}
+              onClick={() => {
+                start.mutate(path, {
+                  onSuccess: (result) => {
+                    window.location.assign(result.authorize_url);
+                  },
+                });
+              }}
+            >
+              {start.isPending ? 'Opening…' : `${view.link.label} ${identity.cluster}`}
+            </Button>
+          )}
+          {view.link?.method === 'paste' && !pasting && (
+            <Button className="uppercase" variant="filled" disabled={busy} onClick={() => setPasting(true)}>
+              {`${view.link.label} ${identity.cluster}`}
+            </Button>
+          )}
+          {view.unlinkable && (
+            <Button
+              className="uppercase"
+              variant="quiet"
+              disabled={busy}
+              onClick={() => {
+                unlink.mutate(path, { onSuccess: () => void qc.invalidateQueries() });
+              }}
+            >
+              {unlink.isPending ? 'Unlinking…' : 'Unlink'}
+            </Button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ClusterIdentities() {
+  const identities = $api.useQuery('get', '/api/me/cluster-identities');
+  const whoami = $api.useQuery('get', '/api/whoami');
+  const [search] = useSearchParams();
+  const outcome = linkOutcome(search);
+
+  if (identities.isError) {
+    return <Empty title="Cluster identities unavailable" description={formatError(identities.error)} />;
+  }
+  if (identities.isPending) {
+    return <LoadingBlock label="Loading cluster identities" />;
+  }
+  const readOnly = Boolean(whoami.data?.impersonation);
+  return (
+    <Section>
+      <SectionHeader
+        title="Cluster identities"
+        note="who you are on each cluster, for tools that check your Kubernetes permissions there"
+      />
+      <SectionBody>
+        <p className="text-body text-ink-2">
+          MCP servers act on a cluster as your username there, limited by its RBAC. Most clusters
+          take it from your SSO sign-in; the rest you link once by signing in to the cluster.
+        </p>
+        {outcome !== null && (
+          <p
+            data-testid="cluster-link-outcome"
+            className={outcome.ok ? 'mt-2 text-body text-ink-2' : 'mt-2 text-body text-red'}
+          >
+            {outcome.ok ? `Linked ${outcome.cluster}.` : outcome.message}
+          </p>
+        )}
+        <div className="mt-4">
+          {sortIdentities(identities.data).map((identity) => (
+            <IdentityRow key={identity.cluster} identity={identity} readOnly={readOnly} />
+          ))}
+        </div>
+      </SectionBody>
+    </Section>
+  );
+}
+
 function Memberships() {
   const whoami = $api.useQuery('get', '/api/whoami');
   if (whoami.isError) {
@@ -276,6 +436,7 @@ export function SettingsPage() {
         description="The credentials this controller holds on your behalf, and what stops working without them."
       />
       <Memberships />
+      <ClusterIdentities />
       <OfflineCredential />
       <ApiKeys />
     </>

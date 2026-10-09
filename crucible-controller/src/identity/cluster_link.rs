@@ -10,7 +10,7 @@
 
 use crate::identity::api_key::constant_time_eq;
 use crate::runs::clusters::ClusterClients;
-use crucible_contract::cluster_link::{DEFAULT_CLIENT_ID, ExternalUrl, SCOPE, https_or_loopback};
+use crucible_contract::cluster_link::{ExternalUrl, SCOPE, https_or_loopback};
 use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
@@ -29,7 +29,7 @@ pub enum LinkFlowError {
     #[error("cluster {cluster:?} is not one this controller is connected to")]
     UnknownCluster { cluster: String },
     #[error(
-        "cluster {cluster:?} has no OAuth link registered (no client secret mounted); paste a token instead"
+        "cluster {cluster:?} has no OAuth link registered ([cluster_link].openshift and a mounted client secret); paste a token instead"
     )]
     NotOffered { cluster: String },
     #[error("cluster {cluster:?} did not publish usable OAuth metadata: {detail}")]
@@ -58,41 +58,48 @@ pub enum LinkFlowError {
     Secret { cluster: String, detail: String },
 }
 
-/// The deployment's link configuration: where the cluster sends people back to, and where each
+impl LinkFlowError {
+    /// The outcome code the callback sends the browser back to Settings with. Codes, not text,
+    /// so a crafted URL cannot put words on that page.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NoFlow => "no-flow",
+            Self::Expired { .. } => "expired",
+            Self::StateMismatch => "state-mismatch",
+            Self::WrongCluster { .. } => "wrong-cluster",
+            Self::WrongPerson => "wrong-person",
+            Self::Refused { .. } => "refused",
+            Self::NoCode | Self::Exchange { .. } => "exchange",
+            Self::UnknownCluster { .. }
+            | Self::NotOffered { .. }
+            | Self::Discovery { .. }
+            | Self::NoS256 { .. }
+            | Self::Secret { .. } => "unavailable",
+        }
+    }
+}
+
+/// The deployment's link configuration: the profile's `[cluster_link]` table, and where each
 /// cluster's client secret is mounted (`<secrets>/<cluster>`).
 #[derive(Debug, Clone)]
 pub struct LinkCfg {
     pub client_id: String,
     pub external_url: ExternalUrl,
     pub secrets: PathBuf,
+    /// Clusters whose OAuth server links people.
+    pub openshift: Vec<String>,
 }
 
 impl LinkCfg {
-    /// `CONTROLLER_CLUSTER_LINK_URL` and `CONTROLLER_CLUSTER_LINK_SECRETS`, both or neither;
-    /// `CONTROLLER_CLUSTER_LINK_CLIENT_ID` names the OAuthClient.
-    pub fn from_env() -> anyhow::Result<Option<Self>> {
-        use anyhow::Context;
-        let url = std::env::var("CONTROLLER_CLUSTER_LINK_URL").ok();
-        let secrets = std::env::var("CONTROLLER_CLUSTER_LINK_SECRETS").ok();
-        let (url, secrets) = match (url, secrets) {
-            (None, None) => return Ok(None),
-            (Some(url), Some(secrets)) => (url, secrets),
-            _ => anyhow::bail!(
-                "CONTROLLER_CLUSTER_LINK_URL and CONTROLLER_CLUSTER_LINK_SECRETS are set together or not at all"
-            ),
-        };
-        let client_id = std::env::var("CONTROLLER_CLUSTER_LINK_CLIENT_ID")
-            .unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
-        Self::new(client_id, &url, PathBuf::from(secrets))
-            .with_context(|| format!("CONTROLLER_CLUSTER_LINK_URL={url:?}"))
-            .map(Some)
-    }
-
-    pub fn new(client_id: String, external_url: &str, secrets: PathBuf) -> anyhow::Result<Self> {
+    pub fn from_profile(
+        table: &crucible::deploy::profile::ClusterLinkCfg,
+        secrets: PathBuf,
+    ) -> Result<Self, crucible_contract::cluster_link::ExternalUrlError> {
         Ok(Self {
-            client_id,
-            external_url: ExternalUrl::parse(external_url)?,
+            client_id: table.client_id.to_string(),
+            external_url: ExternalUrl::parse(&table.external_url)?,
             secrets,
+            openshift: table.openshift.iter().map(|c| c.to_string()).collect(),
         })
     }
 }
@@ -159,6 +166,34 @@ pub struct ClusterLinks {
 }
 
 impl ClusterLinks {
+    /// The flow the deploy profile's `[cluster_link]` table configures, with each cluster's secret
+    /// under `CONTROLLER_CLUSTER_LINK_SECRETS`. `None` without the table.
+    pub fn from_env(
+        profile: Option<&std::path::Path>,
+        clusters: Arc<ClusterClients>,
+    ) -> anyhow::Result<Option<Self>> {
+        use anyhow::Context;
+        let Some(path) = profile else {
+            return Ok(None);
+        };
+        let profile = crucible::deploy::DeployProfile::load(path)
+            .context("reading the deploy profile for cluster links")?;
+        let Some(table) = profile.cluster_link.as_ref() else {
+            return Ok(None);
+        };
+        let secrets = std::env::var("CONTROLLER_CLUSTER_LINK_SECRETS").context(
+            "the deploy profile has a [cluster_link] table, so CONTROLLER_CLUSTER_LINK_SECRETS must name the mounted client secrets",
+        )?;
+        let cfg = LinkCfg::from_profile(table, PathBuf::from(secrets))
+            .context("[cluster_link].external_url")?;
+        tracing::info!(
+            clusters = ?cfg.openshift,
+            client_id = cfg.client_id,
+            "linking cluster usernames through OpenShift OAuth"
+        );
+        Self::new(cfg, clusters).map(Some)
+    }
+
     pub fn new(cfg: LinkCfg, clusters: Arc<ClusterClients>) -> anyhow::Result<Self> {
         use anyhow::Context;
         let http = reqwest::Client::builder()
@@ -173,10 +208,10 @@ impl ClusterLinks {
         })
     }
 
-    /// Whether `cluster` links through its OAuth server: it is connected and has a secret mounted.
+    /// Whether `cluster` links through its OAuth server: the profile lists it, it is connected,
+    /// and its client secret is mounted.
     pub fn offers(&self, cluster: &str) -> bool {
-        self.clusters.names().iter().any(|c| c == cluster)
-            && self.cfg.secrets.join(cluster).is_file()
+        self.registered(cluster).is_ok()
     }
 
     /// Start a link: the authorization URL to send the browser to, and what to park on the session.
@@ -269,7 +304,9 @@ impl ClusterLinks {
                 cluster: cluster.to_string(),
             });
         }
-        if !self.cfg.secrets.join(cluster).is_file() {
+        if !self.cfg.openshift.iter().any(|c| c == cluster)
+            || !self.cfg.secrets.join(cluster).is_file()
+        {
             return Err(LinkFlowError::NotOffered {
                 cluster: cluster.to_string(),
             });
@@ -352,34 +389,35 @@ fn exchange_failure<RE: std::error::Error + 'static>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod testing {
     use crate::identity::cluster_link::*;
     use axum::extract::{Form, Query, State};
     use axum::http::StatusCode;
     use axum::response::{IntoResponse, Redirect, Response};
     use base64::Engine;
+    use crucible_contract::cluster_link::DEFAULT_CLIENT_ID;
     use sha2::Digest;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    const SECRET: &str = "oauthclient-secret";
-    const EXTERNAL: &str = "https://crucible.example.com/console";
+    pub(crate) const SECRET: &str = "oauthclient-secret";
+    pub(crate) const EXTERNAL: &str = "https://crucible.example.com/console";
 
     #[derive(Default)]
-    struct Issued {
+    pub(crate) struct Issued {
         /// code -> (code_challenge, redirect_uri, client_id)
-        codes: HashMap<String, (String, String, String)>,
+        pub(crate) codes: HashMap<String, (String, String, String)>,
         next: u32,
     }
 
     /// One OpenShift cluster: its API server's RFC 8414 document and its OAuth server, which
     /// enforces what the real one does for a confidential client with PKCE.
     #[derive(Clone)]
-    struct OpenShift {
-        base: String,
-        s256: bool,
-        redirect: String,
-        issued: Arc<Mutex<Issued>>,
+    pub(crate) struct OpenShift {
+        pub(crate) base: String,
+        pub(crate) s256: bool,
+        pub(crate) redirect: String,
+        pub(crate) issued: Arc<Mutex<Issued>>,
     }
 
     #[derive(Deserialize)]
@@ -469,13 +507,13 @@ mod tests {
         .into_response()
     }
 
-    struct Fleet {
-        links: ClusterLinks,
-        pirate: OpenShift,
-        _dir: tempfile::TempDir,
+    pub(crate) struct Fleet {
+        pub(crate) links: ClusterLinks,
+        pub(crate) pirate: OpenShift,
+        pub(crate) dir: tempfile::TempDir,
     }
 
-    async fn serve(os_for: impl FnOnce(String) -> OpenShift) -> OpenShift {
+    pub(crate) async fn serve(os_for: impl FnOnce(String) -> OpenShift) -> OpenShift {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let os = os_for(base);
@@ -491,7 +529,7 @@ mod tests {
         os
     }
 
-    fn register(dir: &std::path::Path, cluster: &str, server: &str) {
+    pub(crate) fn register(dir: &std::path::Path, cluster: &str, server: &str) {
         let spoke = dir.join("clusters").join(cluster);
         std::fs::create_dir_all(&spoke).unwrap();
         let token = spoke.join("token");
@@ -521,7 +559,7 @@ current-context: {cluster}
 
     /// `pirate` links through OAuth; `waldorf` is connected with a secret too; `nosecret` is
     /// connected but has no OAuthClient secret mounted.
-    async fn fleet(s256: bool) -> Fleet {
+    pub(crate) async fn fleet(s256: bool) -> Fleet {
         let external = ExternalUrl::parse(EXTERNAL).unwrap();
         let redirect_for = |cluster: &str| external.callback(cluster).unwrap().to_string();
         let pirate = serve(|base| OpenShift {
@@ -547,17 +585,22 @@ current-context: {cluster}
         std::fs::write(secrets.join("pirate"), format!("{SECRET}\n")).unwrap();
         std::fs::write(secrets.join("waldorf"), SECRET).unwrap();
         let clusters = Arc::new(ClusterClients::new(Some(dir.path().join("clusters"))));
-        let cfg = LinkCfg::new(DEFAULT_CLIENT_ID.to_string(), EXTERNAL, secrets).unwrap();
+        let cfg = LinkCfg {
+            client_id: DEFAULT_CLIENT_ID.to_string(),
+            external_url: ExternalUrl::parse(EXTERNAL).unwrap(),
+            secrets,
+            openshift: vec!["pirate".into(), "waldorf".into(), "nosecret".into()],
+        };
         Fleet {
             links: ClusterLinks::new(cfg, clusters).unwrap(),
             pirate,
-            _dir: dir,
+            dir,
         }
     }
 
     /// What the browser does between `start` and the callback: follow the authorization URL and
     /// read the query the cluster redirected back with.
-    async fn authorize_in_browser(url: &Url) -> Callback {
+    pub(crate) async fn authorize_in_browser(url: &Url) -> Callback {
         let res = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -581,9 +624,17 @@ current-context: {cluster}
         }
     }
 
-    fn now() -> jiff::Timestamp {
+    pub(crate) fn now() -> jiff::Timestamp {
         jiff::Timestamp::now()
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::identity::cluster_link::testing::*;
+    use crate::identity::cluster_link::*;
+    use crucible_contract::cluster_link::DEFAULT_CLIENT_ID;
+    use std::collections::HashMap;
 
     #[tokio::test]
     async fn a_link_redeems_the_code_the_cluster_issued_for_this_browser() {

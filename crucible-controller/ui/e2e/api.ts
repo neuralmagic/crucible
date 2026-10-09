@@ -1180,11 +1180,42 @@ function fallback(path: string): Json {
 /** Serve every API call from fixtures so a render is a function of the code alone. A proposal is
  * the one stateful stub: the row it lands is what its own URL serves back, so a shared link and a
  * refresh read what was proposed. */
+export const CLUSTER_IDENTITIES = [
+  {
+    cluster: 'hub',
+    rule: { kind: 'claim', claim: 'login', prefix: null },
+    kube_user: 'wren',
+    source: 'rule',
+    linked_at: null,
+  },
+  { cluster: 'pirate', rule: { kind: 'link', oauth: true }, kube_user: null, source: null, linked_at: null },
+  { cluster: 'rig', rule: { kind: 'link', oauth: false }, kube_user: null, source: null, linked_at: null },
+  {
+    cluster: 'waldorf',
+    rule: { kind: 'claim', claim: 'email', prefix: null },
+    kube_user: 'wren@example.com',
+    source: 'rule',
+    linked_at: null,
+  },
+];
+
+/** The token a stand-in cluster accepts for wren on any `link` cluster. */
+export const GOOD_CLUSTER_TOKEN = 'sha256~wren';
+
 export async function stubApi(page: Page): Promise<void> {
   let proposed: Record<string, unknown> = { ...PACK_IMPORT };
   let shares = [...(ROUTES['/api/playbook-drafts/studio/shares'] as Record<string, unknown>[])];
   let team = { ...TEAMS[0] };
   let policySets = POLICY_SETS.map((set) => ({ ...set }));
+  let identities = CLUSTER_IDENTITIES.map((identity) => ({ ...identity }));
+  const linked = (cluster: string, source: string) => {
+    identities = identities.map((i) =>
+      i.cluster === cluster
+        ? { ...i, kube_user: 'wren-k8s', source, linked_at: '2026-10-08T21:00:00Z' }
+        : i,
+    );
+    return identities.find((i) => i.cluster === cluster);
+  };
   await page.route(
     (url: URL) => url.pathname.startsWith('/api/'),
     (route: Route) => {
@@ -1247,6 +1278,33 @@ export async function stubApi(page: Page): Promise<void> {
           members: members.map((m) => ({ ...m, since: '2026-09-14T00:00:00Z', added_by: 'wren', signed_in: m.kind === 'user' })),
         };
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(team) });
+      }
+      // Cluster identities: signing in at a cluster is its OAuth round trip collapsed to one hop,
+      // straight back to Settings with the outcome the controller's callback would send.
+      if (path === '/api/me/cluster-identities') {
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(identities) });
+      }
+      const identity = /^\/api\/me\/cluster-identities\/([^/]+)(\/link)?$/.exec(path);
+      if (identity !== null && identity[2] === '/link' && route.request().method() === 'POST') {
+        linked(identity[1], 'openshift-oauth');
+        const authorize_url = `${new URL(route.request().url()).origin}/settings?linked=${identity[1]}`;
+        return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ authorize_url }) });
+      }
+      if (identity !== null && route.request().method() === 'PUT') {
+        const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
+        const token = typeof sent === 'object' && sent !== null && 'cluster_token' in sent ? sent.cluster_token : null;
+        if (token !== GOOD_CLUSTER_TOKEN) {
+          const body = JSON.stringify({ error: `cluster "${identity[1]}" did not accept the presented token` });
+          return route.fulfill({ status: 400, contentType: 'application/json', body });
+        }
+        const body = JSON.stringify(linked(identity[1], 'token-review'));
+        return route.fulfill({ status: 200, contentType: 'application/json', body });
+      }
+      if (identity !== null && route.request().method() === 'DELETE') {
+        identities = identities.map((i) =>
+          i.cluster === identity[1] ? { ...i, kube_user: null, source: null, linked_at: null } : i,
+        );
+        return route.fulfill({ status: 204, body: '' });
       }
       if (path === '/api/teams/llm-d') {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(team) });

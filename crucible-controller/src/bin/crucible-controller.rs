@@ -1145,7 +1145,15 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         policy,
         &cfg,
     )
-    .with_vault(serve_vault);
+    .with_vault(serve_vault)
+    .with_cluster_links(
+        crucible_controller::identity::cluster_link::ClusterLinks::from_env(
+            cfg.deploy_profile.as_deref(),
+            clusters.clone(),
+        )
+        .context("configuring cluster identity links")?
+        .map(std::sync::Arc::new),
+    );
     let images_refresh = serve_state.images_refresh();
     let agent_auth = crucible_controller::agent_auth::AgentAuth::from_env(
         db.pool().clone(),

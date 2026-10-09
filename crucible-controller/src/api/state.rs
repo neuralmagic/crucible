@@ -144,6 +144,12 @@ pub struct ApiState {
     pub(crate) cluster_policy: Arc<crate::runs::dispatch_target::ClusterPolicy>,
     /// The policy set in force (RFC-0003 C-POLICY), swapped whole by `activate`.
     pub(crate) policy: crate::authz::policy::ActivePolicy,
+    /// The deploy profile the cluster identity rules are read from, per request.
+    pub(crate) deploy_profile: Option<std::path::PathBuf>,
+    /// The TokenReview every cluster identity link is proven by.
+    pub(crate) reviewer: Arc<dyn crate::identity::kube_links::ClusterReviewer>,
+    /// Linking through a cluster's OpenShift OAuth server; `None` without a `[cluster_link]` table.
+    pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
 }
 
 impl ApiState {
@@ -196,6 +202,9 @@ impl ApiState {
             cluster_stats: Arc::new(crate::runs::cluster_stats::ClusterStats::new(
                 clusters.clone(),
             )),
+            reviewer: Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
+            cluster_links: None,
+            deploy_profile: cfg.deploy_profile.clone(),
             clusters,
             control_port: cfg.control_port,
             config,
@@ -259,6 +268,16 @@ impl ApiState {
         self
     }
 
+    /// Attach the OpenShift OAuth link flow, built by the binary because reading its secrets can
+    /// fail.
+    pub fn with_cluster_links(
+        mut self,
+        links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
+    ) -> Self {
+        self.cluster_links = links;
+        self
+    }
+
     /// Attach the hub's Vault client. Built by the binary (the client reads its own environment
     /// and can fail), so assembling the state itself stays infallible.
     pub fn with_vault(mut self, vault: Option<Arc<crate::secrets::vault::VaultClient>>) -> Self {
@@ -312,6 +331,9 @@ impl ApiState {
             cluster_stats: Arc::new(crate::runs::cluster_stats::ClusterStats::new(
                 clusters.clone(),
             )),
+            reviewer: Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
+            cluster_links: None,
+            deploy_profile: None,
             clusters,
             control_port: 7777,
             config: None,
