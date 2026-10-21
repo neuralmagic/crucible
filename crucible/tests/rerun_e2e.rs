@@ -244,3 +244,54 @@ fn a_rerun_needs_a_finished_parent() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A pack whose workspace is only its injected files: editing the script the failing task runs
+/// changes the workspace's starting tree, and a rerun on a fresh workspace still starts.
+#[test]
+fn a_rerun_of_a_repo_less_workspace_starts_from_its_own_injects() {
+    let dir = pack("injected");
+    std::fs::write(
+        dir.join("crucible.toml"),
+        r#"
+[workspace]
+inject = ["check.sh"]
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "rerun with an edited script"
+[workflow]
+type = "playbook"
+file = "workflow.star"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("workflow.star"),
+        r#"
+make = command(name = "make", run = "echo make >> ../ran.log && echo built > built.txt && printf '{}\n'")
+check = command(name = "check", run = "echo check >> ../ran.log && sh check.sh", depends_on = [make])
+workflow(type = "playbook", tasks = [make, check])
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.join("check.sh"), "exit 1\n").unwrap();
+
+    let first = run(&dir, "crucible-run-parent", &[]);
+    assert!(!first.status.success(), "{}", describe(&first));
+    keep_parent(&dir);
+    std::fs::write(
+        dir.join("check.sh"),
+        "cat built.txt > ../seen.log && printf '{}\\n'\n",
+    )
+    .unwrap();
+    std::fs::remove_dir_all(dir.join("workspace")).unwrap();
+
+    let rerun = run(&dir, "crucible-run-child", RERUN_CHECK);
+    assert!(rerun.status.success(), "{}", describe(&rerun));
+    assert_eq!(ran(&dir), ["make", "check", "check"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("seen.log")).unwrap(),
+        "built\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

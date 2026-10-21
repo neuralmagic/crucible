@@ -213,6 +213,18 @@ against the new ceilings.
 
 You may edit the tasks you rerun. An edit to a task the rerun would reuse is refused, naming
 the task, so a stale result is never carried over silently; add it to `--from` to run it again.
+The check covers what the graph declares, not the scripts a task runs from the pack: editing
+`check.sh` reruns nothing by itself.
+
+On the control plane, a finished launch's page offers **Rerun** with what it would reuse and at
+what cost. From the CLI, launch the draft or playbook again with the run to rerun:
+
+```sh
+crux draft-launch haiku --max-cost 1 --max-time 5m --rerun-of <run id> --from check
+```
+
+A draft rerun runs the newest save. Reruns need a controller that runs playbooks locally
+(`CONTROLLER_PLAYBOOK_EXECUTOR=local`) for now.
 
 ## Put a real agent on it
 

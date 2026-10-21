@@ -322,8 +322,8 @@ struct RerunBaseUnavailable {
 }
 
 /// Rebuild a rerun's workspace: the commit its parent started from, or this checkout's `HEAD`
-/// when that holds the same tree, then the reused tasks' commits, then the manifest's injects.
-/// Returns the commit the rerun starts from.
+/// when that holds the same tree or the workspace has no repository of its own, then the reused
+/// tasks' commits, then the manifest's injects. Returns the commit the rerun starts from.
 pub(crate) fn restore_for_rerun(
     manifest_path: &Path,
     m: &manifest::Manifest,
@@ -337,7 +337,9 @@ pub(crate) fn restore_for_rerun(
         parent.base.clone()
     } else {
         let head = vcs::head_sha(&workspace)?;
+        let own_baseline = m.workspace.setup_cmd.is_none() && m.repo.source().is_none();
         match git_memory::tree_of(&workspace, &head)? {
+            _ if own_baseline => head,
             Some(tree) if !parent.base_tree.is_empty() && tree == parent.base_tree => head,
             _ => {
                 return Err(RerunBaseUnavailable {
