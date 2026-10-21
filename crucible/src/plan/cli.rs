@@ -1641,7 +1641,7 @@ mod tests {
         let receiver = std::thread::spawn(move || {
             listener
                 .incoming()
-                .take(2)
+                .take(4)
                 .map(|s| read_one_post(&mut s.expect("accept")))
                 .collect::<Vec<_>>()
         });
@@ -1734,9 +1734,21 @@ mod tests {
         drop(_ingest);
 
         let posts = receiver.join().expect("receiver");
-        assert_eq!(posts.len(), 2, "both runs deliver");
-        for ((path, body), outcome) in posts.iter().zip(["finished", "error"]) {
-            assert_eq!(path, "/api/pods/crucible-run-pod/artifacts/run-session");
+        let paths: Vec<&str> = posts.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/api/pods/crucible-run-pod/artifacts/run-session",
+                "/api/pods/crucible-run-pod/artifacts/run-commits",
+                "/api/pods/crucible-run-pod/artifacts/run-session",
+                "/api/pods/crucible-run-pod/artifacts/run-commits",
+            ],
+            "each run delivers its session and its git memory"
+        );
+        let sessions = posts
+            .iter()
+            .filter(|(path, _)| path.ends_with("/run-session"));
+        for ((_, body), outcome) in sessions.zip(["finished", "error"]) {
             assert_eq!(&body[..2], b"\x1f\x8b", "the body is gzip");
             let mut text = String::new();
             std::io::Read::read_to_string(
