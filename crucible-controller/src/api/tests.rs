@@ -10109,9 +10109,10 @@ async fn a_run_lists_and_serves_the_files_its_tasks_captured(pool: PgPool) -> Re
     assert_eq!(status, StatusCode::OK, "{empty}");
     assert!(empty["files"].as_array().expect("files").is_empty());
 
-    crate::runs::blob_store::put_run_files(
+    crate::runs::blob_store::put_run_bundle(
         &pool,
         "run-pod",
+        crucible_contract::ArtifactKind::RunFiles,
         run_files_bundle(&[
             ("roundup/FINDINGS.json", b"{\"broken\":21}"),
             ("propose/fix.patch", b"diff --git a/x b/x\n"),

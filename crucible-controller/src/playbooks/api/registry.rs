@@ -795,6 +795,7 @@ pub(crate) async fn launch_playbook(
         draft_version: None,
         created_by: actor,
         launcher_groups: Some(&saver.groups),
+        rerun: None,
     };
     use crate::launches::store::AdoptPlaybookOutcome;
     match crate::launches::store::adopt_playbook_launch(

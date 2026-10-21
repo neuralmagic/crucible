@@ -315,7 +315,13 @@ pub(crate) async fn get_run_files(
     {
         return Ok(not_found(format!("run not found: {run_id}")));
     }
-    let files = match crate::runs::blob_store::get_run_files(state.db.pool(), &run_id).await? {
+    let files = match crate::runs::blob_store::get_run_bundle(
+        state.db.pool(),
+        &run_id,
+        crucible_contract::ArtifactKind::RunFiles,
+    )
+    .await?
+    {
         Some(bundle) => crate::runs::run_files::list_bundle(&bundle)?,
         None => crate::runs::run_files::list_local(&state.scratch_dir, &run_id).await,
     };
@@ -352,7 +358,13 @@ pub(crate) async fn get_run_file(
     {
         return Ok(not_found(format!("run not found: {run_id}")));
     }
-    let body = match crate::runs::blob_store::get_run_files(state.db.pool(), &run_id).await? {
+    let body = match crate::runs::blob_store::get_run_bundle(
+        state.db.pool(),
+        &run_id,
+        crucible_contract::ArtifactKind::RunFiles,
+    )
+    .await?
+    {
         Some(bundle) => crate::runs::run_files::read_bundle(&bundle, &key)?,
         None => crate::runs::run_files::read_local(&state.scratch_dir, &run_id, &key).await,
     };

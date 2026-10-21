@@ -951,6 +951,7 @@ pub(crate) async fn launch_playbook_draft(
         draft_version: Some(latest.version),
         created_by: actor,
         launcher_groups: Some(&saver.groups),
+        rerun: None,
     };
     // A draft's content changes on every save, so the disclosure is recomputed from the version
     // being launched and lands in the same transaction that adopts it, before anything executes.

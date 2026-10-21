@@ -109,7 +109,9 @@ pub(crate) fn task_result_event(
         secs: 0.0,
         trace_id,
         span_id,
-        agent: args.and_then(|args| crate::plan::harness::resolved_agent(args, task)),
+        agent: args
+            .and_then(|args| crate::plan::harness::resolved_agent(args, task))
+            .map(Box::new),
         repairs: r.repairs.clone(),
         reused_from: None,
     }

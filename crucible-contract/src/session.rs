@@ -532,7 +532,7 @@ pub enum SessionEvent {
         links: Vec<crate::link::ExternalLink>,
         /// What the attempts ran on, resolved. Present exactly when the task runs an agent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        agent: Option<TaskAgent>,
+        agent: Option<Box<TaskAgent>>,
         /// The repair turns the attempts took, in order. Their cost is part of `cost_usd`.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         repairs: Vec<TaskRepair>,
@@ -1278,11 +1278,11 @@ mod tests {
             trace_id: String::new(),
             span_id: String::new(),
             reused_from: None,
-            agent: Some(TaskAgent {
+            agent: Some(Box::new(TaskAgent {
                 harness: "claude".into(),
                 model: "glm-5.3".into(),
                 effort: "low".into(),
-            }),
+            })),
             repairs: Vec::new(),
         };
         assert!(

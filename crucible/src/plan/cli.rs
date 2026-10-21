@@ -734,24 +734,14 @@ pub fn run(
                         let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
                             manifest: m.display().to_string(),
                         })?;
-                        let caps =
-                            crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
-                                .with_persistent_sessions();
                         if workflow.workflow_type == crate::plan::workflow::WorkflowType::Playbook {
-                            workflow
-                                .admit(&caps)
-                                .context("admitting one-pass playbook")?;
                             series_entry = Some(workflow.history_record.clone());
-                            Plan {
-                                version: 1,
-                                reason: None,
-                                budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
-                                params: workflow.params.clone(),
-                                tasks: workflow.tasks.clone(),
-                            }
-                            .validate()
-                            .context("building one-pass playbook")?
+                            workflow.playbook_plan()?
                         } else {
+                            let caps = crate::plan::workflow::WorkflowCaps::for_lane(
+                                workflow.workflow_type,
+                            )
+                            .with_persistent_sessions();
                             crate::plan::template::iteration_template(Some(workflow), &caps)?
                         }
                     }

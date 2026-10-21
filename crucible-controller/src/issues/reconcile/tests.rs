@@ -6687,6 +6687,7 @@ async fn adopt_launch_with_groups(
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups,
+                    rerun: None,
                 },
                 registered.revision()
             )
@@ -6756,6 +6757,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         },
         registered.revision(),
     )
