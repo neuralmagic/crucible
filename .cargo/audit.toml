@@ -4,6 +4,4 @@
 [advisories]
 ignore = [
     "RUSTSEC-2023-0071",
-    # noyalib 0.0.28 via the OpenShell fork pin; parses policy YAML crucible renders.
-    "RUSTSEC-2026-0333",
 ]
