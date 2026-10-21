@@ -223,4 +223,4 @@ desktop-install:
 
 # Format, lint and test the desktop app, which is its own Cargo workspace.
 desktop-check:
-    cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features -- -D warnings && cargo test
+    cd crucible-desktop && cargo fmt --check && cargo clippy --all-targets --all-features --locked -- -D warnings && cargo test --locked
