@@ -136,6 +136,10 @@ for i in "${!SHARDS[@]}"; do
     done
 done
 
+if [ -r /proc/sys/fs/inotify/max_user_instances ] && [ "$(cat /proc/sys/fs/inotify/max_user_instances)" -lt 512 ]; then
+    fail "fs.inotify.max_user_instances is $(cat /proc/sys/fs/inotify/max_user_instances); kube-proxy runs out of inotify instances with three kind clusters: sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288"
+fi
+
 cluster_name() { echo "crucible-e2e-$ID-$1"; }
 
 collect() {

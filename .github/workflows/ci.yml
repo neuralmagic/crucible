@@ -359,6 +359,11 @@ jobs:
           chmod +x "$bin/kind" "$bin/kubectl"
           echo "$bin" >> "$GITHUB_PATH"
 
+      # The default inotify instance limit (128) starves kube-proxy once three kind clusters share
+      # the host; kind's known-issues page gives these values.
+      - name: Raise inotify limits
+        run: sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
+
       - name: Start Postgres
         uses: ./.github/actions/postgres
 
