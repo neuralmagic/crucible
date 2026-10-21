@@ -833,9 +833,15 @@ pub fn local_pack(digest: &crucible_contract::pack_tree::TreeDigest, ignored: &[
 }
 
 /// A save that landed: the new version, its diagnostics, and the studio page a human opens on it.
-pub fn draft_created(id: &str, saved: &dto::DraftCompile, studio_url: &str) -> String {
+pub fn draft_created(
+    id: &str,
+    saved: &dto::DraftCompile,
+    studio_url: &str,
+    skill_url: &str,
+) -> String {
     let mut out = format!("created draft {id} at version {}\n", saved.version);
     out.push_str(&compiled(saved, studio_url));
+    out.push_str(&format!("agent skill: {skill_url}\n"));
     out
 }
 
@@ -2553,6 +2559,32 @@ mod tests {
         assert!(out.contains("schema: sha256:cc\n"), "{out}");
         assert!(
             out.ends_with("studio: https://c/playbooks/drafts/calibrate\n"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn a_create_hands_out_the_agent_skill_after_the_studio_link() {
+        let saved: dto::DraftCompile = serde_json::from_str(
+            r#"{"version":1,"saved_by":"wren","saved_at":"2026-08-23T10:00:00Z",
+               "params_schema":null,"schema_digest":"sha256:aa","graph":null,"diagnostics":[]}"#,
+        )
+        .expect("the create fixture parses");
+        let out = draft_created(
+            "haiku",
+            &saved,
+            "https://c/playbooks/drafts/haiku",
+            "https://c/api/playbooks/drafts/skill",
+        );
+        assert!(
+            out.starts_with("created draft haiku at version 1\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "studio: https://c/playbooks/drafts/haiku\n\
+                 agent skill: https://c/api/playbooks/drafts/skill\n"
+            ),
             "{out}"
         );
     }
