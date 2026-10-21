@@ -1,14 +1,2 @@
-h2 v0.3.27
-h2 v0.4.20
-hyper v0.14.32
-hyper v1.12.0
-hyper-rustls v0.24.2
-hyper-rustls v0.27.10
 reqwest v0.12.28
 reqwest v0.13.5
-rustls v0.21.12
-rustls v0.23.46
-rustls-webpki v0.101.7
-rustls-webpki v0.103.16
-tokio-rustls v0.24.1
-tokio-rustls v0.26.6
