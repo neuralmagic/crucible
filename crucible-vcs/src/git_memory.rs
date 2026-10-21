@@ -3,7 +3,7 @@
 //! git-backed World so the engine never names git.
 
 use crate::vcs;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::Path;
 
 /// Paths a discard must NOT delete: the agent's toolbox (`.claude`), the results log, and any
@@ -113,6 +113,55 @@ pub fn restore(ws: &Path, sha: &str, keep_extra: &[String]) -> Result<()> {
         .collect();
     vcs::clean_untracked(ws, &keep)?;
     Ok(())
+}
+
+/// One commit of a playbook run's git memory: the task that made it and its change as a patch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskCommit {
+    pub task: String,
+    pub patch: Vec<u8>,
+}
+
+const TASK_LABEL: &str = "task ";
+
+/// The commit message a settled task's snapshot carries.
+pub fn task_label(task: &str) -> String {
+    format!("{TASK_LABEL}{task}")
+}
+
+/// A commit between a run's base and `HEAD` that no task made.
+#[derive(Debug, thiserror::Error)]
+#[error("commit {summary:?} after the run's base was not made by a task")]
+pub struct UnlabelledCommit {
+    pub summary: String,
+}
+
+/// Every commit since `base`, oldest first, each with the task that made it.
+pub fn task_commits(ws: &Path, base: &str) -> Result<Vec<TaskCommit>> {
+    vcs::commits_since(ws, base)?
+        .into_iter()
+        .map(|(summary, patch)| match summary.strip_prefix(TASK_LABEL) {
+            Some(task) => Ok(TaskCommit {
+                task: task.to_string(),
+                patch,
+            }),
+            None => Err(UnlabelledCommit { summary }.into()),
+        })
+        .collect()
+}
+
+/// Apply each commit onto `HEAD` in order, labelled with its task as the original was.
+pub fn replay(ws: &Path, commits: &[TaskCommit]) -> Result<()> {
+    for commit in commits {
+        vcs::apply_and_commit(ws, &commit.patch, &task_label(&commit.task))
+            .with_context(|| format!("replaying the commit of task {}", commit.task))?;
+    }
+    Ok(())
+}
+
+/// The tree `sha` points at, or `None` when this repository does not have that commit.
+pub fn tree_of(ws: &Path, sha: &str) -> Result<Option<String>> {
+    vcs::commit_tree(ws, sha)
 }
 
 #[cfg(test)]
@@ -320,5 +369,112 @@ mod tests {
             std::fs::read_to_string(ws.join("kernel.cuh")).expect("tracked"),
             "v0\n"
         );
+    }
+
+    /// A copy of `ws` at its first commit, as a fresh checkout of the same base would be.
+    fn clone_at_base(ws: &Path) -> TempDir {
+        let tmp = tempdir();
+        git2::Repository::clone(ws.to_str().expect("utf-8 path"), &tmp.0).expect("clone");
+        let first = vcs::commits_since(ws, &first_commit(ws)).expect("history");
+        let back = first.len();
+        let repo = git2::Repository::open(&tmp.0).expect("open clone");
+        let mut head = repo.head().unwrap().peel_to_commit().unwrap();
+        for _ in 0..back {
+            head = head.parent(0).unwrap();
+        }
+        repo.reset(head.as_object(), git2::ResetType::Hard, None)
+            .unwrap();
+        let mut cfg = repo.config().unwrap();
+        cfg.set_str("user.name", "t").unwrap();
+        cfg.set_str("user.email", "t@t").unwrap();
+        tmp
+    }
+
+    fn first_commit(ws: &Path) -> String {
+        let repo = git2::Repository::open(ws).unwrap();
+        let mut walk = repo.revwalk().unwrap();
+        walk.push_head().unwrap();
+        walk.set_sorting(git2::Sort::REVERSE).unwrap();
+        walk.next().unwrap().unwrap().to_string()
+    }
+
+    #[test]
+    fn task_commits_replay_onto_a_fresh_checkout_of_the_base() {
+        let (tmp, base) = seeded_repo();
+        let ws = tmp.0.clone();
+        std::fs::write(ws.join("kernel.cuh"), "v1\n").unwrap();
+        std::fs::write(ws.join("blob.bin"), [0u8, 159, 146, 150, 255, 0, 7]).unwrap();
+        snapshot(&ws, &task_label("edit")).unwrap();
+        std::fs::remove_file(ws.join("kernel.cuh")).unwrap();
+        std::fs::write(ws.join("notes.md"), "fanned\n").unwrap();
+        snapshot(&ws, &task_label("audit[a b]")).unwrap();
+
+        let commits = task_commits(&ws, &base).unwrap();
+        assert_eq!(
+            commits.iter().map(|c| c.task.as_str()).collect::<Vec<_>>(),
+            ["edit", "audit[a b]"]
+        );
+
+        let fresh = clone_at_base(&ws);
+        assert_eq!(vcs::head_sha(&fresh.0).unwrap(), base);
+        replay(&fresh.0, &commits).unwrap();
+        assert!(!fresh.0.join("kernel.cuh").exists());
+        assert_eq!(
+            std::fs::read(fresh.0.join("blob.bin")).unwrap(),
+            [0u8, 159, 146, 150, 255, 0, 7]
+        );
+        assert_eq!(
+            std::fs::read_to_string(fresh.0.join("notes.md")).unwrap(),
+            "fanned\n"
+        );
+        assert_eq!(
+            tree_of(&fresh.0, &vcs::head_sha(&fresh.0).unwrap()).unwrap(),
+            tree_of(&ws, &vcs::head_sha(&ws).unwrap()).unwrap(),
+            "the replayed tree is the original's"
+        );
+        assert_eq!(
+            task_commits(&fresh.0, &base).unwrap(),
+            commits,
+            "a replayed history exports as the one it came from"
+        );
+    }
+
+    #[test]
+    fn a_commit_no_task_made_is_refused() {
+        let (tmp, base) = seeded_repo();
+        let ws = tmp.0.clone();
+        std::fs::write(ws.join("kernel.cuh"), "v1\n").unwrap();
+        snapshot(&ws, "operator fixup").unwrap();
+        let err = task_commits(&ws, &base).unwrap_err();
+        assert!(
+            err.downcast_ref::<UnlabelledCommit>()
+                .is_some_and(|e| e.summary == "operator fixup"),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn a_patch_that_no_longer_applies_names_its_task() {
+        let (tmp, base) = seeded_repo();
+        let ws = tmp.0.clone();
+        std::fs::write(ws.join("kernel.cuh"), "v1\n").unwrap();
+        snapshot(&ws, &task_label("edit")).unwrap();
+        let commits = task_commits(&ws, &base).unwrap();
+        restore(&ws, &base, &[]).unwrap();
+        std::fs::write(ws.join("kernel.cuh"), "diverged\n").unwrap();
+        snapshot(&ws, "elsewhere").unwrap();
+        let err = replay(&ws, &commits).unwrap_err();
+        assert!(format!("{err:#}").contains("task edit"), "{err:#}");
+    }
+
+    #[test]
+    fn tree_of_an_unknown_commit_is_none() {
+        let (tmp, base) = seeded_repo();
+        assert!(tree_of(&tmp.0, &base).unwrap().is_some());
+        assert_eq!(
+            tree_of(&tmp.0, "0123456789012345678901234567890123456789").unwrap(),
+            None
+        );
+        assert_eq!(tree_of(&tmp.0, "not-a-sha").unwrap(), None);
     }
 }

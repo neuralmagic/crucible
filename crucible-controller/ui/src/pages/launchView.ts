@@ -70,6 +70,13 @@ export function originLinks(detail: LaunchDetail): OriginLink[] {
   if (launch.schedule !== null && launch.schedule !== undefined) {
     links.push({ label: 'schedule', value: launch.schedule, to: null });
   }
+  if (detail.rerun) {
+    links.push({
+      label: 'rerun of',
+      value: detail.rerun.run_id,
+      to: `/runs/${encodeURIComponent(detail.rerun.run_id)}`,
+    });
+  }
   return links;
 }
 
@@ -89,4 +96,47 @@ export function dispatchTone(state: DispatchState): DispatchTone {
 /// supersedes what came before. Null when nothing ever started.
 export function graphRunId(detail: LaunchDetail): string | null {
   return detail.runs[0]?.run_id ?? null;
+}
+
+type RerunPreview = components['schemas']['RerunPreviewDto'];
+
+export type RerunState = 'reused' | 'reruns' | 'changed';
+
+export interface RerunRow {
+  task: string;
+  state: RerunState;
+  /** What a reused task cost the run that settled it; null for a task that runs again. */
+  costUsd: number | null;
+}
+
+/// A rerun's tasks as the panel lists them: what is reused in the order the parent settled it,
+/// then what runs again, then any reused task that changed since the parent.
+export function rerunRows(preview: RerunPreview): RerunRow[] {
+  return [
+    ...preview.reused.map((r) => ({ task: r.task, state: 'reused' as const, costUsd: r.cost_usd })),
+    ...preview.rerun.map((task) => ({ task, state: 'reruns' as const, costUsd: null })),
+    ...preview.changed.map((task) => ({ task, state: 'changed' as const, costUsd: null })),
+  ];
+}
+
+/// Add `task` to a rerun's selection, keeping it sorted and free of repeats so the preview query
+/// key is stable.
+export function withTask(from: readonly string[], task: string): string[] {
+  return [...new Set([...from, task])].sort();
+}
+
+/// The launch body a rerun posts: the parent launch's own values and ceilings.
+export function rerunLaunchBody(
+  launch: LaunchDetail['launch'],
+  runId: string,
+  from: readonly string[],
+) {
+  return {
+    params: Object.fromEntries(
+      Object.entries(launch.params).map(([name, value]) => [name, String(value)]),
+    ),
+    max_cost: launch.max_cost,
+    max_time: launch.max_time,
+    rerun: { of: runId, from: [...from] },
+  };
 }

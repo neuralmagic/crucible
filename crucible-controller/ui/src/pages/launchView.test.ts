@@ -1,6 +1,16 @@
 import { describe, expect, it } from 'vitest';
 import type { components } from '../api/schema';
-import { detailPath, dispatchTone, graphRunId, originLabel, originLinks, relaunchPath } from './launchView';
+import {
+  detailPath,
+  dispatchTone,
+  graphRunId,
+  originLabel,
+  originLinks,
+  relaunchPath,
+  rerunLaunchBody,
+  rerunRows,
+  withTask,
+} from './launchView';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
 
@@ -100,5 +110,48 @@ describe('relaunchPath', () => {
       '/playbooks/fences/launch?relaunch=playbook%3Afences%3A01a02ffb',
     );
     expect(relaunchPath('a/b', 'k&v')).toBe('/playbooks/a%2Fb/launch?relaunch=k%26v');
+  });
+});
+
+describe('rerun', () => {
+  it('names the run a rerun launch reruns', () => {
+    const links = originLinks(detail({ rerun: { run_id: 'RUN-0412', from: ['rank'] } }));
+    expect(links.at(-1)).toEqual({ label: 'rerun of', value: 'RUN-0412', to: '/runs/RUN-0412' });
+  });
+
+  it('lists what is reused, then what runs again, then what changed', () => {
+    const rows = rerunRows({
+      run_id: 'RUN-0412',
+      playbook: 'survey',
+      draft_version: 3,
+      reused: [
+        { task: 'scan', cost_usd: 0.25 },
+        { task: 'fix', cost_usd: 1 },
+      ],
+      rerun: ['check'],
+      reused_usd: 1.25,
+      changed: ['lint'],
+    });
+    expect(rows).toEqual([
+      { task: 'scan', state: 'reused', costUsd: 0.25 },
+      { task: 'fix', state: 'reused', costUsd: 1 },
+      { task: 'check', state: 'reruns', costUsd: null },
+      { task: 'lint', state: 'changed', costUsd: null },
+    ]);
+  });
+
+  it('keeps a selection sorted and free of repeats', () => {
+    expect(withTask(['fix'], 'check')).toEqual(['check', 'fix']);
+    expect(withTask(['check', 'fix'], 'fix')).toEqual(['check', 'fix']);
+  });
+
+  it('launches with the parent launch\'s own values and ceilings', () => {
+    const { launch } = detail({}, { max_cost: 3, max_time: '45m' });
+    expect(rerunLaunchBody(launch, 'RUN-0412', ['fix'])).toEqual({
+      params: {},
+      max_cost: 3,
+      max_time: '45m',
+      rerun: { of: 'RUN-0412', from: ['fix'] },
+    });
   });
 });

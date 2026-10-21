@@ -613,6 +613,9 @@ pub(crate) struct LaunchPlaybookBody {
     /// The model to ask that provider for. Free text; absent takes the provider's own default.
     #[serde(default)]
     model: Option<String>,
+    /// Rerun a finished run of this playbook from some of its tasks.
+    #[serde(default)]
+    rerun: Option<crate::runs::api::rerun::RerunBody>,
 }
 
 /// What a launch landed: the issue key the run is tracked under, and the values it was authorized
@@ -778,6 +781,13 @@ pub(crate) async fn launch_playbook(
         Ok(v) => v,
         Err(refusal) => return refusal,
     };
+    let rerun =
+        match crate::runs::api::rerun::admit_launch(&state, &pack.id, false, body.rerun.as_ref())
+            .await
+        {
+            Ok(rerun) => rerun,
+            Err(refusal) => return *refusal,
+        };
     let actor = saver.actor.as_deref();
     let dispatch_target = saver.dispatch_target.clone();
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
@@ -795,6 +805,7 @@ pub(crate) async fn launch_playbook(
         draft_version: None,
         created_by: actor,
         launcher_groups: Some(&saver.groups),
+        rerun: rerun.as_ref(),
     };
     use crate::launches::store::AdoptPlaybookOutcome;
     match crate::launches::store::adopt_playbook_launch(

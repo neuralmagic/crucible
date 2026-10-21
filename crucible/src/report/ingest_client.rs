@@ -183,7 +183,16 @@ pub(crate) fn deliver_run_evidence(p: &Paths) {
         crucible_contract::ArtifactKind::RunSession,
         &p.session_log,
     );
-    deliver_captured_files(&cfg, p);
+    deliver_dir(
+        &cfg,
+        crucible_contract::ArtifactKind::RunFiles,
+        &p.state.join("files"),
+    );
+    deliver_dir(
+        &cfg,
+        crucible_contract::ArtifactKind::RunCommits,
+        &p.state.join(crucible::plan::rerun::GIT_MEMORY_DIR),
+    );
     // R5's in-process OTLP collector captures `otel.jsonl` in the run (state) dir; deliver it when it
     // exists. Absent until R5 lands, so this is inert plumbing today.
     let otel = p.state.join("otel.jsonl");
@@ -192,19 +201,17 @@ pub(crate) fn deliver_run_evidence(p: &Paths) {
     }
 }
 
-/// POST the run's captured files to the drop-box as one gzipped tar of `state/files`. The tree is
-/// `<task>/<declared path>`, and `capture_declared` publishes a task's directory by rename only
-/// once every file it declared is there, so what is tarred is exactly what the run captured.
+/// POST a state directory to the drop-box as one gzipped tar: the captured files of
+/// `state/files`, whose tree is `<task>/<declared path>` published by rename once complete, or
+/// the git memory of `state/git-memory`.
 ///
-/// A run whose tasks declared nothing has no `state/files` and delivers nothing: the absent artifact
-/// is the honest answer, not an empty tar.
-fn deliver_captured_files(cfg: &IngestConfig, p: &Paths) {
-    let files = p.state.join("files");
+/// A run that produced none has no directory and delivers nothing: the absent artifact is the
+/// honest answer, not an empty tar.
+fn deliver_dir(cfg: &IngestConfig, kind: crucible_contract::ArtifactKind, files: &Path) {
     if !files.is_dir() {
         return;
     }
-    let kind = crucible_contract::ArtifactKind::RunFiles;
-    let tar = match tar_dir(&files) {
+    let tar = match tar_dir(files) {
         Ok(t) => t,
         Err(e) => {
             eprintln!(
@@ -218,7 +225,8 @@ fn deliver_captured_files(cfg: &IngestConfig, p: &Paths) {
         Ok(g) => g,
         Err(e) => {
             eprintln!(
-                "[crucible] Tier 2: gzipping the captured files for {kind} delivery failed: {e}"
+                "[crucible] Tier 2: gzipping {} for {kind} delivery failed: {e}",
+                files.display()
             );
             return;
         }

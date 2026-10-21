@@ -6687,6 +6687,7 @@ async fn adopt_launch_with_groups(
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups,
+                    rerun: None,
                 },
                 registered.revision()
             )
@@ -6756,6 +6757,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         },
         registered.revision(),
     )
@@ -7869,6 +7871,15 @@ async fn a_restart_adopts_the_local_runs_it_orphaned(pool: PgPool) -> Result<()>
         .fetch_all(db.pool())
         .await?;
     assert_eq!(statuses, vec!["finished", "no-session"]);
+    let run_id: String = sqlx::query_scalar("SELECT run_id FROM runs WHERE issue = $1")
+        .bind(published)
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(
+        crate::runs::blob_store::get_run_session(db.pool(), &run_id).await?,
+        Some(playbook_log("finished")),
+        "a folded local session is stored like a pod's, so a rerun can read it"
+    );
     Ok(())
 }
 

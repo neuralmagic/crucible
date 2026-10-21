@@ -194,6 +194,38 @@ A pod the control plane dispatches does this itself: when the engine dies, the c
 restarts and resumes, up to three times. A hand-rendered pod does the same when its profile sets
 `[cluster] state_pvc`.
 
+## Rerun from a task
+
+When a late task fails, fix it and rerun from it instead of running the whole graph again.
+Set the finished run's state aside and point `--rerun-of` at it:
+
+```sh
+mv state parent
+crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m \
+  --rerun-of parent --from check
+```
+
+`check` and everything downstream of it run again, as does any task the parent did not pass.
+Every other task is reused: its output and declared files reach its dependents as before, and
+the commits it made are replayed onto the commit the parent started from. Reused rows are
+logged with `reused_from` naming the run that settled them, and their spend does not count
+against the new ceilings.
+
+You may edit the tasks you rerun. An edit to a task the rerun would reuse is refused, naming
+the task, so a stale result is never carried over silently; add it to `--from` to run it again.
+The check covers what the graph declares, not the scripts a task runs from the pack: editing
+`check.sh` reruns nothing by itself.
+
+On the control plane, a finished launch's page offers **Rerun** with what it would reuse and at
+what cost. From the CLI, launch the draft or playbook again with the run to rerun:
+
+```sh
+crux draft-launch haiku --max-cost 1 --max-time 5m --rerun-of <run id> --from check
+```
+
+A draft rerun runs the newest save. Reruns need a controller that runs playbooks locally
+(`CONTROLLER_PLAYBOOK_EXECUTOR=local`) for now.
+
 ## Put a real agent on it
 
 Drop `agent_cmd` and pick a backend:
