@@ -286,9 +286,13 @@ workflow(type = "playbook", tasks = [make, check])
     .unwrap();
     std::fs::remove_dir_all(dir.join("workspace")).unwrap();
 
-    let rerun = run(&dir, "crucible-run-child", RERUN_CHECK);
+    let rerun = run(&dir, "crucible-run-child", &["--rerun-of", "parent"]);
     assert!(rerun.status.success(), "{}", describe(&rerun));
-    assert_eq!(ran(&dir), ["make", "check", "check"]);
+    assert_eq!(
+        ran(&dir),
+        ["make", "check", "check"],
+        "with nothing named, only what failed runs again"
+    );
     assert_eq!(
         std::fs::read_to_string(dir.join("seen.log")).unwrap(),
         "built\n"
