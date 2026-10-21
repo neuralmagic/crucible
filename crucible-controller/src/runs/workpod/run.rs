@@ -125,6 +125,8 @@ pub enum RunRenderOpts {
         max_cost: f64,
         max_time: crate::model::MaxTime,
         agent: AgentSelection,
+        /// The finished run this launch reruns.
+        rerun: Option<crate::launches::model::RerunOf>,
     },
 }
 
@@ -197,6 +199,7 @@ impl RunRenderOpts {
                 params,
                 max_cost,
                 max_time,
+                rerun,
                 ..
             } => RenderOpts {
                 max_cost: *max_cost,
@@ -206,6 +209,10 @@ impl RunRenderOpts {
                     max_time: max_time.engine()?,
                     max_cost: *max_cost,
                     params: params.iter().cloned().collect(),
+                    rerun: rerun.as_ref().map(|r| crucible::deploy::RerunLaunch {
+                        parent: r.run.clone(),
+                        from: r.from.clone(),
+                    }),
                 }),
                 harness: agent.harness,
                 model: agent.model.clone(),
@@ -728,6 +735,17 @@ pub async fn dispatch_run(
             .merge(extra)
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
     }
+    let reads_run = match &opts {
+        RunRenderOpts::Playbook {
+            rerun: Some(rerun), ..
+        } => Some(rerun.run.as_str()),
+        _ => None,
+    };
+    let lifetime = crate::runs::completion::run_pod_deadline(db, cfg, issue_key).await?;
+    let token = crate::runs::run_token::mint(db.pool(), run_id, reads_run, lifetime).await?;
+    delivery
+        .merge(crate::secrets::deliver::run_token(token))
+        .map_err(|e| anyhow::anyhow!("folding the run token into the run's delivery: {e}"))?;
     // A run pushing as the App has to have the identity, so a failed resolve fails the dispatch.
     // Everywhere else it is a default, and a failure degrades to the pack's own.
     let git_identity = match cfg.github_app.as_ref() {
@@ -853,6 +871,7 @@ pub async fn dispatch_run(
             })
         }
         Err(e) => {
+            crate::runs::run_token::revoke_run(db.pool(), run_id).await?;
             // Retain a failed-to-launch row with the real reason (swept after retention), then let the
             // reconcile see the error and retry the issue from `awaiting-approval`.
             let reason = format!("{e:#}");

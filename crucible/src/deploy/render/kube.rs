@@ -55,6 +55,11 @@ pub enum RenderError {
     },
     #[error("the openshell-loop deploy template needs [agent].sandbox_image (the agent's sandbox)")]
     MissingSandboxImage,
+    #[error(
+        "a rerun pod fetches its parent's evidence from the controller, and this profile names no \
+         [cluster].ingest_url to reach it"
+    )]
+    RerunNeedsControllerUrl,
 }
 
 /// In-pod paths fixed by the openshell-loop template (the volume mounts the renderer always emits).
@@ -173,20 +178,20 @@ pub struct PlaybookLaunch {
     pub max_time: crate::duration::MaxTime,
     pub max_cost: f64,
     pub params: BTreeMap<String, String>,
+    /// The finished run this launch reruns, fetched from the controller.
+    pub rerun: Option<RerunLaunch>,
+}
+
+/// A rerun launch: the parent run's controller id, and the tasks dispatched again.
+#[derive(Debug, Clone)]
+pub struct RerunLaunch {
+    pub parent: String,
+    pub from: Vec<String>,
 }
 
 /// How many times a playbook pod starts its run before leaving it unfinished: the first start
 /// and three resumes.
 const MAX_PLAYBOOK_STARTS: u32 = 4;
-
-/// The in-pod mount dir for the projected Tier 2 ingest ServiceAccount token (Tier 2 ingest). The turn
-/// reads `<dir>/token` and sends it as the bearer to the controller's ingest drop-box.
-pub(super) const INGEST_TOKEN_DIR: &str = "/var/run/secrets/crucible.io/ingest";
-/// The pod-volume name for the ingest token projection.
-pub(super) const INGEST_TOKEN_VOLUME: &str = "crucible-ingest-token";
-/// The ingest token's TTL. Short by design (a turn is minutes, not hours), the kubelet rotates it
-/// and the API server invalidates it the instant the pod dies.
-pub(super) const INGEST_TOKEN_TTL_SECS: i64 = 900;
 
 /// The in-pod init-container mount where the pack ConfigMap is projected (read-only) before it is
 /// staged into the writable domain dir.
@@ -530,6 +535,38 @@ impl Renderer<'_> {
 
     /// A non-empty session log means an earlier start of this run already produced rows, so this
     /// start is a continuation, not a fresh run.
+    /// How a playbook pod picks up where it left off: `--resume` once a session exists, and for
+    /// a rerun, `--rerun-of` the parent's evidence on the controller until then. Returns a line
+    /// that sets the shell's arguments, and the flags to append to `crucible plan run`.
+    fn playbook_resume(&self, pb: &PlaybookLaunch) -> Result<(String, String), RenderError> {
+        let Some(rerun) = &pb.rerun else {
+            return Ok((String::new(), self.resume_flag().to_string()));
+        };
+        if self.profile.cluster.ingest_url.is_none() {
+            return Err(RenderError::RerunNeedsControllerUrl);
+        }
+        let parent = crucible_contract::artifact::path_segment(&rerun.parent);
+        let from: String = rerun
+            .from
+            .iter()
+            .map(|task| format!(" --from {}", sh_quote(task)))
+            .collect();
+        let rerun_args = format!(
+            r#"--rerun-of "${{{url}}}/api/runs/{parent}"{from}"#,
+            url = crucible_contract::ENV_CONTROLLER_URL,
+        );
+        Ok(if self.resumable() {
+            (
+                format!(
+                    "\n  if [ -s \"$D/state/session.jsonl\" ]; then set -- --resume; else set -- {rerun_args}; fi"
+                ),
+                r#" "$@""#.to_string(),
+            )
+        } else {
+            (String::new(), format!(" {rerun_args}"))
+        })
+    }
+
     fn resume_flag(&self) -> &'static str {
         if self.resumable() {
             r#" $([ -s "$D/state/session.jsonl" ] && echo --resume)"#
@@ -888,9 +925,8 @@ impl Renderer<'_> {
         // that literal string rather than failing.
         env.push(downward("HOST_IP", "status.hostIP"));
 
-        // The pod's own identity from the downward API. The name makes the ingest `{pod}` path
-        // segment equal the token's bound-pod claim by construction (pod-binding = run-scoping);
-        // name + uid + namespace let the broker set this pod as its GPU Jobs' owner, so orphaned
+        // The pod's own identity from the downward API: name + uid + namespace let the broker set
+        // this pod as its GPU Jobs' owner, so orphaned
         // jobs garbage-collect when the pod dies instead of holding a GPU for nobody. Same ordering
         // constraint as HOST_IP above, so a profile can interpolate these too.
         env.push(downward(crucible_contract::ENV_POD_NAME, "metadata.name"));
@@ -928,16 +964,11 @@ impl Renderer<'_> {
             env.push(plain(k, v.clone()));
         }
 
-        // Tier 2 ingest: when the profile names the controller's drop-box URL, tell the
-        // loop where to POST its run-session (and, when the R5 collector produced one, the otel log)
-        // and where its projected `crucible-ingest`-audience token is. Absent = no drop-box; the loop
-        // falls back to the `SESSION` delimiter the wrapper still emits (old controller / local run).
-        if let Some(ingest_url) = &self.profile.cluster.ingest_url {
-            env.push(plain(crucible_contract::ENV_INGEST_URL, ingest_url.clone()));
-            env.push(plain(
-                crucible_contract::ENV_INGEST_TOKEN_PATH,
-                format!("{INGEST_TOKEN_DIR}/token"),
-            ));
+        // The controller the run uploads its evidence to, with the run token the controller's
+        // Secret projects (RFC-0004:C-RUN-EVIDENCE). Absent = no controller to reach; the wrapper
+        // dumps the session behind the `SESSION` delimiter instead.
+        if let Some(url) = &self.profile.cluster.ingest_url {
+            env.push(plain(crucible_contract::ENV_CONTROLLER_URL, url.clone()));
         }
 
         Ok(env)
@@ -948,10 +979,9 @@ impl Renderer<'_> {
     /// the wrapper's business: `REGISTRY_AUTH_FILE` (see [`Self::env`]) points podman at the mounted
     /// authfile, which the gateway's `podman system service` inherits.
     ///
-    /// Session delivery is two-tier (Tier 2 ingest): when `CRUCIBLE_INGEST_URL` is set (a new
-    /// controller injected the drop-box env), crucible POSTs `state/session.jsonl` to the Tier 2
-    /// drop-box itself, so the wrapper stops dumping the (up to 128 MiB) session into the pod logs.
-    /// When it is absent (an old controller, or a local run) the wrapper falls back to the
+    /// Session delivery is two-tier: when `CRUCIBLE_CONTROLLER_URL` is set, crucible uploads
+    /// `state/session.jsonl` as the run's evidence itself, so the wrapper stops dumping the (up to
+    /// 128 MiB) session into the pod logs. When it is absent the wrapper falls back to the
     /// `SESSION (rc=…)` delimiter contract, the controller scrapes everything after the shared
     /// [`crucible_contract::RUN_SESSION_DELIMITER`] line as the run's session log.
     fn wrapper_script(&self) -> Result<String> {
@@ -972,21 +1002,21 @@ impl Renderer<'_> {
             };
             let harness_flag = harness_flag(self.opts.harness, '=');
             let model_flag = model_flag(self.opts.model.as_ref(), '=');
-            let resume_flag = self.resume_flag();
+            let (rerun_setup, resume_flag) = self.playbook_resume(pb)?;
             let invalid_verdict = crate::plan::INVALID_VERDICT_EXIT;
             return Ok(format!(
                 r#"D={domain_dir}
 mkdir -p "$D/state"
 n=$(( $(cat "$D/state/starts" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$D/state/starts"
-if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then
+if [ "$n" -le {MAX_PLAYBOOK_STARTS} ]; then{rerun_setup}
   crucible plan run --manifest "$D/{manifest_file}" --max-cost {max_cost} --max-time {max_time}{driver_flag}{harness_flag}{model_flag}{param_flags}{resume_flag}
   rc=$?
 else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
   rc=0
 fi
-if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
+if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
@@ -1025,7 +1055,7 @@ exit $rc
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
   --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}{harness_flag}{model_flag}{resume_flag}
 rc=$?
-if [ -z "${{CRUCIBLE_INGEST_URL:-}}" ]; then
+if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
@@ -1077,16 +1107,6 @@ exit $rc
         // Persistent run state: mounted OVER the domain dir's state/ subdir so session.jsonl and
         // the agent-session files outlive the pod (the wrapper's `--resume` reads them back).
         mounts.extend(self.state_mount());
-        // Tier 2 ingest token (Tier 2 ingest): the projected `crucible-ingest`-audience token the loop
-        // reads to POST its run-session. Mounted read-only, only when the drop-box URL is configured.
-        if self.profile.cluster.ingest_url.is_some() {
-            mounts.push(core::VolumeMount {
-                name: INGEST_TOKEN_VOLUME.to_string(),
-                mount_path: INGEST_TOKEN_DIR.to_string(),
-                read_only: Some(true),
-                ..Default::default()
-            });
-        }
         // Trace transport: writable, the broker deletes each trace after collecting it.
         if self
             .profile
@@ -1230,27 +1250,6 @@ exit $rc
             volumes.push(core::Volume {
                 name: PACK_WORKDIR_VOLUME.to_string(),
                 empty_dir: Some(core::EmptyDirVolumeSource::default()),
-                ..Default::default()
-            });
-        }
-
-        // Tier 2 ingest token (Tier 2 ingest): a projected SA token audience'd to the ingest endpoint
-        // only, useless against the kube API. Added only when the drop-box URL is configured; the
-        // pod's default `automountServiceAccountToken: false` stays (this is one explicit file).
-        if self.profile.cluster.ingest_url.is_some() {
-            volumes.push(core::Volume {
-                name: INGEST_TOKEN_VOLUME.to_string(),
-                projected: Some(core::ProjectedVolumeSource {
-                    sources: Some(vec![core::VolumeProjection {
-                        service_account_token: Some(core::ServiceAccountTokenProjection {
-                            audience: Some(crucible_contract::INGEST_TOKEN_AUDIENCE.to_string()),
-                            expiration_seconds: Some(INGEST_TOKEN_TTL_SECS),
-                            path: "token".to_string(),
-                        }),
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }),
                 ..Default::default()
             });
         }
@@ -2420,13 +2419,12 @@ mod tests {
         .expect("render")
     }
 
-    /// A loop pod with `[cluster].ingest_url` set grows the Tier 2 run-session scaffolding: the
-    /// `CRUCIBLE_INGEST_URL`/`_TOKEN_PATH`/`POD_NAME` env, a projected
-    /// `crucible-ingest`-audience token volume + mount, and (the behavioral switch) the wrapper
-    /// GUARDS the `SESSION` delimiter behind the env's absence so a new-controller loop stops dumping
-    /// the (up to 128 MiB) session into the pod logs (crucible POSTs it to the drop-box instead).
+    /// A loop pod with `[cluster].ingest_url` set learns the controller's URL, and the wrapper
+    /// guards the `SESSION` delimiter behind its absence, since crucible uploads the session as
+    /// the run's evidence instead. It mounts no ServiceAccount token: the run token rides the
+    /// run's Secret, which the controller stamps at dispatch.
     #[test]
-    fn loop_pod_with_ingest_url_delivers_the_session_over_the_dropbox() {
+    fn loop_pod_with_ingest_url_uploads_the_session_to_the_controller() {
         let profile: DeployProfile = toml::from_str(
             r#"
             [cluster]
@@ -2444,22 +2442,24 @@ mod tests {
 
         let yaml = render_loop_pod(&profile);
 
-        // The env carrying the drop-box URL + the token path + the pod's own name (downward API).
-        assert!(yaml.contains("name: CRUCIBLE_INGEST_URL"));
-        assert!(yaml.contains("http://crucible-controller.autoresearch.svc:8080"));
-        assert!(yaml.contains("name: CRUCIBLE_INGEST_TOKEN_PATH"));
-        assert!(yaml.contains("name: CRUCIBLE_POD_NAME"));
-        assert!(yaml.contains("metadata.name"), "downward-API pod name");
-        // The projected, audience-locked token volume + read-only mount.
-        assert!(yaml.contains("crucible-ingest-token"));
-        assert!(yaml.contains("audience: crucible-ingest"));
-        assert!(yaml.contains("/var/run/secrets/crucible.io/ingest"));
-        // The behavioral switch: the delimiter dump is now guarded by the env's absence.
         assert!(
-            yaml.contains("if [ -z \"${CRUCIBLE_INGEST_URL:-}\" ]; then"),
-            "the SESSION delimiter dump is guarded behind the drop-box env: {yaml}"
+            yaml.contains(
+                "name: CRUCIBLE_CONTROLLER_URL\n      value: http://crucible-controller.autoresearch.svc:8080"
+            ),
+            "{yaml}"
         );
-        // `automountServiceAccountToken: false` still stands, the ingest token is one explicit file.
+        assert!(
+            yaml.contains("if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ]; then"),
+            "the SESSION delimiter dump is guarded behind the controller env: {yaml}"
+        );
+        for gone in [
+            "CRUCIBLE_INGEST_URL",
+            "CRUCIBLE_INGEST_TOKEN_PATH",
+            "crucible-ingest-token",
+            "audience: crucible-ingest",
+        ] {
+            assert!(!yaml.contains(gone), "{gone} in a run pod: {yaml}");
+        }
         assert!(yaml.contains("automountServiceAccountToken: false"));
     }
 
@@ -2484,22 +2484,15 @@ mod tests {
 
         let yaml = render_loop_pod(&profile);
 
-        // The env DECLARATION is absent (the wrapper's guard string mentions the var name, but no
-        // `name: CRUCIBLE_INGEST_URL` env is projected and no token is mounted).
         assert!(
-            !yaml.contains("name: CRUCIBLE_INGEST_URL"),
-            "no ingest env without a drop-box: {yaml}"
+            !yaml.contains("name: CRUCIBLE_CONTROLLER_URL"),
+            "no controller env without a URL: {yaml}"
         );
-        assert!(
-            !yaml.contains("crucible-ingest-token"),
-            "no ingest token volume without a drop-box"
-        );
-        // The delimiter contract survives (behind the same guard, which is true with the env absent).
         assert!(
             yaml.contains("SESSION (rc="),
             "the SESSION delimiter is still emitted"
         );
-        assert!(yaml.contains("if [ -z \"${CRUCIBLE_INGEST_URL:-}\" ]; then"));
+        assert!(yaml.contains("if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ]; then"));
     }
 
     /// The manifest + a fake single-domain profile, plus a pack dir on disk with a NESTED
@@ -4628,6 +4621,7 @@ mod tests {
                 ("topic".to_string(), "attention sinks".to_string()),
                 ("depth".to_string(), "--deep".to_string()),
             ]),
+            rerun: None,
         }
     }
 
@@ -4786,24 +4780,103 @@ mod tests {
             "{yaml}"
         );
         assert!(
-            yaml.contains(r#"if [ -z "${CRUCIBLE_INGEST_URL:-}" ]; then"#),
+            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ]; then"#),
             "{yaml}"
         );
 
-        let ingesting = k8s_profile(r#"ingest_url = "https://controller.example/ingest""#);
-        let yaml = render_playbook(&ingesting, playbook_launch());
+        let uploading = k8s_profile(r#"ingest_url = "https://controller.example""#);
+        let yaml = render_playbook(&uploading, playbook_launch());
         assert!(
-            yaml.contains(r#"if [ -z "${CRUCIBLE_INGEST_URL:-}" ]; then"#),
+            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ]; then"#),
             "the delimiter stays guarded, never unconditional: {yaml}"
         );
         assert!(
-            yaml.contains(crucible_contract::ENV_INGEST_URL),
-            "the drop-box env: {yaml}"
+            yaml.contains("name: CRUCIBLE_CONTROLLER_URL\n      value: https://controller.example"),
+            "{yaml}"
+        );
+    }
+
+    fn rerun_launch() -> PlaybookLaunch {
+        PlaybookLaunch {
+            rerun: Some(RerunLaunch {
+                parent: "acme_x_7-1700000000".to_string(),
+                from: vec!["triage".to_string(), "it's".to_string()],
+            }),
+            ..playbook_launch()
+        }
+    }
+
+    /// A rerun pod fetches its parent's evidence from the controller it was given, by the parent's
+    /// run id, and dispatches the named tasks again.
+    #[test]
+    fn a_rerun_pod_names_its_parent_on_the_controller() {
+        let profile = k8s_profile(r#"ingest_url = "https://controller.example""#);
+        let yaml = render_playbook(&profile, rerun_launch());
+        assert!(
+            yaml.contains(
+                r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'"#
+            ),
+            "{yaml}"
         );
         assert!(
-            yaml.contains(INGEST_TOKEN_VOLUME),
-            "token projection: {yaml}"
+            !yaml.contains("--resume"),
+            "a one-shot pod never resumes: {yaml}"
         );
+    }
+
+    /// A run id is escaped as one URL path segment.
+    #[test]
+    fn a_rerun_parent_id_is_one_path_segment() {
+        let profile = k8s_profile(r#"ingest_url = "https://controller.example""#);
+        let launch = PlaybookLaunch {
+            rerun: Some(RerunLaunch {
+                parent: "a/b c?d".to_string(),
+                from: vec!["t".to_string()],
+            }),
+            ..playbook_launch()
+        };
+        let yaml = render_playbook(&profile, launch);
+        assert!(yaml.contains("/api/runs/a%2Fb%20c%3Fd\""), "{yaml}");
+    }
+
+    /// With persistent state, a restarted rerun pod resumes the rerun its claim holds rather than
+    /// seeding it from the parent again.
+    #[test]
+    fn a_restarted_rerun_pod_resumes() {
+        let profile = k8s_profile(
+            r#"ingest_url = "https://controller.example"
+            state_pvc = "deepgemm-state""#,
+        );
+        let yaml = render_playbook(&profile, rerun_launch());
+        assert!(
+            yaml.contains(
+                r#"if [ -s "$D/state/session.jsonl" ]; then set -- --resume; else set -- --rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'; fi"#
+            ),
+            "{yaml}"
+        );
+        assert!(
+            yaml.contains(r#"--param 'topic=attention sinks' "$@""#),
+            "{yaml}"
+        );
+    }
+
+    /// Without a controller to fetch from, a rerun cannot render.
+    #[test]
+    fn a_rerun_needs_a_controller_url() {
+        let manifest = playbook_manifest();
+        let input = RenderInput::from_playbook_manifest(&manifest, "alpha");
+        let err = render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/alpha"),
+            "crucible.toml",
+            &k8s_profile(""),
+            &RenderOpts {
+                playbook: Some(rerun_launch()),
+                ..RenderOpts::default()
+            },
+        )
+        .expect_err("a rerun with no controller url");
+        assert!(err.to_string().contains("[cluster].ingest_url"), "{err:#}");
     }
 
     /// With persistent state a playbook pod survives a crash the way a loop pod does: the kubelet

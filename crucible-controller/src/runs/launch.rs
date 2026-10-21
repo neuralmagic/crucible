@@ -18,12 +18,6 @@ use anyhow::{Context, Result};
 /// dispatch state back off these events, so the text is a shared constant rather than a literal.
 pub(crate) const PLAYBOOK_DISPATCH_FAILED: &str = "playbook dispatch failed";
 
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "{0} reruns a finished run, and this controller runs playbooks in pods, which cannot rerun yet"
-)]
-struct PodRerun(String);
-
 /// Dispatch `issue`'s playbook launch, parking it when its pack is unconvertible.
 pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let Err(e) = start(db, cfg, issue).await else {
@@ -197,15 +191,14 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         inference,
         exposure,
     });
-    let rerun = launch.rerun.clone();
     let opts = crate::runs::workpod::RunRenderOpts::Playbook {
         params: launch.params,
         max_cost: launch.max_cost,
         max_time: launch.max_time,
         agent,
+        rerun: launch.rerun,
     };
     let started = match cfg.playbook_executor {
-        PlaybookExecutor::Pod if rerun.is_some() => Err(PodRerun(issue.key.clone()).into()),
         PlaybookExecutor::Pod => {
             dispatch_pod(db, cfg, issue, &run_id, opts, secrets.as_ref()).await
         }
@@ -220,16 +213,9 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
             {
                 Ok(()) => match resolve_local_secrets(db, issue, secrets.as_ref()).await? {
                     Some(refusal) => Ok(Some(Started::SecretsRefused(refusal))),
-                    None => crate::runs::local_run::start(
-                        db,
-                        cfg,
-                        &issue.key,
-                        &run_id,
-                        opts,
-                        rerun.as_ref(),
-                    )
-                    .await
-                    .map(|run| run.map(|r| Started::Local(Box::new(r)))),
+                    None => crate::runs::local_run::start(db, cfg, &issue.key, &run_id, opts)
+                        .await
+                        .map(|run| run.map(|r| Started::Local(Box::new(r)))),
                 },
                 Err(failure) => {
                     crate::runs::contract::refuse(db, &issue.key, &failure.into_rejection()?)

@@ -348,11 +348,10 @@ fn real_git_path() -> String {
 
 /// The scripted loop run, on the WorkPod primitive's cluster boundary: `create` receives the
 /// controller-stamped loop pod, reads its run-id + issue-key annotations, stores the synthetic
-/// session log where the completion edge looks for it (the run-session artifact), and (when
-/// `deliver`) flips the pod to completed by pushing the key through the injected completion
-/// stream — the same edge the kube pod watch feeds in production. `delete` (the GC) is a recorded
-/// no-op; `await_terminal`/`logs` are unreachable in these tests (grounded ranking runs `local`,
-/// never a WorkPod turn).
+/// session log where a pod's upload lands it (the run-session artifact), and (when `deliver`)
+/// pushes the key through the injected completion stream — the same edge the kube pod watch
+/// feeds in production. A pod reads as terminal once its session is stored, as a pod that
+/// uploaded and exited would. `delete` (the GC) is a recorded no-op.
 struct FakePodDispatcher {
     pool: sqlx::PgPool,
     deliver: bool,
@@ -415,14 +414,34 @@ impl PodDispatcher for FakePodDispatcher {
         &self,
         _cluster: &str,
         _namespace: &str,
-        _name: &str,
+        name: &str,
         _timeout: Duration,
     ) -> Result<crucible_controller::runs::workpod::TerminalState> {
-        anyhow::bail!("await_terminal is not exercised on the run path (out-of-band completion)")
+        use crucible_controller::runs::workpod::{TerminalState, TurnPhase};
+        let run_id: Option<String> = sqlx::query_scalar("SELECT run_id FROM runs WHERE pod = $1")
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+        let uploaded = match run_id {
+            Some(run_id) => {
+                crucible_controller::runs::blob_store::get_run_session(&self.pool, &run_id)
+                    .await?
+                    .is_some()
+            }
+            None => false,
+        };
+        Ok(TerminalState {
+            phase: if uploaded {
+                TurnPhase::Succeeded
+            } else {
+                TurnPhase::TimedOut
+            },
+            message: None,
+        })
     }
 
     async fn logs(&self, _cluster: &str, _namespace: &str, _name: &str) -> Result<String> {
-        anyhow::bail!("logs is not exercised on the run path")
+        Ok(String::new())
     }
 
     async fn delete(&self, _cluster: &str, _namespace: &str, name: &str) -> Result<()> {

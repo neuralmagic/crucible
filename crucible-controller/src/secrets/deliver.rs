@@ -305,6 +305,22 @@ pub fn role_credentials(
     Ok(delivery)
 }
 
+/// The Secret key the run token rides under.
+const RUN_TOKEN_KEY: &str = "crucible-run-token";
+
+/// The run token (RFC-0004:C-RUN-EVIDENCE) as a delivery: one Secret key, read as
+/// [`crucible_contract::ENV_RUN_TOKEN`]. Never agent-visible.
+pub fn run_token(token: String) -> Delivery {
+    Delivery {
+        data: BTreeMap::from([(RUN_TOKEN_KEY.to_string(), token)]),
+        env: vec![(
+            crucible_contract::ENV_RUN_TOKEN.to_string(),
+            RUN_TOKEN_KEY.to_string(),
+        )],
+        ..Delivery::default()
+    }
+}
+
 /// The Secret object itself, owner-referenced to the pod that mounts it. `owner` comes from the
 /// create response, so the reference carries the UID the cluster garbage-collects on.
 pub fn secret_object(

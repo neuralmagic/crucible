@@ -230,8 +230,8 @@ pub enum TurnPhase {
 /// back to the marker scrape).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalState {
-    pub(crate) phase: TurnPhase,
-    pub(crate) message: Option<String>,
+    pub phase: TurnPhase,
+    pub message: Option<String>,
 }
 
 impl TerminalState {

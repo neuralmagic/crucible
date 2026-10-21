@@ -2881,8 +2881,9 @@ impl WrapperRecorder {
 
 #[async_trait::async_trait]
 impl PodDispatcher for WrapperRecorder {
-    async fn create(&self, _cluster: &str, _ns: &str, pod: Pod) -> Result<Pod> {
+    async fn create(&self, _cluster: &str, _ns: &str, mut pod: Pod) -> Result<Pod> {
         self.pods.lock().expect("lock").push(pod.clone());
+        pod.metadata.uid = Some("recorded-pod-uid".to_string());
         Ok(pod)
     }
     async fn await_terminal(
@@ -2993,6 +2994,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
             max_cost: 3.5,
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
+            rerun: None,
         },
         None,
     )
@@ -3362,6 +3364,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
             max_cost: 3.5,
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::from_resolved(resolved.as_ref()),
+            rerun: None,
         },
         None,
     )
@@ -3525,6 +3528,7 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
             max_cost: 3.5,
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
+            rerun: None,
         },
         None,
     )
@@ -3553,6 +3557,122 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
     assert!(
         !wrapper.contains("--pr-repo"),
         "a launch has nothing to link a PR back to: {wrapper}"
+    );
+    Ok(())
+}
+
+/// A dispatch mints the run's token into the run's Secret, never the pod spec, and a rerun's
+/// token reads the parent it names (RFC-0004:C-RUN-EVIDENCE); the wrapper fetches that parent
+/// from the controller.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+    let text = std::fs::read_to_string(&profile)?;
+    std::fs::write(
+        &profile,
+        text.replacen(
+            "[cluster]\n",
+            "[cluster]\ningest_url = \"http://crucible-controller.ns.svc:8080\"\n",
+            1,
+        ),
+    )?;
+    let db = Db::new(pool);
+    let cfg = pod_cfg(&profile, "img");
+    let created = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(SpecCapturingDispatcher {
+        created: created.clone(),
+        created_cms: Arc::new(Mutex::new(Vec::new())),
+        created_secrets: secrets.clone(),
+    });
+
+    let out = dispatch_run(
+        &db,
+        &cfg,
+        dispatcher,
+        "playbook:survey:0199c0de-7c2c-71a5-8000-2",
+        "playbook_survey_0199c0de-43",
+        &materialized(crate::testing::fixtures::write_playbook_pack(
+            tmp.path(),
+            crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
+        )),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::Playbook {
+            params: vec![("topic".to_string(), "t".to_string())],
+            max_cost: 3.5,
+            max_time: crate::model::MaxTime::parse("30m").expect("duration"),
+            agent: AgentSelection::default(),
+            rerun: Some(crate::launches::model::RerunOf {
+                run: "playbook_survey_0199c0de-42".to_string(),
+                from: vec!["draft".to_string()],
+            }),
+        },
+        None,
+    )
+    .await?;
+    assert!(matches!(out, RunAdmission::Launched { .. }), "{out:?}");
+
+    let pod = created
+        .lock()
+        .expect("lock")
+        .first()
+        .cloned()
+        .expect("a pod");
+    let container = &pod.spec.as_ref().expect("spec").containers[0];
+    let env = container.env.as_ref().expect("env");
+    let token_ref = env
+        .iter()
+        .find(|e| e.name == crucible_contract::ENV_RUN_TOKEN)
+        .expect("the run token env");
+    assert!(token_ref.value.is_none(), "the token never rides the spec");
+    let key_ref = token_ref
+        .value_from
+        .as_ref()
+        .and_then(|v| v.secret_key_ref.as_ref())
+        .expect("a Secret key reference");
+    let secret = secrets
+        .lock()
+        .expect("lock")
+        .first()
+        .cloned()
+        .expect("the run's Secret");
+    assert_eq!(Some(key_ref.name.as_str()), secret.metadata.name.as_deref());
+    let token = secret
+        .string_data
+        .as_ref()
+        .and_then(|d| d.get(&key_ref.key).cloned())
+        .or_else(|| {
+            secret
+                .data
+                .as_ref()
+                .and_then(|d| d.get(&key_ref.key))
+                .map(|b| String::from_utf8_lossy(&b.0).into_owned())
+        })
+        .expect("the token in the Secret");
+    let grant = crate::runs::run_token::verify(db.pool(), &token)
+        .await
+        .expect("a live token");
+    assert_eq!(grant.run_id, "playbook_survey_0199c0de-43");
+    assert_eq!(
+        grant.reads_run.as_deref(),
+        Some("playbook_survey_0199c0de-42")
+    );
+
+    let wrapper = container.args.as_ref().expect("args").join("\n");
+    assert!(
+        wrapper.contains(
+            r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/runs/playbook_survey_0199c0de-42" --from 'draft'"#
+        ),
+        "{wrapper}"
+    );
+    assert!(
+        env.iter()
+            .any(|e| e.name == crucible_contract::ENV_CONTROLLER_URL
+                && e.value.as_deref() == Some("http://crucible-controller.ns.svc:8080")),
+        "{env:?}"
     );
     Ok(())
 }

@@ -338,3 +338,88 @@ api GET "/api/runs/$RUN"
 pass "[Y] the run's spend includes the repair turns"
 stop_controller
 
+
+# ---- scenario JP ----------------------------------------------------------------------------
+# The run pod reaches the controller on the host, by the address the kind node resolves the
+# host alias to, else the kind network's gateway. A controller bound past loopback needs its
+# bearer guard on.
+J_HOST=$(docker exec "$CLUSTER-control-plane" getent ahostsv4 host.docker.internal host.containers.internal 2>/dev/null | awk 'NR == 1 { print $1 }')
+[ -n "$J_HOST" ] || J_HOST=$(docker network inspect kind --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}' | tr ' ' '\n' | grep -m1 '\.')
+[ -n "$J_HOST" ] || fail "[JP] no address the kind network reaches the host on"
+awk -v url="http://$J_HOST:$PORT" '{ print } /^\[cluster\]$/ { print "ingest_url = \"" url "\"" }' \
+    "$WORK/profile.toml" >"$WORK/profile-evidence.toml"
+export CONTROLLER_API_TOKEN="e2e-$(openssl rand -hex 16)"
+CONTROLLER_ENV=(CONTROLLER_API_ADDR="0.0.0.0:$PORT" CONTROLLER_DEV_IDENTITY= CONTROLLER_API_TOKEN_IDENTITY=e2e
+    CONTROLLER_PROXY_TOKEN="proxy-$(openssl rand -hex 16)")
+start_controller "$WORK/profile-evidence.toml"
+
+# run_artifacts <run>: the kinds of artifact the run owns, sorted.
+run_artifacts() { sql -c "SELECT string_agg(kind, ' ' ORDER BY kind) FROM artifacts WHERE owner_kind = 'run-session' AND owner_id = '$1'"; }
+
+# token_state <run>: whether the run's one token is revoked, and the run it reads.
+token_state() { sql -c "SELECT count(*) || ' ' || bool_and(revoked_at IS NOT NULL) || ' ' || coalesce(max(reads_run), '-') FROM run_tokens WHERE run_id = '$1'"; }
+
+# evidence <run> <kind> <out>: GET the run's evidence as a person, printing the status.
+evidence() {
+    curl -s -o "$3" -w '%{http_code}' -H "authorization: Bearer $CONTROLLER_API_TOKEN" \
+        "$CONTROLLER_URL/api/runs/$1/evidence/$2"
+}
+
+log "[JP] a run pod uploads its evidence to its run under the run token"
+cp -R "$FIX/packs/rerun" "$WORK/rerun"
+new_draft "$DRAFT-rerun" "$WORK/rerun"
+watch_start JP
+launch JP draft-launch "$DRAFT-rerun" --params '{"mode":"broken"}'
+PARENT_KEY="$KEY"
+settle JP "$PARENT_KEY"
+PARENT=$(jq -r '.runs[0].run_id' "$WORK/run-JP.json")
+[ -n "$PARENT" ] && [ "$PARENT" != null ] || fail "[JP] the parent launch recorded no run: $(cat "$WORK/run-JP.json")"
+# engine_lines <run>: the engine's own lines from the run's kept log.
+engine_lines() {
+    api GET "/api/runs/$1/log"
+    jq -r '.text // empty' "$WORK/api.json" | grep '^\[crucible\]' || true
+}
+[ "$(run_artifacts "$PARENT")" = "run-commits run-engine-log run-files run-session" ] ||
+    fail "[JP] the parent run owns: $(run_artifacts "$PARENT"); its engine said: $(engine_lines "$PARENT")"
+[ "$(sql -c "SELECT count(*) FROM artifacts WHERE owner_kind = 'pod-evidence'")" = 0 ] ||
+    fail "[JP] a pod-keyed artifact was stored"
+pass "[JP] the pod's session, files and git memory landed on its run, with nothing keyed by the pod"
+PARENT_POD=$(sql -c "SELECT pod FROM runs WHERE run_id = '$PARENT'")
+jq -se --arg n "$PARENT_POD" '[.[] | .object | select(.metadata.name == $n) | .spec.containers[0].env[]
+    | select(.name == "CRUCIBLE_RUN_TOKEN")] | length > 0 and all(.[]; .value == null
+    and .valueFrom.secretKeyRef.name == ($n + "-secrets"))' "$WORK/pods-JP.json" >/dev/null ||
+    fail "[JP] the run token does not ride the run's Secret: $(jq -sc --arg n "$PARENT_POD" '[.[] | .object | select(.metadata.name == $n) | .spec.containers[0].env[] | select(.name | startswith("CRUCIBLE_"))] | unique' "$WORK/pods-JP.json")"
+jq -se '[.[] | .object.spec.volumes[]?.projected.sources[]?.serviceAccountToken | select(.audience == "crucible-ingest")] | length == 0' "$WORK/pods-JP.json" >/dev/null ||
+    fail "[JP] a run pod still projects the drop-box's ServiceAccount token"
+[ "$(token_state "$PARENT")" = "1 true -" ] || fail "[JP] the parent's token: $(token_state "$PARENT")"
+pass "[JP] the token rode the run's Secret, no drop-box token was projected, and completion revoked it"
+
+[ "$(evidence "$PARENT" run-session "$WORK/JP-session.gz")" = 200 ] || fail "[JP] a person cannot read the parent's session"
+gunzip -c "$WORK/JP-session.gz" | grep -q '"kind":"shutdown"' || fail "[JP] the fetched session is not the parent's"
+[ "$(evidence "$PARENT" scope-pack "$WORK/JP-nope")" = 404 ] || fail "[JP] a scope kind was served as run evidence"
+pass "[JP] a person reads the parent's evidence over the API"
+
+log "[JP] a rerun pod fetches its parent's evidence over its run token"
+api POST "/api/playbook-drafts/$DRAFT-rerun/launch" \
+    "{\"params\":{\"mode\":\"fixed\"},\"max_cost\":1,\"max_time\":\"5m\",\"rerun\":{\"of\":\"$PARENT\",\"from\":[\"second\"]}}"
+[ "$HTTP" = 201 ] || [ "$HTTP" = 200 ] || fail "[JP] the rerun launch answered $HTTP: $(cat "$WORK/api.json")"
+KEY=$(jq -r .key "$WORK/api.json")
+settle JP-rerun "$KEY"
+watch_stop
+expect_finished JP-rerun
+RERUN=$(jq -r '.runs[0].run_id' "$WORK/run-JP-rerun.json")
+RERUN_POD=$(sql -c "SELECT pod FROM runs WHERE run_id = '$RERUN'")
+jq -rs --arg n "$RERUN_POD" '[.[] | .object | select(.metadata.name == $n) | .spec.containers[0].args[]?] | unique | join("\n")' \
+    "$WORK/pods-JP.json" | grep -qF -- "--rerun-of \"\${CRUCIBLE_CONTROLLER_URL}/api/runs/$PARENT\" --from 'second'" ||
+    fail "[JP] the rerun pod does not name its parent on the controller"
+[ "$(token_state "$RERUN")" = "1 true $PARENT" ] || fail "[JP] the rerun's token: $(token_state "$RERUN")"
+[ "$(evidence "$RERUN" run-session "$WORK/JP-rerun.gz")" = 200 ] || fail "[JP] the rerun uploaded no session"
+gunzip -c "$WORK/JP-rerun.gz" | jq -se --arg p "$PARENT" \
+    '[.[] | select(.kind == "task_result" and .task == "first")] | length == 1 and .[0].reused_from == $p' >/dev/null ||
+    fail "[JP] the rerun did not reuse first from $PARENT: $(gunzip -c "$WORK/JP-rerun.gz" | grep '"task_result"')"
+pass "[JP] the rerun pod read its parent's session, files and commits, reused first, and passed second"
+[ "$(run_artifacts "$RERUN")" = "run-commits run-engine-log run-files run-session" ] ||
+    fail "[JP] the rerun owns: $(run_artifacts "$RERUN")"
+stop_controller
+unset CONTROLLER_API_TOKEN
+CONTROLLER_ENV=()

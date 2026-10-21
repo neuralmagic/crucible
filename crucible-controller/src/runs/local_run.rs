@@ -181,7 +181,6 @@ pub(crate) async fn start(
     issue_key: &str,
     run_id: &str,
     opts: RunRenderOpts,
-    rerun: Option<&crate::launches::model::RerunOf>,
 ) -> Result<Option<LocalRun>> {
     if u32::try_from(crate::runs::store::count_running(db.pool()).await?).unwrap_or(u32::MAX)
         >= cfg.effective().max_concurrent_pods
@@ -214,7 +213,10 @@ pub(crate) async fn start(
 
     let bin = crate::runs::engine::resolve_bin();
     let mut argv = run_argv(&pack.join("crucible.toml"), &opts);
-    if let Some(rerun) = rerun {
+    if let RunRenderOpts::Playbook {
+        rerun: Some(rerun), ..
+    } = &opts
+    {
         let parent = dir.join("parent");
         crate::runs::rerun::materialize_parent(db, cfg.scratch_root(), &rerun.run, &parent)
             .await
@@ -586,6 +588,7 @@ mod tests {
             max_cost: 1.0,
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
         };
         assert_eq!(playbook.tracker_item("playbook:fences:0199"), None);
         let looped = RunRenderOpts::Loop {
@@ -610,6 +613,7 @@ mod tests {
             max_cost: 4.5,
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
         };
         assert_eq!(
             run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts),
@@ -642,6 +646,7 @@ mod tests {
                 harness: Some(crucible::manifest::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
+            rerun: None,
         };
         let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
         assert_eq!(
