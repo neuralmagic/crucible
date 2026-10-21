@@ -65,7 +65,7 @@ test.describe('shares', () => {
 test.describe('team members', () => {
   test('an owner adds a member, changes a role, and removes one', async ({ page }) => {
     await stubApi(page);
-    await ready(page, '/teams/llm-d');
+    await ready(page, '/teams/llm-d/members');
 
     const rows = page.getByTestId('members').locator('tbody tr');
     await expect(rows).toHaveCount(4);
@@ -89,7 +89,7 @@ test.describe('team members', () => {
 
   test('the last user at owner cannot be demoted', async ({ page }) => {
     await stubApi(page);
-    await ready(page, '/teams/llm-d');
+    await ready(page, '/teams/llm-d/members');
     const rows = page.getByTestId('members').locator('tbody tr');
     await rows.nth(0).getByRole('combobox', { name: 'Role of wren' }).selectOption('member');
     await expect(page.locator('main')).toContainText('a team keeps at least one user at owner');

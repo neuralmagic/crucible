@@ -20,7 +20,11 @@ import { OwnerSwitcher } from './OwnerSwitcher';
 import { AutopilotBanner } from './AutopilotBanner';
 import { ViewAsBanner } from './ViewAsBanner';
 import { CommandPalette } from './palette/CommandPalette';
-import { useResetOnActAs } from './actAs';
+import { actAsFor, useResetOnActAs } from './actAs';
+import { scopedPath } from './ownerContext';
+import { useOwnerContext } from './useOwnerContext';
+import { pickTeams } from './teamPicks';
+import { useActiveTeams, useStarredTeams } from './useTeamPicks';
 import { HomePage } from './pages/HomePage';
 import { approvalsWaiting } from './pages/home';
 import { MoltenLogo } from './MoltenLogo';
@@ -71,6 +75,7 @@ const ProvidersPage = page(() => import('./pages/ProvidersPage'), 'ProvidersPage
 const SettingsPage = page(() => import('./pages/SettingsPage'), 'SettingsPage');
 const TeamsPage = page(() => import('./pages/TeamsPage'), 'TeamsPage');
 const TeamDetailPage = page(() => import('./pages/TeamDetailPage'), 'TeamDetailPage');
+const TeamMembersPage = page(() => import('./pages/TeamDetailPage'), 'TeamMembersPage');
 // Explore carries the DuckDB-WASM bundle (multi-MB of wasm).
 const ExplorePage = lazy(() => import('./pages/ExplorePage'));
 
@@ -186,6 +191,8 @@ interface RailItem {
   autoresearch?: boolean;
   /// Shown only to platform administrators.
   admin?: boolean;
+  /// Active only on its own path, not on the paths under it.
+  end?: boolean;
 }
 
 interface RailSection {
@@ -193,10 +200,11 @@ interface RailSection {
   items: RailItem[];
 }
 
-function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch' | 'admin'>) {
+function RailLink({ to, label, count, end }: Omit<RailItem, 'icon' | 'autoresearch' | 'admin'>) {
   return (
     <NavLink
       to={to}
+      end={end}
       data-ui="nav-link"
       className={({ isActive }) =>
         cn(
@@ -217,11 +225,12 @@ function RailLink({ to, label, count }: Omit<RailItem, 'icon' | 'autoresearch' |
   );
 }
 
-function RailIcon({ to, label, icon, count }: Omit<RailItem, 'autoresearch' | 'admin'>) {
+function RailIcon({ to, label, icon, count, end }: Omit<RailItem, 'autoresearch' | 'admin'>) {
   return (
     <Tooltip side="right" delay={120} content={count === undefined ? label : `${label} · ${count}`}>
       <NavLink
         to={to}
+        end={end}
         aria-label={label}
         data-ui="nav-link"
         className={({ isActive }) =>
@@ -275,9 +284,67 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
   const repos = $api.useQuery('get', '/api/repos', {}, { enabled: autoresearch });
   const whoami = $api.useQuery('get', '/api/whoami');
 
+  const owner = useOwnerContext();
+
   const statuses = overview.isSuccess ? overview.data.statuses : [];
   const teams = [...(whoami.data?.teams ?? [])].sort((a, b) => a.team.localeCompare(b.team));
-  const allSections: RailSection[] = [
+  const team = owner.team ?? actAsFor(owner.stored);
+  const [starred] = useStarredTeams();
+  const active = useActiveTeams();
+  const picked = pickTeams(
+    teams.map((membership) => membership.team),
+    starred,
+    active,
+    team === null ? null : team.slice('team:'.length),
+  );
+  const teamItems = (except: string | null): RailItem[] => [
+    ...picked.shown
+      .filter((pick) => `team:${pick.slug}` !== except)
+      .map((pick) => ({
+        to: `/teams/${encodeURIComponent(pick.slug)}`,
+        label: pick.starred ? `★ ${pick.slug}` : pick.slug,
+        icon: pick.slug.slice(0, 2).toUpperCase(),
+      })),
+    {
+      to: '/teams',
+      label: 'All teams',
+      icon: 'TM',
+      count: picked.hidden > 0 ? picked.hidden : undefined,
+      end: true,
+    },
+  ];
+  const teamRail = (team: string): RailSection[] => {
+    const at = (page: string) => scopedPath(team, page);
+    return [
+      {
+        heading: team.slice('team:'.length),
+        items: [
+          { to: at('/'), label: 'Home', icon: 'HM', end: true },
+          { to: at('/playbooks'), label: 'Playbooks', icon: 'PB' },
+          { to: at('/playbooks/drafts'), label: 'Drafts', icon: 'DR' },
+          { to: at('/playbook-runs'), label: 'Runs', icon: 'PR' },
+          { to: at('/schedules'), label: 'Schedules', icon: 'SC' },
+          { to: at('/webhooks'), label: 'Webhooks', icon: 'WH' },
+        ],
+      },
+      {
+        heading: 'Resources',
+        items: [
+          { to: at('/secrets'), label: 'Secrets', icon: 'SE' },
+          { to: at('/providers'), label: 'Providers', icon: 'PV' },
+          { to: at('/members'), label: 'Members', icon: 'MB' },
+        ],
+      },
+      {
+        heading: 'Teams',
+        items: [
+          ...teamItems(team),
+          ...(actAsFor(owner.stored) === null ? [{ to: '/', label: 'Everything', icon: 'EV' }] : []),
+        ],
+      },
+    ];
+  };
+  const allSections: RailSection[] = team !== null ? teamRail(team) : [
     {
       heading: 'Queue',
       items: [
@@ -320,14 +387,7 @@ function CategoryRail({ collapsed, onToggle }: CategoryRailProps) {
     },
     {
       heading: 'Teams',
-      items: [
-        ...teams.map((membership) => ({
-          to: `/teams/${encodeURIComponent(membership.team)}`,
-          label: membership.team,
-          icon: membership.team.slice(0, 2).toUpperCase(),
-        })),
-        { to: '/teams', label: 'All teams', icon: 'TM' },
-      ],
+      items: teamItems(null),
     },
     {
       heading: 'System',
@@ -487,6 +547,14 @@ export function App() {
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/teams/:slug" element={<TeamDetailPage />} />
+            <Route path="/teams/:slug/members" element={<TeamMembersPage />} />
+            <Route path="/teams/:slug/playbooks" element={<PlaybooksPage />} />
+            <Route path="/teams/:slug/playbooks/drafts" element={<PlaybookDraftsPage />} />
+            <Route path="/teams/:slug/playbook-runs" element={<PlaybookRunsPage />} />
+            <Route path="/teams/:slug/schedules" element={<SchedulesPage />} />
+            <Route path="/teams/:slug/webhooks" element={<WebhooksPage />} />
+            <Route path="/teams/:slug/secrets" element={<SecretsPage />} />
+            <Route path="/teams/:slug/providers" element={<ProvidersPage />} />
             <Route path="/admin" element={<AdminPage />} />
             <Route path="/policy" element={<PolicyPage />} />
             <Route
