@@ -128,6 +128,7 @@ fn traces_to_protobuf(payload: &Value, resource_attrs: &[(&str, &str)]) -> Resul
                 value: Some(AnyValue {
                     value: Some(AnyValueEnum::StringValue((*v).to_string())),
                 }),
+                ..KeyValue::default()
             })
             .collect();
         for rs in &mut req.resource_spans {

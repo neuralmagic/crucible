@@ -36,7 +36,7 @@ SNAPSHOT_FILE="$SCRIPT_DIR/dep-dups.snapshot"
 generate_actual() {
   cargo tree -d --locked --workspace -e normal,build,dev --all-features --color=never 2>/dev/null \
     | grep -E '^[a-zA-Z]' \
-    | grep -E 'reqwest|rustls|hyper|ring|h2' \
+    | { grep -E 'reqwest|rustls|hyper|ring|h2' || true; } \
     | sed -E 's/ \(\*\)$//' \
     | sort -u
 }
@@ -61,4 +61,4 @@ if [ -n "$NEW" ]; then
   exit 1
 fi
 
-echo "dep-dup guard OK ($(echo "$ACTUAL" | wc -l | tr -d ' ') duplicated generations, none new)"
+echo "dep-dup guard OK ($(grep -c . <<< "$ACTUAL" || true) duplicated generations, none new)"

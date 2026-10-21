@@ -109,7 +109,7 @@ pub fn router(api: Router, keys: crate::identity::auth::KeyGuard, public_url: St
     // than an SSE frame. It fits what authenticates here — the key rides every request, so there
     // is nothing a session would remember that the credential does not already say — and it leaves
     // no per-session state for a restart or a second replica to lose.
-    config.stateful_mode = false;
+    config.legacy_session_mode = false;
     config.json_response = true;
     let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
         move || {
