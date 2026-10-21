@@ -1,6 +1,7 @@
-//! The engine side of the Tier 2 ingest drop-box: a turn pod POSTs its large artifacts (pack,
-//! transcript, and the otel log) to the controller's evidence drop-box before it writes the Tier 1
-//! termination message, so the manifest can state the truth about every upload the pod attempted.
+//! The engine side of the Tier 2 ingest drop-box: a scope turn pod POSTs its pack and transcript
+//! to the controller's evidence drop-box before it writes the Tier 1 termination message, so the
+//! manifest can state the truth about every upload the pod attempted. A run pod's evidence goes to
+//! the run instead ([`crate::report::evidence_client`]).
 //!
 //! Delivery is at-least-once and the controller deduplicates (content-addressed), so a retried POST
 //! is normal, not an error. We retry a failed POST [`MAX_ATTEMPTS`] times with a short backoff and
@@ -11,9 +12,8 @@
 //! When `CRUCIBLE_INGEST_URL` is absent (a local run, or an old controller that never injected the
 //! env) [`IngestConfig::from_env`] returns `None` and the caller falls back to marker emission.
 
-use crate::args::Paths;
 use crucible_contract::{ArtifactKind, ArtifactRef, content_digest};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// How many times a single artifact POST is attempted before giving up and marking it undelivered.
@@ -167,150 +167,9 @@ fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
-/// Deliver the finished run's evidence to the controller's Tier 2 drop-box when the loop pod
-/// carries the ingest env (`CRUCIBLE_INGEST_URL` + token path + pod name). Best-effort and never
-/// fatal: a missing drop-box (a local run, or an old controller that injected nothing) is a silent
-/// no-op and the wrapper's `SESSION` delimiter is the controller's fallback; a failed POST is already
-/// logged loudly inside [`post_artifact`]. The run-session is the loop's
-/// authoritative record; the captured files and the otel log ride along only when the run produced
-/// them.
-pub(crate) fn deliver_run_evidence(p: &Paths) {
-    let Some(cfg) = IngestConfig::from_env() else {
-        return;
-    };
-    deliver_artifact(
-        &cfg,
-        crucible_contract::ArtifactKind::RunSession,
-        &p.session_log,
-    );
-    deliver_dir(
-        &cfg,
-        crucible_contract::ArtifactKind::RunFiles,
-        &p.state.join("files"),
-    );
-    deliver_dir(
-        &cfg,
-        crucible_contract::ArtifactKind::RunCommits,
-        &p.state.join(crucible::plan::rerun::GIT_MEMORY_DIR),
-    );
-    // R5's in-process OTLP collector captures `otel.jsonl` in the run (state) dir; deliver it when it
-    // exists. Absent until R5 lands, so this is inert plumbing today.
-    let otel = p.state.join("otel.jsonl");
-    if otel.exists() {
-        deliver_artifact(&cfg, crucible_contract::ArtifactKind::OtelLog, &otel);
-    }
-}
-
-/// POST a state directory to the drop-box as one gzipped tar: the captured files of
-/// `state/files`, whose tree is `<task>/<declared path>` published by rename once complete, or
-/// the git memory of `state/git-memory`.
-///
-/// A run that produced none has no directory and delivers nothing: the absent artifact is the
-/// honest answer, not an empty tar.
-fn deliver_dir(cfg: &IngestConfig, kind: crucible_contract::ArtifactKind, files: &Path) {
-    if !files.is_dir() {
-        return;
-    }
-    let tar = match tar_dir(files) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!(
-                "[crucible] Tier 2: tarring {} for {kind} delivery failed: {e}",
-                files.display()
-            );
-            return;
-        }
-    };
-    let gz = match gzip(&tar) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!(
-                "[crucible] Tier 2: gzipping {} for {kind} delivery failed: {e}",
-                files.display()
-            );
-            return;
-        }
-    };
-    let art = post_artifact(cfg, kind, &gz);
-    if art.delivered {
-        eprintln!(
-            "[crucible] Tier 2: delivered {kind} ({} gzipped bytes) to the drop-box",
-            art.bytes
-        );
-    }
-}
-
-/// Tar `dir`'s files under paths relative to it. Captured files are regular files by construction
-/// (`capture_declared` copies with `std::fs::copy`), so there is nothing to filter and no symlink
-/// to resolve.
-fn tar_dir(dir: &Path) -> std::io::Result<Vec<u8>> {
-    fn append(
-        builder: &mut tar::Builder<Vec<u8>>,
-        dir: &Path,
-        prefix: &Path,
-    ) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let rel = prefix.join(entry.file_name());
-            if path.is_dir() {
-                append(builder, &path, &rel)?;
-            } else {
-                builder.append_path_with_name(&path, &rel)?;
-            }
-        }
-        Ok(())
-    }
-    let mut builder = tar::Builder::new(Vec::new());
-    append(&mut builder, dir, Path::new(""))?;
-    builder.into_inner()
-}
-
-/// Read `path`, gzip it, and POST it to the drop-box as `kind`. A read/gzip failure is logged and
-/// skipped (never fatal to the run); the POST itself never fails the caller, a dead drop-box lands
-/// `delivered: false` on the manifest, which the controller surfaces.
-fn deliver_artifact(cfg: &IngestConfig, kind: crucible_contract::ArtifactKind, path: &Path) {
-    let raw = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!(
-                "[crucible] Tier 2: reading {} for {kind} delivery failed: {e}",
-                path.display()
-            );
-            return;
-        }
-    };
-    let gz = match gzip(&raw) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!(
-                "[crucible] Tier 2: gzipping {} for {kind} delivery failed: {e}",
-                path.display()
-            );
-            return;
-        }
-    };
-    let art = post_artifact(cfg, kind, &gz);
-    if art.delivered {
-        eprintln!(
-            "[crucible] Tier 2: delivered {kind} ({} gzipped bytes) to the drop-box",
-            art.bytes
-        );
-    }
-}
-
-/// Gzip `bytes` at the default compression level (the same discipline the scope transcript uses).
-fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    use std::io::Write as _;
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(bytes)?;
-    enc.finish()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::fs;
+    use crate::report::ingest_client::*;
 
     #[test]
     fn from_env_needs_all_three_vars() {
@@ -382,49 +241,5 @@ mod tests {
         assert_eq!(art.digest, content_digest(bytes));
         assert_eq!(art.bytes, bytes.len() as u64);
         let _ = std::fs::remove_file(&tok);
-    }
-
-    #[test]
-    fn the_captured_files_tar_carries_every_task_directory_by_relative_path() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let files = dir.path().join("files");
-        fs::create_dir_all(files.join("roundup")).expect("mkdir");
-        fs::create_dir_all(files.join("propose/nested")).expect("mkdir");
-        fs::write(files.join("roundup/FINDINGS.json"), b"{}").expect("write");
-        fs::write(files.join("propose/nested/fix.patch"), b"diff").expect("write");
-
-        let tar = tar_dir(&files).expect("tar");
-        let mut archive = tar::Archive::new(std::io::Cursor::new(tar));
-        let mut names: Vec<String> = archive
-            .entries()
-            .expect("entries")
-            .map(|e| {
-                e.expect("entry")
-                    .path()
-                    .expect("path")
-                    .display()
-                    .to_string()
-            })
-            .collect();
-        names.sort();
-        assert_eq!(names, ["propose/nested/fix.patch", "roundup/FINDINGS.json"]);
-    }
-
-    /// The run-session/otel gzip helper round-trips: what the controller decompresses out of the
-    /// drop-box is byte-for-byte the session NDJSON the loop delivered.
-    #[test]
-    fn gzip_roundtrips_the_session_ndjson() {
-        use std::io::Read as _;
-        let ndjson = "{\"v\":1,\"kind\":\"row\"}\n{\"v\":1,\"kind\":\"shutdown\"}\n";
-        let gz = gzip(ndjson.as_bytes()).expect("gzip");
-        assert!(
-            gz != ndjson.as_bytes(),
-            "the bytes were actually compressed"
-        );
-        let mut out = String::new();
-        flate2::read::GzDecoder::new(gz.as_slice())
-            .read_to_string(&mut out)
-            .expect("gunzip");
-        assert_eq!(out, ndjson);
     }
 }

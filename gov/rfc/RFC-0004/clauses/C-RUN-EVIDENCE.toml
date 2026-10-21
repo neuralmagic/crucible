@@ -1,0 +1,17 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-RUN-EVIDENCE"
+title = "Run evidence travels on a run token"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A run's evidence is its session log, its captured files, its git memory, and its captured telemetry. A run pod MUST deliver its evidence to the controller's run evidence routes under `/api/runs/{run}/evidence/{kind}`, keyed by the run, never by the pod that produced it. The controller MUST store an upload as the run's own artifact; nothing at completion re-owns pod-keyed uploads to a run.
+
+At dispatch the controller MUST mint one opaque run token for the run and deliver it to the pod through the run's Secret, never in the pod spec, the launch row, or argv. The controller MUST store only a digest of its secret. A run token grants exactly two things: writing the evidence of the run it was minted for, and reading the evidence of the run that run's launch reruns, when it reruns one. Every other route MUST refuse it. A run token MUST expire no later than the run's ceiling allows the pod to live, and MUST be revoked when the run completes or fails.
+
+Reading a run's session log, captured files, or git memory MUST also be open to any caller the human API admits, and a run the local executor produced MUST be served from its run directory when the controller stored no copy.
+
+A rerun launched in a pod MUST name its parent as the parent's evidence URL on the controller, and the engine MUST fetch the parent's evidence over that URL into a directory laid out like a run's state directory before it reads the parent, with the same refusals as a parent read from disk."""

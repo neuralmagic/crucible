@@ -1,5 +1,5 @@
-//! The Tier 2 ingest drop-box: `POST /api/pods/{pod}/artifacts/{kind}` streams the raw gzipped
-//! artifact body into the artifact chunk tables ([`crate::runs::blob_store`]) and records a POINTER +
+//! The Tier 2 ingest drop-box: `POST /api/pods/{pod}/artifacts/{kind}` streams a scope turn's
+//! gzipped pack or transcript into the artifact chunk tables ([`crate::runs::blob_store`]) and records a POINTER +
 //! digest in the ledger — the ledger row stays a pointer at the evidence. It is a **data-plane
 //! evidence drop**, the network equivalent of the S3 bucket: pods still never touch the DB beyond
 //! this approval, and the fold that turns evidence into `scopes`/`runs` rows still runs in the
@@ -9,11 +9,13 @@
 //! SPA surface — write-only, never in the generated client. Its auth is the pod-bound TokenReview
 //! extractor ([`crate::runs::ingest_auth::IngestAuth`]).
 //!
+//! A run pod's evidence never comes here: it goes to its run under the run token
+//! ([`crate::runs::evidence_api`]), and this route refuses the run kinds.
+//!
 //! Three approval invariants:
 //!   * **caps** — a body over the per-kind cap ([`ArtifactKind::max_bytes`]) is a 413 with the limit
 //!     in the JSON body; the stream is abandoned the instant it crosses the cap (no unbounded read).
-//!   * **content-addressed dedup** — the body is sha256'd as it streams; a re-POST of a digest the
-//!     drop-box already holds returns 200 with `stored:false` and leaves the pointer untouched
+//!   * **idempotence** — a re-POST replaces the bytes and the pointer with the same digest
 //!     (at-least-once delivery, idempotent approval — the Temporal lesson).
 //!   * **atomic publish** — the chunks land in one transaction, so a torn upload never leaves a
 //!     half-written artifact the fold trusts.
@@ -28,7 +30,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use crucible_contract::{ArtifactKind, IngestError, IngestResponse};
+use crucible_contract::{ArtifactKind, EvidenceRefused, EvidenceStored};
 use std::sync::Arc;
 
 /// The state the ingest routes carry: the ledger (pointer rows + the chunk store) and the
@@ -61,10 +63,15 @@ async fn ingest_artifact(
     State(state): State<IngestState>,
     body: Body,
 ) -> Response {
-    let Ok(kind) = auth.kind.parse::<ArtifactKind>() else {
+    let Some(kind) = auth
+        .kind
+        .parse::<ArtifactKind>()
+        .ok()
+        .filter(|k| matches!(k, ArtifactKind::ScopePack | ArtifactKind::ScopeTranscript))
+    else {
         return err(
             StatusCode::NOT_FOUND,
-            format!("unknown artifact kind: {}", auth.kind),
+            format!("{} is not a scope turn's artifact", auth.kind),
             None,
         );
     };
@@ -118,15 +125,13 @@ enum StoreError {
     Io(String),
 }
 
-/// Stream `body` into the chunk store, hashing + capping as it arrives, dedup by digest against
-/// the existing pointer row, and record the pointer. The heavy lifting behind [`ingest_artifact`],
-/// split out so tests can exercise the storage contract directly.
+/// Stream `body` into the chunk store, hashing + capping as it arrives, and record the pointer.
 async fn store(
     state: &IngestState,
     pod: &str,
     kind: ArtifactKind,
     body: Body,
-) -> Result<IngestResponse, StoreError> {
+) -> Result<EvidenceStored, StoreError> {
     let owner = ArtifactOwner::PodEvidence {
         pod: pod.to_string(),
     };
@@ -144,21 +149,6 @@ async fn store(
         PutArtifactError::Store(e) => StoreError::Io(format!("{e:#}")),
     })?;
 
-    // Content-addressed dedup: a re-POST of the digest the pointer already names is a no-op approval
-    // answer (the rewrite above landed identical bytes).
-    match crate::runs::work_pods::pod_artifact(state.db.pool(), pod, kind.as_str()).await {
-        Ok(Some(existing)) if existing.digest == stored.digest => {
-            return Ok(IngestResponse {
-                kind,
-                digest: stored.digest,
-                bytes: stored.bytes,
-                stored: false,
-            });
-        }
-        Ok(_) => {}
-        Err(e) => return Err(StoreError::Io(format!("dedup lookup: {e:#}"))),
-    }
-
     crate::runs::work_pods::record_pod_artifact(
         state.db.pool(),
         &NewPodArtifact {
@@ -172,19 +162,18 @@ async fn store(
     .await
     .map_err(|e| StoreError::Io(format!("recording pointer: {e:#}")))?;
 
-    Ok(IngestResponse {
+    Ok(EvidenceStored {
         kind,
         digest: stored.digest,
         bytes: stored.bytes,
-        stored: true,
     })
 }
 
-/// Build a typed [`IngestError`] JSON response.
+/// Build a typed [`EvidenceRefused`] JSON response.
 fn err(status: StatusCode, message: String, limit_bytes: Option<u64>) -> Response {
     (
         status,
-        Json(IngestError {
+        Json(EvidenceRefused {
             error: message,
             limit_bytes,
         }),
@@ -194,12 +183,20 @@ fn err(status: StatusCode, message: String, limit_bytes: Option<u64>) -> Respons
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::runs::ingest_auth::ExpectedServiceAccount;
+    use crate::client::Db;
+    use crate::runs::blob_store::ArtifactOwner;
+    use crate::runs::ingest_auth::{ExpectedServiceAccount, IngestValidator};
+    use crate::runs::ingest_drop::{IngestState, router};
+    use axum::Router;
+    use axum::body::Body;
     use axum::body::to_bytes;
     use axum::http::Request;
+    use axum::http::StatusCode;
+    use axum::response::Response;
     use crucible_contract::content_digest;
+    use crucible_contract::{ArtifactKind, EvidenceRefused, EvidenceStored};
     use sqlx::PgPool;
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     /// A ready-to-serve ingest router whose validator trusts `(token, pod)` via the accept cache, so
@@ -236,7 +233,7 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn stores_then_dedups_by_digest(pool: PgPool) {
+    async fn stores_and_a_repost_is_idempotent(pool: PgPool) {
         let payload = b"gzip-bytes-pretend".to_vec();
         let expect_digest = content_digest(&payload);
 
@@ -252,8 +249,7 @@ mod tests {
             .await
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::OK);
-        let r: IngestResponse = json_body(resp).await;
-        assert!(r.stored, "first POST stores");
+        let r: EvidenceStored = json_body(resp).await;
         assert_eq!(r.digest, expect_digest);
         assert_eq!(r.bytes, payload.len() as u64);
 
@@ -274,7 +270,7 @@ mod tests {
         assert_eq!(ptr.digest, expect_digest);
         assert_eq!(ptr.bytes, payload.len() as i64);
 
-        // Re-POST of the identical bytes is idempotent: 200, stored:false, one row still.
+        // Re-POST of the identical bytes is idempotent: 200, one row still.
         let app2 = app(pool.clone(), "tok", "crucible-turn-x");
         let resp = app2
             .oneshot(post_req(
@@ -286,8 +282,7 @@ mod tests {
             .await
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::OK);
-        let r: IngestResponse = json_body(resp).await;
-        assert!(!r.stored, "re-POST of a held digest dedups");
+        let r: EvidenceStored = json_body(resp).await;
         assert_eq!(r.digest, expect_digest);
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pod_artifacts")
             .fetch_one(&pool)
@@ -307,7 +302,7 @@ mod tests {
             .await
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
-        let e: IngestError = json_body(resp).await;
+        let e: EvidenceRefused = json_body(resp).await;
         assert_eq!(e.limit_bytes, Some(ArtifactKind::ScopePack.max_bytes()));
         // Nothing was published — the aborted transaction left no artifact.
         let owner = ArtifactOwner::PodEvidence {
@@ -335,6 +330,22 @@ mod tests {
             .await
             .expect("resp");
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_run_kind_is_refused(pool: PgPool) {
+        for kind in ["run-session", "run-files", "run-commits", "otel-log"] {
+            let resp = app(pool.clone(), "tok", "crucible-run-x")
+                .oneshot(post_req("crucible-run-x", kind, "tok", b"x".to_vec()))
+                .await
+                .expect("resp");
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{kind}");
+        }
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM artifacts")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(n, 0, "nothing stored");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

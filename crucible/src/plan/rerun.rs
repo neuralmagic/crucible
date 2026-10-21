@@ -19,6 +19,38 @@ use crate::plan::resume::{ResumeError, RunStart, settled_row};
 pub const GIT_MEMORY_DIR: &str = "git-memory";
 const GIT_MEMORY_INDEX: &str = "tasks.json";
 
+/// Where a rerun reads its parent from: a finished run's state directory, or that run's evidence
+/// on the controller (`https://controller/api/runs/<id>`), fetched into a directory laid out the
+/// same way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParentRef {
+    Dir(PathBuf),
+    Url(Box<url::Url>),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--rerun-of {raw:?} is not a URL: {source}")]
+pub struct BadParentUrl {
+    raw: String,
+    source: url::ParseError,
+}
+
+impl std::str::FromStr for ParentRef {
+    type Err = BadParentUrl;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw.starts_with("http://") || raw.starts_with("https://") {
+            return url::Url::parse(raw)
+                .map(|url| ParentRef::Url(Box::new(url)))
+                .map_err(|source| BadParentUrl {
+                    raw: raw.to_string(),
+                    source,
+                });
+        }
+        Ok(ParentRef::Dir(PathBuf::from(raw)))
+    }
+}
+
 /// Each task's definition digest: the compiled task with its parameters bound, and the
 /// definition digests of its dependencies.
 pub fn definition_digests(plan: &ValidPlan) -> BTreeMap<TaskName, String> {
@@ -365,7 +397,8 @@ mod tests {
     use crate::plan::exec::TaskStatus;
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
     use crate::plan::rerun::{
-        ParentDir, RerunError, definition_digests, plan, read_git_memory, write_git_memory,
+        ParentDir, ParentRef, RerunError, definition_digests, plan, read_git_memory,
+        write_git_memory,
     };
     use crate::plan::resume::RunStart;
     use crucible_vcs::git_memory::TaskCommit;
@@ -817,5 +850,27 @@ mod tests {
         );
         write_git_memory(&dir.0, &start(&plan), &[]).unwrap();
         assert_eq!(read_git_memory(&dir.0).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn a_parent_is_a_url_only_when_it_says_http() {
+        assert_eq!(
+            "https://controller.example/api/runs/acme-1"
+                .parse::<ParentRef>()
+                .unwrap(),
+            ParentRef::Url(Box::new(
+                url::Url::parse("https://controller.example/api/runs/acme-1").unwrap()
+            ))
+        );
+        assert!(matches!(
+            "http://127.0.0.1:8080/api/runs/acme-1".parse::<ParentRef>(),
+            Ok(ParentRef::Url(_))
+        ));
+        assert_eq!(
+            "runs/acme-1/state".parse::<ParentRef>().unwrap(),
+            ParentRef::Dir("runs/acme-1/state".into())
+        );
+        let err = "https://".parse::<ParentRef>().unwrap_err();
+        assert!(err.to_string().contains("not a URL"), "{err}");
     }
 }

@@ -40,9 +40,7 @@ pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
     SteerSource,
 };
-pub use artifact::{
-    ArtifactKind, ArtifactRef, IngestError, IngestPath, IngestResponse, content_digest,
-};
+pub use artifact::{ArtifactKind, ArtifactRef, EvidenceRefused, EvidenceStored, content_digest};
 pub use ask::{Ask, AskKey, AskKeyError};
 pub use envelope::{Envelope, EnvelopeKind, SCHEMA_VERSION, TERMINATION_MESSAGE_CAP, Usage};
 pub use event::{AgentEvent, ModelUsage, RawStream, Tokens};
@@ -53,11 +51,11 @@ pub use link::{
     ExternalLink, ExternalUrl, LinkError, LinkKind, LinkProvider, MAX_URL_LEN, decode_links,
 };
 pub use markers::{
-    ENV_INGEST_TOKEN_PATH, ENV_INGEST_URL, ENV_POD_NAME, ENV_RUN_DISPLAY_NAME, ENV_RUN_NAME,
-    INGEST_POD_NAME_CLAIM, INGEST_TOKEN_AUDIENCE, MANAGED_BY_KEY, MANAGED_BY_SELECTOR,
-    MANAGED_BY_VALUE, RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER, SCOPE_ACTIVITY_MARKER,
-    SCOPE_PACK_MARKER, SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER,
-    VERDICT_MARKER,
+    ENV_CONTROLLER_URL, ENV_INGEST_TOKEN_PATH, ENV_INGEST_URL, ENV_POD_NAME, ENV_RUN_DISPLAY_NAME,
+    ENV_RUN_NAME, ENV_RUN_TOKEN, INGEST_POD_NAME_CLAIM, INGEST_TOKEN_AUDIENCE, MANAGED_BY_KEY,
+    MANAGED_BY_SELECTOR, MANAGED_BY_VALUE, RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER,
+    SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER, SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER,
+    SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
 };
 pub use outputs::{
     BoundSource, BoundViolation, ENV_OUTPUT_PARAMS, ENV_OUTPUTS, ENV_SESSION_LOG,

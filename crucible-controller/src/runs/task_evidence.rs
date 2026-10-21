@@ -49,12 +49,14 @@ pub fn engine_log(run_dir: &Path) -> PathBuf {
     run_dir.join("engine.log")
 }
 
+/// A local run's state directory: its session log, captured files, and git memory.
+pub(crate) fn state_dir(scratch_root: &Path, run_id: &str) -> PathBuf {
+    run_dir(scratch_root, run_id).join("pack").join("state")
+}
+
 /// The root every task's captured files sit under, for one run.
 pub(crate) fn files_root(scratch_root: &Path, run_id: &str) -> PathBuf {
-    run_dir(scratch_root, run_id)
-        .join("pack")
-        .join("state")
-        .join("files")
+    state_dir(scratch_root, run_id).join("files")
 }
 
 /// Resolve one task's captured-files directory, or `None` when it does not exist or resolves
