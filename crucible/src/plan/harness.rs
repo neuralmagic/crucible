@@ -312,8 +312,11 @@ impl TaskRunner for HarnessRunner {
         }
         let workspace = &self.paths.workspace;
         let outcome = if passed {
-            crucible_vcs::git_memory::snapshot(workspace, &format!("task {}", task.name))
-                .map(|_| ())
+            crucible_vcs::git_memory::snapshot(
+                workspace,
+                &crucible_vcs::git_memory::task_label(&task.name.0),
+            )
+            .map(|_| ())
         } else {
             crucible_vcs::vcs::head_sha(workspace)
                 .and_then(|head| crucible_vcs::git_memory::restore(workspace, &head, &[]))

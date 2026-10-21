@@ -339,36 +339,34 @@ pub async fn get_run_engine_log(pool: &PgPool, run_id: &str) -> Result<Option<St
     Ok(Some(gunzip_maybe(&payload.data)?))
 }
 
-/// Store a run's captured files: the gzipped tar the loop POSTed, kept exactly as ingested.
-/// Replaces any prior bundle for the run.
-pub async fn put_run_files(pool: &PgPool, run_id: &str, tar_gz: Vec<u8>) -> Result<StoredArtifact> {
+/// Store one of a run's tarred state directories, its captured files or its git memory: the
+/// gzipped tar the loop POSTed, kept exactly as ingested. Replaces any prior bundle of that kind.
+pub async fn put_run_bundle(
+    pool: &PgPool,
+    run_id: &str,
+    kind: crucible_contract::ArtifactKind,
+    tar_gz: Vec<u8>,
+) -> Result<StoredArtifact> {
     let owner = ArtifactOwner::Run {
         run_id: run_id.to_string(),
     };
-    let cap = crucible_contract::ArtifactKind::RunFiles.max_bytes();
-    put_artifact_bytes(
-        pool,
-        &owner,
-        crucible_contract::ArtifactKind::RunFiles.as_str(),
-        cap,
-        tar_gz,
-    )
-    .await
-    .map_err(anyhow::Error::from)
+    put_artifact_bytes(pool, &owner, kind.as_str(), kind.max_bytes(), tar_gz)
+        .await
+        .map_err(anyhow::Error::from)
 }
 
-/// Read a run's captured-files bundle back as the gzipped tar bytes, or `None` if never stored.
-pub async fn get_run_files(pool: &PgPool, run_id: &str) -> Result<Option<Vec<u8>>> {
+/// Read a run's bundle of `kind` back as the gzipped tar bytes, or `None` if never stored.
+pub async fn get_run_bundle(
+    pool: &PgPool,
+    run_id: &str,
+    kind: crucible_contract::ArtifactKind,
+) -> Result<Option<Vec<u8>>> {
     let owner = ArtifactOwner::Run {
         run_id: run_id.to_string(),
     };
-    Ok(get_artifact(
-        pool,
-        &owner,
-        crucible_contract::ArtifactKind::RunFiles.as_str(),
-    )
-    .await?
-    .map(|payload| payload.data))
+    Ok(get_artifact(pool, &owner, kind.as_str())
+        .await?
+        .map(|payload| payload.data))
 }
 
 /// Read a run's stored session back as NDJSON text, or `None` if never stored.

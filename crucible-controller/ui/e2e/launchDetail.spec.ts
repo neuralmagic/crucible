@@ -1,6 +1,6 @@
 import AxeBuilder from '@axe-core/playwright';
-import { expect, test, type Page } from '@playwright/test';
-import { stubApi } from './api';
+import { expect, test, type Page, type Route } from '@playwright/test';
+import { ROUTES, stubApi } from './api';
 
 const LAUNCH = '/playbook-runs/playbook%3Asurvey%3A0199';
 const FAILED = '/playbook-runs/playbook%3Asurvey%3A0198';
@@ -13,6 +13,22 @@ async function ready(page: Page, path: string): Promise<void> {
   await page.waitForLoadState('networkidle');
   expect(crashes, `uncaught exceptions on ${path}:\n${crashes.join('\n')}`).toEqual([]);
   await expect(page.locator('main')).toBeVisible();
+}
+
+
+/// Launch 0199 with its run finished, which is when it offers a rerun.
+async function finished(page: Page): Promise<void> {
+  const detail = ROUTES['/api/playbook-runs/playbook:survey:0199'];
+  if (typeof detail !== 'object' || detail === null || Array.isArray(detail) || !Array.isArray(detail.runs)) {
+    throw new Error('launch 0199 fixture has no runs');
+  }
+  const runs = detail.runs.map((run) =>
+    typeof run === 'object' && run !== null && !Array.isArray(run) ? { ...run, status: 'failed' } : run,
+  );
+  const body = { ...detail, runs };
+  await page.route('**/api/playbook-runs/playbook%3Asurvey%3A0199', (route: Route) =>
+    route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) }),
+  );
 }
 
 test.describe('the launch view', () => {
@@ -137,5 +153,97 @@ test.describe('the launch view', () => {
       const summary = violations.map((v) => `${v.id} (${v.nodes.length}): ${v.help}`).join('\n');
       expect(violations, `${path}\n${summary}`).toEqual([]);
     }
+  });
+
+  /// A finished run offers a rerun: what it would reuse at what cost, what runs again, and a way
+  /// to widen it from a task. The rerun is a launch of the same pack with the same values.
+  test('reruns a finished run from a chosen task', async ({ page }) => {
+    await stubApi(page);
+    await finished(page);
+    const asked: string[] = [];
+    await page.route('**/api/runs/RUN-0412/rerun**', (route: Route) => {
+      const from = new URL(route.request().url()).searchParams.get('from') ?? '';
+      asked.push(from);
+      const widened = from.includes('summarize');
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          run_id: 'RUN-0412',
+          playbook: 'survey',
+          draft_version: null,
+          reused: widened
+            ? [{ task: 'discover', cost_usd: 0.25 }]
+            : [
+                { task: 'discover', cost_usd: 0.25 },
+                { task: 'summarize', cost_usd: 1.5 },
+              ],
+          rerun: widened ? ['rank', 'summarize'] : ['rank'],
+          reused_usd: widened ? 0.25 : 1.75,
+          changed: [],
+        }),
+      });
+    });
+    const posted: unknown[] = [];
+    await page.route('**/api/playbooks/survey/launch', (route: Route) => {
+      posted.push(JSON.parse(route.request().postData() ?? 'null'));
+      return route.fulfill({
+        status: 201,
+        contentType: 'application/json',
+        body: JSON.stringify({ key: 'playbook:survey:0300' }),
+      });
+    });
+    await ready(page, LAUNCH);
+
+    const tasks = page.getByTestId('rerun-tasks');
+    await expect(tasks.locator('li[data-state="reused"]')).toHaveCount(2);
+    await expect(tasks.locator('li[data-state="reruns"]')).toContainText('rank');
+    await expect(page.getByText('$1.75 reused')).toBeVisible();
+
+    await tasks.locator('li', { hasText: 'summarize' }).getByRole('button', { name: 'Rerun from' }).click();
+    await expect(page.getByRole('button', { name: 'Rerun 2' })).toBeVisible();
+    expect(asked).toContain('summarize');
+
+    await page.getByRole('button', { name: 'Rerun 2' }).click();
+    await expect(page).toHaveURL(/\/playbook-runs\/playbook%3Asurvey%3A0300$/);
+    expect(posted).toEqual([
+      {
+        params: { topic: 'attention kernels', depth: 'deep' },
+        max_cost: 12,
+        max_time: '2h',
+        rerun: { of: 'RUN-0412', from: ['summarize'] },
+      },
+    ]);
+  });
+
+  /// An edit to a task the rerun would reuse is named before anything launches, with the one move
+  /// that makes the rerun honest: run that task again too.
+  test('holds a rerun whose reused task changed until it is included', async ({ page }) => {
+    await stubApi(page);
+    await finished(page);
+    await page.route('**/api/runs/RUN-0412/rerun**', (route: Route) => {
+      const from = new URL(route.request().url()).searchParams.get('from') ?? '';
+      const included = from.includes('discover');
+      return route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          run_id: 'RUN-0412',
+          playbook: 'survey',
+          draft_version: null,
+          reused: [],
+          rerun: included ? ['discover', 'rank', 'summarize'] : [],
+          reused_usd: 0,
+          changed: included ? [] : ['discover'],
+        }),
+      });
+    });
+    await ready(page, LAUNCH);
+
+    const tasks = page.getByTestId('rerun-tasks');
+    await expect(tasks.locator('li[data-state="changed"]')).toContainText('discover');
+    await expect(page.getByRole('button', { name: /^Rerun \d/ })).toBeDisabled();
+    await tasks.getByRole('button', { name: 'Include' }).click();
+    await expect(page.getByRole('button', { name: 'Rerun 3' })).toBeEnabled();
   });
 });

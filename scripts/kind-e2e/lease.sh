@@ -45,6 +45,64 @@ $STEER_STAMP
 kind-steer-marker" ] || fail "[O] the local run's STEER.md is: $(cat "$LOCAL_PACK/STEER.md")"
 pass "[O] the local executor ran the stored tree with its steering and parked the tampered one"
 
+# ---- scenario J ----------------------------------------------------------------------------
+# rerun_pack <dir> <check command>: produce -> edit -> check -> consume, each appending its name to
+# a ledger outside the run so a task dispatched twice shows up twice.
+J_LEDGER="$WORK/rerun-ran.log"
+rerun_pack() {
+    mkdir -p "$1"
+    sed 's|^inject = .*|inject = []|' "$FIX/packs/deliver/crucible.toml" >"$1/crucible.toml"
+    cat >"$1/workflow.star" <<STAR
+produce = command(name = "produce", run = "echo produce >> $J_LEDGER && echo carried > out.txt && echo '{}'", emits_files = ["out.txt"])
+edit = command(name = "edit", run = "echo edit >> $J_LEDGER && echo kept > edited.txt && echo '{}'", depends_on = [produce])
+check = command(name = "check", run = "echo check >> $J_LEDGER && $2", depends_on = [edit])
+consume = command(name = "consume", run = "echo consume >> $J_LEDGER && cp inputs/produce/out.txt $WORK/rerun-consumed && echo '{}'", depends_on = [check])
+workflow(type = "playbook", tasks = [produce, edit, check, consume])
+STAR
+}
+ledger() { paste -sd' ' "$J_LEDGER"; }
+
+log "[J] a draft run that fails at its last edited task"
+rerun_pack "$WORK/rerun" "exit 1"
+new_draft "$DRAFT-rerun" "$WORK/rerun"
+launch J-parent draft-launch "$DRAFT-rerun"
+settle J-parent "$KEY"
+PARENT_RUN=$(jq -r '.runs[0].run_id' "$WORK/run-J-parent.json")
+[ "$(ledger)" = "produce edit check" ] || fail "[J] the parent ran: $(ledger)"
+
+log "[J] fixing check and rerunning from it"
+rerun_pack "$WORK/rerun" "cat edited.txt > $WORK/rerun-seen && echo '{}'"
+crux draft-push "$DRAFT-rerun" "$WORK/rerun" --base-version 2 --json >"$WORK/push-J.json"
+api GET "/api/runs/$PARENT_RUN/rerun?from=check"
+[ "$HTTP" = 200 ] || fail "[J] preview answered $HTTP: $(cat "$WORK/api.json")"
+[ "$(jq -c '[[.reused[].task], .rerun, .changed]' "$WORK/api.json")" = '[["produce","edit"],["check","consume"],[]]' ] ||
+    fail "[J] preview: $(cat "$WORK/api.json")"
+launch J draft-launch "$DRAFT-rerun" --rerun-of "$PARENT_RUN" --from check
+RERUN_KEY="$KEY"
+settle J "$RERUN_KEY"
+expect_finished J
+[ "$(ledger)" = "produce edit check check consume" ] || fail "[J] the rerun dispatched: $(ledger)"
+[ "$(cat "$WORK/rerun-seen")" = kept ] || fail "[J] the reused edit's commit is not in the rerun's workspace"
+[ "$(cat "$WORK/rerun-consumed")" = carried ] || fail "[J] the reused producer's file did not reach consume"
+J_SESSION=$(ls "$WORK/scratch/local-runs/$(slug "$RERUN_KEY")"-*/pack/state/session.jsonl)
+[ "$(jq -sc --arg p "$PARENT_RUN" '[.[] | select(.kind == "task_result" and .reused_from == $p) | .task]' "$J_SESSION")" = '["produce","edit"]' ] ||
+    fail "[J] reused rows: $(jq -c 'select(.kind == "task_result")' "$J_SESSION")"
+[ "$(crux playbook-run "$RERUN_KEY" | jq -r '.rerun.run_id')" = "$PARENT_RUN" ] ||
+    fail "[J] the rerun launch does not name its parent"
+
+log "[J] an edit upstream of the selection"
+sed -i.bak 's/echo carried > out.txt/echo changed > out.txt/' "$WORK/rerun/workflow.star"
+rm "$WORK/rerun/workflow.star.bak"
+crux draft-push "$DRAFT-rerun" "$WORK/rerun" --base-version 3 --json >"$WORK/push-J2.json"
+if crux draft-launch "$DRAFT-rerun" --rerun-of "$PARENT_RUN" --from check --max-cost 1 --max-time 5m \
+    --json >"$WORK/launch-J-refused.json" 2>&1; then
+    fail "[J] a rerun reusing an edited task launched: $(cat "$WORK/launch-J-refused.json")"
+fi
+grep -qF "produce changed since the parent run" "$WORK/launch-J-refused.json" ||
+    fail "[J] the refusal does not name produce: $(cat "$WORK/launch-J-refused.json")"
+[ "$(ledger)" = "produce edit check check consume" ] || fail "[J] the refused rerun dispatched: $(ledger)"
+pass "[J] a rerun reused upstream work, its files and commits, and refused an edit it would have reused"
+
 # ---- scenario N ----------------------------------------------------------------------------
 N_BOUND=10
 LEASE=crucible-controller-leader

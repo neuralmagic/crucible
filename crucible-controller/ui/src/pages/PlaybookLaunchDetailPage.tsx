@@ -25,6 +25,7 @@ import { dispatchTone, graphRunId, originLabel, originLinks, relaunchPath } from
 import { AgentProviderTag } from './ProviderIcon';
 import { runLabel } from './runLabel';
 import { formatCost } from './runReport';
+import { RerunSection } from './RerunSection';
 import { RunTaskGraph } from './RunTaskGraph';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
@@ -101,6 +102,10 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
       <ParamsSection launch={launch} />
 
       {runId !== null && <RunTaskGraph runId={runId} />}
+
+      {runId !== null && detail.runs[0]?.status !== 'running' && (
+        <RerunSection detail={detail} runId={runId} />
+      )}
 
       {launch.secrets_refusal && (
         <Section>

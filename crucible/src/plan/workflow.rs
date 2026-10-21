@@ -533,6 +533,23 @@ impl WorkflowCfg {
         }
     }
 
+    /// The graph one playbook run executes: these tasks and params, admitted under the playbook
+    /// lane, with no budget of its own because the launcher's ceiling replaces it.
+    pub fn playbook_plan(&self) -> anyhow::Result<crate::plan::ir::ValidPlan> {
+        use anyhow::Context;
+        let caps = WorkflowCaps::for_lane(self.workflow_type).with_persistent_sessions();
+        self.admit(&caps).context("admitting one-pass playbook")?;
+        crate::plan::ir::Plan {
+            version: 1,
+            reason: None,
+            budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
+            params: self.params.clone(),
+            tasks: self.tasks.clone(),
+        }
+        .validate()
+        .context("building one-pass playbook")
+    }
+
     /// Require orchestrator authority for the workflow and its engine operations.
     pub fn admit(&self, caps: &WorkflowCaps) -> Result<(), WorkflowError> {
         self.validate()?;

@@ -467,6 +467,7 @@ pub(crate) async fn fire(
             .map(strip_user_prefix)
             .or(core.created_by.as_deref()),
         launcher_groups: core.owner_groups.as_ref(),
+        rerun: None,
     };
     match crate::launches::store::insert_playbook_launch_with(tx, key, &launch, exposure).await {
         Ok(true) => {}

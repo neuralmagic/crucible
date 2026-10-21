@@ -781,6 +781,13 @@ the external results the task reported, one object per url with `url`, `provider
 task declared `link` or `links`, so every url in it is an http(s) url it validated. A reader
 renders these rather than reading urls out of `output`.
 
+A `plan_admitted` task carries `definition` (contract 1.17.0), the digest of the compiled task
+with its parameters bound and of its dependencies' definitions. A `task_result` event carries
+`reused_from` when a rerun reused the row instead of dispatching it, naming the run that settled
+it; omitted otherwise. A playbook run delivers its git memory as the `run-commits` artifact: a
+gzipped tar of one patch per task commit, `tasks.json` naming each commit's task in order, and
+`playbook-run.json`, the record of where the run started.
+
 A `plan_admitted` task carries `keyed` (contract 1.16.0), each `producer.field` a mapped task
 narrows to its own item's entry, empty when it declares none. A mapped node's folded output and its
 `task_result` fan-out summary count the instances that settled not taken under `not_taken`; a
