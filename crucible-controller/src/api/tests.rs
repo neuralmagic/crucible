@@ -3376,6 +3376,7 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/runs/{run_id}/tasks/{task}/evidence",
         "/api/runs/{run_id}/log",
         "/api/runs/{run_id}/files",
+        "/api/runs/{run_id}/rerun",
         "/api/runs/{run_id}/files/{key}",
         "/api/runs/{run_id}/artifacts",
         "/api/runs/{run_id}/artifacts/{path}",

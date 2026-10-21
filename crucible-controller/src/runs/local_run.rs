@@ -175,12 +175,13 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
 /// worker may not park on it. The caller records the run row, then hands the child to
 /// [`supervise`]. `None` is the concurrency cap declining the launch, the same bound a work-pod
 /// dispatch is held to.
-pub async fn start(
+pub(crate) async fn start(
     db: &Db,
     cfg: &ControllerCfg,
     issue_key: &str,
     run_id: &str,
     opts: RunRenderOpts,
+    rerun: Option<&crate::launches::model::RerunOf>,
 ) -> Result<Option<LocalRun>> {
     if u32::try_from(crate::runs::store::count_running(db.pool()).await?).unwrap_or(u32::MAX)
         >= cfg.effective().max_concurrent_pods
@@ -212,7 +213,19 @@ pub async fn start(
         .context("writing the run's inputs over its pack")?;
 
     let bin = crate::runs::engine::resolve_bin();
-    let argv = run_argv(&pack.join("crucible.toml"), &opts);
+    let mut argv = run_argv(&pack.join("crucible.toml"), &opts);
+    if let Some(rerun) = rerun {
+        let parent = dir.join("parent");
+        crate::runs::rerun::materialize_parent(db, cfg.scratch_root(), &rerun.run, &parent)
+            .await
+            .with_context(|| format!("laying out the evidence of {} for its rerun", rerun.run))?;
+        argv.push("--rerun-of".to_string());
+        argv.push(parent.to_string_lossy().into_owned());
+        for task in &rerun.from {
+            argv.push("--from".to_string());
+            argv.push(task.clone());
+        }
+    }
     let deadline = match &opts {
         RunRenderOpts::Playbook { max_time, .. } => {
             Duration::from_secs(max_time.secs()) + CEILING_SLACK
