@@ -380,6 +380,7 @@ pub fn parse_response(
                 probabilities: BTreeMap::new(),
                 score: None,
                 asked_as,
+                options: Vec::new(),
             },
             Reply::Answered(answer) => Answer {
                 asked_as,
@@ -1201,5 +1202,69 @@ mod tests {
                 assert_eq!(answer.asked_as, None);
             }
         }
+    }
+
+    fn package() -> BTreeMap<QuestionId, Question> {
+        let options = crucible_contract::decision::dynamic_options(&json!([
+            {"value": "p1", "description": "golang.org/x/net 0.17.0"},
+            "none",
+        ]))
+        .unwrap();
+        BTreeMap::from([(
+            qid("package"),
+            Question {
+                instructions: "Which shipped package?".into(),
+                kind: QuestionKind::Choice { options },
+                drop: vec![],
+            },
+        )])
+    }
+
+    #[test]
+    fn options_read_at_run_time_are_sent_as_each_apis_choice() {
+        let openai = DecisionApi::OpenAi.request_body("gpt-6-luna", &package(), &json!({}));
+        assert_eq!(
+            openai["questions"],
+            json!([{
+                "type": "choice", "name": "package", "instructions": "Which shipped package?",
+                "choices": [
+                    {"value": "p1", "description": "golang.org/x/net 0.17.0"},
+                    {"value": "none"},
+                ],
+            }])
+        );
+        let system_one = DecisionApi::SystemOne.request_body("dgemma", &package(), &json!({}));
+        assert_eq!(system_one["questions"]["package"]["type"], "choice");
+        assert_eq!(
+            system_one["questions"]["package"]["criteria"],
+            json!({"p1": "golang.org/x/net 0.17.0", "none": null})
+        );
+    }
+
+    #[test]
+    fn options_read_at_run_time_answer_refuse_and_reject_as_declared_ones_do() {
+        let openai = r#"{"answers":[{"type":"choice","name":"package","probabilities":[{"value":"p1","probability":0.8},{"value":"none","probability":0.2}]}]}"#;
+        let system_one =
+            r#"{"answers":{"package":{"type":"choice","probabilities":{"p1":0.8,"none":0.2}}}}"#;
+        for (api, body) in [
+            (DecisionApi::OpenAi, openai),
+            (DecisionApi::SystemOne, system_one),
+        ] {
+            let d = parse_response(api, body, &package(), 0.5).unwrap();
+            assert_eq!(d.0[&qid("package")].label, label("p1"));
+            let d = parse_response(api, body, &package(), 0.9).unwrap();
+            assert!(d.0[&qid("package")].label.is_uncertain());
+            let stray = body.replace("\"none\"", "\"p9\"");
+            match parse_response(api, &stray, &package(), 0.5) {
+                Err(DecideError::Invalid(m)) => {
+                    assert!(m.contains("undeclared label \"p9\""), "{m}")
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let refusal = r#"{"answers":[{"type":"refusal","name":"package"}]}"#;
+        let d = parse_response(DecisionApi::OpenAi, refusal, &package(), 0.5).unwrap();
+        assert!(d.0[&qid("package")].label.is_uncertain());
+        assert_eq!(d.0[&qid("package")].confidence, 0.0);
     }
 }

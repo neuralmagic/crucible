@@ -42,8 +42,8 @@ An agent turn driven by a prompt.
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `skill()`
 
@@ -76,8 +76,8 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `command()`
 
@@ -103,8 +103,8 @@ A deterministic shell task in the candidate workspace.
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `evaluate()`
 
@@ -132,8 +132,8 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `report()`
 
@@ -285,8 +285,8 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `join` | `"all" \| "passed" \| "settled"` | Which dependency outputs form the state, as on any task. |
 | `stage` | `"iteration" \| "epilogue"` | As on any task. |
 | `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
-| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
-| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
+| `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. A choice whose options come from a field declares none, so only `"uncertain"`. |
+| `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. On a choice whose options come from a field, it also stands for every option the choice resolves to, and is the only way to route them. |
 
 ### `noul()`
 
@@ -304,7 +304,7 @@ A one-of-N question for `route()`.
 | Argument | Type | Purpose |
 | --- | --- | --- |
 | `ask` | `str` | What to decide. |
-| `options` | `list[str] \| dict[str, str \| None]` | At least two distinct identifier labels, optionally each with a description the model sees. `"uncertain"` is reserved. |
+| `options` | `list[str] \| dict[str, str \| None] \| producer.field` | At least two distinct identifier labels, optionally each with a description the model sees. `"uncertain"` is reserved. Or an unmapped dependency's field, read at each decision: the list itself, or, on a route with `over`, an object keyed by item holding each item's list. Each entry is a label or `{"value": label, "description": str}`; at most 64, a repeated label keeps its first entry, and fewer than two fails that decision. The answer records the options it chose among. Needs `min_confidence`. |
 | `drop` | `str \| list[str]` | Answers that deliberately lead nowhere, so no `when` has to list them. |
 
 ### `score()`

@@ -11,7 +11,7 @@ use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, RE
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 #[cfg(test)]
 use crate::plan::workflow::WorkflowType;
-use crucible_contract::decision::UNCERTAIN;
+use crucible_contract::decision::{MAX_DYNAMIC_OPTIONS, UNCERTAIN};
 use crucible_contract::history::MAX_HISTORY_DEPTH;
 
 /// Which lanes see a constructor.
@@ -204,7 +204,8 @@ fn otherwise_kwarg() -> Kwarg {
         format!(
             "In place of `answers`: every answer no other task lists and the question does not \
              `drop`, `\"{UNCERTAIN}\"` included. Expanded at compile time. An unreachable \
-             `otherwise` is an error."
+             `otherwise` is an error. On a choice whose options come from a field, it also \
+             stands for every option the choice resolves to, and is the only way to route them."
         ),
     )
 }
@@ -215,7 +216,8 @@ fn answers_kwarg() -> Kwarg {
         "str | list[str]",
         format!(
             "The answers `when` accepts: labels the question declares, or `\"{UNCERTAIN}\"`. \
-             Defaults to `\"yes\"` for a noul and is required for a choice or a score."
+             Defaults to `\"yes\"` for a noul and is required for a choice or a score. A choice \
+             whose options come from a field declares none, so only `\"{UNCERTAIN}\"`."
         ),
     )
 }
@@ -637,9 +639,17 @@ pub fn functions() -> Vec<Function> {
                 Kwarg::new("ask", "str", "What to decide."),
                 Kwarg::new(
                     "options",
-                    "list[str] | dict[str, str | None]",
-                    "At least two distinct identifier labels, optionally each with a description \
-                     the model sees. `\"uncertain\"` is reserved.",
+                    "list[str] | dict[str, str | None] | producer.field",
+                    format!(
+                        "At least two distinct identifier labels, optionally each with a \
+                         description the model sees. `\"uncertain\"` is reserved. Or an unmapped \
+                         dependency's field, read at each decision: the list itself, or, on a \
+                         route with `over`, an object keyed by item holding each item's list. \
+                         Each entry is a label or `{{\"value\": label, \"description\": str}}`; \
+                         at most {MAX_DYNAMIC_OPTIONS}, a repeated label keeps its first entry, \
+                         and fewer than two fails that decision. The answer records the options \
+                         it chose among. Needs `min_confidence`."
+                    ),
                 ),
                 Kwarg::new(
                     "drop",

@@ -789,6 +789,16 @@ settle as `route[K]`, each with the decision for item `K` as its output. A score
 carries `score`, its expected level position in [0, 1], and `asked_as`, `score` or `choice`, the form
 the decision API was asked in.
 
+A route question may be a `dynamic_choice` (contract 1.17.0), whose `options_from = {task, field}`
+names a dependency field the options are read from at each decision: the list itself, or for a
+route with `over` the item's entry in an object keyed by item. Each entry is a label or
+`{value, description}`, at most 64, a repeated label keeps its first entry, and fewer than two
+fails that decision before the model is asked. Its answer carries `options`, the
+`{label, description?}` list it was asked over, whatever the label; no other answer carries it.
+A `when` on such a question may carry `any_option = true`, satisfied by any label but
+`uncertain`, and a `plan_admitted` task's `when` string spells it `*`, as in
+`match.package in *|uncertain`.
+
 A `plan_admitted` task carries `emits_files` (contract 1.14.0): each declared path, as a string,
 or `{path, schema}` when the declaration gave a schema. A field typed by a schema carries
 `{"schema": "<JSON Schema text>"}` as its `type`. A `task_result` event carries `repairs` (contract 1.14.0), one

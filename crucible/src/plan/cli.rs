@@ -311,7 +311,12 @@ fn render_mermaid_styled(
             let arrow = if aligned { "==>" } else { "-->" };
             let mut labels = Vec::new();
             if let Some(when) = t.when.as_ref().filter(|when| &when.task == d) {
-                let answers: Vec<&str> = when.is.iter().map(|l| l.as_str()).collect();
+                let answers: Vec<&str> = when
+                    .any_option
+                    .then_some("any option")
+                    .into_iter()
+                    .chain(when.is.iter().map(|l| l.as_str()))
+                    .collect();
                 labels.push(format!(
                     "{}: {}",
                     mermaid_label(when.question.as_str()),
