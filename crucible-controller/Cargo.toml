@@ -24,7 +24,7 @@ serde.workspace = true
 serde_json.workspace = true
 # Reads the pack manifest's `[build.<name>]` blocks into `forge::spec::BuildSpec`. Also a
 # workspace-standard dep this crate's dev-deps use.
-toml = "0.8"
+toml = "1.1"
 # The build spec/backends: `forge::spec` (the canonical `[build]` parser + `content_digest` +
 # `validate_builds`), `forge::build::dispatch_cluster` (detached rootless-buildah Job), and
 # `forge::github::dispatch_github` (`workflow_dispatch` + poll). Both dispatch fns are blocking,
@@ -32,7 +32,7 @@ toml = "0.8"
 forge = { path = "../forge" }
 # Reads a dispatch image's OCI config labels for the contract-version check (`contract.rs`); the
 # same client and version forge's digest pinning uses, so no new tree.
-oci-client = "0.17.0"
+oci-client = "0.18.0"
 crucible-capability = { path = "../capability", features = ["openapi"] }
 clap.workspace = true
 # Parses the cron expressions on `playbook_schedules`; `crate::schedules::cron` drives its field
@@ -94,7 +94,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 tower = { version = "0.5", features = ["util"] }
 # The hosted MCP surface. rmcp's streamable-HTTP server is itself a `tower::Service`, so it nests
 # into axum directly. Same version the CLI's stdio server speaks.
-rmcp = { version = "1.8", features = ["server", "macros", "transport-streamable-http-server"] }
+rmcp = { version = "3.6", features = ["server", "macros", "transport-streamable-http-server"] }
 # The tool surface, written once and hosted over either wire.
 crux = { path = "../crux" }
 # Building and draining the synthetic requests the MCP host hands its own router.
@@ -102,7 +102,7 @@ http = "1"
 http-body-util = "0.1"
 # Signs the GitHub App's RS256 JWT (github_app.rs) — the credential exchanged for the pack-PR
 # installation token. Already in the workspace tree via oci-client, so this adds no new build.
-jsonwebtoken = { version = "10", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # The OIDC relying party: discovery, the authorization-code + PKCE request, the token exchange, and
 # ID token validation against the issuer's JWKS. `default-features = false` drops its bundled
 # reqwest 0.12 — the HTTP calls run on this crate's own reqwest 0.13 client through the
@@ -139,7 +139,7 @@ cel = { git = "https://github.com/cel-rust/cel-rust", rev = "92f4376e200124e8dba
 gcp_auth = { version = "0.12", optional = true }
 # The ranker's multi-provider LLM client (lane J2): Claude-on-Vertex and the OpenAI-compatible
 # custom-endpoint arm (vLLM/llm-d, wiremock in tests) behind one `exec_chat` interface.
-genai = { version = "0.6.5", optional = true }
+genai = { version = "0.7.0", optional = true }
 # The Prometheus client (the de-facto tikv crate, not the `metrics` facade): the controller
 # re-exports what it already ingests at `/metrics`. `default-features = false` drops the protobuf
 # exposition path — we serve only the text format the shared kube-prometheus-stack scrapes.
@@ -152,25 +152,25 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # the entrypoint install the layer, so unset = zero overhead, no connection attempt. The HTTP/proto
 # exporter with the blocking reqwest client needs no runtime on the batch thread (plaintext OTLP;
 # an https collector is a follow-up). tonic is deliberately avoided to keep the dep tree lean.
-tracing-opentelemetry = "0.32"
-opentelemetry = { version = "0.31", default-features = false, features = ["trace"] }
-opentelemetry_sdk = { version = "0.31", default-features = false, features = ["trace"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+tracing-opentelemetry = "0.34"
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "http-proto",
     "reqwest-blocking-client",
 ] }
 # OpenAPI schema generation for the typed API contract.
-utoipa = "5.5"
-utoipa-axum = "0.2"
+utoipa = "6.0"
+utoipa-axum = "0.3"
 # Embed the built React SPA into the controller binary at compile time.
 rust-embed = "8"
 mime_guess = "2"
 # On-demand analytics sidecars (`GET /api/export/*.parquet`), replacing the SSG's parquet files so
 # DuckDB keeps reading over the API. Same version/features as `crucible`'s report.rs writer so the
 # on-disk format is identical (schema mirrored from report.rs — see `export.rs`).
-parquet = { version = "59.0.0", default-features = false, features = ["snap"] }
-parquet_derive = "59.0.0"
+parquet = { version = "60.0.0", default-features = false, features = ["snap"] }
+parquet_derive = "60.0.0"
 # Stream a downloaded artifact temp file back through axum without buffering it in memory (the
 # artifact proxy — session.jsonl can be tens of MB).
 tokio-util = { version = "0.7", features = ["io"] }
@@ -179,7 +179,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 tempfile = "3"
 # Scope-turn transcripts arrive gzipped (base64 on the pod-log marker line, raw bytes from the
 # local executor's --transcript-out file); stored compressed, decompressed on serve.
-base64 = "0.22"
+base64 = "0.23"
 flate2 = "1"
 # A surviving scope pack arrives from the turn pod as a gzip'd tar on its own marker line and is
 # unpacked (traversal-guarded) into the controller's pack_out dir.
@@ -190,7 +190,7 @@ tar = "0.4"
 # `/v1/traces` ingests. `gen-tonic-messages` brings the collector's ExportTraceServiceRequest
 # message (no gRPC stack). Already in the tree via opentelemetry-otlp, so no new transitive
 # build.
-opentelemetry-proto = { version = "0.31", default-features = false, features = [
+opentelemetry-proto = { version = "0.33", default-features = false, features = [
     "gen-tonic-messages",
     "trace",
     "with-serde",
@@ -204,7 +204,7 @@ regex-syntax = "0.8"
 cedar-policy = "4.12.0"
 
 # A Postgres the controller runs itself, for `DATABASE_URL=embedded`.
-postgresql_embedded = { version = "0.21", default-features = false, features = [
+postgresql_embedded = { version = "0.22", default-features = false, features = [
     "theseus",
     "tokio",
     "tls-rustls-aws-lc-rs",

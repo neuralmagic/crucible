@@ -21,7 +21,7 @@ import {
   SectionHeader,
   useDataTable,
 } from '../ui';
-import { CoDraftHint } from './CoDraftHint';
+import { CoDraftHint, SkillLink } from './CoDraftHint';
 import { DeleteDraftDialog } from './DeleteDraftDialog';
 import { FormActions, FormError, FormGrid, SelectField, TextField } from './formControls';
 import { originLabel } from './draftStudio';
@@ -206,6 +206,7 @@ export function PlaybookDraftsPage() {
         eyebrow="Queue"
         title="Draft packs"
         description="Packs authored here instead of imported. Every save compiles against the pinned engine; graduation exports one as a pull request."
+        actions={<SkillLink />}
       />
 
       <DeleteDraftDialog

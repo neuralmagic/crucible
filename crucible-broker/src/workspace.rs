@@ -53,8 +53,9 @@ pub fn scoped<R: WorkspaceScoped>(mut request: R) -> R {
 }
 
 /// The request struct literals in `source` (outside its trailing `mod tests`) that are not built
-/// inside a [`scoped`] call. `HealthRequest` is exempt: health is not workspace-scoped. Lets each
-/// crate's tests prove its gateway client cannot send an unscoped request.
+/// inside a [`scoped`] call. Return types are not literals. `HealthRequest` is exempt: health is
+/// not workspace-scoped. Lets each crate's tests prove its gateway client cannot send an unscoped
+/// request.
 pub fn unscoped_request_literals(source: &str) -> Vec<String> {
     let body = source
         .split("\n#[cfg(test)]\nmod tests {")
@@ -69,7 +70,8 @@ pub fn unscoped_request_literals(source: &str) -> Vec<String> {
         if !name.starts_with(|c: char| c.is_ascii_uppercase()) || name == "HealthRequest" {
             continue;
         }
-        if !body[..name_start].trim_end().ends_with("scoped(") {
+        let before = body[..name_start].trim_end();
+        if !before.ends_with("scoped(") && !before.ends_with("->") {
             unscoped.push(name.to_string());
         }
     }
@@ -121,6 +123,12 @@ mod tests {
     #[test]
     fn a_let_bound_scoped_request_passes() {
         let source = "let request = scoped(\n    ExecSandboxRequest {\n        x\n    },\n);";
+        assert!(unscoped_request_literals(source).is_empty());
+    }
+
+    #[test]
+    fn a_return_type_is_not_a_literal() {
+        let source = "fn build() -> ExecSandboxRequest {\n    scoped(ExecSandboxRequest {\n        x\n    })\n}";
         assert!(unscoped_request_literals(source).is_empty());
     }
 

@@ -494,13 +494,15 @@ pub async fn draft_create(
     let mut raw: Value = c.create_draft(draft_id, description, template).await?;
     let saved: dto::DraftCompile = serde_json::from_value(raw.clone())?;
     let url = studio_url(c, draft_id);
+    let skill = c.web_url("/api/playbooks/drafts/skill");
     if as_json {
         if let Some(obj) = raw.as_object_mut() {
             obj.insert("studio_url".to_string(), Value::String(url));
+            obj.insert("skill_url".to_string(), Value::String(skill));
         }
         return json(&raw);
     }
-    Ok(render::draft_created(draft_id, &saved, &url))
+    Ok(render::draft_created(draft_id, &saved, &url, &skill))
 }
 
 pub async fn draft_save(

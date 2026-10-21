@@ -23,7 +23,7 @@ version = "0.4.0"
 # licenses check requires every workspace crate to declare it.
 license = "MIT OR Apache-2.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 
 [workspace.dependencies]
 anyhow = "1"
@@ -45,15 +45,15 @@ openshell-core = { git = "https://github.com/wseaton/OpenShell.git", rev = "3441
 openshell-policy = { git = "https://github.com/wseaton/OpenShell.git", rev = "3441f91a1de8ee1688c2add95d72fec53d404812", default-features = false }
 tonic = { version = "0.14", features = ["channel", "tls-native-roots", "tls-ring"] }
 thiserror = "2"
-strum = { version = "0.27", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
 # Cron expression parsing for playbook schedules. Owns the pattern grammar only: it matches
-# civil fields as integers, so jiff stays the single timezone authority (croner and the older
-# `cron` crate both evaluate against chrono; nothing on crates.io evaluates against jiff).
-croner = "3"
+# civil fields as integers, so jiff stays the single timezone authority. Default features off
+# drops croner's chrono backend.
+croner = { version = "4", default-features = false }
 # Launch-time validation of playbook param values against the pack's stored params schema. The
 # de-facto Rust validator; `default-features = false` keeps remote `$ref` resolution off, so a
 # stored schema can never make the controller fetch a URL.
-jsonschema = { version = "0.50", default-features = false }
+jsonschema = { version = "0.59", default-features = false }
 moka = { version = "0.12", features = ["sync", "future"] }
 url = "2"
 percent-encoding = "2"
