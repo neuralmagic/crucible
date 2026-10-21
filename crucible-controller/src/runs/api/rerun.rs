@@ -10,6 +10,7 @@ use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Response};
 
 #[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct RerunQuery {
     /// The tasks to dispatch again, comma-separated. Empty reruns only what did not pass.
     #[serde(default)]
