@@ -366,6 +366,26 @@ is ready, `crux draft-graduate` opens the PR that exports it to a repository, an
 `crux playbook-import owner/repo --path haiku` proposes registering it from there. Once
 registered, `crux launch` starts it with parameters, and `crux playbook-runs` lists what ran.
 
+### Let your own agent write it
+
+If an agent is doing the authoring, give it the co-draft skill before it starts. The controller
+generates the skill with its own URL baked in, at `<controller>/api/playbooks/drafts/skill`.
+The skill teaches the agent the draft tools, the `base_version` rule for saves, and when to
+stop. The **Agent skill** button on the drafts page downloads it, and `crux draft-create`
+prints the link. Install it and register the controller's MCP endpoint:
+
+```sh
+mkdir -p ~/.claude/skills/crucible-co-draft
+curl -fsSL -o ~/.claude/skills/crucible-co-draft/SKILL.md \
+  -H "Authorization: Bearer $CONTROLLER_API_TOKEN" \
+  "$CONTROLLER_URL/api/playbooks/drafts/skill"
+claude mcp add --transport http crucible "$CONTROLLER_URL/mcp" \
+  --header "Authorization: Bearer $CONTROLLER_API_TOKEN"
+```
+
+Then ask it for a pack. It saves into a draft you can watch compile in the studio, and hands
+you the studio link once the diagnostics are clean.
+
 <div class="cru-callout">
   <p><strong>Next:</strong> <a href="./playbook-patterns.html">Branching and review</a> covers routes, fan-out, sessions and advisory tasks. <code>examples/playbook</code>, <code>examples/route</code>, <code>examples/revise-loop</code> and <code>examples/triage</code> are complete packs to copy from.</p>
 </div>
