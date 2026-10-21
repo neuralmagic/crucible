@@ -2,7 +2,7 @@
 
 macOS app around the controller UI, on Tauri 2. It is its own Cargo workspace, so the root
 workspace does not build it. `just desktop-check` formats, lints and tests it; the Desktop workflow
-runs the same on macOS when anything under `crucible-desktop/` changes.
+runs the same on macOS when `crucible-desktop/` or a crate it builds from changes.
 
 ```sh
 just desktop-install

@@ -1,16 +1,24 @@
 name: Desktop
 
 # Format, lint and test the macOS desktop app (its own Cargo workspace, so ci.yml never builds it).
-# Runs only when the app or this workflow changes: macOS runner minutes are billed.
+# Runs only when the app, the crates it builds from (crux, crucible-contract, and the root
+# Cargo.toml whose workspace dependencies crux inherits) or this workflow change: macOS runner
+# minutes are billed.
 on:
   push:
     branches: [main]
     paths:
       - 'crucible-desktop/**'
+      - 'crux/**'
+      - 'crucible-contract/**'
+      - 'Cargo.toml'
       - '.github/workflows/desktop.yml'
   pull_request:
     paths:
       - 'crucible-desktop/**'
+      - 'crux/**'
+      - 'crucible-contract/**'
+      - 'Cargo.toml'
       - '.github/workflows/desktop.yml'
   workflow_dispatch:
 
