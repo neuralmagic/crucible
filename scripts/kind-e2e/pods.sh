@@ -6,26 +6,43 @@ start_controller
 SA_REF="system:serviceaccount:$NS:crucible-loop"
 TLS_PREFIX=crucible-openshell-client-tls-
 
-# tls_secrets: the client-TLS Secrets in the namespace, as one JSON array.
-tls_secrets() {
-    kubectl -n "$NS" get secrets -o json | jq -c --arg p "$TLS_PREFIX" '[.items[] | select(.metadata.name | startswith($p))]'
+# secrets_watch_start <watch label>: record Secret events in $WORK/secrets-<label>.json until
+# watch_stop.
+secrets_watch_start() {
+    kubectl -n "$NS" get secrets -w --output-watch-events -o json >"$WORK/secrets-$1.json" 2>/dev/null &
+    BG_PIDS+=($!)
 }
 
+# tls_secrets <watch label>: every client-TLS Secret the watch saw created, as one JSON array.
+tls_secrets() {
+    jq -cs --arg p "$TLS_PREFIX" '[.[] | select(.type == "ADDED") | .object | select(.metadata.name | startswith($p))] | unique_by(.metadata.uid)' "$WORK/secrets-$1.json"
+}
+
+# tls_secret_published <watch label>: the watch saw a client-TLS Secret created.
+tls_secret_published() { [ "$(tls_secrets "$1" | jq length)" -gt 0 ]; }
+
 # tls_secret_count <n>: exactly n client-TLS Secrets exist.
-tls_secret_count() { [ "$(tls_secrets | jq length)" = "$1" ]; }
+tls_secret_count() {
+    [ "$(kubectl -n "$NS" get secrets -o json | jq --arg p "$TLS_PREFIX" '[.items[] | select(.metadata.name | startswith($p))] | length')" = "$1" ]
+}
 
-# tls_secret_published: at least one client-TLS Secret exists.
-tls_secret_published() { [ "$(tls_secrets | jq length)" -gt 0 ]; }
+# pod_uid <watch label> <pod>: the uid of the one pod of that name the watch saw.
+pod_uid() {
+    jq -rs --arg n "$2" '[.[] | .object | select(.metadata.name == $n) | .metadata.uid] | unique | if length == 1 then .[0] else empty end' "$WORK/pods-$1.json"
+}
 
-# expect_pod_secrets <label> <pod>: every client-TLS Secret is named for the pod and a distinct
-# boot (each transport retry boots again), owned by the live pod, and carries the mTLS keys the
-# driver mounts.
+# expect_pod_secrets <label> <pod> <watch label>: every client-TLS Secret the watch saw is named
+# for the pod and a distinct boot (each transport retry boots again), owned by the pod, and carries
+# the mTLS keys the driver mounts.
 expect_pod_secrets() {
     local s uid
-    s=$(tls_secrets)
-    jq -e --arg n "$TLS_PREFIX$2-" 'all(.[]; .metadata.name | startswith($n) and (ltrimstr($n) | test("^[0-9a-f]{12}$")))' <<<"$s" >/dev/null ||
+    s=$(tls_secrets "$3")
+    jq -e --arg n "$TLS_PREFIX$2-" 'length > 0 and all(.[]; .metadata.name | startswith($n) and (ltrimstr($n) | test("^[0-9a-f]{12}$")))' <<<"$s" >/dev/null ||
         fail "[$1] a Secret is not named for pod $2 and one boot: $(jq -c 'map(.metadata.name)' <<<"$s")"
-    uid=$(kubectl -n "$NS" get pod "$2" -o jsonpath='{.metadata.uid}')
+    [ "$(jq '[.[].metadata.name] | unique | length' <<<"$s")" = "$(jq length <<<"$s")" ] ||
+        fail "[$1] two boots published the same Secret name: $(jq -c 'map(.metadata.name)' <<<"$s")"
+    uid=$(pod_uid "$3" "$2")
+    [ -n "$uid" ] || fail "[$1] the watch did not see exactly one pod $2"
     jq -e --arg pod "$2" --arg uid "$uid" 'all(.[]; [.metadata.ownerReferences[] | [.kind, .name, .uid]] == [["Pod", $pod, $uid]])' <<<"$s" >/dev/null ||
         fail "[$1] a Secret is not owned by pod $2 ($uid): $(jq -c 'map(.metadata.ownerReferences)' <<<"$s")"
     jq -e 'all(.[]; (.data | keys) == ["ca.crt", "tls.crt", "tls.key"])' <<<"$s" >/dev/null ||
@@ -52,14 +69,15 @@ pass "[H] the loop SA may create Secrets and may not get, patch, or update them"
 log "[H] a controller-dispatched run pod boots the gateway"
 new_draft "$DRAFT-gateway" "$GW_PACK"
 watch_start H
+secrets_watch_start H
 launch H draft-launch "$DRAFT-gateway"
-wait_for 120 "the run pod's gateway to publish its client-TLS Secret" tls_secret_published
-H_POD=$(tls_secrets | jq -r '.[0].metadata.ownerReferences[0].name')
-[ "$(kubectl -n "$NS" get pod "$H_POD" -o jsonpath='{.metadata.labels.crucible\.dev/issue-key}')" = "$(label "$KEY")" ] ||
-    fail "[H] the Secret's owner $H_POD is not the launch's pod"
-expect_pod_secrets H "$H_POD"
 settle H "$KEY"
 watch_stop
+tls_secret_published H || fail "[H] the run pod's gateway published no client-TLS Secret"
+H_POD=$(tls_secrets H | jq -r '.[0].metadata.ownerReferences[0].name')
+[ "$(jq -rs --arg n "$H_POD" '[.[] | .object | select(.metadata.name == $n) | .metadata.labels["crucible.dev/issue-key"]] | unique | join(" ")' "$WORK/pods-H.json")" = "$(label "$KEY")" ] ||
+    fail "[H] the Secret's owner $H_POD is not the launch's pod"
+expect_pod_secrets H "$H_POD" H
 reason=$(jq -r '.launch.parked_reason // empty' "$WORK/run-H.json")
 [ "$STATUS" = parked ] && grep -q 'gateway' <<<"$reason" || fail "[H] expected a park at the gateway, got '$STATUS': $reason"
 grep -qi -e forbidden -e 'publishing Secret' <<<"$reason" && fail "[H] the publish was refused: $reason"
@@ -78,9 +96,12 @@ H_TURN=crucible-turn-e2e-tls
 "$BIN/crucible" deploy render-turn --profile "$WORK/profile.toml" --name "$H_TURN" --issue e2e/tls#1 \
     --turn-kind scope --goal-file "$WORK/goal-H.txt" --repo-url "git://crucible-e2e-gitd.$NS.svc:9418/code" \
     --sandbox-image ghcr.io/org/sandbox:latest --no-pin >"$WORK/turn-H.yaml"
+watch_start H-turn
+secrets_watch_start H-turn
 kubectl apply -f "$WORK/turn-H.yaml" >/dev/null
-wait_for 120 "the turn pod's gateway to publish its client-TLS Secret" tls_secret_published
-expect_pod_secrets H-turn "$H_TURN"
+wait_for 120 "the turn pod to finish" pods_in ".metadata.name == \"$H_TURN\" and (.status.phase == \"Succeeded\" or .status.phase == \"Failed\")" 1
+watch_stop
+expect_pod_secrets H-turn "$H_TURN" H-turn
 kubectl -n "$NS" delete pod "$H_TURN" crucible-e2e-gitd --grace-period=1 --wait=true >/dev/null
 kubectl -n "$NS" delete service crucible-e2e-gitd >/dev/null
 wait_for 90 "the turn pod's Secret to be collected with it" tls_secret_count 0
