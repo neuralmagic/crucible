@@ -102,7 +102,7 @@ WORK="$TOP"
 ARTIFACTS="${ARTIFACT_DIR:-$TOP/artifacts}"
 OWN_PG=""
 PG=""
-BUILD_PID=""
+BUILD_PIDS=()
 CREATE_PIDS=()
 SHARD_PIDS=()
 CONTROLLER_PID=""
@@ -166,7 +166,7 @@ halt() {
 
 cleanup() {
     local rc=$? p shard
-    for p in $BUILD_PID ${SHARD_PIDS[@]+"${SHARD_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
+    for p in ${BUILD_PIDS[@]+"${BUILD_PIDS[@]}"} ${SHARD_PIDS[@]+"${SHARD_PIDS[@]}"}; do kill "$p" 2>/dev/null || true; done
     for p in ${CREATE_PIDS[@]+"${CREATE_PIDS[@]}"}; do wait "$p" 2>/dev/null || true; done
     if [ "$rc" -ne 0 ]; then
         mkdir -p "$ARTIFACTS"
@@ -794,11 +794,12 @@ case "$NODE_ARCH" in x86_64 | amd64) NODE_ARCH=amd64 ;; aarch64 | arm64) NODE_AR
 if [ "${SKIP_BUILD:-0}" != 1 ]; then
     log "building the controller, crux, and crucible for the host, beside both with the autoresearch lane"
     (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible -p crucible-controller -p crux --bins) &
-    BUILD_PID=$!
-    (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible-controller --features autoresearch \
-        --bin crucible-controller --target-dir "$ROOT/target/autoresearch")
+    BUILD_PIDS+=($!)
     (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible --features autoresearch \
         --bin crucible --target-dir "$ROOT/target/autoresearch")
+    (cd "$ROOT" && SQLX_OFFLINE=true cargo build --locked -q -p crucible-controller --features autoresearch \
+        --bin crucible-controller --target-dir "$ROOT/target/autoresearch") &
+    BUILD_PIDS+=($!)
 fi
 BIN="$ROOT/target/debug"
 AUTORESEARCH_CONTROLLER="$ROOT/target/autoresearch/debug/crucible-controller"
@@ -859,10 +860,10 @@ sed "s|@LOOP_IMAGE@|$LOOP_IMAGE|g" "$FIX/profile.toml.in" >"$TOP/profile.toml"
 sed "s|@LOOP_IMAGE@|$MISMATCH_IMAGE|g" "$FIX/profile.toml.in" >"$TOP/profile-mismatch.toml"
 awk '{ print } /^\[cluster\]$/ { print "state_pvc = \"crucible-e2e-state\"" }' "$TOP/profile.toml" >"$TOP/profile-state.toml"
 
-if [ -n "$BUILD_PID" ]; then
-    wait "$BUILD_PID" || fail "the host build failed"
-    BUILD_PID=""
-fi
+for p in ${BUILD_PIDS[@]+"${BUILD_PIDS[@]}"}; do
+    wait "$p" || fail "a controller build failed"
+done
+BUILD_PIDS=()
 wait_for 60 postgres docker exec "$PG" pg_isready -h 127.0.0.1 -U postgres -d crucible
 PG_PORT=$(docker port "$PG" 5432/tcp | head -n1 | cut -d: -f2)
 
