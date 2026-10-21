@@ -7,7 +7,7 @@ edition.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-base64 = "0.22"
+base64 = "0.23"
 clap.workspace = true
 flate2 = "1.1.9"
 futures-util = "0.3.32"
@@ -21,7 +21,7 @@ hex = "0.4.3"
 # and for reading overlayfs whiteout xattrs / setting extracted-file ownership (`lgetxattr`, `lchown`).
 # std exposes none of these, and shelling out to `mount`/`chroot` would add a runtime PATH dependency.
 libc = "0.2"
-oci-client = "0.17.0"
+oci-client = "0.18.0"
 # GitHub REST client for the workflow_dispatch build backend (Declarative builds M2): dispatch, run
 # correlation/poll, and the contents-API workflow fetch for introspection. Async + rustls, matching
 # crucible-broker/-controller's feature set (already in the workspace tree).
@@ -56,4 +56,4 @@ jiff = "0.2"
 # (aws-lc-rs is, via aws-sdk); we install the aws-lc-rs provider before the first kube client connect.
 rustls = "0.23"
 # The fleet file (`clusters.toml`) and the `[build.<name>]` spec fixtures are TOML.
-toml = "0.8"
+toml = "1.1"
