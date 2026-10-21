@@ -71,9 +71,12 @@
 #      its file's schema passes after one repair turn, the mapped instance that never fixes its
 #      file fails with a note that does not repeat the refused value, and the run's spend and the
 #      task results count the repair turns
+#   J  a failed draft run reruns on the local executor from its edited last task: upstream tasks
+#      are reused with their commits and files, reused rows name the parent, and an edit upstream
+#      of the selection is refused
 # The scenarios run in three shards at once, each on its own kind cluster, database, and controller
 # ports, sharing one registry and loop image: store (A P U F C B D L T I W E X Q V G M Z), pods
-# (H R S K Y), and lease (O N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
+# (H R S K Y), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
 # Needs docker, kind, kubectl, jq, curl, git, shasum, openssl. Uses $DATABASE_URL and $PG_CONTAINER when
 # set (the CI postgres action), else starts its own Postgres. KEEP=1 leaves everything up;
 # ARTIFACT_DIR collects logs on failure.
