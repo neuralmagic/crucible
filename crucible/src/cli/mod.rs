@@ -325,6 +325,14 @@ pub(crate) enum PlanAction {
         /// ceilings. The graph compiled now must be the one the run started with.
         #[arg(long, requires = "manifest")]
         resume: bool,
+        /// Rerun a finished playbook run from the tasks `--from` names: they and everything
+        /// downstream of them run again, and every other task the run passed is reused with its
+        /// output, files, and commits. DIR is that run's state directory.
+        #[arg(long, value_name = "DIR", requires_all = ["manifest", "from"])]
+        rerun_of: Option<PathBuf>,
+        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+        #[arg(long, value_name = "TASK", requires = "rerun_of")]
+        from: Vec<String>,
     },
 }
 

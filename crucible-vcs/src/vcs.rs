@@ -156,6 +156,69 @@ pub(crate) fn reset_to(ws: &Path, sha: &str) -> Result<()> {
     Ok(())
 }
 
+/// The commits from `base` (exclusive) to `HEAD`, oldest first, following first parents, each as
+/// its summary line and its change as a binary-safe patch.
+pub(crate) fn commits_since(ws: &Path, base: &str) -> Result<Vec<(String, Vec<u8>)>> {
+    let repo = Repository::open(ws).context("open workspace repo")?;
+    let base = git2::Oid::from_str(base).with_context(|| format!("parse sha {base}"))?;
+    let mut commit = repo
+        .head()
+        .context("HEAD")?
+        .peel_to_commit()
+        .context("peel HEAD to commit")?;
+    let mut out = Vec::new();
+    while commit.id() != base {
+        let parent = commit
+            .parent(0)
+            .with_context(|| format!("{} does not descend from {base}", commit.id()))?;
+        let mut opts = git2::DiffOptions::new();
+        opts.show_binary(true);
+        let diff = repo
+            .diff_tree_to_tree(
+                Some(&parent.tree().context("parent tree")?),
+                Some(&commit.tree().context("commit tree")?),
+                Some(&mut opts),
+            )
+            .context("diff commit against its parent")?;
+        let mut patch = Vec::new();
+        diff.print(DiffFormat::Patch, |_, _, line| {
+            if matches!(line.origin(), '+' | '-' | ' ') {
+                patch.push(line.origin() as u8);
+            }
+            patch.extend_from_slice(line.content());
+            true
+        })
+        .context("render patch")?;
+        let summary =
+            String::from_utf8_lossy(commit.summary_bytes().unwrap_or_default()).into_owned();
+        out.push((summary, patch));
+        commit = parent;
+    }
+    out.reverse();
+    Ok(out)
+}
+
+/// Apply `patch` to the working tree and index, then commit it as `msg`.
+pub(crate) fn apply_and_commit(ws: &Path, patch: &[u8], msg: &str) -> Result<git2::Oid> {
+    let repo = Repository::open(ws).context("open workspace repo")?;
+    let diff = git2::Diff::from_buffer(patch).context("parse patch")?;
+    repo.apply(&diff, git2::ApplyLocation::Both, None)
+        .context("apply patch")?;
+    commit_all(ws, msg)
+}
+
+/// The tree `sha` points at, when the repository has that commit.
+pub(crate) fn commit_tree(ws: &Path, sha: &str) -> Result<Option<String>> {
+    let repo = Repository::open(ws).context("open workspace repo")?;
+    let Ok(oid) = git2::Oid::from_str(sha) else {
+        return Ok(None);
+    };
+    Ok(repo
+        .find_commit(oid)
+        .ok()
+        .map(|commit| commit.tree_id().to_string()))
+}
+
 /// The current `HEAD` commit sha (the snapshot token when nothing changed to commit).
 pub fn head_sha(ws: &Path) -> Result<String> {
     let repo = Repository::open(ws).context("open workspace repo")?;

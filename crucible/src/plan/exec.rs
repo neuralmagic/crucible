@@ -276,6 +276,9 @@ pub struct Prior {
     pub recorded_history: bool,
     /// The log ends in a shutdown: the run finished and there is nothing left to append.
     pub shut_down: bool,
+    /// The rows a rerun reused, each with the run that settled it. Their spend was charged to
+    /// that run, not this one.
+    pub reused: BTreeMap<TaskName, String>,
 }
 
 impl Prior {
@@ -299,8 +302,24 @@ impl Prior {
         self.results
             .iter()
             .filter(|(name, _)| name.0.contains('[') || !parents.contains(name.0.as_str()))
+            .filter(|(name, _)| !self.reused.contains_key(*name))
             .map(|(_, r)| r.cost_usd)
             .sum()
+    }
+
+    /// What the rows a rerun reused had cost the runs that settled them.
+    pub fn reused_usd(&self) -> f64 {
+        Prior {
+            reused: BTreeMap::new(),
+            results: self
+                .results
+                .iter()
+                .filter(|(name, _)| self.reused.contains_key(*name))
+                .map(|(name, r)| (name.clone(), r.clone()))
+                .collect(),
+            ..Prior::default()
+        }
+        .spent_usd()
     }
 }
 

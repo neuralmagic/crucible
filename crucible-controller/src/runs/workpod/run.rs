@@ -1484,7 +1484,10 @@ pub(crate) async fn apply_dropbox_artifacts(
             },
             // A scope turn never uploads a loop run's evidence or (in R2) an otel-log; ignore any
             // stray entry.
-            ArtifactKind::RunSession | ArtifactKind::RunFiles | ArtifactKind::OtelLog => {}
+            ArtifactKind::RunSession
+            | ArtifactKind::RunFiles
+            | ArtifactKind::RunCommits
+            | ArtifactKind::OtelLog => {}
         }
     }
     Ok(())

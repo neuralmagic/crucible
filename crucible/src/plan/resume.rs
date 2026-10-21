@@ -24,6 +24,10 @@ pub struct RunStart {
     pub run: String,
     pub started_at: jiff::Timestamp,
     pub base: String,
+    /// The tree `base` points at, so a rerun can start from the same content in a checkout
+    /// that does not have the commit itself.
+    #[serde(default)]
+    pub base_tree: String,
     pub plan: String,
 }
 
@@ -81,11 +85,12 @@ pub enum ResumeError {
 }
 
 impl RunStart {
-    pub fn begin(run: &str, base: String, plan: &ValidPlan) -> Self {
+    pub fn begin(run: &str, base: String, base_tree: String, plan: &ValidPlan) -> Self {
         RunStart {
             run: run.to_string(),
             started_at: jiff::Timestamp::now(),
             base,
+            base_tree,
             plan: plan_digest(plan),
         }
     }
@@ -157,50 +162,18 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
         prior.shut_down = false;
         match event {
             SessionEvent::PlanAdmitted { .. } => prior.admitted = true,
-            SessionEvent::TaskResult {
-                task,
-                status,
-                attempts,
-                cost_usd,
-                output,
-                note,
-                blocked,
-                transport,
-                repairs,
-                ..
-            } => {
+            SessionEvent::TaskResult { ref task, .. } => {
                 if !prior.admitted {
-                    return Err(ResumeError::NotAdmitted { task });
+                    return Err(ResumeError::NotAdmitted { task: task.clone() });
                 }
-                let name = TaskName(task.clone());
-                let row = row_task(plan, &name)
-                    .ok_or_else(|| ResumeError::UnknownTask { task: task.clone() })?;
-                let status =
-                    status
-                        .parse::<TaskStatus>()
-                        .map_err(|source| ResumeError::BadStatus {
-                            task: task.clone(),
-                            source,
-                        })?;
-                let fanout = row
-                    .over
-                    .as_ref()
-                    .and(output.clone())
-                    .and_then(|output| serde_json::from_value::<FanoutSummary>(output).ok());
-                let blocked = blocked.map(|b| BlockedReason::from_wire(b, &note));
-                let result = TaskResult {
-                    status,
-                    attempts,
-                    cost_usd,
-                    output,
-                    note: (!note.is_empty()).then_some(note),
-                    fanout,
-                    blocked,
-                    transport,
-                    repairs,
+                let Some(row) = settled_row(plan, event)? else {
+                    continue;
                 };
-                if prior.results.insert(name.clone(), result).is_none() {
-                    prior.order.push(name);
+                if let Some(from) = row.reused_from {
+                    prior.reused.insert(row.name.clone(), from);
+                }
+                if prior.results.insert(row.name.clone(), row.result).is_none() {
+                    prior.order.push(row.name);
                 }
             }
             SessionEvent::HistoryEntry { .. } => prior.recorded_history = true,
@@ -209,6 +182,68 @@ pub fn fold(log: &str, plan: &ValidPlan, elapsed: Duration) -> Result<Prior, Res
         }
     }
     Ok(prior)
+}
+
+/// One settled row of a session log as the executor holds it.
+#[derive(Debug, Clone)]
+pub struct SettledRow {
+    pub name: TaskName,
+    pub result: TaskResult,
+    /// The run that settled it, when the run that logged it reused it.
+    pub reused_from: Option<String>,
+}
+
+/// The row a `task_result` event logs, read against `plan`; `None` for any other event.
+pub fn settled_row(
+    plan: &ValidPlan,
+    event: SessionEvent,
+) -> Result<Option<SettledRow>, ResumeError> {
+    let SessionEvent::TaskResult {
+        task,
+        status,
+        attempts,
+        cost_usd,
+        output,
+        note,
+        blocked,
+        transport,
+        repairs,
+        reused_from,
+        ..
+    } = event
+    else {
+        return Ok(None);
+    };
+    let name = TaskName(task.clone());
+    let row =
+        row_task(plan, &name).ok_or_else(|| ResumeError::UnknownTask { task: task.clone() })?;
+    let status = status
+        .parse::<TaskStatus>()
+        .map_err(|source| ResumeError::BadStatus {
+            task: task.clone(),
+            source,
+        })?;
+    let fanout = row
+        .over
+        .as_ref()
+        .and(output.clone())
+        .and_then(|output| serde_json::from_value::<FanoutSummary>(output).ok());
+    let blocked = blocked.map(|b| BlockedReason::from_wire(b, &note));
+    Ok(Some(SettledRow {
+        name,
+        result: TaskResult {
+            status,
+            attempts,
+            cost_usd,
+            output,
+            note: (!note.is_empty()).then_some(note),
+            fanout,
+            blocked,
+            transport,
+            repairs,
+        },
+        reused_from,
+    }))
 }
 
 /// Read and fold `state/session.jsonl`. A run killed before its first line has an empty log.
@@ -286,6 +321,7 @@ mod tests {
             run: run.into(),
             started_at: "2026-09-29T12:00:00Z".parse().unwrap(),
             base: "abc".into(),
+            base_tree: String::new(),
             plan: plan_digest(plan),
         }
     }

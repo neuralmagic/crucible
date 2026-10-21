@@ -312,6 +312,51 @@ pub(crate) fn restore_pristine(
     Ok(())
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the parent run started from {base}, which this workspace neither has nor matches; a rerun \
+     starts where its parent did"
+)]
+struct RerunBaseUnavailable {
+    base: String,
+}
+
+/// Rebuild a rerun's workspace: the commit its parent started from, or this checkout's `HEAD`
+/// when that holds the same tree, then the reused tasks' commits, then the manifest's injects.
+/// Returns the commit the rerun starts from.
+pub(crate) fn restore_for_rerun(
+    manifest_path: &Path,
+    m: &manifest::Manifest,
+    parent: &crate::plan::resume::RunStart,
+    commits: &[crucible_vcs::git_memory::TaskCommit],
+) -> Result<String> {
+    use crucible_vcs::git_memory;
+    let manifest_dir = manifest::manifest_dir(manifest_path);
+    let workspace = manifest_dir.join(&m.workspace.dir);
+    let base = if git_memory::tree_of(&workspace, &parent.base)?.is_some() {
+        parent.base.clone()
+    } else {
+        let head = vcs::head_sha(&workspace)?;
+        match git_memory::tree_of(&workspace, &head)? {
+            Some(tree) if !parent.base_tree.is_empty() && tree == parent.base_tree => head,
+            _ => {
+                return Err(RerunBaseUnavailable {
+                    base: parent.base.clone(),
+                }
+                .into());
+            }
+        }
+    };
+    git_memory::restore(&workspace, &base, &[])
+        .with_context(|| format!("restoring the workspace to the parent's base ({base})"))?;
+    git_memory::replay(&workspace, commits)?;
+    for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
+        manifest::apply_inject(&src, &dst)
+            .context("applying [workspace].inject to the rerun's workspace")?;
+    }
+    Ok(base)
+}
+
 /// Where a manifest run keeps its state: the session log, captured files, and run records.
 pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
     manifest::manifest_dir(manifest_path).join("state")

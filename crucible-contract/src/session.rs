@@ -175,6 +175,10 @@ pub struct PlanTaskWire {
     /// How many earlier runs of its series the task reads under `history`; 0 when it reads none.
     #[serde(default)]
     pub history_depth: u32,
+    /// Digest of the compiled task with its parameters bound and of its dependencies'
+    /// definitions. A rerun refuses to reuse a task whose definition moved since its parent.
+    #[serde(default)]
+    pub definition: String,
 }
 
 fn write_revise_targets<S: serde::Serializer>(targets: &[String], s: S) -> Result<S::Ok, S::Error> {
@@ -546,6 +550,9 @@ pub enum SessionEvent {
         trace_id: String,
         #[serde(default)]
         span_id: String,
+        /// The run that settled this result, when a rerun reused it rather than dispatching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reused_from: Option<String>,
     },
     /// What this run records for its launch series, emitted once before `Shutdown` by a playbook
     /// run. The orchestrator copies it into the record later runs of the series receive.
@@ -967,6 +974,7 @@ mod tests {
                 ],
                 timeout: "10m".into(),
                 history_depth: 5,
+                definition: String::new(),
             }],
             history_record: "propose-a".into(),
         });
@@ -1037,6 +1045,7 @@ mod tests {
             emits_files: Vec::new(),
             timeout: String::new(),
             history_depth: 0,
+            definition: String::new(),
         };
         let written = |revise: Vec<String>| {
             serde_json::to_value(task(revise)).expect("encodes")["revise"].clone()
@@ -1105,6 +1114,7 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            reused_from: None,
             agent: None,
             repairs: vec![TaskRepair {
                 label: "measure-a repair 1/2".into(),
@@ -1163,6 +1173,7 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            reused_from: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1220,6 +1231,7 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            reused_from: None,
             agent: None,
             repairs: Vec::new(),
         };
@@ -1265,6 +1277,7 @@ mod tests {
             secs: 0.0,
             trace_id: String::new(),
             span_id: String::new(),
+            reused_from: None,
             agent: Some(TaskAgent {
                 harness: "claude".into(),
                 model: "glm-5.3".into(),

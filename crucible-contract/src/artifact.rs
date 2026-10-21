@@ -48,6 +48,9 @@ pub enum ArtifactKind {
     RunSession,
     /// The gzipped tar of a loop run's `state/files`, one directory per task that captured.
     RunFiles,
+    /// The gzipped tar of a playbook run's `state/git-memory`: each passing task's commit as a
+    /// patch, in the order they were made, and `tasks.json` naming the task of each.
+    RunCommits,
     /// The raw OTLP jsonl the in-process collector captured next to the agent.
     OtelLog,
 }
@@ -60,6 +63,7 @@ impl ArtifactKind {
             ArtifactKind::ScopeTranscript => "scope-transcript",
             ArtifactKind::RunSession => "run-session",
             ArtifactKind::RunFiles => "run-files",
+            ArtifactKind::RunCommits => "run-commits",
             ArtifactKind::OtelLog => "otel-log",
         }
     }
@@ -71,16 +75,18 @@ impl ArtifactKind {
             ArtifactKind::ScopeTranscript => 32 * MIB,
             ArtifactKind::RunSession => 128 * MIB,
             ArtifactKind::RunFiles => 256 * MIB,
+            ArtifactKind::RunCommits => 64 * MIB,
             ArtifactKind::OtelLog => 32 * MIB,
         }
     }
 
     /// Every kind, for exhaustive iteration in tests and route registration.
-    const ALL: [ArtifactKind; 5] = [
+    const ALL: [ArtifactKind; 6] = [
         ArtifactKind::ScopePack,
         ArtifactKind::ScopeTranscript,
         ArtifactKind::RunSession,
         ArtifactKind::RunFiles,
+        ArtifactKind::RunCommits,
         ArtifactKind::OtelLog,
     ];
 }
