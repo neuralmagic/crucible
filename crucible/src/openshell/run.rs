@@ -18,6 +18,7 @@ use crate::agent::harness::{
     TurnArtifacts,
 };
 use crate::agent::relay;
+use crate::agent::tool_chain::StopReason;
 use crate::agent::turn::{TurnFailure, TurnOutcome};
 use crate::args::{Args, Paths};
 use crate::manifest::Harness;
@@ -140,15 +141,28 @@ pub fn turn(
     match outcome {
         Ok(cost) => TurnOutcome::completed(cost),
         Err(e) => {
-            let cause = transport_cause(&e);
-            let message = format!("{e:#}");
-            let ev = AgentEvent::Error {
-                error_type: "openshell".into(),
-                message: message.clone(),
-            };
-            sink("", RawStream::Stderr, Some(&ev));
-            TurnOutcome::failed(spent.get(), TurnFailure::Orchestration { cause, message })
+            let failure = failure_of(e);
+            if let TurnFailure::Orchestration { message, .. } = &failure {
+                let ev = AgentEvent::Error {
+                    error_type: "openshell".into(),
+                    message: message.clone(),
+                };
+                sink("", RawStream::Stderr, Some(&ev));
+            }
+            TurnOutcome::failed(spent.get(), failure)
         }
+    }
+}
+
+/// What a turn that unwound with `e` failed as: a tool plugin stop, or the orchestration step the
+/// error came from.
+fn failure_of(e: anyhow::Error) -> TurnFailure {
+    match e.downcast::<StopReason>() {
+        Ok(reason) => TurnFailure::Stopped(reason),
+        Err(e) => TurnFailure::Orchestration {
+            cause: transport_cause(&e),
+            message: format!("{e:#}"),
+        },
     }
 }
 
@@ -735,13 +749,14 @@ async fn try_turn(
             })),
             AuthProvider::Codex | AuthProvider::AnthropicKey | AuthProvider::ApiKey => None,
         };
-        let decoder = backend.decoder(
-            args,
-            meters.as_ref(),
-            crate::agent::turn::tool_io_full(args),
+        let full = crate::agent::turn::tool_io_full(args);
+        let pump = crate::agent::turn::StreamPump::new(
+            backend.decoder(args, meters.as_ref(), full),
+            (!full).then(|| backend.decoder(args, None, true)),
+            crate::agent::tool_chain::ToolChain::for_args(args),
         );
         let exec_result =
-            exec_and_stream(&gw, &name, &wrapper, decoder, &exec_opts, spent, sink).await;
+            exec_and_stream(&gw, &name, &wrapper, pump, &exec_opts, spent, sink).await;
         if let Some(refresher) = &refresher {
             refresher.abort();
         }
@@ -960,26 +975,34 @@ struct ExecOpts<'a> {
     cancel: &'a CancellationToken,
 }
 
-/// Exec the agent over the gateway's `ExecSandbox` stream, driving a [`crate::agent::turn::StreamPump`] with the
-/// stdout lines the stream yields, and return the turn's cost (estimated from tokens if none was
-/// reported). The stream's stderr is replayed through the sink after the agent exits, mirroring the
-/// old CLI-child behavior. `cancel` unwinds the exec on Ctrl-C (see [`Gateway::exec`]).
+/// Exec the agent over the gateway's `ExecSandbox` stream, driving `pump` with the stdout lines the
+/// stream yields, and return the turn's cost (estimated from tokens if none was reported). The
+/// stream's stderr is replayed through the sink after the agent exits, mirroring the old CLI-child
+/// behavior. `cancel` unwinds the exec on Ctrl-C (see [`Gateway::exec`]); a tool chain stop
+/// unwinds only the exec, so teardown still runs.
 async fn exec_and_stream(
     gw: &Gateway,
     name: &str,
     command: &[String],
-    decoder: Box<dyn crate::agent::harness::StreamDecoder>,
+    mut pump: crate::agent::turn::StreamPump,
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
 ) -> Result<f64> {
-    let mut pump = crate::agent::turn::StreamPump::new(decoder);
+    let stop = opts.cancel.child_token();
     let exec = gw
-        .exec(name, command, opts.cancel, |line| {
-            pump.push(line, opts.json, sink)
+        .exec(name, command, &stop, |line| {
+            pump.push(line, opts.json, sink);
+            if pump.stopped().is_some() {
+                stop.cancel();
+            }
         })
         .await?;
-    let (mut cost, best_tokens) = pump.finish();
+    let crate::agent::turn::PumpEnd {
+        mut cost,
+        best_tokens,
+        stopped,
+    } = pump.finish(sink);
     let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
 
     if cost == 0.0
@@ -990,6 +1013,9 @@ async fn exec_and_stream(
     // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
     // non-zero below, and a turn that spent money is never reported free.
     spent.raise(cost);
+    if let Some(reason) = stopped {
+        return Err(reason.into());
+    }
 
     // Replay the agent's stderr (provisioning notes / errors) through the sink as raw lines.
     for line in exec.stderr_lines {
@@ -1830,6 +1856,26 @@ mod tests {
 
     /// A broken exec stream is not a finished turn. Before this it reported no exit code, and
     /// "no exit code" read as a clean one.
+    #[test]
+    fn a_plugin_stop_is_a_stopped_turn_through_any_context() {
+        let wedged = crate::agent::tool_chain::Wedged {
+            calls: vec!["Bash `$ go list -deps ./cmd/server`".into()],
+            repeats: 25,
+        };
+        let reason = StopReason::Wedged(wedged);
+        let e = anyhow::Error::from(reason.clone()).context("running the agent in sandbox s-1");
+        assert_eq!(failure_of(e), TurnFailure::Stopped(reason));
+        let other = anyhow::Error::from(OpenshellCliError::Failed {
+            label: "workdir upload".into(),
+            stderr: "connection reset".into(),
+        })
+        .context("uploading the workspace");
+        assert!(matches!(
+            failure_of(other),
+            TurnFailure::Orchestration { message, .. } if message.contains("connection reset")
+        ));
+    }
+
     #[test]
     fn a_broken_exec_stream_is_its_own_error() {
         let e = OpenshellCliError::ExecStreamBroke {

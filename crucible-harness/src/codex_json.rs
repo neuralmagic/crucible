@@ -150,6 +150,7 @@ impl CodexJsonParser {
                     subagent: false,
                     input,
                     result,
+                    failed: item_failed(item),
                 });
             }
             _ => {}
@@ -216,6 +217,15 @@ fn tool_name(kind: &str, item: &Value) -> String {
         "plan_update" | "todo_list" => "plan_update".to_string(),
         other => other.to_string(),
     }
+}
+
+/// A finished item that exited non-zero or ended in a status other than `completed`.
+fn item_failed(item: &Value) -> bool {
+    let status = str_field(item, "status");
+    item.get("exit_code")
+        .and_then(Value::as_i64)
+        .is_some_and(|code| code != 0)
+        || !(status.is_empty() || status == "completed")
 }
 
 /// A compact one-line summary per item type; cosmetic only.
@@ -462,11 +472,18 @@ mod tests {
                     subagent,
                     input,
                     result,
+                    failed: ok_failed,
                 },
                 AgentEvent::Tool {
-                    summary: failed, ..
+                    summary: failed,
+                    failed: bad_failed,
+                    ..
                 },
             ] => {
+                assert!(
+                    !ok_failed && *bad_failed,
+                    "a non-zero exit is a failed call"
+                );
                 assert_eq!(name, "shell");
                 assert_eq!(summary, "$ cargo test");
                 assert!(!subagent);

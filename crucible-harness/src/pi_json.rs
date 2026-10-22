@@ -206,6 +206,7 @@ impl PiJsonParser {
             subagent: false,
             input,
             result,
+            failed: is_error,
         });
     }
 
@@ -355,13 +356,16 @@ mod tests {
                     subagent,
                     input,
                     result,
+                    failed: ok_failed,
                 },
                 AgentEvent::Tool {
                     name: n2,
                     summary: s2,
+                    failed: bad_failed,
                     ..
                 },
             ] => {
+                assert!(!ok_failed && *bad_failed, "isError is a failed call");
                 assert_eq!(name, "bash");
                 assert_eq!(summary, "$ cargo test");
                 assert!(!subagent);

@@ -14,7 +14,8 @@ Tasks are addressed by CRUCIBLE_TASK, the task's own name, not by matching promp
       "stale":   {"exit": 1, "stderr": "nothing to date the entries against"},
       "slow":    {"sleep_ms": 90000},
       "flaky":   {"fail_attempts": 1, "result": {"ok": true}},
-      "fixer":   {"result": {"n": "x"}, "turns": [{}, {"result": {"n": 1}}]}
+      "fixer":   {"result": {"n": "x"}, "turns": [{}, {"result": {"n": 1}}]},
+      "stuck":   {"loop_tool": "$ go list ./...", "turns": [{}, {"loop_tool": null, "result": {}}]}
     }
 
 Directives, all optional:
@@ -23,6 +24,8 @@ Directives, all optional:
   writes        path -> content, written before the result
   appends       path -> content, appended; use for proving one session spanned several turns
   sleep_ms      wall time to burn, for exercising deadlines and ceilings
+  loop_tool     a Bash call summary to print as a native tool event until the engine kills the
+                turn, the shape of an agent wedged on one command
   fail_attempts fail this many times before passing; the count is kept beside the workspace
   stderr        text to emit on stderr
   exit          exit code (default 0); a nonzero code skips the result file
@@ -137,6 +140,12 @@ def main() -> int:
     if sleep_ms:
         time.sleep(sleep_ms / 1000.0)
 
+    loop_tool = spec.get("loop_tool")
+    if loop_tool is not None:
+        event = json.dumps({"v": 1, "kind": "tool", "name": "Bash", "summary": loop_tool})
+        while True:
+            print(event, flush=True)
+
     fail_attempts = int(spec.get("fail_attempts", 0))
     if fail_attempts and attempt_number(task) <= fail_attempts:
         print(f"fake-agent: {task} failing attempt by request", file=sys.stderr)
@@ -158,6 +167,7 @@ def main() -> int:
         payload = json.dumps(expand(spec["result"]), sort_keys=True)
         pathlib.Path(RESULT_FILE).write_text(payload)
         print(payload)
+
     return 0
 
 

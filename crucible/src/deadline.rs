@@ -176,6 +176,16 @@ impl Supervised {
         })
     }
 
+    /// Kill the child now, with its whole process group when it leads one.
+    pub fn kill(&mut self) {
+        match self.group {
+            Some(pgid) => kill_group(pgid),
+            None => {
+                let _ = self.child.kill();
+            }
+        }
+    }
+
     pub fn child(&mut self) -> &mut Child {
         &mut self.child
     }

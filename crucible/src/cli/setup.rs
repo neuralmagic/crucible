@@ -191,6 +191,7 @@ pub(crate) fn apply_agent_cfg(
     args.disclosure = frozen.disclosure.clone();
     args.output_bounds = frozen.bounds.clone();
     args.openshell = agent.openshell.clone();
+    args.tool_plugins = agent.tool_plugins.clone();
     if !agent.resources.is_empty() && args.agent_backend != manifest::AgentBackend::Openshell {
         return Err(ResourcesWithoutSandbox {
             backend: args.agent_backend,
