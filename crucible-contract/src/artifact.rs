@@ -123,8 +123,8 @@ impl FromStr for ArtifactKind {
 
 /// One entry in the Tier 1 manifest: the authoritative index of an artifact the pod attempted to
 /// upload. It rides the kubelet-authenticated termination message; the controller checks the
-/// drop-box against it, so a missing or digest-mismatched artifact is caught without trusting the
-/// POST path.
+/// uploads against it, so a missing or digest-mismatched artifact is caught without trusting the
+/// upload path.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ArtifactRef {
     pub kind: ArtifactKind,

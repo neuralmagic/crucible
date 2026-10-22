@@ -329,7 +329,7 @@ pub(crate) enum PlanAction {
         /// them, and every task the run did not pass run again; every other task is reused with
         /// its output, files, and commits. PARENT is that run's state directory, or its evidence
         /// on the controller (`https://controller/api/runs/<id>`), fetched with the run token in
-        /// CRUCIBLE_RUN_TOKEN or a person's CONTROLLER_API_TOKEN.
+        /// CRUCIBLE_POD_TOKEN or a person's CONTROLLER_API_TOKEN.
         #[arg(long, value_name = "PARENT", requires = "manifest")]
         rerun_of: Option<crucible::plan::rerun::ParentRef>,
         /// A task the rerun dispatches again, with everything downstream of it. Repeatable.

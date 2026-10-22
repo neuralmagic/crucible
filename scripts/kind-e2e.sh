@@ -66,11 +66,15 @@
 #      leader killed, the peer takes the lease and fires a one-shot on time, once
 #   M  a loop image labelled with another contract version parks the launch without a pod
 #   Z  db rebuild carries the trees and aliases the pack rows reference
-#   JP a run pod uploads its session, captured files and git memory to its own run under a run
+#   JP a run pod uploads its session, captured files and git memory to its own run under a pod
 #      token minted at dispatch and carried in the run's Secret, with nothing stored by pod and no
-#      drop-box token projected; completion revokes the token; a person reads the evidence
+#      ServiceAccount token projected; completion revokes the token; a person reads the evidence
 #      over the API; a rerun launch's pod fetches its parent's evidence over its own token, reuses
 #      the parent's passing task, and passes the task it reran
+#   JT a scope pod running the engine uploads its pack and transcript under its own name on its
+#      turn's pod token, matching the digests its termination manifest reports; the token writes
+#      no other pod's evidence and no run's, a person cannot write a turn's, and a revoked token
+#      is refused
 #   Y  examples/schema-repair through the controller: the draft's compiled graph and the run's
 #      admitted plan parse with schema-typed fields and files, the agent whose first turn breaks
 #      its file's schema passes after one repair turn, the mapped instance that never fixes its
@@ -81,7 +85,7 @@
 #      of the selection is refused
 # The scenarios run in three shards at once, each on its own kind cluster, database, and controller
 # ports, sharing one registry and loop image: store (A P U F C B D L T I W E X Q V G M Z), pods
-# (H R S K Y JP), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
+# (H R S K Y JP JT), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
 # Needs docker, kind, kubectl, jq, curl, git, shasum, openssl. Uses $DATABASE_URL and $PG_CONTAINER when
 # set (the CI postgres action), else starts its own Postgres. KEEP=1 leaves everything up;
 # ARTIFACT_DIR collects logs on failure.
@@ -243,7 +247,6 @@ run_controller() {
         CONTROLLER_SESSION_SECURE=false \
         CONTROLLER_PLAYBOOK_EXECUTOR=pod CONTROLLER_SCOPE_EXECUTOR=disabled \
         CONTROLLER_DEPLOY_PROFILE="$4" CONTROLLER_POD_NAMESPACE="$NS" \
-        CONTROLLER_TURN_SERVICE_ACCOUNT=crucible-loop \
         CONTROLLER_STATE_DIR="$WORK/state" CONTROLLER_SCRATCH_DIR="$WORK/scratch" \
         CRUCIBLE_BIN="$BIN/crucible" FORGE_INSECURE_REGISTRIES="localhost:$REGPORT" \
         RUST_LOG="${RUST_LOG:-info}" NO_COLOR=1 \

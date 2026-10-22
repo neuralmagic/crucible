@@ -160,8 +160,8 @@ pub(crate) fn extract_run_session_logs(logs: &str) -> RunSessionScrape {
 }
 
 /// The engine's own output in a finished pod's log: everything before the last
-/// [`RUN_SESSION_DELIMITER`] line, or the whole log when the wrapper never printed one (the
-/// drop-box path skips it).
+/// [`RUN_SESSION_DELIMITER`] line, or the whole log when the wrapper never printed one (a pod
+/// that uploaded its session skips it).
 pub(crate) fn engine_log_of(logs: &str) -> &str {
     &logs[..last_delimiter(logs).map_or(logs.len(), |(start, _, _)| start)]
 }

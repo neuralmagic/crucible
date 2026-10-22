@@ -25,10 +25,10 @@ pub fn emit(kind: EnvelopeKind, payload: Value) {
     emit_with_artifacts(kind, payload, Vec::new());
 }
 
-/// Like [`emit`] but with the Tier 2 artifacts manifest: the authoritative index of every drop-box
-/// upload the pod attempted, with content digests and a `delivered` flag. The controller trusts
-/// this (it rides the kubelet-authenticated termination message), then checks the drop-box against
-/// it, a missing or digest-mismatched artifact is caught without trusting the POST path at all.
+/// Like [`emit`] but with the artifacts manifest: the authoritative index of every upload the pod
+/// attempted, with content digests and a `delivered` flag. The controller trusts this (it rides
+/// the kubelet-authenticated termination message), then checks what was uploaded against it, so
+/// a missing or digest-mismatched artifact is caught without trusting the upload path at all.
 pub fn emit_with_artifacts(kind: EnvelopeKind, payload: Value, artifacts: Vec<ArtifactRef>) {
     if let Err(e) = write_to(Path::new(TERMINATION_LOG_PATH), kind, payload, artifacts) {
         eprintln!("[crucible] failed to write the Tier 1 termination message: {e:#}");
