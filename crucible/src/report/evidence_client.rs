@@ -87,7 +87,7 @@ impl Upload {
             Target::Turn(pod) => ("turns", pod),
         };
         format!(
-            "{}/api/{collection}/{}/evidence/{}",
+            "{}/api/evidence/{collection}/{}/{}",
             self.base,
             crucible_contract::artifact::path_segment(id),
             kind.as_str()
@@ -274,7 +274,7 @@ pub enum FetchError {
     },
 }
 
-/// Download the evidence of the run at `parent` (`<controller>/api/runs/<id>`) into `dest`, laid
+/// Download the evidence of the run at `parent` (`<controller>/api/evidence/runs/<id>`) into `dest`, laid
 /// out like that run's state directory: `session.jsonl`, `files/`, and `git-memory/`. Evidence
 /// the controller does not hold is left absent, for the rerun's own read of the parent to name.
 /// The bearer is the run token when this process holds one, else a person's controller token.
@@ -302,7 +302,7 @@ pub fn fetch_parent(parent: &url::Url, dest: &Path) -> Result<(), FetchError> {
         ArtifactKind::RunFiles,
         ArtifactKind::RunCommits,
     ] {
-        let url = format!("{base}/evidence/{}", kind.as_str());
+        let url = format!("{base}/{}", kind.as_str());
         let mut req = client.get(&url);
         if let Some(token) = &token {
             req = req.bearer_auth(token);
@@ -433,7 +433,7 @@ mod tests {
         let (line, headers, body) = server.join().expect("server");
         assert_eq!(
             line,
-            "PUT /api/turns/crucible-turn-a/evidence/scope-pack HTTP/1.1"
+            "PUT /api/evidence/turns/crucible-turn-a/scope-pack HTTP/1.1"
         );
         assert!(
             headers.contains("authorization: bearer crr_id_secret"),
@@ -482,7 +482,7 @@ mod tests {
         let upload = Upload::turn_from_env().expect("all three set");
         assert_eq!(
             upload.url(ArtifactKind::ScopePack),
-            "http://c:8080/api/turns/x/evidence/scope-pack"
+            "http://c:8080/api/evidence/turns/x/scope-pack"
         );
         set(0);
     }

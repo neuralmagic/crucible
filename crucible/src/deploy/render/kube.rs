@@ -552,7 +552,7 @@ impl Renderer<'_> {
             .map(|task| format!(" --from {}", sh_quote(task)))
             .collect();
         let rerun_args = format!(
-            r#"--rerun-of "${{{url}}}/api/runs/{parent}"{from}"#,
+            r#"--rerun-of "${{{url}}}/api/evidence/runs/{parent}"{from}"#,
             url = crucible_contract::ENV_CONTROLLER_URL,
         );
         Ok(if self.resumable() {
@@ -2495,7 +2495,9 @@ mod tests {
             yaml.contains("SESSION (rc="),
             "the SESSION delimiter is still emitted"
         );
-        assert!(yaml.contains("if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ]; then"));
+        assert!(yaml.contains(
+            "if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ] || [ -e \"$D/state/session.undelivered\" ]; then"
+        ));
     }
 
     /// The manifest + a fake single-domain profile, plus a pack dir on disk with a NESTED
@@ -4784,14 +4786,14 @@ mod tests {
             "{yaml}"
         );
         assert!(
-            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ]; then"#),
+            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ] || [ -e "$D/state/session.undelivered" ]; then"#),
             "{yaml}"
         );
 
         let uploading = k8s_profile(r#"ingest_url = "https://controller.example""#);
         let yaml = render_playbook(&uploading, playbook_launch());
         assert!(
-            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ]; then"#),
+            yaml.contains(r#"if [ -z "${CRUCIBLE_CONTROLLER_URL:-}" ] || [ -e "$D/state/session.undelivered" ]; then"#),
             "the delimiter stays guarded, never unconditional: {yaml}"
         );
         assert!(
@@ -4818,7 +4820,7 @@ mod tests {
         let yaml = render_playbook(&profile, rerun_launch());
         assert!(
             yaml.contains(
-                r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'"#
+                r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'"#
             ),
             "{yaml}"
         );
@@ -4840,7 +4842,10 @@ mod tests {
             ..playbook_launch()
         };
         let yaml = render_playbook(&profile, launch);
-        assert!(yaml.contains("/api/runs/a%2Fb%20c%3Fd\""), "{yaml}");
+        assert!(
+            yaml.contains("/api/evidence/runs/a%2Fb%20c%3Fd\""),
+            "{yaml}"
+        );
     }
 
     /// With persistent state, a restarted rerun pod resumes the rerun its claim holds rather than
@@ -4854,7 +4859,7 @@ mod tests {
         let yaml = render_playbook(&profile, rerun_launch());
         assert!(
             yaml.contains(
-                r#"if [ -s "$D/state/session.jsonl" ]; then set -- --resume; else set -- --rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'; fi"#
+                r#"if [ -s "$D/state/session.jsonl" ]; then set -- --resume; else set -- --rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/acme_x_7-1700000000" --from 'triage' --from 'it'\''s'; fi"#
             ),
             "{yaml}"
         );

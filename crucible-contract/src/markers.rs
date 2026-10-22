@@ -60,7 +60,7 @@ pub const ENV_RUN_NAME: &str = "CRUCIBLE_RUN_NAME";
 pub const ENV_RUN_DISPLAY_NAME: &str = "CRUCIBLE_RUN_DISPLAY_NAME";
 
 /// Env var carrying the controller's base URL as a pod reaches it. A run pod uploads its evidence
-/// under `<url>/api/runs/{run}/evidence/{kind}` and a rerun fetches its parent's from there.
+/// under `<url>/api/evidence/runs/{run}/{kind}` and a rerun fetches its parent's from there.
 /// Absent means the pod has no controller to deliver to.
 pub const ENV_CONTROLLER_URL: &str = "CRUCIBLE_CONTROLLER_URL";
 

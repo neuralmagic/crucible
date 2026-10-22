@@ -3667,7 +3667,7 @@ async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) ->
     let wrapper = container.args.as_ref().expect("args").join("\n");
     assert!(
         wrapper.contains(
-            r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/runs/playbook_survey_0199c0de-42" --from 'draft'"#
+            r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/playbook_survey_0199c0de-42" --from 'draft'"#
         ),
         "{wrapper}"
     );
