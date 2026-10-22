@@ -289,6 +289,7 @@ pub(crate) async fn register_ranker_as(
             harness: None,
             enabled: true,
             created_by: "test",
+            price: None,
         },
     )
     .await

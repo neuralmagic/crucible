@@ -493,6 +493,13 @@ enum Command {
         json: bool,
     },
 
+    /// List the inference providers you may read: id, kind, default model, harness, the price per
+    /// million tokens a run on it is charged, and whether launches may pick it.
+    Providers {
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List the secrets you own: id, name, kind, visibility, mode, owner. Never a value.
     Secrets {
         #[arg(long)]
@@ -844,6 +851,7 @@ pub async fn run() -> Result<()> {
             base_version,
             json,
         } => ops::draft_push(&client, &draft_id, &dir, base_version, json).await?,
+        Command::Providers { json } => ops::providers(&client, json).await?,
         Command::Secrets { json } => ops::secrets(&client, json).await?,
         Command::SecretBind {
             secret_id,

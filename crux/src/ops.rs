@@ -565,6 +565,14 @@ pub async fn playbook_caps(c: &Client, as_json: bool) -> Result<String> {
     Ok(render::playbook_caps(&caps))
 }
 
+pub async fn providers(c: &Client, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.providers::<Value>().await?);
+    }
+    let list: Vec<dto::Provider> = c.providers().await?;
+    Ok(render::providers(&list))
+}
+
 pub async fn secrets(c: &Client, as_json: bool) -> Result<String> {
     if as_json {
         return json(&c.secrets::<Value>().await?);
