@@ -55,6 +55,15 @@ pub const ENV_RUN_NAME: &str = "CRUCIBLE_RUN_NAME";
 /// show it; links keep [`ENV_RUN_NAME`], the id.
 pub const ENV_RUN_DISPLAY_NAME: &str = "CRUCIBLE_RUN_DISPLAY_NAME";
 
+/// Env var carrying the controller's base URL as a pod reaches it. A run pod uploads its evidence
+/// under `<url>/api/runs/{run}/evidence/{kind}` and a rerun fetches its parent's from there.
+/// Absent means the pod has no controller to deliver to.
+pub const ENV_CONTROLLER_URL: &str = "CRUCIBLE_CONTROLLER_URL";
+
+/// Env var carrying the run token (RFC-0004:C-RUN-EVIDENCE), projected from the run's Secret: the
+/// bearer for the run's own evidence and for the evidence of the run it reruns.
+pub const ENV_RUN_TOKEN: &str = "CRUCIBLE_RUN_TOKEN";
+
 /// Env var carrying the controller's Tier 2 ingest base URL into a turn pod (Tier 2 ingest).
 /// Absent means no drop-box is available, and the engine falls back to marker emission.
 pub const ENV_INGEST_URL: &str = "CRUCIBLE_INGEST_URL";

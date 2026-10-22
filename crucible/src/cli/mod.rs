@@ -327,9 +327,11 @@ pub(crate) enum PlanAction {
         resume: bool,
         /// Rerun a finished playbook run: the tasks `--from` names, everything downstream of
         /// them, and every task the run did not pass run again; every other task is reused with
-        /// its output, files, and commits. DIR is that run's state directory.
-        #[arg(long, value_name = "DIR", requires = "manifest")]
-        rerun_of: Option<PathBuf>,
+        /// its output, files, and commits. PARENT is that run's state directory, or its evidence
+        /// on the controller (`https://controller/api/runs/<id>`), fetched with the run token in
+        /// CRUCIBLE_RUN_TOKEN or a person's CONTROLLER_API_TOKEN.
+        #[arg(long, value_name = "PARENT", requires = "manifest")]
+        rerun_of: Option<crucible::plan::rerun::ParentRef>,
         /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
         #[arg(long, value_name = "TASK", requires = "rerun_of")]
         from: Vec<String>,
@@ -489,6 +491,14 @@ pub(crate) struct DeployArgs {
     /// is what it accepts.
     #[arg(long = "param", value_name = "NAME=VALUE", requires = "playbook")]
     pub params: Vec<String>,
+    /// Rerun a finished run: the rendered pod fetches that run's evidence from the controller at
+    /// `[cluster].ingest_url` and dispatches the tasks `--from` names, and every task the run did
+    /// not pass, again. RUN is the controller's run id.
+    #[arg(long, value_name = "RUN", requires = "playbook")]
+    pub rerun_of: Option<String>,
+    /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+    #[arg(long, value_name = "TASK", requires = "rerun_of")]
+    pub from: Vec<String>,
     /// Publish-on-keep: the `owner/repo` fork the rendered loop opens its kept-commits draft PR against
     /// (emitted as the loop's `--pr-repo`). The controller passes its per-repo default so a dispatched
     /// run publishes; omit for a manual render (the manifest's `[publish] pr_repo` still applies). The

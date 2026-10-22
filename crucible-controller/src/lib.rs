@@ -98,8 +98,8 @@ pub(crate) struct HumanAuth {
     pub(crate) routes: identity::oidc::routes::AuthState,
 }
 
-/// The human surface: API + SPA behind the auth guard, the `/auth/*` login routes beside it, and
-/// the session layer over both. Machine surfaces (`/metrics`, ingest, the discovery mirror) never
+/// The human surface: API + SPA behind the auth guard, the run evidence routes and the `/auth/*`
+/// login routes beside it, and the session layer over all three. Machine surfaces (`/metrics`, ingest, the discovery mirror) never
 /// route through this. Shared with the API tests so the test stack cannot drift from what
 /// [`Surface::bind`] mounts.
 ///
@@ -117,12 +117,18 @@ pub(crate) fn human_router(
         guard: auth.guard,
         pool: state.db.pool().clone(),
     };
+    let evidence = runs::evidence_api::router(runs::evidence_api::EvidenceState {
+        db: state.db.clone(),
+        scratch_dir: state.scratch_dir.clone(),
+        guard: both.clone(),
+    });
     api::router(state)
         .merge(spa::router(ui))
         .layer(axum::middleware::from_fn_with_state(
             both,
             identity::auth::require_auth_or_api_key,
         ))
+        .merge(evidence)
         .merge(identity::oidc::routes::router(auth.routes))
         .layer(identity::session::layer(store, secure_cookies))
 }

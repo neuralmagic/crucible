@@ -66,6 +66,11 @@
 #      leader killed, the peer takes the lease and fires a one-shot on time, once
 #   M  a loop image labelled with another contract version parks the launch without a pod
 #   Z  db rebuild carries the trees and aliases the pack rows reference
+#   JP a run pod uploads its session, captured files and git memory to its own run under a run
+#      token minted at dispatch and carried in the run's Secret, with nothing stored by pod and no
+#      drop-box token projected; completion revokes the token; a person reads the evidence
+#      over the API; a rerun launch's pod fetches its parent's evidence over its own token, reuses
+#      the parent's passing task, and passes the task it reran
 #   Y  examples/schema-repair through the controller: the draft's compiled graph and the run's
 #      admitted plan parse with schema-typed fields and files, the agent whose first turn breaks
 #      its file's schema passes after one repair turn, the mapped instance that never fixes its
@@ -76,7 +81,7 @@
 #      of the selection is refused
 # The scenarios run in three shards at once, each on its own kind cluster, database, and controller
 # ports, sharing one registry and loop image: store (A P U F C B D L T I W E X Q V G M Z), pods
-# (H R S K Y), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
+# (H R S K Y JP), and lease (O J N), in scripts/kind-e2e/<shard>.sh. Arguments name the shards to run.
 # Needs docker, kind, kubectl, jq, curl, git, shasum, openssl. Uses $DATABASE_URL and $PG_CONTAINER when
 # set (the CI postgres action), else starts its own Postgres. KEEP=1 leaves everything up;
 # ARTIFACT_DIR collects logs on failure.
@@ -261,9 +266,10 @@ ports_free() {
 
 # await_health <what> <pid> <url> <log>: wait for <url>/healthz, failing early when <pid> exits.
 await_health() {
-    local what="$1" pid="$2" url="$3" log="$4"
+    local what="$1" pid="$2" url="$3" log="$4" auth=()
+    [ -n "${CONTROLLER_API_TOKEN:-}" ] && auth=(-H "authorization: Bearer $CONTROLLER_API_TOKEN")
     for _ in $(seq 1 90); do
-        curl -sf "$url/healthz" >/dev/null 2>&1 && return 0
+        curl -sf ${auth[@]+"${auth[@]}"} "$url/healthz" >/dev/null 2>&1 && return 0
         kill -0 "$pid" 2>/dev/null || fail "$what exited before answering $url; its log ends:
 $(tail -n 20 "$log")"
         sleep 1
@@ -307,11 +313,12 @@ crux() { "$BIN/crux" "$@"; }
 # api_call <out> <method> <path> [json body]: call the controller API, writing the response body
 # to <out> and printing the status. AS_USER, when set, is asserted as the caller's login.
 api_call() {
-    local out="$1" method="$2" path="$3" data=() who=()
+    local out="$1" method="$2" path="$3" data=() who=() auth=()
     [ $# -ge 4 ] && data=(--data "$4")
     [ -n "${AS_USER:-}" ] && who=(-H "x-auth-request-user: $AS_USER")
+    [ -n "${CONTROLLER_API_TOKEN:-}" ] && auth=(-H "authorization: Bearer $CONTROLLER_API_TOKEN")
     curl -s -o "$out" -w '%{http_code}' -X "$method" -H 'content-type: application/json' \
-        ${who[@]+"${who[@]}"} ${data[@]+"${data[@]}"} "$CONTROLLER_URL$path"
+        ${who[@]+"${who[@]}"} ${auth[@]+"${auth[@]}"} ${data[@]+"${data[@]}"} "$CONTROLLER_URL$path"
 }
 
 # api <method> <path> [json body]: the status lands in HTTP and the body in $WORK/api.json.
@@ -827,7 +834,7 @@ else
     docker run --rm --platform "linux/$NODE_ARCH" \
         -v "$ROOT":/src -w /src \
         -v kind-e2e-cargo:/usr/local/cargo/registry \
-        -v "kind-e2e-target-$NODE_ARCH":/ctarget \
+        -v "kind-e2e-target-$NODE_ARCH-$(printf %s "$ROOT" | shasum -a 256 | cut -c1-12)":/ctarget \
         -v "$TOP/image":/out \
         -e CARGO_TARGET_DIR=/ctarget -e SQLX_OFFLINE=true -e CARGO_PROFILE_DEV_DEBUG=0 \
         rust:1-bookworm sh -c 'cargo build --locked -q -p crucible --features autoresearch --bin crucible && cp /ctarget/debug/crucible /out/ && strip /out/crucible'

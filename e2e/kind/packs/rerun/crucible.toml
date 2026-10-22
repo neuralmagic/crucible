@@ -1,0 +1,13 @@
+[workspace]
+dir = "workspace"
+setup_cmd = "mkdir -p workspace && git -C workspace init -q && git -C workspace -c user.email=e2e@example.com -c user.name=e2e -c commit.gpgsign=false commit -q --allow-empty -m baseline"
+inject = ["second.sh"]
+
+[agent]
+backend = "command"
+agent_cmd = "true"
+goal = "Rerun the second task from the first's evidence."
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

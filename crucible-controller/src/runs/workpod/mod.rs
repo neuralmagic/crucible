@@ -88,4 +88,4 @@ pub use run::{
 };
 #[cfg(feature = "autoresearch")]
 pub use run::{ScopeOutcome, dispatch_scope};
-pub use scrape::TerminalState;
+pub use scrape::{TerminalState, TurnPhase};
