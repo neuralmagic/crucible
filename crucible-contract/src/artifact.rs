@@ -1,5 +1,5 @@
 //! Tier 2 artifacts: the kinds, their server-side size caps, the typed answers of a run's
-//! evidence upload (`PUT /api/runs/{run}/evidence/{kind}`, RFC-0004:C-RUN-EVIDENCE), and the
+//! evidence upload (`PUT /api/evidence/runs/{run}/{kind}`, RFC-0004:C-RUN-EVIDENCE), and the
 //! gzipped tar a state directory travels as.
 //!
 //! The body of an upload is the raw gzipped artifact bytes; the response and error are typed JSON.

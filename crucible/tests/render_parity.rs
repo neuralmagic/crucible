@@ -252,7 +252,7 @@ fn deploy_render_rerun_matches_render_yaml() {
     .expect("library render");
     assert!(
         from_lib.contains(
-            r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/runs/acme_x_7-1700" --from 'draft'"#
+            r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/acme_x_7-1700" --from 'draft'"#
         ),
         "{from_lib}"
     );
