@@ -218,12 +218,10 @@ async fn settle_run(
     key: &str,
     run: &crate::runs::model::RunningRun,
 ) -> Result<bool> {
-    // The artifact store first (an explicit `session_uri`, or the run-session artifact a local
-    // launcher stored), else scrape the finished pod's own logs — a loop-run pod publishes only
-    // onto its emptyDir, so for the pod path the scrape IS the normal completion edge.
-    let session = match locate_session(db, run).await? {
-        Some(content) => Some(content),
-        None => scrape_pod_session(db, cfg, key, run).await?,
+    // A pod run settles once its pod is terminal.
+    let session = match run.pod.as_deref() {
+        Some(pod) => pod_session(db, cfg, key, run, pod).await?,
+        None => locate_session(db, run).await?,
     };
     let Some(session) = session else {
         return Ok(false); // no complete log yet — the run is still in flight
@@ -253,6 +251,7 @@ async fn settle_run(
         emission.as_ref(),
     )
     .await?;
+    crate::runs::run_token::revoke_run(db.pool(), &run.run_id).await?;
     // The run's session is ingested and its cost booked (once, in `complete_run`'s ingest):
     // close the WorkPod ledger row + GC the run pod. Best-effort — a leaked pod is swept
     // later, never fatal to the completion.
@@ -298,61 +297,12 @@ async fn locate_session(db: &Db, run: &crate::runs::model::RunningRun) -> Result
     crate::runs::blob_store::get_run_session(db.pool(), &run.run_id).await
 }
 
-/// Prefer the Tier 2 drop-box run-session over the log scrape. A loop pod carrying the ingest env
-/// POSTs its `state/session.jsonl` (gzipped) to the drop-box as its final act, so a present
-/// artifact is the authoritative copy. `None` = no drop-box artifact (an old engine image, or a
-/// run whose POST never landed): the caller falls back to the `SESSION`-delimiter scrape, which
-/// stays the fallback until R4. A corrupt artifact returns `Err` and the caller also falls back to
-/// the scrape rather than wedging the completion.
-async fn adopt_dropbox_run_session(db: &Db, pod: &str) -> Result<Option<String>> {
-    let owner = crate::runs::blob_store::ArtifactOwner::PodEvidence {
-        pod: pod.to_string(),
-    };
-    let Some(payload) = crate::runs::blob_store::get_artifact(
-        db.pool(),
-        &owner,
-        crucible_contract::ArtifactKind::RunSession.as_str(),
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-    Ok(Some(crate::runs::blob_store::gunzip_maybe(&payload.data)?))
-}
-
-/// Re-own one of the pod's tarred state directories, its `run-files` or its `run-commits`, to the
-/// run, so the files a run's tasks captured and the commits they made outlive the pod exactly as
-/// long as its session does ([`crate::runs::run_files`]). The bytes are the gzipped tar the loop
-/// POSTed and are stored unchanged; the tar is only ever read on the way out.
-///
-/// Independent of the session: a run that produced no such directory POSTs no artifact and there
-/// is nothing to adopt, and a failure here is logged and dropped rather than wedging the
-/// completion — the session is the run's authoritative record and must land regardless.
-async fn adopt_dropbox_bundle(
-    db: &Db,
-    run_id: &str,
-    pod: &str,
-    kind: crucible_contract::ArtifactKind,
-) -> Result<bool> {
-    let owner = crate::runs::blob_store::ArtifactOwner::PodEvidence {
-        pod: pod.to_string(),
-    };
-    let Some(payload) =
-        crate::runs::blob_store::get_artifact(db.pool(), &owner, kind.as_str()).await?
-    else {
-        return Ok(false);
-    };
-    crate::runs::blob_store::put_run_bundle(db.pool(), run_id, kind, payload.data).await?;
-    Ok(true)
-}
-
-/// The pod leg of the completion edge: a loop-run pod writes `session.jsonl` onto its own emptyDir
-/// (never the controller's storage), and its wrapper `cat`s the file to stdout behind a delimiter —
-/// so when nothing is stored, peek the pod's phase and, once terminal, take the drop-box artifact
-/// or scrape that dump ([`crate::runs::workpod::extract_run_session_logs`]). Either way the session is
-/// persisted as the run's artifact first ([`crate::runs::blob_store::put_run_session`]), which keeps the
-/// rest of the ingest path (and crash recovery: a restarted daemon re-reads the stored artifact,
-/// not the by-then-GC'd pod) unchanged.
+/// The pod leg of the completion edge: peek the pod's phase and, once terminal, keep its log and
+/// take the session it uploaded as the run's evidence (RFC-0004:C-RUN-EVIDENCE), or scrape the
+/// dump its wrapper `cat`s behind a delimiter when it had no controller to upload to
+/// ([`crate::runs::workpod::extract_run_session_logs`]). A scraped session is persisted as the
+/// run's artifact first ([`crate::runs::blob_store::put_run_session`]), so a restarted daemon finds
+/// it in the store once the pod is gone.
 ///
 /// Outcomes: `Some(session)` — recovered, ingest proceeds. `None` quietly — the pod is still
 /// running (or its phase/logs were momentarily unreadable; the next completion event or startup
@@ -361,17 +311,15 @@ async fn adopt_dropbox_bundle(
 /// `run_scope_and_transition` dead-proposal discipline — visible in the UI, never a silent
 /// `running` forever), stamp the run row `no-session`, and retain the pod as `failed` for
 /// `kubectl logs`.
-async fn scrape_pod_session(
+async fn pod_session(
     db: &Db,
     cfg: &ControllerCfg,
     key: &str,
     run: &crate::runs::model::RunningRun,
+    pod: &str,
 ) -> Result<Option<String>> {
     use crate::runs::workpod::TurnPhase;
 
-    let Some(pod) = run.pod.as_deref() else {
-        return Ok(None); // a local/pre-primitive run: no pod to scrape, keep waiting on the store
-    };
     let dispatcher = crate::runs::workpod::active_dispatcher();
     // The work_pods row records the pod's cluster; a run predating the ledger has no row and
     // only ever ran on the hub.
@@ -443,6 +391,9 @@ async fn scrape_pod_session(
                 crate::runs::workpod::retry::classify_chain(&e),
                 Some(crate::runs::workpod::retry::KubeFailure::Gone)
             ) {
+                if let Some(session) = locate_session(db, run).await? {
+                    return Ok(Some(session));
+                }
                 fail_run_without_terminal_evidence(
                     db,
                     key,
@@ -459,20 +410,6 @@ async fn scrape_pod_session(
             }
             tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: pod phase unreadable; retrying on the next completion event");
             return Ok(None);
-        }
-    }
-    for kind in [
-        crucible_contract::ArtifactKind::RunFiles,
-        crucible_contract::ArtifactKind::RunCommits,
-    ] {
-        match adopt_dropbox_bundle(db, &run.run_id, pod, kind).await {
-            Ok(true) => {
-                tracing::info!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, %kind, "run completion: bundle adopted from the Tier 2 drop-box");
-            }
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, %kind, error = format!("{e:#}"), "run completion: adopting a drop-box bundle failed; the run keeps its session and loses this evidence");
-            }
         }
     }
     // The pod is deleted minutes after this, and its log is the only copy of the engine's own
@@ -494,19 +431,11 @@ async fn scrape_pod_session(
             tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: keeping the pod's engine log failed");
         }
     }
-    // Prefer the Tier 2 drop-box run-session: a new loop pod POSTs it and the wrapper then skips
-    // the `SESSION` delimiter, so the drop-box IS the completion edge. The log scrape below stays
-    // the fallback for old images and failed POSTs.
-    match adopt_dropbox_run_session(db, pod).await {
-        Ok(Some(session)) => {
-            crate::runs::blob_store::put_run_session(db.pool(), &run.run_id, session.as_bytes())
-                .await?;
-            tracing::info!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, "run completion: session adopted from the Tier 2 drop-box");
-            return Ok(Some(session));
-        }
+    match locate_session(db, run).await {
+        Ok(Some(session)) => return Ok(Some(session)),
         Ok(None) => {}
         Err(e) => {
-            tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: drop-box run-session unreadable; falling back to the log scrape");
+            tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: the uploaded session is unreadable; falling back to the log scrape");
         }
     }
     let Some(logs) = logs else {
@@ -556,7 +485,7 @@ const RUN_POD_STARTUP_MARGIN: Duration = Duration::from_secs(60 * 60);
 
 /// How long a run pod of `key` may stay non-terminal after dispatch: a playbook launch's
 /// `max_time` plus [`RUN_POD_STARTUP_MARGIN`], else the controller's loop-run bound.
-async fn run_pod_deadline(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<Duration> {
+pub(crate) async fn run_pod_deadline(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<Duration> {
     Ok(
         match crate::launches::store::get_playbook_launch(db.pool(), key).await? {
             Some(launch) => Duration::from_secs(launch.max_time.secs()) + RUN_POD_STARTUP_MARGIN,
@@ -593,7 +522,7 @@ async fn fail_run_without_terminal_evidence(
         pod,
     )
     .await?;
-    Ok(())
+    crate::runs::run_token::revoke_run(db.pool(), run_id).await
 }
 
 #[cfg(test)]

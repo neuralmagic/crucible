@@ -22,11 +22,3 @@ CREATE TABLE decision_requests (
 );
 CREATE INDEX decision_requests_open ON decision_requests (state, expires_at) WHERE state = 'open';
 
--- The ingest credential a local run's controller mints at spawn: the run presents it as the bearer
--- for its `local-<run>` pod name. Only the digest is kept.
-CREATE TABLE local_run_tokens (
-    pod          TEXT PRIMARY KEY,
-    run_id       TEXT NOT NULL,
-    token_sha256 TEXT NOT NULL,
-    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
-);

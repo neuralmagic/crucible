@@ -1,8 +1,7 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::kube::{
-    FORGE_STORAGE_ROOT, INGEST_TOKEN_DIR, INGEST_TOKEN_TTL_SECS, INGEST_TOKEN_VOLUME,
-    PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env, node_avoid_affinity, resources,
-    secret_env_vars,
+    FORGE_STORAGE_ROOT, PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env,
+    node_avoid_affinity, resources, secret_env_vars,
 };
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
@@ -11,6 +10,15 @@ use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// The in-pod mount dir for the projected Tier 2 ingest ServiceAccount token (Tier 2 ingest). The turn
+/// reads `<dir>/token` and sends it as the bearer to the controller's ingest drop-box.
+const INGEST_TOKEN_DIR: &str = "/var/run/secrets/crucible.io/ingest";
+/// The pod-volume name for the ingest token projection.
+const INGEST_TOKEN_VOLUME: &str = "crucible-ingest-token";
+/// The ingest token's TTL. Short by design (a turn is minutes, not hours), the kubelet rotates it
+/// and the API server invalidates it the instant the pod dies.
+const INGEST_TOKEN_TTL_SECS: i64 = 900;
 
 #[derive(Debug, thiserror::Error)]
 #[error("unknown --turn-kind `{got}` (expected `rank` or `scope`)")]

@@ -1,20 +1,21 @@
 //! Decision requests (RFC-0002 C-HUMAN-DECISION, C-DECISION-EVIDENCE). A run opens and polls its
-//! requests on the pod ingest surface; a person allowed `run:approve` lists, reads, and answers
-//! them on the human API.
+//! requests under `/api/runs/{run}/decisions` with its run token; a person allowed `run:approve`
+//! lists, reads, and answers them on the human API.
 
 pub(crate) mod store;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, Request, State};
+use axum::http::{StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use crucible_contract::decision::{Label, Question, QuestionId, QuestionKind};
 use crucible_contract::decision_request::{Evidence, OpenRequest, RequestStatus, SubmitAnswer};
 use serde::{Deserialize, Serialize};
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use utoipa::ToSchema;
 
 use crate::api::state::{ApiState, AppError, ErrorBody};
@@ -23,8 +24,7 @@ use crate::authz::action::{Action, ResourceType, Verb};
 use crate::authz::decision::Resource;
 use crate::authz::model::Principal;
 use crate::event_log::Event;
-use crate::runs::ingest_auth::{LOCAL_POD_PREFIX, PodAuth};
-use crate::runs::ingest_drop::IngestState;
+use crate::runs::run_token::Grant;
 
 /// The longest note an answer may carry, in bytes. Overridden by `CONTROLLER_DECISION_NOTE_MAX`.
 const DEFAULT_NOTE_MAX: usize = 4096;
@@ -36,54 +36,58 @@ fn note_max() -> usize {
         .unwrap_or(DEFAULT_NOTE_MAX)
 }
 
-/// The run-facing routes, mounted on the ingest router beside the artifact drop-box.
-pub(crate) fn ingest_routes() -> Router<IngestState> {
+/// The run-facing routes. Only a run token for the run in the path opens or polls its requests.
+pub(crate) fn run_routes(db: crate::Db) -> Router {
     Router::new()
-        .route("/api/pods/{pod}/decisions", post(open_request))
-        .route("/api/pods/{pod}/decisions/{id}", get(poll_request))
+        .route("/api/runs/{run_id}/decisions", post(open_request))
+        .route("/api/runs/{run_id}/decisions/{id}", get(poll_request))
+        .layer(axum::middleware::from_fn_with_state(
+            db.clone(),
+            require_run_token,
+        ))
+        .with_state(db)
 }
 
-/// The run a verified pod belongs to, and that run's launch.
-async fn pod_run(pool: &PgPool, pod: &str) -> anyhow::Result<Option<(String, Option<String>)>> {
-    if pod.starts_with(LOCAL_POD_PREFIX) {
-        let row = sqlx::query(
-            "SELECT t.run_id, r.issue FROM local_run_tokens t \
-             LEFT JOIN runs r ON r.run_id = t.run_id WHERE t.pod = $1",
-        )
-        .bind(pod)
-        .fetch_optional(pool)
-        .await?;
-        return Ok(row.map(|r| (r.get("run_id"), r.get("issue"))));
-    }
-    let Some(key): Option<String> =
-        sqlx::query_scalar("SELECT issue_key FROM work_pods WHERE pod_name = $1")
-            .bind(pod)
-            .fetch_optional(pool)
-            .await?
-            .flatten()
+async fn require_run_token(State(db): State<crate::Db>, mut req: Request, next: Next) -> Response {
+    let Some(presented) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(str::to_string)
     else {
-        return Ok(None);
+        return refuse(StatusCode::UNAUTHORIZED, "a run token is required");
     };
-    let runs: Vec<String> = sqlx::query_scalar("SELECT run_id FROM runs WHERE issue = $1")
-        .bind(&key)
-        .fetch_all(pool)
-        .await?;
-    Ok(runs
-        .into_iter()
-        .find(|run| crate::runs::workpod::run_pod_name(run) == pod)
-        .map(|run| (run, Some(key))))
+    match crate::runs::run_token::verify(db.pool(), &presented).await {
+        Ok(grant) => {
+            req.extensions_mut().insert(grant);
+            next.run(req).await
+        }
+        Err(refusal) => refuse(StatusCode::UNAUTHORIZED, refusal.to_string()),
+    }
 }
 
 fn refuse(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorBody::new(msg))).into_response()
 }
 
+fn not_this_run(grant: &Grant) -> Response {
+    refuse(
+        StatusCode::FORBIDDEN,
+        format!("this run token opens decisions for {}", grant.run_id),
+    )
+}
+
 async fn open_request(
-    auth: PodAuth,
-    State(state): State<IngestState>,
+    Extension(grant): Extension<Grant>,
+    State(db): State<crate::Db>,
+    Path(run_id): Path<String>,
     Json(request): Json<OpenRequest>,
 ) -> Response {
-    let pool = state.db.pool();
+    if !grant.may_write(&run_id) {
+        return not_this_run(&grant);
+    }
+    let pool = db.pool();
     match request.evidence.digest() {
         Ok(digest) if digest == request.evidence_digest => {}
         Ok(_) => {
@@ -100,43 +104,34 @@ async fn open_request(
             "a decision request asks at least one question",
         );
     }
-    let (run_id, launch) = match pod_run(pool, &auth.pod).await {
-        Ok(Some(found)) => found,
-        Ok(None) => {
-            return refuse(
-                StatusCode::NOT_FOUND,
-                format!("no run for pod {}", auth.pod),
-            );
-        }
-        Err(e) => return AppError::from(e).into_response(),
-    };
+    let launch: Option<String> =
+        match sqlx::query_scalar("SELECT issue FROM runs WHERE run_id = $1")
+            .bind(&run_id)
+            .fetch_optional(pool)
+            .await
+        {
+            Ok(issue) => issue.flatten(),
+            Err(e) => return AppError::from(anyhow::Error::from(e)).into_response(),
+        };
     let (decision, opened) = match store::open(pool, &run_id, launch.as_deref(), &request).await {
         Ok(found) => found,
         Err(e) => return AppError::from(e).into_response(),
     };
     if opened {
-        publish(&state.db, &decision, "open").await;
+        publish(&db, &decision, "open").await;
     }
     Json(decision.state()).into_response()
 }
 
 async fn poll_request(
-    auth: PodAuth,
-    State(state): State<IngestState>,
-    Path((_pod, id)): Path<(String, String)>,
+    Extension(grant): Extension<Grant>,
+    State(db): State<crate::Db>,
+    Path((run_id, id)): Path<(String, String)>,
 ) -> Response {
-    let pool = state.db.pool();
-    let run_id = match pod_run(pool, &auth.pod).await {
-        Ok(Some((run_id, _))) => run_id,
-        Ok(None) => {
-            return refuse(
-                StatusCode::NOT_FOUND,
-                format!("no run for pod {}", auth.pod),
-            );
-        }
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    match store::get(pool, &id).await {
+    if !grant.may_write(&run_id) {
+        return not_this_run(&grant);
+    }
+    match store::get(db.pool(), &id).await {
         Ok(Some(d)) if d.run_id == run_id => Json(d.state()).into_response(),
         Ok(_) => refuse(StatusCode::NOT_FOUND, format!("no decision request {id}")),
         Err(e) => AppError::from(e).into_response(),
@@ -155,8 +150,7 @@ async fn publish(db: &crate::Db, d: &store::Decision, to: &str) {
     }
 }
 
-/// A run reached a terminal state: its open requests are withdrawn and a local run's ingest
-/// credential stops working.
+/// A run reached a terminal state: its open requests are withdrawn and its run tokens revoked.
 pub(crate) async fn run_ended(db: &crate::Db, run_id: &str) {
     match store::withdraw_run(db.pool(), run_id).await {
         Ok(withdrawn) => {
@@ -168,12 +162,8 @@ pub(crate) async fn run_ended(db: &crate::Db, run_id: &str) {
             tracing::warn!(%run_id, error = format!("{e:#}"), "withdrawing the run's decision requests failed")
         }
     }
-    if let Err(e) = sqlx::query("DELETE FROM local_run_tokens WHERE run_id = $1")
-        .bind(run_id)
-        .execute(db.pool())
-        .await
-    {
-        tracing::warn!(%run_id, error = %e, "revoking the local run's ingest credential failed");
+    if let Err(e) = crate::runs::run_token::revoke_run(db.pool(), run_id).await {
+        tracing::warn!(%run_id, error = format!("{e:#}"), "revoking the run's tokens failed");
     }
 }
 

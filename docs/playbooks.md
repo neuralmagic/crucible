@@ -223,8 +223,8 @@ what cost. From the CLI, launch the draft or playbook again with the run to reru
 crux draft-launch haiku --max-cost 1 --max-time 5m --rerun-of <run id> --from check
 ```
 
-A draft rerun runs the newest save. Reruns need a controller that runs playbooks locally
-(`CONTROLLER_PLAYBOOK_EXECUTOR=local`) for now.
+A draft rerun runs the newest save. A pod rerun fetches the parent's evidence from the
+controller at `[cluster].ingest_url`, so a pod executor's profile must set it.
 
 ## Put a real agent on it
 

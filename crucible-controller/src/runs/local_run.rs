@@ -181,7 +181,6 @@ pub(crate) async fn start(
     issue_key: &str,
     run_id: &str,
     opts: RunRenderOpts,
-    rerun: Option<&crate::launches::model::RerunOf>,
 ) -> Result<Option<LocalRun>> {
     if u32::try_from(crate::runs::store::count_running(db.pool()).await?).unwrap_or(u32::MAX)
         >= cfg.effective().max_concurrent_pods
@@ -214,7 +213,10 @@ pub(crate) async fn start(
 
     let bin = crate::runs::engine::resolve_bin();
     let mut argv = run_argv(&pack.join("crucible.toml"), &opts);
-    if let Some(rerun) = rerun {
+    if let RunRenderOpts::Playbook {
+        rerun: Some(rerun), ..
+    } = &opts
+    {
         let parent = dir.join("parent");
         crate::runs::rerun::materialize_parent(db, cfg.scratch_root(), &rerun.run, &parent)
             .await
@@ -244,8 +246,15 @@ pub(crate) async fn start(
         "FORGE_STORAGE_ROOT".to_string(),
         forge_root(&dir).to_string_lossy().into_owned(),
     ));
-    env.extend(ingest_env(db, cfg, run_id, &dir).await?);
-    env.retain(|(name, _)| name != crucible_contract::ENV_RUN_NAME);
+    env.retain(|(name, _)| {
+        ![
+            crucible_contract::ENV_RUN_NAME,
+            crucible_contract::ENV_CONTROLLER_URL,
+            crucible_contract::ENV_RUN_TOKEN,
+        ]
+        .contains(&name.as_str())
+    });
+    env.extend(controller_env(db, cfg, run_id, deadline).await?);
     env.push((
         crucible_contract::ENV_RUN_NAME.to_string(),
         run_id.to_string(),
@@ -424,40 +433,23 @@ async fn open_engine_log(dir: &Path) -> Option<Arc<Mutex<tokio::fs::File>>> {
 /// controller's default loopback bind.
 const LOCAL_CONTROLLER_URL: &str = "http://127.0.0.1:8870";
 
-/// The ingest surface a local run reaches its own controller on: a credential minted for this run,
-/// written beside its state where only the user can read it, and the `local-` pod name it presents.
-async fn ingest_env(
+/// What a local run reaches its own controller with: the controller's URL and a run token for this
+/// run, which revokes when the run completes.
+async fn controller_env(
     db: &Db,
     cfg: &ControllerCfg,
     run_id: &str,
-    dir: &std::path::Path,
+    lifetime: std::time::Duration,
 ) -> Result<Vec<(String, String)>> {
-    let (pod, token) = crate::runs::ingest_auth::mint_local_token(db.pool(), run_id).await?;
-    let path = dir.join("ingest.token");
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&path)
-            .with_context(|| format!("writing {}", path.display()))?;
-        f.write_all(token.as_bytes())?;
-    }
+    let token = crate::runs::run_token::mint(db.pool(), run_id, None, lifetime).await?;
     Ok(vec![
         (
-            crucible_contract::ENV_INGEST_URL.to_string(),
+            crucible_contract::ENV_CONTROLLER_URL.to_string(),
             cfg.public_url
                 .clone()
                 .unwrap_or_else(|| LOCAL_CONTROLLER_URL.to_string()),
         ),
-        (
-            crucible_contract::ENV_INGEST_TOKEN_PATH.to_string(),
-            path.to_string_lossy().into_owned(),
-        ),
-        (crucible_contract::ENV_POD_NAME.to_string(), pod),
+        (crucible_contract::ENV_RUN_TOKEN.to_string(), token),
     ])
 }
 
@@ -628,6 +620,7 @@ mod tests {
             max_cost: 1.0,
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
         };
         assert_eq!(playbook.tracker_item("playbook:fences:0199"), None);
         let looped = RunRenderOpts::Loop {
@@ -652,6 +645,7 @@ mod tests {
             max_cost: 4.5,
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
         };
         assert_eq!(
             run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts),
@@ -684,6 +678,7 @@ mod tests {
                 harness: Some(crucible::manifest::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
+            rerun: None,
         };
         let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
         assert_eq!(

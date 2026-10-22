@@ -418,6 +418,10 @@ fn playbook_launch(args: &crate::cli::DeployArgs) -> Result<Option<deploy::Playb
         max_time,
         max_cost: args.max_cost,
         params: crate::plan::cli::parse_params(&args.params)?,
+        rerun: args.rerun_of.clone().map(|parent| deploy::RerunLaunch {
+            parent,
+            from: args.from.clone(),
+        }),
     }))
 }
 

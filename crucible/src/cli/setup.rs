@@ -269,7 +269,7 @@ fn end_run_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Err
 
 /// Deliver a run whose session log already records the setup failure it ended on.
 pub(crate) fn ended_at_setup(p: &crate::args::Paths, error: anyhow::Error) -> anyhow::Error {
-    crate::report::ingest_client::deliver_run_evidence(p);
+    crate::report::evidence_client::deliver_run_evidence(p);
     error.context(EndedAtSetup)
 }
 

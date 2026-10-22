@@ -1,9 +1,8 @@
-//! The run's decision desk: the controller's ingest surface, reached with the pod's ingest
-//! credential (a local run's controller hands it the same three variables).
+//! The run's decision desk: the controller that dispatched the run, reached at
+//! `/api/runs/{run}/decisions` with the run token it handed the run.
 
 use std::time::Duration;
 
-use crate::report::ingest_client::IngestConfig;
 use crate::report::session::SessionEvent;
 use crucible::plan::decide::DecisionDesk;
 use crucible_contract::decision_request::{OpenRequest, RequestState, RequestStatus};
@@ -15,7 +14,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub struct HttpDesk<'a> {
-    cfg: IngestConfig,
+    /// `{controller}/api/runs/{run}/decisions`.
+    base: String,
+    token: String,
     client: reqwest::blocking::Client,
     interval: Duration,
     /// The session log `decision_wait` lines go to.
@@ -23,19 +24,26 @@ pub struct HttpDesk<'a> {
 }
 
 impl<'a> HttpDesk<'a> {
-    /// `None` when the run has no ingest surface to open requests on.
+    /// `None` unless the controller handed the run its URL, the run's id and a run token.
     pub fn from_env(log: Option<&'a std::fs::File>) -> Option<Self> {
-        let cfg = IngestConfig::from_env()?;
+        let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+        let controller = env(crucible_contract::ENV_CONTROLLER_URL)?;
+        let run = env(crucible_contract::ENV_RUN_NAME)?;
+        let token = env(crucible_contract::ENV_RUN_TOKEN)?;
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
             .ok()?;
-        let interval = std::env::var(POLL_ENV)
-            .ok()
+        let interval = env(POLL_ENV)
             .and_then(|v| v.parse().ok())
             .map_or(DEFAULT_POLL, Duration::from_secs);
         Some(HttpDesk {
-            cfg,
+            base: format!(
+                "{}/api/runs/{}/decisions",
+                controller.trim_end_matches('/'),
+                crucible_contract::artifact::path_segment(&run)
+            ),
+            token,
             client,
             interval,
             log,
@@ -56,14 +64,10 @@ impl<'a> HttpDesk<'a> {
 
 impl DecisionDesk for HttpDesk<'_> {
     fn open(&self, request: &OpenRequest) -> Result<RequestState, String> {
-        let token = self
-            .cfg
-            .bearer()
-            .map_err(|e| format!("reading the ingest token: {e}"))?;
         let state = Self::decode(
             self.client
-                .post(self.cfg.pod_url("decisions"))
-                .bearer_auth(token)
+                .post(&self.base)
+                .bearer_auth(&self.token)
                 .json(request)
                 .send(),
         )?;
@@ -85,14 +89,10 @@ impl DecisionDesk for HttpDesk<'_> {
     }
 
     fn poll(&self, id: &str) -> Result<RequestState, String> {
-        let token = self
-            .cfg
-            .bearer()
-            .map_err(|e| format!("reading the ingest token: {e}"))?;
         Self::decode(
             self.client
-                .get(self.cfg.pod_url(&format!("decisions/{id}")))
-                .bearer_auth(token)
+                .get(format!("{}/{id}", self.base))
+                .bearer_auth(&self.token)
                 .send(),
         )
     }

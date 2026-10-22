@@ -14,8 +14,6 @@ use sqlx::PgPool;
 use crate::Db;
 use crate::api::state::ApiState;
 use crate::decisions::store::{self, Refused};
-use crate::runs::ingest_auth::IngestValidator;
-use crate::runs::ingest_drop::IngestState;
 
 struct NoOverrides;
 
@@ -290,14 +288,16 @@ async fn an_expired_request_reads_expired_and_refuses_answers(pool: PgPool) {
     );
 }
 
+const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
+
 #[sqlx::test(migrator = "crate::MIGRATOR")]
-async fn a_run_ending_withdraws_its_open_requests_and_revokes_its_local_token(pool: PgPool) {
+async fn a_run_ending_withdraws_its_open_requests_and_revokes_its_run_token(pool: PgPool) {
     seed_run(&pool, "r1").await;
     let db = Db::new(pool.clone());
     let (d, _) = store::open(&pool, "r1", None, &request("gate", 8, 3600))
         .await
         .unwrap();
-    crate::runs::ingest_auth::mint_local_token(&pool, "r1")
+    let token = crate::runs::run_token::mint(&pool, "r1", None, HOUR)
         .await
         .unwrap();
     crate::decisions::run_ended(&db, "r1").await;
@@ -305,28 +305,24 @@ async fn a_run_ending_withdraws_its_open_requests_and_revokes_its_local_token(po
         store::get(&pool, &d.id).await.unwrap().unwrap().status,
         RequestStatus::Withdrawn
     );
-    let tokens: i64 = sqlx::query_scalar("SELECT count(*) FROM local_run_tokens")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(tokens, 0);
+    assert!(matches!(
+        crate::runs::run_token::verify(&pool, &token).await,
+        Err(crate::runs::run_token::TokenRefusal::Revoked { .. })
+    ));
 }
 
-fn ingest(pool: &PgPool) -> axum::Router {
-    crate::decisions::ingest_routes().with_state(IngestState {
-        db: Db::new(pool.clone()),
-        validator: Arc::new(IngestValidator::local_only(pool.clone())),
-    })
+fn runs(pool: &PgPool) -> axum::Router {
+    crate::decisions::run_routes(Db::new(pool.clone()))
 }
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
-async fn a_local_run_opens_and_polls_its_request_with_its_minted_token(pool: PgPool) {
+async fn a_run_opens_and_polls_its_request_with_its_run_token(pool: PgPool) {
     seed_run(&pool, "r1").await;
     seed_run(&pool, "r2").await;
-    let (pod, token) = crate::runs::ingest_auth::mint_local_token(&pool, "r1")
+    let token = crate::runs::run_token::mint(&pool, "r1", None, HOUR)
         .await
         .unwrap();
-    let app = ingest(&pool);
+    let app = runs(&pool);
     let bearer = format!("Bearer {token}");
     let auth = ("authorization", bearer.as_str());
     let body = serde_json::to_value(request("gate", 8, 3600)).unwrap();
@@ -334,7 +330,7 @@ async fn a_local_run_opens_and_polls_its_request_with_its_minted_token(pool: PgP
     let (status, opened) = send(
         &app,
         "POST",
-        &format!("/api/pods/{pod}/decisions"),
+        "/api/runs/r1/decisions",
         auth,
         Some(body.clone()),
     )
@@ -342,44 +338,46 @@ async fn a_local_run_opens_and_polls_its_request_with_its_minted_token(pool: PgP
     assert_eq!(status, StatusCode::OK, "{opened}");
     let opened: RequestState = serde_json::from_value(opened).unwrap();
     assert_eq!(opened.status, RequestStatus::Open);
-    let (_, reopened) = send(
-        &app,
-        "POST",
-        &format!("/api/pods/{pod}/decisions"),
-        auth,
-        Some(body),
-    )
-    .await;
+    let stored = store::get(&pool, &opened.id).await.unwrap().unwrap();
+    assert_eq!(stored.launch_key.as_deref(), Some("pb#1"));
+    let (_, reopened) = send(&app, "POST", "/api/runs/r1/decisions", auth, Some(body)).await;
     assert_eq!(reopened["id"], opened.id.as_str());
-    let (status, polled) = send(
-        &app,
-        "GET",
-        &format!("/api/pods/{pod}/decisions/{}", opened.id),
-        auth,
-        None,
-    )
-    .await;
+    let poll = format!("/api/runs/r1/decisions/{}", opened.id);
+    let (status, polled) = send(&app, "GET", &poll, auth, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(polled["state"], "open");
 
-    let (status, _) = send(
-        &app,
-        "GET",
-        &format!("/api/pods/{pod}/decisions/{}", opened.id),
-        ("authorization", "Bearer nope"),
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let (other_pod, other_token) = crate::runs::ingest_auth::mint_local_token(&pool, "r2")
+    for (bad, why) in [
+        ("Bearer nope", "not a run token"),
+        ("Bearer crr_x_y", "unknown"),
+    ] {
+        let (status, _) = send(&app, "GET", &poll, ("authorization", bad), None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{why}");
+    }
+    let req = Request::builder()
+        .method("GET")
+        .uri(&poll)
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = crate::testing::oneshot_bytes(&app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no bearer at all");
+
+    let other = crate::runs::run_token::mint(&pool, "r2", Some("r1"), HOUR)
         .await
         .unwrap();
-    let other = format!("Bearer {other_token}");
+    let other = format!("Bearer {other}");
+    let other = ("authorization", other.as_str());
+    let (status, _) = send(&app, "GET", &poll, other, None).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a token that only reads r1 cannot poll its requests"
+    );
     let (status, _) = send(
         &app,
         "GET",
-        &format!("/api/pods/{other_pod}/decisions/{}", opened.id),
-        ("authorization", other.as_str()),
+        &format!("/api/runs/r2/decisions/{}", opened.id),
+        other,
         None,
     )
     .await;
@@ -388,21 +386,36 @@ async fn a_local_run_opens_and_polls_its_request_with_its_minted_token(pool: PgP
         StatusCode::NOT_FOUND,
         "a run reads only its own requests"
     );
+    let (status, _) = send(
+        &app,
+        "POST",
+        "/api/runs/r1/decisions",
+        other,
+        Some(serde_json::to_value(request("gate-2", 8, 3600)).unwrap()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "nor open one for r1");
+
+    crate::runs::run_token::revoke_run(&pool, "r1")
+        .await
+        .unwrap();
+    let (status, _) = send(&app, "GET", &poll, auth, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "a revoked token");
 }
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_request_whose_digest_does_not_match_its_evidence_is_refused(pool: PgPool) {
     seed_run(&pool, "r1").await;
-    let (pod, token) = crate::runs::ingest_auth::mint_local_token(&pool, "r1")
+    let token = crate::runs::run_token::mint(&pool, "r1", None, HOUR)
         .await
         .unwrap();
     let mut req = request("gate", 8, 3600);
     req.evidence_digest = request("gate", 9, 3600).evidence_digest;
     let bearer = format!("Bearer {token}");
     let (status, _) = send(
-        &ingest(&pool),
+        &runs(&pool),
         "POST",
-        &format!("/api/pods/{pod}/decisions"),
+        "/api/runs/r1/decisions",
         ("authorization", bearer.as_str()),
         Some(serde_json::to_value(req).unwrap()),
     )

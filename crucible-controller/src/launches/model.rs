@@ -41,7 +41,7 @@ pub(crate) struct NewPlaybookLaunch<'a> {
 /// A launch that reruns a finished run: that run's id and the tasks it dispatches again
 /// (RFC-0002:C-PLAYBOOK-RERUN).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RerunOf {
+pub struct RerunOf {
     pub run: String,
     pub from: Vec<String>,
 }

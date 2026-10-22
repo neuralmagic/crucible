@@ -75,8 +75,7 @@ pub(crate) struct RerunBody {
     from: Vec<String>,
 }
 
-/// Admit a launch's rerun of `playbook`, or the response that refuses it. Only a controller that
-/// runs playbooks on its own machine can lay a parent's evidence out for the engine.
+/// Admit a launch's rerun of `playbook`, or the response that refuses it.
 pub(crate) async fn admit_launch(
     state: &ApiState,
     playbook: &str,
@@ -86,11 +85,6 @@ pub(crate) async fn admit_launch(
     let Some(rerun) = rerun else {
         return Ok(None);
     };
-    if !state.dispatch.is_local() {
-        return Err(Box::new(unprocessable(
-            "this controller runs playbooks in pods, which cannot rerun yet",
-        )));
-    }
     match crate::runs::rerun::admit(&state.db, playbook, draft, &rerun.of, &rerun.from).await {
         Ok(()) => Ok(Some(crate::launches::model::RerunOf {
             run: rerun.of.clone(),
