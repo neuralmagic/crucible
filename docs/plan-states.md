@@ -10,7 +10,7 @@ A task is pending until its dependencies settle, runs (retrying transport-class 
 
 ## The plan
 
-The plan dispatches ready tasks in topological order until every task has settled or a required task fails or a ceiling is reached. After a halt the remaining tasks settle as blocked; epilogue tasks still run after a required task fails so the failure is reported.
+The plan dispatches ready tasks in topological order until every task has settled or a required task fails or a ceiling is reached. After a halt the remaining tasks settle as blocked; epilogue tasks still run after a required task fails so the failure is reported, and tasks that cannot spend still run after the cost ceiling so the run reports the work it paid for.
 
 ![The plan's states](img/plan-states.svg)
 
@@ -23,7 +23,7 @@ The note on a blocked task's result is one of these.
 | Note | Meaning |
 |---|---|
 | `required task <task> failed` | A required task failed and the plan short-circuited before this one ran. |
-| `budget ceiling reached` | The plan's spend reached its budget. |
+| `budget ceiling reached` | The plan's spend reached its budget and this task, or this lane of a fan-out, can spend. |
 | `wall-clock ceiling reached` | The plan's wall-clock limit passed. |
 | `dependency did not pass` | A dependency settled without passing and the task's join needs it to. |
 | `<the runner's reason>` | The runner could not stage the task's declared inputs. |

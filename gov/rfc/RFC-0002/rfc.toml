@@ -52,5 +52,6 @@ changed = [
     "the run's wall-clock ceiling is the default and maximum per-attempt deadline; a timed-out attempt fails measured and is not retried",
     "C-TASK-FILES: a declared file may carry a schema, validated from the captured copy when the task passes",
     "C-TASK-FILES: an absent or mismatched file is a repair note for an agent task that declares repair",
+    "C-PLAYBOOK-BUDGET admits each fan-out lane against settled and in-flight spend under a bounded width, and the cost ceiling blocks only tasks that can spend, so commands after it still run; C-SETTLED-JOIN and C-PLAYBOOK-LANE follow",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

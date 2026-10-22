@@ -314,9 +314,10 @@ roundup = command(
 The item is the key of each instance. `triage[123]` is issue 123 in every retry and in every
 report row. An instance reads its own key from the reserved `item` input. `max_fanout` sets
 the maximum count, and the engine limit is 256. `isolated = True` runs the instances at the
-same time in private worktrees. `required = False` lets the sweep finish when some instances
-fail. `join = "passed"` gives `roundup` only the instances that passed. `examples/triage` is
-the full pack.
+same time in private worktrees, at most eight at a time, and each one starts only while the run
+is under `--max-cost`. `required = False` lets the sweep finish when some instances fail.
+`join = "passed"` gives `roundup` only the instances that passed. `examples/triage` is the full
+pack.
 
 If you know the list at compile time, write the fan-out in Starlark. It unrolls into normal
 tasks:

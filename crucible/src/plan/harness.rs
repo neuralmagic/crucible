@@ -16,6 +16,7 @@ use serde_json::Value;
 use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::HarnessRuntime;
 use crate::agent::turn::TurnFailure;
+use crate::plan::admission::{Admission, Lane, Refusal};
 use crate::plan::exec::{Attempt, AttemptOutcome, BatchItem, TaskRunner, TransportFailure};
 use crate::plan::ir::{Isolation, Task, TaskKind, TaskName};
 use crate::plan::runner::ShellRunner;
@@ -240,6 +241,7 @@ impl TaskRunner for HarnessRunner {
                 inputs,
                 deadline,
                 budget_left: self.budget_left,
+                lane: None,
             },
             None,
         )
@@ -335,76 +337,47 @@ impl TaskRunner for HarnessRunner {
     /// Isolated tasks that are ready together run concurrently, each in its own worktree.
     /// Concurrency is what isolation buys: two reviewers reading the same artifact would
     /// otherwise race on the single `PLAN_TASK_RESULT.json` in the shared workspace.
-    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
-        if batch.len() == 1 {
-            let b = &batch[0];
-            return vec![run_task(
+    fn run_many(
+        &mut self,
+        batch: &[BatchItem<'_>],
+        admission: &Admission,
+    ) -> Vec<Result<Attempt, Refusal>> {
+        // Every item clones the same workspace, so its pending state is captured once here:
+        // concurrent `git add -A` in one repo races on `.git/index.lock`.
+        let pending = match batch {
+            [_] => None,
+            _ => match crate::plan::worktree::capture_diff(&self.paths.workspace) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let note = format!("capturing the workspace's uncommitted state failed: {e:#}");
+                    return batch
+                        .iter()
+                        .map(|_| Ok(Attempt::failed(0.0, note.clone())))
+                        .collect();
+                }
+            },
+        };
+        let budget_left = self.budget_left;
+        let (args, paths, captured_bytes, staged) =
+            (&self.args, &self.paths, &self.captured_bytes, &self.staged);
+        admission.run_all(batch, |b, lane| {
+            run_task(
                 &Dispatch {
-                    args: &self.args,
-                    paths: &self.paths,
-                    captured_bytes: &self.captured_bytes,
-                    staged: self.staged.get(&b.task.name).map(Vec::as_slice),
+                    args,
+                    paths,
+                    captured_bytes,
+                    staged: staged.get(&b.task.name).map(Vec::as_slice),
                 },
                 b.task,
                 Job {
                     attempt: b.attempt,
                     inputs: &b.inputs,
-                    deadline: b.deadline,
-                    budget_left: self.budget_left,
+                    deadline: lane.deadline(),
+                    budget_left,
+                    lane: Some(lane),
                 },
-                None,
-            )];
-        }
-        // Every item clones the same workspace, so its pending state is captured once here:
-        // concurrent `git add -A` in one repo races on `.git/index.lock`.
-        let pending = match crate::plan::worktree::capture_diff(&self.paths.workspace) {
-            Ok(p) => p,
-            Err(e) => {
-                let note = format!("capturing the workspace's uncommitted state failed: {e:#}");
-                return batch
-                    .iter()
-                    .map(|_| Attempt::failed(0.0, note.clone()))
-                    .collect();
-            }
-        };
-        let captured = &self.captured_bytes;
-        let staged = &self.staged;
-        let budget_left = self.budget_left;
-        std::thread::scope(|scope| {
-            let handles: Vec<_> = batch
-                .iter()
-                .map(|b| {
-                    let args = self.args.clone();
-                    let paths = self.paths.clone();
-                    let pending = pending.as_str();
-                    scope.spawn(move || {
-                        run_task(
-                            &Dispatch {
-                                args: &args,
-                                paths: &paths,
-                                captured_bytes: captured,
-                                staged: staged.get(&b.task.name).map(Vec::as_slice),
-                            },
-                            b.task,
-                            Job {
-                                attempt: b.attempt,
-                                inputs: &b.inputs,
-                                deadline: b.deadline,
-                                budget_left,
-                            },
-                            Some(pending),
-                        )
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Attempt::failed(0.0, "task thread panicked".to_string())
-                    })
-                })
-                .collect()
+                pending.as_deref(),
+            )
         })
     }
 }
@@ -418,14 +391,15 @@ struct Dispatch<'a> {
     staged: Option<&'a [StagedInput]>,
 }
 
-/// One attempt of one task: its number, its inputs, when it must be over by, and what the run
-/// may still spend on it.
+/// One attempt of one task: its number, its inputs, when it must be over by, what the run may
+/// still spend on it, and the lane it reports its spend through while it runs.
 #[derive(Clone, Copy)]
 struct Job<'a> {
     attempt: u32,
     inputs: &'a BTreeMap<TaskName, Value>,
     deadline: Option<Deadline>,
     budget_left: f64,
+    lane: Option<&'a Lane<'a>>,
 }
 
 /// Dispatch one task, in the shared workspace or in a private worktree. `pending` is the
@@ -831,6 +805,7 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         inputs,
         deadline,
         budget_left,
+        lane,
     } = job;
     let (prompt, harness, model, effort, sandbox) = match &task.task {
         TaskKind::Agent {
@@ -911,8 +886,9 @@ fn run_in(args: &Args, paths: &Paths, task: &Task, job: Job<'_>) -> Attempt {
         name: &task.name.0,
         deadline,
         ledgered,
+        lane,
     };
-    let (cost, end) = agent_turn(&cx, &full_prompt, session.as_ref());
+    let (cost, end) = agent_turn(&cx, &full_prompt, session.as_ref(), 0.0);
     let attempt = end.into_attempt(cost);
     match session {
         Some(session) if task.repair > 0 => repaired(&cx, task, session, attempt, budget_left),
@@ -929,6 +905,7 @@ struct TurnCx<'a> {
     /// Whether the session is a named one whose ledger cursor advances after the turn. A task's
     /// own repair conversation is not, so a later attempt starts it fresh.
     ledgered: bool,
+    lane: Option<&'a Lane<'a>>,
 }
 
 /// How one agent turn ended, before it is read as an attempt.
@@ -959,11 +936,13 @@ impl TurnEnd {
     }
 }
 
-/// Run one agent turn in `cx.paths.workspace` and read the result file it left.
+/// Run one agent turn in `cx.paths.workspace` and read the result file it left. `banked` is what
+/// the attempt spent on earlier turns, so the lane's running figure covers the whole attempt.
 fn agent_turn(
     cx: &TurnCx<'_>,
     prompt: &str,
     session: Option<&crate::agent::agent_session::SessionTurn>,
+    banked: f64,
 ) -> (f64, TurnEnd) {
     let paths = cx.paths;
     let result_path = paths.workspace.join(RESULT_FILE);
@@ -994,6 +973,9 @@ fn agent_turn(
                 for progress in log.on_event(ev, Instant::now()) {
                     eprintln!("[{name}] {progress}");
                 }
+            }
+            if let (Some(lane), Some(cost)) = (cx.lane, ev.and_then(crate::agent::event::cost_of)) {
+                lane.spent_so_far(banked + cost);
             }
             if let Some(failure) = ev.and_then(agent_transport_error) {
                 transport_error = Some(failure);
@@ -1091,6 +1073,7 @@ fn repaired(
             cx,
             &repair_prompt(round, task.repair, &notes),
             Some(&session),
+            attempt.cost_usd,
         );
         attempt.cost_usd += cost;
         attempt.repairs.push(TaskRepair {

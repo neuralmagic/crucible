@@ -122,9 +122,13 @@ verdict: valid
 ```
 
 `--max-cost` and `--max-time` are required. A pack cannot set its own limits. The person or
-system that launches the pack sets them. `crucible check` validates the manifest, resolves
-every file that it references, and lists the egress and credentials that the pack would get.
-It does not run a task.
+system that launches the pack sets them. Once spend reaches `--max-cost`, no further agent task,
+model-decided route, or fan-out lane starts. At most eight lanes of one fan-out run at once, so
+the overrun is at most what the lanes already running go on to spend. Commands still run after
+the cost ceiling, so the run reports the work it paid for. `--max-time` stops everything.
+
+`crucible check` validates the manifest, resolves every file that it references, and lists the
+egress and credentials that the pack would get. It does not run a task.
 
 The verdict is `valid` because every required task passed. Use the verdict in scripts.
 `plan run` exits with status 3 for any other verdict, and with status 1 if it cannot run the
