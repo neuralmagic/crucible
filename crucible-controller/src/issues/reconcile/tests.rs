@@ -4063,9 +4063,10 @@ impl crate::runs::workpod::PodDispatcher for PodArmDispatcher {
         &self,
         _cluster: &str,
         _ns: &str,
-        pod: k8s_openapi::api::core::v1::Pod,
+        mut pod: k8s_openapi::api::core::v1::Pod,
     ) -> Result<k8s_openapi::api::core::v1::Pod> {
         self.created.lock().expect("lock").push(pod.clone());
+        pod.metadata.uid = Some("fake-pod-uid".to_string());
         Ok(pod)
     }
     async fn await_terminal(
