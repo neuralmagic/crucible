@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
-import { stubApi } from './api';
+import { ROUTES, stubApi } from './api';
 
 async function ready(page: Page, path: string): Promise<void> {
   const crashes: string[] = [];
@@ -155,6 +155,8 @@ test.describe('teams', () => {
     await page.locator('main tbody tr').first().getByRole('link', { name: 'llm-d' }).click();
 
     await expect(page).toHaveURL(/\/teams\/llm-d$/);
+    await page.locator('main').getByRole('link', { name: '4', exact: true }).click();
+    await expect(page).toHaveURL(/\/teams\/llm-d\/members$/);
     await expect(page.locator('main')).toContainText('LLM-D');
     const cells = page.locator('main tbody tr');
     await expect(cells).toHaveCount(4);
@@ -170,33 +172,207 @@ test.describe('teams', () => {
   });
 });
 
-test.describe('team-centric views', () => {
-  test('the rail lists each team, and a team page shows what it owns and acts as it', async ({ page }) => {
+test.describe('team workspace', () => {
+  test('a team page is its home, and the rail collapses to the team', async ({ page }) => {
     await stubApi(page);
     await ready(page, '/teams/llm-d');
 
     const rail = page.getByTestId('category-rail');
-    await expect(rail.getByRole('link', { name: 'llm-d', exact: true })).toBeVisible();
+    await expect(rail.getByRole('heading', { name: 'llm-d' })).toBeVisible();
+    for (const [label, href] of [
+      ['Home', '/teams/llm-d'],
+      ['Playbooks', '/teams/llm-d/playbooks'],
+      ['Drafts', '/teams/llm-d/playbooks/drafts'],
+      ['Runs', '/teams/llm-d/playbook-runs'],
+      ['Schedules', '/teams/llm-d/schedules'],
+      ['Webhooks', '/teams/llm-d/webhooks'],
+      ['Secrets', '/teams/llm-d/secrets'],
+      ['Providers', '/teams/llm-d/providers'],
+      ['Members', '/teams/llm-d/members'],
+    ]) {
+      await expect(rail.getByRole('link', { name: label, exact: true })).toHaveAttribute('href', href);
+    }
+    await expect(rail.getByRole('link', { name: 'All teams', exact: true })).toHaveAttribute('href', '/teams');
+    for (const global of ['Activity', 'Admin', 'Approvals']) {
+      await expect(rail.getByRole('link', { name: global, exact: true })).toHaveCount(0);
+    }
     await expect(rail.getByRole('link', { name: 'platform-administrators', exact: true })).toBeVisible();
-    await expect(rail.getByRole('link', { name: 'All teams', exact: true })).toBeVisible();
+    await expect(rail.getByRole('link', { name: 'Everything', exact: true })).toBeVisible();
 
-    const resources = page.getByTestId('team-resources');
-    await expect(resources).toContainText('survey');
-    await expect(resources).not.toContainText('triage');
-    await expect(resources).toContainText('No drafts');
+    const main = page.locator('main');
+    await expect(main).toContainText('survey');
+    await expect(main).not.toContainText('triage');
+    await expect(main.getByRole('link', { name: /All runs/ })).toHaveAttribute('href', '/teams/llm-d/playbook-runs');
 
-    await expect(page.getByTestId('act-as-team')).toHaveText('Act as');
-    await page.getByTestId('act-as-team').click();
-    await expect(page.getByTestId('act-as-team')).toHaveText('Acting as');
-    await expect(page.getByTestId('owner-switcher')).toContainText('llm-d');
+    await expect(page.getByTestId('owner-switcher')).toContainText('All');
+    await expect(page.getByTestId('owner-switcher')).not.toHaveAttribute('data-acting-as');
 
-    await rail.getByRole('link', { name: 'Playbooks', exact: true }).first().click();
+    await rail.getByRole('link', { name: 'Everything', exact: true }).click();
+    await expect(rail.getByRole('link', { name: 'Activity', exact: true })).toBeVisible();
+    await expect(main).toContainText('triage');
+  });
+
+  test('a team link opens straight onto the team\'s view of each list', async ({ page }) => {
+    await stubApi(page);
+    const secrets = ROUTES['/api/secrets'];
+    if (!Array.isArray(secrets) || typeof secrets[0] !== 'object' || secrets[0] === null) throw new Error('secret stub');
+    const teamSecret = { ...secrets[0], id: 'sec-team', name: 'hf_token', owner: 'team:llm-d' };
+    await page.route('**/api/secrets', (route: Route) =>
+      route.fulfill({ contentType: 'application/json', body: JSON.stringify([...secrets, teamSecret]) }),
+    );
+
+    await ready(page, '/teams/llm-d/playbooks');
     await expect(page.locator('main tbody tr')).toHaveCount(1);
     await expect(page.locator('main tbody tr').first()).toContainText('survey');
+    await expect(page.getByTestId('category-rail').getByRole('link', { name: 'Playbooks', exact: true })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
 
-    await page.goBack();
+    await ready(page, '/teams/llm-d/playbook-runs');
+    await expect(page.locator('main')).toContainText('survey');
+    await expect(page.locator('main')).not.toContainText('kylesayrs');
+
+    await ready(page, '/teams/llm-d/secrets');
+    await expect(page.locator('main').getByRole('cell', { name: 'hf_token', exact: true })).toBeVisible();
+    await expect(page.locator('main').getByRole('cell', { name: 'pr_token', exact: true })).toHaveCount(0);
+
+    await ready(page, '/teams/llm-d/members');
+    await expect(page.locator('main')).toContainText('Members');
+    await expect(page.getByTestId('category-rail').getByRole('link', { name: 'Members', exact: true })).toHaveAttribute(
+      'aria-current',
+      'page',
+    );
+  });
+
+  test('acting as a team keeps its rail everywhere, and the switcher is the way out', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, '/teams/llm-d');
     await page.getByTestId('act-as-team').click();
-    await expect(page.getByTestId('act-as-team')).toHaveText('Act as');
-    await expect(page.getByTestId('owner-switcher')).toContainText('All');
+    await expect(page.getByTestId('act-as-team')).toHaveText('Acting as');
+    await expect(page.getByTestId('owner-switcher')).toHaveAttribute('data-acting-as', 'team:llm-d');
+
+    await ready(page, '/');
+    const rail = page.getByTestId('category-rail');
+    await expect(rail.getByRole('heading', { name: 'llm-d' })).toBeVisible();
+    await expect(rail.getByRole('link', { name: 'Everything', exact: true })).toHaveCount(0);
+    await expect(page.locator('main')).not.toContainText('triage');
+
+    await switchTo(page, 'all');
+    await expect(rail.getByRole('link', { name: 'Activity', exact: true })).toBeVisible();
+  });
+});
+
+test.describe('many teams', () => {
+  /// Group claims put the caller in ten more teams that own nothing.
+  async function manyTeams(page: Page): Promise<void> {
+    await stubApi(page);
+    const whoami = ROUTES['/api/whoami'];
+    const teams = ROUTES['/api/teams'];
+    if (typeof whoami !== 'object' || whoami === null || Array.isArray(whoami) || !Array.isArray(whoami.teams)) {
+      throw new Error('whoami stub');
+    }
+    if (!Array.isArray(teams) || typeof teams[1] !== 'object' || teams[1] === null || Array.isArray(teams[1])) {
+      throw new Error('teams stub');
+    }
+    const claims = Array.from({ length: 10 }, (_, i) => `claim-${String(i).padStart(2, '0')}`);
+    const memberships = [
+      ...whoami.teams,
+      ...claims.map((team) => ({ team, role: 'member', via: [{ kind: 'group', group: `/groups/${team}`, role: 'member' }] })),
+    ];
+    const rows = [
+      ...teams,
+      ...claims.map((slug) => ({ ...teams[1], slug, display_name: slug.toUpperCase(), my_role: 'member' })),
+      { ...teams[1], slug: 'not-mine', display_name: 'Not mine', my_role: null },
+    ];
+    await page.route('**/api/whoami', (route: Route) =>
+      route.request().headers()['x-crucible-act-as'] === undefined
+        ? route.fulfill({ contentType: 'application/json', body: JSON.stringify({ ...whoami, teams: memberships }) })
+        : route.fallback(),
+    );
+    await page.route('**/api/teams', (route: Route) =>
+      route.fulfill({ contentType: 'application/json', body: JSON.stringify(rows) }),
+    );
+    let prefs: unknown = {};
+    await page.route('**/api/prefs/pickers', (route: Route) => {
+      if (route.request().method() === 'PUT') {
+        const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
+        if (typeof sent === 'object' && sent !== null && 'prefs' in sent) prefs = sent.prefs;
+      }
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ prefs }) });
+    });
+  }
+
+  test('the rail and the switcher name only starred and active teams', async ({ page }) => {
+    await manyTeams(page);
+    await ready(page, '/');
+
+    const rail = page.getByTestId('category-rail');
+    await expect(rail.getByRole('link', { name: 'llm-d', exact: true })).toBeVisible();
+    await expect(rail.getByRole('link', { name: 'claim-03', exact: true })).toHaveCount(0);
+    await expect(rail.getByRole('link', { name: /^All teams/ })).toContainText('11');
+
+    await page.getByTestId('owner-switcher').click();
+    const menu = page.getByTestId('owner-switcher-menu');
+    await expect(menu.locator('[data-value]')).toHaveText(['All', 'user:wren', 'team:llm-dmaintainer']);
+    await expect(page.getByTestId('owner-switcher-more')).toContainText('11 more');
+    await page.getByTestId('owner-switcher-more').click();
+    await expect(page).toHaveURL(/\/teams$/);
+
+    await expect(page.locator('main tbody tr')).toHaveCount(12);
+    await page.getByRole('searchbox', { name: 'Filter teams' }).fill('CLAIM-03');
+    await expect(page.locator('main tbody tr')).toHaveCount(1);
+    await page.getByRole('button', { name: 'Star claim-03' }).click();
+    await expect(page.getByRole('button', { name: 'Unstar claim-03' })).toHaveAttribute('aria-pressed', 'true');
+
+    await expect(rail.getByRole('link', { name: '★ claim-03', exact: true })).toBeVisible();
+    await expect(rail.getByRole('link', { name: /^All teams/ })).toContainText('10');
+
+    await page.reload();
+    await page.waitForLoadState('networkidle');
+    await expect(rail.getByRole('link', { name: '★ claim-03', exact: true })).toBeVisible();
+    await page.getByTestId('owner-switcher').click();
+    await expect(page.getByTestId('owner-switcher-menu').locator('[data-value]')).toHaveText([
+      'All',
+      'user:wren',
+      'team:claim-03member',
+      'team:llm-dmaintainer',
+    ]);
+    await page.keyboard.press('Escape');
+
+    // A team star is the owner picker's star: the same principal reads starred there.
+    await page.getByRole('searchbox', { name: 'Filter teams' }).fill('llm-d');
+    await page.getByRole('button', { name: 'Star llm-d' }).click();
+    await expect(page.getByRole('button', { name: 'Unstar llm-d' })).toBeVisible();
+    await ready(page, '/secrets');
+    await expect(page.getByRole('button', { name: 'Unstar team:llm-d (maintainer)' })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  test('the teams page shows memberships by default and every readable team on demand', async ({ page }) => {
+    await manyTeams(page);
+    await ready(page, '/teams');
+    const rows = page.locator('main tbody tr');
+    await expect(rows).toHaveCount(12);
+    await expect(page.locator('main')).not.toContainText('not-mine');
+    await page.locator('main [data-ui="toolbar-group"]').getByRole('button', { name: 'All', exact: true }).click();
+    await expect(rows).toHaveCount(13);
+    await expect(rows.first()).toContainText('llm-d');
+    await expect(rows.last()).toContainText('not-mine');
+  });
+});
+
+test.describe('team view polish', () => {
+  test('a team list names the team, and its secrets page drops the personal split', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, '/teams/llm-d/secrets');
+    const main = page.locator('main');
+    await expect(main.getByText('llm-d', { exact: true }).first()).toBeVisible();
+    await expect(main).not.toContainText('Personal');
+    await expect(main).toContainText('No team secrets');
+
+    await ready(page, '/teams/llm-d');
+    await expect(main).not.toContainText('waiting for approval');
+    await ready(page, '/');
+    await expect(main).toContainText('waiting for approval');
   });
 });

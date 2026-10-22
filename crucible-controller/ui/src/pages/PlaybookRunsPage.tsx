@@ -3,7 +3,7 @@ import { useMemo } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { $api } from '../api/client';
 import type { components } from '../api/schema';
-import { narrow } from '../ownerContext';
+import { eyebrowFor, narrow } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
   Applied,
@@ -210,7 +210,7 @@ export function PlaybookRunsPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Execution"
+        eyebrow={eyebrowFor(owner.team, 'Execution')}
         title="Playbook runs"
         description="Ad-hoc playbook launches with the values they froze, what they cost, and the deferred ones still waiting."
       />

@@ -34,12 +34,20 @@ export function viewAsOffer(member: MemberDto, viewer: string | null): ViewAsOff
   return member.signed_in ? 'ready' : 'never-signed-in';
 }
 
-/// The teams the caller is in first, then the rest, each group by slug.
-export function sortedTeams(teams: readonly TeamDto[]): TeamDto[] {
+/// Starred teams first, then the ones the caller is in, then the ones that own something, each
+/// group by slug.
+export function sortedTeams(
+  teams: readonly TeamDto[],
+  starred: ReadonlySet<string> = new Set(),
+  active: ReadonlySet<string> = new Set(),
+): TeamDto[] {
+  const mine = (t: TeamDto) => t.my_role !== null && t.my_role !== undefined;
   return [...teams].sort(
     (a, b) =>
-      Number(b.my_role !== null && b.my_role !== undefined) -
-        Number(a.my_role !== null && a.my_role !== undefined) || a.slug.localeCompare(b.slug),
+      Number(starred.has(b.slug)) - Number(starred.has(a.slug)) ||
+      Number(mine(b)) - Number(mine(a)) ||
+      Number(active.has(b.slug)) - Number(active.has(a.slug)) ||
+      a.slug.localeCompare(b.slug),
   );
 }
 
