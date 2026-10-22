@@ -101,12 +101,23 @@ pub(crate) fn select_agent(
     (harness, selection.model.clone())
 }
 
-/// Resolve [`select_agent`] against the process environment and pin the result on `args`.
+/// Resolve [`select_agent`] against the process environment and pin the result, with the agent
+/// binding's price, on `args`.
 pub(crate) fn pin_agent(args: &mut Args, agent: &manifest::AgentCfg) -> Result<manifest::Harness> {
     let inference = crate::agent::inference::InferenceEnv::from_process_env()?;
     let (harness, model) = select_agent(args.harness, args.model.as_deref(), agent, &inference);
     args.harness = Some(harness);
     args.model = Some(model);
+    args.price = inference.selection.and_then(|s| s.price);
+    if let Some(price) = &args.price {
+        tracing::info!(
+            input = price.input.get(),
+            output = price.output.get(),
+            cache_read = price.cache_read.get(),
+            cache_write = price.cache_write.get(),
+            "the injected agent binding's price replaces the cost the harness reports"
+        );
+    }
     Ok(harness)
 }
 
@@ -449,6 +460,7 @@ mod tests {
             selection: Some(crate::agent::inference::AgentSelection {
                 protocol,
                 model: "bound-model".into(),
+                price: None,
             }),
             ..Default::default()
         }
@@ -501,6 +513,41 @@ mod tests {
             ),
             (Harness::Claude, "bound-model".to_string())
         );
+    }
+
+    /// The agent binding's price is pinned with its model, so every agent turn of the run settles
+    /// at tokens times that price; a binding without one leaves the vendor table in charge.
+    #[test]
+    fn pin_agent_pins_the_binding_price_beside_its_model() {
+        use crate::agent::event::Pricing;
+        use crucible_contract::inference::ENV_INFERENCE;
+        let _guard = crucible::test_support::env_lock();
+        let m: manifest::Manifest = toml::from_str(&manifest_toml("")).unwrap();
+
+        unsafe {
+            std::env::set_var(
+                ENV_INFERENCE,
+                r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","url":"https://selfhosted.example/v1","model":"zai-org/glm-5","price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6}}]}"#,
+            )
+        };
+        let mut priced = args_from(&["crucible"]);
+        pin_agent(&mut priced, &m.agent).unwrap();
+        assert_eq!(priced.model(), "zai-org/glm-5");
+        let price = priced.price.expect("the binding's price");
+        assert_eq!(price.output.get(), 2.2);
+        assert!(matches!(priced.pricing(), Pricing::Fixed(_)));
+
+        unsafe {
+            std::env::set_var(
+                ENV_INFERENCE,
+                r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","model":"zai-org/glm-5"}]}"#,
+            )
+        };
+        let mut unpriced = args_from(&["crucible"]);
+        pin_agent(&mut unpriced, &m.agent).unwrap();
+        assert_eq!(unpriced.price, None);
+        assert_eq!(unpriced.pricing(), Pricing::resolve("zai-org/glm-5", None));
+        unsafe { std::env::remove_var(ENV_INFERENCE) };
     }
 
     /// Resources schedule a sandbox, so only the backend that runs one takes them; any other
