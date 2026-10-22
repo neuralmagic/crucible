@@ -34,7 +34,7 @@ pub mod verdict;
 /// `crucible --contract-version` and the runtime image carries it as the
 /// `io.crucible.contract-version` OCI label, so a deployed image can be matched against the
 /// controller it talks to without a probe.
-pub const CONTRACT_VERSION: &str = "1.17.0";
+pub const CONTRACT_VERSION: &str = "1.18.0";
 
 pub use admission::{
     ADMISSION_WIRE_VERSION, AdmissionEvent, AdmissionKey, AdmissionOutcome, AdmittedInput,
@@ -51,11 +51,10 @@ pub use link::{
     ExternalLink, ExternalUrl, LinkError, LinkKind, LinkProvider, MAX_URL_LEN, decode_links,
 };
 pub use markers::{
-    ENV_CONTROLLER_URL, ENV_INGEST_TOKEN_PATH, ENV_INGEST_URL, ENV_POD_NAME, ENV_RUN_DISPLAY_NAME,
-    ENV_RUN_NAME, ENV_RUN_TOKEN, INGEST_POD_NAME_CLAIM, INGEST_TOKEN_AUDIENCE, MANAGED_BY_KEY,
-    MANAGED_BY_SELECTOR, MANAGED_BY_VALUE, RANK_ACTIVITY_MARKER, RUN_SESSION_DELIMITER,
-    SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER, SCOPE_PROGRESS_MARKER, SCOPE_REPORT_MARKER,
-    SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
+    ENV_CONTROLLER_URL, ENV_POD_NAME, ENV_POD_TOKEN, ENV_RUN_DISPLAY_NAME, ENV_RUN_NAME,
+    MANAGED_BY_KEY, MANAGED_BY_SELECTOR, MANAGED_BY_VALUE, RANK_ACTIVITY_MARKER,
+    RUN_SESSION_DELIMITER, SCOPE_ACTIVITY_MARKER, SCOPE_PACK_MARKER, SCOPE_PROGRESS_MARKER,
+    SCOPE_REPORT_MARKER, SCOPE_TRANSCRIPT_MARKER, VERDICT_MARKER,
 };
 pub use outputs::{
     BoundSource, BoundViolation, ENV_OUTPUT_PARAMS, ENV_OUTPUTS, ENV_SESSION_LOG,

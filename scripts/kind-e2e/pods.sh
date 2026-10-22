@@ -357,7 +357,7 @@ start_controller "$WORK/profile-evidence.toml"
 run_artifacts() { sql -c "SELECT string_agg(kind, ' ' ORDER BY kind) FROM artifacts WHERE owner_kind = 'run-session' AND owner_id = '$1'"; }
 
 # token_state <run>: whether the run's one token is revoked, and the run it reads.
-token_state() { sql -c "SELECT count(*) || ' ' || bool_and(revoked_at IS NOT NULL) || ' ' || coalesce(max(reads_run), '-') FROM run_tokens WHERE run_id = '$1'"; }
+token_state() { sql -c "SELECT count(*) || ' ' || bool_and(revoked_at IS NOT NULL) || ' ' || coalesce(max(reads_run), '-') FROM pod_tokens WHERE run_id = '$1'"; }
 
 # evidence <run> <kind> <out>: GET the run's evidence as a person, printing the status.
 evidence() {
@@ -386,7 +386,7 @@ engine_lines() {
 pass "[JP] the pod's session, files and git memory landed on its run, with nothing keyed by the pod"
 PARENT_POD=$(sql -c "SELECT pod FROM runs WHERE run_id = '$PARENT'")
 jq -se --arg n "$PARENT_POD" '[.[] | .object | select(.metadata.name == $n) | .spec.containers[0].env[]
-    | select(.name == "CRUCIBLE_RUN_TOKEN")] | length > 0 and all(.[]; .value == null
+    | select(.name == "CRUCIBLE_POD_TOKEN")] | length > 0 and all(.[]; .value == null
     and .valueFrom.secretKeyRef.name == ($n + "-secrets"))' "$WORK/pods-JP.json" >/dev/null ||
     fail "[JP] the run token does not ride the run's Secret: $(jq -sc --arg n "$PARENT_POD" '[.[] | .object | select(.metadata.name == $n) | .spec.containers[0].env[] | select(.name | startswith("CRUCIBLE_"))] | unique' "$WORK/pods-JP.json")"
 jq -se '[.[] | .object.spec.volumes[]?.projected.sources[]?.serviceAccountToken | select(.audience == "crucible-ingest")] | length == 0' "$WORK/pods-JP.json" >/dev/null ||
@@ -420,6 +420,73 @@ gunzip -c "$WORK/JP-rerun.gz" | jq -se --arg p "$PARENT" \
 pass "[JP] the rerun pod read its parent's session, files and commits, reused first, and passed second"
 [ "$(run_artifacts "$RERUN")" = "run-commits run-engine-log run-files run-session" ] ||
     fail "[JP] the rerun owns: $(run_artifacts "$RERUN")"
+
+# ---- scenario JT ----------------------------------------------------------------------------
+log "[JT] a scope pod uploads its pack and transcript on its turn's pod token"
+JT_POD=crucible-turn-e2e-jt
+JT_ID=$(openssl rand -hex 16)
+JT_SECRET=$(openssl rand -hex 32)
+JT_HASH=$(printf %s "$JT_SECRET" | openssl dgst -sha256 -binary | openssl base64 -A | tr '+/' '-_' | tr -d '=')
+sql -c "INSERT INTO pod_tokens (id, turn_pod, secret_hash, created_at, expires_at)
+        VALUES ('$JT_ID', '$JT_POD', '$JT_HASH', '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z')" >/dev/null
+JT_TOKEN="crr_${JT_ID}_${JT_SECRET}"
+kubectl -n "$NS" create configmap "$JT_POD-pack" --from-file="$FIX/packs/scope/workflow.star" \
+    --from-file="$FIX/packs/scope/measure.sh" --from-file="$FIX/packs/scope/SCOPE.md" >/dev/null
+kubectl -n "$NS" apply -f - >/dev/null <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: $JT_POD
+spec:
+  restartPolicy: Never
+  containers:
+  - name: scope
+    image: $LOOP_IMAGE
+    env:
+    - { name: CRUCIBLE_CONTROLLER_URL, value: "http://$J_HOST:$PORT" }
+    - { name: CRUCIBLE_POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+    - { name: CRUCIBLE_POD_TOKEN, value: "$JT_TOKEN" }
+    command: [sh, -c]
+    args:
+    - |
+      set -e
+      mkdir -p /tmp/code /tmp/pack && cd /tmp/code && git init -q && echo code >README
+      git -c user.name=e2e -c user.email=e2e@example.com add -A
+      git -c user.name=e2e -c user.email=e2e@example.com commit -qm code
+      cp /fixture/* /tmp/pack/ && chmod +x /tmp/pack/measure.sh
+      printf '[repo]\npath = "/tmp/code"\n\n[workspace]\ninject = ["measure.sh"]\n\n[agent]\nbackend = "openshell"\ngoal = "Freeze the pack."\nsandbox_image = "ghcr.io/org/sandbox:latest"\n\n[judge]\nmeasure_cmd = "./measure.sh"\ndirection = "higher"\nobjective = "score"\n\n[workflow]\ntype = "autoresearch"\nfile = "workflow.star"\n' >/tmp/pack/crucible.toml
+      crucible scope --pack /tmp/pack --json --marker >/dev/null
+    volumeMounts: [{ name: fixture, mountPath: /fixture }]
+  volumes: [{ name: fixture, configMap: { name: $JT_POD-pack } }]
+YAML
+wait_for 120 "the scope pod to finish" pods_in ".metadata.name == \"$JT_POD\" and (.status.phase == \"Succeeded\" or .status.phase == \"Failed\")" 1
+kubectl -n "$NS" get pod "$JT_POD" -o jsonpath='{.status.containerStatuses[0].state.terminated.message}' >"$WORK/JT-message.json"
+jt_manifest() { jq -r --arg k "$1" '.artifacts[] | select(.kind == $k) | .digest + " " + (.delivered | tostring)' "$WORK/JT-message.json"; }
+for kind in scope-pack scope-transcript; do
+    [ "$(jt_manifest "$kind")" = "$(sql -c "SELECT digest FROM pod_artifacts WHERE pod = '$JT_POD' AND kind = '$kind'") true" ] ||
+        fail "[JT] $kind: the manifest says '$(jt_manifest "$kind")'; the controller holds '$(sql -c "SELECT digest FROM pod_artifacts WHERE pod = '$JT_POD' AND kind = '$kind'")'; the pod said: $(kubectl -n "$NS" logs "$JT_POD" 2>&1 | tail -5)"
+done
+[ "$(sql -c "SELECT count(*) FROM artifacts WHERE owner_kind = 'pod-evidence' AND owner_id = '$JT_POD'")" = 2 ] ||
+    fail "[JT] the pack and transcript were not stored under the pod"
+pass "[JT] the pod's pack and transcript landed under its name, matching the digests its manifest reports"
+
+# jt_put <path> <bearer>: PUT a body to an evidence route, printing the status.
+jt_put() {
+    curl -s -o /dev/null -w '%{http_code}' -X PUT -H "authorization: Bearer $2" \
+        -H 'content-type: application/gzip' --data-binary @"$WORK/JT-message.json" "$CONTROLLER_URL$1"
+}
+[ "$(jt_put "/api/turns/crucible-turn-other/evidence/scope-pack" "$JT_TOKEN")" = 403 ] ||
+    fail "[JT] a turn's token wrote another pod's pack"
+[ "$(jt_put "/api/runs/$PARENT/evidence/run-session" "$JT_TOKEN")" = 403 ] ||
+    fail "[JT] a turn's token wrote a run's evidence"
+[ "$(jt_put "/api/turns/$JT_POD/evidence/scope-pack" "$CONTROLLER_API_TOKEN")" = 403 ] ||
+    fail "[JT] a person wrote a turn's pack"
+sql -c "UPDATE pod_tokens SET revoked_at = '2026-01-01T00:00:00Z' WHERE id = '$JT_ID'" >/dev/null
+[ "$(jt_put "/api/turns/$JT_POD/evidence/scope-pack" "$JT_TOKEN")" = 401 ] ||
+    fail "[JT] a revoked turn token still uploaded"
+kubectl -n "$NS" delete pod "$JT_POD" --grace-period=1 --wait=true >/dev/null
+kubectl -n "$NS" delete configmap "$JT_POD-pack" >/dev/null
+pass "[JT] the turn's token writes only its own pod's pack and transcript, and not once revoked"
 stop_controller
 unset CONTROLLER_API_TOKEN
 CONTROLLER_ENV=()

@@ -1,6 +1,6 @@
 //! The cluster-snapshot push surface: `POST /api/clusters/push` for spokes the hub cannot reach
 //! (corp-internal clusters have no inbound path from the hub, but plenty of outbound). Mounted
-//! OUTSIDE the human bearer guard, like the ingest drop-box — it authenticates with its own
+//! OUTSIDE the human bearer guard, like `/metrics` — it authenticates with its own
 //! per-cluster static token (`CONTROLLER_PUSH_TOKENS`, `cluster=token[,cluster=token…]`).
 //!
 //! TokenReview-style validation is deliberately not used here: reviewing a spoke's ServiceAccount

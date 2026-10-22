@@ -515,7 +515,7 @@ pub(crate) async fn clear_scope_now(ex: impl PgExecutor<'_>, key: &str) -> Resul
     Ok(())
 }
 
-/// Record (or dedup) a Tier 2 drop-box pointer (`pod_artifacts`). Content-addressed: a re-POST of
+/// Record (or dedup) a turn upload's pointer (`pod_artifacts`). Content-addressed: a re-POST of
 /// the same (pod, kind) with the same digest is idempotent (`INSERT OR REPLACE` with an identical
 /// row), so the caller can treat the pre-existing digest as the dedup signal. Runtime query (not
 /// the `query!` macro) so a fresh migration needs no `.sqlx` offline-cache entry.
@@ -545,8 +545,7 @@ pub(crate) async fn record_pod_artifact(
     Ok(())
 }
 
-/// The drop-box pointer for one (pod, kind), or `None`. The ingest approval reads it to answer "do I
-/// already hold this digest?" (idempotent dedup); the fold reads it to resolve + validate a Tier 1
+/// The upload pointer for one (pod, kind), or `None`. The fold reads it to resolve + validate a Tier 1
 /// manifest entry against the stored bytes.
 #[tracing::instrument(name = "db.pod_artifact", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", pod = %pod, kind = %kind), err)]
 pub(crate) async fn pod_artifact(

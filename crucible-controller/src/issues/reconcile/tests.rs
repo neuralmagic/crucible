@@ -2614,9 +2614,9 @@ async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Resul
     let (db, dir) = db_with(pool);
     let cfg = cfg_with(dir.path(), Profile::default());
     seed_running_pod_run(&db, "owner/repo#43", "run-43", "crucible-run-43").await?;
-    let token = crate::runs::run_token::mint(
+    let token = crate::runs::pod_token::mint(
         db.pool(),
-        "run-43",
+        &crate::runs::pod_token::Subject::Run("run-43".to_string()),
         None,
         std::time::Duration::from_secs(3600),
     )
@@ -2657,8 +2657,8 @@ async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Resul
     assert_eq!(run.best_score, Some(245.0));
     assert!(
         matches!(
-            crate::runs::run_token::verify(db.pool(), &token).await,
-            Err(crate::runs::run_token::TokenRefusal::Revoked { .. })
+            crate::runs::pod_token::verify(db.pool(), &token).await,
+            Err(crate::runs::pod_token::TokenRefusal::Revoked { .. })
         ),
         "completion revokes the run's token"
     );

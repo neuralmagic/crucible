@@ -11,8 +11,6 @@ pub(crate) mod console;
 pub(crate) mod evidence_client;
 pub(crate) mod flow_dd;
 #[cfg(feature = "autoresearch")]
-pub(crate) mod ingest_client;
-#[cfg(feature = "autoresearch")]
 pub(crate) mod reporter;
 #[cfg(feature = "autoresearch")]
 pub(crate) mod result_mode;

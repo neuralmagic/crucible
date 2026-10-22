@@ -250,7 +250,11 @@ async fn settle_run(
         emission.as_ref(),
     )
     .await?;
-    crate::runs::run_token::revoke_run(db.pool(), &run.run_id).await?;
+    crate::runs::pod_token::revoke(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run.run_id.clone()),
+    )
+    .await?;
     // The run's session is ingested and its cost booked (once, in `complete_run`'s ingest):
     // close the WorkPod ledger row + GC the run pod. Best-effort — a leaked pod is swept
     // later, never fatal to the completion.
@@ -521,7 +525,11 @@ async fn fail_run_without_terminal_evidence(
         pod,
     )
     .await?;
-    crate::runs::run_token::revoke_run(db.pool(), run_id).await
+    crate::runs::pod_token::revoke(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run_id.to_string()),
+    )
+    .await
 }
 
 #[cfg(test)]

@@ -62,12 +62,6 @@ async fn main() -> anyhow::Result<()> {
             .expect("the shipped default policy set loads"),
         &cfg,
     );
-    let surface = Surface::bind(
-        state,
-        addr,
-        crucible_controller::config::TurnAccounts::default(),
-        cfg.session_secure_cookies,
-    )
-    .await?;
+    let surface = Surface::bind(state, addr, cfg.session_secure_cookies).await?;
     Err(surface.serve().await.into())
 }

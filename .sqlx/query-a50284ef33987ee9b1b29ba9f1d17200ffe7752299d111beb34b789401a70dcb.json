@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT run_id, secret_hash, reads_run, expires_at, revoked_at\n         FROM run_tokens WHERE id = $1",
+  "query": "SELECT run_id, turn_pod, secret_hash, reads_run, expires_at, revoked_at\n         FROM pod_tokens WHERE id = $1",
   "describe": {
     "columns": [
       {
@@ -9,51 +9,62 @@
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "run_tokens",
+            "table": "pod_tokens",
             "name": "run_id"
           }
         }
       },
       {
         "ordinal": 1,
-        "name": "secret_hash",
+        "name": "turn_pod",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "run_tokens",
-            "name": "secret_hash"
+            "table": "pod_tokens",
+            "name": "turn_pod"
           }
         }
       },
       {
         "ordinal": 2,
-        "name": "reads_run",
+        "name": "secret_hash",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "run_tokens",
-            "name": "reads_run"
+            "table": "pod_tokens",
+            "name": "secret_hash"
           }
         }
       },
       {
         "ordinal": 3,
-        "name": "expires_at",
+        "name": "reads_run",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "run_tokens",
-            "name": "expires_at"
+            "table": "pod_tokens",
+            "name": "reads_run"
           }
         }
       },
       {
         "ordinal": 4,
+        "name": "expires_at",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pod_tokens",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
         "name": "revoked_at",
         "type_info": "Text",
         "origin": {
           "Table": {
-            "table": "run_tokens",
+            "table": "pod_tokens",
             "name": "revoked_at"
           }
         }
@@ -65,12 +76,13 @@
       ]
     },
     "nullable": [
-      false,
+      true,
+      true,
       false,
       true,
       false,
       true
     ]
   },
-  "hash": "9749ad866824c97bef02286897897ac5a8020255f78fd04ae3f2b529a184f852"
+  "hash": "a50284ef33987ee9b1b29ba9f1d17200ffe7752299d111beb34b789401a70dcb"
 }

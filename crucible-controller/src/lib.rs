@@ -164,7 +164,6 @@ impl Surface {
     pub async fn bind(
         state: api::state::ApiState,
         addr: SocketAddr,
-        turn_accounts: config::TurnAccounts,
         secure_session_cookies: bool,
     ) -> anyhow::Result<Self> {
         let kube_user_auth = identity::kube_user::KubeUserAuth::from_env()
@@ -208,12 +207,11 @@ impl Surface {
             addr
         };
 
-        // Cloned off the shared state before it moves into the router, for the separate ingest
-        // surface below.
+        // Cloned off the shared state before it moves into the router, for the machine surfaces
+        // below.
         let db = state.db.clone();
         let cluster_stats_for_push = state.cluster_stats.clone();
         let clusters = state.clusters.clone();
-        let pod_namespace_for_ingest = state.pod_namespace.clone();
 
         // The API + SPA sit behind the bearer guard; `/metrics` is merged in *after* the layer so
         // the shared kube-prometheus-stack can scrape it without a token (the ServiceMonitor sends
@@ -252,35 +250,9 @@ impl Surface {
             spa::Source::from_env(),
         );
 
-        // One in-cluster client shared by the two non-bearer machine surfaces below (the ingest
-        // drop-box's TokenReview and the discovery mirror's upstream fetch); if it can't be built
-        // both fail closed (503) until kube is reachable.
+        // The in-cluster client the discovery mirror fetches its upstream through; if it can't be
+        // built the mirror fails closed (503) until kube is reachable.
         let kube_client = clusters.client(runs::clusters::HUB_CLUSTER).await;
-
-        // The Tier 2 ingest drop-box (turn result contract): merged in *after* the human
-        // bearer-guard layer, exactly like `/metrics`, because it authenticates with its OWN
-        // pod-bound TokenReview credential, not the oauth2-proxy/admin token. The validator is
-        // cluster-keyed: the uploading pod's ledger row selects which cluster's API server reviews
-        // its token. A cluster whose client cannot be built fails that POST closed (503); the rest
-        // of the surface stays up.
-        if let Err(e) = kube_client.as_ref() {
-            tracing::warn!(error = %e, "no hub kube client at startup — hub ingest TokenReviews fail closed until one is reachable");
-        }
-        let validator = Arc::new(runs::ingest_auth::IngestValidator::new(
-            Arc::new(runs::ingest_auth::ClusterKube::new(
-                clusters.clone(),
-                pod_namespace_for_ingest.clone(),
-            )),
-            db.pool().clone(),
-            crucible_contract::INGEST_TOKEN_AUDIENCE,
-            runs::ingest_auth::ExpectedServiceAccount {
-                namespace: pod_namespace_for_ingest,
-                name: turn_accounts.hub,
-            },
-            turn_accounts.spokes,
-        ));
-        let ingest_router =
-            runs::ingest_drop::router(runs::ingest_drop::IngestState { db, validator });
 
         // The OIDC discovery mirror (hub-spoke trust bootstrap): mounted OUTSIDE the bearer layer
         // like `/metrics` — public read-only by design. Disabled (routes 404) unless
@@ -296,7 +268,7 @@ impl Surface {
         oidc_mirror::Mirror::new(upstream, base)
     });
 
-        // The cluster-snapshot push surface: outside the bearer guard like the ingest drop-box,
+        // The cluster-snapshot push surface: outside the bearer guard like `/metrics`,
         // authenticated by its own per-cluster static tokens (see `cluster_push`'s module doc for
         // why TokenReview can't work for unreachable spokes).
         let push_router = {
@@ -313,7 +285,6 @@ impl Surface {
 
         let router = guarded
             .merge(api::metrics::router(state))
-            .merge(ingest_router)
             .merge(push_router)
             .merge(mcp_router)
             .merge(oidc_mirror::router(mirror));

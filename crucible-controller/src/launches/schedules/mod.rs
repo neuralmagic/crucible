@@ -3088,7 +3088,7 @@ mod tests {
         CursorSpec::parse("rollup/STATE.json", None, Some("state/cursor.json")).expect("cursor")
     }
 
-    /// A run-files bundle the way the loop's drop-box POSTs it: one gzipped tar keyed
+    /// A run-files bundle the way a run pod uploads it: one gzipped tar keyed
     /// `<task>/<declared path>`.
     fn run_files(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
