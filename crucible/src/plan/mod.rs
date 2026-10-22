@@ -10,6 +10,7 @@ pub mod ir;
 pub mod machine;
 pub mod param;
 pub mod record;
+pub mod rerun;
 pub mod resume;
 pub mod route;
 pub mod runner;

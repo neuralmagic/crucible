@@ -823,6 +823,9 @@ pub(crate) struct LaunchDraftBody {
     /// The model to ask that provider for. Free text; absent takes the provider's own default.
     #[serde(default)]
     model: Option<String>,
+    /// Rerun a finished run of this draft from some of its tasks, against the newest save.
+    #[serde(default)]
+    rerun: Option<crate::runs::api::rerun::RerunBody>,
 }
 
 /// `POST /api/playbook-drafts/{id}/launch` — test-fire a draft. The values are validated against
@@ -930,6 +933,11 @@ pub(crate) async fn launch_playbook_draft(
         Ok(v) => v,
         Err(refusal) => return refusal,
     };
+    let rerun =
+        match crate::runs::api::rerun::admit_launch(&state, &id, true, body.rerun.as_ref()).await {
+            Ok(rerun) => rerun,
+            Err(refusal) => return *refusal,
+        };
     let actor = saver.actor.as_deref();
     let dispatch_target = saver.dispatch_target.clone();
     let key = format!("playbook:{id}:{}", uuid::Uuid::now_v7());
@@ -951,6 +959,7 @@ pub(crate) async fn launch_playbook_draft(
         draft_version: Some(latest.version),
         created_by: actor,
         launcher_groups: Some(&saver.groups),
+        rerun: rerun.as_ref(),
     };
     // A draft's content changes on every save, so the disclosure is recomputed from the version
     // being launched and lands in the same transaction that adopts it, before anything executes.

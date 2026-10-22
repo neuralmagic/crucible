@@ -43,6 +43,8 @@ pub(crate) async fn insert_playbook_launch_with(
     let tier = Tier::T1.as_str();
     let max_time = launch.max_time.as_str();
     let origin = launch.origin.as_str();
+    let rerun_of = launch.rerun.map(|r| r.run.as_str());
+    let rerun_from = serde_json::json!(launch.rerun.map(|r| r.from.as_slice()).unwrap_or_default());
     sqlx::query!(
         "INSERT INTO issues (key, repo, tier, status, priority, input_kind, title, updated_at) \
          VALUES ($1, $2, $3, 'new', 0, 'playbook', $4, $5)",
@@ -58,8 +60,8 @@ pub(crate) async fn insert_playbook_launch_with(
     sqlx::query!(
         "INSERT INTO playbook_launches (key, playbook, params, schema_digest, max_cost, max_time, \
          advance_dedupe, dedupe_schedule, origin, draft_version, created_by, launcher_groups, \
-         created_at, exposure, exposure_digest) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
+         created_at, exposure, exposure_digest, rerun_of, rerun_from) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
         key,
         launch.playbook,
         launch.params,
@@ -75,6 +77,8 @@ pub(crate) async fn insert_playbook_launch_with(
         now,
         exposure_json,
         exposure_digest,
+        rerun_of,
+        rerun_from,
     )
     .execute(&mut **tx)
     .await
@@ -100,7 +104,8 @@ pub(crate) async fn get_playbook_launch(
 ) -> Result<Option<PlaybookLaunch>> {
     let row = sqlx::query!(
         "SELECT playbook, params, schema_digest, max_cost, max_time, created_by, \
-         launcher_groups, created_at, draft_version, exposure FROM playbook_launches WHERE key = $1",
+         launcher_groups, created_at, draft_version, exposure, rerun_of, rerun_from \
+         FROM playbook_launches WHERE key = $1",
         key,
     )
     .fetch_optional(pool)
@@ -125,6 +130,10 @@ pub(crate) async fn get_playbook_launch(
             .exposure
             .map(crate::playbooks::exposure::Exposure::from_value)
             .transpose()?,
+        rerun: row.rerun_of.map(|run| crate::launches::model::RerunOf {
+            run,
+            from: serde_json::from_value(row.rerun_from).unwrap_or_default(),
+        }),
     }))
 }
 

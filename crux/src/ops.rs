@@ -637,6 +637,7 @@ pub struct DraftLaunch {
     /// `[agent]` harness; `model` is the model to ask it for and needs a provider.
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub rerun: Option<Rerun>,
 }
 
 /// Test-fire a draft. The values are the newest save's stored schema's, and a draft launch is held
@@ -660,6 +661,7 @@ pub async fn draft_launch(
     );
     put_trimmed(&mut body, "provider", launch.provider.as_deref());
     put_trimmed(&mut body, "model", launch.model.as_deref());
+    put_rerun(&mut body, launch.rerun.as_ref());
     if as_json {
         return json(&c.launch_draft::<Value>(draft_id, &body).await?);
     }
@@ -900,6 +902,20 @@ pub struct Launch {
     /// `[agent]` harness; `model` is the model to ask it for and needs a provider.
     pub provider: Option<String>,
     pub model: Option<String>,
+    pub rerun: Option<Rerun>,
+}
+
+/// A launch that reruns a finished run of the same pack from some of its tasks.
+#[derive(Debug, Clone)]
+pub struct Rerun {
+    pub of: String,
+    pub from: Vec<String>,
+}
+
+fn put_rerun(body: &mut Value, rerun: Option<&Rerun>) {
+    if let Some(rerun) = rerun {
+        body["rerun"] = serde_json::json!({ "of": rerun.of, "from": rerun.from });
+    }
 }
 
 fn put_trimmed(body: &mut Value, field: &str, value: Option<&str>) {
@@ -923,6 +939,7 @@ pub async fn launch(c: &Client, id: &str, launch: Launch, as_json: bool) -> Resu
     );
     put_trimmed(&mut body, "provider", launch.provider.as_deref());
     put_trimmed(&mut body, "model", launch.model.as_deref());
+    put_rerun(&mut body, launch.rerun.as_ref());
     if as_json {
         return json(&c.launch::<Value>(id, &body).await?);
     }
@@ -1699,6 +1716,10 @@ mod tests {
                 dispatch_target: Some("  ".to_string()),
                 provider: Some("plat-openai".to_string()),
                 model: Some(" gpt-5.6-luna ".to_string()),
+                rerun: Some(Rerun {
+                    of: "run-7".to_string(),
+                    from: vec!["check".to_string()],
+                }),
             },
             false,
         )
@@ -1728,6 +1749,10 @@ mod tests {
         assert!(
             sent.get("dispatch_target").is_none(),
             "a blank target is omitted, not sent: {sent}"
+        );
+        assert_eq!(
+            sent["rerun"],
+            serde_json::json!({"of": "run-7", "from": ["check"]})
         );
 
         let bare = launch(

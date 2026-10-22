@@ -359,6 +359,9 @@ jobs:
           chmod +x "$bin/kind" "$bin/kubectl"
           echo "$bin" >> "$GITHUB_PATH"
 
+      - name: Raise inotify limits
+        run: sudo sysctl -w fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=524288
+
       - name: Start Postgres
         uses: ./.github/actions/postgres
 

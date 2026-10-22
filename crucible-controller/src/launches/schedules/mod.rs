@@ -126,7 +126,12 @@ impl ScheduleStore {
                 }
             }
             CursorSpec::File { from, path } => {
-                let bundle = crate::runs::blob_store::get_run_files(self.db.pool(), run_id).await?;
+                let bundle = crate::runs::blob_store::get_run_bundle(
+                    self.db.pool(),
+                    run_id,
+                    crucible_contract::ArtifactKind::RunFiles,
+                )
+                .await?;
                 let found = match bundle {
                     Some(bundle) => crate::runs::run_files::read_bundle(&bundle, from.as_str())?,
                     None => None,
@@ -1316,6 +1321,7 @@ mod tests {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
         assert!(matches!(
@@ -2437,6 +2443,7 @@ mod tests {
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups: None,
+                    rerun: None,
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
@@ -3149,9 +3156,10 @@ mod tests {
         assert_eq!(store.cursor_file(&fired[0]).await?, None);
 
         let body = br#"{"seen": [{"pr": 12345, "head_sha": "ab12"}]}"#;
-        crate::runs::blob_store::put_run_files(
+        crate::runs::blob_store::put_run_bundle(
             &pool,
             "run-1",
+            crucible_contract::ArtifactKind::RunFiles,
             run_files(&[("rollup/STATE.json", body), ("rollup/REPORT.md", b"# hi")]),
         )
         .await?;
@@ -3222,7 +3230,13 @@ mod tests {
         ];
         for (run_id, bundle, expected) in cases {
             if let Some(bundle) = bundle {
-                crate::runs::blob_store::put_run_files(&pool, run_id, bundle).await?;
+                crate::runs::blob_store::put_run_bundle(
+                    &pool,
+                    run_id,
+                    crucible_contract::ArtifactKind::RunFiles,
+                    bundle,
+                )
+                .await?;
             }
             let key = fired.remove(0);
             store

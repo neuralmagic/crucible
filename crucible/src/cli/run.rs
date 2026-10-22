@@ -214,6 +214,8 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 harness,
                 model,
                 resume,
+                rerun_of,
+                from,
             } => {
                 let _engine = crate::agent::engine::EngineCtx::new()?;
                 crate::plan::cli::run(
@@ -236,6 +238,14 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                             model: model.clone(),
                         },
                         resume: *resume,
+                        rerun: rerun_of.as_ref().map(|parent| crate::plan::cli::Rerun {
+                            parent: parent.clone(),
+                            from: from
+                                .iter()
+                                .cloned()
+                                .map(crucible::plan::ir::TaskName)
+                                .collect(),
+                        }),
                     },
                 )
             }

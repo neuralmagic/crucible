@@ -320,27 +320,29 @@ async fn adopt_dropbox_run_session(db: &Db, pod: &str) -> Result<Option<String>>
     Ok(Some(crate::runs::blob_store::gunzip_maybe(&payload.data)?))
 }
 
-/// Re-own the pod's `run-files` drop-box artifact to the run, so the files a run's tasks captured
-/// outlive the pod exactly as long as its session does ([`crate::runs::run_files`]). The bytes are the
-/// gzipped tar the loop POSTed and are stored unchanged; the tar is only ever read on the way out.
+/// Re-own one of the pod's tarred state directories, its `run-files` or its `run-commits`, to the
+/// run, so the files a run's tasks captured and the commits they made outlive the pod exactly as
+/// long as its session does ([`crate::runs::run_files`]). The bytes are the gzipped tar the loop
+/// POSTed and are stored unchanged; the tar is only ever read on the way out.
 ///
-/// Independent of the session: a run whose tasks declared no files POSTs no artifact and there is
-/// nothing to adopt, and a failure here is logged and dropped rather than wedging the completion —
-/// the session is the run's authoritative record and must land regardless.
-async fn adopt_dropbox_run_files(db: &Db, run_id: &str, pod: &str) -> Result<bool> {
+/// Independent of the session: a run that produced no such directory POSTs no artifact and there
+/// is nothing to adopt, and a failure here is logged and dropped rather than wedging the
+/// completion — the session is the run's authoritative record and must land regardless.
+async fn adopt_dropbox_bundle(
+    db: &Db,
+    run_id: &str,
+    pod: &str,
+    kind: crucible_contract::ArtifactKind,
+) -> Result<bool> {
     let owner = crate::runs::blob_store::ArtifactOwner::PodEvidence {
         pod: pod.to_string(),
     };
-    let Some(payload) = crate::runs::blob_store::get_artifact(
-        db.pool(),
-        &owner,
-        crucible_contract::ArtifactKind::RunFiles.as_str(),
-    )
-    .await?
+    let Some(payload) =
+        crate::runs::blob_store::get_artifact(db.pool(), &owner, kind.as_str()).await?
     else {
         return Ok(false);
     };
-    crate::runs::blob_store::put_run_files(db.pool(), run_id, payload.data).await?;
+    crate::runs::blob_store::put_run_bundle(db.pool(), run_id, kind, payload.data).await?;
     Ok(true)
 }
 
@@ -459,13 +461,18 @@ async fn scrape_pod_session(
             return Ok(None);
         }
     }
-    match adopt_dropbox_run_files(db, &run.run_id, pod).await {
-        Ok(true) => {
-            tracing::info!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, "run completion: captured files adopted from the Tier 2 drop-box");
-        }
-        Ok(false) => {}
-        Err(e) => {
-            tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, error = format!("{e:#}"), "run completion: adopting the drop-box run-files failed; the run keeps its session and loses its captured files");
+    for kind in [
+        crucible_contract::ArtifactKind::RunFiles,
+        crucible_contract::ArtifactKind::RunCommits,
+    ] {
+        match adopt_dropbox_bundle(db, &run.run_id, pod, kind).await {
+            Ok(true) => {
+                tracing::info!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, %kind, "run completion: bundle adopted from the Tier 2 drop-box");
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(issue_key = %key, run_id = %run.run_id, pod_name = %pod, %kind, error = format!("{e:#}"), "run completion: adopting a drop-box bundle failed; the run keeps its session and loses this evidence");
+            }
         }
     }
     // The pod is deleted minutes after this, and its log is the only copy of the engine's own

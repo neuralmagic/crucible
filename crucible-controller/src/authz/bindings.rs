@@ -223,6 +223,7 @@ pub static BINDINGS: &[Binding] = &[
     ),
     bind("GET", "/api/runs/{run_id}/log", R::Run, V::Read, Route),
     bind("GET", "/api/runs/{run_id}/files", R::Run, V::Read, Route),
+    bind("GET", "/api/runs/{run_id}/rerun", R::Run, V::Read, Route),
     bind(
         "GET",
         "/api/runs/{run_id}/files/{*key}",

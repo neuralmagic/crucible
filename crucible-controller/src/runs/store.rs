@@ -718,6 +718,7 @@ mod tests {
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups: None,
+                    rerun: None,
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )
@@ -854,6 +855,7 @@ mod tests {
                 advance_dedupe: false,
                 dedupe_schedule: None,
                 launcher_groups: None,
+                rerun: None,
                 origin: crate::model::LaunchOrigin::Manual,
                 draft_version: None,
                 created_by: Some("wren"),

@@ -517,7 +517,27 @@ pub struct RunOpts {
     pub agent: AgentOverride,
     /// Continue the playbook run the manifest's state dir holds instead of starting one.
     pub resume: bool,
+    /// Rerun a finished playbook run from some of its tasks instead of starting afresh.
+    pub rerun: Option<Rerun>,
 }
+
+/// A rerun's parent and the tasks it dispatches again.
+#[derive(Debug, Clone)]
+pub struct Rerun {
+    /// The finished run's state directory.
+    pub parent: std::path::PathBuf,
+    pub from: Vec<TaskName>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--rerun-of reruns a playbook run; {manifest} does not declare a playbook")]
+struct RerunNeedsPlaybook {
+    manifest: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("--rerun-of {} is this run's own state directory; copy the parent's state elsewhere first", .0.display())]
+struct RerunIntoParent(std::path::PathBuf);
 
 #[derive(Debug, thiserror::Error)]
 #[error("--resume continues a playbook run; {manifest} does not declare a playbook")]
@@ -593,6 +613,43 @@ pub fn parse_params(pairs: &[String]) -> Result<BTreeMap<String, String>> {
         .collect()
 }
 
+/// Keep the run's task commits beside its other evidence, so a rerun can replay them.
+fn record_git_memory(paths: &crate::args::Paths) -> Result<()> {
+    let start = RunStart::read(&paths.state)?;
+    let commits = crucible_vcs::git_memory::task_commits(&paths.workspace, &start.base)?;
+    crate::plan::rerun::write_git_memory(&paths.state, &start, &commits)?;
+    Ok(())
+}
+
+/// Seed a rerun: rebuild the workspace from the parent's base and the reused tasks' commits,
+/// restore their captured files, and record where this run started.
+fn start_rerun(
+    manifest: &Path,
+    loaded: &crate::manifest::Manifest,
+    paths: &crate::args::Paths,
+    run: &str,
+    plan: &ValidPlan,
+    rerun: &Rerun,
+) -> Result<Prior> {
+    let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    };
+    if same(&rerun.parent, &paths.state) {
+        return Err(RerunIntoParent(rerun.parent.clone()).into());
+    }
+    let parent = crate::plan::rerun::ParentDir::read(&rerun.parent)?;
+    let seeded = crate::plan::rerun::plan(plan, &parent.parent, &rerun.from)?;
+    let commits = seeded.evidence(plan, &parent)?;
+    let base = crate::cli::setup::restore_for_rerun(manifest, loaded, &parent.start, &commits)?;
+    seeded
+        .restore_captured(&parent, &paths.state)
+        .context("restoring the parent's captured files")?;
+    let tree = crucible_vcs::git_memory::tree_of(&paths.workspace, &base)?.unwrap_or_default();
+    RunStart::begin(run, base, tree, plan).write(&paths.state)?;
+    Ok(seeded.prior)
+}
+
 pub fn run(
     path: Option<&Path>,
     params: &BTreeMap<String, String>,
@@ -608,6 +665,7 @@ pub fn run(
         compute_driver,
         agent,
         resume,
+        rerun,
     } = opts;
 
     if let (None, Some(raw)) = (ceilings.wall_clock, ceilings.wall_clock_raw.as_ref()) {
@@ -624,6 +682,7 @@ pub fn run(
     let mut series_entry: Option<Option<TaskName>> = None;
     let mut playbook = false;
     let mut prior: Option<Prior> = None;
+    let mut resuming = false;
     // The run's agent knobs; None for a precompiled plan, which has no manifest.
     let mut agent_args: Option<crate::args::Args> = None;
     let (plan, mut runner, events): (ValidPlan, Box<dyn TaskRunner>, Option<std::fs::File>) =
@@ -649,6 +708,12 @@ pub fn run(
                     }
                     .into());
                 }
+                if rerun.is_some() && !playbook {
+                    return Err(RerunNeedsPlaybook {
+                        manifest: m.display().to_string(),
+                    }
+                    .into());
+                }
                 if playbook {
                     series_entry = Some(None);
                     let missing = match (ceilings.usd, ceilings.wall_clock) {
@@ -670,24 +735,14 @@ pub fn run(
                         let workflow = loaded.workflow.as_ref().ok_or_else(|| NoGraph {
                             manifest: m.display().to_string(),
                         })?;
-                        let caps =
-                            crate::plan::workflow::WorkflowCaps::for_lane(workflow.workflow_type)
-                                .with_persistent_sessions();
                         if workflow.workflow_type == crate::plan::workflow::WorkflowType::Playbook {
-                            workflow
-                                .admit(&caps)
-                                .context("admitting one-pass playbook")?;
                             series_entry = Some(workflow.history_record.clone());
-                            Plan {
-                                version: 1,
-                                reason: None,
-                                budget: crate::plan::ir::PlanBudget { usd: f64::MAX },
-                                params: workflow.params.clone(),
-                                tasks: workflow.tasks.clone(),
-                            }
-                            .validate()
-                            .context("building one-pass playbook")?
+                            workflow.playbook_plan()?
                         } else {
+                            let caps = crate::plan::workflow::WorkflowCaps::for_lane(
+                                workflow.workflow_type,
+                            )
+                            .with_persistent_sessions();
                             crate::plan::template::iteration_template(Some(workflow), &caps)?
                         }
                     }
@@ -695,8 +750,8 @@ pub fn run(
                 if let Some(usd) = ceilings.usd {
                     plan = plan.with_budget(usd)?;
                 }
-                match resumed {
-                    Some(resumed) => {
+                match (resumed, &rerun) {
+                    (Some(resumed), _) => {
                         resumed.continues(run, &plan)?;
                         crate::cli::setup::restore_pristine(m, &loaded, &resumed.base)?;
                         prior = Some(crate::plan::resume::fold_log(
@@ -704,14 +759,22 @@ pub fn run(
                             &plan,
                             resumed.elapsed(jiff::Timestamp::now()),
                         )?);
+                        resuming = true;
                         prepared.take_over();
                     }
-                    None if playbook => {
-                        let base = crucible_vcs::vcs::head_sha(&prepared.paths.workspace)
-                            .context("reading the workspace's starting commit")?;
-                        RunStart::begin(run, base, &plan).write(&state)?;
+                    (None, Some(rerun)) => {
+                        prior = Some(start_rerun(m, &loaded, &prepared.paths, run, &plan, rerun)?);
+                        prepared.take_over();
                     }
-                    None => {}
+                    (None, None) if playbook => {
+                        let workspace = &prepared.paths.workspace;
+                        let base = crucible_vcs::vcs::head_sha(workspace)
+                            .context("reading the workspace's starting commit")?;
+                        let tree = crucible_vcs::git_memory::tree_of(workspace, &base)?
+                            .unwrap_or_default();
+                        RunStart::begin(run, base, tree, &plan).write(&state)?;
+                    }
+                    (None, None) => {}
                 }
                 let f = std::fs::OpenOptions::new()
                     .create(true)
@@ -762,7 +825,7 @@ pub fn run(
     }
     let substrate = Substrate::detecting(caps, &crucible::inference::from_process_env()?);
     if let Some(f) = &events {
-        if let Some(prior) = &prior {
+        if let Some(prior) = prior.as_ref().filter(|_| resuming) {
             append(
                 f,
                 &crate::report::session::SessionEvent::Recovery {
@@ -788,6 +851,21 @@ pub fn run(
                     series_entry.as_ref().and_then(Option::as_ref),
                 ),
             );
+            if let Some(prior) = &prior {
+                for (task, result) in prior.rows(&plan) {
+                    if let Some(from) = prior.reused.get(&task.name) {
+                        append(
+                            f,
+                            &crate::plan::events::reused_result_event(
+                                plan.plan().version,
+                                &task,
+                                result,
+                                from,
+                            ),
+                        );
+                    }
+                }
+            }
         }
     }
     let selected_results: std::collections::BTreeSet<_> = plan
@@ -936,6 +1014,11 @@ pub fn run(
             None => format!("completed early by {task}"),
         },
     };
+    if let Some(p) = evidence.as_ref().filter(|_| playbook)
+        && let Err(error) = record_git_memory(p)
+    {
+        eprintln!("git memory could not be kept for a rerun: {error:#}");
+    }
     if let (Some(f), Some(record)) = (&events, &series_entry)
         && !prior.as_ref().is_some_and(|p| p.recorded_history)
     {
@@ -1568,7 +1651,7 @@ mod tests {
         let receiver = std::thread::spawn(move || {
             listener
                 .incoming()
-                .take(2)
+                .take(4)
                 .map(|s| read_one_post(&mut s.expect("accept")))
                 .collect::<Vec<_>>()
         });
@@ -1661,9 +1744,21 @@ mod tests {
         drop(_ingest);
 
         let posts = receiver.join().expect("receiver");
-        assert_eq!(posts.len(), 2, "both runs deliver");
-        for ((path, body), outcome) in posts.iter().zip(["finished", "error"]) {
-            assert_eq!(path, "/api/pods/crucible-run-pod/artifacts/run-session");
+        let paths: Vec<&str> = posts.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "/api/pods/crucible-run-pod/artifacts/run-session",
+                "/api/pods/crucible-run-pod/artifacts/run-commits",
+                "/api/pods/crucible-run-pod/artifacts/run-session",
+                "/api/pods/crucible-run-pod/artifacts/run-commits",
+            ],
+            "each run delivers its session and its git memory"
+        );
+        let sessions = posts
+            .iter()
+            .filter(|(path, _)| path.ends_with("/run-session"));
+        for ((_, body), outcome) in sessions.zip(["finished", "error"]) {
             assert_eq!(&body[..2], b"\x1f\x8b", "the body is gzip");
             let mut text = String::new();
             std::io::Read::read_to_string(

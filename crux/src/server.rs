@@ -765,6 +765,7 @@ impl CrucibleMcp {
                     dispatch_target: a.dispatch_target,
                     provider: a.provider,
                     model: a.model,
+                    rerun: None,
                 },
                 a.json,
             )
@@ -854,6 +855,7 @@ impl CrucibleMcp {
                     dispatch_target: a.dispatch_target,
                     provider: a.provider,
                     model: a.model,
+                    rerun: None,
                 },
                 a.json,
             )
