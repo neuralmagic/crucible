@@ -1,8 +1,8 @@
 # Crucible implementation contract (frozen interface)
 
-This is the spec for the interface between the engine (`crucible`) and a
-domain. The engine implements it, a domain satisfies it, and a minimal fake domain
-(`examples/counter/`) tests it end-to-end with no EPP and no cluster.
+This is the specification of the interface between the engine (`crucible`) and a
+domain. The engine implements it, and a domain satisfies it. A minimal fake domain
+(`examples/counter/`) tests it end to end without EPP and without a cluster.
 
 Concept: [The loop in one read](./crucible.md).
 Trust line (engine hands the agent a World, never a Judge): [ADR 0001](./adr/0001-adaptive-harness.md).
@@ -97,7 +97,9 @@ policy_k   = 1                                # how many wide-round winners seed
 ```
 
 Rules:
-- **Required:** `[repo]` (url xor path), `[judge].measure_cmd`, `[judge].direction`.
+- **Required:** `[agent]`. A scored run also requires `[repo]` (url xor path),
+  `[judge].measure_cmd`, and `[judge].direction`. A playbook can omit `[repo]`. A manifest
+  without `[judge]` is a task ([the task lane](./task-lane.md)).
 - `[world]` with no commands ⇒ **GitWorld** (§5). Any command given ⇒ **CommandWorld** (§5),
   which still owns git memory and layers the given commands on top.
 - `[judge.selftest]`, if present, requires both `good_cmd` and `bad_cmd` (a self-test that only
@@ -309,8 +311,8 @@ new authoritative delta: current regime, current-best status, and new steering. 
 session already holds the stable instructions and hypotheses, while the current checkout and
 `RESULTS.md` remain authoritative after any world rollback.
 
-A custom orchestrator can admit a graph with no research lifecycle at all—for example, a creative
-studio that fans out three treatments, curates them, and publishes a contact sheet:
+A custom orchestrator can admit a graph without a research lifecycle. For example, a creative
+studio fans out three treatments, curates them, and publishes a contact sheet:
 
 ```python
 treatments = [
@@ -328,7 +330,7 @@ publish = command(name = "contact-sheet", run = "./render.sh", depends_on = [cur
 workflow(type = "custom", tasks = treatments + [curate, publish], result = publish)
 ```
 
-That graph requires `workflow.custom`; it does not pretend to satisfy autoresearch just because it
+That graph requires `workflow.custom`. It does not satisfy the autoresearch shape, although it
 uses agents and commands.
 
 This is Starlark over a constructor-only global surface: assignments, strings, numbers, booleans,
@@ -417,7 +419,7 @@ Scope validation renders the admitted graph to `WORKFLOW.png` for the scope PR, 
 
 ---
 
-### 1.9 `[outputs]` and `[capabilities]` — declared writes and disclosed reach
+### 1.9 `[outputs]` and `[capabilities]`: declared writes and disclosed reach
 
 `[outputs]` bounds the run's mediated writes (RFC-0001:C-OUTPUTS). The kind vocabulary is closed
 and engine-defined; a kind outside it is a manifest error.
@@ -456,9 +458,9 @@ posture. A default whose target does not resolve refuses every write of that kin
 Bounds are enforced in the broker, at one chokepoint every mutating tool routes through. They are
 projected there from the frozen manifest as `BROKER_OUTPUTS` (with `BROKER_OUTPUT_PARAMS` and
 `BROKER_SESSION_LOG`), handed to the broker child only, so nothing inside the sandbox can alter
-one. The two kinds the engine writes itself rather than through a broker tool — the draft PRs
-publish-on-keep opens and the `workflow_dispatch` a `github-actions` build fires — are mediated in
-the engine against the same resolved value. A write over a count or outside a scope fails that
+one. The engine writes two kinds itself, not through a broker tool: the draft PRs that
+publish-on-keep opens, and the `workflow_dispatch` that a `github-actions` build fires. The
+engine mediates these against the same resolved value. A write over a count or outside a scope fails that
 write naming the bound, writes an `output_refused` row on the session log, and does not terminate
 the run: publishing skips the remaining candidates and the run completes.
 
@@ -560,7 +562,7 @@ Rules that are easy to get wrong, and that `crucible check` should catch before 
   loop's fastest feedback signal: a compile error is returned to the agent as a *free retry* with no
   candidate spent. An `apply_cmd` that collapses "did not compile" into "scored badly" throws that
   away.
-- **A Containerfile on the measured path is part of the judge, not part of the solution.** If the
+- **A Containerfile on the measured path belongs to the judge.** If the
   build recipe lives in the agent's workspace, it must be a `frozen = true` inject (§1), re-copied
   before every scored measure. Otherwise the agent can edit the recipe that builds the artifact it
   is scored on (vendor a prebuilt binary, neuter the compile), which is the ADR-0001 trust line,
@@ -606,12 +608,12 @@ better(s, b, higher) = s > b
 tiebreak counts as the worst value. A reading without a `tiebreak` ties exactly as before:
 discard.
 
-- **`solved` implies `keep`.** A win is the whole point, so a candidate the measure command
-  declares `solved` is kept (and terminates the loop) *even if its score doesn't strictly beat
-  best*. This is load-bearing for any domain whose win lands at an equal score: EPP's test gate
-  wins with a green suite (0 failures == the baseline's 0) plus a new regression test. Without
-  `|| solved` that win would be discarded and the loop would never finish. `solved` never
-  rescues an invalid reading.
+- **`solved` implies `keep`.** The engine keeps a candidate that the measure command declares
+  `solved`, and ends the loop, *even if its score is not strictly better than the best*. This
+  rule is necessary for a domain whose win has an equal score. For example, the EPP test gate
+  wins with a passing suite (0 failures, equal to the 0 of the baseline) and a new regression
+  test. Without `|| solved`, the engine would discard that win, and the loop would not finish.
+  `solved` does not make an invalid reading valid.
 - The **first valid reading** sets the baseline (`best_score`, and `baseline_total` =
   `detail.total` if present) and is always kept.
 - The loop terminates when a kept iteration is `solved`, or budget/iterations exhausted, or
@@ -661,9 +663,10 @@ hands it + the workspace to an agent that edits the workspace, and never hands i
   (node selector, tolerations, runtime class) is added to every GPU sandbox, and a selector key it
   sets keeps its value over the pack's.
 - **`command`**: run `[agent].agent_cmd` via `sh -c` in the workspace as the proposal. A
-  *deterministic, free* proposer (no LLM). This is a real transport, not a mock: it makes the
-  minimal example a fast, deterministic e2e (e.g. `agent_cmd = "./bump.nu"` increments a
-  counter). Use it to test the engine's loop/protocol without burning tokens.
+  *deterministic* proposer with no cost (no LLM). It is a real transport. With it, the
+  minimal example is a fast, deterministic e2e test (for example, `agent_cmd = "./bump.nu"`
+  increments a counter). Use it to test the loop and protocol of the engine without token
+  cost.
 
 ### One vs two execution environments (the only backend fact a domain must know)
 
@@ -681,11 +684,11 @@ hands it + the workspace to an agent that edits the workspace, and never hands i
   `sandbox_image`.
 
 The manifest `[agent]` block (`backend`, `sandbox_image`, `env`, `relay`, `openshell`) *selects and
-configures* the backend; flipping `local`↔`openshell` is config, not code. What the manifest
-cannot do is *build* the sandbox image or inject creds for you, that's the inherent cost of
-sandboxing, called out here so it's a known rule, not a surprise. Reversibility commands
-(`snapshot`/`restore`) run engine-side, so they reach the live system directly regardless of
-backend; only the agent is boxed.
+configures* the backend. A change between `local` and `openshell` is a configuration change.
+It needs no code change. The manifest cannot *build* the sandbox image or supply credentials.
+The domain must do this for a sandbox. Reversibility commands (`snapshot`/`restore`) run in
+the engine environment, so they reach the live system directly with every backend. Only the
+agent runs in the sandbox.
 
 ### 6.1 Sandbox egress (`[agent.openshell]`)
 
@@ -716,11 +719,12 @@ The broker endpoint is **auto-appended** by the engine when `[agent.broker].enab
 (ADR-0019 P2). The engine first resolves the broker URL (an explicit `[agent.broker].url`
 override, or derived from the active compute driver's hostname), then derives the egress
 `host:port:full` entry from that URL's authority. When no explicit port is present, the scheme
-default applies (`http` = 80, `https` = 443). Because both are derived from the same resolved
-URL, the allowlist entry and the address the sandbox contacts cannot disagree. The broker
-endpoint is appended regardless of `inherit_defaults`, because the broker is engine plumbing
-the domain opted into, not a built-in the domain can subtract. A broker-less opt-out with both
-lists empty is still a legal total air-gap: nothing resolves, and no binary may open a socket.
+default applies (`http` = 80, `https` = 443). Both values come from the same resolved URL, so
+the allowlist entry and the address that the sandbox contacts are always the same. The engine
+appends the broker endpoint for every value of `inherit_defaults`, because the domain enabled
+the broker. A domain cannot remove it as it removes a built-in. A configuration without a
+broker and with both lists empty is a valid total air-gap: no host resolves, and no binary can
+open a socket.
 
 ### 6.2 MCP token file (`MCP_TOKENS_FILE`)
 
@@ -875,7 +879,7 @@ Additive event kinds beyond the compat set include:
   run (after `finished`/`summary`). `outcome` is one of `finished`/`solved`/`budget`/`stopped`/
   `escalated`/`stalled`/`error`. Session-log consumers key a run's terminal state off this line; a
   dead stream with **no** `shutdown` line means the pod likely died mid-run, not a clean exit.
-  `--resume` consumes this invariant, not just documents it: a resumed run classifies the log
+  `--resume` depends on this invariant: a resumed run classifies the log
   tail (see `recovery` below) and a trailing `shutdown` is the "exited on purpose" signal. In a
   resumed (appended) log, only the **trailing** `shutdown` counts; one followed by more events
   belongs to an earlier process.
@@ -917,8 +921,8 @@ stop, abort) is recorded in a second NDJSON file, `state/admissions.jsonl`, befo
 effect. Same envelope shape as the session log (`{"v":1,"kind":…}`, blank/torn lines skipped),
 two kinds:
 
-- **`admitted`**: `{ key, seq, ts, input, …payload }` — `input` is the command token and the
-  payload is flattened alongside it (`{"input":"rescope","regime":"c=48"}`).
+- **`admitted`**: `{ key, seq, ts, input, …payload }`. `input` is the command token, and the
+  payload fields are at the same level (`{"input":"rescope","regime":"c=48"}`).
 - **`settled`**: `{ key, outcome, ts, note }` with `outcome` one of `applied`/`superseded`/
   `rejected`.
 
@@ -983,7 +987,7 @@ noted here tersely so this doc stays the map of what's authoritative:
   is reachable by the agent's own edits: a `measure_cmd` token pointing inside the workspace with
   no matching frozen inject). Exit nonzero with findings on failure; warnings never fail it.
 - **`crucible scope --pack <dir> [--issue owner/repo#N | --goal-file <f>] [--force] [--json]`**
-  (ADR-0014 S0): pipeline over a hand-written domain pack. **ingest** the goal (from `--issue`,
+  (ADR-0014 S0): pipeline over a hand-written domain pack. **resolve** the goal (from `--issue`,
   fetched natively from the GitHub REST API (honors `GITHUB_TOKEN`/`GH_TOKEN` and
   `GITHUB_API_URL`), or `--goal-file`, or the pack's own `[agent].goal`/`goal_file`),
   then **validate** (`crucible check`, as a library call), then **freeze** (writes `SCOPE.md` in
