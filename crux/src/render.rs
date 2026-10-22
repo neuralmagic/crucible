@@ -997,6 +997,48 @@ pub fn playbook_caps(caps: &dto::PlaybookCaps) -> String {
     )
 }
 
+/// `-` for a provider with no price, which the engine prices by the vendor's list price, or at
+/// nothing for a model no vendor sells.
+fn price(p: Option<&dto::ProviderPrice>) -> String {
+    match p {
+        Some(p) => format!(
+            "{}/{}/{}/{}",
+            p.input, p.output, p.cache_read, p.cache_write
+        ),
+        None => "-".to_string(),
+    }
+}
+
+pub fn providers(list: &[dto::Provider]) -> String {
+    if list.is_empty() {
+        return "no providers registered\n".to_string();
+    }
+    let rows: Vec<Vec<String>> = list
+        .iter()
+        .map(|p| {
+            vec![
+                p.id.clone(),
+                p.kind.clone(),
+                p.default_model.clone(),
+                p.harness.clone().unwrap_or_else(|| "-".to_string()),
+                price(p.price.as_ref()),
+                if p.enabled { "yes" } else { "no" }.to_string(),
+                p.owner.clone(),
+            ]
+        })
+        .collect();
+    format!(
+        "{} providers (price: USD per million tokens, input/output/cache read/cache write)\n{}",
+        list.len(),
+        table(
+            &[
+                "ID", "KIND", "MODEL", "HARNESS", "PRICE", "ENABLED", "OWNER"
+            ],
+            &rows
+        )
+    )
+}
+
 pub fn secrets(list: &[dto::Secret]) -> String {
     if list.is_empty() {
         return "no secrets you own\n".to_string();
@@ -2817,5 +2859,46 @@ mod tests {
             ["owner_repo_7-1720000000", "-", "finished"],
             "{out}"
         );
+    }
+
+    /// The provider table names each registration's price per million tokens, bucket by bucket,
+    /// and a dash for one the engine prices from the vendor's list.
+    #[test]
+    fn providers_show_the_price_per_million_tokens() {
+        let list: Vec<dto::Provider> = serde_json::from_str(
+            r#"[
+              {"id":"selfhosted","display_name":"Self-hosted","kind":"custom","models":[],
+               "default_model":"zai-org/glm-5","harness":"claude","roles":["agent"],
+               "price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.6},
+               "enabled":true,"owner":"platform","created_by":"wren",
+               "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
+               "actions":[]},
+              {"id":"plat-openai","display_name":"OpenAI","kind":"openai","models":[],
+               "default_model":"gpt-5.6-luna","harness":"codex","roles":["agent"],
+               "price":null,"enabled":false,"owner":"platform","created_by":"wren",
+               "created_at":"2026-10-22T00:00:00Z","updated_at":"2026-10-22T00:00:00Z",
+               "actions":[]}
+            ]"#,
+        )
+        .expect("wire shape");
+        let out = providers(&list);
+        assert!(out.starts_with("2 providers"), "{out}");
+        assert!(out.contains("PRICE"), "{out}");
+        let rows: Vec<&str> = out.lines().collect();
+        let row = rows
+            .iter()
+            .find(|l| l.starts_with("selfhosted"))
+            .expect("row");
+        assert!(row.contains("0.6/2.2/0.11/0.6"), "{row}");
+        assert!(row.contains("yes"), "{row}");
+        let openai = rows
+            .iter()
+            .find(|l| l.starts_with("plat-openai"))
+            .expect("row");
+        assert!(
+            openai.contains("  -  ") && openai.contains("no"),
+            "{openai}"
+        );
+        assert_eq!(providers(&[]), "no providers registered\n");
     }
 }

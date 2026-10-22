@@ -3257,6 +3257,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -3331,6 +3332,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -5041,6 +5043,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -5155,6 +5158,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
                 url: None,
                 model: "gpt-5.6-luna".to_string(),
                 key_env: key_env("CRUCIBLE_INFERENCE_KEY_AGENT"),
+                price: None,
             },
             InferenceBinding {
                 role: InferenceRole::Decision,
@@ -5162,6 +5166,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
                 url: None,
                 model: "gpt-6-luna".to_string(),
                 key_env: key_env("CRUCIBLE_INFERENCE_KEY_DECISION"),
+                price: None,
             },
         ]
     );
@@ -5215,6 +5220,7 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -5284,10 +5290,13 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
     Ok(())
 }
 
-/// A custom provider hands the pod where to reach it in the inference document beside the
-/// secretKeyRef that carries its key, and the harness flag its protocol decides.
+/// A custom provider hands the pod where to reach it and what its tokens cost in the inference
+/// document beside the secretKeyRef that carries its key, and the harness flag its protocol
+/// decides.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPool) -> Result<()> {
+async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
+    pool: sqlx::PgPool,
+) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir()?;
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
@@ -5295,6 +5304,13 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
     let endpoint = crate::playbooks::providers::Endpoint {
         url: "http://vllm.internal:8000/v1".to_string(),
         protocol: crate::playbooks::providers::InferenceProtocol::Responses,
+    };
+    let usd = |v| crucible_contract::inference::UsdPerMtok::new(v).expect("a price");
+    let price = crucible_contract::inference::TokenPrice {
+        input: usd(0.6),
+        output: usd(2.2),
+        cache_read: usd(0.11),
+        cache_write: usd(0.6),
     };
     crate::playbooks::providers::upsert(
         &pool,
@@ -5314,6 +5330,7 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: Some(price),
         },
     )
     .await?;
@@ -5387,6 +5404,7 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
             url: Some("http://vllm.internal:8000/v1".to_string()),
             model: "gpt-oss-120b".to_string(),
             key_env: Some(EnvName::new("CRUCIBLE_INFERENCE_KEY_AGENT").expect("a name")),
+            price: Some(price),
         }]
     );
     assert!(var("OPENAI_BASE_URL").is_none() && var("OPENAI_API_KEY").is_none());
@@ -5453,6 +5471,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
         created_by: "alice".to_string(),
         created_at: String::new(),
         updated_at: String::new(),
+        price: None,
     };
     // Registered, but its credentials map also sets the variable the scope's own binding holds.
     crate::testing::register_inference_key(&pool, "user:platform-admin", "pr_token").await?;

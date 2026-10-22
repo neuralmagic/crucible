@@ -535,6 +535,7 @@ async fn register_ranker(db: &Db, url: &str) -> Result<()> {
             secret: None,
             endpoint: Some(&endpoint),
             harness: None,
+            price: None,
             enabled: true,
             created_by: "e2e",
         },

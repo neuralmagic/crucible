@@ -379,6 +379,11 @@ impl Client {
         self.get("/api/config/playbook-caps").await
     }
 
+    /// Every provider registration the caller may read, disabled ones included.
+    pub async fn providers<T: DeserializeOwned>(&self) -> Result<T> {
+        self.get("/api/providers").await
+    }
+
     /// The secrets the caller owns or is an owner-group member of. Metadata only.
     pub async fn secrets<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/secrets").await
