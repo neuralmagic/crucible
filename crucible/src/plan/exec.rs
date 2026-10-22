@@ -20,7 +20,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
-use crate::plan::admission::{Admission, Refusal};
+use crate::plan::admission::{Admission, BatchLane, Refusal, Settled};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
     COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
@@ -140,6 +140,22 @@ pub struct Attempt {
     pub cost_usd: f64,
     /// The repair turns this attempt took, in order.
     pub repairs: Vec<TaskRepair>,
+}
+
+impl Settled for Attempt {
+    fn cost_usd(&self) -> f64 {
+        self.cost_usd
+    }
+
+    fn panicked() -> Self {
+        Attempt::failed(0.0, "task thread panicked".to_string())
+    }
+}
+
+impl BatchLane for BatchItem<'_> {
+    fn task(&self) -> &Task {
+        self.task
+    }
 }
 
 impl Attempt {

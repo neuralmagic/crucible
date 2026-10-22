@@ -9,12 +9,22 @@ use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
 use crate::deadline::{Deadline, RunCeiling};
-use crate::plan::exec::{Attempt, BatchItem};
 use crate::plan::ir::Task;
 use crate::plan::machine::BlockedReason;
 
 /// Lanes of one dispatch in flight at once, unless the executor is configured otherwise.
 pub const DEFAULT_WIDTH: NonZeroUsize = NonZeroUsize::MIN.saturating_add(7);
+
+/// What a lane's attempt cost, and the result a lane that panicked settles as.
+pub trait Settled {
+    fn cost_usd(&self) -> f64;
+    fn panicked() -> Self;
+}
+
+/// One lane of a batch: the task it runs.
+pub trait BatchLane {
+    fn task(&self) -> &Task;
+}
 
 /// Which ceiling refused a lane. The lane never started.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,18 +145,18 @@ impl Admission {
     }
 
     /// Count what an admitted lane cost and retire its running figure.
-    fn settle(&self, lane: Lane<'_>, attempt: &Attempt) {
+    fn settle(&self, lane: Lane<'_>, attempt: &impl Settled) {
         let mut tally = self.tally();
         tally.live.remove(&lane.id);
-        tally.settled += attempt.cost_usd;
+        tally.settled += attempt.cost_usd();
     }
 
     /// Run one lane of `task` if the ceilings admit it, and count what it cost.
-    pub fn run(
+    pub fn run<A: Settled>(
         &self,
         task: &Task,
-        lane: impl FnOnce(&Lane<'_>) -> Attempt,
-    ) -> Result<Attempt, Refusal> {
+        lane: impl FnOnce(&Lane<'_>) -> A,
+    ) -> Result<A, Refusal> {
         let admitted = self.admit(task)?;
         let attempt = lane(&admitted);
         self.settle(admitted, &attempt);
@@ -156,26 +166,28 @@ impl Admission {
     /// Run every lane of `batch` on at most `width` threads. Lanes are admitted in
     /// batch order as each starts, so once one is refused on cost every later lane that can spend
     /// is too. Results are in batch order. A lane that panics settles as a measured failure.
-    pub fn run_all<F>(&self, batch: &[BatchItem<'_>], lane: F) -> Vec<Result<Attempt, Refusal>>
+    pub fn run_all<I, A, F>(&self, batch: &[I], lane: F) -> Vec<Result<A, Refusal>>
     where
-        F: Fn(&BatchItem<'_>, &Lane<'_>) -> Attempt + Sync,
+        I: BatchLane + Sync,
+        A: Settled + Send + Sync,
+        F: Fn(&I, &Lane<'_>) -> A + Sync,
     {
-        let guarded = |item: &BatchItem<'_>, admitted: &Lane<'_>| {
+        let guarded = |item: &I, admitted: &Lane<'_>| {
             std::panic::catch_unwind(AssertUnwindSafe(|| lane(item, admitted)))
-                .unwrap_or_else(|_| Attempt::failed(0.0, "task thread panicked".to_string()))
+                .unwrap_or_else(|_| A::panicked())
         };
         if let [only] = batch {
-            return vec![self.run(only.task, |admitted| guarded(only, admitted))];
+            return vec![self.run(only.task(), |admitted| guarded(only, admitted))];
         }
         let next = Mutex::new(0usize);
-        let slots: Vec<OnceLock<Result<Attempt, Refusal>>> =
+        let slots: Vec<OnceLock<Result<A, Refusal>>> =
             batch.iter().map(|_| OnceLock::new()).collect();
         let take = || {
             let mut next = next.lock().unwrap_or_else(PoisonError::into_inner);
             let i = *next;
             let item = batch.get(i)?;
             *next += 1;
-            Some((item, slots.get(i)?, self.admit(item.task)))
+            Some((item, slots.get(i)?, self.admit(item.task())))
         };
         std::thread::scope(|scope| {
             for _ in 0..self.width.get().min(batch.len()) {
@@ -193,10 +205,7 @@ impl Admission {
         });
         slots
             .into_iter()
-            .map(|slot| {
-                slot.into_inner()
-                    .unwrap_or_else(|| Ok(Attempt::failed(0.0, "task thread panicked".to_string())))
-            })
+            .map(|slot| slot.into_inner().unwrap_or_else(|| Ok(A::panicked())))
             .collect()
     }
 }
