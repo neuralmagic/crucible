@@ -152,9 +152,10 @@ export function emptyRegisterForm(owner: string): RegisterForm {
 /// The owner a form actually registers under. The options arrive with the session, which lands
 /// after the first render, so a form that still holds an owner nobody offers falls back to the
 /// first one rather than submitting a principal the caller does not hold.
-export function withOwners(form: RegisterForm, owners: readonly PickOption[]): RegisterForm {
+export function withOwners(form: RegisterForm, owners: readonly PickOption[], preferred?: string): RegisterForm {
   if (owners.some((owner) => owner.value === form.owner)) return form;
-  return { ...form, owner: owners[0]?.value ?? '' };
+  const fallback = owners.find((owner) => owner.value === preferred) ?? owners[0];
+  return { ...form, owner: fallback?.value ?? '' };
 }
 
 /// Changing the kind can invalidate the visibility that was chosen under the previous one, and an
