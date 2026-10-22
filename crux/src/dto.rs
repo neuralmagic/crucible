@@ -712,6 +712,33 @@ pub struct PlaybookCaps {
     pub max_time: String,
 }
 
+/// An inference provider registration as the admin list returns it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Provider {
+    pub id: String,
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub default_model: String,
+    #[serde(default)]
+    pub harness: Option<String>,
+    #[serde(default)]
+    pub price: Option<ProviderPrice>,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub owner: String,
+}
+
+/// USD per million tokens for each billed bucket.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct ProviderPrice {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+}
+
 /// A registry secret's metadata. The value never leaves the controller.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Secret {

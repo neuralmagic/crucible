@@ -618,6 +618,7 @@ mod tests {
             url: Some("http://dgemma:8011/v1/systemone".into()),
             model: "dgemma".into(),
             key_env: key_env.map(|name| EnvName::new(name).unwrap()),
+            price: None,
         }
     }
 

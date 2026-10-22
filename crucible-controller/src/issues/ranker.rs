@@ -1197,6 +1197,7 @@ mod tests {
                 harness: None,
                 enabled: true,
                 created_by: "test",
+                price: None,
             },
         )
         .await?;
@@ -1228,6 +1229,7 @@ mod tests {
                 created_by: "t".to_string(),
                 created_at: String::new(),
                 updated_at: String::new(),
+                price: None,
             },
             model: "m".to_string(),
             harness: crucible::manifest::Harness::Claude,

@@ -180,6 +180,15 @@ are skipped and listed as `ignored`, a symlink is refused, and `local tree:` pri
 directory's `tree1:` digest.
 `skills/draft-a-playbook/SKILL.md` is the full authoring workflow.
 
+### `providers`
+
+```
+$ crux providers                                 # id, kind, model, harness, price, enabled, owner
+```
+
+`PRICE` is USD per million tokens as `input/output/cache read/cache write`. A dash means the
+engine prices the run from the vendor's list, which charges nothing for a model no vendor sells.
+
 ### `secrets` / `secret-bind`
 
 ```
