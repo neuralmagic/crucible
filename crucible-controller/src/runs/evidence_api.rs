@@ -1,7 +1,9 @@
-//! A pod's evidence over HTTP (RFC-0004:C-RUN-EVIDENCE): `PUT /api/runs/{run}/evidence/{kind}`
+//! A pod's evidence over HTTP (RFC-0004:C-RUN-EVIDENCE): `PUT /api/evidence/runs/{run}/{kind}`
 //! stores what a run pod uploads as the run's own artifact, and `GET` hands the gzipped bytes back
-//! to the run's rerun or to a person. `PUT /api/turns/{pod}/evidence/{kind}` stores a scope turn's
+//! to the run's rerun or to a person. `PUT /api/evidence/turns/{pod}/{kind}` stores a scope turn's
 //! pack and transcript under its pod, for the turn's collection to check against its manifest.
+//! The same handlers answer the earlier `/api/runs/{run}/evidence/{kind}` and
+//! `/api/turns/{pod}/evidence/{kind}` for loop images that still use them.
 //!
 //! The routes carry their own guard, [`require_pod_token_or_human`]: a `crr_` bearer is checked as
 //! a pod token and answers with its [`Grant`], and anything else goes through the human guard
@@ -32,6 +34,8 @@ pub(crate) struct EvidenceState {
 
 pub(crate) fn router(state: EvidenceState) -> Router {
     Router::new()
+        .route("/api/evidence/runs/{run_id}/{kind}", put(upload).get(fetch))
+        .route("/api/evidence/turns/{pod}/{kind}", put(upload_turn))
         .route("/api/runs/{run_id}/evidence/{kind}", put(upload).get(fetch))
         .route("/api/turns/{pod}/evidence/{kind}", put(upload_turn))
         .layer(axum::middleware::from_fn_with_state(
@@ -85,7 +89,7 @@ fn fetchable(kind: ArtifactKind) -> bool {
     )
 }
 
-/// `PUT /api/runs/{run_id}/evidence/{kind}`: store the gzipped body as the run's `kind`, replacing
+/// `PUT /api/evidence/runs/{run_id}/{kind}`: store the gzipped body as the run's `kind`, replacing
 /// any earlier upload. Run token only.
 async fn upload(
     grant: Option<Extension<Grant>>,
@@ -151,7 +155,7 @@ async fn upload(
     }
 }
 
-/// `GET /api/runs/{run_id}/evidence/{kind}`: the run's `kind` as gzipped bytes, from the store, or
+/// `GET /api/evidence/runs/{run_id}/{kind}`: the run's `kind` as gzipped bytes, from the store, or
 /// for a local run from its directory on this controller's disk.
 async fn fetch(
     grant: Option<Extension<Grant>>,
@@ -232,7 +236,7 @@ async fn evidence_bytes(
     .map_err(anyhow::Error::from)
 }
 
-/// `PUT /api/turns/{pod}/evidence/{kind}`: store a scope turn's gzipped pack or transcript under
+/// `PUT /api/evidence/turns/{pod}/{kind}`: store a scope turn's gzipped pack or transcript under
 /// its pod and record the pointer its collection checks against the turn's manifest. The turn's
 /// own pod token only.
 async fn upload_turn(
@@ -411,7 +415,7 @@ mod tests {
             let (status, resp) = call(
                 &app,
                 "PUT",
-                &format!("/api/runs/run-b/evidence/{kind}"),
+                &format!("/api/evidence/runs/run-b/{kind}"),
                 Some(&token),
                 body.clone(),
             )
@@ -448,13 +452,52 @@ mod tests {
         let (status, got) = call(
             &app,
             "GET",
-            "/api/runs/run-b/evidence/run-commits",
+            "/api/evidence/runs/run-b/run-commits",
             Some(&token),
             Vec::new(),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(got, gz(b"commits-tar"));
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn the_earlier_evidence_paths_still_store_and_serve(pool: PgPool) {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let app = app(&pool, scratch.path());
+        let run = mint(&pool, &Subject::Run("run-b".to_string()), None, HOUR)
+            .await
+            .expect("mint run");
+        let body = gz(b"{\"v\":1}\n");
+        let (status, _) = call(
+            &app,
+            "PUT",
+            "/api/runs/run-b/evidence/run-session",
+            Some(&run),
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, got) = call(
+            &app,
+            "GET",
+            "/api/evidence/runs/run-b/run-session",
+            Some(&run),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got, body);
+        let (status, got) = call(
+            &app,
+            "GET",
+            "/api/runs/run-b/evidence/run-session",
+            Some(&run),
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(got, body);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -483,7 +526,7 @@ mod tests {
         let (status, got) = call(
             &app,
             "GET",
-            "/api/runs/run-a/evidence/run-files",
+            "/api/evidence/runs/run-a/run-files",
             Some(&token),
             Vec::new(),
         )
@@ -494,7 +537,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "GET",
-            "/api/runs/run-c/evidence/run-files",
+            "/api/evidence/runs/run-c/run-files",
             Some(&token),
             Vec::new(),
         )
@@ -505,7 +548,7 @@ mod tests {
             let (status, _) = call(
                 &app,
                 "PUT",
-                &format!("/api/runs/{run}/evidence/run-files"),
+                &format!("/api/evidence/runs/{run}/run-files"),
                 Some(&token),
                 gz(b"overwrite"),
             )
@@ -536,7 +579,7 @@ mod tests {
         let (status, got) = call(
             &app,
             "GET",
-            "/api/runs/run-a/evidence/run-session",
+            "/api/evidence/runs/run-a/run-session",
             Some(MACHINE),
             Vec::new(),
         )
@@ -550,7 +593,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "GET",
-            "/api/runs/run-a/evidence/run-session",
+            "/api/evidence/runs/run-a/run-session",
             None,
             Vec::new(),
         )
@@ -564,7 +607,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "PUT",
-            "/api/runs/run-a/evidence/run-session",
+            "/api/evidence/runs/run-a/run-session",
             Some(MACHINE),
             gz(b"forged"),
         )
@@ -586,7 +629,7 @@ mod tests {
             let (status, body) = call(
                 &app,
                 "PUT",
-                "/api/runs/run-b/evidence/run-session",
+                "/api/evidence/runs/run-b/run-session",
                 Some(bearer),
                 gz(b"x"),
             )
@@ -608,7 +651,7 @@ mod tests {
             let (status, _) = call(
                 &app,
                 "PUT",
-                &format!("/api/runs/run-b/evidence/{kind}"),
+                &format!("/api/evidence/runs/run-b/{kind}"),
                 Some(&token),
                 gz(b"x"),
             )
@@ -619,7 +662,7 @@ mod tests {
             let (status, _) = call(
                 &app,
                 "GET",
-                &format!("/api/runs/run-b/evidence/{kind}"),
+                &format!("/api/evidence/runs/run-b/{kind}"),
                 Some(&token),
                 Vec::new(),
             )
@@ -629,7 +672,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "GET",
-            "/api/runs/run-b/evidence/run-session",
+            "/api/evidence/runs/run-b/run-session",
             Some(&token),
             Vec::new(),
         )
@@ -648,7 +691,7 @@ mod tests {
         let (status, body) = call(
             &app,
             "PUT",
-            "/api/runs/run-b/evidence/otel-log",
+            "/api/evidence/runs/run-b/otel-log",
             Some(&token),
             over,
         )
@@ -680,7 +723,7 @@ mod tests {
                 call(
                     &app,
                     "GET",
-                    &format!("/api/runs/playbook:x%231-17/evidence/{kind}"),
+                    &format!("/api/evidence/runs/playbook:x%231-17/{kind}"),
                     Some(MACHINE),
                     Vec::new(),
                 )
@@ -717,7 +760,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "GET",
-            "/api/runs/..%2F..%2Fetc/evidence/run-session",
+            "/api/evidence/runs/..%2F..%2Fetc/run-session",
             Some(MACHINE),
             Vec::new(),
         )
@@ -769,7 +812,7 @@ mod tests {
             let (status, resp) = call(
                 &app,
                 "PUT",
-                &format!("/api/turns/{pod}/evidence/{kind}"),
+                &format!("/api/evidence/turns/{pod}/{kind}"),
                 Some(&token),
                 body.clone(),
             )
@@ -800,7 +843,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "PUT",
-            "/api/turns/crucible-turn-other/evidence/scope-pack",
+            "/api/evidence/turns/crucible-turn-other/scope-pack",
             Some(&token),
             gz(b"x"),
         )
@@ -809,7 +852,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "PUT",
-            &format!("/api/runs/{pod}/evidence/run-session"),
+            &format!("/api/evidence/runs/{pod}/run-session"),
             Some(&token),
             gz(b"x"),
         )
@@ -818,7 +861,7 @@ mod tests {
         let (status, _) = call(
             &app,
             "PUT",
-            &format!("/api/turns/{pod}/evidence/run-session"),
+            &format!("/api/evidence/turns/{pod}/run-session"),
             Some(&token),
             gz(b"x"),
         )
@@ -834,7 +877,7 @@ mod tests {
         let run_token = mint(&pool, &Subject::Run(pod.to_string()), None, HOUR)
             .await
             .expect("mint");
-        let uri = format!("/api/turns/{pod}/evidence/scope-pack");
+        let uri = format!("/api/evidence/turns/{pod}/scope-pack");
         for bearer in [Some(run_token.as_str()), Some(MACHINE), None] {
             let (status, _) = call(&app, "PUT", &uri, bearer, gz(b"x")).await;
             assert!(

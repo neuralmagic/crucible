@@ -20,7 +20,7 @@ pub const GIT_MEMORY_DIR: &str = "git-memory";
 const GIT_MEMORY_INDEX: &str = "tasks.json";
 
 /// Where a rerun reads its parent from: a finished run's state directory, or that run's evidence
-/// on the controller (`https://controller/api/runs/<id>`), fetched into a directory laid out the
+/// on the controller (`https://controller/api/evidence/runs/<id>`), fetched into a directory laid out the
 /// same way.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParentRef {

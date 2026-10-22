@@ -383,6 +383,38 @@ impl TaskKind {
             },
         }
     }
+
+    /// Whether an attempt of this kind asks a model, and so draws on the run's cost ceiling.
+    pub fn spends(&self) -> bool {
+        match self {
+            TaskKind::Agent { .. }
+            | TaskKind::Route {
+                decider: Decider::Model { .. },
+                ..
+            }
+            | TaskKind::Engine {
+                op: EngineOp::Propose,
+                ..
+            } => true,
+            TaskKind::Command { .. }
+            | TaskKind::Evaluate { .. }
+            | TaskKind::Report { .. }
+            | TaskKind::TopK { .. }
+            | TaskKind::Route {
+                decider: Decider::Output { .. } | Decider::Human { .. },
+                ..
+            }
+            | TaskKind::Engine {
+                op:
+                    EngineOp::Apply
+                    | EngineOp::Measure
+                    | EngineOp::Grade
+                    | EngineOp::Decide
+                    | EngineOp::MeasureDiff,
+                ..
+            } => false,
+        }
+    }
 }
 
 /// `f64` fields deserialized through [`serde_json::Number`].
@@ -676,6 +708,11 @@ pub struct ReviseLoop<'a> {
 impl ReviseLoop<'_> {
     pub fn contains(&self, name: &TaskName) -> bool {
         self.body.iter().any(|t| &t.name == name)
+    }
+
+    /// Whether a round can spend: the loop dispatches as one unit, so one task that can makes it.
+    pub fn spends(&self) -> bool {
+        self.body.iter().any(|t| t.task.spends())
     }
 }
 
@@ -2576,6 +2613,12 @@ mod tests {
         assert_eq!(toml::from_str::<Decider>(&text).unwrap(), decider);
         let bare = toml::to_string(&Decider::Human { review: None }).unwrap();
         assert!(!bare.contains("review"), "{bare}");
+    }
+
+    #[test]
+    fn a_human_route_does_not_spend() {
+        let gate = human_route("gate", &[], &[("pick", pick_question("a", "items", false))]);
+        assert!(!gate.task.spends());
     }
 
     fn human_route(name: &str, deps: &[&str], questions: &[(&str, Question)]) -> Task {

@@ -7,9 +7,11 @@
 //! Dispatch is serial in topo order, with one exception: simultaneously-ready
 //! isolation-marked tasks go to the runner as a single [`TaskRunner::run_many`] batch
 //! (the wide fan-out), and their results are recorded in declaration order so the event
-//! stream stays deterministic regardless of completion order.
+//! stream stays deterministic regardless of completion order. Each lane of a batch is
+//! admitted against the ceilings as it starts; the cost ceiling stops only work that can spend.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +20,7 @@ use serde_json::Value;
 use crate::crucible::Direction;
 use crate::deadline::{Bound, Deadline, RunCeiling};
 use crate::diagram::IllegalTransition;
+use crate::plan::admission::{Admission, BatchLane, Refusal, Settled};
 use crate::plan::history::SeriesHistory;
 use crate::plan::ir::{
     COMPLETE_FIELD, Decider, FILES_INPUT, HISTORY_INPUT, ITEM_INPUT, Join, OUTCOME_INPUT,
@@ -140,6 +143,22 @@ pub struct Attempt {
     pub repairs: Vec<TaskRepair>,
 }
 
+impl Settled for Attempt {
+    fn cost_usd(&self) -> f64 {
+        self.cost_usd
+    }
+
+    fn panicked() -> Self {
+        Attempt::failed(0.0, "task thread panicked".to_string())
+    }
+}
+
+impl BatchLane for BatchItem<'_> {
+    fn task(&self) -> &Task {
+        self.task
+    }
+}
+
 impl Attempt {
     pub fn failed(cost_usd: f64, note: String) -> Self {
         Self {
@@ -166,13 +185,12 @@ impl Attempt {
     }
 }
 
-/// One task of a concurrent dispatch batch (see [`TaskRunner::run_many`]).
+/// One task of a concurrent dispatch batch (see [`TaskRunner::run_many`]). Its deadline is its
+/// lane's, stamped when the lane is admitted.
 pub struct BatchItem<'a> {
     pub task: &'a Task,
     pub attempt: u32,
     pub inputs: BTreeMap<TaskName, Value>,
-    /// This item's own deadline: items of one batch do not share one.
-    pub deadline: Option<Deadline>,
 }
 
 /// Runs one attempt of an `Agent` or `Command` task. The engine implements this against the
@@ -191,10 +209,6 @@ pub trait TaskRunner {
         deadline: Option<Deadline>,
     ) -> Attempt;
 
-    /// Run several isolation-marked tasks, possibly concurrently. The executor only
-    /// batches tasks that are simultaneously ready, so items never depend on each other.
-    /// The default runs them serially through [`TaskRunner::run`]; a runner that can
-    /// parallelize (per-task worktrees) overrides this.
     /// Stage every declared file produced by the tasks named, into the workspace this task is
     /// about to run in. An error refuses the dispatch rather than running a task whose inputs
     /// are not there.
@@ -226,10 +240,23 @@ pub trait TaskRunner {
     /// turns starts none once an attempt's own spend reaches it; the default takes none.
     fn budget_left(&mut self, _usd: f64) {}
 
-    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+    /// Run several isolation-marked tasks, possibly concurrently, each as a lane `admission`
+    /// admits as it starts; a refused lane never runs. The executor only batches tasks that are
+    /// simultaneously ready, so items never depend on each other. Results are in batch order.
+    /// The default runs them serially through [`TaskRunner::run`]; a runner that can
+    /// parallelize (per-task worktrees) overrides this.
+    fn run_many(
+        &mut self,
+        batch: &[BatchItem<'_>],
+        admission: &Admission,
+    ) -> Vec<Result<Attempt, Refusal>> {
         batch
             .iter()
-            .map(|b| self.run(b.task, b.attempt, &b.inputs, b.deadline))
+            .map(|b| {
+                admission.run(b.task, |lane| {
+                    self.run(b.task, b.attempt, &b.inputs, lane.deadline())
+                })
+            })
             .collect()
     }
 }
@@ -251,6 +278,9 @@ pub struct ExecCfg<'a> {
     pub prior: Option<&'a Prior>,
     /// Where human-decided routes open their requests. `None` leaves the `human` capability off.
     pub decisions: Option<&'a dyn crate::plan::decide::DecisionDesk>,
+    /// How many lanes of one dispatch run at once. It bounds what lanes already in flight can
+    /// spend past the cost ceiling.
+    pub width: NonZeroUsize,
 }
 
 impl Default for ExecCfg<'_> {
@@ -262,6 +292,7 @@ impl Default for ExecCfg<'_> {
             early_completion: false,
             prior: None,
             decisions: None,
+            width: crate::plan::admission::DEFAULT_WIDTH,
         }
     }
 }
@@ -562,6 +593,17 @@ impl Halt {
             Halt::Time => BlockedReason::WallClockCeiling,
         }
     }
+
+    /// Whether this halt keeps a dispatch unit of `stage` from running. A short circuit spares
+    /// the epilogue that reports it, and the cost ceiling spares a unit that cannot spend, so the
+    /// run still collects and reports what it already paid for.
+    fn stops(&self, stage: Stage, spends: bool) -> bool {
+        match self {
+            Halt::ShortCircuit(_) => stage != Stage::Epilogue,
+            Halt::Budget => spends,
+            Halt::Time => true,
+        }
+    }
 }
 
 impl PlanExit {
@@ -675,6 +717,11 @@ pub fn execute(
         .iter()
         .flat_map(|l| l.body.iter().map(move |t| (&t.name, l)))
         .collect();
+    let unit_spends = |t: &Task| {
+        loop_of
+            .get(&t.name)
+            .map_or(t.task.spends(), |body| body.spends())
+    };
     let clock = Clock {
         started: Instant::now(),
         before: cfg.prior.map_or(Duration::ZERO, |prior| prior.elapsed),
@@ -763,10 +810,60 @@ pub fn execute(
             {
                 continue;
             }
+            let spends = unit_spends(t);
             if let Some(halt) = &halted
-                && !reports_the_short_circuit(t, halt)
+                && halt.stops(t.stage, spends)
             {
                 let reason = halt.blocked();
+                // A node whose lanes an interrupted run partly settled folds them as the live
+                // run did.
+                let partial = fanout_items(t, &results).ok().filter(|keys| {
+                    keys.iter()
+                        .any(|key| results.contains_key(&instance_name(&t.name, key)))
+                });
+                if let Some(keys) = partial {
+                    machines
+                        .entry(t.name.clone())
+                        .or_default()
+                        .advance(TaskEvent::FannedOut)?;
+                    let mut settled = Vec::new();
+                    for key in keys {
+                        let instance = instance_task(t, &key);
+                        let r = match results.get(&instance.name) {
+                            Some(r) => r.clone(),
+                            None => {
+                                let r = TaskResult::blocked(&reason);
+                                record(
+                                    &mut *runner,
+                                    &instance,
+                                    r.clone(),
+                                    reason.event(),
+                                    &mut results,
+                                    &mut machines,
+                                    &mut halted,
+                                    &mut plan_machine,
+                                    false,
+                                )?;
+                                r
+                            }
+                        };
+                        settled.push((key, r));
+                    }
+                    let folded = fold_instances(settled);
+                    let event = fold_event(folded.status);
+                    record(
+                        &mut *runner,
+                        t,
+                        folded,
+                        event,
+                        &mut results,
+                        &mut machines,
+                        &mut halted,
+                        &mut plan_machine,
+                        true,
+                    )?;
+                    continue;
+                }
                 let r = TaskResult::blocked(&reason);
                 record(
                     &mut *runner,
@@ -855,7 +952,7 @@ pub fn execute(
                 )?;
                 continue;
             }
-            if spent >= budget {
+            if spends && spent >= budget {
                 halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                 let reason = BlockedReason::BudgetCeiling;
                 let r = TaskResult::blocked(&reason);
@@ -956,8 +1053,7 @@ pub fn execute(
             }
         }
         if let Some(halt) = &halted {
-            let reports = matches!(halt, Halt::ShortCircuit(_));
-            dispatch.retain(|t| reports && t.stage == Stage::Epilogue);
+            dispatch.retain(|t| !halt.stops(t.stage, unit_spends(t)));
         }
         if !parked.is_empty() {
             // A run that halted, or whose wall-clock ceiling fell while a request was open, fails
@@ -1278,15 +1374,8 @@ pub fn execute(
                                 task,
                                 attempt: 1,
                                 inputs: item_inputs(&task.name),
-                                deadline: None,
                             })
                             .collect();
-                        for item in &batch {
-                            machines
-                                .entry(item.task.name.clone())
-                                .or_default()
-                                .advance(TaskEvent::Dispatched)?;
-                        }
                         let (batch_results, overrun) = run_batch_with_retries(
                             batch,
                             cfg,
@@ -1305,8 +1394,17 @@ pub fn execute(
                             let Some((task, result, event)) = live.next() else {
                                 break;
                             };
-                            let result = noted(&task.name, result);
-                            runner.settled(task, result.status == TaskStatus::Pass);
+                            let result = if result.attempts > 0 {
+                                machines
+                                    .entry(task.name.clone())
+                                    .or_default()
+                                    .advance(TaskEvent::Dispatched)?;
+                                let result = noted(&task.name, result);
+                                runner.settled(task, result.status == TaskStatus::Pass);
+                                result
+                            } else {
+                                result
+                            };
                             settled.push((key.clone(), result.clone()));
                             record(
                                 &mut *runner,
@@ -1329,12 +1427,16 @@ pub fn execute(
                                 settled.push((key.clone(), result.clone()));
                                 continue;
                             }
-                            if spent >= budget {
+                            let spends = node.task.spends();
+                            if spends && spent >= budget {
                                 halt(&mut halted, &mut plan_machine, Halt::Budget)?;
                             } else if clock.past(cfg.wall_clock) {
                                 halt(&mut halted, &mut plan_machine, Halt::Time)?;
                             }
-                            if let Some(halt) = &halted {
+                            if let Some(halt) = halted
+                                .as_ref()
+                                .filter(|halt| halt.stops(node.stage, spends))
+                            {
                                 let reason = halt.blocked();
                                 let r = TaskResult::blocked(&reason);
                                 settled.push((key.clone(), r.clone()));
@@ -1382,11 +1484,7 @@ pub fn execute(
                         }
                     }
                     let folded = fold_instances(settled);
-                    let event = match folded.status {
-                        TaskStatus::Pass => TaskEvent::InstancesPassed,
-                        TaskStatus::NotTaken => TaskEvent::InstancesNotTaken,
-                        _ => TaskEvent::InstancesFailed,
-                    };
+                    let event = fold_event(folded.status);
                     record(
                         &mut *runner,
                         node,
@@ -1477,20 +1575,19 @@ pub fn execute(
                     task: t,
                     attempt: 1,
                     inputs: inputs_for_dispatch.remove(&t.name).unwrap_or_default(),
-                    deadline: None,
                 })
                 .collect();
-            for t in &dispatch {
-                machines
-                    .entry(t.name.clone())
-                    .or_default()
-                    .advance(TaskEvent::Dispatched)?;
-            }
             let (batch_results, overrun) =
                 run_batch_with_retries(batch, cfg, run_ceiling, runner, &mut spent, budget);
             overrun.halt(first.stage, &mut halted, &mut plan_machine)?;
             for (t, result, event) in batch_results {
-                runner.settled(t, result.status == TaskStatus::Pass);
+                if result.attempts > 0 {
+                    machines
+                        .entry(t.name.clone())
+                        .or_default()
+                        .advance(TaskEvent::Dispatched)?;
+                    runner.settled(t, result.status == TaskStatus::Pass);
+                }
                 record(
                     &mut *runner,
                     t,
@@ -1571,6 +1668,13 @@ impl Overrun {
                     ..
                 })
             ),
+        }
+    }
+
+    fn refused(&mut self, refusal: Refusal) {
+        match refusal {
+            Refusal::CostCeiling => self.budget = true,
+            Refusal::WallClockCeiling => self.time = true,
         }
     }
 
@@ -1978,6 +2082,7 @@ where
     ) -> Result<(), IllegalTransition>,
 {
     let reviewer = body.reviewer;
+    let spends = body.spends();
     let mut view = ledger.results.clone();
     let mut rounds: Vec<Vec<RoundRow<'_>>> = Vec::new();
     // A round an interrupted run settled is replayed from its rows rather than run again.
@@ -2007,11 +2112,11 @@ where
             if ledger
                 .halted
                 .as_ref()
-                .is_some_and(|halt| !reports_the_short_circuit(body.reviewer, halt))
+                .is_some_and(|halt| halt.stops(reviewer.stage, spends))
             {
                 break;
             }
-            if let Some(halt) = ceiling_reached(cfg, ledger) {
+            if let Some(halt) = ceiling_reached(cfg, ledger, spends) {
                 halt_on(ledger, halt)?;
                 break;
             }
@@ -2039,7 +2144,7 @@ where
             let halted = ledger
                 .halted
                 .as_ref()
-                .filter(|halt| !reports_the_short_circuit(t, halt));
+                .filter(|halt| halt.stops(t.stage, spends));
             let settled = if let Some(halt) = halted {
                 let reason = halt.blocked();
                 Err((TaskResult::blocked(&reason), reason.event()))
@@ -2048,7 +2153,7 @@ where
             } else if !dependencies_allow(t, &view, &BTreeSet::new()) {
                 let reason = BlockedReason::DependencyDidNotPass;
                 Err((TaskResult::blocked(&reason), reason.event()))
-            } else if let Some(halt) = ceiling_reached(cfg, ledger) {
+            } else if let Some(halt) = ceiling_reached(cfg, ledger, spends) {
                 let reason = halt.blocked();
                 halt_on(ledger, halt)?;
                 Err((TaskResult::blocked(&reason), reason.event()))
@@ -2230,14 +2335,10 @@ where
     Ok(())
 }
 
-/// The epilogue is what reports a required failure, so a short-circuit is the one halt it
-/// outlives. A ceiling still blocks it.
-fn reports_the_short_circuit(t: &Task, halt: &Halt) -> bool {
-    t.stage == Stage::Epilogue && matches!(halt, Halt::ShortCircuit(_))
-}
-
-fn ceiling_reached(cfg: ExecCfg<'_>, ledger: &Ledger<'_>) -> Option<Halt> {
-    if *ledger.spent >= ledger.budget {
+/// The ceiling a unit about to dispatch has reached. Only a unit that can spend is held to the
+/// cost ceiling.
+fn ceiling_reached(cfg: ExecCfg<'_>, ledger: &Ledger<'_>, spends: bool) -> Option<Halt> {
+    if spends && *ledger.spent >= ledger.budget {
         Some(Halt::Budget)
     } else if ledger.clock.past(cfg.wall_clock) {
         Some(Halt::Time)
@@ -2325,12 +2426,18 @@ fn replay(
         .iter()
         .filter_map(|name| Some((plan.get(name)?, prior.results.get(name)?)))
         .collect();
-    for (t, r) in &settled {
+    for name in &prior.order {
+        let Some(r) = prior.results.get(name) else {
+            continue;
+        };
         match r.blocked {
             Some(BlockedReason::BudgetCeiling) => halt(halted, plan_machine, Halt::Budget)?,
             Some(BlockedReason::WallClockCeiling) => halt(halted, plan_machine, Halt::Time)?,
             _ => {}
         }
+        let Some(t) = plan.get(name) else {
+            continue;
+        };
         let failed = !matches!(r.status, TaskStatus::Pass | TaskStatus::NotTaken);
         if failed && t.required && t.stage == Stage::Iteration {
             halt(halted, plan_machine, Halt::ShortCircuit(t.name.clone()))?;
@@ -2386,6 +2493,15 @@ fn dependencies_allow(
         // Every dependency already holds a result by the caller's guard, so terminality is
         // established and no status blocks the dispatch.
         Join::Settled => true,
+    }
+}
+
+/// The event a fan-out node settles on, given the status its instances folded to.
+fn fold_event(status: TaskStatus) -> TaskEvent {
+    match status {
+        TaskStatus::Pass => TaskEvent::InstancesPassed,
+        TaskStatus::NotTaken => TaskEvent::InstancesNotTaken,
+        _ => TaskEvent::InstancesFailed,
     }
 }
 
@@ -2621,25 +2737,30 @@ fn settle_attempt(
     ))
 }
 
-/// A task that died on transport and will not be retried: the retries ran out, or the budget
-/// did with retries still allowed.
+/// A task that died on transport and will not be retried: the retries ran out, or a ceiling
+/// refused the next attempt with retries still allowed.
 fn transport_result(
     attempts: u32,
     max_attempts: u32,
     cost_usd: f64,
     failure: &TransportFailure,
-    cut_by_budget: bool,
+    cut: Option<Refusal>,
 ) -> (TaskResult, TaskEvent) {
-    let (note, event) = if cut_by_budget {
-        (
-            format!("budget ceiling reached after transport attempt: {failure}"),
-            TaskEvent::TransportCutByBudget,
-        )
-    } else {
-        (
+    let (note, event) = match cut {
+        Some(refusal) => (
+            format!(
+                "{} after transport attempt: {failure}",
+                BlockedReason::from(refusal)
+            ),
+            match refusal {
+                Refusal::CostCeiling => TaskEvent::TransportCutByBudget,
+                Refusal::WallClockCeiling => TaskEvent::TransportExhausted,
+            },
+        ),
+        None => (
             format!("transport retries exhausted ({max_attempts} attempts): {failure}"),
             TaskEvent::TransportExhausted,
-        )
+        ),
     };
     (
         TaskResult {
@@ -2685,9 +2806,16 @@ fn run_with_retries(
         match settle_attempt(outcome, attempts, cost, a.repairs) {
             Ok((result, event)) => return (result, event, overrun),
             Err(failure) => {
-                if *spent > budget || (*spent >= budget && attempts < max_attempts) {
-                    let (result, event) =
-                        transport_result(attempts, max_attempts, cost, &failure, true);
+                if t.task.spends()
+                    && (*spent > budget || (*spent >= budget && attempts < max_attempts))
+                {
+                    let (result, event) = transport_result(
+                        attempts,
+                        max_attempts,
+                        cost,
+                        &failure,
+                        Some(Refusal::CostCeiling),
+                    );
                     overrun.budget = true;
                     return (result, event, overrun);
                 }
@@ -2695,7 +2823,7 @@ fn run_with_retries(
             }
         }
     }
-    let (result, event) = transport_result(attempts, max_attempts, cost, &last_transport, false);
+    let (result, event) = transport_result(attempts, max_attempts, cost, &last_transport, None);
     let overrun = Overrun {
         budget: *spent > budget,
         time: false,
@@ -2704,8 +2832,9 @@ fn run_with_retries(
 }
 
 /// Run a batch of isolated tasks through the runner's parallel path, retrying the transport
-/// failures as a smaller wave until every task has a result or retries run out. Each wave stamps
-/// every item with its own deadline as it starts.
+/// failures as a smaller wave until every task has a result or retries run out. Every lane of a
+/// wave is admitted against the run's ceilings as it starts, under its own deadline; a lane the
+/// ceilings refuse settles blocked, or, on a retry, as the transport failure it already had.
 fn run_batch_with_retries<'a>(
     batch: Vec<BatchItem<'a>>,
     cfg: ExecCfg<'_>,
@@ -2718,52 +2847,77 @@ fn run_batch_with_retries<'a>(
     let mut done: BTreeMap<usize, (TaskResult, TaskEvent)> = BTreeMap::new();
     let mut cost_so_far: Vec<f64> = vec![0.0; batch.len()];
     let order: Vec<&'a Task> = batch.iter().map(|b| b.task).collect();
-    let mut wave: Vec<(usize, BatchItem<'a>)> = batch.into_iter().enumerate().collect();
+    let mut wave: Vec<(usize, BatchItem<'a>, Option<TransportFailure>)> = batch
+        .into_iter()
+        .enumerate()
+        .map(|(idx, item)| (idx, item, None))
+        .collect();
     let mut overrun = Overrun::default();
 
     while !wave.is_empty() {
-        let now = Instant::now();
         let items: Vec<BatchItem<'_>> = wave
             .iter()
-            .map(|(_, b)| BatchItem {
+            .map(|(_, b, _)| BatchItem {
                 task: b.task,
                 attempt: b.attempt,
                 inputs: b.inputs.clone(),
-                deadline: Deadline::for_attempt(now, b.task.timeout, run_ceiling),
             })
             .collect();
         runner.budget_left(budget - *spent);
-        let attempts = runner.run_many(&items);
+        let admission = Admission::new(budget, *spent, run_ceiling, cfg.width);
+        let attempts = runner.run_many(&items, &admission);
         let mut attempted = Vec::new();
-        for ((idx, item), a) in wave.into_iter().zip(attempts) {
-            *spent += a.cost_usd;
-            cost_so_far[idx] += a.cost_usd;
-            let outcome = enforce_emits(item.task, a.outcome);
-            overrun.time |= Overrun::of(&outcome).time;
-            attempted.push((idx, item, outcome, a.repairs));
+        for ((idx, item, previous), a) in wave.into_iter().zip(attempts) {
+            match a {
+                Err(refusal) => {
+                    overrun.refused(refusal);
+                    let settled = match &previous {
+                        Some(failure) => transport_result(
+                            item.attempt.saturating_sub(1),
+                            max_attempts,
+                            cost_so_far[idx],
+                            failure,
+                            Some(refusal),
+                        ),
+                        None => {
+                            let reason = BlockedReason::from(refusal);
+                            (TaskResult::blocked(&reason), reason.event())
+                        }
+                    };
+                    done.insert(idx, settled);
+                }
+                Ok(a) => {
+                    *spent += a.cost_usd;
+                    cost_so_far[idx] += a.cost_usd;
+                    let outcome = enforce_emits(item.task, a.outcome);
+                    overrun.time |= Overrun::of(&outcome).time;
+                    attempted.push((idx, item, outcome, a.repairs));
+                }
+            }
         }
         let retry_budget_blocked = *spent >= budget;
         overrun.budget |= *spent > budget;
-        let mut next: Vec<(usize, BatchItem<'a>)> = Vec::new();
+        let mut next: Vec<(usize, BatchItem<'a>, Option<TransportFailure>)> = Vec::new();
         for (idx, item, outcome, repairs) in attempted {
             match settle_attempt(outcome, item.attempt, cost_so_far[idx], repairs) {
                 Ok(settled) => {
                     done.insert(idx, settled);
                 }
                 Err(failure) => {
-                    if item.attempt < max_attempts && !retry_budget_blocked {
+                    let cut_by_budget = item.task.task.spends() && retry_budget_blocked;
+                    if item.attempt < max_attempts && !cut_by_budget {
                         next.push((
                             idx,
                             BatchItem {
                                 task: item.task,
                                 attempt: item.attempt + 1,
                                 inputs: item.inputs,
-                                deadline: None,
                             },
+                            Some(failure),
                         ));
                     } else {
-                        let cut_by_budget = item.attempt < max_attempts;
-                        overrun.budget |= cut_by_budget;
+                        let cut = (item.attempt < max_attempts).then_some(Refusal::CostCeiling);
+                        overrun.budget |= cut.is_some();
                         done.insert(
                             idx,
                             transport_result(
@@ -2771,7 +2925,7 @@ fn run_batch_with_retries<'a>(
                                 max_attempts,
                                 cost_so_far[idx],
                                 &failure,
-                                cut_by_budget,
+                                cut,
                             ),
                         );
                     }
@@ -3623,6 +3777,11 @@ mod tests {
             );
             self.seen_values.insert(task.name.0.clone(), inputs.clone());
             self.runs.push((task.name.0.clone(), inputs.clone()));
+            let default_cost = if task.task.spends() {
+                self.default_cost
+            } else {
+                0.0
+            };
             if let Some(outcome) = self
                 .rounds
                 .get_mut(&task.name.0)
@@ -3630,7 +3789,7 @@ mod tests {
             {
                 return Attempt {
                     outcome: outcome(),
-                    cost_usd: self.default_cost,
+                    cost_usd: default_cost,
                     repairs: Vec::new(),
                 };
             }
@@ -3647,7 +3806,7 @@ mod tests {
                             .cloned()
                             .unwrap_or_else(|| serde_json::json!({"score": 1.0})),
                     ),
-                    cost_usd: self.default_cost,
+                    cost_usd: default_cost,
                     repairs: Vec::new(),
                 },
             }
@@ -3678,6 +3837,24 @@ mod tests {
             history: None,
             repair: 0,
         }
+    }
+
+    /// `t` as an agent task: unlike a command, every attempt can spend.
+    fn spending(t: Task) -> Task {
+        Task {
+            task: TaskKind::Agent {
+                prompt: format!("do {}", t.name),
+                harness: None,
+                model: None,
+                effort: None,
+                sandbox: None,
+            },
+            ..t
+        }
+    }
+
+    fn agent(name: &str, deps: &[&str], needs: &str, required: bool) -> Task {
+        spending(task(name, deps, needs, required))
     }
 
     fn valid(tasks: Vec<Task>, usd: f64) -> ValidPlan {
@@ -4349,7 +4526,7 @@ mod tests {
     #[test]
     fn budget_fails_closed_mid_plan() {
         let plan = valid(
-            vec![task("a", &[], "any", false), task("b", &[], "any", false)],
+            vec![agent("a", &[], "any", false), agent("b", &[], "any", false)],
             0.5,
         );
         let mut r = ScriptRunner::new();
@@ -4402,7 +4579,7 @@ mod tests {
 
     #[test]
     fn transport_retry_stops_when_the_budget_is_consumed() {
-        let plan = valid(vec![task("a", &[], "any", true)], 0.5);
+        let plan = valid(vec![agent("a", &[], "any", true)], 0.5);
         let mut r = ScriptRunner::new();
         r.on(
             "a",
@@ -4603,16 +4780,22 @@ mod tests {
                     repairs: Vec::new(),
                 }
             }
-            fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+            fn run_many(
+                &mut self,
+                batch: &[BatchItem<'_>],
+                admission: &Admission,
+            ) -> Vec<Result<Attempt, Refusal>> {
                 self.batches
                     .push(batch.iter().map(|b| b.task.name.0.clone()).collect());
                 // The executor zips results by position; the runner must answer in order.
                 batch
                     .iter()
-                    .map(|_| Attempt {
-                        outcome: AttemptOutcome::Pass(serde_json::json!({})),
-                        cost_usd: 0.0,
-                        repairs: Vec::new(),
+                    .map(|b| {
+                        admission.run(b.task, |_| Attempt {
+                            outcome: AttemptOutcome::Pass(serde_json::json!({})),
+                            cost_usd: 0.0,
+                            repairs: Vec::new(),
+                        })
                     })
                     .collect()
             }
@@ -4874,7 +5057,11 @@ mod tests {
             ) -> Attempt {
                 unreachable!("batchable plan must go through run_many");
             }
-            fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+            fn run_many(
+                &mut self,
+                batch: &[BatchItem<'_>],
+                admission: &Admission,
+            ) -> Vec<Result<Attempt, Refusal>> {
                 self.waves.push(
                     batch
                         .iter()
@@ -4883,17 +5070,19 @@ mod tests {
                 );
                 batch
                     .iter()
-                    .map(|x| Attempt {
-                        outcome: if x.task.name.0 == "iso-a" {
-                            AttemptOutcome::Pass(serde_json::json!({}))
-                        } else {
-                            AttemptOutcome::Transport(TransportFailure::new(
-                                TransportCause::Other,
-                                "flaky",
-                            ))
-                        },
-                        cost_usd: 0.1,
-                        repairs: Vec::new(),
+                    .map(|x| {
+                        admission.run(x.task, |_| Attempt {
+                            outcome: if x.task.name.0 == "iso-a" {
+                                AttemptOutcome::Pass(serde_json::json!({}))
+                            } else {
+                                AttemptOutcome::Transport(TransportFailure::new(
+                                    TransportCause::Other,
+                                    "flaky",
+                                ))
+                            },
+                            cost_usd: 0.1,
+                            repairs: Vec::new(),
+                        })
                     })
                     .collect()
             }
@@ -6324,11 +6513,19 @@ mod tests {
             }
         }
 
-        fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+        fn run_many(
+            &mut self,
+            batch: &[BatchItem<'_>],
+            admission: &Admission,
+        ) -> Vec<Result<Attempt, Refusal>> {
             self.log.push(format!("batch of {}", batch.len()));
             batch
                 .iter()
-                .map(|b| self.run(b.task, b.attempt, &b.inputs, b.deadline))
+                .map(|b| {
+                    admission.run(b.task, |lane| {
+                        self.run(b.task, b.attempt, &b.inputs, lane.deadline())
+                    })
+                })
                 .collect()
         }
 
@@ -6463,14 +6660,346 @@ mod tests {
         );
     }
 
+    /// An isolated fan-out is one batch, but each lane is admitted as it starts: once the lanes
+    /// already settled reach the ceiling the rest never dispatch, rather than every lane running
+    /// and the ceiling being noticed when the node folds.
+    #[test]
+    fn an_isolated_fanout_stops_admitting_lanes_at_the_cost_ceiling() {
+        let mut audit = spending(mapped_node("audit", "discover", "targets", false));
+        audit.isolation = Some(Isolation::Worktree);
+        let plan = valid(vec![task("discover", &[], "any", true), audit], 0.25);
+        let mut runner = FanoutRunner::new(&["a", "b", "c", "d", "e", "f"]);
+        runner.cost = 0.1;
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |_, _| {},
+        );
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!out.valid);
+        assert_eq!(
+            runner.log,
+            [
+                "run discover",
+                "settled discover true",
+                "batch of 6",
+                "run audit[a]",
+                "run audit[b]",
+                "run audit[c]",
+                "settled audit[a] true",
+                "settled audit[b] true",
+                "settled audit[c] true",
+            ]
+        );
+        for key in ["d", "e", "f"] {
+            let lane = &out.results[&format!("audit[{key}]").as_str().into()];
+            assert_eq!(lane.blocked, Some(BlockedReason::BudgetCeiling), "{key}");
+            assert_eq!(lane.attempts, 0, "{key}");
+        }
+        let fanout = out.results[&"audit".into()].fanout.clone().unwrap();
+        assert_eq!((fanout.instances, fanout.passed, fanout.failed), (6, 3, 3));
+        assert!((out.spent_usd - 0.3).abs() < 1e-9, "{}", out.spent_usd);
+    }
+
+    /// A runner that runs a batch's lanes as if all were in flight at once: each lane reports
+    /// what it has spent so far, then the next lane asks for admission before the first settles.
+    struct OverlappingLanes {
+        reported: f64,
+        settles_at: f64,
+        ran: Vec<String>,
+    }
+
+    impl OverlappingLanes {
+        fn overlap<'b>(
+            &mut self,
+            batch: &'b [BatchItem<'b>],
+            admission: &Admission,
+        ) -> Vec<Result<Attempt, Refusal>> {
+            let Some((first, rest)) = batch.split_first() else {
+                return Vec::new();
+            };
+            let mut later = Vec::new();
+            let head = admission.run(first.task, |lane| {
+                self.ran.push(first.task.name.0.clone());
+                lane.spent_so_far(self.reported);
+                later = self.overlap(rest, admission);
+                Attempt {
+                    outcome: AttemptOutcome::Pass(json!({"lane": first.task.name.0})),
+                    cost_usd: self.settles_at,
+                    repairs: Vec::new(),
+                }
+            });
+            if head.is_err() {
+                later = self.overlap(rest, admission);
+            }
+            std::iter::once(head).chain(later).collect()
+        }
+    }
+
+    impl TaskRunner for OverlappingLanes {
+        fn run(
+            &mut self,
+            task: &Task,
+            _attempt: u32,
+            _inputs: &BTreeMap<TaskName, Value>,
+            _deadline: Option<Deadline>,
+        ) -> Attempt {
+            self.ran.push(task.name.0.clone());
+            let output = match task.name.0.as_str() {
+                "discover" => json!({"targets": ["a", "b", "c"]}),
+                _ => json!({}),
+            };
+            Attempt {
+                outcome: AttemptOutcome::Pass(output),
+                cost_usd: if task.task.spends() {
+                    self.settles_at
+                } else {
+                    0.0
+                },
+                repairs: Vec::new(),
+            }
+        }
+
+        fn run_many(
+            &mut self,
+            batch: &[BatchItem<'_>],
+            admission: &Admission,
+        ) -> Vec<Result<Attempt, Refusal>> {
+            self.overlap(batch, admission)
+        }
+    }
+
+    /// The ceiling counts what a lane has spent while it is still running, so a lane is refused
+    /// on the strength of its siblings' running figures before any of them settles, and a resumed
+    /// run halts where the live one did although the settled total ended under the ceiling.
+    #[test]
+    fn the_cost_ceiling_counts_a_lanes_running_spend_before_its_fanout_settles() {
+        let mut audit = spending(mapped_node("audit", "discover", "targets", false));
+        audit.isolation = Some(Isolation::Worktree);
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                audit,
+                agent("fix", &["discover"], "any", false),
+                settled_task("report", &["audit", "fix"], true),
+            ],
+            1.0,
+        );
+        let mut runner = OverlappingLanes {
+            reported: 0.6,
+            settles_at: 0.05,
+            ran: Vec::new(),
+        };
+        let mut rows: Rows = Vec::new();
+        let out = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut runner,
+            |t, r| rows.push((t.name.clone(), r.clone())),
+        );
+
+        assert_eq!(runner.ran, ["discover", "audit[a]", "audit[b]", "report"]);
+        assert_eq!(
+            out.results[&"audit[c]".into()].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+        assert_eq!(
+            out.results[&"fix".into()].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+        assert!(out.spent_usd < 1.0, "{}", out.spent_usd);
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!out.valid);
+
+        let cut = rows.iter().position(|(name, _)| name.0 == "audit").unwrap();
+        let prior = prior_of(&rows[..cut]);
+        let mut resumed = OverlappingLanes {
+            reported: 0.0,
+            settles_at: 0.05,
+            ran: Vec::new(),
+        };
+        let again = execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                prior: Some(&prior),
+                ..ExecCfg::default()
+            },
+            &mut resumed,
+            |_, _| {},
+        );
+        assert_eq!(again.exit, PlanExit::BudgetExceeded);
+        assert_eq!(resumed.ran, ["report"]);
+    }
+
+    /// The production shape: an advisory agent fan-out stops at the ceiling partway through, and
+    /// the commands after it still run over the lanes that finished, so the run reports what it
+    /// paid for. A model-decided route and an agent after the ceiling stay blocked, while an
+    /// output-decided route and an epilogue command, which cannot spend, run.
+    #[test]
+    fn commands_after_a_budget_stopped_fanout_still_run_over_what_finished() {
+        let mut analyze = spending(mapped_node("analyze", "discover", "targets", false));
+        analyze.isolation = Some(Isolation::Worktree);
+        let mut apply = task("apply", &["discover", "analyze"], "any", true);
+        apply.join = Join::Passed;
+        let mut judge = Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(QuestionId::new("area").unwrap(), area(&[]))]),
+                decider: Decider::Model {
+                    min_confidence: 0.5,
+                    files: Vec::new(),
+                },
+            },
+            ..task("judge", &["analyze"], "any", false)
+        };
+        judge.needs = crate::plan::ir::NEEDS_DECISION.to_owned();
+        let classify = Task {
+            task: TaskKind::Route {
+                questions: BTreeMap::from([(QuestionId::new("area").unwrap(), area(&[]))]),
+                decider: Decider::Output {
+                    task: "apply".into(),
+                },
+            },
+            ..task("classify", &["apply"], "any", false)
+        };
+        let plan = valid(
+            vec![
+                task("discover", &[], "any", true),
+                analyze,
+                apply,
+                judge,
+                classify,
+                agent("fix", &["apply"], "any", false),
+                settled_task("report", &["apply", "judge", "fix"], true),
+                epilogue("notify", &[], true),
+            ],
+            0.25,
+        );
+        let setup = |r: &mut ScriptRunner| {
+            r.on(
+                "discover",
+                1,
+                || AttemptOutcome::Pass(json!({"targets": ["a", "b", "c", "d", "e"]})),
+                0.0,
+            );
+            r.outputs
+                .insert("apply".into(), json!({"area": "scheduler"}));
+        };
+        let decides = Substrate {
+            caps: [crate::plan::ir::NEEDS_DECISION.to_owned()].into(),
+        };
+        let mut r = ScriptRunner::new();
+        setup(&mut r);
+        let out = execute(&plan, &decides, ExecCfg::default(), &mut r, |_, _| {});
+
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert!(!out.valid);
+        assert_eq!(
+            dispatches(&r),
+            [
+                "discover",
+                "analyze[a]",
+                "analyze[b]",
+                "analyze[c]",
+                "apply",
+                "report",
+                "notify"
+            ]
+        );
+        let passed: Vec<&str> = r.seen_values["apply"][&TaskName("analyze".into())]["outputs"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(passed, ["a", "b", "c"]);
+        for name in ["analyze[d]", "analyze[e]", "judge", "fix"] {
+            assert_eq!(
+                out.results[&name.into()].blocked,
+                Some(BlockedReason::BudgetCeiling),
+                "{name}"
+            );
+        }
+        for name in ["apply", "classify", "report", "notify"] {
+            assert_eq!(out.results[&name.into()].status, TaskStatus::Pass, "{name}");
+        }
+        assert_eq!(status_of(r.entry("report", "judge")), "blocked");
+        assert_eq!(status_of(r.entry("report", "apply")), "pass");
+
+        assert_resumes_from_every_cut_on(&plan, &decides, ExecCfg::default(), |r| {
+            r.on(
+                "discover",
+                1,
+                || AttemptOutcome::Pass(json!({"targets": ["a", "b", "c", "d", "e"]})),
+                0.0,
+            );
+            r.outputs
+                .insert("apply".into(), json!({"area": "scheduler"}));
+        });
+    }
+
+    /// The wall-clock ceiling is not the cost ceiling: past it a command is blocked like
+    /// anything else.
+    #[test]
+    fn a_command_does_not_outlive_the_wall_clock_ceiling() {
+        let plan = valid(
+            vec![
+                agent("analyze", &[], "any", false),
+                settled_task("apply", &["analyze"], true),
+            ],
+            10.0,
+        );
+        let mut r = ScriptRunner::new();
+        let cfg = ExecCfg {
+            wall_clock: Some(Duration::ZERO),
+            ..ExecCfg::default()
+        };
+        let out = execute(&plan, &any_substrate(), cfg, &mut r, |_, _| {});
+        assert_eq!(out.exit, PlanExit::TimeExceeded);
+        assert_eq!(
+            out.results[&"apply".into()].blocked,
+            Some(BlockedReason::WallClockCeiling)
+        );
+        assert!(r.dispatched.is_empty());
+    }
+
+    /// A transport failure in a command after the cost ceiling is retried like any other: the
+    /// ceiling that stopped spending says nothing about a task that cannot spend.
+    #[test]
+    fn a_command_after_the_cost_ceiling_still_retries_a_transport_failure() {
+        let plan = valid(
+            vec![
+                agent("analyze", &[], "any", false),
+                settled_task("apply", &["analyze"], true),
+            ],
+            0.1,
+        );
+        let mut r = ScriptRunner::new();
+        r.on("analyze", 1, || AttemptOutcome::Pass(json!({})), 0.2);
+        r.on(
+            "apply",
+            1,
+            || AttemptOutcome::Transport(TransportFailure::new(TransportCause::Other, "blip")),
+            0.0,
+        );
+        let out = run_plan(&plan, &mut r);
+        assert_eq!(out.exit, PlanExit::BudgetExceeded);
+        assert_eq!(out.results[&"apply".into()].status, TaskStatus::Pass);
+        assert_eq!(out.results[&"apply".into()].attempts, 2);
+    }
+
     /// The budget is checked before every instance, exactly as it is before every serial task:
     /// the ones that never ran are Blocked rows the fold counts as failures.
     #[test]
     fn a_budget_hit_mid_fanout_blocks_the_instances_that_never_ran() {
         let plan = valid(
             vec![
-                task("discover", &[], "any", true),
-                mapped_node("audit", "discover", "targets", false),
+                agent("discover", &[], "any", true),
+                spending(mapped_node("audit", "discover", "targets", false)),
             ],
             0.25,
         );
@@ -6740,7 +7269,10 @@ mod tests {
     #[test]
     fn an_epilogue_is_blocked_once_a_budget_ceiling_ended_the_main_graph() {
         let plan = valid(
-            vec![task("a", &[], "any", true), epilogue("report", &[], true)],
+            vec![
+                agent("a", &[], "any", true),
+                spending(epilogue("report", &[], true)),
+            ],
             0.05,
         );
         let mut r = ScriptRunner::new();
@@ -6773,8 +7305,8 @@ mod tests {
     fn an_epilogue_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
         let plan = valid(
             vec![
-                task("probe", &[], "any", true),
-                epilogue("report", &[], true),
+                agent("probe", &[], "any", true),
+                spending(epilogue("report", &[], true)),
             ],
             0.15,
         );
@@ -6797,8 +7329,8 @@ mod tests {
     fn a_budget_reached_before_the_epilogue_blocks_it_without_relabelling_the_exit() {
         let plan = valid(
             vec![
-                task("probe", &[], "any", true),
-                epilogue("report", &[], true),
+                agent("probe", &[], "any", true),
+                spending(epilogue("report", &[], true)),
             ],
             0.1,
         );
@@ -6855,19 +7387,24 @@ mod tests {
         assert!(!r.dispatched.iter().any(|(n, _)| n == "report"));
     }
 
+    /// The first lane of the batch crosses the ceiling and the second is refused when it would
+    /// start; neither changes how the main graph ended.
     #[test]
     fn an_epilogue_batch_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
-        let mut first = epilogue("first", &[], true);
+        let mut first = spending(epilogue("first", &[], true));
         first.isolation = Some(crate::plan::ir::Isolation::Worktree);
-        let mut second = epilogue("second", &[], true);
+        let mut second = spending(epilogue("second", &[], true));
         second.isolation = Some(crate::plan::ir::Isolation::Worktree);
-        let plan = valid(vec![task("probe", &[], "any", true), first, second], 0.15);
+        let plan = valid(vec![agent("probe", &[], "any", true), first, second], 0.15);
         let mut r = ScriptRunner::new();
         r.on("probe", 1, || AttemptOutcome::fail("vetoed"), 0.1);
         let out = run_plan(&plan, &mut r);
-        for name in ["first", "second"] {
-            assert_eq!(out.results[&name.into()].status, TaskStatus::Pass);
-        }
+        assert_eq!(out.results[&"first".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            out.results[&"second".into()].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+        assert!(!r.dispatched.iter().any(|(n, _)| n == "second"));
         assert!(out.spent_usd > 0.15);
         assert_eq!(
             out.exit,
@@ -6879,17 +7416,17 @@ mod tests {
 
     /// The mapped-node batch is the second site a ceiling crossed after a required failure can
     /// relabel the exit from. A fan-out over another epilogue task crosses no stage, so the
-    /// site is reachable: the instances run, spend past the ceiling, and the run still reports
-    /// the short-circuit that ended the main graph.
+    /// site is reachable: the first instance spends up to the ceiling, the second is refused, and
+    /// the run still reports the short-circuit that ended the main graph.
     #[test]
     fn a_mapped_epilogue_batch_crossing_the_budget_ceiling_does_not_relabel_a_short_circuit() {
-        let mut fan = mapped_node("fan", "src", "items", true);
+        let mut fan = spending(mapped_node("fan", "src", "items", true));
         fan.stage = Stage::Epilogue;
         fan.isolation = Some(crate::plan::ir::Isolation::Worktree);
         let plan = valid(
             vec![
-                task("probe", &[], "any", true),
-                epilogue("src", &[], true),
+                agent("probe", &[], "any", true),
+                spending(epilogue("src", &[], true)),
                 fan,
             ],
             0.25,
@@ -6903,11 +7440,12 @@ mod tests {
             0.05,
         );
         let out = run_plan(&plan, &mut r);
-        for key in ["x", "y"] {
-            let instance: TaskName = format!("fan[{key}]").as_str().into();
-            assert_eq!(out.results[&instance].status, TaskStatus::Pass);
-        }
-        assert!(out.spent_usd > 0.25, "the batch never crossed the ceiling");
+        assert_eq!(out.results[&"fan[x]".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            out.results[&"fan[y]".into()].blocked,
+            Some(BlockedReason::BudgetCeiling)
+        );
+        assert!(out.spent_usd >= 0.25, "the batch never reached the ceiling");
         assert_eq!(
             out.exit,
             PlanExit::ShortCircuit {
@@ -7074,8 +7612,8 @@ mod tests {
     fn a_settled_join_does_not_outlive_a_budget_halt() {
         let plan = valid(
             vec![
-                task("probe", &[], "any", false),
-                settled_task("report", &["probe"], false),
+                agent("probe", &[], "any", false),
+                spending(settled_task("report", &["probe"], false)),
             ],
             0.15,
         );
@@ -8059,9 +8597,9 @@ mod tests {
     fn a_failing_review_sends_its_verdict_back_until_a_round_passes() {
         let plan = valid(
             vec![
-                task("author", &[], "any", true),
-                reviewing("repro", &["author"], "author", 3),
-                task("pick", &["author", "repro"], "any", true),
+                agent("author", &[], "any", true),
+                spending(reviewing("repro", &["author"], "author", 3)),
+                agent("pick", &["author", "repro"], "any", true),
             ],
             10.0,
         );
@@ -8250,9 +8788,9 @@ mod tests {
     fn a_budget_spent_by_a_round_stops_the_loop_before_the_next() {
         let plan = valid(
             vec![
-                task("author", &[], "any", true),
-                reviewing("repro", &["author"], "author", 3),
-                task("pick", &["repro"], "any", true),
+                agent("author", &[], "any", true),
+                spending(reviewing("repro", &["author"], "author", 3)),
+                agent("pick", &["repro"], "any", true),
             ],
             0.25,
         );
@@ -8280,8 +8818,8 @@ mod tests {
     fn a_proposer_that_spends_the_budget_leaves_its_review_blocked() {
         let plan = valid(
             vec![
-                task("author", &[], "any", true),
-                reviewing("repro", &["author"], "author", 3),
+                agent("author", &[], "any", true),
+                spending(reviewing("repro", &["author"], "author", 3)),
             ],
             0.25,
         );
@@ -8442,10 +8980,15 @@ mod tests {
         valid(
             vec![
                 task("resolve", &[], "any", true),
-                task("pick", &["resolve"], "any", true),
-                task("build", &["pick"], "any", true),
+                agent("pick", &["resolve"], "any", true),
+                agent("build", &["pick"], "any", true),
                 joining(
-                    reviewing_chain("confirm", &["build", "resolve"], &["pick", "build"], 3),
+                    spending(reviewing_chain(
+                        "confirm",
+                        &["build", "resolve"],
+                        &["pick", "build"],
+                        3,
+                    )),
                     confirm_join,
                 ),
                 task("deliver", &["confirm"], "any", true),
@@ -8603,7 +9146,8 @@ mod tests {
 
     #[test]
     fn a_budget_spent_inside_a_round_blocks_the_rest_of_the_body() {
-        let plan = valid(fix_chain(Join::All).plan().tasks.clone(), 0.15);
+        let tasks = fix_chain(Join::All).plan().tasks.clone();
+        let plan = valid(tasks.into_iter().map(spending).collect(), 0.15);
         let mut r = ScriptRunner::new();
         let (out, rows) = rows_of(&plan, &mut r);
 
@@ -9039,32 +9583,46 @@ mod tests {
                 .push(GraphEvent::Run(vec![task.name.0.clone()]));
             Attempt {
                 outcome: self.outcomes[&task.name.0](),
-                cost_usd: 0.1,
+                cost_usd: graph_cost(task),
                 repairs: Vec::new(),
             }
         }
 
-        fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
-            self.log.borrow_mut().push(GraphEvent::Run(
-                batch.iter().map(|b| b.task.name.0.clone()).collect(),
-            ));
-            batch
+        fn run_many(
+            &mut self,
+            batch: &[BatchItem<'_>],
+            admission: &Admission,
+        ) -> Vec<Result<Attempt, Refusal>> {
+            let mut admitted = Vec::new();
+            let attempts = batch
                 .iter()
                 .map(|b| {
-                    assert_eq!(
-                        b.deadline.map(|d| d.bound),
-                        b.task.timeout.map(Bound::Task),
-                        "{} ran under another item's deadline",
-                        b.task.name
-                    );
-                    Attempt {
-                        outcome: self.outcomes[&b.task.name.0](),
-                        cost_usd: 0.1,
-                        repairs: Vec::new(),
-                    }
+                    admission.run(b.task, |lane| {
+                        assert_eq!(
+                            lane.deadline().map(|d| d.bound),
+                            b.task.timeout.map(Bound::Task),
+                            "{} ran under another item's deadline",
+                            b.task.name
+                        );
+                        admitted.push(b.task.name.0.clone());
+                        Attempt {
+                            outcome: self.outcomes[&b.task.name.0](),
+                            cost_usd: graph_cost(b.task),
+                            repairs: Vec::new(),
+                        }
+                    })
                 })
-                .collect()
+                .collect();
+            if !admitted.is_empty() {
+                self.log.borrow_mut().push(GraphEvent::Run(admitted));
+            }
+            attempts
         }
+    }
+
+    /// What one attempt costs in the exhaustive graph test: a task that cannot spend costs nothing.
+    fn graph_cost(task: &Task) -> f64 {
+        if task.task.spends() { 0.1 } else { 0.0 }
     }
 
     const THREE_TASK_EDGES: [(usize, usize); 3] = [(1, 0), (2, 0), (2, 1)];
@@ -9075,7 +9633,8 @@ mod tests {
 
     /// The invariants formal/CrucibleSpec/PlanExec.lean proves for the model, checked against
     /// `execute` on every three-task graph: every edge set, stage split, required set, substrate
-    /// fit, join, isolation split, per-task outcome, and a budget that does and does not run out.
+    /// fit, join, isolation split, per-task outcome, and a budget that does not run out, or that
+    /// does under every split of the tasks into ones that can spend and ones that cannot.
     /// One test per edge set, so nextest runs them in parallel.
     /// Every task declares a typed `score`, and the last outcome is a pass whose `score` is not a
     /// number: output drift must settle as a measured failure wherever it lands in the graph.
@@ -9162,7 +9721,9 @@ mod tests {
                                 continue;
                             }
                             for outcome_pick in 0..(outcomes.len().pow(N as u32)) {
-                                for budget in [0.25, 10.0] {
+                                let ceilings = std::iter::once((10.0, (1u32 << N) - 1))
+                                    .chain((0..(1u32 << N)).map(|spends| (0.25, spends)));
+                                for (budget, spends) in ceilings {
                                     let tasks: Vec<Task> = (0..N)
                                         .map(|t| {
                                             let dep_names: Vec<String> =
@@ -9181,6 +9742,11 @@ mod tests {
                                             }
                                             if is_epilogue(t) {
                                                 task.stage = Stage::Epilogue;
+                                            }
+                                            if spends & (1 << t) == 0 {
+                                                task.task = TaskKind::Command {
+                                                    command: "true".into(),
+                                                };
                                             }
                                             task.emits = crate::plan::ir::Emits::Typed(
                                                 [(
@@ -9238,7 +9804,7 @@ mod tests {
                 }
             }
         }
-        assert!(runs > 50_000, "edge set {edges} shrank to {runs} runs");
+        assert!(runs > 200_000, "edge set {edges} shrank to {runs} runs");
     }
 
     fn own_limit() -> crate::duration::TaskTimeout {
@@ -9322,8 +9888,15 @@ mod tests {
         for e in log {
             match e {
                 GraphEvent::Run(wave) => {
-                    // nothing_runs_after_a_ceiling: every dispatch and retry is decided under it.
-                    assert!(spent < budget, "dispatched at the budget: {}", ctx());
+                    // nothing_spends_after_a_cost_ceiling: every lane that can spend is admitted
+                    // under the ceiling, counting the lanes of its own wave admitted before it.
+                    for n in wave {
+                        let t = find(n);
+                        if t.task.spends() {
+                            assert!(spent < budget, "{n} dispatched at the budget: {}", ctx());
+                        }
+                        spent += graph_cost(t);
+                    }
                     let fresh: Vec<&str> = wave
                         .iter()
                         .map(String::as_str)
@@ -9375,7 +9948,6 @@ mod tests {
                     for n in wave {
                         *runs.entry(n.as_str()).or_default() += 1;
                     }
-                    spent += 0.1 * wave.len() as f64;
                 }
                 GraphEvent::Settled(n, s) => {
                     let t = find(n);
@@ -9400,6 +9972,11 @@ mod tests {
             // not_taken_never_dispatched.
             if status(t) == TaskStatus::NotTaken {
                 assert_eq!(n, 0, "{}", ctx());
+            }
+            // cost_ceiling_spares_what_cannot_spend: the cost ceiling blocks only a task that
+            // can spend, so the run still collects what it paid for.
+            if out.results[&t.name].blocked == Some(BlockedReason::BudgetCeiling) {
+                assert!(t.task.spends(), "{} blocked on cost: {}", t.name, ctx());
             }
             // Output drift is a measured failure at the producer: it never passes, never retries.
             if drifted.contains(&t.name.0) {
@@ -9930,9 +10507,9 @@ mod tests {
     fn a_revised_task_declaring_completion_ends_its_loop_unreviewed() {
         let plan = valid(
             vec![
-                task("author", &[], "any", true),
-                reviewing("repro", &["author"], "author", 3),
-                task("after", &["repro"], "any", true),
+                agent("author", &[], "any", true),
+                spending(reviewing("repro", &["author"], "author", 3)),
+                agent("after", &["repro"], "any", true),
             ],
             10.0,
         );
@@ -10285,7 +10862,10 @@ mod tests {
     #[test]
     fn spend_before_the_interruption_counts_against_the_budget() {
         let plan = valid(
-            vec![task("a", &[], "any", true), task("b", &["a"], "any", true)],
+            vec![
+                agent("a", &[], "any", true),
+                agent("b", &["a"], "any", true),
+            ],
             1.0,
         );
         let mut settled = ScriptRunner::new();

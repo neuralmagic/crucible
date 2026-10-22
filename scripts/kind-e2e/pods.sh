@@ -362,7 +362,7 @@ token_state() { sql -c "SELECT count(*) || ' ' || bool_and(revoked_at IS NOT NUL
 # evidence <run> <kind> <out>: GET the run's evidence as a person, printing the status.
 evidence() {
     curl -s -o "$3" -w '%{http_code}' -H "authorization: Bearer $CONTROLLER_API_TOKEN" \
-        "$CONTROLLER_URL/api/runs/$1/evidence/$2"
+        "$CONTROLLER_URL/api/evidence/runs/$1/$2"
 }
 
 log "[JP] a run pod uploads its evidence to its run under the run token"
@@ -410,7 +410,7 @@ expect_finished JP-rerun
 RERUN=$(jq -r '.runs[0].run_id' "$WORK/run-JP-rerun.json")
 RERUN_POD=$(sql -c "SELECT pod FROM runs WHERE run_id = '$RERUN'")
 jq -rs --arg n "$RERUN_POD" '[.[] | .object | select(.metadata.name == $n) | .spec.containers[0].args[]?] | unique | join("\n")' \
-    "$WORK/pods-JP.json" | grep -qF -- "--rerun-of \"\${CRUCIBLE_CONTROLLER_URL}/api/runs/$PARENT\" --from 'second'" ||
+    "$WORK/pods-JP.json" | grep -qF -- "--rerun-of \"\${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/$PARENT\" --from 'second'" ||
     fail "[JP] the rerun pod does not name its parent on the controller"
 [ "$(token_state "$RERUN")" = "1 true $PARENT" ] || fail "[JP] the rerun's token: $(token_state "$RERUN")"
 [ "$(evidence "$RERUN" run-session "$WORK/JP-rerun.gz")" = 200 ] || fail "[JP] the rerun uploaded no session"
@@ -473,18 +473,18 @@ jt_put() {
     curl -s -o /dev/null -w '%{http_code}' -X PUT -H "authorization: Bearer $2" \
         -H 'content-type: application/gzip' --data-binary @"$WORK/JT-message.json" "$CONTROLLER_URL$1"
 }
-[ "$(jt_put "/api/turns/$JT_POD/evidence/scope-transcript" "$JT_TOKEN")" = 200 ] ||
+[ "$(jt_put "/api/evidence/turns/$JT_POD/scope-transcript" "$JT_TOKEN")" = 200 ] ||
     fail "[JT] the turn's token did not upload its transcript"
 [ "$(sql -c "SELECT count(*) FROM artifacts WHERE owner_kind = 'pod-evidence' AND owner_id = '$JT_POD'")" = 2 ] ||
     fail "[JT] the pack and transcript were not stored under the pod"
-[ "$(jt_put "/api/turns/crucible-turn-other/evidence/scope-pack" "$JT_TOKEN")" = 403 ] ||
+[ "$(jt_put "/api/evidence/turns/crucible-turn-other/scope-pack" "$JT_TOKEN")" = 403 ] ||
     fail "[JT] a turn's token wrote another pod's pack"
-[ "$(jt_put "/api/runs/$PARENT/evidence/run-session" "$JT_TOKEN")" = 403 ] ||
+[ "$(jt_put "/api/evidence/runs/$PARENT/run-session" "$JT_TOKEN")" = 403 ] ||
     fail "[JT] a turn's token wrote a run's evidence"
-[ "$(jt_put "/api/turns/$JT_POD/evidence/scope-pack" "$CONTROLLER_API_TOKEN")" = 403 ] ||
+[ "$(jt_put "/api/evidence/turns/$JT_POD/scope-pack" "$CONTROLLER_API_TOKEN")" = 403 ] ||
     fail "[JT] a person wrote a turn's pack"
 sql -c "UPDATE pod_tokens SET revoked_at = '2026-01-01T00:00:00Z' WHERE id = '$JT_ID'" >/dev/null
-[ "$(jt_put "/api/turns/$JT_POD/evidence/scope-pack" "$JT_TOKEN")" = 401 ] ||
+[ "$(jt_put "/api/evidence/turns/$JT_POD/scope-pack" "$JT_TOKEN")" = 401 ] ||
     fail "[JT] a revoked turn token still uploaded"
 kubectl -n "$NS" delete pod "$JT_POD" --grace-period=1 --wait=true >/dev/null
 kubectl -n "$NS" delete configmap "$JT_POD-pack" >/dev/null

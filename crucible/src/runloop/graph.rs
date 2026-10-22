@@ -18,6 +18,7 @@ use crate::args::{Args, Paths, Prepared};
 
 use crate::agent;
 use crate::control;
+use crate::plan::admission::{Admission, Refusal};
 use crate::plan::exec::TransportFailure;
 use crate::plan::exec::{
     Attempt, AttemptOutcome, BatchItem, ExecCfg, Substrate, TaskRunner, TaskStatus, execute,
@@ -356,17 +357,20 @@ impl TaskRunner for EpilogueRunner {
         self.inner.run(task, attempt, &inputs, deadline)
     }
 
-    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
+    fn run_many(
+        &mut self,
+        batch: &[BatchItem<'_>],
+        admission: &Admission,
+    ) -> Vec<Result<Attempt, Refusal>> {
         let batch: Vec<BatchItem<'_>> = batch
             .iter()
             .map(|b| BatchItem {
                 task: b.task,
                 attempt: b.attempt,
                 inputs: self.with_kept(&b.inputs),
-                deadline: b.deadline,
             })
             .collect();
-        self.inner.run_many(&batch)
+        self.inner.run_many(&batch, admission)
     }
 
     fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
@@ -777,8 +781,12 @@ impl<R: Reporter> TaskRunner for LoopTaskRunner<R> {
         }
     }
 
-    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
-        self.workflow_runner.run_many(batch)
+    fn run_many(
+        &mut self,
+        batch: &[BatchItem<'_>],
+        admission: &Admission,
+    ) -> Vec<Result<Attempt, Refusal>> {
+        self.workflow_runner.run_many(batch, admission)
     }
 
     fn stage(&mut self, task: &Task, producers: &[&Task]) -> Result<(), String> {
@@ -1298,54 +1306,38 @@ impl<R: Reporter> TaskRunner for WideRunner<'_, R> {
         }
     }
 
-    fn run_many(&mut self, batch: &[BatchItem<'_>]) -> Vec<Attempt> {
-        let workspace = self.p.workspace.clone();
-        let wide_dir = self.wide_dir.clone();
-        let skills = self.p.skills.clone();
-        let args = self.args;
+    fn run_many(
+        &mut self,
+        batch: &[BatchItem<'_>],
+        admission: &Admission,
+    ) -> Vec<Result<Attempt, Refusal>> {
         // Every candidate clones the same workspace, so its pending state is captured once
         // here: concurrent `git add -A` in one repo races on `.git/index.lock`.
-        let pending = match crate::plan::worktree::capture_diff(&workspace) {
+        let pending = match crate::plan::worktree::capture_diff(&self.p.workspace) {
             Ok(p) => p,
             Err(e) => {
                 let note = format!("capturing the workspace state failed: {e:#}");
                 return batch
                     .iter()
-                    .map(|_| Attempt::failed(0.0, note.clone()))
+                    .map(|_| Ok(Attempt::failed(0.0, note.clone())))
                     .collect();
             }
         };
-        std::thread::scope(|s| {
-            let handles: Vec<_> = batch
-                .iter()
-                .map(|b| {
-                    let workspace = workspace.clone();
-                    let wide_dir = wide_dir.clone();
-                    let skills = skills.clone();
-                    let args = args.clone();
-                    let pending = pending.as_str();
-                    let parsed = match (&b.task.task, candidate_id(&b.task.name)) {
-                        (TaskKind::Agent { prompt, .. }, Some(id)) => Some((id, prompt.clone())),
-                        _ => None,
-                    };
-                    s.spawn(move || match parsed {
-                        Some((id, prompt)) => {
-                            wide_propose(&args, &workspace, &wide_dir, skills, id, &prompt, pending)
-                        }
-                        None => {
-                            Attempt::failed(0.0, "non-agent task in a propose batch".to_string())
-                        }
-                    })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .map(|h| {
-                    h.join().unwrap_or_else(|_| {
-                        Attempt::failed(0.0, "propose thread panicked".to_string())
-                    })
-                })
-                .collect()
+        let (args, workspace, wide_dir, skills) =
+            (self.args, &self.p.workspace, &self.wide_dir, &self.p.skills);
+        admission.run_all(batch, |b, _lane| {
+            match (&b.task.task, candidate_id(&b.task.name)) {
+                (TaskKind::Agent { prompt, .. }, Some(id)) => wide_propose(
+                    args,
+                    workspace,
+                    wide_dir,
+                    skills.clone(),
+                    id,
+                    prompt,
+                    &pending,
+                ),
+                _ => Attempt::failed(0.0, "non-agent task in a propose batch".to_string()),
+            }
         })
     }
 }
