@@ -7,6 +7,8 @@ public import Veil
 `crucible::plan::exec::execute` over the tables in `crucible/src/plan/machine.rs`: a serial task,
 a revise loop, or a batch of isolated tasks in flight; no fan-out or transport retries. The graph is state that `after_init`
 chooses and no action writes, so `#model_check` covers every well-formed graph of the instance.
+`spends` marks a task whose attempt asks a model; the cost ceiling stops only those. To keep the
+state space checkable, only the last task in topological order may not spend.
 -/
 
 veil module PlanExec
@@ -19,7 +21,7 @@ type task
 enum tstate = { t_pending, t_running, t_revising, t_pass, t_fail, t_skipped, t_not_taken, t_transport, t_blocked, t_truncated }
 enum pstate = { p_admitted, p_dispatching, p_draining, p_completed, p_halted, p_truncated }
 enum jkind = { j_all, j_passed, j_settled }
-enum hkind = { h_none, h_short, h_ceiling }
+enum hkind = { h_none, h_short, h_cost, h_time }
 enum rphase = { rp_none, rp_target, rp_review, rp_between }
 
 instantiate topo : TotalOrder task
@@ -33,6 +35,7 @@ relation runnable : task → Bool
 relation route_of : task → task → Bool
 function join : task → jkind
 relation isolated : task → Bool
+relation spends : task → Bool
 -- `revises r t`: reviewer r sends t back (C-REVISE-LOOP).
 relation revises : task → task → Bool
 relation reach : task → task → Bool
@@ -43,6 +46,7 @@ individual plan : pstate
 individual halt : hkind
 relation dispatched : task → Bool
 relation dispatched_while_halted : task → Bool
+relation blocked_on_cost : task → Bool
 function phase : task → rphase
 function rounds : task → Nat
 function last : task → tstate
@@ -64,8 +68,16 @@ ghost relation deps_settled (t : task) := ∀ d, dep t d → settled d
 
 ghost relation idle := ∀ u, status u ≠ t_running ∧ status u ≠ t_revising
 
+-- A revise loop dispatches as one unit, which spends when either task of the pair does.
+ghost relation unit_spends (t : task) :=
+  spends t ∨ (∃ r, revises r t ∧ runnable r ∧ runnable t ∧ spends r) ∨
+    (∃ u, revises t u ∧ runnable t ∧ runnable u ∧ spends u)
+
+-- C-PLAYBOOK-BUDGET: the cost ceiling stops only what can spend.
+ghost relation spared (t : task) := plan = p_draining ∧ halt = h_cost ∧ ¬ unit_spends t
+
 ghost relation open_for (t : task) :=
-  (plan = p_dispatching ∨ (plan = p_draining ∧ halt = h_short ∧ epilogue t)) ∧
+  (plan = p_dispatching ∨ (plan = p_draining ∧ halt = h_short ∧ epilogue t) ∨ spared t) ∧
   (epilogue t → main_settled)
 
 ghost relation route_not_taken (t : task) := ∃ r, route_of t r ∧ status r = t_not_taken
@@ -112,11 +124,14 @@ after_init {
     (∀ r t d, revises r t ∧ dep r d ∧ d ≠ t → ¬ reach d t)
   required T := *
   isolated T := *
+  spends T := *
+  require ∀ t u, ¬ spends t → le u t
   status T := t_pending
   plan := p_admitted
   halt := h_none
   dispatched T := false
   dispatched_while_halted T := false
+  blocked_on_cost T := false
   phase T := rp_none
   rounds T := 0
   last T := t_pending
@@ -144,14 +159,18 @@ procedure short_circuit (t : task) {
     halt := h_short
 }
 
--- After a halt everything left settles blocked, except an epilogue reporting a short circuit.
+-- After a halt everything left settles blocked, except an epilogue reporting a short circuit and
+-- what the cost ceiling spares.
 action block_on_halt (t : task) {
   require idle
   require plan = p_draining
   require status t = t_pending
   require epilogue t → main_settled
   require ¬ (epilogue t ∧ halt = h_short)
+  require ¬ spared t
   status t := t_blocked
+  if halt = h_cost then
+    blocked_on_cost t := true
 }
 
 -- An advisory task the substrate cannot run is skipped (Pending --Unrunnable--> Skipped).
@@ -244,13 +263,15 @@ action target_round (t : task) {
   let s :| s = t_pass ∨ s = t_fail ∨ s = t_skipped ∨ s = t_transport
   last t := s
   dispatched t := true
+  if plan = p_draining then
+    dispatched_while_halted t := true
   phase t := rp_review
 }
 
 action review_round (t r : task) {
   require phase t = rp_review
   require revises r t
-  require plan = p_dispatching
+  require plan = p_dispatching ∨ spared t
   if review_allowed r t then
     let s :| s = t_pass ∨ s = t_fail ∨ s = t_skipped ∨ s = t_transport
     last r := s
@@ -266,7 +287,7 @@ action review_round (t r : task) {
 
 action next_round (t : task) {
   require phase t = rp_between
-  require plan = p_dispatching
+  require plan = p_dispatching ∨ spared t
   rounds t := rounds t + 1
   phase t := rp_target
 }
@@ -277,10 +298,13 @@ action ceiling_in_rounds (t r : task) {
   require phase t = rp_review ∨ phase t = rp_between
   require revises r t
   require plan = p_dispatching
+  let h :| h = h_time ∨ (h = h_cost ∧ unit_spends t)
   if phase t = rp_review then
     last r := t_blocked
+    if h = h_cost then
+      blocked_on_cost r := true
   plan := p_draining
-  halt := h_ceiling
+  halt := h
   end_rounds t r
 }
 
@@ -288,8 +312,9 @@ action ceiling_in_rounds (t r : task) {
 action ceiling {
   require plan = p_dispatching
   require idle
+  let h :| h = h_cost ∨ h = h_time
   plan := p_draining
-  halt := h_ceiling
+  halt := h
 }
 
 action finish {
@@ -347,9 +372,14 @@ safety [completed_means_valid] plan = p_completed ∧ required T ∧ ¬ epilogue
 safety [short_circuit_has_a_cause]
   halt = h_short → ∃ t, required t ∧ ¬ epilogue t ∧ settled t ∧ ¬ held t
 
--- After a halt, the only dispatch is an epilogue reporting a short circuit.
-safety [nothing_runs_after_a_ceiling]
-  dispatched_while_halted T → epilogue T ∧ halt = h_short
+-- After a halt, the only dispatch is an epilogue reporting a short circuit, or a task the cost
+-- ceiling spares because it cannot spend.
+safety [nothing_spends_after_a_ceiling]
+  dispatched_while_halted T → (epilogue T ∧ halt = h_short) ∨ (halt = h_cost ∧ ¬ unit_spends T)
+
+-- C-PLAYBOOK-BUDGET: the cost ceiling blocks only what can spend, so the run still collects the
+-- work it paid for.
+safety [cost_ceiling_spares_what_cannot_spend] blocked_on_cost T → unit_spends T
 
 -- A serial task runs alone; tasks in flight together are isolated and independent.
 safety [serial_runs_alone] status T = t_running ∧ ¬ isolated T ∧ status U = t_running → T = U
@@ -366,11 +396,12 @@ invariant [phase_means_revising] phase T ≠ rp_none → status T = t_revising �
 invariant [revising_has_phase] status T = t_revising ∧ revises R T → phase T ≠ rp_none
 invariant [reviewer_revising] status R = t_revising ∧ revises R T → status T = t_revising
 invariant [revising_is_paired] status T = t_revising → (∃ r, revises r T) ∨ (∃ t, revises T t)
-invariant [loop_only_while_dispatching] phase T ≠ rp_none → plan = p_dispatching
+invariant [loop_only_while_dispatching] phase T ≠ rp_none → plan = p_dispatching ∨ spared T
 invariant [reviewer_alone_means_no_loop] revises R T ∧ dispatched R → ¬ dispatched T
 invariant [pending_reviewer_means_no_loop]
   revises R T ∧ runnable R ∧ status R = t_pending → ¬ dispatched T ∧ ¬ review_ran R
 invariant [rounds_start_at_one] phase T ≠ rp_none → 1 ≤ rounds T
+invariant [loop_is_runnable] phase T ≠ rp_none ∧ revises R T → runnable T ∧ runnable R
 invariant [one_loop] phase T ≠ rp_none ∧ phase U ≠ rp_none → T = U
 invariant [nothing_runs_in_a_loop] phase T ≠ rp_none → status U ≠ t_running
 invariant [loop_target_ready] phase T ≠ rp_none → (∀ d, dep T d → settled d) ∧ deps_allow T ∧ ¬ epilogue T
@@ -381,7 +412,8 @@ invariant [reviewer_runs_alone_only_without_a_loop] revises R T ∧ status R = t
 invariant [reviewer_waits_for_target]
   status T = t_pending ∧ revises R T →
     ¬ review_ran R ∧
-      (status R = t_pending ∨ (status R = t_blocked ∧ plan = p_draining) ∨ (status R = t_skipped ∧ ¬ runnable R))
+      (status R = t_pending ∨ (status R = t_blocked ∧ plan = p_draining ∧ ¬ spared R) ∨
+        (status R = t_skipped ∧ ¬ runnable R))
 invariant [revising_only_in_the_loop] status U = t_revising → ∃ t, phase t ≠ rp_none ∧ (U = t ∨ revises U t)
 
 -- C-REVISE-LOOP: the bound holds.
@@ -400,7 +432,8 @@ safety [dependent_waits_for_the_pair] dispatched X ∧ dep X T ∧ revises R T �
 
 -- A failing reviewer row ends the loop only at the bound, or when a ceiling stopped it.
 safety [failing_review_ends_at_the_bound]
-  revises R T ∧ review_ran R ∧ status R = t_fail → rounds T = max_rounds ∨ halt = h_ceiling
+  revises R T ∧ review_ran R ∧ status R = t_fail →
+    rounds T = max_rounds ∨ halt = h_cost ∨ halt = h_time
 
 safety [halt_matches_plan]
   (plan = p_dispatching ∨ plan = p_completed ∨ plan = p_admitted ∨ plan = p_truncated) ↔ halt = h_none
