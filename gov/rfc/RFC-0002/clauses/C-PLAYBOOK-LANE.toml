@@ -9,6 +9,7 @@ since = "0.1.0"
 
 [content]
 text = """
+
 A manifest with no [judge] MUST accept a [workflow] whose type is "playbook". A manifest with no [judge] MUST reject every other workflow type, and a manifest with [judge] MUST reject type = "playbook".
 
 A playbook graph MUST NOT contain a task naming an engine operation: an operation the scored loop's orchestrator owns rather than the plan author, namely producing a candidate, applying one, measuring one, grading evidence, deciding keep or discard, and measuring one differentially against another. A task that runs an author-supplied command and grades its own result is not an engine operation and MUST be permitted, because it asserts something about the work rather than advancing a scored loop.
@@ -29,7 +30,7 @@ A playbook MUST NOT be required to declare a result task. Its verdict is defined
 
 A task declared required = false MUST NOT affect the run's verdict, and its failure MUST block only its dependents. The choice of which tasks are advisory is the author's; the engine MUST NOT infer it.
 
-A task declared stage = "epilogue" MUST be excluded from the main graph, MUST run once after the main graph settles, and MUST NOT change the verdict. It MUST run when the main graph completed, when it failed, and when a task declared early completion. It MUST NOT run when the run was stopped by an operator or ended by an exhausted ceiling, evaluated at the moment the main graph settles: continuing to spend after either would defeat the control that ended the run.
+A task declared stage = "epilogue" MUST be excluded from the main graph, MUST run once after the main graph settles, and MUST NOT change the verdict. It MUST run when the main graph completed, when it failed, and when a task declared early completion. It MUST NOT run when the run was stopped by an operator or ended by an exhausted wall-clock ceiling, and an epilogue task that can spend under [[RFC-0002:C-PLAYBOOK-BUDGET]] MUST NOT run when the run ended by an exhausted cost ceiling, evaluated at the moment the main graph settles: continuing to spend after either would defeat the control that ended the run.
 
 An epilogue task MUST NOT depend on a main-graph task. It MUST instead receive the main graph's outcome as the reserved input [[RFC-0002:C-SETTLED-JOIN]] defines, which carries the run's shutdown outcome and one entry per settled main-graph task, and MUST be staged with each main-graph task's captured files as that clause requires. This is what makes an epilogue task reachable on the failure path, where dependencies would not have passed.
 
