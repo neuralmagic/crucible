@@ -1,9 +1,10 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
 import {
   Button,
+  cn,
   createDataColumnHelper,
   DataTable,
   Empty,
@@ -14,15 +15,51 @@ import {
   Section,
   SectionBody,
   SectionHeader,
+  Toolbar,
+  ToolbarGroup,
+  ToolbarSearch,
   useDataTable,
 } from '../ui';
+import { matchesTeam } from '../teamPicks';
+import { useActiveTeams, useStarredTeams } from '../useTeamPicks';
 import { FormActions, FormError, FormGrid, TextField } from './formControls';
 import { sortedTeams, validSlug, type TeamDto } from './teamsView';
 
 const NO_TEAMS: TeamDto[] = [];
+
+type Show = 'mine' | 'all';
+const SHOW: { value: Show; label: string }[] = [
+  { value: 'mine', label: 'Mine' },
+  { value: 'all', label: 'All' },
+];
 const helper = createDataColumnHelper<TeamDto>();
 
-const columns = helper.columns([
+function makeColumns(starred: ReadonlySet<string>, active: ReadonlySet<string>, toggle: (slug: string) => void) {
+  return helper.columns([
+  helper.display({
+    id: 'star',
+    header: '',
+    meta: { pad: 'tight', shrink: true },
+    cell: ({ row }) => {
+      const on = starred.has(row.original.slug);
+      return (
+        <button
+          type="button"
+          aria-pressed={on}
+          aria-label={`${on ? 'Unstar' : 'Star'} ${row.original.slug}`}
+          className={cn(
+            'cursor-pointer border-0 bg-transparent px-2 py-1 font-mono text-data hover:text-ink',
+            on ? 'text-amber' : 'text-ink-3',
+          )}
+          onClick={() => {
+            toggle(row.original.slug);
+          }}
+        >
+          {on ? '★' : '☆'}
+        </button>
+      );
+    },
+  }),
   helper.accessor('slug', {
     header: 'Team',
     enableSorting: false,
@@ -49,6 +86,16 @@ const columns = helper.columns([
     meta: { shrink: true, align: 'end', className: 'font-mono text-data text-ink-2' },
     cell: ({ row }) => row.original.members.length,
   }),
+  helper.display({
+    id: 'active',
+    header: 'Owns',
+    meta: { shrink: true },
+    cell: ({ row }) => (
+      <Mono size="data" tone={active.has(row.original.slug) ? 'ink' : 'ink-3'}>
+        {active.has(row.original.slug) ? 'yes' : 'no'}
+      </Mono>
+    ),
+  }),
   helper.accessor('reachable', {
     header: 'Reachable',
     enableSorting: false,
@@ -70,6 +117,7 @@ const columns = helper.columns([
     ),
   }),
 ]);
+}
 
 function CreateTeam() {
   const navigate = useNavigate();
@@ -121,12 +169,26 @@ function CreateTeam() {
 /// Every team the caller may read, the ones they are in first.
 export function TeamsPage() {
   const teams = $api.useQuery('get', '/api/teams');
-  const rows = sortedTeams(teams.data ?? NO_TEAMS);
+  const [starredList, toggle] = useStarredTeams();
+  const active = useActiveTeams();
+  const [query, setQuery] = useState('');
+  const [show, setShow] = useState<Show>('mine');
+  const starred = useMemo(() => new Set(starredList), [starredList]);
+  const columns = useMemo(() => makeColumns(starred, active, toggle), [starred, active, toggle]);
+  const rows = sortedTeams(teams.data ?? NO_TEAMS, starred, active).filter(
+    (team) =>
+      matchesTeam(query, team.slug, team.display_name) &&
+      (show === 'all' || starred.has(team.slug) || (team.my_role !== null && team.my_role !== undefined)),
+  );
   const table = useDataTable({ columns, data: rows, getRowId: (row) => row.slug });
 
   return (
     <>
       <PageHeader eyebrow="System" title="Teams" />
+      <Toolbar>
+        <ToolbarSearch value={query} onChange={setQuery} placeholder="Filter teams…" aria-label="Filter teams" />
+        <ToolbarGroup label="Show" options={SHOW} value={show} onChange={setShow} />
+      </Toolbar>
       <QueryState query={teams} noun="teams">
         <DataTable table={table} empty={<Empty title="No teams" />} footer={<>Showing {rows.length}</>} />
       </QueryState>

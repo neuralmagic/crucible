@@ -82,6 +82,8 @@ describe('withOwners', () => {
   it('falls back to the first option when the form holds nothing offered', () => {
     expect(withOwners(form({ owner: '' }), options).owner).toBe('user:will');
     expect(withOwners(form({ owner: 'group:/groups/gone' }), options).owner).toBe('user:will');
+    expect(withOwners(form({ owner: '' }), options, 'group:/groups/team-x').owner).toBe('group:/groups/team-x');
+    expect(withOwners(form({ owner: '' }), options, 'team:elsewhere').owner).toBe('user:will');
   });
 
   it('leaves the form unregisterable when nobody is signed in', () => {

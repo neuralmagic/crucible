@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
-import { narrow } from '../ownerContext';
+import { eyebrowFor, narrow } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import { usePickerPrefs } from '../api/pickerPrefs';
 import {
@@ -265,11 +265,11 @@ function OwnerPickField({ id, value, onChange, options, hint }: OwnerPickFieldPr
 
 /// Register a secret. The bytes ride this one request and are dropped with it: no route on the
 /// registry returns a value, so the form clears itself the moment the server answers.
-function RegisterSection({ owners }: { owners: readonly PickOption[] }) {
+function RegisterSection({ owners, preferred }: { owners: readonly PickOption[]; preferred: string }) {
   const qc = useQueryClient();
   const register = $api.useMutation('post', '/api/secrets');
   const [entered, setForm] = useState<RegisterForm>(() => emptyRegisterForm(''));
-  const form = withOwners(entered, owners);
+  const form = withOwners(entered, owners, preferred);
   const [error, setError] = useState<string | null>(null);
   const [registered, setRegistered] = useState<string | null>(null);
 
@@ -804,13 +804,23 @@ export function SecretsPage() {
 
   return (
     <>
-      <PageHeader eyebrow="System" title="Secrets" />
+      <PageHeader eyebrow={eyebrowFor(ownerContext.team, 'System')} title="Secrets" />
 
       {secrets.isError ? (
         <Empty title="Secrets unavailable" description={formatError(secrets.error)} />
       ) : secrets.isPending || groups === null ? (
         <LoadingBlock label="Loading secrets" />
       ) : (
+        ownerContext.team !== null ? (
+          <Section>
+            <SecretTable
+              rows={rows}
+              onOpen={setSelected}
+              emptyTitle="No team secrets"
+              emptyDescription="Register one below with this team as its owner."
+            />
+          </Section>
+        ) : (
         <>
           <Section>
             <SectionHeader title="Personal" />
@@ -832,13 +842,14 @@ export function SecretsPage() {
             />
           </Section>
         </>
+        )
       )}
 
       {selected !== null && (
         <SecretDetail id={selected} owners={owners} onClosed={() => { setSelected(null); }} />
       )}
 
-      <RegisterSection owners={owners} />
+      <RegisterSection owners={owners} preferred={ownerContext.context} />
     </>
   );
 }

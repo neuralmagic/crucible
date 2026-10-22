@@ -1,5 +1,5 @@
 import { $api } from '../api/client';
-import { narrow } from '../ownerContext';
+import { eyebrowFor, narrow } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
   createDataColumnHelper,
@@ -94,7 +94,7 @@ export function WebhooksPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Queue"
+        eyebrow={eyebrowFor(owner.team, 'Queue')}
         title="Webhooks"
       />
 
