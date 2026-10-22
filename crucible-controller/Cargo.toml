@@ -42,8 +42,8 @@ croner.workspace = true
 # uses for its own).
 ctrlc = "3"
 jiff.workspace = true
-# TTL caches: the ingest TokenReview accept/reject caches (sync), and the OIDC-mirror /
-# github-app single-flight refreshes (`future::Cache::get_with` coalesces concurrent inits).
+# TTL caches: the OIDC-mirror / github-app single-flight refreshes (`future::Cache::get_with`
+# coalesces concurrent inits).
 moka.workspace = true
 # Killing a local run's whole process group.
 nix = { version = "0.31.3", features = ["signal"] }
@@ -109,7 +109,7 @@ jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # `AsyncHttpClient` closure in `oidc::http_client`, so no second http/tls generation enters the tree.
 openidconnect = { version = "4", default-features = false }
 # The HTTP API (lane F): default features give the Json/Form extractors the frozen routes need
-# (API clients POST JSON, the ingest drop-box POSTs urlencoded).
+# (API clients POST JSON).
 axum = "0.8"
 # Server-side HTTP sessions (cookie id -> Postgres row) on the human surface. The store is pinned
 # to its sqlx 0.9 main by git until a release carries it; bump tower-sessions with it.

@@ -1,5 +1,5 @@
 //! Decision requests (RFC-0002 C-HUMAN-DECISION, C-DECISION-EVIDENCE). A run opens and polls its
-//! requests under `/api/runs/{run}/decisions` with its run token; a person allowed `run:approve`
+//! requests under `/api/runs/{run}/decisions` with its pod token; a person allowed `run:approve`
 //! lists, reads, and answers them on the human API.
 
 pub(crate) mod store;
@@ -24,7 +24,7 @@ use crate::authz::action::{Action, ResourceType, Verb};
 use crate::authz::decision::Resource;
 use crate::authz::model::Principal;
 use crate::event_log::Event;
-use crate::runs::run_token::Grant;
+use crate::runs::pod_token::Grant;
 
 /// The longest note an answer may carry, in bytes. Overridden by `CONTROLLER_DECISION_NOTE_MAX`.
 const DEFAULT_NOTE_MAX: usize = 4096;
@@ -36,7 +36,7 @@ fn note_max() -> usize {
         .unwrap_or(DEFAULT_NOTE_MAX)
 }
 
-/// The run-facing routes. Only a run token for the run in the path opens or polls its requests.
+/// The run-facing routes. Only the pod token of the run in the path opens or polls its requests.
 pub(crate) fn run_routes(db: crate::Db) -> Router {
     Router::new()
         .route("/api/runs/{run_id}/decisions", post(open_request))
@@ -56,9 +56,9 @@ async fn require_run_token(State(db): State<crate::Db>, mut req: Request, next: 
         .and_then(|h| h.strip_prefix("Bearer "))
         .map(str::to_string)
     else {
-        return refuse(StatusCode::UNAUTHORIZED, "a run token is required");
+        return refuse(StatusCode::UNAUTHORIZED, "a pod token is required");
     };
-    match crate::runs::run_token::verify(db.pool(), &presented).await {
+    match crate::runs::pod_token::verify(db.pool(), &presented).await {
         Ok(grant) => {
             req.extensions_mut().insert(grant);
             next.run(req).await
@@ -71,10 +71,10 @@ fn refuse(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(ErrorBody::new(msg))).into_response()
 }
 
-fn not_this_run(grant: &Grant) -> Response {
+fn not_this_run() -> Response {
     refuse(
         StatusCode::FORBIDDEN,
-        format!("this run token opens decisions for {}", grant.run_id),
+        "this pod token opens decisions only for its own run",
     )
 }
 
@@ -84,8 +84,8 @@ async fn open_request(
     Path(run_id): Path<String>,
     Json(request): Json<OpenRequest>,
 ) -> Response {
-    if !grant.may_write(&run_id) {
-        return not_this_run(&grant);
+    if !grant.may_write_run(&run_id) {
+        return not_this_run();
     }
     let pool = db.pool();
     match request.evidence.digest() {
@@ -128,8 +128,8 @@ async fn poll_request(
     State(db): State<crate::Db>,
     Path((run_id, id)): Path<(String, String)>,
 ) -> Response {
-    if !grant.may_write(&run_id) {
-        return not_this_run(&grant);
+    if !grant.may_write_run(&run_id) {
+        return not_this_run();
     }
     match store::get(db.pool(), &id).await {
         Ok(Some(d)) if d.run_id == run_id => Json(d.state()).into_response(),
@@ -150,7 +150,7 @@ async fn publish(db: &crate::Db, d: &store::Decision, to: &str) {
     }
 }
 
-/// A run reached a terminal state: its open requests are withdrawn and its run tokens revoked.
+/// A run reached a terminal state: its open requests are withdrawn and its pod tokens revoked.
 pub(crate) async fn run_ended(db: &crate::Db, run_id: &str) {
     match store::withdraw_run(db.pool(), run_id).await {
         Ok(withdrawn) => {
@@ -162,8 +162,13 @@ pub(crate) async fn run_ended(db: &crate::Db, run_id: &str) {
             tracing::warn!(%run_id, error = format!("{e:#}"), "withdrawing the run's decision requests failed")
         }
     }
-    if let Err(e) = crate::runs::run_token::revoke_run(db.pool(), run_id).await {
-        tracing::warn!(%run_id, error = format!("{e:#}"), "revoking the run's tokens failed");
+    if let Err(e) = crate::runs::pod_token::revoke(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run_id.to_owned()),
+    )
+    .await
+    {
+        tracing::warn!(%run_id, error = format!("{e:#}"), "revoking the run's pod tokens failed");
     }
 }
 

@@ -250,7 +250,7 @@ pub(crate) async fn start(
         ![
             crucible_contract::ENV_RUN_NAME,
             crucible_contract::ENV_CONTROLLER_URL,
-            crucible_contract::ENV_RUN_TOKEN,
+            crucible_contract::ENV_POD_TOKEN,
         ]
         .contains(&name.as_str())
     });
@@ -433,7 +433,7 @@ async fn open_engine_log(dir: &Path) -> Option<Arc<Mutex<tokio::fs::File>>> {
 /// controller's default loopback bind.
 const LOCAL_CONTROLLER_URL: &str = "http://127.0.0.1:8870";
 
-/// What a local run reaches its own controller with: the controller's URL and a run token for this
+/// What a local run reaches its own controller with: the controller's URL and a pod token for this
 /// run, which revokes when the run completes.
 async fn controller_env(
     db: &Db,
@@ -441,7 +441,13 @@ async fn controller_env(
     run_id: &str,
     lifetime: std::time::Duration,
 ) -> Result<Vec<(String, String)>> {
-    let token = crate::runs::run_token::mint(db.pool(), run_id, None, lifetime).await?;
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run_id.to_owned()),
+        None,
+        lifetime,
+    )
+    .await?;
     Ok(vec![
         (
             crucible_contract::ENV_CONTROLLER_URL.to_string(),
@@ -449,7 +455,7 @@ async fn controller_env(
                 .clone()
                 .unwrap_or_else(|| LOCAL_CONTROLLER_URL.to_string()),
         ),
-        (crucible_contract::ENV_RUN_TOKEN.to_string(), token),
+        (crucible_contract::ENV_POD_TOKEN.to_string(), token),
     ])
 }
 

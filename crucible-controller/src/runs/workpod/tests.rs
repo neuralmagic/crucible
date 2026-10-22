@@ -637,8 +637,8 @@ fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() 
     assert_eq!(report.digest.as_deref(), Some("v1:cafe"));
 }
 
-/// Build a minimal surviving ScopeReport (digest frozen, one passed stage) for the drop-box
-/// fold tests.
+/// Build a minimal surviving ScopeReport (digest frozen, one passed stage) for the turn
+/// artifact tests.
 #[cfg(feature = "autoresearch")]
 fn survived_report() -> engine::ScopeReport {
     let env = Envelope::new(
@@ -671,7 +671,7 @@ async fn drop_artifact(pool: &sqlx::PgPool, pod: &str, kind: ArtifactKind, bytes
 
 #[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn dropbox_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
+async fn an_uploaded_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
     let pack = b"the-real-gzipped-pack";
     drop_artifact(&pool, "pod-x", ArtifactKind::ScopePack, pack).await;
     let manifest = vec![ArtifactRef {
@@ -681,9 +681,9 @@ async fn dropbox_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
         delivered: true,
     }];
     let mut report = survived_report();
-    apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
-        .expect("valid drop-box pack accepted");
+        .expect("a valid uploaded pack is accepted");
     assert_eq!(report.pack_tgz.as_deref(), Some(&pack[..]));
     assert!(report.pack_error.is_none());
 }
@@ -699,7 +699,7 @@ async fn survived_scope_with_a_missing_delivered_pack_fails_loudly(pool: sqlx::P
         delivered: true,
     }];
     let mut report = survived_report();
-    let err = apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect_err("a survival's missing pack is fatal");
     assert!(err.contains("scope pack not recovered"), "{err}");
@@ -716,7 +716,7 @@ async fn a_digest_mismatch_fails_loudly(pool: sqlx::PgPool) {
         delivered: true,
     }];
     let mut report = survived_report();
-    let err = apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect_err("digest mismatch is fatal for a survival");
     assert!(err.contains("integrity mismatch"), "{err}");
@@ -732,7 +732,7 @@ async fn an_undelivered_pack_on_a_survival_fails_loudly(pool: sqlx::PgPool) {
         delivered: false,
     }];
     let mut report = survived_report();
-    let err = apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect_err("delivered:false pack on a survival is fatal");
     assert!(err.contains("delivered:false"), "{err}");
@@ -760,7 +760,7 @@ async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
     ];
     let mut report = survived_report();
     // No error: the missing transcript is logged, not fatal.
-    apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect("transcript problem is best-effort");
     assert_eq!(report.pack_tgz.as_deref(), Some(&pack[..]));
@@ -774,7 +774,7 @@ async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn an_empty_manifest_leaves_the_report_untouched(pool: sqlx::PgPool) {
     let mut report = survived_report();
-    apply_dropbox_artifacts(&mut report, &[], &pool, "pod-x")
+    apply_turn_artifacts(&mut report, &[], &pool, "pod-x")
         .await
         .expect("no-op");
     assert!(report.pack_tgz.is_none());
@@ -3625,7 +3625,7 @@ async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) ->
     let env = container.env.as_ref().expect("env");
     let token_ref = env
         .iter()
-        .find(|e| e.name == crucible_contract::ENV_RUN_TOKEN)
+        .find(|e| e.name == crucible_contract::ENV_POD_TOKEN)
         .expect("the run token env");
     assert!(token_ref.value.is_none(), "the token never rides the spec");
     let key_ref = token_ref
@@ -3652,10 +3652,13 @@ async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) ->
                 .map(|b| String::from_utf8_lossy(&b.0).into_owned())
         })
         .expect("the token in the Secret");
-    let grant = crate::runs::run_token::verify(db.pool(), &token)
+    let grant = crate::runs::pod_token::verify(db.pool(), &token)
         .await
         .expect("a live token");
-    assert_eq!(grant.run_id, "playbook_survey_0199c0de-43");
+    assert_eq!(
+        grant.subject,
+        crate::runs::pod_token::Subject::Run("playbook_survey_0199c0de-43".to_string())
+    );
     assert_eq!(
         grant.reads_run.as_deref(),
         Some("playbook_survey_0199c0de-42")

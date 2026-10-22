@@ -1600,7 +1600,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Process-global env vars, removed on drop so a panicking assertion cannot leak the drop-box
+    /// Process-global env vars, removed on drop so a panicking assertion cannot leak the controller
     /// URL into every later test in this process. Pair with [`crate::test_env_lock`].
     struct ScopedEnv(Vec<&'static str>);
 
@@ -1621,46 +1621,16 @@ mod tests {
         }
     }
 
-    /// Read one HTTP POST off `s`, answer 200, and return `(path, body)`. The drop-box client is
+    /// Read one HTTP POST off `s`, answer 200, and return `(path, body)`. The evidence client is
     /// real `reqwest`, so the receiver has to be a real socket.
     fn read_one_post(s: &mut std::net::TcpStream) -> (String, Vec<u8>) {
-        let (line, _, body) = read_one_request(s);
+        let (line, _, body) = crate::testing::read_one_request(s);
         let path = line
             .split_whitespace()
             .nth(1)
             .expect("a request path")
             .to_string();
         (path, body)
-    }
-
-    /// One request off `s`, answered `200`: its request line, its headers lowercased, its body.
-    fn read_one_request(s: &mut std::net::TcpStream) -> (String, String, Vec<u8>) {
-        use std::io::{Read, Write};
-        let mut buf: Vec<u8> = Vec::new();
-        let mut chunk = [0u8; 8192];
-        let (head_end, len) = loop {
-            if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-                let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
-                let len: usize = head
-                    .lines()
-                    .find_map(|l| l.strip_prefix("content-length:"))
-                    .and_then(|v| v.trim().parse().ok())
-                    .unwrap_or(0);
-                if buf.len() >= i + 4 + len {
-                    break (i, len);
-                }
-            }
-            let n = s.read(&mut chunk).expect("read");
-            assert!(n > 0, "the client hung up mid-request");
-            buf.extend_from_slice(&chunk[..n]);
-        };
-        let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
-        let (line, headers) = head.split_once("\r\n").unwrap_or((head.as_str(), ""));
-        let body = buf[head_end + 4..head_end + 4 + len].to_vec();
-        s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-            .expect("respond");
-        let _ = s.flush();
-        (line.to_string(), headers.to_ascii_lowercase(), body)
     }
 
     /// The evidence contract a pod-dispatched playbook rides (RFC-0004:C-RUN-EVIDENCE): a
@@ -1674,7 +1644,7 @@ mod tests {
         let receiver = std::thread::spawn(move || {
             let mut got = Vec::new();
             for s in listener.incoming() {
-                let request = read_one_request(&mut s.expect("accept"));
+                let request = crate::testing::read_one_request(&mut s.expect("accept"));
                 if request.0.starts_with("GET /done ") {
                     break;
                 }
@@ -1728,7 +1698,7 @@ mod tests {
                 crucible_contract::ENV_CONTROLLER_URL,
                 format!("http://127.0.0.1:{port}/"),
             ),
-            (crucible_contract::ENV_RUN_TOKEN, "crr_id_secret".into()),
+            (crucible_contract::ENV_POD_TOKEN, "crr_id_secret".into()),
             (crucible_contract::ENV_RUN_NAME, "acme_x_7-1700".into()),
         ]);
 

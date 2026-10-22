@@ -457,7 +457,11 @@ mod tests {
                 "5744ec28a3d729333135133de6f8a5cde2e1a4cb47f12d27a050afcbb66a461b",
             ),
             (
-                "0057_decision_requests.sql",
+                "0057_pod_tokens.sql",
+                "dc0c1787bd91c3c39696b3a1eceeb6217b17918ff7d108d912a195cee9acad0f",
+            ),
+            (
+                "0058_decision_requests.sql",
                 "f8570a13c3269c667da6add411d8927e4b8e4dccc3a629378970528f03f6baff",
             ),
         ];
@@ -955,11 +959,11 @@ mod tests {
             sqlx::Postgres::database_exists(&url).await?,
             "connect creates the database"
         );
-        assert_eq!(crate::schema_version(&pool).await?, 57);
+        assert_eq!(crate::schema_version(&pool).await?, 58);
 
         // Idempotent: re-opening an already-migrated DB is a no-op, not an error.
         let pool2 = connect(&url).await?;
-        assert_eq!(crate::schema_version(&pool2).await?, 57);
+        assert_eq!(crate::schema_version(&pool2).await?, 58);
         pool.close().await;
         pool2.close().await;
         let _ = sqlx::Postgres::drop_database(&url).await;

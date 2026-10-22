@@ -1,5 +1,5 @@
 //! The run's decision desk: the controller that dispatched the run, reached at
-//! `/api/runs/{run}/decisions` with the run token it handed the run.
+//! `/api/runs/{run}/decisions` with the pod token it handed the run.
 
 use std::time::Duration;
 
@@ -24,12 +24,12 @@ pub struct HttpDesk<'a> {
 }
 
 impl<'a> HttpDesk<'a> {
-    /// `None` unless the controller handed the run its URL, the run's id and a run token.
+    /// `None` unless the controller handed the run its URL, the run's id and its pod token.
     pub fn from_env(log: Option<&'a std::fs::File>) -> Option<Self> {
         let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
         let controller = env(crucible_contract::ENV_CONTROLLER_URL)?;
         let run = env(crucible_contract::ENV_RUN_NAME)?;
-        let token = env(crucible_contract::ENV_RUN_TOKEN)?;
+        let token = env(crucible_contract::ENV_POD_TOKEN)?;
         let client = reqwest::blocking::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()

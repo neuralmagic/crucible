@@ -639,8 +639,8 @@ pub(crate) async fn require_auth_or_api_key(
     req: Request,
     next: Next,
 ) -> Response {
-    if presented_bearer(req.headers()).is_some_and(crate::runs::run_token::looks_like_token) {
-        return key_refused("a run token authenticates only its run's evidence routes");
+    if presented_bearer(req.headers()).is_some_and(crate::runs::pod_token::looks_like_token) {
+        return key_refused("a pod token authenticates only its own evidence routes");
     }
     if presented_bearer(req.headers()).is_some_and(crate::identity::api_key::looks_like_key) {
         let keys = KeyGuard {

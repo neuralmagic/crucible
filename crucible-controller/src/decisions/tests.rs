@@ -290,14 +290,18 @@ async fn an_expired_request_reads_expired_and_refuses_answers(pool: PgPool) {
 
 const HOUR: std::time::Duration = std::time::Duration::from_secs(3600);
 
+fn run(id: &str) -> crate::runs::pod_token::Subject {
+    crate::runs::pod_token::Subject::Run(id.to_owned())
+}
+
 #[sqlx::test(migrator = "crate::MIGRATOR")]
-async fn a_run_ending_withdraws_its_open_requests_and_revokes_its_run_token(pool: PgPool) {
+async fn a_run_ending_withdraws_its_open_requests_and_revokes_its_pod_token(pool: PgPool) {
     seed_run(&pool, "r1").await;
     let db = Db::new(pool.clone());
     let (d, _) = store::open(&pool, "r1", None, &request("gate", 8, 3600))
         .await
         .unwrap();
-    let token = crate::runs::run_token::mint(&pool, "r1", None, HOUR)
+    let token = crate::runs::pod_token::mint(&pool, &run("r1"), None, HOUR)
         .await
         .unwrap();
     crate::decisions::run_ended(&db, "r1").await;
@@ -306,8 +310,8 @@ async fn a_run_ending_withdraws_its_open_requests_and_revokes_its_run_token(pool
         RequestStatus::Withdrawn
     );
     assert!(matches!(
-        crate::runs::run_token::verify(&pool, &token).await,
-        Err(crate::runs::run_token::TokenRefusal::Revoked { .. })
+        crate::runs::pod_token::verify(&pool, &token).await,
+        Err(crate::runs::pod_token::TokenRefusal::Revoked { .. })
     ));
 }
 
@@ -316,10 +320,10 @@ fn runs(pool: &PgPool) -> axum::Router {
 }
 
 #[sqlx::test(migrator = "crate::MIGRATOR")]
-async fn a_run_opens_and_polls_its_request_with_its_run_token(pool: PgPool) {
+async fn a_run_opens_and_polls_its_request_with_its_pod_token(pool: PgPool) {
     seed_run(&pool, "r1").await;
     seed_run(&pool, "r2").await;
-    let token = crate::runs::run_token::mint(&pool, "r1", None, HOUR)
+    let token = crate::runs::pod_token::mint(&pool, &run("r1"), None, HOUR)
         .await
         .unwrap();
     let app = runs(&pool);
@@ -348,7 +352,7 @@ async fn a_run_opens_and_polls_its_request_with_its_run_token(pool: PgPool) {
     assert_eq!(polled["state"], "open");
 
     for (bad, why) in [
-        ("Bearer nope", "not a run token"),
+        ("Bearer nope", "not a pod token"),
         ("Bearer crr_x_y", "unknown"),
     ] {
         let (status, _) = send(&app, "GET", &poll, ("authorization", bad), None).await;
@@ -362,7 +366,7 @@ async fn a_run_opens_and_polls_its_request_with_its_run_token(pool: PgPool) {
     let (status, _) = crate::testing::oneshot_bytes(&app, req).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED, "no bearer at all");
 
-    let other = crate::runs::run_token::mint(&pool, "r2", Some("r1"), HOUR)
+    let other = crate::runs::pod_token::mint(&pool, &run("r2"), Some("r1"), HOUR)
         .await
         .unwrap();
     let other = format!("Bearer {other}");
@@ -396,7 +400,7 @@ async fn a_run_opens_and_polls_its_request_with_its_run_token(pool: PgPool) {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "nor open one for r1");
 
-    crate::runs::run_token::revoke_run(&pool, "r1")
+    crate::runs::pod_token::revoke(&pool, &run("r1"))
         .await
         .unwrap();
     let (status, _) = send(&app, "GET", &poll, auth, None).await;
@@ -406,7 +410,7 @@ async fn a_run_opens_and_polls_its_request_with_its_run_token(pool: PgPool) {
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_request_whose_digest_does_not_match_its_evidence_is_refused(pool: PgPool) {
     seed_run(&pool, "r1").await;
-    let token = crate::runs::run_token::mint(&pool, "r1", None, HOUR)
+    let token = crate::runs::pod_token::mint(&pool, &run("r1"), None, HOUR)
         .await
         .unwrap();
     let mut req = request("gate", 8, 3600);

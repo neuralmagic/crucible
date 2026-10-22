@@ -1,5 +1,5 @@
 //! MLflow exporter — the MLflow exporter, a controller background task over evidence that already
-//! exists (the `otel-log` Tier 2 artifact in the drop-box + the folded `runs`/`candidates` rows).
+//! exists (a run's `otel-log` evidence + the folded `runs`/`candidates` rows).
 //!
 //! It runs POST-fold, never inline with a run or a fold. A failed export marks the bookkeeping row
 //! ([`crate::runs::model::MlflowExportRow`]) and retries on the next sweep — the agentic-ci
