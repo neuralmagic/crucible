@@ -343,8 +343,8 @@ stop_controller
 # The run pod reaches the controller on the host, by the address the kind node resolves the
 # host alias to, else the kind network's gateway. A controller bound past loopback needs its
 # bearer guard on.
-J_HOST=$(docker exec "$CLUSTER-control-plane" getent ahostsv4 host.docker.internal host.containers.internal 2>/dev/null | awk 'NR == 1 { print $1 }')
-[ -n "$J_HOST" ] || J_HOST=$(docker network inspect kind --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}' | tr ' ' '\n' | grep -m1 '\.')
+J_HOST=$(docker exec "$CLUSTER-control-plane" getent ahostsv4 host.docker.internal host.containers.internal 2>/dev/null | awk 'NR == 1 { print $1 }' || true)
+[ -n "$J_HOST" ] || J_HOST=$(docker network inspect kind --format '{{range .IPAM.Config}}{{.Gateway}} {{end}}' | tr ' ' '\n' | grep -m1 '\.' || true)
 [ -n "$J_HOST" ] || fail "[JP] no address the kind network reaches the host on"
 awk -v url="http://$J_HOST:$PORT" '{ print } /^\[cluster\]$/ { print "ingest_url = \"" url "\"" }' \
     "$WORK/profile.toml" >"$WORK/profile-evidence.toml"
