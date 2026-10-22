@@ -576,6 +576,28 @@ pub fn functions() -> Vec<Function> {
                      question answers, or `\"boolean\"` for a noul.",
                 ),
                 Kwarg::new(
+                    "human",
+                    "bool",
+                    "True: a person allowed to approve the run answers, from the controller \
+                     UI, after seeing the dependencies' declared outputs and files. Needs the \
+                     `human` capability. Tasks that do not depend on the route keep running \
+                     while it waits.",
+                ),
+                Kwarg::new(
+                    "review",
+                    "path",
+                    "With `human`: a Markdown template in the pack, rendered over the evidence \
+                     (`inputs`, `run`, `gated`) and shown above it. Every inserted value is \
+                     escaped.",
+                ),
+                Kwarg::new(
+                    "timeout",
+                    "duration",
+                    "With `human`: how long the request stays open, from when it opens; the \
+                     run's wall-clock ceiling by default. An unanswered request records every \
+                     question as `\"uncertain\"`.",
+                ),
+                Kwarg::new(
                     "files",
                     "list[str]",
                     "Declared JSON files of dependencies the model reads, under `files` in its \
@@ -642,9 +664,38 @@ pub fn functions() -> Vec<Function> {
                      the model sees. `\"uncertain\"` is reserved.",
                 ),
                 Kwarg::new(
+                    "multiple",
+                    "bool",
+                    "Take one or more labels. Only a `human = True` route asks it; a `when` runs \
+                     if any listed label was chosen.",
+                ),
+                Kwarg::new(
                     "drop",
                     "str | list[str]",
                     "Answers that deliberately lead nowhere, so no `when` has to list them.",
+                ),
+            ],
+        },
+        Function {
+            name: "pick",
+            lane: Lane::Routed,
+            purpose: "A question for a `human = True` route whose options are a list a \
+                      dependency produced. The route's output holds the picked values under the \
+                      question id, so `over = gate.question` fans out over them. No `when` \
+                      routes on it.",
+            positional: None,
+            kwargs: vec![
+                Kwarg::new("ask", "str", "What to pick."),
+                Kwarg::new(
+                    "source",
+                    "producer.field",
+                    "A list of strings in the output of a task the route depends on, read when \
+                     the route opens its request.",
+                ),
+                Kwarg::new(
+                    "multiple",
+                    "bool",
+                    "Take one or more values rather than one.",
                 ),
             ],
         },

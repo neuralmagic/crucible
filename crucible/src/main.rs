@@ -66,6 +66,7 @@ mod plan {
     };
 
     pub mod cli;
+    pub mod desk;
     pub mod events;
     pub mod harness;
     pub mod template;

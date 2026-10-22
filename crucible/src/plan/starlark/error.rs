@@ -358,6 +358,11 @@ pub enum CompileError {
     )]
     RouteFilesWithSource { task: String },
     #[error(
+        "route {task:?} reads files but is decided by a person, who sees its dependencies' files \
+         as evidence already; drop files"
+    )]
+    RouteFilesWithHuman { task: String },
+    #[error(
         "argument {argument:?} carries a value supplied from outside the pack. A prompt marks \
          such a span so an agent can tell it from an instruction; nothing else can, so do not \
          build it into {argument:?}. A command or evaluate task reads it as data from the \
@@ -520,12 +525,23 @@ pub enum CompileError {
         error: crucible_contract::decision::QuestionError,
     },
     #[error(
-        "route {task:?} needs exactly one of min_confidence (a decision model answers) or \
-         source (a dependency's output answers)"
+        "route {task:?} needs exactly one of min_confidence (a decision model answers), \
+         source (a dependency's output answers), or human = True (a person answers)"
     )]
     RouteDecider { task: String },
+    #[error("route {task:?}: review is shown to the person who answers, so it needs human = True")]
+    ReviewWithoutHuman { task: String },
+    #[error(
+        "route {task:?}: timeout bounds how long a person has to answer, so it needs human = True"
+    )]
+    TimeoutWithoutHuman { task: String },
     #[error("argument \"when\" must be one question of a route task, like `gate.area`")]
     WhenNotAnAnswer,
+    #[error(
+        "\"source\" must name a declared list field of a task the route depends on, as \
+         `source = producer.field`"
+    )]
+    PickNotOutputField,
     #[error("argument \"answers\" has no meaning without \"when\"")]
     AnswersWithoutWhen,
     #[error("argument \"answers\" lists no labels")]

@@ -11,6 +11,8 @@ export type { DeltaProps } from './Delta';
 export { DetailHeader } from './DetailHeader';
 export type { DetailHeaderProps } from './DetailHeader';
 export { Empty } from './Empty';
+export { ErrorBoundary } from './ErrorBoundary';
+export type { ErrorBoundaryProps } from './ErrorBoundary';
 export type { EmptyProps } from './Empty';
 export { ExternalLinkChip, ExternalLinkMark, ExternalLinks, shownLinks } from './ExternalLink';
 export type {

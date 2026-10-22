@@ -22,6 +22,7 @@ import {
   useDataTable,
 } from '../ui';
 import type { ControlEvidence, RoundRecord } from './approvalEvidence';
+import { DecisionsSection } from './DecisionsSection';
 import {
   adversaryAttacks,
   adversaryPassed,
@@ -216,6 +217,7 @@ export function ApprovalsPage() {
         description="Scope packs waiting on a human, packs proposed for the registry, and the candidate PRs the loop already kept."
       />
 
+      <DecisionsSection />
       <QueryState query={approvals} noun="approvals">
         <Section>
           <SectionHeader title="Pack approvals" note={`${packs.length} at the checkpoint`} />
