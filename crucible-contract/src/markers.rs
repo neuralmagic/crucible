@@ -37,6 +37,10 @@ pub const SCOPE_PACK_MARKER: &str = "CRUCIBLE_SCOPE_PACK:";
 /// `cat` of the run's `state/session.jsonl`.
 pub const RUN_SESSION_DELIMITER: &str = "SESSION (rc=";
 
+/// The file under a run's state directory that marks its session log as not uploaded, so the
+/// loop-run wrapper prints the log after the session delimiter for the controller to scrape.
+pub const RUN_SESSION_UNDELIVERED: &str = "session.undelivered";
+
 /// The `managed-by` label key every rendered loop/turn pod carries, so `crucible ps` and the
 /// controller's pod-completion watch can select the pods this system owns.
 pub const MANAGED_BY_KEY: &str = "app.kubernetes.io/managed-by";

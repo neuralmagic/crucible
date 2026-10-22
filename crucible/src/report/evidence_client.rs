@@ -3,8 +3,9 @@
 //! evidence, a scope turn's pod uploads its pack and transcript, and a rerun downloads its
 //! parent's evidence into a directory laid out like a state directory.
 //!
-//! Uploads are best-effort and never fail the pod: a failed upload is logged, a run's controller
-//! falls back to scraping the session from the pod log, and a turn's manifest marks the artifact
+//! Uploads are best-effort and never fail the pod: a failed upload is logged, a run whose session
+//! did not upload leaves [`crucible_contract::RUN_SESSION_UNDELIVERED`] so its wrapper prints the
+//! session for the controller to scrape from the pod log, and a turn's manifest marks the artifact
 //! undelivered.
 
 use crate::args::Paths;
@@ -16,11 +17,19 @@ use crucible_contract::{ArtifactRef, content_digest};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// How many times one upload is attempted before it is given up.
-const MAX_ATTEMPTS: u32 = 3;
-
-/// Base backoff between attempts (attempt N waits `BACKOFF * N`).
-const BACKOFF: Duration = Duration::from_millis(300);
+/// The waits between attempts at an upload that failed transiently: a connection error, a timeout,
+/// 408, 429, or a 5xx. About three minutes in all, so a router or controller restart does not
+/// lose a finished run's evidence.
+const RETRY_WAITS: [Duration; 8] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+    Duration::from_secs(32),
+    Duration::from_secs(60),
+    Duration::from_secs(60),
+];
 
 /// Per-request timeout. A session log is up to 128 MiB, so this is generous.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
@@ -42,6 +51,7 @@ pub(crate) struct Upload {
     base: String,
     target: Target,
     token: String,
+    waits: &'static [Duration],
 }
 
 impl Upload {
@@ -66,6 +76,7 @@ impl Upload {
                 .to_string(),
             target,
             token: non_empty_env(crucible_contract::ENV_POD_TOKEN)?,
+            waits: &RETRY_WAITS,
         })
     }
 
@@ -105,7 +116,26 @@ pub(crate) fn deliver_run_evidence(p: &Paths) {
     if otel.exists() {
         deliver_file(&upload, ArtifactKind::OtelLog, &otel);
     }
-    deliver_file(&upload, ArtifactKind::RunSession, &p.session_log);
+    let delivered = deliver_file(&upload, ArtifactKind::RunSession, &p.session_log);
+    if let Err(e) = mark_session(&p.state, delivered) {
+        eprintln!(
+            "[crucible] marking the session in {} failed: {e}",
+            p.state.display()
+        );
+    }
+}
+
+/// Leave [`crucible_contract::RUN_SESSION_UNDELIVERED`] in `state` when the session did not
+/// upload, and clear one an earlier start left when it did.
+fn mark_session(state: &Path, delivered: bool) -> std::io::Result<()> {
+    let marker = state.join(crucible_contract::RUN_SESSION_UNDELIVERED);
+    if !delivered {
+        return std::fs::write(&marker, b"");
+    }
+    match std::fs::remove_file(&marker) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// Upload a state directory as one gzipped tar. A run that produced none uploads nothing.
@@ -121,15 +151,17 @@ fn deliver_dir(upload: &Upload, kind: ArtifactKind, dir: &Path) {
     }
 }
 
-fn deliver_file(upload: &Upload, kind: ArtifactKind, path: &Path) {
+/// Upload one file gzipped. Whether the controller stored it.
+fn deliver_file(upload: &Upload, kind: ArtifactKind, path: &Path) -> bool {
     match std::fs::read(path).and_then(|raw| gzip(&raw)) {
-        Ok(gz) => {
-            send(upload, kind, &gz);
+        Ok(gz) => send(upload, kind, &gz),
+        Err(e) => {
+            eprintln!(
+                "[crucible] reading {} as {kind} failed: {e}",
+                path.display()
+            );
+            false
         }
-        Err(e) => eprintln!(
-            "[crucible] reading {} as {kind} failed: {e}",
-            path.display()
-        ),
     }
 }
 
@@ -145,8 +177,16 @@ pub(crate) fn upload_turn_artifact(upload: &Upload, kind: ArtifactKind, gz: &[u8
     }
 }
 
-/// PUT one artifact, retrying anything but an oversize refusal. Returns whether it was stored.
+fn transient(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
+/// PUT one artifact, retrying transient failures over the upload's waits. Returns whether it was
+/// stored.
 fn send(upload: &Upload, kind: ArtifactKind, gz: &[u8]) -> bool {
+    let waits = upload.waits;
     let client = match reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -159,7 +199,8 @@ fn send(upload: &Upload, kind: ArtifactKind, gz: &[u8]) -> bool {
     };
     let url = upload.url(kind);
     let bytes = gz.len();
-    for attempt in 1..=MAX_ATTEMPTS {
+    let attempts = waits.len() + 1;
+    for attempt in 1..=attempts {
         let resp = client
             .put(&url)
             .bearer_auth(&upload.token)
@@ -174,25 +215,43 @@ fn send(upload: &Upload, kind: ArtifactKind, gz: &[u8]) -> bool {
             Ok(r) if r.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE => {
                 eprintln!(
                     "[crucible] the controller refused {kind} as oversize: {}",
-                    r.text().unwrap_or_default().trim()
+                    first_line(&r.text().unwrap_or_default())
+                );
+                return false;
+            }
+            Ok(r) if !transient(r.status()) => {
+                eprintln!(
+                    "[crucible] the controller refused {kind}: HTTP {}: {}",
+                    r.status(),
+                    first_line(&r.text().unwrap_or_default())
                 );
                 return false;
             }
             Ok(r) => eprintln!(
-                "[crucible] uploading {kind}, attempt {attempt}/{MAX_ATTEMPTS}: HTTP {}: {}",
+                "[crucible] uploading {kind}, attempt {attempt}/{attempts}: HTTP {}: {}",
                 r.status(),
-                r.text().unwrap_or_default().trim()
+                first_line(&r.text().unwrap_or_default())
             ),
-            Err(e) => {
-                eprintln!("[crucible] uploading {kind}, attempt {attempt}/{MAX_ATTEMPTS}: {e}")
-            }
+            Err(e) => eprintln!("[crucible] uploading {kind}, attempt {attempt}/{attempts}: {e}"),
         }
-        if attempt < MAX_ATTEMPTS {
-            std::thread::sleep(BACKOFF * attempt);
+        if let Some(wait) = waits.get(attempt - 1) {
+            std::thread::sleep(*wait);
         }
     }
-    eprintln!("[crucible] gave up uploading {kind} after {MAX_ATTEMPTS} attempts");
+    eprintln!("[crucible] gave up uploading {kind} after {attempts} attempts");
     false
+}
+
+/// The first non-blank line of an error body, at most 200 characters: a router's HTML error page
+/// is not worth a pod log screenful.
+fn first_line(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(200)
+        .collect()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -282,14 +341,82 @@ pub fn fetch_parent(parent: &url::Url, dest: &Path) -> Result<(), FetchError> {
 
 #[cfg(all(test, feature = "autoresearch"))]
 mod tests {
-    use crate::report::evidence_client::{Target, Upload, upload_turn_artifact};
+    use crate::report::evidence_client::{Target, Upload, send, upload_turn_artifact};
     use crucible_contract::{ArtifactKind, content_digest};
+    use std::time::Duration;
+
+    /// A controller that answers each request in turn with the next of `statuses`; the server
+    /// thread returns how many requests it served.
+    fn controller(statuses: &[&'static str]) -> (String, std::thread::JoinHandle<usize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let base = format!("http://{}", listener.local_addr().expect("addr"));
+        let statuses = statuses.to_vec();
+        let server = std::thread::spawn(move || {
+            for status in &statuses {
+                let (mut s, _) = listener.accept().expect("accept");
+                crate::testing::answer_one_request(&mut s, status);
+            }
+            statuses.len()
+        });
+        (base, server)
+    }
+
+    #[test]
+    fn a_transient_failure_is_retried_until_the_controller_stores_it() {
+        let (base, server) = controller(&[
+            "503 Service Unavailable",
+            "502 Bad Gateway",
+            "429 Too Many Requests",
+            "200 OK",
+        ]);
+        assert!(send(&turn(base), ArtifactKind::ScopePack, b"gz"));
+        assert_eq!(server.join().expect("server"), 4);
+    }
+
+    #[test]
+    fn a_refusal_is_not_retried() {
+        let (base, server) = controller(&["401 Unauthorized"]);
+        assert!(!send(&turn(base), ArtifactKind::ScopePack, b"gz"));
+        assert_eq!(server.join().expect("server"), 1);
+    }
+
+    #[test]
+    fn retries_stop_when_the_waits_run_out() {
+        let (base, server) = controller(&["503 Service Unavailable"; 4]);
+        assert!(!send(&turn(base), ArtifactKind::ScopePack, b"gz"));
+        assert_eq!(server.join().expect("server"), 4);
+    }
+
+    #[test]
+    fn an_undelivered_session_is_marked_and_a_delivered_one_clears_the_mark() {
+        let state = tempfile::tempdir().expect("tempdir");
+        let marker = state
+            .path()
+            .join(crucible_contract::RUN_SESSION_UNDELIVERED);
+        crate::report::evidence_client::mark_session(state.path(), true).expect("no mark yet");
+        assert!(!marker.exists());
+        crate::report::evidence_client::mark_session(state.path(), false).expect("mark");
+        assert!(marker.exists());
+        crate::report::evidence_client::mark_session(state.path(), true).expect("clear");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn an_error_body_is_cut_to_its_first_line() {
+        let page = "\n  <html>\n  <body>all pods are down</body>\n</html>";
+        assert_eq!(crate::report::evidence_client::first_line(page), "<html>");
+        assert_eq!(
+            crate::report::evidence_client::first_line(&"x".repeat(500)).len(),
+            200
+        );
+    }
 
     fn turn(base: String) -> Upload {
         Upload {
             base,
             target: Target::Turn("crucible-turn-a".to_string()),
             token: "crr_id_secret".to_string(),
+            waits: &[Duration::ZERO; 3],
         }
     }
 

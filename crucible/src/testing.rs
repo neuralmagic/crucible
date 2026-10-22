@@ -43,6 +43,15 @@ pub(crate) fn tempdir(name: &str) -> PathBuf {
 
 /// One request off `s`, answered `200`: its request line, its headers lowercased, its body.
 pub(crate) fn read_one_request(s: &mut std::net::TcpStream) -> (String, String, Vec<u8>) {
+    answer_one_request(s, "200 OK")
+}
+
+/// One request off `s`, answered with `status` (e.g. `"503 Service Unavailable"`): its request
+/// line, its headers lowercased, its body.
+pub(crate) fn answer_one_request(
+    s: &mut std::net::TcpStream,
+    status: &str,
+) -> (String, String, Vec<u8>) {
     use std::io::{Read, Write};
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
@@ -65,7 +74,7 @@ pub(crate) fn read_one_request(s: &mut std::net::TcpStream) -> (String, String, 
     let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
     let (line, headers) = head.split_once("\r\n").unwrap_or((head.as_str(), ""));
     let body = buf[head_end + 4..head_end + 4 + len].to_vec();
-    s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+    s.write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
         .expect("respond");
     let _ = s.flush();
     (line.to_string(), headers.to_ascii_lowercase(), body)

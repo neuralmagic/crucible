@@ -988,6 +988,7 @@ impl Renderer<'_> {
         let domain_dir = self.domain_dir();
         let manifest_file = self.manifest_file;
         let session_delimiter = crucible_contract::RUN_SESSION_DELIMITER;
+        let session_undelivered = crucible_contract::RUN_SESSION_UNDELIVERED;
         if let Some(pb) = &self.opts.playbook {
             let max_cost = pb.max_cost;
             let max_time = pb.max_time;
@@ -1016,7 +1017,7 @@ else
   echo "[crucible] this run has started $n times; leaving it unfinished" >&2
   rc=0
 fi
-if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ]; then
+if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ] || [ -e "$D/state/{session_undelivered}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
@@ -1055,7 +1056,7 @@ exit $rc
 crucible --manifest="$D/{manifest_file}" --ui=stream --agent-backend=openshell \
   --sandbox-image={sandbox_image} --control-port={CONTROL_PORT} --iterations={iterations} --max-cost={max_cost}{results_bucket_flag}{pr_repo_flag}{compute_driver_flag}{harness_flag}{model_flag}{resume_flag}
 rc=$?
-if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ]; then
+if [ -z "${{CRUCIBLE_CONTROLLER_URL:-}}" ] || [ -e "$D/state/{session_undelivered}" ]; then
   echo "=================== {session_delimiter}$rc) ==================="
   cat "$D/state/session.jsonl" 2>/dev/null
 fi
@@ -2449,8 +2450,10 @@ mod tests {
             "{yaml}"
         );
         assert!(
-            yaml.contains("if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ]; then"),
-            "the SESSION delimiter dump is guarded behind the controller env: {yaml}"
+            yaml.contains(
+                "if [ -z \"${CRUCIBLE_CONTROLLER_URL:-}\" ] || [ -e \"$D/state/session.undelivered\" ]; then"
+            ),
+            "the SESSION delimiter dump runs without a controller or after a failed upload: {yaml}"
         );
         for gone in [
             "CRUCIBLE_INGEST_URL",
