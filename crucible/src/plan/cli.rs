@@ -1727,8 +1727,8 @@ mod tests {
 
         let requests = receiver.join().expect("receiver");
         let lines: Vec<&str> = requests.iter().map(|(l, _, _)| l.as_str()).collect();
-        let commits = "PUT /api/runs/acme_x_7-1700/evidence/run-commits HTTP/1.1";
-        let session = "PUT /api/runs/acme_x_7-1700/evidence/run-session HTTP/1.1";
+        let commits = "PUT /api/evidence/runs/acme_x_7-1700/run-commits HTTP/1.1";
+        let session = "PUT /api/evidence/runs/acme_x_7-1700/run-session HTTP/1.1";
         assert_eq!(
             lines,
             [commits, session, commits, session],
