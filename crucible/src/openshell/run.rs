@@ -12,7 +12,7 @@
 //! The sandbox name is derived per (process, workspace), so parallel wide-round candidates and parallel
 //! crucible processes sharing one gateway never collide on a fixed name.
 
-use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
+use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::{
     AuthProvider, HarnessRuntime, McpServer, SandboxAuth, SandboxLayout, TranscriptLocator,
     TurnArtifacts,
@@ -700,7 +700,7 @@ async fn try_turn(
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
-            model: args.model(),
+            pricing: args.pricing(),
             json,
             cancel: &cancel,
         };
@@ -752,17 +752,16 @@ async fn try_turn(
             replay_sandbox_log(&gw, &name, LogReplay::Tail, sink).await;
         }
         let mut cost = exec_result?;
-        spent.raise(cost);
+        spent.raise(cost.total());
 
         // 8a. Agent exited: roll the captured OTLP jsonl up into the `otel_summary` event
-        //     (authoritative cost, per-model usage, API latency). `cost_of`'s prefer-OTEL rule
-        //     lifts the turn's cost onto the authoritative number.
+        //     (authoritative cost, per-model usage, API latency).
         if let Some(c) = &collector
             && let Some(summary) = c.summary()
         {
             let ev = summary.to_event();
-            cost = cost.max(cost_of(&ev).unwrap_or(0.0));
-            spent.raise(cost);
+            cost.observe(&ev);
+            spent.raise(cost.total());
             sink("", RawStream::Stdout, Some(&ev));
         }
 
@@ -788,10 +787,10 @@ async fn try_turn(
         if harness.spec().backfill_required
             || crate::agent::engine::TurnExport::resolve().emits_anything()
         {
-            cost = graft_turn_telemetry(harness, &gw, &name, &cancel, cost, sink).await;
-            spent.raise(cost);
+            graft_turn_telemetry(harness, &gw, &name, &cancel, &mut cost, sink).await;
+            spent.raise(cost.total());
         }
-        Ok(cost)
+        Ok(cost.total())
     }
     .await;
 
@@ -952,17 +951,16 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
         .context("pre-warming the aws-s3 credentials")
 }
 
-/// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the pricing
-/// model for the token-estimate fallback, the front-end mode, and the turn's cancellation token.
+/// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the turn's
+/// pricing, the front-end mode, and the turn's cancellation token.
 struct ExecOpts<'a> {
-    model: &'a str,
+    pricing: crate::agent::event::Pricing,
     json: bool,
     cancel: &'a CancellationToken,
 }
 
 /// Exec the agent over the gateway's `ExecSandbox` stream, driving a [`crate::agent::turn::StreamPump`] with the
-/// stdout lines the stream yields, and return the turn's cost (estimated from tokens if none was
-/// reported). The stream's stderr is replayed through the sink after the agent exits, mirroring the
+/// stdout lines the stream yields, and return the turn's running cost. The stream's stderr is replayed through the sink after the agent exits, mirroring the
 /// old CLI-child behavior. `cancel` unwinds the exec on Ctrl-C (see [`Gateway::exec`]).
 async fn exec_and_stream(
     gw: &Gateway,
@@ -972,24 +970,18 @@ async fn exec_and_stream(
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> Result<f64> {
-    let mut pump = crate::agent::turn::StreamPump::new(decoder);
+) -> Result<crate::agent::turn::TurnCost> {
+    let mut pump = crate::agent::turn::StreamPump::new(decoder, opts.pricing);
     let exec = gw
         .exec(name, command, opts.cancel, |line| {
             pump.push(line, opts.json, sink)
         })
         .await?;
-    let (mut cost, best_tokens) = pump.finish();
+    let cost = pump.finish();
     let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
-
-    if cost == 0.0
-        && let Some(t) = &best_tokens
-    {
-        cost = estimate_cost(opts.model, t);
-    }
     // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
     // non-zero below, and a turn that spent money is never reported free.
-    spent.raise(cost);
+    spent.raise(cost.total());
 
     // Replay the agent's stderr (provisioning notes / errors) through the sink as raw lines.
     for line in exec.stderr_lines {
@@ -1233,9 +1225,9 @@ async fn graft_turn_telemetry(
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
-    cost: f64,
+    cost: &mut crate::agent::turn::TurnCost,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> f64 {
+) {
     let fetched = tokio::time::timeout(
         harness.spec().transcript_fetch_timeout,
         fetch_transcript(harness, gw, name, cancel),
@@ -1250,7 +1242,7 @@ async fn graft_turn_telemetry(
             };
             sink("", RawStream::Stderr, Some(&ev));
         }
-        return cost;
+        return;
     };
 
     let export = crate::agent::engine::TurnExport::resolve();
@@ -1278,16 +1270,15 @@ async fn graft_turn_telemetry(
         }
     }
 
-    let mut cost = cost;
     if harness.spec().backfill_required {
         for ev in &artifacts.events {
+            cost.observe(ev);
             sink("", RawStream::Stdout, Some(ev));
         }
         if let Some(c) = artifacts.cost_usd {
-            cost = cost.max(c);
+            cost.report(c);
         }
     }
-    cost
 }
 
 const PRIVATE_SESSION_DIR: &str = "agent-session-private";
@@ -1685,6 +1676,7 @@ mod tests {
             selection: Some(crate::agent::inference::AgentSelection {
                 protocol: crucible_contract::inference::InferenceProtocol::Responses,
                 model: "m".into(),
+                price: None,
             }),
             ..Default::default()
         };

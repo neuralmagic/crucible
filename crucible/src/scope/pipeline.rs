@@ -718,7 +718,7 @@ fn run_adversary_turn(
     activity: &mut ActivityFeed,
 ) -> (TurnOutcome, String) {
     let args = turn_args(opts);
-    let model = args.model().to_string();
+    let pricing = args.pricing();
     let meta = scratch_dir("scope-adversary-meta");
     let paths = Paths {
         workspace: pack.to_path_buf(),
@@ -737,7 +737,7 @@ fn run_adversary_turn(
         forward_error(ev);
         if let Some(ev) = ev {
             transcript_event(session, ev);
-            activity.observe(&model, ev);
+            activity.observe(&pricing, ev);
         }
         if stream != RawStream::Stdout {
             return;
@@ -957,14 +957,14 @@ fn run_propose_turn(
     activity: &mut ActivityFeed,
 ) -> TurnOutcome {
     let args = turn_args(opts);
-    let model = args.model().to_string();
+    let pricing = args.pricing();
     let paths = propose_paths(scratch);
     let _ = std::fs::create_dir_all(&paths.state);
     agent::run_turn(&args, &paths, prompt, false, |_line, _stream, ev| {
         forward_error(ev);
         if let Some(ev) = ev {
             transcript_event(session, ev);
-            activity.observe(&model, ev);
+            activity.observe(&pricing, ev);
         }
     })
 }
@@ -2581,12 +2581,16 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let mut feed = ActivityFeed::new(SCOPE_ACTIVITY_MARKER, false);
         let now = std::time::Instant::now();
         assert!(
-            feed.line_for("claude-opus-4-6", &tool_event("Edit", "x"), now)
-                .is_none()
+            feed.line_for(
+                &crate::agent::event::Pricing::resolve("claude-opus-4-6", None),
+                &tool_event("Edit", "x"),
+                now
+            )
+            .is_none()
         );
         assert!(
             feed.line_for(
-                "claude-opus-4-6",
+                &crate::agent::event::Pricing::resolve("claude-opus-4-6", None),
                 &AgentEvent::Text { delta: "hi".into() },
                 now
             )
@@ -2604,10 +2608,18 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             cost_usd: Some(0.25),
             ..Tokens::default()
         };
-        let _ = feed.line_for("claude-opus-4-6", &AgentEvent::Tokens(tokens), now);
+        let _ = feed.line_for(
+            &crate::agent::event::Pricing::resolve("claude-opus-4-6", None),
+            &AgentEvent::Tokens(tokens),
+            now,
+        );
         let long = "y".repeat(ACTIVITY_TOOL_CAP + 40);
         let line = feed
-            .line_for("claude-opus-4-6", &tool_event("Bash", &long), now)
+            .line_for(
+                &crate::agent::event::Pricing::resolve("claude-opus-4-6", None),
+                &tool_event("Bash", &long),
+                now,
+            )
             .expect("tool events always emit");
         let v = activity_json(&line);
         assert_eq!(v["kind"], "tool");
@@ -2625,15 +2637,23 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let text = AgentEvent::Text {
             delta: "working on the manifest".into(),
         };
-        assert!(feed.line_for("m", &text, t0).is_some(), "first text emits");
         assert!(
-            feed.line_for("m", &text, t0 + std::time::Duration::from_secs(1))
-                .is_none(),
+            feed.line_for(&crate::agent::event::Pricing::resolve("m", None), &text, t0)
+                .is_some(),
+            "first text emits"
+        );
+        assert!(
+            feed.line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &text,
+                t0 + std::time::Duration::from_secs(1)
+            )
+            .is_none(),
             "a second within the interval is suppressed"
         );
         assert!(
             feed.line_for(
-                "m",
+                &crate::agent::event::Pricing::resolve("m", None),
                 &AgentEvent::Tokens(Tokens::default()),
                 t0 + std::time::Duration::from_secs(2)
             )
@@ -2642,13 +2662,22 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
         let later = t0 + ACTIVITY_MIN_INTERVAL + std::time::Duration::from_secs(1);
         assert!(
-            feed.line_for("m", &text, later).is_some(),
+            feed.line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &text,
+                later
+            )
+            .is_some(),
             "the interval elapsing reopens the lane"
         );
         // Tool lines never wait on the text limiter.
         assert!(
-            feed.line_for("m", &tool_event("Read", "crucible.toml"), later)
-                .is_some()
+            feed.line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &tool_event("Read", "crucible.toml"),
+                later
+            )
+            .is_some()
         );
     }
 
@@ -2658,7 +2687,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let now = std::time::Instant::now();
         assert!(
             feed.line_for(
-                "m",
+                &crate::agent::event::Pricing::resolve("m", None),
                 &AgentEvent::Text {
                     delta: "  \n".into()
                 },
@@ -2669,7 +2698,11 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
         let long = "z".repeat(ACTIVITY_TEXT_CAP + 30);
         let line = feed
-            .line_for("m", &AgentEvent::Text { delta: long }, now)
+            .line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &AgentEvent::Text { delta: long },
+                now,
+            )
             .expect("text emits");
         let v = activity_json(&line);
         assert_eq!(v["kind"], "text");
@@ -2687,7 +2720,7 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         };
         let line = feed
             .line_for(
-                "claude-haiku-4-5",
+                &crate::agent::event::Pricing::resolve("claude-haiku-4-5", None),
                 &AgentEvent::Tokens(tokens),
                 std::time::Instant::now(),
             )
@@ -2708,7 +2741,13 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             label: "openshell".into(),
             value: Some("creating sandbox (pulling the image)".into()),
         };
-        let line = feed.line_for("m", &stage, now).expect("stage emits");
+        let line = feed
+            .line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &stage,
+                now,
+            )
+            .expect("stage emits");
         let v = activity_json(&line);
         assert_eq!(v["kind"], "stage");
         assert_eq!(v["detail"], "creating sandbox (pulling the image)");
@@ -2717,10 +2756,21 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
             label: "Cost".into(),
             value: Some("$0.10".into()),
         };
-        assert!(feed.line_for("m", &other, now).is_none());
         assert!(
-            feed.line_for("m", &AgentEvent::Thinking { delta: "x".into() }, now)
-                .is_none()
+            feed.line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &other,
+                now
+            )
+            .is_none()
+        );
+        assert!(
+            feed.line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &AgentEvent::Thinking { delta: "x".into() },
+                now
+            )
+            .is_none()
         );
     }
 
@@ -2731,9 +2781,11 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         let now = std::time::Instant::now();
         let mut lines = Vec::new();
         for i in 0..10 {
-            if let Some(line) =
-                feed.line_for("m", &tool_event("Read", &format!("file-{i}.rs")), now)
-            {
+            if let Some(line) = feed.line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &tool_event("Read", &format!("file-{i}.rs")),
+                now,
+            ) {
                 lines.push(line);
             }
         }
@@ -2749,7 +2801,14 @@ workflow(type = "autoresearch", tasks = [candidate, live, measurement, decision]
         );
         assert!(lines.len() < 10, "the budget stopped the feed: {lines:?}");
         // And the feed stays quiet afterwards, even for tool events.
-        assert!(feed.line_for("m", &tool_event("Edit", "x"), now).is_none());
+        assert!(
+            feed.line_for(
+                &crate::agent::event::Pricing::resolve("m", None),
+                &tool_event("Edit", "x"),
+                now
+            )
+            .is_none()
+        );
     }
 
     #[test]

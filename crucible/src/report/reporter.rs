@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 /// Cumulative-budget context for one agent turn. Cost is only authoritative at turn
 /// end, so mid-turn the reporters price the streamed token samples (see
-/// [`crate::agent::event::provisional_cost`]) and emit provisional budget updates; the
+/// [`crate::agent::event::Pricing::provisional`]) and emit provisional budget updates; the
 /// loop's turn-end budget call reconciles them. Without this a run could spend its
 /// whole cap inside one turn before any guard fires.
 #[derive(Clone)]

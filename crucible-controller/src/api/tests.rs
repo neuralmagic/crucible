@@ -10508,6 +10508,7 @@ async fn seed_provider(
             harness: None,
             enabled,
             created_by: "wren",
+            price: None,
         },
     )
     .await
@@ -10598,6 +10599,7 @@ async fn config_providers_lists_enabled_providers_and_the_defaults(pool: PgPool)
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -10689,6 +10691,7 @@ async fn an_owned_provider_is_offered_and_pinned_only_by_those_who_may_read_it(
                 harness: None,
                 enabled,
                 created_by: "reed",
+                price: None,
             },
         )
         .await?;
@@ -12188,6 +12191,127 @@ async fn a_custom_provider_needs_an_endpoint_a_protocol_and_a_default_model(
         "http://vllm.internal:8000/v1"
     );
     assert_eq!(picker["providers"][0]["protocol"], "responses");
+    Ok(())
+}
+
+/// A provider's price is per million tokens for each billed bucket: registered, shown to the
+/// picker and the admin list, replaced or cleared by a PUT, and refused when a rate is negative, a
+/// bucket is missing, or the provider serves no agent.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_provider_carries_a_price_per_million_tokens(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+    let glm = |price: serde_json::Value| {
+        serde_json::json!({
+            "id": "selfhosted", "display_name": "Self-hosted", "kind": "custom",
+            "default_model": "zai-org/glm-5", "protocol": "messages",
+            "endpoint": "https://selfhosted.example/v1", "price": price,
+        })
+    };
+
+    for (body, expected) in [
+        (
+            glm(
+                serde_json::json!({"input": -0.6, "output": 2.2, "cache_read": 0.11,
+                "cache_write": 0.6}),
+            ),
+            "price.input must be a finite, non-negative number",
+        ),
+        (
+            glm(
+                serde_json::json!({"input": 0.6, "output": 2.2, "cache_read": -1,
+                "cache_write": 0.6}),
+            ),
+            "price.cache_read",
+        ),
+        (
+            serde_json::json!({"id": "dgemma", "display_name": "dgemma", "kind": "custom",
+                "default_model": "dgemma", "protocol": "system_one",
+                "endpoint": "http://dgemma.internal:8011/v1/systemone",
+                "price": {"input": 1, "output": 1, "cache_read": 1, "cache_write": 1}}),
+            "takes no price",
+        ),
+    ] {
+        let (status, refused) = post_admin(&app, "/api/providers", body).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expected),
+            "{expected}: {refused}"
+        );
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "POST",
+            "/api/providers",
+            glm(serde_json::json!({"input": 0.6, "output": 2.2, "cache_read": 0.11})),
+        )?)
+        .await?;
+    assert!(
+        res.status().is_client_error(),
+        "a price names all four buckets: {}",
+        res.status()
+    );
+
+    let price = serde_json::json!({"input": 0.6, "output": 2.2, "cache_read": 0.11,
+        "cache_write": 0.6});
+    let (status, created) = post_admin(&app, "/api/providers", glm(price.clone())).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["price"], price);
+    let stored = crate::playbooks::providers::get(db.pool(), "selfhosted")
+        .await?
+        .expect("the row");
+    assert_eq!(
+        stored.price.map(|p| p.output.get()),
+        Some(2.2),
+        "the registry holds what the API took"
+    );
+
+    let (status, picker) = get_json_object(&app, "/api/config/providers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(picker["providers"][0]["price"], price);
+
+    let repriced = serde_json::json!({"input": 1.0, "output": 4.0, "cache_read": 0.1,
+        "cache_write": 1.25});
+    let mut body = glm(repriced.clone());
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("id");
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json(
+            "PUT",
+            "/api/providers/selfhosted",
+            body.clone(),
+        )?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(json_of(res).await?["price"], repriced);
+
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("price");
+    }
+    let res = app
+        .clone()
+        .oneshot(admin_json("PUT", "/api/providers/selfhosted", body)?)
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        json_of(res).await?["price"].is_null(),
+        "a PUT without a price clears it"
+    );
+    let res = app
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/providers")
+                .header("x-auth-request-user", "wren")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert!(json_of(res).await?[0]["price"].is_null());
     Ok(())
 }
 

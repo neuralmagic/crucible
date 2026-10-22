@@ -771,6 +771,7 @@ async fn a_transfer_moves_the_bytes_and_the_row_to_the_new_owner(pool: PgPool) {
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await
