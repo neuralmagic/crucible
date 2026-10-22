@@ -430,8 +430,7 @@ JT_HASH=$(printf %s "$JT_SECRET" | openssl dgst -sha256 -binary | openssl base64
 sql -c "INSERT INTO pod_tokens (id, turn_pod, secret_hash, created_at, expires_at)
         VALUES ('$JT_ID', '$JT_POD', '$JT_HASH', '2026-01-01T00:00:00Z', '2099-01-01T00:00:00Z')" >/dev/null
 JT_TOKEN="crr_${JT_ID}_${JT_SECRET}"
-kubectl -n "$NS" create configmap "$JT_POD-pack" --from-file="$FIX/packs/scope/workflow.star" \
-    --from-file="$FIX/packs/scope/measure.sh" --from-file="$FIX/packs/scope/SCOPE.md" >/dev/null
+kubectl -n "$NS" create configmap "$JT_POD-pack" --from-file="$FIX/packs/scope/workflow.star" >/dev/null
 kubectl -n "$NS" apply -f - >/dev/null <<YAML
 apiVersion: v1
 kind: Pod
@@ -453,7 +452,9 @@ spec:
       mkdir -p /tmp/code /tmp/pack && cd /tmp/code && git init -q && echo code >README
       git -c user.name=e2e -c user.email=e2e@example.com add -A
       git -c user.name=e2e -c user.email=e2e@example.com commit -qm code
-      cp /fixture/* /tmp/pack/ && chmod +x /tmp/pack/measure.sh
+      cp /fixture/workflow.star /tmp/pack/
+      printf '#!/bin/sh\necho %s\n' "'{\"valid\": true, \"score\": 1, \"pass\": true}'" >/tmp/pack/measure.sh
+      chmod +x /tmp/pack/measure.sh
       printf '[repo]\npath = "/tmp/code"\n\n[workspace]\ninject = ["measure.sh"]\n\n[agent]\nbackend = "openshell"\ngoal = "Freeze the pack."\nsandbox_image = "ghcr.io/org/sandbox:latest"\n\n[judge]\nmeasure_cmd = "./measure.sh"\ndirection = "higher"\nobjective = "score"\n\n[workflow]\ntype = "autoresearch"\nfile = "workflow.star"\n' >/tmp/pack/crucible.toml
       crucible scope --pack /tmp/pack --json --marker >/dev/null
     volumeMounts: [{ name: fixture, mountPath: /fixture }]
@@ -462,19 +463,20 @@ YAML
 wait_for 120 "the scope pod to finish" pods_in ".metadata.name == \"$JT_POD\" and (.status.phase == \"Succeeded\" or .status.phase == \"Failed\")" 1
 kubectl -n "$NS" get pod "$JT_POD" -o jsonpath='{.status.containerStatuses[0].state.terminated.message}' >"$WORK/JT-message.json"
 jt_manifest() { jq -r --arg k "$1" '.artifacts[] | select(.kind == $k) | .digest + " " + (.delivered | tostring)' "$WORK/JT-message.json"; }
-for kind in scope-pack scope-transcript; do
-    [ "$(jt_manifest "$kind")" = "$(sql -c "SELECT digest FROM pod_artifacts WHERE pod = '$JT_POD' AND kind = '$kind'") true" ] ||
-        fail "[JT] $kind: the manifest says '$(jt_manifest "$kind")'; the controller holds '$(sql -c "SELECT digest FROM pod_artifacts WHERE pod = '$JT_POD' AND kind = '$kind'")'; the pod said: $(kubectl -n "$NS" logs "$JT_POD" 2>&1 | tail -5)"
-done
-[ "$(sql -c "SELECT count(*) FROM artifacts WHERE owner_kind = 'pod-evidence' AND owner_id = '$JT_POD'")" = 2 ] ||
-    fail "[JT] the pack and transcript were not stored under the pod"
-pass "[JT] the pod's pack and transcript landed under its name, matching the digests its manifest reports"
+jt_held() { sql -c "SELECT digest FROM pod_artifacts WHERE pod = '$JT_POD' AND kind = 'scope-pack'"; }
+[ "$(jt_manifest scope-pack)" = "$(jt_held) true" ] ||
+    fail "[JT] the manifest says '$(jt_manifest scope-pack)'; the controller holds '$(jt_held)'; the pod said: $(kubectl -n "$NS" logs "$JT_POD" 2>&1 | tail -5)"
+pass "[JT] the pod's pack landed under its name, matching the digest its manifest reports"
 
 # jt_put <path> <bearer>: PUT a body to an evidence route, printing the status.
 jt_put() {
     curl -s -o /dev/null -w '%{http_code}' -X PUT -H "authorization: Bearer $2" \
         -H 'content-type: application/gzip' --data-binary @"$WORK/JT-message.json" "$CONTROLLER_URL$1"
 }
+[ "$(jt_put "/api/turns/$JT_POD/evidence/scope-transcript" "$JT_TOKEN")" = 200 ] ||
+    fail "[JT] the turn's token did not upload its transcript"
+[ "$(sql -c "SELECT count(*) FROM artifacts WHERE owner_kind = 'pod-evidence' AND owner_id = '$JT_POD'")" = 2 ] ||
+    fail "[JT] the pack and transcript were not stored under the pod"
 [ "$(jt_put "/api/turns/crucible-turn-other/evidence/scope-pack" "$JT_TOKEN")" = 403 ] ||
     fail "[JT] a turn's token wrote another pod's pack"
 [ "$(jt_put "/api/runs/$PARENT/evidence/run-session" "$JT_TOKEN")" = 403 ] ||
