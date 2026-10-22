@@ -4377,6 +4377,7 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -4552,6 +4553,7 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -7311,6 +7313,7 @@ async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool)
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;

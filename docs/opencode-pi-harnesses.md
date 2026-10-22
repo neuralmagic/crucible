@@ -41,9 +41,10 @@ through `{env:OPENAI_API_KEY}`, pi gets a `models.json` with the `crucible` prov
 
 - **No session resume** on either harness; a logical session's second turn errors rather than
   silently starting fresh.
-- **No OTEL.** Cost is the endpoint's own number when the CLI priced the model (it never does for
-  the `crucible` provider) and otherwise the pricing-table estimate over the token usage the stream
-  reports. OpenCode also spends one extra model request per turn generating the session's title,
+- **No OTEL.** Cost is the endpoint's own number when the CLI priced a vendor's model and
+  otherwise the pricing-table estimate over the token usage the stream reports. A model no vendor
+  sells costs nothing unless the agent binding carries a price (see `CRUCIBLE_INFERENCE` in the
+  contract). OpenCode also spends one extra model request per turn generating the session's title,
   which its export counts in the turn's usage.
 - **Egress.** Both add `api.openai.com` to the sandbox allowlist; a custom base URL's host is added
   per turn as it is for codex. A claude turn's allowlist is unchanged.

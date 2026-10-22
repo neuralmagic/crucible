@@ -1,6 +1,6 @@
 //! What one agent turn hands back, and the stream pump that folds its events into that.
 
-use crate::agent::event::{AgentEvent, RawStream, Tokens, cost_of};
+use crate::agent::event::{AgentEvent, Pricing, RawStream, Tokens, cost_of};
 use crate::agent::harness::StreamDecoder;
 use crate::args::Args;
 use crucible_contract::TransportCause;
@@ -119,24 +119,22 @@ pub(crate) fn tool_io_full(args: &Args) -> bool {
 }
 
 /// The decoder-driving core of an agent stdout pump: one [`StreamDecoder`] plus the
-/// turn's running (max authoritative cost, largest token sample). Pure and sync, no I/O. Each
+/// turn's running [`TurnCost`]. Pure and sync, no I/O. Each
 /// complete stdout line is [`push`](StreamPump::push)ed in; the local-child path feeds it off a
 /// `BufReader` ([`pump_stream`]), the openshell exec path feeds it lines straight off the
 /// gRPC stream. Splitting the loop from the byte source is what lets the async exec path reuse the
 /// exact same accounting + sink dispatch from any line source (BufReader or gRPC stream).
 pub(crate) struct StreamPump {
     decoder: Box<dyn StreamDecoder>,
-    cost: f64,
-    best_tokens: Option<Tokens>,
+    cost: TurnCost,
 }
 
 impl StreamPump {
     /// A fresh pump over the harness's `decoder` (see `Backend::decoder`).
-    pub(crate) fn new(decoder: Box<dyn StreamDecoder>) -> Self {
+    pub(crate) fn new(decoder: Box<dyn StreamDecoder>, pricing: Pricing) -> Self {
         Self {
             decoder,
-            cost: 0.0,
-            best_tokens: None,
+            cost: TurnCost::new(pricing),
         }
     }
 
@@ -150,7 +148,7 @@ impl StreamPump {
         sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
     ) {
         for ev in self.decoder.push(line) {
-            account(&ev, &mut self.cost, &mut self.best_tokens);
+            self.cost.observe(&ev);
             if json {
                 sink(line, RawStream::Stdout, Some(&ev));
             } else if let Some(human) = human_line(&ev) {
@@ -159,22 +157,47 @@ impl StreamPump {
         }
     }
 
-    /// The turn's (max authoritative cost, largest token sample) once the stream ends.
-    pub(crate) fn finish(self) -> (f64, Option<Tokens>) {
-        (self.cost, self.best_tokens)
+    pub(crate) fn finish(self) -> TurnCost {
+        self.cost
     }
 }
 
-/// Fold one event into the turn's running totals: the highest authoritative cost seen,
-/// and the largest token sample (the estimate fallback when no cost is reported).
-pub(crate) fn account(ev: &AgentEvent, cost: &mut f64, best_tokens: &mut Option<Tokens>) {
-    if let Some(c) = cost_of(ev) {
-        *cost = cost.max(c);
+/// One turn's running cost: the highest cost its harness reported and its largest token sample,
+/// settled under the turn's [`Pricing`].
+#[derive(Debug, Clone)]
+pub(crate) struct TurnCost {
+    pricing: Pricing,
+    reported: f64,
+    tokens: Option<Tokens>,
+}
+
+impl TurnCost {
+    pub(crate) fn new(pricing: Pricing) -> Self {
+        Self {
+            pricing,
+            reported: 0.0,
+            tokens: None,
+        }
     }
-    if let AgentEvent::Tokens(t) = ev
-        && best_tokens.as_ref().is_none_or(|b| t.total >= b.total)
-    {
-        *best_tokens = Some(t.clone());
+
+    pub(crate) fn observe(&mut self, ev: &AgentEvent) {
+        if let Some(c) = cost_of(ev) {
+            self.report(c);
+        }
+        if let AgentEvent::Tokens(t) = ev
+            && self.tokens.as_ref().is_none_or(|b| t.total >= b.total)
+        {
+            self.tokens = Some(t.clone());
+        }
+    }
+
+    /// A cost the harness reported outside its event stream.
+    pub(crate) fn report(&mut self, usd: f64) {
+        self.reported = self.reported.max(usd);
+    }
+
+    pub(crate) fn total(&self) -> f64 {
+        self.pricing.settle(self.reported, self.tokens.as_ref())
     }
 }
 
@@ -217,7 +240,85 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::event::{Pricing, Tokens};
+    use crate::agent::turn::TurnCost;
     use crucible_contract::event::AgentEvent;
+    use crucible_contract::inference::{TokenPrice, UsdPerMtok};
+
+    fn result(cost_usd: f64) -> AgentEvent {
+        AgentEvent::Result {
+            subtype: "success".into(),
+            is_error: false,
+            turns: 4,
+            cost_usd,
+            error: None,
+        }
+    }
+
+    fn tokens(input: u64, output: u64, cache_read: u64, cache_write: u64) -> AgentEvent {
+        AgentEvent::Tokens(Tokens {
+            input,
+            output,
+            cache_read,
+            cache_write,
+            total: input + output + cache_read + cache_write,
+            rate: None,
+            cost_usd: None,
+        })
+    }
+
+    fn settle(pricing: Pricing, events: &[AgentEvent]) -> f64 {
+        let mut cost = TurnCost::new(pricing);
+        for ev in events {
+            cost.observe(ev);
+        }
+        cost.total()
+    }
+
+    #[test]
+    fn a_self_hosted_turn_reporting_25_dollars_settles_at_zero() {
+        let events = [tokens(3_000_000, 400_000, 9_000_000, 200_000), result(25.0)];
+        let pricing = Pricing::resolve("zai-org/glm-5", None);
+        assert_eq!(settle(pricing, &events), 0.0);
+        let mut backfilled = TurnCost::new(pricing);
+        backfilled.report(25.0);
+        assert_eq!(backfilled.total(), 0.0);
+    }
+
+    #[test]
+    fn a_vendor_turn_keeps_the_cost_its_harness_reported() {
+        let events = [tokens(3_000_000, 400_000, 9_000_000, 200_000), result(25.0)];
+        assert_eq!(
+            settle(Pricing::resolve("claude-opus-4-6", None), &events),
+            25.0
+        );
+        let estimated = settle(
+            Pricing::resolve("claude-opus-4-6", None),
+            &[tokens(1_000_000, 0, 0, 0)],
+        );
+        assert!((estimated - 5.0).abs() < 1e-9, "{estimated}");
+    }
+
+    #[test]
+    fn a_priced_binding_settles_at_its_largest_token_sample_times_its_price() {
+        let usd = |v| UsdPerMtok::new(v).unwrap();
+        let price = TokenPrice {
+            input: usd(1.0),
+            output: usd(4.0),
+            cache_read: usd(0.1),
+            cache_write: usd(2.0),
+        };
+        let events = [
+            tokens(1_000_000, 100_000, 0, 0),
+            tokens(3_000_000, 400_000, 9_000_000, 200_000),
+            result(25.0),
+        ];
+        let want = 3.0 * 1.0 + 0.4 * 4.0 + 9.0 * 0.1 + 0.2 * 2.0;
+        for model in ["zai-org/glm-5", "claude-opus-4-6"] {
+            let got = settle(Pricing::resolve(model, Some(&price)), &events);
+            assert!((got - want).abs() < 1e-9, "{model}: got {got}, want {want}");
+        }
+    }
 
     #[test]
     fn tool_lines_scrub_credentials_from_the_summary() {

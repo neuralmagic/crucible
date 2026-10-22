@@ -135,6 +135,53 @@ impl From<EnvName> for String {
     }
 }
 
+/// A price in USD per million tokens: finite and not negative.
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct UsdPerMtok(f64);
+
+impl Eq for UsdPerMtok {}
+
+impl UsdPerMtok {
+    pub fn new(usd: f64) -> Result<Self, InferenceError> {
+        if usd.is_finite() && usd >= 0.0 {
+            Ok(UsdPerMtok(usd))
+        } else {
+            Err(InferenceError::Price {
+                value: usd.to_string(),
+            })
+        }
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for UsdPerMtok {
+    type Error = InferenceError;
+    fn try_from(usd: f64) -> Result<Self, InferenceError> {
+        Self::new(usd)
+    }
+}
+
+impl From<UsdPerMtok> for f64 {
+    fn from(price: UsdPerMtok) -> f64 {
+        price.0
+    }
+}
+
+/// What an agent binding's tokens cost. Present, it prices every agent turn of the run and
+/// replaces whatever cost the harness reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenPrice {
+    pub input: UsdPerMtok,
+    pub output: UsdPerMtok,
+    pub cache_read: UsdPerMtok,
+    pub cache_write: UsdPerMtok,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InferenceBinding {
@@ -146,6 +193,9 @@ pub struct InferenceBinding {
     pub model: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_env: Option<EnvName>,
+    /// Agent bindings only. Absent prices the run's turns by the engine's vendor table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<TokenPrice>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +246,12 @@ pub enum InferenceError {
     KeyEnvName {
         name: String,
     },
+    Price {
+        value: String,
+    },
+    PriceForRole {
+        role: InferenceRole,
+    },
 }
 
 impl std::fmt::Display for InferenceError {
@@ -233,6 +289,14 @@ impl std::fmt::Display for InferenceError {
             InferenceError::KeyEnvName { name } => write!(
                 f,
                 "key_env {name:?} is not an environment variable name a credential may use"
+            ),
+            InferenceError::Price { value } => write!(
+                f,
+                "price {value} is not a finite, non-negative number of USD per million tokens"
+            ),
+            InferenceError::PriceForRole { role } => write!(
+                f,
+                "the {role} binding carries a price; only an agent binding is priced"
             ),
         }
     }
@@ -311,6 +375,9 @@ impl ResolvedInference {
                 }
                 None => {}
             }
+            if binding.price.is_some() && role != InferenceRole::Agent {
+                return Err(InferenceError::PriceForRole { role });
+            }
             let model = &binding.model;
             if model.is_empty()
                 || model.len() > MAX_MODEL_LEN
@@ -341,6 +408,7 @@ mod tests {
             url: Some("http://dgemma.weaton-dev:8011/v1/systemone".into()),
             model: "dgemma".into(),
             key_env: None,
+            price: None,
         }
     }
 
@@ -351,6 +419,7 @@ mod tests {
             url: Some("https://claude.corp/v1".into()),
             model: "claude-opus-5".into(),
             key_env: Some(EnvName::new("INFERENCE_KEY_AGENT").unwrap()),
+            price: None,
         }
     }
 
@@ -453,6 +522,7 @@ mod tests {
             url: None,
             model: "gpt-6-luna".into(),
             key_env: Some(EnvName::new("OPENAI_API_KEY").unwrap()),
+            price: None,
         }
     }
 
@@ -605,5 +675,83 @@ mod tests {
             ResolvedInference::parse(json).unwrap_err(),
             InferenceError::Decode { .. }
         ));
+    }
+
+    fn glm_price() -> TokenPrice {
+        TokenPrice {
+            input: UsdPerMtok::new(0.6).unwrap(),
+            output: UsdPerMtok::new(2.2).unwrap(),
+            cache_read: UsdPerMtok::new(0.11).unwrap(),
+            cache_write: UsdPerMtok::new(0.0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn a_priced_agent_binding_has_a_pinned_wire_shape() {
+        let mut priced = agent();
+        priced.price = Some(glm_price());
+        let json = r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","url":"https://claude.corp/v1","model":"claude-opus-5","key_env":"INFERENCE_KEY_AGENT","price":{"input":0.6,"output":2.2,"cache_read":0.11,"cache_write":0.0}}]}"#;
+        assert_eq!(
+            serde_json::to_string(&doc(vec![priced.clone()])).unwrap(),
+            json
+        );
+        assert_eq!(ResolvedInference::parse(json).unwrap(), doc(vec![priced]));
+    }
+
+    #[test]
+    fn a_document_written_before_prices_existed_parses_with_no_price() {
+        let json = r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","url":"https://claude.corp/v1","model":"claude-opus-5","key_env":"INFERENCE_KEY_AGENT"}]}"#;
+        let parsed = ResolvedInference::parse(json).unwrap();
+        assert_eq!(parsed, doc(vec![agent()]));
+        assert_eq!(parsed.binding(InferenceRole::Agent).unwrap().price, None);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), json);
+    }
+
+    #[test]
+    fn a_price_is_finite_and_not_negative() {
+        for ok in [0.0, 0.11, 25.0, 1e6] {
+            assert_eq!(UsdPerMtok::new(ok).unwrap().get(), ok);
+        }
+        for bad in [-0.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = UsdPerMtok::new(bad).unwrap_err();
+            assert!(matches!(err, InferenceError::Price { .. }), "{bad}");
+            assert!(err.to_string().contains("USD per million tokens"), "{err}");
+        }
+        let json = r#"{"version":1,"bindings":[{"role":"agent","protocol":"messages","model":"m","price":{"input":-1,"output":0,"cache_read":0,"cache_write":0}}]}"#;
+        let err = ResolvedInference::parse(json).unwrap_err().to_string();
+        assert!(err.contains("price -1"), "{err}");
+    }
+
+    #[test]
+    fn a_price_names_all_four_buckets_and_nothing_else() {
+        for price in [
+            r#"{"input":1,"output":1,"cache_read":1}"#,
+            r#"{"input":1,"output":1,"cache_read":1,"cache_write":1,"reasoning":1}"#,
+        ] {
+            let json = format!(
+                r#"{{"version":1,"bindings":[{{"role":"agent","protocol":"messages","model":"m","price":{price}}}]}}"#
+            );
+            assert!(
+                matches!(
+                    ResolvedInference::parse(&json).unwrap_err(),
+                    InferenceError::Decode { .. }
+                ),
+                "{price}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_an_agent_binding_is_priced() {
+        let mut priced = decision();
+        priced.price = Some(glm_price());
+        let err = doc(vec![priced]).validate().unwrap_err();
+        assert_eq!(
+            err,
+            InferenceError::PriceForRole {
+                role: InferenceRole::Decision
+            }
+        );
+        assert!(err.to_string().contains("decision binding"), "{err}");
     }
 }
