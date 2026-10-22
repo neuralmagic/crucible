@@ -2463,7 +2463,7 @@ mod tests {
         assert!(yaml.contains("automountServiceAccountToken: false"));
     }
 
-    /// Without a drop-box URL a loop pod carries NO ingest scaffolding, and the wrapper still emits the
+    /// Without a controller URL a loop pod carries no upload env, and the wrapper still emits the
     /// `SESSION` delimiter (guarded, but the guard is TRUE when the env is absent) so an old controller
     /// scrapes the session exactly as before, the fallback the migration keeps until R4.
     #[test]
@@ -4770,7 +4770,8 @@ mod tests {
     }
 
     /// The ingest contract: a playbook pod publishes its session at the same path a loop pod does,
-    /// under the same two tiers (drop-box when the profile names one, the delimiter otherwise).
+    /// under the same two paths (an upload when the profile names a controller, the delimiter
+    /// otherwise).
     #[test]
     fn playbook_pod_keeps_the_session_path_and_delimiter() {
         let yaml = render_playbook(&k8s_profile(""), playbook_launch());

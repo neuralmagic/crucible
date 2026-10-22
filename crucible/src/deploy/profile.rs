@@ -209,10 +209,9 @@ pub struct Cluster {
     /// The controller's base URL as a pod reaches it, e.g.
     /// `http://crucible-controller.autoresearch.svc:8080`. A run pod gets it as
     /// `CRUCIBLE_CONTROLLER_URL` and uploads its evidence to its run there under the run token
-    /// (RFC-0004:C-RUN-EVIDENCE); a rerun fetches its parent's from it. A turn pod gets a projected
-    /// `crucible-ingest`-audience ServiceAccount token + the `CRUCIBLE_INGEST_URL` /
-    /// `CRUCIBLE_INGEST_TOKEN_PATH` env so its large artifacts POST to the drop-box. Unset = pods
-    /// fall back to the log markers, and a rerun cannot render.
+    /// (RFC-0004:C-RUN-EVIDENCE); a rerun fetches its parent's from it. A scope turn's pod uploads
+    /// its pack and transcript there under its own name. Both carry a pod token from their Secret.
+    /// Unset = pods fall back to the log markers, and a rerun cannot render.
     #[serde(default)]
     pub ingest_url: Option<String>,
     /// PVC mounted at the domain's `state/` dir. When set, run state (session.jsonl, the

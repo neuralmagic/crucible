@@ -49,7 +49,7 @@ pub fn run_id_of_session_uri(uri: &str) -> Option<&str> {
 /// Whose payload an `artifacts` row holds. The variants mirror the `owner_kind` CHECK constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArtifactOwner {
-    /// A drop-box body a work pod POSTed; `pod` is the uploading pod's name.
+    /// A scope turn's upload; `pod` is the uploading pod's name.
     PodEvidence { pod: String },
     /// An artifact a run owns, dispatched or adopted; `run_id` is the ledger's run id.
     Run { run_id: String },

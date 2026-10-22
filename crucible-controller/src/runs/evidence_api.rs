@@ -1,15 +1,16 @@
-//! A run's evidence over HTTP (RFC-0004:C-RUN-EVIDENCE): `PUT /api/runs/{run}/evidence/{kind}`
+//! A pod's evidence over HTTP (RFC-0004:C-RUN-EVIDENCE): `PUT /api/runs/{run}/evidence/{kind}`
 //! stores what a run pod uploads as the run's own artifact, and `GET` hands the gzipped bytes back
-//! to the run's rerun or to a person.
+//! to the run's rerun or to a person. `PUT /api/turns/{pod}/evidence/{kind}` stores a scope turn's
+//! pack and transcript under its pod, for the turn's collection to check against its manifest.
 //!
-//! The routes carry their own guard, [`require_run_token_or_human`]: a `crr_` bearer is checked as
-//! a run token and answers with its [`Grant`], and anything else goes through the human guard
-//! unchanged. Only a run token uploads, and only to its own run.
+//! The routes carry their own guard, [`require_pod_token_or_human`]: a `crr_` bearer is checked as
+//! a pod token and answers with its [`Grant`], and anything else goes through the human guard
+//! unchanged. Only a pod token uploads, and only its own evidence.
 
 use crate::client::Db;
 use crate::identity::auth::{HumanOrKeyGuard, require_auth_or_api_key};
 use crate::runs::blob_store::{ArtifactOwner, PutArtifactError};
-use crate::runs::run_token::Grant;
+use crate::runs::pod_token::Grant;
 use crate::runs::task_evidence::safe_segment;
 use axum::body::Body;
 use axum::extract::{Path, Request, State};
@@ -32,15 +33,16 @@ pub(crate) struct EvidenceState {
 pub(crate) fn router(state: EvidenceState) -> Router {
     Router::new()
         .route("/api/runs/{run_id}/evidence/{kind}", put(upload).get(fetch))
+        .route("/api/turns/{pod}/evidence/{kind}", put(upload_turn))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            require_run_token_or_human,
+            require_pod_token_or_human,
         ))
         .with_state(state)
 }
 
-/// Admit a run token with its grant, or hand the request to the human guard.
-async fn require_run_token_or_human(
+/// Admit a pod token with its grant, or hand the request to the human guard.
+async fn require_pod_token_or_human(
     State(state): State<EvidenceState>,
     mut req: Request,
     next: Next,
@@ -50,12 +52,12 @@ async fn require_run_token_or_human(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .filter(|t| crate::runs::run_token::looks_like_token(t))
+        .filter(|t| crate::runs::pod_token::looks_like_token(t))
         .map(str::to_string);
     let Some(presented) = presented else {
         return require_auth_or_api_key(State(state.guard), req, next).await;
     };
-    match crate::runs::run_token::verify(state.db.pool(), &presented).await {
+    match crate::runs::pod_token::verify(state.db.pool(), &presented).await {
         Ok(grant) => {
             req.extensions_mut().insert(grant);
             next.run(req).await
@@ -103,10 +105,10 @@ async fn upload(
             "only the run's own token uploads its evidence".to_string(),
         );
     };
-    if !grant.may_write(&run_id) {
+    if !grant.may_write_run(&run_id) {
         return refuse(
             StatusCode::FORBIDDEN,
-            format!("this run token writes the evidence of {}", grant.run_id),
+            "this token does not write that run's evidence".to_string(),
         );
     }
     let owner = ArtifactOwner::Run {
@@ -163,7 +165,7 @@ async fn fetch(
         );
     };
     if let Some(Extension(grant)) = &grant
-        && !grant.may_read(&run_id)
+        && !grant.may_read_run(&run_id)
     {
         return refuse(
             StatusCode::FORBIDDEN,
@@ -230,6 +232,94 @@ async fn evidence_bytes(
     .map_err(anyhow::Error::from)
 }
 
+/// `PUT /api/turns/{pod}/evidence/{kind}`: store a scope turn's gzipped pack or transcript under
+/// its pod and record the pointer its collection checks against the turn's manifest. The turn's
+/// own pod token only.
+async fn upload_turn(
+    grant: Option<Extension<Grant>>,
+    State(state): State<EvidenceState>,
+    Path((pod, kind)): Path<(String, String)>,
+    body: Body,
+) -> Response {
+    let Some(kind) = kind
+        .parse::<ArtifactKind>()
+        .ok()
+        .filter(|k| matches!(k, ArtifactKind::ScopePack | ArtifactKind::ScopeTranscript))
+    else {
+        return refuse(
+            StatusCode::NOT_FOUND,
+            format!("{kind} is not a scope turn's evidence"),
+        );
+    };
+    match grant {
+        Some(Extension(grant)) if grant.may_write_turn(&pod) => {}
+        _ => {
+            return refuse(
+                StatusCode::FORBIDDEN,
+                "only the turn's own token uploads its evidence".to_string(),
+            );
+        }
+    }
+    if !safe_segment(&pod) {
+        return refuse(
+            StatusCode::BAD_REQUEST,
+            "a pod name is one path segment".to_string(),
+        );
+    }
+    let owner = ArtifactOwner::PodEvidence { pod: pod.clone() };
+    let stored = match crate::runs::blob_store::put_artifact(
+        state.db.pool(),
+        &owner,
+        kind.as_str(),
+        kind.max_bytes(),
+        body.into_data_stream(),
+    )
+    .await
+    {
+        Ok(stored) => stored,
+        Err(PutArtifactError::TooLarge { limit }) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Json(EvidenceRefused {
+                    error: format!("{kind} exceeds its cap of {limit} bytes"),
+                    limit_bytes: Some(limit),
+                }),
+            )
+                .into_response();
+        }
+        Err(PutArtifactError::Source(e)) => {
+            tracing::warn!(%pod, %kind, error = %e, "turn evidence upload: reading the body failed");
+            return refuse(StatusCode::BAD_REQUEST, format!("reading the body: {e}"));
+        }
+        Err(PutArtifactError::Store(e)) => {
+            tracing::error!(%pod, %kind, error = format!("{e:#}"), "turn evidence upload: storing failed");
+            return refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storing the evidence failed".to_string(),
+            );
+        }
+    };
+    let pointer = crate::runs::model::NewPodArtifact {
+        pod: pod.clone(),
+        kind: kind.as_str().to_string(),
+        digest: stored.digest.clone(),
+        bytes: i64::try_from(stored.bytes).unwrap_or(i64::MAX),
+    };
+    if let Err(e) = crate::runs::work_pods::record_pod_artifact(state.db.pool(), &pointer).await {
+        tracing::error!(%pod, %kind, error = format!("{e:#}"), "turn evidence upload: recording the pointer failed");
+        return refuse(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "recording the evidence failed".to_string(),
+        );
+    }
+    Json(EvidenceStored {
+        kind,
+        digest: stored.digest,
+        bytes: stored.bytes,
+    })
+    .into_response()
+}
+
 fn refuse(status: StatusCode, error: String) -> Response {
     (
         status,
@@ -247,7 +337,7 @@ mod tests {
     use crate::identity::auth::{AuthMode, BearerGuard, HumanOrKeyGuard, SharedToken};
     use crate::runs::blob_store::ArtifactOwner;
     use crate::runs::evidence_api::{EvidenceState, router};
-    use crate::runs::run_token::{mint, revoke_run};
+    use crate::runs::pod_token::{Subject, mint, revoke};
     use axum::body::{Body, to_bytes};
     use axum::http::{Request, StatusCode, header};
     use crucible_contract::{ArtifactKind, EvidenceRefused, EvidenceStored};
@@ -308,7 +398,9 @@ mod tests {
     async fn a_run_token_uploads_its_own_evidence_and_reads_it_back(pool: PgPool) {
         let scratch = tempfile::tempdir().expect("scratch");
         let app = app(&pool, scratch.path());
-        let token = mint(&pool, "run-b", None, HOUR).await.expect("mint");
+        let token = mint(&pool, &Subject::Run("run-b".to_string()), None, HOUR)
+            .await
+            .expect("mint");
 
         for (kind, body) in [
             ("run-files", gz(b"files-tar")),
@@ -379,9 +471,14 @@ mod tests {
             .await
             .expect("seed");
         }
-        let token = mint(&pool, "run-b", Some("run-a"), HOUR)
-            .await
-            .expect("mint");
+        let token = mint(
+            &pool,
+            &Subject::Run("run-b".to_string()),
+            Some("run-a"),
+            HOUR,
+        )
+        .await
+        .expect("mint");
 
         let (status, got) = call(
             &app,
@@ -479,8 +576,12 @@ mod tests {
     async fn a_revoked_or_unknown_token_is_refused(pool: PgPool) {
         let scratch = tempfile::tempdir().expect("scratch");
         let app = app(&pool, scratch.path());
-        let token = mint(&pool, "run-b", None, HOUR).await.expect("mint");
-        revoke_run(&pool, "run-b").await.expect("revoke");
+        let token = mint(&pool, &Subject::Run("run-b".to_string()), None, HOUR)
+            .await
+            .expect("mint");
+        revoke(&pool, &Subject::Run("run-b".to_string()))
+            .await
+            .expect("revoke");
         for bearer in [token.as_str(), "crr_nosuch_secret"] {
             let (status, body) = call(
                 &app,
@@ -492,7 +593,7 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::UNAUTHORIZED);
             let refused: EvidenceRefused = serde_json::from_slice(&body).expect("json");
-            assert!(refused.error.contains("run token"), "{}", refused.error);
+            assert!(refused.error.contains("pod token"), "{}", refused.error);
         }
     }
 
@@ -500,7 +601,9 @@ mod tests {
     async fn only_run_evidence_kinds_are_routed(pool: PgPool) {
         let scratch = tempfile::tempdir().expect("scratch");
         let app = app(&pool, scratch.path());
-        let token = mint(&pool, "run-b", None, HOUR).await.expect("mint");
+        let token = mint(&pool, &Subject::Run("run-b".to_string()), None, HOUR)
+            .await
+            .expect("mint");
         for kind in ["scope-pack", "scope-transcript", "nope"] {
             let (status, _) = call(
                 &app,
@@ -538,7 +641,9 @@ mod tests {
     async fn an_oversize_upload_is_413_and_stores_nothing(pool: PgPool) {
         let scratch = tempfile::tempdir().expect("scratch");
         let app = app(&pool, scratch.path());
-        let token = mint(&pool, "run-b", None, HOUR).await.expect("mint");
+        let token = mint(&pool, &Subject::Run("run-b".to_string()), None, HOUR)
+            .await
+            .expect("mint");
         let over = vec![0u8; ArtifactKind::OtelLog.max_bytes() as usize + 1];
         let (status, body) = call(
             &app,
@@ -623,7 +728,9 @@ mod tests {
     /// A run token is refused everywhere but its evidence routes, however valid.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_human_surface_refuses_a_run_token(pool: PgPool) {
-        let token = mint(&pool, "run-b", None, HOUR).await.expect("mint");
+        let token = mint(&pool, &Subject::Run("run-b".to_string()), None, HOUR)
+            .await
+            .expect("mint");
         let human = axum::Router::new()
             .route("/api/runs/{run_id}", axum::routing::get(|| async { "run" }))
             .layer(axum::middleware::from_fn_with_state(
@@ -636,7 +743,7 @@ mod tests {
         let (status, body) = call(&human, "GET", "/api/runs/run-b", Some(&token), Vec::new()).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
         assert!(
-            String::from_utf8_lossy(&body).contains("only its run's evidence routes"),
+            String::from_utf8_lossy(&body).contains("only its own evidence routes"),
             "{}",
             String::from_utf8_lossy(&body)
         );
@@ -646,5 +753,132 @@ mod tests {
             StatusCode::OK,
             "the open guard admits everyone else"
         );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_turn_token_uploads_its_pack_and_transcript_and_nothing_else(pool: PgPool) {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let app = app(&pool, scratch.path());
+        let pod = "crucible-turn-owner-repo-1-ab";
+        let token = mint(&pool, &Subject::Turn(pod.to_string()), None, HOUR)
+            .await
+            .expect("mint");
+
+        for kind in ["scope-pack", "scope-transcript"] {
+            let body = gz(kind.as_bytes());
+            let (status, resp) = call(
+                &app,
+                "PUT",
+                &format!("/api/turns/{pod}/evidence/{kind}"),
+                Some(&token),
+                body.clone(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "{kind}: {}",
+                String::from_utf8_lossy(&resp)
+            );
+            let stored: EvidenceStored = serde_json::from_slice(&resp).expect("ack");
+            assert_eq!(stored.digest, crucible_contract::content_digest(&body));
+            let pointer = crate::runs::work_pods::pod_artifact(&pool, pod, kind)
+                .await
+                .expect("read pointer")
+                .expect("a pointer the turn's collection checks");
+            assert_eq!(pointer.digest, stored.digest);
+            let owner = ArtifactOwner::PodEvidence {
+                pod: pod.to_string(),
+            };
+            let held = crate::runs::blob_store::get_artifact(&pool, &owner, kind)
+                .await
+                .expect("read")
+                .expect("stored under the pod");
+            assert_eq!(held.data, body);
+        }
+
+        let (status, _) = call(
+            &app,
+            "PUT",
+            "/api/turns/crucible-turn-other/evidence/scope-pack",
+            Some(&token),
+            gz(b"x"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "another turn's pod");
+        let (status, _) = call(
+            &app,
+            "PUT",
+            &format!("/api/runs/{pod}/evidence/run-session"),
+            Some(&token),
+            gz(b"x"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "a turn writes no run");
+        let (status, _) = call(
+            &app,
+            "PUT",
+            &format!("/api/turns/{pod}/evidence/run-session"),
+            Some(&token),
+            gz(b"x"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "a run kind is not a turn's");
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn only_the_turns_own_token_uploads_to_it(pool: PgPool) {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let app = app(&pool, scratch.path());
+        let pod = "crucible-turn-a";
+        let run_token = mint(&pool, &Subject::Run(pod.to_string()), None, HOUR)
+            .await
+            .expect("mint");
+        let uri = format!("/api/turns/{pod}/evidence/scope-pack");
+        for bearer in [Some(run_token.as_str()), Some(MACHINE), None] {
+            let (status, _) = call(&app, "PUT", &uri, bearer, gz(b"x")).await;
+            assert!(
+                matches!(status, StatusCode::FORBIDDEN | StatusCode::UNAUTHORIZED),
+                "{bearer:?}: {status}"
+            );
+        }
+        let token = mint(&pool, &Subject::Turn(pod.to_string()), None, HOUR)
+            .await
+            .expect("mint");
+        revoke(&pool, &Subject::Turn(pod.to_string()))
+            .await
+            .expect("revoke");
+        let (status, _) = call(&app, "PUT", &uri, Some(&token), gz(b"x")).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "a collected turn's token");
+        assert!(
+            crate::runs::work_pods::pod_artifact(&pool, pod, "scope-pack")
+                .await
+                .expect("read")
+                .is_none(),
+            "nothing refused was stored"
+        );
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_turn_upload_past_its_cap_is_refused_with_the_limit(pool: PgPool) {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let app = app(&pool, scratch.path());
+        let pod = "crucible-turn-big";
+        let token = mint(&pool, &Subject::Turn(pod.to_string()), None, HOUR)
+            .await
+            .expect("mint");
+        let cap = ArtifactKind::ScopePack.max_bytes();
+        let body = vec![0u8; usize::try_from(cap).expect("cap fits") + 1];
+        let (status, resp) = call(
+            &app,
+            "PUT",
+            &format!("/api/turns/{pod}/evidence/scope-pack"),
+            Some(&token),
+            body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        let refused: EvidenceRefused = serde_json::from_slice(&resp).expect("refusal");
+        assert_eq!(refused.limit_bytes, Some(cap));
     }
 }

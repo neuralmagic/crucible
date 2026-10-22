@@ -45,8 +45,8 @@ pub struct RunningRun {
     pub(crate) pod: Option<String>,
 }
 
-/// A Tier 2 drop-box pointer to persist (`pod_artifacts`): the content digest of one artifact a
-/// turn pod POSTed. Pointer only — the bytes live in the artifact chunk tables
+/// A turn upload's pointer to persist (`pod_artifacts`): the content digest of one artifact a
+/// turn pod uploaded. Pointer only — the bytes live in the artifact chunk tables
 /// ([`crate::runs::blob_store`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewPodArtifact {
@@ -60,7 +60,7 @@ pub struct NewPodArtifact {
     pub(crate) bytes: i64,
 }
 
-/// One `pod_artifacts` row read back: the drop-box pointer the fold resolves and validates against
+/// One `pod_artifacts` row read back: the upload pointer the fold resolves and validates against
 /// the Tier 1 manifest digest.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PodArtifactRow {

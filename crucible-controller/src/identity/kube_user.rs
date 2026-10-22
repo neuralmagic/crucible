@@ -13,7 +13,7 @@
 //! server is the authority, not the caller.
 //!
 //! Fail-closed: a token the API server rejects is 401, an API server we cannot reach is 503
-//! (same split as the ingest drop-box's TokenReview) — never a pass-through.
+//! — never a pass-through.
 
 #![allow(clippy::disallowed_macros)]
 

@@ -742,9 +742,15 @@ pub async fn dispatch_run(
         _ => None,
     };
     let lifetime = crate::runs::completion::run_pod_deadline(db, cfg, issue_key).await?;
-    let token = crate::runs::run_token::mint(db.pool(), run_id, reads_run, lifetime).await?;
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run_id.to_string()),
+        reads_run,
+        lifetime,
+    )
+    .await?;
     delivery
-        .merge(crate::secrets::deliver::run_token(token))
+        .merge(crate::secrets::deliver::pod_token(token))
         .map_err(|e| anyhow::anyhow!("folding the run token into the run's delivery: {e}"))?;
     // A run pushing as the App has to have the identity, so a failed resolve fails the dispatch.
     // Everywhere else it is a default, and a failure degrades to the pack's own.
@@ -871,7 +877,11 @@ pub async fn dispatch_run(
             })
         }
         Err(e) => {
-            crate::runs::run_token::revoke_run(db.pool(), run_id).await?;
+            crate::runs::pod_token::revoke(
+                db.pool(),
+                &crate::runs::pod_token::Subject::Run(run_id.to_string()),
+            )
+            .await?;
             // Retain a failed-to-launch row with the real reason (swept after retention), then let the
             // reconcile see the error and retry the issue from `awaiting-approval`.
             let reason = format!("{e:#}");
@@ -1443,7 +1453,7 @@ fn scope_report_from_envelope(env: Envelope, logs: &str) -> Result<engine::Scope
 
 /// The Tier 1 artifacts manifest carried by a scope-report termination message, or empty when the
 /// message is absent/unparseable/not our envelope (the old-engine marker path — no manifest, so the
-/// drop-box preference is a no-op and the log-scraped payloads stand).
+/// uploaded artifacts are not consulted and the log-scraped payloads stand).
 #[cfg(feature = "autoresearch")]
 pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
     let Some(m) = message else {
@@ -1458,17 +1468,17 @@ pub(crate) fn manifest_from_message(message: Option<&str>) -> Vec<ArtifactRef> {
     env.artifacts
 }
 
-/// Prefer the drop-box artifacts over log-scraped payloads, validating each against its manifest
-/// digest. The controller trusts the kubelet-authenticated manifest, then checks the drop-box against
-/// it — so a missing, undelivered, or digest-mismatched artifact is caught without trusting the POST
-/// path at all.
+/// Prefer the turn's uploaded artifacts over log-scraped payloads, validating each against its
+/// manifest digest. The controller trusts the kubelet-authenticated manifest, then checks what the
+/// turn uploaded against it, so a missing, undelivered, or digest-mismatched artifact is caught
+/// without trusting the upload path at all.
 ///
-/// A surviving scope's PACK is required: if the manifest lists it but the drop-box can't hand back
+/// A surviving scope's PACK is required: if the manifest lists it but the store can't hand back
 /// the exact bytes, this returns `Err` with a loud reason (→ a NoReport that lands on the work_pods
 /// row). The transcript is best-effort — a problem there is logged, not fatal, matching the marker
 /// path's long-standing discipline (a garbled transcript never failed a report).
 #[cfg(feature = "autoresearch")]
-pub(crate) async fn apply_dropbox_artifacts(
+pub(crate) async fn apply_turn_artifacts(
     report: &mut engine::ScopeReport,
     manifest: &[ArtifactRef],
     pool: &sqlx::PgPool,
@@ -1477,7 +1487,7 @@ pub(crate) async fn apply_dropbox_artifacts(
     let survived = report.digest.is_some() && report.stages.iter().all(|s| s.passed);
     for art in manifest {
         match art.kind {
-            ArtifactKind::ScopePack => match resolve_dropbox_artifact(pool, pod, art).await {
+            ArtifactKind::ScopePack => match resolve_turn_artifact(pool, pod, art).await {
                 Ok(bytes) => {
                     report.pack_tgz = Some(bytes);
                     report.pack_error = None;
@@ -1486,18 +1496,18 @@ pub(crate) async fn apply_dropbox_artifacts(
                     // A dead proposal has no pack to deliver; only a survival's missing pack is fatal.
                     if survived {
                         return Err(format!(
-                            "scope pack not recovered from the drop-box: {problem}"
+                            "scope pack not recovered from the turn's upload: {problem}"
                         ));
                     }
                 }
             },
-            ArtifactKind::ScopeTranscript => match resolve_dropbox_artifact(pool, pod, art).await {
+            ArtifactKind::ScopeTranscript => match resolve_turn_artifact(pool, pod, art).await {
                 Ok(bytes) => report.transcript_gz = Some(bytes),
                 Err(problem) => {
                     tracing::warn!(
                         pod,
                         %problem,
-                        "scope transcript not recovered from the drop-box (best-effort)"
+                        "scope transcript not recovered from the turn's upload (best-effort)"
                     );
                 }
             },
@@ -1512,18 +1522,18 @@ pub(crate) async fn apply_dropbox_artifacts(
     Ok(())
 }
 
-/// Resolve one manifest entry to its drop-box bytes, validating the content digest. `Err` when the
+/// Resolve one manifest entry to the bytes the turn uploaded, validating the content digest. `Err` when the
 /// pod marked it undelivered, no artifact is stored, or the stored digest doesn't match the
 /// manifest.
 #[cfg(feature = "autoresearch")]
-async fn resolve_dropbox_artifact(
+async fn resolve_turn_artifact(
     pool: &sqlx::PgPool,
     pod: &str,
     art: &ArtifactRef,
 ) -> Result<Vec<u8>, String> {
     if !art.delivered {
         return Err(format!(
-            "the manifest marks {} delivered:false (the pod's POST failed after retries)",
+            "the manifest marks {} delivered:false (the pod's upload failed after retries)",
             art.kind
         ));
     }
@@ -1532,8 +1542,8 @@ async fn resolve_dropbox_artifact(
     };
     let payload = crate::runs::blob_store::get_artifact(pool, &owner, art.kind.as_str())
         .await
-        .map_err(|e| format!("reading drop-box {}: {e:#}", art.kind))?
-        .ok_or_else(|| format!("no {} in the drop-box store", art.kind))?;
+        .map_err(|e| format!("reading the uploaded {}: {e:#}", art.kind))?
+        .ok_or_else(|| format!("the turn uploaded no {}", art.kind))?;
     let digest = content_digest(&payload.data);
     if digest != art.digest {
         return Err(format!(
