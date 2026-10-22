@@ -9,7 +9,9 @@
 
 use crate::manifest::Harness;
 use anyhow::{Context, Result};
-use crucible_contract::inference::{InferenceBinding, InferenceProtocol, InferenceRole};
+use crucible_contract::inference::{
+    InferenceBinding, InferenceProtocol, InferenceRole, TokenPrice,
+};
 
 #[derive(Debug, thiserror::Error)]
 #[error("{WIRE_API}={raw:?} is neither chat nor responses")]
@@ -72,11 +74,12 @@ impl WireApi {
     }
 }
 
-/// The protocol and model an injected agent binding fixes for the run.
+/// The protocol, model and price an injected agent binding fixes for the run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSelection {
     pub protocol: InferenceProtocol,
     pub model: String,
+    pub price: Option<TokenPrice>,
 }
 
 /// Whether `harness` is a client of `protocol`.
@@ -183,6 +186,7 @@ impl InferenceEnv {
             selection: Some(AgentSelection {
                 protocol: binding.protocol,
                 model: binding.model.clone(),
+                price: binding.price,
             }),
             ..InferenceEnv::default()
         };
@@ -291,6 +295,7 @@ mod tests {
             url: url.map(str::to_owned),
             model: "the-model".into(),
             key_env: key_env.map(|n| crucible_contract::inference::EnvName::new(n).unwrap()),
+            price: None,
         }
     }
 
@@ -317,6 +322,7 @@ mod tests {
                 selection: Some(AgentSelection {
                     protocol: InferenceProtocol::Messages,
                     model: "the-model".into(),
+                    price: None,
                 }),
                 ..InferenceEnv::default()
             }
@@ -476,6 +482,7 @@ mod tests {
         let select = |protocol| AgentSelection {
             protocol,
             model: "m".into(),
+            price: None,
         };
         let messages = select(InferenceProtocol::Messages);
         assert_eq!(messages.harness(Harness::Claude), Harness::Claude);

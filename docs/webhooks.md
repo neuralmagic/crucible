@@ -1,11 +1,11 @@
 # Launching from webhooks
 
 A webhook launches a registered playbook when a sender outside the controller posts a delivery.
-The sender can be anything that POSTs JSON to a URL: quay.io after an image push, GitHub after a
-release, a CI job, or your own script. The controller checks the delivery
-is genuine and queues it. Within a few seconds it takes the delivery off the queue and runs a small
-CEL transform that decides whether it launches, which event it is, and what params the launch
-gets.
+A sender is any system that POSTs JSON to a URL: quay.io after an image push, GitHub after a
+release, a CI job, or your own script. The controller verifies the delivery and puts it in a
+queue. Within a few seconds, the controller takes the delivery from the queue and runs a small
+CEL transform. The transform decides if the delivery launches a run, which event it is, and
+which params the launch gets.
 
 ```mermaid
 flowchart LR
@@ -18,46 +18,50 @@ flowchart LR
   R --> F[filtered / duplicate / throttled / failed]
 ```
 
-The listener never launches anything itself. It answers `202` once the delivery is queued. The
-controller then works through each webhook's queue in the order deliveries arrived, and gives each
-one exactly one outcome you can read back.
+The listener does not launch runs. It answers `202` when the delivery is in the queue. The
+controller then processes the queue of each webhook in arrival order. Each delivery gets
+exactly one outcome, and you can read that outcome later.
 
 ## Verifiers
 
-A webhook proves each delivery with one of two verifiers, chosen when it is created and fixed after
-that. To switch, delete the webhook and create another.
+A webhook verifies each delivery with one of two verifiers. You select the verifier when you
+create the webhook, and you cannot change it later. To use a different verifier, delete the
+webhook and create a new one.
 
 | Verifier | Sender | What a delivery carries |
 | --- | --- | --- |
 | `path_token` | Any sender: quay.io, GitLab, a CI job, `curl` | The secret as the last path segment: `/hooks/<id>/<token>` |
 | `hmac_sha256` | GitHub, or any sender that signs the same way | `sha256=` and the lowercase hex HMAC-SHA256 of the raw body, in the header you name (`x-hub-signature-256`) |
 
-A sender that signs some other way (a base64 signature, or a signature over a timestamp and the
-body) cannot use `hmac_sha256`. Give it a `path_token` URL instead; the token is the credential.
+A sender that signs in a different way (a base64 signature, or a signature over a timestamp
+and the body) cannot use `hmac_sha256`. Give that sender a `path_token` URL. The token is the
+credential.
 
-The controller generates every secret (256 random bits) and shows it once, in the response that
-created or rotated it. Path tokens are stored as SHA-256 digests. HMAC secrets are sealed with
-AES-256-GCM under the webhook key; a controller without one refuses `hmac_sha256` webhooks.
+The controller generates every secret (256 random bits). It shows the secret once, in the
+response to the create or rotate request. The controller stores path tokens as SHA-256
+digests. It seals HMAC secrets with AES-256-GCM under the webhook key. A controller without a
+webhook key rejects `hmac_sha256` webhooks.
 
-A delivery that is not recorded, for any reason, gets the same answer: `404` with
-`{"error":"not found"}`. That covers an unknown or deleted webhook, a paused one, a wrong token or
-signature, and a body over 512 KiB. Webhook ids are random UUIDs, so the address alone reveals
-nothing.
+If the controller does not record a delivery, the answer is always `404` with
+`{"error":"not found"}`. This applies to an unknown or deleted webhook, a paused webhook, a
+wrong token or signature, and a body larger than 512 KiB. Webhook ids are random UUIDs, so the
+address alone gives no information.
 
 ## Creating a webhook
 
 ### From the UI
 
-Open a playbook and choose **Add webhook**. **Sender** starts on **Custom**, for any sender that
-POSTs JSON: the filter launches every delivery, the dedupe key is `delivery`, and every param is
-fixed until you derive it. The named senders (quay.io repository push, GitHub release, GitHub push)
-fill the verifier, the transform, and the params they can match by name; switching back to
-**Custom** starts the transform over. For each param the playbook
-declares, choose **fixed value** or **derived (CEL)**. Expressions are checked as you type and
-marked where they fail. **Run preview** evaluates the transform on a sample body and headers
-without storing anything.
+Open a playbook and select **Add webhook**. The default **Sender** is **Custom**, for any
+sender that POSTs JSON. With **Custom**, the filter launches every delivery, the dedupe key is
+`delivery`, and every param is a fixed value until you derive it. The named senders (quay.io
+repository push, GitHub release, GitHub push) set the verifier, the transform, and the params
+that they can match by name. If you select **Custom** again, the transform starts from the
+beginning. For each param that the playbook declares, select **fixed value** or
+**derived (CEL)**. The form checks each expression as you type and marks the location of each
+error. **Run preview** evaluates the transform on a sample body and headers. It does not store
+anything.
 
-Saving shows the delivery URL and the secret once. Configure the sender with them:
+When you save, the form shows the delivery URL and the secret one time. Configure the sender with them:
 
 - **Any sender:** POST JSON to the delivery URL (it includes the token). See
   [A custom sender](#a-custom-sender).
@@ -66,13 +70,14 @@ Saving shows the delivery URL and the secret once. Configure the sender with the
 - **GitHub:** repository settings, **Webhooks**, **Add webhook**, payload URL = the delivery URL,
   content type `application/json`, secret = the HMAC secret, then choose the events.
 
-**Webhooks** in the navigation lists every webhook you can read. A webhook's page shows its
-delivery URL, its transform, the pause/resume, rotate, and delete controls, and its delivery log.
-**Edit** reopens the form, and its preview can load any recorded delivery as the sample.
+**Webhooks** in the navigation lists every webhook that you can read. The page of a webhook
+shows its delivery URL, its transform, the pause/resume, rotate, and delete controls, and its
+delivery log. **Edit** opens the form again. Its preview can load any recorded delivery as the
+sample.
 
 ### A custom sender
 
-Anything that can send an HTTP POST with a JSON body works with a `path_token` webhook:
+Any system that can send an HTTP POST with a JSON body can use a `path_token` webhook:
 
 ```sh
 curl -X POST -H 'content-type: application/json' \
@@ -80,14 +85,18 @@ curl -X POST -H 'content-type: application/json' \
   "$DELIVERY_URL"
 ```
 
-The body is yours to shape. Write the transform against it: a filter such as
-`body.env == "staging"`, a dedupe key such as `body.service + "@" + body.version` so a retried
-POST launches once, and a derive for each param (`version: body.version`). Load a recorded delivery
-into the edit form's preview to try the transform on what the sender actually posted. Keys a sender
-sometimes omits need a guard: `has(body.env) && body.env == "staging"`.
+You choose the body format. Write the transform for that format:
 
-An `hmac_sha256` sender also signs the raw body, in the header the webhook was created with
-(`x-signature` here):
+- a filter, for example `body.env == "staging"`;
+- a dedupe key, for example `body.service + "@" + body.version`, so that a retried POST
+  launches only once;
+- a derive for each param, for example `version: body.version`.
+
+To test the transform on a real delivery, load a recorded delivery into the preview of the
+edit form. If a sender sometimes omits a key, guard it: `has(body.env) && body.env == "staging"`.
+
+An `hmac_sha256` sender also signs the raw body. It puts the signature in the header that the
+webhook names (`x-signature` in this example):
 
 ```sh
 body='{"service": "api", "version": "1.4.2"}'
@@ -96,7 +105,7 @@ curl -X POST -H 'content-type: application/json' -H "x-signature: sha256=$sig" \
   -d "$body" "$DELIVERY_URL"
 ```
 
-The body must be JSON; anything else is recorded and ends `failed`.
+The body must be JSON. The controller records any other body with the outcome `failed`.
 
 ### From crux
 
@@ -132,9 +141,10 @@ A create body:
 }
 ```
 
-`params` are fixed values, validated against the playbook's schema like a launch form. `derive`
-maps a declared param to the expression that derives it; a param may be fixed or derived, not
-both. An `hmac_sha256` body also names `"header": "x-hub-signature-256"`.
+`params` are fixed values. The controller validates them against the schema of the playbook,
+as it does for a launch form. `derive` maps a declared param to the expression that derives
+it. A param is fixed or derived, not both. An `hmac_sha256` body also contains
+`"header": "x-hub-signature-256"`.
 
 ### From the API
 
@@ -142,13 +152,13 @@ both. An `hmac_sha256` body also names `"header": "x-hub-signature-256"`.
 `POST /api/webhooks/{id}/enabled`, `POST /api/webhooks/{id}/secret`,
 `GET /api/webhooks/{id}/deliveries?before=&limit=`, `POST /api/webhooks/preview`,
 `POST /api/webhooks/check`, `GET /api/webhooks/cel`, `GET /api/webhooks/presets`. The schemas are
-in `/api/openapi.json`. Webhooks are standing launches for authorization: reading one takes `read`
-on it, changing one takes `update`, and a save that changes what it launches is also decided as a
-launch of the playbook.
+in `/api/openapi.json`. For authorization, a webhook is a standing launch. To read a webhook,
+you need `read` on it. To change it, you need `update`. If a save changes what the webhook
+launches, the policy also evaluates the save as a launch of the playbook.
 
 ## The transform
 
-Three kinds of CEL expression, each over the same variables:
+The transform has three kinds of CEL expression. All of them use the same variables:
 
 | Variable | Value |
 | --- | --- |
@@ -157,25 +167,30 @@ Three kinds of CEL expression, each over the same variables:
 | `delivery` | The delivery's id, unique per delivery. |
 | `received_at` | When it arrived, RFC 3339. |
 
-- **`filter`** is a bool. A delivery it rejects ends `filtered`. Absent means `true`.
-- **`dedupe`** is a string or int, at most 512 bytes. A delivery whose key already launched ends
-  `duplicate`, for as long as the webhook exists, even after the delivery that used it is pruned.
-  `delivery` makes every delivery its own event.
-- **`derive.<param>`** yields a string, number, bool, or list of strings for that param.
+- **`filter`** is a bool. A delivery that it rejects ends `filtered`. If there is no filter,
+  the value is `true`.
+- **`dedupe`** is a string or int, at most 512 bytes. If a key already launched a run, a new
+  delivery with that key ends `duplicate`. This is true while the webhook exists, also after
+  the controller prunes the delivery that used the key. With `delivery`, each delivery is a
+  separate event.
+- **`derive.<param>`** returns a string, number, bool, or list of strings for that param.
 
 Functions: `size`, `int`, `uint`, `double`, `string`, `bytes`, `type`, `timestamp`, `duration`,
 and on a target `contains`, `startsWith`, `endsWith`, `matches`. Macros: `has`, `all`, `exists`,
-`exists_one`, `map`, `filter`. `GET /api/webhooks/cel` returns the same lists; there is no `join`.
+`exists_one`, `map`, `filter`. `GET /api/webhooks/cel` returns the same lists. There is no
+`join`.
 
-A save is refused, with the field and where the parser can say the line and column, when an
-expression:
+The controller rejects a save if an expression has one of these problems. The error names the
+field, and the line and column when the parser knows them:
 
-- does not parse, or nests brackets more than 32 deep, or is longer than 2 KiB;
-- reads a variable other than the four above, or calls a function CEL here does not define;
-- nests comprehensions more than two deep;
-- has a comprehension whose condition or step reads anything but its own variables
-  (`body.l.map(x, body.l)` is refused; `body.items.exists(i, i.tags.exists(t, t == "x"))` is
-  allowed). This is what keeps evaluation linear in the body.
+- it does not parse, it nests brackets more than 32 levels deep, or it is longer than 2 KiB;
+- it reads a variable other than the four above, or it calls a function that is not in the
+  list above;
+- it nests comprehensions more than two levels deep;
+- it has a comprehension whose condition or step reads values other than its own variables.
+  For example, `body.l.map(x, body.l)` is rejected, and
+  `body.items.exists(i, i.tags.exists(t, t == "x"))` is allowed. This rule keeps the
+  evaluation time linear in the size of the body.
 
 ### Examples
 
@@ -195,14 +210,15 @@ dedupe  string(body.release.id)
 tag     body.release.tag_name
 ```
 
-quay.io's push payload names the pushed tags and no digest, so the quay preset dedupes on
-`delivery`: every push launches. The rate limit is what stops a playbook that pushes the image it
-listens to from launching itself in a loop.
+The quay.io push payload names the pushed tags but no digest. For this reason, the quay
+preset uses `delivery` as the dedupe key, and every push launches a run. If a playbook pushes
+the image that it listens to, the rate limit stops it from launching itself in a loop.
 
 ## Outcomes
 
-A delivery shows `queued` until the controller gets to it, a few seconds at most. Deliveries are
-handled in the order they arrived, and each stops at the first step that decides it:
+A delivery shows `queued` until the controller processes it, which takes a few seconds at
+most. The controller processes deliveries in arrival order. Each delivery stops at the first
+step that gives it an outcome:
 
 | Step | Outcome |
 | --- | --- |
@@ -214,15 +230,16 @@ handled in the order they arrived, and each stops at the first step that decides
 | A param cannot be derived, or the schema refuses it, or the launch is denied | `failed` |
 | Otherwise | `launched`, with the launch key |
 
-Failures a delivery causes do not count toward disabling the webhook. Failures of the launch itself
-(the playbook is gone, its stored params no longer fit its schema, the policy denies it) do, and a
-webhook that fails `CONTROLLER_SCHEDULE_AUTO_DISABLE_FAILURES` times in a row (the threshold
-schedules and watches share) pauses itself. Pausing or deleting a webhook fails its queued
-deliveries. Finished deliveries are kept for
-`retention_days` (1 to 90, default 14); `max_launches_per_hour` is 1 to 120.
+Failures that a delivery causes do not count toward disabling the webhook. Failures of the
+launch do count: the playbook is gone, its stored params do not fit its schema, or the policy
+denies it. A webhook that fails `CONTROLLER_SCHEDULE_AUTO_DISABLE_FAILURES` times in sequence
+pauses itself. Schedules and watches use the same threshold. When you pause or delete a
+webhook, its queued deliveries fail. The controller keeps finished deliveries for
+`retention_days` (1 to 90, default 14). `max_launches_per_hour` is 1 to 120.
 
-A delivery's body and headers are readable by anyone who can read the webhook; a header that can
-carry a credential (`authorization`, `cookie`, the signature header) is never recorded.
+Any user who can read the webhook can read the body and headers of its deliveries. The
+controller does not record a header that can contain a credential (`authorization`, `cookie`,
+the signature header).
 
 ## Deploying
 
@@ -232,20 +249,20 @@ carry a credential (`authorization`, `cookie`, the signature header) is never re
 | `CONTROLLER_HOOKS_PUBLIC_URL` | The listener's public base URL; delivery URLs are built on it. Unset returns only the path. |
 | `CONTROLLER_WEBHOOK_KEY_FILE` or `CONTROLLER_WEBHOOK_KEY` | Base64 AES-256 keys, newest first, that seal `hmac_sha256` secrets. Unset refuses `hmac_sha256` webhooks. |
 
-The listener is a separate port from the API, so a deployment can publish it alone. In the Helm
-chart, `webhooks.enabled` adds the `hooks` container and Service port and a Route on the external
-host for the `/hooks` path only, and `webhooks.key.existingSecret` mounts the webhook key. The
-webhook key is independent of `CONTROLLER_CREDENTIAL_KEY`, which also turns on offline credentials
-at sign-in.
+The listener uses a different port from the API, so a deployment can publish only the
+listener. In the Helm chart, `webhooks.enabled` adds the `hooks` container, the Service port,
+and a Route on the external host for the `/hooks` path only. `webhooks.key.existingSecret`
+mounts the webhook key. The webhook key is separate from `CONTROLLER_CREDENTIAL_KEY`, which
+also enables offline credentials at sign-in.
 
-Generate a key with `head -c 32 /dev/urandom | base64`. To rotate, put the new key first and keep
-the old one after it until every secret sealed under it has been rotated.
+Generate a key with `head -c 32 /dev/urandom | base64`. To rotate the key, put the new key
+first. Keep the old key after it until you rotate every secret that it sealed.
 
 ## Trying it locally
 
-`just controller-local` serves the delivery listener on `127.0.0.1:8871` (`HOOKS_PORT` overrides)
-and generates a webhook key once in its state directory. A command-only pack exercises webhooks
-with no agent:
+`just controller-local` serves the delivery listener on `127.0.0.1:8871` (set `HOOKS_PORT` to
+change it). It generates a webhook key one time in its state directory. A pack with only
+commands can test webhooks without an agent:
 
 ```sh
 mkdir -p /tmp/image-pushed && cd /tmp/image-pushed
@@ -279,8 +296,8 @@ crux draft-push image-pushed /tmp/image-pushed --base-version 1
 crux draft-publish image-pushed --playbook on-image-push
 ```
 
-Create a quay webhook for `on-image-push` (the body above, or the UI), then post a push the way
-quay.io would, with the `delivery_url` the create printed:
+Create a quay webhook for `on-image-push`, with the body above or in the UI. Then post a push
+as quay.io does, to the `delivery_url` that the create command printed:
 
 ```sh
 curl -X POST --data '{"repository":"org/img","docker_url":"quay.io/org/img","updated_tags":["latest"]}' \
@@ -288,8 +305,8 @@ curl -X POST --data '{"repository":"org/img","docker_url":"quay.io/org/img","upd
 crux webhook-deliveries <id>
 ```
 
-The delivery is processed within a few seconds (`POST /api/reconcile` makes it immediate). A GitHub-shaped delivery
-to an `hmac_sha256` webhook signs its body:
+The controller processes the delivery within a few seconds. `POST /api/reconcile` processes
+it immediately. A GitHub delivery to an `hmac_sha256` webhook signs its body:
 
 ```sh
 sig="sha256=$(printf '%s' "$BODY" | openssl dgst -sha256 -hmac "$SECRET" | awk '{print $NF}')"
@@ -301,12 +318,13 @@ curl -X POST -H "X-GitHub-Event: release" -H "X-Hub-Signature-256: $sig" --data 
 | Symptom | Cause |
 | --- | --- |
 | The sender sees `404` | Wrong id or token, a changed or rotated secret, a paused webhook, a signature over a different body, or a body over 512 KiB. |
-| The sender sees `503` | The controller could not record the delivery, or is shedding load; the sender retries. |
-| `filtered` | The filter was false. Load the delivery into the edit form's preview to see why. |
-| Stays `queued` | The webhook's owner has to sign in again, or the controller is not running its launch loop. |
-| `failed` with `no key "x"` | An expression read a key this payload does not have. Guard a field with `has(body.x)` and a header with `"x" in headers`, before the part that reads it. |
-| `duplicate` | The dedupe key already launched. Use `delivery` if every delivery is its own event. |
-| `hmac_sha256` refused on save | The controller has no webhook key. |
+| The sender sees `503` | The controller could not record the delivery, or it is rejecting load. The sender retries. |
+| `filtered` | The filter was false. Load the delivery into the preview of the edit form to find the cause. |
+| Stays `queued` | The owner of the webhook must sign in again, or the controller is not running its launch loop. |
+| `failed` with `no key "x"` | An expression read a key that the payload does not have. Guard a field with `has(body.x)` and a header with `"x" in headers` before the expression reads it. |
+| `duplicate` | The dedupe key already launched a run. Use `delivery` if each delivery is a separate event. |
+| The save rejects `hmac_sha256` | The controller has no webhook key. |
 
-The design is [ADR-0055](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0055-webhook-triggers-verified-deliveries-land-in-an-inbox-and-cel-maps-them-to-a-launch.toml);
-the obligations are RFC-0003's webhook clauses in [RFC-0003](./rfc/RFC-0003.md).
+[ADR-0055](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0055-webhook-triggers-verified-deliveries-land-in-an-inbox-and-cel-maps-them-to-a-launch.toml)
+records the design. The webhook clauses of [RFC-0003](./rfc/RFC-0003.md) give the
+requirements.
