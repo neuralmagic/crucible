@@ -9,6 +9,7 @@ pub mod hardware;
 pub mod kueue;
 pub mod manifest;
 pub mod quantity;
+pub mod report;
 pub mod server;
 pub mod status;
 pub mod task;

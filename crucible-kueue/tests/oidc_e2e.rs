@@ -364,7 +364,7 @@ async fn connect(url: &str, token: &str) -> Client {
     ClientConfig::default().serve(transport).await.unwrap()
 }
 
-/// A tool's JSON reply, or the JSON-RPC error message when the call was refused.
+/// A tool's JSON reply, or the text of a tool error result (a refusal by the guard or the tool).
 async fn call(client: &Client, tool: &str, args: Value) -> Result<Value, String> {
     let Value::Object(map) = args else {
         panic!("args must be an object")
@@ -379,6 +379,9 @@ async fn call(client: &Client, tool: &str, args: Value) -> Result<Value, String>
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .unwrap_or_else(|| panic!("{tool}: no text content"));
+    if result.is_error.unwrap_or(false) {
+        return Err(text);
+    }
     Ok(serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}: {text}")))
 }
 
@@ -474,7 +477,8 @@ async fn a_sandbox_svid_becomes_a_controller_token_that_policy_and_kueue_honor()
         json!({"queue": env.queue, "manifest": forged}),
     )
     .await
-    .unwrap();
+    .expect_err("a forged actor annotation must be refused");
+    let refused: Value = serde_json::from_str(&refused).unwrap();
     assert_eq!(refused["status"], "refused", "{refused}");
     assert!(
         refused["error"]

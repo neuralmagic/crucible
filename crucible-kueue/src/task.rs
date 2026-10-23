@@ -4,9 +4,9 @@
 //! `tasks/get`; nothing is held in the server. Serving kinds are not tasks: they never finish, and
 //! report readiness through `workload_status`.
 
-use crate::manifest::WorkloadKind;
+use crate::manifest::{DEFAULT_TTL_SECONDS_AFTER_FINISHED, WorkloadKind};
 use crate::status::{Phase, Rollup};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 pub const CANCELLED_ANNOTATION: &str = "crucible.dev/task-cancelled";
 pub const POLL_INTERVAL_MS: u64 = 5_000;
@@ -62,6 +62,36 @@ pub enum Outcome {
         message: String,
     },
     Cancelled,
+}
+
+/// The error for a task whose object no longer exists. The server gives every Job and RayJob a
+/// TTL, so a finished task's object is deleted and its outcome with it.
+pub fn gone(t: &TaskRef) -> String {
+    format!(
+        "task {}: {} {} no longer exists. It finished and was deleted after its ttlSecondsAfterFinished (default {DEFAULT_TTL_SECONDS_AFTER_FINISHED}s), or it was deleted; its outcome is gone",
+        t.encode(),
+        t.kind.kind(),
+        t.name
+    )
+}
+
+pub fn replaced(t: &TaskRef) -> String {
+    format!(
+        "task {}: {} {} was deleted and created again under the same name; this task's outcome is gone",
+        t.encode(),
+        t.kind.kind(),
+        t.name
+    )
+}
+
+/// A completed task's result text. A failed workload is a tool error with status `failed`.
+pub fn completed_body(failed: bool, message: &str, report: Value) -> Value {
+    json!({
+        "status": if failed { "failed" } else { "ok" },
+        "outcome": if failed { "failed" } else { "succeeded" },
+        "message": message,
+        "report": report,
+    })
 }
 
 fn annotation<'a>(object: &'a Value, key: &str) -> Option<&'a str> {
@@ -157,6 +187,33 @@ mod tests {
             outcome(&obj, &rollup(Phase::Finished, "Failed")),
             Outcome::Completed { failed: true, .. }
         ));
+    }
+
+    #[test]
+    fn a_gone_task_says_it_was_deleted_after_its_ttl() {
+        let t = TaskRef::parse("team-a/Job/train/6f1c-uid").unwrap();
+        let msg = gone(&t);
+        assert!(
+            msg.starts_with("task team-a/Job/train/6f1c-uid: Job train no longer exists"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("ttlSecondsAfterFinished (default 3600s)"),
+            "{msg}"
+        );
+        assert!(!msg.contains("unknown task"), "{msg}");
+        assert!(replaced(&t).contains("created again under the same name"));
+    }
+
+    #[test]
+    fn a_completed_body_never_says_ok_for_a_failed_workload() {
+        let failed = completed_body(true, "BackoffLimitExceeded", json!({}));
+        assert_eq!(failed["status"], "failed");
+        assert_eq!(failed["outcome"], "failed");
+        let ok = completed_body(false, "done", json!({"phase": "finished"}));
+        assert_eq!(ok["status"], "ok");
+        assert_eq!(ok["outcome"], "succeeded");
+        assert_eq!(ok["report"]["phase"], "finished");
     }
 
     #[test]

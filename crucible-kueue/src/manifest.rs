@@ -181,14 +181,26 @@ pub struct Normalized {
 
 impl Normalized {
     pub fn total_requests(&self) -> BTreeMap<String, ParsedQuantity> {
-        let mut total: BTreeMap<String, ParsedQuantity> = BTreeMap::new();
-        for set in &self.pod_sets {
-            for (k, v) in set.total() {
-                crate::quantity::add_into(&mut total, &k, v);
-            }
-        }
-        total
+        total_requests(&self.pod_sets)
     }
+
+    /// How long Kubernetes keeps the object after it finishes, when it is deleted then.
+    pub fn retention_seconds(&self) -> Option<i64> {
+        self.object
+            .pointer("/spec/ttlSecondsAfterFinished")
+            .and_then(Value::as_i64)
+    }
+}
+
+/// Every pod set's requests summed.
+pub fn total_requests(sets: &[PodSet]) -> BTreeMap<String, ParsedQuantity> {
+    let mut total: BTreeMap<String, ParsedQuantity> = BTreeMap::new();
+    for set in sets {
+        for (k, v) in set.total() {
+            crate::quantity::add_into(&mut total, &k, v);
+        }
+    }
+    total
 }
 
 /// A batch workload runs at most this long unless its manifest says otherwise.
@@ -326,6 +338,28 @@ pub fn normalize(
         pod_sets,
         plan_hash,
     })
+}
+
+/// The pod sets of an object already in the cluster, for re-estimating its fit while it waits.
+pub fn pod_sets_of(kind: WorkloadKind, object: &Value) -> Result<Vec<PodSet>, ManifestError> {
+    template_slots(kind, object)?
+        .into_iter()
+        .map(|slot| {
+            let spec_path = format!("{}/spec", slot.pointer);
+            let spec = object
+                .pointer(&spec_path)
+                .and_then(Value::as_object)
+                .ok_or(ManifestError::NoTemplate {
+                    kind: kind.kind(),
+                    path: slot.pointer.clone(),
+                })?;
+            Ok(PodSet {
+                name: slot.name,
+                count: slot.count,
+                per_pod: pod_requests(spec, &spec_path)?,
+            })
+        })
+        .collect()
 }
 
 /// SHA-256 over the key-sorted JSON of the normalized object, so the hash depends only on content.
@@ -1219,6 +1253,21 @@ mod tests {
     }
 
     #[test]
+    fn a_live_objects_pod_sets_match_what_its_plan_counted() {
+        let n = normalize(job(), &caller(), &queue()).unwrap();
+        let mut live = n.object.clone();
+        live["status"] = json!({"active": 2});
+        let sets = pod_sets_of(WorkloadKind::Job, &live).unwrap();
+        assert_eq!(sets.len(), n.pod_sets.len());
+        assert_eq!(sets[0].count, 2);
+        assert_eq!(sets[0].per_pod, n.pod_sets[0].per_pod);
+        assert!(matches!(
+            pod_sets_of(WorkloadKind::Job, &json!({"spec": {}})),
+            Err(ManifestError::NoTemplate { .. })
+        ));
+    }
+
+    #[test]
     fn a_job_is_pinned_to_the_callers_namespace_queue_and_run() {
         let n = normalize(job(), &caller(), &queue()).unwrap();
         let o = &n.object;
@@ -1253,6 +1302,10 @@ mod tests {
             n.object.pointer("/spec/ttlSecondsAfterFinished"),
             Some(&json!(DEFAULT_TTL_SECONDS_AFTER_FINISHED))
         );
+        assert_eq!(
+            n.retention_seconds(),
+            Some(DEFAULT_TTL_SECONDS_AFTER_FINISHED)
+        );
 
         let mut own = job();
         own["spec"]["activeDeadlineSeconds"] = json!(600);
@@ -1266,6 +1319,7 @@ mod tests {
             n.object.pointer("/spec/ttlSecondsAfterFinished"),
             Some(&json!(0))
         );
+        assert_eq!(n.retention_seconds(), Some(0));
 
         let ray = |shutdown: Option<bool>| {
             let mut m = json!({

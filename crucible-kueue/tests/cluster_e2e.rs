@@ -5,6 +5,7 @@
 //!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=<ns> \
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> cargo test --test cluster_e2e -- --ignored --nocapture
 //!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<user the tokens act as>
+//!   CRUCIBLE_KUEUE_E2E_KUBE_GROUPS=<comma-separated groups of that user, optional>
 //! The namespace must carry the label Kueue's ClusterQueue selects on and hold the LocalQueue. The
 //! tokens act as CRUCIBLE_KUEUE_E2E_KUBE_USER, decided by SubjectAccessReview: it needs `use` on the
 //! LocalQueue and the workload verbs the tests exercise in the namespace, and the context's identity
@@ -33,6 +34,7 @@ struct Env {
     namespace: String,
     queue: String,
     kube_user: String,
+    kube_groups: Vec<String>,
 }
 
 fn env() -> Env {
@@ -44,6 +46,12 @@ fn env() -> Env {
         namespace: var("CRUCIBLE_KUEUE_E2E_NAMESPACE"),
         queue: var("CRUCIBLE_KUEUE_E2E_QUEUE"),
         kube_user: var("CRUCIBLE_KUEUE_E2E_KUBE_USER"),
+        kube_groups: std::env::var("CRUCIBLE_KUEUE_E2E_KUBE_GROUPS")
+            .unwrap_or_default()
+            .split(',')
+            .filter(|g| !g.is_empty())
+            .map(str::to_string)
+            .collect(),
     }
 }
 
@@ -87,6 +95,9 @@ fn run_token(env: &Env, run: &str, scope: &str) -> String {
     claims["run_id"] = json!(run);
     claims["namespace"] = json!(env.namespace);
     claims["kube_user"] = json!(env.kube_user);
+    if !env.kube_groups.is_empty() {
+        claims["kube_groups"] = json!(env.kube_groups);
+    }
     claims["scope"] = json!(scope);
     testing::sign("a", &claims)
 }
@@ -190,6 +201,7 @@ fn completed_body(task: &DetailedTask) -> (bool, Value) {
     )
 }
 
+/// A tool's JSON reply. Every reply but `ok` must come back as a tool error with `retryable`.
 async fn call(client: &Client, tool: &str, args: Value) -> Value {
     let Value::Object(map) = args else {
         panic!("args must be an object")
@@ -204,7 +216,17 @@ async fn call(client: &Client, tool: &str, args: Value) -> Value {
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
         .unwrap_or_else(|| panic!("{tool}: no text content"));
-    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}: {text}"))
+    let body: Value = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{tool}: {e}: {text}"));
+    let failed = body["status"] != "ok";
+    assert_eq!(
+        result.is_error.unwrap_or(false),
+        failed,
+        "{tool}: isError must match the status: {body:#}"
+    );
+    if failed {
+        assert!(body["retryable"].is_boolean(), "{tool}: {body:#}");
+    }
+    body
 }
 
 fn job(name: &str, script: &str) -> Value {
@@ -230,9 +252,52 @@ fn job(name: &str, script: &str) -> Value {
 
 async fn wait_for_phase(client: &Client, name: &str, want: &[&str], timeout: Duration) -> Value {
     wait_until(client, "Job", name, timeout, |s| {
-        want.contains(&s["phase"]["phase"].as_str().unwrap_or_default())
+        want.contains(&s["phase"].as_str().unwrap_or_default())
     })
     .await
+}
+
+/// workload_status with a server-side wait, called again until `until` is reached.
+async fn wait_on_server(
+    client: &Client,
+    kind: &str,
+    name: &str,
+    until: &str,
+    timeout: Duration,
+) -> Value {
+    let start = Instant::now();
+    loop {
+        let s = call(
+            client,
+            "workload_status",
+            json!({"kind": kind, "name": name, "until": until, "timeout_seconds": 20}),
+        )
+        .await;
+        assert_eq!(s["status"], "ok", "{s:#}");
+        assert_eq!(s["wait"]["until"], until, "{s:#}");
+        assert!(
+            s["wait"]["waited_seconds"].as_u64().unwrap() <= 22,
+            "the wait is bounded: {s:#}"
+        );
+        eprintln!(
+            "  {kind}/{name} until={until}: {} {}",
+            s["wait"], s["phase"]
+        );
+        if s["wait"]["ended"] != "timeout" {
+            return s;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "{kind}/{name} never reached {until}: {s:#}"
+        );
+    }
+}
+
+fn workloads_total(s: &Value) -> u64 {
+    s["workload_counts"]
+        .as_object()
+        .map(|c| c.values().filter_map(Value::as_u64).sum())
+        .unwrap_or(0)
 }
 
 async fn wait_until(
@@ -252,7 +317,7 @@ async fn wait_until(
         .await;
         eprintln!(
             "  {kind}/{name}: {} {} {}",
-            s["phase"]["phase"], s["phase"]["counts"], s["phase"]["message"]
+            s["phase"], s["workload_counts"], s["message"]
         );
         if done(&s) {
             return s;
@@ -266,7 +331,7 @@ async fn wait_until(
 }
 
 fn admitted(s: &Value, n: u64) -> bool {
-    s["phase"]["phase"] == "admitted" && s["phase"]["counts"]["admitted"] == n
+    s["phase"] == "admitted" && s["workload_counts"]["admitted"] == n
 }
 
 fn serving(kind: &str, name: &str, replicas: i64) -> Value {
@@ -359,7 +424,8 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
 
     let me = call(&agent, "whoami", json!({})).await;
     assert_eq!(me["namespace"], env.namespace.as_str());
-    assert_eq!(me["role"], "submitter");
+    assert_eq!(me["run_id"], run.as_str());
+    assert_eq!(me["kube_user"], env.kube_user.as_str());
 
     let queues = call(&agent, "queues_list", json!({})).await;
     assert!(
@@ -382,13 +448,9 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
         serde_json::to_string_pretty(&hw["flavors"]).unwrap()
     );
 
-    let other = call(
-        &agent,
-        "queue_describe",
-        json!({"queue": "not-in-allowlist"}),
-    )
-    .await;
-    assert_eq!(other["status"], "refused", "{other:#}");
+    let missing = call(&agent, "queue_describe", json!({"queue": "no-such-queue"})).await;
+    assert_eq!(missing["status"], "not_found", "{missing:#}");
+    assert_eq!(missing["retryable"], false, "{missing:#}");
 
     let privileged = {
         let mut m = job("never", "true");
@@ -402,6 +464,7 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
         .await
     };
     assert_eq!(privileged["status"], "refused", "{privileged:#}");
+    assert_eq!(privileged["retryable"], false, "{privileged:#}");
 
     let name = unique("ck-e2e");
     let manifest = job(&name, "echo crucible-kueue-sentinel; sleep 2");
@@ -414,6 +477,10 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
     assert_eq!(plan["status"], "ok", "{plan:#}");
     assert_eq!(plan["dry_run"], "accepted");
     assert_eq!(plan["fit"]["verdict"], "fits_now", "{:#}", plan["fit"]);
+    assert_eq!(
+        plan["finished_retention_seconds"], 600,
+        "the manifest's own TTL"
+    );
     let hash = plan["plan_hash"].as_str().unwrap().to_string();
 
     let tampered = call(
@@ -446,6 +513,7 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
     .await;
     assert_eq!(submitted["status"], "ok", "{submitted:#}");
     assert_eq!(submitted["submitted"], true);
+    assert_eq!(submitted["finished_retention_seconds"], 600);
 
     let again = call(
         &agent,
@@ -456,12 +524,39 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
     assert_eq!(again["status"], "ok", "{again:#}");
     assert_eq!(again["submitted"], false);
 
-    let done = wait_for_phase(&agent, &name, &["finished"], Duration::from_secs(300)).await;
+    let done = wait_on_server(&agent, "Job", &name, "finished", Duration::from_secs(300)).await;
+    assert_eq!(done["wait"]["reached"], true, "{done:#}");
+    assert_eq!(done["phase"], "finished", "{done:#}");
+    assert_eq!(done["reason"], "Succeeded", "{done:#}");
     assert_eq!(done["object_status"]["succeeded"], 1, "{done:#}");
+    assert!(done["admitted_to"]["cluster_queue"].is_string(), "{done:#}");
     assert!(
-        done["workloads"][0]["admission"]["clusterQueue"].is_string(),
+        done["next_action"]
+            .as_str()
+            .unwrap()
+            .starts_with("Finished successfully"),
         "{done:#}"
     );
+    assert!(
+        done.get("workloads").is_none(),
+        "the summary leaves conditions out"
+    );
+    let summary_bytes = done.to_string().len();
+    let full = call(
+        &agent,
+        "workload_status",
+        json!({"kind": "Job", "name": name, "detail": "full"}),
+    )
+    .await;
+    assert!(
+        full["workloads"][0]["admission"]["clusterQueue"].is_string(),
+        "{full:#}"
+    );
+    eprintln!(
+        "status bytes: summary {summary_bytes}, full {}",
+        full.to_string().len()
+    );
+    assert!(summary_bytes < full.to_string().len());
 
     let logs = call(
         &agent,
@@ -477,6 +572,9 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
             .contains("crucible-kueue-sentinel"),
         "{logs:#}"
     );
+    assert_eq!(logs["logs"][0]["role"], "job", "{logs:#}");
+    assert_eq!(logs["budget_bytes"], 16384, "{logs:#}");
+    assert_eq!(logs["truncated"], false, "{logs:#}");
 
     let listed = call(&agent, "workload_list", json!({})).await;
     assert!(
@@ -488,13 +586,16 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
         "{listed:#}"
     );
 
-    let viewer_delete = call(
-        &viewer,
-        "workload_delete",
-        json!({"kind": "Job", "name": name}),
-    )
-    .await;
-    assert_eq!(viewer_delete["status"], "refused", "{viewer_delete:#}");
+    let Value::Object(delete_args) = json!({"kind": "Job", "name": name}) else {
+        unreachable!()
+    };
+    let viewer_delete = viewer
+        .call_tool(CallToolRequestParams::new("workload_delete").with_arguments(delete_args))
+        .await;
+    assert!(
+        viewer_delete.is_err(),
+        "a read-only token gets a step-up challenge, not a delete: {viewer_delete:?}"
+    );
 
     let deleted = call(
         &agent,
@@ -609,7 +710,7 @@ async fn a_deployment_is_admitted_pod_by_pod_and_scales_stops_and_resumes() {
         admitted(s, 2)
     })
     .await;
-    assert_eq!(s["workloads_total"], 2, "{s:#}");
+    assert_eq!(workloads_total(&s), 2, "{s:#}");
 
     let scaled = call(
         &agent,
@@ -627,7 +728,7 @@ async fn a_deployment_is_admitted_pod_by_pod_and_scales_stops_and_resumes() {
     let stopped = call(&agent, "workload_stop", r.clone()).await;
     assert_eq!(stopped["stopped_from"], 3, "{stopped:#}");
     wait_until(&agent, "Deployment", &name, Duration::from_secs(120), |s| {
-        s["workloads_total"] == 0
+        workloads_total(s) == 0
     })
     .await;
     let not_scalable = call(
@@ -669,7 +770,7 @@ async fn a_statefulset_is_admitted_as_one_group_and_stops_by_scaling_to_zero() {
         |s| admitted(s, 1),
     )
     .await;
-    assert_eq!(s["workloads_total"], 1, "one group Workload: {s:#}");
+    assert_eq!(workloads_total(&s), 1, "one group Workload: {s:#}");
 
     let resize = call(
         &agent,
@@ -681,6 +782,7 @@ async fn a_statefulset_is_admitted_as_one_group_and_stops_by_scaling_to_zero() {
         resize["status"], "rejected",
         "Kueue only scales a StatefulSet to or from zero: {resize:#}"
     );
+    eprintln!("resize rejected, retryable={}", resize["retryable"]);
 
     let stopped = call(&agent, "workload_stop", r.clone()).await;
     assert_eq!(stopped["stopped_from"], 2, "{stopped:#}");
@@ -720,12 +822,16 @@ async fn a_tasks_client_gets_a_task_and_polls_a_job_to_completion() {
         &job(&name, "echo task-sentinel; sleep 2"),
     )
     .await;
-    assert!(id.starts_with(&format!("Job/{name}/")), "{id}");
+    assert!(
+        id.starts_with(&format!("{}/Job/{name}/", env.namespace)),
+        "{id}"
+    );
 
     let done = poll_task(&agent, &id, Duration::from_secs(300)).await;
     assert_eq!(done.status(), TaskStatus::Completed);
     let (is_error, body) = completed_body(&done);
     assert!(!is_error, "{body:#}");
+    assert_eq!(body["status"], "ok", "{body:#}");
     assert_eq!(body["outcome"], "succeeded", "{body:#}");
     assert_eq!(body["report"]["object_status"]["succeeded"], 1, "{body:#}");
 
@@ -744,12 +850,114 @@ async fn a_tasks_client_gets_a_task_and_polls_a_job_to_completion() {
         is_error,
         "a failed Job completes the task with a tool error: {body:#}"
     );
+    assert_eq!(
+        body["status"], "failed",
+        "never ok beside a failed outcome: {body:#}"
+    );
     assert_eq!(body["outcome"], "failed");
+    assert_eq!(
+        body["report"]["problem_pods"][0]["exit_code"], 3,
+        "{body:#}"
+    );
 
     for n in [&name, &failing] {
         let deleted = call(&agent, "workload_delete", json!({"kind": "Job", "name": n})).await;
         assert_eq!(deleted["status"], "ok", "{deleted:#}");
     }
+    let start = Instant::now();
+    loop {
+        let s = call(
+            &agent,
+            "workload_status",
+            json!({"kind": "Job", "name": failing}),
+        )
+        .await;
+        if s["status"] == "not_found" {
+            assert!(
+                s["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("ttlSecondsAfterFinished"),
+                "{s:#}"
+            );
+            break;
+        }
+        assert!(start.elapsed() < Duration::from_secs(60), "{s:#}");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let gone = agent
+        .peer()
+        .get_task(GetTaskParams::new(id.clone()))
+        .await
+        .expect_err("a deleted task's object is gone")
+        .to_string();
+    assert!(
+        gone.contains("no longer exists") && !gone.contains("unknown task"),
+        "{gone}"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_failing_job_names_its_problem_pod_and_its_logs_come_first() {
+    let env = env();
+    let run = unique("e2e-fail");
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
+    let name = unique("ck-e2e-fail");
+    let script = "for i in $(seq 1 400); do echo noise-line-$i-padding-padding-padding; done; \
+        echo boom-sentinel >&2; echo bad-input > /dev/termination-log; exit 3";
+    submit(&agent, &env.queue, &job(&name, script)).await;
+
+    let done = wait_on_server(&agent, "Job", &name, "finished", Duration::from_secs(300)).await;
+    assert_eq!(done["phase"], "finished", "{done:#}");
+    assert_ne!(done["reason"], "Succeeded", "{done:#}");
+    let problem = &done["problem_pods"][0];
+    assert_eq!(problem["exit_code"], 3, "{done:#}");
+    assert_eq!(problem["termination_message"], "bad-input", "{done:#}");
+    assert_eq!(problem["role"], "job", "{done:#}");
+    assert!(
+        done["next_action"]
+            .as_str()
+            .unwrap()
+            .starts_with("Finished and failed"),
+        "{done:#}"
+    );
+
+    let logs = call(
+        &agent,
+        "workload_logs",
+        json!({"kind": "Job", "name": name, "tail_lines": 2000, "max_bytes": 2048}),
+    )
+    .await;
+    assert_eq!(logs["status"], "ok", "{logs:#}");
+    let log = logs["logs"][0]["log"].as_str().unwrap();
+    assert!(log.len() <= 2048, "{logs:#}");
+    assert!(log.contains("boom-sentinel"), "the tail is kept: {logs:#}");
+    assert_eq!(logs["truncated"], true, "{logs:#}");
+    assert!(logs["bytes_omitted"].as_u64().unwrap() > 10_000, "{logs:#}");
+    assert_eq!(logs["logs"][0]["phase"], "Failed", "{logs:#}");
+    let log_bytes = logs.to_string().len();
+
+    let grepped = call(
+        &agent,
+        "workload_logs",
+        json!({"kind": "Job", "name": name, "grep": "boom"}),
+    )
+    .await;
+    assert_eq!(grepped["logs"][0]["log"], "boom-sentinel", "{grepped:#}");
+    eprintln!(
+        "log bytes: budgeted {log_bytes}, grep {}",
+        grepped.to_string().len()
+    );
+
+    let deleted = call(
+        &agent,
+        "workload_delete",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert_eq!(deleted["status"], "ok", "{deleted:#}");
 }
 
 #[tokio::test]
@@ -783,10 +991,15 @@ async fn a_deployment_is_no_task_and_reports_readiness_until_stopped() {
         "a Deployment is answered synchronously even to a tasks client: {submitted:?}"
     );
 
-    let up = wait_until(&agent, "Deployment", &name, Duration::from_secs(240), |s| {
-        s["readiness"]["ready"] == true
-    })
+    let up = wait_on_server(
+        &agent,
+        "Deployment",
+        &name,
+        "ready",
+        Duration::from_secs(240),
+    )
     .await;
+    assert_eq!(up["wait"]["reached"], true, "{up:#}");
     assert_eq!(
         up["readiness"],
         json!({"ready": true, "replicas": 2, "ready_replicas": 2})

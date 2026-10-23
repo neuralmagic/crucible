@@ -11,7 +11,8 @@ use crate::manifest::{
     self, MANAGED_LABEL, MANAGED_VALUE, ManifestError, Normalized, RUN_LABEL, WORKLOAD_LABEL,
     WorkloadKind,
 };
-use crate::status::{self, Rollup};
+use crate::report::{self, Detail, Situation, Until, WaitEnd};
+use crate::status::{self, Phase, Readiness, Rollup};
 use crate::task::{self, Outcome, TaskRef};
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
@@ -31,6 +32,7 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 pub const FIELD_MANAGER: &str = "crucible-kueue";
 pub const PLAN_HASH_ANNOTATION: &str = "crucible.dev/plan-hash";
@@ -43,6 +45,13 @@ const MAX_LOG_PODS: usize = 4;
 const DEFAULT_TAIL: i64 = 200;
 const MAX_TAIL: i64 = 2000;
 const MAX_LOG_BYTES: i64 = 64 * 1024;
+const DEFAULT_LOG_BUDGET: usize = 16 * 1024;
+const MIN_LOG_BUDGET: usize = 1024;
+const MAX_PROBLEM_PODS: usize = 5;
+const SUMMARY_EVENTS: usize = 10;
+const FULL_EVENTS: usize = 15;
+const MAX_WAIT_SECONDS: u64 = 50;
+const WAIT_POLL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ToolError {
@@ -56,7 +65,7 @@ pub enum ToolError {
     Name(#[from] NameError),
     #[error(transparent)]
     Kube(#[from] KubeError),
-    #[error("{kind} {name} not found in namespace {namespace}")]
+    #[error("{kind} {name} not found in namespace {namespace}{}", gone_hint(.kind))]
     NotFound {
         kind: &'static str,
         name: String,
@@ -91,7 +100,23 @@ pub enum ToolError {
     #[error("replicas must be between 0 and {max}, got {got}")]
     Replicas { got: i64, max: i64 },
     #[error("the API server rejected the {kind}: {message}")]
-    Rejected { kind: &'static str, message: String },
+    Rejected {
+        kind: &'static str,
+        code: u16,
+        message: String,
+    },
+}
+
+/// Why a Job or RayJob may be gone: the TTL the server defaults deletes it after it finishes.
+fn gone_hint(kind: &str) -> String {
+    if kind == WorkloadKind::Job.kind() || kind == WorkloadKind::RayJob.kind() {
+        format!(
+            "; a finished {kind} is deleted ttlSecondsAfterFinished after it finishes (default {}s)",
+            manifest::DEFAULT_TTL_SECONDS_AFTER_FINISHED
+        )
+    } else {
+        String::new()
+    }
 }
 
 impl ToolError {
@@ -113,27 +138,95 @@ impl ToolError {
             Self::Kube(_) => "error",
         }
     }
-}
 
-fn reply(result: Result<Value, ToolError>) -> String {
-    match result {
-        Ok(Value::Object(mut map)) => {
-            map.entry("status").or_insert_with(|| json!("ok"));
-            Value::Object(map).to_string()
-        }
-        Ok(other) => json!({"status": "ok", "result": other}).to_string(),
-        Err(e) => {
-            tracing::info!(error = %e, status = e.status(), "tool call refused or failed");
-            json!({"status": e.status(), "error": e.to_string()}).to_string()
+    /// Whether the same call may succeed later: an admission webhook that refused it may accept
+    /// it once the workload settles, and the API server may come back.
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Rejected { code, message, .. } => {
+                message.contains("admission webhook") || *code == 409 || *code == 429
+            }
+            Self::Kube(e) => e.retryable(),
+            _ => false,
         }
     }
 }
 
-struct StatusReport {
-    body: Value,
+fn text_result(body: &Value, is_error: bool) -> CallToolResult {
+    let content = vec![ContentBlock::text(body.to_string())];
+    if is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
+    }
+}
+
+/// Every tool answers JSON text with a `status`. Anything but `ok` is a tool error result.
+fn reply(result: Result<Value, ToolError>) -> CallToolResult {
+    match result {
+        Ok(Value::Object(mut map)) => {
+            map.entry("status").or_insert_with(|| json!("ok"));
+            text_result(&Value::Object(map), false)
+        }
+        Ok(other) => text_result(&json!({"status": "ok", "result": other}), false),
+        Err(e) => {
+            tracing::info!(error = %e, status = e.status(), "tool call refused or failed");
+            text_result(
+                &json!({"status": e.status(), "error": e.to_string(), "retryable": e.retryable()}),
+                true,
+            )
+        }
+    }
+}
+
+/// One read of a workload: the object, its pods, and the Workloads Kueue tracks it as.
+struct Snapshot {
     object: DynamicObject,
+    pods: Vec<Pod>,
+    workloads: Vec<Workload>,
     rollup: Rollup,
-    last_updated: Option<String>,
+}
+
+impl Snapshot {
+    fn readiness(&self, kind: WorkloadKind) -> Option<Readiness> {
+        (!kind.is_batch()).then(|| status::readiness(&self.object.data, &self.rollup))
+    }
+
+    fn last_updated(&self) -> Option<String> {
+        self.workloads
+            .iter()
+            .flat_map(|w| w.status.conditions.iter())
+            .filter_map(|c| c.last_transition_time.clone())
+            .max()
+    }
+}
+
+#[derive(Serialize)]
+struct EventLine {
+    time: String,
+    object: String,
+    #[serde(rename = "type")]
+    type_: Option<String>,
+    reason: Option<String>,
+    message: Option<String>,
+    count: Option<i32>,
+}
+
+impl EventLine {
+    fn line(&self) -> String {
+        let mut out = format!(
+            "{} {} {} {}: {}",
+            self.time,
+            self.object,
+            self.type_.as_deref().unwrap_or_default(),
+            self.reason.as_deref().unwrap_or_default(),
+            self.message.as_deref().unwrap_or_default().trim()
+        );
+        if let Some(n) = self.count.filter(|n| *n > 1) {
+            out.push_str(&format!(" (x{n})"));
+        }
+        out
+    }
 }
 
 fn internal(e: impl std::fmt::Display) -> McpError {
@@ -237,6 +330,7 @@ fn api_rejection(kind: WorkloadKind, err: kube::Error) -> ToolError {
         kube::Error::Api(s) if (400..500).contains(&s.code) && s.code != 404 => {
             ToolError::Rejected {
                 kind: kind.kind(),
+                code: s.code,
                 message: s.message,
             }
         }
@@ -249,7 +343,7 @@ pub struct QueueArgs {
     /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
     #[serde(default)]
     pub namespace: Option<String>,
-    /// LocalQueue name in this run's namespace.
+    /// LocalQueue name in the namespace acted in (queues_list lists them).
     pub queue: String,
 }
 
@@ -258,10 +352,12 @@ pub struct PlanArgs {
     /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
     #[serde(default)]
     pub namespace: Option<String>,
-    /// LocalQueue name in this run's namespace.
+    /// LocalQueue name in the namespace acted in (queues_list lists them).
     pub queue: String,
-    /// The workload as a JSON object: batch/v1 Job, ray.io/v1 RayJob, or leaderworkerset.x-k8s.io/v1
-    /// LeaderWorkerSet. metadata.name is required; namespace and queue are filled in.
+    /// The workload as a JSON object: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1
+    /// LeaderWorkerSet, apps/v1 Deployment, or apps/v1 StatefulSet. metadata.name is required;
+    /// the namespace and queue label are filled in. Pod templates may not use host access,
+    /// privilege, another service account, Secrets, or scheduling fields that bypass Kueue.
     pub manifest: Value,
 }
 
@@ -283,9 +379,34 @@ pub struct WorkloadRef {
     /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// The submitted object's kind.
     pub kind: WorkloadKind,
     /// metadata.name of the submitted object.
     pub name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StatusArgs {
+    /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
+    #[serde(default)]
+    pub namespace: Option<String>,
+    /// The submitted object's kind.
+    pub kind: WorkloadKind,
+    /// metadata.name of the submitted object.
+    pub name: String,
+    /// summary (default) or full, which adds every Workload's conditions, the object's status,
+    /// and every pod.
+    #[serde(default)]
+    pub detail: Option<Detail>,
+    /// Wait on the server until the workload reaches this point (or passes it), it settles
+    /// short of it, a pod is stuck, or timeout_seconds passes; then answer as usual, with `wait`
+    /// saying which.
+    #[serde(default)]
+    pub until: Option<Until>,
+    /// How long `until` waits, in seconds (default and max 50).
+    #[serde(default)]
+    #[schemars(range(min = 1, max = 50))]
+    pub timeout_seconds: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -293,16 +414,33 @@ pub struct LogArgs {
     /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// The submitted object's kind.
     pub kind: WorkloadKind,
+    /// metadata.name of the submitted object.
     pub name: String,
-    /// One pod's name; omit for up to four of the workload's pods.
+    /// One pod's name; omit for up to four of the workload's pods, failed ones first, then a
+    /// RayJob's head and submitter or a LeaderWorkerSet's leader.
     #[serde(default)]
     pub pod: Option<String>,
+    /// Container to read; omit for the pod's default container.
     #[serde(default)]
     pub container: Option<String>,
-    /// Lines from the end of each log (default 200, max 2000).
+    /// Lines from the end of each log (default 200, or 2000 with grep).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 2000))]
     pub tail_lines: Option<i64>,
+    /// Only lines written in the last this many seconds.
+    #[serde(default)]
+    #[schemars(range(min = 1))]
+    pub since_seconds: Option<i64>,
+    /// Keep only lines containing this text (case-sensitive), applied before the byte budget.
+    #[serde(default)]
+    pub grep: Option<String>,
+    /// Total bytes of log text across all pods (default 16384, max 65536). Each pod keeps the
+    /// end of its log; `bytes_omitted` counts what was cut from the front.
+    #[serde(default)]
+    #[schemars(range(min = 1024, max = 65536))]
+    pub max_bytes: Option<usize>,
     /// Logs of the previous container instance, after a restart.
     #[serde(default)]
     pub previous: bool,
@@ -315,8 +453,10 @@ pub struct ScaleArgs {
     pub namespace: Option<String>,
     /// Deployment or StatefulSet.
     pub kind: WorkloadKind,
+    /// metadata.name of the submitted object.
     pub name: String,
     /// Target replica count. Kueue admits a StatefulSet only when scaling to or from zero.
+    #[schemars(range(min = 0, max = 1000))]
     pub replicas: i64,
 }
 
@@ -526,9 +666,10 @@ impl KueueMcp {
             .items)
     }
 
-    async fn events_for(&self, ns: &str, names: &[&str]) -> Result<Vec<Value>, ToolError> {
+    /// The newest events about the named objects, oldest first.
+    async fn events_for(&self, ns: &str, names: &[&str]) -> Result<Vec<EventLine>, ToolError> {
         let api: Api<Event> = Api::namespaced(self.client.clone(), ns);
-        let mut out: Vec<(String, Value)> = Vec::new();
+        let mut out = Vec::new();
         for name in names {
             let lp = ListParams::default().fields(&format!("involvedObject.name={name}"));
             let events = api
@@ -536,28 +677,28 @@ impl KueueMcp {
                 .await
                 .map_err(|source| KubeError::api("list", format!("events of {name}"), source))?;
             for e in events.items {
-                let when = e
+                let time = e
                     .last_timestamp
                     .as_ref()
                     .map(|t| t.0.to_string())
                     .or_else(|| e.event_time.as_ref().map(|t| t.0.to_string()))
                     .unwrap_or_default();
-                out.push((
-                    when.clone(),
-                    json!({
-                        "time": when,
-                        "object": format!("{}/{}", e.involved_object.kind.clone().unwrap_or_default(), name),
-                        "type": e.type_,
-                        "reason": e.reason,
-                        "message": e.message,
-                        "count": e.count,
-                    }),
-                ));
+                out.push(EventLine {
+                    time,
+                    object: format!(
+                        "{}/{}",
+                        e.involved_object.kind.clone().unwrap_or_default(),
+                        name
+                    ),
+                    type_: e.type_,
+                    reason: e.reason,
+                    message: e.message,
+                    count: e.count,
+                });
             }
         }
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        let skip = out.len().saturating_sub(15);
-        Ok(out.into_iter().skip(skip).map(|(_, v)| v).collect())
+        out.sort_by(|a, b| a.time.cmp(&b.time));
+        Ok(out)
     }
 
     async fn plan(
@@ -624,6 +765,7 @@ impl KueueMcp {
                 kube::Error::Api(s) if (400..500).contains(&s.code) && s.code != 404 => {
                     ToolError::Rejected {
                         kind: r.kind.kind(),
+                        code: s.code,
                         message: s.message,
                     }
                 }
@@ -708,93 +850,318 @@ impl KueueMcp {
         Ok(json!({"workload": wl.metadata.name, "active": active}))
     }
 
-    async fn status_report(
+    async fn snapshot(
         &self,
         c: &Caller,
         kind: WorkloadKind,
         name: &str,
-    ) -> Result<StatusReport, ToolError> {
+    ) -> Result<Snapshot, ToolError> {
         let ns = c.namespace.as_str();
-        let obj = self.get_object(c, kind, name).await?;
+        let object = self.get_object(c, kind, name).await?;
         let pods = self.pods_of(ns, name).await?;
-        let wls = self.workloads_of(ns, &obj, &pods).await?;
-        let refs: Vec<&Workload> = wls.iter().collect();
-        let rollup = status::rollup(&refs);
-        let pending: Vec<&Workload> = wls
-            .iter()
-            .filter(|w| status::phase(Some(w)).phase == status::Phase::Pending)
-            .collect();
-        let mut positions = Vec::new();
-        if let Some(first) = pending.first() {
-            let line = kueue::pending_in_local_queue(
-                &self.client,
-                self.kueue,
-                ns,
-                &first.spec.queue_name,
-                1000,
-            )
-            .await?;
-            for w in &pending {
-                if let Some(p) = line.iter().find(|p| p.metadata.name == w.metadata.name) {
-                    positions.push(json!({"workload": w.metadata.name, "in_local_queue": p.position_in_local_queue, "in_cluster_queue": p.position_in_cluster_queue}));
-                }
-            }
-        }
-        let mut names = vec![name];
-        names.extend(wls.iter().take(3).map(|w| w.metadata.name.as_str()));
-        let events = self.events_for(ns, &names).await?;
-        let last_updated = wls
-            .iter()
-            .flat_map(|w| w.status.conditions.iter())
-            .filter_map(|c| c.last_transition_time.clone())
-            .max();
-        let readiness = (!kind.is_batch()).then(|| status::readiness(&obj.data, &rollup));
-        let body = json!({
-            "kind": kind,
-            "name": name,
-            "admission": kind.admission(),
-            "phase": rollup,
-            "readiness": readiness,
-            "queue_position": positions,
-            "workloads": wls.iter().take(MAX_WORKLOADS_SHOWN).map(|w| json!({
-                "name": w.metadata.name,
-                "phase": status::phase(Some(w)).phase,
-                "queue": w.spec.queue_name,
-                "active": w.spec.active.unwrap_or(true),
-                "admission": w.status.admission,
-                "admission_checks": w.status.admission_checks,
-                "requeue_state": w.status.requeue_state,
-                "conditions": w.status.conditions,
-            })).collect::<Vec<_>>(),
-            "workloads_total": wls.len(),
-            "object_status": obj.data.get("status"),
-            "pods": pods.iter().map(pod_summary).collect::<Vec<_>>(),
-            "events": events,
-        });
-        Ok(StatusReport {
-            body,
-            object: obj,
+        let workloads = self.workloads_of(ns, &object, &pods).await?;
+        let rollup = status::rollup(&workloads.iter().collect::<Vec<_>>());
+        Ok(Snapshot {
+            object,
+            pods,
+            workloads,
             rollup,
-            last_updated,
         })
     }
 
-    /// Resolves a task id to its object in the caller's namespace. A malformed id, a missing
-    /// object, or a UID mismatch (the name was reused) are all an unknown task.
+    /// Where the pending Workloads stand in their LocalQueue, and the first one's position, or
+    /// why the visibility API could not say.
+    async fn queue_positions(&self, ns: &str, pending: &[&Workload]) -> (Value, Option<i64>) {
+        let Some(first) = pending.first() else {
+            return (Value::Null, None);
+        };
+        let line = match kueue::pending_in_local_queue(
+            &self.client,
+            self.kueue,
+            ns,
+            &first.spec.queue_name,
+            1000,
+        )
+        .await
+        {
+            Ok(line) => line,
+            Err(e) => return (json!(format!("unavailable: {e}")), None),
+        };
+        let mut positions = Vec::new();
+        let mut head = None;
+        for w in pending {
+            if let Some(p) = line.iter().find(|p| p.metadata.name == w.metadata.name) {
+                head.get_or_insert(p.position_in_local_queue);
+                positions.push(json!({"workload": w.metadata.name, "in_local_queue": p.position_in_local_queue, "in_cluster_queue": p.position_in_cluster_queue}));
+            }
+        }
+        (json!(positions), head)
+    }
+
+    /// The plan's fit estimate against the queue as it is now; for a Deployment, one pod's.
+    async fn refit(
+        &self,
+        c: &Caller,
+        kind: WorkloadKind,
+        snap: &Snapshot,
+    ) -> Result<kueue::FitReport, String> {
+        let queue = snap
+            .workloads
+            .first()
+            .map(|w| w.spec.queue_name.clone())
+            .unwrap_or_default();
+        let lq = self
+            .local_queue(c, &queue)
+            .await
+            .map_err(|e| e.to_string())?;
+        let cq = self.cluster_queue(&lq).await.map_err(|e| e.to_string())?;
+        let object = serde_json::to_value(&snap.object).map_err(|e| e.to_string())?;
+        let sets = manifest::pod_sets_of(kind, &object).map_err(|e| e.to_string())?;
+        let requests = match kind.admission() {
+            manifest::Admission::PerPod => {
+                sets.first().map(|s| s.per_pod.clone()).unwrap_or_default()
+            }
+            manifest::Admission::AllOrNothing => manifest::total_requests(&sets),
+        };
+        Ok(kueue::fit(&requests, &cq))
+    }
+
+    async fn report(
+        &self,
+        c: &Caller,
+        kind: WorkloadKind,
+        name: &str,
+        snap: &Snapshot,
+        detail: Detail,
+    ) -> Value {
+        let ns = c.namespace.as_str();
+        let head = &snap.rollup.headline;
+        let readiness = snap.readiness(kind);
+        let pending: Vec<&Workload> = snap
+            .workloads
+            .iter()
+            .filter(|w| status::phase(Some(w)).phase == Phase::Pending)
+            .collect();
+        let (queue_position, position) = self.queue_positions(ns, &pending).await;
+        let fit = match head.phase {
+            Phase::Pending => Some(self.refit(c, kind, snap).await),
+            _ => None,
+        };
+        let problems = report::problem_pods(kind, &snap.pods);
+        let mut names = vec![name];
+        names.extend(
+            snap.workloads
+                .iter()
+                .take(3)
+                .map(|w| w.metadata.name.as_str()),
+        );
+        match problems.is_empty() {
+            true => names.extend(snap.pods.iter().take(2).map(report::pod_name)),
+            false => names.extend(
+                problems
+                    .iter()
+                    .take(MAX_PROBLEM_PODS)
+                    .map(|p| p.name.as_str()),
+            ),
+        }
+        let events = self.events_for(ns, &names).await;
+        let retention_seconds = snap
+            .object
+            .data
+            .pointer("/spec/ttlSecondsAfterFinished")
+            .and_then(Value::as_i64);
+        let next_action = report::next_action(&Situation {
+            kind,
+            rollup: &snap.rollup,
+            readiness,
+            fit: fit
+                .as_ref()
+                .and_then(|f| f.as_ref().ok())
+                .map(|f| f.verdict),
+            position,
+            problems: &problems,
+            retention_seconds,
+        });
+        let admitted_to = snap
+            .workloads
+            .iter()
+            .find_map(|w| w.status.admission.as_ref())
+            .map(|a| {
+                json!({
+                    "cluster_queue": a.get("clusterQueue"),
+                    "flavors": a.get("podSetAssignments").and_then(Value::as_array).map(|sets| {
+                        sets.iter()
+                            .map(|p| (p.get("name").and_then(Value::as_str).unwrap_or_default().to_string(), p.get("flavors").cloned().unwrap_or(Value::Null)))
+                            .collect::<serde_json::Map<_, _>>()
+                    }),
+                })
+            });
+        let mut body = json!({
+            "kind": kind,
+            "name": name,
+            "phase": head.phase,
+            "reason": head.reason,
+            "message": head.message,
+            "workload_counts": snap.rollup.counts,
+            "next_action": next_action,
+            "pods": {"total": snap.pods.len(), "by_state": report::pod_counts(&snap.pods)},
+            "problem_pods": problems.iter().take(MAX_PROBLEM_PODS).collect::<Vec<_>>(),
+        });
+        let mut set = |key: &str, value: Value| {
+            if !value.is_null() {
+                body[key] = value;
+            }
+        };
+        set("readiness", json!(readiness));
+        set("queue_position", queue_position);
+        set("admitted_to", json!(admitted_to));
+        if problems.len() > MAX_PROBLEM_PODS {
+            set("problem_pods_total", json!(problems.len()));
+        }
+        set("retention_seconds_after_finish", json!(retention_seconds));
+        match (&fit, detail) {
+            (None, _) => {}
+            (Some(Err(e)), _) => set("fit", json!(format!("unavailable: {e}"))),
+            (Some(Ok(f)), Detail::Summary) => set(
+                "fit",
+                json!({"verdict": f.verdict, "cluster_queue": f.cluster_queue}),
+            ),
+            (Some(Ok(f)), Detail::Full) => set("fit", json!(f)),
+        }
+        let keep = match detail {
+            Detail::Summary => SUMMARY_EVENTS,
+            Detail::Full => FULL_EVENTS,
+        };
+        set(
+            "events",
+            match (events, detail) {
+                (Err(e), _) => json!(format!("unavailable: {e}")),
+                (Ok(ev), Detail::Summary) => json!(
+                    ev[ev.len().saturating_sub(keep)..]
+                        .iter()
+                        .map(EventLine::line)
+                        .collect::<Vec<_>>()
+                ),
+                (Ok(ev), Detail::Full) => json!(ev[ev.len().saturating_sub(keep)..]),
+            },
+        );
+        match detail {
+            Detail::Summary => set(
+                "object_status",
+                report::scalar_status(snap.object.data.get("status")),
+            ),
+            Detail::Full => {
+                set("admission", json!(kind.admission()));
+                set(
+                    "object_status",
+                    snap.object
+                        .data
+                        .get("status")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+                set("workloads_total", json!(snap.workloads.len()));
+                set(
+                    "workloads",
+                    json!(
+                        snap.workloads
+                            .iter()
+                            .take(MAX_WORKLOADS_SHOWN)
+                            .map(|w| json!({
+                                "name": w.metadata.name,
+                                "phase": status::phase(Some(w)).phase,
+                                "queue": w.spec.queue_name,
+                                "active": w.spec.active.unwrap_or(true),
+                                "admission": w.status.admission,
+                                "admission_checks": w.status.admission_checks,
+                                "requeue_state": w.status.requeue_state,
+                                "conditions": w.status.conditions,
+                            }))
+                            .collect::<Vec<_>>()
+                    ),
+                );
+                set(
+                    "pod_list",
+                    json!(snap.pods.iter().map(pod_summary).collect::<Vec<_>>()),
+                );
+            }
+        }
+        body
+    }
+
+    /// workload_status: one report, or with `until` the report once the wait ends.
+    async fn status(&self, c: &Caller, args: StatusArgs) -> Result<Value, ToolError> {
+        let started = Instant::now();
+        let timeout = Duration::from_secs(
+            args.timeout_seconds
+                .unwrap_or(MAX_WAIT_SECONDS)
+                .clamp(1, MAX_WAIT_SECONDS),
+        );
+        let mut snap = self.snapshot(c, args.kind, &args.name).await?;
+        let mut wait = Value::Null;
+        if let Some(until) = args.until {
+            let ended = loop {
+                if report::reached(
+                    until,
+                    args.kind,
+                    &snap.rollup,
+                    snap.readiness(args.kind),
+                    &snap.pods,
+                ) {
+                    break WaitEnd::Reached;
+                }
+                if report::settled(&snap.rollup) {
+                    break WaitEnd::Settled;
+                }
+                if report::stuck(&report::problem_pods(args.kind, &snap.pods)) {
+                    break WaitEnd::Stuck;
+                }
+                if started.elapsed() + WAIT_POLL > timeout {
+                    break WaitEnd::Timeout;
+                }
+                tokio::time::sleep(WAIT_POLL).await;
+                snap = self.snapshot(c, args.kind, &args.name).await?;
+            };
+            wait = json!({
+                "until": until,
+                "reached": ended == WaitEnd::Reached,
+                "ended": ended,
+                "waited_seconds": started.elapsed().as_secs(),
+            });
+        }
+        let mut body = self
+            .report(
+                c,
+                args.kind,
+                &args.name,
+                &snap,
+                args.detail.unwrap_or_default(),
+            )
+            .await;
+        if !wait.is_null() {
+            body["wait"] = wait;
+        }
+        Ok(body)
+    }
+
+    /// Resolves a task id to its object in the caller's namespace. A malformed id is an unknown
+    /// task; a well-formed one whose object is gone, or was recreated under the same name, says so.
     async fn task_object(
         &self,
         c: &Caller,
         id: &str,
     ) -> Result<(TaskRef, DynamicObject), McpError> {
-        let unknown = || McpError::invalid_params(format!("unknown task: {id}"), None);
-        let t = TaskRef::parse(id).ok_or_else(unknown)?;
+        let t = TaskRef::parse(id)
+            .ok_or_else(|| McpError::invalid_params(format!("unknown task: {id}"), None))?;
         let obj = match self.get_object(c, t.kind, &t.name).await {
             Ok(o) => o,
-            Err(ToolError::NotFound { .. }) => return Err(unknown()),
+            Err(ToolError::NotFound { .. }) => {
+                return Err(McpError::invalid_params(task::gone(&t), None));
+            }
             Err(e) => return Err(internal(e)),
         };
         if obj.metadata.uid.as_deref() != Some(t.uid.as_str()) {
-            return Err(unknown());
+            return Err(McpError::invalid_params(task::replaced(&t), None));
         }
         Ok((t, obj))
     }
@@ -825,23 +1192,20 @@ impl KueueMcp {
 
     /// A batch workload's task state.
     async fn detailed_task(&self, c: &Caller, t: &TaskRef) -> Result<DetailedTask, ToolError> {
-        let report = self.status_report(c, t.kind, &t.name).await?;
-        let full = serde_json::to_value(&report.object).map_err(|source| KubeError::Decode {
+        let snap = self.snapshot(c, t.kind, &t.name).await?;
+        let full = serde_json::to_value(&snap.object).map_err(|source| KubeError::Decode {
             what: format!("{} {}", t.kind.kind(), t.name),
             source,
         })?;
-        let outcome = task::outcome(&full, &report.rollup);
-        let created = report
+        let outcome = task::outcome(&full, &snap.rollup);
+        let created = snap
             .object
             .metadata
             .creation_timestamp
             .as_ref()
             .map(|ts| ts.0.to_string())
             .unwrap_or_default();
-        let updated = report
-            .last_updated
-            .clone()
-            .unwrap_or_else(|| created.clone());
+        let updated = snap.last_updated().unwrap_or_else(|| created.clone());
         let base = |status: TaskStatus, message: &str| {
             Task::new(t.encode(), status, created.clone(), updated.clone())
                 .with_poll_interval_ms(task::POLL_INTERVAL_MS)
@@ -856,12 +1220,10 @@ impl KueueMcp {
                 TaskPayload::Cancelled,
             ),
             Outcome::Completed { failed, message } => {
-                let text = json!({"status": "ok", "outcome": if failed { "failed" } else { "succeeded" }, "message": message, "report": report.body});
-                let result = if failed {
-                    CallToolResult::error(vec![ContentBlock::text(text.to_string())])
-                } else {
-                    CallToolResult::success(vec![ContentBlock::text(text.to_string())])
-                };
+                let report = self
+                    .report(c, t.kind, &t.name, &snap, Detail::Summary)
+                    .await;
+                let result = text_result(&task::completed_body(failed, &message, report), failed);
                 let result = match serde_json::to_value(result) {
                     Ok(Value::Object(map)) => map,
                     Ok(_) | Err(_) => serde_json::Map::new(),
@@ -878,13 +1240,14 @@ impl KueueMcp {
 #[tool_router]
 impl KueueMcp {
     #[tool(
-        description = "Who this token acts as: its run, launcher, Kubernetes user, and default namespace."
+        description = "Who this token acts as: its run, launcher, Kubernetes user, and default namespace.",
+        annotations(title = "Who am I", read_only_hint = true, open_world_hint = false)
     )]
     async fn whoami(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<NamespaceArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(caller(&parts, args.namespace.as_deref()).map(|c| {
             json!({
                 "run_id": c.run_id.as_str(),
@@ -897,13 +1260,14 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "LocalQueues in the namespace, with their ClusterQueue and pending/admitted counts."
+        description = "LocalQueues in the namespace, with their ClusterQueue and pending/admitted counts.",
+        annotations(title = "List queues", read_only_hint = true, open_world_hint = false)
     )]
     async fn queues_list(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<NamespaceArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
@@ -935,13 +1299,18 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Quota, usage, borrowing, preemption, and the pending line for one LocalQueue's ClusterQueue."
+        description = "Quota, usage, borrowing, preemption, and the pending line for one LocalQueue's ClusterQueue.",
+        annotations(
+            title = "Describe a queue",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn queue_describe(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<QueueArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
@@ -1005,13 +1374,18 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Hardware behind a queue: each ResourceFlavor's node labels, taints, and topology joined with the GPU nodes it can land on."
+        description = "Hardware behind a queue: each ResourceFlavor's node labels, taints, and topology joined with the GPU nodes it can land on.",
+        annotations(
+            title = "Describe a queue's hardware",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn hardware_describe(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<QueueArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
@@ -1036,13 +1410,18 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Validate a workload without creating it: pins it to this run's namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it. Returns the plan_hash workload_submit requires."
+        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, and how long a finished Job or RayJob is kept (finished_retention_seconds).",
+        annotations(
+            title = "Plan a workload",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn workload_plan(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<PlanArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
@@ -1066,6 +1445,7 @@ impl KueueMcp {
                     "kind": n.kind,
                     "name": n.name,
                     "plan_hash": n.plan_hash,
+                    "finished_retention_seconds": n.retention_seconds(),
                     "dry_run": "accepted",
                     "admission": n.kind.admission(),
                     "pod_sets": pod_sets,
@@ -1079,7 +1459,14 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Create a planned workload. The manifest and queue must be the ones passed to workload_plan and plan_hash must match. Resubmitting an identical plan is a no-op."
+        description = "Create a planned workload. The manifest and queue must be the ones passed to workload_plan and plan_hash must match. Resubmitting an identical plan is a no-op.",
+        annotations(
+            title = "Submit a workload",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn workload_submit(
         &self,
@@ -1105,7 +1492,7 @@ impl KueueMcp {
                     Ok(obj) => {
                         tracing::info!(kind = n.kind.kind(), name = %n.name, namespace = %c.namespace, run = %c.run_id, "workload submitted");
                         let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &obj));
-                        Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "submitted": true}), task))
+                        Ok((json!({"kind": n.kind, "name": n.name, "uid": obj.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "submitted": true}), task))
                     }
                     Err(ToolError::Rejected { .. }) if self.get_object(&c, n.kind, &n.name).await.is_ok() => {
                         let existing = self.owned_object(&c, n.kind, &n.name).await?;
@@ -1124,7 +1511,7 @@ impl KueueMcp {
                             });
                         }
                         let task = n.kind.is_batch().then(|| new_task(&c.namespace, n.kind, &n.name, &existing));
-                        Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "submitted": false, "note": "already submitted with this plan"}), task))
+                        Ok((json!({"kind": n.kind, "name": n.name, "uid": existing.metadata.uid, "task_id": task.as_ref().map(|t| t.task_id.clone()), "finished_retention_seconds": n.retention_seconds(), "submitted": false, "note": "already submitted with this plan"}), task))
                     }
                     Err(e) => Err(e),
                 }
@@ -1134,38 +1521,46 @@ impl KueueMcp {
             Ok((_, Some(task))) if wants_task => {
                 CallToolResponse::Task(CreateTaskResult::new(task))
             }
-            Ok((body, _)) => {
-                CallToolResult::success(vec![ContentBlock::text(reply(Ok(body)))]).into()
-            }
-            Err(e) => CallToolResult::success(vec![ContentBlock::text(reply(Err(e)))]).into(),
+            Ok((body, _)) => reply(Ok(body)).into(),
+            Err(e) => reply(Err(e)).into(),
         }
     }
 
     #[tool(
-        description = "Where a workload is: Kueue phase and the reason it is not admitted, queue position, flavor assignment, the object's own status, its pods, and recent events."
+        description = "Where a workload is: Kueue phase and why it is not admitted, queue position and fit while pending, pod counts, the pods with problems and their exit messages, recent events, and next_action. With until, waits on the server (up to 50s) for admitted, running, ready or finished instead of polling.",
+        annotations(
+            title = "Workload status",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn workload_status(
         &self,
         Extension(parts): Extension<http::request::Parts>,
-        Parameters(r): Parameters<WorkloadRef>,
-    ) -> String {
+        Parameters(args): Parameters<StatusArgs>,
+    ) -> CallToolResult {
         reply(
             async {
-                let c = caller(&parts, r.namespace.as_deref())?;
-                Ok(self.status_report(&c, r.kind, &r.name).await?.body)
+                let c = caller(&parts, args.namespace.as_deref())?;
+                self.status(&c, args).await
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Workloads crucible-kueue created in this namespace, with their Kueue phase."
+        description = "Workloads crucible-kueue created in the namespace, with their Kueue phase.",
+        annotations(
+            title = "List workloads",
+            read_only_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn workload_list(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<ListArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
@@ -1217,12 +1612,19 @@ impl KueueMcp {
         )
     }
 
-    #[tool(description = "Tail container logs of a workload's pods.")]
+    #[tool(
+        description = "Tail container logs of a workload's pods within a byte budget (16 KiB by default): failed pods first, then a RayJob's head and submitter or a LeaderWorkerSet's leader. Filter with grep and since_seconds.",
+        annotations(
+            title = "Workload logs",
+            read_only_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn workload_logs(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<LogArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
@@ -1240,40 +1642,107 @@ impl KueueMcp {
                     }
                 }
                 let total = pods.len();
+                pods.sort_by(|a, b| {
+                    (report::log_priority(args.kind, a), report::pod_name(a))
+                        .cmp(&(report::log_priority(args.kind, b), report::pod_name(b)))
+                });
+                pods.truncate(MAX_LOG_PODS);
                 let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
-                let lp = LogParams {
-                    container: args.container.clone(),
-                    tail_lines: Some(args.tail_lines.unwrap_or(DEFAULT_TAIL).clamp(1, MAX_TAIL)),
-                    limit_bytes: Some(MAX_LOG_BYTES),
-                    previous: args.previous,
-                    ..LogParams::default()
+                let grep = args.grep.as_deref().filter(|g| !g.is_empty());
+                let default_tail = if grep.is_some() {
+                    MAX_TAIL
+                } else {
+                    DEFAULT_TAIL
                 };
-                let mut logs = Vec::new();
-                for p in pods.iter().take(MAX_LOG_PODS) {
-                    let name = p.metadata.name.clone().unwrap_or_default();
+                let budget = args
+                    .max_bytes
+                    .unwrap_or(DEFAULT_LOG_BUDGET)
+                    .clamp(MIN_LOG_BUDGET, MAX_LOG_BYTES as usize);
+                let mut fetched = Vec::new();
+                for p in &pods {
+                    let name = report::pod_name(p).to_string();
+                    let container = args
+                        .container
+                        .clone()
+                        .or_else(|| report::default_container(p));
+                    let lp = LogParams {
+                        container: container.clone(),
+                        tail_lines: Some(
+                            args.tail_lines.unwrap_or(default_tail).clamp(1, MAX_TAIL),
+                        ),
+                        since_seconds: args.since_seconds.filter(|s| *s > 0),
+                        limit_bytes: Some(MAX_LOG_BYTES),
+                        previous: args.previous,
+                        ..LogParams::default()
+                    };
                     let text = match api.logs(&name, &lp).await {
-                        Ok(t) => json!(t),
-                        Err(kube::Error::Api(s)) => json!(format!("unavailable: {}", s.message)),
+                        Ok(t) => Ok(match grep {
+                            Some(g) => report::grep(&t, g),
+                            None => t,
+                        }),
+                        Err(kube::Error::Api(s)) => Err(s.message),
                         Err(source) => {
                             return Err(KubeError::api("read logs of", name, source).into());
                         }
                     };
-                    logs.push(json!({"pod": name, "log": text}));
+                    fetched.push((p, container, text));
                 }
-                Ok(json!({"pods_total": total, "logs": logs}))
+                let sizes: Vec<usize> = fetched
+                    .iter()
+                    .map(|(_, _, t)| t.as_ref().map_or(0, String::len))
+                    .collect();
+                let grants = report::budget(&sizes, budget);
+                let mut omitted_total = 0;
+                let mut logs = Vec::new();
+                for ((p, container, text), grant) in fetched.iter().zip(grants) {
+                    let mut entry = json!({
+                        "pod": report::pod_name(p),
+                        "role": report::role(args.kind, p),
+                        "phase": report::pod_state(p),
+                    });
+                    if let Some(c) = container {
+                        entry["container"] = json!(c);
+                    }
+                    match text {
+                        Ok(t) => {
+                            let (kept, omitted) = report::tail(t, grant);
+                            entry["log"] = json!(kept);
+                            if omitted > 0 {
+                                entry["bytes_omitted"] = json!(omitted);
+                                omitted_total += omitted;
+                            }
+                        }
+                        Err(message) => entry["error"] = json!(format!("unavailable: {message}")),
+                    }
+                    logs.push(entry);
+                }
+                Ok(json!({
+                    "pods_total": total,
+                    "pods_shown": logs.len(),
+                    "budget_bytes": budget,
+                    "truncated": omitted_total > 0,
+                    "bytes_omitted": omitted_total,
+                    "logs": logs,
+                }))
             }
             .await,
         )
     }
 
     #[tool(
-        description = "Set the replica count of a Deployment or StatefulSet this run submitted. New Deployment pods queue individually; a StatefulSet scales only to or from zero."
+        description = "Set the replica count of a Deployment or StatefulSet this run submitted. New Deployment pods queue individually; a StatefulSet scales only to or from zero.",
+        annotations(
+            title = "Scale a workload",
+            read_only_hint = false,
+            destructive_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn workload_scale(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<ScaleArgs>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
@@ -1304,13 +1773,20 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Hold a submitted workload out of the queue until workload_resume. Jobs, RayJobs, and LeaderWorkerSets are deactivated in Kueue (evicted if admitted); Deployments and StatefulSets scale to zero and remember their replica count."
+        description = "Hold a submitted workload out of the queue until workload_resume. Jobs, RayJobs, and LeaderWorkerSets are deactivated in Kueue (evicted if admitted); Deployments and StatefulSets scale to zero and remember their replica count.",
+        annotations(
+            title = "Stop a workload",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
     )]
     async fn workload_stop(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(r): Parameters<WorkloadRef>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, r.namespace.as_deref())?;
@@ -1320,12 +1796,21 @@ impl KueueMcp {
         )
     }
 
-    #[tool(description = "Return a stopped workload to its queue.")]
+    #[tool(
+        description = "Return a stopped workload to its queue.",
+        annotations(
+            title = "Resume a workload",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn workload_resume(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(r): Parameters<WorkloadRef>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, r.namespace.as_deref())?;
@@ -1335,12 +1820,21 @@ impl KueueMcp {
         )
     }
 
-    #[tool(description = "Delete a workload this run submitted, along with its pods.")]
+    #[tool(
+        description = "Delete a workload this run submitted, along with its pods.",
+        annotations(
+            title = "Delete a workload",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
     async fn workload_delete(
         &self,
         Extension(parts): Extension<http::request::Parts>,
         Parameters(r): Parameters<WorkloadRef>,
-    ) -> String {
+    ) -> CallToolResult {
         reply(
             async {
                 let c = caller(&parts, r.namespace.as_deref())?;
@@ -1357,12 +1851,24 @@ impl KueueMcp {
     }
 }
 
+const INSTRUCTIONS: &str = "Submit and watch Kueue workloads (Job, RayJob, LeaderWorkerSet, Deployment, StatefulSet) in a namespace: a run's token acts in its own, a person names one they may use. \
+Flow: queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> workload_status with until=admitted|running|ready|finished, which waits on the server up to 50s per call (or, for a Job or RayJob, tasks/get when the client speaks the tasks extension) -> workload_logs. \
+Every tool answers JSON text with a status: ok; refused (the request is not allowed or not valid: fix it, do not retry it as is); rejected (the API server or an admission webhook refused it); not_found; error (the server could not complete it); failed (a finished task whose workload failed). Anything but ok comes back with isError and a retryable flag: retry a retryable call a few times with a pause, change a non-retryable one. \
+workload_status answers a summary by default with next_action, the pods with problems and their exit messages; detail=full adds every Workload's conditions and every pod. Logs come within a 16 KiB budget, failed pods first; narrow them with grep and since_seconds. \
+A Job or RayJob runs at most 24h (activeDeadlineSeconds) and is deleted 1h after it finishes (ttlSecondsAfterFinished), with its pods, logs and task, unless its manifest sets its own; plan and submit report this as finished_retention_seconds. Read the outcome and logs before then. \
+Manifests are allowlisted: host namespaces and paths, privileged containers and added capabilities, service accounts and their tokens, Secrets (volumes and env), nodeName, tolerations, priority, scheduler and runtime class fields, and labels or annotations reserved for Kueue or this server are refused. \
+Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.";
+
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KueueMcp {
     fn get_info(&self) -> ServerConfig {
-        ServerConfig::new(ServerCapabilities::builder().enable_tools().enable_tasks().build()).with_instructions(
-            "Submit and watch Kueue workloads. Flow: queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> poll workload_status (or, for a Job or RayJob, tasks/get when the client speaks the tasks extension) -> workload_logs. Deployments, StatefulSets and LeaderWorkerSets are not tasks: workload_status reports their readiness. Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.",
+        ServerConfig::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tasks()
+                .build(),
         )
+        .with_instructions(INSTRUCTIONS)
     }
 
     async fn get_task(
@@ -1446,29 +1952,121 @@ mod tests {
         );
     }
 
+    /// A reply's `isError` and its JSON text.
+    fn body(r: &CallToolResult) -> (bool, Value) {
+        let text = r.content[0].as_text().unwrap().text.clone();
+        (
+            r.is_error.unwrap_or(false),
+            serde_json::from_str(&text).unwrap(),
+        )
+    }
+
     #[test]
-    fn replies_carry_a_status_tag_and_policy_failures_are_refusals() {
-        let ok: Value = serde_json::from_str(&reply(Ok(json!({"x": 1})))).unwrap();
+    fn replies_carry_a_status_tag_and_every_failure_is_a_tool_error() {
+        let (is_error, ok) = body(&reply(Ok(json!({"x": 1}))));
+        assert!(!is_error);
         assert_eq!(ok["status"], "ok");
-        let refused: Value = serde_json::from_str(&reply(Err(ToolError::HashMismatch {
+        assert!(ok.get("retryable").is_none());
+        let (is_error, refused) = body(&reply(Err(ToolError::HashMismatch {
             got: "a".into(),
             want: "b".into(),
-        })))
-        .unwrap();
+        })));
+        assert!(is_error);
         assert_eq!(refused["status"], "refused");
+        assert_eq!(refused["retryable"], false);
         assert!(
             refused["error"]
                 .as_str()
                 .unwrap()
                 .contains("re-run workload_plan")
         );
-        let missing: Value = serde_json::from_str(&reply(Err(ToolError::NotFound {
+        let (is_error, missing) = body(&reply(Err(ToolError::NotFound {
             kind: "LocalQueue",
             name: "q".into(),
             namespace: "n".into(),
-        })))
-        .unwrap();
+        })));
+        assert!(is_error);
         assert_eq!(missing["status"], "not_found");
+        assert_eq!(missing["error"], "LocalQueue q not found in namespace n");
+    }
+
+    fn rejected(code: u16, message: &str) -> ToolError {
+        ToolError::Rejected {
+            kind: "StatefulSet",
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn kube(code: u16) -> ToolError {
+        ToolError::Kube(KubeError::api(
+            "get",
+            "Job j",
+            kube::Error::Api(
+                kube::core::Status::failure("m", "r")
+                    .with_code(code)
+                    .boxed(),
+            ),
+        ))
+    }
+
+    #[test]
+    fn webhook_rejections_and_server_errors_are_retryable() {
+        let webhook = rejected(
+            403,
+            "admission webhook \"vstatefulset.kb.io\" denied the request: spec.replicas: Forbidden",
+        );
+        let (_, b) = body(&reply(Err(webhook)));
+        assert_eq!(
+            (b["status"].as_str(), b["retryable"].as_bool()),
+            (Some("rejected"), Some(true))
+        );
+        assert!(rejected(409, "the object has been modified").retryable());
+        assert!(!rejected(422, "spec.template: Invalid value").retryable());
+        let (_, b) = body(&reply(Err(kube(503))));
+        assert_eq!(
+            (b["status"].as_str(), b["retryable"].as_bool()),
+            (Some("error"), Some(true))
+        );
+        assert!(!kube(403).retryable());
+        assert_eq!(kube(404).status(), "not_found");
+        assert!(!ToolError::NoCaller.retryable());
+    }
+
+    #[test]
+    fn a_missing_job_or_rayjob_points_at_its_ttl() {
+        let missing = |kind| ToolError::NotFound {
+            kind,
+            name: "train".into(),
+            namespace: "team-a".into(),
+        };
+        for kind in ["Job", "RayJob"] {
+            let msg = missing(kind).to_string();
+            assert!(
+                msg.contains("deleted ttlSecondsAfterFinished after it finishes (default 3600s)"),
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            missing("Deployment").to_string(),
+            "Deployment train not found in namespace team-a"
+        );
+    }
+
+    #[test]
+    fn an_event_reads_as_one_line() {
+        let e = EventLine {
+            time: "2026-10-23T10:00:00Z".into(),
+            object: "Pod/train-0".into(),
+            type_: Some("Warning".into()),
+            reason: Some("BackOff".into()),
+            message: Some("Back-off restarting failed container\n".into()),
+            count: Some(4),
+        };
+        assert_eq!(
+            e.line(),
+            "2026-10-23T10:00:00Z Pod/train-0 Warning BackOff: Back-off restarting failed container (x4)"
+        );
     }
 
     fn obj(uid: &str, replicas: Option<i64>) -> DynamicObject {
@@ -1598,6 +2196,142 @@ mod tests {
                 "{}: {checks:?}",
                 tool.name
             );
+        }
+    }
+
+    #[test]
+    fn every_tool_is_annotated_for_what_it_changes() {
+        let read_only = [
+            "whoami",
+            "queues_list",
+            "queue_describe",
+            "hardware_describe",
+            "workload_status",
+            "workload_list",
+            "workload_logs",
+            "workload_plan",
+        ];
+        let destructive = ["workload_delete", "workload_stop", "workload_scale"];
+        let idempotent = [
+            "workload_submit",
+            "workload_stop",
+            "workload_resume",
+            "workload_delete",
+        ];
+        let tools = KueueMcp::tool_router().list_all();
+        assert_eq!(tools.len(), 13);
+        for tool in tools {
+            let name = tool.name.as_ref();
+            let a = tool
+                .annotations
+                .clone()
+                .unwrap_or_else(|| panic!("{name} has no annotations"));
+            assert!(
+                a.title.as_deref().is_some_and(|t| !t.is_empty()),
+                "{name} has no title"
+            );
+            assert_eq!(a.open_world_hint, Some(false), "{name}");
+            assert_eq!(
+                a.read_only_hint,
+                Some(read_only.contains(&name)),
+                "{name} readOnlyHint"
+            );
+            if read_only.contains(&name) {
+                continue;
+            }
+            assert_eq!(
+                a.destructive_hint,
+                Some(destructive.contains(&name)),
+                "{name} destructiveHint"
+            );
+            assert_eq!(
+                a.idempotent_hint.unwrap_or(false),
+                idempotent.contains(&name),
+                "{name} idempotentHint"
+            );
+        }
+    }
+
+    fn property(tool: &str, field: &str) -> Value {
+        let tool = KueueMcp::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == tool)
+            .unwrap();
+        Value::Object((*tool.input_schema).clone())["properties"][field].clone()
+    }
+
+    #[test]
+    fn bounded_arguments_advertise_their_bounds() {
+        let bounds = |tool, field| {
+            let p = property(tool, field);
+            (p["minimum"].as_i64(), p["maximum"].as_i64())
+        };
+        assert_eq!(bounds("workload_logs", "tail_lines"), (Some(1), Some(2000)));
+        assert_eq!(
+            bounds("workload_logs", "max_bytes"),
+            (Some(1024), Some(65536))
+        );
+        assert_eq!(bounds("workload_scale", "replicas"), (Some(0), Some(1000)));
+        assert_eq!(
+            bounds("workload_status", "timeout_seconds"),
+            (Some(1), Some(50))
+        );
+    }
+
+    #[test]
+    fn every_argument_is_described() {
+        for tool in KueueMcp::tool_router().list_all() {
+            let schema = Value::Object((*tool.input_schema).clone());
+            let Some(props) = schema["properties"].as_object() else {
+                continue;
+            };
+            for (field, p) in props {
+                let described = p["description"].as_str().is_some_and(|d| !d.is_empty())
+                    || p["$ref"].is_string()
+                    || p["allOf"].is_array()
+                    || p["anyOf"].is_array();
+                assert!(described, "{}.{field} has no description: {p}", tool.name);
+            }
+        }
+    }
+
+    #[test]
+    fn the_plan_names_every_submittable_kind() {
+        let doc = property("workload_plan", "manifest")["description"]
+            .as_str()
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for kind in WorkloadKind::ALL {
+            assert!(
+                doc.contains(&format!("{} {}", kind.api_version(), kind.kind())),
+                "{doc}"
+            );
+        }
+        let queue = property("workload_plan", "queue")["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(!queue.contains("this run's namespace"), "{queue}");
+    }
+
+    #[test]
+    fn the_instructions_cover_status_retries_lifetimes_and_refused_fields() {
+        for want in [
+            "until=admitted|running|ready|finished",
+            "refused",
+            "rejected",
+            "retryable",
+            "24h",
+            "deleted 1h after it finishes",
+            "finished_retention_seconds",
+            "Secrets",
+            "privileged",
+            "tolerations",
+        ] {
+            assert!(INSTRUCTIONS.contains(want), "instructions lack {want:?}");
         }
     }
 

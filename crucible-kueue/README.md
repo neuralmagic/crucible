@@ -16,7 +16,26 @@ to or from zero. Stop/resume deactivates the Kueue Workload for batch kinds and 
 Deployments and StatefulSets to zero and back. A Job or RayJob that sets no
 `activeDeadlineSeconds` gets 24 hours, and one that sets no `ttlSecondsAfterFinished` is deleted an
 hour after it finishes (a RayJob only when `shutdownAfterJobFinishes` is true, the only case
-KubeRay accepts a TTL).
+KubeRay accepts a TTL). `workload_plan` and `workload_submit` report that TTL as
+`finished_retention_seconds`; past it the object, its pods, logs and task are gone.
+
+Every tool answers JSON text with a `status`: `ok`, `refused`, `rejected`, `not_found`, `error`,
+or `failed` (a completed task whose workload failed). Anything but `ok` is a tool result with
+`isError: true` and a `retryable` flag (an admission webhook's refusal, a 5xx, or an API server
+that did not answer). The auth guard answers a refused tool call the same way.
+
+`workload_status` answers a summary by default: phase, reason, queue position and a fresh fit
+estimate while pending, pod counts by state, up to five pods with problems (stuck, failed,
+restarted, unschedulable) with their exit code and termination message, recent events of the
+object, its Workloads and those pods, and a `next_action`. `detail: "full"` adds every
+Workload's conditions, the object's full status and every pod. `until`
+(`admitted`/`running`/`ready`/`finished`) waits on the server for up to `timeout_seconds` (max
+50) and stops early once the workload settles short of it or a pod is stuck.
+
+`workload_logs` shares a byte budget (16 KiB by default, `max_bytes` up to 64 KiB) across at most
+four pods, failed ones first, then a RayJob's head and submitter or a LeaderWorkerSet's leader.
+Each pod keeps the end of its log; `truncated` and `bytes_omitted` say what was cut. `grep` and
+`since_seconds` narrow it first.
 
 ## Tasks
 
