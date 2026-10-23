@@ -8,10 +8,10 @@ pub const ENV_BUILDIT_RUN_ISSUER: &str = "CRUCIBLE_BUILDIT_RUN_ISSUER";
 pub const ENV_BUILDIT_PUSH_REPO: &str = "CRUCIBLE_BUILDIT_PUSH_REPO";
 
 /// The port buildit serves on in the loop pod.
-pub const PORT: u16 = 8851;
+pub const PORT: u16 = 8848;
 
 /// The URL sandboxes reach buildit at, and the audience of the tokens it accepts.
-pub const URL: &str = "http://host.openshell.internal:8851/mcp";
+pub const URL: &str = "http://host.openshell.internal:8848/mcp";
 
 /// OAuth scope to read builds' status and logs.
 pub const SCOPE_READ: &str = "buildit.read";

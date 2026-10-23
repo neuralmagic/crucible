@@ -267,7 +267,7 @@ crux run-log "$CRUN" > "$WORK/run-log.json"
 kc -n "$CTL_NS" logs deploy/crucible-controller | sed 's/\x1b\[[0-9;]*m//g' > "$WORK/controller.log"
 
 log "checking the controller issued the run's tokens to its supervisor"
-for aud in "$KUEUE_URL" "http://host.openshell.internal:8851/mcp"; do
+for aud in "$KUEUE_URL" "http://host.openshell.internal:8848/mcp"; do
     issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" \
         | grep -F "aud=\"$aud\"" | head -1)
     [ -n "$issued" ] || fail "the controller issued no token for $aud to run $RUN"

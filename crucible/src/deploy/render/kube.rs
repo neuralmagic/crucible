@@ -1324,7 +1324,8 @@ exit $rc
     /// NetworkPolicy on the loop pod. Under `podman` the sandbox is nested inside the loop pod and
     /// reaches the broker over the pod-internal bridge (traffic a NetworkPolicy never sees), so this
     /// is a pure deny-all-ingress lockdown. Under `kubernetes` the sandbox is a sibling pod, so
-    /// gateway (:17670), broker (:8849), OTLP collector (:17671), and `[mcp]` server traffic becomes
+    /// gateway (:17670), broker (:8849), OTLP collector (:17671), buildit (:8848, with `[buildit]`),
+    /// and `[mcp]` server traffic becomes
     /// real cluster networking. The policy then allows ingress **only** from sandbox pods (in
     /// `cluster.sandbox_namespace` when it is set), **only** on those ports. Sandbox pods are
     /// matched by either identity they may carry: the OpenShell managed-by label (the driver only
@@ -1406,6 +1407,15 @@ exit $rc
                                 ..Default::default()
                             },
                         ])
+                        .chain(self.profile.buildit.as_ref().map(|_| {
+                            networking::NetworkPolicyPort {
+                                port: Some(IntOrString::Int(
+                                    crucible_contract::buildit::PORT.into(),
+                                )),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            }
+                        }))
                         .chain(mcp_ports)
                         .collect(),
                 ),
@@ -4698,6 +4708,18 @@ mod tests {
             netpol.contains("port: 8850"),
             "mcp port in netpol: {netpol}"
         );
+        assert!(
+            !netpol.contains("port: 8848"),
+            "no buildit port without [buildit]: {netpol}"
+        );
+        let with_buildit =
+            k8s_profile("[buildit]\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n");
+        let yaml = render_k8s_manifest(&manifest, &with_buildit);
+        let netpol = yaml
+            .split("\n---\n")
+            .find(|d| d.contains("kind: NetworkPolicy"))
+            .expect("netpol doc");
+        assert!(netpol.contains("port: 8848"), "buildit port: {netpol}");
         // policyTypes still declares Ingress.
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");
         // No Egress lockdown.

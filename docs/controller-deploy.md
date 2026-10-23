@@ -265,11 +265,11 @@ server trusts runs' tokens from it, fetching keys from `<run_issuer>/.well-known
 SubjectAccessReviews. A token's scopes are what its audience lists here. For example:
 
 ```bash
-CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,http://host.openshell.internal:8851/mcp=buildit.read buildit.build"
+CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,http://host.openshell.internal:8848/mcp=buildit.read buildit.build"
 ```
 
 **buildit.** A run dispatched onto one of the `[buildit]` clusters starts `buildit mcp` in its loop
-pod on port 8851, and its sandboxes reach it at `http://host.openshell.internal:8851/mcp` with
+pod on port 8848, and its sandboxes reach it at `http://host.openshell.internal:8848/mcp` with
 tokens their supervisors obtain like crucible-kueue's. buildit takes only tokens for that
 audience whose `run_id` is its own run, reads each build's context from the token's `sandbox`
 and `workdir` through the run's gateway, and runs builder pods in the loop namespace, so the loop

@@ -248,7 +248,7 @@ mod tests {
         let a = access(None);
         assert_eq!(
             a.egress_endpoint(),
-            "host.openshell.internal:8851:full:rest"
+            "host.openshell.internal:8848:full:rest"
         );
         let profile = a.token_grant_profile();
         assert_eq!(profile.id, provider::BUILDIT_GRANT_PROFILE_ID);
@@ -259,10 +259,10 @@ mod tests {
                 endpoint.port,
                 endpoint.protocol.as_str()
             ),
-            ("host.openshell.internal", 8851, "rest")
+            ("host.openshell.internal", 8848, "rest")
         );
         let grant = profile.credentials[0].token_grant.as_ref().unwrap();
-        assert_eq!(grant.audience, "http://host.openshell.internal:8851/mcp");
+        assert_eq!(grant.audience, "http://host.openshell.internal:8848/mcp");
         assert_eq!(grant.token_endpoint, ENDPOINT);
         assert_eq!(grant.jwt_svid_audience, AUDIENCE);
         assert_eq!(grant.scopes, ["buildit.read", "buildit.build"]);
@@ -289,13 +289,13 @@ mod tests {
         assert_eq!(flag(&args, "--run-issuer").as_deref(), Some(ISSUER));
         assert_eq!(
             flag(&args, "--resource").as_deref(),
-            Some("http://host.openshell.internal:8851/mcp")
+            Some("http://host.openshell.internal:8848/mcp")
         );
         assert_eq!(
             flag(&args, "--namespace").as_deref(),
             Some("crucible-system")
         );
-        assert_eq!(flag(&args, "--bind").as_deref(), Some("0.0.0.0:8851"));
+        assert_eq!(flag(&args, "--bind").as_deref(), Some("0.0.0.0:8848"));
         assert!(
             !args.contains(&"--push-repo".to_string()),
             "no repo: {args:?}"
