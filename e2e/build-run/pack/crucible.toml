@@ -1,0 +1,15 @@
+# The build-and-run smoke pack: one sandboxed agent turn that builds an image with the run's
+# `buildit` MCP server, then runs it as a Kueue Job through the `kueue` MCP server.
+[agent]
+backend       = "openshell"
+harness       = "claude"
+model         = "claude-sonnet-5"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-go-cgo-cc@sha256:33cc058e97a0f9fded61d6c2a4584cc189854a0c6e0576215e8f6c0ba2a44628"
+goal          = "Build an image with buildit, run it as a Kueue Job, and confirm its output."
+
+[agent.resources]
+node_selector = { "kubernetes.io/arch" = "amd64" }
+
+[workflow]
+type = "playbook"
+file = "workflow.star"
