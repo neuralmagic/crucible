@@ -226,8 +226,10 @@ priority classes to those labelled `openshell.ai/sandbox-attachable=true`, and t
 carry its own gateway id. The pinned OpenShell (3441f91) predates v0.1.2: supervisors are separate
 pods, and nothing here depends on the sidecar supervisor topology or other v0.1.2 features.
 
-**`kube_user`.** Tokens carry the dispatcher's Kubernetes username when the controller knows it;
-a server that sees it runs SubjectAccessReview as that user. It is learned from the API server
+**`kube_user`.** Tokens carry the dispatcher's Kubernetes username on the run's cluster when the
+controller knows it, by the same rule people's tokens use there (Settings > Cluster identities); a
+server that sees it runs SubjectAccessReview as that user. On the hub's `link` rule it falls back
+to the username learned from the API server
 (`users/~`): when someone calls the API with a cluster token whose username equals their login
 exactly (filling an empty value only), or when a signed-in person links one with
 `PUT /api/me/kube-user` (`{"cluster_token": "<oc whoami -t>"}`). Another platform administrator

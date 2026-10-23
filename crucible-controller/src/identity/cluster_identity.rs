@@ -105,6 +105,39 @@ pub async fn resolve(
     Ok(from_claim(rule, cluster, person))
 }
 
+/// The username the person signed in as `login` acts as on `cluster`, under the deploy profile's
+/// rule for it. A login with no sign-in recorded has none.
+pub async fn for_login(
+    pool: &PgPool,
+    profile: &crucible::deploy::DeployProfile,
+    cluster: &str,
+    login: &str,
+) -> anyhow::Result<Resolution> {
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT sub, email FROM users WHERE login = $1")
+            .bind(login.trim().to_lowercase())
+            .fetch_optional(pool)
+            .await
+            .context("reading the launcher's sign-in")?;
+    let Some((sub, email)) = row else {
+        return Ok(Resolution::Unavailable(format!(
+            "{login} has never signed in, so no username on {cluster} is known"
+        )));
+    };
+    let rule = profile
+        .cluster_identities()
+        .into_iter()
+        .find(|(name, _)| *name == cluster)
+        .map(|(_, rule)| rule.clone())
+        .unwrap_or_default();
+    let person = Person {
+        sub: &sub,
+        login,
+        email: email.as_deref(),
+    };
+    resolve(pool, cluster, &rule, person).await
+}
+
 /// The deploy profile with its fleet file folded in, `None` without one.
 pub async fn load_profile(
     path: Option<&std::path::Path>,

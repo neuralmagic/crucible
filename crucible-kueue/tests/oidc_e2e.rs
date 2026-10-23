@@ -133,11 +133,14 @@ async fn seed_run(pool: &sqlx::PgPool, kube_user: &str) {
     )
     .await
     .unwrap();
-    crucible_controller::identity::kube_identity::learn(
-        pool,
-        "alice",
-        &crucible_controller::identity::kube_identity::KubeUser::parse(kube_user).unwrap(),
+    sqlx::query(
+        "INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
+         VALUES ('sub-alice', $1, $2, 'token-review', '2026-01-01T00:00:00Z')
+         ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user",
     )
+    .bind("dev")
+    .bind(kube_user)
+    .execute(pool)
     .await
     .unwrap();
     for sql in [

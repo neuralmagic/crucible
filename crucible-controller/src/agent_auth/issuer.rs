@@ -477,10 +477,14 @@ pub enum GrantError {
         grantable: Vec<String>,
     },
     #[error(
-        "launcher {launcher} has no known kubernetes username and this deployment requires one; \
-         link it with PUT /api/me/kube-user or have an administrator set it"
+        "launcher {launcher} has no known kubernetes username on cluster {cluster}, which crucible-kueue \
+         requires ({why}); link it under Settings > Cluster identities"
     )]
-    NoKubeUser { launcher: String },
+    NoKubeUser {
+        launcher: String,
+        cluster: String,
+        why: String,
+    },
     #[error(
         "the SVID comes from cluster {spire}'s SPIRE, but sandbox {sandbox} is bound to a run on \
          {run}"

@@ -344,23 +344,35 @@ async fn issue(
     let kueue = profile.kueue.as_ref();
     let namespace = kueue.and_then(|k| issuer::default_namespace(k, &run.cluster));
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
-    let kube_user = crate::identity::kube_identity::effective(&state.pool, &launcher)
-        .await
-        .map_err(|e| OAuthError::Server(format!("{e:#}")))?;
-    if kube_user.is_none() {
-        if scopes.iter().any(|s| issuer::is_kueue_scope(s)) {
-            return Err(GrantError::NoKubeUser {
-                launcher: launcher.clone(),
+    let resolved =
+        crate::identity::cluster_identity::for_login(&state.pool, profile, &run.cluster, &launcher)
+            .await
+            .map_err(|e| OAuthError::Server(format!("{e:#}")))?;
+    let kube_user = match resolved {
+        crate::identity::cluster_identity::Resolution::Known { user, .. } => Some(user),
+        unknown => {
+            let why = match unknown {
+                crate::identity::cluster_identity::Resolution::Unavailable(why) => why,
+                _ => format!("{launcher} has not linked a username on {}", run.cluster),
+            };
+            if scopes.iter().any(|s| issuer::is_kueue_scope(s)) {
+                return Err(GrantError::NoKubeUser {
+                    launcher: launcher.clone(),
+                    cluster: run.cluster.clone(),
+                    why,
+                }
+                .into());
             }
-            .into());
+            tracing::warn!(
+                launcher,
+                sandbox = %sandbox.id,
+                cluster = run.cluster,
+                reason = why,
+                "agent token minted without kube_user"
+            );
+            None
         }
-        tracing::warn!(
-            launcher,
-            sandbox = %sandbox.id,
-            reason = "launcher has no known kubernetes username",
-            "agent token minted without kube_user"
-        );
-    }
+    };
     let grant = AgentGrant {
         sandbox,
         launcher,
@@ -579,20 +591,27 @@ mod tests {
         .unwrap()
     }
 
+    /// alice signs in and links `kube_user` as her username on the run's cluster.
     async fn link(pool: &PgPool, kube_user: &str) {
-        crate::identity::oidc::users::record_login(
+        link_as(pool, "sub-alice", "alice", kube_user).await;
+    }
+
+    async fn link_as(pool: &PgPool, sub: &str, login: &str, kube_user: &str) {
+        crate::identity::oidc::users::record_login(pool, sub, login, None, jiff::Timestamp::now())
+            .await
+            .unwrap();
+        let cluster = crate::identity::kube_links::testing::Clusters::with(&[(
+            testing::CLUSTER,
+            "t",
+            kube_user,
+        )]);
+        crate::identity::kube_links::link(
             pool,
-            "sub-alice",
-            "alice",
-            None,
-            jiff::Timestamp::now(),
-        )
-        .await
-        .unwrap();
-        crate::identity::kube_identity::learn(
-            pool,
-            "alice",
-            &crate::identity::kube_identity::KubeUser::parse(kube_user).unwrap(),
+            &cluster,
+            sub,
+            testing::CLUSTER,
+            "t",
+            crate::identity::kube_links::LinkSource::TokenReview,
         )
         .await
         .unwrap();
@@ -640,6 +659,56 @@ mod tests {
         let (status, _, body) = post(&strict.app, &form(&svid, &[])).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(claims_of(&body)["kube_user"], "alice-k8s");
+    }
+
+    /// A spoke checks RBAC as the launcher's username there; the hub's is no stand-in for it.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_token_carries_the_launchers_username_on_the_runs_cluster(pool: PgPool) {
+        bound_unlinked(&pool, "sbx-1").await;
+        crate::identity::oidc::users::record_login(
+            &pool,
+            "sub-alice",
+            "alice",
+            Some("alice@example.com"),
+            jiff::Timestamp::now(),
+        )
+        .await
+        .unwrap();
+        crate::identity::kube_identity::learn(
+            &pool,
+            "alice",
+            &crate::identity::kube_identity::KubeUser::parse("alice-hub").unwrap(),
+        )
+        .await
+        .unwrap();
+        let h = harness(pool.clone()).await;
+        let svid = h.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            "alice's hub username is not hers on the run's cluster: {body}"
+        );
+
+        let claim = harness_with(
+            pool.clone(),
+            &format!(
+                "{PROFILE}[clusters.{}]\nkubeconfig_secret = \"dev-kubeconfig\"\n\
+                 identity = {{ claim = \"email\", prefix = \"oidc:\" }}\n",
+                testing::CLUSTER
+            ),
+        )
+        .await;
+        let svid = claim.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&claim.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(claims_of(&body)["kube_user"], "oidc:alice@example.com");
+
+        link(&pool, "alice-dev").await;
+        let svid = h.spire.svid(&Spire::claims("sbx-1"));
+        let (status, _, body) = post(&h.app, &form(&svid, &[])).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(claims_of(&body)["kube_user"], "alice-dev");
     }
 
     /// alice launched the issue; bob unparks it. The run that follows was dispatched for bob, so
@@ -731,22 +800,7 @@ mod tests {
         .await
         .unwrap();
         link(&pool, "alice-k8s").await;
-        crate::identity::oidc::users::record_login(
-            &pool,
-            "sub-bob",
-            "bob",
-            None,
-            jiff::Timestamp::now(),
-        )
-        .await
-        .unwrap();
-        crate::identity::kube_identity::learn(
-            &pool,
-            "bob",
-            &crate::identity::kube_identity::KubeUser::parse("bob-k8s").unwrap(),
-        )
-        .await
-        .unwrap();
+        link_as(&pool, "sub-bob", "bob", "bob-k8s").await;
 
         let h = harness(pool).await;
         let svid = h
