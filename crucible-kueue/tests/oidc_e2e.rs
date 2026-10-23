@@ -352,6 +352,7 @@ async fn serve_kueue(kube: kube::Client, controller: &str) -> String {
             reviewer: Some(reviewer),
             kueue: kueue_version,
             allowed_hosts: Vec::new(),
+            pull_secrets: Vec::new(),
         },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -139,6 +139,9 @@ fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
     if jwks.scheme() == "http" {
         args.push("--insecure-jwks-http".to_string());
     }
+    for secret in &cfg.pull_secrets {
+        args.extend(["--pull-secret".to_string(), secret.clone()]);
+    }
     Ok(args)
 }
 
@@ -407,6 +410,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["crucible-kueue-e2e"]
         );
+    }
+
+    #[test]
+    fn the_profiles_pull_secrets_are_the_only_ones_workloads_may_name() {
+        assert!(!args(&docs(PROFILE)).contains(&"--pull-secret".to_string()));
+        let text = PROFILE.replace(
+            "kube_authz",
+            "pull_secrets = [\"quay-wseaton-pull\"]\n        kube_authz",
+        );
+        let args = args(&docs(&text));
+        let at = args
+            .iter()
+            .position(|a| a == "--pull-secret")
+            .expect("{args:?}");
+        assert_eq!(args[at + 1], "quay-wseaton-pull");
     }
 
     #[test]

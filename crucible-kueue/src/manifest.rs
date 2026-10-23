@@ -151,6 +151,12 @@ pub enum ManifestError {
     Quantity { path: String, value: String },
     #[error("{kind} has no pod template at {path}")]
     NoTemplate { kind: &'static str, path: String },
+    #[error("{path}: pull secret {name:?} is not one this server allows; allowed: {allowed:?}")]
+    PullSecret {
+        path: String,
+        name: String,
+        allowed: Vec<String>,
+    },
 }
 
 /// One group of identical pods the workload will ask Kueue to admit.
@@ -326,6 +332,35 @@ pub fn normalize(
         pod_sets,
         plan_hash,
     })
+}
+
+/// Refuses an `imagePullSecrets` entry in any pod template that names a secret outside `allowed`,
+/// the server's configured set; with none configured, a workload names no pull secret.
+pub fn check_pull_secrets(n: &Normalized, allowed: &[String]) -> Result<(), ManifestError> {
+    for slot in template_slots(n.kind, &n.object)? {
+        let path = format!("{}/spec/imagePullSecrets", slot.pointer);
+        let Some(list) = n.object.pointer(&path) else {
+            continue;
+        };
+        for (i, entry) in array_of(list, &path)?.iter().enumerate() {
+            let entry_path = format!("{path}/{i}");
+            let name = object_at(entry, &entry_path)?
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or(ManifestError::Shape {
+                    path: format!("{entry_path}/name"),
+                    expected: "a secret name",
+                })?;
+            if !allowed.iter().any(|a| a == name) {
+                return Err(ManifestError::PullSecret {
+                    path: entry_path,
+                    name: name.to_string(),
+                    allowed: allowed.to_vec(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// SHA-256 over the key-sorted JSON of the normalized object, so the hash depends only on content.
@@ -1589,6 +1624,47 @@ mod tests {
         let a = normalize(job(), &caller(), &queue()).unwrap();
         let b = normalize(job(), &delegated, &queue()).unwrap();
         assert_ne!(a.plan_hash, b.plan_hash);
+    }
+
+    #[test]
+    fn pull_secrets_are_only_the_ones_the_server_allows() {
+        let with = |names: &[&str]| {
+            let mut m = job();
+            m["spec"]["template"]["spec"]["imagePullSecrets"] =
+                json!(names.iter().map(|n| json!({"name": n})).collect::<Vec<_>>());
+            normalize(m, &caller(), &queue()).unwrap()
+        };
+        let allowed = vec!["quay-wseaton-pull".to_string()];
+        check_pull_secrets(&normalize(job(), &caller(), &queue()).unwrap(), &[])
+            .expect("naming none needs no allowance");
+        check_pull_secrets(&with(&["quay-wseaton-pull"]), &allowed).expect("the allowed one");
+        for (names, allow) in [
+            (&["crucible-github"][..], &allowed[..]),
+            (&["quay-wseaton-pull", "admin-dockercfg"][..], &allowed[..]),
+            (&["quay-wseaton-pull"][..], &[][..]),
+        ] {
+            match check_pull_secrets(&with(names), allow) {
+                Err(ManifestError::PullSecret { path, .. }) => {
+                    assert!(
+                        path.starts_with("/spec/template/spec/imagePullSecrets/"),
+                        "{path}"
+                    )
+                }
+                other => panic!("{names:?} with {allow:?}: {other:?}"),
+            }
+        }
+        let mut deployment = job();
+        deployment["apiVersion"] = json!("apps/v1");
+        deployment["kind"] = json!("Deployment");
+        deployment["spec"] = json!({"replicas": 1, "template": {"spec": {
+            "containers": [{"name": "main", "image": "ubi9"}],
+            "imagePullSecrets": [{"name": "elsewhere"}]
+        }}});
+        let n = normalize(deployment, &caller(), &queue()).unwrap();
+        assert!(matches!(
+            check_pull_secrets(&n, &allowed),
+            Err(ManifestError::PullSecret { .. })
+        ));
     }
 
     fn refused_with(m: Value, needle: &str) {
