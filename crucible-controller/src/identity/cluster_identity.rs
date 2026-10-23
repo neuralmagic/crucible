@@ -69,14 +69,12 @@ pub async fn resolve(
     rule: &ClusterIdentity,
     person: Person<'_>,
 ) -> anyhow::Result<Resolution> {
-    let hub = if cluster == HUB_CLUSTER {
-        crate::identity::kube_identity::get_for_sub(pool, person.sub).await?
-    } else {
-        None
-    };
-    if let Some(raw) = hub.as_ref().and_then(|h| h.r#override.as_deref()) {
+    if cluster == HUB_CLUSTER
+        && let Some(user) =
+            crate::identity::kube_identity::override_for_sub(pool, person.sub).await?
+    {
         return Ok(Resolution::Known {
-            user: KubeUser::parse(raw).context("the stored hub username override")?,
+            user,
             source: Source::Override,
             linked_at: None,
         });
@@ -86,21 +84,14 @@ pub async fn resolve(
             .await?
             .into_iter()
             .find(|l| l.cluster == cluster);
-        if let Some(link) = link {
-            return Ok(Resolution::Known {
+        return Ok(match link {
+            Some(link) => Resolution::Known {
                 user: link.kube_user,
                 source: Source::Link(link.source),
                 linked_at: Some(link.linked_at),
-            });
-        }
-        return match hub.and_then(|h| h.learned) {
-            Some(raw) => Ok(Resolution::Known {
-                user: KubeUser::parse(&raw).context("the stored hub username")?,
-                source: Source::Link(LinkSource::TokenReview),
-                linked_at: None,
-            }),
-            None => Ok(Resolution::Unlinked),
-        };
+            },
+            None => Resolution::Unlinked,
+        });
     };
     Ok(from_claim(rule, cluster, person))
 }
@@ -136,20 +127,6 @@ pub async fn for_login(
         email: email.as_deref(),
     };
     resolve(pool, cluster, &rule, person).await
-}
-
-/// The deploy profile with its fleet file folded in, `None` without one.
-pub async fn load_profile(
-    path: Option<&std::path::Path>,
-) -> anyhow::Result<Option<crucible::deploy::DeployProfile>> {
-    let Some(path) = path.map(std::path::Path::to_path_buf) else {
-        return Ok(None);
-    };
-    tokio::task::spawn_blocking(move || {
-        crucible::deploy::DeployProfile::load_with_fleet(&path, None).map(Some)
-    })
-    .await
-    .context("joining the deploy profile read")?
 }
 
 #[cfg(test)]
@@ -300,25 +277,6 @@ mod tests {
                 .await
                 .unwrap(),
             Resolution::Unlinked
-        );
-    }
-
-    /// A hub username learned before per-cluster links existed still counts as the hub link.
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_hub_username_learned_from_a_cluster_token_counts_as_linked(pool: PgPool) {
-        signed_in(&pool).await;
-        crate::identity::kube_identity::learn_for_sub(
-            &pool,
-            ALICE.sub,
-            &KubeUser::parse("alice-k8s").unwrap(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            resolve(&pool, HUB_CLUSTER, &ClusterIdentity::Link, ALICE)
-                .await
-                .unwrap(),
-            known("alice-k8s", Source::Link(LinkSource::TokenReview))
         );
     }
 }

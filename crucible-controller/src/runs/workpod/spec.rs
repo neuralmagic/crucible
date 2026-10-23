@@ -411,14 +411,15 @@ pub(crate) async fn spawn_turn_pod(
     spec: &WorkPodSpec,
     pod_noun: &'static str,
     profile: &Path,
+    loaded: &crate::config::ProfileCache,
     digests: Option<Arc<dyn DigestResolver>>,
     cluster: &str,
     ns: &str,
     delivery: &crate::secrets::deliver::Delivery,
     deadline: Duration,
 ) -> Result<Result<(), LaunchFailure>> {
-    let isolated = match crate::agent_auth::placement::load_profile(Some(profile)).await {
-        Ok(loaded) => loaded.filter(crucible::deploy::render::gateway::isolated),
+    let isolated = match loaded.get(Some(profile)).await {
+        Ok(loaded) => loaded.filter(|p| crucible::deploy::render::gateway::isolated(p)),
         Err(e) => return Ok(Err(LaunchFailure::RenderFailed(format!("{e:#}")))),
     };
     let gateway_failed = async |detail: String| {
@@ -715,6 +716,7 @@ pub(crate) async fn dispatch_turn<S: TurnSpec>(
         &wp_spec,
         spec.pod_noun(),
         &profile,
+        &cfg.profile_cache,
         cfg.digest_resolver(),
         &cluster,
         &ns,

@@ -410,12 +410,8 @@ fn stopped(surface: &'static str, served: std::io::Result<()>) -> SurfaceStopped
 /// The one migration set, referenced by every `#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]`.
 /// One shared static MIGRATOR avoids re-expanding the migration set's proc-macro at every call
 /// site, which is slow and easy to get subtly wrong across duplicates. Never re-run
-/// `sqlx::migrate!()` elsewhere. Migrations the database has applied but this build does not know
-/// are ignored.
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate::Migrator {
-    ignore_missing: true,
-    ..sqlx::migrate!()
-};
+/// `sqlx::migrate!()` elsewhere.
+static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
 /// The applied schema version (the highest migration), for `crucible-controller db verify`.
 pub async fn schema_version(pool: &sqlx::PgPool) -> anyhow::Result<i64> {
@@ -442,4 +438,139 @@ pub(crate) fn test_ledger_url() -> String {
         &format!("crucible_test_{}", uuid::Uuid::new_v4().simple()),
     )
     .expect("deriving a test ledger URL")
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::{Method, Request, StatusCode};
+    use sqlx::PgPool;
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    struct NoSink;
+    impl crate::daemon::queue::OverrideSink for NoSink {
+        fn submit(&self, _ov: crate::daemon::queue::Override) {}
+    }
+
+    async fn answer(router: &axum::Router, method: Method, uri: &str) -> (StatusCode, Vec<u8>) {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from("{}"))
+            .unwrap();
+        let res = router.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// A controller started as the binary starts it, with a deploy profile but none of the agent
+    /// configuration, serves none of the agent routes (each answers as an unrouted path does),
+    /// runs none of their background sources, and tells the SPA every agent feature is off.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_controller_without_agent_config_serves_and_runs_none_of_it(pool: PgPool) {
+        let _env = crate::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::testing::cfg_from_args(["ctl"]);
+        cfg.deploy_profile = Some(crate::testing::fixtures::write_deploy_profile(dir.path()));
+        assert!(!cfg.issues_agent_tokens());
+        let db = crate::Db::new(pool.clone());
+        assert!(
+            crate::daemon::agent_sources(&db, &cfg).await.is_empty(),
+            "no gateway sweep without isolated gateways"
+        );
+
+        let clusters = Arc::new(crate::runs::clusters::ClusterClients::new(None));
+        let agent_auth = crate::agent_auth::AgentAuth::from_env(
+            pool.clone(),
+            &cfg,
+            clusters.clone(),
+            crate::identity::people_directory::people,
+        )
+        .await
+        .unwrap();
+        assert!(agent_auth.is_none(), "no issuer without its configuration");
+        let links = crate::identity::cluster_link::ClusterLinks::from_env(&cfg, clusters.clone())
+            .await
+            .unwrap();
+        assert!(
+            links.is_none(),
+            "no cluster links without a [cluster_link] table"
+        );
+        let state = crate::api::state::ApiState::new(
+            db.clone(),
+            Arc::new(NoSink),
+            Arc::new(crate::daemon::queue::WorkQueue::new()),
+            clusters,
+            None,
+            Arc::new(tokio::sync::Notify::new()),
+            crate::runs::contract::permissive(),
+            crate::authz::policy::ActivePolicy::default_set().unwrap(),
+            &cfg,
+        )
+        .with_cluster_links(links.map(Arc::new))
+        .with_people_issuer(agent_auth.clone());
+        let surface =
+            crate::Surface::bind(state, "127.0.0.1:0".parse().unwrap(), false, agent_auth)
+                .await
+                .unwrap();
+        let router = &surface.router;
+
+        let routes = [
+            (Method::POST, "/oauth/token"),
+            (Method::GET, "/.well-known/jwks.json"),
+            (Method::GET, "/.well-known/oauth-authorization-server"),
+            (Method::GET, "/oauth/authorize"),
+            (Method::POST, "/api/sandbox-bindings/runs/run-1"),
+            (Method::GET, "/oauth/cluster-link/hub/callback"),
+            (Method::GET, "/api/me/kube-user"),
+            (Method::PUT, "/api/users/alice/kube-user"),
+            (Method::GET, "/api/me/cluster-identities"),
+            (Method::PUT, "/api/me/cluster-identities/hub"),
+            (Method::DELETE, "/api/me/cluster-identities/hub"),
+            (Method::POST, "/api/me/cluster-identities/hub/link"),
+            (Method::GET, "/api/me/mcp-sign-ins"),
+            (Method::DELETE, "/api/me/mcp-sign-ins"),
+            (Method::GET, "/api/oauth/consent"),
+            (Method::POST, "/api/oauth/consent"),
+            (Method::GET, "/api/agent-tools"),
+            (Method::GET, "/api/prefs/notices"),
+            (Method::PUT, "/api/prefs/notices"),
+        ];
+        for (method, path) in &routes {
+            let unrouted = match path.starts_with("/api/") {
+                true => "/api/no-such-route",
+                false => "/no-such-route",
+            };
+            assert_eq!(
+                answer(router, method.clone(), path).await,
+                answer(router, method.clone(), unrouted).await,
+                "{method} {path} is served"
+            );
+        }
+
+        let (status, body) = answer(router, Method::GET, "/api/whoami").await;
+        assert_eq!(status, StatusCode::OK);
+        let whoami: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            whoami["features"],
+            serde_json::json!({"agent_tools": false, "identities": false})
+        );
+        let (_, spec) = answer(router, Method::GET, "/api/openapi.json").await;
+        let spec: serde_json::Value = serde_json::from_slice(&spec).unwrap();
+        for (_, path) in &routes {
+            let template = path
+                .replace("/run-1", "/{run_id}")
+                .replace("/alice/", "/{login}/")
+                .replace("/hub", "/{cluster}");
+            assert!(
+                spec["paths"].get(&template).is_none(),
+                "the served spec documents {template}"
+            );
+        }
+    }
 }

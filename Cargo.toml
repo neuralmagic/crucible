@@ -64,9 +64,8 @@ url = "2"
 kube = { version = "4.0", default-features = false }
 k8s-openapi = { version = "0.28", features = ["v1_32"] }
 percent-encoding = "2"
-# CEL for webhook transforms (ADR-0055) and MCP tool policy. 0.15 carries cel-rust#341, which makes
-# `map` and `filter` linear.
-cel = "0.15"
+# CEL for MCP tool policy, at the controller's pin.
+cel = { git = "https://github.com/cel-rust/cel-rust", rev = "92f4376e200124e8dbafe5323a69cbe6bc3765c6" }
 
 [profile.release]
 opt-level = 2

@@ -41,6 +41,7 @@ use std::time::Duration;
 /// Everything the blocking half of a dispatch needs: render the run's pod and pack ConfigMap, then
 /// stamp the pod with what the controller knows about the run.
 struct RunPodRender {
+    isolated: bool,
     pack: std::path::PathBuf,
     pack_digest: TreeDigest,
     inputs: RunInputs,
@@ -72,6 +73,7 @@ impl RunPodRender {
             &self.opts,
             self.inputs,
             self.digests,
+            self.isolated,
         )?;
         check_delivered_tree(pack.as_ref(), &self.pack_digest)?;
         stamp_run_pod(
@@ -245,7 +247,8 @@ impl RunRenderOpts {
 /// runs it under `spawn_blocking`. `pod_name` is the run's pod: the render names the run after it,
 /// so its state is its own, and names the pack ConfigMap `<pod>-pack`, so the CM and
 /// the pod volume that references it never drift. `opts` carries the per-kind run knobs
-/// ([`RunRenderOpts`]), and `inputs` the per-run files delivered beside the pack.
+/// ([`RunRenderOpts`]), and `inputs` the per-run files delivered beside the pack. `isolated` reads the
+/// sandbox ports an isolated gateway's loop Service needs.
 pub fn render_run_docs(
     pack_out: &Path,
     profile_path: &Path,
@@ -253,6 +256,7 @@ pub fn render_run_docs(
     opts: &RunRenderOpts,
     inputs: RunInputs,
     digests: Option<Arc<dyn DigestResolver>>,
+    isolated: bool,
 ) -> Result<RunDocs> {
     let manifest = pack_out.join("crucible.toml");
     let yaml = render_yaml(
@@ -260,7 +264,7 @@ pub fn render_run_docs(
         profile_path,
         &opts.render_opts(pod_name, inputs, digests)?,
     )?;
-    extract_run_docs(&yaml)
+    extract_run_docs(&yaml, isolated)
 }
 
 /// Per-run files delivered beside a pack's tree, keyed by the pack-relative path a run reads them
@@ -313,11 +317,11 @@ pub struct RunDocs {
     pub sandbox_ports: Vec<u16>,
 }
 
-/// Pull the `Pod`, (optional) `ConfigMap`, and the loop NetworkPolicy's ingress ports out of a
-/// (possibly multi-doc) rendered manifest — the loop pod, its RBAC/NetworkPolicy, and, under pack
-/// delivery, the pack ConfigMap. A baked-domain render carries no ConfigMap, so `None` is the
-/// backward-compatible case. The Pod is required; its absence is a render bug.
-fn extract_run_docs(yaml: &str) -> Result<RunDocs> {
+/// Pull the `Pod`, (optional) `ConfigMap`, and, when `isolated`, the loop NetworkPolicy's ingress
+/// ports out of a (possibly multi-doc) rendered manifest — the loop pod, its RBAC/NetworkPolicy,
+/// and, under pack delivery, the pack ConfigMap. A baked-domain render carries no ConfigMap, so
+/// `None` is the backward-compatible case. The Pod is required; its absence is a render bug.
+fn extract_run_docs(yaml: &str, isolated: bool) -> Result<RunDocs> {
     let mut pod = None;
     let mut cm = None;
     let mut sandbox_ports = Vec::new();
@@ -336,7 +340,7 @@ fn extract_run_docs(yaml: &str) -> Result<RunDocs> {
                         .context("decoding the rendered pack ConfigMap")?,
                 );
             }
-            Some("NetworkPolicy") => {
+            Some("NetworkPolicy") if isolated => {
                 let policy = serde_norway::from_value::<
                     k8s_openapi::api::networking::v1::NetworkPolicy,
                 >(value)
@@ -637,11 +641,11 @@ pub async fn dispatch_run(
         "dispatch_run needs a deploy profile: set CONTROLLER_DEPLOY_PROFILE (or --deploy-profile) \
          to the profile the loop-pod render reads",
     )?;
-    let loaded = crate::agent_auth::placement::load_profile(Some(&profile)).await?;
+    let loaded = cfg.profile().await?;
     let kueue_cfg = loaded.as_ref().and_then(|p| p.kueue.as_ref());
     let buildit_cfg = loaded.as_ref().and_then(|p| p.buildit.as_ref());
     let isolated = loaded
-        .as_ref()
+        .as_deref()
         .filter(|p| crucible::deploy::render::gateway::isolated(p));
 
     let targets: Vec<crate::runs::contract::DispatchTarget> =
@@ -884,6 +888,7 @@ pub async fn dispatch_run(
         None => Ok(()),
     };
     let job = RunPodRender {
+        isolated: isolated.is_some(),
         pack: pack.path().to_path_buf(),
         pack_digest: pack.digest().clone(),
         inputs,
@@ -1357,6 +1362,7 @@ pub(crate) async fn dispatch_grounded_rank(
         &spec,
         spec::GroundedRankSpec.pod_noun(),
         &profile,
+        &cfg.profile_cache,
         cfg.digest_resolver(),
         &cluster,
         &namespace,

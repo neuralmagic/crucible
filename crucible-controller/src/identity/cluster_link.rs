@@ -148,19 +148,16 @@ impl ClusterLinks {
     /// The flow the deploy profile's `[cluster_link]` table configures, with each cluster's secret
     /// under `CONTROLLER_CLUSTER_LINK_SECRETS`. `None` without the table, or when the profile cannot
     /// be read (logged at warn).
-    pub fn from_env(
-        profile: Option<&std::path::Path>,
+    pub async fn from_env(
+        cfg: &crate::config::ControllerCfg,
         clusters: Arc<ClusterClients>,
     ) -> anyhow::Result<Option<Self>> {
         use anyhow::Context;
-        let Some(path) = profile else {
-            return Ok(None);
-        };
-        let profile = match crucible::deploy::DeployProfile::load(path) {
-            Ok(profile) => profile,
+        let profile = match cfg.profile().await {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return Ok(None),
             Err(error) => {
                 tracing::warn!(
-                    profile = %path.display(),
                     error = format!("{error:#}"),
                     "cluster links off: the deploy profile could not be read"
                 );
@@ -630,20 +627,32 @@ mod tests {
     async fn an_unreadable_profile_leaves_cluster_links_off() {
         let dir = tempfile::tempdir().unwrap();
         let clusters = Arc::new(ClusterClients::new(None));
-        let missing = dir.path().join("absent.toml");
+        let cfg_at = |path: Option<std::path::PathBuf>| {
+            let mut cfg = crate::testing::cfg_from_args(["ctl"]);
+            cfg.deploy_profile = path;
+            cfg
+        };
+        let missing = cfg_at(Some(dir.path().join("absent.toml")));
         assert!(
-            ClusterLinks::from_env(Some(&missing), clusters.clone())
+            ClusterLinks::from_env(&missing, clusters.clone())
+                .await
                 .unwrap()
                 .is_none()
         );
         let broken = dir.path().join("broken.toml");
         std::fs::write(&broken, "[cluster\nnot toml").unwrap();
         assert!(
-            ClusterLinks::from_env(Some(&broken), clusters.clone())
+            ClusterLinks::from_env(&cfg_at(Some(broken)), clusters.clone())
+                .await
                 .unwrap()
                 .is_none()
         );
-        assert!(ClusterLinks::from_env(None, clusters).unwrap().is_none());
+        assert!(
+            ClusterLinks::from_env(&cfg_at(None), clusters)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

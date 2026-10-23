@@ -384,7 +384,8 @@ dto! {
 pub struct RunDetail {
     pub run: RunDto,
     pub candidates: Vec<CandidateDto>,
-    /// The MCP servers the run's agent was granted at dispatch.
+    /// The MCP servers the run's agent was granted at dispatch; absent when it was granted none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_tools: Vec<crate::runs::agent_tools::AgentTool>,
 }
 
@@ -898,19 +899,38 @@ dto! {
 }
 
 /// Assemble the full provenance graph for one issue: issue row → scopes → runs → candidates,
-/// plus the event-log history. `None` if the issue is untracked.
+/// plus the event-log history. `None` if the issue is untracked. With `agent_tools`, each run
+/// carries what its agent was granted.
 #[cfg(feature = "autoresearch")]
-pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDetail>> {
+pub async fn issue_detail(
+    db: &Db,
+    key: &str,
+    agent_tools: bool,
+) -> anyhow::Result<Option<IssueDetail>> {
     let Some(issue) = crate::issues::store::get_issue(db.pool(), key).await? else {
         return Ok(None);
     };
     let scopes = crate::issues::store::list_scopes_for_issue(db.pool(), key).await?;
-    let mut scope_details = Vec::with_capacity(scopes.len());
+    let mut scope_runs = Vec::with_capacity(scopes.len());
+    for scope in scopes {
+        let runs = crate::runs::store::list_runs_for_scope(db.pool(), scope.id).await?;
+        scope_runs.push((scope, runs));
+    }
+    let mut tools = match agent_tools {
+        true => {
+            let run_ids: Vec<String> = scope_runs
+                .iter()
+                .flat_map(|(_, runs)| runs.iter().map(|r| r.run_id.clone()))
+                .collect();
+            crate::runs::agent_tools::for_runs(db.pool(), &run_ids).await?
+        }
+        false => std::collections::BTreeMap::new(),
+    };
+    let mut scope_details = Vec::with_capacity(scope_runs.len());
     // The issue's kept PR for the header chip: the kept candidate from the newest run (run-id
     // lexical order is chronological), tracked while the provenance graph is assembled anyway.
     let mut kept_pr: Option<(String, String)> = None;
-    for scope in scopes {
-        let runs = crate::runs::store::list_runs_for_scope(db.pool(), scope.id).await?;
+    for (scope, runs) in scope_runs {
         let mut run_details = Vec::with_capacity(runs.len());
         for run in runs {
             let candidates =
@@ -925,7 +945,7 @@ pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDeta
             }
             let transport_losses =
                 crate::runs::task_results::count_transport_losses(db.pool(), &run.run_id).await?;
-            let agent_tools = crate::runs::agent_tools::for_run(db.pool(), &run.run_id).await?;
+            let agent_tools = tools.remove(&run.run_id).unwrap_or_default();
             run_details.push(RunDetail {
                 run: RunDto::from_parts(
                     run,

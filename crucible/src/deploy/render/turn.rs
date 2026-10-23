@@ -883,6 +883,14 @@ mod tests {
         );
     }
 
+    /// Under `sandbox_driver = "kubernetes"` a turn pod must thread the same `--compute-driver`
+    /// flag and `CRUCIBLE_SANDBOX_*` env the loop pod's wrapper gets (`kube.rs`'s
+    /// `kubernetes_sandbox_env`), without it the turn's `rank-grounded`/`scope --propose`
+    /// subcommand synthesizes a fresh `Args` that defaults to the podman driver regardless of the
+    /// profile, and the gateway resolves the sandbox image through the nested-podman/authfile path
+    /// (wrong credential) instead of the kubelet's `imagePullSecrets`. It must also automount the SA
+    /// token, the in-pod gateway calls the API server directly for Sandbox CRs and has no mounted
+    /// kubeconfig to fall back on, so without the token it never becomes healthy.
     #[test]
     fn turn_pod_under_kubernetes_driver_threads_the_flag_and_sandbox_env() {
         let profile: DeployProfile = toml::from_str(

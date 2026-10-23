@@ -3366,8 +3366,6 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/prefs",
         "/api/prefs/editor",
         "/api/prefs/pickers",
-        "/api/prefs/notices",
-        "/api/agent-tools",
         "/api/overview",
         "/api/funnel",
         "/api/runs",
@@ -3462,14 +3460,6 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/providers/{id}",
         "/api/keys",
         "/api/keys/{id}",
-        "/api/me/kube-user",
-        "/api/me/cluster-identities",
-        "/api/me/cluster-identities/{cluster}",
-        "/api/me/cluster-identities/{cluster}/link",
-        "/oauth/cluster-link/{cluster}/callback",
-        "/api/oauth/consent",
-        "/api/me/mcp-sign-ins",
-        "/api/users/{login}/kube-user",
         "/api/version",
         "/api/images",
         "/api/images/refresh",
@@ -4650,7 +4640,7 @@ async fn adopt_authoritative_scenario_persists_the_flag(pool: PgPool) -> Result<
     );
 
     // The detail DTO carries the flag out to the SPA.
-    let detail = crate::api::dto::issue_detail(&db, &key)
+    let detail = crate::api::dto::issue_detail(&db, &key, false)
         .await?
         .expect("issue detail");
     assert!(
@@ -5139,6 +5129,66 @@ async fn approve_scenario_stamps_approved_at(pool: PgPool) -> Result<()> {
     )
     .await?;
     let app = app_with_admins(db.clone(), vec!["wren".to_string()]);
+
+    let res = app
+        .oneshot(
+            HttpRequest::post("/api/scenarios/scenario%3Aapprove-1/approve")
+                .header("x-auth-request-user", "wren")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+    let v: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(v["scope_id"], scope_id);
+    assert_eq!(v["approved_by"], "wren");
+    assert!(v["approved_at"].as_str().is_some());
+
+    let scope = crate::issues::store::latest_scope_for_issue(db.pool(), "scenario:approve-1")
+        .await?
+        .expect("scope");
+    assert!(scope.is_approved());
+    assert_eq!(scope.approved_by.as_deref(), Some("wren"));
+
+    let events = db.events().read_for_key("scenario:approve-1").await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor.as_deref(), Some("wren"));
+    let requested: Option<String> =
+        sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+            .bind("scenario:approve-1")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(
+        requested, None,
+        "without the agent token issuer an approval records no dispatcher"
+    );
+    Ok(())
+}
+
+/// With the agent token issuer configured, the approval's dispatch acts for the approver.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn with_the_issuer_an_approval_dispatches_for_the_approver(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("scenario:approve-1")).await?;
+    sqlx::query("UPDATE issues SET input_kind = 'scenario' WHERE key = $1")
+        .bind("scenario:approve-1")
+        .execute(db.pool())
+        .await?;
+    let scope_id = crate::issues::store::insert_scope(
+        db.pool(),
+        &crate::issues::model::NewScope {
+            issue: "scenario:approve-1".to_string(),
+            pack_digest: Some("v1:deadbeef".to_string()),
+            check_outcome: Some("OK".to_string()),
+        },
+    )
+    .await?;
+    let app = router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
+        agent_tools: true,
+        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+    });
 
     let res = app
         .oneshot(

@@ -135,7 +135,9 @@ impl ApprovalPoll {
         if crate::issues::store::record_approval(self.db.pool(), row.scope_id, &approval.by, &now)
             .await?
         {
-            if let Some(login) = self.authz.crucible_login(&approval.by) {
+            if self.cfg.issues_agent_tokens()
+                && let Some(login) = self.authz.crucible_login(&approval.by)
+            {
                 crate::issues::store::request_dispatch(self.db.pool(), &row.key, login).await?;
             }
             self.db
@@ -1182,7 +1184,11 @@ mod tests {
         .await;
         let poll = ApprovalPoll::new(
             db.clone(),
-            crate::testing::cfg_from_args(["ctl"]),
+            crate::testing::cfg_from_args([
+                "ctl",
+                "--agent-issuer",
+                "https://crucible.example.com",
+            ]),
             Authz::from_lookup(|var| {
                 (var == "CONTROLLER_GITHUB_LOGINS").then(|| "maint=alice".to_string())
             }),

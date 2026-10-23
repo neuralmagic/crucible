@@ -396,10 +396,7 @@ async fn serve_controller(
         people: None,
         issuer: AgentIssuer::new(cfg, keys),
         pool: pool.clone(),
-        profile: crucible_controller::agent_auth::placement::load_profile(Some(&env.profile))
-            .await
-            .unwrap()
-            .unwrap(),
+        profile: Arc::new(crucible::deploy::DeployProfile::load(&env.profile).unwrap()),
         directory: Arc::new(KubeDirectory(clusters)),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -516,10 +513,7 @@ async fn cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let (clusters, kube) = clusters(&env, dir.path()).await;
     let dispatcher = crucible_controller::KubePodDispatcher::new(clusters);
-    let profile = crucible_controller::agent_auth::placement::load_profile(Some(&env.profile))
-        .await
-        .unwrap()
-        .unwrap();
+    let profile = crucible::deploy::DeployProfile::load(&env.profile).unwrap();
     let loop_ns = profile.cluster.loop_namespace.as_str();
     let sandbox_ns = profile.cluster.sandbox_namespace.as_ref().unwrap().as_str();
     let loop_pods: Api<Pod> = Api::namespaced(kube.clone(), loop_ns);
@@ -541,10 +535,7 @@ async fn scenario() {
     let dir = tempfile::tempdir().unwrap();
     let (clusters, kube) = clusters(&env, dir.path()).await;
     let dispatcher = crucible_controller::KubePodDispatcher::new(clusters.clone());
-    let profile = crucible_controller::agent_auth::placement::load_profile(Some(&env.profile))
-        .await
-        .unwrap()
-        .unwrap();
+    let profile = crucible::deploy::DeployProfile::load(&env.profile).unwrap();
     let loop_ns = profile.cluster.loop_namespace.as_str();
     let sandbox_ns = profile.cluster.sandbox_namespace.as_ref().unwrap().as_str();
     let loop_sa = profile.cluster.service_account.as_str();

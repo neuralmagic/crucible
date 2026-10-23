@@ -70,12 +70,20 @@ impl OverrideSink for QueueOverrideSink {
 }
 
 /// Drain and apply any pending override for `key` before reconcile runs (called by the daemon's
-/// reconcile step). A no-op when nothing is pending, so it's cheap on every dequeue.
-pub async fn apply_pending(db: &Db, store: &OverrideStore, key: &str) -> Result<()> {
+/// reconcile step). A no-op when nothing is pending, so it's cheap on every dequeue. With
+/// `records_dispatchers`, an override that dispatches records its actor as who the dispatch acts
+/// for.
+pub async fn apply_pending(
+    db: &Db,
+    store: &OverrideStore,
+    key: &str,
+    records_dispatchers: bool,
+) -> Result<()> {
     let Some(ov) = store.take(key) else {
         return Ok(());
     };
     let actor = ov.actor.as_deref();
+    let requester = actor.filter(|_| records_dispatchers);
     match ov.kind {
         OverrideKind::Park => apply_park(db, key, ov.reason.as_deref(), actor).await,
         OverrideKind::Unpark => {
@@ -87,8 +95,8 @@ pub async fn apply_pending(db: &Db, store: &OverrideStore, key: &str) -> Result<
                 actor,
             )
             .await?;
-            if unparked && let Some(actor) = actor {
-                request_dispatch(db.pool(), key, actor).await?;
+            if unparked && let Some(requester) = requester {
+                request_dispatch(db.pool(), key, requester).await?;
             }
             Ok(())
         }
@@ -96,9 +104,9 @@ pub async fn apply_pending(db: &Db, store: &OverrideStore, key: &str) -> Result<
         OverrideKind::ScopeNow {
             ref justification,
             max_cost,
-        } => apply_scope_now(db, key, justification, max_cost, actor).await,
+        } => apply_scope_now(db, key, justification, max_cost, actor, requester).await,
         OverrideKind::Redispatch { ref justification } => {
-            apply_redispatch(db, key, justification, actor).await
+            apply_redispatch(db, key, justification, actor, requester).await
         }
     }
 }
@@ -187,6 +195,7 @@ async fn apply_scope_now(
     justification: &str,
     max_cost: Option<f64>,
     actor: Option<&str>,
+    requester: Option<&str>,
 ) -> Result<()> {
     let Some(issue) = crate::issues::store::get_issue(db.pool(), key).await? else {
         return Ok(());
@@ -237,8 +246,8 @@ async fn apply_scope_now(
             .by(actor),
         )
         .await?;
-    if let Some(actor) = actor {
-        request_dispatch(db.pool(), key, actor).await?;
+    if let Some(requester) = requester {
+        request_dispatch(db.pool(), key, requester).await?;
     }
     Ok(())
 }
@@ -256,6 +265,7 @@ async fn apply_redispatch(
     key: &str,
     justification: &str,
     actor: Option<&str>,
+    requester: Option<&str>,
 ) -> Result<()> {
     let Some(issue) = crate::issues::store::get_issue(db.pool(), key).await? else {
         return Ok(());
@@ -294,8 +304,8 @@ async fn apply_redispatch(
     let mut tx = db.pool().begin().await?;
     if crate::issues::store::claim_issue(&mut *tx, key, from, Status::AwaitingApproval).await? {
         crate::runs::work_pods::set_redispatch(&mut *tx, key, justification).await?;
-        if let Some(actor) = actor {
-            request_dispatch(&mut *tx, key, actor).await?;
+        if let Some(requester) = requester {
+            request_dispatch(&mut *tx, key, requester).await?;
         }
         let reason = format!("redispatch: {justification}");
         let ev = Event::now(
@@ -369,7 +379,7 @@ mod tests {
             actor: None,
         });
 
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
             .await?
@@ -380,7 +390,7 @@ mod tests {
         let events = crate::event_log::export_string(db.pool()).await?;
         assert_eq!(events.lines().count(), 1, "one park event logged");
         // Draining is one-shot: a second apply finds nothing pending.
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
         assert_eq!(
             crate::event_log::export_string(db.pool())
                 .await?
@@ -404,7 +414,7 @@ mod tests {
             actor: Some("wren".into()),
         });
 
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let events = db.events().read_for_key("owner/repo#1").await?;
         assert_eq!(events.len(), 1);
@@ -425,7 +435,7 @@ mod tests {
             actor: Some("wren".into()),
         });
 
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
             .await?
@@ -466,7 +476,7 @@ mod tests {
             actor: Some(actor.into()),
         };
         store.stash(unpark("mallory"));
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await,
             None,
@@ -481,7 +491,7 @@ mod tests {
         )
         .await?;
         store.stash(unpark(" Bob "));
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
             Some("user:bob")
@@ -494,7 +504,7 @@ mod tests {
             priority: Some(5),
             actor: Some("carol".into()),
         });
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
             Some("user:bob"),
@@ -509,13 +519,38 @@ mod tests {
         )
         .await?;
         store.stash(unpark("system:serviceaccount:ops:release-bot"));
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await,
             None,
             "a name that is not a login clears the earlier request, so the dispatch acts for the \
              owner rather than for bob"
         );
+        Ok(())
+    }
+
+    /// Without the agent token issuer no override records a dispatcher.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn without_the_issuer_an_override_records_nobody(pool: PgPool) -> Result<()> {
+        let (db, _d) = db_with(pool);
+        crate::issues::store::upsert_issue(db.pool(), &issue("owner/repo#1")).await?;
+        crate::issues::transitions::park_and_purge(
+            db.pool(),
+            "owner/repo#1",
+            "sticky",
+            ParkedBy::Human,
+        )
+        .await?;
+        let store = OverrideStore::new();
+        store.stash(Override {
+            key: IssueKey("owner/repo#1".into()),
+            kind: OverrideKind::Unpark,
+            reason: None,
+            priority: None,
+            actor: Some("bob".into()),
+        });
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
+        assert_eq!(requested_by(&db, "owner/repo#1").await, None);
         Ok(())
     }
 
@@ -600,7 +635,7 @@ mod tests {
             priority: None,
             actor: Some("Dana".into()),
         });
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
             Some("user:dana")
@@ -628,7 +663,7 @@ mod tests {
             priority: None,
             actor: Some("dana".into()),
         });
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(requested_by(&db, "owner/repo#1").await, None);
         Ok(())
     }
@@ -655,7 +690,7 @@ mod tests {
             priority: None,
             actor: Some("erin".into()),
         });
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", true).await?;
         assert_eq!(
             requested_by(&db, "owner/repo#1").await.as_deref(),
             Some("user:erin")
@@ -689,7 +724,7 @@ mod tests {
             priority: None,
             actor: None,
         });
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
             .await?
@@ -838,7 +873,7 @@ mod tests {
             priority: Some(42),
             actor: None,
         });
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
             .await?
@@ -885,7 +920,7 @@ mod tests {
             priority: None,
             actor: Some("wren".into()),
         });
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
             .await?
@@ -946,7 +981,7 @@ mod tests {
             actor: Some("wren".into()),
         });
 
-        apply_pending(&db, &store, "owner/repo#1").await?;
+        apply_pending(&db, &store, "owner/repo#1", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#1")
             .await?
@@ -984,7 +1019,7 @@ mod tests {
             actor: None,
         });
 
-        apply_pending(&db, &store, "owner/repo#2").await?;
+        apply_pending(&db, &store, "owner/repo#2", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#2")
             .await?
@@ -1013,7 +1048,7 @@ mod tests {
             actor: Some("wren".into()),
         });
 
-        apply_pending(&db, &store, "owner/repo#3").await?;
+        apply_pending(&db, &store, "owner/repo#3", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#3")
             .await?
@@ -1053,7 +1088,7 @@ mod tests {
             actor: None,
         });
 
-        apply_pending(&db, &store, "owner/repo#4").await?;
+        apply_pending(&db, &store, "owner/repo#4", false).await?;
 
         let got = crate::issues::store::get_issue(db.pool(), "owner/repo#4")
             .await?

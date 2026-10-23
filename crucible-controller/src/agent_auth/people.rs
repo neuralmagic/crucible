@@ -1206,6 +1206,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let api_state = crate::api::state::ApiState {
             deploy_profile: Some(path),
             people_issuer: Some(auth.clone()),
+            identities: true,
             ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
         };
         let signed_in = crate::identity::session::Resolved {

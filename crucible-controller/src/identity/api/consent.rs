@@ -8,10 +8,10 @@ use crate::agent_auth::people::{
 };
 use crate::api::dto::{bad_request, conflict, forbidden, not_found, unavailable};
 use crate::api::state::{ApiState, AppError, ErrorBody, Json};
+use crate::identity::api::cluster_identities::no_subject;
 use crate::identity::api::cluster_identities::{
     ClusterIdentityDto, identity_of, person_row, rules,
 };
-use crate::identity::api::kube_user::no_subject;
 use crate::identity::api_key::constant_time_eq;
 use crate::identity::auth::{AuthPath, Subject};
 use crate::identity::cluster_identity::Person;

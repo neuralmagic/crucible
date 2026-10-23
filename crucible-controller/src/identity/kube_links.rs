@@ -8,7 +8,7 @@
 
 use crate::daemon::queue::BoxFuture;
 use crate::identity::kube_identity::{KubeUser, KubeUserError};
-use crate::runs::clusters::{ClusterClients, HUB_CLUSTER};
+use crate::runs::clusters::ClusterClients;
 use anyhow::Context;
 use k8s_openapi::api::authentication::v1::{TokenReview, TokenReviewSpec, TokenReviewStatus};
 use kube::Api;
@@ -151,8 +151,6 @@ async fn upsert(
     user: &KubeUser,
     source: LinkSource,
 ) -> anyhow::Result<()> {
-    let now = crate::clock::now_rfc3339();
-    let mut tx = pool.begin().await.context("opening the link write")?;
     sqlx::query(
         "INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
          VALUES ($1, $2, $3, $4, $5)
@@ -164,49 +162,24 @@ async fn upsert(
     .bind(cluster)
     .bind(user.as_str())
     .bind(source.as_str())
-    .bind(&now)
-    .execute(&mut *tx)
+    .bind(crate::clock::now_rfc3339())
+    .execute(pool)
     .await
     .context("recording a kubernetes identity link")?;
-    if cluster == HUB_CLUSTER {
-        sqlx::query("UPDATE users SET kube_user = $2, updated_at = $3 WHERE sub = $1")
-            .bind(sub)
-            .bind(user.as_str())
-            .bind(&now)
-            .execute(&mut *tx)
-            .await
-            .context("recording the hub username agent tokens carry")?;
-    }
-    tx.commit().await.context("committing the link write")
+    Ok(())
 }
 
 /// Forget `sub`'s username on `cluster`. Returns whether there was one. An administrator's
 /// override is not a link and stays.
 pub async fn unlink(pool: &PgPool, sub: &str, cluster: &str) -> anyhow::Result<bool> {
-    let mut tx = pool.begin().await.context("opening the unlink write")?;
     let removed = sqlx::query("DELETE FROM kube_identity_links WHERE sub = $1 AND cluster = $2")
         .bind(sub)
         .bind(cluster)
-        .execute(&mut *tx)
+        .execute(pool)
         .await
         .context("removing a kubernetes identity link")?
-        .rows_affected()
-        > 0;
-    let mut learned = false;
-    if cluster == HUB_CLUSTER {
-        learned = sqlx::query(
-            "UPDATE users SET kube_user = NULL, updated_at = $2 WHERE sub = $1 AND kube_user IS NOT NULL",
-        )
-        .bind(sub)
-        .bind(crate::clock::now_rfc3339())
-        .execute(&mut *tx)
-        .await
-        .context("clearing the hub username agent tokens carry")?
-        .rows_affected()
-            > 0;
-    }
-    tx.commit().await.context("committing the unlink")?;
-    Ok(removed || learned)
+        .rows_affected();
+    Ok(removed > 0)
 }
 
 /// `sub`'s username on `cluster`. A stored value that no longer parses is an error.
@@ -491,8 +464,7 @@ mod tests {
         assert_eq!(left[0].source, LinkSource::TokenReview);
     }
 
-    /// Agent tokens for a person's runs read the hub username off the user row, so a hub link and
-    /// unlink move it too, and an administrator's override survives both.
+    /// The hub link is a link like any other, and an administrator's override survives its unlink.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_hub_link_is_the_username_agent_tokens_carry(pool: PgPool) {
         signed_in(&pool, "sub-alice", "alice").await;
@@ -507,8 +479,14 @@ mod tests {
         )
         .await
         .unwrap();
-        let effective = || crate::identity::kube_identity::effective(&pool, "alice");
-        assert_eq!(effective().await.unwrap().unwrap().as_str(), "alice-k8s");
+        assert_eq!(
+            get(&pool, "sub-alice", "hub")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "alice-k8s"
+        );
         crate::identity::kube_identity::set_override(
             &pool,
             "alice",
@@ -517,11 +495,15 @@ mod tests {
         .await
         .unwrap();
         assert!(unlink(&pool, "sub-alice", "hub").await.unwrap());
-        assert_eq!(effective().await.unwrap().unwrap().as_str(), "alice-admin");
-        crate::identity::kube_identity::set_override(&pool, "alice", None)
-            .await
-            .unwrap();
-        assert_eq!(effective().await.unwrap(), None);
+        assert_eq!(get(&pool, "sub-alice", "hub").await.unwrap(), None);
+        assert_eq!(
+            crate::identity::kube_identity::override_for_sub(&pool, "sub-alice")
+                .await
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "alice-admin"
+        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -538,11 +520,6 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            crate::identity::kube_identity::effective(&pool, "alice")
-                .await
-                .unwrap(),
-            None
-        );
+        assert_eq!(get(&pool, "sub-alice", "hub").await.unwrap(), None);
     }
 }

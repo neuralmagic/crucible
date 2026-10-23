@@ -6,7 +6,6 @@
 
 use crucible::deploy::DeployProfile;
 use crucible::deploy::profile::KubeName;
-use std::path::{Path, PathBuf};
 
 /// Where Kubernetes projects the namespace of the pod's service account.
 const SERVICE_ACCOUNT_NAMESPACE: &str = "/var/run/secrets/kubernetes.io/serviceaccount/namespace";
@@ -120,17 +119,6 @@ pub fn controller_namespace() -> Option<String> {
                 .map(|ns| ns.trim().to_string())
                 .filter(|ns| !ns.is_empty())
         })
-}
-
-/// The deploy profile at `path`, read off the async runtime. `None` without a path.
-pub async fn load_profile(path: Option<&Path>) -> anyhow::Result<Option<DeployProfile>> {
-    use anyhow::Context;
-    let Some(path) = path.map(PathBuf::from) else {
-        return Ok(None);
-    };
-    tokio::task::spawn_blocking(move || DeployProfile::load(&path).map(Some))
-        .await
-        .context("joining the deploy profile read")?
 }
 
 #[cfg(test)]

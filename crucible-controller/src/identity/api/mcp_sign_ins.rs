@@ -2,7 +2,7 @@
 
 use crate::api::dto::not_found;
 use crate::api::state::{ApiState, AppError, ErrorBody, Json};
-use crate::identity::api::kube_user::{no_subject, not_from_a_key};
+use crate::identity::api::cluster_identities::{no_subject, not_from_a_key};
 use crate::identity::auth::{AuthPath, Subject};
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};

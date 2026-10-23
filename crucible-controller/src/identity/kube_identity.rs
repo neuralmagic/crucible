@@ -2,8 +2,8 @@
 //! endpoint mints it as `kube_user`, and crucible MCP servers run SubjectAccessReview as that user,
 //! so a run can do only what its launcher could.
 //!
-//! The value is only ever the API server's word (`users/~` answering for a cluster token the person
-//! presented) or a platform administrator's override. A caller never names it for itself.
+//! Per-cluster links live in `kube_identity_links`; this is a platform administrator's override for
+//! the hub, which a caller never names for itself.
 
 use anyhow::Context;
 use sqlx::PgPool;
@@ -42,53 +42,6 @@ impl KubeUser {
     }
 }
 
-/// Both values a person's row holds, and the one that applies.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KubeIdentity {
-    pub learned: Option<String>,
-    pub r#override: Option<String>,
-}
-
-impl KubeIdentity {
-    /// The override when set, else the learned value.
-    pub fn effective(&self) -> Option<&str> {
-        self.r#override.as_deref().or(self.learned.as_deref())
-    }
-}
-
-/// Record what the API server said a cluster-token caller is, on the row whose login is exactly
-/// that username, and only when the row holds no username yet: a passive sighting never replaces
-/// a link or an earlier sighting. Returns whether a row with that login exists.
-pub async fn learn(pool: &PgPool, login: &str, user: &KubeUser) -> anyhow::Result<bool> {
-    let row: Option<bool> = sqlx::query_scalar(
-        "WITH target AS (SELECT sub FROM users WHERE login = $1),
-              filled AS (
-                UPDATE users SET kube_user = $2, updated_at = $3
-                 WHERE login = $1 AND kube_user IS NULL
-                RETURNING 1)
-         SELECT true FROM target",
-    )
-    .bind(login)
-    .bind(user.as_str())
-    .bind(crate::clock::now_rfc3339())
-    .fetch_optional(pool)
-    .await
-    .context("recording a learned kubernetes username")?;
-    Ok(row.is_some())
-}
-
-/// Record the username a signed-in person linked, replacing whatever was learned before.
-pub async fn learn_for_sub(pool: &PgPool, sub: &str, user: &KubeUser) -> anyhow::Result<bool> {
-    let updated = sqlx::query("UPDATE users SET kube_user = $2, updated_at = $3 WHERE sub = $1")
-        .bind(sub)
-        .bind(user.as_str())
-        .bind(crate::clock::now_rfc3339())
-        .execute(pool)
-        .await
-        .context("recording a linked kubernetes username")?;
-    Ok(updated.rows_affected() > 0)
-}
-
 /// Set or clear the administrator's override for `login`. Returns whether `login` has a row.
 pub async fn set_override(
     pool: &PgPool,
@@ -106,45 +59,19 @@ pub async fn set_override(
     Ok(updated.rows_affected() > 0)
 }
 
-/// What `login`'s row holds, `None` without a row.
-pub async fn get(pool: &PgPool, login: &str) -> anyhow::Result<Option<KubeIdentity>> {
-    let row: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT kube_user, kube_user_override FROM users WHERE login = $1")
-            .bind(login.trim().to_lowercase())
-            .fetch_optional(pool)
-            .await
-            .context("reading a kubernetes username")?;
-    Ok(row.map(|(learned, r#override)| KubeIdentity {
-        learned,
-        r#override,
-    }))
-}
-
-/// [`get`] for issuer subject `sub`.
-pub async fn get_for_sub(pool: &PgPool, sub: &str) -> anyhow::Result<Option<KubeIdentity>> {
-    let row: Option<(Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT kube_user, kube_user_override FROM users WHERE sub = $1")
+/// The administrator's override for issuer subject `sub`, which applies on the hub alone. A stored
+/// value that no longer parses is an error, never silently dropped.
+pub async fn override_for_sub(pool: &PgPool, sub: &str) -> anyhow::Result<Option<KubeUser>> {
+    let raw: Option<Option<String>> =
+        sqlx::query_scalar("SELECT kube_user_override FROM users WHERE sub = $1")
             .bind(sub)
             .fetch_optional(pool)
             .await
-            .context("reading a kubernetes username")?;
-    Ok(row.map(|(learned, r#override)| KubeIdentity {
-        learned,
-        r#override,
-    }))
-}
-
-/// The Kubernetes username `login` acts as, `None` when unknown. A stored value that no longer
-/// parses is an error, never silently dropped.
-pub async fn effective(pool: &PgPool, login: &str) -> anyhow::Result<Option<KubeUser>> {
-    match get(pool, login).await? {
-        Some(identity) => identity
-            .effective()
-            .map(KubeUser::parse)
-            .transpose()
-            .with_context(|| format!("the stored kubernetes username for {login}")),
-        None => Ok(None),
-    }
+            .context("reading a kubernetes username override")?;
+    raw.flatten()
+        .map(|raw| KubeUser::parse(&raw))
+        .transpose()
+        .context("the stored hub username override")
 }
 
 #[cfg(test)]
@@ -184,106 +111,36 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_learned_username_applies_until_an_override_replaces_it(pool: PgPool) {
+    async fn an_override_lands_on_the_logins_row_and_clears_with_none(pool: PgPool) {
         assert!(
-            !learn(&pool, "alice", &user("alice-k8s")).await.unwrap(),
+            !set_override(&pool, "alice", Some(&user("alice-admin")))
+                .await
+                .unwrap(),
             "no row yet"
         );
-        assert_eq!(effective(&pool, "alice").await.unwrap(), None);
-
         signed_in(&pool, "sub-alice", "alice").await;
-        assert_eq!(
-            effective(&pool, "alice").await.unwrap(),
-            None,
-            "nothing learned yet"
-        );
+        assert_eq!(override_for_sub(&pool, "sub-alice").await.unwrap(), None);
         assert!(
-            !learn(&pool, "Alice", &user("Alice")).await.unwrap(),
-            "the username must equal the login exactly"
-        );
-        assert_eq!(effective(&pool, "alice").await.unwrap(), None);
-        assert!(learn(&pool, "alice", &user("alice-k8s")).await.unwrap());
-        assert_eq!(
-            effective(&pool, "alice").await.unwrap(),
-            Some(user("alice-k8s"))
-        );
-        learn(&pool, "alice", &user("alice-other")).await.unwrap();
-        assert_eq!(
-            effective(&pool, "alice").await.unwrap(),
-            Some(user("alice-k8s")),
-            "a later sighting never replaces the first"
-        );
-
-        assert!(
-            set_override(&pool, "alice", Some(&user("alice-admin")))
+            set_override(&pool, " Alice ", Some(&user("alice-admin")))
                 .await
                 .unwrap()
         );
         assert_eq!(
-            get(&pool, "alice").await.unwrap(),
-            Some(KubeIdentity {
-                learned: Some("alice-k8s".into()),
-                r#override: Some("alice-admin".into()),
-            })
-        );
-        assert_eq!(
-            effective(&pool, "alice").await.unwrap(),
+            override_for_sub(&pool, "sub-alice").await.unwrap(),
             Some(user("alice-admin"))
         );
+        assert_eq!(override_for_sub(&pool, "sub-ghost").await.unwrap(), None);
         assert!(set_override(&pool, "alice", None).await.unwrap());
-        assert_eq!(
-            effective(&pool, "alice").await.unwrap(),
-            Some(user("alice-k8s"))
-        );
-        assert!(
-            !set_override(&pool, "nobody", Some(&user("x")))
-                .await
-                .unwrap()
-        );
-    }
-
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn linking_by_subject_lands_on_that_subjects_row_and_a_sighting_never_replaces_it(
-        pool: PgPool,
-    ) {
-        signed_in(&pool, "sub-alice", "alice").await;
-        assert!(
-            learn_for_sub(&pool, "sub-alice", &user("alice-k8s"))
-                .await
-                .unwrap()
-        );
-        assert!(
-            !learn_for_sub(&pool, "sub-ghost", &user("alice-k8s"))
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            get_for_sub(&pool, "sub-alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .effective(),
-            Some("alice-k8s")
-        );
-        learn(&pool, "alice", &user("alice")).await.unwrap();
-        assert_eq!(
-            get_for_sub(&pool, "sub-alice")
-                .await
-                .unwrap()
-                .unwrap()
-                .effective(),
-            Some("alice-k8s"),
-            "a cluster token for login alice does not replace the linked username"
-        );
+        assert_eq!(override_for_sub(&pool, "sub-alice").await.unwrap(), None);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_stored_system_identity_is_an_error_not_a_claim(pool: PgPool) {
         signed_in(&pool, "sub-alice", "alice").await;
-        sqlx::query("UPDATE users SET kube_user = 'system:admin' WHERE login = 'alice'")
+        sqlx::query("UPDATE users SET kube_user_override = 'system:admin' WHERE login = 'alice'")
             .execute(&pool)
             .await
             .unwrap();
-        assert!(effective(&pool, "alice").await.is_err());
+        assert!(override_for_sub(&pool, "sub-alice").await.is_err());
     }
 }

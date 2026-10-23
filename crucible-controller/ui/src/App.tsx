@@ -9,7 +9,7 @@ import {
 } from 'react';
 import { Route, Routes, Link, NavLink, Navigate } from 'react-router-dom';
 import { $api } from './api/client';
-import { useAutoresearch } from './api/lanes';
+import { useAgentTools, useAutoresearch, useIdentities } from './api/lanes';
 import { budgetPercent, budgetState, usd, yourSpendToday, type BudgetState } from './budget';
 import { cn, Spinner, Status, Tooltip } from './ui';
 import { useDeviceFlag } from './useDeviceFlag';
@@ -467,6 +467,8 @@ export function App() {
   useResetOnActAs();
   const [collapsed, toggleRail] = useRailCollapsed();
   const autoresearch = useAutoresearch() === true;
+  const agentTools = useAgentTools() === true;
+  const identities = useIdentities() === true;
 
   return (
     <div className="flex h-screen min-h-0 flex-col">
@@ -497,7 +499,7 @@ export function App() {
       <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
-      <AgentToolsBanner />
+      {agentTools ? <AgentToolsBanner /> : null}
 
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
@@ -548,7 +550,7 @@ export function App() {
             <Route path="/secrets" element={<SecretsPage />} />
             <Route path="/providers" element={<ProvidersPage />} />
             <Route path="/settings" element={<SettingsPage />} />
-            <Route path="/consent" element={<ConsentPage />} />
+            {identities ? <Route path="/consent" element={<ConsentPage />} /> : null}
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/teams/:slug" element={<TeamDetailPage />} />
             <Route path="/teams/:slug/members" element={<TeamMembersPage />} />

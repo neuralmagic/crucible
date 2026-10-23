@@ -214,7 +214,17 @@ pub async fn record(pool: &PgPool, run_id: &str, tools: &[AgentTool]) -> Result<
 
 /// What run `run_id` was granted, by server.
 pub async fn for_run(pool: &PgPool, run_id: &str) -> Result<Vec<AgentTool>> {
+    let mut by_run = for_runs(pool, &[run_id.to_string()]).await?;
+    Ok(by_run.remove(run_id).unwrap_or_default())
+}
+
+/// What each of `run_ids` was granted, by server; a run granted nothing is absent.
+pub async fn for_runs(
+    pool: &PgPool,
+    run_ids: &[String],
+) -> Result<BTreeMap<String, Vec<AgentTool>>> {
     type Row = (
+        String,
         String,
         String,
         String,
@@ -223,28 +233,31 @@ pub async fn for_run(pool: &PgPool, run_id: &str) -> Result<Vec<AgentTool>> {
         sqlx::types::Json<BTreeMap<String, String>>,
     );
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT server, cluster, url, kube_user, scopes, limits FROM run_agent_tools
-          WHERE run_id = $1",
+        "SELECT run_id, server, cluster, url, kube_user, scopes, limits FROM run_agent_tools
+          WHERE run_id = ANY($1)",
     )
-    .bind(run_id)
+    .bind(run_ids)
     .fetch_all(pool)
     .await
-    .context("reading the run's agent tools")?;
-    let mut tools: Vec<AgentTool> = rows
-        .into_iter()
-        .filter_map(|(server, cluster, url, kube_user, scopes, limits)| {
-            Some(AgentTool {
-                server: AgentServer::parse(&server)?,
-                cluster,
-                url,
-                kube_user,
-                scopes: scopes.0,
-                limits: limits.0,
-            })
-        })
-        .collect();
-    tools.sort_by_key(|t| t.server);
-    Ok(tools)
+    .context("reading runs' agent tools")?;
+    let mut by_run: BTreeMap<String, Vec<AgentTool>> = BTreeMap::new();
+    for (run_id, server, cluster, url, kube_user, scopes, limits) in rows {
+        let Some(server) = AgentServer::parse(&server) else {
+            continue;
+        };
+        by_run.entry(run_id).or_default().push(AgentTool {
+            server,
+            cluster,
+            url,
+            kube_user,
+            scopes: scopes.0,
+            limits: limits.0,
+        });
+    }
+    for tools in by_run.values_mut() {
+        tools.sort_by_key(|t| t.server);
+    }
+    Ok(by_run)
 }
 
 /// Record what run `run_id`, launched by `launcher` onto `cluster`, is granted, and say so on the

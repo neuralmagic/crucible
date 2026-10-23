@@ -129,7 +129,10 @@ pub(crate) async fn get_run(
     let candidates = crate::runs::store::list_candidates_for_run(state.db.pool(), &run_id).await?;
     let transport_losses =
         crate::runs::task_results::count_transport_losses(state.db.pool(), &run_id).await?;
-    let agent_tools = crate::runs::agent_tools::for_run(state.db.pool(), &run_id).await?;
+    let agent_tools = match state.agent_tools {
+        true => crate::runs::agent_tools::for_run(state.db.pool(), &run_id).await?,
+        false => Vec::new(),
+    };
     let detail = RunDetail {
         run: RunDto::from_parts(run, issue_key, repo, agent, transport_losses),
         candidates: candidates.into_iter().map(CandidateDto::from).collect(),
@@ -148,9 +151,8 @@ pub(crate) async fn get_run(
 pub(crate) async fn get_agent_tool_defaults(
     State(state): State<ApiState>,
 ) -> Result<Response, AppError> {
-    let profile =
-        crate::identity::cluster_identity::load_profile(state.deploy_profile.as_deref()).await?;
-    Ok(Json(crate::runs::agent_tools::defaults(profile.as_ref())).into_response())
+    let profile = state.profile().await?;
+    Ok(Json(crate::runs::agent_tools::defaults(profile.as_deref())).into_response())
 }
 
 /// `GET /api/runs/{run_id}/graph` — the run's newest admitted work graph plus every task attempt

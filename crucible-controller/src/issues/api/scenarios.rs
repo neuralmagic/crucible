@@ -710,11 +710,16 @@ pub(crate) async fn approve_scenario(
         .await
     {
         Ok(true) => {
-            if let Some(login) = identity.as_deref()
+            if state.agent_tools
+                && let Some(login) = identity.as_deref()
                 && let Err(e) =
                     crate::issues::store::request_dispatch(state.db.pool(), &key, login).await
             {
-                return AppError::from(e).into_response();
+                tracing::warn!(
+                    issue_key = %key,
+                    error = format!("{e:#}"),
+                    "recording who the approved dispatch acts for failed; it acts for the run's owner"
+                );
             }
         }
         // `approved_at IS NOT NULL` already — someone beat this caller to the stamp. Report the

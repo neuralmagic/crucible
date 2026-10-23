@@ -17,6 +17,7 @@ use utoipa_axum::routes;
 pub mod state;
 use state::*;
 
+mod agent_auth;
 #[cfg(feature = "autoresearch")]
 mod autoresearch;
 
@@ -40,18 +41,6 @@ pub(crate) mod tests;
         crate::identity::api::keys::list_keys,
         crate::identity::api::keys::mint_key,
         crate::identity::api::keys::revoke_key,
-        crate::identity::api::kube_user::get_my_kube_user,
-        crate::identity::api::kube_user::link_my_kube_user,
-        crate::identity::api::kube_user::override_kube_user,
-        crate::identity::api::cluster_identities::list_my_cluster_identities,
-        crate::identity::api::cluster_identities::link_by_token,
-        crate::identity::api::cluster_identities::unlink,
-        crate::identity::api::cluster_identities::start_oauth_link,
-        crate::identity::api::cluster_identities::oauth_link_callback,
-        crate::identity::api::consent::get_consent,
-        crate::identity::api::consent::decide_consent,
-        crate::identity::api::mcp_sign_ins::list_mcp_sign_ins,
-        crate::identity::api::mcp_sign_ins::sign_out_mcp_clients,
         system::get_access,
         crate::identity::api::prefs::get_prefs,
         crate::identity::api::prefs::put_prefs,
@@ -59,9 +48,6 @@ pub(crate) mod tests;
         crate::identity::api::prefs::put_editor_prefs,
         crate::identity::api::prefs::get_picker_prefs,
         crate::identity::api::prefs::put_picker_prefs,
-        crate::identity::api::prefs::get_notice_prefs,
-        crate::identity::api::prefs::put_notice_prefs,
-        crate::runs::api::runs::get_agent_tool_defaults,
         system::overview,
         dto::funnel,
         crate::runs::api::runs::list_runs,
@@ -211,31 +197,13 @@ pub(crate) mod tests;
     components(schemas(
         system::Health,
         system::Whoami,
+        system::Features,
         crate::identity::auth::Role,
         system::AccessDto,
         crate::identity::api::prefs::PrefsDto,
-        crate::identity::api::cluster_identities::ClusterIdentityDto,
-        crate::identity::api::cluster_identities::IdentityRuleDto,
-        crate::identity::api::cluster_identities::ClaimDto,
-        crate::identity::api::cluster_identities::IdentitySourceDto,
-        crate::identity::api::cluster_identities::LinkStartDto,
-        crate::identity::api::cluster_identities::LinkStartBody,
-        crate::identity::api::consent::ConsentDto,
-        crate::identity::api::mcp_sign_ins::McpSignInDto,
-        crate::identity::api::mcp_sign_ins::McpSignInsDto,
-        crate::identity::api::mcp_sign_ins::SignedOutDto,
-        crate::identity::api::consent::DecisionBody,
-        crate::identity::api::consent::DecisionDto,
-        crate::identity::api::consent::Verdict,
-        crate::identity::api::kube_user::KubeUserDto,
-        crate::identity::api::kube_user::LinkBody,
-        crate::identity::api::kube_user::OverrideBody,
         crate::identity::api::prefs::EditorPrefsDto,
         crate::identity::api::prefs::PickerPrefsDto,
-        crate::identity::api::prefs::NoticePrefsDto,
         crate::runs::agent_tools::AgentTool,
-        crate::runs::agent_tools::AgentServer,
-        crate::runs::agent_tools::Defaults,
         dto::Overview,
         dto::StatusCount,
         dto::TierCount,
@@ -434,8 +402,9 @@ struct ApiDoc;
 
 /// Return the OpenAPI spec as JSON. Can be called without a running server for typegen workflows.
 pub(crate) fn openapi_spec() -> anyhow::Result<String> {
-    #[allow(unused_mut)]
     let mut doc = ApiDoc::openapi();
+    doc.merge(agent_auth::IdentityDoc::openapi());
+    doc.merge(agent_auth::AgentToolsDoc::openapi());
     #[cfg(feature = "autoresearch")]
     doc.merge(autoresearch::AutoresearchDoc::openapi());
     Ok(doc.to_json()?)
@@ -463,32 +432,6 @@ pub fn router(state: ApiState) -> Router {
             crate::identity::api::keys::mint_key
         ))
         .routes(routes!(crate::identity::api::keys::revoke_key))
-        .routes(routes!(
-            crate::identity::api::kube_user::get_my_kube_user,
-            crate::identity::api::kube_user::link_my_kube_user
-        ))
-        .routes(routes!(crate::identity::api::kube_user::override_kube_user))
-        .routes(routes!(
-            crate::identity::api::cluster_identities::list_my_cluster_identities
-        ))
-        .routes(routes!(
-            crate::identity::api::cluster_identities::link_by_token,
-            crate::identity::api::cluster_identities::unlink
-        ))
-        .routes(routes!(
-            crate::identity::api::cluster_identities::start_oauth_link
-        ))
-        .routes(routes!(
-            crate::identity::api::cluster_identities::oauth_link_callback
-        ))
-        .routes(routes!(
-            crate::identity::api::mcp_sign_ins::list_mcp_sign_ins,
-            crate::identity::api::mcp_sign_ins::sign_out_mcp_clients
-        ))
-        .routes(routes!(
-            crate::identity::api::consent::get_consent,
-            crate::identity::api::consent::decide_consent
-        ))
         .routes(routes!(system::get_access))
         .routes(routes!(system::overview))
         .routes(routes!(dto::funnel))
@@ -726,7 +669,18 @@ pub fn router(state: ApiState) -> Router {
     } else {
         router
     };
-    let (router, api) = router.split_for_parts();
+    let router = match state.identities {
+        true => agent_auth::identity_routes(router),
+        false => router,
+    };
+    let (router, mut api) = router.split_for_parts();
+    let router = match state.agent_tools {
+        true => {
+            api.merge(agent_auth::AgentToolsDoc::openapi());
+            agent_auth::agent_tool_routes(router)
+        }
+        false => router,
+    };
 
     router
         // The artifact proxy is a catch-all (`{*path}` captures `diffs/<file>`, which carries a
@@ -767,18 +721,6 @@ pub fn router(state: ApiState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(
                     crate::identity::api::prefs::MAX_PREFS_BYTES,
                 )),
-        )
-        .route(
-            "/api/prefs/notices",
-            get(crate::identity::api::prefs::get_notice_prefs)
-                .put(crate::identity::api::prefs::put_notice_prefs)
-                .layer(axum::extract::DefaultBodyLimit::max(
-                    crate::identity::api::prefs::MAX_PREFS_BYTES,
-                )),
-        )
-        .route(
-            "/api/agent-tools",
-            get(crate::runs::api::runs::get_agent_tool_defaults),
         )
         .route("/api/openapi.json", get(move || async { Json(api) }))
         .layer(axum::middleware::from_fn_with_state(

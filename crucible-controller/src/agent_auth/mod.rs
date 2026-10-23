@@ -33,7 +33,6 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use sqlx::PgPool;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 pub struct AgentAuth {
@@ -41,7 +40,7 @@ pub struct AgentAuth {
     pub pool: PgPool,
     /// The deploy profile naming the sandbox namespace and, in `[kueue]`, a run's default
     /// namespace, read once at startup.
-    pub profile: crucible::deploy::DeployProfile,
+    pub profile: Arc<crucible::deploy::DeployProfile>,
     pub directory: Arc<dyn directory::SandboxDirectory>,
     /// The authorization code grant for people, when `CONTROLLER_PEOPLE_AUDIENCES` is set.
     pub people: Option<people::People>,
@@ -50,9 +49,9 @@ pub struct AgentAuth {
 impl AgentAuth {
     /// The issuer `CONTROLLER_AGENT_*` configures, `None` when `CONTROLLER_AGENT_ISSUER` is unset.
     /// `people` builds the people grant from its configuration, over the controller's tables.
-    pub fn from_env(
+    pub async fn from_env(
         pool: PgPool,
-        deploy_profile: Option<PathBuf>,
+        cfg: &crate::config::ControllerCfg,
         clusters: Arc<crate::runs::clusters::ClusterClients>,
         people: impl FnOnce(
             people::PeopleConfig,
@@ -61,16 +60,16 @@ impl AgentAuth {
         ) -> people::People,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         use anyhow::Context;
-        let Some(cfg) = issuer::AgentIssuerConfig::from_env()? else {
+        let Some(issuer_cfg) = issuer::AgentIssuerConfig::from_env()? else {
             return Ok(None);
         };
-        let profile_path = deploy_profile
-            .as_deref()
+        let profile = cfg
+            .profile()
+            .await
+            .context("reading the deploy profile for the agent issuer")?
             .ok_or(placement::PlacementError::NoProfile)?;
-        let profile = crucible::deploy::DeployProfile::load(profile_path)
-            .context("reading the deploy profile for the agent issuer")?;
         let namespace = placement::controller_namespace();
-        match cfg.spire.is_empty() {
+        match issuer_cfg.spire.is_empty() {
             false => placement::check_key_placement(namespace.as_deref(), &profile)?,
             true => placement::check_key_exposure(namespace.as_deref(), &profile)?,
         }
@@ -85,14 +84,14 @@ impl AgentAuth {
             people::grants::spawn_sweep(people.grants.clone());
             people
         });
-        if cfg.spire.is_empty() && people.is_none() {
+        if issuer_cfg.spire.is_empty() && people.is_none() {
             return Err(issuer::ConfigError::NoRecipients.into());
         }
         tracing::info!(
-            issuer = cfg.issuer.as_str(),
-            kid = cfg.signing_key.kid(),
-            spire = ?cfg.spire.iter().map(|s| (s.cluster.as_str(), s.svid_issuer.as_str())).collect::<Vec<_>>(),
-            audiences = ?cfg.audiences.iter().map(|a| a.resource.as_str()).collect::<Vec<_>>(),
+            issuer = issuer_cfg.issuer.as_str(),
+            kid = issuer_cfg.signing_key.kid(),
+            spire = ?issuer_cfg.spire.iter().map(|s| (s.cluster.as_str(), s.svid_issuer.as_str())).collect::<Vec<_>>(),
+            audiences = ?issuer_cfg.audiences.iter().map(|a| a.resource.as_str()).collect::<Vec<_>>(),
             "issuing agent access tokens"
         );
         let keys = |entry: &issuer::ClusterSpire| {
@@ -102,7 +101,7 @@ impl AgentAuth {
             )))
         };
         Ok(Some(Arc::new(Self {
-            issuer: AgentIssuer::new(cfg, keys),
+            issuer: AgentIssuer::new(issuer_cfg, keys),
             pool,
             profile,
             directory: Arc::new(directory::KubeDirectory(clusters)),
@@ -695,10 +694,10 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::identity::kube_identity::learn(
+        crate::identity::kube_identity::set_override(
             &pool,
             "alice",
-            &crate::identity::kube_identity::KubeUser::parse("alice-hub").unwrap(),
+            Some(&crate::identity::kube_identity::KubeUser::parse("alice-hub").unwrap()),
         )
         .await
         .unwrap();
@@ -773,7 +772,7 @@ mod tests {
                 actor: Some("Bob".into()),
             },
         );
-        crate::daemon::overrides::apply_pending(&db, &store, key)
+        crate::daemon::overrides::apply_pending(&db, &store, key, true)
             .await
             .unwrap();
 

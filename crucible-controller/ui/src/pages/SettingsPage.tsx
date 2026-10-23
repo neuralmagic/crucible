@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
+import { useIdentities } from '../api/lanes';
 import { viaLabel } from '../ownerContext';
 import { Link, useSearchParams } from 'react-router-dom';
 import {
@@ -375,6 +376,7 @@ function Memberships() {
 }
 
 export function SettingsPage() {
+  const identities = useIdentities() === true;
   return (
     <>
       <PageHeader
@@ -383,8 +385,8 @@ export function SettingsPage() {
         description="The credentials this controller holds on your behalf, and what stops working without them."
       />
       <Memberships />
-      <ClusterIdentities />
-      <McpSignIns />
+      {identities ? <ClusterIdentities /> : null}
+      {identities ? <McpSignIns /> : null}
       <OfflineCredential />
       <ApiKeys />
     </>

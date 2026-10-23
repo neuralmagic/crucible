@@ -255,10 +255,7 @@ kube_authz = "openshift"
         people: None,
         issuer: AgentIssuer::new(cfg, keys),
         pool: pool.clone(),
-        profile: crucible_controller::agent_auth::placement::load_profile(Some(&profile))
-            .await
-            .unwrap()
-            .unwrap(),
+        profile: Arc::new(crucible::deploy::DeployProfile::load(&profile).unwrap()),
         directory: Arc::new(crucible_controller::agent_auth::directory::KubeDirectory(
             Arc::new(crucible_controller::runs::clusters::ClusterClients::new(
                 None,

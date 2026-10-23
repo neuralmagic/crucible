@@ -4,7 +4,6 @@
 
 use crate::api::dto::{bad_request, conflict, not_found, unavailable};
 use crate::api::state::{ApiState, AppError, ErrorBody, Json};
-use crate::identity::api::kube_user::{LinkBody, no_subject, not_from_a_key};
 use crate::identity::auth::{AuthPath, Subject};
 use crate::identity::cluster_identity::{self, Person, Resolution, Source};
 use crate::identity::cluster_link::{Callback, LinkFlowError};
@@ -17,6 +16,25 @@ use forge::fleet::{ClusterIdentity, SsoClaim};
 use serde::{Deserialize, Serialize};
 use tower_sessions::Session;
 use utoipa::ToSchema;
+
+/// A cluster token whose owner the cluster's API server names.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LinkBody {
+    pub cluster_token: String,
+}
+
+pub(crate) fn no_subject() -> Response {
+    crate::api::dto::forbidden(
+        "this credential names no issuer subject, so it has no user row to link",
+    )
+}
+
+pub(crate) fn not_from_a_key() -> Response {
+    crate::api::dto::forbidden(
+        "api keys cannot change their owner's kubernetes username; sign in to link one",
+    )
+}
 
 /// The SSO claim a rule cluster's usernames come from.
 #[derive(Debug, Clone, Copy, Serialize, ToSchema, PartialEq, Eq)]
@@ -147,7 +165,7 @@ pub(crate) async fn person_row(
 
 /// Every cluster the deploy profile knows, with its rule. Without a profile only the hub, as `link`.
 pub(crate) async fn rules(state: &ApiState) -> anyhow::Result<Vec<(String, ClusterIdentity)>> {
-    let profile = cluster_identity::load_profile(state.deploy_profile.as_deref()).await?;
+    let profile = state.profile().await?;
     Ok(match profile {
         Some(p) => p
             .cluster_identities()
@@ -259,9 +277,6 @@ pub(crate) async fn list_my_cluster_identities(
     State(state): State<ApiState>,
     subject: Subject,
 ) -> Result<Response, AppError> {
-    if !offered(&state) {
-        return Ok(Json(Vec::<ClusterIdentityDto>::new()).into_response());
-    }
     let Some(sub) = subject.as_deref() else {
         return Ok(no_subject());
     };
@@ -282,14 +297,6 @@ pub(crate) async fn list_my_cluster_identities(
 
 /// Whether this controller links cluster usernames at all: it serves people's tokens, or links
 /// clusters through OAuth. Without either, the list is empty and the writes are not served.
-fn offered(state: &ApiState) -> bool {
-    state.people_issuer.is_some() || state.cluster_links.is_some()
-}
-
-fn not_offered() -> Response {
-    not_found("this controller links no cluster usernames")
-}
-
 fn link_refused(e: LinkError) -> Result<Response, AppError> {
     match e {
         LinkError::Unreachable { cluster, detail } => {
@@ -326,9 +333,6 @@ pub(crate) async fn link_by_token(
     Path(cluster): Path<String>,
     Json(body): Json<LinkBody>,
 ) -> Result<Response, AppError> {
-    if !offered(&state) {
-        return Ok(not_offered());
-    }
     if path == AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -369,9 +373,6 @@ pub(crate) async fn unlink(
     path: AuthPath,
     Path(cluster): Path<String>,
 ) -> Result<Response, AppError> {
-    if !offered(&state) {
-        return Ok(not_offered());
-    }
     if path == AuthPath::ApiKey {
         return Ok(not_from_a_key());
     }
@@ -411,9 +412,6 @@ pub(crate) async fn start_oauth_link(
     Path(cluster): Path<String>,
     Json(body): Json<LinkStartBody>,
 ) -> Result<Response, AppError> {
-    if !offered(&state) {
-        return Ok(not_offered());
-    }
     if path != AuthPath::Session {
         return Ok(browser_only());
     }
@@ -473,16 +471,20 @@ pub(crate) async fn oauth_link_callback(
     Path(cluster): Path<String>,
     Query(callback): Query<Callback>,
 ) -> Result<Response, AppError> {
+    let refused = |page: Option<&str>, e: LinkFlowError| {
+        tracing::info!(cluster, reason = %e, "cluster link refused");
+        land(page, &[("link_error", e.code())])
+    };
+    let Some(links) = state.cluster_links.as_ref() else {
+        return Ok(refused(None, LinkFlowError::NoFlow));
+    };
     let pending = crate::identity::session::take_cluster_link(&session)
         .await
         .context("reading the parked cluster link")?;
     let return_to = pending.as_ref().and_then(|p| p.return_to.clone());
     let page = return_to.as_deref();
-    let failed = |e: LinkFlowError| {
-        tracing::info!(cluster, reason = %e, "cluster link refused");
-        Ok(land(page, &[("link_error", e.code())]))
-    };
-    let (Some(sub), Some(links)) = (subject.as_deref(), state.cluster_links.as_ref()) else {
+    let failed = |e: LinkFlowError| Ok(refused(page, e));
+    let Some(sub) = subject.as_deref() else {
         return failed(LinkFlowError::NoFlow);
     };
     let token = match links
@@ -621,6 +623,7 @@ openshift = ["pirate"]
             deploy_profile: Some(path),
             reviewer: Arc::new(reviewer),
             cluster_links: Some(Arc::new(links)),
+            identities: true,
             ..ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
         };
         let store = crate::identity::session::store(&pool).await.unwrap();
@@ -1025,9 +1028,18 @@ openshift = ["pirate"]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn without_people_oauth_or_cluster_links_nothing_is_offered(pool: PgPool) {
         let mut h = harness(pool).await;
-        h.state.cluster_links = None;
-        assert!(h.state.people_issuer.is_none());
-        assert!(h.identities().await.is_empty(), "the list is empty");
+        h.state = h.state.clone().with_cluster_links(None);
+        assert!(!h.state.identities);
+        let listed = h
+            .send(
+                AuthPath::Session,
+                "GET",
+                "/api/me/cluster-identities",
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(listed.status, StatusCode::NOT_FOUND);
         assert_eq!(
             h.put_token(AuthPath::Session, "pirate", "sha256~pasted")
                 .await

@@ -3188,6 +3188,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
         },
         Default::default(),
         None,
+        false,
     )?
     .pod;
     let with_the_registry = render_run_docs(
@@ -3201,6 +3202,7 @@ async fn an_empty_registry_renders_the_pod_it_always_did(pool: sqlx::PgPool) -> 
         ),
         Default::default(),
         None,
+        false,
     )?
     .pod;
     assert_eq!(
@@ -6631,13 +6633,9 @@ async fn the_gateway_sweep_removes_gateways_whose_run_pod_is_not_running(
         .into(),
         ..Default::default()
     };
-    crate::runs::workpod::gateway::sweep_orphan_gateways(
-        &db,
-        &dispatcher,
-        Some(&profile),
-        "autoresearch",
-    )
-    .await;
+    let mut cfg = crate::testing::cfg_from_args(["ctl", "--pod-namespace", "autoresearch"]);
+    cfg.deploy_profile = Some(profile.clone());
+    crate::runs::workpod::gateway::sweep_orphan_gateways(&db, &dispatcher, &cfg).await;
     let gateways = crucible::deploy::render::gateway::gateway_selector();
     let deleted: Vec<String> = dispatcher
         .events()
@@ -6662,13 +6660,9 @@ async fn the_gateway_sweep_removes_gateways_whose_run_pod_is_not_running(
 
     let shared = shared_profile(tmp.path());
     let untouched = GatewayDispatcher::default();
-    crate::runs::workpod::gateway::sweep_orphan_gateways(
-        &db,
-        &untouched,
-        Some(&shared),
-        "autoresearch",
-    )
-    .await;
+    let mut cfg = crate::testing::cfg_from_args(["ctl", "--pod-namespace", "autoresearch"]);
+    cfg.deploy_profile = Some(shared.clone());
+    crate::runs::workpod::gateway::sweep_orphan_gateways(&db, &untouched, &cfg).await;
     assert!(
         untouched.events().is_empty(),
         "a profile without isolation sweeps nothing"

@@ -297,7 +297,7 @@ pub fn agent_auth(
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("profile.toml");
     std::fs::write(&path, profile_toml).unwrap();
-    let profile = crucible::deploy::DeployProfile::load(&path).unwrap();
+    let profile = std::sync::Arc::new(crucible::deploy::DeployProfile::load(&path).unwrap());
     let directory = std::sync::Arc::new(StaticDirectory {
         known: known
             .iter()

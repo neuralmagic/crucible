@@ -369,21 +369,12 @@ pub async fn teardown(
 /// in the middle of, does not leave its gateway running.
 pub(crate) struct GatewaySweep {
     db: crate::client::Db,
-    profile: Option<std::path::PathBuf>,
-    hub_namespace: String,
+    cfg: crate::config::ControllerCfg,
 }
 
 impl GatewaySweep {
-    pub(crate) fn new(
-        db: crate::client::Db,
-        profile: Option<std::path::PathBuf>,
-        hub_namespace: String,
-    ) -> Self {
-        Self {
-            db,
-            profile,
-            hub_namespace,
-        }
+    pub(crate) fn new(db: crate::client::Db, cfg: crate::config::ControllerCfg) -> Self {
+        Self { db, cfg }
     }
 }
 
@@ -393,31 +384,24 @@ impl crate::daemon::queue::DiscoverySource for GatewaySweep {
         _enqueue: std::sync::Arc<dyn crate::daemon::queue::Enqueue>,
     ) -> crate::daemon::queue::BoxFuture<Result<()>> {
         let db = self.db.clone();
-        let profile = self.profile.clone();
-        let hub_namespace = self.hub_namespace.clone();
+        let cfg = self.cfg.clone();
         Box::pin(async move {
-            sweep_orphan_gateways(
-                &db,
-                active_dispatcher().as_ref(),
-                profile.as_deref(),
-                &hub_namespace,
-            )
-            .await;
+            sweep_orphan_gateways(&db, active_dispatcher().as_ref(), &cfg).await;
             Ok(())
         })
     }
 }
 
 /// Delete the gateway objects in each cluster's sandbox namespace whose run pod's `work_pods` row is
-/// missing or no longer `running`. A no-op unless the profile at `profile_path` isolates gateways.
+/// missing or no longer `running`. A no-op unless the deploy profile isolates gateways.
 /// Best-effort: a cluster or run that fails is logged and the sweep moves on.
 pub(crate) async fn sweep_orphan_gateways(
     db: &crate::client::Db,
     dispatcher: &dyn PodDispatcher,
-    profile_path: Option<&std::path::Path>,
-    hub_namespace: &str,
+    cfg: &crate::config::ControllerCfg,
 ) {
-    let profile = match crate::agent_auth::placement::load_profile(profile_path).await {
+    let hub_namespace = cfg.pod_namespace.as_str();
+    let profile = match cfg.profile().await {
         Ok(Some(profile)) if render::isolated(&profile) => profile,
         Ok(_) => return,
         Err(e) => {

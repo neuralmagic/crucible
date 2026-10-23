@@ -400,24 +400,6 @@ impl BearerGuard {
         }
     }
 
-    /// Record that the API server vouched for `user` as the Kubernetes username of the login it
-    /// names. Best effort: the request is already authenticated either way.
-    async fn learn_kube_user(&self, user: &str) {
-        let Some(pool) = &self.users else {
-            return;
-        };
-        let kube_user = match crate::identity::kube_identity::KubeUser::parse(user) {
-            Ok(k) => k,
-            Err(reason) => {
-                tracing::debug!(%reason, "cluster-token user not recorded as a kubernetes identity");
-                return;
-            }
-        };
-        if let Err(e) = crate::identity::kube_identity::learn(pool, user, &kube_user).await {
-            tracing::warn!(error = %format!("{e:#}"), "recording the cluster-token user's kubernetes username failed");
-        }
-    }
-
     /// Whether the cluster-token username names somebody who has signed in through the issuer. In
     /// proxy mode there are no logins to check against, so every cluster token stays linked and the
     /// path behaves exactly as it did before native mode existed.
@@ -619,9 +601,6 @@ pub(crate) async fn require_auth(
                 };
                 stamp_identity(req.headers_mut(), Some(value));
                 let path = guard.cluster_token_path(&user).await;
-                if path == AuthPath::ClusterToken {
-                    guard.learn_kube_user(&user).await;
-                }
                 admit(&mut req, path, Resolved::named(source, user));
                 return next.run(req).await;
             }
@@ -2196,49 +2175,6 @@ mod tests {
             let (status, body, _) = call(&app, probe()).await;
             assert_eq!(status, StatusCode::OK);
             assert_eq!(body, "wynn||ClusterToken");
-        }
-
-        /// A cluster token for a known login records the API server's username on that login's
-        /// row, where the agent token endpoint reads it as `kube_user`. Unknown logins record
-        /// nothing.
-        #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-        async fn a_cluster_token_teaches_its_logins_kubernetes_username(pool: PgPool) {
-            let guard = BearerGuard {
-                kube: Some(kube_auth().await),
-                users: Some(pool.clone()),
-                ..native_guard()
-            };
-            let app = app(&pool, guard).await;
-            let probe = || {
-                HttpRequest::get("/probe")
-                    .header(header::AUTHORIZATION, "Bearer sha256~mine")
-                    .body(Body::empty())
-                    .expect("request")
-            };
-            call(&app, probe()).await;
-            assert_eq!(
-                crate::identity::kube_identity::get(&pool, "wynn")
-                    .await
-                    .expect("get"),
-                None
-            );
-            crate::identity::oidc::users::record_login(
-                &pool,
-                "sub-wynn",
-                "wynn",
-                None,
-                jiff::Timestamp::now(),
-            )
-            .await
-            .expect("login");
-            call(&app, probe()).await;
-            assert_eq!(
-                crate::identity::kube_identity::effective(&pool, "wynn")
-                    .await
-                    .expect("effective")
-                    .map(|k| k.as_str().to_string()),
-                Some("wynn".to_string())
-            );
         }
 
         /// A deployment with no issuer configured cannot validate a JWT, so it must not fall
