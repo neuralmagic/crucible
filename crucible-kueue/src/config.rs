@@ -27,6 +27,10 @@ pub struct Config {
     pub queue_verb: QueueVerb,
     pub lifetimes: Lifetimes,
     pub hardware: Hardware,
+    /// Namespaces this server is installed in; empty discovers them from LocalQueues.
+    pub namespaces: Vec<String>,
+    /// The image pull secrets a pod template may name; none when empty.
+    pub pull_secrets: Vec<String>,
 }
 
 impl Default for Config {
@@ -39,6 +43,8 @@ impl Default for Config {
             queue_verb: QueueVerb::Use,
             lifetimes: Lifetimes::default(),
             hardware: Hardware::default(),
+            namespaces: Vec::new(),
+            pull_secrets: Vec::new(),
         }
     }
 }

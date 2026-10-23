@@ -10,9 +10,11 @@ use crate::kueue::{
     self, ClusterQueue, KubeError, KueueVersion, LocalQueue, ResourceFlavor, Workload,
 };
 use crate::manifest::{self, ManifestError, Normalized, WorkloadKind};
+use crate::namespaces::{self, Namespaces};
 use crate::report::{self, Detail, Situation, Until, WaitEnd};
 use crate::status::{self, Phase, Readiness, Rollup};
 use crate::task::{self, Outcome, TaskRef};
+use crucible_mcp_auth::principal::Principal;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
@@ -102,6 +104,13 @@ pub enum ToolError {
         code: u16,
         message: String,
     },
+    #[error("namespace {namespace} does not exist or this server is not installed there; {}", namespaces::describe(.usable))]
+    NotServed {
+        namespace: String,
+        usable: Vec<String>,
+    },
+    #[error("name a namespace: this token has no default one; {}", namespaces::describe(.usable))]
+    NamespaceRequired { usable: Vec<String> },
 }
 
 /// Why a batch workload may be gone: a finished one is deleted after its TTL.
@@ -129,9 +138,22 @@ impl ToolError {
             | Self::Replicas { .. }
             | Self::NoCaller => "refused",
             Self::Rejected { .. } => "rejected",
-            Self::NotFound { .. } => "not_found",
+            Self::NotFound { .. } | Self::NotServed { .. } => "not_found",
+            Self::NamespaceRequired { .. } => "refused",
             Self::Kube(e) if e.is_not_found() => "not_found",
             Self::Kube(_) => "error",
+        }
+    }
+
+    /// The server's own credential was refused: it is not installed in the namespace, so the
+    /// API server's message (which names its service account) must not reach the caller.
+    fn server_forbidden(&self) -> bool {
+        match self {
+            Self::Kube(e) => e.code() == Some(403),
+            Self::Rejected { code, message, .. } => {
+                *code == 403 && !message.contains("admission webhook")
+            }
+            _ => false,
         }
     }
 
@@ -514,6 +536,7 @@ pub struct KueueMcp {
     config: Arc<Config>,
     /// The served kinds the cluster has installed.
     kinds: Arc<Vec<WorkloadKind>>,
+    namespaces: Arc<Namespaces>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -571,13 +594,65 @@ impl KueueMcp {
         kueue: KueueVersion,
         config: Arc<Config>,
         kinds: Arc<Vec<WorkloadKind>>,
+        namespaces: Arc<Namespaces>,
     ) -> Self {
         Self {
             client,
             kueue,
             config,
             kinds,
+            namespaces,
             tool_router: Self::tool_router(),
+        }
+    }
+
+    /// Rewrites a failure that means the call named a namespace this server does not serve (its
+    /// own credential refused there, a missing namespace default, or a missing LocalQueue outside
+    /// the caller's namespaces) into one that lists the namespaces the caller can use.
+    async fn explain(
+        &self,
+        parts: &http::request::Parts,
+        requested: Option<&str>,
+        result: Result<Value, ToolError>,
+    ) -> Result<Value, ToolError> {
+        let Err(e) = result else {
+            return result;
+        };
+        let Some(principal) = parts.extensions.get::<Principal>() else {
+            return Err(e);
+        };
+        let usable = || self.namespaces.usable(principal);
+        match e {
+            ToolError::Refused(Refusal::NamespaceRequired) => Err(ToolError::NamespaceRequired {
+                usable: usable().await,
+            }),
+            e if e.server_forbidden() => {
+                let namespace = requested
+                    .or(principal.namespace.as_deref())
+                    .unwrap_or_default()
+                    .to_string();
+                tracing::warn!(error = %e, %namespace, "this server's credential was refused");
+                Err(ToolError::NotServed {
+                    namespace,
+                    usable: usable().await,
+                })
+            }
+            ToolError::NotFound {
+                kind: "LocalQueue",
+                name,
+                namespace,
+            } => {
+                let usable = usable().await;
+                match usable.contains(&namespace) {
+                    true => Err(ToolError::NotFound {
+                        kind: "LocalQueue",
+                        name,
+                        namespace,
+                    }),
+                    false => Err(ToolError::NotServed { namespace, usable }),
+                }
+            }
+            e => Err(e),
         }
     }
 
@@ -1315,17 +1390,47 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<NamespaceArgs>,
     ) -> CallToolResult {
-        reply(caller(&parts, args.namespace.as_deref()).map(|c| {
-            json!({
-                "run_id": c.run_id.as_str(),
-                "namespace": c.namespace.as_str(),
-                "launched_by": c.launched_by.as_str(),
-                "kube_user": c.kube_user,
-                "submittable_kinds": self.kinds.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
-                "ownership": self.config.ownership,
-                "allowlist_profile": self.config.profile.name,
-            })
-        }))
+        let requested = args.namespace.clone();
+        reply(
+            self.explain(&parts, requested.as_deref(), async {
+                let id = identity(&parts)?;
+                let namespace = match id.in_namespace(args.namespace.as_deref()) {
+                    Ok(c) => Some(c.namespace.to_string()),
+                    Err(Refusal::NamespaceRequired) => None,
+                    Err(e) => return Err(e.into()),
+                };
+                let usable = match parts.extensions.get::<Principal>() {
+                    Some(p) => self.namespaces.usable(p).await,
+                    None => Vec::new(),
+                };
+                let mut queues = serde_json::Map::new();
+                for ns in &usable {
+                    let names: Vec<String> = kueue::list::<LocalQueue>(
+                        &self.client,
+                        &self.kueue.local_queues(),
+                        Some(ns),
+                        &ListParams::default(),
+                    )
+                    .await
+                    .map(|qs| qs.into_iter().map(|q| q.metadata.name).collect())
+                    .unwrap_or_default();
+                    queues.insert(ns.clone(), json!(names));
+                }
+                Ok(json!({
+                    "run_id": id.run_id.as_str(),
+                    "namespace": namespace,
+                    "namespaces": usable,
+                    "queues": queues,
+                    "launched_by": id.launched_by.as_str(),
+                    "kube_user": id.kube_user,
+                    "submittable_kinds": self.kinds.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
+                    "ownership": self.config.ownership,
+                    "allowlist_profile": self.config.profile.name,
+                }))
+            }
+            .await)
+            .await,
+        )
     }
 
     #[tool(
@@ -1337,32 +1442,38 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<NamespaceArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
-                let c = caller(&parts, args.namespace.as_deref())?;
-                let all: Vec<LocalQueue> = kueue::list(
-                    &self.client,
-                    &self.kueue.local_queues(),
-                    Some(c.namespace.as_str()),
-                    &ListParams::default(),
-                )
-                .await?;
-                let rows: Vec<Value> = all
-                    .into_iter()
-                    .map(|q| {
-                        json!({
-                            "queue": q.metadata.name,
-                            "cluster_queue": q.spec.cluster_queue,
-                            "stop_policy": q.spec.stop_policy,
-                            "pending": q.status.pending_workloads,
-                            "reserving": q.status.reserving_workloads,
-                            "admitted": q.status.admitted_workloads,
-                            "active": kueue::is_true(&q.status.conditions, "Active"),
+            self.explain(
+                &parts,
+                requested.as_deref(),
+                async {
+                    let c = caller(&parts, args.namespace.as_deref())?;
+                    let all: Vec<LocalQueue> = kueue::list(
+                        &self.client,
+                        &self.kueue.local_queues(),
+                        Some(c.namespace.as_str()),
+                        &ListParams::default(),
+                    )
+                    .await?;
+                    let rows: Vec<Value> = all
+                        .into_iter()
+                        .map(|q| {
+                            json!({
+                                "queue": q.metadata.name,
+                                "cluster_queue": q.spec.cluster_queue,
+                                "stop_policy": q.spec.stop_policy,
+                                "pending": q.status.pending_workloads,
+                                "reserving": q.status.reserving_workloads,
+                                "admitted": q.status.admitted_workloads,
+                                "active": kueue::is_true(&q.status.conditions, "Active"),
+                            })
                         })
-                    })
-                    .collect();
-                Ok(json!({"namespace": c.namespace.as_str(), "queues": rows}))
-            }
+                        .collect();
+                    Ok(json!({"namespace": c.namespace.as_str(), "queues": rows}))
+                }
+                .await,
+            )
             .await,
         )
     }
@@ -1380,8 +1491,9 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<QueueArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
+            self.explain(&parts, requested.as_deref(), async {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 let lq = self.local_queue(&c, &args.queue).await?;
                 let cq = self.cluster_queue(&lq).await?;
@@ -1438,6 +1550,7 @@ impl KueueMcp {
                     "pending_in_local_queue": pending,
                 }))
             }
+            .await)
             .await,
         )
     }
@@ -1455,8 +1568,9 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<QueueArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
+            self.explain(&parts, requested.as_deref(), async {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 let lq = self.local_queue(&c, &args.queue).await?;
                 let cq = self.cluster_queue(&lq).await?;
@@ -1474,6 +1588,7 @@ impl KueueMcp {
                 }
                 Ok(json!({"queue": lq.metadata.name, "cluster_queue": cq.metadata.name, "flavors": flavors}))
             }
+            .await)
             .await,
         )
     }
@@ -1491,8 +1606,9 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<PlanArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
+            self.explain(&parts, requested.as_deref(), async {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 let actor = identity(&parts)?.actor.as_deref();
                 let (n, cq) = self.plan(&c, &args.queue, args.manifest).await?;
@@ -1523,6 +1639,7 @@ impl KueueMcp {
                     "manifest": n.object,
                 }))
             }
+            .await)
             .await,
         )
     }
@@ -1546,6 +1663,7 @@ impl KueueMcp {
             .client_capabilities()
             .is_some_and(|c| c.supports_tasks());
         let parts = ctx.extensions.get::<http::request::Parts>();
+        let requested = args.namespace.clone();
         let submitted: Result<(Value, Option<Task>), ToolError> = async {
                 let parts = parts.ok_or(ToolError::NoCaller)?;
                 let c = caller(parts, args.namespace.as_deref())?;
@@ -1591,7 +1709,10 @@ impl KueueMcp {
                 CallToolResponse::Task(CreateTaskResult::new(task))
             }
             Ok((body, _)) => reply(Ok(body)).into(),
-            Err(e) => reply(Err(e)).into(),
+            Err(e) => match parts {
+                Some(p) => reply(self.explain(p, requested.as_deref(), Err(e)).await).into(),
+                None => reply(Err(e)).into(),
+            },
         }
     }
 
@@ -1608,11 +1729,17 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<StatusArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
-                let c = caller(&parts, args.namespace.as_deref())?;
-                self.status(&c, args).await
-            }
+            self.explain(
+                &parts,
+                requested.as_deref(),
+                async {
+                    let c = caller(&parts, args.namespace.as_deref())?;
+                    self.status(&c, args).await
+                }
+                .await,
+            )
             .await,
         )
     }
@@ -1630,8 +1757,9 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<ListArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
+            self.explain(&parts, requested.as_deref(), async {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 let ns = c.namespace.as_str();
                 let labels = &self.config.labels;
@@ -1683,6 +1811,7 @@ impl KueueMcp {
                 }
                 Ok(json!({"namespace": ns, "workloads": rows}))
             }
+            .await)
             .await,
         )
     }
@@ -1700,106 +1829,114 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<LogArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
-                let c = caller(&parts, args.namespace.as_deref())?;
-                let ns = c.namespace.as_str();
-                let obj = self.get_object(&c, args.kind, &args.name).await?;
-                let mut pods = self.pods_of(ns, args.kind, &obj).await?;
-                if let Some(want) = &args.pod {
-                    pods.retain(|p| p.metadata.name.as_deref() == Some(want.as_str()));
-                    if pods.is_empty() {
-                        return Err(ToolError::NotFound {
-                            kind: "Pod",
-                            name: want.clone(),
-                            namespace: ns.to_string(),
-                        });
-                    }
-                }
-                let total = pods.len();
-                pods.sort_by(|a, b| {
-                    (report::log_priority(args.kind, a), report::pod_name(a))
-                        .cmp(&(report::log_priority(args.kind, b), report::pod_name(b)))
-                });
-                pods.truncate(MAX_LOG_PODS);
-                let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
-                let grep = args.grep.as_deref().filter(|g| !g.is_empty());
-                let default_tail = if grep.is_some() {
-                    MAX_TAIL
-                } else {
-                    DEFAULT_TAIL
-                };
-                let budget = args
-                    .max_bytes
-                    .unwrap_or(DEFAULT_LOG_BUDGET)
-                    .clamp(MIN_LOG_BUDGET, MAX_LOG_BYTES as usize);
-                let mut fetched = Vec::new();
-                for p in &pods {
-                    let name = report::pod_name(p).to_string();
-                    let container = args
-                        .container
-                        .clone()
-                        .or_else(|| report::default_container(p));
-                    let lp = LogParams {
-                        container: container.clone(),
-                        tail_lines: Some(
-                            args.tail_lines.unwrap_or(default_tail).clamp(1, MAX_TAIL),
-                        ),
-                        since_seconds: args.since_seconds.filter(|s| *s > 0),
-                        limit_bytes: Some(MAX_LOG_BYTES),
-                        previous: args.previous,
-                        ..LogParams::default()
-                    };
-                    let text = match api.logs(&name, &lp).await {
-                        Ok(t) => Ok(match grep {
-                            Some(g) => report::grep(&t, g),
-                            None => t,
-                        }),
-                        Err(kube::Error::Api(s)) => Err(s.message),
-                        Err(source) => {
-                            return Err(KubeError::api("read logs of", name, source).into());
+            self.explain(
+                &parts,
+                requested.as_deref(),
+                async {
+                    let c = caller(&parts, args.namespace.as_deref())?;
+                    let ns = c.namespace.as_str();
+                    let obj = self.get_object(&c, args.kind, &args.name).await?;
+                    let mut pods = self.pods_of(ns, args.kind, &obj).await?;
+                    if let Some(want) = &args.pod {
+                        pods.retain(|p| p.metadata.name.as_deref() == Some(want.as_str()));
+                        if pods.is_empty() {
+                            return Err(ToolError::NotFound {
+                                kind: "Pod",
+                                name: want.clone(),
+                                namespace: ns.to_string(),
+                            });
                         }
-                    };
-                    fetched.push((p, container, text));
-                }
-                let sizes: Vec<usize> = fetched
-                    .iter()
-                    .map(|(_, _, t)| t.as_ref().map_or(0, String::len))
-                    .collect();
-                let grants = report::budget(&sizes, budget);
-                let mut omitted_total = 0;
-                let mut logs = Vec::new();
-                for ((p, container, text), grant) in fetched.iter().zip(grants) {
-                    let mut entry = json!({
-                        "pod": report::pod_name(p),
-                        "role": report::role(args.kind, p),
-                        "phase": report::pod_state(p),
-                    });
-                    if let Some(c) = container {
-                        entry["container"] = json!(c);
                     }
-                    match text {
-                        Ok(t) => {
-                            let (kept, omitted) = report::tail(t, grant);
-                            entry["log"] = json!(kept);
-                            if omitted > 0 {
-                                entry["bytes_omitted"] = json!(omitted);
-                                omitted_total += omitted;
+                    let total = pods.len();
+                    pods.sort_by(|a, b| {
+                        (report::log_priority(args.kind, a), report::pod_name(a))
+                            .cmp(&(report::log_priority(args.kind, b), report::pod_name(b)))
+                    });
+                    pods.truncate(MAX_LOG_PODS);
+                    let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
+                    let grep = args.grep.as_deref().filter(|g| !g.is_empty());
+                    let default_tail = if grep.is_some() {
+                        MAX_TAIL
+                    } else {
+                        DEFAULT_TAIL
+                    };
+                    let budget = args
+                        .max_bytes
+                        .unwrap_or(DEFAULT_LOG_BUDGET)
+                        .clamp(MIN_LOG_BUDGET, MAX_LOG_BYTES as usize);
+                    let mut fetched = Vec::new();
+                    for p in &pods {
+                        let name = report::pod_name(p).to_string();
+                        let container = args
+                            .container
+                            .clone()
+                            .or_else(|| report::default_container(p));
+                        let lp = LogParams {
+                            container: container.clone(),
+                            tail_lines: Some(
+                                args.tail_lines.unwrap_or(default_tail).clamp(1, MAX_TAIL),
+                            ),
+                            since_seconds: args.since_seconds.filter(|s| *s > 0),
+                            limit_bytes: Some(MAX_LOG_BYTES),
+                            previous: args.previous,
+                            ..LogParams::default()
+                        };
+                        let text = match api.logs(&name, &lp).await {
+                            Ok(t) => Ok(match grep {
+                                Some(g) => report::grep(&t, g),
+                                None => t,
+                            }),
+                            Err(kube::Error::Api(s)) => Err(s.message),
+                            Err(source) => {
+                                return Err(KubeError::api("read logs of", name, source).into());
+                            }
+                        };
+                        fetched.push((p, container, text));
+                    }
+                    let sizes: Vec<usize> = fetched
+                        .iter()
+                        .map(|(_, _, t)| t.as_ref().map_or(0, String::len))
+                        .collect();
+                    let grants = report::budget(&sizes, budget);
+                    let mut omitted_total = 0;
+                    let mut logs = Vec::new();
+                    for ((p, container, text), grant) in fetched.iter().zip(grants) {
+                        let mut entry = json!({
+                            "pod": report::pod_name(p),
+                            "role": report::role(args.kind, p),
+                            "phase": report::pod_state(p),
+                        });
+                        if let Some(c) = container {
+                            entry["container"] = json!(c);
+                        }
+                        match text {
+                            Ok(t) => {
+                                let (kept, omitted) = report::tail(t, grant);
+                                entry["log"] = json!(kept);
+                                if omitted > 0 {
+                                    entry["bytes_omitted"] = json!(omitted);
+                                    omitted_total += omitted;
+                                }
+                            }
+                            Err(message) => {
+                                entry["error"] = json!(format!("unavailable: {message}"))
                             }
                         }
-                        Err(message) => entry["error"] = json!(format!("unavailable: {message}")),
+                        logs.push(entry);
                     }
-                    logs.push(entry);
+                    Ok(json!({
+                        "pods_total": total,
+                        "pods_shown": logs.len(),
+                        "budget_bytes": budget,
+                        "truncated": omitted_total > 0,
+                        "bytes_omitted": omitted_total,
+                        "logs": logs,
+                    }))
                 }
-                Ok(json!({
-                    "pods_total": total,
-                    "pods_shown": logs.len(),
-                    "budget_bytes": budget,
-                    "truncated": omitted_total > 0,
-                    "bytes_omitted": omitted_total,
-                    "logs": logs,
-                }))
-            }
+                .await,
+            )
             .await,
         )
     }
@@ -1818,8 +1955,9 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(args): Parameters<ScaleArgs>,
     ) -> CallToolResult {
+        let requested = args.namespace.clone();
         reply(
-            async {
+            self.explain(&parts, requested.as_deref(), async {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 if !args.kind.is_scalable() {
                     return Err(ToolError::NotScalable {
@@ -1843,6 +1981,7 @@ impl KueueMcp {
                     .await?;
                 Ok(json!({"kind": r.kind, "name": r.name, "replicas": args.replicas, "from": from}))
             }
+            .await)
             .await,
         )
     }
@@ -1862,11 +2001,17 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(r): Parameters<WorkloadRef>,
     ) -> CallToolResult {
+        let requested = r.namespace.clone();
         reply(
-            async {
-                let c = caller(&parts, r.namespace.as_deref())?;
-                self.set_active(&c, &r, false).await
-            }
+            self.explain(
+                &parts,
+                requested.as_deref(),
+                async {
+                    let c = caller(&parts, r.namespace.as_deref())?;
+                    self.set_active(&c, &r, false).await
+                }
+                .await,
+            )
             .await,
         )
     }
@@ -1886,11 +2031,17 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(r): Parameters<WorkloadRef>,
     ) -> CallToolResult {
+        let requested = r.namespace.clone();
         reply(
-            async {
-                let c = caller(&parts, r.namespace.as_deref())?;
-                self.set_active(&c, &r, true).await
-            }
+            self.explain(
+                &parts,
+                requested.as_deref(),
+                async {
+                    let c = caller(&parts, r.namespace.as_deref())?;
+                    self.set_active(&c, &r, true).await
+                }
+                .await,
+            )
             .await,
         )
     }
@@ -1910,8 +2061,9 @@ impl KueueMcp {
         Extension(parts): Extension<http::request::Parts>,
         Parameters(r): Parameters<WorkloadRef>,
     ) -> CallToolResult {
+        let requested = r.namespace.clone();
         reply(
-            async {
+            self.explain(&parts, requested.as_deref(), async {
                 let c = caller(&parts, r.namespace.as_deref())?;
                 self.owned_object(&c, r.kind, &r.name).await?;
                 self.dynamic(r.kind, c.namespace.as_str())
@@ -1921,6 +2073,7 @@ impl KueueMcp {
                 tracing::info!(kind = r.kind.kind(), name = %r.name, namespace = %c.namespace, "workload deleted");
                 Ok(json!({"kind": r.kind, "name": r.name, "deleted": true}))
             }
+            .await)
             .await,
         )
     }
@@ -1981,7 +2134,7 @@ pub fn instructions(cfg: &Config, kinds: &[WorkloadKind]) -> String {
     domains.extend(lists.reserved_domains.iter().map(String::as_str));
     format!(
         "Submit and watch Kueue workloads ({}) in a namespace: a run's token acts in its own, a person names one they may use. \
-Flow: queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> workload_status with until=admitted|running|ready|finished, which waits on the server up to 50s per call (or, for a batch workload, tasks/get when the client speaks the tasks extension) -> workload_logs. \
+Flow: whoami (the namespaces you can use and their queues) -> queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> workload_status with until=admitted|running|ready|finished, which waits on the server up to 50s per call (or, for a batch workload, tasks/get when the client speaks the tasks extension) -> workload_logs. \
 Every tool answers JSON text with a status: ok; refused (the request is not allowed or not valid: fix it, do not retry it as is); rejected (the API server or an admission webhook refused it); not_found; error (the server could not complete it); failed (a finished task whose workload failed). Anything but ok comes back with isError and a retryable flag: retry a retryable call a few times with a pause, change a non-retryable one. \
 workload_status answers a summary by default with next_action, the pods with problems and their exit messages; detail=full adds every Workload's conditions and every pod. Logs come within a 16 KiB budget, failed pods first; narrow them with grep and since_seconds. \
 {lifetime} {control} \
@@ -2155,6 +2308,138 @@ mod tests {
                     .boxed(),
             ),
         ))
+    }
+
+    fn server_in(served: &[&str]) -> KueueMcp {
+        crate::install_tls_provider();
+        let client =
+            kube::Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap()))
+                .unwrap();
+        let namespaces = Namespaces::new(
+            client.clone(),
+            KueueVersion::default(),
+            served.iter().map(|n| n.to_string()).collect(),
+            None,
+        );
+        KueueMcp::new(
+            client,
+            KueueVersion::default(),
+            Arc::new(Config::default()),
+            Arc::new(WorkloadKind::ALL.to_vec()),
+            Arc::new(namespaces),
+        )
+    }
+
+    fn parts_of(claims: Value) -> http::request::Parts {
+        let (mut parts, _) = http::Request::new(()).into_parts();
+        let Value::Object(m) = claims else {
+            unreachable!()
+        };
+        parts.extensions.insert(
+            Principal::from_claims(m, crucible_mcp_auth::principal::Callers::People).unwrap(),
+        );
+        parts
+    }
+
+    const SA_403: &str = "localqueues.kueue.x-k8s.io is forbidden: User \"system:serviceaccount:crucible-system:crucible-kueue-people\" cannot list resource \"localqueues\" in API group \"kueue.x-k8s.io\" in the namespace \"crucible-e2e\"";
+
+    #[tokio::test]
+    async fn the_servers_own_refusal_names_the_usable_namespaces_and_never_its_account() {
+        let server = server_in(&["crucible-kueue-e2e"]);
+        let parts = parts_of(json!({"sub": "w", "kube_user": "wseaton"}));
+        let forbidden = ToolError::Kube(KubeError::api(
+            "list",
+            "LocalQueue list",
+            kube::Error::Api(
+                kube::core::Status::failure(SA_403, "Forbidden")
+                    .with_code(403)
+                    .boxed(),
+            ),
+        ));
+        let (is_error, out) = body(&reply(
+            server
+                .explain(&parts, Some("crucible-e2e"), Err(forbidden))
+                .await,
+        ));
+        assert!(is_error);
+        assert_eq!(out["status"], "not_found", "{out}");
+        assert_eq!(
+            out["error"],
+            "namespace crucible-e2e does not exist or this server is not installed there; namespaces you can use: crucible-kueue-e2e"
+        );
+        assert!(!out.to_string().contains("system:serviceaccount"), "{out}");
+
+        let create = rejected(403, SA_403);
+        let (_, out) = body(&reply(
+            server
+                .explain(&parts, Some("crucible-e2e"), Err(create))
+                .await,
+        ));
+        assert_eq!(out["status"], "not_found", "{out}");
+        assert!(!out.to_string().contains("system:serviceaccount"), "{out}");
+
+        let webhook = rejected(
+            403,
+            "admission webhook \"vstatefulset.kb.io\" denied the request",
+        );
+        let (_, out) = body(&reply(
+            server
+                .explain(&parts, Some("crucible-kueue-e2e"), Err(webhook))
+                .await,
+        ));
+        assert_eq!(
+            out["status"], "rejected",
+            "a webhook's refusal is the caller's to read: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_queue_outside_the_callers_namespaces_points_at_them() {
+        let server = server_in(&["ml-a", "ml-b"]);
+        let parts = parts_of(json!({"sub": "w", "kube_user": "wseaton"}));
+        let missing = |namespace: &str| ToolError::NotFound {
+            kind: "LocalQueue",
+            name: "gpu".into(),
+            namespace: namespace.into(),
+        };
+        let (_, outside) = body(&reply(
+            server
+                .explain(&parts, Some("ml-c"), Err(missing("ml-c")))
+                .await,
+        ));
+        assert_eq!(
+            outside["error"],
+            "namespace ml-c does not exist or this server is not installed there; namespaces you can use: ml-a, ml-b"
+        );
+        let (_, inside) = body(&reply(
+            server
+                .explain(&parts, Some("ml-a"), Err(missing("ml-a")))
+                .await,
+        ));
+        assert_eq!(
+            inside["error"],
+            "LocalQueue gpu not found in namespace ml-a"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_without_a_namespace_is_told_which_it_can_name() {
+        let server = server_in(&["ml-a", "ml-b"]);
+        let parts = parts_of(json!({"sub": "w", "kube_user": "wseaton"}));
+        let (_, out) = body(&reply(
+            server
+                .explain(
+                    &parts,
+                    None,
+                    Err(ToolError::Refused(Refusal::NamespaceRequired)),
+                )
+                .await,
+        ));
+        assert_eq!(out["status"], "refused");
+        assert_eq!(
+            out["error"],
+            "name a namespace: this token has no default one; namespaces you can use: ml-a, ml-b"
+        );
     }
 
     #[test]

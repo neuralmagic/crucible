@@ -53,9 +53,14 @@ struct Env {
 impl Env {
     fn config(&self) -> crucible_kueue::config::Config {
         use crucible_kueue::config::{ClaimMap, Config, Labels, Ownership};
+        let served = vec![self.namespace.clone()];
         match self.mode {
-            Mode::Crucible => Config::default(),
+            Mode::Crucible => Config {
+                namespaces: served,
+                ..Config::default()
+            },
             Mode::Tenant => Config {
+                namespaces: served,
                 labels: Labels::new(TENANT_DOMAIN),
                 ownership: Ownership::Rbac,
                 profile: crucible_kueue::profile::Profile::tenant(),
@@ -163,6 +168,11 @@ async fn serve(env: &Env) -> String {
 }
 
 fn run_token(env: &Env, run: &str, scope: &str) -> String {
+    testing::sign("a", &token_claims(env, run, scope))
+}
+
+/// The claims of a token for `run` in the server's mode.
+fn token_claims(env: &Env, run: &str, scope: &str) -> Value {
     let mut claims = testing::run_claims();
     claims["namespace"] = json!(env.namespace);
     claims["scope"] = json!(scope);
@@ -184,7 +194,7 @@ fn run_token(env: &Env, run: &str, scope: &str) -> String {
             map.insert("groups".into(), json!(env.kube_groups));
         }
     }
-    testing::sign("a", &claims)
+    claims
 }
 
 /// A run's token that may submit, acting as the e2e user.
@@ -1347,4 +1357,55 @@ async fn the_profile_decides_tolerations_and_secrets_and_the_domain_labels_what_
     )
     .await;
     assert_eq!(deleted["status"], "ok", "{deleted:#}");
+}
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_token_without_a_namespace_finds_and_defaults_to_the_one_it_can_use() {
+    let env = env();
+    let run = unique("e2e-ns");
+    let url = serve(&env).await;
+    let mut claims = token_claims(&env, &run, "kueue.read kueue.submit");
+    claims.as_object_mut().unwrap().remove("namespace");
+    let agent = connect(&url, &testing::sign("a", &claims)).await.unwrap();
+
+    let me = call(&agent, "whoami", json!({})).await;
+    assert_eq!(me["namespaces"], json!([env.namespace]), "{me:#}");
+    assert_eq!(
+        me["namespace"],
+        env.namespace.as_str(),
+        "the only usable namespace is the default: {me:#}"
+    );
+    assert!(
+        me["queues"][&env.namespace]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|q| q == env.queue.as_str()),
+        "{me:#}"
+    );
+    let queues = call(&agent, "queues_list", json!({})).await;
+    assert_eq!(queues["namespace"], env.namespace.as_str(), "{queues:#}");
+}
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn naming_a_namespace_the_server_does_not_serve_lists_the_ones_it_does() {
+    let env = env();
+    let run = unique("e2e-wrong-ns");
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
+    let wrong = call(
+        &agent,
+        "queue_describe",
+        json!({"namespace": env.queue, "queue": env.queue}),
+    )
+    .await;
+    assert_eq!(wrong["status"], "not_found", "{wrong:#}");
+    let error = wrong["error"].as_str().unwrap();
+    assert!(
+        error.ends_with(&format!("namespaces you can use: {}", env.namespace)),
+        "{wrong:#}"
+    );
+    assert!(!error.contains("system:serviceaccount"), "{wrong:#}");
 }

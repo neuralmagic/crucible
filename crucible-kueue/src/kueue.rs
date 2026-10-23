@@ -115,6 +115,17 @@ impl KubeError {
         matches!(self, Self::Api { source, .. } if matches!(source.as_ref(), kube::Error::Api(s) if s.code == 404))
     }
 
+    /// The API server's HTTP status, when it answered with one.
+    pub fn code(&self) -> Option<u16> {
+        match self {
+            Self::Api { source, .. } => match source.as_ref() {
+                kube::Error::Api(s) => Some(s.code),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Whether the same request may succeed later: the API server answered 5xx or 429, or never
     /// answered at all.
     pub fn retryable(&self) -> bool {

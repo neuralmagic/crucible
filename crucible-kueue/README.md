@@ -110,6 +110,11 @@ crucible-kueue \
   permits; `workload_list` with `filter: "all"` lists them. `managed` (the default) limits
   control to what this server created for the caller.
 - The server's service account needs what [Deploy](#deploy) lists, in each namespace it serves.
+  A caller can use the served namespaces (`--namespace`, else every namespace holding a
+  LocalQueue) where its RBAC lets it list LocalQueues; `whoami` lists them with their queues. A
+  token that names no namespace defaults to the only one, when there is exactly one. A call in a
+  namespace the server is not installed in answers `not_found` with that list, never the API
+  server's message about the server's own account.
 
 ### Configuration
 
@@ -127,6 +132,8 @@ crucible-kueue \
 | `--default-active-deadline` (`DEFAULT_ACTIVE_DEADLINE`) | `86400` | Seconds, or `none` |
 | `--default-ttl-after-finished` (`DEFAULT_TTL_AFTER_FINISHED`) | `3600` | Seconds, or `none` |
 | `--suspend` (`SUSPEND`) | `true` | Create Jobs, JobSets and PyTorchJobs suspended for Kueue |
+| `--namespace` (`NAMESPACES`) | discovered | Namespaces the server is installed in; empty lists LocalQueues cluster-wide to find them |
+| `--pull-secret` (`PULL_SECRETS`) | none | Image pull secrets pod templates may name; with none, `imagePullSecrets` is refused |
 | `--accelerator-resource` (`ACCELERATOR_RESOURCES`) | `nvidia.com/gpu`, `nvidia.com/mig-*`, `amd.com/gpu`, `habana.ai/gaudi`, `google.com/tpu` | Resources `hardware_describe` counts; `*` matches a prefix |
 | `--accelerator-product-label` (`ACCELERATOR_PRODUCT_LABELS`) | `nvidia.com/gpu.product`, `amd.com/gpu.product-name`, `habana.ai/gaudi.product`, `cloud.google.com/gke-tpu-accelerator` | Node labels naming the product |
 

@@ -10,6 +10,7 @@
 
 use crate::caller::{Identity, NameError, Namespace};
 use crate::config::{self, ClaimMap, NAMESPACE_CLAIM, RUN_ID_CLAIM};
+use crate::namespaces::Namespaces;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -26,6 +27,22 @@ pub struct Auth {
     /// access reviewer, without which no person's call could be checked.
     pub people: bool,
     pub claims: ClaimMap,
+    /// Supplies the default namespace of a token that names none.
+    pub namespaces: Arc<Namespaces>,
+}
+
+/// A token that names no namespace gets the one namespace its caller can use, when there is
+/// exactly one, before the guard checks it and the tools read it.
+async fn default_namespace(principal: &mut Principal, namespaces: &Namespaces) {
+    if principal.namespace.is_some() {
+        return;
+    }
+    if let [only] = namespaces.usable(principal).await.as_slice() {
+        principal
+            .claims
+            .insert(NAMESPACE_CLAIM.to_string(), Value::String(only.clone()));
+        principal.namespace = Some(only.clone());
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,6 +124,7 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
         }
     };
     auth.claims.canonicalize(&mut principal);
+    default_namespace(&mut principal, &auth.namespaces).await;
     let identity = match Identity::from_principal(&principal, auth.people) {
         Ok(identity) => identity,
         Err(error) => {
@@ -324,6 +342,40 @@ mod tests {
         ));
     }
 
+    /// Namespaces configured as `names`; the client is never reached.
+    fn served(names: &[&str]) -> Namespaces {
+        crate::install_tls_provider();
+        let config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        Namespaces::new(
+            kube::Client::try_from(config).unwrap(),
+            crate::kueue::KueueVersion::default(),
+            names.iter().map(|n| n.to_string()).collect(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_token_without_a_namespace_defaults_to_the_only_one_its_caller_can_use() {
+        let mut p = person(json!({"sub": "p", "kube_user": "alice"}));
+        default_namespace(&mut p, &served(&["ml-a"])).await;
+        assert_eq!(p.namespace.as_deref(), Some("ml-a"));
+        assert_eq!(p.claims["namespace"], "ml-a");
+        let id = Identity::from_principal(&p, true).unwrap();
+        assert_eq!(id.in_namespace(None).unwrap().namespace.as_str(), "ml-a");
+
+        let mut two = person(json!({"sub": "p", "kube_user": "alice"}));
+        default_namespace(&mut two, &served(&["ml-a", "ml-b"])).await;
+        assert_eq!(two.namespace, None, "two choices: the caller names one");
+
+        let mut named = person(json!({"sub": "p", "kube_user": "alice", "namespace": "ml-b"}));
+        default_namespace(&mut named, &served(&["ml-a"])).await;
+        assert_eq!(
+            named.namespace.as_deref(),
+            Some("ml-b"),
+            "a token's own namespace wins"
+        );
+    }
+
     async fn app() -> (crucible_mcp_auth::testing::JwksServer, axum::Router) {
         let jwks =
             crucible_mcp_auth::testing::JwksServer::start(vec![crucible_mcp_auth::testing::jwk(
@@ -339,6 +391,7 @@ mod tests {
             oidc: Arc::new(oidc),
             people: false,
             claims: ClaimMap::default(),
+            namespaces: Arc::new(served(&[])),
         };
         let app = axum::Router::new()
             .route(

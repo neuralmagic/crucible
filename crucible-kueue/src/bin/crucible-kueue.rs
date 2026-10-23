@@ -137,6 +137,21 @@ struct Cli {
         value_delimiter = ','
     )]
     accelerator_resources: Vec<String>,
+    /// Namespaces this server is installed in (its service account holds the workload role
+    /// there). Empty discovers them by listing LocalQueues cluster-wide. Repeatable.
+    #[arg(
+        long = "namespace",
+        env = "CRUCIBLE_KUEUE_NAMESPACES",
+        value_delimiter = ','
+    )]
+    namespaces: Vec<String>,
+    /// An image pull secret pod templates may name; with none, they may name none. Repeatable.
+    #[arg(
+        long = "pull-secret",
+        env = "CRUCIBLE_KUEUE_PULL_SECRETS",
+        value_delimiter = ','
+    )]
+    pull_secrets: Vec<String>,
     /// Node labels naming an accelerator product, first match wins. Repeatable.
     #[arg(
         long = "accelerator-product-label",
@@ -193,6 +208,8 @@ impl Cli {
                     defaults.product_labels,
                 ),
             },
+            namespaces: self.namespaces.clone(),
+            pull_secrets: self.pull_secrets.clone(),
         })
     }
 }
@@ -386,6 +403,8 @@ mod tests {
         assert_eq!(got.queue_verb, want.queue_verb);
         assert_eq!(got.lifetimes, want.lifetimes);
         assert_eq!(got.hardware, want.hardware);
+        assert_eq!(got.namespaces, want.namespaces);
+        assert_eq!(got.pull_secrets, want.pull_secrets);
     }
 
     #[test]
@@ -422,6 +441,10 @@ mod tests {
             "false",
             "--accelerator-resource",
             "nvidia.com/gpu,example.com/npu",
+            "--namespace",
+            "ml-a,ml-b",
+            "--pull-secret",
+            "quay-pull",
         ])
         .unwrap();
         let c = cli.config().unwrap();
@@ -442,6 +465,8 @@ mod tests {
             }
         );
         assert_eq!(c.hardware.resources, ["nvidia.com/gpu", "example.com/npu"]);
+        assert_eq!(c.namespaces, ["ml-a", "ml-b"]);
+        assert_eq!(c.pull_secrets, ["quay-pull"]);
         assert_eq!(
             c.hardware.product_labels,
             Hardware::default().product_labels

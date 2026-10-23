@@ -10,6 +10,7 @@ pub mod hardware;
 pub mod kinds;
 pub mod kueue;
 pub mod manifest;
+pub mod namespaces;
 pub mod profile;
 pub mod quantity;
 pub mod report;
@@ -69,10 +70,17 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
         config,
     } = options;
     let people = reviewer.is_some();
+    let namespaces = Arc::new(namespaces::Namespaces::new(
+        client.clone(),
+        kueue,
+        config.namespaces.clone(),
+        reviewer.clone(),
+    ));
     let auth = auth::Auth {
         oidc: oidc.clone(),
         people,
         claims: config.claims.clone(),
+        namespaces: namespaces.clone(),
     };
     let rules = access::KueueRules {
         queue_verb: config.queue_verb,
@@ -96,6 +104,7 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
                     kueue,
                     cfg.clone(),
                     kinds.clone(),
+                    namespaces.clone(),
                 ))
             },
             Arc::new(NeverSessionManager::default()),

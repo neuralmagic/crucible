@@ -150,6 +150,15 @@ pub enum ManifestError {
     Forbidden { path: String, what: &'static str },
     #[error("{path}: a field outside the allowlist for agent manifests; allowed here: {}", allowed.join(", "))]
     NotAllowed { path: String, allowed: Vec<String> },
+    #[error("{path}: image pull secret {name:?} is not one this server offers; {}", match allowed.is_empty() {
+        true => "it offers none".to_string(),
+        false => format!("it offers {}", allowed.join(", ")),
+    })]
+    PullSecret {
+        path: String,
+        name: String,
+        allowed: Vec<String>,
+    },
     #[error("{path}: expected {expected}")]
     Shape {
         path: String,
@@ -1096,6 +1105,25 @@ fn check_pod_spec(
         let sc_path = format!("{path}/securityContext");
         check_security_context(object_at(sc, &sc_path)?, POD_SECURITY_FIELDS, &sc_path)?;
     }
+    if let Some(secrets) = spec.get("imagePullSecrets") {
+        let s_path = format!("{path}/imagePullSecrets");
+        for (i, entry) in array_of(secrets, &s_path)?.iter().enumerate() {
+            let e_path = format!("{s_path}/{i}");
+            let entry = object_at(entry, &e_path)?;
+            only_fields(entry, &["name"], &e_path)?;
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !cfg.pull_secrets.iter().any(|s| s == name) {
+                return Err(ManifestError::PullSecret {
+                    path: format!("{e_path}/name"),
+                    name: name.to_string(),
+                    allowed: cfg.pull_secrets.clone(),
+                });
+            }
+        }
+    }
     if let Some(volumes) = spec.get("volumes") {
         for (i, vol) in array_of(volumes, &format!("{path}/volumes"))?
             .iter()
@@ -1572,6 +1600,38 @@ mod tests {
         );
         assert!(text.contains("nodeSelector"), "{text}");
         assert!(!text.contains("tolerations"), "{text}");
+    }
+
+    #[test]
+    fn a_pod_names_only_the_pull_secrets_the_server_offers() {
+        let pulling = |name: &str| with_pod(json!({"imagePullSecrets": [{"name": name}]}));
+        let none = normalize(
+            pulling("quay-pull"),
+            &caller(),
+            &queue(),
+            &Config::default(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(none.contains("imagePullSecrets/0/name"), "{none}");
+        assert!(none.contains("it offers none"), "{none}");
+        let cfg = Config {
+            pull_secrets: vec!["quay-pull".into(), "ghcr".into()],
+            ..Config::default()
+        };
+        normalize(pulling("quay-pull"), &caller(), &queue(), &cfg).unwrap();
+        let other = normalize(pulling("someone-elses"), &caller(), &queue(), &cfg)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            other.contains(
+                "\"someone-elses\" is not one this server offers; it offers quay-pull, ghcr"
+            ),
+            "{other}"
+        );
+        let extra = with_pod(json!({"imagePullSecrets": [{"name": "ghcr", "namespace": "x"}]}));
+        assert!(normalize(extra, &caller(), &queue(), &cfg).is_err());
+        normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
     }
 
     #[test]
