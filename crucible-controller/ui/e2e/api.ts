@@ -624,6 +624,8 @@ const POLICY_SETS = [
 ];
 
 export const ROUTES: Record<string, Json> = {
+  '/api/agent-tools': { revision: '', changelog: '', tools: [] },
+  '/api/prefs/notices': { prefs: {} },
   '/api/issues': ISSUES,
   '/api/issues/facets': {
     total: 4,

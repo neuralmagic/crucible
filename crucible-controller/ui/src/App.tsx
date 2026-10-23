@@ -17,6 +17,7 @@ import { relativeTime } from './pages/journeyView';
 import { DisplayPrefs } from './DisplayPrefs';
 import { IdentityBadge } from './IdentityBadge';
 import { OwnerSwitcher } from './OwnerSwitcher';
+import { AgentToolsBanner } from './AgentToolsBanner';
 import { AutopilotBanner } from './AutopilotBanner';
 import { ViewAsBanner } from './ViewAsBanner';
 import { CommandPalette } from './palette/CommandPalette';
@@ -496,6 +497,7 @@ export function App() {
       <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
+      <AgentToolsBanner />
 
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
