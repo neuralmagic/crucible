@@ -103,6 +103,11 @@ impl PodDispatcher for KubePodDispatcher {
         delete_selected_of::<Secret>(&client, namespace, selector).await
     }
 
+    async fn delete_services(&self, cluster: &str, namespace: &str, selector: &str) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        delete_selected_of::<Service>(&client, namespace, selector).await
+    }
+
     async fn delete_sandboxes(&self, cluster: &str, namespace: &str, selector: &str) -> Result<()> {
         let client = self.clusters.client(cluster).await?;
         for version in crate::agent_auth::directory::SANDBOX_VERSIONS {

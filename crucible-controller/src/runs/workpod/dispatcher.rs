@@ -80,6 +80,17 @@ pub trait PodDispatcher: Send + Sync {
     ) -> Result<()> {
         Ok(())
     }
+    /// Delete the Services in `namespace` that match the label `selector`, and nothing else: a run
+    /// gateway leaves only its loop Service in the loop namespace, where the controller may touch
+    /// Services alone. Nothing matching is success. The default no-ops.
+    async fn delete_services(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _selector: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Delete the OpenShell `Sandbox` resources in `namespace` that match the label `selector`.
     /// Nothing matching is success. The default no-ops.
     async fn delete_sandboxes(

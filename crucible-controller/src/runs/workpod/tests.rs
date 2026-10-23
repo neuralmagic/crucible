@@ -6004,6 +6004,10 @@ enum GatewayEvent {
         namespace: String,
         selector: String,
     },
+    DeleteServices {
+        namespace: String,
+        selector: String,
+    },
     DeleteSandboxes {
         namespace: String,
         selector: String,
@@ -6096,6 +6100,13 @@ impl PodDispatcher for GatewayDispatcher {
     }
     async fn delete_selected(&self, _cluster: &str, ns: &str, selector: &str) -> Result<()> {
         self.push(GatewayEvent::DeleteSelected {
+            namespace: ns.to_string(),
+            selector: selector.to_string(),
+        });
+        Ok(())
+    }
+    async fn delete_services(&self, _cluster: &str, ns: &str, selector: &str) -> Result<()> {
+        self.push(GatewayEvent::DeleteServices {
             namespace: ns.to_string(),
             selector: selector.to_string(),
         });
@@ -6216,6 +6227,7 @@ async fn an_isolated_dispatch_starts_the_runs_gateway_beside_its_sandboxes(
             GatewayEvent::ConfigMap { namespace } => ("configmap", namespace.as_str()),
             GatewayEvent::NetworkPolicy { namespace, .. } => ("networkpolicy", namespace.as_str()),
             GatewayEvent::DeleteSelected { namespace, .. }
+            | GatewayEvent::DeleteServices { namespace, .. }
             | GatewayEvent::DeleteSandboxes { namespace, .. } => ("delete", namespace.as_str()),
         })
         .collect();
@@ -6458,6 +6470,10 @@ async fn a_gateway_that_fails_to_start_is_torn_down_with_the_launch(
                 namespace,
                 selector,
             } => Some(("objects", namespace.as_str(), selector.as_str())),
+            GatewayEvent::DeleteServices {
+                namespace,
+                selector,
+            } => Some(("services", namespace.as_str(), selector.as_str())),
             _ => None,
         })
         .collect();
@@ -6466,7 +6482,7 @@ async fn a_gateway_that_fails_to_start_is_torn_down_with_the_launch(
         [
             ("sandboxes", "sandboxes", created.as_str()),
             ("objects", "sandboxes", created.as_str()),
-            ("objects", "autoresearch", own.as_str()),
+            ("services", "autoresearch", own.as_str()),
             ("objects", "sandboxes", own.as_str()),
         ],
         "what the gateway made goes first, its own objects last"
@@ -6563,6 +6579,10 @@ async fn collecting_an_isolated_run_deletes_its_gateway(pool: sqlx::PgPool) -> R
         .into_iter()
         .filter_map(|e| match e {
             GatewayEvent::DeleteSelected {
+                namespace,
+                selector,
+            }
+            | GatewayEvent::DeleteServices {
                 namespace,
                 selector,
             } => Some((namespace, selector)),
@@ -6754,6 +6774,7 @@ async fn an_isolated_turn_gets_its_own_gateway(pool: sqlx::PgPool) -> Result<()>
             GatewayEvent::ConfigMap { namespace } => ("configmap", namespace.as_str()),
             GatewayEvent::NetworkPolicy { namespace, .. } => ("networkpolicy", namespace.as_str()),
             GatewayEvent::DeleteSelected { namespace, .. }
+            | GatewayEvent::DeleteServices { namespace, .. }
             | GatewayEvent::DeleteSandboxes { namespace, .. } => ("delete", namespace.as_str()),
         })
         .collect();

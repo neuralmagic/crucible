@@ -355,7 +355,7 @@ pub async fn teardown(
         .await
         .with_context(context)?;
     dispatcher
-        .delete_selected(cluster, loop_namespace, &own)
+        .delete_services(cluster, loop_namespace, &own)
         .await
         .with_context(context)?;
     dispatcher
