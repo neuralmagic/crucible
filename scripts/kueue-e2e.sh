@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# End-to-end proof that a sandboxed agent reaches crucible-kueue with an agent token its own
-# supervisor obtained, and with nothing else.
+# End-to-end proof that a sandboxed agent builds an image with the run's buildit and runs it
+# through crucible-kueue, with agent tokens its own supervisor obtained and with nothing else.
 #
 # A controller from this checkout runs in the cluster (CTL_NS, with its own Postgres) and
 # dispatches a playbook launch of e2e/kueue/pack into LOOP_NS, with each run's OpenShell gateway
-# isolated in crucible-sandboxes. The engine registers a token-grant provider for the run; the
-# sandbox's supervisor fetches its JWT-SVID from SPIRE, exchanges it at the controller's token
-# endpoint, and injects the token on traffic to crucible-kueue, which acts as the token's
-# kube_user. The script then checks the cluster and the controller, not the agent's word alone:
-#   - the controller issued a token to a supervisor SPIFFE ID under this cluster's gateway prefix,
-#     for the launcher's kube_user and the run;
-#   - the Job exists in the workload namespace, carries that run, launcher and queue, and succeeded;
+# isolated in crucible-sandboxes. The engine starts buildit in the loop pod and registers a
+# token-grant provider for it and for crucible-kueue; the sandbox's supervisor fetches its JWT-SVID
+# from SPIRE, exchanges it at the controller's token endpoint, and injects each token on traffic
+# to its server alone. The agent writes a program printing a nonce, builds and pushes it to
+# PUSH_REPO, and runs it as a Job. The script then checks the cluster and the controller, not the
+# agent's word alone:
+#   - the controller issued buildit and crucible-kueue tokens to a supervisor SPIFFE ID under this
+#     cluster's gateway prefix, for the launcher's kube_user and the run;
+#   - the Job exists in the workload namespace, carries that run, launcher and queue, runs an
+#     image pushed to PUSH_REPO by digest, succeeded, and its log carries the nonce;
 #   - the agent's whoami reported the same run and kube_user;
 #   - no kueue token rode the loop pod's env, its Secrets, or any log.
 #
@@ -20,7 +23,8 @@
 #
 # Needs kubectl, jq, openssl, cargo, and on the cluster: Kueue, OpenShift's Zero Trust Workload
 # Identity Manager with a ClusterSPIFFEID for supervisors in crucible-sandboxes, the crucible-enmaas
-# Secret (the EnMaaS key, under api-key) and the PULL_SECRET Secret in crucible-system.
+# Secret (the EnMaaS key, under api-key) and the PULL_SECRET Secret in crucible-system, whose
+# account may also push to PUSH_REPO (default quay.io/wseaton/crucible-smoke).
 #
 #   CONTEXT=<kube context> LOOP_IMAGE=<runtime image> KUEUE_IMAGE=<crucible-kueue image> \
 #   CONTROLLER_IMAGE=<controller image> PULL_SECRET=<secret> scripts/kueue-e2e.sh
@@ -43,7 +47,9 @@ SANDBOX_NS=crucible-sandboxes
 WORKLOAD_NS=crucible-kueue-e2e
 SPIRE_NS=zero-trust-workload-identity-manager
 SPIRE_DISCOVERY=spire-spiffe-oidc-discovery-provider:443
-JOB=kueue-e2e-hello
+JOB=crucible-smoke
+PUSH_REPO=${PUSH_REPO:-quay.io/wseaton/crucible-smoke}
+NONCE=$(openssl rand -hex 12)
 TIMEOUT_SECS=${TIMEOUT_SECS:-1800}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -100,6 +106,7 @@ fill() {
         -e "s|@PULL_SECRET@|$PULL_SECRET|g" -e "s|@CTL_NS@|$CTL_NS|g" -e "s|@LOOP_NS@|$LOOP_NS|g" \
         -e "s|@SPIRE_NS@|$SPIRE_NS|g" -e "s|@ISSUER@|$ISSUER|g" -e "s|@KUEUE_URL@|$KUEUE_URL|g" \
         -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
+        -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@NONCE@|$NONCE|g" \
         -e "s|@AGENT_SPIRE@|hub=$SVID_ISSUER $GATEWAY_PREFIX $SPIRE_NS/$SPIRE_DISCOVERY|g" "$1"
 }
 fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
@@ -120,7 +127,7 @@ log "deploying the controller, the namespaces and their RBAC"
 fill "$ROOT/e2e/kueue/controller.yaml.in" | kc apply -f - >/dev/null
 kc create namespace "$SANDBOX_NS" --dry-run=client -o yaml | kc apply -f - >/dev/null
 kc apply -f "$ROOT/e2e/kueue/namespace.yaml" >/dev/null
-for ns in "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS"; do
+for ns in "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
     kc -n crucible-system get secret "$PULL_SECRET" -o json \
         | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.managedFields)' \
         | kc -n "$ns" apply -f - >/dev/null
@@ -202,9 +209,11 @@ kc -n "$CTL_NS" exec deploy/postgres -- psql -q -U crucible -d crucible -v ON_ER
      VALUES ('e2e:$LAUNCHER', '$LAUNCHER', '$NOW', '$NOW', '$NOW', '$LAUNCHER')
      ON CONFLICT (login) DO UPDATE SET kube_user = EXCLUDED.kube_user" >/dev/null
 
-log "launching e2e/kueue/pack"
-crux draft-create kueue-e2e --description "crucible-kueue e2e" >/dev/null
-crux draft-push kueue-e2e "$ROOT/e2e/kueue/pack" --base-version 1 >/dev/null
+log "launching e2e/kueue/pack with nonce $NONCE"
+cp -R "$ROOT/e2e/kueue/pack" "$WORK/pack"
+fill "$ROOT/e2e/kueue/pack/prompts/smoke.md" > "$WORK/pack/prompts/smoke.md"
+crux draft-create kueue-e2e --description "build-and-run e2e" >/dev/null
+crux draft-push kueue-e2e "$WORK/pack" --base-version 1 >/dev/null
 crux draft-launch kueue-e2e --max-cost 3 --max-time 30m >/dev/null
 
 log "waiting for Job $WORKLOAD_NS/$JOB to succeed"
@@ -230,6 +239,13 @@ RUN=$(jq -r '.metadata.labels["crucible.dev/run-id"]' <<<"$job")
 [ "$(jq -r '.metadata.labels["kueue.x-k8s.io/queue-name"]' <<<"$job")" = crucible-e2e ] \
     || fail "Job $JOB was not queued through crucible-e2e"
 log "Job $JOB succeeded for run $RUN, launched by $LAUNCHER, admitted through crucible-e2e"
+IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"$job")
+[[ $IMAGE == "$PUSH_REPO@sha256:"* ]] || fail "Job $JOB runs $IMAGE, not an image pushed to $PUSH_REPO by digest"
+[ "$(jq -c '[.spec.template.spec.imagePullSecrets[]?.name]' <<<"$job")" = "[\"$PULL_SECRET\"]" ] \
+    || fail "Job $JOB pulls with $(jq -c .spec.template.spec.imagePullSecrets <<<"$job")"
+kc -n "$WORKLOAD_NS" logs "job/$JOB" | grep -qx "crucible-smoke-ok $NONCE" \
+    || fail "Job $JOB's log does not carry the nonce: $(kc -n "$WORKLOAD_NS" logs "job/$JOB" | tail -5)"
+log "Job $JOB ran $IMAGE and printed the nonce"
 
 log "checking the loop pod carries no kueue token"
 POD=$(kc -n "$LOOP_NS" get pods -o json | jq -r '[.items[] | select(.metadata.labels["crucible/run"])][0].metadata.name')
@@ -250,13 +266,16 @@ CRUN=$(crux runs --json | jq -r '.[0].run_id')
 crux run-log "$CRUN" > "$WORK/run-log.json"
 kc -n "$CTL_NS" logs deploy/crucible-controller | sed 's/\x1b\[[0-9;]*m//g' > "$WORK/controller.log"
 
-log "checking the controller issued the run's token to its supervisor"
-issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" | head -1)
-[ -n "$issued" ] || fail "the controller issued no agent token for run $RUN"
-grep -qE "kube_user=\"?$LAUNCHER\"?( |$)" <<<"$issued" || fail "the token was not for kube_user $LAUNCHER: $issued"
-grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}$RUN/sandbox/" <<<"$issued" \
-    || fail "the token went to no supervisor under $GATEWAY_PREFIX: $issued"
-log "issued: $issued"
+log "checking the controller issued the run's tokens to its supervisor"
+for aud in "$KUEUE_URL" "http://host.openshell.internal:8851/mcp"; do
+    issued=$(grep 'agent token issued' "$WORK/controller.log" | grep "gateway/$RUN/sandbox/" \
+        | grep -F "aud=\"$aud\"" | head -1)
+    [ -n "$issued" ] || fail "the controller issued no token for $aud to run $RUN"
+    grep -qE "kube_user=\"?$LAUNCHER\"?( |$)" <<<"$issued" || fail "the token was not for kube_user $LAUNCHER: $issued"
+    grep -qE "spiffe_id=\"?${GATEWAY_PREFIX}$RUN/sandbox/" <<<"$issued" \
+        || fail "the token went to no supervisor under $GATEWAY_PREFIX: $issued"
+    log "issued: $issued"
+done
 
 log "checking the agent's whoami"
 whoami=$(python3 - "$WORK/run-log.json" <<'EOF'

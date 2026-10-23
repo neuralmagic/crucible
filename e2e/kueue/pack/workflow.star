@@ -1,5 +1,5 @@
-submit = agent(
-    name = "submit",
-    prompt = prompt_file("prompts/submit.md"),
+smoke = agent(
+    name = "smoke",
+    prompt = prompt_file("prompts/smoke.md"),
 )
-workflow(type = "playbook", tasks = [submit], result = submit)
+workflow(type = "playbook", tasks = [smoke], result = smoke)
