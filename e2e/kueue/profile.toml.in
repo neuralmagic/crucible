@@ -41,7 +41,7 @@ namespace          = "crucible-system"
 workload_namespace = "crucible-kueue-e2e"
 run_issuer         = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
 kube_authz         = "openshift"
-pull_secrets       = ["@PULL_SECRET@"]
+pull_secrets       = ["@PULL_SECRET@=@PUSH_REPO@"]
 
 [buildit]
 cluster    = "hub"

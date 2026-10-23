@@ -151,8 +151,8 @@ pub enum ManifestError {
     #[error("{path}: a field outside the allowlist for agent manifests; allowed here: {}", allowed.join(", "))]
     NotAllowed { path: String, allowed: Vec<String> },
     #[error("{path}: image pull secret {name:?} is not one this server offers; {}", match allowed.is_empty() {
-        true => "it offers none".to_string(),
-        false => format!("it offers {}", allowed.join(", ")),
+        true => "it offers none, so only public images can be pulled".to_string(),
+        false => format!("it offers {}. The server adds the secret an image's registry needs to the pod itself; an image on any other registry must be public, so dropping the field does not let a private image pull", allowed.join(", ")),
     })]
     PullSecret {
         path: String,
@@ -194,6 +194,8 @@ pub struct Normalized {
     pub object: Value,
     pub pod_sets: Vec<PodSet>,
     pub plan_hash: String,
+    /// What the server added to the manifest beyond its own labels and defaults, for the plan.
+    pub server_changes: Vec<String>,
 }
 
 impl Normalized {
@@ -376,6 +378,7 @@ pub fn normalize(
     let mut root = Value::Object(obj);
     check_object_fields(kind, &root, cfg)?;
     let mut pod_sets = Vec::new();
+    let mut server_changes = Vec::new();
     for slot in template_slots(kind, &root)? {
         let template = root
             .pointer_mut(&slot.pointer)
@@ -402,6 +405,7 @@ pub fn normalize(
         let spec = object_entry(template, "spec", &spec_path)?;
         check_pod_spec(spec, &spec_path, cfg)?;
         spec.insert("automountServiceAccountToken".into(), Value::Bool(false));
+        server_changes.extend(add_pull_secrets(spec, &spec_path, cfg)?);
         pod_sets.push(PodSet {
             name: slot.name,
             count: slot.count,
@@ -420,7 +424,58 @@ pub fn normalize(
         object,
         pod_sets,
         plan_hash,
+        server_changes,
     })
+}
+
+/// Adds each configured pull secret whose registry serves one of the pod's images and that the
+/// pod does not already name, returning a line per addition.
+fn add_pull_secrets(
+    spec: &mut Map<String, Value>,
+    path: &str,
+    cfg: &Config,
+) -> Result<Vec<String>, ManifestError> {
+    let images: Vec<String> = ["initContainers", "containers"]
+        .iter()
+        .flat_map(|list| {
+            spec.get(*list)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|c| c.get("image").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut changes = Vec::new();
+    for secret in &cfg.pull_secrets {
+        let Some(image) = images.iter().find(|i| secret.serves(i)) else {
+            continue;
+        };
+        let named = spec
+            .get("imagePullSecrets")
+            .and_then(Value::as_array)
+            .is_some_and(|l| {
+                l.iter()
+                    .any(|e| e.get("name").and_then(Value::as_str) == Some(&secret.name))
+            });
+        if named {
+            continue;
+        }
+        let list = spec
+            .entry("imagePullSecrets")
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let Value::Array(list) = list else {
+            return Err(ManifestError::Shape {
+                path: format!("{path}/imagePullSecrets"),
+                expected: "an array",
+            });
+        };
+        list.push(serde_json::json!({"name": secret.name}));
+        changes.push(format!(
+            "{path}/imagePullSecrets: added {} to pull {image}",
+            secret.name
+        ));
+    }
+    Ok(changes)
 }
 
 /// The pod sets of an object already in the cluster, for re-estimating its fit while it waits.
@@ -1115,11 +1170,11 @@ fn check_pod_spec(
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if !cfg.pull_secrets.iter().any(|s| s == name) {
+            if !cfg.pull_secrets.iter().any(|s| s.name == name) {
                 return Err(ManifestError::PullSecret {
                     path: format!("{e_path}/name"),
                     name: name.to_string(),
-                    allowed: cfg.pull_secrets.clone(),
+                    allowed: cfg.pull_secrets.iter().map(ToString::to_string).collect(),
                 });
             }
         }
@@ -1432,6 +1487,7 @@ fn object_entry<'a>(
 #[cfg(test)]
 mod tests {
     use crate::caller::{Launcher, Namespace, QueueName, RunId};
+    use crate::config::PullSecret;
     use crate::manifest::*;
     use serde_json::json;
 
@@ -1616,7 +1672,10 @@ mod tests {
         assert!(none.contains("imagePullSecrets/0/name"), "{none}");
         assert!(none.contains("it offers none"), "{none}");
         let cfg = Config {
-            pull_secrets: vec!["quay-pull".into(), "ghcr".into()],
+            pull_secrets: vec![
+                PullSecret::parse("quay-pull=quay.io/wseaton").unwrap(),
+                PullSecret::parse("ghcr").unwrap(),
+            ],
             ..Config::default()
         };
         normalize(pulling("quay-pull"), &caller(), &queue(), &cfg).unwrap();
@@ -1625,13 +1684,130 @@ mod tests {
             .to_string();
         assert!(
             other.contains(
-                "\"someone-elses\" is not one this server offers; it offers quay-pull, ghcr"
+                "\"someone-elses\" is not one this server offers; it offers quay-pull (quay.io/wseaton), ghcr. The server adds the secret an image's registry needs to the pod itself"
             ),
+            "{other}"
+        );
+        assert!(
+            other.contains("dropping the field does not let a private image pull"),
             "{other}"
         );
         let extra = with_pod(json!({"imagePullSecrets": [{"name": "ghcr", "namespace": "x"}]}));
         assert!(normalize(extra, &caller(), &queue(), &cfg).is_err());
         normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
+    }
+
+    fn quay() -> Config {
+        Config {
+            pull_secrets: vec![PullSecret::parse("quay-pull=quay.io/wseaton").unwrap()],
+            ..Config::default()
+        }
+    }
+
+    fn imaged(image: &str) -> Value {
+        let mut m = job();
+        m["spec"]["template"]["spec"]["containers"][0]["image"] = json!(image);
+        m
+    }
+
+    #[test]
+    fn the_server_adds_the_pull_secret_an_images_registry_needs_and_reports_it() {
+        let n = normalize(
+            imaged("quay.io/wseaton/crucible-smoke@sha256:ab"),
+            &caller(),
+            &queue(),
+            &quay(),
+        )
+        .unwrap();
+        assert_eq!(
+            n.object.pointer("/spec/template/spec/imagePullSecrets"),
+            Some(&json!([{"name": "quay-pull"}]))
+        );
+        assert_eq!(
+            n.server_changes,
+            [
+                "/spec/template/spec/imagePullSecrets: added quay-pull to pull quay.io/wseaton/crucible-smoke@sha256:ab"
+            ]
+        );
+        let again = normalize(
+            imaged("quay.io/wseaton/crucible-smoke@sha256:ab"),
+            &caller(),
+            &queue(),
+            &quay(),
+        )
+        .unwrap();
+        assert_eq!(
+            n.plan_hash, again.plan_hash,
+            "the addition is part of a stable plan"
+        );
+    }
+
+    #[test]
+    fn no_secret_is_added_for_another_registry_or_twice() {
+        let public = normalize(
+            imaged("registry.access.redhat.com/ubi9/ubi-minimal"),
+            &caller(),
+            &queue(),
+            &quay(),
+        )
+        .unwrap();
+        assert_eq!(
+            public
+                .object
+                .pointer("/spec/template/spec/imagePullSecrets"),
+            None
+        );
+        assert!(public.server_changes.is_empty());
+        let mut named = imaged("quay.io/wseaton/x:1");
+        named["spec"]["template"]["spec"]["imagePullSecrets"] = json!([{"name": "quay-pull"}]);
+        let n = normalize(named, &caller(), &queue(), &quay()).unwrap();
+        assert_eq!(
+            n.object.pointer("/spec/template/spec/imagePullSecrets"),
+            Some(&json!([{"name": "quay-pull"}]))
+        );
+        assert!(n.server_changes.is_empty());
+        let plain = Config {
+            pull_secrets: vec![PullSecret::parse("quay-pull").unwrap()],
+            ..Config::default()
+        };
+        let unmapped =
+            normalize(imaged("quay.io/wseaton/x:1"), &caller(), &queue(), &plain).unwrap();
+        assert!(
+            unmapped.server_changes.is_empty(),
+            "a secret without a registry is never added"
+        );
+    }
+
+    #[test]
+    fn every_pod_template_gets_the_secret_its_own_images_need() {
+        let mut m = json!({
+            "apiVersion": "ray.io/v1",
+            "kind": "RayJob",
+            "metadata": {"name": "r"},
+            "spec": {"rayClusterSpec": {
+                "headGroupSpec": {"template": {"spec": {"containers": [{"name": "h", "image": "quay.io/wseaton/ray:1"}]}}},
+                "workerGroupSpecs": [{"groupName": "w", "template": {"spec": {
+                    "initContainers": [{"name": "i", "image": "quay.io/wseaton/init:1"}],
+                    "containers": [{"name": "w", "image": "docker.io/rayproject/ray:2"}]}}}]
+            }}
+        });
+        m["spec"]["submitterPodTemplate"] = json!({"spec": {"restartPolicy": "Never", "containers": [{"name": "s", "image": "docker.io/rayproject/ray:2"}]}});
+        let n = normalize(m, &caller(), &queue(), &quay()).unwrap();
+        let o = &n.object;
+        assert!(
+            o.pointer("/spec/rayClusterSpec/headGroupSpec/template/spec/imagePullSecrets")
+                .is_some()
+        );
+        assert!(
+            o.pointer("/spec/rayClusterSpec/workerGroupSpecs/0/template/spec/imagePullSecrets")
+                .is_some(),
+            "an init container's image counts"
+        );
+        assert!(
+            o.pointer("/spec/submitterPodTemplate/spec/imagePullSecrets")
+                .is_none()
+        );
+        assert_eq!(n.server_changes.len(), 2, "{:?}", n.server_changes);
     }
 
     #[test]

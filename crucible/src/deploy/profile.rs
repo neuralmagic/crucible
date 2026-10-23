@@ -169,7 +169,9 @@ pub struct KueueCfg {
     /// so the Service is addressed by its fully qualified name.
     #[serde(default = "default_cluster_domain")]
     pub cluster_domain: String,
-    /// Image pull secrets in the workload namespace that agents' pod templates may name.
+    /// Image pull secrets in the workload namespace that agents' pod templates may name, each
+    /// `name` or `name=registry`; the server adds a secret to any pod whose image is on its
+    /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
 }

@@ -1594,7 +1594,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, and how long a finished Job or RayJob is kept (finished_retention_seconds).",
+        description = "Validate a workload without creating it: pins it to the namespace and queue, runs a server-side dry run, and estimates whether the queue's quota can admit it (fit: fits_now, waits_for_quota, never_fits). Returns the plan_hash workload_submit requires, how long a finished Job or RayJob is kept (finished_retention_seconds), and server_changes: what the server added, such as the image pull secret an image's registry needs.",
         annotations(
             title = "Plan a workload",
             read_only_hint = true,
@@ -1631,6 +1631,7 @@ impl KueueMcp {
                     "name": n.name,
                     "plan_hash": n.plan_hash,
                     "finished_retention_seconds": n.retention_seconds(),
+                    "server_changes": n.server_changes,
                     "dry_run": "accepted",
                     "admission": n.kind.admission(),
                     "pod_sets": pod_sets,

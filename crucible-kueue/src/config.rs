@@ -29,8 +29,94 @@ pub struct Config {
     pub hardware: Hardware,
     /// Namespaces this server is installed in; empty discovers them from LocalQueues.
     pub namespaces: Vec<String>,
-    /// The image pull secrets a pod template may name; none when empty.
-    pub pull_secrets: Vec<String>,
+    /// The image pull secrets a pod template may name, and the ones the server adds itself to a
+    /// pod whose image is on their registries; none when empty.
+    pub pull_secrets: Vec<PullSecret>,
+}
+
+/// An image pull secret in the served namespaces and the registries it pulls from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSecret {
+    pub name: String,
+    /// Registry hosts or host/path prefixes (`quay.io`, `quay.io/acme`). Empty: the secret may be
+    /// named but is never added.
+    pub registries: Vec<String>,
+}
+
+impl PullSecret {
+    /// `name` or `name=registry`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (name, registry) = match s.split_once('=') {
+            Some((n, r)) => (n.trim(), Some(r.trim().trim_end_matches('/'))),
+            None => (s.trim(), None),
+        };
+        if name.is_empty() || registry.is_some_and(str::is_empty) {
+            return Err(format!("{s:?} is not name or name=registry"));
+        }
+        Ok(Self {
+            name: name.to_string(),
+            registries: registry.map(str::to_string).into_iter().collect(),
+        })
+    }
+
+    /// Whether this secret pulls `image`: its registry host, or a host/path prefix of its
+    /// repository, is one of ours.
+    pub fn serves(&self, image: &str) -> bool {
+        let repository = repository_of(image);
+        self.registries.iter().any(|r| {
+            repository == *r
+                || repository
+                    .strip_prefix(r.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+        })
+    }
+}
+
+impl std::fmt::Display for PullSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.registries.is_empty() {
+            true => f.write_str(&self.name),
+            false => write!(f, "{} ({})", self.name, self.registries.join(", ")),
+        }
+    }
+}
+
+/// One entry per secret, its registries gathered from every flag that named it.
+pub fn merge_pull_secrets(secrets: Vec<PullSecret>) -> Vec<PullSecret> {
+    let mut out: Vec<PullSecret> = Vec::new();
+    for s in secrets {
+        match out.iter_mut().find(|o| o.name == s.name) {
+            Some(o) => {
+                for r in s.registries {
+                    if !o.registries.contains(&r) {
+                        o.registries.push(r);
+                    }
+                }
+            }
+            None => out.push(s),
+        }
+    }
+    out
+}
+
+/// `host/path` of an image reference without tag or digest, with Docker Hub's implicit host and
+/// `library/` filled in.
+fn repository_of(image: &str) -> String {
+    let without_digest = image.split('@').next().unwrap_or_default();
+    let (first, rest) = match without_digest.split_once('/') {
+        Some((f, r)) => (f, Some(r)),
+        None => (without_digest, None),
+    };
+    let is_host = |c: &str| c.contains('.') || c.contains(':') || c == "localhost";
+    let full = match rest {
+        Some(r) if is_host(first) => format!("{first}/{r}"),
+        Some(_) => format!("docker.io/{without_digest}"),
+        None => format!("docker.io/library/{without_digest}"),
+    };
+    match full.rsplit_once(':') {
+        Some((repo, tag)) if !tag.contains('/') => repo.to_string(),
+        _ => full,
+    }
 }
 
 impl Default for Config {
@@ -342,6 +428,45 @@ mod tests {
         assert_eq!(label_safe("@@@"), symbols, "deterministic");
         assert!(run_id_of("auth0|abc").is_ok());
         assert!(launcher_of("CN=Alice Smith,OU=x").is_ok());
+    }
+
+    #[test]
+    fn a_pull_secret_serves_images_on_its_registry_or_under_its_prefix() {
+        let quay = PullSecret::parse("quay-pull=quay.io/wseaton").unwrap();
+        assert!(quay.serves("quay.io/wseaton/crucible-smoke:abc"));
+        assert!(quay.serves("quay.io/wseaton/x@sha256:0123"));
+        assert!(
+            !quay.serves("quay.io/wseatonx/y:1"),
+            "a prefix ends at a path boundary"
+        );
+        assert!(!quay.serves("quay.io/other/y:1"));
+        let host = PullSecret::parse("local=registry.local:5000").unwrap();
+        assert!(host.serves("registry.local:5000/a/b:1"));
+        assert!(!host.serves("registry.local/a/b:1"));
+        let hub = PullSecret::parse("hub=docker.io/library").unwrap();
+        assert!(hub.serves("ubuntu:24.04"));
+        assert!(hub.serves("library/ubuntu"));
+        assert!(!hub.serves("acme/tool:1"));
+        let named = PullSecret::parse("plain").unwrap();
+        assert!(named.registries.is_empty());
+        assert!(!named.serves("quay.io/wseaton/x"));
+        for bad in ["", "=quay.io", "name="] {
+            assert!(PullSecret::parse(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn repeated_pull_secrets_gather_their_registries() {
+        let merged = merge_pull_secrets(
+            ["a=quay.io", "b", "a=ghcr.io", "a=quay.io"]
+                .iter()
+                .map(|s| PullSecret::parse(s).unwrap())
+                .collect(),
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].registries, ["quay.io", "ghcr.io"]);
+        assert_eq!(merged[0].to_string(), "a (quay.io, ghcr.io)");
+        assert_eq!(merged[1].to_string(), "b");
     }
 
     #[test]
