@@ -1180,7 +1180,11 @@ impl KueueMcp {
                     break WaitEnd::Timeout;
                 }
                 tokio::time::sleep(WAIT_POLL).await;
-                snap = self.snapshot(c, args.kind, &args.name).await?;
+                let left = timeout.saturating_sub(started.elapsed());
+                match tokio::time::timeout(left, self.snapshot(c, args.kind, &args.name)).await {
+                    Ok(next) => snap = next?,
+                    Err(_) => break WaitEnd::Timeout,
+                }
             };
             wait = json!({
                 "until": until,
