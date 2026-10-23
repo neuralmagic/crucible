@@ -177,8 +177,10 @@ in SPIRE's namespace. The `iss` of an SVID picks the cluster whose keys verify i
 issued only when the sandbox's run is on that cluster.
 
 The engine binds each sandbox it creates by posting its id and workdir to
-`/api/runs/{run}/sandboxes` with the run's pod token (`CRUCIBLE_POD_TOKEN`, the same token that
-uploads its evidence), and only when the loop pod carries `CRUCIBLE_AGENT_TOKEN_ENDPOINT`. The
+`/api/sandbox-bindings/runs/{run}` with the run's pod token (`CRUCIBLE_POD_TOKEN`, the same token that
+uploads its evidence), and only when the loop pod carries `CRUCIBLE_AGENT_TOKEN_ENDPOINT`. A spoke
+that reaches the controller through an external route needs `/api/sandbox-bindings` and
+`/oauth/token` there, beside `/api/evidence` and the issuer's `/.well-known/jwks.json`. The
 controller binds only a `Sandbox` resource
 (`agents.x-k8s.io`) in the sandbox namespace carrying that id and the run's gateway id, reads the
 sandbox's name from it, and owner-references it to the gateway pod. At token issue it refuses an

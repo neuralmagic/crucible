@@ -3,7 +3,7 @@
 //! `token_grant` sends (no `client_id`; the SVID's `sub` identifies the sandbox).
 //!
 //! ```text
-//!  run pod ──POST /api/runs/{run}/sandboxes (the run's pod token)──▶ run_sandboxes
+//!  run pod ──POST /api/sandbox-bindings/runs/{run} (the run's pod token)──▶ run_sandboxes
 //!  supervisor ──POST /oauth/token, client_assertion=<JWT-SVID>──▶ verify SVID (its cluster's
 //!                                                                   SPIRE, via the API server)
 //!                                                                   resolve sandbox → live run

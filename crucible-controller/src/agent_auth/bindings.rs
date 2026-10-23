@@ -317,7 +317,7 @@ pub(crate) struct BindState {
 pub(crate) fn router(state: BindState) -> axum::Router {
     axum::Router::new()
         .route(
-            "/api/runs/{run_id}/sandboxes",
+            "/api/sandbox-bindings/runs/{run_id}",
             axum::routing::post(bind_sandbox),
         )
         .with_state(state)

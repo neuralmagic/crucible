@@ -25,7 +25,7 @@ pub const ENV_AGENT_SVID_AUDIENCE: &str = "CRUCIBLE_AGENT_SVID_AUDIENCE";
 /// authenticates it.
 pub fn binding_path(run_id: &str) -> String {
     format!(
-        "/api/runs/{}/sandboxes",
+        "/api/sandbox-bindings/runs/{}",
         crate::artifact::path_segment(run_id)
     )
 }

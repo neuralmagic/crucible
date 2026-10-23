@@ -158,7 +158,7 @@ mod tests {
         bind_sandbox(&target, &binding()).await.unwrap();
         let request = seen.recv().await.unwrap();
         assert!(
-            request.starts_with("POST /api/runs/playbook_x_01%2Fa/sandboxes HTTP/1.1"),
+            request.starts_with("POST /api/sandbox-bindings/runs/playbook_x_01%2Fa HTTP/1.1"),
             "{request}"
         );
         assert!(
