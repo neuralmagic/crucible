@@ -51,6 +51,9 @@ pub struct DeployProfile {
     /// The crucible-kueue MCP server: where it runs, and the scope each run's token gets.
     #[serde(default)]
     pub kueue: Option<KueueCfg>,
+    /// buildit, started in each run's loop pod on the clusters it names.
+    #[serde(default)]
+    pub buildit: Option<BuilditCfg>,
     /// The controller's OpenShift OAuth client, through which people link their username on a
     /// cluster without pasting a token.
     #[serde(default)]
@@ -230,6 +233,51 @@ impl KueueCfg {
                 self.run_issuer.trim_end_matches('/')
             )),
         }
+    }
+}
+
+/// The `[buildit]` table. A run on one of `clusters` starts buildit in its loop pod, which builds in
+/// the loop namespace for the run's own sandboxes, accepting their tokens from the controller's
+/// agent issuer.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilditCfg {
+    /// The dispatch clusters whose runs get buildit: `clusters = [...]`, or `cluster = "..."`.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
+    /// The controller's agent token issuer (`CONTROLLER_AGENT_ISSUER`), compared exactly with a
+    /// token's `iss`.
+    pub run_issuer: String,
+    /// Where buildit fetches the issuer's keys. Default `<run_issuer>/.well-known/jwks.json`; a
+    /// loop pod that cannot reach the issuer's own address names a route here.
+    #[serde(default)]
+    pub run_jwks_uri: Option<url::Url>,
+    /// The one repository builds may be pushed to, with the loop pod's push authfile
+    /// (`[secrets] push_authfile`). Unset, buildit pushes nothing.
+    #[serde(default)]
+    pub push_repo: Option<String>,
+}
+
+impl BuilditCfg {
+    /// Whether runs on dispatch cluster `cluster` get buildit.
+    pub fn serves(&self, cluster: &str) -> bool {
+        self.clusters.iter().any(|c| c == cluster)
+    }
+
+    /// `<issuer>=<jwks uri>`, as buildit's `--run-issuer` takes it.
+    pub fn trusted_issuer(&self) -> Result<String, url::ParseError> {
+        let jwks = match &self.run_jwks_uri {
+            Some(uri) => uri.clone(),
+            None => url::Url::parse(&format!(
+                "{}/.well-known/jwks.json",
+                self.run_issuer.trim_end_matches('/')
+            ))?,
+        };
+        Ok(format!("{}={jwks}", self.run_issuer))
     }
 }
 

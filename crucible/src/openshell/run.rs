@@ -397,7 +397,20 @@ async fn try_turn(
     let kueue = crate::openshell::kueue::KueueAccess::from_env()
         .context("reading the run's crucible-kueue access")?;
     if let Some(k) = &kueue {
-        ensure_token_grant_provider(&gw, k.token_grant_profile()).await?;
+        ensure_token_grant_provider(&gw, provider::KUEUE_PROVIDER_NAME, k.token_grant_profile())
+            .await?;
+    }
+    // 2e. The run's buildit, started in this pod, reached the same way.
+    let buildit = crate::openshell::buildit::BuilditAccess::from_env()
+        .context("reading the run's buildit access")?;
+    if let Some(b) = &buildit {
+        tokio::task::block_in_place(|| b.ensure_running()).context("starting the run's buildit")?;
+        ensure_token_grant_provider(
+            &gw,
+            provider::BUILDIT_PROVIDER_NAME,
+            b.token_grant_profile(),
+        )
+        .await?;
     }
 
     // 3. Create the sandbox, attaching the managed provider. Best-effort delete first: a prior
@@ -436,6 +449,9 @@ async fn try_turn(
     }
     if kueue.is_some() {
         providers.push(provider::KUEUE_PROVIDER_NAME.to_string());
+    }
+    if buildit.is_some() {
+        providers.push(provider::BUILDIT_PROVIDER_NAME.to_string());
     }
     let sandbox_id = gw
         .create_sandbox(
@@ -600,8 +616,11 @@ async fn try_turn(
             })
             .into_iter()
             .collect();
-        if let Some(k) = &kueue {
-            let ep = k.egress_endpoint();
+        for ep in kueue
+            .iter()
+            .map(|k| k.egress_endpoint())
+            .chain(buildit.iter().map(|b| b.egress_endpoint()))
+        {
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
@@ -713,6 +732,13 @@ async fn try_turn(
             servers.push(McpServer {
                 name: crate::openshell::kueue::MCP_SERVER_NAME,
                 url: k.url(),
+                token: None,
+            });
+        }
+        if let Some(b) = &buildit {
+            servers.push(McpServer {
+                name: crate::openshell::buildit::MCP_SERVER_NAME,
+                url: b.url(),
                 token: None,
             });
         }
@@ -1034,21 +1060,22 @@ async fn ensure_static_provider(gw: &Gateway, p: &StaticProvider, token: &str) -
     }
 }
 
-/// Import the token-grant `crucible-kueue` profile and create its provider, which holds no secret:
-/// the supervisor obtains each token itself. A provider already registered under the name on this
+/// Import a token-grant profile and create its provider `name`, which holds no secret: the
+/// supervisor obtains each token itself. A provider already registered under the name on this
 /// gateway is left as it is.
 async fn ensure_token_grant_provider(
     gw: &Gateway,
+    name: &str,
     profile: openshell_core::proto::ProviderProfile,
 ) -> Result<()> {
     let profile_id = profile.id.clone();
     gw.ensure_provider_profile(profile)
         .await
-        .context("importing the crucible-kueue token-grant profile")?;
-    if !gw.provider_exists(provider::KUEUE_PROVIDER_NAME).await {
-        gw.create_minted_provider(provider::KUEUE_PROVIDER_NAME, &profile_id)
+        .with_context(|| format!("importing the {name} token-grant profile"))?;
+    if !gw.provider_exists(name).await {
+        gw.create_minted_provider(name, &profile_id)
             .await
-            .context("creating the crucible-kueue token-grant provider")?;
+            .with_context(|| format!("creating the {name} token-grant provider"))?;
     }
     Ok(())
 }

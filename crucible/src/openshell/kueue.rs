@@ -48,8 +48,10 @@ impl KueueAccess {
         endpoint: Option<String>,
         svid_audience: Option<String>,
     ) -> Result<Option<Self>, KueueAccessError> {
+        if url.is_none() && endpoint.is_some() == svid_audience.is_some() {
+            return Ok(None);
+        }
         let (url, endpoint, svid_audience) = match (url, endpoint, svid_audience) {
-            (None, None, None) => return Ok(None),
             (Some(u), Some(e), Some(a)) => (u, e, a),
             (u, e, a) => {
                 let named = [
@@ -103,13 +105,19 @@ impl KueueAccess {
     /// The token-grant provider profile for this server. Its endpoint binds the injected token to
     /// the server alone.
     pub fn token_grant_profile(&self) -> openshell_core::proto::ProviderProfile {
-        provider::kueue_token_grant_profile(
-            &self.host,
-            self.port,
-            &self.url,
-            &self.endpoint,
-            &self.svid_audience,
-        )
+        provider::token_grant_profile(&provider::GrantedServer {
+            profile_id: provider::KUEUE_GRANT_PROFILE_ID,
+            name: "crucible-kueue",
+            host: &self.host,
+            port: self.port,
+            url: &self.url,
+            token_endpoint: &self.endpoint,
+            svid_audience: &self.svid_audience,
+            scopes: &[
+                crucible_contract::kueue::SCOPE_READ,
+                crucible_contract::kueue::SCOPE_SUBMIT,
+            ],
+        })
     }
 }
 
@@ -156,11 +164,17 @@ mod tests {
             }
         );
         assert_eq!(
-            values(None, Some(ENDPOINT), Some(ISSUER)).unwrap_err(),
+            values(None, Some(ENDPOINT), None).unwrap_err(),
             KueueAccessError::Partial {
                 set: ENV_AGENT_TOKEN_ENDPOINT,
                 missing: ENV_KUEUE_URL
             }
+        );
+        assert!(
+            values(None, Some(ENDPOINT), Some(ISSUER))
+                .unwrap()
+                .is_none(),
+            "a run with buildit alone has the token endpoint and no crucible-kueue"
         );
     }
 

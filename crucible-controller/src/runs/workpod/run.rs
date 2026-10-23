@@ -646,6 +646,7 @@ pub async fn dispatch_run(
     )?;
     let loaded = crate::agent_auth::placement::load_profile(Some(&profile)).await?;
     let kueue_cfg = loaded.as_ref().and_then(|p| p.kueue.as_ref());
+    let buildit_cfg = loaded.as_ref().and_then(|p| p.buildit.as_ref());
     let isolated = loaded
         .as_ref()
         .filter(|p| crucible::deploy::render::gateway::isolated(p));
@@ -804,12 +805,12 @@ pub async fn dispatch_run(
             .merge(extra)
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
     }
-    if let Some(kueue) = kueue_cfg
-        && let Some(tokens) = crate::runs::workpod::kueue::AgentTokens::from_cfg(cfg)?
-        && let Some(access) = crate::runs::workpod::kueue::access(kueue, &cluster, &tokens)
+    if let Some(tokens) = crate::runs::workpod::kueue::AgentTokens::from_cfg(cfg)?
+        && let Some(access) =
+            crate::runs::workpod::kueue::access(kueue_cfg, buildit_cfg, &cluster, &tokens)?
     {
         delivery.merge(access).map_err(|e| {
-            anyhow::anyhow!("folding the crucible-kueue access into the run's: {e}")
+            anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
         })?;
     }
     let reads_run = match &opts {

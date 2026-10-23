@@ -341,46 +341,57 @@ pub const KUEUE_PROVIDER_NAME: &str = "crucible-kueue";
 /// The custom profile id backing [`KUEUE_PROVIDER_NAME`].
 pub const KUEUE_GRANT_PROFILE_ID: &str = "crucible-kueue-grant";
 
-/// The token-grant `crucible-kueue` profile: one dynamic credential the supervisor obtains from the
-/// controller's `token_endpoint` with a JWT-SVID for `svid_audience`, requesting a token whose
-/// audience is the server's `url`, and injects as a bearer header on traffic to `host:port` alone.
-/// It holds no secret and gives the sandbox no placeholder.
-pub fn kueue_token_grant_profile(
-    host: &str,
-    port: u16,
-    url: &str,
-    token_endpoint: &str,
-    svid_audience: &str,
-) -> openshell_core::proto::ProviderProfile {
+/// The provider carrying the sandbox's buildit access.
+pub const BUILDIT_PROVIDER_NAME: &str = "buildit";
+
+/// The custom profile id backing [`BUILDIT_PROVIDER_NAME`].
+pub const BUILDIT_GRANT_PROFILE_ID: &str = "buildit-grant";
+
+/// An MCP server a sandbox reaches with controller-issued agent tokens.
+pub struct GrantedServer<'a> {
+    pub profile_id: &'a str,
+    /// The server's name in the profile's descriptions.
+    pub name: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    /// The server's MCP URL, the audience of its tokens.
+    pub url: &'a str,
+    pub token_endpoint: &'a str,
+    pub svid_audience: &'a str,
+    pub scopes: &'a [&'a str],
+}
+
+/// A token-grant profile: one dynamic credential the supervisor obtains from the controller's
+/// `token_endpoint` with a JWT-SVID for `svid_audience`, requesting a token whose audience is the
+/// server's `url`, and injects as a bearer header on traffic to `host:port` alone. It holds no
+/// secret and gives the sandbox no placeholder.
+pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto::ProviderProfile {
     use openshell_core::proto::{
         NetworkAccessPreset, NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile,
         ProviderProfileCategory, ProviderProfileCredential,
     };
     ProviderProfile {
-        id: KUEUE_GRANT_PROFILE_ID.to_string(),
-        display_name: "Crucible Kueue (agent token)".to_string(),
-        description: "crucible-kueue access with controller-issued agent tokens".to_string(),
+        id: server.profile_id.to_string(),
+        display_name: format!("{} (agent token)", server.name),
+        description: format!("{} access with controller-issued agent tokens", server.name),
         category: ProviderProfileCategory::Agent as i32,
         credentials: vec![ProviderProfileCredential {
             name: "token".to_string(),
-            description: "Agent access token for crucible-kueue".to_string(),
+            description: format!("Agent access token for {}", server.name),
             auth_style: "bearer".to_string(),
             header_name: "authorization".to_string(),
             token_grant: Some(ProviderCredentialTokenGrant {
-                token_endpoint: token_endpoint.to_string(),
-                audience: url.to_string(),
-                jwt_svid_audience: svid_audience.to_string(),
-                scopes: vec![
-                    crucible_contract::kueue::SCOPE_READ.to_string(),
-                    crucible_contract::kueue::SCOPE_SUBMIT.to_string(),
-                ],
+                token_endpoint: server.token_endpoint.to_string(),
+                audience: server.url.to_string(),
+                jwt_svid_audience: server.svid_audience.to_string(),
+                scopes: server.scopes.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             }),
             ..Default::default()
         }],
         endpoints: vec![NetworkEndpoint {
-            host: host.to_string(),
-            port: u32::from(port),
+            host: server.host.to_string(),
+            port: u32::from(server.port),
             protocol: "rest".to_string(),
             access: NetworkAccessPreset::Full as i32,
             ..Default::default()
