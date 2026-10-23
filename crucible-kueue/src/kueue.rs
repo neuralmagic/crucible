@@ -114,6 +114,30 @@ impl KubeError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Api { source, .. } if matches!(source.as_ref(), kube::Error::Api(s) if s.code == 404))
     }
+
+    /// The API server's HTTP status, when it answered with one.
+    pub fn code(&self) -> Option<u16> {
+        match self {
+            Self::Api { source, .. } => match source.as_ref() {
+                kube::Error::Api(s) => Some(s.code),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether the same request may succeed later: the API server answered 5xx or 429, or never
+    /// answered at all.
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::Api { source, .. } => match source.as_ref() {
+                kube::Error::Api(s) => s.code >= 500 || s.code == 429,
+                kube::Error::HyperError(_) | kube::Error::Service(_) => true,
+                _ => false,
+            },
+            Self::UnsupportedVersion { .. } | Self::Decode { .. } => false,
+        }
+    }
 }
 
 fn decode<T: DeserializeOwned>(obj: DynamicObject, what: &str) -> Result<T, KubeError> {
@@ -633,6 +657,28 @@ mod tests {
             fit(&req(&[("cpu", "15")]), &q).verdict,
             Verdict::WaitsForQuota
         );
+    }
+
+    #[test]
+    fn server_side_failures_are_retryable_and_refusals_are_not() {
+        let api = |code: u16| {
+            KubeError::api(
+                "get",
+                "Job j",
+                kube::Error::Api(
+                    kube::core::Status::failure("m", "r")
+                        .with_code(code)
+                        .boxed(),
+                ),
+            )
+        };
+        assert!(api(500).retryable());
+        assert!(api(503).retryable());
+        assert!(api(429).retryable());
+        assert!(!api(403).retryable());
+        assert!(!api(404).retryable());
+        assert!(!api(422).retryable());
+        assert!(!KubeError::UnsupportedVersion { served: vec![] }.retryable());
     }
 
     #[test]

@@ -135,7 +135,12 @@ fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
         cfg.url(),
         "--kube-authz".to_string(),
         cfg.kube_authz.as_str().to_string(),
+        "--namespace".to_string(),
+        cfg.workload_namespace.to_string(),
     ];
+    for secret in &cfg.pull_secrets {
+        args.extend(["--pull-secret".to_string(), secret.clone()]);
+    }
     if jwks.scheme() == "http" {
         args.push("--insecure-jwks-http".to_string());
     }
@@ -300,6 +305,8 @@ fn workload_cluster_role() -> rbac::ClusterRole {
                 WORKLOAD_VERBS,
             ),
             rule(&["apps"], &["deployments", "statefulsets"], WORKLOAD_VERBS),
+            rule(&["jobset.x-k8s.io"], &["jobsets"], WORKLOAD_VERBS),
+            rule(&["kubeflow.org"], &["pytorchjobs"], WORKLOAD_VERBS),
             rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
         ]),
         ..Default::default()
@@ -386,8 +393,21 @@ mod tests {
                 "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp",
                 "--kube-authz",
                 "openshift",
+                "--namespace",
+                "crucible-kueue-e2e",
                 "--insecure-jwks-http",
             ]
+        );
+        let pulling = crate::deploy::kueue::tests::docs(&PROFILE.replace(
+            "[kueue]",
+            "[kueue]\npull_secrets = [\"quay-pull\", \"ghcr\"]",
+        ));
+        let rendered = args(&pulling);
+        assert!(
+            rendered
+                .windows(4)
+                .any(|w| w == ["--pull-secret", "quay-pull", "--pull-secret", "ghcr"]),
+            "{rendered:?}"
         );
         assert_eq!(
             deploy["spec"]["template"]["spec"]["serviceAccountName"],
@@ -532,6 +552,8 @@ mod tests {
             ("leaderworkerset.x-k8s.io", "leaderworkersets"),
             ("apps", "deployments"),
             ("apps", "statefulsets"),
+            ("jobset.x-k8s.io", "jobsets"),
+            ("kubeflow.org", "pytorchjobs"),
         ]
     }
 

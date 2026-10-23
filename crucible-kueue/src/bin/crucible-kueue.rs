@@ -1,5 +1,10 @@
 use anyhow::Context;
-use clap::Parser;
+use clap::{ArgAction, Parser};
+use crucible_kueue::access::{SCOPE_READ, SCOPE_SUBMIT};
+use crucible_kueue::config::{
+    self, ClaimMap, Config, Hardware, Labels, Lifetimes, Ownership, QueueVerb,
+};
+use crucible_kueue::profile::Profile;
 use crucible_mcp_auth::policy::ToolPolicy;
 use crucible_mcp_auth::server::{JwksTls, TrustedIssuer};
 use std::io::IsTerminal;
@@ -66,6 +71,147 @@ struct Cli {
     /// token's kube_groups claim. Turns on people's tokens.
     #[arg(long, env = "CRUCIBLE_KUEUE_KUBE_AUTHZ", value_enum)]
     kube_authz: Option<KubeAuthz>,
+    /// Domain of the labels and annotations the server stamps (`<domain>/run-id`, ...).
+    #[arg(long, env = "CRUCIBLE_KUEUE_LABEL_DOMAIN", default_value = config::DEFAULT_LABEL_DOMAIN)]
+    label_domain: String,
+    /// managed: callers control only what this server created for them. rbac: any workload of a
+    /// served kind their RBAC permits.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_OWNERSHIP",
+        value_enum,
+        default_value = "managed"
+    )]
+    ownership: Ownership,
+    /// Manifest allowlist: strict, tenant, or a TOML profile file.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_ALLOWLIST_PROFILE",
+        default_value = "strict"
+    )]
+    allowlist_profile: String,
+    /// Claim naming the caller's Kubernetes user.
+    #[arg(long, env = "CRUCIBLE_KUEUE_USER_CLAIM", default_value = "kube_user")]
+    user_claim: String,
+    /// Prefix for the user claim's value, matching the API server's --oidc-username-prefix.
+    #[arg(long, env = "CRUCIBLE_KUEUE_USER_PREFIX", default_value = "")]
+    user_prefix: String,
+    /// Claim listing the caller's Kubernetes groups (with --kube-authz token).
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_GROUPS_CLAIM",
+        default_value = "kube_groups"
+    )]
+    groups_claim: String,
+    /// Claim naming a run in a run issuer's tokens; empty for none.
+    #[arg(long, env = "CRUCIBLE_KUEUE_RUN_ID_CLAIM", default_value = "run_id")]
+    run_id_claim: String,
+    /// Claim naming the caller's default namespace.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_NAMESPACE_CLAIM",
+        default_value = "namespace"
+    )]
+    namespace_claim: String,
+    /// LocalQueue verb submitting needs: Kueue's `use`, or `get` where roles do not grant it.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_QUEUE_VERB",
+        value_enum,
+        default_value = "use"
+    )]
+    queue_verb: QueueVerb,
+    /// activeDeadlineSeconds for a batch workload that sets none: seconds, or `none`.
+    #[arg(long, env = "CRUCIBLE_KUEUE_DEFAULT_ACTIVE_DEADLINE", default_value = "86400", value_parser = seconds)]
+    default_active_deadline: Seconds,
+    /// ttlSecondsAfterFinished for a batch workload that sets none: seconds, or `none`.
+    #[arg(long, env = "CRUCIBLE_KUEUE_DEFAULT_TTL_AFTER_FINISHED", default_value = "3600", value_parser = seconds)]
+    default_ttl_after_finished: Seconds,
+    /// Create Jobs, JobSets and PyTorchJobs suspended for Kueue to start.
+    #[arg(long, env = "CRUCIBLE_KUEUE_SUSPEND", default_value_t = true, action = ArgAction::Set)]
+    suspend: bool,
+    /// Node resources that count as accelerators; a trailing `*` matches a prefix. Repeatable.
+    #[arg(
+        long = "accelerator-resource",
+        env = "CRUCIBLE_KUEUE_ACCELERATOR_RESOURCES",
+        value_delimiter = ','
+    )]
+    accelerator_resources: Vec<String>,
+    /// Namespaces this server is installed in (its service account holds the workload role
+    /// there). Empty discovers them by listing LocalQueues cluster-wide. Repeatable.
+    #[arg(
+        long = "namespace",
+        env = "CRUCIBLE_KUEUE_NAMESPACES",
+        value_delimiter = ','
+    )]
+    namespaces: Vec<String>,
+    /// An image pull secret pod templates may name; with none, they may name none. Repeatable.
+    #[arg(
+        long = "pull-secret",
+        env = "CRUCIBLE_KUEUE_PULL_SECRETS",
+        value_delimiter = ','
+    )]
+    pull_secrets: Vec<String>,
+    /// Node labels naming an accelerator product, first match wins. Repeatable.
+    #[arg(
+        long = "accelerator-product-label",
+        env = "CRUCIBLE_KUEUE_ACCELERATOR_PRODUCT_LABELS",
+        value_delimiter = ','
+    )]
+    accelerator_product_labels: Vec<String>,
+}
+
+/// A lifetime in seconds, or none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Seconds(Option<i64>);
+
+fn seconds(s: &str) -> Result<Seconds, String> {
+    match s {
+        "none" => Ok(Seconds(None)),
+        n => n
+            .parse::<i64>()
+            .ok()
+            .filter(|n| *n >= 0)
+            .map(|n| Seconds(Some(n)))
+            .ok_or_else(|| format!("{s:?} is neither a number of seconds nor none")),
+    }
+}
+
+impl Cli {
+    fn config(&self) -> anyhow::Result<Config> {
+        let defaults = Hardware::default();
+        let or_default = |given: &[String], fallback: Vec<String>| match given.is_empty() {
+            true => fallback,
+            false => given.to_vec(),
+        };
+        Ok(Config {
+            labels: Labels::new(&self.label_domain),
+            ownership: self.ownership,
+            profile: Profile::load(&self.allowlist_profile)?,
+            claims: ClaimMap {
+                user: self.user_claim.clone(),
+                user_prefix: self.user_prefix.clone(),
+                groups: self.groups_claim.clone(),
+                run_id: (!self.run_id_claim.is_empty()).then(|| self.run_id_claim.clone()),
+                namespace: self.namespace_claim.clone(),
+            },
+            queue_verb: self.queue_verb,
+            lifetimes: Lifetimes {
+                active_deadline_seconds: self.default_active_deadline.0,
+                ttl_seconds_after_finished: self.default_ttl_after_finished.0,
+                suspend: self.suspend,
+            },
+            hardware: Hardware {
+                resources: or_default(&self.accelerator_resources, defaults.resources),
+                product_labels: or_default(
+                    &self.accelerator_product_labels,
+                    defaults.product_labels,
+                ),
+            },
+            namespaces: self.namespaces.clone(),
+            pull_secrets: self.pull_secrets.clone(),
+        })
+    }
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -84,12 +230,13 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(std::io::stderr().is_terminal())
         .init();
     let cli = Cli::parse();
+    let config = cli.config()?;
     crucible_kueue::install_tls_provider();
     let options = kube::config::KubeConfigOptions {
         context: cli.context.clone(),
         ..Default::default()
     };
-    let config = match &cli.context {
+    let kube_config = match &cli.context {
         Some(_) => kube::Config::from_kubeconfig(&options)
             .await
             .context("loading kubeconfig context")?,
@@ -97,11 +244,21 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("inferring kube config")?,
     };
-    let client = kube::Client::try_from(config).context("building kube client")?;
+    let client = kube::Client::try_from(kube_config).context("building kube client")?;
     let kueue = crucible_kueue::kueue::KueueVersion::discover(&client)
         .await
         .context("discovering the cluster's Kueue API version")?;
     tracing::info!(version = kueue.as_str(), "kueue api");
+    let kinds = crucible_kueue::kinds::installed(&client)
+        .await
+        .context("discovering the served kinds the cluster installs")?;
+    tracing::info!(
+        kinds = ?kinds.iter().map(|k| k.kind()).collect::<Vec<_>>(),
+        ownership = ?config.ownership,
+        profile = %config.profile.name,
+        label_domain = %config.labels.domain,
+        "serving"
+    );
     let issuers: Vec<TrustedIssuer> = cli
         .run_issuers
         .into_iter()
@@ -112,14 +269,11 @@ async fn main() -> anyhow::Result<()> {
         .map(|t| (t.issuer.as_str(), t.callers))
         .collect();
     tracing::info!(issuers = ?names, resources = ?cli.resources, "accepting access tokens");
-    let config = crucible_mcp_auth::server::ResourceServerConfig {
+    let rs_config = crucible_mcp_auth::server::ResourceServerConfig {
         issuers,
         resources: cli.resources,
-        required_scopes: vec![crucible_contract::kueue::SCOPE_READ.to_string()],
-        scopes_supported: vec![
-            crucible_contract::kueue::SCOPE_READ.to_string(),
-            crucible_contract::kueue::SCOPE_SUBMIT.to_string(),
-        ],
+        required_scopes: vec![SCOPE_READ.to_string()],
+        scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_SUBMIT.to_string()],
         resource_name: Some("crucible-kueue".to_string()),
     };
     let tls = JwksTls {
@@ -127,7 +281,7 @@ async fn main() -> anyhow::Result<()> {
         insecure_http: cli.insecure_jwks_http,
     };
     let oidc = Arc::new(
-        crucible_mcp_auth::server::ResourceServer::new(config, &tls)
+        crucible_mcp_auth::server::ResourceServer::new(rs_config, &tls)
             .context("building the resource server")?,
     );
     let policy = match &cli.tool_policy {
@@ -165,6 +319,8 @@ async fn main() -> anyhow::Result<()> {
             reviewer,
             allowed_hosts: cli.allowed_hosts,
             kueue,
+            kinds,
+            config,
         },
     );
     let listener = tokio::net::TcpListener::bind(&cli.bind)
@@ -226,6 +382,96 @@ mod tests {
                 Callers::People
             )]
         );
+    }
+
+    #[test]
+    fn no_new_flags_is_crucibles_config() {
+        let cli = Cli::try_parse_from([
+            "crucible-kueue",
+            "--run-issuer",
+            "https://a.example=https://a.example/keys",
+            "--resource",
+            RESOURCE,
+        ])
+        .unwrap();
+        let got = cli.config().unwrap();
+        let want = Config::default();
+        assert_eq!(got.labels, want.labels);
+        assert_eq!(got.ownership, want.ownership);
+        assert_eq!(got.profile, want.profile);
+        assert_eq!(got.claims, want.claims);
+        assert_eq!(got.queue_verb, want.queue_verb);
+        assert_eq!(got.lifetimes, want.lifetimes);
+        assert_eq!(got.hardware, want.hardware);
+        assert_eq!(got.namespaces, want.namespaces);
+        assert_eq!(got.pull_secrets, want.pull_secrets);
+    }
+
+    #[test]
+    fn a_generic_deployment_is_configured_through_flags() {
+        let cli = Cli::try_parse_from([
+            "crucible-kueue",
+            "--person-issuer",
+            "https://idp.example/realms/r=https://idp.example/realms/r/certs",
+            "--resource",
+            RESOURCE,
+            "--kube-authz",
+            "token",
+            "--label-domain",
+            "kueue-mcp.example.com",
+            "--ownership",
+            "rbac",
+            "--allowlist-profile",
+            "tenant",
+            "--user-claim",
+            "preferred_username",
+            "--user-prefix",
+            "oidc:",
+            "--groups-claim",
+            "groups",
+            "--run-id-claim",
+            "",
+            "--queue-verb",
+            "get",
+            "--default-active-deadline",
+            "none",
+            "--default-ttl-after-finished",
+            "600",
+            "--suspend",
+            "false",
+            "--accelerator-resource",
+            "nvidia.com/gpu,example.com/npu",
+            "--namespace",
+            "ml-a,ml-b",
+            "--pull-secret",
+            "quay-pull",
+        ])
+        .unwrap();
+        let c = cli.config().unwrap();
+        assert_eq!(c.labels.run_id, "kueue-mcp.example.com/run-id");
+        assert_eq!(c.ownership, Ownership::Rbac);
+        assert_eq!(c.profile, Profile::tenant());
+        assert_eq!(c.claims.user, "preferred_username");
+        assert_eq!(c.claims.user_prefix, "oidc:");
+        assert_eq!(c.claims.groups, "groups");
+        assert_eq!(c.claims.run_id, None);
+        assert_eq!(c.queue_verb, QueueVerb::Get);
+        assert_eq!(
+            c.lifetimes,
+            Lifetimes {
+                active_deadline_seconds: None,
+                ttl_seconds_after_finished: Some(600),
+                suspend: false,
+            }
+        );
+        assert_eq!(c.hardware.resources, ["nvidia.com/gpu", "example.com/npu"]);
+        assert_eq!(c.namespaces, ["ml-a", "ml-b"]);
+        assert_eq!(c.pull_secrets, ["quay-pull"]);
+        assert_eq!(
+            c.hardware.product_labels,
+            Hardware::default().product_labels
+        );
+        assert!(seconds("-1").is_err() && seconds("soon").is_err());
     }
 
     #[test]

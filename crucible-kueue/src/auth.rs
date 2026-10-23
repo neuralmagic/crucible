@@ -5,9 +5,12 @@
 //! A token stands for a run (from a run issuer, carrying `run_id`) or a person (from a people
 //! issuer), and either way names the Kubernetes user it acts as (`kube_user`): the launcher for a
 //! run, the person themselves otherwise. That user's RBAC decides every call; the token's
-//! `namespace` claim is only a default.
+//! `namespace` claim is only a default. Which of the token's claims play those parts is a
+//! [`ClaimMap`], applied before anything else reads the claims.
 
-use crate::caller::{Identity, Launcher, NameError, Namespace, RunId};
+use crate::caller::{Identity, NameError, Namespace};
+use crate::config::{self, ClaimMap, NAMESPACE_CLAIM, RUN_ID_CLAIM};
+use crate::namespaces::Namespaces;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::Next;
@@ -23,6 +26,23 @@ pub struct Auth {
     /// Accept people's tokens (from a people issuer). The server sets it exactly when it has an
     /// access reviewer, without which no person's call could be checked.
     pub people: bool,
+    pub claims: ClaimMap,
+    /// Supplies the default namespace of a token that names none.
+    pub namespaces: Arc<Namespaces>,
+}
+
+/// A token that names no namespace gets the one namespace its caller can use, when there is
+/// exactly one, before the guard checks it and the tools read it.
+async fn default_namespace(principal: &mut Principal, namespaces: &Namespaces) {
+    if principal.namespace.is_some() {
+        return;
+    }
+    if let [only] = namespaces.usable(principal).await.as_slice() {
+        principal
+            .claims
+            .insert(NAMESPACE_CLAIM.to_string(), Value::String(only.clone()));
+        principal.namespace = Some(only.clone());
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -40,10 +60,11 @@ pub enum ClaimError {
 }
 
 impl Identity {
-    /// The identity an access token carries; its issuer decides which kind. Both kinds need
-    /// `kube_user`. A run's is its `run_id` and its presenter (`act.sub`) is recorded as the actor;
-    /// a person's needs `people` and owns its workloads under its own subject. `role` and `queues`
-    /// claims are ignored.
+    /// The identity an access token carries, after [`ClaimMap::canonicalize`]; its issuer decides
+    /// which kind. Both kinds need `kube_user`. A run's is its `run_id` and its presenter
+    /// (`act.sub`) is recorded as the actor; a person's needs `people` and owns its workloads
+    /// under its own subject. A subject or run id that is not a label value is sanitized with a
+    /// hash. `role` and `queues` claims are ignored.
     pub fn from_principal(principal: &Principal, people: bool) -> Result<Self, ClaimError> {
         let claim = |key: &'static str| {
             principal
@@ -53,7 +74,7 @@ impl Identity {
                 .ok_or(ClaimError::Missing(key))
         };
         let is_person = principal.callers == Callers::People;
-        if is_person && principal.claims.contains_key("run_id") {
+        if is_person && principal.claims.contains_key(RUN_ID_CLAIM) {
             return Err(ClaimError::RunFromPeopleIssuer);
         }
         if is_person && !people {
@@ -63,21 +84,21 @@ impl Identity {
             return Err(ClaimError::NoKubeUser);
         }
         let kube_user = claim(USER_CLAIM)?.to_string();
-        let namespace = match principal.claims.get("namespace") {
+        let namespace = match principal.claims.get(NAMESPACE_CLAIM) {
             None | Some(Value::Null) => None,
-            Some(_) => Some(Namespace::parse(claim("namespace")?)?),
+            Some(_) => Some(Namespace::parse(claim(NAMESPACE_CLAIM)?)?),
         };
         let (run_id, actor) = match is_person {
-            true => (RunId::parse(&principal.subject)?, None),
+            true => (config::run_id_of(&principal.subject)?, None),
             false => (
-                RunId::parse(claim("run_id")?)?,
+                config::run_id_of(claim(RUN_ID_CLAIM)?)?,
                 principal.actor_chain.first().cloned(),
             ),
         };
         Ok(Self {
             run_id,
             namespace,
-            launched_by: Launcher::parse(&principal.subject)?,
+            launched_by: config::launcher_of(&principal.subject)?,
             kube_user,
             actor,
         })
@@ -95,13 +116,15 @@ fn refused(status: StatusCode, error: &str, description: String) -> Response {
 /// Middleware: authenticate the bearer token and attach [`Identity`] and [`Principal`].
 pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next: Next) -> Response {
     let headers = req.headers();
-    let principal = match auth.oidc.authenticate(headers).await {
+    let mut principal = match auth.oidc.authenticate(headers).await {
         Ok(p) => p,
         Err(error) => {
             tracing::info!(%error, "token refused");
             return auth.oidc.challenge(headers, &error);
         }
     };
+    auth.claims.canonicalize(&mut principal);
+    default_namespace(&mut principal, &auth.namespaces).await;
     let identity = match Identity::from_principal(&principal, auth.people) {
         Ok(identity) => identity,
         Err(error) => {
@@ -128,7 +151,7 @@ pub async fn authenticate(State(auth): State<Arc<Auth>>, mut req: Request, next:
 #[cfg(test)]
 mod tests {
     use crate::auth::*;
-    use crate::caller::Caller;
+    use crate::caller::{Caller, Launcher};
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
 
@@ -265,7 +288,6 @@ mod tests {
         let cases = [
             ("run_id", Some(json!(7))),
             ("namespace", Some(json!("Not_A_Label"))),
-            ("sub", Some(json!("alice@example.com"))),
         ];
         for (key, value) in cases {
             let mut claims = realm_claims();
@@ -279,6 +301,79 @@ mod tests {
                 "{key} = {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_subject_that_is_not_a_label_value_is_sanitized_not_refused() {
+        let mut claims = person_claims();
+        claims["sub"] = json!("alice@example.com");
+        let id = Identity::from_principal(&person(claims), true).unwrap();
+        assert!(
+            id.launched_by.as_str().starts_with("alice-example.com-"),
+            "{}",
+            id.launched_by.as_str()
+        );
+        assert_eq!(id.run_id.as_str(), id.launched_by.as_str());
+    }
+
+    #[test]
+    fn a_stock_oidc_token_maps_to_a_person_through_the_claim_map() {
+        let map = ClaimMap {
+            user: "preferred_username".into(),
+            user_prefix: String::new(),
+            groups: "groups".into(),
+            run_id: None,
+            namespace: "namespace".into(),
+        };
+        let mut p = person(json!({
+            "sub": "8c1f2e9a-4b7d", "preferred_username": "alice", "groups": ["ml"],
+            "scope": "kueue.read kueue.submit",
+        }));
+        map.canonicalize(&mut p);
+        let id = Identity::from_principal(&p, true).unwrap();
+        assert_eq!(id.kube_user, "alice");
+        assert_eq!(id.run_id.as_str(), "8c1f2e9a-4b7d");
+        assert_eq!(id.namespace, None);
+        let mut nameless = person(json!({"sub": "s", "scope": "kueue.read"}));
+        map.canonicalize(&mut nameless);
+        assert!(matches!(
+            Identity::from_principal(&nameless, true),
+            Err(ClaimError::NoKubeUser)
+        ));
+    }
+
+    /// Namespaces configured as `names`; the client is never reached.
+    fn served(names: &[&str]) -> Namespaces {
+        crate::install_tls_provider();
+        let config = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        Namespaces::new(
+            kube::Client::try_from(config).unwrap(),
+            crate::kueue::KueueVersion::default(),
+            names.iter().map(|n| n.to_string()).collect(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_token_without_a_namespace_defaults_to_the_only_one_its_caller_can_use() {
+        let mut p = person(json!({"sub": "p", "kube_user": "alice"}));
+        default_namespace(&mut p, &served(&["ml-a"])).await;
+        assert_eq!(p.namespace.as_deref(), Some("ml-a"));
+        assert_eq!(p.claims["namespace"], "ml-a");
+        let id = Identity::from_principal(&p, true).unwrap();
+        assert_eq!(id.in_namespace(None).unwrap().namespace.as_str(), "ml-a");
+
+        let mut two = person(json!({"sub": "p", "kube_user": "alice"}));
+        default_namespace(&mut two, &served(&["ml-a", "ml-b"])).await;
+        assert_eq!(two.namespace, None, "two choices: the caller names one");
+
+        let mut named = person(json!({"sub": "p", "kube_user": "alice", "namespace": "ml-b"}));
+        default_namespace(&mut named, &served(&["ml-a"])).await;
+        assert_eq!(
+            named.namespace.as_deref(),
+            Some("ml-b"),
+            "a token's own namespace wins"
+        );
     }
 
     async fn app() -> (crucible_mcp_auth::testing::JwksServer, axum::Router) {
@@ -295,6 +390,8 @@ mod tests {
         let auth = Auth {
             oidc: Arc::new(oidc),
             people: false,
+            claims: ClaimMap::default(),
+            namespaces: Arc::new(served(&[])),
         };
         let app = axum::Router::new()
             .route(

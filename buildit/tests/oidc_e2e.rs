@@ -86,12 +86,16 @@ async fn call(client: &Client, tool: &str, args: Value) -> Result<String, String
         .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(map))
         .await
         .map_err(|e| e.to_string())?;
-    Ok(result
+    let text = result
         .content
         .first()
         .and_then(|c| c.as_text())
         .map(|t| t.text.clone())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if result.is_error.unwrap_or(false) {
+        return Err(text);
+    }
+    Ok(text)
 }
 
 #[tokio::test]
