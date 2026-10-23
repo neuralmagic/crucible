@@ -62,7 +62,7 @@ pub enum ConfigError {
     NoRecipients,
     #[error(
         "CONTROLLER_AGENT_SPIRE entry {0:?} is not \
-         <cluster>=<svid issuer> <gateway prefix> <namespace>/<service>:<port>"
+         <cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>"
     )]
     SpireEntry(String),
     #[error("CONTROLLER_AGENT_SPIRE names {0:?} twice; each cluster and each SVID issuer once")]
@@ -171,6 +171,8 @@ impl fmt::Debug for SigningKey {
 /// route of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryService {
+    /// Whether the Service serves TLS: `http://` before the namespace says it does not.
+    pub tls: bool,
     pub namespace: KubeName,
     pub name: KubeName,
     pub port: u16,
@@ -179,15 +181,19 @@ pub struct DiscoveryService {
 impl DiscoveryService {
     /// The API server path of the provider's JWKS.
     pub fn keys_path(&self) -> String {
+        let scheme = match self.tls {
+            true => "https",
+            false => "http",
+        };
         format!(
-            "/api/v1/namespaces/{}/services/https:{}:{}/proxy/keys",
+            "/api/v1/namespaces/{}/services/{scheme}:{}:{}/proxy/keys",
             self.namespace, self.name, self.port
         )
     }
 }
 
 /// One cluster's SPIRE, trusted for the SVIDs of sandboxes whose runs it hosts:
-/// `<cluster>=<svid issuer> <gateway prefix> <namespace>/<service>:<port>`.
+/// `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterSpire {
     pub cluster: String,
@@ -207,6 +213,10 @@ impl std::str::FromStr for ClusterSpire {
         let [issuer, prefix, service] = rest.split_whitespace().collect::<Vec<_>>()[..] else {
             return Err(bad());
         };
+        let (tls, service) = match service.strip_prefix("http://") {
+            Some(rest) => (false, rest),
+            None => (true, service),
+        };
         let (namespace, name_port) = service.split_once('/').ok_or_else(bad)?;
         let (name, port) = name_port.split_once(':').ok_or_else(bad)?;
         let kube_name = |v: &str| KubeName::try_from(v.to_string()).map_err(|_| bad());
@@ -219,6 +229,7 @@ impl std::str::FromStr for ClusterSpire {
             svid_issuer: issuer.to_string(),
             gateway_prefix: GatewayPrefix::parse(prefix)?,
             discovery: DiscoveryService {
+                tls,
                 namespace: kube_name(namespace)?,
                 name: kube_name(name)?,
                 port: port.parse().map_err(|_| bad())?,
@@ -1468,6 +1479,7 @@ mod tests {
                     )
                     .unwrap(),
                     discovery: DiscoveryService {
+                        tls: true,
                         namespace: KubeName::try_from("spire-system".to_string()).unwrap(),
                         name: KubeName::try_from("spire-oidc".to_string()).unwrap(),
                         port: 8443,
@@ -1478,6 +1490,16 @@ mod tests {
         assert_eq!(
             cfg.spire[1].discovery.keys_path(),
             "/api/v1/namespaces/spire-system/services/https:spire-oidc:8443/proxy/keys"
+        );
+        let plain: ClusterSpire = "waldorf=https://oidc-discovery.waldorf.crucible \
+             spiffe://waldorf.crucible/openshell/gateway/ \
+             http://spire-server/spire-spiffe-oidc-discovery-provider:80"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            plain.discovery.keys_path(),
+            "/api/v1/namespaces/spire-server/services/http:spire-spiffe-oidc-discovery-provider:80/proxy/keys",
+            "a discovery provider without TLS is read over http"
         );
 
         assert!(
