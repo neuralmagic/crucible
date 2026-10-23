@@ -25,7 +25,8 @@ use std::sync::Arc;
 /// Largest request or `tools/list` response body the guard buffers.
 const BODY_LIMIT: usize = 4 * 1024 * 1024;
 
-/// JSON-RPC error code for a call the policy refused (implementation-defined server error range).
+/// JSON-RPC error code for a refused method other than a tool call (implementation-defined server
+/// error range).
 pub const POLICY_REFUSED: i64 = -32001;
 
 const PROTOCOL_METHODS: [&str; 3] = ["initialize", "ping", "server/discover"];
@@ -77,7 +78,7 @@ pub async fn enforce(State(guard): State<Arc<PolicyGuard>>, req: Request, next: 
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             if let Err(refusal) = decide(&guard, &mut message, &principal, method).await {
                 tracing::info!(sub = %principal.subject, presenter = principal.presenter(), %refusal, "request refused");
-                return refuse(&guard, &parts.headers, id, refusal);
+                return refuse(&guard, &parts.headers, id, method, refusal);
             }
             false
         }
@@ -125,7 +126,7 @@ async fn review(
                 });
             }
             Err(error) => {
-                return Err(Refusal::ReviewError {
+                return Err(Refusal::ReviewFailed {
                     tool: check.tool.clone(),
                     rule: check.rule.clone(),
                     error: error.to_string(),
@@ -204,7 +205,16 @@ fn tool_call(message: &mut Value) -> Result<(String, &mut Map<String, Value>), R
     }
 }
 
-fn refuse(guard: &PolicyGuard, headers: &http::HeaderMap, id: Value, refusal: Refusal) -> Response {
+/// A missing scope is a step-up challenge when a server is attached. A refused tool call is a tool
+/// result with `isError`, so the model reads why; a call that names no tool and any other method
+/// get a JSON-RPC error.
+fn refuse(
+    guard: &PolicyGuard,
+    headers: &http::HeaderMap,
+    id: Value,
+    method: &str,
+    refusal: Refusal,
+) -> Response {
     if let (Refusal::Scope { missing, .. }, Some(server)) = (&refusal, &guard.server) {
         return server.challenge(
             headers,
@@ -213,12 +223,26 @@ fn refuse(guard: &PolicyGuard, headers: &http::HeaderMap, id: Value, refusal: Re
             },
         );
     }
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {"code": POLICY_REFUSED, "message": refusal.to_string()},
-    });
+    let body = if method == "tools/call" && refusal != Refusal::NoToolName {
+        json!({"jsonrpc": "2.0", "id": id, "result": refused_tool_result(&refusal)})
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {"code": POLICY_REFUSED, "message": refusal.to_string()},
+        })
+    };
     (StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// A `CallToolResult` with `isError` whose text is `{"status": "refused", "error", "retryable"}`.
+fn refused_tool_result(refusal: &Refusal) -> Value {
+    let text = json!({
+        "status": "refused",
+        "error": refusal.to_string(),
+        "retryable": refusal.retryable(),
+    });
+    json!({"content": [{"type": "text", "text": text.to_string()}], "isError": true})
 }
 
 fn plain(status: StatusCode, message: &'static str) -> Response {
@@ -547,11 +571,20 @@ mod tests {
         let (status, _, body, _) =
             post(app, call("workload_plan", json!({"queue": "other"}))).await;
         assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["id"], 7);
         assert_eq!(
-            body,
-            json!({"jsonrpc": "2.0", "id": 7, "error": {"code": POLICY_REFUSED,
-                "message": "tool workload_plan refused by policy rule queue-allowed: queue is not in this run's allowlist"}})
+            refusal(&body),
+            json!({"status": "refused", "retryable": false,
+                "error": "tool workload_plan refused by policy rule queue-allowed: queue is not in this run's allowlist"})
         );
+    }
+
+    /// The refusal a tool call was answered with: a tool result with `isError` whose text is JSON.
+    fn refusal(body: &Value) -> Value {
+        assert!(body.get("error").is_none(), "not a JSON-RPC error: {body}");
+        assert_eq!(body["result"]["isError"], true, "{body}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        serde_json::from_str(text).unwrap()
     }
 
     #[tokio::test]
@@ -565,7 +598,7 @@ mod tests {
         assert_eq!(nameless["error"]["message"], "tools/call names no tool");
         let (_, _, listy, _) = post(app.clone(), call("whoami", json!([1]))).await;
         assert_eq!(
-            listy["error"]["message"],
+            refusal(&listy)["error"],
             "tool whoami: arguments must be an object"
         );
         let (_, _, null_args, _) = post(app, call("whoami", Value::Null)).await;
@@ -603,7 +636,7 @@ mod tests {
         let app = app(guard(None), Some(principal("kueue.read")), false);
         let (_, _, body, _) =
             post(app, call("workload_plan", json!({"queue": "crucible-e2e"}))).await;
-        body["error"]["message"].clone()
+        refusal(&body)["error"].clone()
     }
 
     #[tokio::test]
@@ -825,7 +858,8 @@ mod tests {
         let app = app(open, Some(principal("kueue.submit")), false);
         let (_, _, body, _) = post(app.clone(), call("workload_delete", json!({}))).await;
         assert_eq!(
-            body["error"]["message"], "tool workload_delete is not permitted",
+            refusal(&body)["error"],
+            "tool workload_delete is not permitted",
             "{body}"
         );
         let (_, _, body, _) = post(app, call("workload_plan", json!({"queue": "q"}))).await;
@@ -875,15 +909,18 @@ mod tests {
         let denied = app(reviewed(&[], false), Some(kube_user("kueue.submit")), false);
         let (_, _, body, _) = post(denied, plan()).await;
         assert_eq!(
-            body["error"]["message"],
-            "workload_plan refused by access check localqueues-use: you may not use this"
+            refusal(&body),
+            json!({"status": "refused", "retryable": false,
+                "error": "workload_plan refused by access check localqueues-use: you may not use this"})
         );
 
         let broken = app(reviewed(&[], true), Some(kube_user("kueue.submit")), false);
         let (_, _, body, _) = post(broken, plan()).await;
         assert_eq!(
-            body["error"]["message"],
-            "workload_plan refused: access check localqueues-use could not be made: the API server is unreachable"
+            refusal(&body),
+            json!({"status": "refused", "retryable": true,
+                "error": "workload_plan refused: access check localqueues-use failed: the API server is unreachable"}),
+            "a review that could not complete may succeed later"
         );
 
         let cancel = app(
@@ -904,8 +941,9 @@ mod tests {
         let (_, _, body, _) =
             post(app, call("workload_plan", json!({"queue": "crucible-e2e"}))).await;
         assert_eq!(
-            body["error"]["message"],
-            "workload_plan refused: access check localqueues-use could not be made: this server has no access reviewer"
+            refusal(&body),
+            json!({"status": "refused", "retryable": false,
+                "error": "workload_plan refused: access check localqueues-use could not be made: this server has no access reviewer"})
         );
     }
 

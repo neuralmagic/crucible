@@ -90,12 +90,26 @@ pub enum Refusal {
         rule: String,
         error: String,
     },
+    #[error("{tool} refused: access check {rule} failed: {error}")]
+    ReviewFailed {
+        tool: String,
+        rule: String,
+        error: String,
+    },
     #[error("tool {tool} refused: server-owned argument {path} could not be set: {error}")]
     Mutate {
         tool: String,
         path: String,
         error: String,
     },
+}
+
+impl Refusal {
+    /// Whether the same call can succeed later: only an access review the reviewer could not
+    /// complete.
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::ReviewFailed { .. })
+    }
 }
 
 #[derive(Deserialize)]

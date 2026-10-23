@@ -1976,7 +1976,7 @@ mod tests {
         .await;
         assert_eq!(status, 200, "{reply}");
         assert!(reply.contains("build-timeout-cap"), "{reply}");
-        assert!(reply.contains(r#""code":-32001"#), "{reply}");
+        assert!(reply.contains(r#""isError":true"#), "{reply}");
         let (status, metadata) = post(&addr, "host.openshell.internal", "", "").await;
         assert_eq!(status, 401, "{metadata}");
     }
