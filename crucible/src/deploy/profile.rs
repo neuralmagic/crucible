@@ -166,9 +166,6 @@ pub struct KueueCfg {
     /// so the Service is addressed by its fully qualified name.
     #[serde(default = "default_cluster_domain")]
     pub cluster_domain: String,
-    /// The image pull secrets a workload's pods may name; none by default.
-    #[serde(default)]
-    pub pull_secrets: Vec<String>,
 }
 
 /// The dispatch name of the controller's own cluster.

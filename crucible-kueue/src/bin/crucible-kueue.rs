@@ -66,13 +66,6 @@ struct Cli {
     /// token's kube_groups claim. Turns on people's tokens.
     #[arg(long, env = "CRUCIBLE_KUEUE_KUBE_AUTHZ", value_enum)]
     kube_authz: Option<KubeAuthz>,
-    /// An image pull secret workloads' pods may name. Repeatable; with none, pods name none.
-    #[arg(
-        long = "pull-secret",
-        env = "CRUCIBLE_KUEUE_PULL_SECRETS",
-        value_delimiter = ','
-    )]
-    pull_secrets: Vec<String>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -172,7 +165,6 @@ async fn main() -> anyhow::Result<()> {
             reviewer,
             allowed_hosts: cli.allowed_hosts,
             kueue,
-            pull_secrets: cli.pull_secrets,
         },
     );
     let listener = tokio::net::TcpListener::bind(&cli.bind)

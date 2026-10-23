@@ -45,8 +45,6 @@ pub struct Options {
     pub allowed_hosts: Vec<String>,
     /// The Kueue API version the cluster serves; see [`kueue::KueueVersion::discover`].
     pub kueue: kueue::KueueVersion,
-    /// The image pull secrets a workload's pods may name; none when empty.
-    pub pull_secrets: Vec<String>,
 }
 
 /// The HTTP app: the MCP endpoint behind authentication and the guard; plus an
@@ -58,9 +56,7 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
         reviewer,
         allowed_hosts,
         kueue,
-        pull_secrets,
     } = options;
-    let pull_secrets: Arc<[String]> = pull_secrets.into();
     let people = reviewer.is_some();
     let auth = auth::Auth {
         oidc: oidc.clone(),
@@ -77,13 +73,7 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
     }
     let service: StreamableHttpService<server::KueueMcp, NeverSessionManager> =
         StreamableHttpService::new(
-            move || {
-                Ok(server::KueueMcp::new(
-                    client.clone(),
-                    kueue,
-                    pull_secrets.clone(),
-                ))
-            },
+            move || Ok(server::KueueMcp::new(client.clone(), kueue)),
             Arc::new(NeverSessionManager::default()),
             config,
         );

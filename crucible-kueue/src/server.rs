@@ -341,7 +341,6 @@ pub struct ListArgs {
 pub struct KueueMcp {
     client: kube::Client,
     kueue: KueueVersion,
-    pull_secrets: std::sync::Arc<[String]>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -394,15 +393,10 @@ fn pod_summary(p: &Pod) -> PodSummary {
 }
 
 impl KueueMcp {
-    pub fn new(
-        client: kube::Client,
-        kueue: KueueVersion,
-        pull_secrets: std::sync::Arc<[String]>,
-    ) -> Self {
+    pub fn new(client: kube::Client, kueue: KueueVersion) -> Self {
         Self {
             client,
             kueue,
-            pull_secrets,
             tool_router: Self::tool_router(),
         }
     }
@@ -575,7 +569,6 @@ impl KueueMcp {
         let lq = self.local_queue(caller, queue).await?;
         let queue = QueueName::parse(queue)?;
         let normalized = manifest::normalize(manifest, caller, &queue)?;
-        manifest::check_pull_secrets(&normalized, &self.pull_secrets)?;
         let cq = self.cluster_queue(&lq).await?;
         Ok((normalized, cq))
     }
