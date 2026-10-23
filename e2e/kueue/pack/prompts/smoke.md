@@ -25,7 +25,7 @@ your shell.
    {
      "apiVersion": "batch/v1",
      "kind": "Job",
-     "metadata": {"name": "crucible-smoke"},
+     "metadata": {"name": "crucible-smoke-@NONCE_SHORT@"},
      "spec": {
        "backoffLimit": 0,
        "ttlSecondsAfterFinished": 3600,
@@ -44,7 +44,7 @@ your shell.
 
 6. Call kueue `workload_submit` with the same queue, the same manifest, and the `plan_hash` the
    plan returned.
-7. Poll kueue `workload_status` for kind `Job`, name `crucible-smoke` until the Job has succeeded
+7. Poll kueue `workload_status` for kind `Job`, name `crucible-smoke-@NONCE_SHORT@` until the Job has succeeded
    or failed, running `sleep 10` between polls. Give up after 5 minutes.
 8. Call kueue `workload_logs` for the Job.
 9. Call buildit `clean` with the build_id.

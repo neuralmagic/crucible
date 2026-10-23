@@ -47,9 +47,9 @@ SANDBOX_NS=crucible-sandboxes
 WORKLOAD_NS=crucible-kueue-e2e
 SPIRE_NS=zero-trust-workload-identity-manager
 SPIRE_DISCOVERY=spire-spiffe-oidc-discovery-provider:443
-JOB=crucible-smoke
 PUSH_REPO=${PUSH_REPO:-quay.io/wseaton/crucible-smoke}
 NONCE=$(openssl rand -hex 12)
+JOB=crucible-smoke-${NONCE:0:8}
 TIMEOUT_SECS=${TIMEOUT_SECS:-1800}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -114,7 +114,7 @@ fill() {
         -e "s|@PULL_SECRET@|$PULL_SECRET|g" -e "s|@CTL_NS@|$CTL_NS|g" -e "s|@LOOP_NS@|$LOOP_NS|g" \
         -e "s|@SPIRE_NS@|$SPIRE_NS|g" -e "s|@ISSUER@|$ISSUER|g" -e "s|@KUEUE_URL@|$KUEUE_URL|g" \
         -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
-        -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@NONCE@|$NONCE|g" \
+        -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@NONCE@|$NONCE|g" -e "s|@NONCE_SHORT@|${NONCE:0:8}|g" \
         -e "s|@AGENT_SPIRE@|hub=$SVID_ISSUER $GATEWAY_PREFIX $SPIRE_NS/$SPIRE_DISCOVERY|g" "$1"
 }
 fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
