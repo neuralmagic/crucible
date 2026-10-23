@@ -248,13 +248,14 @@ username is unknown; other tokens are issued without the claim, logged at warn.
 | `CONTROLLER_AGENT_SPIRE` | Comma-separated `<cluster>=<svid issuer> <gateway prefix> <namespace>/<service>:<port>` entries, one per cluster hosting isolated gateways (`hub` for the controller's own): the `iss` of that SPIRE's JWT-SVIDs, its gateway prefix (`spiffe://<trust domain>/openshell/gateway/`; supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`), and its OIDC discovery provider Service, whose `/keys` is read through that cluster's API server. Each cluster and each issuer appears once. SVIDs must carry `iat` and live at most 15 minutes. |
 | `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
 
-A run dispatched onto the `[kueue]` cluster gets the server's URL (`CRUCIBLE_KUEUE_URL`), the
+A run dispatched onto one of the `[kueue]` clusters (`clusters = ["pirate", "waldorf"]`, or
+`cluster = "pirate"`) gets the server's URL (`CRUCIBLE_KUEUE_URL`), the
 token endpoint (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`) and the issuer as SVID audience
 (`CRUCIBLE_AGENT_SVID_AUDIENCE`) as plain env. The engine registers a token-grant provider from
 them, so each sandbox's supervisor obtains its own token and injects it on traffic to the server
 alone; no token is minted per run and nothing is recorded.
 
-The deploy profile's `[kueue] workload_namespace` is the `namespace` claim for runs on its cluster;
+The deploy profile's `[kueue] workload_namespace` is the `namespace` claim for runs on its clusters;
 a run elsewhere gets none. `[kueue] run_issuer` must equal `CONTROLLER_AGENT_ISSUER`: the rendered
 server trusts runs' tokens from it, fetching keys from `<run_issuer>/.well-known/jwks.json` unless
 `run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).

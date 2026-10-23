@@ -133,16 +133,21 @@ impl TryFrom<String> for ServiceAccountRef {
     }
 }
 
-/// The `[kueue]` table. The server on `cluster` accepts runs' tokens from the controller's agent
-/// issuer and acts for each as its `kube_user`, as Kubernetes RBAC decides.
+/// The `[kueue]` table. The server on each of `clusters` accepts runs' tokens from the controller's
+/// agent issuer and acts for each as its `kube_user`, as Kubernetes RBAC decides.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KueueCfg {
     /// The server image, a tag the renderer resolves to `@sha256:…`.
     pub image: String,
-    /// The dispatch cluster the server runs on: `hub` or a spoke name.
-    #[serde(default = "hub_cluster")]
-    pub cluster: String,
+    /// The dispatch clusters the server runs on, `hub` or spoke names: `clusters = ["pirate",
+    /// "waldorf"]`, or `cluster = "pirate"` for one.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
     /// Namespace of the server's Deployment, Service, and ServiceAccount.
     pub namespace: KubeName,
     /// The namespace a run's token names as its default, and the only one where the server's own
@@ -166,8 +171,26 @@ pub struct KueueCfg {
 /// The dispatch name of the controller's own cluster.
 pub const HUB_CLUSTER: &str = "hub";
 
-fn hub_cluster() -> String {
-    HUB_CLUSTER.to_string()
+fn hub_clusters() -> Vec<String> {
+    vec![HUB_CLUSTER.to_string()]
+}
+
+/// A string or a non-empty list of strings.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let list = match OneOrMany::deserialize(d)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    };
+    match list.is_empty() {
+        true => Err(serde::de::Error::custom("names no cluster")),
+        false => Ok(list),
+    }
 }
 
 fn default_cluster_domain() -> String {
@@ -177,6 +200,11 @@ fn default_cluster_domain() -> String {
 impl KueueCfg {
     pub const SERVICE_NAME: &str = "crucible-kueue";
     pub const PORT: u16 = 8850;
+
+    /// Whether a server runs on dispatch cluster `cluster`.
+    pub fn serves(&self, cluster: &str) -> bool {
+        self.clusters.iter().any(|c| c == cluster)
+    }
 
     /// The Service DNS name sandboxes reach the server at, and the Host the server accepts.
     pub fn service_host(&self) -> String {

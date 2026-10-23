@@ -561,11 +561,32 @@ mod tests {
         let cfg = profile(PROFILE.replace("cluster = \"pirate\"\n", "").as_str())
             .kueue
             .unwrap();
-        assert_eq!(cfg.cluster, "hub");
+        assert_eq!(cfg.clusters, ["hub"]);
         assert_eq!(
             cfg.url(),
             "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp"
         );
+    }
+
+    #[test]
+    fn the_server_may_run_on_several_clusters() {
+        let one = profile(PROFILE).kueue.unwrap();
+        assert!(one.serves("pirate") && !one.serves("waldorf") && !one.serves("hub"));
+        let many = profile(
+            PROFILE
+                .replace(
+                    "cluster = \"pirate\"",
+                    "clusters = [\"pirate\", \"waldorf\"]",
+                )
+                .as_str(),
+        )
+        .kueue
+        .unwrap();
+        assert!(many.serves("pirate") && many.serves("waldorf") && !many.serves("hub"));
+        let none = toml::from_str::<crate::deploy::profile::DeployProfile>(
+            &PROFILE.replace("cluster = \"pirate\"", "clusters = []"),
+        );
+        assert!(none.is_err(), "a [kueue] table on no cluster is refused");
     }
 
     #[test]

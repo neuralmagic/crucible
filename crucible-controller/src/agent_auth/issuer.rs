@@ -506,7 +506,9 @@ pub enum GrantError {
 /// The `namespace` claim, crucible-kueue's default namespace for a run's workloads: the deploy
 /// profile's `[kueue] workload_namespace` for a run on that table's cluster, `None` elsewhere.
 pub fn default_namespace(kueue: &KueueCfg, cluster: &str) -> Option<String> {
-    (kueue.cluster == cluster).then(|| kueue.workload_namespace.to_string())
+    kueue
+        .serves(cluster)
+        .then(|| kueue.workload_namespace.to_string())
 }
 
 /// The launcher a run's token acts for: the login of the person the run was dispatched for.

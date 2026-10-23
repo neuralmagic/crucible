@@ -40,7 +40,7 @@ impl AgentTokens {
 /// The loop pod's crucible-kueue env for a run dispatched onto `cluster`, `None` when the server
 /// runs elsewhere.
 pub fn access(cfg: &KueueCfg, cluster: &str, tokens: &AgentTokens) -> Option<Delivery> {
-    (cfg.cluster == cluster).then(|| Delivery {
+    cfg.serves(cluster).then(|| Delivery {
         plain_env: vec![
             (ENV_KUEUE_URL.to_string(), cfg.url()),
             (
@@ -120,6 +120,21 @@ mod tests {
     #[test]
     fn a_run_elsewhere_gets_nothing() {
         assert!(access(&kueue(), "hub", &tokens()).is_none());
+    }
+
+    #[test]
+    fn a_run_on_any_of_the_servers_clusters_gets_access() {
+        let both = toml::from_str::<DeployProfile>(&PROFILE.replace(
+            "cluster = \"pirate\"",
+            "clusters = [\"pirate\", \"waldorf\"]",
+        ))
+        .ok()
+        .and_then(|p| p.kueue)
+        .expect("profile parses");
+        for cluster in ["pirate", "waldorf"] {
+            assert!(access(&both, cluster, &tokens()).is_some(), "{cluster}");
+        }
+        assert!(access(&both, "hub", &tokens()).is_none());
     }
 
     #[test]

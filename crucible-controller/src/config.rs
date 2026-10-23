@@ -601,7 +601,7 @@ pub struct ControllerCfg {
     #[arg(long = "public-url", env = "CONTROLLER_PUBLIC_URL")]
     pub public_url: Option<String>,
     /// The agent token issuer identifier, the same `CONTROLLER_AGENT_ISSUER` the issuer serves
-    /// under. Runs on the `[kueue]` cluster get it as their sandboxes' SVID audience, and its token
+    /// under. Runs on a `[kueue]` cluster get it as their sandboxes' SVID audience, and its token
     /// endpoint for their token grants.
     #[arg(long = "agent-issuer", env = "CONTROLLER_AGENT_ISSUER")]
     pub agent_issuer: Option<String>,
