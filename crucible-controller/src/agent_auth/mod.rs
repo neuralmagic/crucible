@@ -20,6 +20,7 @@ pub mod directory;
 pub mod issuer;
 pub mod people;
 pub mod placement;
+pub mod sandbox;
 pub mod spire;
 #[cfg(test)]
 mod testing;
@@ -48,10 +49,16 @@ pub struct AgentAuth {
 
 impl AgentAuth {
     /// The issuer `CONTROLLER_AGENT_*` configures, `None` when `CONTROLLER_AGENT_ISSUER` is unset.
+    /// `people` builds the people grant from its configuration, over the controller's tables.
     pub fn from_env(
         pool: PgPool,
         deploy_profile: Option<PathBuf>,
         clusters: Arc<crate::runs::clusters::ClusterClients>,
+        people: impl FnOnce(
+            people::PeopleConfig,
+            PgPool,
+            &crucible::deploy::DeployProfile,
+        ) -> people::People,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         use anyhow::Context;
         let Some(cfg) = issuer::AgentIssuerConfig::from_env()? else {
@@ -67,13 +74,14 @@ impl AgentAuth {
             false => placement::check_key_placement(namespace.as_deref(), &profile)?,
             true => placement::check_key_exposure(namespace.as_deref(), &profile)?,
         }
+        let make_people = people;
         let people = people::PeopleConfig::from_env()?.map(|config| {
             tracing::info!(
                 audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
                 access_ttl_secs = config.access_ttl_secs,
                 "issuing access tokens to people"
             );
-            let people = crate::identity::people_directory::people(config, pool.clone(), &profile);
+            let people = make_people(config, pool.clone(), &profile);
             people::grants::spawn_sweep(people.grants.clone());
             people
         });
@@ -100,6 +108,19 @@ impl AgentAuth {
             directory: Arc::new(directory::KubeDirectory(clusters)),
             people,
         })))
+    }
+}
+
+impl AgentAuth {
+    /// What the sandbox bind route needs from the issuer's configuration.
+    pub(crate) fn bind_state(&self, db: crate::Db) -> bindings::BindState {
+        bindings::BindState {
+            db,
+            directory: self.directory.clone(),
+            sandbox_namespace: placement::sandbox_namespace(Some(&self.profile))
+                .map(ToString::to_string)
+                .map_err(|e| e.to_string()),
+        }
     }
 }
 
@@ -415,7 +436,7 @@ async fn metadata(State(state): State<Arc<AgentAuth>>) -> Response {
     Json(
         state
             .issuer
-            .metadata(state.people.as_ref().map(|p| &p.config)),
+            .metadata(state.people.as_ref().map(|p| p.config.scopes()).as_deref()),
     )
     .into_response()
 }

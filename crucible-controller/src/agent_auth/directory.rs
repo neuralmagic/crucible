@@ -2,7 +2,7 @@
 //! it, by id. The run pod that binds a sandbox reports only the id; the name buildit acts on, and
 //! the proof that its gateway made it, come from the cluster, never from the binder.
 
-use crate::agent_auth::bindings::SandboxId;
+use crate::agent_auth::sandbox::SandboxId;
 use crate::daemon::queue::BoxFuture;
 use crate::runs::clusters::ClusterClients;
 use kube::api::{Api, ApiResource, DynamicObject, ListParams};

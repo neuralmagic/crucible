@@ -20,7 +20,7 @@ pub mod directory;
 pub mod grants;
 
 use crate::agent_auth::AgentAuth;
-use crate::agent_auth::issuer::{AgentIssuer, MintError, token_id};
+use crate::agent_auth::issuer::{AUTHORIZE_PATH, AgentIssuer, MintError, token_id};
 use crate::identity::api_key::constant_time_eq;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
@@ -36,7 +36,6 @@ use tower_sessions::Session;
 use url::Url;
 
 pub const CLIENT_ID: &str = "claude-code";
-pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const CODE_TTL_SECS: u64 = 60;
 /// An access token's lifetime unless `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` says otherwise.
 pub const ACCESS_TTL_SECS: u64 = 900;
@@ -108,6 +107,17 @@ pub struct PeopleConfig {
 }
 
 impl PeopleConfig {
+    /// Every scope a person's token may carry, for the issuer's metadata.
+    pub fn scopes(&self) -> Vec<String> {
+        let mut scopes: Vec<String> = Vec::new();
+        for scope in self.audiences.iter().flat_map(|a| a.scopes.iter()) {
+            if !scopes.contains(scope) {
+                scopes.push(scope.clone());
+            }
+        }
+        scopes
+    }
+
     /// `CONTROLLER_PEOPLE_AUDIENCES`, comma separated; `None` when unset.
     pub fn from_env() -> Result<Option<Self>, PeopleConfigError> {
         let Some(mut config) =

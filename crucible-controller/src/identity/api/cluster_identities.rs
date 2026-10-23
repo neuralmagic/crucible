@@ -934,10 +934,7 @@ openshift = ["pirate"]
             let reply = h.put_token(path, cluster, token).await;
             assert_eq!(reply.status, want, "{cluster} {token}: {}", reply.body);
         }
-        assert_eq!(
-            h.identities().await["pirate"]["kube_user"],
-            "casey-pasted"
-        );
+        assert_eq!(h.identities().await["pirate"]["kube_user"], "casey-pasted");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

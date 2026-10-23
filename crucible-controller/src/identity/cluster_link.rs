@@ -15,7 +15,7 @@ use oauth2::{
     AuthType, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
     PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -101,30 +101,6 @@ impl LinkCfg {
             secrets,
             openshift: table.openshift.iter().map(|c| c.to_string()).collect(),
         })
-    }
-}
-
-/// A link waiting for its callback, parked on the browser session.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PendingLink {
-    pub cluster: String,
-    pub sub: String,
-    state: String,
-    pkce_verifier: String,
-    token_endpoint: String,
-    started_at: jiff::Timestamp,
-    /// The in-app page the callback lands on; Settings when `None`.
-    #[serde(default)]
-    pub return_to: Option<String>,
-}
-
-impl std::fmt::Debug for PendingLink {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PendingLink")
-            .field("cluster", &self.cluster)
-            .field("sub", &self.sub)
-            .field("started_at", &self.started_at)
-            .finish_non_exhaustive()
     }
 }
 
@@ -233,7 +209,7 @@ impl ClusterLinks {
         sub: &str,
         cluster: &str,
         now: jiff::Timestamp,
-    ) -> Result<(Url, PendingLink), LinkFlowError> {
+    ) -> Result<(Url, crate::identity::session::PendingLink), LinkFlowError> {
         self.registered(cluster)?;
         let metadata = self.discover(cluster).await?;
         let authorize = AuthUrl::new(metadata.authorization_endpoint)
@@ -247,7 +223,7 @@ impl ClusterLinks {
             .url();
         Ok((
             url,
-            PendingLink {
+            crate::identity::session::PendingLink {
                 cluster: cluster.to_string(),
                 sub: sub.to_string(),
                 state: state.secret().clone(),
@@ -263,7 +239,7 @@ impl ClusterLinks {
     /// person the callback arrived as, `cluster` the cluster its path names.
     pub async fn finish(
         &self,
-        pending: Option<PendingLink>,
+        pending: Option<crate::identity::session::PendingLink>,
         sub: &str,
         cluster: &str,
         callback: Callback,

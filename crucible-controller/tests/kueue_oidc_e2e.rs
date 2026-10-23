@@ -17,10 +17,11 @@
 //! Deployments; the realm's spike client carries the same user for the RBAC test.
 
 use base64::Engine;
-use crucible_controller::agent_auth::bindings::{self, Binding, SandboxId};
+use crucible_controller::agent_auth::bindings::{self, Binding};
 use crucible_controller::agent_auth::issuer::{
     AgentIssuer, AgentIssuerConfig, IssuerUrl, SigningKey,
 };
+use crucible_controller::agent_auth::sandbox::SandboxId;
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::kube::{GroupSource, SubjectAccessReviewer};

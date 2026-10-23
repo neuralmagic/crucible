@@ -1135,6 +1135,7 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         db.pool().clone(),
         cfg.deploy_profile.clone(),
         clusters.clone(),
+        crucible_controller::identity::people_directory::people,
     )
     .context("configuring the agent token issuer")?;
     let serve_state = crucible_controller::api::state::ApiState::new(

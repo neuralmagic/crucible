@@ -303,12 +303,7 @@ impl Surface {
         // The sandbox bind, like the evidence routes, authenticates with the run's own pod token.
         let router = match agent_auth {
             Some(state) => router
-                .merge(agent_auth::bindings::router(
-                    agent_auth::bindings::BindState {
-                        db: db.clone(),
-                        agent: state.clone(),
-                    },
-                ))
+                .merge(agent_auth::bindings::router(state.bind_state(db.clone())))
                 .merge(agent_auth::router(state)),
             None => router,
         };

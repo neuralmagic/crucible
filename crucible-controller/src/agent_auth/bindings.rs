@@ -1,8 +1,8 @@
 //! Which run each sandbox belongs to. Only a run's pod, authenticated by the run's pod token,
 //! binds a sandbox, and only to its own run; the token endpoint trusts nothing else.
 
-use crate::agent_auth::AgentAuth;
 use crate::agent_auth::directory::DirectoryError;
+use crate::agent_auth::sandbox::{SandboxId, SandboxIdError};
 use crate::runs::workpod::WorkPodState;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
@@ -12,41 +12,6 @@ use axum::response::{IntoResponse, Response};
 use crucible_contract::sandbox::SandboxBinding;
 use sqlx::PgPool;
 use std::sync::Arc;
-
-const MAX_SANDBOX_ID_LEN: usize = 128;
-
-/// An OpenShell sandbox id: the gateway-assigned id, also the last segment of the sandbox
-/// supervisor's SPIFFE ID.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SandboxId(String);
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("sandbox id {0:?} is not 1-{MAX_SANDBOX_ID_LEN} characters of [A-Za-z0-9._-]")]
-pub struct SandboxIdError(pub String);
-
-impl SandboxId {
-    pub fn parse(raw: &str) -> Result<Self, SandboxIdError> {
-        let valid = !raw.is_empty()
-            && raw.len() <= MAX_SANDBOX_ID_LEN
-            && raw
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
-        match valid {
-            true => Ok(Self(raw.to_string())),
-            false => Err(SandboxIdError(raw.to_string())),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for SandboxId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
 
 /// A run pod's request to bind a sandbox: its id, and where its workspace sits inside it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -311,7 +276,9 @@ pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, Res
 #[derive(Clone)]
 pub(crate) struct BindState {
     pub(crate) db: crate::Db,
-    pub(crate) agent: Arc<AgentAuth>,
+    pub(crate) directory: Arc<dyn crate::agent_auth::directory::SandboxDirectory>,
+    /// The namespace runs' sandboxes live in, or why the profile names none.
+    pub(crate) sandbox_namespace: Result<String, String>,
 }
 
 pub(crate) fn router(state: BindState) -> axum::Router {
@@ -381,13 +348,11 @@ async fn bind_sandbox(
             return refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
     };
-    let namespace =
-        match crate::agent_auth::placement::sandbox_namespace(Some(&state.agent.profile)) {
-            Ok(ns) => ns.to_string(),
-            Err(e) => return refuse(StatusCode::CONFLICT, e.to_string()),
-        };
+    let namespace = match &state.sandbox_namespace {
+        Ok(ns) => ns.clone(),
+        Err(e) => return refuse(StatusCode::CONFLICT, e.clone()),
+    };
     let name = match state
-        .agent
         .directory
         .sandbox_name(&run.cluster, &namespace, &request.id, &run.pod)
         .await
@@ -417,7 +382,6 @@ async fn bind_sandbox(
         Ok(()) => {
             tracing::info!(pod = %run.pod, run_id, sandbox = %sandbox, name = binding.name, "sandbox bound");
             if let Err(e) = state
-                .agent
                 .directory
                 .adopt(&run.cluster, &namespace, sandbox, &run.pod)
                 .await
@@ -745,10 +709,7 @@ mod tests {
     ) {
         let spire = Spire::start().await;
         let (agent, directory) = testing::agent_auth(&pool, &spire, profile, known);
-        let state = BindState {
-            db: crate::Db::new(pool),
-            agent,
-        };
+        let state = agent.bind_state(crate::Db::new(pool));
         (router(state), directory)
     }
 

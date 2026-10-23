@@ -382,24 +382,11 @@ fn ingress_ports(policy: &k8s_openapi::api::networking::v1::NetworkPolicy) -> Re
 /// bespoke cleanup — the CM's lifetime is glued to the pod's. The render already set the CM's name +
 /// namespace to the run-unique values, so this only adds ownership + selectors.
 fn stamp_run_configmap(cm: &mut ConfigMap, pod: &Pod, issue_key: &str) {
-    stamp_managed_meta(&mut cm.metadata, issue_key, owner_reference_to_pod(pod));
-}
-
-/// An ownerReference pointing at a just-created pod (its UID populated by the API server), for
-/// cascade-GC'ing the pack ConfigMap with the pod. `None` when the pod has no name/UID yet (a fake
-/// dispatcher that doesn't stamp a UID) — the CM is still created, just not cascade-owned, and the
-/// managed-by selector keeps it sweepable.
-pub(crate) fn owner_reference_to_pod(pod: &Pod) -> Option<OwnerReference> {
-    let name = pod.metadata.name.clone().filter(|s| !s.is_empty())?;
-    let uid = pod.metadata.uid.clone().filter(|s| !s.is_empty())?;
-    Some(OwnerReference {
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        name,
-        uid,
-        controller: Some(true),
-        block_owner_deletion: Some(true),
-    })
+    stamp_managed_meta(
+        &mut cm.metadata,
+        issue_key,
+        crate::runs::workpod::gateway::owner_reference_to_pod(pod),
+    );
 }
 
 /// Stamp the controller-owned metadata onto a rendered loop-run pod: override its object name with

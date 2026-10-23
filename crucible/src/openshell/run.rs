@@ -325,7 +325,8 @@ async fn try_turn(
     }
     // The gateway is up, open the typed gRPC client for the rest of the turn (control plane;
     // file transfer stays on the CLI). Constructed in this runtime context (`connect_lazy`).
-    let gw = Gateway::connect(&access).context("connecting to the openshell gateway over gRPC")?;
+    let gw = Gateway::connect(&access.dial()?)
+        .context("connecting to the openshell gateway over gRPC")?;
 
     // 2. Resolve this harness's model credential: Vertex's static credential becomes a gateway
     //    provider the metadata emulator serves to claude/hermes, and to opencode/pi when the

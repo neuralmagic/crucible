@@ -295,7 +295,7 @@ impl<'a> RunGateway<'a> {
             )
             .await
             .context("creating the gateway pod")?;
-        let owner = crate::runs::workpod::run::owner_reference_to_pod(&gateway_pod)
+        let owner = owner_reference_to_pod(&gateway_pod)
             .context("the gateway pod create response carried no UID to own its Secrets")?;
         let secret = |name: &str, leaf: &Leaf| {
             let mut secret = render::gateway_tls_secret(
@@ -494,6 +494,27 @@ pub(crate) async fn sweep_orphan_gateways(
             }
         }
     }
+}
+
+/// An ownerReference pointing at a just-created pod (its UID populated by the API server), for
+/// cascade-GC'ing the pack ConfigMap with the pod. `None` when the pod has no name/UID yet (a fake
+/// dispatcher that doesn't stamp a UID) — the CM is still created, just not cascade-owned, and the
+/// managed-by selector keeps it sweepable.
+pub(crate) fn owner_reference_to_pod(
+    pod: &Pod,
+) -> Option<k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference> {
+    let name = pod.metadata.name.clone().filter(|s| !s.is_empty())?;
+    let uid = pod.metadata.uid.clone().filter(|s| !s.is_empty())?;
+    Some(
+        k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+            api_version: "v1".to_string(),
+            kind: "Pod".to_string(),
+            name,
+            uid,
+            controller: Some(true),
+            block_owner_deletion: Some(true),
+        },
+    )
 }
 
 #[cfg(test)]

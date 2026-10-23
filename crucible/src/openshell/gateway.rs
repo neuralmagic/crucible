@@ -436,6 +436,14 @@ impl GatewayAccess {
         })
     }
 
+    /// The URL and client material the gRPC client dials with.
+    pub fn dial(&self) -> Result<crate::openshell::grpc::GatewayDial> {
+        Ok(crate::openshell::grpc::GatewayDial {
+            endpoint: self.endpoint(),
+            tls_dir: self.tls_dir()?,
+        })
+    }
+
     /// The URL dialed over mTLS.
     pub fn endpoint(&self) -> String {
         match self {
@@ -828,7 +836,11 @@ pub async fn ensure_running(
 /// Wait for a gateway running in its own pod to answer. It may still be starting, and its
 /// client material is already mounted, so only health is polled.
 async fn await_remote(access: &GatewayAccess, endpoint: &str) -> Result<()> {
-    let healthy = match crate::openshell::grpc::HealthProbe::new(access) {
+    let healthy = match access
+        .dial()
+        .ok()
+        .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
+    {
         Some(probe) => {
             let deadline = Instant::now() + Duration::from_secs(120);
             loop {
@@ -937,7 +949,7 @@ pub fn serve_args() -> Vec<String> {
 /// returned warning, so a gateway-side format change can't brick the loop.
 async fn check_gateway_version(access: &GatewayAccess) -> Result<Option<String>> {
     use crate::openshell::grpc::{self, VersionGate};
-    let Some(probe) = grpc::HealthProbe::new(access) else {
+    let Some(probe) = access.dial().ok().and_then(|d| grpc::HealthProbe::new(&d)) else {
         return Ok(Some(
             "gateway version check skipped: mTLS certs unreadable".to_string(),
         ));
@@ -1078,7 +1090,11 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
     // The certs now exist (register wrote them), so a single reusable probe covers the poll loop.
     // Its `healthy()` is async, so the health wait is an async loop (not the sync `wait_for` the
     // socket/register waits use).
-    let healthy = match crate::openshell::grpc::HealthProbe::new(&GatewayAccess::Local) {
+    let healthy = match GatewayAccess::Local
+        .dial()
+        .ok()
+        .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
+    {
         Some(probe) => {
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
@@ -1110,7 +1126,11 @@ async fn boot(driver: ComputeDriver, images: &DriverImages) -> Result<()> {
 /// succeeds with a non-unhealthy status. Before the certs exist (pre-boot) there is nothing to
 /// probe, which reads as "not running".
 pub async fn is_running(access: &GatewayAccess) -> bool {
-    match crate::openshell::grpc::HealthProbe::new(access) {
+    match access
+        .dial()
+        .ok()
+        .and_then(|d| crate::openshell::grpc::HealthProbe::new(&d))
+    {
         Some(p) => p.healthy().await,
         None => false,
     }

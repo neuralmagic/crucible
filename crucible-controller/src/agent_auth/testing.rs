@@ -2,10 +2,11 @@
 //! discovery provider, SVIDs shaped like a sandbox supervisor's, and a running run pod to bind
 //! sandboxes to.
 
-use crate::agent_auth::bindings::{Binding, SandboxId};
+use crate::agent_auth::bindings::Binding;
 use crate::agent_auth::issuer::{
     AgentIssuer, AgentIssuerConfig, ClusterSpire, IssuerUrl, SigningKey,
 };
+use crate::agent_auth::sandbox::SandboxId;
 use base64::Engine;
 use crucible_mcp_auth::jwks::Jwks;
 use jsonwebtoken::jwk::{Jwk, JwkSet};

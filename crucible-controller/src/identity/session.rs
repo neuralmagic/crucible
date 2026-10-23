@@ -207,7 +207,7 @@ pub async fn take_login(
 /// Park a cluster link on the session, replacing any link this browser started before.
 pub async fn start_cluster_link(
     session: &Session,
-    pending: &crate::identity::cluster_link::PendingLink,
+    pending: &PendingLink,
 ) -> Result<(), tower_sessions::session::Error> {
     write_slot(session, CLUSTER_LINK_KEY, pending).await
 }
@@ -216,7 +216,7 @@ pub async fn start_cluster_link(
 /// authorization response can never be replayed.
 pub async fn take_cluster_link(
     session: &Session,
-) -> Result<Option<crate::identity::cluster_link::PendingLink>, tower_sessions::session::Error> {
+) -> Result<Option<PendingLink>, tower_sessions::session::Error> {
     take_slot(session, CLUSTER_LINK_KEY).await
 }
 
@@ -528,6 +528,30 @@ pub(crate) fn asserted_groups(headers: &HeaderMap) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// A link waiting for its callback, parked on the browser session.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PendingLink {
+    pub cluster: String,
+    pub sub: String,
+    pub(crate) state: String,
+    pub(crate) pkce_verifier: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) started_at: jiff::Timestamp,
+    /// The in-app page the callback lands on; Settings when `None`.
+    #[serde(default)]
+    pub return_to: Option<String>,
+}
+
+impl std::fmt::Debug for PendingLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingLink")
+            .field("cluster", &self.cluster)
+            .field("sub", &self.sub)
+            .field("started_at", &self.started_at)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(test)]

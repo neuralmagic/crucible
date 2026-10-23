@@ -4,7 +4,8 @@
 //! (checked against an allowlist), and the scope (narrowed to what the audience lists) reaches the
 //! claims.
 
-use crate::agent_auth::bindings::{BoundRun, SandboxId, SandboxIdError};
+use crate::agent_auth::bindings::BoundRun;
+use crate::agent_auth::sandbox::{SandboxId, SandboxIdError};
 use crucible::deploy::profile::{KubeName, KueueCfg};
 use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
 use crucible_mcp_auth::jwks::Jwks;
@@ -22,6 +23,9 @@ pub const MIN_TOKEN_TTL_SECS: u64 = 15 * 60;
 pub const MAX_TOKEN_TTL_SECS: u64 = 30 * 60;
 
 pub const TOKEN_PATH: &str = "/oauth/token";
+
+/// People's authorization endpoint.
+pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
 pub const JWKS_PATH: &str = "/.well-known/jwks.json";
 pub const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
 
@@ -804,15 +808,11 @@ impl AgentIssuer {
         }
     }
 
-    /// The metadata document; `people` adds the authorization code grant for people's clients.
-    pub fn metadata(
-        &self,
-        people: Option<&crate::agent_auth::people::PeopleConfig>,
-    ) -> AuthorizationServerMetadata {
+    /// The metadata document; `people`, the scopes people's tokens may carry, adds the
+    /// authorization code grant for people's clients.
+    pub fn metadata(&self, people: Option<&[String]>) -> AuthorizationServerMetadata {
         let mut scopes_supported = Vec::new();
-        let people_scopes = people
-            .into_iter()
-            .flat_map(|p| p.audiences.iter().flat_map(|a| a.scopes.iter()));
+        let people_scopes = people.into_iter().flatten();
         for scope in self
             .audiences
             .iter()
@@ -845,10 +845,7 @@ impl AgentIssuer {
                 crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec();
         }
         if people.is_some() {
-            metadata.authorization_endpoint = Some(
-                self.issuer
-                    .endpoint(crate::agent_auth::people::AUTHORIZE_PATH),
-            );
+            metadata.authorization_endpoint = Some(self.issuer.endpoint(AUTHORIZE_PATH));
             metadata
                 .grant_types_supported
                 .extend(["authorization_code", "refresh_token"]);
@@ -1215,7 +1212,7 @@ mod tests {
                 spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
                 cluster: CLUSTER.into(),
                 gateway: GatewayId::of_run_pod(POD),
-                id: crate::agent_auth::bindings::SandboxId::parse("sbx-1").unwrap(),
+                id: crate::agent_auth::sandbox::SandboxId::parse("sbx-1").unwrap(),
             },
             launcher: "alice".into(),
             kube_user: Some("alice-k8s".into()),
@@ -1616,7 +1613,7 @@ mod tests {
         )))
         .unwrap()
         .unwrap();
-        let doc = issuer.metadata(Some(&people));
+        let doc = issuer.metadata(Some(&people.scopes()));
         assert_eq!(
             doc.grant_types_supported,
             ["authorization_code", "refresh_token"]
