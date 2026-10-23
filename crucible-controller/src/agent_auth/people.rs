@@ -866,17 +866,17 @@ mod tests {
     use tower::ServiceExt;
 
     const PIRATE_KUEUE: &str = "https://crucible-kueue.apps.pirate.example/mcp";
-    const MPP_KUEUE: &str = "https://crucible-kueue.apps.mpp.example/mcp";
+    const EAST_KUEUE: &str = "https://crucible-kueue.apps.east.example/mcp";
     const WALDORF_KUEUE: &str = "http://localhost:8852/mcp";
     const REDIRECT: &str = "http://localhost:8765/callback";
     /// RFC 7636 appendix B.
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
-    const SUB: &str = "f:sso:weaton";
+    const SUB: &str = "f:sso:jordan";
 
     fn config() -> PeopleConfig {
         PeopleConfig::from_lookup(Some(format!(
-            "pirate:{PIRATE_KUEUE}=kueue.read kueue.submit, mpp:{MPP_KUEUE}=kueue.read, \
+            "pirate:{PIRATE_KUEUE}=kueue.read kueue.submit, east:{EAST_KUEUE}=kueue.read, \
              waldorf:{WALDORF_KUEUE}=kueue.read, nowhere:https://unlisted.example/mcp=kueue.read"
         )))
         .unwrap()
@@ -1069,7 +1069,7 @@ mod tests {
             (("resource", "https://other.example/mcp"), "invalid_target"),
             (("resource", ""), "invalid_target"),
             (
-                ("resource", MPP_KUEUE.trim_end_matches("/mcp")),
+                ("resource", EAST_KUEUE.trim_end_matches("/mcp")),
                 "invalid_target",
             ),
             (("response_type", "token"), "unsupported_response_type"),
@@ -1117,8 +1117,8 @@ mod tests {
     fn approved(resource: &str, cluster: &str) -> Approved {
         Approved {
             sub: SUB.into(),
-            login: "weaton".into(),
-            email: Some("weaton@redhat.com".into()),
+            login: "jordan".into(),
+            email: Some("casey@example.com".into()),
             resource: resource.into(),
             cluster: cluster.into(),
             scopes: vec!["kueue.read".into()],
@@ -1143,8 +1143,8 @@ mod tests {
     async fn test_login(session: Session) -> StatusCode {
         let claims = NativeClaims {
             sub: SUB.into(),
-            login: "weaton".into(),
-            email: Some("weaton@redhat.com".into()),
+            login: "jordan".into(),
+            email: Some("casey@example.com".into()),
             groups: Vec::new(),
             groups_at: String::new(),
             downgraded: false,
@@ -1161,8 +1161,8 @@ mod tests {
             r#"{}
 [clusters.pirate]
 kubeconfig_secret = "pirate-kubeconfig"
-[clusters.mpp]
-kubeconfig_secret = "mpp-kubeconfig"
+[clusters.east]
+kubeconfig_secret = "east-kubeconfig"
 identity = {{ claim = "login" }}
 [clusters.waldorf]
 kubeconfig_secret = "waldorf-kubeconfig"
@@ -1184,8 +1184,8 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         crate::identity::oidc::users::record_login(
             pool,
             SUB,
-            "weaton",
-            Some("weaton@redhat.com"),
+            "jordan",
+            Some("casey@example.com"),
             jiff::Timestamp::now(),
         )
         .await
@@ -1199,7 +1199,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             ..crate::api::state::ApiState::test(crate::Db::new(pool.clone()), Arc::new(NoSink))
         };
         let signed_in = crate::identity::session::Resolved {
-            user: Some("weaton".into()),
+            user: Some("jordan".into()),
             groups: Vec::new(),
             sub: Some(SUB.into()),
             source: crate::identity::session::IdentitySource::Native,
@@ -1334,7 +1334,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     }
 
     fn link_pirate() -> Clusters {
-        Clusters::with(&[("pirate", "sha256~pirate", "wseaton")])
+        Clusters::with(&[("pirate", "sha256~pirate", "casey")])
     }
 
     fn claims_of(auth: &AgentAuth, token: &str, aud: &str) -> Map<String, Value> {
@@ -1443,9 +1443,9 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             body["access_token"].as_str().unwrap(),
             PIRATE_KUEUE,
         );
-        assert_eq!(claims["sub"], "weaton");
+        assert_eq!(claims["sub"], "jordan");
         assert_eq!(claims["aud"], PIRATE_KUEUE);
-        assert_eq!(claims["kube_user"], "wseaton");
+        assert_eq!(claims["kube_user"], "casey");
         assert_eq!(claims["kube_cluster"], "pirate");
         assert_eq!(claims["azp"], CLIENT_ID);
         assert_eq!(claims["scope"], "kueue.read kueue.submit");
@@ -1478,7 +1478,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     async fn a_cluster_whose_users_are_logins_needs_no_link(pool: PgPool) {
         let h = harness(&pool).await;
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
-        let id = consent_id(&h.app, &authorize_uri(&[("resource", MPP_KUEUE)]), &cookie).await;
+        let id = consent_id(&h.app, &authorize_uri(&[("resource", EAST_KUEUE)]), &cookie).await;
         let approved = decide_as(&h.app, Some(&cookie), &id, "approve").await;
         let code = query_of(&redirect_of(&approved))["code"].clone();
         let (status, body) = token(
@@ -1493,8 +1493,8 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let claims = claims_of(&h.auth, body["access_token"].as_str().unwrap(), MPP_KUEUE);
-        assert_eq!(claims["kube_user"], "weaton");
+        let claims = claims_of(&h.auth, body["access_token"].as_str().unwrap(), EAST_KUEUE);
+        assert_eq!(claims["kube_user"], "jordan");
         assert_eq!(claims["scope"], "kueue.read");
     }
 
@@ -1529,7 +1529,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             body["access_token"].as_str().unwrap(),
             WALDORF_KUEUE,
         );
-        assert_eq!(claims["kube_user"], "oidc:weaton@redhat.com");
+        assert_eq!(claims["kube_user"], "oidc:casey@example.com");
         assert_eq!(claims["kube_cluster"], "waldorf");
 
         let id = consent_id(
@@ -1618,7 +1618,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         assert_eq!(body["client_id"], CLIENT_ID);
         assert_eq!(body["resource"], PIRATE_KUEUE);
         assert_eq!(body["scopes"], json!(["kueue.read", "kueue.submit"]));
-        assert_eq!(body["login"], "weaton");
+        assert_eq!(body["login"], "jordan");
         assert_eq!(
             body["identity"],
             json!({"cluster": "pirate", "rule": {"kind": "link", "oauth": false},
@@ -1633,7 +1633,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         )
         .await;
         let body: Value = serde_json::from_str(&read(id).await.body).unwrap();
-        assert_eq!(body["identity"]["kube_user"], "oidc:weaton@redhat.com");
+        assert_eq!(body["identity"]["kube_user"], "oidc:casey@example.com");
         assert_eq!(body["identity"]["source"], "rule");
     }
 
@@ -1657,7 +1657,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     async fn issued_code(h: &Harness, pool: &PgPool) -> String {
         crate::identity::kube_links::link(
             pool,
-            &Clusters::with(&[("pirate", "t", "wseaton")]),
+            &Clusters::with(&[("pirate", "t", "casey")]),
             SUB,
             "pirate",
             "t",
@@ -1695,7 +1695,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
                 "invalid_grant",
             ),
             (
-                ("resource", MPP_KUEUE),
+                ("resource", EAST_KUEUE),
                 StatusCode::BAD_REQUEST,
                 "invalid_target",
             ),
@@ -1824,7 +1824,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             second["access_token"].as_str().unwrap(),
             PIRATE_KUEUE,
         );
-        assert_eq!(claims["kube_user"], "wseaton");
+        assert_eq!(claims["kube_user"], "casey");
         let wider = token(
             &h.app,
             &[
@@ -1867,7 +1867,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             on_b["access_token"].as_str().unwrap(),
             PIRATE_KUEUE,
         );
-        assert_eq!(claims["kube_user"], "wseaton");
+        assert_eq!(claims["kube_user"], "casey");
         let (status, on_a) = refreshed(&a.app, &on_b["refresh_token"]).await;
         assert_eq!(status, StatusCode::OK, "{on_a}");
         assert!(
@@ -1885,7 +1885,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let (_, first) = code_exchange(&h.app, &code).await;
         crate::identity::kube_links::link(
             &pool,
-            &Clusters::with(&[("pirate", "t2", "wseaton-next")]),
+            &Clusters::with(&[("pirate", "t2", "casey-next")]),
             SUB,
             "pirate",
             "t2",
@@ -1900,7 +1900,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             second["access_token"].as_str().unwrap(),
             PIRATE_KUEUE,
         );
-        assert_eq!(claims["kube_user"], "wseaton-next");
+        assert_eq!(claims["kube_user"], "casey-next");
         assert!(
             crate::identity::kube_links::unlink(&pool, SUB, "pirate")
                 .await

@@ -12,9 +12,9 @@ function tool(over: Partial<AgentTool> = {}): AgentTool {
     server: 'kueue',
     cluster: 'pirate',
     url: 'http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp',
-    kube_user: 'wseaton',
+    kube_user: 'casey',
     scopes: ['kueue.read', 'kueue.submit'],
-    limits: { pull_secrets: 'quay-wseaton-pull', namespace: 'crucible-kueue-e2e' },
+    limits: { pull_secrets: 'quay-pull', namespace: 'crucible-kueue-e2e' },
     ...over,
   };
 }
@@ -34,9 +34,9 @@ describe('agentToolRows', () => {
       {
         key: 'kueue/pirate',
         title: 'kueue on pirate',
-        identity: 'as wseaton',
+        identity: 'as casey',
         scopes: 'kueue.read kueue.submit',
-        limits: 'namespace crucible-kueue-e2e · pull_secrets quay-wseaton-pull',
+        limits: 'namespace crucible-kueue-e2e · pull_secrets quay-pull',
         url: 'http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp',
       },
     ]);

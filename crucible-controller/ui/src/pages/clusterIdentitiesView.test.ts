@@ -21,9 +21,9 @@ function linkCluster(over: Partial<ClusterIdentityDto> = {}): ClusterIdentityDto
 
 function ruleCluster(over: Partial<ClusterIdentityDto> = {}): ClusterIdentityDto {
   return {
-    cluster: 'mpp',
+    cluster: 'east',
     rule: { kind: 'claim', claim: 'login', prefix: null },
-    kube_user: 'weaton',
+    kube_user: 'jordan',
     source: 'rule',
     linked_at: null,
     ...over,
@@ -48,7 +48,7 @@ describe('identityView', () => {
   it('shows a rule cluster read-only, with the name the SSO login resolves to', () => {
     const view = identityView(ruleCluster());
     expect(view.state).toBe('resolved');
-    expect(view.username).toBe('weaton');
+    expect(view.username).toBe('jordan');
     expect(view.link).toBeNull();
     expect(view.unlinkable).toBe(false);
   });
@@ -78,13 +78,13 @@ describe('identityView', () => {
   it('shows who a linked cluster says you are, when, and how, and offers relink and unlink', () => {
     const view = identityView(
       linkCluster({
-        kube_user: 'wseaton',
+        kube_user: 'casey',
         source: 'openshift-oauth',
         linked_at: '2026-10-08T20:00:00Z',
       }),
     );
     expect(view.state).toBe('linked');
-    expect(view.username).toBe('wseaton');
+    expect(view.username).toBe('casey');
     expect(view.detail).toBe('Proven by signing in to the cluster on 2026-10-08T20:00:00Z.');
     expect(view.link).toEqual({ method: 'oauth', label: 'Relink' });
     expect(view.unlinkable).toBe(true);
@@ -92,7 +92,7 @@ describe('identityView', () => {
 
   it('names a pasted token as the proof when that is how the link was made', () => {
     const view = identityView(
-      linkCluster({ kube_user: 'wseaton', source: 'token-review', linked_at: '2026-10-08T20:00:00Z' }),
+      linkCluster({ kube_user: 'casey', source: 'token-review', linked_at: '2026-10-08T20:00:00Z' }),
     );
     expect(view.detail).toContain('TokenReview');
   });
@@ -117,10 +117,10 @@ describe('sortIdentities', () => {
     const sorted = sortIdentities([
       ruleCluster({ cluster: 'waldorf' }),
       linkCluster({ cluster: 'zeta', kube_user: 'z', source: 'token-review' }),
-      ruleCluster({ cluster: 'mpp' }),
+      ruleCluster({ cluster: 'east' }),
       linkCluster({ cluster: 'pirate' }),
     ]);
-    expect(sorted.map((i) => i.cluster)).toEqual(['pirate', 'mpp', 'waldorf', 'zeta']);
+    expect(sorted.map((i) => i.cluster)).toEqual(['pirate', 'east', 'waldorf', 'zeta']);
   });
 });
 

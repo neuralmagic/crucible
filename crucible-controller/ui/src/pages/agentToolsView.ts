@@ -10,7 +10,7 @@ export interface AgentToolRow {
   key: string;
   /** `kueue on pirate` */
   title: string;
-  /** `as wseaton`, or empty when the server acts as no Kubernetes user. */
+  /** `as casey`, or empty when the server acts as no Kubernetes user. */
   identity: string;
   scopes: string;
   /** `namespace crucible-kueue-e2e · push_repo quay.io/...`, sorted by name. */

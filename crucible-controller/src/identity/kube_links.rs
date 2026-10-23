@@ -311,7 +311,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_reviewed_token_records_the_username_the_cluster_named(pool: PgPool) {
-        let clusters = Clusters::with(&[("pirate", "sha256~pirate", "wseaton")]);
+        let clusters = Clusters::with(&[("pirate", "sha256~pirate", "casey")]);
         let user = link(
             &pool,
             &clusters,
@@ -322,10 +322,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(user.as_str(), "wseaton");
+        assert_eq!(user.as_str(), "casey");
         assert_eq!(
             get(&pool, "sub-1", "pirate").await.unwrap(),
-            Some(KubeUser::parse("wseaton").unwrap())
+            Some(KubeUser::parse("casey").unwrap())
         );
         let links = list(&pool, "sub-1").await.unwrap();
         assert_eq!(links.len(), 1);
@@ -345,15 +345,15 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_token_from_another_cluster_links_nothing(pool: PgPool) {
         let clusters = Clusters::with(&[
-            ("pirate", "sha256~pirate", "wseaton"),
-            ("mpp", "sha256~mpp", "weaton"),
+            ("pirate", "sha256~pirate", "casey"),
+            ("east", "sha256~east", "jordan"),
         ]);
         let err = link(
             &pool,
             &clusters,
             "sub-1",
             "pirate",
-            "sha256~mpp",
+            "sha256~east",
             LinkSource::TokenReview,
         )
         .await
@@ -401,9 +401,9 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn relinking_replaces_the_username_per_cluster(pool: PgPool) {
         let clusters = Clusters::with(&[
-            ("pirate", "t1", "wseaton"),
-            ("pirate", "t2", "wseaton2"),
-            ("mpp", "t3", "weaton"),
+            ("pirate", "t1", "casey"),
+            ("pirate", "t2", "casey2"),
+            ("east", "t3", "jordan"),
         ]);
         link(
             &pool,
@@ -419,7 +419,7 @@ mod tests {
             &pool,
             &clusters,
             "sub-1",
-            "mpp",
+            "east",
             "t3",
             LinkSource::TokenReview,
         )
@@ -444,8 +444,8 @@ mod tests {
         assert_eq!(
             links,
             [
-                ("mpp".to_string(), "weaton".to_string()),
-                ("pirate".to_string(), "wseaton2".to_string())
+                ("east".to_string(), "jordan".to_string()),
+                ("pirate".to_string(), "casey2".to_string())
             ]
         );
     }
@@ -458,7 +458,7 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn unlinking_forgets_one_cluster_and_keeps_the_others(pool: PgPool) {
-        let clusters = Clusters::with(&[("pirate", "t1", "wseaton"), ("mpp", "t2", "weaton")]);
+        let clusters = Clusters::with(&[("pirate", "t1", "casey"), ("east", "t2", "jordan")]);
         link(
             &pool,
             &clusters,
@@ -473,7 +473,7 @@ mod tests {
             &pool,
             &clusters,
             "sub-1",
-            "mpp",
+            "east",
             "t2",
             LinkSource::TokenReview,
         )
@@ -487,7 +487,7 @@ mod tests {
         assert_eq!(get(&pool, "sub-1", "pirate").await.unwrap(), None);
         let left = list(&pool, "sub-1").await.unwrap();
         assert_eq!(left.len(), 1);
-        assert_eq!(left[0].cluster, "mpp");
+        assert_eq!(left[0].cluster, "east");
         assert_eq!(left[0].source, LinkSource::TokenReview);
     }
 
@@ -527,7 +527,7 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_spoke_link_leaves_the_hub_username_alone(pool: PgPool) {
         signed_in(&pool, "sub-alice", "alice").await;
-        let clusters = Clusters::with(&[("pirate", "t1", "wseaton")]);
+        let clusters = Clusters::with(&[("pirate", "t1", "casey")]);
         link(
             &pool,
             &clusters,

@@ -2564,13 +2564,13 @@ mod tests {
         ] {
             assert!(PushTarget::new(bad.into(), "/a".into()).is_err(), "{bad}");
         }
-        let target = PushTarget::new("quay.io/wseaton/crucible-smoke".into(), "/a".into()).unwrap();
+        let target = PushTarget::new("quay.io/example/crucible-smoke".into(), "/a".into()).unwrap();
         assert!(PushTarget::new("registry.local:5000/org/smoke".into(), "/a".into()).is_ok());
         let id = BuildId::parse("buildit-7").unwrap();
         let sandbox = SandboxName::parse("ci-0123abcd").unwrap();
         assert_eq!(
             target.reference(&sandbox, &id),
-            "quay.io/wseaton/crucible-smoke:ci-0123abcd-buildit-7"
+            "quay.io/example/crucible-smoke:ci-0123abcd-buildit-7"
         );
         let argv = push_argv(&id.tag(), &target.reference(&sandbox, &id));
         assert_eq!(&argv[..2], ["sh", "-c"]);
@@ -2584,7 +2584,7 @@ mod tests {
             [
                 "sh",
                 "localhost/buildit/buildit-7:latest",
-                "quay.io/wseaton/crucible-smoke:ci-0123abcd-buildit-7"
+                "quay.io/example/crucible-smoke:ci-0123abcd-buildit-7"
             ]
         );
     }

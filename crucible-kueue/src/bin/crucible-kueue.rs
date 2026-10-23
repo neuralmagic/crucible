@@ -447,7 +447,7 @@ mod tests {
             "--namespace",
             "ml-a,ml-b",
             "--pull-secret",
-            "quay-pull=quay.io/wseaton,quay-pull=quay.io/crucible,public-only",
+            "quay-pull=quay.io/example,quay-pull=quay.io/crucible,public-only",
         ])
         .unwrap();
         let c = cli.config().unwrap();
@@ -474,7 +474,7 @@ mod tests {
             [
                 PullSecret {
                     name: "quay-pull".into(),
-                    registries: vec!["quay.io/wseaton".into(), "quay.io/crucible".into()],
+                    registries: vec!["quay.io/example".into(), "quay.io/crucible".into()],
                 },
                 PullSecret {
                     name: "public-only".into(),

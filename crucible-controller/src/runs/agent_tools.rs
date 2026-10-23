@@ -64,7 +64,7 @@ pub struct AgentTool {
 }
 
 impl AgentTool {
-    /// `granted kueue/pirate as wseaton (kueue.read kueue.submit)`, the run's event line.
+    /// `granted kueue/pirate as casey (kueue.read kueue.submit)`, the run's event line.
     pub fn summary(&self) -> String {
         let user = match &self.kube_user {
             Some(user) => format!(" as {user}"),

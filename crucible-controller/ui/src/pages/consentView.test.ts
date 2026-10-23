@@ -7,7 +7,7 @@ function consent(identity: Partial<ConsentDto['identity']> = {}): ConsentDto {
     client_id: 'claude-code',
     resource: 'http://localhost:8851/mcp',
     scopes: ['kueue.read', 'kueue.submit'],
-    login: 'weaton',
+    login: 'jordan',
     identity: {
       cluster: 'pirate',
       rule: { kind: 'link', oauth: true },
@@ -31,7 +31,7 @@ describe('consentView', () => {
   });
 
   it('allows once the cluster names who the person acts as', () => {
-    const view = consentView(consent({ kube_user: 'wseaton', source: 'openshift-oauth' }));
+    const view = consentView(consent({ kube_user: 'casey', source: 'openshift-oauth' }));
     expect(view.canApprove).toBe(true);
     expect(view.blocked).toBeNull();
   });

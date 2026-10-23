@@ -432,11 +432,11 @@ mod tests {
 
     #[test]
     fn a_pull_secret_serves_images_on_its_registry_or_under_its_prefix() {
-        let quay = PullSecret::parse("quay-pull=quay.io/wseaton").unwrap();
-        assert!(quay.serves("quay.io/wseaton/crucible-smoke:abc"));
-        assert!(quay.serves("quay.io/wseaton/x@sha256:0123"));
+        let quay = PullSecret::parse("quay-pull=quay.io/example").unwrap();
+        assert!(quay.serves("quay.io/example/crucible-smoke:abc"));
+        assert!(quay.serves("quay.io/example/x@sha256:0123"));
         assert!(
-            !quay.serves("quay.io/wseatonx/y:1"),
+            !quay.serves("quay.io/examplex/y:1"),
             "a prefix ends at a path boundary"
         );
         assert!(!quay.serves("quay.io/other/y:1"));
@@ -449,7 +449,7 @@ mod tests {
         assert!(!hub.serves("acme/tool:1"));
         let named = PullSecret::parse("plain").unwrap();
         assert!(named.registries.is_empty());
-        assert!(!named.serves("quay.io/wseaton/x"));
+        assert!(!named.serves("quay.io/example/x"));
         for bad in ["", "=quay.io", "name="] {
             assert!(PullSecret::parse(bad).is_err(), "{bad:?}");
         }

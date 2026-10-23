@@ -1673,7 +1673,7 @@ mod tests {
         assert!(none.contains("it offers none"), "{none}");
         let cfg = Config {
             pull_secrets: vec![
-                PullSecret::parse("quay-pull=quay.io/wseaton").unwrap(),
+                PullSecret::parse("quay-pull=quay.io/example").unwrap(),
                 PullSecret::parse("ghcr").unwrap(),
             ],
             ..Config::default()
@@ -1684,7 +1684,7 @@ mod tests {
             .to_string();
         assert!(
             other.contains(
-                "\"someone-elses\" is not one this server offers; it offers quay-pull (quay.io/wseaton), ghcr. The server adds the secret an image's registry needs to the pod itself"
+                "\"someone-elses\" is not one this server offers; it offers quay-pull (quay.io/example), ghcr. The server adds the secret an image's registry needs to the pod itself"
             ),
             "{other}"
         );
@@ -1699,7 +1699,7 @@ mod tests {
 
     fn quay() -> Config {
         Config {
-            pull_secrets: vec![PullSecret::parse("quay-pull=quay.io/wseaton").unwrap()],
+            pull_secrets: vec![PullSecret::parse("quay-pull=quay.io/example").unwrap()],
             ..Config::default()
         }
     }
@@ -1713,7 +1713,7 @@ mod tests {
     #[test]
     fn the_server_adds_the_pull_secret_an_images_registry_needs_and_reports_it() {
         let n = normalize(
-            imaged("quay.io/wseaton/crucible-smoke@sha256:ab"),
+            imaged("quay.io/example/crucible-smoke@sha256:ab"),
             &caller(),
             &queue(),
             &quay(),
@@ -1726,11 +1726,11 @@ mod tests {
         assert_eq!(
             n.server_changes,
             [
-                "/spec/template/spec/imagePullSecrets: added quay-pull to pull quay.io/wseaton/crucible-smoke@sha256:ab"
+                "/spec/template/spec/imagePullSecrets: added quay-pull to pull quay.io/example/crucible-smoke@sha256:ab"
             ]
         );
         let again = normalize(
-            imaged("quay.io/wseaton/crucible-smoke@sha256:ab"),
+            imaged("quay.io/example/crucible-smoke@sha256:ab"),
             &caller(),
             &queue(),
             &quay(),
@@ -1758,7 +1758,7 @@ mod tests {
             None
         );
         assert!(public.server_changes.is_empty());
-        let mut named = imaged("quay.io/wseaton/x:1");
+        let mut named = imaged("quay.io/example/x:1");
         named["spec"]["template"]["spec"]["imagePullSecrets"] = json!([{"name": "quay-pull"}]);
         let n = normalize(named, &caller(), &queue(), &quay()).unwrap();
         assert_eq!(
@@ -1771,7 +1771,7 @@ mod tests {
             ..Config::default()
         };
         let unmapped =
-            normalize(imaged("quay.io/wseaton/x:1"), &caller(), &queue(), &plain).unwrap();
+            normalize(imaged("quay.io/example/x:1"), &caller(), &queue(), &plain).unwrap();
         assert!(
             unmapped.server_changes.is_empty(),
             "a secret without a registry is never added"
@@ -1785,9 +1785,9 @@ mod tests {
             "kind": "RayJob",
             "metadata": {"name": "r"},
             "spec": {"rayClusterSpec": {
-                "headGroupSpec": {"template": {"spec": {"containers": [{"name": "h", "image": "quay.io/wseaton/ray:1"}]}}},
+                "headGroupSpec": {"template": {"spec": {"containers": [{"name": "h", "image": "quay.io/example/ray:1"}]}}},
                 "workerGroupSpecs": [{"groupName": "w", "template": {"spec": {
-                    "initContainers": [{"name": "i", "image": "quay.io/wseaton/init:1"}],
+                    "initContainers": [{"name": "i", "image": "quay.io/example/init:1"}],
                     "containers": [{"name": "w", "image": "docker.io/rayproject/ray:2"}]}}}]
             }}
         });

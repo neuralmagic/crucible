@@ -302,10 +302,10 @@ mod tests {
         );
         assert!(!args.contains(&"--insecure-jwks-http".to_string()));
 
-        let pushing = access(Some("quay.io/wseaton/crucible-smoke")).args(&site, "/p");
+        let pushing = access(Some("quay.io/example/crucible-smoke")).args(&site, "/p");
         assert_eq!(
             flag(&pushing, "--push-repo").as_deref(),
-            Some("quay.io/wseaton/crucible-smoke")
+            Some("quay.io/example/crucible-smoke")
         );
         assert_eq!(
             flag(&pushing, "--push-authfile").as_deref(),
@@ -316,7 +316,7 @@ mod tests {
             ..site
         };
         assert!(
-            !access(Some("quay.io/wseaton/crucible-smoke"))
+            !access(Some("quay.io/example/crucible-smoke"))
                 .args(&no_authfile, "/p")
                 .contains(&"--push-repo".to_string())
         );

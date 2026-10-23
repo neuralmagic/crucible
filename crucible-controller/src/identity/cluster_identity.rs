@@ -223,7 +223,7 @@ mod tests {
             prefix: "system:".into(),
         };
         assert!(matches!(
-            from_claim(&system, "mpp", ALICE),
+            from_claim(&system, "east", ALICE),
             Resolution::Unavailable(_)
         ));
         let spaced = ClaimIdentity {
@@ -231,7 +231,7 @@ mod tests {
             prefix: "a b:".into(),
         };
         assert!(matches!(
-            from_claim(&spaced, "mpp", ALICE),
+            from_claim(&spaced, "east", ALICE),
             Resolution::Unavailable(_)
         ));
         let empty = Person {
@@ -252,7 +252,7 @@ mod tests {
                 .unwrap(),
             Resolution::Unlinked
         );
-        let clusters = Clusters::with(&[("pirate", "t1", "wseaton")]);
+        let clusters = Clusters::with(&[("pirate", "t1", "casey")]);
         kube_links::link(
             &pool,
             &clusters,
@@ -273,7 +273,7 @@ mod tests {
         else {
             panic!("linked");
         };
-        assert_eq!(user.as_str(), "wseaton");
+        assert_eq!(user.as_str(), "casey");
         assert_eq!(source, Source::Link(LinkSource::OpenshiftOauth));
         assert!(linked_at.is_some());
     }

@@ -602,14 +602,14 @@ openshift = ["pirate"]
                 (
                     "pirate".to_string(),
                     format!("sha256~for-code-{n}"),
-                    "wseaton".to_string(),
+                    "casey".to_string(),
                 )
             })
             .collect();
         tokens.push((
             "pirate".into(),
             "sha256~pasted".into(),
-            "wseaton-pasted".into(),
+            "casey-pasted".into(),
         ));
         let reviewer = Clusters::with(
             &tokens
@@ -805,7 +805,7 @@ openshift = ["pirate"]
         assert_eq!(done.status, StatusCode::SEE_OTHER);
         assert_eq!(done.location.as_deref(), Some("/settings?linked=pirate"));
         let pirate = &h.identities().await["pirate"];
-        assert_eq!(pirate["kube_user"], "wseaton");
+        assert_eq!(pirate["kube_user"], "casey");
         assert_eq!(pirate["source"], "openshift-oauth");
         assert!(pirate["linked_at"].is_string());
         let stored: Vec<String> = sqlx::query_scalar(
@@ -903,7 +903,7 @@ openshift = ["pirate"]
             .put_token(AuthPath::Session, "pirate", "sha256~pasted")
             .await;
         assert_eq!(linked.status, StatusCode::OK, "{}", linked.body);
-        assert_eq!(linked.body["kube_user"], "wseaton-pasted");
+        assert_eq!(linked.body["kube_user"], "casey-pasted");
         assert_eq!(linked.body["source"], "token-review");
         for (path, cluster, token, want) in [
             (
@@ -936,7 +936,7 @@ openshift = ["pirate"]
         }
         assert_eq!(
             h.identities().await["pirate"]["kube_user"],
-            "wseaton-pasted"
+            "casey-pasted"
         );
     }
 

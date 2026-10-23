@@ -25,13 +25,13 @@ pull_secret = "@PULL_SECRET@"
 [secrets]
 push_authfile = "@PULL_SECRET@"
 
-# Claude through EnMaaS on the Anthropic Messages API; the key is a Secret on the cluster.
+# Claude on an Anthropic Messages API endpoint; the key is a Secret on the cluster.
 [env]
-ANTHROPIC_BASE_URL = "https://api.enmaas.devshift.net"
+ANTHROPIC_BASE_URL = "@ANTHROPIC_BASE_URL@"
 
 [[secret_env]]
 name   = "ANTHROPIC_API_KEY"
-secret = "crucible-enmaas"
+secret = "@ANTHROPIC_KEY_SECRET@"
 key    = "api-key"
 
 [kueue]

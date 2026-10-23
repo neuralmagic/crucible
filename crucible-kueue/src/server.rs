@@ -2347,7 +2347,7 @@ mod tests {
     #[tokio::test]
     async fn the_servers_own_refusal_names_the_usable_namespaces_and_never_its_account() {
         let server = server_in(&["crucible-kueue-e2e"]);
-        let parts = parts_of(json!({"sub": "w", "kube_user": "wseaton"}));
+        let parts = parts_of(json!({"sub": "w", "kube_user": "casey"}));
         let forbidden = ToolError::Kube(KubeError::api(
             "list",
             "LocalQueue list",
@@ -2397,7 +2397,7 @@ mod tests {
     #[tokio::test]
     async fn a_missing_queue_outside_the_callers_namespaces_points_at_them() {
         let server = server_in(&["ml-a", "ml-b"]);
-        let parts = parts_of(json!({"sub": "w", "kube_user": "wseaton"}));
+        let parts = parts_of(json!({"sub": "w", "kube_user": "casey"}));
         let missing = |namespace: &str| ToolError::NotFound {
             kind: "LocalQueue",
             name: "gpu".into(),
@@ -2426,7 +2426,7 @@ mod tests {
     #[tokio::test]
     async fn a_token_without_a_namespace_is_told_which_it_can_name() {
         let server = server_in(&["ml-a", "ml-b"]);
-        let parts = parts_of(json!({"sub": "w", "kube_user": "wseaton"}));
+        let parts = parts_of(json!({"sub": "w", "kube_user": "casey"}));
         let (_, out) = body(&reply(
             server
                 .explain(

@@ -128,7 +128,7 @@ mod tests {
         clusters = ["pirate", "waldorf"]
         run_issuer = "https://crucible.hub.example"
         run_jwks_uri = "https://crucible-ext.hub.example/.well-known/jwks.json"
-        push_repo = "quay.io/wseaton/crucible-smoke"
+        push_repo = "quay.io/example/crucible-smoke"
     "#;
 
     fn env_of(d: &Delivery) -> std::collections::BTreeMap<&str, &str> {
@@ -209,7 +209,7 @@ mod tests {
             env[ENV_BUILDIT_RUN_ISSUER],
             "https://crucible.hub.example=https://crucible-ext.hub.example/.well-known/jwks.json"
         );
-        assert_eq!(env[ENV_BUILDIT_PUSH_REPO], "quay.io/wseaton/crucible-smoke");
+        assert_eq!(env[ENV_BUILDIT_PUSH_REPO], "quay.io/example/crucible-smoke");
         assert!(env.contains_key(ENV_AGENT_TOKEN_ENDPOINT));
         assert!(!env.contains_key(ENV_KUEUE_URL), "kueue serves pirate only");
         assert!(on_waldorf.env.is_empty() && on_waldorf.is_empty());
@@ -235,7 +235,7 @@ mod tests {
                     "run_jwks_uri = \"https://crucible-ext.hub.example/.well-known/jwks.json\"\n",
                     "",
                 )
-                .replace("push_repo = \"quay.io/wseaton/crucible-smoke\"\n", ""),
+                .replace("push_repo = \"quay.io/example/crucible-smoke\"\n", ""),
         );
         let env = access(None, own.buildit.as_ref(), "waldorf", &tokens())
             .unwrap()

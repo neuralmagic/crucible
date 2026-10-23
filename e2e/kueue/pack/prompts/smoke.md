@@ -31,7 +31,7 @@ your shell.
        "ttlSecondsAfterFinished": 3600,
        "template": {"spec": {
          "restartPolicy": "Never",
-         "imagePullSecrets": [{"name": "quay-wseaton-pull"}],
+         "imagePullSecrets": [{"name": "@PULL_SECRET@"}],
          "containers": [{
            "name": "main",
            "image": "IMAGE",

@@ -186,11 +186,11 @@ mod tests {
     #[test]
     fn a_cluster_the_table_does_not_list_or_the_fleet_does_not_know_is_refused() {
         let p = profile(PROFILE);
-        let err = render(&p, "mpp").unwrap_err();
+        let err = render(&p, "east").unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::NotListed {
-                cluster: "mpp".into(),
+                cluster: "east".into(),
                 listed: vec![
                     "pirate".into(),
                     "hub".into(),

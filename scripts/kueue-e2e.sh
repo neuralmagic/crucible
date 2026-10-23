@@ -22,12 +22,13 @@
 # first and restored on exit.
 #
 # Needs kubectl, jq, openssl, cargo, and on the cluster: Kueue, OpenShift's Zero Trust Workload
-# Identity Manager with a ClusterSPIFFEID for supervisors in crucible-sandboxes, the crucible-enmaas
-# Secret (the EnMaaS key, under api-key) and the PULL_SECRET Secret in crucible-system, whose
-# account may also push to PUSH_REPO (default quay.io/wseaton/crucible-smoke).
+# Identity Manager with a ClusterSPIFFEID for supervisors in crucible-sandboxes, the
+# ANTHROPIC_KEY_SECRET Secret (an Anthropic Messages API key for ANTHROPIC_BASE_URL, under api-key)
+# and the PULL_SECRET Secret in crucible-system, whose account may also push to PUSH_REPO.
 #
 #   CONTEXT=<kube context> LOOP_IMAGE=<runtime image> KUEUE_IMAGE=<crucible-kueue image> \
-#   CONTROLLER_IMAGE=<controller image> PULL_SECRET=<secret> scripts/kueue-e2e.sh
+#   CONTROLLER_IMAGE=<controller image> PULL_SECRET=<secret> PUSH_REPO=<registry/path> \
+#   ANTHROPIC_BASE_URL=<url> ANTHROPIC_KEY_SECRET=<secret> scripts/kueue-e2e.sh
 #
 # LOOP_IMAGE is Containerfile.runtime-selfcontained built from this checkout, CONTROLLER_IMAGE is
 # Containerfile.controller-selfcontained on top of it, KUEUE_IMAGE is Containerfile.kueue.
@@ -41,13 +42,15 @@ set -euo pipefail
 : "${KUEUE_IMAGE:?set KUEUE_IMAGE to a crucible-kueue image built from this checkout}"
 : "${CONTROLLER_IMAGE:?set CONTROLLER_IMAGE to a controller image built from this checkout}"
 : "${PULL_SECRET:?set PULL_SECRET to the crucible-system pull Secret for those images}"
+: "${PUSH_REPO:?set PUSH_REPO to the repository the pack pushes its build to, which PULL_SECRET may push to}"
+: "${ANTHROPIC_BASE_URL:?set ANTHROPIC_BASE_URL to the Anthropic Messages API endpoint the agent uses}"
+: "${ANTHROPIC_KEY_SECRET:?set ANTHROPIC_KEY_SECRET to the crucible-system Secret holding its api-key}"
 CTL_NS=crucible-kueue-e2e-ctl
 LOOP_NS=crucible-kueue-e2e-loops
 SANDBOX_NS=crucible-sandboxes
 WORKLOAD_NS=crucible-kueue-e2e
 SPIRE_NS=zero-trust-workload-identity-manager
 SPIRE_DISCOVERY=spire-spiffe-oidc-discovery-provider:443
-PUSH_REPO=${PUSH_REPO:-quay.io/wseaton/crucible-smoke}
 NONCE=$(openssl rand -hex 12)
 JOB=crucible-smoke-${NONCE:0:8}
 TIMEOUT_SECS=${TIMEOUT_SECS:-1800}
@@ -114,7 +117,8 @@ fill() {
         -e "s|@PULL_SECRET@|$PULL_SECRET|g" -e "s|@CTL_NS@|$CTL_NS|g" -e "s|@LOOP_NS@|$LOOP_NS|g" \
         -e "s|@SPIRE_NS@|$SPIRE_NS|g" -e "s|@ISSUER@|$ISSUER|g" -e "s|@KUEUE_URL@|$KUEUE_URL|g" \
         -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
-        -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@NONCE@|$NONCE|g" -e "s|@NONCE_SHORT@|${NONCE:0:8}|g" \
+        -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@ANTHROPIC_BASE_URL@|$ANTHROPIC_BASE_URL|g" \
+        -e "s|@ANTHROPIC_KEY_SECRET@|$ANTHROPIC_KEY_SECRET|g" -e "s|@NONCE@|$NONCE|g" -e "s|@NONCE_SHORT@|${NONCE:0:8}|g" \
         -e "s|@AGENT_SPIRE@|hub=$SVID_ISSUER $GATEWAY_PREFIX $SPIRE_NS/$SPIRE_DISCOVERY|g" "$1"
 }
 fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
@@ -143,7 +147,7 @@ for ns in "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
         | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.managedFields)' \
         | kc -n "$ns" apply -f - >/dev/null
 done
-kc -n crucible-system get secret crucible-enmaas -o json \
+kc -n crucible-system get secret "$ANTHROPIC_KEY_SECRET" -o json \
     | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.managedFields)' \
     | kc -n "$LOOP_NS" apply -f - >/dev/null
 kc -n "$LOOP_NS" create serviceaccount crucible-kueue-e2e-loop --dry-run=client -o yaml | kc apply -f - >/dev/null
