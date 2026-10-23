@@ -70,7 +70,7 @@ cleanup() {
     [ -f "$WORK/rendered.yaml" ] && yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")' \
         "$WORK/rendered.yaml" | kc delete --ignore-not-found -f - >/dev/null 2>&1 || true
     kc -n "$SPIRE_NS" delete role,rolebinding crucible-kueue-e2e-spire-keys --ignore-not-found >/dev/null || true
-    kc delete namespace "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" --ignore-not-found --wait=false >/dev/null || true
+    kc delete namespace -l "$E2E_LABEL" --ignore-not-found --wait=false >/dev/null || true
     if [ -s "$WORK/kueue-saved.yaml" ]; then
         kc replace -f "$WORK/kueue-saved.yaml" >/dev/null && log "restored crucible-system's crucible-kueue"
     elif [ -f "$WORK/kueue.yaml" ]; then
@@ -78,6 +78,14 @@ cleanup() {
     fi
     rm -rf "$WORK"
 }
+# The e2e owns crucible-sandboxes for its run. On a cluster where something else uses it (a live
+# deployment's sandboxes), stop before saving, replacing or deleting anything.
+E2E_LABEL=crucible.dev/e2e=kueue
+if kc get namespace "$SANDBOX_NS" >/dev/null 2>&1 \
+    && [ "$(kc get namespace "$SANDBOX_NS" -o jsonpath='{.metadata.labels.crucible\.dev/e2e}')" != kueue ]; then
+    log "FAIL: $SANDBOX_NS exists and is not this e2e's; run it on a cluster without live sandboxes"
+    exit 1
+fi
 trap cleanup EXIT
 trap 'log "FAIL: line $LINENO: $BASH_COMMAND"' ERR
 
@@ -122,10 +130,13 @@ fi
 
 log "clearing what an earlier run left"
 kc delete namespace "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" --ignore-not-found --timeout=300s >/dev/null
+for ns in "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS"; do
+    kc create namespace "$ns" --dry-run=client -o yaml | kc apply -f - >/dev/null
+    kc label namespace "$ns" "$E2E_LABEL" --overwrite >/dev/null
+done
 
 log "deploying the controller, the namespaces and their RBAC"
 fill "$ROOT/e2e/kueue/controller.yaml.in" | kc apply -f - >/dev/null
-kc create namespace "$SANDBOX_NS" --dry-run=client -o yaml | kc apply -f - >/dev/null
 kc apply -f "$ROOT/e2e/kueue/namespace.yaml" >/dev/null
 for ns in "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
     kc -n crucible-system get secret "$PULL_SECRET" -o json \
