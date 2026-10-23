@@ -2,7 +2,7 @@ use anyhow::Context;
 use clap::{ArgAction, Parser};
 use crucible_kueue::access::{SCOPE_READ, SCOPE_SUBMIT};
 use crucible_kueue::config::{
-    self, ClaimMap, Config, Hardware, Labels, Lifetimes, Ownership, QueueVerb,
+    self, ClaimMap, Config, Hardware, Labels, Lifetimes, Ownership, PullSecret, QueueVerb,
 };
 use crucible_kueue::profile::Profile;
 use crucible_mcp_auth::policy::ToolPolicy;
@@ -145,13 +145,16 @@ struct Cli {
         value_delimiter = ','
     )]
     namespaces: Vec<String>,
-    /// An image pull secret pod templates may name; with none, they may name none. Repeatable.
+    /// An image pull secret pod templates may name, as `name` or `name=registry` (a host or
+    /// host/path prefix): the server adds it to any pod whose image is on that registry. With
+    /// none, pod templates may name none. Repeatable.
     #[arg(
         long = "pull-secret",
         env = "CRUCIBLE_KUEUE_PULL_SECRETS",
-        value_delimiter = ','
+        value_delimiter = ',',
+        value_parser = PullSecret::parse
     )]
-    pull_secrets: Vec<String>,
+    pull_secrets: Vec<PullSecret>,
     /// Node labels naming an accelerator product, first match wins. Repeatable.
     #[arg(
         long = "accelerator-product-label",
@@ -209,7 +212,7 @@ impl Cli {
                 ),
             },
             namespaces: self.namespaces.clone(),
-            pull_secrets: self.pull_secrets.clone(),
+            pull_secrets: config::merge_pull_secrets(self.pull_secrets.clone()),
         })
     }
 }
@@ -444,7 +447,7 @@ mod tests {
             "--namespace",
             "ml-a,ml-b",
             "--pull-secret",
-            "quay-pull",
+            "quay-pull=quay.io/wseaton,quay-pull=quay.io/crucible,public-only",
         ])
         .unwrap();
         let c = cli.config().unwrap();
@@ -466,7 +469,19 @@ mod tests {
         );
         assert_eq!(c.hardware.resources, ["nvidia.com/gpu", "example.com/npu"]);
         assert_eq!(c.namespaces, ["ml-a", "ml-b"]);
-        assert_eq!(c.pull_secrets, ["quay-pull"]);
+        assert_eq!(
+            c.pull_secrets,
+            [
+                PullSecret {
+                    name: "quay-pull".into(),
+                    registries: vec!["quay.io/wseaton".into(), "quay.io/crucible".into()],
+                },
+                PullSecret {
+                    name: "public-only".into(),
+                    registries: vec![],
+                },
+            ]
+        );
         assert_eq!(
             c.hardware.product_labels,
             Hardware::default().product_labels

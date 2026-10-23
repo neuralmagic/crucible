@@ -133,7 +133,7 @@ crucible-kueue \
 | `--default-ttl-after-finished` (`DEFAULT_TTL_AFTER_FINISHED`) | `3600` | Seconds, or `none` |
 | `--suspend` (`SUSPEND`) | `true` | Create Jobs, JobSets and PyTorchJobs suspended for Kueue |
 | `--namespace` (`NAMESPACES`) | discovered | Namespaces the server is installed in; empty lists LocalQueues cluster-wide to find them |
-| `--pull-secret` (`PULL_SECRETS`) | none | Image pull secrets pod templates may name; with none, `imagePullSecrets` is refused |
+| `--pull-secret` (`PULL_SECRETS`) | none | Image pull secrets pod templates may name, as `name` or `name=registry` (host or host/path prefix; repeat for more registries). The server adds a secret to any pod whose image is on its registry and lists it in the plan's `server_changes`. With none, `imagePullSecrets` is refused |
 | `--accelerator-resource` (`ACCELERATOR_RESOURCES`) | `nvidia.com/gpu`, `nvidia.com/mig-*`, `amd.com/gpu`, `habana.ai/gaudi`, `google.com/tpu` | Resources `hardware_describe` counts; `*` matches a prefix |
 | `--accelerator-product-label` (`ACCELERATOR_PRODUCT_LABELS`) | `nvidia.com/gpu.product`, `amd.com/gpu.product-name`, `habana.ai/gaudi.product`, `cloud.google.com/gke-tpu-accelerator` | Node labels naming the product |
 
