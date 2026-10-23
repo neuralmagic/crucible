@@ -87,6 +87,12 @@ impl ClusterClients {
         Ok(cache.entry(cluster.to_string()).or_insert(client).clone())
     }
 
+    /// Whether the controller has a client of its own for `cluster`: the hub, a personal target, or
+    /// a clusters-directory entry carrying a kubeconfig.
+    pub fn reaches(&self, cluster: &str) -> bool {
+        personal_secret_id(cluster).is_some() || self.names().iter().any(|n| n == cluster)
+    }
+
     /// Every connected cluster: `hub`, then each clusters-directory entry that carries a
     /// kubeconfig, sorted. Directory presence is the registration — the same rule `target`
     /// resolves by.
@@ -183,6 +189,23 @@ pub fn personal_secret_id(target: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use crate::runs::clusters::*;
+
+    #[test]
+    fn a_cluster_with_a_kubeconfig_is_reached_directly_even_when_it_also_pushes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("pirate")).unwrap();
+        std::fs::write(dir.path().join("pirate/kubeconfig"), "apiVersion: v1\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("pushonly")).unwrap();
+        let clients = ClusterClients::new(Some(dir.path().to_path_buf()));
+        assert!(clients.reaches("hub"));
+        assert!(clients.reaches("pirate"));
+        assert!(
+            !clients.reaches("pushonly"),
+            "a directory without a kubeconfig is no client"
+        );
+        assert!(!clients.reaches("elsewhere"));
+        assert!(!ClusterClients::new(None).reaches("pirate"));
+    }
 
     #[tokio::test]
     async fn unknown_cluster_without_dir_errors() {

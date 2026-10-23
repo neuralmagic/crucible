@@ -561,6 +561,12 @@ pub enum RunAdmission {
     ContractRejected,
 }
 
+/// Whether the hub can only receive pushes from a cluster, and so cannot create a run's gateway
+/// there: it holds a push token for it and no client of its own.
+pub(crate) fn push_only(pushes: bool, reaches: bool) -> bool {
+    pushes && !reaches
+}
+
 /// What a dispatch needs to resolve the run's secrets: the scope whose bindings apply, who is
 /// launching, and what content the launch runs. `None` at a call site means the launch resolves no
 /// bindings at all — an import test-fire, which has no scope to bind against.
@@ -700,7 +706,11 @@ pub async fn dispatch_run(
     };
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
-    if isolated.is_some() && crate::runs::cluster_push::PushTokens::from_env()?.pushes_for(&cluster)
+    if isolated.is_some()
+        && push_only(
+            crate::runs::cluster_push::PushTokens::from_env()?.pushes_for(&cluster),
+            crate::runs::clusters::ClusterClients::new(cfg.clusters_dir.clone()).reaches(&cluster),
+        )
     {
         return Err(
             crate::runs::workpod::gateway::DispatchError::PushOnlyCluster { cluster }.into(),

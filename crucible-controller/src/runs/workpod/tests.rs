@@ -6664,15 +6664,40 @@ async fn an_isolated_dispatch_to_a_push_only_cluster_is_refused_before_anything_
     let tmp = tempfile::tempdir()?;
     let db = Db::new(pool);
     let profile = isolated_profile(tmp.path());
-    let cluster = pod_cfg(&profile, "img").dispatch_cluster;
+    let mut cfg = pod_cfg(&profile, "img");
+    let cluster = "edge".to_string();
+    cfg.dispatch_cluster = cluster.clone();
     unsafe {
-        std::env::set_var("CONTROLLER_PUSH_TOKENS", format!("{cluster}=push-token"));
+        std::env::set_var("CONTROLLER_PUSH_TOKENS", "edge=push-token,hub=hub-token");
     }
     let dispatcher = Arc::new(GatewayDispatcher::default());
-    let result = dispatch_isolated(&db, tmp.path(), &profile, dispatcher.clone()).await;
+    let result = dispatch_run(
+        &db,
+        &cfg,
+        dispatcher.clone(),
+        "owner/repo#7",
+        "owner_repo_7-42",
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
+        None,
+    )
+    .await;
+    let hub = dispatch_isolated(
+        &db,
+        tmp.path(),
+        &profile,
+        Arc::new(GatewayDispatcher::default()),
+    )
+    .await;
     unsafe {
         std::env::remove_var("CONTROLLER_PUSH_TOKENS");
     }
+    assert!(
+        matches!(hub, Ok(RunAdmission::Launched { .. })),
+        "a cluster the hub has a client for is dispatched to despite its push token: {hub:?}"
+    );
     let err = result.expect_err("refused");
     assert!(
         matches!(
@@ -6686,8 +6711,9 @@ async fn an_isolated_dispatch_to_a_push_only_cluster_is_refused_before_anything_
     assert!(
         crate::runs::work_pods::work_pods_in_states(db.pool(), &[WorkPodState::Running])
             .await?
-            .is_empty(),
-        "no work pod row for a dispatch that cannot start"
+            .iter()
+            .all(|row| row.cluster == "hub"),
+        "no work pod row for the dispatch that cannot start"
     );
     Ok(())
 }
@@ -6786,4 +6812,19 @@ async fn an_isolated_turn_gets_its_own_gateway(pool: sqlx::PgPool) -> Result<()>
         "the turn's gateway client key rides its Secret"
     );
     Ok(())
+}
+
+#[test]
+fn only_a_cluster_the_hub_has_no_client_for_is_push_only() {
+    use crate::runs::workpod::run::push_only;
+    assert!(
+        !push_only(true, true),
+        "a push token beside a client of the hub's own is dispatched to directly"
+    );
+    assert!(
+        push_only(true, false),
+        "a push token and no client is a cluster the hub cannot create a gateway on"
+    );
+    assert!(!push_only(false, false));
+    assert!(!push_only(false, true));
 }
