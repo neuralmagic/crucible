@@ -71,6 +71,8 @@ async fn serve(jwks: &JwksServer, policy: ToolPolicy, grants: Option<Grants>) ->
             reviewer: grants.map(|g| Arc::new(g) as Arc<dyn AccessReview>),
             kueue: crucible_kueue::kueue::KueueVersion::default(),
             allowed_hosts: Vec::new(),
+            kinds: crucible_kueue::manifest::WorkloadKind::ALL.to_vec(),
+            config: crucible_kueue::config::Config::default(),
         },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

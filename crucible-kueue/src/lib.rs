@@ -5,9 +5,12 @@
 pub mod access;
 pub mod auth;
 pub mod caller;
+pub mod config;
 pub mod hardware;
+pub mod kinds;
 pub mod kueue;
 pub mod manifest;
+pub mod profile;
 pub mod quantity;
 pub mod report;
 pub mod server;
@@ -46,6 +49,11 @@ pub struct Options {
     pub allowed_hosts: Vec<String>,
     /// The Kueue API version the cluster serves; see [`kueue::KueueVersion::discover`].
     pub kueue: kueue::KueueVersion,
+    /// The served kinds the cluster has installed; see [`kinds::installed`].
+    pub kinds: Vec<manifest::WorkloadKind>,
+    /// Labels, ownership, allowlist, claim names, queue verb, lifetimes and hardware.
+    /// [`config::Config::default`] is crucible's deployment.
+    pub config: config::Config,
 }
 
 /// The HTTP app: the MCP endpoint behind authentication and the guard; plus an
@@ -57,12 +65,20 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
         reviewer,
         allowed_hosts,
         kueue,
+        kinds,
+        config,
     } = options;
     let people = reviewer.is_some();
     let auth = auth::Auth {
         oidc: oidc.clone(),
         people,
+        claims: config.claims.clone(),
     };
+    let rules = access::KueueRules {
+        queue_verb: config.queue_verb,
+    };
+    let cfg = Arc::new(config);
+    let kinds = Arc::new(kinds);
     let extra_hosts = &allowed_hosts;
     let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
@@ -74,12 +90,19 @@ pub fn router(client: kube::Client, options: Options) -> axum::Router {
     }
     let service: StreamableHttpService<server::KueueMcp, NeverSessionManager> =
         StreamableHttpService::new(
-            move || Ok(server::KueueMcp::new(client.clone(), kueue)),
+            move || {
+                Ok(server::KueueMcp::new(
+                    client.clone(),
+                    kueue,
+                    cfg.clone(),
+                    kinds.clone(),
+                ))
+            },
             Arc::new(NeverSessionManager::default()),
             config,
         );
     let guard = PolicyGuard {
-        rules: Arc::new(access::KueueRules),
+        rules: Arc::new(rules),
         policy,
         server: Some(oidc.clone()),
         reviewer,

@@ -15,7 +15,7 @@
 //!   CRUCIBLE_GATEWAY_E2E_SPIRE_DISCOVERY=<namespace>/<service>:<port> of SPIRE's OIDC discovery
 //!     provider, whose keys the controller reads through the API server's Service proxy
 //!   CRUCIBLE_GATEWAY_E2E_KUBE_USER=<Kubernetes user the run's launcher acts as> \
-//!   cargo test -p crucible-kueue --test gateway_e2e -- --ignored --nocapture --test-threads=1
+//!   cargo test -p crucible-controller --test kueue_gateway_e2e -- --ignored --nocapture --test-threads=1
 
 use base64::Engine;
 use crucible::deploy::DeployProfile;
@@ -434,13 +434,18 @@ async fn serve_kueue(kube: kube::Client, controller: &str) -> String {
     };
     let http = reqwest::Client::new();
     let server = ResourceServer::with_jwks(config, |t| Jwks::new(http.clone(), t.jwks_uri.clone()));
-    let policy = ToolPolicy::from_toml(include_str!("../deploy/kueue-policy.toml")).unwrap();
+    let policy = ToolPolicy::from_toml(include_str!(
+        "../../crucible-kueue/deploy/kueue-policy.toml"
+    ))
+    .unwrap();
     let kueue_version = crucible_kueue::kueue::KueueVersion::discover(&kube)
         .await
         .unwrap();
     let app = crucible_kueue::router(
         kube,
         crucible_kueue::Options {
+            kinds: crucible_kueue::manifest::WorkloadKind::ALL.to_vec(),
+            config: crucible_kueue::config::Config::default(),
             oidc: Arc::new(server),
             policy,
             reviewer: None,

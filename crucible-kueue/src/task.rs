@@ -1,14 +1,13 @@
-//! MCP tasks (`io.modelcontextprotocol/tasks`) over batch Kueue workloads (Job, RayJob). A task id
+//! MCP tasks (`io.modelcontextprotocol/tasks`) over batch Kueue workloads. A task id
 //! names the submitted object including its UID, so the id is unguessable and a recreated object
 //! of the same name is a different task. Task state is derived from the cluster on every
 //! `tasks/get`; nothing is held in the server. Serving kinds are not tasks: they never finish, and
 //! report readiness through `workload_status`.
 
-use crate::manifest::{DEFAULT_TTL_SECONDS_AFTER_FINISHED, WorkloadKind};
+use crate::manifest::WorkloadKind;
 use crate::status::{Phase, Rollup};
 use serde_json::{Value, json};
 
-pub const CANCELLED_ANNOTATION: &str = "crucible.dev/task-cancelled";
 pub const POLL_INTERVAL_MS: u64 = 5_000;
 
 /// `<namespace>/<kind>/<name>/<uid>`. Ids minted before namespaces were per call have no
@@ -64,11 +63,14 @@ pub enum Outcome {
     Cancelled,
 }
 
-/// The error for a task whose object no longer exists. The server gives every Job and RayJob a
-/// TTL, so a finished task's object is deleted and its outcome with it.
-pub fn gone(t: &TaskRef) -> String {
+/// The error for a task whose object no longer exists. A finished batch workload is deleted after
+/// its TTL, `default_ttl` unless its manifest set one, and its outcome with it.
+pub fn gone(t: &TaskRef, default_ttl: Option<i64>) -> String {
+    let default = default_ttl
+        .map(|s| format!(" (default {s}s)"))
+        .unwrap_or_default();
     format!(
-        "task {}: {} {} no longer exists. It finished and was deleted after its ttlSecondsAfterFinished (default {DEFAULT_TTL_SECONDS_AFTER_FINISHED}s), or it was deleted; its outcome is gone",
+        "task {}: {} {} no longer exists. It finished and was deleted after its ttlSecondsAfterFinished{default}, or it was deleted; its outcome is gone",
         t.encode(),
         t.kind.kind(),
         t.name
@@ -102,9 +104,10 @@ fn annotation<'a>(object: &'a Value, key: &str) -> Option<&'a str> {
 }
 
 /// A batch workload's task completes when Kueue marks its Workload finished; it failed unless the
-/// Workload succeeded. `object` is the full object, whose annotations record cancellation.
-pub fn outcome(object: &Value, rollup: &Rollup) -> Outcome {
-    if annotation(object, CANCELLED_ANNOTATION).is_some() {
+/// Workload succeeded. `object` is the full object, whose `cancelled` annotation records
+/// cancellation.
+pub fn outcome(object: &Value, rollup: &Rollup, cancelled: &str) -> Outcome {
+    if annotation(object, cancelled).is_some() {
         return Outcome::Cancelled;
     }
     let head = &rollup.headline;
@@ -126,6 +129,8 @@ mod tests {
     use crate::task::*;
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    const CANCELLED: &str = "crucible.dev/task-cancelled";
 
     fn rollup(phase: Phase, reason: &str) -> Rollup {
         Rollup {
@@ -173,18 +178,18 @@ mod tests {
     fn a_job_completes_when_kueue_finishes_it_and_fails_unless_it_succeeded() {
         let obj = json!({});
         assert!(matches!(
-            outcome(&obj, &rollup(Phase::Admitted, "Admitted")),
+            outcome(&obj, &rollup(Phase::Admitted, "Admitted"), CANCELLED),
             Outcome::Working { .. }
         ));
         assert_eq!(
-            outcome(&obj, &rollup(Phase::Finished, "Succeeded")),
+            outcome(&obj, &rollup(Phase::Finished, "Succeeded"), CANCELLED),
             Outcome::Completed {
                 failed: false,
                 message: "msg".into()
             }
         );
         assert!(matches!(
-            outcome(&obj, &rollup(Phase::Finished, "Failed")),
+            outcome(&obj, &rollup(Phase::Finished, "Failed"), CANCELLED),
             Outcome::Completed { failed: true, .. }
         ));
     }
@@ -192,7 +197,7 @@ mod tests {
     #[test]
     fn a_gone_task_says_it_was_deleted_after_its_ttl() {
         let t = TaskRef::parse("team-a/Job/train/6f1c-uid").unwrap();
-        let msg = gone(&t);
+        let msg = gone(&t, Some(3600));
         assert!(
             msg.starts_with("task team-a/Job/train/6f1c-uid: Job train no longer exists"),
             "{msg}"
@@ -202,6 +207,7 @@ mod tests {
             "{msg}"
         );
         assert!(!msg.contains("unknown task"), "{msg}");
+        assert!(!gone(&t, None).contains("default"), "{}", gone(&t, None));
         assert!(replaced(&t).contains("created again under the same name"));
     }
 
@@ -218,9 +224,9 @@ mod tests {
 
     #[test]
     fn a_cancelled_task_stays_cancelled_whatever_kueue_says() {
-        let obj = json!({"metadata": {"annotations": {CANCELLED_ANNOTATION: "true"}}});
+        let obj = json!({"metadata": {"annotations": {CANCELLED: "true"}}});
         assert_eq!(
-            outcome(&obj, &rollup(Phase::Finished, "Succeeded")),
+            outcome(&obj, &rollup(Phase::Finished, "Succeeded"), CANCELLED),
             Outcome::Cancelled
         );
     }

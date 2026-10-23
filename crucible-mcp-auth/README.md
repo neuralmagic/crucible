@@ -540,7 +540,7 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
 | this crate, unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting, access rules and review (allowed, denied, failed, no reviewer, checks over the final arguments), Kubernetes identity and SubjectAccessReview requests |
 | crucible-kueue, unit tests | claims to identity, default and per-call namespaces, `kube_user` required, person tokens, JWT-only authentication, launched-by label, every tool but `whoami` reviewed for people, namespaced task ids |
 | buildit, 60 unit tests | realm and tokens-file callers, refusals, challenges, launched-by label, a policy refusal over HTTP |
-| `crucible-kueue/tests/oidc_e2e.rs` (cluster) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), another namespace refused by RBAC |
+| `crucible-controller/tests/kueue_oidc_e2e.rs` (cluster) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), another namespace refused by RBAC |
 | `buildit/tests/oidc_e2e.rs` (cluster) | the `buildit mcp` binary with a realm token: challenge, metadata, authenticated status, policy refusal |
 
 The `testing` feature exposes real RSA keys, a loopback JWKS server and token minting for other

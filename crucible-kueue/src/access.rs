@@ -10,7 +10,7 @@
 //! | workload_status, tasks/get            | kueue.read   | `get` the workload                     |
 //! | workload_list                         | kueue.read   | `list` kueue workloads                 |
 //! | workload_logs                         | kueue.read   | `get` pods/log                         |
-//! | workload_plan, workload_submit        | kueue.submit | `use` the localqueue, `create` the kind |
+//! | workload_plan, workload_submit        | kueue.submit | `use` (or `get`) the localqueue, `create` the kind, `get` each Secret and PVC it names |
 //! | workload_scale                        | kueue.submit | `update` the workload's scale          |
 //! | workload_stop, workload_resume        | kueue.submit | `update` the workload                  |
 //! | tasks/cancel                          | kueue.submit | `update` the workload                  |
@@ -18,20 +18,36 @@
 //!
 //! The namespace checked is the call's `namespace` argument, else the token's `namespace` claim.
 
+use crate::config::QueueVerb;
 use crate::manifest::WorkloadKind;
 use crate::task::TaskRef;
-use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
 use crucible_mcp_auth::access::{AccessCheck, AccessRules, Call};
 use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::policy::Refusal;
 use crucible_mcp_auth::principal::Principal;
 use serde_json::{Map, Value};
 
+/// The scope reading tools need.
+pub const SCOPE_READ: &str = "kueue.read";
+/// The scope creating and controlling workloads needs.
+pub const SCOPE_SUBMIT: &str = "kueue.submit";
+
 const KUEUE_GROUP: &str = "kueue.x-k8s.io";
 const READ: &[&str] = &[SCOPE_READ];
 const SUBMIT: &[&str] = &[SCOPE_SUBMIT];
 
-pub struct KueueRules;
+pub struct KueueRules {
+    /// The LocalQueue verb submitting needs.
+    pub queue_verb: QueueVerb,
+}
+
+impl Default for KueueRules {
+    fn default() -> Self {
+        Self {
+            queue_verb: QueueVerb::Use,
+        }
+    }
+}
 
 impl AccessRules for KueueRules {
     fn scopes(&self, call: &Call<'_>) -> Result<&'static [&'static str], Refusal> {
@@ -57,7 +73,9 @@ impl AccessRules for KueueRules {
         }
         let default_namespace = principal.namespace.as_deref().unwrap_or_default();
         match call {
-            Call::Tool { name, args } => tool_checks(name, args, default_namespace),
+            Call::Tool { name, args } => {
+                tool_checks(name, args, default_namespace, self.queue_verb)
+            }
             Call::Method { name, params } => method_checks(name, params, default_namespace),
         }
     }
@@ -126,10 +144,42 @@ fn kind(call: &str, rule: &str, value: Option<&Value>) -> Result<WorkloadKind, R
         })
 }
 
+/// The Secrets and PersistentVolumeClaims a manifest names, wherever they appear: the server
+/// creates its pods with its own identity, so the caller must be able to read them itself.
+fn referenced(manifest: &Value) -> (Vec<String>, Vec<String>) {
+    fn walk(v: &Value, secrets: &mut Vec<String>, claims: &mut Vec<String>) {
+        match v {
+            Value::Object(map) => {
+                for (k, child) in map {
+                    let name =
+                        |key: &str| child.get(key).and_then(Value::as_str).map(str::to_string);
+                    match k.as_str() {
+                        "secretKeyRef" | "secretRef" => secrets.extend(name("name")),
+                        "secret" => secrets.extend(name("secretName").or_else(|| name("name"))),
+                        "persistentVolumeClaim" => claims.extend(name("claimName")),
+                        _ => {}
+                    }
+                    walk(child, secrets, claims);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|i| walk(i, secrets, claims)),
+            _ => {}
+        }
+    }
+    let (mut secrets, mut claims) = (Vec::new(), Vec::new());
+    walk(manifest, &mut secrets, &mut claims);
+    for list in [&mut secrets, &mut claims] {
+        list.sort();
+        list.dedup();
+    }
+    (secrets, claims)
+}
+
 fn tool_checks(
     tool: &str,
     args: &Map<String, Value>,
     default_namespace: &str,
+    queue_verb: QueueVerb,
 ) -> Result<Vec<AccessCheck>, Refusal> {
     let namespace = match text(args, "namespace") {
         "" => default_namespace,
@@ -187,12 +237,12 @@ fn tool_checks(
                 "workload-create",
                 args.get("manifest").and_then(|m| m.get("kind")),
             )?;
-            vec![
+            let mut checks = vec![
                 c.check(
                     "queue-use",
                     "you may not submit to this queue",
                     queues,
-                    "use",
+                    queue_verb.as_str(),
                     text(args, "queue"),
                 ),
                 c.workload(
@@ -202,7 +252,27 @@ fn tool_checks(
                     "create",
                     "",
                 ),
-            ]
+            ];
+            let (secrets, claims) = referenced(args.get("manifest").unwrap_or(&Value::Null));
+            for secret in secrets {
+                checks.push(c.check(
+                    "secret-get",
+                    "you may not read a Secret this manifest names",
+                    ("", "secrets", ""),
+                    "get",
+                    &secret,
+                ));
+            }
+            for claim in claims {
+                checks.push(c.check(
+                    "pvc-get",
+                    "you may not use a PersistentVolumeClaim this manifest names",
+                    ("", "persistentvolumeclaims", ""),
+                    "get",
+                    &claim,
+                ));
+            }
+            checks
         }
         "workload_scale" => {
             let kind = kind(tool, "workload-scale", args.get("kind"))?;
@@ -312,7 +382,7 @@ mod tests {
         let Value::Object(args) = args else {
             panic!("args must be an object")
         };
-        KueueRules.checks(&Call::Tool { name, args: &args }, p)
+        KueueRules::default().checks(&Call::Tool { name, args: &args }, p)
     }
 
     fn shown(checks: Vec<AccessCheck>) -> Vec<String> {
@@ -331,7 +401,7 @@ mod tests {
     fn unknown_tools_and_methods_are_refused() {
         let args = Map::new();
         assert_eq!(
-            KueueRules.scopes(&Call::Tool {
+            KueueRules::default().scopes(&Call::Tool {
                 name: "rm_rf",
                 args: &args
             }),
@@ -340,7 +410,7 @@ mod tests {
             })
         );
         assert_eq!(
-            KueueRules.scopes(&Call::Method {
+            KueueRules::default().scopes(&Call::Method {
                 name: "tasks/list",
                 params: &Value::Null
             }),
@@ -368,6 +438,60 @@ mod tests {
     }
 
     #[test]
+    fn a_cluster_without_the_use_verb_checks_get_on_the_queue() {
+        let Value::Object(args) =
+            json!({"namespace": "team-b", "queue": "gpu", "manifest": {"kind": "Job"}})
+        else {
+            unreachable!()
+        };
+        let rules = KueueRules {
+            queue_verb: QueueVerb::Get,
+        };
+        let checks = rules
+            .checks(
+                &Call::Tool {
+                    name: "workload_plan",
+                    args: &args,
+                },
+                &person(),
+            )
+            .unwrap();
+        assert_eq!(
+            shown(checks)[0],
+            "queue-use kueue.x-k8s.io/localqueues/ get ns=team-b name=gpu"
+        );
+    }
+
+    #[test]
+    fn every_secret_and_claim_a_manifest_names_is_checked_for_the_caller() {
+        let manifest = json!({"kind": "Job", "spec": {"template": {"spec": {
+            "volumes": [
+                {"name": "a", "secret": {"secretName": "tls"}},
+                {"name": "b", "persistentVolumeClaim": {"claimName": "data"}},
+                {"name": "c", "projected": {"sources": [{"secret": {"name": "tls"}}]}}
+            ],
+            "containers": [{"name": "m",
+                "env": [{"name": "T", "valueFrom": {"secretKeyRef": {"name": "hf-token", "key": "t"}}}],
+                "envFrom": [{"secretRef": {"name": "s3"}}]}]
+        }}}});
+        let checks = tool_checks_for(
+            &person(),
+            "workload_submit",
+            json!({"namespace": "team-b", "queue": "gpu", "manifest": manifest}),
+        )
+        .unwrap();
+        assert_eq!(
+            shown(checks)[2..],
+            [
+                "secret-get /secrets/ get ns=team-b name=hf-token",
+                "secret-get /secrets/ get ns=team-b name=s3",
+                "secret-get /secrets/ get ns=team-b name=tls",
+                "pvc-get /persistentvolumeclaims/ get ns=team-b name=data",
+            ]
+        );
+    }
+
+    #[test]
     fn the_tokens_namespace_is_the_default() {
         let run = principal(json!({"sub": "alice", "kube_user": "alice", "namespace": "team-a"}));
         let checks = tool_checks_for(
@@ -385,7 +509,7 @@ mod tests {
     #[test]
     fn tasks_are_checked_on_the_object_their_id_names() {
         let params = json!({"taskId": "team-c/Job/train/u1"});
-        let get = KueueRules
+        let get = KueueRules::default()
             .checks(
                 &Call::Method {
                     name: "tasks/get",
@@ -398,7 +522,7 @@ mod tests {
             shown(get),
             ["task-get batch/jobs/ get ns=team-c name=train"]
         );
-        let cancel = KueueRules
+        let cancel = KueueRules::default()
             .checks(
                 &Call::Method {
                     name: "tasks/cancel",
@@ -444,7 +568,7 @@ mod tests {
         }
         let bad = json!({"taskId": "nope"});
         assert!(matches!(
-            KueueRules.checks(
+            KueueRules::default().checks(
                 &Call::Method {
                     name: "tasks/get",
                     params: &bad

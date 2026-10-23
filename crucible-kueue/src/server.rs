@@ -1,16 +1,15 @@
 //! The MCP tool surface. Every tool resolves the [`Caller`] the auth layer attached to the HTTP
-//! request and acts only inside that caller's namespace; mutations additionally require the
-//! submitter role and, past submit, an object this server created for the same run.
+//! request and acts in the namespace the call names; past submit, mutations need an object this
+//! server created for the same run, unless the server runs with [`Ownership::Rbac`].
 
 use crate::caller::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
+use crate::config::{Config, Labels, MANAGED_VALUE, Ownership, QUEUE_LABEL};
 use crate::hardware;
+use crate::kinds;
 use crate::kueue::{
     self, ClusterQueue, KubeError, KueueVersion, LocalQueue, ResourceFlavor, Workload,
 };
-use crate::manifest::{
-    self, MANAGED_LABEL, MANAGED_VALUE, ManifestError, Normalized, RUN_LABEL, WORKLOAD_LABEL,
-    WorkloadKind,
-};
+use crate::manifest::{self, ManifestError, Normalized, WorkloadKind};
 use crate::report::{self, Detail, Situation, Until, WaitEnd};
 use crate::status::{self, Phase, Readiness, Rollup};
 use crate::task::{self, Outcome, TaskRef};
@@ -18,6 +17,7 @@ use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
     Api, DeleteParams, DynamicObject, ListParams, LogParams, Patch, PatchParams, PostParams,
 };
+use kube::core::SelectorExt;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
@@ -32,13 +32,10 @@ use rmcp::{ServerHandler, schemars, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub const FIELD_MANAGER: &str = "crucible-kueue";
-pub const PLAN_HASH_ANNOTATION: &str = "crucible.dev/plan-hash";
-pub const STOPPED_REPLICAS_ANNOTATION: &str = "crucible.dev/stopped-replicas";
-/// The sandbox that presented the run's token when the workload was planned and submitted.
-pub const ACTOR_ANNOTATION: &str = "crucible.dev/actor";
 const MAX_WORKLOADS_SHOWN: usize = 20;
 const MAX_REPLICAS: i64 = 1000;
 const MAX_LOG_PODS: usize = 4;
@@ -107,15 +104,14 @@ pub enum ToolError {
     },
 }
 
-/// Why a Job or RayJob may be gone: the TTL the server defaults deletes it after it finishes.
+/// Why a batch workload may be gone: a finished one is deleted after its TTL.
 fn gone_hint(kind: &str) -> String {
-    if kind == WorkloadKind::Job.kind() || kind == WorkloadKind::RayJob.kind() {
-        format!(
-            "; a finished {kind} is deleted ttlSecondsAfterFinished after it finishes (default {}s)",
-            manifest::DEFAULT_TTL_SECONDS_AFTER_FINISHED
-        )
-    } else {
-        String::new()
+    let batch = WorkloadKind::ALL
+        .iter()
+        .any(|k| k.is_batch() && k.kind() == kind);
+    match batch {
+        true => format!("; a finished {kind} is deleted ttlSecondsAfterFinished after it finishes"),
+        false => String::new(),
     }
 }
 
@@ -267,22 +263,32 @@ fn request_parts(ctx: &RequestContext<RoleServer>) -> Result<&http::request::Par
 }
 
 /// The annotations only the server writes: the plan hash and, for a run, the sandbox that acted.
-fn stamp(object: &mut DynamicObject, plan_hash: &str, actor: Option<&str>) {
+fn stamp(object: &mut DynamicObject, labels: &Labels, plan_hash: &str, actor: Option<&str>) {
     let annotations = object
         .metadata
         .annotations
         .get_or_insert_with(BTreeMap::new);
-    annotations.insert(PLAN_HASH_ANNOTATION.into(), plan_hash.into());
+    annotations.insert(labels.plan_hash.clone(), plan_hash.into());
     if let Some(actor) = actor {
-        annotations.insert(ACTOR_ANNOTATION.into(), actor.into());
+        annotations.insert(labels.actor.clone(), actor.into());
     }
 }
 
-/// Whether `caller` created `obj`: crucible-kueue's managed label and the caller's run label.
-fn owns(caller: &Caller, obj: &DynamicObject) -> bool {
-    let labels = obj.metadata.labels.as_ref();
-    let label = |key: &str| labels.and_then(|l| l.get(key)).map(String::as_str);
-    label(MANAGED_LABEL) == Some(MANAGED_VALUE) && label(RUN_LABEL) == Some(caller.run_id.as_str())
+/// Whether `caller` created `obj`: this server's managed label and the caller's run label.
+fn created_by(caller: &Caller, obj: &DynamicObject, labels: &Labels) -> bool {
+    let set = obj.metadata.labels.as_ref();
+    let label = |key: &str| set.and_then(|l| l.get(key)).map(String::as_str);
+    label(&labels.managed_by) == Some(MANAGED_VALUE)
+        && label(&labels.run_id) == Some(caller.run_id.as_str())
+}
+
+/// Whether `caller` may stop, resume, scale or delete `obj`. Under [`Ownership::Rbac`] the access
+/// checks the guard ran already decided.
+fn controls(caller: &Caller, obj: &DynamicObject, cfg: &Config) -> bool {
+    match cfg.ownership {
+        Ownership::Managed => created_by(caller, obj, &cfg.labels),
+        Ownership::Rbac => true,
+    }
 }
 
 fn owner_uids(obj: &DynamicObject, pods: &[Pod]) -> Vec<String> {
@@ -355,9 +361,11 @@ pub struct PlanArgs {
     /// LocalQueue name in the namespace acted in (queues_list lists them).
     pub queue: String,
     /// The workload as a JSON object: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1
-    /// LeaderWorkerSet, apps/v1 Deployment, or apps/v1 StatefulSet. metadata.name is required;
+    /// LeaderWorkerSet, apps/v1 Deployment, apps/v1 StatefulSet, jobset.x-k8s.io/v1alpha2 JobSet,
+    /// or kubeflow.org/v1 PyTorchJob (whoami lists those installed). metadata.name is required;
     /// the namespace and queue label are filled in. Pod templates may not use host access,
-    /// privilege, another service account, Secrets, or scheduling fields that bypass Kueue.
+    /// privilege, another service account, or scheduling fields that bypass Kueue; the server's
+    /// allowlist profile (whoami) decides Secrets, volume claims and tolerations.
     pub manifest: Value,
 }
 
@@ -472,15 +480,40 @@ pub struct ListArgs {
     /// Namespace to act in. A run's token is bound to its own; a person names one they may use.
     #[serde(default)]
     pub namespace: Option<String>,
-    /// Include workloads other runs created in this namespace.
+    /// mine (default): what this run created; managed: what this server created for any run;
+    /// all: every Kueue-queued workload of a served kind.
     #[serde(default)]
-    pub all_runs: bool,
+    pub filter: Option<ListFilter>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ListFilter {
+    #[default]
+    Mine,
+    Managed,
+    All,
+}
+
+/// The label selector `filter` lists objects by.
+fn list_selector(filter: ListFilter, labels: &Labels, run: &str) -> String {
+    match filter {
+        ListFilter::Mine => format!(
+            "{}={MANAGED_VALUE},{}={run}",
+            labels.managed_by, labels.run_id
+        ),
+        ListFilter::Managed => format!("{}={MANAGED_VALUE}", labels.managed_by),
+        ListFilter::All => QUEUE_LABEL.to_string(),
+    }
 }
 
 #[derive(Clone)]
 pub struct KueueMcp {
     client: kube::Client,
     kueue: KueueVersion,
+    config: Arc<Config>,
+    /// The served kinds the cluster has installed.
+    kinds: Arc<Vec<WorkloadKind>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -533,10 +566,17 @@ fn pod_summary(p: &Pod) -> PodSummary {
 }
 
 impl KueueMcp {
-    pub fn new(client: kube::Client, kueue: KueueVersion) -> Self {
+    pub fn new(
+        client: kube::Client,
+        kueue: KueueVersion,
+        config: Arc<Config>,
+        kinds: Arc<Vec<WorkloadKind>>,
+    ) -> Self {
         Self {
             client,
             kueue,
+            config,
+            kinds,
             tool_router: Self::tool_router(),
         }
     }
@@ -622,7 +662,7 @@ impl KueueMcp {
         name: &str,
     ) -> Result<DynamicObject, ToolError> {
         let obj = self.get_object(caller, kind, name).await?;
-        if !owns(caller, &obj) {
+        if !controls(caller, &obj, &self.config) {
             return Err(ToolError::NotOwned {
                 kind: kind.kind(),
                 name: name.to_string(),
@@ -656,14 +696,33 @@ impl KueueMcp {
         Ok(owned_by(&all, &owners).into_iter().cloned().collect())
     }
 
-    async fn pods_of(&self, ns: &str, name: &str) -> Result<Vec<Pod>, ToolError> {
+    /// The object's pods, found through its selector or its controller's labels.
+    async fn pods_of(
+        &self,
+        ns: &str,
+        kind: WorkloadKind,
+        obj: &DynamicObject,
+    ) -> Result<Vec<Pod>, ToolError> {
+        let name = obj.metadata.name.as_deref().unwrap_or_default();
+        let object = serde_json::to_value(obj).map_err(|source| KubeError::Decode {
+            what: format!("{} {name}", kind.kind()),
+            source,
+        })?;
         let api: Api<Pod> = Api::namespaced(self.client.clone(), ns);
-        let lp = ListParams::default().labels(&format!("{WORKLOAD_LABEL}={name}"));
-        Ok(api
-            .list(&lp)
-            .await
-            .map_err(|source| KubeError::api("list", format!("pods of {name}"), source))?
-            .items)
+        let mut pods: Vec<Pod> = Vec::new();
+        for selector in kinds::pod_selectors(kind, &object) {
+            let lp = ListParams::default().labels(&selector.to_string());
+            let found = api
+                .list(&lp)
+                .await
+                .map_err(|source| KubeError::api("list", format!("pods of {name}"), source))?;
+            for p in found.items {
+                if !pods.iter().any(|q| q.metadata.uid == p.metadata.uid) {
+                    pods.push(p);
+                }
+            }
+        }
+        Ok(pods)
     }
 
     /// The newest events about the named objects, oldest first.
@@ -709,7 +768,7 @@ impl KueueMcp {
     ) -> Result<(Normalized, ClusterQueue), ToolError> {
         let lq = self.local_queue(caller, queue).await?;
         let queue = QueueName::parse(queue)?;
-        let normalized = manifest::normalize(manifest, caller, &queue)?;
+        let normalized = manifest::normalize(manifest, caller, &queue, &self.config)?;
         let cq = self.cluster_queue(&lq).await?;
         Ok((normalized, cq))
     }
@@ -726,7 +785,7 @@ impl KueueMcp {
                 what: format!("normalized {}", n.kind.kind()),
                 source,
             })?;
-        stamp(&mut object, &n.plan_hash, actor);
+        stamp(&mut object, &self.config.labels, &n.plan_hash, actor);
         let pp = PostParams {
             dry_run,
             field_manager: Some(FIELD_MANAGER.into()),
@@ -749,7 +808,8 @@ impl KueueMcp {
             patch["spec"] = json!({"replicas": n});
         }
         if let Some(value) = stopped_annotation {
-            patch["metadata"] = json!({"annotations": {STOPPED_REPLICAS_ANNOTATION: value}});
+            patch["metadata"] =
+                json!({"annotations": {self.config.labels.stopped_replicas.as_str(): value}});
         }
         self.dynamic(r.kind, caller.namespace.as_str())
             .patch(
@@ -792,7 +852,7 @@ impl KueueMcp {
             .metadata
             .annotations
             .as_ref()
-            .and_then(|a| a.get(STOPPED_REPLICAS_ANNOTATION))
+            .and_then(|a| a.get(&self.config.labels.stopped_replicas))
             .and_then(|v| v.parse::<i64>().ok());
         match (active, current, remembered) {
             (false, 0, _) => Ok(json!({"replicas": 0, "note": "already stopped"})),
@@ -825,7 +885,7 @@ impl KueueMcp {
             return self.scale_active(caller, r, &obj, active).await;
         }
         let ns = caller.namespace.as_str();
-        let pods = self.pods_of(ns, &r.name).await?;
+        let pods = self.pods_of(ns, r.kind, &obj).await?;
         let wl = self
             .workloads_of(ns, &obj, &pods)
             .await?
@@ -858,7 +918,7 @@ impl KueueMcp {
     ) -> Result<Snapshot, ToolError> {
         let ns = c.namespace.as_str();
         let object = self.get_object(c, kind, name).await?;
-        let pods = self.pods_of(ns, name).await?;
+        let pods = self.pods_of(ns, kind, &object).await?;
         let workloads = self.workloads_of(ns, &object, &pods).await?;
         let rollup = status::rollup(&workloads.iter().collect::<Vec<_>>());
         Ok(Snapshot {
@@ -1156,7 +1216,10 @@ impl KueueMcp {
         let obj = match self.get_object(c, t.kind, &t.name).await {
             Ok(o) => o,
             Err(ToolError::NotFound { .. }) => {
-                return Err(McpError::invalid_params(task::gone(&t), None));
+                return Err(McpError::invalid_params(
+                    task::gone(&t, self.config.lifetimes.ttl_seconds_after_finished),
+                    None,
+                ));
             }
             Err(e) => return Err(internal(e)),
         };
@@ -1197,7 +1260,7 @@ impl KueueMcp {
             what: format!("{} {}", t.kind.kind(), t.name),
             source,
         })?;
-        let outcome = task::outcome(&full, &snap.rollup);
+        let outcome = task::outcome(&full, &snap.rollup, &self.config.labels.task_cancelled);
         let created = snap
             .object
             .metadata
@@ -1254,7 +1317,9 @@ impl KueueMcp {
                 "namespace": c.namespace.as_str(),
                 "launched_by": c.launched_by.as_str(),
                 "kube_user": c.kube_user,
-                "submittable_kinds": WorkloadKind::ALL.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
+                "submittable_kinds": self.kinds.iter().map(|k| format!("{} {}", k.api_version(), k.kind())).collect::<Vec<_>>(),
+                "ownership": self.config.ownership,
+                "allowlist_profile": self.config.profile.name,
             })
         }))
     }
@@ -1400,7 +1465,7 @@ impl KueueMcp {
                 for group in &cq.spec.resource_groups {
                     for f in &group.flavors {
                         let rf: ResourceFlavor = kueue::get(&self.client, &self.kueue.resource_flavors(), None, &f.name).await?;
-                        flavors.push(hardware::describe(&rf, &group.covered_resources, &nodes));
+                        flavors.push(hardware::describe(&rf, &group.covered_resources, &nodes, &self.config.hardware));
                     }
                 }
                 Ok(json!({"queue": lq.metadata.name, "cluster_queue": cq.metadata.name, "flavors": flavors}))
@@ -1500,7 +1565,7 @@ impl KueueMcp {
                             .metadata
                             .annotations
                             .as_ref()
-                            .and_then(|a| a.get(PLAN_HASH_ANNOTATION))
+                            .and_then(|a| a.get(&self.config.labels.plan_hash))
                             .cloned()
                             .unwrap_or_default();
                         if hash != n.plan_hash {
@@ -1549,7 +1614,7 @@ impl KueueMcp {
     }
 
     #[tool(
-        description = "Workloads crucible-kueue created in the namespace, with their Kueue phase.",
+        description = "Workloads in the namespace with their Kueue phase: by default those this run created; filter=managed adds other runs', filter=all every Kueue-queued workload of a served kind, however it was created.",
         annotations(
             title = "List workloads",
             read_only_hint = true,
@@ -1565,18 +1630,16 @@ impl KueueMcp {
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 let ns = c.namespace.as_str();
-                let mut selector = format!("{MANAGED_LABEL}={MANAGED_VALUE}");
-                if !args.all_runs {
-                    selector.push_str(&format!(",{RUN_LABEL}={}", c.run_id));
-                }
+                let labels = &self.config.labels;
+                let selector = list_selector(args.filter.unwrap_or_default(), labels, c.run_id.as_str());
                 let workloads = self.namespace_workloads(ns).await?;
                 let pods: Vec<Pod> = Api::<Pod>::namespaced(self.client.clone(), ns)
-                    .list(&ListParams::default().labels(WORKLOAD_LABEL))
+                    .list(&ListParams::default())
                     .await
                     .map_err(|source| KubeError::api("list", "pods", source))?
                     .items;
                 let mut rows = Vec::new();
-                for kind in WorkloadKind::ALL {
+                for &kind in self.kinds.iter() {
                     let objs = match self.dynamic(kind, ns).list(&ListParams::default().labels(&selector)).await {
                         Ok(list) => list.items,
                         Err(kube::Error::Api(s)) if s.code == 404 => continue,
@@ -1587,9 +1650,16 @@ impl KueueMcp {
                     };
                     for o in objs {
                         let name = o.metadata.name.clone().unwrap_or_default();
+                        let selectors = serde_json::to_value(&o)
+                            .map(|v| kinds::pod_selectors(kind, &v))
+                            .unwrap_or_default();
+                        let none = BTreeMap::new();
                         let its_pods: Vec<Pod> = pods
                             .iter()
-                            .filter(|p| p.metadata.labels.as_ref().and_then(|l| l.get(WORKLOAD_LABEL)) == Some(&name))
+                            .filter(|p| {
+                                let l = p.metadata.labels.as_ref().unwrap_or(&none);
+                                selectors.iter().any(|s| s.matches(l))
+                            })
                             .cloned()
                             .collect();
                         let owners = owner_uids(&o, &its_pods);
@@ -1597,8 +1667,9 @@ impl KueueMcp {
                         rows.push(json!({
                             "kind": kind,
                             "name": name,
-                            "run": o.metadata.labels.as_ref().and_then(|l| l.get(RUN_LABEL)),
-                            "queue": o.metadata.labels.as_ref().and_then(|l| l.get(manifest::QUEUE_LABEL)),
+                            "run": o.metadata.labels.as_ref().and_then(|l| l.get(&labels.run_id)),
+                            "managed": o.metadata.labels.as_ref().and_then(|l| l.get(&labels.managed_by)).is_some_and(|v| v == MANAGED_VALUE),
+                            "queue": o.metadata.labels.as_ref().and_then(|l| l.get(QUEUE_LABEL)),
                             "phase": p.headline.phase,
                             "counts": p.counts,
                             "reason": p.headline.reason,
@@ -1629,8 +1700,8 @@ impl KueueMcp {
             async {
                 let c = caller(&parts, args.namespace.as_deref())?;
                 let ns = c.namespace.as_str();
-                self.get_object(&c, args.kind, &args.name).await?;
-                let mut pods = self.pods_of(ns, &args.name).await?;
+                let obj = self.get_object(&c, args.kind, &args.name).await?;
+                let mut pods = self.pods_of(ns, args.kind, &obj).await?;
                 if let Some(want) = &args.pod {
                     pods.retain(|p| p.metadata.name.as_deref() == Some(want.as_str()));
                     if pods.is_empty() {
@@ -1851,13 +1922,73 @@ impl KueueMcp {
     }
 }
 
-const INSTRUCTIONS: &str = "Submit and watch Kueue workloads (Job, RayJob, LeaderWorkerSet, Deployment, StatefulSet) in a namespace: a run's token acts in its own, a person names one they may use. \
-Flow: queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> workload_status with until=admitted|running|ready|finished, which waits on the server up to 50s per call (or, for a Job or RayJob, tasks/get when the client speaks the tasks extension) -> workload_logs. \
+fn duration(seconds: i64) -> String {
+    match seconds {
+        s if s > 0 && s % 3600 == 0 => format!("{}h", s / 3600),
+        s if s > 0 && s % 60 == 0 => format!("{}m", s / 60),
+        s => format!("{s}s"),
+    }
+}
+
+/// The server instructions for this deployment's kinds, lifetimes, ownership and allowlist.
+pub fn instructions(cfg: &Config, kinds: &[WorkloadKind]) -> String {
+    let names: Vec<&str> = kinds.iter().map(|k| k.kind()).collect();
+    let lists = &cfg.profile.lists;
+    let lifetime = match (
+        cfg.lifetimes.active_deadline_seconds,
+        cfg.lifetimes.ttl_seconds_after_finished,
+    ) {
+        (None, None) => "A batch workload keeps its own activeDeadlineSeconds and ttlSecondsAfterFinished; plan and submit report its retention as finished_retention_seconds.".to_string(),
+        (deadline, ttl) => {
+            let runs = deadline
+                .map(|d| format!("runs at most {} (activeDeadlineSeconds)", duration(d)))
+                .unwrap_or_else(|| "runs until it ends".into());
+            let kept = ttl
+                .map(|t| format!(" and is deleted {} after it finishes (ttlSecondsAfterFinished), with its pods, logs and task,", duration(t)))
+                .unwrap_or_default();
+            format!("A batch workload {runs}{kept} unless its manifest sets its own; plan and submit report this as finished_retention_seconds. Read the outcome and logs before then.")
+        }
+    };
+    let control = match cfg.ownership {
+        Ownership::Managed => {
+            "workload_stop, workload_resume, workload_scale and workload_delete act only on workloads this server created for the caller's run."
+        }
+        Ownership::Rbac => {
+            "workload_stop, workload_resume, workload_scale and workload_delete act on any workload the caller's Kubernetes RBAC permits, including ones created outside this server; workload_list with filter=all lists them."
+        }
+    };
+    let mut refused = vec![
+        "host namespaces and paths",
+        "privileged containers and added capabilities",
+        "service accounts and their tokens",
+        "nodeName",
+    ];
+    if !lists.volume_sources.contains("secret") && !lists.env_sources.contains("secretKeyRef") {
+        refused.push("Secrets (volumes and env)");
+    }
+    if !lists.pod.contains("tolerations") {
+        refused.push("tolerations");
+    }
+    refused.push(match lists.pod.contains("priorityClassName") {
+        true => "scheduler and runtime class fields",
+        false => "priority, scheduler and runtime class fields",
+    });
+    let mut domains: Vec<&str> = vec![cfg.labels.domain.as_str()];
+    domains.extend(lists.reserved_domains.iter().map(String::as_str));
+    format!(
+        "Submit and watch Kueue workloads ({}) in a namespace: a run's token acts in its own, a person names one they may use. \
+Flow: queues_list -> hardware_describe/queue_describe -> workload_plan -> workload_submit -> workload_status with until=admitted|running|ready|finished, which waits on the server up to 50s per call (or, for a batch workload, tasks/get when the client speaks the tasks extension) -> workload_logs. \
 Every tool answers JSON text with a status: ok; refused (the request is not allowed or not valid: fix it, do not retry it as is); rejected (the API server or an admission webhook refused it); not_found; error (the server could not complete it); failed (a finished task whose workload failed). Anything but ok comes back with isError and a retryable flag: retry a retryable call a few times with a pause, change a non-retryable one. \
 workload_status answers a summary by default with next_action, the pods with problems and their exit messages; detail=full adds every Workload's conditions and every pod. Logs come within a 16 KiB budget, failed pods first; narrow them with grep and since_seconds. \
-A Job or RayJob runs at most 24h (activeDeadlineSeconds) and is deleted 1h after it finishes (ttlSecondsAfterFinished), with its pods, logs and task, unless its manifest sets its own; plan and submit report this as finished_retention_seconds. Read the outcome and logs before then. \
-Manifests are allowlisted: host namespaces and paths, privileged containers and added capabilities, service accounts and their tokens, Secrets (volumes and env), nodeName, tolerations, priority, scheduler and runtime class fields, and labels or annotations reserved for Kueue or this server are refused. \
-Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.";
+{lifetime} {control} \
+Manifests are allowlisted (profile {}): {}, and labels or annotations reserved for {} are refused. \
+Kueue chooses the node; pin hardware with a nodeSelector only when hardware_describe shows the flavor spans several GPU products.",
+        names.join(", "),
+        cfg.profile.name,
+        refused.join(", "),
+        domains.join(", "),
+    )
+}
 
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for KueueMcp {
@@ -1868,7 +1999,7 @@ impl ServerHandler for KueueMcp {
                 .enable_tasks()
                 .build(),
         )
-        .with_instructions(INSTRUCTIONS)
+        .with_instructions(instructions(&self.config, &self.kinds))
     }
 
     async fn get_task(
@@ -1903,9 +2034,15 @@ impl ServerHandler for KueueMcp {
         if current.status().is_terminal() {
             return Ok(());
         }
-        self.annotate(&c, t.kind, &t.name, task::CANCELLED_ANNOTATION, "true")
-            .await
-            .map_err(internal)?;
+        self.annotate(
+            &c,
+            t.kind,
+            &t.name,
+            &self.config.labels.task_cancelled,
+            "true",
+        )
+        .await
+        .map_err(internal)?;
         self.set_active(&c, &r, false).await.map_err(internal)?;
         tracing::info!(task = %request.task_id, namespace = %c.namespace, "task cancelled");
         Ok(())
@@ -1928,27 +2065,33 @@ mod tests {
             }))
             .unwrap()
         };
+        let labels = Labels::new("crucible.dev");
         let mut run = object();
-        stamp(&mut run, "h1", Some("spiffe://example.crucible/s1"));
+        stamp(
+            &mut run,
+            &labels,
+            "h1",
+            Some("spiffe://example.crucible/s1"),
+        );
         assert_eq!(
             run.metadata.annotations.unwrap(),
             BTreeMap::from([
                 ("keep".to_string(), "x".to_string()),
-                (PLAN_HASH_ANNOTATION.to_string(), "h1".to_string()),
+                ("crucible.dev/plan-hash".to_string(), "h1".to_string()),
                 (
-                    ACTOR_ANNOTATION.to_string(),
+                    "crucible.dev/actor".to_string(),
                     "spiffe://example.crucible/s1".to_string()
                 ),
             ])
         );
         let mut person = object();
-        stamp(&mut person, "h1", None);
+        stamp(&mut person, &labels, "h1", None);
         assert!(
             !person
                 .metadata
                 .annotations
                 .unwrap()
-                .contains_key(ACTOR_ANNOTATION)
+                .contains_key("crucible.dev/actor")
         );
     }
 
@@ -2040,10 +2183,10 @@ mod tests {
             name: "train".into(),
             namespace: "team-a".into(),
         };
-        for kind in ["Job", "RayJob"] {
+        for kind in ["Job", "RayJob", "JobSet", "PyTorchJob"] {
             let msg = missing(kind).to_string();
             assert!(
-                msg.contains("deleted ttlSecondsAfterFinished after it finishes (default 3600s)"),
+                msg.contains("is deleted ttlSecondsAfterFinished after it finishes"),
                 "{msg}"
             );
         }
@@ -2131,7 +2274,7 @@ mod tests {
                 args: &args,
             };
             assert_eq!(
-                KueueRules.scopes(&call).map(<[_]>::len),
+                KueueRules::default().scopes(&call).map(<[_]>::len),
                 Ok(1),
                 "{} needs exactly one kueue scope",
                 tool.name
@@ -2181,7 +2324,7 @@ mod tests {
                 name: &tool.name,
                 args: &args,
             };
-            let checks = KueueRules.checks(&call, &person).unwrap();
+            let checks = KueueRules::default().checks(&call, &person).unwrap();
             if tool.name == "whoami" {
                 assert!(checks.is_empty());
                 continue;
@@ -2319,20 +2462,132 @@ mod tests {
 
     #[test]
     fn the_instructions_cover_status_retries_lifetimes_and_refused_fields() {
+        let crucible = instructions(&Config::default(), &WorkloadKind::ALL);
         for want in [
             "until=admitted|running|ready|finished",
             "refused",
             "rejected",
             "retryable",
-            "24h",
+            "runs at most 24h",
             "deleted 1h after it finishes",
             "finished_retention_seconds",
             "Secrets",
             "privileged",
             "tolerations",
+            "priority, scheduler",
+            "only on workloads this server created",
+            "profile strict",
+            "crucible.dev, kueue.x-k8s.io",
+            "PyTorchJob",
         ] {
-            assert!(INSTRUCTIONS.contains(want), "instructions lack {want:?}");
+            assert!(
+                crucible.contains(want),
+                "instructions lack {want:?}: {crucible}"
+            );
         }
+    }
+
+    #[test]
+    fn a_tenant_deployments_instructions_follow_its_config() {
+        let cfg = Config {
+            labels: Labels::new("kueue-mcp.example.com"),
+            ownership: Ownership::Rbac,
+            profile: crate::profile::Profile::tenant(),
+            lifetimes: crate::config::Lifetimes {
+                active_deadline_seconds: None,
+                ttl_seconds_after_finished: Some(600),
+                suspend: true,
+            },
+            ..Config::default()
+        };
+        let text = instructions(&cfg, &[WorkloadKind::Job, WorkloadKind::Deployment]);
+        assert!(text.contains("(Job, Deployment)"), "{text}");
+        assert!(
+            text.contains("runs until it ends and is deleted 10m after"),
+            "{text}"
+        );
+        assert!(
+            text.contains("any workload the caller's Kubernetes RBAC permits"),
+            "{text}"
+        );
+        assert!(text.contains("profile tenant"), "{text}");
+        assert!(
+            text.contains("reserved for kueue-mcp.example.com are refused"),
+            "{text}"
+        );
+        for absent in ["Secrets", "tolerations", "priority,", "crucible.dev"] {
+            assert!(!text.contains(absent), "{absent}: {text}");
+        }
+        let none = instructions(
+            &Config {
+                lifetimes: crate::config::Lifetimes {
+                    active_deadline_seconds: None,
+                    ttl_seconds_after_finished: None,
+                    suspend: true,
+                },
+                ..Config::default()
+            },
+            &[WorkloadKind::Job],
+        );
+        assert!(
+            none.contains("keeps its own activeDeadlineSeconds"),
+            "{none}"
+        );
+    }
+
+    #[test]
+    fn list_filters_select_this_run_this_server_or_everything_queued() {
+        let l = Labels::new("crucible.dev");
+        assert_eq!(
+            list_selector(ListFilter::Mine, &l, "r1"),
+            "crucible.dev/managed-by=crucible-kueue,crucible.dev/run-id=r1"
+        );
+        assert_eq!(
+            list_selector(ListFilter::Managed, &l, "r1"),
+            "crucible.dev/managed-by=crucible-kueue"
+        );
+        assert_eq!(
+            list_selector(ListFilter::All, &l, "r1"),
+            "kueue.x-k8s.io/queue-name"
+        );
+    }
+
+    #[test]
+    fn only_rbac_ownership_lets_a_caller_control_what_it_did_not_create() {
+        let caller = Caller {
+            run_id: crate::caller::RunId::parse("r1").unwrap(),
+            namespace: Namespace::parse("team-a").unwrap(),
+            launched_by: crate::caller::Launcher::parse("alice").unwrap(),
+            kube_user: "alice".into(),
+        };
+        let with = |labels: Value| -> DynamicObject {
+            serde_json::from_value(json!({"apiVersion": "batch/v1", "kind": "Job",
+                "metadata": {"name": "j", "labels": labels}}))
+            .unwrap()
+        };
+        let mine =
+            with(json!({"crucible.dev/managed-by": "crucible-kueue", "crucible.dev/run-id": "r1"}));
+        let other_run =
+            with(json!({"crucible.dev/managed-by": "crucible-kueue", "crucible.dev/run-id": "r2"}));
+        let kubectl = with(json!({}));
+        let managed = Config::default();
+        assert!(controls(&caller, &mine, &managed));
+        assert!(!controls(&caller, &other_run, &managed));
+        assert!(!controls(&caller, &kubectl, &managed));
+        let rbac = Config {
+            ownership: Ownership::Rbac,
+            ..Config::default()
+        };
+        assert!(controls(&caller, &kubectl, &rbac));
+        assert!(controls(&caller, &other_run, &rbac));
+        let elsewhere = Config {
+            labels: Labels::new("kueue-mcp.example.com"),
+            ..Config::default()
+        };
+        assert!(
+            !controls(&caller, &mine, &elsewhere),
+            "labels follow the domain"
+        );
     }
 
     #[test]

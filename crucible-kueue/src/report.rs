@@ -96,7 +96,11 @@ fn label<'a>(p: &'a Pod, key: &str) -> Option<&'a str> {
 /// What a pod does in its workload, from the labels its controller sets.
 pub fn role(kind: WorkloadKind, p: &Pod) -> &'static str {
     match kind {
-        WorkloadKind::Job => "job",
+        WorkloadKind::Job | WorkloadKind::JobSet => "job",
+        WorkloadKind::PyTorchJob => match label(p, "training.kubeflow.org/replica-type") {
+            Some(t) if t.eq_ignore_ascii_case("master") => "master",
+            _ => "worker",
+        },
         WorkloadKind::Deployment | WorkloadKind::StatefulSet => "replica",
         WorkloadKind::RayJob => match label(p, "ray.io/node-type") {
             Some("head") => "head",
@@ -362,13 +366,13 @@ pub fn next_action(s: &Situation<'_>) -> String {
 }
 
 /// Order for spending a log budget: pods with problems, then the pods that coordinate (Ray head
-/// and submitter, LWS leader), then the rest.
+/// and submitter, LWS leader, PyTorch master), then the rest.
 pub fn log_priority(kind: WorkloadKind, p: &Pod) -> u8 {
     if problem(kind, p).is_some_and(|x| x.severity <= 2) {
         return 0;
     }
     match role(kind, p) {
-        "head" | "submitter" | "leader" => 1,
+        "head" | "submitter" | "leader" | "master" => 1,
         _ => 2,
     }
 }
@@ -612,6 +616,21 @@ mod tests {
             "worker"
         );
         assert_eq!(role(WorkloadKind::Job, &labelled(json!({}))), "job");
+        assert_eq!(role(WorkloadKind::JobSet, &labelled(json!({}))), "job");
+        assert_eq!(
+            role(
+                WorkloadKind::PyTorchJob,
+                &labelled(json!({"training.kubeflow.org/replica-type": "master"}))
+            ),
+            "master"
+        );
+        assert_eq!(
+            role(
+                WorkloadKind::PyTorchJob,
+                &labelled(json!({"training.kubeflow.org/replica-type": "worker"}))
+            ),
+            "worker"
+        );
         assert_eq!(
             role(WorkloadKind::StatefulSet, &labelled(json!({}))),
             "replica"

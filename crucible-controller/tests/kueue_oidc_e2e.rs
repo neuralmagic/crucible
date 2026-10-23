@@ -11,7 +11,7 @@
 //! Run with the cluster values `crucible_mcp_auth::testing::cluster` documents, plus:
 //!   CRUCIBLE_KUEUE_E2E_CONTEXT=<kube context> CRUCIBLE_KUEUE_E2E_NAMESPACE=<namespace> \
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> CRUCIBLE_KUEUE_E2E_DATABASE_URL=<postgres url> \
-//!   cargo test -p crucible-kueue --test oidc_e2e -- --ignored --nocapture --test-threads=1
+//!   cargo test -p crucible-controller --test kueue_oidc_e2e -- --ignored --nocapture --test-threads=1
 //!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<the launcher's Kubernetes user>
 //! The launcher's user needs `use` on that LocalQueue and Jobs in that namespace, and no
 //! Deployments; the realm's spike client carries the same user for the RBAC test.
@@ -333,7 +333,10 @@ async fn serve_kueue(kube: kube::Client, controller: &str) -> String {
     };
     let http = cluster::routes_http(cluster::ingress_ip());
     let server = ResourceServer::with_jwks(config, |t| Jwks::new(http.clone(), t.jwks_uri.clone()));
-    let policy = ToolPolicy::from_toml(include_str!("../deploy/kueue-policy.toml")).unwrap();
+    let policy = ToolPolicy::from_toml(include_str!(
+        "../../crucible-kueue/deploy/kueue-policy.toml"
+    ))
+    .unwrap();
     let reviewer = Arc::new(SubjectAccessReviewer::new(
         kube.clone(),
         GroupSource::OpenShift,
@@ -344,6 +347,8 @@ async fn serve_kueue(kube: kube::Client, controller: &str) -> String {
     let app = crucible_kueue::router(
         kube,
         crucible_kueue::Options {
+            kinds: crucible_kueue::manifest::WorkloadKind::ALL.to_vec(),
+            config: crucible_kueue::config::Config::default(),
             oidc: Arc::new(server),
             policy,
             reviewer: Some(reviewer),
@@ -613,4 +618,16 @@ async fn kubernetes_rbac_decides_what_the_launcher_may_create() {
 
     let listed = call(&client, "queues_list", json!({})).await.unwrap();
     assert!(listed.to_string().contains(&env.queue), "{listed}");
+}
+
+#[test]
+fn the_contract_names_the_scopes_crucible_kueue_checks() {
+    assert_eq!(
+        crucible_contract::kueue::SCOPE_READ,
+        crucible_kueue::access::SCOPE_READ
+    );
+    assert_eq!(
+        crucible_contract::kueue::SCOPE_SUBMIT,
+        crucible_kueue::access::SCOPE_SUBMIT
+    );
 }

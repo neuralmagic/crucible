@@ -1,21 +1,24 @@
 //! Hardware behind a ResourceFlavor: its node selector joined with the live node inventory. A
 //! flavor's labels are what Kueue enforces, so a GPU flavor with no labels is reported as able to
-//! land on every GPU product in the cluster.
+//! land on every GPU product in the cluster. Which resources count as accelerators (GPUs, MIG
+//! slices, Gaudi, TPU) and which node labels name the product is [`Hardware`] configuration.
 
+use crate::config::Hardware;
 use crate::kueue::ResourceFlavor;
 use k8s_openapi::api::core::v1::Node;
 use kube_quantity::ParsedQuantity;
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-pub const GPU_RESOURCES: [&str; 2] = ["nvidia.com/gpu", "amd.com/gpu"];
-const PRODUCT_LABELS: [&str; 2] = ["nvidia.com/gpu.product", "amd.com/gpu.product-name"];
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ProductCount {
     pub product: String,
     pub nodes: usize,
     pub schedulable_nodes: usize,
+    /// The most accelerators any one node of this product offers: the largest pod that fits on a
+    /// single node.
+    #[serde(serialize_with = "crate::quantity::serialize")]
+    pub max_per_node: ParsedQuantity,
     #[serde(serialize_with = "crate::quantity::serialize")]
     pub gpus: ParsedQuantity,
     #[serde(serialize_with = "crate::quantity::serialize")]
@@ -35,17 +38,36 @@ pub struct FlavorHardware {
     pub warnings: Vec<String>,
 }
 
-fn product(node: &Node) -> Option<String> {
-    let labels = node.metadata.labels.as_ref()?;
-    PRODUCT_LABELS.iter().find_map(|k| labels.get(*k).cloned())
+/// The node's product label, else the accelerator resources it offers.
+fn product(node: &Node, hw: &Hardware) -> String {
+    let labels = node.metadata.labels.as_ref();
+    if let Some(p) = hw
+        .product_labels
+        .iter()
+        .find_map(|k| labels.and_then(|l| l.get(k)).cloned())
+    {
+        return p;
+    }
+    let alloc = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
+    let names: Vec<&str> = alloc
+        .into_iter()
+        .flat_map(|a| a.keys())
+        .filter(|r| hw.is_accelerator(r))
+        .map(String::as_str)
+        .collect();
+    match names.is_empty() {
+        true => "unlabeled".into(),
+        false => names.join("+"),
+    }
 }
 
-fn gpus(node: &Node) -> ParsedQuantity {
+fn gpus(node: &Node, hw: &Hardware) -> ParsedQuantity {
     let alloc = node.status.as_ref().and_then(|s| s.allocatable.as_ref());
-    GPU_RESOURCES
-        .iter()
-        .filter_map(|r| alloc.and_then(|a| a.get(*r)))
-        .filter_map(|q| ParsedQuantity::try_from(q).ok())
+    alloc
+        .into_iter()
+        .flat_map(|a| a.iter())
+        .filter(|(r, _)| hw.is_accelerator(r))
+        .filter_map(|(_, q)| ParsedQuantity::try_from(q).ok())
         .fold(crate::quantity::zero(), |a, b| a + b)
 }
 
@@ -64,25 +86,34 @@ fn matches(node: &Node, selector: &BTreeMap<String, String>) -> bool {
         .all(|(k, v)| labels.and_then(|l| l.get(k)) == Some(v))
 }
 
-pub fn describe(flavor: &ResourceFlavor, provides: &[String], nodes: &[Node]) -> FlavorHardware {
-    let provides_gpu = provides.iter().any(|r| GPU_RESOURCES.contains(&r.as_str()));
+pub fn describe(
+    flavor: &ResourceFlavor,
+    provides: &[String],
+    nodes: &[Node],
+    hw: &Hardware,
+) -> FlavorHardware {
+    let provides_gpu = provides.iter().any(|r| hw.is_accelerator(r));
     let zero = crate::quantity::zero();
     let matching: Vec<&Node> = nodes
         .iter()
         .filter(|n| matches(n, &flavor.spec.node_labels))
-        .filter(|n| !provides_gpu || gpus(n) > zero)
+        .filter(|n| !provides_gpu || gpus(n, hw) > zero)
         .collect();
     let mut products: BTreeMap<String, ProductCount> = BTreeMap::new();
-    for node in matching.iter().filter(|n| gpus(n) > zero) {
-        let name = product(node).unwrap_or_else(|| "unlabeled".into());
+    for node in matching.iter().filter(|n| gpus(n, hw) > zero) {
+        let name = product(node, hw);
         let entry = products.entry(name.clone()).or_insert(ProductCount {
             product: name,
             nodes: 0,
             schedulable_nodes: 0,
+            max_per_node: crate::quantity::zero(),
             gpus: crate::quantity::zero(),
             schedulable_gpus: crate::quantity::zero(),
         });
-        let count = gpus(node);
+        let count = gpus(node, hw);
+        if count > entry.max_per_node {
+            entry.max_per_node = count.clone();
+        }
         entry.nodes += 1;
         entry.gpus = entry.gpus.clone() + count.clone();
         if schedulable(node) {
@@ -158,6 +189,7 @@ mod tests {
             &flavor("b200", json!({"nvidia.com/gpu.product": "NVIDIA-B200"})),
             &["nvidia.com/gpu".into()],
             &fleet(),
+            &Hardware::default(),
         );
         assert_eq!(hw.matching_nodes, 2);
         assert_eq!(hw.gpu_products.len(), 1);
@@ -176,6 +208,7 @@ mod tests {
             &flavor("nvidia-gpu-flavor", json!({})),
             &["nvidia.com/gpu".into()],
             &fleet(),
+            &Hardware::default(),
         );
         assert_eq!(hw.gpu_products.len(), 2);
         assert_eq!(hw.matching_nodes, 4);
@@ -186,6 +219,63 @@ mod tests {
         );
         let a100 = &hw.gpu_products[0];
         assert_eq!(a100.gpus.to_string(), "15");
+        assert_eq!(
+            a100.max_per_node.to_string(),
+            "8",
+            "the largest single node"
+        );
+    }
+
+    fn accelerator_node(name: &str, labels: serde_json::Value, resource: &str, n: &str) -> Node {
+        serde_json::from_value(json!({
+            "metadata": {"name": name, "labels": labels},
+            "status": {"allocatable": {resource: n, "cpu": "64"}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn mig_gaudi_and_tpu_count_as_accelerators_by_default() {
+        let nodes = vec![
+            accelerator_node(
+                "mig",
+                json!({"nvidia.com/gpu.product": "NVIDIA-A100-SXM4-80GB-MIG-1g.10gb"}),
+                "nvidia.com/mig-1g.10gb",
+                "7",
+            ),
+            accelerator_node("gaudi", json!({}), "habana.ai/gaudi", "8"),
+            accelerator_node(
+                "tpu",
+                json!({"cloud.google.com/gke-tpu-accelerator": "tpu-v5-lite-podslice"}),
+                "google.com/tpu",
+                "4",
+            ),
+        ];
+        let hw = describe(
+            &flavor("any", json!({})),
+            &["habana.ai/gaudi".into()],
+            &nodes,
+            &Hardware::default(),
+        );
+        let products: Vec<(&str, String)> = hw
+            .gpu_products
+            .iter()
+            .map(|p| (p.product.as_str(), p.max_per_node.to_string()))
+            .collect();
+        assert_eq!(
+            products,
+            vec![
+                ("NVIDIA-A100-SXM4-80GB-MIG-1g.10gb", "7".to_string()),
+                ("habana.ai/gaudi", "8".to_string()),
+                ("tpu-v5-lite-podslice", "4".to_string()),
+            ]
+        );
+        let narrow = Hardware {
+            resources: vec!["nvidia.com/gpu".into()],
+            product_labels: vec!["nvidia.com/gpu.product".into()],
+        };
+        let none = describe(&flavor("any", json!({})), &["cpu".into()], &nodes, &narrow);
+        assert!(none.gpu_products.is_empty(), "{:?}", none.gpu_products);
     }
 
     #[test]
@@ -194,6 +284,7 @@ mod tests {
             &flavor("default-flavor", json!({})),
             &["cpu".into(), "memory".into()],
             &fleet(),
+            &Hardware::default(),
         );
         assert_eq!(hw.matching_nodes, 5);
         assert!(hw.warnings.is_empty());
@@ -205,6 +296,7 @@ mod tests {
             &flavor("h100", json!({"nvidia.com/gpu.product": "NVIDIA-H100"})),
             &["nvidia.com/gpu".into()],
             &fleet(),
+            &Hardware::default(),
         );
         assert_eq!(hw.matching_nodes, 0);
         assert!(hw.warnings.iter().any(|w| w.contains("no GPU node")));

@@ -4,20 +4,13 @@
 //! secret, or a scheduling escape from Kueue is refused by not being on the list.
 
 use crate::caller::{Caller, QueueName};
+use crate::config::{Config, Lifetimes, MANAGED_VALUE, QUEUE_LABEL};
 use kube::core::ApiResource;
 use kube_quantity::ParsedQuantity;
 use rmcp::schemars;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
-
-pub const QUEUE_LABEL: &str = "kueue.x-k8s.io/queue-name";
-pub const MANAGED_LABEL: &str = "crucible.dev/managed-by";
-pub const MANAGED_VALUE: &str = "crucible-kueue";
-pub const RUN_LABEL: &str = "crucible.dev/run-id";
-/// The human a delegated token acted for. Server-owned: set from the caller, never the manifest.
-pub const LAUNCHED_BY_LABEL: &str = "crucible.dev/launched-by";
-pub const WORKLOAD_LABEL: &str = "crucible.dev/workload";
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
@@ -28,6 +21,8 @@ pub enum WorkloadKind {
     LeaderWorkerSet,
     Deployment,
     StatefulSet,
+    JobSet,
+    PyTorchJob,
 }
 
 /// How Kueue admits the pods of a kind.
@@ -41,12 +36,14 @@ pub enum Admission {
 }
 
 impl WorkloadKind {
-    pub const ALL: [WorkloadKind; 5] = [
+    pub const ALL: [WorkloadKind; 7] = [
         Self::Job,
         Self::RayJob,
         Self::LeaderWorkerSet,
         Self::Deployment,
         Self::StatefulSet,
+        Self::JobSet,
+        Self::PyTorchJob,
     ];
 
     pub fn admission(self) -> Admission {
@@ -56,14 +53,17 @@ impl WorkloadKind {
         }
     }
 
-    /// Kinds whose stop and resume scale `spec.replicas` to zero and back, since Kueue gives
-    /// them no single Workload to deactivate.
-    /// Runs to completion (Job, RayJob), so a submission is an MCP task. The other kinds serve
-    /// until stopped and report readiness instead.
+    /// Runs to completion (Job, RayJob, JobSet, PyTorchJob), so a submission is an MCP task. The
+    /// other kinds serve until stopped and report readiness instead.
     pub fn is_batch(self) -> bool {
-        matches!(self, Self::Job | Self::RayJob)
+        matches!(
+            self,
+            Self::Job | Self::RayJob | Self::JobSet | Self::PyTorchJob
+        )
     }
 
+    /// Kinds whose stop and resume scale `spec.replicas` to zero and back, since Kueue gives
+    /// them no single Workload to deactivate.
     pub fn is_scalable(self) -> bool {
         matches!(self, Self::Deployment | Self::StatefulSet)
     }
@@ -74,6 +74,8 @@ impl WorkloadKind {
             Self::RayJob => "ray.io/v1",
             Self::LeaderWorkerSet => "leaderworkerset.x-k8s.io/v1",
             Self::Deployment | Self::StatefulSet => "apps/v1",
+            Self::JobSet => "jobset.x-k8s.io/v1alpha2",
+            Self::PyTorchJob => "kubeflow.org/v1",
         }
     }
 
@@ -84,6 +86,8 @@ impl WorkloadKind {
             Self::LeaderWorkerSet => "LeaderWorkerSet",
             Self::Deployment => "Deployment",
             Self::StatefulSet => "StatefulSet",
+            Self::JobSet => "JobSet",
+            Self::PyTorchJob => "PyTorchJob",
         }
     }
 
@@ -94,6 +98,8 @@ impl WorkloadKind {
             Self::LeaderWorkerSet => "leaderworkersets",
             Self::Deployment => "deployments",
             Self::StatefulSet => "statefulsets",
+            Self::JobSet => "jobsets",
+            Self::PyTorchJob => "pytorchjobs",
         }
     }
 
@@ -123,7 +129,7 @@ pub enum ManifestError {
     #[error("manifest must be a JSON object")]
     NotObject,
     #[error(
-        "{api_version}/{kind} is not submittable; allowed: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1 LeaderWorkerSet, apps/v1 Deployment, apps/v1 StatefulSet"
+        "{api_version}/{kind} is not submittable; allowed: batch/v1 Job, ray.io/v1 RayJob, leaderworkerset.x-k8s.io/v1 LeaderWorkerSet, apps/v1 Deployment, apps/v1 StatefulSet, jobset.x-k8s.io/v1alpha2 JobSet, kubeflow.org/v1 PyTorchJob"
     )]
     Kind { api_version: String, kind: String },
     #[error("metadata.name is required and must be a DNS-1123 label, got {0:?}")]
@@ -142,6 +148,8 @@ pub enum ManifestError {
     Metadata(&'static str),
     #[error("{path}: {what} is not allowed")]
     Forbidden { path: String, what: &'static str },
+    #[error("{path}: a field outside the allowlist for agent manifests; allowed here: {}", allowed.join(", "))]
+    NotAllowed { path: String, allowed: Vec<String> },
     #[error("{path}: expected {expected}")]
     Shape {
         path: String,
@@ -203,30 +211,89 @@ pub fn total_requests(sets: &[PodSet]) -> BTreeMap<String, ParsedQuantity> {
     total
 }
 
-/// A batch workload runs at most this long unless its manifest says otherwise.
-pub const DEFAULT_ACTIVE_DEADLINE_SECONDS: i64 = 24 * 60 * 60;
-/// A finished batch workload is deleted this long after it finishes unless its manifest says
-/// otherwise.
-pub const DEFAULT_TTL_SECONDS_AFTER_FINISHED: i64 = 60 * 60;
-
 /// Bounds a batch workload's lifetime where its manifest does not: an active deadline, and a TTL
 /// after it finishes. A RayJob honors a TTL only when it shuts its cluster down after the job, and
 /// KubeRay refuses one otherwise, so it gets the TTL only then.
-fn default_lifetimes(spec: &mut Map<String, Value>, kind: WorkloadKind) {
-    spec.entry("activeDeadlineSeconds")
-        .or_insert_with(|| Value::from(DEFAULT_ACTIVE_DEADLINE_SECONDS));
+fn default_lifetimes(
+    spec: &mut Map<String, Value>,
+    kind: WorkloadKind,
+    lifetimes: &Lifetimes,
+) -> Result<(), ManifestError> {
+    match kind {
+        WorkloadKind::JobSet => {
+            if let Some(ttl) = lifetimes.ttl_seconds_after_finished {
+                spec.entry("ttlSecondsAfterFinished")
+                    .or_insert_with(|| Value::from(ttl));
+            }
+            if let (Some(deadline), Some(Value::Array(jobs))) = (
+                lifetimes.active_deadline_seconds,
+                spec.get_mut("replicatedJobs"),
+            ) {
+                for job in jobs.iter_mut() {
+                    if let Some(job_spec) = job
+                        .pointer_mut("/template/spec")
+                        .and_then(Value::as_object_mut)
+                    {
+                        job_spec
+                            .entry("activeDeadlineSeconds")
+                            .or_insert_with(|| Value::from(deadline));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        WorkloadKind::PyTorchJob => {
+            let run = object_entry(spec, "runPolicy", "/spec/runPolicy")?;
+            for (key, value) in [
+                ("activeDeadlineSeconds", lifetimes.active_deadline_seconds),
+                (
+                    "ttlSecondsAfterFinished",
+                    lifetimes.ttl_seconds_after_finished,
+                ),
+            ] {
+                if let Some(v) = value {
+                    run.entry(key).or_insert_with(|| Value::from(v));
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    if let Some(deadline) = lifetimes.active_deadline_seconds {
+        spec.entry("activeDeadlineSeconds")
+            .or_insert_with(|| Value::from(deadline));
+    }
     let ttl_applies = kind == WorkloadKind::Job
         || spec.get("shutdownAfterJobFinishes") == Some(&Value::Bool(true));
-    if ttl_applies {
+    if let (true, Some(ttl)) = (ttl_applies, lifetimes.ttl_seconds_after_finished) {
         spec.entry("ttlSecondsAfterFinished")
-            .or_insert_with(|| Value::from(DEFAULT_TTL_SECONDS_AFTER_FINISHED));
+            .or_insert_with(|| Value::from(ttl));
     }
+    Ok(())
+}
+
+/// Creates the object suspended where its controller has a suspend switch, for Kueue to start it
+/// on admission.
+fn suspend(obj: &mut Map<String, Value>, kind: WorkloadKind) -> Result<(), ManifestError> {
+    match kind {
+        WorkloadKind::Job | WorkloadKind::JobSet => {
+            object_entry(obj, "spec", "spec")?.insert("suspend".into(), Value::Bool(true));
+        }
+        WorkloadKind::PyTorchJob => {
+            let spec = object_entry(obj, "spec", "spec")?;
+            object_entry(spec, "runPolicy", "/spec/runPolicy")?
+                .insert("suspend".into(), Value::Bool(true));
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 pub fn normalize(
     manifest: Value,
     caller: &Caller,
     queue: &QueueName,
+    cfg: &Config,
 ) -> Result<Normalized, ManifestError> {
     let Value::Object(mut obj) = manifest else {
         return Err(ManifestError::NotObject);
@@ -277,22 +344,28 @@ pub fn normalize(
             meta.insert("namespace".into(), Value::String(ns.to_string()));
         }
     }
-    check_reserved(meta, "/metadata", OBJECT_LABELS)?;
+    let l = &cfg.labels;
+    let object_labels = [QUEUE_LABEL, &l.managed_by, &l.run_id, &l.launched_by];
+    check_reserved(meta, "/metadata", &object_labels, cfg)?;
     let labels = object_entry(meta, "labels", "metadata.labels")?;
     set_label(labels, QUEUE_LABEL, queue.as_str())?;
-    set_label(labels, MANAGED_LABEL, MANAGED_VALUE)?;
-    set_label(labels, RUN_LABEL, caller.run_id.as_str())?;
-    set_label(labels, LAUNCHED_BY_LABEL, caller.launched_by.as_str())?;
+    set_label(labels, &l.managed_by, MANAGED_VALUE)?;
+    set_label(labels, &l.run_id, caller.run_id.as_str())?;
+    set_label(labels, &l.launched_by, caller.launched_by.as_str())?;
 
-    if kind == WorkloadKind::Job {
-        object_entry(&mut obj, "spec", "spec")?.insert("suspend".into(), Value::Bool(true));
+    if cfg.lifetimes.suspend {
+        suspend(&mut obj, kind)?;
     }
     if kind.is_batch() {
-        default_lifetimes(object_entry(&mut obj, "spec", "spec")?, kind);
+        default_lifetimes(
+            object_entry(&mut obj, "spec", "spec")?,
+            kind,
+            &cfg.lifetimes,
+        )?;
     }
 
     let mut root = Value::Object(obj);
-    check_object_fields(kind, &root)?;
+    check_object_fields(kind, &root, cfg)?;
     let mut pod_sets = Vec::new();
     for slot in template_slots(kind, &root)? {
         let template = root
@@ -306,18 +379,19 @@ pub fn normalize(
         check_reserved(
             tmeta,
             &format!("{}/metadata", slot.pointer),
-            TEMPLATE_LABELS,
+            &[&l.workload, &l.run_id],
+            cfg,
         )?;
         let tlabels = object_entry(
             tmeta,
             "labels",
             &format!("{}/metadata/labels", slot.pointer),
         )?;
-        set_label(tlabels, WORKLOAD_LABEL, &name)?;
-        set_label(tlabels, RUN_LABEL, caller.run_id.as_str())?;
+        set_label(tlabels, &l.workload, &name)?;
+        set_label(tlabels, &l.run_id, caller.run_id.as_str())?;
         let spec_path = format!("{}/spec", slot.pointer);
         let spec = object_entry(template, "spec", &spec_path)?;
-        check_pod_spec(spec, &spec_path)?;
+        check_pod_spec(spec, &spec_path, cfg)?;
         spec.insert("automountServiceAccountToken".into(), Value::Bool(false));
         pod_sets.push(PodSet {
             name: slot.name,
@@ -327,7 +401,7 @@ pub fn normalize(
     }
 
     if matches!(kind, WorkloadKind::Deployment | WorkloadKind::StatefulSet) {
-        pin_selector(&mut root, &name, caller.run_id.as_str())?;
+        pin_selector(&mut root, &name, caller.run_id.as_str(), cfg)?;
     }
     let object = root;
     let plan_hash = plan_hash(&object);
@@ -483,6 +557,51 @@ fn template_slots(kind: WorkloadKind, root: &Value) -> Result<Vec<TemplateSlot>,
                 count: count_at("/spec/replicas", 1)?,
             });
         }
+        WorkloadKind::JobSet => {
+            let jobs = root
+                .pointer("/spec/replicatedJobs")
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            for i in 0..jobs {
+                let base = format!("/spec/replicatedJobs/{i}");
+                let pointer = format!("{base}/template/spec/template");
+                require(&pointer)?;
+                let name = root
+                    .pointer(&format!("{base}/name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("job")
+                    .to_string();
+                let replicas = count_at(&format!("{base}/replicas"), 1)?;
+                let parallelism = count_at(&format!("{base}/template/spec/parallelism"), 1)?;
+                slots.push(TemplateSlot {
+                    name,
+                    pointer,
+                    count: replicas.saturating_mul(parallelism),
+                });
+            }
+            if jobs == 0 {
+                require("/spec/replicatedJobs/0/template/spec/template")?;
+            }
+        }
+        WorkloadKind::PyTorchJob => {
+            let specs = root
+                .pointer("/spec/pytorchReplicaSpecs")
+                .and_then(Value::as_object)
+                .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            if specs.is_empty() {
+                require("/spec/pytorchReplicaSpecs/Master/template")?;
+            }
+            for role in specs {
+                let base = format!("/spec/pytorchReplicaSpecs/{role}");
+                require(&format!("{base}/template"))?;
+                slots.push(TemplateSlot {
+                    name: role.to_lowercase(),
+                    pointer: format!("{base}/template"),
+                    count: count_at(&format!("{base}/replicas"), 1)?,
+                });
+            }
+        }
         WorkloadKind::LeaderWorkerSet => {
             let worker = "/spec/leaderWorkerTemplate/workerTemplate";
             require(worker)?;
@@ -513,64 +632,6 @@ fn template_slots(kind: WorkloadKind, root: &Value) -> Result<Vec<TemplateSlot>,
 }
 
 /// Label and annotation domains only this server, Kueue, OpenShell, or SPIRE may set.
-const RESERVED_DOMAINS: [&str; 4] = [
-    "kueue.x-k8s.io",
-    "crucible.dev",
-    "openshell.ai",
-    "spiffe.io",
-];
-/// Reserved labels the object may carry; each is set by the server and conflicts are refused.
-const OBJECT_LABELS: &[&str] = &[QUEUE_LABEL, MANAGED_LABEL, RUN_LABEL, LAUNCHED_BY_LABEL];
-const TEMPLATE_LABELS: &[&str] = &[WORKLOAD_LABEL, RUN_LABEL];
-
-const POD_FIELDS: &[&str] = &[
-    "containers",
-    "initContainers",
-    "restartPolicy",
-    "terminationGracePeriodSeconds",
-    "activeDeadlineSeconds",
-    "dnsPolicy",
-    "dnsConfig",
-    "nodeSelector",
-    "affinity",
-    "topologySpreadConstraints",
-    "securityContext",
-    "volumes",
-    "imagePullSecrets",
-    "hostname",
-    "subdomain",
-    "setHostnameAsFQDN",
-    "enableServiceLinks",
-    "shareProcessNamespace",
-    "hostAliases",
-    "readinessGates",
-    "automountServiceAccountToken",
-];
-const CONTAINER_FIELDS: &[&str] = &[
-    "name",
-    "image",
-    "imagePullPolicy",
-    "command",
-    "args",
-    "workingDir",
-    "env",
-    "envFrom",
-    "ports",
-    "resources",
-    "volumeMounts",
-    "livenessProbe",
-    "readinessProbe",
-    "startupProbe",
-    "lifecycle",
-    "terminationMessagePath",
-    "terminationMessagePolicy",
-    "stdin",
-    "stdinOnce",
-    "tty",
-    "securityContext",
-    "restartPolicy",
-    "resizePolicy",
-];
 const POD_SECURITY_FIELDS: &[&str] = &[
     "runAsNonRoot",
     "runAsUser",
@@ -594,19 +655,8 @@ const CONTAINER_SECURITY_FIELDS: &[&str] = &[
     "appArmorProfile",
     "procMount",
 ];
-const VOLUME_SOURCES: &[&str] = &[
-    "emptyDir",
-    "configMap",
-    "downwardAPI",
-    "ephemeral",
-    "projected",
-];
-const PROJECTED_SOURCES: &[&str] = &["configMap", "downwardAPI"];
 const ENV_FIELDS: &[&str] = &["name", "value", "valueFrom"];
-const ENV_SOURCES: &[&str] = &["fieldRef", "resourceFieldRef", "configMapKeyRef"];
-const ENV_FROM_FIELDS: &[&str] = &["configMapRef", "prefix"];
 const PORT_FIELDS: &[&str] = &["containerPort", "name", "protocol"];
-const RESOURCE_FIELDS: &[&str] = &["requests", "limits"];
 const MOUNT_FIELDS: &[&str] = &[
     "name",
     "mountPath",
@@ -636,45 +686,92 @@ fn array_of<'a>(v: &'a Value, path: &str) -> Result<&'a [Value], ManifestError> 
     })
 }
 
+/// A set of field names a JSON object may use.
+trait Allowlist {
+    fn allows(&self, key: &str) -> bool;
+    fn names(&self) -> Vec<String>;
+}
+
+impl Allowlist for &[&str] {
+    fn allows(&self, key: &str) -> bool {
+        self.contains(&key)
+    }
+    fn names(&self) -> Vec<String> {
+        self.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+impl<const N: usize> Allowlist for &[&str; N] {
+    fn allows(&self, key: &str) -> bool {
+        self.contains(&key)
+    }
+    fn names(&self) -> Vec<String> {
+        self.iter().map(|s| s.to_string()).collect()
+    }
+}
+
+impl Allowlist for &BTreeSet<String> {
+    fn allows(&self, key: &str) -> bool {
+        self.contains(key)
+    }
+    fn names(&self) -> Vec<String> {
+        self.iter().cloned().collect()
+    }
+}
+
 fn only_fields(
     obj: &Map<String, Value>,
-    allowed: &[&str],
+    allowed: impl Allowlist,
     path: &str,
 ) -> Result<(), ManifestError> {
-    match obj.keys().find(|k| !allowed.contains(&k.as_str())) {
-        Some(k) => Err(forbidden(
-            format!("{path}/{k}"),
-            "a field outside the allowlist for agent manifests",
-        )),
+    match obj.keys().find(|k| !allowed.allows(k)) {
+        Some(k) => Err(ManifestError::NotAllowed {
+            path: format!("{path}/{k}"),
+            allowed: allowed.names(),
+        }),
         None => Ok(()),
     }
 }
 
-fn is_reserved(key: &str) -> bool {
+/// Keys the server and the platform own: the server's label domain, the queue label it sets,
+/// and the profile's reserved domains.
+fn is_reserved(key: &str, cfg: &Config) -> bool {
+    if key == QUEUE_LABEL {
+        return true;
+    }
     let Some((domain, _)) = key.split_once('/') else {
         return false;
     };
-    RESERVED_DOMAINS
-        .iter()
-        .any(|d| domain == *d || domain.ends_with(&format!(".{d}")))
+    let reserved = |d: &str| domain == d || domain.ends_with(&format!(".{d}"));
+    reserved(&cfg.labels.domain)
+        || cfg
+            .profile
+            .lists
+            .reserved_domains
+            .iter()
+            .any(|d| reserved(d))
 }
 
-/// Refuses reserved labels outside `allowed_labels` and every reserved annotation, so an agent
-/// can neither pick a Kueue priority or pod group nor forge the server's own bookkeeping.
+/// Refuses reserved labels and annotations other than the server-set `server_labels` and the
+/// ones the profile allows, so an agent can neither pick a Kueue setting the profile withholds
+/// nor forge the server's own bookkeeping.
 fn check_reserved(
     meta: &Map<String, Value>,
     path: &str,
-    allowed_labels: &[&str],
+    server_labels: &[&str],
+    cfg: &Config,
 ) -> Result<(), ManifestError> {
-    for (field, allowed) in [("labels", allowed_labels), ("annotations", &[][..])] {
+    let lists = &cfg.profile.lists;
+    for field in ["labels", "annotations"] {
         let Some(map) = meta.get(field).filter(|v| !v.is_null()) else {
             continue;
         };
         let map = object_at(map, &format!("{path}/{field}"))?;
-        if let Some(key) = map
-            .keys()
-            .find(|k| is_reserved(k) && !allowed.contains(&k.as_str()))
-        {
+        let allowed = |k: &str| match field {
+            "labels" => server_labels.contains(&k) || lists.allowed_labels.contains(k),
+            _ => lists.allowed_annotations.contains(k),
+        };
+        if let Some(key) = map.keys().find(|k| is_reserved(k, cfg) && !allowed(k)) {
             return Err(forbidden(
                 format!("{path}/{field}/{key}"),
                 "a label or annotation reserved for the server",
@@ -776,13 +873,41 @@ const RAY_WORKER: &[&str] = &[
     "idleTimeoutSeconds",
     "suspend",
 ];
+const JOBSET_SPEC: &[&str] = &[
+    "replicatedJobs",
+    "network",
+    "successPolicy",
+    "failurePolicy",
+    "startupPolicy",
+    "suspend",
+    "ttlSecondsAfterFinished",
+];
+const REPLICATED_JOB: &[&str] = &["name", "replicas", "template", "dependsOn"];
+const PYTORCHJOB_SPEC: &[&str] = &[
+    "pytorchReplicaSpecs",
+    "runPolicy",
+    "elasticPolicy",
+    "nprocPerNode",
+];
+const RUN_POLICY: &[&str] = &[
+    "cleanPodPolicy",
+    "ttlSecondsAfterFinished",
+    "activeDeadlineSeconds",
+    "backoffLimit",
+    "suspend",
+];
+const REPLICA_SPEC: &[&str] = &["replicas", "restartPolicy", "template"];
 const PVC_TEMPLATE: &[&str] = &["metadata", "spec"];
 const PVC_SPEC: &[&str] = &["accessModes", "resources", "volumeMode"];
 
 /// Object-level fields outside the pod templates. Each kind's spec is allowlisted, so fields that
 /// hand the object to another controller (`managedBy`, `clusterSelector`), adopt foreign pods,
 /// or provision storage from another claim or class never reach the cluster.
-fn check_object_fields(kind: WorkloadKind, root: &Value) -> Result<(), ManifestError> {
+fn check_object_fields(
+    kind: WorkloadKind,
+    root: &Value,
+    cfg: &Config,
+) -> Result<(), ManifestError> {
     let top = object_at(root, "")?;
     only_fields(top, TOP_FIELDS, "")?;
     let Some(spec) = top.get("spec") else {
@@ -794,7 +919,7 @@ fn check_object_fields(kind: WorkloadKind, root: &Value) -> Result<(), ManifestE
         WorkloadKind::Deployment => only_fields(spec, DEPLOYMENT_SPEC, "/spec"),
         WorkloadKind::StatefulSet => {
             only_fields(spec, STATEFULSET_SPEC, "/spec")?;
-            check_claim_templates(spec, "/spec")
+            check_claim_templates(spec, "/spec", cfg)
         }
         WorkloadKind::LeaderWorkerSet => {
             only_fields(spec, LWS_SPEC, "/spec")?;
@@ -802,12 +927,58 @@ fn check_object_fields(kind: WorkloadKind, root: &Value) -> Result<(), ManifestE
                 let path = "/spec/leaderWorkerTemplate";
                 let t = object_at(t, path)?;
                 only_fields(t, LWS_TEMPLATE, path)?;
-                check_claim_templates(t, path)?;
+                check_claim_templates(t, path, cfg)?;
             }
             Ok(())
         }
         WorkloadKind::RayJob => check_rayjob(spec),
+        WorkloadKind::JobSet => check_jobset(spec),
+        WorkloadKind::PyTorchJob => check_pytorchjob(spec),
     }
+}
+
+fn check_jobset(spec: &Map<String, Value>) -> Result<(), ManifestError> {
+    only_fields(spec, JOBSET_SPEC, "/spec")?;
+    let Some(jobs) = spec.get("replicatedJobs") else {
+        return Ok(());
+    };
+    for (i, job) in array_of(jobs, "/spec/replicatedJobs")?.iter().enumerate() {
+        let path = format!("/spec/replicatedJobs/{i}");
+        let job = object_at(job, &path)?;
+        only_fields(job, REPLICATED_JOB, &path)?;
+        if let Some(template) = job.get("template") {
+            let t_path = format!("{path}/template");
+            let template = object_at(template, &t_path)?;
+            only_fields(template, &["metadata", "spec"], &t_path)?;
+            if let Some(job_spec) = template.get("spec") {
+                let s_path = format!("{t_path}/spec");
+                only_fields(object_at(job_spec, &s_path)?, JOB_SPEC, &s_path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_pytorchjob(spec: &Map<String, Value>) -> Result<(), ManifestError> {
+    only_fields(spec, PYTORCHJOB_SPEC, "/spec")?;
+    if let Some(run) = spec.get("runPolicy") {
+        only_fields(
+            object_at(run, "/spec/runPolicy")?,
+            RUN_POLICY,
+            "/spec/runPolicy",
+        )?;
+    }
+    let Some(replicas) = spec.get("pytorchReplicaSpecs") else {
+        return Ok(());
+    };
+    let path = "/spec/pytorchReplicaSpecs";
+    let replicas = object_at(replicas, path)?;
+    only_fields(replicas, &["Master", "Worker"], path)?;
+    for (role, r) in replicas {
+        let r_path = format!("{path}/{role}");
+        only_fields(object_at(r, &r_path)?, REPLICA_SPEC, &r_path)?;
+    }
+    Ok(())
 }
 
 fn check_rayjob(spec: &Map<String, Value>) -> Result<(), ManifestError> {
@@ -847,20 +1018,24 @@ fn check_rayjob(spec: &Map<String, Value>) -> Result<(), ManifestError> {
     Ok(())
 }
 
-fn check_claim_templates(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestError> {
+fn check_claim_templates(
+    spec: &Map<String, Value>,
+    path: &str,
+    cfg: &Config,
+) -> Result<(), ManifestError> {
     let Some(templates) = spec.get("volumeClaimTemplates") else {
         return Ok(());
     };
     let t_path = format!("{path}/volumeClaimTemplates");
     for (i, t) in array_of(templates, &t_path)?.iter().enumerate() {
-        check_claim_template(t, &format!("{t_path}/{i}"))?;
+        check_claim_template(t, &format!("{t_path}/{i}"), cfg)?;
     }
     Ok(())
 }
 
 /// A claim the workload provisions: default storage class only, empty, never cloned from or
 /// bound to an existing volume.
-fn check_claim_template(t: &Value, path: &str) -> Result<(), ManifestError> {
+fn check_claim_template(t: &Value, path: &str, cfg: &Config) -> Result<(), ManifestError> {
     let t = object_at(t, path)?;
     only_fields(t, PVC_TEMPLATE, path)?;
     if let Some(meta) = t.get("metadata") {
@@ -868,6 +1043,7 @@ fn check_claim_template(t: &Value, path: &str) -> Result<(), ManifestError> {
             object_at(meta, &format!("{path}/metadata"))?,
             &format!("{path}/metadata"),
             &[],
+            cfg,
         )?;
     }
     if let Some(spec) = t.get("spec") {
@@ -879,7 +1055,12 @@ fn check_claim_template(t: &Value, path: &str) -> Result<(), ManifestError> {
 
 /// Pins a Deployment or StatefulSet selector to the server-set template labels, so its
 /// controller can only adopt pods this object created.
-fn pin_selector(root: &mut Value, name: &str, run: &str) -> Result<(), ManifestError> {
+fn pin_selector(
+    root: &mut Value,
+    name: &str,
+    run: &str,
+    cfg: &Config,
+) -> Result<(), ManifestError> {
     let Some(spec) = root.get_mut("spec").and_then(Value::as_object_mut) else {
         return Ok(());
     };
@@ -890,12 +1071,16 @@ fn pin_selector(root: &mut Value, name: &str, run: &str) -> Result<(), ManifestE
         "/spec/selector",
     )?;
     let labels = object_entry(selector, "matchLabels", "/spec/selector/matchLabels")?;
-    set_label(labels, WORKLOAD_LABEL, name)?;
-    set_label(labels, RUN_LABEL, run)
+    set_label(labels, &cfg.labels.workload, name)?;
+    set_label(labels, &cfg.labels.run_id, run)
 }
 
-fn check_pod_spec(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestError> {
-    only_fields(spec, POD_FIELDS, path)?;
+fn check_pod_spec(
+    spec: &Map<String, Value>,
+    path: &str,
+    cfg: &Config,
+) -> Result<(), ManifestError> {
+    only_fields(spec, &cfg.profile.lists.pod, path)?;
     if spec.get("automountServiceAccountToken") == Some(&Value::Bool(true)) {
         return Err(forbidden(
             format!("{path}/automountServiceAccountToken"),
@@ -916,7 +1101,7 @@ fn check_pod_spec(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestE
             .iter()
             .enumerate()
         {
-            check_volume(vol, &format!("{path}/volumes/{i}"))?;
+            check_volume(vol, &format!("{path}/volumes/{i}"), cfg)?;
         }
     }
     for list in ["containers", "initContainers"] {
@@ -927,17 +1112,18 @@ fn check_pod_spec(spec: &Map<String, Value>, path: &str) -> Result<(), ManifestE
             .iter()
             .enumerate()
         {
-            check_container(c, &format!("{path}/{list}/{i}"))?;
+            check_container(c, &format!("{path}/{list}/{i}"), cfg)?;
         }
     }
     Ok(())
 }
 
-fn check_volume(vol: &Value, path: &str) -> Result<(), ManifestError> {
+fn check_volume(vol: &Value, path: &str, cfg: &Config) -> Result<(), ManifestError> {
+    let lists = &cfg.profile.lists;
     let vol = object_at(vol, path)?;
     let source = vol.keys().find(|k| k.as_str() != "name");
     match source {
-        Some(k) if VOLUME_SOURCES.contains(&k.as_str()) => {}
+        Some(k) if lists.volume_sources.contains(k) => {}
         Some(k) => {
             return Err(forbidden(format!("{path}/{k}"), "this volume type"));
         }
@@ -954,7 +1140,7 @@ fn check_volume(vol: &Value, path: &str) -> Result<(), ManifestError> {
         let ephemeral = object_at(ephemeral, &e_path)?;
         only_fields(ephemeral, &["volumeClaimTemplate"], &e_path)?;
         if let Some(template) = ephemeral.get("volumeClaimTemplate") {
-            check_claim_template(template, &format!("{e_path}/volumeClaimTemplate"))?;
+            check_claim_template(template, &format!("{e_path}/volumeClaimTemplate"), cfg)?;
         }
     }
     if let Some(projected) = vol.get("projected") {
@@ -967,7 +1153,7 @@ fn check_volume(vol: &Value, path: &str) -> Result<(), ManifestError> {
             {
                 only_fields(
                     object_at(src, &format!("{p_path}/sources/{i}"))?,
-                    PROJECTED_SOURCES,
+                    &lists.projected_sources,
                     &format!("{p_path}/sources/{i}"),
                 )?;
             }
@@ -976,9 +1162,10 @@ fn check_volume(vol: &Value, path: &str) -> Result<(), ManifestError> {
     Ok(())
 }
 
-fn check_container(c: &Value, path: &str) -> Result<(), ManifestError> {
+fn check_container(c: &Value, path: &str, cfg: &Config) -> Result<(), ManifestError> {
+    let lists = &cfg.profile.lists;
     let c = object_at(c, path)?;
-    only_fields(c, CONTAINER_FIELDS, path)?;
+    only_fields(c, &lists.container, path)?;
     if let Some(env) = c.get("env") {
         for (i, e) in array_of(env, &format!("{path}/env"))?.iter().enumerate() {
             let e_path = format!("{path}/env/{i}");
@@ -986,7 +1173,7 @@ fn check_container(c: &Value, path: &str) -> Result<(), ManifestError> {
             only_fields(e, ENV_FIELDS, &e_path)?;
             if let Some(from) = e.get("valueFrom") {
                 let f_path = format!("{e_path}/valueFrom");
-                only_fields(object_at(from, &f_path)?, ENV_SOURCES, &f_path)?;
+                only_fields(object_at(from, &f_path)?, &lists.env_sources, &f_path)?;
             }
         }
     }
@@ -996,7 +1183,7 @@ fn check_container(c: &Value, path: &str) -> Result<(), ManifestError> {
             .enumerate()
         {
             let e_path = format!("{path}/envFrom/{i}");
-            only_fields(object_at(e, &e_path)?, ENV_FROM_FIELDS, &e_path)?;
+            only_fields(object_at(e, &e_path)?, &lists.env_from, &e_path)?;
         }
     }
     if let Some(ports) = c.get("ports") {
@@ -1010,7 +1197,7 @@ fn check_container(c: &Value, path: &str) -> Result<(), ManifestError> {
     }
     if let Some(res) = c.get("resources") {
         let r_path = format!("{path}/resources");
-        only_fields(object_at(res, &r_path)?, RESOURCE_FIELDS, &r_path)?;
+        only_fields(object_at(res, &r_path)?, &lists.resources, &r_path)?;
     }
     if let Some(mounts) = c.get("volumeMounts") {
         for (i, m) in array_of(mounts, &format!("{path}/volumeMounts"))?
@@ -1252,9 +1439,264 @@ mod tests {
         })
     }
 
+    fn tenant() -> Config {
+        Config {
+            profile: crate::profile::Profile::tenant(),
+            ..Config::default()
+        }
+    }
+
+    fn with_pod(patch: Value) -> Value {
+        let mut m = job();
+        for (k, v) in patch.as_object().unwrap() {
+            m["spec"]["template"]["spec"][k] = v.clone();
+        }
+        m
+    }
+
+    #[test]
+    fn the_label_domain_decides_every_key_the_server_stamps_and_reserves() {
+        let cfg = Config {
+            labels: crate::config::Labels::new("kueue-mcp.example.com"),
+            ..Config::default()
+        };
+        let n = normalize(job(), &caller(), &queue(), &cfg).unwrap();
+        let o = &n.object;
+        assert_eq!(
+            o.pointer("/metadata/labels/kueue-mcp.example.com~1run-id"),
+            Some(&json!("run-7"))
+        );
+        assert_eq!(
+            o.pointer("/metadata/labels/kueue-mcp.example.com~1managed-by"),
+            Some(&json!("crucible-kueue"))
+        );
+        assert_eq!(
+            o.pointer("/spec/template/metadata/labels/kueue-mcp.example.com~1workload"),
+            Some(&json!("train"))
+        );
+        assert!(o.pointer("/metadata/labels/crucible.dev~1run-id").is_none());
+        let mut forged = job();
+        forged["metadata"]["annotations"] = json!({"kueue-mcp.example.com/actor": "x"});
+        assert!(
+            normalize(forged, &caller(), &queue(), &cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("reserved for the server")
+        );
+    }
+
+    #[test]
+    fn strict_refuses_what_tenant_admits() {
+        let cases = [
+            json!({"tolerations": [{"key": "nvidia.com/gpu", "operator": "Exists"}]}),
+            json!({"priorityClassName": "high"}),
+            json!({"resourceClaims": [{"name": "gpu", "resourceClaimTemplateName": "a100"}]}),
+            json!({"volumes": [{"name": "s", "secret": {"secretName": "tls"}}]}),
+            json!({"volumes": [{"name": "d", "persistentVolumeClaim": {"claimName": "data"}}]}),
+            json!({"containers": [{"name": "main", "image": "i",
+                "env": [{"name": "T", "valueFrom": {"secretKeyRef": {"name": "hf", "key": "t"}}}],
+                "envFrom": [{"secretRef": {"name": "s3"}}],
+                "resources": {"claims": [{"name": "gpu"}]}}]}),
+        ];
+        for patch in cases {
+            assert!(
+                normalize(
+                    with_pod(patch.clone()),
+                    &caller(),
+                    &queue(),
+                    &Config::default()
+                )
+                .is_err(),
+                "strict admitted {patch}"
+            );
+            normalize(with_pod(patch.clone()), &caller(), &queue(), &tenant())
+                .unwrap_or_else(|e| panic!("tenant refused {patch}: {e}"));
+        }
+        for patch in [
+            json!({"hostNetwork": true}),
+            json!({"serviceAccountName": "admin"}),
+            json!({"nodeName": "n1"}),
+            json!({"volumes": [{"name": "h", "hostPath": {"path": "/"}}]}),
+        ] {
+            assert!(
+                normalize(with_pod(patch.clone()), &caller(), &queue(), &tenant()).is_err(),
+                "tenant admitted {patch}"
+            );
+        }
+    }
+
+    #[test]
+    fn tenant_reserves_only_the_server_domain_and_the_keys_it_sets() {
+        let mut m = job();
+        m["metadata"]["labels"] = json!({"kueue.x-k8s.io/priority-class": "high"});
+        m["spec"]["template"]["metadata"] = json!({"annotations": {
+            "kueue.x-k8s.io/podset-required-topology": "cloud.provider.com/topology-block"}});
+        assert!(normalize(m.clone(), &caller(), &queue(), &Config::default()).is_err());
+        let n = normalize(m, &caller(), &queue(), &tenant()).unwrap();
+        assert_eq!(
+            n.object
+                .pointer("/metadata/labels/kueue.x-k8s.io~1priority-class"),
+            Some(&json!("high"))
+        );
+        let mut queue_label = job();
+        queue_label["spec"]["template"]["metadata"] =
+            json!({"labels": {"kueue.x-k8s.io/queue-name": "other"}});
+        assert!(
+            normalize(queue_label, &caller(), &queue(), &tenant())
+                .unwrap_err()
+                .to_string()
+                .contains("reserved")
+        );
+        let mut own = job();
+        own["metadata"]["annotations"] = json!({"crucible.dev/plan-hash": "forged"});
+        assert!(normalize(own, &caller(), &queue(), &tenant()).is_err());
+    }
+
+    #[test]
+    fn a_field_outside_the_allowlist_names_the_fields_allowed_beside_it() {
+        let err = normalize(
+            with_pod(json!({"schedulerName": "mine"})),
+            &caller(),
+            &queue(),
+            &Config::default(),
+        )
+        .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.starts_with("/spec/template/spec/schedulerName: a field outside the allowlist"),
+            "{text}"
+        );
+        assert!(
+            text.contains("allowed here: activeDeadlineSeconds, affinity,"),
+            "{text}"
+        );
+        assert!(text.contains("nodeSelector"), "{text}");
+        assert!(!text.contains("tolerations"), "{text}");
+    }
+
+    #[test]
+    fn lifetimes_and_suspend_follow_the_config() {
+        let cfg = Config {
+            lifetimes: Lifetimes {
+                active_deadline_seconds: None,
+                ttl_seconds_after_finished: Some(120),
+                suspend: false,
+            },
+            ..Config::default()
+        };
+        let n = normalize(job(), &caller(), &queue(), &cfg).unwrap();
+        assert_eq!(n.object.pointer("/spec/activeDeadlineSeconds"), None);
+        assert_eq!(
+            n.object.pointer("/spec/ttlSecondsAfterFinished"),
+            Some(&json!(120))
+        );
+        assert_eq!(n.object.pointer("/spec/suspend"), None);
+        assert_eq!(n.retention_seconds(), Some(120));
+    }
+
+    fn jobset() -> Value {
+        json!({
+            "apiVersion": "jobset.x-k8s.io/v1alpha2",
+            "kind": "JobSet",
+            "metadata": {"name": "train"},
+            "spec": {"replicatedJobs": [
+                {"name": "leader", "replicas": 1, "template": {"spec": {"template": {"spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{"name": "m", "image": "i", "resources": {"requests": {"cpu": "1"}}}]}}}}},
+                {"name": "workers", "replicas": 2, "template": {"spec": {"parallelism": 4, "template": {"spec": {
+                    "restartPolicy": "Never",
+                    "containers": [{"name": "m", "image": "i", "resources": {"requests": {"nvidia.com/gpu": "1"}}}]}}}}}
+            ]}
+        })
+    }
+
+    #[test]
+    fn a_jobset_is_suspended_bounded_and_counted_per_replicated_job() {
+        let n = normalize(jobset(), &caller(), &queue(), &Config::default()).unwrap();
+        let sets: Vec<(&str, u32)> = n
+            .pod_sets
+            .iter()
+            .map(|p| (p.name.as_str(), p.count))
+            .collect();
+        assert_eq!(sets, vec![("leader", 1), ("workers", 8)]);
+        assert_eq!(n.total_requests()["nvidia.com/gpu"].to_string(), "8");
+        assert_eq!(n.object.pointer("/spec/suspend"), Some(&json!(true)));
+        assert_eq!(
+            n.object.pointer("/spec/ttlSecondsAfterFinished"),
+            Some(&json!(3600))
+        );
+        assert_eq!(
+            n.object
+                .pointer("/spec/replicatedJobs/1/template/spec/activeDeadlineSeconds"),
+            Some(&json!(86400))
+        );
+        assert_eq!(
+            n.object.pointer("/spec/replicatedJobs/1/template/spec/template/metadata/labels/crucible.dev~1workload"),
+            Some(&json!("train"))
+        );
+        let mut escaped = jobset();
+        escaped["spec"]["managedBy"] = json!("other-controller");
+        assert!(normalize(escaped, &caller(), &queue(), &Config::default()).is_err());
+        let mut privileged = jobset();
+        privileged["spec"]["replicatedJobs"][0]["template"]["spec"]["template"]["spec"]["hostPID"] =
+            json!(true);
+        assert!(normalize(privileged, &caller(), &queue(), &Config::default()).is_err());
+    }
+
+    fn pytorchjob() -> Value {
+        let pod = json!({"spec": {"containers": [{"name": "pytorch", "image": "i",
+            "resources": {"limits": {"nvidia.com/gpu": "2"}}}]}});
+        json!({
+            "apiVersion": "kubeflow.org/v1",
+            "kind": "PyTorchJob",
+            "metadata": {"name": "ddp"},
+            "spec": {"pytorchReplicaSpecs": {
+                "Master": {"replicas": 1, "restartPolicy": "OnFailure", "template": pod},
+                "Worker": {"replicas": 3, "restartPolicy": "OnFailure", "template": pod}
+            }}
+        })
+    }
+
+    #[test]
+    fn a_pytorchjob_is_suspended_and_bounded_through_its_run_policy() {
+        let n = normalize(pytorchjob(), &caller(), &queue(), &Config::default()).unwrap();
+        let sets: Vec<(&str, u32)> = n
+            .pod_sets
+            .iter()
+            .map(|p| (p.name.as_str(), p.count))
+            .collect();
+        assert_eq!(sets, vec![("master", 1), ("worker", 3)]);
+        assert_eq!(n.total_requests()["nvidia.com/gpu"].to_string(), "8");
+        assert_eq!(
+            n.object.pointer("/spec/runPolicy/suspend"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            n.object.pointer("/spec/runPolicy/activeDeadlineSeconds"),
+            Some(&json!(86400))
+        );
+        assert_eq!(
+            n.object.pointer("/spec/runPolicy/ttlSecondsAfterFinished"),
+            Some(&json!(3600))
+        );
+        assert!(WorkloadKind::PyTorchJob.is_batch() && WorkloadKind::JobSet.is_batch());
+        let mut volcano = pytorchjob();
+        volcano["spec"]["runPolicy"] = json!({"schedulingPolicy": {"queue": "other"}});
+        assert!(
+            normalize(volcano, &caller(), &queue(), &Config::default())
+                .unwrap_err()
+                .to_string()
+                .contains("schedulingPolicy")
+        );
+        let mut chief = pytorchjob();
+        chief["spec"]["pytorchReplicaSpecs"]["Chief"] =
+            chief["spec"]["pytorchReplicaSpecs"]["Master"].clone();
+        assert!(normalize(chief, &caller(), &queue(), &Config::default()).is_err());
+    }
+
     #[test]
     fn a_live_objects_pod_sets_match_what_its_plan_counted() {
-        let n = normalize(job(), &caller(), &queue()).unwrap();
+        let n = normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
         let mut live = n.object.clone();
         live["status"] = json!({"active": 2});
         let sets = pod_sets_of(WorkloadKind::Job, &live).unwrap();
@@ -1269,7 +1711,7 @@ mod tests {
 
     #[test]
     fn a_job_is_pinned_to_the_callers_namespace_queue_and_run() {
-        let n = normalize(job(), &caller(), &queue()).unwrap();
+        let n = normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
         let o = &n.object;
         assert_eq!(o.pointer("/metadata/namespace"), Some(&json!("team-a")));
         assert_eq!(
@@ -1293,24 +1735,28 @@ mod tests {
 
     #[test]
     fn batch_workloads_get_a_default_deadline_and_ttl_unless_they_set_their_own() {
-        let n = normalize(job(), &caller(), &queue()).unwrap();
+        let n = normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
         assert_eq!(
             n.object.pointer("/spec/activeDeadlineSeconds"),
-            Some(&json!(DEFAULT_ACTIVE_DEADLINE_SECONDS))
+            Some(&json!(
+                Lifetimes::default().active_deadline_seconds.unwrap()
+            ))
         );
         assert_eq!(
             n.object.pointer("/spec/ttlSecondsAfterFinished"),
-            Some(&json!(DEFAULT_TTL_SECONDS_AFTER_FINISHED))
+            Some(&json!(
+                Lifetimes::default().ttl_seconds_after_finished.unwrap()
+            ))
         );
         assert_eq!(
             n.retention_seconds(),
-            Some(DEFAULT_TTL_SECONDS_AFTER_FINISHED)
+            Some(Lifetimes::default().ttl_seconds_after_finished.unwrap())
         );
 
         let mut own = job();
         own["spec"]["activeDeadlineSeconds"] = json!(600);
         own["spec"]["ttlSecondsAfterFinished"] = json!(0);
-        let n = normalize(own, &caller(), &queue()).unwrap();
+        let n = normalize(own, &caller(), &queue(), &Config::default()).unwrap();
         assert_eq!(
             n.object.pointer("/spec/activeDeadlineSeconds"),
             Some(&json!(600))
@@ -1333,18 +1779,24 @@ mod tests {
             if let Some(shutdown) = shutdown {
                 m["spec"]["shutdownAfterJobFinishes"] = json!(shutdown);
             }
-            normalize(m, &caller(), &queue()).unwrap().object
+            normalize(m, &caller(), &queue(), &Config::default())
+                .unwrap()
+                .object
         };
         for kept_cluster in [ray(None), ray(Some(false))] {
             assert_eq!(
                 kept_cluster.pointer("/spec/activeDeadlineSeconds"),
-                Some(&json!(DEFAULT_ACTIVE_DEADLINE_SECONDS))
+                Some(&json!(
+                    Lifetimes::default().active_deadline_seconds.unwrap()
+                ))
             );
             assert_eq!(kept_cluster.pointer("/spec/ttlSecondsAfterFinished"), None);
         }
         assert_eq!(
             ray(Some(true)).pointer("/spec/ttlSecondsAfterFinished"),
-            Some(&json!(DEFAULT_TTL_SECONDS_AFTER_FINISHED))
+            Some(&json!(
+                Lifetimes::default().ttl_seconds_after_finished.unwrap()
+            ))
         );
     }
 
@@ -1356,14 +1808,14 @@ mod tests {
             "metadata": {"name": "d"},
             "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "c"}]}}}
         });
-        let n = normalize(deployment, &caller(), &queue()).unwrap();
+        let n = normalize(deployment, &caller(), &queue(), &Config::default()).unwrap();
         assert_eq!(n.object.pointer("/spec/activeDeadlineSeconds"), None);
         assert_eq!(n.object.pointer("/spec/ttlSecondsAfterFinished"), None);
     }
 
     #[test]
     fn job_requests_multiply_by_parallelism_and_limits_fill_missing_requests() {
-        let n = normalize(job(), &caller(), &queue()).unwrap();
+        let n = normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
         let total = n.total_requests();
         assert_eq!(total["cpu"], ParsedQuantity::try_from("1").unwrap());
         assert_eq!(total["memory"], ParsedQuantity::try_from("2Gi").unwrap());
@@ -1375,18 +1827,24 @@ mod tests {
 
     #[test]
     fn the_plan_hash_ignores_key_order_but_tracks_content() {
-        let a = normalize(job(), &caller(), &queue()).unwrap();
+        let a = normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
         let reordered: Value = serde_json::from_str(
             r#"{"spec":{"template":{"spec":{"containers":[{"resources":{"limits":{"nvidia.com/gpu":"1"},"requests":{"memory":"1Gi","cpu":"500m"}},"image":"ubi9","name":"main"}],"restartPolicy":"Never"}},"parallelism":2},"metadata":{"name":"train"},"kind":"Job","apiVersion":"batch/v1"}"#,
         )
         .unwrap();
-        let b = normalize(reordered, &caller(), &queue()).unwrap();
+        let b = normalize(reordered, &caller(), &queue(), &Config::default()).unwrap();
         assert_eq!(a.plan_hash, b.plan_hash);
         let mut changed = job();
         changed["spec"]["parallelism"] = json!(3);
-        let c = normalize(changed, &caller(), &queue()).unwrap();
+        let c = normalize(changed, &caller(), &queue(), &Config::default()).unwrap();
         assert_ne!(a.plan_hash, c.plan_hash);
-        let other_queue = normalize(job(), &caller(), &QueueName::parse("cpu").unwrap()).unwrap();
+        let other_queue = normalize(
+            job(),
+            &caller(),
+            &QueueName::parse("cpu").unwrap(),
+            &Config::default(),
+        )
+        .unwrap();
         assert_ne!(a.plan_hash, other_queue.plan_hash);
     }
 
@@ -1394,12 +1852,12 @@ mod tests {
     fn kinds_outside_the_allowlist_are_refused() {
         let pod = json!({"apiVersion": "v1", "kind": "Pod", "metadata": {"name": "p"}});
         assert!(matches!(
-            normalize(pod, &caller(), &queue()),
+            normalize(pod, &caller(), &queue(), &Config::default()),
             Err(ManifestError::Kind { .. })
         ));
         let old_job = json!({"apiVersion": "batch/v2", "kind": "Job", "metadata": {"name": "j"}});
         assert!(matches!(
-            normalize(old_job, &caller(), &queue()),
+            normalize(old_job, &caller(), &queue(), &Config::default()),
             Err(ManifestError::Kind { .. })
         ));
     }
@@ -1409,19 +1867,19 @@ mod tests {
         let mut m = job();
         m["metadata"]["namespace"] = json!("team-b");
         assert!(matches!(
-            normalize(m, &caller(), &queue()),
+            normalize(m, &caller(), &queue(), &Config::default()),
             Err(ManifestError::Namespace { .. })
         ));
         let mut m = job();
         m["metadata"]["labels"] = json!({"kueue.x-k8s.io/queue-name": "other"});
         assert!(matches!(
-            normalize(m, &caller(), &queue()),
+            normalize(m, &caller(), &queue(), &Config::default()),
             Err(ManifestError::LabelConflict { .. })
         ));
         let mut m = job();
         m["metadata"]["labels"] = json!({"crucible.dev/run-id": "someone-else"});
         assert!(matches!(
-            normalize(m, &caller(), &queue()),
+            normalize(m, &caller(), &queue(), &Config::default()),
             Err(ManifestError::LabelConflict { .. })
         ));
     }
@@ -1447,7 +1905,7 @@ mod tests {
             for (k, v) in patch.as_object().unwrap() {
                 m["spec"]["template"]["spec"][k] = v.clone();
             }
-            let err = normalize(m, &caller(), &queue()).unwrap_err();
+            let err = normalize(m, &caller(), &queue(), &Config::default()).unwrap_err();
             assert!(err.to_string().contains(needle), "{needle}: {err}");
         }
         for (needle, sc) in [
@@ -1463,7 +1921,7 @@ mod tests {
         ] {
             let mut m = job();
             m["spec"]["template"]["spec"]["containers"][0]["securityContext"] = sc;
-            let err = normalize(m, &caller(), &queue()).unwrap_err();
+            let err = normalize(m, &caller(), &queue(), &Config::default()).unwrap_err();
             assert!(err.to_string().contains(needle), "{needle}: {err}");
         }
     }
@@ -1477,14 +1935,14 @@ mod tests {
             let mut m = job();
             m["metadata"][field] = v;
             assert_eq!(
-                normalize(m, &caller(), &queue()).unwrap_err(),
+                normalize(m, &caller(), &queue(), &Config::default()).unwrap_err(),
                 ManifestError::Metadata(field)
             );
         }
         let mut m = job();
         m["metadata"] = json!({"generateName": "x-"});
         assert_eq!(
-            normalize(m, &caller(), &queue()).unwrap_err(),
+            normalize(m, &caller(), &queue(), &Config::default()).unwrap_err(),
             ManifestError::GenerateName
         );
     }
@@ -1503,7 +1961,7 @@ mod tests {
                 }]
             }}
         });
-        let n = normalize(ray, &caller(), &queue()).unwrap();
+        let n = normalize(ray, &caller(), &queue(), &Config::default()).unwrap();
         let names: Vec<_> = n
             .pod_sets
             .iter()
@@ -1529,7 +1987,7 @@ mod tests {
                 "workerTemplate": {"spec": {"containers": [{"name": "w", "resources": {"limits": {"nvidia.com/gpu": "8"}}}]}}
             }}
         });
-        let n = normalize(lws, &caller(), &queue()).unwrap();
+        let n = normalize(lws, &caller(), &queue(), &Config::default()).unwrap();
         let names: Vec<_> = n
             .pod_sets
             .iter()
@@ -1544,7 +2002,9 @@ mod tests {
         m["spec"]["parallelism"] = json!(1);
         m["spec"]["template"]["spec"]["initContainers"] =
             json!([{"name": "i", "resources": {"requests": {"cpu": "2", "memory": "1Mi"}}}]);
-        let total = normalize(m, &caller(), &queue()).unwrap().total_requests();
+        let total = normalize(m, &caller(), &queue(), &Config::default())
+            .unwrap()
+            .total_requests();
         assert_eq!(total["cpu"], ParsedQuantity::try_from("2").unwrap());
         assert_eq!(total["memory"], ParsedQuantity::try_from("1Gi").unwrap());
     }
@@ -1554,7 +2014,7 @@ mod tests {
         let mut m = job();
         m["spec"]["template"]["spec"]["containers"][0]["resources"]["requests"]["cpu"] =
             json!("lots");
-        let err = normalize(m, &caller(), &queue()).unwrap_err();
+        let err = normalize(m, &caller(), &queue(), &Config::default()).unwrap_err();
         assert!(
             err.to_string()
                 .contains("containers/0/resources/requests/cpu"),
@@ -1576,7 +2036,7 @@ mod tests {
                 ]}}
             }
         });
-        let n = normalize(d, &caller(), &queue()).unwrap();
+        let n = normalize(d, &caller(), &queue(), &Config::default()).unwrap();
         assert_eq!(n.kind.admission(), Admission::PerPod);
         assert_eq!(
             n.total_requests()["cpu"],
@@ -1603,7 +2063,7 @@ mod tests {
             "metadata": {"name": "db"},
             "spec": {"template": {"spec": {"containers": [{"name": "d", "resources": {"requests": {"memory": "1Gi"}}}]}}}
         });
-        let n = normalize(s, &caller(), &queue()).unwrap();
+        let n = normalize(s, &caller(), &queue(), &Config::default()).unwrap();
         assert_eq!(n.kind.admission(), Admission::AllOrNothing);
         assert_eq!(n.pod_sets[0].count, 1);
         assert!(n.kind.is_scalable());
@@ -1614,7 +2074,7 @@ mod tests {
         let m =
             json!({"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "j"}, "spec": {}});
         assert!(matches!(
-            normalize(m, &caller(), &queue()),
+            normalize(m, &caller(), &queue(), &Config::default()),
             Err(ManifestError::NoTemplate { .. })
         ));
     }
@@ -1622,7 +2082,7 @@ mod tests {
     #[test]
     fn a_delegated_callers_launcher_is_stamped_and_cannot_be_overridden() {
         let delegated = caller();
-        let n = normalize(job(), &delegated, &queue()).unwrap();
+        let n = normalize(job(), &delegated, &queue(), &Config::default()).unwrap();
         assert_eq!(
             n.object
                 .pointer("/metadata/labels/crucible.dev~1launched-by"),
@@ -1631,8 +2091,8 @@ mod tests {
         let mut forged = job();
         forged["metadata"]["labels"] = json!({"crucible.dev/launched-by": "someone-else"});
         assert!(matches!(
-            normalize(forged, &delegated, &queue()),
-            Err(ManifestError::LabelConflict { key, .. }) if key == LAUNCHED_BY_LABEL
+            normalize(forged, &delegated, &queue(), &Config::default()),
+            Err(ManifestError::LabelConflict { key, .. }) if key == "crucible.dev/launched-by"
         ));
     }
 
@@ -1640,13 +2100,13 @@ mod tests {
     fn the_launcher_is_part_of_the_plan_hash() {
         let mut delegated = caller();
         delegated.launched_by = Launcher::parse("bob").unwrap();
-        let a = normalize(job(), &caller(), &queue()).unwrap();
-        let b = normalize(job(), &delegated, &queue()).unwrap();
+        let a = normalize(job(), &caller(), &queue(), &Config::default()).unwrap();
+        let b = normalize(job(), &delegated, &queue(), &Config::default()).unwrap();
         assert_ne!(a.plan_hash, b.plan_hash);
     }
 
     fn refused_with(m: Value, needle: &str) {
-        let err = normalize(m, &caller(), &queue()).unwrap_err();
+        let err = normalize(m, &caller(), &queue(), &Config::default()).unwrap_err();
         assert!(err.to_string().contains(needle), "{needle}: {err}");
     }
 
@@ -1792,7 +2252,7 @@ mod tests {
         c["ports"] = json!([{"containerPort": 8080, "name": "http"}]);
         c["readinessProbe"] = json!({"httpGet": {"path": "/healthz", "port": 8080}});
         c["volumeMounts"] = json!([{"name": "scratch", "mountPath": "/tmp"}]);
-        assert!(normalize(m, &caller(), &queue()).is_ok());
+        assert!(normalize(m, &caller(), &queue(), &Config::default()).is_ok());
     }
 
     #[test]
@@ -1855,7 +2315,7 @@ mod tests {
         let mut ok = job();
         ok["metadata"]["labels"] = json!({"app.kubernetes.io/name": "train", "team": "a"});
         ok["spec"]["template"]["metadata"] = json!({"annotations": {"example.com/note": "x"}});
-        assert!(normalize(ok, &caller(), &queue()).is_ok());
+        assert!(normalize(ok, &caller(), &queue(), &Config::default()).is_ok());
     }
 
     #[test]
@@ -1887,7 +2347,7 @@ mod tests {
         m["spec"]["submitterPodTemplate"] =
             json!({"spec": {"containers": [{"name": "s"}], "hostNetwork": true}});
         refused_with(m, "hostNetwork");
-        assert!(normalize(ray(), &caller(), &queue()).is_ok());
+        assert!(normalize(ray(), &caller(), &queue(), &Config::default()).is_ok());
     }
 
     fn statefulset() -> Value {
@@ -1995,12 +2455,12 @@ mod tests {
         m["spec"]["template"]["spec"]["volumes"] = json!([{"name": "v", "ephemeral": {"volumeClaimTemplate": {
             "spec": {"accessModes": ["ReadWriteOnce"], "resources": {"requests": {"storage": "1Gi"}}}
         }}}]);
-        assert!(normalize(m, &caller(), &queue()).is_ok());
+        assert!(normalize(m, &caller(), &queue(), &Config::default()).is_ok());
     }
 
     #[test]
     fn deployment_and_statefulset_selectors_are_pinned_to_the_server_labels() {
-        let n = normalize(statefulset(), &caller(), &queue()).unwrap();
+        let n = normalize(statefulset(), &caller(), &queue(), &Config::default()).unwrap();
         let sel = n.object.pointer("/spec/selector/matchLabels").unwrap();
         assert_eq!(sel["app"], "db");
         assert_eq!(sel["crucible.dev/workload"], "db");
@@ -2008,7 +2468,7 @@ mod tests {
         let mut m = statefulset();
         m["spec"]["selector"]["matchLabels"]["crucible.dev/run-id"] = json!("another-run");
         assert!(matches!(
-            normalize(m, &caller(), &queue()),
+            normalize(m, &caller(), &queue(), &Config::default()),
             Err(ManifestError::LabelConflict { .. })
         ));
         let mut m = statefulset();

@@ -1,6 +1,6 @@
 [package]
 name = "crucible-kueue"
-description = "MCP server that lets sandboxed agents submit and watch Kueue workloads in their own namespace."
+description = "MCP server that lets agents submit and watch Kueue workloads under their own Kubernetes RBAC."
 version.workspace = true
 license.workspace = true
 edition.workspace = true
@@ -17,7 +17,6 @@ path = "src/bin/crucible-kueue.rs"
 anyhow.workspace = true
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 clap.workspace = true
-crucible-contract = { path = "../crucible-contract" }
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["kube"] }
 hex = "0.4"
 http = "1"
@@ -29,6 +28,7 @@ rustls = "0.23"
 serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
+toml = "0.8"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
 url.workspace = true
@@ -36,13 +36,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dev-dependencies]
-aws-lc-rs = "1.18"
-base64 = "0.22"
-crucible = { path = "../crucible", default-features = false }
-crucible-controller = { path = "../crucible-controller" }
-jiff.workspace = true
-sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
-tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "rustls"] }
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
 tower = { version = "0.5", features = ["util"] }

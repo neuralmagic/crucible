@@ -223,6 +223,10 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dev-dependencies]
 tempfile = "3"
+# The kueue e2e suites: crucible-kueue served against this controller's agent token endpoint.
+crucible-kueue = { path = "../crucible-kueue" }
+crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
+rmcp = { version = "3.6", features = ["client", "transport-streamable-http-client-reqwest"] }
 # `Builder::start_paused` for the virtual-clock tests.
 tokio = { workspace = true, features = ["test-util"] }
 # Fake-GitHub HTTP server for the triage fetch tests (work plan sanctions it).

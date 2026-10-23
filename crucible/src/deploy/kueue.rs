@@ -300,6 +300,8 @@ fn workload_cluster_role() -> rbac::ClusterRole {
                 WORKLOAD_VERBS,
             ),
             rule(&["apps"], &["deployments", "statefulsets"], WORKLOAD_VERBS),
+            rule(&["jobset.x-k8s.io"], &["jobsets"], WORKLOAD_VERBS),
+            rule(&["kubeflow.org"], &["pytorchjobs"], WORKLOAD_VERBS),
             rule(&[""], &["pods", "pods/log", "events"], &["get", "list"]),
         ]),
         ..Default::default()
@@ -532,6 +534,8 @@ mod tests {
             ("leaderworkerset.x-k8s.io", "leaderworkersets"),
             ("apps", "deployments"),
             ("apps", "statefulsets"),
+            ("jobset.x-k8s.io", "jobsets"),
+            ("kubeflow.org", "pytorchjobs"),
         ]
     }
 

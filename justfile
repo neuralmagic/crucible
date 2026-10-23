@@ -224,7 +224,7 @@ route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
 route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
     kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found
 
-# Prepare a cluster for the gateway isolation e2e (crucible-kueue/tests/gateway_e2e.rs): the
+# Prepare a cluster for the gateway isolation e2e (crucible-controller/tests/kueue_gateway_e2e.rs): the
 # profile's loop and sandbox namespaces, its pull secret copied from `pull_from`, the loop and
 # sandbox service accounts (the sandbox one bound to `scc_role`, the ClusterRole granting the
 # sandbox SCC), and the gateway RBAC the profile renders.

@@ -6,6 +6,10 @@
 //!   CRUCIBLE_KUEUE_E2E_QUEUE=<local queue> cargo test --test cluster_e2e -- --ignored --nocapture
 //!   CRUCIBLE_KUEUE_E2E_KUBE_USER=<user the tokens act as>
 //!   CRUCIBLE_KUEUE_E2E_KUBE_GROUPS=<comma-separated groups of that user, optional>
+//!   CRUCIBLE_KUEUE_E2E_MODE=crucible|tenant (default crucible)
+//! `crucible` serves crucible's defaults to run tokens carrying kube_user. `tenant` serves the
+//! generic setup: a people issuer whose tokens name the user in preferred_username and groups in
+//! groups with no run claim, the tenant allowlist, rbac ownership and its own label domain.
 //! The namespace must carry the label Kueue's ClusterQueue selects on and hold the LocalQueue. The
 //! tokens act as CRUCIBLE_KUEUE_E2E_KUBE_USER, decided by SubjectAccessReview: it needs `use` on the
 //! LocalQueue and the workload verbs the tests exercise in the namespace, and the context's identity
@@ -29,12 +33,65 @@ type Client = RunningService<RoleClient, ClientConfig>;
 
 const IMAGE: &str = "registry.access.redhat.com/ubi9/ubi-minimal:latest";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Crucible,
+    Tenant,
+}
+
+const TENANT_DOMAIN: &str = "kueue-mcp.e2e.example";
+
 struct Env {
     context: String,
     namespace: String,
     queue: String,
     kube_user: String,
     kube_groups: Vec<String>,
+    mode: Mode,
+}
+
+impl Env {
+    fn config(&self) -> crucible_kueue::config::Config {
+        use crucible_kueue::config::{ClaimMap, Config, Labels, Ownership};
+        match self.mode {
+            Mode::Crucible => Config::default(),
+            Mode::Tenant => Config {
+                labels: Labels::new(TENANT_DOMAIN),
+                ownership: Ownership::Rbac,
+                profile: crucible_kueue::profile::Profile::tenant(),
+                claims: ClaimMap {
+                    user: "preferred_username".into(),
+                    groups: "groups".into(),
+                    run_id: None,
+                    ..ClaimMap::default()
+                },
+                ..Config::default()
+            },
+        }
+    }
+
+    fn run_label(&self) -> String {
+        format!(
+            "{}/run-id",
+            match self.mode {
+                Mode::Crucible => "crucible.dev",
+                Mode::Tenant => TENANT_DOMAIN,
+            }
+        )
+    }
+
+    /// The run id the server derives for a token minted for `run`.
+    fn run_id(&self, run: &str) -> String {
+        match self.mode {
+            Mode::Crucible => run.to_string(),
+            Mode::Tenant => crucible_kueue::config::label_safe(&subject(run)),
+        }
+    }
+}
+
+/// A tenant token's subject: an email-shaped value no label may hold as is.
+fn subject(run: &str) -> String {
+    format!("{run}@e2e.example")
 }
 
 fn env() -> Env {
@@ -52,6 +109,11 @@ fn env() -> Env {
             .filter(|g| !g.is_empty())
             .map(str::to_string)
             .collect(),
+        mode: match std::env::var("CRUCIBLE_KUEUE_E2E_MODE").as_deref() {
+            Ok("tenant") => Mode::Tenant,
+            Ok("crucible") | Err(_) => Mode::Crucible,
+            Ok(other) => panic!("CRUCIBLE_KUEUE_E2E_MODE {other:?} is not crucible or tenant"),
+        },
     }
 }
 
@@ -59,7 +121,14 @@ fn env() -> Env {
 /// [`viewer`] mint.
 async fn serve(env: &Env) -> String {
     let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
-    let oidc = testing::resource_server(&jwks, Duration::from_secs(300), Duration::from_secs(1));
+    let mut rs = testing::config(jwks.url.clone());
+    if env.mode == Mode::Tenant {
+        rs.issuers[0].callers = crucible_mcp_auth::principal::Callers::People;
+    }
+    let oidc = crucible_mcp_auth::server::ResourceServer::with_jwks(rs, |t| {
+        crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
+            .with_timing(Duration::from_secs(300), Duration::from_secs(1))
+    });
     crucible_kueue::install_tls_provider();
     let options = kube::config::KubeConfigOptions {
         context: Some(env.context.clone()),
@@ -70,6 +139,7 @@ async fn serve(env: &Env) -> String {
     let kueue_version = crucible_kueue::kueue::KueueVersion::discover(&client)
         .await
         .unwrap();
+    let kinds = crucible_kueue::kinds::installed(&client).await.unwrap();
     let reviewer = Arc::new(crucible_mcp_auth::kube::SubjectAccessReviewer::new(
         client.clone(),
         crucible_mcp_auth::kube::GroupSource::Token,
@@ -82,6 +152,8 @@ async fn serve(env: &Env) -> String {
             reviewer: Some(reviewer),
             kueue: kueue_version,
             allowed_hosts: Vec::new(),
+            kinds,
+            config: env.config(),
         },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -92,13 +164,26 @@ async fn serve(env: &Env) -> String {
 
 fn run_token(env: &Env, run: &str, scope: &str) -> String {
     let mut claims = testing::run_claims();
-    claims["run_id"] = json!(run);
     claims["namespace"] = json!(env.namespace);
-    claims["kube_user"] = json!(env.kube_user);
-    if !env.kube_groups.is_empty() {
-        claims["kube_groups"] = json!(env.kube_groups);
-    }
     claims["scope"] = json!(scope);
+    let map = claims.as_object_mut().unwrap();
+    match env.mode {
+        Mode::Crucible => {
+            map.insert("run_id".into(), json!(run));
+            map.insert("kube_user".into(), json!(env.kube_user));
+            if !env.kube_groups.is_empty() {
+                map.insert("kube_groups".into(), json!(env.kube_groups));
+            }
+        }
+        Mode::Tenant => {
+            for key in ["run_id", "kube_user", "kube_groups", "role", "queues"] {
+                map.remove(key);
+            }
+            map.insert("sub".into(), json!(subject(run)));
+            map.insert("preferred_username".into(), json!(env.kube_user));
+            map.insert("groups".into(), json!(env.kube_groups));
+        }
+    }
     testing::sign("a", &claims)
 }
 
@@ -424,8 +509,17 @@ async fn an_agent_plans_submits_watches_and_cleans_up_a_job() {
 
     let me = call(&agent, "whoami", json!({})).await;
     assert_eq!(me["namespace"], env.namespace.as_str());
-    assert_eq!(me["run_id"], run.as_str());
+    assert_eq!(me["run_id"], env.run_id(&run).as_str());
     assert_eq!(me["kube_user"], env.kube_user.as_str());
+    assert!(
+        me["submittable_kinds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|k| k == "batch/v1 Job"),
+        "{me:#}"
+    );
+    eprintln!("whoami: {me}");
 
     let queues = call(&agent, "queues_list", json!({})).await;
     assert!(
@@ -653,20 +747,22 @@ async fn an_agent_stops_and_resumes_a_running_job() {
     let other_run = connect(&serve(&env).await, &submitter(&env, "someone-else"))
         .await
         .unwrap();
-    let foreign_stop = call(
-        &other_run,
-        "workload_stop",
-        json!({"kind": "Job", "name": name}),
-    )
-    .await;
-    assert_eq!(foreign_stop["status"], "refused", "{foreign_stop:#}");
-    let foreign_delete = call(
-        &other_run,
-        "workload_delete",
-        json!({"kind": "Job", "name": name}),
-    )
-    .await;
-    assert_eq!(foreign_delete["status"], "refused", "{foreign_delete:#}");
+    if env.mode == Mode::Crucible {
+        let foreign_stop = call(
+            &other_run,
+            "workload_stop",
+            json!({"kind": "Job", "name": name}),
+        )
+        .await;
+        assert_eq!(foreign_stop["status"], "refused", "{foreign_stop:#}");
+        let foreign_delete = call(
+            &other_run,
+            "workload_delete",
+            json!({"kind": "Job", "name": name}),
+        )
+        .await;
+        assert_eq!(foreign_delete["status"], "refused", "{foreign_delete:#}");
+    }
 
     let deleted = call(
         &agent,
@@ -1075,19 +1171,179 @@ async fn cancelling_a_task_stops_the_job_and_unknown_tasks_are_errors() {
     }
 
     let other_run = connect_with_tasks(&serve(&env).await, &submitter(&env, "someone-else")).await;
-    assert!(
-        other_run
-            .peer()
-            .cancel_task(CancelTaskParams::new(id.clone()))
-            .await
-            .is_err(),
-        "another run cannot cancel this run's task"
-    );
+    let foreign = other_run
+        .peer()
+        .cancel_task(CancelTaskParams::new(id.clone()))
+        .await;
+    match env.mode {
+        Mode::Crucible => assert!(
+            foreign.is_err(),
+            "another run cannot cancel this run's task"
+        ),
+        Mode::Tenant => assert!(
+            foreign.is_ok(),
+            "under rbac ownership a caller whose RBAC permits it may cancel: {foreign:?}"
+        ),
+    }
 
     let deleted = call(
         &agent,
         "workload_delete",
         json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert_eq!(deleted["status"], "ok", "{deleted:#}");
+}
+
+async fn kube_client(env: &Env) -> kube::Client {
+    let options = kube::config::KubeConfigOptions {
+        context: Some(env.context.clone()),
+        ..Default::default()
+    };
+    let config = kube::Config::from_kubeconfig(&options).await.unwrap();
+    kube::Client::try_from(config).unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_job_made_outside_the_server_is_observed_and_controlled_only_under_rbac_ownership() {
+    let env = env();
+    let run = unique("e2e-adopt");
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
+    let name = unique("ck-e2e-kubectl");
+    let jobs: kube::Api<k8s_openapi::api::batch::v1::Job> =
+        kube::Api::namespaced(kube_client(&env).await, &env.namespace);
+    let mut manifest = job(&name, "echo made-by-kubectl; sleep 600");
+    manifest["metadata"]["labels"] = json!({"kueue.x-k8s.io/queue-name": env.queue});
+    manifest["spec"]["suspend"] = json!(true);
+    jobs.create(
+        &kube::api::PostParams::default(),
+        &serde_json::from_value(manifest).unwrap(),
+    )
+    .await
+    .unwrap();
+
+    let listed = call(&agent, "workload_list", json!({"filter": "all"})).await;
+    let row = listed["workloads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["name"] == name.as_str())
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} not in {listed:#}"));
+    assert_eq!(row["managed"], false, "{row:#}");
+    let mine = call(&agent, "workload_list", json!({})).await;
+    assert!(
+        !mine["workloads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["name"] == name.as_str()),
+        "the default filter lists only this run's: {mine:#}"
+    );
+
+    let running = wait_on_server(&agent, "Job", &name, "running", Duration::from_secs(180)).await;
+    assert_eq!(
+        running["pods"]["total"], 1,
+        "pods found through the Job's selector: {running:#}"
+    );
+    let logs = call(
+        &agent,
+        "workload_logs",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert!(
+        logs["logs"][0]["log"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("made-by-kubectl"),
+        "{logs:#}"
+    );
+
+    let stopped = call(
+        &agent,
+        "workload_stop",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    match env.mode {
+        Mode::Crucible => {
+            assert_eq!(stopped["status"], "refused", "{stopped:#}");
+            let deleted = call(
+                &agent,
+                "workload_delete",
+                json!({"kind": "Job", "name": name}),
+            )
+            .await;
+            assert_eq!(deleted["status"], "refused", "{deleted:#}");
+            jobs.delete(&name, &kube::api::DeleteParams::background())
+                .await
+                .unwrap();
+        }
+        Mode::Tenant => {
+            assert_eq!(stopped["status"], "ok", "{stopped:#}");
+            wait_for_phase(&agent, &name, &["stopped"], Duration::from_secs(60)).await;
+            let deleted = call(
+                &agent,
+                "workload_delete",
+                json!({"kind": "Job", "name": name}),
+            )
+            .await;
+            assert_eq!(deleted["status"], "ok", "{deleted:#}");
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn the_profile_decides_tolerations_and_secrets_and_the_domain_labels_what_is_made() {
+    let env = env();
+    let run = unique("e2e-profile");
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
+    let name = unique("ck-e2e-profile");
+    let mut manifest = job(&name, "true");
+    let pod = &mut manifest["spec"]["template"]["spec"];
+    pod["tolerations"] =
+        json!([{"key": "example.com/dedicated", "operator": "Exists", "effect": "NoSchedule"}]);
+    pod["containers"][0]["env"] = json!([{"name": "TOKEN", "valueFrom": {"secretKeyRef": {"name": "e2e-token", "key": "t", "optional": true}}}]);
+    let plan = call(
+        &agent,
+        "workload_plan",
+        json!({"queue": env.queue, "manifest": manifest}),
+    )
+    .await;
+    match env.mode {
+        Mode::Crucible => {
+            assert_eq!(
+                plan["status"], "refused",
+                "strict refuses tolerations: {plan:#}"
+            );
+            assert!(
+                plan["error"].as_str().unwrap().contains("allowed here:"),
+                "{plan:#}"
+            );
+        }
+        Mode::Tenant => assert_eq!(plan["status"], "ok", "tenant admits them: {plan:#}"),
+    }
+
+    let plain = unique("ck-e2e-domain");
+    submit(&agent, &env.queue, &job(&plain, "true")).await;
+    let jobs: kube::Api<k8s_openapi::api::batch::v1::Job> =
+        kube::Api::namespaced(kube_client(&env).await, &env.namespace);
+    let made = jobs.get(&plain).await.unwrap();
+    let labels = made.metadata.labels.unwrap_or_default();
+    assert_eq!(
+        labels.get(&env.run_label()).map(String::as_str),
+        Some(env.run_id(&run).as_str()),
+        "{labels:?}"
+    );
+    let deleted = call(
+        &agent,
+        "workload_delete",
+        json!({"kind": "Job", "name": plain}),
     )
     .await;
     assert_eq!(deleted["status"], "ok", "{deleted:#}");
