@@ -14,13 +14,6 @@ yanked = "warn"
 # with reasons so the job starts green and any NEW advisory fails the build. Re-triage on dep
 # bumps and shrink this list.
 ignore = [
-    # rustls-webpki 0.101.x via the aws-sdk legacy hyper-rustls 0.24 stack. Server-side use
-    # only (S3 client to a fixed endpoint); superseded generation already present alongside.
-    { id = "RUSTSEC-2026-0098", reason = "legacy aws-sdk rustls stack; fixed-endpoint S3 client, not a general TLS verifier" },
-    { id = "RUSTSEC-2026-0099", reason = "legacy aws-sdk rustls stack; fixed-endpoint S3 client, not a general TLS verifier" },
-    { id = "RUSTSEC-2026-0104", reason = "legacy aws-sdk rustls stack; fixed-endpoint S3 client, not a general TLS verifier" },
-    # anyhow Error::downcast_mut unsoundness; no downcast_mut use in this workspace.
-    { id = "RUSTSEC-2026-0190", reason = "workspace does not call Error::downcast_mut" },
     # Font parsing reached only through the vendored mermaid renderer (third_party/,
     # xai-grok-mermaid -> resvg -> usvg). Unmaintained, no fix available upstream. It parses
     # fonts we ship to rasterize our own generated SVG, never untrusted input.
@@ -32,11 +25,14 @@ ignore = [
     { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill via starlark_syntax's postcard/heapless; interpreter-internal" },
     { id = "RUSTSEC-2024-0388", reason = "derivative proc-macro via starlark_syntax; compile-time only" },
     { id = "RUSTSEC-2024-0436", reason = "paste proc-macro via starlark; compile-time only" },
-    # h2 0.3.x empty-DATA-frame DoS; no patched 0.3 release. Reached only through the aws-sdk
-    # legacy hyper 0.14 client (fixed-endpoint S3/STS); the workspace's h2 0.4 line is on 0.4.16.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 via legacy aws-sdk hyper stack; client to fixed AWS endpoints, 0.4 line patched" },
     { id = "RUSTSEC-2023-0071", reason = "rsa via openidconnect; the controller only verifies RS256 ID-token signatures with the issuer's public JWKS, no private-key operation exists for the timing side channel to leak, and no fixed release exists" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile via openshell-core v0.1.2 (one rustls_pemfile::certs call in driver_utils); unmaintained, not vulnerable, and still used on upstream main" },
+    { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml via the vendored mermaid renderer's serde_yaml; parses our own diagram front matter in memory" },
+    # zbus 5's split-out crates, folded into zbus 6. Reached through ujira -> keyring's Linux
+    # secret-service backend; replaced once keyring moves to zbus 6.
+    { id = "RUSTSEC-2026-0370", reason = "zvariant via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive via ujira -> keyring secret-service backend; unmaintained, not vulnerable" },
 ]
 
 [licenses]

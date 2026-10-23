@@ -34,6 +34,16 @@ pub(crate) struct NewPlaybookLaunch<'a> {
     /// The groups the launcher's claims carried, as a JSON array. `created_by` is only half an
     /// identity: a group-owned secret needs the memberships too.
     pub launcher_groups: Option<&'a serde_json::Value>,
+    /// The finished run this launch reruns, and from which tasks.
+    pub rerun: Option<&'a RerunOf>,
+}
+
+/// A launch that reruns a finished run: that run's id and the tasks it dispatches again
+/// (RFC-0002:C-PLAYBOOK-RERUN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerunOf {
+    pub run: String,
+    pub from: Vec<String>,
 }
 
 /// A deferred one-shot's lifecycle. Every state but `Pending` is terminal: a one-shot fires once
@@ -70,6 +80,8 @@ pub(crate) struct PlaybookLaunch {
     /// The exposure recorded on the launch row itself, which a draft one-shot recomputes from the
     /// exact content it launches. `None` on a registered launch, which reads the registry row.
     pub exposure: Option<crate::playbooks::exposure::Exposure>,
+    /// The finished run this launch reruns, if it is a rerun.
+    pub rerun: Option<RerunOf>,
 }
 
 /// Where a schedule's cursor reads its next value: a dotted path into the run result, whose first

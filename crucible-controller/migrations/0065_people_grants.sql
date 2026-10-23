@@ -1,4 +1,4 @@
--- 0061_people_grants.sql — people's OAuth authorization codes and refresh tokens, shared by every
+-- 0065_people_grants.sql — people's OAuth authorization codes and refresh tokens, shared by every
 -- controller replica. Each secret is stored only as the SHA-256 of its text. The tables reference
 -- nothing outside themselves; a subject that may no longer sign in is refused at refresh.
 CREATE TABLE people_codes (

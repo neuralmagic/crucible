@@ -64,7 +64,6 @@ cleanup() {
     [ -f "$WORK/rendered.yaml" ] && yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")' \
         "$WORK/rendered.yaml" | kc delete --ignore-not-found -f - >/dev/null 2>&1 || true
     kc -n "$SPIRE_NS" delete role,rolebinding crucible-kueue-e2e-spire-keys --ignore-not-found >/dev/null || true
-    kc delete clusterrolebinding crucible-kueue-e2e-auth-delegator --ignore-not-found >/dev/null || true
     kc delete namespace "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" --ignore-not-found --wait=false >/dev/null || true
     if [ -s "$WORK/kueue-saved.yaml" ]; then
         kc replace -f "$WORK/kueue-saved.yaml" >/dev/null && log "restored crucible-system's crucible-kueue"

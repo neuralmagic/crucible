@@ -1,18 +1,18 @@
 #:schema ../schema/adr.schema.json
 
 [govctl]
-id = "ADR-0067"
+id = "ADR-0068"
 title = "Agents get identity-only tokens from the controller, bound to their run's own gateway"
 status = "proposed"
 date = "2026-10-08"
 refs = [
-    "ADR-0066",
+    "ADR-0067",
     "ADR-0036",
 ]
 
 [content]
 context = """
-[[ADR-0066]] gave sandboxed agents access to crucible-kueue with per-run bearer tokens: the controller minted a random token at dispatch, wrote its digest, run id, namespace, role and queue allowlist as a tenant record ConfigMap in a controller-only namespace, and the server watched those records. Building the next consumers (buildit, the agent MCP servers behind the OpenShell provider token grant) and reviewing the design surfaced its limits:
+[[ADR-0067]] gave sandboxed agents access to crucible-kueue with per-run bearer tokens: the controller minted a random token at dispatch, wrote its digest, run id, namespace, role and queue allowlist as a tenant record ConfigMap in a controller-only namespace, and the server watched those records. Building the next consumers (buildit, the agent MCP servers behind the OpenShell provider token grant) and reviewing the design surfaced its limits:
 
 - Every resource server would need its own record watch and namespace, or share one, and every new server multiplies the deployment surface the records already cost.
 - The record carried authorization (role, queues) decided by the controller from the deploy profile, which the server then replayed. The person behind the run, and what Kubernetes lets that person do, never entered the decision.
@@ -25,7 +25,7 @@ The controller is the OAuth authorization server for sandboxed agents, and its t
 
 - **Each run's gateway runs in its own pod.** Under the kubernetes driver with `[cluster] sandbox_namespace`, the controller starts every run's OpenShell gateway (and every turn's) as `crucible-openshell-gateway` in the sandbox namespace, the only identity with rights there; the loop service account has none. The controller mints a CA per run, a server certificate for the gateway Service's address and client certificates for the loop pod and the supervisors, and keeps no CA key. A NetworkPolicy admits only that run's loop pod and the supervisors its gateway created.
 - **The SPIFFE ID names the gateway.** Each run's gateway id is its run pod's name; the gateway stamps it as `openshell.ai/gateway-id` on every supervisor and Sandbox it creates, and `driver_config` cannot set labels or annotations. The ClusterSPIFFEID, scoped to the sandbox namespace, is `spiffe://<td>/openshell/gateway/<gateway id>/sandbox/<sandbox id>`.
-- **Binding and issue check the gateway.** The engine binds each sandbox it creates to its run pod with the pod's ingest token; the controller binds only a Sandbox carrying that id and the run's gateway id, and owner-references it to the gateway pod. `POST /oauth/token` verifies the SVID, resolves the binding, and refuses an SVID whose gateway is not the bound run's.
+- **Binding and issue check the gateway.** The engine binds each sandbox it creates to its run with the run's pod token; the controller binds only a Sandbox carrying that id and the run's gateway id, and owner-references it to the gateway pod. `POST /oauth/token` verifies the SVID, resolves the binding, and refuses an SVID whose gateway is not the bound run's.
 - **Claims are identity only.** `sub` (the person the run was dispatched for, consumed per dispatch), `act.sub` (the SVID's SPIFFE ID), `run_id`, `sandbox`, `workdir`, `kube_user` (the person's Kubernetes username, from an explicit link or an administrator's override), and `namespace`, the default namespace for the run's workloads. No role, no queues: a resource server decides what the caller may do, crucible-kueue by SubjectAccessReview as `kube_user`.
 - **Tenant records go away.** Neither the controller nor crucible-kueue keeps per-run records; the token is the grant.
 - **Keys rotate without a flag day.** Tokens are ES256 with an RFC 7638 thumbprint kid. The JWKS publishes the current key and, while configured, the previous one, which no longer signs. Tokens live 15 to 30 minutes (`CONTROLLER_AGENT_TOKEN_TTL_SECS`).
@@ -53,7 +53,7 @@ cons = [
 ]
 
 [[content.alternatives]]
-text = "Keep tenant records ([[ADR-0066]]) and add a record watch per resource server"
+text = "Keep tenant records ([[ADR-0067]]) and add a record watch per resource server"
 status = "rejected"
 pros = ["Already built for crucible-kueue"]
 cons = [

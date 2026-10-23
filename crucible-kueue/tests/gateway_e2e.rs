@@ -676,7 +676,7 @@ async fn scenario() {
     );
     bindings::bind(
         &pool,
-        RUN_POD,
+        &bindings::run_pod(&pool, RUN_ID).await.unwrap(),
         &Binding {
             id: id.clone(),
             name: name.clone(),

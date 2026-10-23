@@ -637,8 +637,8 @@ fn scope_report_falls_back_to_the_marker_when_the_message_is_not_our_envelope() 
     assert_eq!(report.digest.as_deref(), Some("v1:cafe"));
 }
 
-/// Build a minimal surviving ScopeReport (digest frozen, one passed stage) for the drop-box
-/// fold tests.
+/// Build a minimal surviving ScopeReport (digest frozen, one passed stage) for the turn
+/// artifact tests.
 #[cfg(feature = "autoresearch")]
 fn survived_report() -> engine::ScopeReport {
     let env = Envelope::new(
@@ -671,7 +671,7 @@ async fn drop_artifact(pool: &sqlx::PgPool, pod: &str, kind: ArtifactKind, bytes
 
 #[cfg(feature = "autoresearch")]
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn dropbox_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
+async fn an_uploaded_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
     let pack = b"the-real-gzipped-pack";
     drop_artifact(&pool, "pod-x", ArtifactKind::ScopePack, pack).await;
     let manifest = vec![ArtifactRef {
@@ -681,9 +681,9 @@ async fn dropbox_pack_is_preferred_and_digest_validated(pool: sqlx::PgPool) {
         delivered: true,
     }];
     let mut report = survived_report();
-    apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
-        .expect("valid drop-box pack accepted");
+        .expect("a valid uploaded pack is accepted");
     assert_eq!(report.pack_tgz.as_deref(), Some(&pack[..]));
     assert!(report.pack_error.is_none());
 }
@@ -699,7 +699,7 @@ async fn survived_scope_with_a_missing_delivered_pack_fails_loudly(pool: sqlx::P
         delivered: true,
     }];
     let mut report = survived_report();
-    let err = apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect_err("a survival's missing pack is fatal");
     assert!(err.contains("scope pack not recovered"), "{err}");
@@ -716,7 +716,7 @@ async fn a_digest_mismatch_fails_loudly(pool: sqlx::PgPool) {
         delivered: true,
     }];
     let mut report = survived_report();
-    let err = apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect_err("digest mismatch is fatal for a survival");
     assert!(err.contains("integrity mismatch"), "{err}");
@@ -732,7 +732,7 @@ async fn an_undelivered_pack_on_a_survival_fails_loudly(pool: sqlx::PgPool) {
         delivered: false,
     }];
     let mut report = survived_report();
-    let err = apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    let err = apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect_err("delivered:false pack on a survival is fatal");
     assert!(err.contains("delivered:false"), "{err}");
@@ -760,7 +760,7 @@ async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
     ];
     let mut report = survived_report();
     // No error: the missing transcript is logged, not fatal.
-    apply_dropbox_artifacts(&mut report, &manifest, &pool, "pod-x")
+    apply_turn_artifacts(&mut report, &manifest, &pool, "pod-x")
         .await
         .expect("transcript problem is best-effort");
     assert_eq!(report.pack_tgz.as_deref(), Some(&pack[..]));
@@ -774,7 +774,7 @@ async fn a_transcript_problem_is_best_effort_not_fatal(pool: sqlx::PgPool) {
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
 async fn an_empty_manifest_leaves_the_report_untouched(pool: sqlx::PgPool) {
     let mut report = survived_report();
-    apply_dropbox_artifacts(&mut report, &[], &pool, "pod-x")
+    apply_turn_artifacts(&mut report, &[], &pool, "pod-x")
         .await
         .expect("no-op");
     assert!(report.pack_tgz.is_none());
@@ -2881,8 +2881,9 @@ impl WrapperRecorder {
 
 #[async_trait::async_trait]
 impl PodDispatcher for WrapperRecorder {
-    async fn create(&self, _cluster: &str, _ns: &str, pod: Pod) -> Result<Pod> {
+    async fn create(&self, _cluster: &str, _ns: &str, mut pod: Pod) -> Result<Pod> {
         self.pods.lock().expect("lock").push(pod.clone());
+        pod.metadata.uid = Some("recorded-pod-uid".to_string());
         Ok(pod)
     }
     async fn await_terminal(
@@ -2993,6 +2994,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
             max_cost: 3.5,
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
+            rerun: None,
         },
         None,
     )
@@ -3255,6 +3257,7 @@ async fn a_resolved_provider_reaches_the_loop_wrapper(pool: sqlx::PgPool) -> Res
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -3329,6 +3332,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -3362,6 +3366,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
             max_cost: 3.5,
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::from_resolved(resolved.as_ref()),
+            rerun: None,
         },
         None,
     )
@@ -3525,6 +3530,7 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
             max_cost: 3.5,
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
+            rerun: None,
         },
         None,
     )
@@ -3553,6 +3559,125 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
     assert!(
         !wrapper.contains("--pr-repo"),
         "a launch has nothing to link a PR back to: {wrapper}"
+    );
+    Ok(())
+}
+
+/// A dispatch mints the run's token into the run's Secret, never the pod spec, and a rerun's
+/// token reads the parent it names (RFC-0004:C-RUN-EVIDENCE); the wrapper fetches that parent
+/// from the controller.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+    let text = std::fs::read_to_string(&profile)?;
+    std::fs::write(
+        &profile,
+        text.replacen(
+            "[cluster]\n",
+            "[cluster]\ningest_url = \"http://crucible-controller.ns.svc:8080\"\n",
+            1,
+        ),
+    )?;
+    let db = Db::new(pool);
+    let cfg = pod_cfg(&profile, "img");
+    let created = Arc::new(Mutex::new(Vec::new()));
+    let secrets = Arc::new(Mutex::new(Vec::new()));
+    let dispatcher = Arc::new(SpecCapturingDispatcher {
+        created: created.clone(),
+        created_cms: Arc::new(Mutex::new(Vec::new())),
+        created_secrets: secrets.clone(),
+    });
+
+    let out = dispatch_run(
+        &db,
+        &cfg,
+        dispatcher,
+        "playbook:survey:0199c0de-7c2c-71a5-8000-2",
+        "playbook_survey_0199c0de-43",
+        &materialized(crate::testing::fixtures::write_playbook_pack(
+            tmp.path(),
+            crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
+        )),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::Playbook {
+            params: vec![("topic".to_string(), "t".to_string())],
+            max_cost: 3.5,
+            max_time: crate::model::MaxTime::parse("30m").expect("duration"),
+            agent: AgentSelection::default(),
+            rerun: Some(crate::launches::model::RerunOf {
+                run: "playbook_survey_0199c0de-42".to_string(),
+                from: vec!["draft".to_string()],
+            }),
+        },
+        None,
+    )
+    .await?;
+    assert!(matches!(out, RunAdmission::Launched { .. }), "{out:?}");
+
+    let pod = created
+        .lock()
+        .expect("lock")
+        .first()
+        .cloned()
+        .expect("a pod");
+    let container = &pod.spec.as_ref().expect("spec").containers[0];
+    let env = container.env.as_ref().expect("env");
+    let token_ref = env
+        .iter()
+        .find(|e| e.name == crucible_contract::ENV_POD_TOKEN)
+        .expect("the run token env");
+    assert!(token_ref.value.is_none(), "the token never rides the spec");
+    let key_ref = token_ref
+        .value_from
+        .as_ref()
+        .and_then(|v| v.secret_key_ref.as_ref())
+        .expect("a Secret key reference");
+    let secret = secrets
+        .lock()
+        .expect("lock")
+        .first()
+        .cloned()
+        .expect("the run's Secret");
+    assert_eq!(Some(key_ref.name.as_str()), secret.metadata.name.as_deref());
+    let token = secret
+        .string_data
+        .as_ref()
+        .and_then(|d| d.get(&key_ref.key).cloned())
+        .or_else(|| {
+            secret
+                .data
+                .as_ref()
+                .and_then(|d| d.get(&key_ref.key))
+                .map(|b| String::from_utf8_lossy(&b.0).into_owned())
+        })
+        .expect("the token in the Secret");
+    let grant = crate::runs::pod_token::verify(db.pool(), &token)
+        .await
+        .expect("a live token");
+    assert_eq!(
+        grant.subject,
+        crate::runs::pod_token::Subject::Run("playbook_survey_0199c0de-43".to_string())
+    );
+    assert_eq!(
+        grant.reads_run.as_deref(),
+        Some("playbook_survey_0199c0de-42")
+    );
+
+    let wrapper = container.args.as_ref().expect("args").join("\n");
+    assert!(
+        wrapper.contains(
+            r#"--rerun-of "${CRUCIBLE_CONTROLLER_URL}/api/evidence/runs/playbook_survey_0199c0de-42" --from 'draft'"#
+        ),
+        "{wrapper}"
+    );
+    assert!(
+        env.iter()
+            .any(|e| e.name == crucible_contract::ENV_CONTROLLER_URL
+                && e.value.as_deref() == Some("http://crucible-controller.ns.svc:8080")),
+        "{env:?}"
     );
     Ok(())
 }
@@ -4921,6 +5046,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -5035,6 +5161,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
                 url: None,
                 model: "gpt-5.6-luna".to_string(),
                 key_env: key_env("CRUCIBLE_INFERENCE_KEY_AGENT"),
+                price: None,
             },
             InferenceBinding {
                 role: InferenceRole::Decision,
@@ -5042,6 +5169,7 @@ async fn the_resolved_providers_key_is_delivered_with_the_scopes_bindings(
                 url: None,
                 model: "gpt-6-luna".to_string(),
                 key_env: key_env("CRUCIBLE_INFERENCE_KEY_DECISION"),
+                price: None,
             },
         ]
     );
@@ -5095,6 +5223,7 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: None,
         },
     )
     .await?;
@@ -5164,10 +5293,13 @@ async fn a_grounded_rank_runs_under_its_resolved_provider(pool: sqlx::PgPool) ->
     Ok(())
 }
 
-/// A custom provider hands the pod where to reach it in the inference document beside the
-/// secretKeyRef that carries its key, and the harness flag its protocol decides.
+/// A custom provider hands the pod where to reach it and what its tokens cost in the inference
+/// document beside the secretKeyRef that carries its key, and the harness flag its protocol
+/// decides.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPool) -> Result<()> {
+async fn a_custom_provider_delivers_its_endpoint_and_price_beside_its_key(
+    pool: sqlx::PgPool,
+) -> Result<()> {
     let _g = crate::ENV_LOCK.lock().await;
     let tmp = tempfile::tempdir()?;
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
@@ -5175,6 +5307,13 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
     let endpoint = crate::playbooks::providers::Endpoint {
         url: "http://vllm.internal:8000/v1".to_string(),
         protocol: crate::playbooks::providers::InferenceProtocol::Responses,
+    };
+    let usd = |v| crucible_contract::inference::UsdPerMtok::new(v).expect("a price");
+    let price = crucible_contract::inference::TokenPrice {
+        input: usd(0.6),
+        output: usd(2.2),
+        cache_read: usd(0.11),
+        cache_write: usd(0.6),
     };
     crate::playbooks::providers::upsert(
         &pool,
@@ -5194,6 +5333,7 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
             harness: None,
             enabled: true,
             created_by: "alice",
+            price: Some(price),
         },
     )
     .await?;
@@ -5267,6 +5407,7 @@ async fn a_custom_provider_delivers_its_endpoint_beside_its_key(pool: sqlx::PgPo
             url: Some("http://vllm.internal:8000/v1".to_string()),
             model: "gpt-oss-120b".to_string(),
             key_env: Some(EnvName::new("CRUCIBLE_INFERENCE_KEY_AGENT").expect("a name")),
+            price: Some(price),
         }]
     );
     assert!(var("OPENAI_BASE_URL").is_none() && var("OPENAI_API_KEY").is_none());
@@ -5333,6 +5474,7 @@ async fn a_provider_key_the_dispatch_cannot_resolve_refuses_the_run(
         created_by: "alice".to_string(),
         created_at: String::new(),
         updated_at: String::new(),
+        price: None,
     };
     // Registered, but its credentials map also sets the variable the scope's own binding holds.
     crate::testing::register_inference_key(&pool, "user:platform-admin", "pr_token").await?;
@@ -6350,10 +6492,12 @@ async fn a_profile_without_a_sandbox_namespace_runs_its_gateway_in_the_loop_pod(
     assert!(
         events.iter().all(|e| matches!(
             e,
-            GatewayEvent::Pod { namespace, .. } | GatewayEvent::ConfigMap { namespace }
+            GatewayEvent::Pod { namespace, .. }
+                | GatewayEvent::Secret { namespace, .. }
+                | GatewayEvent::ConfigMap { namespace }
                 if namespace == "autoresearch"
         )),
-        "{events:?}"
+        "the loop pod, its run Secret and its pack, all in the loop namespace: {events:?}"
     );
     let loop_pod = events
         .iter()

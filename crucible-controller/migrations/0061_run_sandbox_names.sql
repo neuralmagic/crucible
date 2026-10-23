@@ -1,4 +1,4 @@
--- 0057_run_sandbox_names.sql — each bound sandbox's OpenShell name, read from the cluster's Sandbox
+-- 0061_run_sandbox_names.sql — each bound sandbox's OpenShell name, read from the cluster's Sandbox
 -- resource by id (never taken from the binder), and the workspace path inside it. Both reach agent
 -- tokens as the `sandbox` and `workdir` claims. A name belongs to one bound sandbox at a time.
 ALTER TABLE run_sandboxes ADD COLUMN sandbox_name TEXT;

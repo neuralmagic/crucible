@@ -175,7 +175,7 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
 /// worker may not park on it. The caller records the run row, then hands the child to
 /// [`supervise`]. `None` is the concurrency cap declining the launch, the same bound a work-pod
 /// dispatch is held to.
-pub async fn start(
+pub(crate) async fn start(
     db: &Db,
     cfg: &ControllerCfg,
     issue_key: &str,
@@ -212,7 +212,22 @@ pub async fn start(
         .context("writing the run's inputs over its pack")?;
 
     let bin = crate::runs::engine::resolve_bin();
-    let argv = run_argv(&pack.join("crucible.toml"), &opts);
+    let mut argv = run_argv(&pack.join("crucible.toml"), &opts);
+    if let RunRenderOpts::Playbook {
+        rerun: Some(rerun), ..
+    } = &opts
+    {
+        let parent = dir.join("parent");
+        crate::runs::rerun::materialize_parent(db, cfg.scratch_root(), &rerun.run, &parent)
+            .await
+            .with_context(|| format!("laying out the evidence of {} for its rerun", rerun.run))?;
+        argv.push("--rerun-of".to_string());
+        argv.push(parent.to_string_lossy().into_owned());
+        for task in &rerun.from {
+            argv.push("--from".to_string());
+            argv.push(task.clone());
+        }
+    }
     let deadline = match &opts {
         RunRenderOpts::Playbook { max_time, .. } => {
             Duration::from_secs(max_time.secs()) + CEILING_SLACK
@@ -230,6 +245,11 @@ pub async fn start(
     env.push((
         "FORGE_STORAGE_ROOT".to_string(),
         forge_root(&dir).to_string_lossy().into_owned(),
+    ));
+    env.retain(|(name, _)| name != crucible_contract::ENV_RUN_NAME);
+    env.push((
+        crucible_contract::ENV_RUN_NAME.to_string(),
+        run_id.to_string(),
     ));
     let child = tokio::process::Command::new(&bin)
         .args(&argv)
@@ -321,11 +341,16 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
         settle_no_session(&db, &key, &run_id, detail).await;
         return;
     }
-    if let Err(e) =
-        crate::runs::completion::complete_run(&db, &key, None, &run_id, None, &session, None).await
-    {
+    if let Err(e) = complete(&db, &key, &run_id, &session).await {
         tracing::warn!(%key, %run_id, error = %format!("{e:#}"), "ingesting a local run failed");
     }
+}
+
+/// Store the session a local run published as its artifact, as the pod path does, then fold it.
+async fn complete(db: &Db, key: &str, run_id: &str, session: &str) -> Result<()> {
+    crate::runs::blob_store::put_run_session(db.pool(), run_id, session.as_bytes()).await?;
+    crate::runs::completion::complete_run(db, key, None, run_id, None, session, None).await?;
+    Ok(())
 }
 
 /// Stamp a local run that published no session terminal, and park its launch. The run row settles
@@ -375,10 +400,7 @@ pub async fn adopt_orphans(db: &Db, cfg: &ControllerCfg) -> Result<()> {
             continue;
         }
         tracing::info!(%key, %run_id, "adopting a local run orphaned by a restart");
-        if let Err(e) =
-            crate::runs::completion::complete_run(db, &key, None, &run_id, None, &session, None)
-                .await
-        {
+        if let Err(e) = complete(db, &key, &run_id, &session).await {
             tracing::warn!(%key, %run_id, error = %format!("{e:#}"), "adopting an orphaned local run failed");
         }
     }
@@ -566,6 +588,7 @@ mod tests {
             max_cost: 1.0,
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
         };
         assert_eq!(playbook.tracker_item("playbook:fences:0199"), None);
         let looped = RunRenderOpts::Loop {
@@ -590,6 +613,7 @@ mod tests {
             max_cost: 4.5,
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
         };
         assert_eq!(
             run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts),
@@ -622,6 +646,7 @@ mod tests {
                 harness: Some(crucible::manifest::Harness::Codex),
                 model: Some("gpt-5.6-luna".to_string()),
             },
+            rerun: None,
         };
         let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
         assert_eq!(

@@ -1,32 +1,40 @@
 # Authentication
 
-Three kinds of caller reach the controller, each on its own credential:
+Three kinds of callers use the controller. Each kind has its own credential:
 
 | Caller | Credential | Reaches |
 | --- | --- | --- |
-| A person in the browser | a session the controller minted after an OIDC login | the UI and `/api` |
-| A person's tools (crux, an MCP client) | an API key (`crk_...`) minted on the Settings page | `/api` and `/mcp` |
-| A deployment's automation (CD, sidecars) | the static `CONTROLLER_API_TOKEN` | `/api` only |
+| A person in the browser | a session that the controller creates after an OIDC login | the UI and `/api` |
+| The tools of a person (crux, an MCP client) | an API key (`crk_...`) from the Settings page | `/api` and `/mcp` |
+| The automation of a deployment (CD, sidecars) | the static `CONTROLLER_API_TOKEN` | `/api` only |
 
-Authorization is separate from all three: who may do what is decided by teams, ownership and
-the policy set ([RFC-0003](./rfc/RFC-0003.md)), from the login and groups the credential
-carries. Four lists bootstrap that on a fresh deployment: `CONTROLLER_ADMINS` (logins that
-administer the platform), `CONTROLLER_OPERATORS` (logins that may operate),
-`CONTROLLER_OPERATOR_GROUPS` (IdP groups whose members may operate) and `CONTROLLER_PUBLISHERS`
-(logins that may publish drafts they own without review). They seed the `platform-administrators`,
-`platform-operators` and `playbook-publishers` teams while those teams reach nobody, and a login on
-the admin or operator list holds that team membership on every request whether or not the team
-lists it. Membership added in the UI counts the same: an owner of `platform-administrators` is an
-admin and any other member of it or of `platform-operators` an operator, for the admin- and
-operator-gated routes and for the `role` that `/api/whoami` reports.
+Authorization is separate from the credential. Teams, ownership, and the policy set
+([RFC-0003](./rfc/RFC-0003.md)) decide what each caller can do, from the login and groups in
+the credential. On a new deployment, four lists set the first members:
+
+- `CONTROLLER_ADMINS`: logins that administer the platform;
+- `CONTROLLER_OPERATORS`: logins that can operate;
+- `CONTROLLER_OPERATOR_GROUPS`: IdP groups whose members can operate;
+- `CONTROLLER_PUBLISHERS`: logins that can publish their own drafts without review.
+
+These lists seed the `platform-administrators`, `platform-operators`, and
+`playbook-publishers` teams while those teams have no members. A login on the admin or
+operator list has that team membership on every request, also if the team does not list it.
+Membership that you add in the UI has the same effect. An owner of `platform-administrators`
+is an admin. Any other member of `platform-administrators` or `platform-operators` is an
+operator. This applies to the routes that need admin or operator, and to the `role` that
+`/api/whoami` reports.
+
+Each team has a workspace at `/teams/<slug>`. Each list has a team path (for example
+`/teams/<slug>/secrets`) that shows only the resources of that team.
 
 ### Opening a deployment to an organization
 
-A signed-in user who is in no team reads and launches playbooks and providers owned by
-`team:platform-administrators`, dispatches to its targets, and owns whatever they create. To give
-one organization more than that without opening it to every login the issuer accepts, make a team
-whose members come from a rule, then give that team the shared resources (the Teams page does
-the first call):
+A signed-in user who is in no team can read and launch the playbooks and providers that
+`team:platform-administrators` owns, and dispatch to its targets. The user owns all resources
+that they create. To give one organization more access, without giving it to every login
+that the issuer accepts, create a team whose members come from a rule. Then give the shared
+resources to that team. The Teams page makes the first call:
 
 ```text
 POST /api/teams {"slug": "my-org", "display_name": "My org",
@@ -36,50 +44,53 @@ PUT /api/playbooks/<id>/owner {"owner": "team:my-org"}
 PUT /api/providers/<id>/owner {"owner": "team:my-org"}
 ```
 
-Members read, launch and dispatch what the team owns; maintainers and owners also edit it. A
-provider spends its key on every dispatch, so whoever may pick it spends that key: move a
-provider to a team only when the whole team should. `email-domain:<domain>` rules match only in
-native mode, where the controller records each login's email.
+Members can read, launch, and dispatch what the team owns. Maintainers and owners can also
+edit it. A provider uses its key on every dispatch, so each user who can select the provider
+spends with that key. Move a provider to a team only if the whole team must use it.
+`email-domain:<domain>` rules match only in native mode, where the controller records the
+email of each login.
 
 ### The autoresearch lane
 
-On a deployment that runs autoresearch (`CONTROLLER_AUTORESEARCH=true`), the lane's pages and
-routes (issues, inbox, turns, builds, repos, explore, the autopilot switch) are shown only to
-callers entitled to it; everyone else gets a 404 and a navigation without them. The entitlement is
-`read` on the lane, which the `autoresearch` team owns: its members hold it, platform
-administrators hold everything, and a policy set may grant it to anyone else. The controller
-seeds the team with `platform-operators` nested in it; add a group rule or a person to the team to
-give them the lane. `/api/whoami` reports what the caller holds under `entitlements`.
+On a deployment that runs autoresearch (`CONTROLLER_AUTORESEARCH=true`), only entitled
+callers see the pages and routes of the lane (issues, inbox, turns, builds, repos, explore,
+the autopilot switch). Other callers get a 404, and their navigation does not show these
+pages. The entitlement is `read` on the lane, which the `autoresearch` team owns. Its members
+have the entitlement, platform administrators have all entitlements, and a policy set can give
+it to other users. The controller seeds the team with `platform-operators` as a nested team.
+To give a person access to the lane, add a group rule or the person to the team.
+`/api/whoami` reports the entitlements of the caller under `entitlements`.
 
 ### Viewing as another user
 
 A platform administrator (`platform:impersonate`) can view the controller as any user who has
-signed in, from the user's row on a team page. The browser session then resolves as that user,
-with the groups their last sign-in stamped, for an hour or until stopped. It is read-only: every
-write except `DELETE /api/impersonation` is refused. Starting and stopping land in the event log
-under the administrator's login. API keys and bearer tokens never carry a view.
+signed in, from the row of the user on a team page. The browser session then uses the identity
+of that user, with the groups from their last sign-in, for one hour or until the administrator
+stops it. The view is read-only. The controller rejects every write except
+`DELETE /api/impersonation`. The event log records the start and the stop under the login of
+the administrator. API keys and bearer tokens cannot use a view.
 
 ## The controller as the OIDC relying party
 
-With `CONTROLLER_AUTH_MODE=native` the controller owns `/auth/login`, `/auth/callback` and
-`/auth/logout`, runs the authorization-code flow with PKCE against the issuer, validates the ID
-token against the issuer's JWKS, and mints its own server-side session (a cookie id, rows in
-Postgres). No proxy sits in front, and no identity header is read on any path.
+With `CONTROLLER_AUTH_MODE=native`, the controller serves `/auth/login`, `/auth/callback`,
+and `/auth/logout`. It runs the authorization-code flow with PKCE against the issuer,
+validates the ID token against the JWKS of the issuer, and creates its own server-side
+session (a cookie id and rows in Postgres). There is no proxy in front, and the controller
+reads no identity header on any path.
 
 | Variable | Meaning |
 | --- | --- |
 | `CONTROLLER_AUTH_MODE` | `native` |
-| `CONTROLLER_OIDC_ISSUER` | The issuer URL; discovery is read from `<issuer>/.well-known/openid-configuration`. |
+| `CONTROLLER_OIDC_ISSUER` | The issuer URL. The controller reads discovery from `<issuer>/.well-known/openid-configuration`. |
 | `CONTROLLER_OIDC_CLIENT_ID`, `CONTROLLER_OIDC_CLIENT_SECRET` | The confidential client registered on the issuer. |
-| `CONTROLLER_OIDC_REDIRECT_URL` | A callback URL on this controller's host, registered on the client. The controller answers at that path and at `/auth/callback`. |
-| `CONTROLLER_OIDC_SCOPES` | Default `openid,email,profile,offline_access`. Never add `groups`: the claim comes from a client mapper, not a scope, and an unregistered scope fails every login. |
-| `CONTROLLER_OIDC_POST_LOGOUT_REDIRECT` | Where RP-initiated logout lands the browser. |
-| `CONTROLLER_SESSION_SECURE` | `true` behind TLS: the cookie is `Secure` and `SameSite=Lax`. |
+| `CONTROLLER_OIDC_REDIRECT_URL` | A callback URL on the host of this controller, registered on the client. The controller answers at that path and at `/auth/callback`. |
+| `CONTROLLER_OIDC_SCOPES` | Default `openid,email,profile,offline_access`. Do not add `groups`. The claim comes from a client mapper, not a scope, and an unregistered scope makes every login fail. |
+| `CONTROLLER_OIDC_POST_LOGOUT_REDIRECT` | The page that the browser opens after RP-initiated logout. |
+| `CONTROLLER_SESSION_SECURE` | Set `true` behind TLS. The cookie is then `Secure` and `SameSite=Lax`. |
 
-The session carries the login, the email and the `groups` claim as the issuer asserted them.
-Groups are what team membership rules match on, so an issuer that emits no `groups` claim
-grants nobody anything through groups. That is fail-closed and silent; prove it before
-switching modes:
+The session holds the login, the email, and the `groups` claim from the issuer. Team
+membership rules match on groups. If the issuer emits no `groups` claim, no user gets access
+through groups, and there is no error. Test the claim before you change the mode:
 
 ```sh
 CONTROLLER_OIDC_ISSUER=https://sso.example.com/realms/crucible \
@@ -88,49 +99,51 @@ CONTROLLER_OIDC_CLIENT_SECRET=... \
 crucible-controller oidc-claims
 ```
 
-`oidc-claims` runs a one-shot login and prints every claim the issuer hands this client. A
-`groups` array with the paths you expect is the pass condition. After the switch,
-`GET /api/whoami` in a browser reports `"mode": "native"`, the login, and non-empty groups.
+`oidc-claims` runs one login and prints every claim that the issuer gives this client. The
+test passes if the output has a `groups` array with the expected paths. After the change,
+`GET /api/whoami` in a browser reports `"mode": "native"`, the login, and a list of groups
+that is not empty.
 
 ### Offline credentials for scheduled work
 
-A scheduled launch fires with no session, and a launch under a team's secret needs the owner's
-live group membership. With `CONTROLLER_CREDENTIAL_KEY` (or `CONTROLLER_CREDENTIAL_KEY_FILE`)
-set to a base64 AES-256 key, the callback seals each user's offline refresh token under it,
-and a schedule refreshes its owner's groups at fire time through that credential. Without a
-key nothing is stored and a schedule runs on the group snapshot its last save took, parking
-once that snapshot ages past `CONTROLLER_SCHEDULE_OWNER_TTL_SECS`.
+A scheduled launch has no session, and a launch that uses a team secret needs the current
+group membership of the owner. Set `CONTROLLER_CREDENTIAL_KEY` (or
+`CONTROLLER_CREDENTIAL_KEY_FILE`) to a base64 AES-256 key. The callback then seals the offline
+refresh token of each user with that key, and a schedule uses that credential to refresh the
+groups of its owner when it fires. Without a key, the controller stores nothing. A schedule
+then uses the group snapshot from its last save, and it parks when the snapshot is older than
+`CONTROLLER_SCHEDULE_OWNER_TTL_SECS`.
 
-Three things line up, two of them on the issuer:
+Three conditions are necessary. Two of them are on the issuer:
 
-1. `offline_access` in `CONTROLLER_OIDC_SCOPES`.
-2. The issuer granting `offline_access` to the client and to the user.
-3. Refresh-token reuse allowed on the client. Two schedules of one owner can fire in one sweep;
-   the controller serializes their refreshes per subject, but an issuer that revokes on any reuse
-   kills the credential on an overlap it cannot see.
+1. `offline_access` is in `CONTROLLER_OIDC_SCOPES`.
+2. The issuer grants `offline_access` to the client and to the user.
+3. The client allows refresh-token reuse. Two schedules of one owner can fire in one sweep.
+   The controller runs their refreshes one at a time for each subject, but an issuer that
+   revokes on any reuse can revoke the credential when two refreshes overlap.
 
-Rotate by putting the new key on the first line and keeping the old one below it: the first line
-seals, every line decrypts. `CONTROLLER_SESSION_GROUP_REFRESH_MINUTES` bounds how stale a live
-session's groups may get before the next request re-reads them; a refusal from the issuer
-downgrades the session to viewer until the user signs in again. Users revoke their own credential
-from Settings.
+To rotate the key, put the new key on the first line and keep the old key below it. The first
+line seals, and every line decrypts. `CONTROLLER_SESSION_GROUP_REFRESH_MINUTES` sets the
+maximum age of the groups of a live session before the next request reads them again. If the
+issuer refuses, the session becomes a viewer until the user signs in again. Users revoke their
+own credential on the Settings page.
 
 ## Keycloak
 
-A confidential client with the authorization-code flow and a group-membership mapper. The
-realm the controller's own test suite runs against is at
-`crucible-controller/tests/keycloak/crucible-realm.json` and imports as-is with
-`start-dev --import-realm`; it is the reference for the settings below.
+Use a confidential client with the authorization-code flow and a group-membership mapper.
+The test suite of the controller uses the realm in
+`crucible-controller/tests/keycloak/crucible-realm.json`. It imports without changes with
+`start-dev --import-realm`. It is the reference for the settings below.
 
 1. **Client** `crucible-controller`: confidential, Standard flow on, valid redirect URI
    `https://<host>/auth/callback` (plus the exact `CONTROLLER_OIDC_REDIRECT_URL` if it differs).
-2. **Group mapper** on that client: mapper type *Group Membership*, token claim name `groups`,
-   full group path on, added to the ID token and the userinfo endpoint. The controller reads
-   groups as paths (`/platform-devs`), which is what team rules and `CONTROLLER_OPERATOR_GROUPS`
-   match against.
-3. **Offline access**, if schedules will run under team secrets: the realm's `offline_access`
-   role assigned to the users (or to the default roles), refresh-token reuse allowed on the client
-   (Revoke Refresh Token off, or Refresh Token Max Reuse at least 1).
+2. **Group mapper** on that client: mapper type *Group Membership*, token claim name
+   `groups`, full group path on, added to the ID token and the userinfo endpoint. The
+   controller reads groups as paths (`/platform-devs`). Team rules and
+   `CONTROLLER_OPERATOR_GROUPS` match against these paths.
+3. **Offline access**, if schedules run with team secrets: assign the `offline_access` role
+   of the realm to the users (or to the default roles), and allow refresh-token reuse on the
+   client (Revoke Refresh Token off, or Refresh Token Max Reuse at least 1).
 
 With the reference realm running locally:
 
@@ -151,9 +164,9 @@ export CONTROLLER_OIDC_REDIRECT_URL=http://127.0.0.1:8080/auth/callback
 
 ## Dex
 
-Dex emits `groups` as a top-level claim whenever the upstream connector supplies groups, so no
-mapper is needed. The controller matches the strings Dex emits verbatim, which for most
-connectors are bare names (`platform-devs`) rather than paths; use the same spelling in
+Dex emits `groups` as a top-level claim when the upstream connector supplies groups, so you
+do not need a mapper. The controller matches the exact strings that Dex emits. For most
+connectors, these are bare names (`platform-devs`), not paths. Use the same names in
 `CONTROLLER_OPERATOR_GROUPS` and in team rules.
 
 A static client:
@@ -182,34 +195,35 @@ connectors:
             - platform-devs
 ```
 
-Dex issues refresh tokens when `offline_access` is requested and the connector supports it
-(GitHub, LDAP, OIDC upstreams do); `oidc-claims` shows whether `groups` arrives with the shape
-you expect before you point the controller at it.
+Dex issues refresh tokens if the client requests `offline_access` and the connector supports
+it (GitHub, LDAP, and OIDC upstreams do). Before you point the controller at Dex, use
+`oidc-claims` to check that `groups` has the expected format.
 
 ## Behind a proxy instead
 
-`CONTROLLER_AUTH_MODE=proxy` is the other model: an OIDC proxy in front runs the login and
-asserts the result upstream in `X-Auth-Request-User`, `X-Auth-Request-Email` and
-`X-Auth-Request-Groups`. The controller trusts those three headers only on requests that carry
-the proxy's own bearer in `CONTROLLER_PROXY_TOKEN`, drops them everywhere else, and refuses a
-request that carries the static API token together with any of them. The proxy token must not
-be the API token: sharing one would let every API-token holder name any user and any group.
+With `CONTROLLER_AUTH_MODE=proxy`, an OIDC proxy in front of the controller runs the login. It
+sends the result in `X-Auth-Request-User`, `X-Auth-Request-Email`, and
+`X-Auth-Request-Groups`. The controller trusts these three headers only on requests that
+carry the proxy bearer token from `CONTROLLER_PROXY_TOKEN`. It removes them from all other
+requests. It rejects a request that has the static API token and any of these headers. The
+proxy token must be different from the API token. If they were the same, every holder of the
+API token could claim any user and any group.
 
-Native mode is the one to build on. Proxy mode exists so a deployment can flip and flip back;
-flipping native to proxy flushes every native session.
+Use native mode for new deployments. Proxy mode lets a deployment change modes and change
+back. A change from native to proxy deletes all native sessions.
 
 ## API keys
 
-The Settings page mints `crk_<id>_<secret>` keys. The controller stores only the secret's
-SHA-256, so a lost key is re-minted, not recovered; keys default to 90 days and can be revoked
-on the same page. A key carries its owner's login and the groups their last browser sign-in
-recorded, so it is never more powerful than the person and never fresher than their last login.
-Minting and revoking refuse a caller who authenticated with a key, so a key can neither mint its
-successor nor outlive its own revocation.
+The Settings page creates `crk_<id>_<secret>` keys. The controller stores only the SHA-256
+of the secret, so you cannot recover a lost key. Create a new one. By default, keys expire
+after 90 days. You can revoke a key on the same page. A key has the login of its owner and the
+groups from their last browser sign-in. A key never has more access than its owner, and its
+groups are never newer than the last login. A caller that authenticated with a key cannot
+create or revoke keys. A key cannot create a replacement key or stay valid after revocation.
 
-Every refusal on the bearer path names what to do next: no header, not a key, not this
-controller's key, expired, or revoked. `crux whoami` answering `credential: bearer (anonymous)`
-means the string in the header does not start with `crk_`.
+Each rejection on the bearer path tells the cause: no header, not a key, a key of a different
+controller, expired, or revoked. If `crux whoami` answers `credential: bearer (anonymous)`,
+the string in the header does not start with `crk_`.
 
 ## Cluster identities
 

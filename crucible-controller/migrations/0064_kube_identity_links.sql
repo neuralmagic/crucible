@@ -1,4 +1,4 @@
--- 0060_kube_identity_links.sql — the Kubernetes username each person acts as on each cluster,
+-- 0064_kube_identity_links.sql — the Kubernetes username each person acts as on each cluster,
 -- minted into people's access tokens as `kube_user` for MCP servers on that cluster. `kube_user` is
 -- only ever the cluster's own TokenReview answer for a token the person presented; the token itself
 -- is never stored.

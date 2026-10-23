@@ -486,7 +486,7 @@ fn drive_loop(
             }
         }
     };
-    crate::report::ingest_client::deliver_run_evidence(&p);
+    crate::report::evidence_client::deliver_run_evidence(&p);
     // Explicit because this path ends in `process::exit`, which runs no destructors: the beat
     // thread holds a clone of the run span, so a live beat would keep it open past the flush below.
     drop(heartbeat);

@@ -1,15 +1,13 @@
-//! Which run each sandbox belongs to. Only a run pod, authenticated by its own pod-bound token,
+//! Which run each sandbox belongs to. Only a run's pod, authenticated by the run's pod token,
 //! binds a sandbox, and only to its own run; the token endpoint trusts nothing else.
 
 use crate::agent_auth::AgentAuth;
 use crate::agent_auth::directory::DirectoryError;
-use crate::runs::ingest_auth::{IngestValidator, PodAuth};
-use crate::runs::ingest_drop::IngestState;
 use crate::runs::workpod::WorkPodState;
 use axum::Json;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{FromRef, State};
-use axum::http::StatusCode;
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use crucible_contract::sandbox::SandboxBinding;
 use sqlx::PgPool;
@@ -126,12 +124,12 @@ impl Binding {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BindError {
+    #[error("run {0} has no pod to bind a sandbox for")]
+    UnknownRun(String),
     #[error("pod {0} has no work-pod row")]
     UnknownPod(String),
     #[error("pod {pod} is {}; only a running pod binds sandboxes", state.as_str())]
     NotRunning { pod: String, state: WorkPodState },
-    #[error("pod {0} has no run to bind a sandbox to")]
-    NoRun(String),
     #[error("sandbox {sandbox} is already bound to pod {holder}")]
     Taken { sandbox: SandboxId, holder: String },
     #[error("sandbox name {name} is already bound to pod {holder}")]
@@ -150,24 +148,43 @@ impl From<sqlx::Error> for BindError {
 /// and workdir, and a name the same pod bound to an earlier sandbox moves to this one, as does a
 /// name a finished run's pod held. A sandbox bound by another pod, or a name another running pod
 /// on the same cluster holds, is refused. Returns the run id.
-pub async fn bind(pool: &PgPool, pod: &str, binding: &Binding) -> Result<String, BindError> {
-    let sandbox = &binding.id;
-    let row = crate::runs::work_pods::get_work_pod(pool, pod)
+/// A run and the running pod it executes in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunPod {
+    pub run_id: String,
+    pub pod: String,
+    pub cluster: String,
+}
+
+/// The running pod `run_id` executes in, the only pod that binds sandboxes to it.
+pub async fn run_pod(pool: &PgPool, run_id: &str) -> Result<RunPod, BindError> {
+    let pod: String =
+        sqlx::query_scalar::<_, Option<String>>("SELECT pod FROM runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_optional(pool)
+            .await?
+            .flatten()
+            .ok_or_else(|| BindError::UnknownRun(run_id.to_string()))?;
+    let row = crate::runs::work_pods::get_work_pod(pool, &pod)
         .await
         .map_err(BindError::Db)?
-        .ok_or_else(|| BindError::UnknownPod(pod.to_string()))?;
+        .ok_or_else(|| BindError::UnknownPod(pod.clone()))?;
     if row.state != WorkPodState::Running {
         return Err(BindError::NotRunning {
-            pod: pod.to_string(),
+            pod,
             state: row.state,
         });
     }
-    let run_id: String =
-        sqlx::query_scalar("SELECT run_id FROM runs WHERE pod = $1 ORDER BY seq DESC LIMIT 1")
-            .bind(pod)
-            .fetch_optional(pool)
-            .await?
-            .ok_or_else(|| BindError::NoRun(pod.to_string()))?;
+    Ok(RunPod {
+        run_id: run_id.to_string(),
+        pod,
+        cluster: row.cluster,
+    })
+}
+
+pub async fn bind(pool: &PgPool, run: &RunPod, binding: &Binding) -> Result<(), BindError> {
+    let sandbox = &binding.id;
+    let (run_id, pod) = (&run.run_id, &run.pod);
     let mut tx = pool.begin().await?;
     let named: Vec<(String, String, bool)> = sqlx::query_as(
         "SELECT rs.sandbox_id, rs.pod_name, COALESCE(wp.state = 'running', false)
@@ -179,11 +196,11 @@ pub async fn bind(pool: &PgPool, pod: &str, binding: &Binding) -> Result<String,
     )
     .bind(&binding.name)
     .bind(sandbox.as_str())
-    .bind(&row.cluster)
+    .bind(&run.cluster)
     .fetch_all(&mut *tx)
     .await?;
     for (other, holder, live) in named {
-        if live && holder != pod {
+        if live && &holder != pod {
             return Err(BindError::NameTaken {
                 name: binding.name.clone(),
                 holder,
@@ -208,14 +225,14 @@ pub async fn bind(pool: &PgPool, pod: &str, binding: &Binding) -> Result<String,
     .bind(sandbox.as_str())
     .bind(&binding.name)
     .bind(binding.workdir.as_deref())
-    .bind(&run_id)
+    .bind(run_id)
     .bind(pod)
     .bind(crate::clock::now_rfc3339())
     .fetch_optional(&mut *tx)
     .await?;
     if bound.is_some() {
         tx.commit().await?;
-        return Ok(run_id);
+        return Ok(());
     }
     let holder: String =
         sqlx::query_scalar("SELECT pod_name FROM run_sandboxes WHERE sandbox_id = $1")
@@ -293,20 +310,14 @@ pub async fn resolve(pool: &PgPool, sandbox: &SandboxId) -> Result<BoundRun, Res
 /// live.
 #[derive(Clone)]
 pub(crate) struct BindState {
-    pub(crate) ingest: IngestState,
+    pub(crate) db: crate::Db,
     pub(crate) agent: Arc<AgentAuth>,
-}
-
-impl FromRef<BindState> for Arc<IngestValidator> {
-    fn from_ref(state: &BindState) -> Self {
-        state.ingest.validator.clone()
-    }
 }
 
 pub(crate) fn router(state: BindState) -> axum::Router {
     axum::Router::new()
         .route(
-            "/api/pods/{pod}/sandboxes",
+            "/api/runs/{run_id}/sandboxes",
             axum::routing::post(bind_sandbox),
         )
         .with_state(state)
@@ -316,11 +327,39 @@ fn refuse(status: StatusCode, error: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": error.into() }))).into_response()
 }
 
+/// The refusal for a request that does not carry `run_id`'s own pod token.
+async fn refusal(pool: &PgPool, headers: &HeaderMap, run_id: &str) -> Option<Response> {
+    let Some(presented) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .filter(|t| crate::runs::pod_token::looks_like_token(t))
+    else {
+        return Some(refuse(
+            StatusCode::UNAUTHORIZED,
+            "only a run's pod token binds its sandboxes",
+        ));
+    };
+    match crate::runs::pod_token::verify(pool, presented).await {
+        Ok(grant) if grant.may_write_run(run_id) => None,
+        Ok(_) => Some(refuse(
+            StatusCode::FORBIDDEN,
+            "this token binds sandboxes only to its own run",
+        )),
+        Err(e) => Some(refuse(StatusCode::UNAUTHORIZED, e.to_string())),
+    }
+}
+
 async fn bind_sandbox(
-    auth: PodAuth,
     State(state): State<BindState>,
+    Path(run_id): Path<String>,
+    headers: HeaderMap,
     body: Result<Json<SandboxBinding>, JsonRejection>,
 ) -> Response {
+    let pool = state.db.pool();
+    if let Some(refusal) = refusal(pool, &headers, &run_id).await {
+        return refusal;
+    }
     let wire = match body {
         Ok(Json(wire)) => wire,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, e.body_text()),
@@ -329,21 +368,17 @@ async fn bind_sandbox(
         Ok(r) => r,
         Err(e) => return refuse(StatusCode::BAD_REQUEST, e.to_string()),
     };
-    let pool = state.ingest.db.pool();
-    let row = match crate::runs::work_pods::get_work_pod(pool, &auth.pod).await {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            return refuse(
-                StatusCode::NOT_FOUND,
-                BindError::UnknownPod(auth.pod).to_string(),
-            );
+    let run = match run_pod(pool, &run_id).await {
+        Ok(run) => run,
+        Err(e @ (BindError::UnknownRun(_) | BindError::UnknownPod(_))) => {
+            return refuse(StatusCode::NOT_FOUND, e.to_string());
+        }
+        Err(e @ BindError::NotRunning { .. }) => {
+            return refuse(StatusCode::CONFLICT, e.to_string());
         }
         Err(e) => {
-            tracing::error!(pod = %auth.pod, error = format!("{e:#}"), "sandbox bind failed");
-            return refuse(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "reading the work pod failed",
-            );
+            tracing::error!(run_id, error = format!("{e:#}"), "sandbox bind failed");
+            return refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
         }
     };
     let namespace =
@@ -354,7 +389,7 @@ async fn bind_sandbox(
     let name = match state
         .agent
         .directory
-        .sandbox_name(&row.cluster, &namespace, &request.id, &auth.pod)
+        .sandbox_name(&run.cluster, &namespace, &request.id, &run.pod)
         .await
     {
         Ok(Some(name)) => name,
@@ -368,7 +403,7 @@ async fn bind_sandbox(
             );
         }
         Err(e @ DirectoryError::Unreachable { .. }) => {
-            tracing::warn!(pod = %auth.pod, reason = %e, "sandbox bind could not reach the cluster");
+            tracing::warn!(pod = %run.pod, reason = %e, "sandbox bind could not reach the cluster");
             return refuse(StatusCode::SERVICE_UNAVAILABLE, e.to_string());
         }
         Err(e) => return refuse(StatusCode::CONFLICT, e.to_string()),
@@ -378,20 +413,20 @@ async fn bind_sandbox(
         Err(e) => return refuse(StatusCode::CONFLICT, e.to_string()),
     };
     let sandbox = &binding.id;
-    match bind(pool, &auth.pod, &binding).await {
-        Ok(run_id) => {
-            tracing::info!(pod = %auth.pod, run_id, sandbox = %sandbox, name = binding.name, "sandbox bound");
+    match bind(pool, &run, &binding).await {
+        Ok(()) => {
+            tracing::info!(pod = %run.pod, run_id, sandbox = %sandbox, name = binding.name, "sandbox bound");
             if let Err(e) = state
                 .agent
                 .directory
-                .adopt(&row.cluster, &namespace, sandbox, &auth.pod)
+                .adopt(&run.cluster, &namespace, sandbox, &run.pod)
                 .await
             {
-                tracing::warn!(pod = %auth.pod, sandbox = %sandbox, reason = %e, "the bound sandbox could not be owned by its gateway pod; teardown deletes it by label");
+                tracing::warn!(pod = %run.pod, sandbox = %sandbox, reason = %e, "the bound sandbox could not be owned by its gateway pod; teardown deletes it by label");
             }
             StatusCode::NO_CONTENT.into_response()
         }
-        Err(e @ (BindError::UnknownPod(_) | BindError::NoRun(_))) => {
+        Err(e @ (BindError::UnknownRun(_) | BindError::UnknownPod(_))) => {
             refuse(StatusCode::NOT_FOUND, e.to_string())
         }
         Err(
@@ -399,11 +434,11 @@ async fn bind_sandbox(
             | BindError::Taken { .. }
             | BindError::NameTaken { .. }),
         ) => {
-            tracing::warn!(pod = %auth.pod, sandbox = %sandbox, reason = %e, "sandbox bind refused");
+            tracing::warn!(pod = %run.pod, sandbox = %sandbox, reason = %e, "sandbox bind refused");
             refuse(StatusCode::CONFLICT, e.to_string())
         }
         Err(e @ BindError::Db(_)) => {
-            tracing::error!(pod = %auth.pod, sandbox = %sandbox, error = format!("{e:#}"), "sandbox bind failed");
+            tracing::error!(pod = %run.pod, sandbox = %sandbox, error = format!("{e:#}"), "sandbox bind failed");
             refuse(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
     }
@@ -415,15 +450,14 @@ mod tests {
     use crate::agent_auth::testing::{
         self, CLUSTER, PROFILE, Spire, binding, running_run, set_pod_state,
     };
-    use crate::runs::clusters::HUB_CLUSTER;
-    use crate::runs::ingest_auth::ExpectedServiceAccount;
-    use crate::runs::ingest_auth::test_harness::FakeClusters;
-    use k8s_openapi::api::authentication::v1::{TokenReviewStatus, UserInfo};
-    use std::collections::{BTreeMap, HashMap};
     use tower::ServiceExt;
 
     fn sandbox(id: &str) -> SandboxId {
         SandboxId::parse(id).unwrap()
+    }
+
+    async fn run(pool: &PgPool, run_id: &str) -> RunPod {
+        run_pod(pool, run_id).await.unwrap()
     }
 
     fn wire(id: &str, workdir: Option<&str>) -> SandboxBinding {
@@ -497,22 +531,16 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_bound_sandbox_resolves_to_its_running_run(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
+        let a = run(&pool, "run-a").await;
         assert_eq!(
-            bind(&pool, "crucible-run-a", &binding("sbx-1"))
-                .await
-                .unwrap(),
-            "run-a"
+            (a.pod.as_str(), a.cluster.as_str()),
+            ("crucible-run-a", CLUSTER)
         );
-        assert_eq!(
-            bind(&pool, "crucible-run-a", &binding("sbx-1"))
-                .await
-                .unwrap(),
-            "run-a",
-            "rebinding from the same pod is a no-op"
-        );
-        bind(&pool, "crucible-run-a", &binding("sbx-2"))
+        bind(&pool, &a, &binding("sbx-1")).await.unwrap();
+        bind(&pool, &a, &binding("sbx-1"))
             .await
-            .unwrap();
+            .expect("rebinding from the same pod is a no-op");
+        bind(&pool, &a, &binding("sbx-2")).await.unwrap();
         for id in ["sbx-1", "sbx-2"] {
             let run = resolve(&pool, &sandbox(id)).await.unwrap();
             assert_eq!(
@@ -538,10 +566,10 @@ mod tests {
             name: name.to_string(),
             ..binding(id)
         };
-        bind(&pool, "crucible-run-a", &named("turn-1", "ci-ws"))
+        bind(&pool, &run(&pool, "run-a").await, &named("turn-1", "ci-ws"))
             .await
             .unwrap();
-        bind(&pool, "crucible-run-a", &named("turn-2", "ci-ws"))
+        bind(&pool, &run(&pool, "run-a").await, &named("turn-2", "ci-ws"))
             .await
             .unwrap();
         assert!(
@@ -559,7 +587,7 @@ mod tests {
                 .as_deref(),
             Some("ci-ws")
         );
-        match bind(&pool, "crucible-run-b", &named("other", "ci-ws")).await {
+        match bind(&pool, &run(&pool, "run-b").await, &named("other", "ci-ws")).await {
             Err(BindError::NameTaken { name, holder }) => {
                 assert_eq!(
                     (name.as_str(), holder.as_str()),
@@ -570,7 +598,7 @@ mod tests {
         }
 
         set_pod_state(&pool, "crucible-run-a", WorkPodState::Collected).await;
-        bind(&pool, "crucible-run-b", &named("other", "ci-ws"))
+        bind(&pool, &run(&pool, "run-b").await, &named("other", "ci-ws"))
             .await
             .expect("a finished run's name is free again");
         assert_eq!(
@@ -607,7 +635,7 @@ mod tests {
         )
         .await
         .unwrap();
-        bind(&pool, "crucible-run-c", &named("there", "ci-ws"))
+        bind(&pool, &run(&pool, "run-c").await, &named("there", "ci-ws"))
             .await
             .expect("the same name on another cluster is another sandbox");
         assert_eq!(
@@ -621,10 +649,10 @@ mod tests {
     async fn a_sandbox_bound_by_one_pod_cannot_be_claimed_by_another(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         running_run(&pool, "crucible-run-b", "run-b", Some("user:bob")).await;
-        bind(&pool, "crucible-run-a", &binding("sbx-1"))
+        bind(&pool, &run(&pool, "run-a").await, &binding("sbx-1"))
             .await
             .unwrap();
-        match bind(&pool, "crucible-run-b", &binding("sbx-1")).await {
+        match bind(&pool, &run(&pool, "run-b").await, &binding("sbx-1")).await {
             Err(BindError::Taken { holder, .. }) => assert_eq!(holder, "crucible-run-a"),
             other => panic!("{other:?}"),
         }
@@ -635,36 +663,48 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn only_a_running_pod_with_a_run_binds(pool: PgPool) {
+    async fn only_a_run_with_a_running_pod_binds(pool: PgPool) {
         assert!(matches!(
-            bind(&pool, "crucible-run-ghost", &binding("sbx-1")).await,
-            Err(BindError::UnknownPod(_))
+            run_pod(&pool, "run-ghost").await,
+            Err(BindError::UnknownRun(_))
         ));
         running_run(&pool, "crucible-run-a", "run-a", None).await;
         set_pod_state(&pool, "crucible-run-a", WorkPodState::Collected).await;
         assert!(matches!(
-            bind(&pool, "crucible-run-a", &binding("sbx-1")).await,
+            run_pod(&pool, "run-a").await,
             Err(BindError::NotRunning {
                 state: WorkPodState::Collected,
                 ..
             })
         ));
-        crate::runs::work_pods::insert_work_pod(
-            &pool,
-            &crate::runs::workpod::NewWorkPod {
-                pod_name: "crucible-run-norun".into(),
-                kind: "run".into(),
-                issue_key: None,
-                state: WorkPodState::Running,
-                cost_tag: "run".into(),
-                cluster: CLUSTER.into(),
-            },
-        )
-        .await
-        .unwrap();
+        for (run_id, pod) in [
+            ("run-podless", None),
+            ("run-orphan", Some("crucible-run-gone")),
+        ] {
+            crate::runs::store::insert_run(
+                &pool,
+                &crate::NewRun {
+                    run_id: run_id.into(),
+                    scope: None,
+                    issue: None,
+                    identity_digest: None,
+                    status: "running".into(),
+                    pod: pod.map(str::to_string),
+                    session_uri: None,
+                    best_score: None,
+                    cost_usd: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
         assert!(matches!(
-            bind(&pool, "crucible-run-norun", &binding("sbx-1")).await,
-            Err(BindError::NoRun(_))
+            run_pod(&pool, "run-podless").await,
+            Err(BindError::UnknownRun(_))
+        ));
+        assert!(matches!(
+            run_pod(&pool, "run-orphan").await,
+            Err(BindError::UnknownPod(_))
         ));
     }
 
@@ -675,7 +715,7 @@ mod tests {
             Err(ResolveError::Unbound(_))
         ));
         running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
-        bind(&pool, "crucible-run-a", &binding("sbx-1"))
+        bind(&pool, &run(&pool, "run-a").await, &binding("sbx-1"))
             .await
             .unwrap();
         for ended in [
@@ -694,70 +734,42 @@ mod tests {
         }
     }
 
-    fn review_for(pod: &str) -> TokenReviewStatus {
-        TokenReviewStatus {
-            authenticated: Some(true),
-            audiences: Some(vec!["crucible-ingest".into()]),
-            error: None,
-            user: Some(UserInfo {
-                username: Some("system:serviceaccount:crucible-system:crucible-spoke".into()),
-                extra: Some(BTreeMap::from([(
-                    "authentication.kubernetes.io/pod-name".to_string(),
-                    vec![pod.to_string()],
-                )])),
-                groups: None,
-                uid: None,
-            }),
-        }
-    }
-
-    /// The bind route with the real TokenReview validator over a cluster boundary that vouches for
-    /// `token_pod`'s token, and a directory that knows `known` `(run pod, sandbox id)` pairs.
+    /// The bind route, and a directory that knows `known` `(run pod, sandbox id)` pairs.
     async fn app(
         pool: PgPool,
-        token_pod: &str,
         profile: &str,
         known: &[(&str, &str)],
     ) -> (
         axum::Router,
         Arc<crate::agent_auth::testing::StaticDirectory>,
     ) {
-        let clusters = Arc::new(FakeClusters {
-            namespaces: HashMap::from([(CLUSTER.to_string(), "crucible-system".to_string())]),
-            statuses: HashMap::from([
-                (CLUSTER.to_string(), review_for(token_pod)),
-                (HUB_CLUSTER.to_string(), review_for(token_pod)),
-            ]),
-            ..Default::default()
-        });
-        let validator = Arc::new(IngestValidator::new(
-            clusters,
-            pool.clone(),
-            "crucible-ingest",
-            ExpectedServiceAccount {
-                namespace: "autoresearch".into(),
-                name: None,
-            },
-            BTreeMap::from([(CLUSTER.to_string(), "crucible-spoke".to_string())]),
-        ));
         let spire = Spire::start().await;
         let (agent, directory) = testing::agent_auth(&pool, &spire, profile, known);
         let state = BindState {
-            ingest: IngestState {
-                db: crate::Db::new(pool),
-                validator,
-            },
+            db: crate::Db::new(pool),
             agent,
         };
         (router(state), directory)
     }
 
-    async fn post(app: axum::Router, pod: &str, body: &str) -> (StatusCode, String) {
-        let req = axum::http::Request::post(crucible_contract::sandbox::binding_path(pod))
-            .header("authorization", "Bearer pod-token")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(body.to_string()))
-            .unwrap();
+    async fn token(pool: &PgPool, subject: crate::runs::pod_token::Subject) -> String {
+        crate::runs::pod_token::mint(pool, &subject, None, std::time::Duration::from_secs(600))
+            .await
+            .unwrap()
+    }
+
+    async fn post(
+        app: axum::Router,
+        token: Option<&str>,
+        run_id: &str,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut req = axum::http::Request::post(crucible_contract::sandbox::binding_path(run_id))
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            req = req.header("authorization", format!("Bearer {token}"));
+        }
+        let req = req.body(axum::body::Body::from(body.to_string())).unwrap();
         let res = app.oneshot(req).await.unwrap();
         let status = res.status();
         let body = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
@@ -765,27 +777,38 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn the_route_binds_under_the_name_the_cluster_gives_for_the_pods_own_token(pool: PgPool) {
+    async fn the_route_binds_under_the_name_the_cluster_gives_for_the_runs_own_token(pool: PgPool) {
+        use crate::runs::pod_token::Subject;
         running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         running_run(&pool, "crucible-run-b", "run-b", Some("user:alice")).await;
         let body = serde_json::to_string(&wire("sbx-1", Some("/sandbox/repo"))).unwrap();
+        let a_token = token(&pool, Subject::Run("run-a".into())).await;
+        let b_token = token(&pool, Subject::Run("run-b".into())).await;
+        let turn_token = token(&pool, Subject::Turn("crucible-run-a".into())).await;
 
-        let (a_token, a_directory) = app(
-            pool.clone(),
-            "crucible-run-a",
-            PROFILE,
-            &[("crucible-run-a", "sbx-1")],
-        )
-        .await;
-        let (status, text) = post(a_token.clone(), "crucible-run-b", &body).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
+        let (app_a, a_directory) = app(pool.clone(), PROFILE, &[("crucible-run-a", "sbx-1")]).await;
+        for (presented, status) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some("cr_notapodtoken"), StatusCode::UNAUTHORIZED),
+            (Some("crr_unknown_secret"), StatusCode::UNAUTHORIZED),
+            (Some(b_token.as_str()), StatusCode::FORBIDDEN),
+            (Some(turn_token.as_str()), StatusCode::FORBIDDEN),
+        ] {
+            let (got, text) = post(app_a.clone(), presented, "run-a", &body).await;
+            assert_eq!(got, status, "{presented:?}: {text}");
+        }
+        assert!(resolve(&pool, &sandbox("sbx-1")).await.is_err());
 
-        let (status, text) = post(a_token.clone(), "crucible-run-a", &body).await;
+        let (status, text) = post(app_a.clone(), Some(&a_token), "run-a", &body).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
-        let run = resolve(&pool, &sandbox("sbx-1")).await.unwrap();
+        let bound = resolve(&pool, &sandbox("sbx-1")).await.unwrap();
         assert_eq!(
-            (run.run_id.as_str(), run.sandbox_name.as_deref()),
-            ("run-a", Some("ci-sbx-1")),
+            (
+                bound.run_id.as_str(),
+                bound.pod_name.as_str(),
+                bound.sandbox_name.as_deref()
+            ),
+            ("run-a", "crucible-run-a", Some("ci-sbx-1")),
             "the name came from the cluster, not the request"
         );
         assert_eq!(
@@ -794,14 +817,7 @@ mod tests {
             "the bound Sandbox is owned by run-a's gateway pod"
         );
 
-        let (b_token, _) = app(
-            pool.clone(),
-            "crucible-run-b",
-            PROFILE,
-            &[("crucible-run-a", "sbx-1")],
-        )
-        .await;
-        let (status, text) = post(b_token.clone(), "crucible-run-b", &body).await;
+        let (status, text) = post(app_a.clone(), Some(&b_token), "run-b", &body).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
@@ -810,12 +826,11 @@ mod tests {
 
         let (both, _) = app(
             pool.clone(),
-            "crucible-run-b",
             PROFILE,
             &[("crucible-run-a", "sbx-1"), ("crucible-run-b", "sbx-1")],
         )
         .await;
-        let (status, text) = post(both, "crucible-run-b", &body).await;
+        let (status, text) = post(both, Some(&b_token), "run-b", &body).await;
         assert_eq!(
             status,
             StatusCode::CONFLICT,
@@ -823,7 +838,7 @@ mod tests {
         );
 
         let unknown = serde_json::to_string(&wire("sbx-nowhere", None)).unwrap();
-        let (status, text) = post(a_token.clone(), "crucible-run-a", &unknown).await;
+        let (status, text) = post(app_a.clone(), Some(&a_token), "run-a", &unknown).await;
         assert_eq!(
             status,
             StatusCode::NOT_FOUND,
@@ -836,24 +851,28 @@ mod tests {
             r#"{"sandbox_id": "sbx-2", "workdir": "relative"}"#,
             "not json",
         ] {
-            let (status, text) = post(a_token.clone(), "crucible-run-a", bad).await;
+            let (status, text) = post(app_a.clone(), Some(&a_token), "run-a", bad).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {text}");
         }
+
+        set_pod_state(&pool, "crucible-run-a", WorkPodState::Succeeded).await;
+        let later = serde_json::to_string(&wire("sbx-1", None)).unwrap();
+        let (status, text) = post(app_a, Some(&a_token), "run-a", &later).await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "a finished pod binds nothing: {text}"
+        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn the_route_binds_nothing_without_a_declared_sandbox_namespace(pool: PgPool) {
         running_run(&pool, "crucible-run-a", "run-a", Some("user:alice")).await;
         let unplaced = PROFILE.replace("sandbox_namespace = \"sandboxes\"\n", "");
-        let (app, _) = app(
-            pool.clone(),
-            "crucible-run-a",
-            &unplaced,
-            &[("crucible-run-a", "sbx-1")],
-        )
-        .await;
+        let (app, _) = app(pool.clone(), &unplaced, &[("crucible-run-a", "sbx-1")]).await;
+        let a_token = token(&pool, crate::runs::pod_token::Subject::Run("run-a".into())).await;
         let body = serde_json::to_string(&wire("sbx-1", None)).unwrap();
-        let (status, text) = post(app, "crucible-run-a", &body).await;
+        let (status, text) = post(app, Some(&a_token), "run-a", &body).await;
         assert_eq!(status, StatusCode::CONFLICT, "{text}");
         assert!(resolve(&pool, &sandbox("sbx-1")).await.is_err());
     }

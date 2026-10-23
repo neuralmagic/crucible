@@ -1,13 +1,13 @@
 # Work graphs
 
-A **plan** is a versioned DAG of **tasks** that a deterministic executor runs. Tasks are agent
-turns, plan-authored commands, or engine-owned reducers. The executor owns advancement: a task never
-decides what runs next.
+A **plan** is a versioned DAG of **tasks** that a deterministic executor runs. A task is an
+agent turn, a command that the plan defines, or a reducer that the engine owns. The executor
+advances the plan. A task does not select the next task.
 
-Today, the engine supplies a default loop graph and a wide-tournament template, and a human or
-pack can supply TOML or JSON through the `plan` CLI. Workflow admission separates authorable
-topology from authority: an orchestrator must advertise the workflow type and engine operations
-it can safely execute.
+The engine supplies a default loop graph and a wide-tournament template. A person or a pack
+can supply a plan as TOML or JSON through the `plan` CLI. Workflow admission keeps the graph
+shape separate from authority. An orchestrator must declare each workflow type and each engine
+operation that it can execute safely.
 
 ## Running a plan
 
@@ -27,9 +27,9 @@ crucible plan run --file plan.toml --agent-cmd ./role.sh
 crucible plan run --manifest crucible.toml --harness codex --model gpt-5.6-luna
 ```
 
-`--cap <name>` (repeatable) declares what the substrate can do; see *needs* below.
+`--cap <name>` (repeatable) declares a capability of the substrate. See *needs* below.
 
-`plan run` exits nonzero when the plan does not reach a valid verdict.
+`plan run` exits with a nonzero status if the plan does not reach a valid verdict.
 
 ## File format
 
@@ -77,59 +77,62 @@ depends_on = ["measure"]
 
 | Kind | What it runs |
 | --- | --- |
-| `agent` | One agent turn. `harness` / `model` / `effort` override the manifest's `[agent]` defaults per task; `session` opts into durable continuation. |
-| `command` | A plan-authored command returning JSON on its last stdout line. |
-| `evaluate` | A measurement command. `pass = false` vetoes; paired `threshold` + `direction` grade numeric `score`. |
-| `top_k` | Engine-owned reducer: keep the `k` best inputs by their `score` field. Needs at least one dependency. |
-| `engine` | Capability-owned operation (`propose`, `apply`, `measure`, `grade`, `decide`, or `measure_diff`). Only an admitting orchestrator can execute it. |
+| `agent` | One agent turn. `harness`, `model`, and `effort` override the `[agent]` defaults of the manifest for the task. `session` enables durable continuation. |
+| `command` | A command that the plan defines. It returns JSON on its last stdout line. |
+| `evaluate` | A measurement command. `pass = false` rejects the result. A `threshold` with a `direction` grades a numeric `score`. |
+| `top_k` | A reducer that the engine owns. It keeps the `k` best inputs by their `score` field. It needs at least one dependency. |
+| `engine` | An operation that a capability owns (`propose`, `apply`, `measure`, `grade`, `decide`, or `measure_diff`). Only an orchestrator that admits it can execute it. |
 
-Serialization is not authority. A workflow may author and sequence engine nodes, but admission
-requires matching capabilities such as `workflow.autoresearch`, `engine.apply`, and
-`engine.measure`. The generic plan runner rejects them because it owns neither a `World` nor a
-frozen `Judge`.
+A workflow can declare and order engine nodes, but that does not give it authority to run
+them. Admission needs the matching capabilities, for example `workflow.autoresearch`,
+`engine.apply`, and `engine.measure`. The generic plan runner rejects engine nodes because it
+has no `World` and no frozen `Judge`.
 
-A command string is not a trust boundary by itself. If it invokes a script that must remain
+A command string alone is not a trust boundary. If a command runs a script that must stay
 trusted after an agent task edits the workspace, declare that script as a frozen
-`[[workspace.inject]]` in the manifest. The plan runner restores frozen injects in the task's
-actual workspace before every task, including isolated worktrees.
+`[[workspace.inject]]` in the manifest. Before each task, the plan runner restores frozen
+injects in the workspace of the task. This includes isolated worktrees.
 
-A logical `session` is serial state, so every pair of tasks sharing one must have a dependency
-path between them. A session task cannot use disposable worktree isolation. The private ledger keeps
-only an opaque harness cursor and completed-turn count; neither that cursor nor Claude's native
-transcript is copied into the plan or public session log. Normal streamed harness events retain
-their existing visibility. Claude Code's native transcript remains in its private local store or a
-mode-0600 engine store restored into each fresh OpenShell sandbox. Omit the field for the historical
-fresh-turn behavior.
+A logical `session` is serial state, so each pair of tasks that share a session must have a
+dependency path between them. A session task cannot use disposable worktree isolation. The
+private ledger keeps only an opaque harness cursor and the count of completed turns. The
+engine does not copy that cursor or the native Claude transcript into the plan or the public
+session log. Normal streamed harness events keep their usual visibility. The native Claude
+Code transcript stays in its private local store, or in a mode-0600 engine store that the
+engine restores into each new OpenShell sandbox. If you omit `session`, each turn starts a
+new conversation.
 
 ### Task output
 
-A task's output is JSON and becomes its dependents' input.
+The output of a task is JSON. It becomes the input of the task's dependents.
 
-- `command`: the last non-empty stdout line. Nonzero exit is a measured failure; a spawn
-  failure is a transport failure. Upstream outputs arrive as a JSON object keyed by task name,
-  in the file `CRUCIBLE_INPUTS_FILE` names, plus `CRUCIBLE_TASK`. The same JSON is also in
-  `CRUCIBLE_INPUTS` while it is at most 64 KiB; past that the variable is unset, because Linux
-  refuses an environment string over 128 KiB. Read the file.
-- `agent` under `--manifest`: the turn writes a single JSON object to `PLAN_TASK_RESULT.json`
-  in the workspace root. A missing file after a normal turn is a measured failure; an explicit
-  spawn, harness, or stream error is a transport failure and follows the retry policy.
-- `agent` under `--agent-cmd`: the stand-in receives `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
-  `CRUCIBLE_MODEL`, `CRUCIBLE_EFFORT`, and returns JSON on its last stdout line.
-- `evaluate`: requires a JSON object. `pass = false` fails and malformed `pass` fails closed.
-  Paired `threshold` and `direction` compare numeric `score` (`lower` is `<=`; `higher` is `>=`).
-  Without a threshold, a successful command passes unless `pass` is false.
+- `command`: the last non-empty stdout line. A nonzero exit status is a measured failure. A
+  spawn failure is a transport failure. Upstream outputs arrive as a JSON object keyed by task
+  name, in the file that `CRUCIBLE_INPUTS_FILE` names. `CRUCIBLE_TASK` gives the task name. The
+  same JSON is also in `CRUCIBLE_INPUTS` if it is 64 KiB or smaller. If it is larger, the
+  variable is not set, because Linux rejects an environment string larger than 128 KiB. Read
+  the file.
+- `agent` with `--manifest`: the turn writes one JSON object to `PLAN_TASK_RESULT.json` in the
+  workspace root. If the file is missing after a normal turn, this is a measured failure. An
+  explicit spawn, harness, or stream error is a transport failure and follows the retry policy.
+- `agent` with `--agent-cmd`: the stand-in gets `CRUCIBLE_PROMPT`, `CRUCIBLE_HARNESS`,
+  `CRUCIBLE_MODEL`, and `CRUCIBLE_EFFORT`. It returns JSON on its last stdout line.
+- `evaluate`: needs a JSON object. `pass = false` fails the task, and a malformed `pass` also
+  fails it. A `threshold` with a `direction` compares the numeric `score` (`lower` is `<=`,
+  `higher` is `>=`). Without a threshold, a successful command passes unless `pass` is false.
 
-`top_k` reads a finite numeric `score` from each input, so an upstream task that wants to rank
-must emit one. That contract is declarable: `emits = ["score"]` on an `agent`, `command`, or
-`evaluate` task names fields its JSON output promises to include. Validation rejects a `top_k`
-dependency, `grade` score source or tiebreak, or thresholded `evaluate` whose declared emits omits
-`score`, before anything runs; at runtime a passing attempt missing a declared field is converted
-to a measured failure at the producing task (never retried, blocks dependents), so output drift
-fails where it happened instead of downstream. An empty or absent `emits` declares nothing and is
-never checked. `top_k` and `engine` tasks cannot declare emits; their outputs are
-engine-defined.
+`top_k` reads a finite numeric `score` from each input, so an upstream task that ranks must
+emit a score. You can declare this: `emits = ["score"]` on an `agent`, `command`, or `evaluate`
+task names the fields that its JSON output must contain. Before the run starts, validation
+rejects these tasks if their declared emits do not include `score`: a `top_k` dependency, a
+`grade` score source or tiebreak, and a thresholded `evaluate`. At run time, if a passing
+attempt does not have a declared field, the engine changes it to a measured failure at the
+producing task. The engine does not retry it, and it blocks dependents. The error appears at
+the task that caused it, not downstream. An empty or absent `emits` declares nothing, and the
+engine does not check it. `top_k` and `engine` tasks cannot declare emits, because the engine
+defines their outputs.
 
-`emits` can also promise each field's type, as a dict from field name to type:
+`emits` can also declare the type of each field, as a dict from field name to type:
 
 ```python
 scan = command(
@@ -139,32 +142,35 @@ scan = command(
 )
 ```
 
-A type is `"string"`, `"integer"` (a number with no fractional part), `"number"`, `"boolean"`,
-`"list"`, `"object"`, or a list of labels, which declares a string equal to one of them. Labels
-are identifiers, like route labels. The list form keeps working and promises presence only.
+A type is `"string"`, `"integer"` (a number with no fractional part), `"number"`,
+`"boolean"`, `"list"`, `"object"`, or a list of labels. A list of labels declares a string
+that is equal to one of the labels. Labels are identifiers, as route labels are. The list form
+of `emits` is still valid, and it declares only that the field is present.
 
-At runtime a passing attempt whose field holds the wrong type, or a string outside its labels,
-is a measured failure at the producing task, the same as a missing field, and the note names
-the field, what arrived, and what was declared. A task that settled itself skipped or failed
-owes nothing.
+At run time, if a passing attempt has a field of the wrong type, or a string that is not one
+of its labels, it is a measured failure at the producing task. This is the same as a missing
+field. The note names the field, the value type that arrived, and the declared type. A task
+that settled itself as skipped or failed does not have to supply its fields.
 
-At compile time the types are checked wherever the graph reads a field, before any spend:
+At compile time, before any spend, the compiler checks the types at each place where the
+graph reads a field:
 
-- `over = scan.targets` needs a field declared `"list"`, reported at the `over` argument.
+- `over = scan.targets` needs a field declared `"list"`. The error points to the `over`
+  argument.
 - A `top_k` dependency, a `grade` score source or tiebreak, and a thresholded `evaluate` need
   `score` declared `"number"` or `"integer"`.
-- `route(source = scan, ...)` needs each question's field declared as labels the question
-  answers (its options, or `yes`/`no`, plus `uncertain`), or `"boolean"` for a `noul`. A
-  `"string"` is refused: it promises nothing about which label arrives.
+- `route(source = scan, ...)` needs the field of each question declared as labels that the
+  question answers (its options, or `yes`/`no`, plus `uncertain`), or as `"boolean"` for a
+  `noul`. The compiler rejects `"string"`, because it does not limit which label arrives.
 
-A field declared without a type (list form) or a task with no `emits` stays unchecked at compile
-time. The generated TOML carries the types as a table (`emits = { score = "number" }`) and the
+The compiler does not check a field declared without a type (list form) or a task without
+`emits`. The generated TOML holds the types as a table (`emits = { score = "number" }`). The
 `plan_admitted` event lists each field with its type.
 
 ### Schema types
 
-`schema_file(path)` reads a JSON Schema (draft 2020-12) from the pack and stands in for a type,
-in `emits` and in a dict form of `emits_files`:
+`schema_file(path)` reads a JSON Schema (draft 2020-12) from the pack. You can use it as a
+type in `emits` and in the dict form of `emits_files`:
 
 ```python
 plan = command(
@@ -175,36 +181,39 @@ plan = command(
 )
 ```
 
-The schema's content is compiled into the plan, so editing it changes the plan digest. A file
-that is not a valid 2020-12 schema, declares another `$schema`, or references a remote `$ref` is
-a compile error at the call; nothing is fetched. At runtime a passing output whose field the
-schema rejects, or a declared file that is not JSON or does not match, fails the producing task
-like a wrong type, with a note giving the first three errors as instance path and message:
-`output field "lanes" does not match its schema: /1: value is not of type "string"`. Notes never
-repeat the refused value.
+The compiler puts the schema content into the plan, so a change to the schema changes the
+plan digest. These are compile errors at the call, and the compiler fetches nothing: a file
+that is not a valid 2020-12 schema, a file that declares a different `$schema`, and a file
+that references a remote `$ref`. At run time, the producing task fails, as for a wrong type,
+in these cases: the schema rejects a field of a passing output, or a declared file is not JSON
+or does not match. The note gives the first three errors as instance path and message:
+`output field "lanes" does not match its schema: /1: value is not of type "string"`. Notes do
+not repeat the rejected value.
 
-Each consumer checks the schema exactly, reading `type`, `const`, `enum`, local `$ref`, `allOf`,
-and every branch of `anyOf`/`oneOf`, and refusing what it cannot prove:
+Each consumer checks the schema exactly. It reads `type`, `const`, `enum`, local `$ref`,
+`allOf`, and every branch of `anyOf`/`oneOf`. It rejects a schema if it cannot prove the
+requirement:
 
-- `over` needs `"type": "array"` whose `items` (and any `prefixItems`) are provably strings:
-  `"type": "string"`, or a `const`/`enum` of strings. A mapped instance is named by its item, so
-  `{"type": "array"}` with no `items`, or `"items": {"type": "integer"}`, is a compile error at the
-  `over` argument.
-- A score needs a numeric `type`, and its `const`/`enum` must hold numbers only.
-- A `route(source = ...)` question needs every value the schema bounds (`const`, `enum`, or
-  `"type": "boolean"`, which answers `yes`/`no`) to be a label the question accepts. A schema that
-  bounds nothing is refused, as `"string"` is.
+- `over` needs `"type": "array"` whose `items` (and any `prefixItems`) are strings that the
+  schema can prove: `"type": "string"`, or a `const`/`enum` of strings. The item names a mapped
+  instance. For this reason, `{"type": "array"}` without `items`, or
+  `"items": {"type": "integer"}`, is a compile error at the `over` argument.
+- A score needs a numeric `type`, and its `const`/`enum` must contain only numbers.
+- A `route(source = ...)` question needs every value that the schema limits (`const`, `enum`,
+  or `"type": "boolean"`, which answers `yes`/`no`) to be a label that the question accepts.
+  The compiler rejects a schema that limits no value, as it rejects `"string"`.
 
-When a route's source bounds a question to finitely many answers, by a label list, `"boolean"`, or
-a schema, a `when` naming a label the source can never give is a compile error ("can never be
-answered"), such a label needs no task, and `otherwise` covers only the labels it can give. A schema
-with no single top-level type satisfies no consumer. On the wire a schema is its JSON text (`{ schema = "..." }` in the TOML,
-`{ path = "RESULT.json", schema = "..." }` for a file), since TOML cannot hold the nulls schemas
-often carry.
+A route source can limit a question to a finite set of answers, with a label list,
+`"boolean"`, or a schema. In that case, a `when` that names a label that the source cannot give
+is a compile error ("can never be answered"). Such a label needs no task, and `otherwise`
+covers only the labels that the source can give. A schema without one top-level type does not
+satisfy any consumer. On the wire, a schema is its JSON text (`{ schema = "..." }` in the TOML,
+`{ path = "RESULT.json", schema = "..." }` for a file), because TOML cannot hold the null
+values that schemas often contain.
 
 ### Repair
 
-An agent task can fix its own output instead of failing on it:
+An agent task can repair its own output before the engine fails it:
 
 ```python
 plan = agent(
@@ -216,88 +225,94 @@ plan = agent(
 )
 ```
 
-When a turn passes but its output misses a declared field or file, or breaks a type or schema,
-the engine resumes the same conversation with the validation notes (masked as above) and asks for
-the output and files to be fixed in place, then checks again, up to `repair` times (at most 3).
-Repairs run within the attempt's `timeout`, cost what they cost against the run's budget, and do
-not start once the attempt has spent what the run had left. They are not retries: `attempts`
-stays 1, and when repairs run out the task fails with the note it would have failed with anyway.
-Each mapped instance repairs on its own. A task with no `session` gets a conversation for the
-attempt; one in a session continues it. `command` and `evaluate` refuse `repair`.
+A turn can pass but have output that misses a declared field or file, or does not match a
+type or schema. In that case, the engine continues the same conversation with the validation
+notes (masked as above). It tells the agent to repair the output and files in place, and then
+checks again. It does this up to `repair` times (at most 3).
 
-Each repair is recorded on the task's `task_result` event under `repairs`, as
-`{label, round, of, cost_usd, notes}` with labels like `audit[RHAI-1] repair 1/2`.
+Repairs run in the `timeout` of the attempt, and their cost counts against the run budget. A
+repair does not start if the attempt has already spent the remaining budget. Repairs are not
+retries: `attempts` stays 1. When no repairs remain, the task fails with the same note as
+without repairs. Each mapped instance repairs separately. A task without a `session` gets a
+conversation for the attempt. A task in a session continues that session. `command` and
+`evaluate` do not accept `repair`.
+
+The `task_result` event of the task records each repair under `repairs`, as
+`{label, round, of, cost_usd, notes}`, with labels such as `audit[RHAI-1] repair 1/2`.
 
 ## Execution semantics
 
-How the executor walks a graph, what one task goes through and how the plan as a whole
-ends, is its own generated diagram: [Plan execution states](./plan-states.md).
+[Plan execution states](./plan-states.md) is a generated diagram of how the executor walks a
+graph, the states of one task, and how the plan ends.
 
-**Readiness.** A task dispatches when its dependencies are terminal and its join is satisfied.
-Dispatch order is declaration-stable, so the event stream is deterministic.
+**Readiness.** A task dispatches when its dependencies are terminal and its join is
+satisfied. Dispatch follows declaration order, so the event stream is deterministic.
 
-**Truncation is fail-closed.** If a `required` task can never run on this substrate (its
-`needs` is not in the declared caps, or a dependency cannot run), the whole plan is truncated
-and *nothing* is dispatched. A truncated DAG cannot produce an honest pass. An advisory task
-in the same position is skipped, along with its dependents, and validity is unaffected.
+**Truncation fails closed.** If a `required` task cannot run on this substrate (its `needs` is
+not in the declared caps, or a dependency cannot run), the engine truncates the whole plan and
+dispatches *no* task. A truncated DAG cannot produce a valid pass. If an advisory task is in
+the same position, the engine skips it and its dependents, and validity does not change.
 
-**Failure.** A `required` task that fails short-circuits the plan; everything undispatched is
+**Failure.** If a `required` task fails, the plan stops. All tasks that did not dispatch are
 blocked. An advisory failure blocks only its dependents.
 
-**Early completion.** In a playbook, a passing main-graph task that returns `"complete": true`
-(with an optional `"reason"` string) ends the run: nothing else in the main graph dispatches,
-undispatched tasks stay unsettled rather than blocked, and epilogue tasks still run. The run is
-valid unless a required task had already settled other than passing, and the shutdown outcome
-is `complete`, with the reason. Both fields are reserved, so `emits` cannot list them. A
-revised task that completes ends its loop without another review; a mapped instance that
-completes ends the run once its node has folded.
+**Early completion.** In a playbook, a passing main-graph task can return `"complete": true`,
+with an optional `"reason"` string. This ends the run. No other main-graph task dispatches.
+Tasks that did not dispatch stay unsettled, not blocked. Epilogue tasks still run. The run is
+valid unless a required task already settled with a status other than pass. The shutdown
+outcome is `complete`, with the reason. Both fields are reserved, so `emits` cannot list them.
+A revised task that completes ends its loop without another review. A mapped instance that
+completes ends the run after its node folds.
 
-**Retry is not recheck.** Transport failures retry, bounded (2 by default). A measured failure
-never reruns: a task that failed, failed.
+**Retries apply only to transport failures.** Transport failures retry, up to a limit (2 by
+default). A measured failure does not run again.
 
-**Budget.** Cost is known only after an attempt completes, so an in-flight attempt may report a
-total above `budget.usd`. Any overrun invalidates the plan and blocks all further dispatch and
-retries. Reaching the budget exactly is valid only when no further retry or task is needed.
+**Budget.** The cost of an attempt is known only after the attempt completes. For this reason,
+an attempt in progress can report a total larger than `budget.usd`. Any overrun makes the plan
+invalid and blocks all further dispatches and retries. A spend equal to the budget is valid
+only if no other retry or task is necessary.
 
-**Time.** Elapsed time is known continuously, so it bounds every attempt while it runs. Each
-attempt gets a deadline: its task's `timeout` counted from when the attempt starts, or the run's
-`--max-time` ceiling if that falls first. A task with no `timeout` runs under the ceiling alone.
-At the deadline the runner kills the attempt's whole process group (a command and everything it
-started, or the agent turn) and the task settles as a measured failure with a note naming the
-limit, `timed out: the task ran past its 20m limit`. It is not retried: a rerun would spend the
-same time again. A required task that times out short-circuits like any other failure. An
-attempt the run's ceiling ends instead ends the run on that ceiling, and everything undispatched
-settles blocked on it. A playbook refuses a `timeout` longer than `--max-time` before it
-dispatches anything. In a concurrent batch each task runs under its own deadline.
+**Time.** Elapsed time is known at all times, so it limits each attempt while the attempt
+runs. Each attempt has a deadline: the `timeout` of its task, counted from the start of the
+attempt, or the `--max-time` limit of the run if that is earlier. A task without `timeout`
+runs only under the run limit. At the deadline, the runner stops the whole process group of
+the attempt (a command and all processes that it started, or the agent turn). The task
+settles as a measured failure with a note that names the limit:
+`timed out: the task ran past its 20m limit`. The engine does not retry it, because a retry
+would use the same time again. A required task that times out stops the plan, as any other
+failure does. If the run limit ends an attempt, the run ends on that limit, and all tasks that
+did not dispatch settle as blocked. A playbook rejects a `timeout` longer than `--max-time`
+before it dispatches a task. In a concurrent batch, each task has its own deadline.
 
 ### `needs`
 
-The substrate capability a task requires. `"any"` runs everywhere. Anything else must be
-declared with `--cap`, otherwise the task is unrunnable, and `plan show` reports the truncation
-verdict before you spend anything.
+The substrate capability that a task needs. `"any"` runs on all substrates. You must declare
+any other value with `--cap`. If you do not, the task cannot run. `plan show` reports the
+truncation verdict before any spend.
 
 ### `isolation`
 
-`isolation = "worktree"` gives the task a private clone of the workspace, including its
-uncommitted state. Two effects:
+`isolation = "worktree"` gives the task a private clone of the workspace, with its
+uncommitted state. This has two effects:
 
-- Tasks isolated this way and ready at the same time run **concurrently**. Without isolation
-  they would collide on the single `PLAN_TASK_RESULT.json` in the shared workspace.
-- The task's edits are **discarded**. What leaves is its declared output, so this is for
-  review and analysis work, not for a task whose diff has to survive.
+- Isolated tasks that are ready at the same time run **concurrently**. Without isolation, they
+  would all write the one `PLAN_TASK_RESULT.json` in the shared workspace.
+- The engine **discards** the edits of the task. Only the declared output leaves the task.
+  Use isolation for review and analysis. Do not use it for a task whose diff must be kept.
 
-A runner that cannot isolate refuses the task rather than silently running it in the shared
+A runner that cannot isolate rejects the task. It does not run the task in the shared
 workspace.
 
 ### `join`
 
-`join = "all"` (default) requires every dependency to pass. `join = "passed"` waits for every
-dependency, then folds the non-empty passing set. It fails closed if none can run or pass.
+`join = "all"` (default) needs every dependency to pass. `join = "passed"` waits for every
+dependency, then collects the passing dependencies. There must be at least one. If no
+dependency can run or pass, the task fails.
 
 ### `revise`
 
-A reviewer sends a failing verdict back to the tasks it names, for a bounded number of rounds.
-Playbooks only, and the only repetition the graph itself states.
+A reviewer sends a failing verdict back to the tasks that it names, for a limited number of
+rounds. Only playbooks support `revise`. It is the only repetition that the graph declares.
 
 ```python
 author = agent(
@@ -317,12 +332,12 @@ review = command(
 )
 ```
 
-`review` runs against the draft as any dependent would. When it settles failing and rounds
-remain, `author` runs again and then `review` does, until `review` stops failing or the third
-round is spent. Any other reviewer outcome ends the loop, as does a revision that fails and
-leaves the reviewer blocked. The engine checks the ceilings before every round.
+`review` runs against the draft as any dependent does. If it fails and rounds remain,
+`author` runs again, and then `review` runs again. This continues until `review` passes or
+the third round ends. Any other outcome of the reviewer ends the loop. The loop also ends if a
+revision fails and the reviewer is blocked. The engine checks the limits before each round.
 
-`revise` also takes a list, when a fix needs more than one task to run again:
+`revise` also accepts a list, for a fix that needs more than one task to run again:
 
 ```python
 confirm = evaluate(
@@ -334,13 +349,14 @@ confirm = evaluate(
 )
 ```
 
-The targets and the reviewer are the loop's body. Each round runs the body one task at a time in
-dependency order, each under its own `join` and `when`, so a failed `build` blocks an all-join
-reviewer and ends the loop, while a reviewer joining `settled` sees the failure and can send the
-chain back. The loop starts once everything outside the body that any body task reads has
-settled, and a task outside the body that reads a body task waits for the loop to end.
+The targets and the reviewer are the body of the loop. Each round runs the body one task at
+a time in dependency order. Each task uses its own `join` and `when`. If `build` fails, it
+blocks a reviewer with `join = "all"`, and the loop ends. A reviewer with `join = "settled"`
+sees the failure and can send the chain back. The loop starts after every task outside the body
+that a body task reads has settled. A task outside the body that reads a body task waits until
+the loop ends.
 
-From the second round every target's inputs carry the reserved `revision` key:
+From the second round, the inputs of each target contain the reserved `revision` key:
 
 ```json
 {"round": 2, "max_rounds": 3, "reviewer": "review",
@@ -348,35 +364,43 @@ From the second round every target's inputs carry the reserved `revision` key:
             "output": {"accepted": false, "why": "the probe hit an unrelated 400"}}}
 ```
 
-`files` says whether the reviewer's declared files from that failing round were staged, which
-they are under `inputs/<reviewer>/`, the same place a `join = "settled"` consumer finds them. The
-reviewer itself never receives `revision`. A body task that declares a `session` resumes it each
-round, so it remembers what it already tried.
+`files` tells if the engine staged the declared files of the reviewer from that failing
+round. The engine stages them under `inputs/<reviewer>/`, where a `join = "settled"` consumer
+also finds them. The reviewer does not get `revision`. A body task that declares a `session`
+continues it in each round, so it knows what it already tried.
 
-Each round settles in its own right: a passing round commits, a failing one is discarded, and
-each reports as `task[round-N]`, the naming a mapped node's instances use. Once the loop ends,
-each task reports one row under its own name carrying its last round and the spend of every
-round, and those rows alone gate the verdict. A dependent reads the last round.
+Each round settles separately. A passing round makes a commit, and the engine discards a
+failing round. Each round reports as `task[round-N]`, the same naming that the instances of a
+mapped node use. When the loop ends, each task reports one row under its own name. The row
+holds its last round and the spend of all rounds. Only these rows decide the verdict. A
+dependent reads the last round.
 
-The bound is 2 to 5 and is never defaulted. Validation refuses a target the reviewer does not
-depend on, directly or through other tasks; a body that leaves out a task on a path between two
-of its tasks (that task would read a result a later round replaces); a body task that is not an
-agent, command, or evaluate task, or that fans out; a task in two bodies; and a reviewer that is
-itself a target. Anything whose bound depends on what a task finds stays inside one task.
+The limit is 2 to 5, and it has no default. Validation rejects:
+
+- a target that the reviewer does not depend on, directly or through other tasks;
+- a body that omits a task on a path between two of its tasks (that task would read a result
+  that a later round replaces);
+- a body task that is not an agent, command, or evaluate task, or that fans out;
+- a task in two bodies;
+- a reviewer that is also a target.
+
+If the number of repetitions depends on what a task finds, put that repetition inside one
+task.
 
 ## The loop as a plan
 
-Each loop iteration runs as a capability-admitted `autoresearch` workflow. With no authored
-workflow, the default expands to ordinary tasks:
+Each loop iteration runs as an `autoresearch` workflow that capabilities admit. Without an
+authored workflow, the default workflow expands to normal tasks:
 
 ```mermaid
 flowchart LR
     propose["propose (engine)"] --> apply["apply"] --> measure["measure"] --> decide["decide"]
 ```
 
-Task names and intervening topology are author-defined. An `autoresearch` result must be a decision
-fed by a frozen measurement with apply and proposal ancestors. A `custom` workflow has no such
-shape requirement; the outer orchestrator only admits it when it advertises `workflow.custom`.
+The author defines the task names and the tasks between the engine operations. The result of
+an `autoresearch` workflow must be a decision that a frozen measurement feeds, with apply and
+proposal ancestors. A `custom` workflow has no shape requirement. The outer orchestrator
+admits it only if it declares `workflow.custom`.
 
 ```toml
 [workflow]
@@ -415,24 +439,26 @@ source = "benchmark"
 depends_on = ["benchmark"]
 ```
 
-The corresponding admission needs `workflow.autoresearch`, `engine.propose`, `engine.apply`,
-`engine.measure`, `engine.decide`, and—because it binds `solver`—`agent.session.persist`. A custom orchestrator can instead admit `type = "custom"`
-and any subset of operations it implements. Task-level `needs` still controls where an admitted
-task can run; workflow capabilities control what the orchestrator is authorized to mean.
+To admit this workflow, the orchestrator needs `workflow.autoresearch`, `engine.propose`,
+`engine.apply`, `engine.measure`, and `engine.decide`. Because the workflow binds `solver`, it
+also needs `agent.session.persist`. A custom orchestrator can admit `type = "custom"` and any
+subset of the operations that it implements. Task-level `needs` still controls where an
+admitted task can run. Workflow capabilities control which operations the orchestrator is
+authorized to run.
 
-Same decisions and same session events as the default path, plus additive `plan_admitted` and
-`task_result` lines. Cross-round state, keep/discard, and every between-round control (parking,
-steering, re-scoping, budget) stay with the driver. The wide round runs as a template compiled
-from `[search]` on both paths.
+Each iteration writes `plan_admitted` and `task_result` lines to the session log, in addition
+to the decision and session events. The loop driver keeps cross-round state, keep/discard,
+and all controls between rounds (parking, steering, re-scoping, budget). The wide round runs
+as a template that the engine compiles from `[search]`.
 
-The templates carry no budget of their own: the run budget is the driver's, checked between
-rounds, so a turn that overruns the cap is still measured and decided.
+The templates have no budget of their own. The driver owns the run budget and checks it
+between rounds, so the engine still measures and decides a turn that goes over the limit.
 
 ### Authored measurement subgraphs
 
-The compatible `measure()` path remains available. For visible measurement, use `evaluate()` and
-`grade()`: dependencies define rungs, isolated peers can run concurrently, and `grade()` selects
-the score source for `decide()`.
+You can still use `measure()`. To make the measurement steps visible in the graph, use
+`evaluate()` and `grade()`. Dependencies define the rungs, isolated peers can run
+concurrently, and `grade()` selects the score source for `decide()`.
 
 ```python
 candidate = propose(name = "invent")
@@ -480,53 +506,59 @@ workflow(
 )
 ```
 
-The renderer groups `evaluate` and `grade` as **Measurement** while preserving edges. During
-`crucible scope`, validation writes the admitted graph to `WORKFLOW.png`; agents cannot replace it.
-
-Default off while it soaks.
+The renderer groups `evaluate` and `grade` as **Measurement** and keeps the edges. During
+`crucible scope`, validation writes the admitted graph to `WORKFLOW.png`. Agents cannot
+replace this file.
 
 ### Run-scoped epilogue tasks
 
-`stage = "epilogue"` on a `[[workflow.task]]` (Starlark: `stage = "epilogue"` on `agent()`,
-`command()`, or `evaluate()`) removes the task from the per-iteration graph. The epilogue
-subgraph runs once, after the loop concludes cleanly (finished, budget, or solved), against the
-final kept candidate, and only if the run kept something. This is where a 90-minute
-`compute-sanitizer` racecheck or a slow perf benchmark belongs.
+`stage = "epilogue"` on a `[[workflow.task]]` removes the task from the graph of each
+iteration. In Starlark, set `stage = "epilogue"` on `agent()`, `command()`, or `evaluate()`.
+The epilogue subgraph runs one time, after the loop ends cleanly (finished, budget, or
+solved). It runs against the final kept candidate, and only if the run kept a candidate. Use
+it for slow checks, for example a 90-minute `compute-sanitizer` racecheck or a slow
+performance benchmark.
 
-Each task's `CRUCIBLE_INPUTS` carries the kept candidate under the reserved `kept` key:
-`{"iter", "score", "tiebreak", "sha", "snapshot", "note"}`. Dependencies may not cross stages,
-engine ops cannot be epilogue, and the workflow `result` must iterate.
+The `CRUCIBLE_INPUTS` of each task holds the kept candidate under the reserved `kept` key:
+`{"iter", "score", "tiebreak", "sha", "snapshot", "note"}`. Dependencies cannot cross stages.
+Engine operations cannot be in the epilogue. The workflow `result` must be in the iteration
+stage.
 
-In a playbook the epilogue runs after the main graph completes or fails, and reads the reserved
-`outcome` input instead: `{"exit", "tasks": {name: {"status", "note", "output", "files"}}}`,
-each entry what a `join = "settled"` consumer receives, `per_instance` included. Every
-main-graph task's declared files are staged under `inputs/<name>/` (a mapped node's under
-`inputs/<node>[<key>]/`), from a failed task as well as a passing one, and `files` says whether
-that task's set is there. A skipped, blocked, or transport-failed task stages nothing.
+In a playbook, the epilogue runs after the main graph completes or fails. It reads the
+reserved `outcome` input: `{"exit", "tasks": {name: {"status", "note", "output", "files"}}}`.
+Each entry is the same as the value that a `join = "settled"` consumer gets, with
+`per_instance`. The engine stages the declared files of each main-graph task under
+`inputs/<name>/` (for a mapped node, under `inputs/<node>[<key>]/`). It stages files from
+failed tasks and from passing tasks. `files` tells if the files of that task are present. A
+skipped, blocked, or transport-failed task stages no files.
 
-Epilogue results are advisory: they cannot un-keep the candidate. Rows land in the session log
-and RESULTS.md (`epilogue` / `epilogue-skip` / `epilogue-fail`), and the PR body gets an
-"Epilogue checks (advisory)" section with failures marked **FAILED**.
+Epilogue results are advisory. They cannot undo the keep of the candidate. The engine writes
+their rows to the session log and RESULTS.md (`epilogue` / `epilogue-skip` /
+`epilogue-fail`). The PR body gets an "Epilogue checks (advisory)" section, with failures
+marked **FAILED**.
 
 `report(name = "publish-report", destination = {"kind": "slack"}, template = "reports/slack.md.j2",
-result = roundup, required = True)` is the engine-owned publication epilogue. Destinations are
-engine-known keys, not URLs or secret names; `slack` is the only destination in the first version.
-The optional `result` selector projects only that main-graph task's declared JSON fields into an
-engine-built Block Kit card. It does not expose prompts, stdout, workspaces, undeclared fields, raw
-Slack blocks, channels, or credentials. Selected output defaults to a 16 KiB encoded limit; an
-operator may lower or raise it up to 64 KiB with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. The rendered
-template body is bounded by `CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000, Slack's
-section limit). Oversize data fails without truncation. A required report makes rendering or delivery failure fail the workflow;
-it does not rely on an agent remembering to call a tool.
+result = roundup, required = True)` is the publication epilogue that the engine owns. A
+destination is a key that the engine knows, not a URL or a secret name. `slack` is the only
+destination. The optional `result` selector puts only the declared JSON fields of that
+main-graph task into a Block Kit card that the engine builds. The card does not show prompts,
+stdout, workspaces, undeclared fields, raw Slack blocks, channels, or credentials. The default
+limit for the selected output is 16 KiB encoded. An operator can set a different limit, up to
+64 KiB, with `CRUCIBLE_REPORT_RESULT_MAX_BYTES`. `CRUCIBLE_REPORT_BODY_MAX_BYTES` limits the
+rendered template body (default and maximum 3000, the Slack section limit). Data that is too
+large fails. The engine does not truncate it. For a required report, a render or delivery
+failure fails the workflow. An agent does not have to call a tool to send the report.
 
 ## Worked example
 
-`examples/revise-loop` is the smallest revise loop: an agent drafts a probe, a command rejects
-the draft written without a verdict in hand, and the revision written with it passes.
-`just revise-loop-e2e` runs it through real OpenShell sandboxes on local podman with a
-model-free `claude` image, and checks the rounds, the resumed session, and the commits.
+`examples/revise-loop` is the smallest revise loop. An agent writes a draft probe. A command
+rejects the first draft, which the agent wrote without a verdict. The revision, which the agent
+wrote with the verdict, passes. `just revise-loop-e2e` runs it in real OpenShell sandboxes on
+local podman with a `claude` image that has no model. It checks the rounds, the continued
+session, and the commits.
 
-`examples/adversarial-review` puts a review task between a code node and the gate below it, in
-single-reviewer and two-reviewer panel shapes. The panel runs isolated reviewers concurrently
-and joins them on a policy gate: correctness blocks, copy-edit is advisory. It runs free
-against a stand-in manifest or against real models with the live one.
+`examples/adversarial-review` puts a review task between a code node and the gate below it. It
+has a single-reviewer shape and a two-reviewer panel shape. The panel runs isolated reviewers
+concurrently and joins them on a policy gate. The correctness reviewer blocks, and the
+copy-edit reviewer is advisory. It runs at no cost against a stand-in manifest, or against real
+models with the live manifest.

@@ -1039,9 +1039,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
         crucible_controller::QueueOverrideSink::new(override_store.clone(), queue.clone()),
     );
     let serve_addr = controller_api_addr();
-    let serve_turn_accounts = cfg
-        .turn_accounts()
-        .context("validating the per-cluster turn service accounts")?;
     crucible_controller::runs::dispatch_target::cluster_policy(&cfg)
         .context("validating the per-cluster dispatch policy")?;
     cfg.contract_clusters()
@@ -1165,7 +1162,6 @@ async fn run_autopilot_daemon(mut cfg: crucible_controller::ControllerCfg) -> Re
     let surface = crucible_controller::Surface::bind(
         serve_state,
         serve_addr,
-        serve_turn_accounts,
         serve_secure_cookies,
         agent_auth,
     )

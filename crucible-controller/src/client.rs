@@ -449,32 +449,48 @@ mod tests {
                 "74774c07cce84368ef881707d8fa8d9d85b9608d8e09999f0f975eb1b3507c2c",
             ),
             (
-                "0055_run_sandboxes.sql",
-                "d2ee820dd4b52a0caa815e4a10a188ae8e82a6288ec233ff9f80b5e7ac543b16",
+                "0055_rerun_launches.sql",
+                "fa24d0b218f1c29587e76c67ded72a465677ed0c965c4ee00e6c25300339d010",
             ),
             (
-                "0056_user_kube_user.sql",
-                "1e4ef2662f59f36fa8d2f3b2384c7791a7b78f9a0322dfcb4bb670f8b820ba8b",
+                "0056_run_tokens.sql",
+                "5744ec28a3d729333135133de6f8a5cde2e1a4cb47f12d27a050afcbb66a461b",
             ),
             (
-                "0057_run_sandbox_names.sql",
-                "4296bc01ff076d3af205509f321e0e5e4fb22518bdfc737a42596238f758c4d6",
+                "0057_pod_tokens.sql",
+                "dc0c1787bd91c3c39696b3a1eceeb6217b17918ff7d108d912a195cee9acad0f",
             ),
             (
-                "0058_dispatch_principal.sql",
-                "b094c7d5fdbae4802ec4fdfeb54ccb1ec5c436846346c9ceeae5bdc253f888f2",
+                "0058_provider_price.sql",
+                "00ddcd9ea8ffacc4f7186269a85dc46af111222776abb123a43e56f86f3f81b1",
             ),
             (
-                "0059_run_sandbox_names_not_global.sql",
-                "48357037d76d3a669fc66151f5c8f85ab940313b71720e4092689007a4ac9c67",
+                "0059_run_sandboxes.sql",
+                "65f1b33d83c4f9bf7047811efcaf8898208c784e859b2133b3bf7216abb34895",
             ),
             (
-                "0060_kube_identity_links.sql",
-                "b5289b213039f228db5cec2b98d9ab4d2c40cc0b584e10de41f8f69d583928fe",
+                "0060_user_kube_user.sql",
+                "8f03e789adefc25ad41951d772428b75b4c08e4a09ff9f3f2a787eb308fd3064",
             ),
             (
-                "0061_people_grants.sql",
-                "8e45f258ba380d2b5059e708ee0aba742dfe51dd22c8fc755d01bab0060aef94",
+                "0061_run_sandbox_names.sql",
+                "9d1e7ddbfddf7767806c3f42a6dc4c7ba4053f83bce844a40201f750ac455982",
+            ),
+            (
+                "0062_dispatch_principal.sql",
+                "902a3238c9732bd900f4c95010f4713720029638a6d67aae29bbacbad795037d",
+            ),
+            (
+                "0063_run_sandbox_names_not_global.sql",
+                "aedd4a58621ce522f27c29ed58233696887d0c412e73c5c246da21127352bd37",
+            ),
+            (
+                "0064_kube_identity_links.sql",
+                "4794fdf9bccddabbc22cbc0ed0927eb2f5807d4c19b0014716ed585395ecd55f",
+            ),
+            (
+                "0065_people_grants.sql",
+                "10ca1735a5018f7954889b04aae599227e44d8739dce6ca9a20990f436817448",
             ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
@@ -984,11 +1000,11 @@ mod tests {
             sqlx::Postgres::database_exists(&url).await?,
             "connect creates the database"
         );
-        assert_eq!(crate::schema_version(&pool).await?, 61);
+        assert_eq!(crate::schema_version(&pool).await?, 65);
 
         // Idempotent: re-opening an already-migrated DB is a no-op, not an error.
         let pool2 = connect(&url).await?;
-        assert_eq!(crate::schema_version(&pool2).await?, 61);
+        assert_eq!(crate::schema_version(&pool2).await?, 65);
         pool.close().await;
         pool2.close().await;
         let _ = sqlx::Postgres::drop_database(&url).await;

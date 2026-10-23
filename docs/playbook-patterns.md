@@ -1,17 +1,22 @@
 # Branching and review
 
-The task set is fixed at compile time. Three constructs decide things at runtime, each one
-bounded: `route()` picks branches, `revise` sends work back, and `over` fans out one instance
-per item. This page covers those three, plus the smaller tools around them: sessions, gates,
-joins, advisory tasks and reports.
+The task set is fixed at compile time. Three constructs make decisions at run time, and each
+has a limit:
 
-Every argument is listed in the [DSL reference](./dsl-reference.md). What the executor does with
-the result is in [Work graphs](./work-graphs.md).
+- `route()` selects branches.
+- `revise` sends work back to an earlier task.
+- `over` fans out one instance for each item of a list.
+
+This page describes these three constructs and the related tools: sessions, gates, joins,
+advisory tasks, and reports.
+
+The [DSL reference](./dsl-reference.md) lists every argument. [Work graphs](./work-graphs.md)
+describes what the executor does with each result.
 
 ## Branch on a decision
 
-A `route()` asks typed questions about its dependencies' output and records one answer per
-question. Downstream tasks name the answer they run on with `when`.
+A `route()` asks typed questions about the output of its dependencies. It records one answer
+for each question. A downstream task uses `when` to name the answer that it runs on.
 
 ```mermaid
 flowchart LR
@@ -50,58 +55,67 @@ filed = command(name = "filed", run = "./act.sh filed",
                 depends_on = [oncall, finance, backlog], join = "passed")
 ```
 
-A branch whose answer did not come up settles `not_taken`. It never dispatches, spends
-nothing, and does not affect the verdict. Anything that depends on it with the default
-`join = "all"` is not taken either, which is why `filed` rejoins with `join = "passed"`.
+If the route does not select the answer of a branch, the branch settles `not_taken`. It does
+not dispatch, does not spend, and does not change the verdict. A task that depends on it with
+the default `join = "all"` is also not taken. For this reason, `filed` uses `join = "passed"`.
 
-**Who answers.** Exactly one of two:
+**Source of the answer.** Set exactly one of these two:
 
 | | Answered by | Cost |
 | --- | --- | --- |
 | `source = read` | A dependency's own output: `read` emits `{"bucket": "billing"}`. | Free and deterministic. |
 | `min_confidence = 0.8` | A decision model, through the broker's `decision` capability. An answer below the threshold is recorded as `"uncertain"`. | One model call per route, for all its questions. |
 
-A source that emits a label the question does not declare fails the route, and the run
-short-circuits there. A model-backed route with no decision binding truncates the plan
-before anything spends.
+If a source emits a label that the question does not declare, the route fails and the run
+stops at that route. If a model-backed route has no decision binding, the engine truncates
+the plan before any task spends.
 
-**Question types.** `choice(ask, options)` is one of N labels, and `options` may be a dict
-whose values describe each label for the model. `noul(ask)` answers `"yes"` or `"no"`, and
-`when = gate.urgent` with no `answers` runs on `"yes"`. `score(ask, levels)` is an ordinal
-question: `levels` lists at least two labels lowest first, in the order written, optionally as a
-dict of descriptions. It branches like a choice on its most probable level (the lower one on a
-tie) and also records a `score` in [0, 1], the expected level position, so `low`, `medium`,
-`high` count as 0, 0.5, 1:
+**Question types.**
+
+- `choice(ask, options)` selects one of N labels. `options` can be a dict, and its values
+  describe each label for the model.
+- `noul(ask)` answers `"yes"` or `"no"`. `when = gate.urgent` without `answers` runs on
+  `"yes"`.
+- `score(ask, levels)` is an ordinal question. `levels` lists two or more labels, lowest
+  first, optionally as a dict of descriptions. It branches as a choice on its most probable
+  level (the lower level if two are equal). It also records a `score` in [0, 1], which is the
+  expected level position. For `low`, `medium`, `high`, the positions are 0, 0.5, and 1:
 
 ```python
 "risk": score(ask = "How risky is this change?",
               levels = {"low": "cosmetic", "medium": "one component", "high": "crosses services"}),
 ```
 
-A `source` answers a score with one level label, never a boolean, and records that level's
-position; `"uncertain"` records no score. System One has no ordinal question, so a model-backed
-score is asked as a choice over the levels and recorded with `"asked_as": "choice"`.
+A `source` answers a score with one level label, not a boolean, and the route records the
+position of that level. `"uncertain"` records no score. System One has no ordinal question
+type, so the engine asks a model-backed score as a choice over the levels and records it with
+`"asked_as": "choice"`.
 
-**Every answer goes somewhere.** The compiler refuses a route where some answer a `when`
-could see, `"uncertain"` included, reaches no task. Cover the rest with `otherwise = True`,
-or say an answer deliberately leads nowhere with `drop`:
+**Each answer must have a task.** The compiler rejects a route if an answer that a `when` can
+see does not reach a task. This includes `"uncertain"`. Use `otherwise = True` to cover the
+remaining answers, or use `drop` to declare that an answer goes to no task:
 
 ```python
 "urgent": noul(ask = "Does the customer need a reply within the hour?", drop = ["no", "uncertain"]),
 ```
 
-Adding an option to a question can therefore never strand a ticket silently: `otherwise`
-catches it, or the pack stops compiling until the new label has a home. `examples/route` is
-the full pack, with a model-backed gate and a serving recipe for the decision model.
+If you add an option to a question, `otherwise` takes the new answer, or the pack does not
+compile until a task takes the new label. `examples/route` is the full pack. It has a
+model-backed gate and instructions to serve the decision model.
 
 ## Let a decision model answer
 
-A decision model reads the route's inputs and returns a probability for each label of each
-question, instead of text an agent would have to be trusted to format. Two decision APIs work:
-OpenAI's Decisions API (`POST /v1/decisions`, protocol `decisions`), and any server that speaks
-the System One decision API (`POST /v1/systemone`, protocol `system_one`), such as the hosted Jev
-API or vLLM's DiffusionGemma structured-reads server. The route declares the questions and the
-confidence it needs, and is the same for either:
+A decision model reads the inputs of the route and returns a probability for each label of
+each question. It does not return free text that an agent must format correctly. Crucible
+supports two decision APIs:
+
+- the OpenAI Decisions API (`POST /v1/decisions`, protocol `decisions`);
+- any server that implements the System One decision API (`POST /v1/systemone`, protocol
+  `system_one`), for example the hosted Jev API or the vLLM DiffusionGemma structured-reads
+  server.
+
+The route declares the questions and the confidence that it needs. The route is the same for
+both APIs:
 
 ```python
 read = command(name = "read", run = "./read.sh", emits = ["ticket"])
@@ -127,8 +141,8 @@ gate = route(
 )
 ```
 
-The workflow never names the endpoint. Whoever launches the run binds one in
-`CRUCIBLE_INFERENCE`:
+The workflow does not name the endpoint. The person or system that launches the run binds
+an endpoint in `CRUCIBLE_INFERENCE`:
 
 ```sh
 export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"decisions",
@@ -136,21 +150,21 @@ export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol
 crucible plan run --manifest crucible.toml --max-cost 1 --max-time 5m
 ```
 
-A `decisions` binding with no `url` reaches `https://api.openai.com/v1/decisions`; name one to go
-through a gateway. A `system_one` binding always names its server:
+A `decisions` binding without a `url` uses `https://api.openai.com/v1/decisions`. To use a
+gateway, set `url`. A `system_one` binding must always name its server:
 
 ```sh
 export CRUCIBLE_INFERENCE='{"version":1,"bindings":[{"role":"decision","protocol":"system_one",
   "url":"https://api.example.com/v1/systemone","model":"jev-1","key_env":"JEV_API_KEY"}]}'
 ```
 
-`key_env` names the variable that holds the bearer key; the document never holds the key
-itself. With no `decision` binding the route cannot run, so the plan truncates before
-anything spends.
+`key_env` names the variable that holds the bearer key. The document does not contain the
+key. Without a `decision` binding, the route cannot run, so the engine truncates the plan
+before any task spends.
 
-**What the model sees.** One request per route: the outputs of the route's dependencies, and
-each question with its instructions and the description of each label. System One takes the
-outputs as a `state` object:
+**Model input.** The engine sends one request for each route. The request holds the outputs
+of the route's dependencies and each question with its instructions and label descriptions.
+System One takes the outputs as a `state` object:
 
 ```json
 {
@@ -166,8 +180,8 @@ outputs as a `state` object:
 }
 ```
 
-OpenAI's API takes the same outputs serialized as JSON in its text `input`, a noul as a
-`predicate` question and a choice as a `choice` question named by the question id:
+The OpenAI API takes the same outputs as JSON text in `input`. A noul becomes a `predicate`
+question, and a choice becomes a `choice` question with the question id as its name:
 
 ```json
 {
@@ -183,12 +197,13 @@ OpenAI's API takes the same outputs serialized as JSON in its text `input`, a no
 }
 ```
 
-The label descriptions are the model's only definition of each queue, so write them the way
-you would brief a person.
+The label descriptions are the only definition of each queue that the model gets. Write
+them as you would write instructions for a person.
 
-**What the run records.** The route's output is the decision: for each question the label, its
-confidence, and the whole distribution the model returned. The label is the most probable
-declared one; a choice or confidence the API reports alongside is not read.
+**Run record.** The output of the route is the decision. For each question, it holds the
+label, its confidence, and the full distribution that the model returned. The label is the
+most probable declared label. The engine ignores any separate choice or confidence value that
+the API returns.
 
 ```json
 {"bucket": {"label": "billing", "confidence": 0.9,
@@ -196,27 +211,30 @@ declared one; a choice or confidence the API reports alongside is not read.
  "urgent": {"label": "no", "confidence": 0.9, "probabilities": {"no": 0.9, "yes": 0.1}}}
 ```
 
-A label whose probability is under `min_confidence` is recorded as `"uncertain"`, which
-`otherwise` or `drop` has to cover. So is a question OpenAI declines to answer, with confidence 0
-and an empty distribution.
+If the probability of a label is less than `min_confidence`, the engine records
+`"uncertain"`, and `otherwise` or `drop` must cover it. The engine also records `"uncertain"`,
+with confidence 0 and an empty distribution, if OpenAI does not answer a question.
 
-**From the control plane.** A deployed controller binds the decision model from its provider
-registry: on the Providers page, add a default with role `decision` for the playbook class, on the
-platform or for one domain, naming an OpenAI provider (it asks `gpt-6-luna` unless the default
-names a model) or a custom provider whose protocol is `decisions` or `system_one`. Every playbook
-launch then carries the binding, with the provider's key, beside its agent's
-([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)). A controller started with `just controller-local` reads no secret
-values; it passes its own `CRUCIBLE_*` variables to the runs it launches instead, so export
-`CRUCIBLE_INFERENCE` before starting it and name the key variable with the same prefix
+**Control plane.** A deployed controller binds the decision model from its provider registry.
+On the Providers page, add a default with role `decision` for the playbook class, for the
+platform or for one domain. The default names an OpenAI provider (which uses `gpt-6-luna` if
+the default names no model) or a custom provider with protocol `decisions` or `system_one`.
+Every playbook launch then gets this binding and the provider key, together with the binding
+of its agent
+([ADR-0065](https://github.com/neuralmagic/crucible/blob/main/gov/adr/ADR-0065-the-controller-hands-the-engine-its-models-as-the-inference-document.toml)).
+A controller that you start with `just controller-local` does not read secret values. It
+passes its own `CRUCIBLE_*` variables to the runs that it launches. Export
+`CRUCIBLE_INFERENCE` before you start it, and give the key variable the same prefix
 (`"key_env":"CRUCIBLE_DECISION_KEY"`).
 
-`examples/route` is the runnable pack, with five sample tickets and a recipe for serving
+`examples/route` is the runnable pack. It has five sample tickets and instructions to serve
 DiffusionGemma yourself.
 
 ## Send work back
 
-A task with `revise = <task>` or `revise = [<task>, ...]` is a reviewer. When it settles failing
-and rounds remain, the tasks it names run again with the verdict, and then the reviewer does.
+A task with `revise = <task>` or `revise = [<task>, ...]` is a reviewer. If it fails and
+rounds remain, the tasks that it names run again with the verdict. Then the reviewer runs
+again.
 
 ```python
 author = agent(
@@ -236,8 +254,9 @@ review = command(
 )
 ```
 
-From the second round, the author's inputs carry the reviewer's last verdict under
-`revision`, and the reviewer's declared files are staged under `inputs/review/`:
+From the second round, the inputs of the author contain the last verdict of the reviewer
+under `revision`. The engine stages the declared files of the reviewer under
+`inputs/review/`:
 
 ```json
 {"round": 2, "max_rounds": 3, "reviewer": "review",
@@ -245,23 +264,23 @@ From the second round, the author's inputs carry the reviewer's last verdict und
             "output": {"accepted": false, "why": "the probe hit an unrelated 400"}}}
 ```
 
-- **Rounds are bounded.** `max_rounds` is 2 to 5 and has no default.
-- **Each round settles.** A passing round commits, a failing one is discarded, and the
-  session log records `author[round-1]`, `review[round-1]` and so on. The rows that gate the
-  verdict are the last round's.
-- **Sessions resume.** An author with a `session` continues the same conversation each round,
-  so it remembers what it already tried.
-- **Chains.** `revise = [pick, build]` sends back a chain: every listed task runs again in
-  dependency order, then the reviewer. Every task between a target and the reviewer has to be
-  listed, so no round leaves a task reading a stale result.
-- **One loop per task.** No fan-out inside a loop, no task in two loops, no nested or chained
-  loops.
+- **Rounds have a limit.** `max_rounds` is 2 to 5. It has no default.
+- **Each round settles.** A passing round makes a commit. The engine discards a failing
+  round. The session log records `author[round-1]`, `review[round-1]`, and so on. The verdict
+  uses the rows of the last round.
+- **Sessions continue.** An author with a `session` continues the same conversation in each
+  round, so it knows what it already tried.
+- **Chains.** `revise = [pick, build]` sends back a chain. Every listed task runs again in
+  dependency order, and then the reviewer runs. You must list every task between a target and
+  the reviewer, so that no task in a round reads a stale result.
+- **One loop per task.** A loop cannot contain a fan-out. A task cannot be in two loops.
+  Loops cannot be nested or chained.
 
 `examples/revise-loop` runs a revise pair through a real OpenShell sandbox with a fake model.
 
 ## Fan out
 
-`over = producer.field` maps a task over a list its dependency emits, one instance per item:
+`over = producer.field` maps a task over a list that its dependency emits. There is one instance for each item:
 
 ```python
 scan = skill(
@@ -292,14 +311,16 @@ roundup = command(
 )
 ```
 
-Instances are keyed by item, so `triage[123]` is issue 123 on every retry and in every report
-row, and an instance reads its own key from the reserved `item` input. `max_fanout` caps the
-count within the engine's ceiling of 256. `isolated = True` runs the instances concurrently in
-private worktrees; `required = False` lets a sweep finish with some instances failed; and
-`join = "passed"` hands `roundup` only the ones that passed. `examples/triage` is the full pack.
+The item is the key of each instance. `triage[123]` is issue 123 in every retry and in every
+report row. An instance reads its own key from the reserved `item` input. `max_fanout` sets
+the maximum count, and the engine limit is 256. `isolated = True` runs the instances at the
+same time in private worktrees, at most eight at a time, and each one starts only while the run
+is under `--max-cost`. `required = False` lets the sweep finish when some instances fail.
+`join = "passed"` gives `roundup` only the instances that passed. `examples/triage` is the full
+pack.
 
-When the list is known at compile time, write the fan-out in Starlark instead. It unrolls
-into ordinary tasks:
+If you know the list at compile time, write the fan-out in Starlark. It unrolls into normal
+tasks:
 
 ```python
 AUDITS = [("headings", True), ("bullets", True), ("freshness", False)]
@@ -319,8 +340,9 @@ auditors = [auditor(topic, blocking) for topic, blocking in AUDITS]
 
 ## Decide per item
 
-A route can map over a list too. It asks once per item, and a task mapped over the same list
-reads each item's answer with `when`, so item k's turn runs only when item k's answer allows it:
+A route can also map over a list. It asks one time for each item. A task mapped over the
+same list reads the answer for each item with `when`, so the turn for item k runs only if the
+answer for item k selects it:
 
 ```python
 prepare = command(name = "prepare", run = "./stage.sh",
@@ -349,28 +371,28 @@ deep = agent(name = "deep", prompt = prompt_file("analyze.md"), effort = "high",
              keyed = [prepare.facts], when = gate.depth, otherwise = True)
 ```
 
-- **Items pair by key.** Tasks mapped over the same `producer.field` are aligned: `quick[T-1]`
-  reads `gate[T-1]`, and any aligned dependency reaches an instance as its own instance for the
-  same key, not the whole fan-out.
-- **Untaken items stay visible.** `quick[T-2]` settles `not_taken` with the answer in its note.
-  It does not fail the fan-out, whose output counts it under `not_taken`, and an aligned task
-  joining `all` on it is not taken either.
-- **One request per item.** `max_fanout` bounds them. A resumed run keeps every decision it
-  already has and asks only for the rest.
-- **`keyed` narrows.** `prepare.facts` is an object keyed by item; each instance, route or not,
-  gets only its own entry under `facts`, so a hundred-item fan-out does not send every item's
-  facts to every turn.
-- **Judge a result file.** `files = ["RESULT.json"]` puts a dependency's declared JSON file in
-  the model's state under `files`, so a route mapped after the analysis can ask whether its
-  evidence supports its verdict and send the doubtful ones to a review lane with `when`.
-- **Deterministic first.** An output-decided route mapped over the list reads each item's
-  answer from an object keyed by item (`{"reachable": {"T-1": "no"}}`). Put it in front and give
-  the model route a `when` on it, so the model is asked only about the items the facts leave
-  open.
+- **Items pair by key.** Tasks mapped over the same `producer.field` are aligned.
+  `quick[T-1]` reads `gate[T-1]`. An aligned dependency gives an instance only its instance
+  for the same key, not the whole fan-out.
+- **Items that are not taken stay visible.** `quick[T-2]` settles `not_taken`, with the
+  answer in its note. It does not fail the fan-out. The fan-out output counts it under
+  `not_taken`. An aligned task that joins `all` on it is also not taken.
+- **One request for each item.** `max_fanout` limits the number of requests. A resumed run
+  keeps the decisions that it has and asks only for the others.
+- **`keyed` limits the input.** `prepare.facts` is an object keyed by item. Each instance,
+  route or task, gets only its own entry under `facts`. A fan-out of one hundred items does not
+  send the facts of every item to every turn.
+- **Judge a result file.** `files = ["RESULT.json"]` puts the declared JSON file of a
+  dependency in the model state under `files`. A route mapped after the analysis can ask if
+  the evidence supports the verdict, and use `when` to send uncertain items to a review lane.
+- **Deterministic route first.** A route mapped over the list can read each answer from an
+  output object keyed by item (`{"reachable": {"T-1": "no"}}`). Put that route first, and give
+  the model route a `when` on it. The model then gets questions only about the items that the
+  facts do not decide.
 
 ## Keep a conversation
 
-Agent tasks that share a `session` continue one conversation, in dependency order:
+Agent tasks that share a `session` continue one conversation in dependency order:
 
 ```python
 scribe = session(name = "scribe")
@@ -380,17 +402,17 @@ shape = command(name = "shape", run = "./shape.sh", depends_on = [draft])
 polish = agent(name = "polish", prompt = prompt_file("prompts/polish.md"), session = scribe, depends_on = [shape])
 ```
 
-`polish` picks up where `draft` left off. Every pair of tasks in a session needs a dependency
-path between them, and a session task cannot be isolated. `session()` can also set the
-harness, model and effort its tasks default to.
+`polish` continues from where `draft` stopped. Each pair of tasks in a session needs a
+dependency path between them. A session task cannot be isolated. `session()` can also set the
+default harness, model, and effort for its tasks.
 
-`shape` sitting between the two turns is the other pattern here: **a command as a gate**. It
-reads `draft`'s declared `entries` from `CRUCIBLE_INPUTS`, counts what is on disk, and exits
-nonzero on a mismatch, so a bad draft never pays for a second turn.
+`shape`, between the two turns, shows a second pattern: **a command as a gate**. It reads the
+declared `entries` of `draft` from `CRUCIBLE_INPUTS`, counts the files on disk, and exits
+nonzero if the numbers are different. A bad draft does not get a second, paid turn.
 
 ## Joins
 
-A task's `join` says what it needs from its dependencies before it runs:
+The `join` of a task sets what it needs from its dependencies before it runs:
 
 | `join` | Runs when | Receives |
 | --- | --- | --- |
@@ -398,23 +420,24 @@ A task's `join` says what it needs from its dependencies before it runs:
 | `passed` | Every dependency is terminal and at least one passed. | Only the passing ones. |
 | `settled` | Every dependency is terminal, whatever it settled as. | Each one as `{status, note, output, files}`. |
 
-`passed` is for rejoining branches and folding fan-outs. `settled` is for a task that has to
-see failures, such as a summary that reports what broke.
+Use `passed` to join branches and to collect fan-outs. Use `settled` for a task that must
+see failures, for example a summary that reports which tasks failed.
 
 ## Advisory tasks
 
-`required = False` makes a task advisory. When it fails, its dependents are blocked, but the
-run can still be valid. Use it for checks worth running that should not sink the result: a
-freshness audit, a slow benchmark, one instance of a sweep.
+`required = False` makes a task advisory. If it fails, its dependents are blocked, but the
+run can still be valid. Use it for useful checks that must not fail the result: a freshness
+audit, a slow benchmark, one instance of a sweep.
 
-The inverse matters too. A `required` task that cannot run on this substrate, because its
-`needs` capability is not declared, truncates the whole plan before anything dispatches. A
-graph missing a required piece cannot produce an honest pass, so it does not try.
+A `required` task can be unable to run on the substrate, because the substrate does not
+declare its `needs` capability. In that case, the engine truncates the whole plan before it
+dispatches any task. Without a required task, the graph cannot produce a valid pass, so the
+engine does not start it.
 
 ## Report the result
 
-`report()` is an engine-owned task that publishes a rendered template to a destination the
-controller configures:
+`report()` is a task that the engine owns. It publishes a rendered template to a destination
+that the controller configures:
 
 ```python
 publish = report(
@@ -426,11 +449,12 @@ publish = report(
 )
 ```
 
-The workflow names a destination key, never a URL, channel or credential. `result` projects
-only that task's declared fields into the message. No agent can skip the call or write the
-payload.
+The workflow names a destination key. It does not name a URL, channel, or credential.
+`result` puts only the declared fields of that task into the message. An agent cannot skip
+the call or write the payload.
 
-The template is a Jinja file in the pack, rendered into the card body. It reads:
+The template is a Jinja file in the pack. The engine renders it into the card body. The
+template can read these values:
 
 | Name | Value |
 | --- | --- |
@@ -442,16 +466,16 @@ The template is a Jinja file in the pack, rendered into the card body. It reads:
 | `result.name`, `result.status` | the selected task and its terminal status |
 | `result.output` | the selected task's declared fields, with their JSON types; defined only when it passed |
 
-A field the selected task did not declare is never defined, so guard optional reads with
-`is defined`. Every value the template inserts is escaped for Slack, `|safe` included: a result
-holding `<!channel>` renders as that literal text. A body over
-`CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000) fails the report task.
+A field that the selected task did not declare is not defined. Guard optional reads with
+`is defined`. The engine escapes every inserted value for Slack, also with `|safe`. A result
+that holds `<!channel>` shows as that literal text. If the body is larger than
+`CRUCIBLE_REPORT_BODY_MAX_BYTES` (default and maximum 3000), the report task fails.
 
 ```jinja
 {% if result.output is defined %}{{ result.output.summary }}{% else %}roundup {{ result.status }}{% endif %}
 ```
 
-`severity_field` names one declared field of `result` whose value picks the card's accent:
+`severity_field` names one declared field of `result`. Its value sets the accent color of the card:
 
 ```python
 publish = report(
@@ -463,11 +487,12 @@ publish = report(
 )
 ```
 
-`"good"`, `"warning"` and `"danger"` set that accent whatever the run's verdict; the card shows
-the verdict on its own line. Any other value is neutral, as is a selected task that was skipped
-or not taken. A selected task that failed, transport-failed or was blocked renders `"danger"`.
-The field only picks an accent, never a payload fragment. Naming it without `result`, or naming
-a field `result` does not declare in `emits`, is a compile error.
+`"good"`, `"warning"`, and `"danger"` set the accent for any verdict. The card shows the
+verdict on a separate line. Any other value gives a neutral accent. A selected task that was
+skipped or not taken also gives a neutral accent. A selected task that failed, had a
+transport failure, or was blocked gives `"danger"`. The field sets only the accent, not part
+of the payload. It is a compile error to set `severity_field` without `result`, or to name a
+field that `result` does not declare in `emits`.
 
 ## Where to look next
 
@@ -478,10 +503,10 @@ a field `result` does not declare in `emits`, is a compile error.
   </a>
   <a class="cru-card" href="./work-graphs.html">
     <p class="cru-card-title">Work graphs <span class="arrow">→</span></p>
-    <p>Readiness, retries, budget, isolation and the plan file format.</p>
+    <p>Readiness, retries, budget, isolation, and the plan file format.</p>
   </a>
   <a class="cru-card" href="./plan-states.html">
     <p class="cru-card-title">Plan states <span class="arrow">→</span></p>
-    <p>The state machine every task and plan moves through.</p>
+    <p>The state machine of each task and plan.</p>
   </a>
 </div>

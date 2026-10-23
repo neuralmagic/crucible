@@ -196,6 +196,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         max_cost: launch.max_cost,
         max_time: launch.max_time,
         agent,
+        rerun: launch.rerun,
     };
     let started = match cfg.playbook_executor {
         PlaybookExecutor::Pod => {

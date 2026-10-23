@@ -22,3 +22,6 @@ percent-encoding.workspace = true
 # Schema-typed emits: the engine checks a task's output and the controller reads the same
 # schema off the admitted plan. No default features, so a `$ref` never fetches.
 jsonschema.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -174,8 +174,9 @@ async fn seed_run(pool: &sqlx::PgPool, kube_user: &str) {
         name: SANDBOX_NAME.to_string(),
         workdir: Some(WORKDIR.to_string()),
     };
-    let run = bindings::bind(pool, &run_pod(), &binding).await.unwrap();
-    assert_eq!(run, RUN_ID);
+    let run = bindings::run_pod(pool, RUN_ID).await.unwrap();
+    assert_eq!(run.pod, run_pod());
+    bindings::bind(pool, &run, &binding).await.unwrap();
 }
 
 async fn collect_run(pool: &sqlx::PgPool) {

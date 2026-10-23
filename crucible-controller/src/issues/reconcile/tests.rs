@@ -2578,48 +2578,52 @@ async fn ingest_completion_scrapes_the_session_from_the_finished_pods_logs(
     Ok(())
 }
 
-/// Store a gzipped run-session artifact exactly where the Tier 2 approval would (the pod-evidence
-/// owner in the artifact store), so the completion edge finds it and prefers it.
-async fn seed_dropbox_run_session(pool: &sqlx::PgPool, pod: &str, ndjson: &str) {
-    use std::io::Write as _;
-    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(ndjson.as_bytes()).expect("gzip");
+/// Store a gzipped run-session exactly where a pod's upload lands it: the run's own artifact.
+async fn seed_uploaded_run_session(pool: &sqlx::PgPool, run_id: &str, ndjson: &str) {
     crate::runs::blob_store::put_artifact_bytes(
         pool,
-        &crate::runs::blob_store::ArtifactOwner::PodEvidence {
-            pod: pod.to_string(),
+        &crate::runs::blob_store::ArtifactOwner::Run {
+            run_id: run_id.to_string(),
         },
         crucible_contract::ArtifactKind::RunSession.as_str(),
         u64::MAX,
-        enc.finish().expect("gzip finish"),
+        crucible_contract::artifact::gzip(ndjson.as_bytes()).expect("gzip"),
     )
     .await
     .expect("store artifact");
 }
 
-/// The Tier 2 drop-box run-session is PREFERRED over the log scrape: with the artifact present
-/// the completion edge decompresses it into the run's stored session and folds it — proven by feeding
-/// the dispatcher logs that carry NO session at all (which would otherwise park loud), so only
-/// the drop-box could have produced the ingested run.
-#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-async fn ingest_completion_prefers_the_dropbox_run_session(pool: PgPool) -> Result<()> {
-    let _g = crate::ENV_LOCK.lock().await;
-    let (db, dir) = db_with(pool);
-    let cfg = cfg_with(dir.path(), Profile::default());
-    seed_running_pod_run(&db, "owner/repo#43", "run-43", "crucible-run-43").await?;
-
-    let session = [
+fn finished_loop_session() -> String {
+    [
         r#"{"v":1,"kind":"row","row":{"iter":0,"decision":"baseline","score":200.0}}"#,
         r#"{"v":1,"kind":"row","row":{"iter":1,"decision":"keep","score":245.0}}"#,
         r#"{"v":1,"kind":"budget","spent":1.4,"elapsed_secs":90}"#,
         r#"{"v":1,"kind":"summary","rows":[],"gate":"bench","best_score":245.0}"#,
         r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":"done"}"#,
     ]
-    .join("\n");
-    seed_dropbox_run_session(db.pool(), "crucible-run-43", &session).await;
+    .join("\n")
+}
 
-    // Logs carry NO session (the new wrapper skips the delimiter when ingest is on): if the scrape
-    // ran it would NoDelimiter-park. Only the drop-box can advance this run.
+/// A pod run completes from the session it uploaded to its run once its pod is terminal, with
+/// logs that carry no session at all (which would otherwise park loud), so only the upload could
+/// have produced the ingested run. Completion keeps the pod's own output and revokes the run's
+/// token.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn ingest_completion_takes_the_uploaded_run_session(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    seed_running_pod_run(&db, "owner/repo#43", "run-43", "crucible-run-43").await?;
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run("run-43".to_string()),
+        None,
+        std::time::Duration::from_secs(3600),
+    )
+    .await?;
+    let session = finished_loop_session();
+    seed_uploaded_run_session(db.pool(), "run-43", &session).await;
+
     crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
         phase: crate::runs::workpod::TurnPhase::Succeeded,
         logs: "podman login noise\n".into(),
@@ -2628,20 +2632,16 @@ async fn ingest_completion_prefers_the_dropbox_run_session(pool: PgPool) -> Resu
     let outcome = ingest_completion(&db, &cfg, "owner/repo#43").await;
     crate::runs::workpod::reset_dispatcher();
 
-    assert!(outcome?, "the completion edge ingested from the drop-box");
+    assert!(
+        outcome?,
+        "the completion edge ingested the uploaded session"
+    );
     assert_eq!(
         crate::runs::blob_store::get_run_engine_log(db.pool(), "run-43")
             .await?
             .as_deref(),
         Some("podman login noise\n"),
-        "the pod's own output is kept even when the session came from the drop-box"
-    );
-    let written = crate::runs::blob_store::get_run_session(db.pool(), "run-43")
-        .await?
-        .expect("the drop-box session was persisted for the run");
-    assert_eq!(
-        written, session,
-        "the plain NDJSON round-trips out of the drop-box gzip"
+        "the pod's own output is kept beside the uploaded session"
     );
     assert_eq!(
         crate::issues::store::get_issue(db.pool(), "owner/repo#43")
@@ -2649,13 +2649,73 @@ async fn ingest_completion_prefers_the_dropbox_run_session(pool: PgPool) -> Resu
             .unwrap()
             .status,
         Status::Done,
-        "the issue advanced off running via the drop-box, not the (empty) scrape"
     );
     let run = sqlx::query!(r#"SELECT status, best_score FROM runs WHERE run_id='run-43'"#)
         .fetch_one(db.pool())
         .await?;
     assert_eq!(run.status, "finished");
     assert_eq!(run.best_score, Some(245.0));
+    assert!(
+        matches!(
+            crate::runs::pod_token::verify(db.pool(), &token).await,
+            Err(crate::runs::pod_token::TokenRefusal::Revoked { .. })
+        ),
+        "completion revokes the run's token"
+    );
+    Ok(())
+}
+
+/// A pod that uploaded its session is not settled until it is terminal: its pod is still
+/// finishing, and its log is kept only once it has stopped writing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn an_uploaded_session_waits_for_its_pod(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    seed_running_pod_run(&db, "owner/repo#44", "run-44", "crucible-run-44").await?;
+    seed_uploaded_run_session(db.pool(), "run-44", &finished_loop_session()).await;
+
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(RunPodDispatcher {
+        phase: crate::runs::workpod::TurnPhase::TimedOut,
+        logs: String::new(),
+        created: Default::default(),
+    }));
+    let outcome = ingest_completion(&db, &cfg, "owner/repo#44").await;
+    crate::runs::workpod::reset_dispatcher();
+
+    assert!(!outcome?, "a running pod's run is still in flight");
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), "owner/repo#44")
+            .await?
+            .unwrap()
+            .status,
+        Status::Running,
+    );
+    Ok(())
+}
+
+/// A pod already gone once its session was stored completes from the store, rather than failing
+/// as lost: a restarted controller finds the pod collected and the session uploaded.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_gone_pod_with_an_uploaded_session_completes(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    seed_running_pod_run(&db, "owner/repo#45", "run-45", "crucible-run-45").await?;
+    seed_uploaded_run_session(db.pool(), "run-45", &finished_loop_session()).await;
+
+    crate::runs::workpod::install_dispatcher(std::sync::Arc::new(GoneRunPodDispatcher));
+    let outcome = ingest_completion(&db, &cfg, "owner/repo#45").await;
+    crate::runs::workpod::reset_dispatcher();
+
+    assert!(outcome?, "the stored session settles the run");
+    assert_eq!(
+        crate::issues::store::get_issue(db.pool(), "owner/repo#45")
+            .await?
+            .unwrap()
+            .status,
+        Status::Done,
+    );
     Ok(())
 }
 
@@ -4003,9 +4063,10 @@ impl crate::runs::workpod::PodDispatcher for PodArmDispatcher {
         &self,
         _cluster: &str,
         _ns: &str,
-        pod: k8s_openapi::api::core::v1::Pod,
+        mut pod: k8s_openapi::api::core::v1::Pod,
     ) -> Result<k8s_openapi::api::core::v1::Pod> {
         self.created.lock().expect("lock").push(pod.clone());
+        pod.metadata.uid = Some("fake-pod-uid".to_string());
         Ok(pod)
     }
     async fn await_terminal(
@@ -4316,6 +4377,7 @@ async fn a_pinned_issue_dispatches_its_loop_run_with_the_pair(pool: PgPool) -> R
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -4491,6 +4553,7 @@ async fn a_pinned_scope_turn_renders_its_provider_and_carries_its_key(pool: PgPo
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -5277,8 +5340,9 @@ impl crate::runs::workpod::PodDispatcher for StillRunningDispatcher {
         &self,
         _cluster: &str,
         _ns: &str,
-        pod: k8s_openapi::api::core::v1::Pod,
+        mut pod: k8s_openapi::api::core::v1::Pod,
     ) -> Result<k8s_openapi::api::core::v1::Pod> {
+        pod.metadata.uid = Some("still-running-uid".to_string());
         Ok(pod)
     }
     async fn await_terminal(
@@ -6687,6 +6751,7 @@ async fn adopt_launch_with_groups(
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups,
+                    rerun: None,
                 },
                 registered.revision()
             )
@@ -6756,6 +6821,7 @@ async fn scheduled_launch_with_cursor(db: &Db, key: &str) -> String {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         },
         registered.revision(),
     )
@@ -7247,6 +7313,7 @@ async fn a_playbook_launch_carries_its_agent_and_decision_bindings(pool: PgPool)
             harness: None,
             enabled: true,
             created_by: "wren",
+            price: None,
         },
     )
     .await?;
@@ -7869,6 +7936,15 @@ async fn a_restart_adopts_the_local_runs_it_orphaned(pool: PgPool) -> Result<()>
         .fetch_all(db.pool())
         .await?;
     assert_eq!(statuses, vec!["finished", "no-session"]);
+    let run_id: String = sqlx::query_scalar("SELECT run_id FROM runs WHERE issue = $1")
+        .bind(published)
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(
+        crate::runs::blob_store::get_run_session(db.pool(), &run_id).await?,
+        Some(playbook_log("finished")),
+        "a folded local session is stored like a pod's, so a rerun can read it"
+    );
     Ok(())
 }
 

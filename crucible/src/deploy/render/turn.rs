@@ -1,8 +1,7 @@
 use crate::deploy::profile::DeployProfile;
 use crate::deploy::render::kube::{
-    FORGE_STORAGE_ROOT, INGEST_TOKEN_DIR, INGEST_TOKEN_TTL_SECS, INGEST_TOKEN_VOLUME,
-    PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env, node_avoid_affinity, resources,
-    secret_env_vars,
+    FORGE_STORAGE_ROOT, PULL_AUTHFILE_PATH, driver_image_env, kubernetes_sandbox_env,
+    node_avoid_affinity, resources, secret_env_vars,
 };
 use crate::deploy::render::{DigestResolver, pin_image};
 use crate::openshell::gateway::ComputeDriver;
@@ -359,23 +358,19 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         env.push(plain(k, v.clone()));
     }
 
-    // Tier 2 ingest: when the profile names the controller's drop-box URL, tell the turn
-    // where to POST its large artifacts and where its projected `crucible-ingest`-audience token is.
-    // Absent = no drop-box; the engine falls back to marker emission. The token volume itself is
-    // added below, it's a separate, audience-locked file, independent of the API-server automount
-    // above.
-    if let Some(ingest_url) = &profile.cluster.ingest_url {
-        env.push(plain(crucible_contract::ENV_INGEST_URL, ingest_url.clone()));
+    // When the profile names the controller, the turn uploads its pack and transcript there under
+    // its own name, with the pod token the controller puts in its Secret. Absent = the engine falls
+    // back to marker emission.
+    if let Some(controller) = &profile.cluster.ingest_url {
         env.push(plain(
-            crucible_contract::ENV_INGEST_TOKEN_PATH,
-            format!("{INGEST_TOKEN_DIR}/token"),
+            crucible_contract::ENV_CONTROLLER_URL,
+            controller.clone(),
         ));
     }
 
-    // The pod learns its own name from the downward API, so the ingest `{pod}` path segment it
-    // POSTs to equals the token's bound-pod claim by construction (pod-binding = turn-scoping).
-    // Name + uid also let the in-pod gateway create a client-TLS Secret unique to this pod and
-    // owned by it, which is what gets it garbage-collected with the turn.
+    // The pod learns its own name from the downward API: the `{pod}` segment its uploads go to,
+    // and, with its uid, what lets the in-pod gateway create a client-TLS Secret unique to this
+    // pod and owned by it, which is what gets it garbage-collected with the turn.
     let downward = |name: &str, field_path: &str| core::EnvVar {
         name: name.to_string(),
         value: None,
@@ -524,33 +519,6 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         empty_dir: Some(core::EmptyDirVolumeSource::default()),
         ..Default::default()
     });
-
-    // Tier 2 ingest token (Tier 2 ingest): a projected SA token audience'd to the ingest endpoint only,
-    // useless against the kube API or any other service. Mounted read-only; the engine reads
-    // `<dir>/token` and sends it as the bearer. Added only when the drop-box URL is configured.
-    if profile.cluster.ingest_url.is_some() {
-        mounts.push(core::VolumeMount {
-            name: INGEST_TOKEN_VOLUME.to_string(),
-            mount_path: INGEST_TOKEN_DIR.to_string(),
-            read_only: Some(true),
-            ..Default::default()
-        });
-        volumes.push(core::Volume {
-            name: INGEST_TOKEN_VOLUME.to_string(),
-            projected: Some(core::ProjectedVolumeSource {
-                sources: Some(vec![core::VolumeProjection {
-                    service_account_token: Some(core::ServiceAccountTokenProjection {
-                        audience: Some(crucible_contract::INGEST_TOKEN_AUDIENCE.to_string()),
-                        expiration_seconds: Some(INGEST_TOKEN_TTL_SECS),
-                        path: "token".to_string(),
-                    }),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-    }
 
     mounts.push(core::VolumeMount {
         name: CHECKOUT_VOLUME.to_string(),
@@ -809,14 +777,10 @@ mod tests {
         assert!(!yaml.contains("kind: RoleBinding"));
         // No avoid-list in the profile, no affinity stanza.
         assert!(!yaml.contains("affinity"), "no affinity key: {yaml}");
-        // No drop-box configured → no Tier 2 ingest env/volume leaks in (Tier 2 ingest).
+        // No controller configured, so the turn uploads nowhere.
         assert!(
-            !yaml.contains("CRUCIBLE_INGEST_URL"),
-            "no ingest env without a drop-box"
-        );
-        assert!(
-            !yaml.contains("crucible-ingest-token"),
-            "no ingest token volume"
+            !yaml.contains("CRUCIBLE_CONTROLLER_URL"),
+            "no controller env without a controller"
         );
     }
 
@@ -999,12 +963,10 @@ mod tests {
         );
     }
 
-    /// With `[cluster].ingest_url` set, a turn pod grows the Tier 2 ingest scaffolding (Tier 2 ingest):
-    /// the `CRUCIBLE_INGEST_URL`/`_TOKEN_PATH`/`POD_NAME` env, a projected `crucible-ingest`-audience
-    /// SA token volume mounted read-only, while `automountServiceAccountToken: false` still stands
-    /// (this is one explicit audience-locked file, not the kube-API passport).
+    /// With `[cluster].ingest_url` set, a turn pod learns the controller's URL and its own name, and
+    /// nothing token-shaped is in its spec: the pod token rides the Secret dispatch creates.
     #[test]
-    fn turn_pod_with_ingest_url_projects_the_drop_box_token_and_env() {
+    fn turn_pod_with_a_controller_uploads_under_its_own_name_and_projects_no_token() {
         let profile: DeployProfile = toml::from_str(
             r#"
             [cluster]
@@ -1043,20 +1005,17 @@ mod tests {
         )
         .expect("render turn");
 
-        // The env carrying the drop-box URL + the token path + the pod's own name (downward API).
-        assert!(yaml.contains("CRUCIBLE_INGEST_URL"));
+        assert!(yaml.contains("CRUCIBLE_CONTROLLER_URL"));
         assert!(yaml.contains("http://crucible-controller.autoresearch.svc:8080"));
-        assert!(yaml.contains("CRUCIBLE_INGEST_TOKEN_PATH"));
         assert!(yaml.contains("CRUCIBLE_POD_NAME"));
         assert!(yaml.contains("metadata.name"), "downward-API pod name");
         // The uid is what lets the in-pod gateway own what it publishes, so that material is
         // collected with the turn instead of outliving it.
         assert!(yaml.contains("CRUCIBLE_POD_UID"));
         assert!(yaml.contains("metadata.uid"), "downward-API pod uid");
-        // The projected, audience-locked token volume + its read-only mount.
-        assert!(yaml.contains("crucible-ingest-token"));
-        assert!(yaml.contains("audience: crucible-ingest"));
-        assert!(yaml.contains("/var/run/secrets/crucible.io/ingest"));
+        // The token rides the Secret the controller creates at dispatch, never the pod spec.
+        assert!(!yaml.contains("serviceAccountToken"), "{yaml}");
+        assert!(!yaml.contains("CRUCIBLE_POD_TOKEN"), "{yaml}");
         // The default stays: the kube-API automount is still off.
         assert!(yaml.contains("automountServiceAccountToken: false"));
     }

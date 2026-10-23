@@ -73,6 +73,7 @@ pub(crate) mod tests;
         crate::runs::api::evidence::get_task_evidence,
         crate::runs::api::evidence::get_run_log,
         crate::runs::api::evidence::get_run_files,
+        crate::runs::api::rerun::preview_rerun,
         crate::runs::api::evidence::get_run_file,
         crate::runs::api::runs::list_run_artifacts,
         crate::runs::api::runs::get_artifact,
@@ -498,6 +499,7 @@ pub fn router(state: ApiState) -> Router {
         .routes(routes!(crate::runs::api::evidence::get_task_evidence))
         .routes(routes!(crate::runs::api::evidence::get_run_log))
         .routes(routes!(crate::runs::api::evidence::get_run_files))
+        .routes(routes!(crate::runs::api::rerun::preview_rerun))
         .routes(routes!(crate::runs::api::runs::list_run_artifacts))
         .routes(routes!(crate::runs::api::flow::get_run_flow_enriched))
         .routes(routes!(crate::runs::api::runs::export_runs))

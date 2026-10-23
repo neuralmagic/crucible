@@ -298,12 +298,6 @@ pub struct ControllerCfg {
         default_value = "autoresearch"
     )]
     pub pod_namespace: String,
-    /// The service account the turn pods run as (`[cluster].service_account` in the deploy
-    /// profile). The Tier 2 ingest drop-box's TokenReview extractor requires an uploader's token
-    /// to belong to exactly this SA in `pod_namespace`. Unset accepts any SA in the namespace,
-    /// which is looser than ideal — the Helm chart sets it to pin the exact account.
-    #[arg(long = "turn-service-account", env = "CONTROLLER_TURN_SERVICE_ACCOUNT")]
-    pub turn_service_account: Option<String>,
     /// The cluster new turn/run pods dispatch to: `hub` (the controller's own cluster) or a
     /// spoke name resolvable under `clusters_dir`. Each row records its cluster, so changing
     /// this affects only new dispatches; in-flight pods are driven on their recorded cluster.
@@ -336,18 +330,6 @@ pub struct ControllerCfg {
         value_delimiter = ','
     )]
     pub dispatch_cluster_by_contract: Vec<String>,
-    /// The turn service account on each spoke, as `cluster=sa` entries. A spoke pod's ingest token
-    /// is TokenReviewed against its own cluster, where the service account is the spoke's rather
-    /// than the hub's; a spoke with no entry uses `turn_service_account`'s value (a name, or any
-    /// service account in that spoke's namespace when it too is unset). The spoke's namespace is
-    /// not configured here: it comes from the spoke's kubeconfig context. Malformed entries fail
-    /// the startup validation.
-    #[arg(
-        long = "spoke-service-accounts",
-        env = "CONTROLLER_SPOKE_SERVICE_ACCOUNTS",
-        value_delimiter = ','
-    )]
-    pub spoke_service_accounts: Vec<String>,
     /// The TCP port a loop pod's in-process control bridge listens on, dialed by the read-only live
     /// relay (`GET /api/runs/:id/live`). Must match the `--control-port` the rendered loop-pod
     /// wrapper passes (`crucible/src/deploy/render.rs`, currently 7777).
@@ -976,30 +958,6 @@ impl ControllerCfg {
         Ok(())
     }
 
-    /// The per-cluster turn service accounts the ingest drop-box validates uploaders against.
-    /// Parsed at startup so a `spoke_service_accounts` entry that is not `cluster=sa` fails the
-    /// boot rather than being ignored.
-    pub fn turn_accounts(&self) -> Result<TurnAccounts> {
-        let spokes = parse_kv_list(
-            &self.spoke_service_accounts,
-            "CONTROLLER_SPOKE_SERVICE_ACCOUNTS",
-            "cluster=serviceaccount",
-        )?;
-        // The hub's account has its own knob; accepting it here would give one cluster two
-        // sources of truth.
-        if let Some(sa) = spokes.get(crate::runs::clusters::HUB_CLUSTER) {
-            let entry = format!("{}={sa}", crate::runs::clusters::HUB_CLUSTER);
-            bail!(
-                "CONTROLLER_SPOKE_SERVICE_ACCOUNTS entry `{entry}` names the hub: set the hub's \
-                 account with CONTROLLER_TURN_SERVICE_ACCOUNT"
-            );
-        }
-        Ok(TurnAccounts {
-            hub: self.turn_service_account.clone(),
-            spokes,
-        })
-    }
-
     /// The contract-to-cluster routing map. Parsed at startup so a malformed entry fails the boot
     /// rather than silently routing to the default, which is what the unread env did before.
     pub fn contract_clusters(&self) -> Result<BTreeMap<String, String>> {
@@ -1064,18 +1022,6 @@ fn parse_kv_list(
         map.insert(key.trim().to_string(), value.trim().to_string());
     }
     Ok(map)
-}
-
-/// The service accounts an uploader's token may belong to, per cluster.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct TurnAccounts {
-    /// The hub's turn service account (`CONTROLLER_TURN_SERVICE_ACCOUNT`). `None` accepts any
-    /// service account in the hub's loop namespace.
-    pub hub: Option<String>,
-    /// Per-spoke turn service accounts (`CONTROLLER_SPOKE_SERVICE_ACCOUNTS`). A spoke with no
-    /// entry uses [`TurnAccounts::hub`]'s value: its name, or any service account in that spoke's
-    /// namespace when the hub's is unset.
-    pub spokes: BTreeMap<String, String>,
 }
 
 #[cfg(test)]
@@ -1240,50 +1186,6 @@ mod tests {
                 .is_empty(),
             "no flag, no contracts"
         );
-    }
-
-    #[test]
-    fn spoke_service_accounts_parse_into_a_map_and_malformed_entries_fail_at_startup() {
-        let ok = crate::testing::cfg_from_args([
-            "ctl",
-            "--turn-service-account",
-            "crucible-turn",
-            "--spoke-service-accounts",
-            "wharf=wharf-turn,slate=slate-turn",
-        ])
-        .turn_accounts()
-        .expect("well-formed entries parse");
-        assert_eq!(ok.hub.as_deref(), Some("crucible-turn"));
-        assert_eq!(
-            ok.spokes.get("wharf").map(String::as_str),
-            Some("wharf-turn")
-        );
-        assert_eq!(
-            ok.spokes.get("slate").map(String::as_str),
-            Some("slate-turn")
-        );
-
-        // Unset is the hub-only default: no spokes, and no pinned hub service account.
-        let bare = crate::testing::cfg_from_args(["ctl"])
-            .turn_accounts()
-            .expect("no entries parse");
-        assert_eq!(bare, TurnAccounts::default());
-
-        for bad in ["wharf", "wharf=", "=wharf-turn"] {
-            let err = crate::testing::cfg_from_args(["ctl", "--spoke-service-accounts", bad])
-                .turn_accounts()
-                .unwrap_err()
-                .to_string();
-            assert!(err.contains(bad), "names the offending entry: {err}");
-        }
-
-        // The hub's account has its own knob; naming `hub` here is a config mistake, not a spoke.
-        let err =
-            crate::testing::cfg_from_args(["ctl", "--spoke-service-accounts", "hub=crucible-turn"])
-                .turn_accounts()
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("CONTROLLER_TURN_SERVICE_ACCOUNT"), "{err}");
     }
 
     #[test]

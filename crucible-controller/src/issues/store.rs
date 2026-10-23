@@ -2071,6 +2071,7 @@ pub(crate) mod tests {
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         };
         let key = "playbook:survey:0199c0de-7c2c-71a5-8000-2";
         assert!(matches!(
@@ -2198,6 +2199,7 @@ pub(crate) mod tests {
                     draft_version: None,
                     created_by: Some("wren"),
                     launcher_groups: None,
+                    rerun: None,
                 },
                 crate::playbooks::registry::PackRevision::Bytes("sha256:tar")
             )

@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
-import { narrow, withOwner } from '../ownerContext';
+import { eyebrowFor, narrow, withOwner } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import { OwnerField } from './OwnerField';
 import {
@@ -696,7 +696,7 @@ export function ProvidersPage() {
 
   return (
     <div className="grid gap-3">
-      <PageHeader eyebrow="System" title="Providers" />
+      <PageHeader eyebrow={eyebrowFor(ownerContext.team, 'System')} title="Providers" />
       {providers.isLoading ? (
         <LoadingBlock />
       ) : (

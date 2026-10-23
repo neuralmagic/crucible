@@ -1,6 +1,6 @@
 import { Link } from 'react-router-dom';
 import { $api } from '../api/client';
-import { narrow } from '../ownerContext';
+import { eyebrowFor, narrow } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import type { components } from '../api/schema';
 import {
@@ -95,7 +95,7 @@ export function PlaybooksPage() {
   return (
     <>
       <PageHeader
-        eyebrow="Queue"
+        eyebrow={eyebrowFor(owner.team, 'Queue')}
         title="Playbooks"
         description="Registered packs, pinned to a commit. Launching one runs its graph once against the values you supply."
         actions={

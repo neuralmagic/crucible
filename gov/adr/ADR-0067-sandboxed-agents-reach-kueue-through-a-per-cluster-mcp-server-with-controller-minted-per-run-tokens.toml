@@ -1,7 +1,7 @@
 #:schema ../schema/adr.schema.json
 
 [govctl]
-id = "ADR-0066"
+id = "ADR-0067"
 title = "Sandboxed agents reach Kueue through a per-cluster MCP server with controller-minted per-run tokens"
 status = "proposed"
 date = "2026-10-08"

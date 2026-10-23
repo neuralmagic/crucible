@@ -3,7 +3,7 @@
 //! `token_grant` sends (no `client_id`; the SVID's `sub` identifies the sandbox).
 //!
 //! ```text
-//!  run pod ──POST /api/pods/{pod}/sandboxes (pod-bound SA token)──▶ run_sandboxes
+//!  run pod ──POST /api/runs/{run}/sandboxes (the run's pod token)──▶ run_sandboxes
 //!  supervisor ──POST /oauth/token, client_assertion=<JWT-SVID>──▶ verify SVID (its cluster's
 //!                                                                   SPIRE, via the API server)
 //!                                                                   resolve sandbox → live run
@@ -502,9 +502,13 @@ mod tests {
             Some("user:alice"),
         )
         .await;
-        bindings::bind(pool, "crucible-run-brave-otter", &testing::binding(sandbox))
-            .await
-            .unwrap();
+        bindings::bind(
+            pool,
+            &bindings::run_pod(pool, "run-1").await.unwrap(),
+            &testing::binding(sandbox),
+        )
+        .await
+        .unwrap();
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -719,9 +723,13 @@ mod tests {
         crate::runs::store::stamp_dispatcher(&pool, "run-again")
             .await
             .unwrap();
-        bindings::bind(&pool, "crucible-run-again", &testing::binding("sbx-1"))
-            .await
-            .unwrap();
+        bindings::bind(
+            &pool,
+            &bindings::run_pod(&pool, "run-again").await.unwrap(),
+            &testing::binding("sbx-1"),
+        )
+        .await
+        .unwrap();
         link(&pool, "alice-k8s").await;
         crate::identity::oidc::users::record_login(
             &pool,
@@ -855,9 +863,13 @@ mod tests {
             Some("team:platform-administrators"),
         )
         .await;
-        bindings::bind(&pool, "crucible-run-team", &testing::binding("sbx-team"))
-            .await
-            .unwrap();
+        bindings::bind(
+            &pool,
+            &bindings::run_pod(&pool, "run-team").await.unwrap(),
+            &testing::binding("sbx-team"),
+        )
+        .await
+        .unwrap();
         let h = harness(pool).await;
         let good = h.spire.svid(&Spire::claims("sbx-1"));
         let svid = |edit: &dyn Fn(&mut serde_json::Map<String, Value>)| {

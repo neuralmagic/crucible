@@ -21,7 +21,11 @@ pub const ENV_AGENT_TOKEN_ENDPOINT: &str = "CRUCIBLE_AGENT_TOKEN_ENDPOINT";
 /// The audience supervisors request their JWT-SVIDs for: the controller's issuer identifier.
 pub const ENV_AGENT_SVID_AUDIENCE: &str = "CRUCIBLE_AGENT_SVID_AUDIENCE";
 
-/// The bind endpoint for `pod`, relative to the controller's ingest base URL.
-pub fn binding_path(pod: &str) -> String {
-    format!("/api/pods/{pod}/sandboxes")
+/// The bind endpoint for run `run_id`, relative to the controller's URL. The run's pod token
+/// authenticates it.
+pub fn binding_path(run_id: &str) -> String {
+    format!(
+        "/api/runs/{}/sandboxes",
+        crate::artifact::path_segment(run_id)
+    )
 }

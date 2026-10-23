@@ -536,7 +536,8 @@ async fn call_ranker(target: &Target, prompt: &str) -> Result<(String, Option<f6
                 Box::pin(resolve_target(resolved.clone(), requested))
             },
         ))
-        .build();
+        .build()
+        .context("building the genai client")?;
     let options = build_chat_options();
     let res = client
         .exec_chat(&*model, ChatRequest::from_user(prompt), Some(&options))
@@ -1196,6 +1197,7 @@ mod tests {
                 harness: None,
                 enabled: true,
                 created_by: "test",
+                price: None,
             },
         )
         .await?;
@@ -1227,6 +1229,7 @@ mod tests {
                 created_by: "t".to_string(),
                 created_at: String::new(),
                 updated_at: String::new(),
+                price: None,
             },
             model: "m".to_string(),
             harness: crucible::manifest::Harness::Claude,

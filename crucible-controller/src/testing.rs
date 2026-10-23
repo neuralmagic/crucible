@@ -86,12 +86,10 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         repos: vec![],
         allowed_orgs: vec![],
         pod_namespace: "default".to_string(),
-        turn_service_account: None,
         dispatch_cluster: "hub".to_string(),
         cluster_policy: Vec::new(),
         dispatch_cluster_by_contract: Vec::new(),
         clusters_dir: None,
-        spoke_service_accounts: Vec::new(),
         control_port: 7777,
         playbook_executor: crucible_controller::PlaybookExecutor::Pod,
         playbook_max_cost_cap: 25.0,
@@ -233,6 +231,7 @@ pub(crate) async fn launch_playbook(
             draft_version: None,
             created_by: Some("wren"),
             launcher_groups: None,
+            rerun: None,
         },
         &crate::playbooks::exposure::Extraction::Absent,
     )
@@ -292,6 +291,7 @@ pub(crate) async fn register_ranker_as(
             harness: None,
             enabled: true,
             created_by: "test",
+            price: None,
         },
     )
     .await

@@ -8,12 +8,13 @@
 
 #[cfg(feature = "autoresearch")]
 pub(crate) mod console;
+pub(crate) mod evidence_client;
 pub(crate) mod flow_dd;
-pub(crate) mod ingest_client;
 #[cfg(feature = "autoresearch")]
 pub(crate) mod reporter;
 #[cfg(feature = "autoresearch")]
 pub(crate) mod result_mode;
+pub(crate) mod sandbox_bind;
 pub(crate) mod session;
 #[cfg(feature = "autoresearch")]
 pub(crate) mod stream;

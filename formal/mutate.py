@@ -22,8 +22,20 @@ MUTANTS = {
         "  if s = t_skipped then\n    short_circuit t",
     ),
     "ceiling_lets_epilogue_run": (
-        "(plan = p_dispatching ∨ (plan = p_draining ∧ halt = h_short ∧ epilogue t))",
-        "(plan = p_dispatching ∨ (plan = p_draining ∧ epilogue t))",
+        "(plan = p_dispatching ∨ (plan = p_draining ∧ halt = h_short ∧ epilogue t) ∨ spared t)",
+        "(plan = p_dispatching ∨ (plan = p_draining ∧ epilogue t) ∨ spared t)",
+    ),
+    "cost_ceiling_lets_spending_run": (
+        "ghost relation spared (t : task) := plan = p_draining ∧ halt = h_cost ∧ ¬ unit_spends t",
+        "ghost relation spared (t : task) := plan = p_draining ∧ halt = h_cost",
+    ),
+    "time_ceiling_spares_what_cannot_spend": (
+        "ghost relation spared (t : task) := plan = p_draining ∧ halt = h_cost ∧ ¬ unit_spends t",
+        "ghost relation spared (t : task) := plan = p_draining ∧ (halt = h_cost ∨ halt = h_time) ∧ ¬ unit_spends t",
+    ),
+    "cost_ceiling_blocks_what_cannot_spend": (
+        "  require ¬ spared t\n  status t := t_blocked",
+        "  status t := t_blocked",
     ),
     "not_taken_without_cause": (
         "  require route_not_taken t ∨ route_passed t ∨ route_undecided t ∨ branch_not_taken t\n",
@@ -42,8 +54,8 @@ MUTANTS = {
         "    if s = t_fail then",
     ),
     "target_row_lands_before_the_review": (
-        "  last t := s\n  dispatched t := true\n  phase t := rp_review",
-        "  last t := s\n  status t := s\n  dispatched t := true\n  phase t := rp_review",
+        "  last t := s\n  dispatched t := true\n  if plan = p_draining then",
+        "  last t := s\n  status t := s\n  dispatched t := true\n  if plan = p_draining then",
     ),
     "serial_task_joins_a_batch": (
         "  require isolated t ∧ batch_open ∧ (∀ u, status u = t_running → isolated u) ∨ idle",

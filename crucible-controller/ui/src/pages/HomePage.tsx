@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import { $api } from '../api/client';
 import type { components } from '../api/schema';
 import { useLiveEvents } from '../api/useLiveEvents';
-import { narrow } from '../ownerContext';
+import { narrow, scopedPath } from '../ownerContext';
 import { useOwnerContext } from '../useOwnerContext';
 import {
   Button,
@@ -23,7 +23,7 @@ import {
 import { issueStatusColor } from './issueStatus';
 import { relativeTime } from './journeyView';
 import { launchPath } from './launchView';
-import { isDraftRun } from './playbookRunsView';
+import { isDraftRun, runInContext } from './playbookRunsView';
 import { formatCost } from './runReport';
 import {
   approvalsWaiting,
@@ -137,11 +137,11 @@ function Playbooks({ playbooks }: { playbooks: PlaybookDto[] }) {
   );
 }
 
-function ComingUp({ schedules }: { schedules: ScheduleDto[] }) {
+function ComingUp({ schedules, team }: { schedules: ScheduleDto[]; team: string | null }) {
   const now = Date.now();
   return (
     <Section>
-      <SectionHeader title="Coming up" actions={<SeeAll to="/schedules">All schedules</SeeAll>} />
+      <SectionHeader title="Coming up" actions={<SeeAll to={scopedPath(team, '/schedules')}>All schedules</SeeAll>} />
       <SectionBody className="py-0">
         <Rows>
           {schedules.map((row) => (
@@ -160,7 +160,7 @@ function ComingUp({ schedules }: { schedules: ScheduleDto[] }) {
   );
 }
 
-function FirstRun() {
+function FirstRun({ team }: { team: string | null }) {
   return (
     <Empty
       title="Nothing here yet"
@@ -169,7 +169,7 @@ function FirstRun() {
           <Button variant="filled" className="uppercase" render={<Link to="/playbooks/import" />}>
             Import from git
           </Button>
-          <Button className="uppercase" render={<Link to="/playbooks/drafts" />}>
+          <Button className="uppercase" render={<Link to={scopedPath(team, '/playbooks/drafts')} />}>
             Start a draft
           </Button>
         </>
@@ -181,6 +181,11 @@ function FirstRun() {
 /// Where a returning user lands: what waits on them, what ran lately, and what to launch next.
 /// Sections with nothing to say stay hidden.
 export function HomePage() {
+  return <Workspace header={<PageHeader title="Home" />} />;
+}
+
+/// The home of the owner context: the caller's whole view, or one team's.
+export function Workspace({ header }: { header: ReactNode }) {
   useLiveEvents();
 
   const playbooks = $api.useQuery('get', '/api/playbooks');
@@ -190,24 +195,22 @@ export function HomePage() {
   const overview = $api.useQuery('get', '/api/overview');
   const owner = useOwnerContext();
 
-  const allRuns = runs.data ?? EMPTY_RUNS;
+  const owners = new Map((playbooks.data ?? EMPTY_PLAYBOOKS).map((p) => [p.id, p.owner]));
+  const allRuns = (runs.data ?? EMPTY_RUNS).filter((run) =>
+    runInContext(run, owner.context, (id) => owners.get(id)),
+  );
   const realRuns = allRuns.filter((run) => !isDraftRun(run));
   const books = narrow(playbooks.data ?? EMPTY_PLAYBOOKS, owner.context, (row) => row.owner);
   const scheduleRows = narrow(schedules.data ?? EMPTY_SCHEDULES, owner.context, (row) => row.owner_principal);
   const budget = overview.data
     ? budgetAttention({ spent: overview.data.cost_today.current, ceiling: overview.data.cost_today.ceiling }, new Date())
     : null;
+  const teamView = owner.context.startsWith('team:');
   const attention = [
-    ...(budget ? [budget] : []),
-    ...attentionItems(realRuns, scheduleRows, approvals.data ? approvalsWaiting(approvals.data) : 0),
+    ...(budget && !teamView ? [budget] : []),
+    ...attentionItems(realRuns, scheduleRows, approvals.data && !teamView ? approvalsWaiting(approvals.data) : 0),
   ];
   const next = upcoming(scheduleRows, UPCOMING_SHOWN);
-
-  const header = (
-    <PageHeader
-      title="Home"
-    />
-  );
 
   if (playbooks.isPending || runs.isPending) {
     return (
@@ -218,11 +221,11 @@ export function HomePage() {
     );
   }
 
-  if (playbooks.isSuccess && runs.isSuccess && playbooks.data.length === 0 && allRuns.length === 0) {
+  if (playbooks.isSuccess && runs.isSuccess && books.length === 0 && allRuns.length === 0) {
     return (
       <>
         {header}
-        <FirstRun />
+        <FirstRun team={owner.team} />
       </>
     );
   }
@@ -233,7 +236,7 @@ export function HomePage() {
       {attention.length > 0 ? <NeedsYou items={attention} /> : null}
       <div className="grid grid-cols-1 wide:grid-cols-2">
         <Section>
-          <SectionHeader title="Recent runs" actions={<SeeAll to="/playbook-runs">All runs</SeeAll>} />
+          <SectionHeader title="Recent runs" actions={<SeeAll to={scopedPath(owner.team, '/playbook-runs')}>All runs</SeeAll>} />
           <SectionBody className="py-0">
             <QueryState query={runs} noun="runs">
               <RecentRuns runs={realRuns.slice(0, RECENT_RUNS)} />
@@ -241,7 +244,7 @@ export function HomePage() {
           </SectionBody>
         </Section>
         <Section className="wide:border-l wide:border-l-rule-hard">
-          <SectionHeader title="Playbooks" actions={<SeeAll to="/playbooks">All playbooks</SeeAll>} />
+          <SectionHeader title="Playbooks" actions={<SeeAll to={scopedPath(owner.team, '/playbooks')}>All playbooks</SeeAll>} />
           <SectionBody className="py-0">
             <QueryState query={playbooks} noun="playbooks">
               <Playbooks playbooks={playbooksByUse(books, allRuns, PLAYBOOKS_SHOWN)} />
@@ -249,7 +252,7 @@ export function HomePage() {
           </SectionBody>
         </Section>
       </div>
-      {next.length > 0 ? <ComingUp schedules={next} /> : null}
+      {next.length > 0 ? <ComingUp schedules={next} team={owner.team} /> : null}
     </>
   );
 }

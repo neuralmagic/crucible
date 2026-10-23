@@ -2,6 +2,7 @@
 //!
 //! Plans are currently built from engine templates or loaded from human/pack-authored TOML
 //! and JSON. `validate` checks the supported version and graph structure before execution.
+pub mod admission;
 pub(crate) mod diag;
 pub mod exec;
 pub mod history;
@@ -9,6 +10,7 @@ pub mod ir;
 pub mod machine;
 pub mod param;
 pub mod record;
+pub mod rerun;
 pub mod resume;
 pub mod route;
 pub mod runner;

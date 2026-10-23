@@ -660,7 +660,10 @@ pub(crate) async fn require_auth_or_api_key(
     req: Request,
     next: Next,
 ) -> Response {
-    if presented_api_key(req.headers()) {
+    if presented_bearer(req.headers()).is_some_and(crate::runs::pod_token::looks_like_token) {
+        return key_refused("a pod token authenticates only its own evidence routes");
+    }
+    if presented_bearer(req.headers()).is_some_and(crate::identity::api_key::looks_like_key) {
         let keys = KeyGuard {
             pool: both.pool,
             refresh: both.guard.refresh.clone(),
@@ -670,14 +673,13 @@ pub(crate) async fn require_auth_or_api_key(
     require_auth(State(both.guard), req, next).await
 }
 
-/// Whether the caller's bearer even claims to be an API key, which is what picks the guard. A
-/// malformed or revoked key still lands on the key guard, so it is told what is wrong with it.
-fn presented_api_key(headers: &header::HeaderMap) -> bool {
+/// The caller's bearer, whose prefix picks the guard. A malformed or revoked key still lands on
+/// the key guard, so it is told what is wrong with it.
+fn presented_bearer(headers: &header::HeaderMap) -> Option<&str> {
     headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|h| h.strip_prefix("Bearer "))
-        .is_some_and(crate::identity::api_key::looks_like_key)
 }
 
 /// What [`require_api_key`] checks a key against: the pool it is stored in, and the offline
@@ -694,8 +696,8 @@ pub struct KeyGuard {
 /// holding one long-lived credential, and none of the human paths — the session cookie, the edge's
 /// header assertions, the static machine token, a cluster token — mean anything there. Keeping the
 /// two guards apart means a bug in either cannot widen the other, and it is the same shape
-/// `/metrics` and the ingest drop-box already use: merged outside the human guard,
-/// carrying its own credential check.
+/// `/metrics` and the run evidence routes already use: merged outside the human guard, carrying
+/// their own credential check.
 ///
 /// What it stamps is what every handler already reads, so nothing downstream needs to know an API
 /// key was involved: the owner's login, their subject, and the groups their `users` row holds.

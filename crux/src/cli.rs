@@ -70,6 +70,13 @@ enum Command {
         /// The model to ask that provider for. Needs --provider; omit for its default.
         #[arg(long, requires = "provider")]
         model: Option<String>,
+        /// Rerun this finished run of the same pack instead of starting afresh: every task it
+        /// passed is reused, and the tasks --from names run again with everything after them.
+        #[arg(long, value_name = "RUN")]
+        rerun_of: Option<String>,
+        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+        #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
+        from: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -486,6 +493,13 @@ enum Command {
         json: bool,
     },
 
+    /// List the inference providers you may read: id, kind, default model, harness, the price per
+    /// million tokens a run on it is charged, and whether launches may pick it.
+    Providers {
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List the secrets you own: id, name, kind, visibility, mode, owner. Never a value.
     Secrets {
         #[arg(long)]
@@ -555,6 +569,13 @@ enum Command {
         /// The model to ask that provider for. Needs --provider; omit for its default.
         #[arg(long, requires = "provider")]
         model: Option<String>,
+        /// Rerun this finished run of the same pack instead of starting afresh: every task it
+        /// passed is reused, and the tasks --from names run again with everything after them.
+        #[arg(long, value_name = "RUN")]
+        rerun_of: Option<String>,
+        /// A task the rerun dispatches again, with everything downstream of it. Repeatable.
+        #[arg(long = "from", value_name = "TASK", requires = "rerun_of")]
+        from: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -607,6 +628,8 @@ pub async fn run() -> Result<()> {
             dispatch_target,
             provider,
             model,
+            rerun_of,
+            from,
             json,
         } => {
             let params: serde_json::Value =
@@ -621,6 +644,7 @@ pub async fn run() -> Result<()> {
                     dispatch_target,
                     provider,
                     model,
+                    rerun: rerun_of.map(|of| ops::Rerun { of, from }),
                 },
                 json,
             )
@@ -827,6 +851,7 @@ pub async fn run() -> Result<()> {
             base_version,
             json,
         } => ops::draft_push(&client, &draft_id, &dir, base_version, json).await?,
+        Command::Providers { json } => ops::providers(&client, json).await?,
         Command::Secrets { json } => ops::secrets(&client, json).await?,
         Command::SecretBind {
             secret_id,
@@ -877,6 +902,8 @@ pub async fn run() -> Result<()> {
             dispatch_target,
             provider,
             model,
+            rerun_of,
+            from,
             json,
         } => {
             let params: std::collections::BTreeMap<String, String> = serde_json::from_str(&params)
@@ -895,6 +922,7 @@ pub async fn run() -> Result<()> {
                     dispatch_target,
                     provider,
                     model,
+                    rerun: rerun_of.map(|of| ops::Rerun { of, from }),
                 },
                 json,
             )
@@ -1418,6 +1446,46 @@ mod tests {
             }
             _ => panic!("expected draft-launch"),
         }
+
+        match Cli::try_parse_from([
+            "crux",
+            "draft-launch",
+            "calibrate",
+            "--max-cost",
+            "1",
+            "--max-time",
+            "5m",
+            "--rerun-of",
+            "run-7",
+            "--from",
+            "check",
+            "--from",
+            "report",
+        ])
+        .expect("parses")
+        .command
+        {
+            Command::DraftLaunch { rerun_of, from, .. } => {
+                assert_eq!(rerun_of.as_deref(), Some("run-7"));
+                assert_eq!(from, ["check", "report"]);
+            }
+            _ => panic!("expected draft-launch"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "crux",
+                "launch",
+                "survey",
+                "--max-cost",
+                "1",
+                "--max-time",
+                "5m",
+                "--from",
+                "check",
+            ])
+            .is_err(),
+            "--from without --rerun-of parsed"
+        );
 
         assert!(
             Cli::try_parse_from(["crux", "draft-graduate", "calibrate"]).is_err(),

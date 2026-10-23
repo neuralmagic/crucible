@@ -1,4 +1,4 @@
--- 0055_run_sandboxes.sql — the OpenShell sandboxes each run pod created, keyed by the gateway's
+-- 0059_run_sandboxes.sql — the OpenShell sandboxes each run pod created, keyed by the gateway's
 -- sandbox id (the last segment of the sandbox supervisor's SPIFFE ID). The agent token endpoint
 -- resolves a presented JWT-SVID to its run through this table. A run pod can hold several
 -- sandboxes at once (fanned-out agent tasks).

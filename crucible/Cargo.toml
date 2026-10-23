@@ -31,7 +31,7 @@ serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 # Manifest parsing: crucible.toml -> the domain config (the standard TOML crate).
-toml = "0.8"
+toml = "1.1"
 # `[workspace].inject` shorthand: a pattern or directory entry expands under the manifest dir.
 glob = "0.3"
 # Validating a `params` pattern constraint. regex-lite over regex because the pattern comes from
@@ -42,7 +42,7 @@ regex-lite = "0.1"
 # Comment-preserving TOML surgery for the pack freeze rewrite (pin [repo], inject [deploy], pin the
 # sandboxed [agent] backend); the deserialize-only `Manifest` can't round-trip, so a targeted edit
 # keeps the agent's authored comments. Already in the tree as `toml`'s own backing crate.
-toml_edit = "0.22"
+toml_edit = "0.25"
 # The workflow DSL frontend: the starlark evaluator runs `workflow.star` against a
 # constructor-only global surface, and starlark_syntax supplies the AST pre-pass and
 # the FileSpan the compile errors carry.
@@ -58,7 +58,7 @@ nix = { version = "0.31.3", features = ["fs", "signal"] }
 # AWS_ROLE_ARN + the projected token). The loop is sync, so `publish` owns a small
 # block_on runtime; the rest of the loop never touches tokio.
 aws-config = { version = "1", optional = true }
-aws-sdk-s3 = { version = "1", optional = true }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
 # `sync` (Notify) backs the autopilot daemon's graceful-shutdown signal. `process` runs the
 # surviving openshell CLI upload/download as cancellable async children inside the turn.
 tokio = { version = "1", features = [
@@ -81,7 +81,7 @@ url = { version = "2", features = ["serde"] }
 # sandbox transcript downloads into, both auto-unlinked on drop instead of a hand-rolled guard.
 tempfile = "3"
 # Credential relay: base64 for embedding a CA into a relayed kubeconfig (`${file64:}`).
-base64 = "0.22"
+base64 = "0.23"
 # `crucible plan show --render`: mermaid -> PNG, fully offline (vendored dagre layout +
 # resvg raster; see third_party/NOTICE).
 xai-grok-mermaid = { path = "../third_party/xai-grok-mermaid" }
@@ -143,16 +143,16 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 # at the in-cluster Tempo. `tracing` macros compile to no-ops when no subscriber is installed.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-opentelemetry = "0.33"
-opentelemetry = { version = "0.32", default-features = false, features = [
+tracing-opentelemetry = "0.34"
+opentelemetry = { version = "0.33", default-features = false, features = [
     "trace",
     "logs",
 ] }
-opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
     "trace",
     "logs",
 ] }
-opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+opentelemetry-otlp = { version = "0.33", default-features = false, features = [
     "trace",
     "logs",
     "grpc-tonic",
@@ -165,7 +165,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = [
 [dev-dependencies]
 # The in-memory log exporter (behind `testing`) drives the gen_ai log mapping through the real SDK
 # export path in unit tests, no mock logger.
-opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+opentelemetry_sdk = { version = "0.33", default-features = false, features = [
     "trace",
     "logs",
     "testing",

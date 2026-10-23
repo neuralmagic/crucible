@@ -1,16 +1,17 @@
 # Hand-rolled codegen pipelines
 
-This document describes how to run Crucible's brokered code-build and GPU-measurement tools
-without the controller or optimization loop. Use this path to validate a new domain's tool
-contract, test a GPU substrate, or diagnose build and measurement failures.
+This page describes how to run the code-build and GPU-measurement tools of the Crucible
+broker without the controller or the optimization loop. Use this path to validate the tool
+contract of a new domain, to test a GPU substrate, or to find the cause of build and
+measurement failures.
 
-The normal deployment path remains a manifest-driven loop rendered by `crucible deploy`.
+The normal deployment is a loop from a manifest, rendered by `crucible deploy`.
 
 ## Current architecture
 
-The broker owns registry credentials and Kubernetes access. Its caller supplies source edits
-and a restricted set of declared arguments; it does not supply build credentials, arbitrary
-job specifications, or measurement commands.
+The broker has the registry credentials and the Kubernetes access. Its caller supplies
+source edits and a limited set of declared arguments. The caller does not supply build
+credentials, job specifications, or measurement commands.
 
 ```mermaid
 flowchart LR
@@ -33,8 +34,8 @@ The data path has four invariants:
    than accepted from the caller.
 
 GPU measurement jobs run the candidate image directly. Do not mount the source workspace
-over the candidate's installed tree: that would make the measurement depend on mutable files
-instead of the recorded image digest.
+over the installed tree of the candidate. If you do, the measurement depends on mutable files
+and not on the recorded image digest.
 
 ## Prerequisites
 
@@ -199,7 +200,7 @@ Optional volume variables are:
   that explicitly require a workspace mount.
 
 Do not set `BROKER_CODEGEN_WORKSPACE_PVC` for normal measurements. The rendered deployment
-intentionally omits it so a workspace volume cannot shadow files baked into the candidate image.
+omits it, so that a workspace volume cannot hide files in the candidate image.
 
 To delegate Jobs to a separate cluster, set `BROKER_CODEGEN_KUBECONFIG`. Optional companion
 variables are `BROKER_CODEGEN_KUBE_CONTEXT`, `BROKER_CODEGEN_PROXY_URL`,
@@ -231,8 +232,8 @@ export STORAGE_DRIVER=vfs
 target/release/crucible-broker
 ```
 
-Run the broker as the foreground process in a container or pod. A background broker tied to a
-short-lived shell or `sleep` process will disappear while calls are still in flight.
+Run the broker as the foreground process in a container or pod. If a background broker
+depends on a short-lived shell or `sleep` process, it can stop while calls are in progress.
 
 ## Connect an MCP client
 
@@ -284,9 +285,9 @@ The normal call sequence is:
    decoded bytes in offset order.
 
 Benchmark, lm-eval, and profile calls block until their Jobs finish. `codegen_jobs` keeps an
-in-memory ring of at most 20 Jobs and reports newest first. Cluster-derived lifecycle data is
-best-effort; an unavailable live lookup produces `unknown` rather than a false queued or running
-state.
+in-memory ring of at most 20 Jobs and reports the newest first. Lifecycle data from the
+cluster is best-effort. If the live lookup fails, the state is `unknown`, not an incorrect
+queued or running state.
 
 ## Frozen command output
 
@@ -312,10 +313,10 @@ the top level or one object level below it. A declared `limit` is passed as
 
 ### Profile
 
-The profile command writes its binary artifact to `$OUT`. With an artifacts PVC, the Job writes
-directly to that volume and the broker imports and removes the transport file. Without the PVC,
-the broker transfers the trace through Job logs and rejects artifacts larger than 64 KiB rather
-than returning truncated data.
+The profile command writes its binary artifact to `$OUT`. With an artifacts PVC, the Job
+writes directly to that volume, and the broker imports and removes the transport file.
+Without the PVC, the broker transfers the trace through the Job logs. It rejects artifacts
+larger than 64 KiB and does not return truncated data.
 
 Use `fetch_trace`, not `fetch_log`, for the returned trace handle.
 
@@ -333,9 +334,9 @@ The broker memoizes:
 - lm-eval runs by digest and limit;
 - profiles by digest.
 
-The memo and the set of broker-built digests are in memory. Restarting the broker preserves log
-files under `FORGE_STORAGE_ROOT` but forgets cache entries and digest provenance; call
-`codegen_build` again before measuring.
+The memo and the set of digests that the broker built are in memory. When the broker
+restarts, it keeps the log files under `FORGE_STORAGE_ROOT`, but it loses the cache entries
+and the digest provenance. Call `codegen_build` again before you measure.
 
 `BROKER_CODEGEN_MAX_CALLS_PER_TURN` and
 `BROKER_CODEGEN_MAX_GPU_MINUTES_PER_TURN` limit GPU work when Crucible supplies a turn token.
@@ -369,12 +370,12 @@ A delegated-cluster reachability error also includes the configured spoke name a
 | Measurement Job cannot pull | Create the Secret named by `BROKER_CODEGEN_PULL_SECRET` in the measurement namespace. |
 | Job remains queued | Verify the LocalQueue, ClusterQueue quota and flavors, GPU resource request, and Kueue Workload status through `codegen_jobs`. |
 | Job starts but fails | Tail the returned handle with `fetch_log`; verify the candidate contains `/bin/sh` and the frozen command writes valid data to `$OUT`. |
-| Digest is rejected after restart | Call `codegen_build` again; provenance is intentionally scoped to one broker lifetime. |
+| Digest is rejected after restart | Call `codegen_build` again. Provenance is valid only for one broker lifetime. |
 | Profile says `unconfigured` | Add a `profile` section with a non-empty frozen command. |
 | Profile exceeds fallback limit | Configure an artifacts PVC and mount the same claim into the broker at `BROKER_CODEGEN_ARTIFACTS_DIR`. |
 | Remote spoke is unreachable | Run `spoke-smoke`; verify kubeconfig, context, proxy, credentials, and the reported reachability tier. |
 
-The workflow DSL and generic work-graph runner are documented separately in
-[Work graphs](./work-graphs.md). The current broker surface still exposes the fixed
-`codegen_benchmark`, `codegen_lm_eval`, and `codegen_profile` tools; the named-job registry in
+[Work graphs](./work-graphs.md) describes the workflow DSL and the generic work-graph
+runner. The broker still has the fixed `codegen_benchmark`, `codegen_lm_eval`, and
+`codegen_profile` tools. The named-job registry in
 [ADR-0022](./adr/0022-measure-task-dags.md) is only partially implemented.

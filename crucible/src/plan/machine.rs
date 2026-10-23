@@ -218,7 +218,8 @@ pub enum PlanState {
     /// Ready tasks are being dispatched in topological order.
     Dispatching,
     /// The plan has halted; what remains settles as blocked, except epilogue tasks after a
-    /// required task failed, which still run so the failure is reported.
+    /// required task failed, which still run so the failure is reported, and tasks that cannot
+    /// spend after the cost ceiling.
     Draining,
     /// A main-graph task declared early completion; epilogue tasks still run.
     Concluding,
@@ -426,7 +427,8 @@ pub fn markdown() -> String {
          The plan dispatches ready tasks in topological order until every task has settled or \
          a required task fails or a ceiling is reached. After a halt the remaining tasks settle \
          as blocked; epilogue tasks still run after a required task fails so the failure is \
-         reported.\n\n\
+         reported, and tasks that cannot spend still run after the cost ceiling so the run \
+         reports the work it paid for.\n\n\
          ![The plan's states](img/plan-states.svg)\n\n\
          The sources are `docs/img/plan-task-states.dot` and `docs/img/plan-states.dot` \
          (`crucible plan states --format dot`).\n\n\
@@ -441,7 +443,7 @@ pub fn markdown() -> String {
         ),
         (
             BlockedReason::BudgetCeiling,
-            "The plan's spend reached its budget.",
+            "The plan's spend reached its budget and this task, or this lane of a fan-out, can spend.",
         ),
         (
             BlockedReason::WallClockCeiling,

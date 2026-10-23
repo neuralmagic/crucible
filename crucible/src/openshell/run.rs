@@ -12,7 +12,7 @@
 //! The sandbox name is derived per (process, workspace), so parallel wide-round candidates and parallel
 //! crucible processes sharing one gateway never collide on a fixed name.
 
-use crate::agent::event::{AgentEvent, RawStream, cost_of, estimate_cost};
+use crate::agent::event::{AgentEvent, RawStream};
 use crate::agent::harness::{
     AuthProvider, HarnessRuntime, McpServer, SandboxAuth, SandboxLayout, TranscriptLocator,
     TurnArtifacts,
@@ -457,10 +457,10 @@ async fn try_turn(
         workdir: Some(SandboxLayout::workdir(&basename)),
     };
     let agent_tokens = std::env::var(crucible_contract::sandbox::ENV_AGENT_TOKEN_ENDPOINT).ok();
-    if let Some(ingest) = binds_sandboxes(
+    if let Some(target) = binds_sandboxes(
         agent_tokens.as_deref(),
-        crate::report::ingest_client::IngestConfig::from_env(),
-    ) && let Err(e) = crate::report::ingest_client::bind_sandbox(&ingest, &binding).await
+        crate::report::sandbox_bind::BindTarget::from_env(),
+    ) && let Err(e) = crate::report::sandbox_bind::bind_sandbox(&target, &binding).await
     {
         let ev = AgentEvent::Raw {
             text: format!("sandbox bind failed (its agent token requests will be refused): {e:#}"),
@@ -747,7 +747,7 @@ async fn try_turn(
         };
         let wrapper = crate::agent::harness::exec_wrapper(&basename, &argv);
         let exec_opts = ExecOpts {
-            model: args.model(),
+            pricing: args.pricing(),
             json,
             cancel: &cancel,
         };
@@ -799,17 +799,16 @@ async fn try_turn(
             replay_sandbox_log(&gw, &name, LogReplay::Tail, sink).await;
         }
         let mut cost = exec_result?;
-        spent.raise(cost);
+        spent.raise(cost.total());
 
         // 8a. Agent exited: roll the captured OTLP jsonl up into the `otel_summary` event
-        //     (authoritative cost, per-model usage, API latency). `cost_of`'s prefer-OTEL rule
-        //     lifts the turn's cost onto the authoritative number.
+        //     (authoritative cost, per-model usage, API latency).
         if let Some(c) = &collector
             && let Some(summary) = c.summary()
         {
             let ev = summary.to_event();
-            cost = cost.max(cost_of(&ev).unwrap_or(0.0));
-            spent.raise(cost);
+            cost.observe(&ev);
+            spent.raise(cost.total());
             sink("", RawStream::Stdout, Some(&ev));
         }
 
@@ -835,10 +834,10 @@ async fn try_turn(
         if harness.spec().backfill_required
             || crate::agent::engine::TurnExport::resolve().emits_anything()
         {
-            cost = graft_turn_telemetry(harness, &gw, &name, &cancel, cost, sink).await;
-            spent.raise(cost);
+            graft_turn_telemetry(harness, &gw, &name, &cancel, &mut cost, sink).await;
+            spent.raise(cost.total());
         }
-        Ok(cost)
+        Ok(cost.total())
     }
     .await;
 
@@ -970,15 +969,15 @@ async fn issued_placeholder(
     })
 }
 
-/// Where to bind this turn's sandbox: the controller's ingest, and only when the controller issues
-/// agent tokens (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`), since nothing reads a binding otherwise.
+/// Where to bind this turn's sandbox: the run at the controller, and only when the controller
+/// issues agent tokens (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`), since nothing reads a binding otherwise.
 fn binds_sandboxes(
     agent_token_endpoint: Option<&str>,
-    ingest: Option<crate::report::ingest_client::IngestConfig>,
-) -> Option<crate::report::ingest_client::IngestConfig> {
+    target: Option<crate::report::sandbox_bind::BindTarget>,
+) -> Option<crate::report::sandbox_bind::BindTarget> {
     agent_token_endpoint
         .filter(|endpoint| !endpoint.trim().is_empty())
-        .and(ingest)
+        .and(target)
 }
 
 /// A line of `printenv` output that is a gateway-issued placeholder.
@@ -1092,17 +1091,16 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
         .context("pre-warming the aws-s3 credentials")
 }
 
-/// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the pricing
-/// model for the token-estimate fallback, the front-end mode, and the turn's cancellation token.
+/// The exec turn's knobs, bundled so [`exec_and_stream`] keeps a small signature: the turn's
+/// pricing, the front-end mode, and the turn's cancellation token.
 struct ExecOpts<'a> {
-    model: &'a str,
+    pricing: crate::agent::event::Pricing,
     json: bool,
     cancel: &'a CancellationToken,
 }
 
 /// Exec the agent over the gateway's `ExecSandbox` stream, driving a [`crate::agent::turn::StreamPump`] with the
-/// stdout lines the stream yields, and return the turn's cost (estimated from tokens if none was
-/// reported). The stream's stderr is replayed through the sink after the agent exits, mirroring the
+/// stdout lines the stream yields, and return the turn's running cost. The stream's stderr is replayed through the sink after the agent exits, mirroring the
 /// old CLI-child behavior. `cancel` unwinds the exec on Ctrl-C (see [`Gateway::exec`]).
 async fn exec_and_stream(
     gw: &Gateway,
@@ -1112,24 +1110,18 @@ async fn exec_and_stream(
     opts: &ExecOpts<'_>,
     spent: &CostMeter,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> Result<f64> {
-    let mut pump = crate::agent::turn::StreamPump::new(decoder);
+) -> Result<crate::agent::turn::TurnCost> {
+    let mut pump = crate::agent::turn::StreamPump::new(decoder, opts.pricing);
     let exec = gw
         .exec(name, command, opts.cancel, |line| {
             pump.push(line, opts.json, sink)
         })
         .await?;
-    let (mut cost, best_tokens) = pump.finish();
+    let cost = pump.finish();
     let (exit_code, transport_error) = (exec.exit_code, exec.transport_error);
-
-    if cost == 0.0
-        && let Some(t) = &best_tokens
-    {
-        cost = estimate_cost(opts.model, t);
-    }
     // Bank it here, not at the caller's `?`: the agent can bill real tokens and still exit
     // non-zero below, and a turn that spent money is never reported free.
-    spent.raise(cost);
+    spent.raise(cost.total());
 
     // Replay the agent's stderr (provisioning notes / errors) through the sink as raw lines.
     for line in exec.stderr_lines {
@@ -1373,9 +1365,9 @@ async fn graft_turn_telemetry(
     gw: &Gateway,
     name: &str,
     cancel: &CancellationToken,
-    cost: f64,
+    cost: &mut crate::agent::turn::TurnCost,
     sink: &mut impl FnMut(&str, RawStream, Option<&AgentEvent>),
-) -> f64 {
+) {
     let fetched = tokio::time::timeout(
         harness.spec().transcript_fetch_timeout,
         fetch_transcript(harness, gw, name, cancel),
@@ -1390,7 +1382,7 @@ async fn graft_turn_telemetry(
             };
             sink("", RawStream::Stderr, Some(&ev));
         }
-        return cost;
+        return;
     };
 
     let export = crate::agent::engine::TurnExport::resolve();
@@ -1418,16 +1410,15 @@ async fn graft_turn_telemetry(
         }
     }
 
-    let mut cost = cost;
     if harness.spec().backfill_required {
         for ev in &artifacts.events {
+            cost.observe(ev);
             sink("", RawStream::Stdout, Some(ev));
         }
         if let Some(c) = artifacts.cost_usd {
-            cost = cost.max(c);
+            cost.report(c);
         }
     }
-    cost
 }
 
 const PRIVATE_SESSION_DIR: &str = "agent-session-private";
@@ -1787,20 +1778,20 @@ mod tests {
     #[test]
     fn a_sandbox_is_bound_only_where_the_controller_issues_agent_tokens() {
         use crate::openshell::run::binds_sandboxes;
-        let ingest = || {
-            crate::report::ingest_client::IngestConfig::new(
+        let target = || {
+            crate::report::sandbox_bind::BindTarget::new(
                 "http://crucible-controller.ns.svc:8080",
-                "crucible-run-a",
-                std::path::PathBuf::from("/var/run/secrets/crucible-ingest/token"),
+                "run-a",
+                "crr_id_secret",
             )
         };
         let endpoint = "http://crucible-controller.ns.svc:8080/oauth/token";
-        assert!(binds_sandboxes(Some(endpoint), Some(ingest())).is_some());
+        assert!(binds_sandboxes(Some(endpoint), Some(target())).is_some());
         assert!(
-            binds_sandboxes(None, Some(ingest())).is_none(),
+            binds_sandboxes(None, Some(target())).is_none(),
             "a controller without the agent issuer serves no bind route"
         );
-        assert!(binds_sandboxes(Some(" "), Some(ingest())).is_none());
+        assert!(binds_sandboxes(Some(" "), Some(target())).is_none());
         assert!(binds_sandboxes(Some(endpoint), None).is_none());
     }
 
@@ -1883,6 +1874,7 @@ mod tests {
             selection: Some(crate::agent::inference::AgentSelection {
                 protocol: crucible_contract::inference::InferenceProtocol::Responses,
                 model: "m".into(),
+                price: None,
             }),
             ..Default::default()
         };
