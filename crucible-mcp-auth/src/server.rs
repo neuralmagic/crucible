@@ -9,7 +9,7 @@
 
 use crate::jwks::Jwks;
 use crate::principal::{Callers, Principal};
-use crate::verify::{TokenError, Verifier, unverified_issuer};
+use crate::verify::{TokenError, Verifier, unverified_claims, unverified_issuer};
 use axum::extract::{Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -195,14 +195,31 @@ impl ResourceServer {
         &self.config
     }
 
-    /// Validate a compact JWS access token and return its principal.
+    /// Validate a compact JWS access token and return its principal. An issuer trusted for both
+    /// runs and people speaks for a run in a token carrying `act` (the sandbox presenting it),
+    /// and for a person otherwise.
     pub async fn validate(&self, token: &str) -> Result<Principal, TokenError> {
         let issuer = unverified_issuer(token)?;
-        let trusted = self
+        let mut matching = self
             .issuers
             .iter()
-            .find(|i| i.verifier.issuer() == issuer)
-            .ok_or(TokenError::UnknownIssuer(issuer))?;
+            .filter(|i| i.verifier.issuer() == issuer);
+        let first = matching
+            .next()
+            .ok_or_else(|| TokenError::UnknownIssuer(issuer.clone()))?;
+        let trusted = match matching.next() {
+            None => first,
+            Some(second) => {
+                let presented = match unverified_claims(token)?.contains_key("act") {
+                    true => Callers::Runs,
+                    false => Callers::People,
+                };
+                [first, second]
+                    .into_iter()
+                    .find(|i| i.callers == presented)
+                    .unwrap_or(first)
+            }
+        };
         let audiences: Vec<&str> = self.config.resources.iter().map(Url::as_str).collect();
         let claims = trusted.verifier.verify(token, &audiences).await?;
         Ok(Principal::from_claims(claims, trusted.callers)?)
@@ -1006,6 +1023,28 @@ mod tests {
             p.callers,
             Callers::People,
             "a run_id claim does not make a person's token a run"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_issuer_trusted_for_runs_and_people_tells_them_apart_by_act() {
+        let jwks = JwksServer::start(vec![jwk("a")]).await;
+        let mut cfg = testing::config(jwks.url.clone());
+        let mut people = cfg.issuers[0].clone();
+        people.callers = Callers::People;
+        cfg.issuers.insert(0, people);
+        let rs = ResourceServer::with_jwks(cfg, |t| {
+            Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
+        });
+        let run = rs.validate(&sign("a", &run_claims())).await.unwrap();
+        assert_eq!(run.callers, Callers::Runs, "a sandbox presents run tokens");
+        let mut person = run_claims();
+        person.as_object_mut().unwrap().remove("act");
+        let p = rs.validate(&sign("a", &person)).await.unwrap();
+        assert_eq!(p.callers, Callers::People);
+        assert!(
+            rs.validate(&sign("b", &run_claims())).await.is_err(),
+            "the choice of issuer entry never skips the signature"
         );
     }
 

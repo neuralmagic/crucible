@@ -93,13 +93,20 @@ impl Verifier {
     }
 }
 
+/// The claims of a compact JWS, read without verifying anything. Only for choosing which
+/// [`Verifier`] checks it.
+pub fn unverified_claims(token: &str) -> Result<Map<String, Value>, TokenError> {
+    Ok(
+        jsonwebtoken::dangerous::insecure_decode::<Map<String, Value>>(token)
+            .map_err(TokenError::Malformed)?
+            .claims,
+    )
+}
+
 /// The `iss` a compact JWS claims, read without verifying anything. Only for choosing which
 /// [`Verifier`] checks it; that verifier then enforces the same `iss` on the verified claims.
 pub fn unverified_issuer(token: &str) -> Result<String, TokenError> {
-    let claims = jsonwebtoken::dangerous::insecure_decode::<Map<String, Value>>(token)
-        .map_err(TokenError::Malformed)?
-        .claims;
-    match claims.get("iss") {
+    match unverified_claims(token)?.get("iss") {
         Some(Value::String(iss)) => Ok(iss.clone()),
         _ => Err(TokenError::Claims(ClaimsError::NotString("iss"))),
     }
