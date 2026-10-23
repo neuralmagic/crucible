@@ -142,6 +142,17 @@ pub struct McpArgs {
     /// Resource limits for builder pods, repeatable: --limit memory=8Gi
     #[arg(long = "limit", value_name = "KEY=QTY", value_parser = crate::parse_kv)]
     pub limits: Vec<(String, String)>,
+    /// The run this server serves, compared with a run token's `run_id`; a token for any other run
+    /// is forbidden
+    #[arg(long, env = "MCP_RUN_ID", requires = "run_issuers")]
+    pub run_id: Option<String>,
+    /// The one repository `push` publishes builds to, e.g. quay.io/org/smoke; unset, `push` is
+    /// refused. Tags are buildit's: <sandbox>-<build_id>
+    #[arg(long, env = "MCP_PUSH_REPO", requires = "push_authfile")]
+    pub push_repo: Option<String>,
+    /// Registry authfile `push` uses, read on each push and piped to the builder pod for it alone
+    #[arg(long, env = "MCP_PUSH_AUTHFILE", requires = "push_repo")]
+    pub push_authfile: Option<PathBuf>,
 }
 
 pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
@@ -194,6 +205,11 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         deadline_secs: args.pod_deadline,
         max_builds: args.max_builds,
         node_arch: args.node_arch,
+        run_id: args.run_id,
+        push: match (args.push_repo, args.push_authfile) {
+            (Some(repo), Some(authfile)) => Some(PushTarget::new(repo, authfile)?),
+            _ => None,
+        },
     });
     let listener = tokio::net::TcpListener::bind(&args.bind)
         .await
@@ -386,6 +402,8 @@ pub enum ClaimError {
     NoWorkdir(String),
     #[error("buildit serves runs only, not people's tokens")]
     Person,
+    #[error("the token is for another run than the one this server serves")]
+    OtherRun,
 }
 
 impl Caller {
@@ -425,6 +443,68 @@ pub struct Broker {
     deadline_secs: i64,
     max_builds: usize,
     node_arch: Option<String>,
+    run_id: Option<String>,
+    push: Option<PushTarget>,
+}
+
+/// Where `push` publishes: one repository the operator chose, and the authfile for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTarget {
+    repo: String,
+    authfile: PathBuf,
+}
+
+impl PushTarget {
+    pub fn new(repo: String, authfile: PathBuf) -> Result<Self> {
+        let named = repo.contains('/')
+            && !repo.contains("://")
+            && !repo.contains('@')
+            && !repo.rsplit('/').next().unwrap_or_default().contains(':')
+            && repo
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-/:".contains(&b));
+        if !named {
+            bail!("push repository {repo:?} is not <registry>/<path> without a tag");
+        }
+        Ok(Self { repo, authfile })
+    }
+
+    /// The tag a build is published under: the sandbox's and the build's names.
+    pub fn reference(&self, sandbox: &SandboxName, id: &BuildId) -> String {
+        format!("{}:{}-{}", self.repo, sandbox.as_str(), id.0)
+    }
+}
+
+/// `buildah push` of `local` to `dest`, the authfile on stdin; prints the pushed digest alone.
+fn push_argv(local: &str, dest: &str) -> Vec<String> {
+    argv([
+        "sh",
+        "-c",
+        r#"set -eu
+a=$(mktemp); d=$(mktemp)
+trap 'rm -f "$a" "$d"' EXIT
+cat > "$a"
+buildah push --authfile "$a" --digestfile "$d" "$1" "docker://$2" >&2
+cat "$d""#,
+        "sh",
+        local,
+        dest,
+    ])
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PushParams {
+    /// build_id of a build whose status is succeeded
+    pub build_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PushReply {
+    pub build_id: String,
+    /// The pushed image by digest, for a workload to run
+    pub image: String,
+    /// The tag it was pushed under
+    pub tag: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -753,6 +833,15 @@ impl Broker {
         if principal.callers != Callers::Runs {
             return Err(ClaimError::Person);
         }
+        if let Some(run) = &self.run_id
+            && principal
+                .claims
+                .get("run_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(run)
+        {
+            return Err(ClaimError::OtherRun);
+        }
         let raw = principal
             .claims
             .get("sandbox")
@@ -994,6 +1083,37 @@ impl Broker {
         Ok(BuildReply {
             build_id: id.0,
             status: snap.state.status(),
+        })
+    }
+
+    pub async fn push(&self, caller: &Caller, p: PushParams) -> Result<PushReply> {
+        let Some(target) = &self.push else {
+            bail!("this server publishes no builds: it was started without --push-repo");
+        };
+        let id = BuildId::parse(&p.build_id)?;
+        let pod = self.find(&caller.sandbox, &id).await?;
+        match step::snapshot(&pod, LogName::Build).await?.map(|s| s.state) {
+            Some(step::State::Exited { code: 0, .. }) => {}
+            Some(step::State::Running) => bail!("build {} is still building; poll status", id.0),
+            _ => bail!("build {} did not succeed; read its logs", id.0),
+        }
+        let tag = target.reference(&caller.sandbox, &id);
+        let authfile = tokio::fs::read(&target.authfile)
+            .await
+            .with_context(|| format!("reading push authfile {}", target.authfile.display()))?;
+        let digest = pod
+            .exec_with_stdin_capture(&push_argv(&id.tag(), &tag), &authfile)
+            .await
+            .with_context(|| format!("pushing build {} to {tag}", id.0))?;
+        let digest = digest.trim();
+        if !digest.starts_with("sha256:") {
+            bail!("buildah reported no digest for {tag}: {digest:?}");
+        }
+        tracing::info!(sandbox = caller.sandbox.as_str(), build = id.0, %tag, digest, "pushed");
+        Ok(PushReply {
+            build_id: id.0,
+            image: format!("{}@{digest}", target.repo),
+            tag,
         })
     }
 
@@ -1327,7 +1447,7 @@ impl AccessRules for BuilditRules {
         match call {
             Call::Tool { name, .. } => match *name {
                 "status" | "logs" => Ok(&[SCOPE_READ]),
-                "build" | "run" | "clean" => Ok(&[SCOPE_BUILD]),
+                "build" | "run" | "push" | "clean" => Ok(&[SCOPE_BUILD]),
                 _ => Err(call.unserved()),
             },
             Call::Method { name, .. } => match *name {
@@ -1432,7 +1552,7 @@ fn internal(e: anyhow::Error) -> McpError {
 impl BuilditMcp {
     #[tool(
         description = "Start building a Dockerfile (params: context, dockerfile, target, build_args, \
-        timeout_s); pushes nothing. Returns build_id with status running at once. Poll `status` \
+        timeout_s); `push` publishes it once it succeeds. Returns build_id with status running at once. Poll `status` \
         until succeeded or failed, then `run`/`logs` as needed, and always `clean` the build_id. \
         Clients with the tasks extension get a task to poll instead."
     )]
@@ -1483,6 +1603,20 @@ impl BuilditMcp {
         let started = async { self.broker.start_run(&caller(&ctx)?, p).await }.await;
         let (id, _, log, snap) = started.map_err(|e| format!("{e:#}"))?;
         Ok(created(&TaskRef { build: id, log }, &snap))
+    }
+
+    #[tool(
+        description = "Push a build whose status is succeeded (params: build_id) to the one \
+        repository this server publishes to, tagged <sandbox>-<build_id>. Returns image, the \
+        repository@sha256 digest a workload should run, and tag. Refused when the server \
+        publishes nothing."
+    )]
+    async fn push(
+        &self,
+        ctx: RequestContext<RoleServer>,
+        Parameters(p): Parameters<PushParams>,
+    ) -> Result<String, String> {
+        reply(async { self.broker.push(&caller(&ctx)?, p).await }.await)
     }
 
     #[tool(
@@ -1580,9 +1714,9 @@ mod tests {
 
     use crate::mcp::{
         Broker, BuildId, BuildParams, BuilditMcp, BuilditRules, Caller, Launcher, LogsParams,
-        MCP_PATH, PodView, ResourceServer, ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ,
-        StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bud_argv, build_limit, parse_tokens,
-        router, unpack,
+        MCP_PATH, PodView, PushParams, PushTarget, ResourceServer, ResourceServerConfig, Response,
+        SCOPE_BUILD, SCOPE_READ, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bud_argv,
+        build_limit, parse_tokens, push_argv, router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crate::step::{State, Status};
@@ -1611,6 +1745,8 @@ mod tests {
             deadline_secs,
             max_builds: 4,
             node_arch: None,
+            run_id: None,
+            push: None,
         })
     }
 
@@ -1879,6 +2015,63 @@ mod tests {
                 "{key} = {value:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_token_for_another_run_or_another_servers_audience_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
+        let broker = Broker {
+            run_id: Some("crucible-run-own".into()),
+            ..Arc::into_inner(broker).unwrap()
+        };
+        let mut own = realm_claims();
+        own["run_id"] = serde_json::json!("crucible-run-own");
+        let token = crucible_mcp_auth::testing::sign("a", &own);
+        broker
+            .authenticate(&bearer_header(&token))
+            .await
+            .expect("this run's token");
+
+        for (key, value) in [
+            ("run_id", Some(serde_json::json!("crucible-run-other"))),
+            ("run_id", None),
+        ] {
+            let mut claims = own.clone();
+            let map = claims.as_object_mut().unwrap();
+            match &value {
+                Some(v) => map.insert(key.into(), v.clone()),
+                None => map.remove(key),
+            };
+            let token = crucible_mcp_auth::testing::sign("a", &claims);
+            let refused = broker
+                .authenticate(&bearer_header(&token))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                status_of(broker.respond(&bearer_header(&token), refused))
+                    .await
+                    .0,
+                StatusCode::FORBIDDEN,
+                "{key} = {value:?}"
+            );
+        }
+
+        let mut kueue = own.clone();
+        kueue["aud"] =
+            serde_json::json!(["http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp"]);
+        let token = crucible_mcp_auth::testing::sign("a", &kueue);
+        let refused = broker
+            .authenticate(&bearer_header(&token))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            status_of(broker.respond(&bearer_header(&token), refused))
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED,
+            "a token minted for crucible-kueue is not buildit's"
+        );
     }
 
     #[tokio::test]
@@ -2358,6 +2551,58 @@ mod tests {
         ] {
             assert!(BuildId::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_push_goes_only_to_the_operators_repository_under_buildits_tag() {
+        for bad in [
+            "smoke",
+            "docker://quay.io/org/smoke",
+            "quay.io/org/smoke:latest",
+            "quay.io/org/smoke@sha256:00",
+            "Quay.io/Org/Smoke",
+        ] {
+            assert!(PushTarget::new(bad.into(), "/a".into()).is_err(), "{bad}");
+        }
+        let target = PushTarget::new("quay.io/wseaton/crucible-smoke".into(), "/a".into()).unwrap();
+        assert!(PushTarget::new("registry.local:5000/org/smoke".into(), "/a".into()).is_ok());
+        let id = BuildId::parse("buildit-7").unwrap();
+        let sandbox = SandboxName::parse("ci-0123abcd").unwrap();
+        assert_eq!(
+            target.reference(&sandbox, &id),
+            "quay.io/wseaton/crucible-smoke:ci-0123abcd-buildit-7"
+        );
+        let argv = push_argv(&id.tag(), &target.reference(&sandbox, &id));
+        assert_eq!(&argv[..2], ["sh", "-c"]);
+        assert!(
+            argv[2].contains("cat > \"$a\""),
+            "the authfile arrives on stdin"
+        );
+        assert!(argv[2].contains("rm -f"), "and is removed after");
+        assert_eq!(
+            &argv[3..],
+            [
+                "sh",
+                "localhost/buildit/buildit-7:latest",
+                "quay.io/wseaton/crucible-smoke:ci-0123abcd-buildit-7"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn push_is_refused_by_a_server_that_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(offline_client(), &tokens(dir.path(), ""), None);
+        let err = broker
+            .push(
+                &sandbox_caller("sb-a"),
+                PushParams {
+                    build_id: "buildit-1".into(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--push-repo"), "{err:#}");
     }
 
     #[tokio::test]

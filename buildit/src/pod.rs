@@ -151,6 +151,33 @@ impl BuilderPod {
         self.finish(attached, argv).await
     }
 
+    pub async fn exec_with_stdin_capture(&self, argv: &[String], data: &[u8]) -> Result<String> {
+        let params = AttachParams::default()
+            .stdin(true)
+            .stdout(true)
+            .stderr(true);
+        let mut attached = self
+            .pods
+            .exec(&self.name, argv.iter().map(String::as_str), &params)
+            .await
+            .with_context(|| format!("exec `{}` in pod {}", argv.join(" "), self.name))?;
+        let mut stdin = attached
+            .stdin()
+            .ok_or_else(|| anyhow!("exec stdin stream missing"))?;
+        stdin.write_all(data).await.context("writing exec stdin")?;
+        stdin.shutdown().await.context("closing exec stdin")?;
+        drop(stdin);
+        let mut stdout = attached
+            .stdout()
+            .ok_or_else(|| anyhow!("exec stdout stream missing"))?;
+        let mut buf = Vec::new();
+        tokio::io::copy(&mut stdout, &mut buf)
+            .await
+            .context("capturing exec stdout")?;
+        self.finish(attached, argv).await?;
+        String::from_utf8(buf).context("exec output was not utf-8")
+    }
+
     pub async fn exec_capture(&self, argv: &[String]) -> Result<String> {
         let params = AttachParams::default().stdout(true).stderr(true);
         let mut attached = self
