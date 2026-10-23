@@ -3366,6 +3366,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/prefs",
         "/api/prefs/editor",
         "/api/prefs/pickers",
+        "/api/prefs/notices",
+        "/api/agent-tools",
         "/api/overview",
         "/api/funnel",
         "/api/runs",

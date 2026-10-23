@@ -129,11 +129,28 @@ pub(crate) async fn get_run(
     let candidates = crate::runs::store::list_candidates_for_run(state.db.pool(), &run_id).await?;
     let transport_losses =
         crate::runs::task_results::count_transport_losses(state.db.pool(), &run_id).await?;
+    let agent_tools = crate::runs::agent_tools::for_run(state.db.pool(), &run_id).await?;
     let detail = RunDetail {
         run: RunDto::from_parts(run, issue_key, repo, agent, transport_losses),
         candidates: candidates.into_iter().map(CandidateDto::from).collect(),
+        agent_tools,
     };
     Ok(Json(detail).into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agent-tools",
+    responses(
+        (status = 200, description = "The MCP servers runs get by default, and the revision naming that set", body = crate::runs::agent_tools::Defaults)
+    )
+)]
+pub(crate) async fn get_agent_tool_defaults(
+    State(state): State<ApiState>,
+) -> Result<Response, AppError> {
+    let profile =
+        crate::identity::cluster_identity::load_profile(state.deploy_profile.as_deref()).await?;
+    Ok(Json(crate::runs::agent_tools::defaults(profile.as_ref())).into_response())
 }
 
 /// `GET /api/runs/{run_id}/graph` — the run's newest admitted work graph plus every task attempt

@@ -384,6 +384,8 @@ dto! {
 pub struct RunDetail {
     pub run: RunDto,
     pub candidates: Vec<CandidateDto>,
+    /// The MCP servers the run's agent was granted at dispatch.
+    pub agent_tools: Vec<crate::runs::agent_tools::AgentTool>,
 }
 
 dto! {
@@ -923,6 +925,7 @@ pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDeta
             }
             let transport_losses =
                 crate::runs::task_results::count_transport_losses(db.pool(), &run.run_id).await?;
+            let agent_tools = crate::runs::agent_tools::for_run(db.pool(), &run.run_id).await?;
             run_details.push(RunDetail {
                 run: RunDto::from_parts(
                     run,
@@ -932,6 +935,7 @@ pub async fn issue_detail(db: &Db, key: &str) -> anyhow::Result<Option<IssueDeta
                     transport_losses,
                 ),
                 candidates: candidates.into_iter().map(CandidateDto::from).collect(),
+                agent_tools,
             });
         }
         scope_details.push(ScopeDetail {

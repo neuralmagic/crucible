@@ -59,6 +59,9 @@ pub(crate) mod tests;
         crate::identity::api::prefs::put_editor_prefs,
         crate::identity::api::prefs::get_picker_prefs,
         crate::identity::api::prefs::put_picker_prefs,
+        crate::identity::api::prefs::get_notice_prefs,
+        crate::identity::api::prefs::put_notice_prefs,
+        crate::runs::api::runs::get_agent_tool_defaults,
         system::overview,
         dto::funnel,
         crate::runs::api::runs::list_runs,
@@ -229,6 +232,10 @@ pub(crate) mod tests;
         crate::identity::api::kube_user::OverrideBody,
         crate::identity::api::prefs::EditorPrefsDto,
         crate::identity::api::prefs::PickerPrefsDto,
+        crate::identity::api::prefs::NoticePrefsDto,
+        crate::runs::agent_tools::AgentTool,
+        crate::runs::agent_tools::AgentServer,
+        crate::runs::agent_tools::Defaults,
         dto::Overview,
         dto::StatusCount,
         dto::TierCount,
@@ -760,6 +767,18 @@ pub fn router(state: ApiState) -> Router {
                 .layer(axum::extract::DefaultBodyLimit::max(
                     crate::identity::api::prefs::MAX_PREFS_BYTES,
                 )),
+        )
+        .route(
+            "/api/prefs/notices",
+            get(crate::identity::api::prefs::get_notice_prefs)
+                .put(crate::identity::api::prefs::put_notice_prefs)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::identity::api::prefs::MAX_PREFS_BYTES,
+                )),
+        )
+        .route(
+            "/api/agent-tools",
+            get(crate::runs::api::runs::get_agent_tool_defaults),
         )
         .route("/api/openapi.json", get(move || async { Json(api) }))
         .layer(axum::middleware::from_fn_with_state(

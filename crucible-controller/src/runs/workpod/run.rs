@@ -812,6 +812,12 @@ pub async fn dispatch_run(
         delivery.merge(access).map_err(|e| {
             anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
         })?;
+        if let Some(loaded) = loaded.as_ref() {
+            let launcher = secrets.and_then(|s| s.launcher.login());
+            crate::runs::agent_tools::grant(db, loaded, issue_key, run_id, &cluster, launcher)
+                .await
+                .context("recording the run's agent tools")?;
+        }
     }
     let reads_run = match &opts {
         RunRenderOpts::Playbook {
