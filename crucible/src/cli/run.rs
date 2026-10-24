@@ -358,10 +358,11 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             );
         }
         if args.kueue {
+            let cluster = args.kueue_cluster.as_deref();
             return if apply {
-                deploy::apply_kueue_cmd(&args.profile, &opts)
+                deploy::apply_kueue_cmd(&args.profile, &opts, cluster)
             } else {
-                deploy::render_kueue_cmd(&args.profile, &opts)
+                deploy::render_kueue_cmd(&args.profile, &opts, cluster)
             };
         }
         let manifest = args.manifest.context(

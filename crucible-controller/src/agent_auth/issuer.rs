@@ -91,7 +91,7 @@ pub enum ConfigError {
         source: jsonwebtoken::errors::Error,
     },
     #[error(
-        "CONTROLLER_AGENT_AUDIENCES entry {0:?} is neither <url>=<scopes> nor <cluster>:<url>=<scopes>"
+        "CONTROLLER_AGENT_AUDIENCES entry {0:?} is not <cluster>:<url>=<scopes>; every agent audience names the cluster whose runs get it"
     )]
     AudienceCluster(String),
     #[error("{var} is set, but CONTROLLER_AGENT_ISSUER is not; it does nothing without the issuer")]
@@ -307,8 +307,9 @@ impl std::str::FromStr for ClusterSpire {
 pub struct Audience {
     /// The resource URL, compared to the requested `audience` as an exact string.
     pub resource: String,
-    /// The only cluster whose runs get tokens for it; `None` for runs on any cluster.
-    pub cluster: Option<String>,
+    /// The cluster whose runs get tokens for it. The same URL on another cluster is another
+    /// audience.
+    pub cluster: String,
     pub scopes: Vec<String>,
     /// Whether the server authorizes as the token's `kube_user`, so no token is minted without
     /// one.
@@ -321,9 +322,9 @@ impl Audience {
     /// This audience with what the server at its URL needs in a token, as the deploy profile
     /// describes the server. A URL no description names needs nothing.
     pub fn described_by(self, servers: &[ServerSpec]) -> Self {
-        let described = servers.iter().find(|s| {
-            s.url == self.resource && self.cluster.as_deref().is_none_or(|c| s.serves(c))
-        });
+        let described = servers
+            .iter()
+            .find(|s| s.url == self.resource && s.serves(&self.cluster));
         match described {
             Some(s) => Self {
                 requires_kube_user: s.requires_kube_user,
@@ -336,28 +337,23 @@ impl Audience {
 
     /// Whether a run on `cluster` may get tokens for this audience.
     pub fn serves(&self, cluster: &str) -> bool {
-        self.cluster.as_deref().is_none_or(|c| c == cluster)
+        self.cluster == cluster
     }
 }
 
-/// `[<cluster>:]<resource url>=<scope> <scope> ...`; a bare URL grants no scopes. Without a cluster
-/// the audience serves runs on every cluster.
+/// `<cluster>:<resource url>=<scope> <scope> ...`; a URL without `=` grants no scopes.
 impl std::str::FromStr for Audience {
     type Err = ConfigError;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let raw = raw.trim();
-        let (cluster, raw) = match raw.starts_with("http://") || raw.starts_with("https://") {
-            true => (None, raw),
-            false => {
-                let (cluster, rest) = raw
-                    .split_once(':')
-                    .ok_or_else(|| ConfigError::AudienceCluster(raw.to_string()))?;
-                check_cluster_name(cluster)
-                    .map_err(|_| ConfigError::AudienceCluster(raw.to_string()))?;
-                (Some(cluster.to_string()), rest)
-            }
-        };
+        let (cluster, raw) = raw
+            .split_once(':')
+            .filter(|(cluster, rest)| {
+                check_cluster_name(cluster).is_ok() && !rest.starts_with("//")
+            })
+            .ok_or_else(|| ConfigError::AudienceCluster(raw.to_string()))?;
+        let cluster = cluster.to_string();
         let (resource, scopes) = raw.split_once('=').unwrap_or((raw, ""));
         let resource = resource.trim();
         Url::parse(resource).map_err(|source| ConfigError::Url {
@@ -1333,21 +1329,24 @@ mod tests {
     async fn only_an_allowlisted_audience_is_granted() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
-        assert_eq!(issuer.audience(Some(KUEUE), "hub").unwrap().resource, KUEUE);
         assert_eq!(
-            issuer.audience(Some(BUILDIT), "hub").unwrap().scopes,
+            issuer.audience(Some(KUEUE), CLUSTER).unwrap().resource,
+            KUEUE
+        );
+        assert_eq!(
+            issuer.audience(Some(BUILDIT), CLUSTER).unwrap().scopes,
             ["buildit.read", "buildit.build"]
         );
         assert!(matches!(
-            issuer.audience(None, "hub"),
+            issuer.audience(None, CLUSTER),
             Err(GrantError::NoAudience { .. })
         ));
         assert!(matches!(
-            issuer.audience(Some(""), "hub"),
+            issuer.audience(Some(""), CLUSTER),
             Err(GrantError::NoAudience { .. })
         ));
         assert!(matches!(
-            issuer.audience(Some(&format!("{KUEUE}/")), "hub"),
+            issuer.audience(Some(&format!("{KUEUE}/")), CLUSTER),
             Err(GrantError::Audience { .. })
         ));
     }
@@ -1358,7 +1357,7 @@ mod tests {
         let spire = Spire::start().await;
         let mut cfg = testing::config(&EcKey::generate());
         cfg.audiences = parse_list(&format!(
-            "spoke-a:{KUEUE}=kueue.read,{BUILDIT}=buildit.read"
+            "spoke-a:{KUEUE}=kueue.read,spoke-b:{BUILDIT}=buildit.read"
         ))
         .unwrap();
         let issuer = AgentIssuer::new(cfg, |_| {
@@ -1380,18 +1379,17 @@ mod tests {
         assert!(issuer.audience(Some(BUILDIT), "spoke-b").is_ok());
     }
 
-    /// A cluster-bound audience serves runs on that cluster only, and the same URL can be bound
-    /// to each cluster on its own; a bare one serves every cluster.
+    /// An audience serves runs on its cluster only, and the same URL can be bound to each cluster
+    /// on its own. An entry without a cluster is refused.
     #[test]
-    fn audiences_bind_to_a_cluster_or_serve_all() {
+    fn every_audience_binds_to_one_cluster() {
         let url = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
         let entries: Vec<Audience> = parse_list(&format!(
-            "spoke-a:{url}=kueue.read kueue.submit,spoke-b:{url}=kueue.read,{BUILDIT}=buildit.read"
+            "spoke-a:{url}=kueue.read kueue.submit,spoke-b:{url}=kueue.read"
         ))
         .unwrap();
-        assert_eq!(entries[0].cluster.as_deref(), Some("spoke-a"));
+        assert_eq!(entries[0].cluster, "spoke-a");
         assert_eq!(entries[0].resource, url);
-        assert_eq!(entries[2].cluster, None);
         let on = |cluster: &str| {
             entries
                 .iter()
@@ -1404,13 +1402,20 @@ mod tests {
         );
         assert_eq!(on("spoke-b"), Some(vec!["kueue.read".to_string()]));
         assert_eq!(on("spoke-c"), None);
-        assert!(entries[2].serves("spoke-c"));
         for bad in [
+            "http://a.example/mcp=kueue.read",
+            "https://a.example/mcp",
             "Spoke:http://a.example/mcp",
             ":http://a.example/mcp",
             "spoke-a",
         ] {
-            assert!(bad.parse::<Audience>().is_err(), "{bad}");
+            assert!(
+                matches!(
+                    bad.parse::<Audience>(),
+                    Err(ConfigError::AudienceCluster(_))
+                ),
+                "{bad}"
+            );
         }
     }
 
@@ -1442,11 +1447,13 @@ mod tests {
     }
 
     fn kueue() -> Audience {
-        format!("{KUEUE}=kueue.read kueue.submit").parse().unwrap()
+        format!("{CLUSTER}:{KUEUE}=kueue.read kueue.submit")
+            .parse()
+            .unwrap()
     }
 
     fn buildit() -> Audience {
-        format!("{BUILDIT}=buildit.read buildit.build")
+        format!("{CLUSTER}:{BUILDIT}=buildit.read buildit.build")
             .parse()
             .unwrap()
     }
@@ -1480,7 +1487,7 @@ mod tests {
             granted_scopes(Some("kueue.read"), &buildit()).is_err(),
             "a scope another audience lists is not grantable here"
         );
-        let bare: Audience = KUEUE.parse().unwrap();
+        let bare: Audience = format!("{CLUSTER}:{KUEUE}").parse().unwrap();
         assert!(granted_scopes(None, &bare).unwrap().is_empty());
     }
 
@@ -1501,7 +1508,9 @@ mod tests {
         );
         for undescribed in [
             buildit(),
-            "http://mcp.example/mcp=x.read".parse::<Audience>().unwrap(),
+            "dev:http://mcp.example/mcp=x.read"
+                .parse::<Audience>()
+                .unwrap(),
         ] {
             let undescribed = undescribed.described_by(&servers);
             assert!(!undescribed.requires_kube_user, "{}", undescribed.resource);
@@ -1777,7 +1786,9 @@ mod tests {
             ),
             (
                 "CONTROLLER_AGENT_AUDIENCES",
-                format!("{KUEUE}=kueue.read kueue.submit, {BUILDIT}=buildit.read buildit.build,"),
+                format!(
+                    "{CLUSTER}:{KUEUE}=kueue.read kueue.submit, {CLUSTER}:{BUILDIT}=buildit.read buildit.build,"
+                ),
             ),
         ])
     }
@@ -1798,14 +1809,14 @@ mod tests {
             [
                 Audience {
                     resource: KUEUE.into(),
-                    cluster: None,
+                    cluster: CLUSTER.into(),
                     scopes: vec!["kueue.read".into(), "kueue.submit".into()],
                     requires_kube_user: false,
                     namespaces: vec![],
                 },
                 Audience {
                     resource: BUILDIT.into(),
-                    cluster: None,
+                    cluster: CLUSTER.into(),
                     scopes: vec!["buildit.read".into(), "buildit.build".into()],
                     requires_kube_user: false,
                     namespaces: vec![],
@@ -1935,7 +1946,7 @@ mod tests {
             ("CONTROLLER_AGENT_ISSUER", "http://controller.svc:8080/?x=1"),
             ("CONTROLLER_AGENT_ISSUER", "spiffe://example.crucible"),
             ("CONTROLLER_AGENT_AUDIENCES", " , "),
-            ("CONTROLLER_AGENT_AUDIENCES", "not a url=kueue.read"),
+            ("CONTROLLER_AGENT_AUDIENCES", "dev:not a url=kueue.read"),
             (
                 "CONTROLLER_AGENT_SIGNING_KEY_FILE",
                 "/nonexistent/signing.pem",

@@ -152,10 +152,15 @@ mod tests {
     const SPIRE: &str = "pirate=https://oidc.pirate.example spiffe://pirate.example/openshell/gateway/ spire/oidc:443,\
          waldorf=https://oidc.waldorf.example spiffe://waldorf.example/openshell/gateway/ spire/oidc:443";
 
-    fn audience(resource: &str, scopes: &str) -> Audience {
-        format!("{resource}={scopes}")
-            .parse()
-            .expect("audience parses")
+    /// `resource` with `scopes` for runs on pirate and on waldorf.
+    fn audience(resource: &str, scopes: &str) -> Vec<Audience> {
+        ["pirate", "waldorf"]
+            .map(|c| {
+                format!("{c}:{resource}={scopes}")
+                    .parse()
+                    .expect("audience parses")
+            })
+            .to_vec()
     }
 
     fn tokens() -> AgentTokens {
@@ -163,13 +168,14 @@ mod tests {
             svid_audience: "http://crucible-controller.crucible-system.svc:8080".into(),
             endpoint: "http://crucible-controller.crucible-system.svc:8080/oauth/token".into(),
             clusters: vec!["pirate".into(), "waldorf".into()],
-            audiences: vec![
+            audiences: [
                 audience(KUEUE_URL, "kueue.read kueue.submit"),
                 audience(
                     crucible_contract::buildit::URL,
                     "buildit.read buildit.build",
                 ),
-            ],
+            ]
+            .concat(),
         }
     }
 
@@ -272,7 +278,7 @@ mod tests {
             "no SPIRE for pirate, so no tokens for its sandboxes"
         );
         let no_audience = AgentTokens {
-            audiences: vec![audience(KUEUE_URL, "kueue.read")],
+            audiences: audience(KUEUE_URL, "kueue.read"),
             ..tokens()
         };
         let pirate = access(&all, "pirate", &no_audience).unwrap().unwrap();
@@ -322,7 +328,7 @@ mod tests {
             cluster = "pirate"
         "#;
         let tokens = AgentTokens {
-            audiences: vec![audience("https://docs.example/mcp", "docs.read")],
+            audiences: audience("https://docs.example/mcp", "docs.read"),
             ..tokens()
         };
         let delivery = access(&servers(docs), "pirate", &tokens).unwrap().unwrap();
@@ -340,8 +346,9 @@ mod tests {
             crate::testing::cfg_from_args(args)
         };
         let audiences = format!(
-            "{KUEUE_URL}=kueue.read kueue.submit,{}=buildit.read buildit.build",
-            crucible_contract::buildit::URL
+            "pirate:{KUEUE_URL}=kueue.read kueue.submit,waldorf:{KUEUE_URL}=kueue.read kueue.submit,\
+             pirate:{b}=buildit.read buildit.build,waldorf:{b}=buildit.read buildit.build",
+            b = crucible_contract::buildit::URL
         );
         assert_eq!(AgentTokens::from_cfg(&cfg(&[])).unwrap(), None);
         assert_eq!(

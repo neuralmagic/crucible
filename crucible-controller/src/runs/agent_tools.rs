@@ -342,15 +342,19 @@ mod tests {
             svid_audience: "https://crucible.hub.example".into(),
             endpoint: "https://crucible.hub.example/oauth/token".into(),
             clusters: clusters.iter().map(|c| c.to_string()).collect(),
-            audiences: vec![
-                format!("{KUEUE_URL}={kueue_scopes}").parse().unwrap(),
-                format!(
-                    "{}=buildit.read buildit.build",
-                    crucible_contract::buildit::URL
-                )
-                .parse()
-                .unwrap(),
-            ],
+            audiences: ["pirate", "waldorf"]
+                .iter()
+                .flat_map(|c| {
+                    [
+                        format!("{c}:{KUEUE_URL}={kueue_scopes}"),
+                        format!(
+                            "{c}:{}=buildit.read buildit.build",
+                            crucible_contract::buildit::URL
+                        ),
+                    ]
+                })
+                .map(|a| a.parse().unwrap())
+                .collect(),
         }
     }
 

@@ -478,6 +478,10 @@ pub(crate) struct DeployArgs {
     /// namespace) from the profile's `[kueue]` table, no `--manifest` needed.
     #[arg(long, conflicts_with = "controller")]
     pub kueue: bool,
+    /// With `--kueue`, the `[kueue] clusters` entry to render the server for: it is started with
+    /// `--cluster` and accepts only tokens for that cluster. Required when the table names several.
+    #[arg(long, value_name = "CLUSTER", requires = "kueue")]
+    pub kueue_cluster: Option<String>,
     /// Render the controller's OpenShift `OAuthClient` for this cluster from the profile's
     /// `[cluster_link]` table, no `--manifest` needed. Render only: it is cluster-scoped on that
     /// cluster, so apply it there yourself.

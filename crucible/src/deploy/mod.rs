@@ -123,16 +123,24 @@ pub fn render_turn_cmd(profile_path: &Path, opts: &render::TurnOpts) -> Result<(
 }
 
 /// Emit the crucible-kueue server's YAML, rendered from the profile's `[kueue]` table.
-pub fn render_kueue_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+pub fn render_kueue_cmd(
+    profile_path: &Path,
+    opts: &RenderOpts,
+    cluster: Option<&str>,
+) -> Result<()> {
     let profile = DeployProfile::load(profile_path)?;
-    print!("{}", kueue::render(&profile, opts)?);
+    print!("{}", kueue::render(&profile, opts, cluster)?);
     Ok(())
 }
 
 /// Render the crucible-kueue server then server-side apply it.
-pub fn apply_kueue_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+pub fn apply_kueue_cmd(
+    profile_path: &Path,
+    opts: &RenderOpts,
+    cluster: Option<&str>,
+) -> Result<()> {
     let profile = DeployProfile::load(profile_path)?;
-    let yaml = kueue::render(&profile, opts)?;
+    let yaml = kueue::render(&profile, opts, cluster)?;
     forge::kube::apply_yaml(&yaml).context("applying the rendered crucible-kueue deployment")
 }
 

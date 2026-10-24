@@ -152,8 +152,10 @@ pub fn config(signing: &EcKey) -> AgentIssuerConfig {
         token_ttl: Default::default(),
         spire: vec![cluster_spire()],
         audiences: vec![
-            format!("{KUEUE}=kueue.read kueue.submit").parse().unwrap(),
-            format!("{BUILDIT}=buildit.read buildit.build")
+            format!("{CLUSTER}:{KUEUE}=kueue.read kueue.submit")
+                .parse()
+                .unwrap(),
+            format!("{CLUSTER}:{BUILDIT}=buildit.read buildit.build")
                 .parse()
                 .unwrap(),
         ],

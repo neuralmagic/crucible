@@ -171,7 +171,7 @@ spec:
             - {name: CONTROLLER_AGENT_ISSUER, value: "@ISSUER@"}
             - {name: CONTROLLER_AGENT_SIGNING_KEY_FILE, value: /etc/crucible/keys/agent-signing.pem}
             - {name: CONTROLLER_AGENT_SPIRE, value: "@AGENT_SPIRE@"}
-            - {name: CONTROLLER_AGENT_AUDIENCES, value: "@KUEUE_URL@=kueue.read kueue.submit,http://host.openshell.internal:8848/mcp=buildit.read buildit.build"}
+            - {name: CONTROLLER_AGENT_AUDIENCES, value: "hub:@KUEUE_URL@=kueue.read kueue.submit,hub:http://host.openshell.internal:8848/mcp=buildit.read buildit.build"}
             - {name: REGISTRY_AUTH_FILE, value: /etc/crucible/registry/.dockerconfigjson}
             - {name: RUST_LOG, value: info}
           ports: [{containerPort: 8080, name: api}]

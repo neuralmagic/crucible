@@ -26,9 +26,42 @@ const APP_LABEL: &str = "app.kubernetes.io/name";
 )]
 pub struct MissingKueueTable;
 
-/// The server's objects as one multi-document YAML string.
-pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum KueueClusterError {
+    #[error("[kueue] serves {clusters:?}; name the one to render with --kueue-cluster")]
+    Several { clusters: Vec<String> },
+    #[error("[kueue] does not serve {cluster:?}; it serves {clusters:?}")]
+    NotServed {
+        cluster: String,
+        clusters: Vec<String>,
+    },
+}
+
+/// The `[kueue] clusters` entry a render is for: `requested`, or the only one.
+fn render_cluster<'a>(
+    cfg: &'a KueueCfg,
+    requested: Option<&str>,
+) -> Result<&'a str, KueueClusterError> {
+    match (requested, cfg.clusters.as_slice()) {
+        (Some(c), clusters) => clusters
+            .iter()
+            .find(|served| *served == c)
+            .map(String::as_str)
+            .ok_or_else(|| KueueClusterError::NotServed {
+                cluster: c.to_string(),
+                clusters: clusters.to_vec(),
+            }),
+        (None, [only]) => Ok(only),
+        (None, clusters) => Err(KueueClusterError::Several {
+            clusters: clusters.to_vec(),
+        }),
+    }
+}
+
+/// The server's objects for `cluster` (see [`render_cluster`]) as one multi-document YAML string.
+pub fn render(profile: &DeployProfile, opts: &RenderOpts, cluster: Option<&str>) -> Result<String> {
     let cfg = profile.kueue.as_ref().ok_or(MissingKueueTable)?;
+    let cluster = render_cluster(cfg, cluster)?;
     let image = pin_image(opts.digests.as_deref(), "crucible-kueue image", &cfg.image)?;
     let pull_secret = profile.image.pull_secret.as_str();
     let mut docs = Vec::new();
@@ -40,7 +73,10 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
         push("workload Namespace", yaml(&workload_namespace(namespace)))?;
     }
     push("ServiceAccount", yaml(&service_account(cfg)))?;
-    push("Deployment", yaml(&deployment(cfg, &image, pull_secret)?))?;
+    push(
+        "Deployment",
+        yaml(&deployment(cfg, cluster, &image, pull_secret)?),
+    )?;
     push("Service", yaml(&service(cfg)))?;
     push("cluster ClusterRole", yaml(&cluster_role(cfg.kube_authz)))?;
     push(
@@ -127,7 +163,7 @@ fn service_account(cfg: &KueueCfg) -> core::ServiceAccount {
     }
 }
 
-fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
+fn args(cfg: &KueueCfg, cluster: &str) -> Result<Vec<String>> {
     let jwks = cfg
         .run_jwks_uri()
         .with_context(|| format!("deriving the key set URI of {}", cfg.run_issuer))?;
@@ -142,6 +178,8 @@ fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
         cfg.url(),
         "--kube-authz".to_string(),
         cfg.kube_authz.as_str().to_string(),
+        "--cluster".to_string(),
+        cluster.to_string(),
     ];
     for namespace in &cfg.workload_namespaces {
         args.extend(["--namespace".to_string(), namespace.to_string()]);
@@ -161,7 +199,12 @@ fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
     Ok(args)
 }
 
-fn deployment(cfg: &KueueCfg, image: &str, pull_secret: &str) -> Result<apps::Deployment> {
+fn deployment(
+    cfg: &KueueCfg,
+    cluster: &str,
+    image: &str,
+    pull_secret: &str,
+) -> Result<apps::Deployment> {
     let probe = |initial: i32| core::Probe {
         http_get: Some(core::HTTPGetAction {
             path: Some("/healthz".to_string()),
@@ -181,7 +224,7 @@ fn deployment(cfg: &KueueCfg, image: &str, pull_secret: &str) -> Result<apps::De
         name: NAME.to_string(),
         image: Some(image.to_string()),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        args: Some(args(cfg)?),
+        args: Some(args(cfg, cluster)?),
         env: Some(vec![env("RUST_LOG", "info".to_string())]),
         ports: Some(vec![core::ContainerPort {
             name: Some(PORT_NAME.to_string()),
@@ -363,7 +406,7 @@ mod tests {
     }
 
     fn docs(text: &str) -> Vec<serde_json::Value> {
-        let yaml = render(&profile(text), &RenderOpts::default()).unwrap();
+        let yaml = render(&profile(text), &RenderOpts::default(), None).unwrap();
         yaml.split("---\n")
             .map(|d| serde_norway::from_str(d).unwrap())
             .collect()
@@ -404,6 +447,8 @@ mod tests {
                 "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp",
                 "--kube-authz",
                 "openshift",
+                "--cluster",
+                "pirate",
                 "--namespace",
                 "crucible-kueue-e2e",
                 "--insecure-jwks-http",
@@ -543,6 +588,42 @@ mod tests {
     }
 
     #[test]
+    fn the_server_is_rendered_for_one_cluster_and_accepts_only_its_tokens() {
+        let cluster_flag = |args: &[String]| {
+            args.windows(2)
+                .find(|w| w[0] == "--cluster")
+                .map(|w| w[1].clone())
+        };
+        assert_eq!(
+            cluster_flag(&args(&docs(PROFILE))).as_deref(),
+            Some("pirate"),
+            "the only cluster"
+        );
+        let two = profile(&PROFILE.replace(
+            "cluster = \"pirate\"",
+            "clusters = [\"pirate\", \"waldorf\"]",
+        ));
+        let rendered = render(&two, &RenderOpts::default(), Some("waldorf")).unwrap();
+        let docs: Vec<serde_json::Value> = rendered
+            .split("---\n")
+            .map(|d| serde_norway::from_str(d).unwrap())
+            .collect();
+        assert_eq!(cluster_flag(&args(&docs)).as_deref(), Some("waldorf"));
+        let several = render(&two, &RenderOpts::default(), None).unwrap_err();
+        assert_eq!(
+            several.downcast_ref::<KueueClusterError>(),
+            Some(&KueueClusterError::Several {
+                clusters: vec!["pirate".into(), "waldorf".into()]
+            })
+        );
+        let elsewhere = render(&two, &RenderOpts::default(), Some("east")).unwrap_err();
+        assert!(matches!(
+            elsewhere.downcast_ref::<KueueClusterError>(),
+            Some(KueueClusterError::NotServed { .. })
+        ));
+    }
+
+    #[test]
     fn each_workload_namespace_gets_its_namespace_binding_and_flag() {
         let many = PROFILE.replace(
             r#"workload_namespace = "crucible-kueue-e2e""#,
@@ -620,7 +701,7 @@ mod tests {
     #[test]
     fn a_profile_without_kueue_refuses_to_render() {
         let without = PROFILE.split("[kueue]").next().unwrap();
-        let err = render(&profile(without), &RenderOpts::default()).unwrap_err();
+        let err = render(&profile(without), &RenderOpts::default(), None).unwrap_err();
         assert!(err.downcast_ref::<MissingKueueTable>().is_some());
     }
 

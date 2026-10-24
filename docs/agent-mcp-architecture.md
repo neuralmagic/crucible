@@ -420,8 +420,8 @@ The steps are these:
 9. `sub` is `<gateway prefix><gateway id>/sandbox/<sandbox id>` for the prefix of that cluster.
 10. A bind record exists for the sandbox id, and its loop pod is in the `running` state.
 11. The cluster of the run is the cluster whose SPIRE signed the assertion.
-12. The requested `audience` is an entry of `CONTROLLER_AGENT_AUDIENCES` that serves the run's
-    cluster: one bound to that cluster, or a bare one.
+12. The requested `audience` is an entry of `CONTROLLER_AGENT_AUDIENCES` bound to the run's
+    cluster.
 13. The gateway id in the SPIFFE ID is the gateway id of the bound loop pod.
 14. The run has a launcher (`dispatched_by` is `user:<login>`).
 15. Each requested scope is in the audience entry. A request with no scope gets all the scopes
@@ -430,6 +430,11 @@ The steps are these:
     authorizes as `kube_user`, as `[kueue]` does), it is known for the launcher on the run's
     cluster. For other audiences, the token omits an unknown `kube_user`, and the controller logs
     a warning (`Audience::described_by`, `crucible-controller/src/agent_auth/issuer.rs`).
+
+Note: Pack code holds the run CA's client certificate, so it can make its gateway create
+sandboxes and request a token for any audience on its run's cluster, with that audience's
+scopes. The audience allowlist, per cluster, is the boundary: list only the servers a run on that
+cluster may use, with the scopes it may hold.
 
 The controller reads SPIRE keys through the API server Service proxy of each cluster, with the
 same client it dispatches with (`crucible-controller/src/agent_auth/spire.rs:21`). The path is
@@ -1622,7 +1627,7 @@ never sees it. Without a push repository or without the authfile, `push` is refu
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | `900` | Agent token lifetime, 900 to 1800. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | `<issuer>/oauth/token` | Where supervisors reach the token endpoint, for a spoke that reaches the controller through a route. |
 | `CONTROLLER_AGENT_SPIRE` | unset | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. The prefix may hold one `{tenant}` segment (section 6.1). The SPIRE Service's namespace must not be one pack code reaches (loop, rig, sandbox, `[buildit] namespace`, crucible-kueue workload namespaces), or the controller does not start (`check_spire_exposure`). A run gets agent tools only on a cluster listed here. Unset: the issuer serves people only, mints no agent tokens, grants no agent tools and stamps no dispatchers. |
-| `CONTROLLER_AGENT_AUDIENCES` | unset | Comma-separated `[<cluster>:]<resource url>=<scope> <scope>`. Necessary with `CONTROLLER_AGENT_SPIRE`. A URL with no `=` grants no scopes. With `<cluster>:` the entry serves runs on that cluster only, and the same URL may appear once per cluster; without it the entry serves every cluster. A run gets a server only when the server URL is a resource here: the `crucible-kueue` Service URL `http://crucible-kueue.<namespace>.svc.<cluster domain>:8850/mcp`, or `http://host.openshell.internal:8848/mcp` for `buildit`. The run records the scopes of that entry. |
+| `CONTROLLER_AGENT_AUDIENCES` | unset | Comma-separated `<cluster>:<resource url>=<scope> <scope>`. Necessary with `CONTROLLER_AGENT_SPIRE`. A URL with no `=` grants no scopes. Each entry serves runs on its cluster only, and the same URL may appear once per cluster; an entry without a cluster stops the controller. A run gets a server only when the server URL is a resource here: the `crucible-kueue` Service URL `http://crucible-kueue.<namespace>.svc.<cluster domain>:8850/mcp`, or `http://host.openshell.internal:8848/mcp` for `buildit`. The run records the scopes of that entry. |
 | `CONTROLLER_PEOPLE_AUDIENCES` | unset | Comma-separated `<cluster>:<resource url>=<scope> <scope>`. Enables people tokens. Each resource once. |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | `900` | People token lifetime, 1 to 3600. |
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | unset | A TOML file of `[[clients]]` with `client_id`, `name`, `redirect_uris` and optional `resources`. It replaces the built-in `claude-code`, `pi` and `codex`. Unset: the built-in clients (section 4.1.2). |
@@ -1723,7 +1728,7 @@ Each flag also has a `CRUCIBLE_KUEUE_*` environment variable (`crucible-kueue/sr
 | `--run-issuer` | at least one of the two issuer flags | `<issuer>=<jwks uri>` of run tokens. |
 | `--person-issuer` | unset | `<issuer>=<jwks uri>` of people tokens. Needs `--resource` and `--kube-authz`. |
 | `--resource` | required | The canonical MCP URLs; `aud` must name one. |
-| `--cluster` | unset | The cluster this server acts on. A token's `kube_cluster` must name it. Unset: any cluster. Set it on each cluster when several serve the same URL. |
+| `--cluster` | required with `--run-issuer` | The cluster this server acts on. A token's `kube_cluster` must name it. Without run issuers, unset accepts people's tokens for any cluster. |
 | `--jwks-ca` | unset | Extra CA bundle for JWKS hosts. |
 | `--insecure-jwks-http` | false | Allows plain-http JWKS off loopback. |
 | `--tool-policy` | unset | The CEL tool policy file. |
@@ -1736,8 +1741,10 @@ Each flag also has a `CRUCIBLE_KUEUE_*` environment variable (`crucible-kueue/sr
 | `--accelerator-resource`, `--accelerator-product-label` | NVIDIA, AMD, Habana, TPU names | What `hardware_describe` counts. |
 | other generic flags | section 7.12 | |
 
-`crucible deploy render --kueue` renders the server with `--run-issuer`, `--resource`,
-`--allowed-host`, `--kube-authz`, `--namespace <workload namespace>` and the pull secrets
+`crucible deploy render --kueue [--kueue-cluster <name>]` renders the server for one `[kueue]
+clusters` entry (the only one, or the one named) with `--run-issuer`, `--resource`,
+`--allowed-host`, `--kube-authz`, `--cluster <name>`, `--namespace` for each workload namespace and
+the pull secrets
 (`crucible/src/deploy/kueue.rs:123`). With `[kueue] people = true`, it also renders
 `--person-issuer` with the same issuer and JWKS URI as `--run-issuer` (`kueue.rs:141`).
 

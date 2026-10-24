@@ -35,7 +35,8 @@ struct Cli {
         env = "CRUCIBLE_KUEUE_RUN_ISSUERS",
         value_delimiter = ',',
         value_parser = TrustedIssuer::runs,
-        required_unless_present = "person_issuers"
+        required_unless_present = "person_issuers",
+        requires = "cluster"
     )]
     run_issuers: Vec<TrustedIssuer>,
     /// Accept people's access tokens from an OAuth issuer (the crucible controller, or another
@@ -51,7 +52,8 @@ struct Cli {
     )]
     person_issuers: Vec<TrustedIssuer>,
     /// The cluster this server acts on, as the issuer names it: a token's `kube_cluster` must
-    /// name it. Unset, tokens for any cluster the issuer names are accepted.
+    /// name it. Required with `--run-issuer`; without run issuers, unset accepts people's tokens
+    /// for any cluster.
     #[arg(long = "cluster", env = "CRUCIBLE_KUEUE_CLUSTER")]
     cluster: Option<String>,
     /// This server's canonical MCP URLs; an access token's aud must name one.
@@ -386,6 +388,8 @@ mod tests {
             "crucible-kueue",
             "--run-issuer",
             "http://crucible-controller.crucible-system.svc:8080=http://crucible-controller.crucible-system.svc:8080/.well-known/jwks.json",
+            "--cluster",
+            "hub",
             "--person-issuer",
             "https://keycloak.example/realms/crucible=https://keycloak.auth.svc:8443/realms/crucible/protocol/openid-connect/certs?x=1",
             "--resource",
@@ -428,6 +432,8 @@ mod tests {
             "crucible-kueue",
             "--run-issuer",
             "https://a.example=https://a.example/keys",
+            "--cluster",
+            "hub",
             "--resource",
             RESOURCE,
         ])
@@ -452,6 +458,8 @@ mod tests {
                 "crucible-kueue",
                 "--run-issuer",
                 "https://a.example=https://a.example/keys",
+                "--cluster",
+                "hub",
                 "--resource",
                 RESOURCE,
                 "--manager",
@@ -472,6 +480,8 @@ mod tests {
             "crucible-kueue",
             "--run-issuer",
             "https://a.example=https://a.example/keys",
+            "--cluster",
+            "hub",
             "--resource",
             RESOURCE,
             "--run-id-claim",
@@ -568,6 +578,12 @@ mod tests {
             vec!["--resource", RESOURCE],
             vec!["--run-issuer", "https://a.example=https://a.example/keys"],
             vec![
+                "--run-issuer",
+                "https://a.example=https://a.example/keys",
+                "--resource",
+                RESOURCE,
+            ],
+            vec![
                 "--person-issuer",
                 "https://a.example=https://a.example/keys",
                 "--resource",
@@ -585,6 +601,8 @@ mod tests {
             "crucible-kueue",
             "--run-issuer",
             "https://a.example=https://a.example/keys",
+            "--cluster",
+            "hub",
             "--resource",
             RESOURCE,
         ])
