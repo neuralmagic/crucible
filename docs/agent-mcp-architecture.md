@@ -1552,6 +1552,8 @@ It admits a pod there only when:
   its seccomp profile;
 - it shares no host network, PID or IPC namespace, and mounts only `emptyDir` volumes;
 - it runs as the `default` account with `automountServiceAccountToken: false`;
+- it reads no Secret or ConfigMap into its environment (`valueFrom`, `envFrom`) and names no
+  image pull Secret;
 - AppArmor is set only as buildit sets it: the annotation for `builder`, `unconfined` (or the
   matching `appArmorProfile` field on that container).
 

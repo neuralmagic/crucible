@@ -2737,6 +2737,37 @@ mod tests {
                 escape(&|p| p["spec"]["automountServiceAccountToken"] = serde_json::json!(true)),
             ),
             (
+                "a Secret in env",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["env"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({"name": "T", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}))
+                }),
+            ),
+            (
+                "a ConfigMap in env",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["env"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({"name": "T", "valueFrom": {"configMapKeyRef": {"name": "c", "key": "k"}}}))
+                }),
+            ),
+            (
+                "envFrom",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["envFrom"] =
+                        serde_json::json!([{"secretRef": {"name": "s"}}])
+                }),
+            ),
+            (
+                "a pull Secret",
+                escape(&|p| {
+                    p["spec"]["imagePullSecrets"] = serde_json::json!([{"name": "quay-pull"}])
+                }),
+            ),
+            (
                 "another account",
                 escape(&|p| p["spec"]["serviceAccountName"] = serde_json::json!("crucible-spoke")),
             ),

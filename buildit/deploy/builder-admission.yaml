@@ -2,7 +2,8 @@
 # (admissionregistration.k8s.io/v1, Kubernetes 1.30+). Whoever may create pods there (a run's loop
 # account) can create only a builder pod shaped like the one buildit/src/mcp.rs `builder_pod`
 # makes: the buildah image, one unprivileged non-root container, emptyDir volumes, no host
-# namespaces, no service account token, and AppArmor unconfined for that container alone.
+# namespaces, no service account token or other Secret, and AppArmor unconfined for that container
+# alone.
 # `crucible deploy` renders it with a binding to the builder namespace; buildit's tests check its
 # own builder pod passes and the escapes do not.
 apiVersion: admissionregistration.k8s.io/v1
@@ -34,6 +35,13 @@ spec:
         (!has(object.spec.initContainers) || size(object.spec.initContainers) == 0) &&
         (!has(object.spec.ephemeralContainers) || size(object.spec.ephemeralContainers) == 0)
       message: a pod here has no init or ephemeral containers
+    - expression: >-
+        object.spec.containers.all(c, (!has(c.envFrom) || size(c.envFrom) == 0) &&
+        (!has(c.env) || c.env.all(e, !has(e.valueFrom))))
+      message: a pod here reads no Secret or ConfigMap into its environment
+    - expression: >-
+        !has(object.spec.imagePullSecrets) || size(object.spec.imagePullSecrets) == 0
+      message: a pod here names no image pull Secret
     - expression: >-
         object.spec.containers.all(c, !has(c.securityContext) ||
         ((!has(c.securityContext.privileged) || c.securityContext.privileged == false) &&
