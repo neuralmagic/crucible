@@ -138,6 +138,12 @@ fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
         "--namespace".to_string(),
         cfg.workload_namespace.to_string(),
     ];
+    if cfg.people {
+        args.extend([
+            "--person-issuer".to_string(),
+            format!("{}={jwks}", cfg.run_issuer),
+        ]);
+    }
     for secret in &cfg.pull_secrets {
         args.extend(["--pull-secret".to_string(), secret.clone()]);
     }
@@ -426,6 +432,24 @@ mod tests {
                 .map(|d| d["metadata"]["name"].as_str().unwrap())
                 .collect::<Vec<_>>(),
             ["crucible-kueue-e2e"]
+        );
+    }
+
+    #[test]
+    fn people_are_accepted_from_the_same_issuer_only_when_the_profile_says_so() {
+        let person_issuer = |text: &str| {
+            let args = args(&docs(text));
+            args.windows(2)
+                .find(|w| w[0] == "--person-issuer")
+                .map(|w| w[1].clone())
+        };
+        assert_eq!(person_issuer(PROFILE), None);
+        assert_eq!(
+            person_issuer(&PROFILE.replace("[kueue]", "[kueue]\npeople = true")).as_deref(),
+            Some(
+                "http://crucible-controller.crucible-system.svc.cluster.local:8080=\
+                 http://crucible-controller.crucible-system.svc.cluster.local:8080/.well-known/jwks.json"
+            )
         );
     }
 

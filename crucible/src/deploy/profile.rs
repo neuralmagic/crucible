@@ -174,6 +174,10 @@ pub struct KueueCfg {
     /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
+    /// Also accept people's tokens from the same issuer: set when `CONTROLLER_PEOPLE_AUDIENCES`
+    /// names this server, so people's MCP clients reach it as themselves.
+    #[serde(default)]
+    pub people: bool,
 }
 
 /// The dispatch name of the controller's own cluster.
