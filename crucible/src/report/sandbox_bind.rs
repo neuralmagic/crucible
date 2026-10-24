@@ -43,6 +43,8 @@ fn non_empty_env(name: &str) -> Option<String> {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum BindError {
+    #[error("the gateway named no id for sandbox {0}, so it cannot be bound")]
+    NoSandboxId(String),
     #[error("building the sandbox bind client: {0}")]
     Client(#[source] reqwest::Error),
     #[error(

@@ -479,12 +479,10 @@ async fn try_turn(
                 sandbox_id,
                 workdir: Some(SandboxLayout::workdir(&basename)),
             };
-            crate::report::sandbox_bind::bind_sandbox(&target, &binding)
-                .await
-                .map_err(anyhow::Error::from)
+            crate::report::sandbox_bind::bind_sandbox(&target, &binding).await
         }
-        None => Err(anyhow::anyhow!(
-            "the gateway named no id for sandbox {name}"
+        None => Err(crate::report::sandbox_bind::BindError::NoSandboxId(
+            name.clone(),
         )),
     } {
         let ev = AgentEvent::Raw {
