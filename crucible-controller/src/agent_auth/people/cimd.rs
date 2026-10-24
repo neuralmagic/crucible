@@ -124,7 +124,7 @@ impl CimdPolicy {
 
 /// Not a special-use address of RFC 6890 (or its IPv6 successors): somewhere a public client
 /// could publish a document.
-pub fn is_public(ip: IpAddr) -> bool {
+fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {

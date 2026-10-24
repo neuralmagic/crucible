@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const DCR_ENV: &str = "CONTROLLER_PEOPLE_DCR";
+pub const TRUSTED_PROXIES_ENV: &str = "CONTROLLER_PEOPLE_TRUSTED_PROXIES";
 const ID_BYTES: usize = 24;
 const MAX_REDIRECTS: usize = 8;
 const MAX_REDIRECT_LEN: usize = 512;
@@ -31,12 +32,14 @@ const MAX_TRACKED_SOURCES: usize = 10_000;
 
 /// How long a registration lives unused, how many may live at once, and how fast one source may
 /// register.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DcrPolicy {
     pub idle: Duration,
     pub max_active: i64,
     pub per_source: u32,
     pub window: Duration,
+    /// The proxies whose `X-Forwarded-For` names the source; any other peer is its own source.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
 }
 
 impl Default for DcrPolicy {
@@ -46,13 +49,18 @@ impl Default for DcrPolicy {
             max_active: 10_000,
             per_source: 20,
             window: Duration::from_secs(3600),
+            trusted_proxies: Vec::new(),
         }
     }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error("{DCR_ENV} {0:?} is not true or false")]
-pub struct DcrConfigError(pub String);
+pub enum DcrConfigError {
+    #[error("{DCR_ENV} {0:?} is not true or false")]
+    Flag(String),
+    #[error("{TRUSTED_PROXIES_ENV} entry {0:?} is not an IP network such as 10.128.0.0/14")]
+    Proxy(String),
+}
 
 impl DcrPolicy {
     /// On unless `CONTROLLER_PEOPLE_DCR` turns it off.
@@ -60,8 +68,23 @@ impl DcrPolicy {
         match raw.as_deref().map(str::trim) {
             None | Some("") | Some("true" | "1" | "on" | "yes") => Ok(Some(Self::default())),
             Some("false" | "0" | "off" | "no") => Ok(None),
-            Some(other) => Err(DcrConfigError(other.to_string())),
+            Some(other) => Err(DcrConfigError::Flag(other.to_string())),
         }
+    }
+
+    /// `CONTROLLER_PEOPLE_TRUSTED_PROXIES`: comma-separated networks, such as the cluster's pod
+    /// network the router runs in. Unset trusts no proxy.
+    pub fn trusted_proxies(raw: Option<String>) -> Result<Vec<ipnet::IpNet>, DcrConfigError> {
+        raw.unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .map(|e| {
+                e.parse::<ipnet::IpNet>()
+                    .or_else(|_| e.parse::<IpAddr>().map(ipnet::IpNet::from))
+                    .map_err(|_| DcrConfigError::Proxy(e.to_string()))
+            })
+            .collect()
     }
 }
 
@@ -401,10 +424,14 @@ impl Dcr {
 }
 
 /// The address a registration counts against: the last `X-Forwarded-For` hop when the connection
-/// comes from a private address (the cluster's router appends the client it saw), else the peer.
-pub fn source(peer: Option<SocketAddr>, headers: &HeaderMap) -> Option<IpAddr> {
+/// comes from one of `trusted` (the cluster's router appends the client it saw), else the peer.
+pub fn source(
+    peer: Option<SocketAddr>,
+    headers: &HeaderMap,
+    trusted: &[ipnet::IpNet],
+) -> Option<IpAddr> {
     let peer = peer.map(|p| p.ip());
-    let behind_proxy = peer.is_some_and(|ip| !crate::agent_auth::people::cimd::is_public(ip));
+    let behind_proxy = peer.is_some_and(|ip| trusted.iter().any(|net| net.contains(&ip)));
     let forwarded = headers
         .get_all("x-forwarded-for")
         .iter()
@@ -443,7 +470,11 @@ pub(crate) async fn register(
         .get::<axum::extract::ConnectInfo<SocketAddr>>()
         .map(|c| c.0);
     match dcr
-        .register(req, source(peer, &headers), crate::clock::unix_secs())
+        .register(
+            req,
+            source(peer, &headers, &dcr.policy.trusted_proxies),
+            crate::clock::unix_secs(),
+        )
         .await
     {
         Ok(registered) => {
@@ -563,25 +594,51 @@ mod tests {
     }
 
     #[test]
-    fn the_source_is_the_peer_or_the_routers_last_hop() {
+    fn the_source_is_the_peer_or_a_trusted_proxys_last_hop() {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-forwarded-for",
             HeaderValue::from_static("6.6.6.6, 203.0.113.9"),
         );
+        let trusted = DcrPolicy::trusted_proxies(Some("10.128.0.0/14, 192.0.2.7".into())).unwrap();
         let public: SocketAddr = "198.51.99.1:443".parse().unwrap();
         let router: SocketAddr = "10.128.0.5:443".parse().unwrap();
+        let in_cluster: SocketAddr = "10.200.0.9:443".parse().unwrap();
+        let named: SocketAddr = "192.0.2.7:443".parse().unwrap();
         assert_eq!(
-            source(Some(public), &headers),
+            source(Some(public), &headers, &trusted),
             Some(public.ip()),
             "a public peer is not trusted to forward"
         );
         assert_eq!(
-            source(Some(router), &headers),
+            source(Some(in_cluster), &headers, &trusted),
+            Some(in_cluster.ip()),
+            "a private peer outside the trusted networks picks no bucket"
+        );
+        assert_eq!(
+            source(Some(router), &headers, &trusted),
             Some("203.0.113.9".parse().unwrap())
         );
-        assert_eq!(source(Some(router), &HeaderMap::new()), Some(router.ip()));
-        assert_eq!(source(None, &headers), None);
+        assert_eq!(
+            source(Some(named), &headers, &trusted),
+            Some("203.0.113.9".parse().unwrap()),
+            "a bare address is a one-address network"
+        );
+        assert_eq!(
+            source(Some(router), &headers, &[]),
+            Some(router.ip()),
+            "with no trusted proxy every peer is its own source"
+        );
+        assert_eq!(
+            source(Some(router), &HeaderMap::new(), &trusted),
+            Some(router.ip())
+        );
+        assert_eq!(source(None, &headers, &trusted), None);
+        assert_eq!(DcrPolicy::trusted_proxies(None), Ok(Vec::new()));
+        assert!(matches!(
+            DcrPolicy::trusted_proxies(Some("10.0.0.0/99".into())),
+            Err(DcrConfigError::Proxy(_))
+        ));
     }
 
     #[test]

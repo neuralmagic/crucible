@@ -71,6 +71,8 @@ jsonschema.workspace = true
 # Scratch-database URL derivation for `db verify`/`db rebuild` (swap the database name in the
 # ledger URL); already in the tree via reqwest.
 url = "2"
+# The proxies whose X-Forwarded-For a client registration trusts.
+ipnet = "2"
 # The daemon's pod watch (lane D only — no other crate needs the async kube client;
 # `forge::kube` is the sync, block_on-wrapped client the rest of the engine uses).
 kube = { workspace = true, features = ["client", "runtime", "rustls-tls"] }

@@ -91,6 +91,7 @@ pub fn people(
             cimd,
             config
                 .dcr
+                .clone()
                 .map(|policy| std::sync::Arc::new(Dcr::new(pool.clone(), policy))),
         ),
         config,

@@ -603,7 +603,7 @@ sequenceDiagram
     M->>C: POST /oauth/register {client_name, redirect_uris, ...}
     Note over C: check: public client, loopback http redirect URIs,<br/>grant and response types, at most 8 URIs
     Note over C: rate limit: 20 each hour for each source address
-    C->>D: INSERT people_dynamic_clients<br/>only while fewer than 10000 are live
+    C->>D: INSERT people_dynamic_clients<br/>only while fewer than about 10000 are live
     C-->>M: 201 {client_id: dyn-..., token_endpoint_auth_method: none}
     M->>C: GET /oauth/authorize?client_id=dyn-...
     C->>D: UPDATE last_used_at WHERE client_id AND not idle, RETURNING the client
@@ -628,11 +628,13 @@ name as "<name> (self-registered)".
 
 - Each source address can register 20 times in each hour. The limit is in memory, for each
   replica. Past it, the answer is `429` with `temporarily_unavailable`.
-- At most 10000 registrations used in the last 30 days can exist. Past it, the answer is `503`
-  with `temporarily_unavailable`.
+- About 10000 registrations used in the last 30 days can exist. Past it, the answer is `503`
+  with `temporarily_unavailable`. The count and the insert are one statement but not serialized
+  across replicas, so concurrent registrations can go slightly over: the cap is soft.
 
-The source address is the TCP peer. When the peer has an address that is not public, as behind
-the cluster router, the source is the last `X-Forwarded-For` hop (`source`, `dynamic.rs:405`).
+The source address is the TCP peer. When the peer is in `CONTROLLER_PEOPLE_TRUSTED_PROXIES`, as
+the cluster router is, the source is the last `X-Forwarded-For` hop (`source`, `dynamic.rs:428`).
+Any other peer, an in-cluster caller included, is its own source and cannot pick a bucket.
 
 `Dcr::client` (`dynamic.rs:345`) reads a registration and stamps `last_used_at` in one
 statement. A registration that is not used for 30 days stops working. The hourly sweep deletes
@@ -791,6 +793,10 @@ sequenceDiagram
             C-->>M: invalid_grant
         else same client
             Note over C: refuse when idle over 14 days,<br/>or older than 90 days
+            alt another resource or a scope beyond the approval
+                C->>D: roll back: the token stays unspent
+                C-->>M: invalid_target or invalid_grant
+            end
             C->>D: issue the next refresh token
             Note over C: client still allowed for the resource,<br/>read the person again: users row, stored<br/>credential not refused, kube_user on the cluster
             alt person still allowed and kube_user known
@@ -807,10 +813,12 @@ sequenceDiagram
 ```
 
 The rotation is one conditional `UPDATE`, so two replicas cannot both spend one refresh token
-(`grants.rs:197`). A spent token stays in the table until its approval goes. When a client
+(`grants.rs:223`). A spent token stays in the table until its approval goes. When a client
 presents it again, the controller revokes the whole approval (RFC 9700 §4.14.2). A live token
-that another client ID presents also revokes the approval (`grants.rs:252`). A refresh also
-refuses a wider scope and another `resource` (`redeem_refresh`, `people.rs:765`).
+that another client ID presents also revokes the approval (`grants.rs:279`). A refresh that
+asks for another `resource` or a wider scope is refused inside the same transaction, before
+anything commits (`refresh_fits`, `people.rs:765`; `grants.rs:309`), so the token it presented stays
+live and the client can refresh with it again.
 
 A refresh also checks the client again. A registered client that the registry no longer lists
 gets `invalid_client`. A registered client whose `resources` no longer lists the resource of the
@@ -1504,6 +1512,7 @@ never sees it. Without a push repository or without the authfile, `push` is refu
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | unset | A TOML file of `[[clients]]` with `client_id`, `name`, `redirect_uris` and optional `resources`. It replaces the built-in `claude-code`, `pi` and `codex`. Unset: the built-in clients (section 4.1.2). |
 | `CONTROLLER_PEOPLE_CIMD_HOSTS` | unset | Comma-separated host names that may publish Client ID Metadata Documents. Unset: every URL `client_id` is refused (section 4.1.3). The controller needs outbound HTTPS to these hosts. It honours `HTTPS_PROXY`. |
 | `CONTROLLER_PEOPLE_DCR` | on | `false`, `0`, `off` or `no` turns off `POST /oauth/register` and removes `registration_endpoint` from the metadata. `true`, `1`, `on`, `yes` or empty keeps it on (section 4.1.4). |
+| `CONTROLLER_PEOPLE_TRUSTED_PROXIES` | unset | Comma-separated networks or addresses whose `X-Forwarded-For` names a registration's source. Unset: the TCP peer is the source (section 4.1.4). |
 | `CONTROLLER_DEPLOY_PROFILE` | unset | The deploy profile. The issuer does not start without it. |
 | `POD_NAMESPACE` | the service account namespace file | The controller namespace, for the issuer key placement check. |
 | `CONTROLLER_AUTH_MODE` | per `docs/controller-auth.md` | People authorization needs `native`: `/oauth/authorize` reads a native session only. |
@@ -1520,6 +1529,7 @@ The issuer refuses to start when any of these is true:
   `resources` entry that is not in `CONTROLLER_PEOPLE_AUDIENCES`.
 - `CONTROLLER_PEOPLE_CIMD_HOSTS` is set and lists no host, or an entry that is not a host name.
 - `CONTROLLER_PEOPLE_DCR` is not one of the values above.
+- `CONTROLLER_PEOPLE_TRUSTED_PROXIES` has an entry that is not an IP network or address.
 - The controller namespace is unknown, or is a loop, rig, sandbox, `crucible-kueue` or workload
   namespace.
 - A value does not parse.
@@ -1967,7 +1977,7 @@ COMMIT;
 | The authorize page says that the redirect URI is not registered for `claude-code` | pi signs in with `claude-code` and a `127.0.0.1` callback. `claude-code` registers only `localhost` | Add the server to pi again without OAuth options, or with `--oauth-client-id pi` |
 | Codex stops with "Dynamic client registration not supported" | `CONTROLLER_PEOPLE_DCR=false`, and Codex has no client id | Pass `--oauth-client-id codex`, or turn registration on |
 | The authorize page refuses an `https://` client ID | `CONTROLLER_PEOPLE_CIMD_HOSTS` is unset or does not list the host, or the document failed a check | Add the host to `CONTROLLER_PEOPLE_CIMD_HOSTS`; check the page for the reason |
-| `POST /oauth/register` returns 429 for many people | The router does not add `X-Forwarded-For`, so every registration counts against the router address | Make the router append `X-Forwarded-For` |
+| `POST /oauth/register` returns 429 for many people | Every registration counts against the router address: `CONTROLLER_PEOPLE_TRUSTED_PROXIES` does not cover the router, or the router does not append `X-Forwarded-For` | Set `CONTROLLER_PEOPLE_TRUSTED_PROXIES` to the network the router connects from, and make the router append `X-Forwarded-For` |
 
 ## 12. Tests
 

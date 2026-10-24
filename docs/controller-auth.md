@@ -372,9 +372,11 @@ like any other client's. The name it chose is cleaned and cut to 100 characters,
 page and Settings always show it as "<name> (self-registered)". The consent page also shows
 the `host:port` the code goes to. A registration unused for 30 days stops authorizing and
 refreshing, and the hourly sweep deletes it with its approvals. Each source address may register
-20 times an hour, and at most 10000 registrations live at once (`429` and `503` past those
-limits). The source is the TCP peer, or the last `X-Forwarded-For` hop when the peer has a
-private address, as behind the cluster router.
+20 times an hour, and about 10000 registrations live at once (`429` and `503` past those
+limits; concurrent registrations on several replicas can go slightly over the cap). The source is
+the TCP peer, or the last `X-Forwarded-For` hop when the peer is in
+`CONTROLLER_PEOPLE_TRUSTED_PROXIES` (the networks the cluster router connects from). Without that
+setting every registration behind a router counts against the router's address.
 
 #### Client ID Metadata Documents
 
