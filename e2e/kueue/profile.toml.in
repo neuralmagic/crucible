@@ -1,13 +1,13 @@
 # Deploy profile for the build-and-run e2e: a controller in @CTL_NS@ dispatches loop pods into
-# @LOOP_NS@, each run's gateway and sandboxes live in crucible-sandboxes, buildit runs in each loop
-# pod and pushes to @PUSH_REPO@, and the server in crucible-system takes Jobs in
-# crucible-kueue-e2e through LocalQueue crucible-e2e.
+# @LOOP_NS@, each run's gateway and sandboxes live in @SANDBOX_NS@, buildit runs in each loop pod
+# and pushes to @PUSH_REPO@, and the server in @KUEUE_NS@ takes Jobs in @WORKLOAD_NS@ through
+# LocalQueue crucible-e2e.
 [cluster]
 loop_namespace          = "@LOOP_NS@"
 rig_namespace           = "@LOOP_NS@"
 service_account         = "crucible-kueue-e2e-loop"
 sandbox_service_account = "crucible-sandbox"
-sandbox_namespace       = "crucible-sandboxes"
+sandbox_namespace       = "@SANDBOX_NS@"
 sandbox_readers         = ["@CTL_NS@/crucible-controller"]
 sandbox_spiffe_socket   = "/spiffe-workload-api/spire-agent.sock"
 supervisor_image        = "@SUPERVISOR_IMAGE@"
@@ -37,8 +37,8 @@ key    = "api-key"
 [kueue]
 image              = "@KUEUE_IMAGE@"
 cluster            = "hub"
-namespace          = "crucible-system"
-workload_namespace = "crucible-kueue-e2e"
+namespace          = "@KUEUE_NS@"
+workload_namespace = "@WORKLOAD_NS@"
 run_issuer         = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
 kube_authz         = "openshift"
 pull_secrets       = ["@PULL_SECRET@=@PUSH_REPO@"]

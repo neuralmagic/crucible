@@ -4,10 +4,10 @@
 #
 # A controller from this checkout runs in the cluster (CTL_NS, with its own Postgres) and
 # dispatches a playbook launch of e2e/kueue/pack into LOOP_NS, with each run's OpenShell gateway
-# isolated in crucible-sandboxes. The engine starts buildit in the loop pod and registers a
-# token-grant provider for it and for crucible-kueue; the sandbox's supervisor fetches its JWT-SVID
-# from SPIRE, exchanges it at the controller's token endpoint, and injects each token on traffic
-# to its server alone. The agent writes a program printing a nonce, builds and pushes it to
+# isolated in SANDBOX_NS and a crucible-kueue server of its own in KUEUE_NS. The engine starts
+# buildit in the loop pod and registers a token-grant provider for it and for crucible-kueue; the
+# sandbox's supervisor fetches its JWT-SVID from SPIRE, exchanges it at the controller's token
+# endpoint, and injects each token on traffic to its server alone. The agent writes a program printing a nonce, builds and pushes it to
 # PUSH_REPO, and runs it as a Job. The script then checks the cluster and the controller, not the
 # agent's word alone:
 #   - the controller issued buildit and crucible-kueue tokens to a supervisor SPIFFE ID under this
@@ -18,12 +18,15 @@
 #   - no kueue token rode the loop pod's env, its Secrets, or any log.
 #
 # The launch is made with the caller's own cluster token, and the launcher's Kubernetes user is
-# seeded in the controller's ledger as a sign-in would record it. crucible-system's crucible-kueue Deployment and ClusterRole are saved
-# first and restored on exit.
+# seeded in the controller's ledger as a hub link would record it.
 #
-# Needs kubectl, jq, openssl, cargo, and on the cluster: Kueue, OpenShift's Zero Trust Workload
-# Identity Manager with a ClusterSPIFFEID for supervisors in crucible-sandboxes, the
-# ANTHROPIC_KEY_SECRET Secret (an Anthropic Messages API key for ANTHROPIC_BASE_URL, under api-key)
+# The e2e runs beside a live deployment on the same cluster: everything it creates lives in its own
+# namespaces or carries an e2e name, the cluster-scoped objects (its ClusterRoles, bindings and a
+# ClusterSPIFFEID for SANDBOX_NS) carry the label crucible.dev/e2e=kueue, and teardown deletes by
+# that label alone. It refuses to start when one of its namespaces exists without the label.
+#
+# Needs kubectl, jq, yq, openssl, cargo, and on the cluster: Kueue with a ClusterQueue crucible,
+# OpenShift's Zero Trust Workload Identity Manager, the ANTHROPIC_KEY_SECRET Secret (an Anthropic Messages API key for ANTHROPIC_BASE_URL, under api-key)
 # and the PULL_SECRET Secret in crucible-system, whose account may also push to PUSH_REPO.
 #
 #   CONTEXT=<kube context> LOOP_IMAGE=<runtime image> KUEUE_IMAGE=<crucible-kueue image> \
@@ -47,8 +50,10 @@ set -euo pipefail
 : "${ANTHROPIC_KEY_SECRET:?set ANTHROPIC_KEY_SECRET to the crucible-system Secret holding its api-key}"
 CTL_NS=crucible-kueue-e2e-ctl
 LOOP_NS=crucible-kueue-e2e-loops
-SANDBOX_NS=crucible-sandboxes
-WORKLOAD_NS=crucible-kueue-e2e
+KUEUE_NS=crucible-kueue-e2e-server
+SANDBOX_NS=${SANDBOX_NS:-crucible-kueue-e2e-sandboxes}
+WORKLOAD_NS=crucible-kueue-e2e-workloads
+E2E_LABEL=crucible.dev/e2e=kueue
 SPIRE_NS=zero-trust-workload-identity-manager
 SPIRE_DISCOVERY=spire-spiffe-oidc-discovery-provider:443
 NONCE=$(openssl rand -hex 12)
@@ -69,26 +74,34 @@ cleanup() {
         log "kept $WORK, the namespaces, and Job $WORKLOAD_NS/$JOB"
         return
     fi
-    kc -n "$WORKLOAD_NS" delete job "$JOB" --ignore-not-found >/dev/null || true
-    [ -f "$WORK/rendered.yaml" ] && yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")' \
-        "$WORK/rendered.yaml" | kc delete --ignore-not-found -f - >/dev/null 2>&1 || true
-    kc -n "$SPIRE_NS" delete role,rolebinding crucible-kueue-e2e-spire-keys --ignore-not-found >/dev/null || true
-    kc delete namespace -l "$E2E_LABEL" --ignore-not-found --wait=false >/dev/null || true
-    if [ -s "$WORK/kueue-saved.yaml" ]; then
-        kc replace -f "$WORK/kueue-saved.yaml" >/dev/null && log "restored crucible-system's crucible-kueue"
-    elif [ -f "$WORK/kueue.yaml" ]; then
-        kc delete --ignore-not-found -f "$WORK/kueue.yaml" >/dev/null || true
-    fi
+    teardown --wait=false
     rm -rf "$WORK"
 }
-# The e2e owns crucible-sandboxes for its run. On a cluster where something else uses it (a live
-# deployment's sandboxes), stop before saving, replacing or deleting anything.
-E2E_LABEL=crucible.dev/e2e=kueue
-if kc get namespace "$SANDBOX_NS" >/dev/null 2>&1 \
-    && [ "$(kc get namespace "$SANDBOX_NS" -o jsonpath='{.metadata.labels.crucible\.dev/e2e}')" != kueue ]; then
-    log "FAIL: $SANDBOX_NS exists and is not this e2e's; run it on a cluster without live sandboxes"
-    exit 1
-fi
+teardown() {
+    kc delete clusterrolebinding,clusterrole,clusterspiffeid -l "$E2E_LABEL" --ignore-not-found >/dev/null || true
+    kc -n "$SPIRE_NS" delete rolebinding,role -l "$E2E_LABEL" --ignore-not-found >/dev/null || true
+    kc delete namespace -l "$E2E_LABEL" --ignore-not-found "$@" >/dev/null || true
+}
+# Name a render's cluster-scoped objects for the e2e and label them, and point bindings at the
+# renamed ClusterRoles, so nothing collides with a live deployment's objects of the same name.
+e2e_scoped() {
+    yq -o=json -I=0 '.' "$1" | jq -s '
+        ([.[] | select(.kind == "ClusterRole") | .metadata.name]) as $roles
+        | {apiVersion: "v1", kind: "List", items: [.[] | select(. != null)
+            | if (.kind | startswith("Cluster")) then
+                .metadata.name += "-kueue-e2e" | .metadata.labels["crucible.dev/e2e"] = "kueue"
+              else . end
+            | if (.roleRef.kind == "ClusterRole" and (.roleRef.name as $n | $roles | index($n))) then
+                .roleRef.name += "-kueue-e2e"
+              else . end]}'
+}
+for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
+    if kc get namespace "$ns" >/dev/null 2>&1 \
+        && [ "$(kc get namespace "$ns" -o jsonpath='{.metadata.labels.crucible\.dev/e2e}')" != kueue ]; then
+        log "FAIL: $ns exists and is not this e2e's"
+        exit 1
+    fi
+done
 trap cleanup EXIT
 trap 'log "FAIL: line $LINENO: $BASH_COMMAND"' ERR
 
@@ -106,7 +119,7 @@ SVID_ISSUER=$(kc get spireoidcdiscoveryprovider cluster -o jsonpath='{.spec.jwtI
 GATEWAY_PREFIX="spiffe://$TRUST_DOMAIN/openshell/gateway/"
 AVOID_NODES=$(kc get nodes -l 'kubernetes.io/arch!=amd64' -o json | jq -r '[.items[].metadata.name | "\"\(.)\""] | join(", ")')
 ISSUER="http://crucible-controller.$CTL_NS.svc.cluster.local:8080"
-KUEUE_URL="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp"
+KUEUE_URL="http://crucible-kueue.$KUEUE_NS.svc.cluster.local:8850/mcp"
 log "launching as $LAUNCHER; SVIDs from $SVID_ISSUER under $GATEWAY_PREFIX"
 
 # The sandbox supervisor must come from the OpenShell rev the engine's gateway client links.
@@ -115,6 +128,7 @@ fill() {
     sed -e "s|@LOOP_IMAGE@|$LOOP_IMAGE|g" -e "s|@KUEUE_IMAGE@|$KUEUE_IMAGE|g" \
         -e "s|@CONTROLLER_IMAGE@|$CONTROLLER_IMAGE|g" -e "s|@SUPERVISOR_IMAGE@|$SUPERVISOR_IMAGE|g" \
         -e "s|@PULL_SECRET@|$PULL_SECRET|g" -e "s|@CTL_NS@|$CTL_NS|g" -e "s|@LOOP_NS@|$LOOP_NS|g" \
+        -e "s|@SANDBOX_NS@|$SANDBOX_NS|g" -e "s|@WORKLOAD_NS@|$WORKLOAD_NS|g" -e "s|@KUEUE_NS@|$KUEUE_NS|g" \
         -e "s|@SPIRE_NS@|$SPIRE_NS|g" -e "s|@ISSUER@|$ISSUER|g" -e "s|@KUEUE_URL@|$KUEUE_URL|g" \
         -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
         -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@ANTHROPIC_BASE_URL@|$ANTHROPIC_BASE_URL|g" \
@@ -123,26 +137,17 @@ fill() {
 }
 fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
 
-log "saving crucible-system's crucible-kueue"
-for obj in deployment/crucible-kueue clusterrole/crucible-kueue-cluster; do
-    kc -n crucible-system get "$obj" -o json 2>/dev/null \
-        | jq 'del(.metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.generation, .metadata.managedFields, .status)'
-done | jq -s '{apiVersion: "v1", kind: "List", items: .}' > "$WORK/kueue-saved.json"
-if [ "$(jq '.items | length' "$WORK/kueue-saved.json")" -gt 0 ]; then
-    cp "$WORK/kueue-saved.json" "$WORK/kueue-saved.yaml"
-fi
-
 log "clearing what an earlier run left"
-kc delete namespace "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" --ignore-not-found --timeout=300s >/dev/null
-for ns in "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS"; do
+teardown --timeout=300s
+for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$SANDBOX_NS"; do
     kc create namespace "$ns" --dry-run=client -o yaml | kc apply -f - >/dev/null
     kc label namespace "$ns" "$E2E_LABEL" --overwrite >/dev/null
 done
 
 log "deploying the controller, the namespaces and their RBAC"
 fill "$ROOT/e2e/kueue/controller.yaml.in" | kc apply -f - >/dev/null
-kc apply -f "$ROOT/e2e/kueue/namespace.yaml" >/dev/null
-for ns in "$CTL_NS" "$LOOP_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
+fill "$ROOT/e2e/kueue/cluster.yaml.in" | kc apply -f - >/dev/null
+for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
     kc -n crucible-system get secret "$PULL_SECRET" -o json \
         | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.managedFields)' \
         | kc -n "$ns" apply -f - >/dev/null
@@ -180,12 +185,12 @@ if [ -n "${SANDBOX_SCC_ROLE:-}" ]; then
 fi
 "$BIN/crucible" deploy render --manifest "$ROOT/e2e/kueue/render.toml" --profile "$WORK/profile.toml" \
     --no-pin 2>/dev/null | yq 'select(.kind != "Pod" and .kind != "NetworkPolicy")' > "$WORK/rendered.yaml"
-kc apply -f "$WORK/rendered.yaml" >/dev/null
+e2e_scoped "$WORK/rendered.yaml" | kc apply -f - >/dev/null
 
-log "deploying crucible-kueue in crucible-system"
-"$BIN/crucible" deploy render --kueue --no-pin --profile "$WORK/profile.toml" 2>/dev/null > "$WORK/kueue.yaml"
-kc apply --server-side --force-conflicts -f "$WORK/kueue.yaml" >/dev/null
-kc -n "$WORKLOAD_NS" delete job "$JOB" --ignore-not-found >/dev/null
+log "deploying crucible-kueue in $KUEUE_NS"
+"$BIN/crucible" deploy render --kueue --no-pin --profile "$WORK/profile.toml" 2>/dev/null \
+    | yq 'select(.kind != "Namespace")' > "$WORK/kueue.yaml"
+e2e_scoped "$WORK/kueue.yaml" | kc apply -f - >/dev/null
 
 log "starting the controller in $CTL_NS"
 openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$WORK/agent-signing.pem" 2>/dev/null
@@ -197,7 +202,7 @@ kc -n "$CTL_NS" create secret generic crucible-controller \
 kc -n "$CTL_NS" create configmap crucible-controller-profile --from-file=profile.toml="$WORK/profile.toml" \
     --dry-run=client -o yaml | kc apply -f - >/dev/null
 kc -n "$CTL_NS" rollout restart deploy/crucible-controller >/dev/null
-kc -n crucible-system rollout status deploy/crucible-kueue --timeout=300s >/dev/null
+kc -n "$KUEUE_NS" rollout status deploy/crucible-kueue --timeout=300s >/dev/null
 kc -n "$CTL_NS" rollout status deploy/postgres --timeout=300s >/dev/null
 kc -n "$CTL_NS" rollout status deploy/crucible-controller --timeout=600s >/dev/null \
     || fail "the controller never became ready: $(kc -n "$CTL_NS" logs deploy/crucible-controller --tail=20)"
@@ -220,9 +225,11 @@ done
 crux whoami | grep -q "$LAUNCHER" || fail "the controller does not see the launch as $LAUNCHER: $(crux whoami)"
 NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 kc -n "$CTL_NS" exec deploy/postgres -- psql -q -U crucible -d crucible -v ON_ERROR_STOP=1 -c \
-    "INSERT INTO users (sub, login, last_login, created_at, updated_at, kube_user)
-     VALUES ('e2e:$LAUNCHER', '$LAUNCHER', '$NOW', '$NOW', '$NOW', '$LAUNCHER')
-     ON CONFLICT (login) DO UPDATE SET kube_user = EXCLUDED.kube_user" >/dev/null
+    "INSERT INTO users (sub, login, last_login, created_at, updated_at)
+     VALUES ('e2e:$LAUNCHER', '$LAUNCHER', '$NOW', '$NOW', '$NOW') ON CONFLICT (login) DO NOTHING;
+     INSERT INTO kube_identity_links (sub, cluster, kube_user, source, linked_at)
+     SELECT sub, 'hub', '$LAUNCHER', 'token-review', '$NOW' FROM users WHERE login = '$LAUNCHER'
+     ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user" >/dev/null
 
 log "launching e2e/kueue/pack with nonce $NONCE"
 cp -R "$ROOT/e2e/kueue/pack" "$WORK/pack"

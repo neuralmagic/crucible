@@ -67,6 +67,8 @@ kind: Role
 metadata:
   name: crucible-kueue-e2e-spire-keys
   namespace: @SPIRE_NS@
+  labels:
+    crucible.dev/e2e: kueue
 rules:
   - apiGroups: [""]
     resources: [services/proxy]
@@ -77,6 +79,8 @@ kind: RoleBinding
 metadata:
   name: crucible-kueue-e2e-spire-keys
   namespace: @SPIRE_NS@
+  labels:
+    crucible.dev/e2e: kueue
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role

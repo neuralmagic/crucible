@@ -179,9 +179,10 @@ revise-loop-e2e:
 # the issued token, the Job and the agent's whoami (scenario in the script header). Images come
 # from Containerfile.runtime-selfcontained, Containerfile.controller-selfcontained on top of it, and
 # Containerfile.kueue, built from this checkout. KEEP=1 leaves everything behind.
-kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo sandbox_scc_role="" loop_scc_role="":
+kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo anthropic_base_url anthropic_key_secret sandbox_scc_role="" loop_scc_role="":
     CONTEXT={{context}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} PULL_SECRET={{pull_secret}} PUSH_REPO={{push_repo}} \
+        ANTHROPIC_BASE_URL={{anthropic_base_url}} ANTHROPIC_KEY_SECRET={{anthropic_key_secret}} \
         SANDBOX_SCC_ROLE={{sandbox_scc_role}} LOOP_SCC_ROLE={{loop_scc_role}} scripts/kueue-e2e.sh
 
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
