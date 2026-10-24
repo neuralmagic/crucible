@@ -358,12 +358,7 @@ impl AgentIssuerConfig {
         let spire: Vec<ClusterSpire> = match get("CONTROLLER_AGENT_SPIRE") {
             None => Vec::new(),
             Some(raw) => {
-                let spire: Vec<ClusterSpire> = raw
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|e| !e.is_empty())
-                    .map(str::parse)
-                    .collect::<Result<_, _>>()?;
+                let spire: Vec<ClusterSpire> = parse_list(&raw)?;
                 if spire.is_empty() {
                     return Err(ConfigError::NoSpire);
                 }
@@ -380,12 +375,7 @@ impl AgentIssuerConfig {
         }
         let audiences: Vec<Audience> = match spire.is_empty() {
             true => Vec::new(),
-            false => need("CONTROLLER_AGENT_AUDIENCES")?
-                .split(',')
-                .map(str::trim)
-                .filter(|a| !a.is_empty())
-                .map(str::parse)
-                .collect::<Result<_, _>>()?,
+            false => parse_list(&need("CONTROLLER_AGENT_AUDIENCES")?)?,
         };
         if !spire.is_empty() && audiences.is_empty() {
             return Err(ConfigError::NoAudiences);
@@ -399,6 +389,17 @@ impl AgentIssuerConfig {
             audiences,
         }))
     }
+}
+
+/// The comma-separated entries of a `CONTROLLER_AGENT_*` list.
+pub fn parse_list<T: std::str::FromStr<Err = ConfigError>>(
+    raw: &str,
+) -> Result<Vec<T>, ConfigError> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(str::parse)
+        .collect()
 }
 
 /// A verified sandbox supervisor.

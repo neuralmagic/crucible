@@ -1,7 +1,10 @@
 //! The MCP servers a run's agent is granted by default, from the deploy profile: crucible-kueue on
-//! the `[kueue]` clusters and buildit on the `[buildit]` clusters. Dispatch records what a run got,
-//! the run page shows it, and a revision of the configured set tells people when it changes.
+//! the `[kueue]` clusters and buildit on the `[buildit]` clusters, where the issuer mints their
+//! tokens and with the scopes it mints. Dispatch records what a run got, the run's principal fills
+//! in who kueue acts as once it is stamped, the run page shows it, and a revision of the
+//! configured set tells people when it changes.
 
+use crate::runs::workpod::kueue::AgentTokens;
 use anyhow::{Context, Result};
 use crucible::deploy::profile::{BuilditCfg, DeployProfile, KueueCfg};
 use serde::{Deserialize, Serialize};
@@ -32,19 +35,6 @@ impl AgentServer {
             "kueue" => Some(Self::Kueue),
             "buildit" => Some(Self::Buildit),
             _ => None,
-        }
-    }
-
-    fn scopes(self) -> [&'static str; 2] {
-        match self {
-            Self::Kueue => [
-                crucible_contract::kueue::SCOPE_READ,
-                crucible_contract::kueue::SCOPE_SUBMIT,
-            ],
-            Self::Buildit => [
-                crucible_contract::buildit::SCOPE_READ,
-                crucible_contract::buildit::SCOPE_BUILD,
-            ],
         }
     }
 }
@@ -79,7 +69,7 @@ impl AgentTool {
     }
 }
 
-fn kueue_tool(cfg: &KueueCfg, cluster: &str, kube_user: Option<&str>) -> AgentTool {
+fn kueue_tool(cfg: &KueueCfg, cluster: &str, scopes: &[String]) -> AgentTool {
     let mut limits =
         BTreeMap::from([("namespace".to_string(), cfg.workload_namespace.to_string())]);
     if !cfg.pull_secrets.is_empty() {
@@ -89,13 +79,13 @@ fn kueue_tool(cfg: &KueueCfg, cluster: &str, kube_user: Option<&str>) -> AgentTo
         server: AgentServer::Kueue,
         cluster: cluster.to_string(),
         url: cfg.url(),
-        kube_user: kube_user.map(str::to_string),
-        scopes: AgentServer::Kueue.scopes().map(String::from).to_vec(),
+        kube_user: None,
+        scopes: scopes.to_vec(),
         limits,
     }
 }
 
-fn buildit_tool(cfg: &BuilditCfg, cluster: &str) -> AgentTool {
+fn buildit_tool(cfg: &BuilditCfg, cluster: &str, scopes: &[String]) -> AgentTool {
     let limits = cfg
         .push_repo
         .iter()
@@ -106,24 +96,29 @@ fn buildit_tool(cfg: &BuilditCfg, cluster: &str) -> AgentTool {
         cluster: cluster.to_string(),
         url: crucible_contract::buildit::URL.to_string(),
         kube_user: None,
-        scopes: AgentServer::Buildit.scopes().map(String::from).to_vec(),
+        scopes: scopes.to_vec(),
         limits,
     }
 }
 
-/// What a run on `cluster` is granted, the launcher acting there as `kube_user`.
+/// What a run on `cluster` is granted: each server there whose tokens the issuer mints, with the
+/// scopes it mints them with.
 pub fn granted(
     kueue: Option<&KueueCfg>,
     buildit: Option<&BuilditCfg>,
     cluster: &str,
-    kube_user: Option<&str>,
+    tokens: &AgentTokens,
 ) -> Vec<AgentTool> {
-    let kueue = kueue
-        .filter(|k| k.serves(cluster))
-        .map(|k| kueue_tool(k, cluster, kube_user));
-    let buildit = buildit
-        .filter(|b| b.serves(cluster))
-        .map(|b| buildit_tool(b, cluster));
+    let kueue = kueue.filter(|k| k.serves(cluster)).and_then(|k| {
+        tokens
+            .audience(cluster, &k.url())
+            .map(|a| kueue_tool(k, cluster, &a.scopes))
+    });
+    let buildit = buildit.filter(|b| b.serves(cluster)).and_then(|b| {
+        tokens
+            .audience(cluster, crucible_contract::buildit::URL)
+            .map(|a| buildit_tool(b, cluster, &a.scopes))
+    });
     kueue.into_iter().chain(buildit).collect()
 }
 
@@ -138,7 +133,7 @@ pub struct Defaults {
 }
 
 /// The default set the profile configures; no `kube_user`, which is per person.
-pub fn defaults(profile: Option<&DeployProfile>) -> Defaults {
+pub fn defaults(profile: Option<&DeployProfile>, tokens: Option<&AgentTokens>) -> Defaults {
     let kueue = profile.and_then(|p| p.kueue.as_ref());
     let buildit = profile.and_then(|p| p.buildit.as_ref());
     let mut clusters: Vec<&str> = kueue
@@ -149,10 +144,13 @@ pub fn defaults(profile: Option<&DeployProfile>) -> Defaults {
         .collect();
     clusters.sort_unstable();
     clusters.dedup();
-    let tools: Vec<AgentTool> = clusters
-        .iter()
-        .flat_map(|cluster| granted(kueue, buildit, cluster, None))
-        .collect();
+    let tools: Vec<AgentTool> = match tokens {
+        Some(tokens) => clusters
+            .iter()
+            .flat_map(|cluster| granted(kueue, buildit, cluster, tokens))
+            .collect(),
+        None => Vec::new(),
+    };
     let canonical = serde_json::to_string(&tools).unwrap_or_default();
     let revision = format!("{:x}", Sha256::digest(canonical.as_bytes()))[..16].to_string();
     Defaults {
@@ -260,54 +258,108 @@ pub async fn for_runs(
     Ok(by_run)
 }
 
-/// Record what run `run_id`, launched by `launcher` onto `cluster`, is granted, and say so on the
-/// issue's event log, one line per server. The launcher's username on the cluster is resolved by
-/// the profile's rule for it, as the run's tokens will carry it.
+/// Record what run `run_id`, dispatched onto `cluster`, is granted. Who kueue acts as is the run's
+/// principal, stamped after dispatch: [`attribute`] fills it in.
 pub async fn grant(
     db: &crate::Db,
     profile: &DeployProfile,
-    issue_key: &str,
     run_id: &str,
     cluster: &str,
-    launcher: Option<&str>,
+    tokens: &AgentTokens,
 ) -> Result<Vec<AgentTool>> {
-    let kube_user = match launcher {
-        Some(login) => {
-            match crate::identity::cluster_identity::for_login(db.pool(), profile, cluster, login)
-                .await?
-            {
-                crate::identity::cluster_identity::Resolution::Known { user, .. } => {
-                    Some(user.as_str().to_string())
-                }
-                _ => None,
-            }
-        }
-        None => None,
-    };
     let tools = granted(
         profile.kueue.as_ref(),
         profile.buildit.as_ref(),
         cluster,
-        kube_user.as_deref(),
+        tokens,
     );
     record(db.pool(), run_id, &tools).await?;
+    Ok(tools)
+}
+
+/// Fill in who run `run_id`'s kueue tools act as, the username its tokens carry: the person it was
+/// dispatched for (`runs.dispatched_by`), under the profile's identity rule for the tool's cluster.
+/// Then say what the run got on the issue's event log, one line per server.
+pub async fn attribute(
+    db: &crate::Db,
+    profile: &DeployProfile,
+    issue_key: &str,
+    run_id: &str,
+) -> Result<()> {
+    let mut tools = for_run(db.pool(), run_id).await?;
+    if tools.is_empty() {
+        return Ok(());
+    }
+    let dispatched_by: Option<String> =
+        sqlx::query_scalar("SELECT dispatched_by FROM runs WHERE run_id = $1")
+            .bind(run_id)
+            .fetch_optional(db.pool())
+            .await
+            .context("reading who the run was dispatched for")?
+            .flatten();
+    let launcher = dispatched_by
+        .as_deref()
+        .and_then(|p| p.strip_prefix("user:"))
+        .filter(|login| !login.is_empty());
+    for tool in tools.iter_mut().filter(|t| t.server == AgentServer::Kueue) {
+        let Some(login) = launcher else { break };
+        if let crate::identity::cluster_identity::Resolution::Known { user, .. } =
+            crate::identity::cluster_identity::for_login(db.pool(), profile, &tool.cluster, login)
+                .await?
+        {
+            tool.kube_user = Some(user.as_str().to_string());
+            sqlx::query(
+                "UPDATE run_agent_tools SET kube_user = $3 WHERE run_id = $1 AND server = $2",
+            )
+            .bind(run_id)
+            .bind(tool.server.as_str())
+            .bind(&tool.kube_user)
+            .execute(db.pool())
+            .await
+            .context("recording who a run's agent tool acts as")?;
+        }
+    }
     let status = crate::issues::store::get_issue(db.pool(), issue_key)
         .await?
         .map(|i| i.status.as_str().to_string())
         .unwrap_or_else(|| "new".to_string());
     for tool in &tools {
-        let reason = tool.summary();
         db.events()
             .append(&crate::event_log::Event::now(
                 issue_key,
                 &status,
                 &status,
-                Some(&reason),
+                Some(&tool.summary()),
                 Some(run_id),
             ))
             .await?;
     }
-    Ok(tools)
+    Ok(())
+}
+
+/// [`attribute`] after a launch committed its run row, when runs get agent tools. A failure is
+/// logged: the run is already launched, and the record is what the run page shows.
+pub async fn attribute_launched(
+    db: &crate::Db,
+    cfg: &crate::config::ControllerCfg,
+    issue_key: &str,
+    run_id: &str,
+) {
+    if !cfg.issues_agent_tokens() {
+        return;
+    }
+    let attributed = match cfg.profile().await {
+        Ok(Some(profile)) => attribute(db, &profile, issue_key, run_id).await,
+        Ok(None) => Ok(()),
+        Err(e) => Err(e),
+    };
+    if let Err(e) = attributed {
+        tracing::warn!(
+            run_id,
+            error = format!("{e:#}"),
+            "recording who a run's agent tools act as failed"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -344,49 +396,77 @@ mod tests {
         toml::from_str(text).expect("profile parses")
     }
 
+    const KUEUE_URL: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
+
+    fn tokens(clusters: &[&str], kueue_scopes: &str) -> AgentTokens {
+        AgentTokens {
+            svid_audience: "https://crucible.hub.example".into(),
+            endpoint: "https://crucible.hub.example/oauth/token".into(),
+            clusters: clusters.iter().map(|c| c.to_string()).collect(),
+            audiences: vec![
+                format!("{KUEUE_URL}={kueue_scopes}").parse().unwrap(),
+                format!(
+                    "{}=buildit.read buildit.build",
+                    crucible_contract::buildit::URL
+                )
+                .parse()
+                .unwrap(),
+            ],
+        }
+    }
+
     #[test]
-    fn a_run_gets_the_servers_its_cluster_runs_with_their_scopes_and_limits() {
+    fn a_run_gets_the_servers_its_cluster_runs_with_the_issuers_scopes_and_limits() {
         let p = profile(PROFILE);
-        let on_waldorf = granted(
-            p.kueue.as_ref(),
-            p.buildit.as_ref(),
-            "waldorf",
-            Some("oidc:alice@example.com"),
-        );
+        let all = tokens(&["pirate", "waldorf"], "kueue.read kueue.submit");
+        let on_waldorf = granted(p.kueue.as_ref(), p.buildit.as_ref(), "waldorf", &all);
         assert_eq!(
             on_waldorf.iter().map(|t| t.server).collect::<Vec<_>>(),
             [AgentServer::Kueue, AgentServer::Buildit]
         );
         let kueue = &on_waldorf[0];
-        assert_eq!(kueue.kube_user.as_deref(), Some("oidc:alice@example.com"));
+        assert_eq!(kueue.kube_user, None, "filled in from the run's principal");
         assert_eq!(kueue.scopes, ["kueue.read", "kueue.submit"]);
         assert_eq!(kueue.limits["namespace"], "crucible-kueue-e2e");
         assert_eq!(kueue.limits["pull_secrets"], "quay-pull");
         let buildit = &on_waldorf[1];
         assert_eq!(buildit.url, "http://host.openshell.internal:8848/mcp");
-        assert_eq!(
-            buildit.kube_user, None,
-            "buildit acts as no Kubernetes user"
-        );
         assert_eq!(buildit.limits["push_repo"], "quay.io/org/smoke");
-        assert_eq!(
-            kueue.summary(),
-            "granted kueue/waldorf as oidc:alice@example.com (kueue.read kueue.submit)"
-        );
         assert_eq!(
             buildit.summary(),
             "granted buildit/waldorf (buildit.read buildit.build)"
         );
 
-        let on_pirate = granted(p.kueue.as_ref(), p.buildit.as_ref(), "pirate", None);
+        let read_only = tokens(&["pirate", "waldorf"], "kueue.read");
+        assert_eq!(
+            granted(p.kueue.as_ref(), None, "waldorf", &read_only)[0].scopes,
+            ["kueue.read"],
+            "the scopes the issuer mints, not a fixed set"
+        );
+        let on_pirate = granted(p.kueue.as_ref(), p.buildit.as_ref(), "pirate", &all);
         assert_eq!(on_pirate.len(), 1, "buildit serves waldorf only");
-        assert!(granted(p.kueue.as_ref(), p.buildit.as_ref(), "hub", None).is_empty());
+        assert!(granted(p.kueue.as_ref(), p.buildit.as_ref(), "hub", &all).is_empty());
+        assert!(
+            granted(
+                p.kueue.as_ref(),
+                p.buildit.as_ref(),
+                "waldorf",
+                &tokens(&["pirate"], "kueue.read")
+            )
+            .is_empty(),
+            "no SPIRE for waldorf, so nothing its sandboxes could get tokens for"
+        );
     }
 
     #[test]
     fn the_defaults_revision_changes_exactly_when_the_granted_set_does() {
-        let base = defaults(Some(&profile(PROFILE)));
-        assert_eq!(base, defaults(Some(&profile(PROFILE))), "stable");
+        let all = tokens(&["pirate", "waldorf"], "kueue.read kueue.submit");
+        let base = defaults(Some(&profile(PROFILE)), Some(&all));
+        assert_eq!(
+            base,
+            defaults(Some(&profile(PROFILE)), Some(&all)),
+            "stable"
+        );
         assert_eq!(base.revision.len(), 16);
         assert_eq!(
             base.changelog,
@@ -397,7 +477,7 @@ mod tests {
             "image = \"registry.example.com/crucible-kueue:v2\"",
         );
         assert_eq!(
-            defaults(Some(&profile(&reworded))).revision,
+            defaults(Some(&profile(&reworded)), Some(&all)).revision,
             base.revision,
             "a new server image grants nothing new"
         );
@@ -413,42 +493,107 @@ mod tests {
             PROFILE.replace("pull_secrets = [\"quay-pull\"]", ""),
         ] {
             assert_ne!(
-                defaults(Some(&profile(&changed))).revision,
+                defaults(Some(&profile(&changed)), Some(&all)).revision,
                 base.revision,
                 "{changed}"
             );
         }
-        let none = defaults(None);
-        assert!(none.tools.is_empty());
-        assert_eq!(none.changelog, "Runs get no MCP servers by default.");
+        assert_ne!(
+            defaults(
+                Some(&profile(PROFILE)),
+                Some(&tokens(&["pirate", "waldorf"], "kueue.read"))
+            )
+            .revision,
+            base.revision,
+            "fewer scopes is a different set"
+        );
+        for none in [
+            defaults(None, Some(&all)),
+            defaults(Some(&profile(PROFILE)), None),
+        ] {
+            assert!(none.tools.is_empty());
+            assert_eq!(none.changelog, "Runs get no MCP servers by default.");
+        }
     }
 
-    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
-    async fn a_grant_is_recorded_for_the_run_and_told_on_the_issue(pool: PgPool) {
-        let db = crate::Db::new(pool.clone());
-        crate::identity::oidc::users::record_login(
-            &pool,
-            "sub-alice",
-            "alice",
-            Some("alice@example.com"),
-            jiff::Timestamp::now(),
+    async fn run_dispatched_for(pool: &PgPool, run_id: &str, principal: &str) {
+        crate::issues::store::upsert_issue(
+            pool,
+            &crate::issues::model::NewIssue {
+                key: "owner/repo#1".into(),
+                repo: "owner/repo".into(),
+                priority: 5,
+                evidence_url: None,
+                title: None,
+                author: None,
+                body: None,
+                labels: Vec::new(),
+                upstream_updated_at: None,
+            },
         )
         .await
         .unwrap();
-        let p = profile(PROFILE);
-        let tools = grant(&db, &p, "owner/repo#1", "run-1", "waldorf", Some("alice"))
+        crate::runs::store::insert_run(
+            pool,
+            &crate::NewRun {
+                run_id: run_id.into(),
+                scope: None,
+                issue: Some("owner/repo#1".into()),
+                identity_digest: None,
+                status: "running".into(),
+                pod: None,
+                session_uri: None,
+                best_score: None,
+                cost_usd: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET dispatched_by = $2 WHERE run_id = $1")
+            .bind(run_id)
+            .bind(principal)
+            .execute(pool)
             .await
             .unwrap();
+    }
+
+    /// The record names who kueue acts as from the run's principal, as its tokens do: after a
+    /// redispatch by someone else, the new run acts for them.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_grant_acts_for_the_runs_principal_and_is_told_on_the_issue(pool: PgPool) {
+        let db = crate::Db::new(pool.clone());
+        for (sub, login) in [("sub-alice", "alice"), ("sub-bob", "bob")] {
+            crate::identity::oidc::users::record_login(
+                &pool,
+                sub,
+                login,
+                Some(&format!("{login}@example.com")),
+                jiff::Timestamp::now(),
+            )
+            .await
+            .unwrap();
+        }
+        let p = profile(PROFILE);
+        let all = tokens(&["pirate", "waldorf"], "kueue.read kueue.submit");
+        let tools = grant(&db, &p, "run-1", "waldorf", &all).await.unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(
             for_run(&pool, "run-1").await.unwrap(),
             tools,
             "read back as recorded"
         );
+
+        run_dispatched_for(&pool, "run-1", "user:alice").await;
+        attribute(&db, &p, "owner/repo#1", "run-1").await.unwrap();
+        let recorded = for_run(&pool, "run-1").await.unwrap();
         assert_eq!(
-            tools[0].kube_user.as_deref(),
+            recorded[0].kube_user.as_deref(),
             Some("oidc:alice@example.com"),
             "the username waldorf's rule gives alice"
+        );
+        assert_eq!(
+            recorded[1].kube_user, None,
+            "buildit acts as no Kubernetes user"
         );
         let events = db.events().read_for_key("owner/repo#1").await.unwrap();
         let reasons: Vec<&str> = events.iter().filter_map(|e| e.reason.as_deref()).collect();
@@ -465,15 +610,26 @@ mod tests {
                 .all(|e| e.evidence.as_deref() == Some("run-1"))
         );
 
-        let again = grant(&db, &p, "owner/repo#1", "run-1", "pirate", None)
-            .await
-            .unwrap();
+        grant(&db, &p, "run-2", "waldorf", &all).await.unwrap();
+        run_dispatched_for(&pool, "run-2", "user:bob").await;
+        attribute(&db, &p, "owner/repo#1", "run-2").await.unwrap();
         assert_eq!(
-            for_run(&pool, "run-1").await.unwrap(),
-            again,
-            "a redispatch replaces it"
+            for_run(&pool, "run-2").await.unwrap()[0]
+                .kube_user
+                .as_deref(),
+            Some("oidc:bob@example.com"),
+            "a redispatch for bob acts as bob"
         );
-        assert_eq!(again[0].kube_user, None, "no launcher, no username");
-        assert!(for_run(&pool, "run-2").await.unwrap().is_empty());
+
+        grant(&db, &p, "run-3", "pirate", &all).await.unwrap();
+        run_dispatched_for(&pool, "run-3", "platform").await;
+        attribute(&db, &p, "owner/repo#1", "run-3").await.unwrap();
+        assert_eq!(
+            for_run(&pool, "run-3").await.unwrap()[0].kube_user,
+            None,
+            "no person, no username"
+        );
+        assert!(for_run(&pool, "run-4").await.unwrap().is_empty());
+        attribute(&db, &p, "owner/repo#1", "run-4").await.unwrap();
     }
 }

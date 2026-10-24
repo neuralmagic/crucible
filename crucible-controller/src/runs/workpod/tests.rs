@@ -5873,7 +5873,14 @@ async fn dispatch_with_kueue(db: &Db, tmp: &Path, issuer: Option<&str>) -> Vec<K
         "img",
     ];
     if let Some(issuer) = issuer {
-        args.extend(["--agent-issuer", issuer]);
+        args.extend([
+            "--agent-issuer",
+            issuer,
+            "--agent-spire",
+            "hub=https://oidc.hub.example spiffe://hub.example/openshell/gateway/ spire/oidc:443",
+            "--agent-audiences",
+            "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit",
+        ]);
     }
     let cfg = crate::testing::cfg_from_args(args);
     let events = Arc::new(Mutex::new(Vec::new()));

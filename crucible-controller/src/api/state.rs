@@ -148,9 +148,11 @@ pub struct ApiState {
     pub(crate) deploy_profile: Option<std::path::PathBuf>,
     /// `deploy_profile`, read once.
     pub(crate) profile_cache: crate::config::ProfileCache,
-    /// Whether the agent token issuer is configured: runs get agent tools, and dispatches record
-    /// who they act for.
+    /// Whether the issuer mints agent tokens: runs get agent tools, and dispatches record who they
+    /// act for.
     pub(crate) agent_tools: bool,
+    /// Where and for what agent tokens are minted, `None` when they are not.
+    pub(crate) agent_tokens: Option<crate::runs::workpod::kueue::AgentTokens>,
     /// Whether people sign in to MCP clients here or link cluster identities: what serves the
     /// identity routes, the consent page and the settings' identity panels.
     pub(crate) identities: bool,
@@ -218,6 +220,9 @@ impl ApiState {
             deploy_profile: cfg.deploy_profile.clone(),
             profile_cache: cfg.profile_cache.clone(),
             agent_tools: cfg.issues_agent_tokens(),
+            agent_tokens: crate::runs::workpod::kueue::AgentTokens::from_cfg(cfg)
+                .ok()
+                .flatten(),
             identities: false,
             clusters,
             control_port: cfg.control_port,
@@ -366,6 +371,7 @@ impl ApiState {
             deploy_profile: None,
             profile_cache: crate::config::ProfileCache::default(),
             agent_tools: false,
+            agent_tokens: None,
             identities: false,
             clusters,
             control_port: 7777,

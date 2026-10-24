@@ -152,7 +152,11 @@ pub(crate) async fn get_agent_tool_defaults(
     State(state): State<ApiState>,
 ) -> Result<Response, AppError> {
     let profile = state.profile().await?;
-    Ok(Json(crate::runs::agent_tools::defaults(profile.as_deref())).into_response())
+    Ok(Json(crate::runs::agent_tools::defaults(
+        profile.as_deref(),
+        state.agent_tokens.as_ref(),
+    ))
+    .into_response())
 }
 
 /// `GET /api/runs/{run_id}/graph` — the run's newest admitted work graph plus every task attempt

@@ -135,6 +135,8 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         public_url: None,
         agent_issuer: None,
         agent_token_endpoint: None,
+        agent_spire: None,
+        agent_audiences: None,
         hooks_public_url: None,
         jira_emission_project: None,
         jira_emission_epic_type_id: None,

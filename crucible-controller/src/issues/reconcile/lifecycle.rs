@@ -264,6 +264,7 @@ async fn launch_approved_run(
         crate::runs::work_pods::clear_redispatch(&mut *tx, &issue.key).await?;
         tx.commit().await?;
         db.events().publish(&ev);
+        crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
     }
     Ok(())
 }

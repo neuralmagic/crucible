@@ -4,9 +4,10 @@
 //! Either way the loop pod gets the controller's agent token endpoint and the audience its
 //! sandboxes' JWT-SVIDs are requested for, as plain env, and the engine turns each server into a
 //! token-grant provider: each sandbox's supervisor obtains its own token. Nothing secret is minted
-//! and nothing is recorded.
+//! and nothing is recorded. A server is granted only where the issuer can mint its tokens: on a
+//! cluster whose SPIRE it trusts, for an audience it is configured with.
 
-use crate::agent_auth::issuer::{IssuerUrl, TOKEN_PATH};
+use crate::agent_auth::issuer::{Audience, ClusterSpire, IssuerUrl, TOKEN_PATH, parse_list};
 use crate::secrets::deliver::Delivery;
 use anyhow::Context;
 use crucible::deploy::profile::{BuilditCfg, KueueCfg};
@@ -14,22 +15,27 @@ use crucible_contract::buildit::{ENV_BUILDIT_PUSH_REPO, ENV_BUILDIT_RUN_ISSUER};
 use crucible_contract::kueue::ENV_KUEUE_URL;
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
-/// Where sandboxes get agent tokens: the controller's issuer identifier (the SVID audience) and the
-/// token endpoint supervisors reach, the issuer's own unless an operator routed it elsewhere.
+/// Where sandboxes get agent tokens and for what: the controller's issuer identifier (the SVID
+/// audience), the token endpoint supervisors reach (the issuer's own unless an operator routed it
+/// elsewhere), the clusters whose SPIRE the issuer trusts, and the audiences it mints for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTokens {
     pub svid_audience: String,
     pub endpoint: String,
+    pub clusters: Vec<String>,
+    pub audiences: Vec<Audience>,
 }
 
 impl AgentTokens {
-    /// From the controller's `CONTROLLER_AGENT_ISSUER` and optional
-    /// `CONTROLLER_AGENT_TOKEN_ENDPOINT`; `None` when the controller issues no agent tokens.
+    /// From the controller's `CONTROLLER_AGENT_ISSUER`, `CONTROLLER_AGENT_SPIRE`,
+    /// `CONTROLLER_AGENT_AUDIENCES` and optional `CONTROLLER_AGENT_TOKEN_ENDPOINT`; `None` when
+    /// the controller mints no agent tokens.
     pub fn from_cfg(cfg: &crate::config::ControllerCfg) -> anyhow::Result<Option<Self>> {
-        let Some(raw) = cfg.agent_issuer.as_deref().filter(|v| !v.trim().is_empty()) else {
+        if !cfg.issues_agent_tokens() {
             return Ok(None);
-        };
-        let issuer = IssuerUrl::parse(raw)?;
+        }
+        let issuer = IssuerUrl::parse(cfg.agent_issuer.as_deref().unwrap_or_default())?;
+        let spire: Vec<ClusterSpire> = parse_list(cfg.agent_spire.as_deref().unwrap_or_default())?;
         Ok(Some(Self {
             svid_audience: issuer.as_str().to_string(),
             endpoint: cfg
@@ -37,7 +43,18 @@ impl AgentTokens {
                 .clone()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| issuer.endpoint(TOKEN_PATH)),
+            clusters: spire.into_iter().map(|s| s.cluster).collect(),
+            audiences: parse_list(cfg.agent_audiences.as_deref().unwrap_or_default())?,
         }))
+    }
+
+    /// The audience a run on `cluster` gets tokens for at `url`, when the issuer can mint them.
+    pub fn audience(&self, cluster: &str, url: &str) -> Option<&Audience> {
+        self.clusters
+            .iter()
+            .any(|c| c == cluster)
+            .then(|| self.audiences.iter().find(|a| a.resource == url))
+            .flatten()
     }
 }
 
@@ -49,8 +66,13 @@ pub fn access(
     cluster: &str,
     tokens: &AgentTokens,
 ) -> anyhow::Result<Option<Delivery>> {
-    let kueue = kueue.filter(|k| k.serves(cluster));
-    let buildit = buildit.filter(|b| b.serves(cluster));
+    let kueue = kueue.filter(|k| k.serves(cluster) && tokens.audience(cluster, &k.url()).is_some());
+    let buildit = buildit.filter(|b| {
+        b.serves(cluster)
+            && tokens
+                .audience(cluster, crucible_contract::buildit::URL)
+                .is_some()
+    });
     if kueue.is_none() && buildit.is_none() {
         return Ok(None);
     }
@@ -112,10 +134,28 @@ mod tests {
             .expect("profile parses")
     }
 
+    const KUEUE_URL: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
+    const SPIRE: &str = "pirate=https://oidc.pirate.example spiffe://pirate.example/openshell/gateway/ spire/oidc:443,\
+         waldorf=https://oidc.waldorf.example spiffe://waldorf.example/openshell/gateway/ spire/oidc:443";
+
+    fn audience(resource: &str, scopes: &str) -> Audience {
+        format!("{resource}={scopes}")
+            .parse()
+            .expect("audience parses")
+    }
+
     fn tokens() -> AgentTokens {
         AgentTokens {
             svid_audience: "http://crucible-controller.crucible-system.svc:8080".into(),
             endpoint: "http://crucible-controller.crucible-system.svc:8080/oauth/token".into(),
+            clusters: vec!["pirate".into(), "waldorf".into()],
+            audiences: vec![
+                audience(KUEUE_URL, "kueue.read kueue.submit"),
+                audience(
+                    crucible_contract::buildit::URL,
+                    "buildit.read buildit.build",
+                ),
+            ],
         }
     }
 
@@ -199,6 +239,39 @@ mod tests {
     }
 
     #[test]
+    fn a_server_the_issuer_cannot_mint_for_is_not_granted() {
+        let p = profile(BUILDIT);
+        let no_spire = AgentTokens {
+            clusters: vec!["waldorf".into()],
+            ..tokens()
+        };
+        assert!(
+            access(p.kueue.as_ref(), None, "pirate", &no_spire)
+                .unwrap()
+                .is_none(),
+            "no SPIRE for pirate, so no tokens for its sandboxes"
+        );
+        let no_audience = AgentTokens {
+            audiences: vec![audience(KUEUE_URL, "kueue.read")],
+            ..tokens()
+        };
+        let env = access(p.kueue.as_ref(), p.buildit.as_ref(), "pirate", &no_audience)
+            .unwrap()
+            .expect("kueue");
+        let env = env_of(&env);
+        assert!(env.contains_key(ENV_KUEUE_URL));
+        assert!(
+            !env.contains_key(ENV_BUILDIT_RUN_ISSUER),
+            "buildit is no audience, so no buildit"
+        );
+        assert!(
+            access(None, p.buildit.as_ref(), "waldorf", &no_audience)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn a_run_on_a_buildit_cluster_gets_the_issuer_buildit_trusts_and_its_push_repo() {
         let p = profile(BUILDIT);
         let on_waldorf = access(p.kueue.as_ref(), p.buildit.as_ref(), "waldorf", &tokens())
@@ -255,10 +328,27 @@ mod tests {
             args.extend_from_slice(extra);
             crate::testing::cfg_from_args(args)
         };
+        let audiences = format!(
+            "{KUEUE_URL}=kueue.read kueue.submit,{}=buildit.read buildit.build",
+            crucible_contract::buildit::URL
+        );
         assert_eq!(AgentTokens::from_cfg(&cfg(&[])).unwrap(), None);
+        assert_eq!(
+            AgentTokens::from_cfg(&cfg(&[
+                "--agent-issuer",
+                "http://crucible-controller.crucible-system.svc:8080/",
+            ]))
+            .unwrap(),
+            None,
+            "an issuer without SPIRE serves people only"
+        );
         let own = AgentTokens::from_cfg(&cfg(&[
             "--agent-issuer",
             "http://crucible-controller.crucible-system.svc:8080/",
+            "--agent-spire",
+            SPIRE,
+            "--agent-audiences",
+            &audiences,
         ]))
         .unwrap()
         .expect("tokens");
@@ -266,6 +356,10 @@ mod tests {
         let routed = AgentTokens::from_cfg(&cfg(&[
             "--agent-issuer",
             "http://crucible-controller.crucible-system.svc:8080",
+            "--agent-spire",
+            SPIRE,
+            "--agent-audiences",
+            &audiences,
             "--agent-token-endpoint",
             "https://crucible.hub.example/oauth/token",
         ]))
@@ -276,6 +370,14 @@ mod tests {
             routed.svid_audience,
             "http://crucible-controller.crucible-system.svc:8080"
         );
-        assert!(AgentTokens::from_cfg(&cfg(&["--agent-issuer", "not a url"])).is_err());
+        assert!(
+            AgentTokens::from_cfg(&cfg(&[
+                "--agent-issuer",
+                "not a url",
+                "--agent-spire",
+                SPIRE
+            ]))
+            .is_err()
+        );
     }
 }

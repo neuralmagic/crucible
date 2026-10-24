@@ -609,6 +609,14 @@ pub struct ControllerCfg {
     /// a spoke that reaches the controller through a route.
     #[arg(long = "agent-token-endpoint", env = "CONTROLLER_AGENT_TOKEN_ENDPOINT")]
     pub agent_token_endpoint: Option<String>,
+    /// The clusters whose sandboxes get agent tokens, the same `CONTROLLER_AGENT_SPIRE` the issuer
+    /// verifies their JWT-SVIDs by. Unset, the issuer serves people only and runs get no tools.
+    #[arg(long = "agent-spire", env = "CONTROLLER_AGENT_SPIRE")]
+    pub agent_spire: Option<String>,
+    /// The MCP servers agent tokens may be minted for and their scopes, the same
+    /// `CONTROLLER_AGENT_AUDIENCES` the issuer grants from.
+    #[arg(long = "agent-audiences", env = "CONTROLLER_AGENT_AUDIENCES")]
+    pub agent_audiences: Option<String>,
     /// `deploy_profile`, read once on first use.
     #[arg(skip)]
     pub profile_cache: ProfileCache,
@@ -845,10 +853,11 @@ impl ControllerCfg {
         self.profile_cache.get(self.deploy_profile.as_deref()).await
     }
 
-    /// Whether the agent token issuer is configured, which is what records who each dispatch acts
-    /// for.
+    /// Whether the issuer mints agent tokens for some cluster's sandboxes, which is what gives runs
+    /// agent tools and records who each dispatch acts for.
     pub fn issues_agent_tokens(&self) -> bool {
-        self.agent_issuer.is_some()
+        let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
+        set(&self.agent_issuer) && set(&self.agent_spire)
     }
 
     /// How a pod render pins its image tags: the registry, unless `render_no_pin` is set.

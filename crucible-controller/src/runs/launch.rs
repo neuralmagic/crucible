@@ -315,6 +315,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         crate::event_log::insert(&mut *tx, &ev).await?;
         tx.commit().await?;
         db.events().publish(&ev);
+        crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
     }
     // The subprocess is supervised out of band, exactly as the pod watch drives a pod's
     // completion — and only once the run row it will fold into is committed.

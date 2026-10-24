@@ -1188,6 +1188,8 @@ mod tests {
                 "ctl",
                 "--agent-issuer",
                 "https://crucible.example.com",
+                "--agent-spire",
+                "hub=https://oidc.example spiffe://hub.example/openshell/gateway/ spire/oidc:443",
             ]),
             Authz::from_lookup(|var| {
                 (var == "CONTROLLER_GITHUB_LOGINS").then(|| "maint=alice".to_string())
