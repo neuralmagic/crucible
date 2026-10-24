@@ -41,8 +41,22 @@ pub enum GrantError {
     #[error("timestamp {0} does not fit the store")]
     Clock(u64),
     #[error(transparent)]
+    Overreach(#[from] Overreach),
+    #[error(transparent)]
     Store(#[from] anyhow::Error),
 }
+
+/// A refresh that asks for more than its approval holds. The presented token stays unspent.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Overreach {
+    #[error("{0}")]
+    Resource(String),
+    #[error("{0}")]
+    Scope(String),
+}
+
+/// What a refresh asks of its approval, checked before the presented token is spent.
+pub type Fits<'a> = &'a (dyn Fn(&Family) -> Result<(), Overreach> + Send + Sync);
 
 /// What a family was approved for, as a refresh finds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +122,18 @@ pub trait GrantStore: Send + Sync {
         token: &str,
         client: &ClientId,
         now: u64,
+    ) -> Result<(Family, String), GrantError> {
+        self.rotate_refresh_if(token, client, now, &|_| Ok(()))
+            .await
+    }
+    /// [`GrantStore::rotate_refresh`], when `fits` accepts the family: a request it refuses leaves
+    /// `token` unspent and the family untouched.
+    async fn rotate_refresh_if(
+        &self,
+        token: &str,
+        client: &ClientId,
+        now: u64,
+        fits: Fits<'_>,
     ) -> Result<(Family, String), GrantError>;
     async fn revoke_family(&self, family: &str, now: u64) -> Result<(), GrantError>;
     /// Revoke every family and code of `sub`. Returns how many families.
@@ -194,11 +220,12 @@ impl GrantStore for PgGrantStore {
         Ok(token)
     }
 
-    async fn rotate_refresh(
+    async fn rotate_refresh_if(
         &self,
         token: &str,
         client: &ClientId,
         now: u64,
+        fits: Fits<'_>,
     ) -> Result<(Family, String), GrantError> {
         let key = key_of(token);
         let mut tx = self.pool.begin().await.context("opening the refresh")?;
@@ -268,28 +295,27 @@ impl GrantStore for PgGrantStore {
         {
             return Err(GrantError::Expired);
         }
+        let scopes: Vec<String> =
+            serde_json::from_value(scopes).context("decoding the approval's scopes")?;
+        let family = Family {
+            id: grant_id,
+            sub,
+            client_id: client_id(&issued)?,
+            client_name,
+            resource,
+            cluster,
+            scopes,
+        };
+        fits(&family)?;
         sqlx::query("UPDATE people_grants SET last_used_at = $2 WHERE id = $1")
-            .bind(&grant_id)
+            .bind(&family.id)
             .bind(at(now)?)
             .execute(&mut *tx)
             .await
             .context("stamping the approval's use")?;
-        let next = issue_token(&mut tx, &grant_id, now).await?;
+        let next = issue_token(&mut tx, &family.id, now).await?;
         tx.commit().await.context("committing the refresh")?;
-        let scopes: Vec<String> =
-            serde_json::from_value(scopes).context("decoding the approval's scopes")?;
-        Ok((
-            Family {
-                id: grant_id,
-                sub,
-                client_id: client_id(&issued)?,
-                client_name,
-                resource,
-                cluster,
-                scopes,
-            },
-            next,
-        ))
+        Ok((family, next))
     }
 
     async fn revoke_family(&self, family: &str, now: u64) -> Result<(), GrantError> {

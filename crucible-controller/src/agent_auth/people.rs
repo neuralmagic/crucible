@@ -31,7 +31,7 @@ use crate::agent_auth::people::cimd::{CIMD_HOSTS_ENV, CimdConfigError, CimdPolic
 use crate::agent_auth::people::clients::{
     CLIENTS_FILE_ENV, Client, ClientId, RedirectUri, RegistryError,
 };
-use crate::agent_auth::people::dynamic::{DCR_ENV, DcrConfigError, DcrPolicy};
+use crate::agent_auth::people::dynamic::{DCR_ENV, DcrConfigError, DcrPolicy, TRUSTED_PROXIES_ENV};
 use crate::agent_auth::people::registry::Clients;
 use crate::identity::api_key::constant_time_eq;
 use axum::extract::{Query, State};
@@ -156,6 +156,10 @@ impl PeopleConfig {
                 .ok_or(PeopleConfigError::AccessTtl(raw))?;
         }
         config.dcr = DcrPolicy::from_lookup(std::env::var(DCR_ENV).ok())?;
+        if let Some(dcr) = config.dcr.as_mut() {
+            dcr.trusted_proxies =
+                DcrPolicy::trusted_proxies(std::env::var(TRUSTED_PROXIES_ENV).ok())?;
+        }
         let file = std::env::var(CLIENTS_FILE_ENV)
             .ok()
             .filter(|p| !p.trim().is_empty());
@@ -713,6 +717,8 @@ impl From<grants::GrantError> for TokenError {
             G::Unknown | G::Expired | G::Reused | G::Revoked | G::WrongClient { .. } => {
                 Self::InvalidGrant(e.to_string())
             }
+            G::Overreach(grants::Overreach::Resource(why)) => Self::InvalidTarget(why),
+            G::Overreach(grants::Overreach::Scope(why)) => Self::InvalidGrant(why),
             G::Random | G::Clock(_) | G::Store(_) => Self::Server(format!("{e:#}")),
         }
     }
@@ -758,6 +764,32 @@ pub(crate) async fn redeem_code(
     ))
 }
 
+/// Whether a refresh asks only for what its approval holds: the approved resource, if it names one,
+/// and no scope beyond the approval's.
+fn refresh_fits(req: &RefreshRequest, family: &grants::Family) -> Result<(), grants::Overreach> {
+    if let Some(r) = req.resource.as_deref()
+        && r != family.resource
+    {
+        return Err(grants::Overreach::Resource(format!(
+            "resource {r:?} is not the approved {:?}",
+            family.resource
+        )));
+    }
+    let wider: Vec<&str> = req
+        .scope
+        .as_deref()
+        .unwrap_or_default()
+        .split_whitespace()
+        .filter(|s| !IGNORED_SCOPES.contains(s) && !family.scopes.iter().any(|g| g == s))
+        .collect();
+    match wider.is_empty() {
+        true => Ok(()),
+        false => Err(grants::Overreach::Scope(format!(
+            "refresh asks for scopes {wider:?} beyond the approval"
+        ))),
+    }
+}
+
 /// `grant_type=refresh_token`, rotating: the presented token is spent and the next one returned.
 /// A token presented by a client other than the one it was issued to revokes the approval. The
 /// person is read again, so a deleted or refused account, a narrowed approval, or a changed cluster
@@ -770,9 +802,10 @@ pub(crate) async fn redeem_refresh(
 ) -> Result<Response, TokenError> {
     let req: RefreshRequest = parse(fields)?;
     let client = client(people, &req.client_id).await?;
+    let fits = |family: &grants::Family| refresh_fits(&req, family);
     let (family, next) = people
         .grants
-        .rotate_refresh(&req.refresh_token, &client, now)
+        .rotate_refresh_if(&req.refresh_token, &client, now, &fits)
         .await?;
     let refused = |why: String| async move {
         if let Err(e) = people.grants.revoke_family(&family.id, now).await {
@@ -780,24 +813,12 @@ pub(crate) async fn redeem_refresh(
         }
         Err(TokenError::InvalidGrant(why))
     };
-    same_resource(req.resource.as_deref(), &family.resource)?;
     if !people.clients.allows_resource(&client, &family.resource) {
         return refused(format!(
             "client {client} may no longer hold tokens for {}",
             family.resource
         ))
         .await;
-    }
-    if let Some(scope) = req.scope.as_deref() {
-        let wider: Vec<&str> = scope
-            .split_whitespace()
-            .filter(|s| !IGNORED_SCOPES.contains(s) && !family.scopes.iter().any(|g| g == s))
-            .collect();
-        if !wider.is_empty() {
-            return Err(TokenError::InvalidGrant(format!(
-                "refresh asks for scopes {wider:?} beyond the approval"
-            )));
-        }
     }
     let person = people
         .subjects
@@ -1956,6 +1977,43 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         )
         .await;
         assert!(refused(&wider), "{wider:?}");
+    }
+
+    /// A refresh refused for asking another resource or a wider scope spends nothing: the token
+    /// it presented still refreshes, and is not taken for a reuse.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refused_refresh_leaves_its_token_live(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (_, first) = code_exchange(&h.app, &code).await;
+        let refresh = first["refresh_token"].as_str().unwrap();
+        let elsewhere = token(
+            &h.app,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+                ("client_id", CLIENT_ID),
+                ("resource", "https://unlisted.example/mcp"),
+            ],
+        )
+        .await;
+        assert_eq!(elsewhere.0, StatusCode::BAD_REQUEST, "{elsewhere:?}");
+        assert_eq!(elsewhere.1["error"], "invalid_target");
+        let wider = token(
+            &h.app,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh),
+                ("client_id", CLIENT_ID),
+                ("scope", "kueue.read kueue.admin"),
+            ],
+        )
+        .await;
+        assert!(refused(&wider), "{wider:?}");
+        let (status, second) = refreshed(&h.app, &first["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        let (status, third) = refreshed(&h.app, &second["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "the approval survived: {third}");
     }
 
     /// A spent refresh token presented again revokes its approval: the latest token dies too.
