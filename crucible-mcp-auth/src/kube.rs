@@ -11,7 +11,7 @@
 //! That account needs `create` on `subjectaccessreviews` and, for OpenShift groups, `list` on
 //! `groups.user.openshift.io`.
 
-use crate::access::{AccessCheck, AccessReview, ReviewFuture};
+use crate::access::{AccessCheck, AccessReview, ReviewError, ReviewFuture};
 use crate::principal::Principal;
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
@@ -243,6 +243,19 @@ impl SubjectAccessReviewer {
 impl AccessReview for SubjectAccessReviewer {
     fn review<'a>(&'a self, principal: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a> {
         Box::pin(async move { Ok(self.allowed(principal, check).await?) })
+    }
+}
+
+impl From<KubeIdentityError> for ReviewError {
+    fn from(error: KubeIdentityError) -> Self {
+        match error {
+            KubeIdentityError::NoUser
+            | KubeIdentityError::SystemUser(_)
+            | KubeIdentityError::Groups => Self::Identity(Box::new(error)),
+            KubeIdentityError::GroupLookup(_) | KubeIdentityError::Review(_) => {
+                Self::Unavailable(Box::new(error))
+            }
+        }
     }
 }
 

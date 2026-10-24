@@ -1198,7 +1198,10 @@ The app is built in `crucible-kueue/src/lib.rs:62`:
    It then sends each access check to the reviewer (`guard.rs:141`). The request goes on as the guard parsed and
    rewrote it.
 7. A refused tool call returns a tool result with `isError` and the text
-   `{"status": "refused", "error", "retryable"}`, so the model can read the reason. An absent
+   `{"status": "refused", "error", "retryable"}`, so the model can read the reason. Only an
+   access review that did not complete (the API server or the group lookup failed) is
+   `retryable`; a caller the reviewer cannot check (an empty or `system:` `kube_user`, malformed
+   `kube_groups`) is refused for good (`ReviewError`, `crucible-mcp-auth/src/access.rs`). An absent
    scope returns a 403 step-up challenge. A refused method returns JSON-RPC error `-32001`.
 
 ### 7.2 Tools

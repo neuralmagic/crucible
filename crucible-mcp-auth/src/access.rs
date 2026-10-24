@@ -70,9 +70,18 @@ pub trait AccessRules: Send + Sync {
     fn checks(&self, call: &Call<'_>, principal: &Principal) -> Result<Vec<AccessCheck>, Refusal>;
 }
 
-pub type ReviewFuture<'a> = Pin<
-    Box<dyn Future<Output = Result<bool, Box<dyn std::error::Error + Send + Sync>>> + Send + 'a>,
->;
+pub type ReviewFuture<'a> = Pin<Box<dyn Future<Output = Result<bool, ReviewError>> + Send + 'a>>;
+
+/// Why an [`AccessCheck`] was not decided.
+#[derive(Debug, thiserror::Error)]
+pub enum ReviewError {
+    /// The caller has no identity the reviewer can check, so the same call always fails.
+    #[error("{0}")]
+    Identity(Box<dyn std::error::Error + Send + Sync>),
+    /// The review did not complete, so the same call may succeed later.
+    #[error("{0}")]
+    Unavailable(Box<dyn std::error::Error + Send + Sync>),
+}
 
 /// Decides an [`AccessCheck`] for a principal: `Ok(true)` allows, `Ok(false)` denies, an error
 /// refuses the call too.

@@ -9,7 +9,7 @@
 //! server executes exactly what was decided on. `tools/list` responses (JSON or SSE) have injected
 //! parameters removed from each tool's `inputSchema`.
 
-use crate::access::{AccessCheck, AccessReview, AccessRules, Call};
+use crate::access::{AccessCheck, AccessReview, AccessRules, Call, ReviewError};
 use crate::policy::{Refusal, ToolPolicy};
 use crate::principal::Principal;
 use crate::server::{AuthError, ResourceServer};
@@ -125,7 +125,14 @@ async fn review(
                     message: check.message.clone(),
                 });
             }
-            Err(error) => {
+            Err(ReviewError::Identity(error)) => {
+                return Err(Refusal::ReviewError {
+                    tool: check.tool.clone(),
+                    rule: check.rule.clone(),
+                    error: error.to_string(),
+                });
+            }
+            Err(ReviewError::Unavailable(error)) => {
                 return Err(Refusal::ReviewFailed {
                     tool: check.tool.clone(),
                     rule: check.rule.clone(),
@@ -449,7 +456,9 @@ mod tests {
             Box::pin(async move {
                 match (allowed, broken) {
                     (true, _) => Ok(true),
-                    (false, true) => Err("the API server is unreachable".into()),
+                    (false, true) => Err(ReviewError::Unavailable(
+                        "the API server is unreachable".into(),
+                    )),
                     (false, false) => Ok(false),
                 }
             })
@@ -933,6 +942,52 @@ mod tests {
             body["error"]["message"],
             "tasks/cancel refused by access check workloads-update: you may not update this"
         );
+    }
+
+    /// A token whose Kubernetes user is empty or a `system:` identity is refused for good: the
+    /// same call would fail again, so the refusal is not retryable.
+    #[tokio::test]
+    async fn a_caller_the_reviewer_cannot_check_is_refused_without_a_retry() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let sar = || {
+            let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
+            let client = kube::Client::try_from(config).unwrap();
+            let reviewer =
+                crate::kube::SubjectAccessReviewer::new(client, crate::kube::GroupSource::Token);
+            PolicyGuard {
+                reviewer: Some(Arc::new(reviewer)),
+                ..guard(None)
+            }
+        };
+        let mut admin = kube_user("kueue.submit");
+        admin
+            .claims
+            .insert("kube_user".into(), json!("system:admin"));
+        let (_, _, body, _) = post(
+            app(sar(), Some(admin), false),
+            call(
+                "workload_plan",
+                json!({"queue": "crucible-e2e", "namespace": "team-a"}),
+            ),
+        )
+        .await;
+        assert_eq!(
+            refusal(&body),
+            json!({"status": "refused", "retryable": false,
+                "error": "workload_plan refused: access check localqueues-use could not be made: kube_user \"system:admin\" is a system identity"})
+        );
+
+        let mut nobody = kube_user("kueue.submit");
+        nobody.claims.insert("kube_user".into(), json!(""));
+        let (_, _, body, _) = post(
+            app(sar(), Some(nobody), false),
+            call(
+                "workload_plan",
+                json!({"queue": "crucible-e2e", "namespace": "team-a"}),
+            ),
+        )
+        .await;
+        assert_eq!(refusal(&body)["retryable"], false, "{body}");
     }
 
     #[tokio::test]
