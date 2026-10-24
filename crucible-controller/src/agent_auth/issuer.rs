@@ -55,7 +55,9 @@ pub enum ConfigError {
          so its metadata sits at /.well-known/oauth-authorization-server"
     )]
     IssuerShape(String),
-    #[error("gateway prefix {0:?} must be a spiffe:// URI ending in /")]
+    #[error(
+        "gateway prefix {0:?} must be a spiffe:// URI ending in /, with at most one {{tenant}} path segment"
+    )]
     Prefix(String),
     #[error("CONTROLLER_AGENT_AUDIENCES names no MCP resource")]
     NoAudiences,
@@ -129,19 +131,68 @@ impl IssuerUrl {
     }
 }
 
-/// The SPIFFE ID path under which every sandbox supervisor's ID sits, ending in `/`, such as
-/// `spiffe://<trust domain>/openshell/gateway/`. The rest of the ID is
-/// `<gateway id>/sandbox/<sandbox id>`, both read from labels the gateway that created the
-/// supervisor pod stamped.
+/// The SPIFFE ID path under which every sandbox supervisor's ID sits, ending in `/`. The rest of
+/// the ID is `<gateway id>/sandbox/<sandbox id>`, both read from labels the gateway that created
+/// the supervisor pod stamped. One path segment may be `{tenant}`, matching a DNS-1123 label:
+///
+/// ```text
+///   spiffe://td/openshell/gateway/            spiffe://td/openshell/gateway/<gw>/sandbox/<id>
+///   spiffe://td/openshell/{tenant}/gateway/   spiffe://td/openshell/<tenant>/gateway/<gw>/sandbox/<id>
+///   └──────── head ──────┘└ tail ─┘
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayPrefix(String);
+pub struct GatewayPrefix {
+    raw: String,
+    /// Everything before `{tenant}`, or the whole prefix without one.
+    head: String,
+    /// Everything after `{tenant}/`, when the prefix has one.
+    tail: Option<String>,
+}
+
+const TENANT_SEGMENT: &str = "/{tenant}/";
 
 impl GatewayPrefix {
     pub fn parse(raw: &str) -> Result<Self, ConfigError> {
-        match raw.starts_with("spiffe://") && raw.ends_with('/') && raw.len() > "spiffe://".len() {
-            true => Ok(Self(raw.to_string())),
-            false => Err(ConfigError::Prefix(raw.to_string())),
+        let bad = || ConfigError::Prefix(raw.to_string());
+        let path = raw.strip_prefix("spiffe://").ok_or_else(bad)?;
+        if path.is_empty() || !raw.ends_with('/') {
+            return Err(bad());
         }
+        let (head, tail) = match raw.split_once(TENANT_SEGMENT) {
+            Some((head, tail)) => (format!("{head}/"), Some(tail.to_string())),
+            None => (raw.to_string(), None),
+        };
+        let trust_domain = head
+            .strip_prefix("spiffe://")
+            .and_then(|p| p.split('/').next());
+        let braces = |v: &str| v.contains(['{', '}']);
+        if trust_domain.is_none_or(str::is_empty)
+            || braces(&head)
+            || tail.as_deref().is_some_and(braces)
+        {
+            return Err(bad());
+        }
+        Ok(Self {
+            raw: raw.to_string(),
+            head,
+            tail,
+        })
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// The tenant (when the prefix has a `{tenant}` segment) and the rest of `spiffe_id` after the
+    /// prefix; `None` when the ID is not under it.
+    pub fn split<'a>(&self, spiffe_id: &'a str) -> Option<(Option<&'a str>, &'a str)> {
+        let rest = spiffe_id.strip_prefix(self.head.as_str())?;
+        let Some(tail) = &self.tail else {
+            return Some((None, rest));
+        };
+        let (tenant, rest) = rest.split_once('/')?;
+        KubeName::try_from(tenant.to_string()).ok()?;
+        Some((Some(tenant), rest.strip_prefix(tail.as_str())?))
     }
 }
 
@@ -461,6 +512,8 @@ pub struct Sandbox {
     pub spiffe_id: String,
     /// The cluster whose SPIRE issued the SVID.
     pub cluster: String,
+    /// The tenant segment of its SPIFFE ID, under a prefix with `{tenant}`.
+    pub tenant: Option<String>,
     /// The gateway that created the supervisor's pod.
     pub gateway: GatewayId,
     pub id: SandboxId,
@@ -794,15 +847,14 @@ impl AgentIssuer {
             .unwrap_or_default();
         let not_a_sandbox = || AssertionError::NotASandbox {
             sub: sub.to_string(),
-            prefix: spire.gateway_prefix.0.clone(),
+            prefix: spire.gateway_prefix.as_str().to_string(),
         };
-        let (gateway, id) = sub
-            .strip_prefix(spire.gateway_prefix.0.as_str())
-            .and_then(|rest| rest.split_once("/sandbox/"))
-            .ok_or_else(not_a_sandbox)?;
+        let (tenant, rest) = spire.gateway_prefix.split(sub).ok_or_else(not_a_sandbox)?;
+        let (gateway, id) = rest.split_once("/sandbox/").ok_or_else(not_a_sandbox)?;
         Ok(Sandbox {
             spiffe_id: sub.to_string(),
             cluster: spire.cluster.clone(),
+            tenant: tenant.map(str::to_string),
             gateway: GatewayId::parse(gateway)?,
             id: SandboxId::parse(id)?,
         })
@@ -968,7 +1020,76 @@ mod tests {
             assert_eq!(sandbox.gateway.as_str(), POD);
             assert_eq!(sandbox.spiffe_id, format!("{PREFIX}{POD}/sandbox/sbx-1"));
             assert_eq!(sandbox.cluster, CLUSTER);
+            assert_eq!(sandbox.tenant, None);
         }
+    }
+
+    #[test]
+    fn a_gateway_prefix_may_hold_one_tenant_segment() {
+        let plain = GatewayPrefix::parse("spiffe://td/openshell/gateway/").unwrap();
+        assert_eq!(
+            plain.split("spiffe://td/openshell/gateway/gw/sandbox/s"),
+            Some((None, "gw/sandbox/s"))
+        );
+        assert_eq!(
+            plain.split("spiffe://td/openshell/team-a/gateway/gw/sandbox/s"),
+            None
+        );
+        let tenanted = GatewayPrefix::parse("spiffe://td/openshell/{tenant}/gateway/").unwrap();
+        assert_eq!(
+            tenanted.split("spiffe://td/openshell/team-a/gateway/gw/sandbox/s"),
+            Some((Some("team-a"), "gw/sandbox/s"))
+        );
+        for outside in [
+            "spiffe://td/openshell/gateway/gw/sandbox/s",
+            "spiffe://td/openshell/Team_A/gateway/gw/sandbox/s",
+            "spiffe://td/openshell/team-a/other/gateway/gw/sandbox/s",
+            "spiffe://other/openshell/team-a/gateway/gw/sandbox/s",
+        ] {
+            assert_eq!(tenanted.split(outside), None, "{outside}");
+        }
+        for bad in [
+            "spiffe://td/openshell/gateway",
+            "https://td/openshell/gateway/",
+            "spiffe:///openshell/gateway/",
+            "spiffe://td/openshell/{tenant}/{tenant}/gateway/",
+            "spiffe://td/openshell/x{tenant}/gateway/",
+            "spiffe://td/openshell/{team}/gateway/",
+            "spiffe://{tenant}/gateway/",
+        ] {
+            assert!(GatewayPrefix::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_svid_under_a_tenant_prefix_names_its_tenant_and_sandbox() {
+        let spire = Spire::start().await;
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.spire[0].gateway_prefix =
+            GatewayPrefix::parse("spiffe://example.crucible/openshell/{tenant}/gateway/").unwrap();
+        let issuer = AgentIssuer::new(cfg, |_| {
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
+        let svid = |sub: String| {
+            spire.svid(&with(Spire::claims("sbx-1"), |c| {
+                c.insert("sub".into(), json!(sub));
+            }))
+        };
+        let sandbox = issuer
+            .sandbox(&svid(format!(
+                "spiffe://example.crucible/openshell/team-a/gateway/{POD}/sandbox/sbx-1"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(sandbox.tenant.as_deref(), Some("team-a"));
+        assert_eq!(sandbox.gateway.as_str(), POD);
+        assert_eq!(sandbox.id.as_str(), "sbx-1");
+        assert!(matches!(
+            issuer
+                .sandbox(&svid(format!("{PREFIX}{POD}/sandbox/sbx-1")))
+                .await,
+            Err(AssertionError::NotASandbox { .. })
+        ));
     }
 
     #[tokio::test]
@@ -1382,6 +1503,7 @@ mod tests {
             sandbox: Sandbox {
                 spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
                 cluster: CLUSTER.into(),
+                tenant: None,
                 gateway: GatewayId::of_run_pod(POD),
                 id: crate::agent_auth::sandbox::SandboxId::parse("sbx-1").unwrap(),
             },

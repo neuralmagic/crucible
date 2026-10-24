@@ -422,6 +422,7 @@ async fn issue(
     tracing::info!(
         sandbox = %grant.sandbox.id,
         spiffe_id = grant.sandbox.spiffe_id,
+        tenant = grant.sandbox.tenant.as_deref(),
         run_id = grant.run.run_id,
         sub = grant.launcher,
         kube_user = grant.kube_user.as_deref(),

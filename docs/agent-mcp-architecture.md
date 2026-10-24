@@ -981,6 +981,15 @@ spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/gateway/{{ index .PodMe
 
 The token endpoint then refuses an SVID whose gateway id is not the bound run's gateway id.
 
+The gateway prefix in `CONTROLLER_AGENT_SPIRE` may hold one `{tenant}` path segment, such as
+`spiffe://<trust domain>/openshell/{tenant}/gateway/`. It then matches IDs of the form
+`spiffe://<trust domain>/openshell/<tenant>/gateway/<gateway id>/sandbox/<sandbox id>`, where
+`<tenant>` is a DNS-1123 label, for a ClusterSPIFFEID that puts a tenant label of the gateway pod
+before `gateway`. The tenant is logged with each token (`GatewayPrefix::split`,
+`crucible-controller/src/agent_auth/issuer.rs`). Nothing else reads it yet. The gateway id check
+is the same with or without a tenant. The default prefix and the rendered template have no
+tenant segment, and a prefix without one refuses an ID that has one, and the other way round.
+
 ### 6.2 Lifecycle
 
 ```mermaid
@@ -1546,7 +1555,7 @@ never sees it. Without a push repository or without the authfile, `push` is refu
 | `CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE` | unset | The previous issuer key. The JWKS publishes it; it signs nothing. |
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | `900` | Agent token lifetime, 900 to 1800. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | `<issuer>/oauth/token` | Where supervisors reach the token endpoint, for a spoke that reaches the controller through a route. |
-| `CONTROLLER_AGENT_SPIRE` | unset | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. A run gets agent tools only on a cluster listed here. Unset: the issuer serves people only, mints no agent tokens, grants no agent tools and stamps no dispatchers. |
+| `CONTROLLER_AGENT_SPIRE` | unset | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. The prefix may hold one `{tenant}` segment (section 6.1). A run gets agent tools only on a cluster listed here. Unset: the issuer serves people only, mints no agent tokens, grants no agent tools and stamps no dispatchers. |
 | `CONTROLLER_AGENT_AUDIENCES` | unset | Comma-separated `[<cluster>:]<resource url>=<scope> <scope>`. Necessary with `CONTROLLER_AGENT_SPIRE`. A URL with no `=` grants no scopes. With `<cluster>:` the entry serves runs on that cluster only, and the same URL may appear once per cluster; without it the entry serves every cluster. A run gets a server only when the server URL is a resource here: the `crucible-kueue` Service URL `http://crucible-kueue.<namespace>.svc.<cluster domain>:8850/mcp`, or `http://host.openshell.internal:8848/mcp` for `buildit`. The run records the scopes of that entry. |
 | `CONTROLLER_PEOPLE_AUDIENCES` | unset | Comma-separated `<cluster>:<resource url>=<scope> <scope>`. Enables people tokens. Each resource once. |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | `900` | People token lifetime, 1 to 3600. |
