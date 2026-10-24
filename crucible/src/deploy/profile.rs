@@ -686,6 +686,9 @@ impl SandboxHostAliases {
     }
 }
 
+/// The service account sandbox pods run as under isolated gateways when the profile names none.
+pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT: &str = "crucible-sandbox";
+
 /// Where the OpenShell image workflow pushes the sandbox runtime image, tagged `sha-<rev>`.
 pub const SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/neuralmagic/openshell-sandbox";
 
@@ -707,11 +710,17 @@ impl Cluster {
             .map_or(self.loop_namespace.as_str(), KubeName::as_str)
     }
 
-    /// The service account sandbox pods run as: `sandbox_service_account`, else the loop's.
+    /// The service account sandbox pods run as: `sandbox_service_account`, else
+    /// [`DEFAULT_SANDBOX_SERVICE_ACCOUNT`] under isolated gateways (sandboxes in a namespace of
+    /// their own, where the loop's account does not exist), else the loop's.
     pub fn sandbox_service_account(&self) -> &str {
-        self.sandbox_service_account
-            .as_deref()
-            .unwrap_or(&self.service_account)
+        let isolated = self.sandbox_driver == crate::openshell::gateway::ComputeDriver::Kubernetes
+            && self.sandbox_namespace.is_some();
+        match (&self.sandbox_service_account, isolated) {
+            (Some(sa), _) => sa,
+            (None, true) => DEFAULT_SANDBOX_SERVICE_ACCOUNT,
+            (None, false) => &self.service_account,
+        }
     }
 }
 

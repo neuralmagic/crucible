@@ -1098,6 +1098,7 @@ traffic. These are the broker, the OTLP collector, `buildit` on 8848 with `[buil
 | --- | --- | --- | --- |
 | `crucible-openshell-gateway` | sandbox | `sandboxes`, `sandboxes/status`: create, delete, get, list, patch, update, watch; `events`: get, list, watch; `pods`: create, delete, get, list, patch, watch; `services`, `networkpolicies`: create, get; `persistentvolumeclaims`: get; `secrets`: create, delete | loop render `sandbox_rbac` (`kube.rs:1473`) |
 | `crucible-openshell-gateway` | cluster | `tokenreviews`: create; `nodes`: get, list, watch; `runtimeclasses`, `priorityclasses`, `namespaces`: get | same |
+| sandbox service account (`[cluster] sandbox_service_account`, default `crucible-sandbox` under isolated gateways) | sandbox | none. Sandbox and supervisor pods mount no token; the account needs only what admits them (an OpenShift SCC). The render creates it | loop render `sandbox_rbac` |
 | controller identity (`[cluster] sandbox_readers`) | sandbox | `sandboxes`: get, list, patch, delete; `pods`: get, list, create, delete; `pods/finalizers`: update; `services`, `secrets`, `networkpolicies`: list, create, delete | loop render `sandbox_reader_rbac` (`kube.rs:1658`) |
 | controller identity | loop | `services`: list, create, delete; plus the dispatch rights in `docs/controller-deploy.md` | same, and the operator |
 | controller identity | SPIRE | `services/proxy`: get | the operator |
@@ -1572,6 +1573,7 @@ tokens, the controller does not read them.
 | --- | --- | --- |
 | `[cluster] sandbox_driver` | per profile | `kubernetes` is one half of an isolated profile. |
 | `[cluster] sandbox_namespace` | unset | The other half. Unset: sandboxes live in the loop namespace and no agent tokens are issued. |
+| `[cluster] sandbox_service_account` | `crucible-sandbox` with a sandbox namespace, else the loop's | The account sandbox pods run as. Under isolated gateways it is never the loop's account, which does not exist in the sandbox namespace. |
 | `[cluster] sandbox_readers` | `[]` | `namespace/name` service accounts that get the controller rights in section 6.6. |
 | `[cluster] sandbox_spiffe_socket` | unset | The SPIFFE Workload API socket path that supervisors get through `csi.spiffe.io`. Unset: no socket, so no JWT-SVIDs. |
 | `[cluster] identity` | `"link"` | The hub identity rule. |

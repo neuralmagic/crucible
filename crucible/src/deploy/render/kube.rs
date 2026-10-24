@@ -1637,14 +1637,21 @@ exit $rc
 
         let mut objects = Vec::new();
         if isolated {
-            objects.push(SandboxRbacObject::ServiceAccount(core::ServiceAccount {
-                metadata: ObjectMeta {
-                    name: Some(gateway_sa.clone()),
-                    namespace: Some(sandbox_ns.clone()),
+            let account = |name: &str| {
+                SandboxRbacObject::ServiceAccount(core::ServiceAccount {
+                    metadata: ObjectMeta {
+                        name: Some(name.to_string()),
+                        namespace: Some(sandbox_ns.clone()),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
-            }));
+                })
+            };
+            objects.push(account(&gateway_sa));
+            let sandbox_sa = self.profile.cluster.sandbox_service_account();
+            if sandbox_sa != gateway_sa {
+                objects.push(account(sandbox_sa));
+            }
         }
         objects.extend([
             SandboxRbacObject::Role(role),
@@ -4078,6 +4085,36 @@ mod tests {
     /// A profile `sandbox_namespace` moves the sandboxes, the gateway's sandbox Role and its
     /// binding there, and the loop pod admits sandbox traffic only from that namespace. The
     /// binding's subject stays the loop SA in the loop namespace.
+    /// Isolated sandboxes run as an account of their own in the sandbox namespace, which the
+    /// render creates; the loop's account does not exist there.
+    #[test]
+    fn isolated_sandboxes_get_an_account_of_their_own() {
+        let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
+        assert_eq!(
+            loop_pod_env(&moved, "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT").as_deref(),
+            Some("crucible-sandbox")
+        );
+        let accounts: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&moved)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .filter(|d| d["kind"] == "ServiceAccount")
+            .collect();
+        assert!(
+            accounts
+                .iter()
+                .any(|a| a["metadata"]["name"] == "crucible-sandbox"
+                    && a["metadata"]["namespace"] == "crucible-sandboxes"),
+            "{moved}"
+        );
+        let named = render_k8s(&k8s_profile(
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_service_account = \"team-sandbox\"",
+        ));
+        assert_eq!(
+            loop_pod_env(&named, "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT").as_deref(),
+            Some("team-sandbox")
+        );
+        assert!(named.contains("name: team-sandbox\n"), "{named}");
+    }
+
     #[test]
     fn an_isolated_gateway_leaves_the_loop_sa_no_verbs_in_the_sandbox_namespace() {
         let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
