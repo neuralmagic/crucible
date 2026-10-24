@@ -382,7 +382,7 @@ async fn issue(
         .audience(req.audience.as_deref(), &run.cluster)?;
     let launcher = issuer::launcher(&run)?;
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
-    let principal = crate::authz::model::Principal::Run(run.run_id.clone());
+    let principal = crate::authz::model::Principal::User(launcher.clone());
     let resolved = crate::identity::cluster_identity::for_principal(
         &state.pool,
         profile,

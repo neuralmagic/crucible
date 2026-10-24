@@ -959,7 +959,7 @@ The same function decides `kube_user` for every consumer:
 | Consumer | Person | Cluster | When |
 | --- | --- | --- | --- |
 | People token | The person who approves | The cluster of the audience in `CONTROLLER_PEOPLE_AUDIENCES` | At code exchange and at each refresh |
-| Agent token | The run's principal, `run:<id>`, resolved through the person in `runs.dispatched_by` | The cluster of the run | At each token request (`for_principal`) |
+| Agent token | The launcher the bound run names (`user:<login>` from `runs.dispatched_by`, read once with the binding), so `sub` and `kube_user` name the same person | The cluster of the run | At each token request (`for_principal`) |
 | Agent tools record | The same `run:<id>` principal | The cluster of each tool whose server acts as `kube_user` | After the launch commits the run row (`attribute`, `crucible-controller/src/runs/agent_tools.rs`) |
 | Settings and consent pages | The caller | Each cluster of the profile | On each read |
 
