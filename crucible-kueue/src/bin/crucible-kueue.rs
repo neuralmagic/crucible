@@ -169,6 +169,13 @@ struct Cli {
     accelerator_product_labels: Vec<String>,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "--run-id-claim \"\" names no run claim, so no run issuer's token could identify its run; \
+     drop --run-issuer or name the claim"
+)]
+struct NoRunIdClaim;
+
 /// A lifetime in seconds, or none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Seconds(Option<i64>);
@@ -187,6 +194,9 @@ fn seconds(s: &str) -> Result<Seconds, String> {
 
 impl Cli {
     fn config(&self) -> anyhow::Result<Config> {
+        if self.run_id_claim.is_empty() && !self.run_issuers.is_empty() {
+            return Err(NoRunIdClaim.into());
+        }
         let defaults = Hardware::default();
         let or_default = |given: &[String], fallback: Vec<String>| match given.is_empty() {
             true => fallback,
@@ -414,6 +424,22 @@ mod tests {
         assert_eq!(got.hardware, want.hardware);
         assert_eq!(got.namespaces, want.namespaces);
         assert_eq!(got.pull_secrets, want.pull_secrets);
+    }
+
+    #[test]
+    fn run_issuers_need_a_run_claim() {
+        let cli = Cli::try_parse_from([
+            "crucible-kueue",
+            "--run-issuer",
+            "https://a.example=https://a.example/keys",
+            "--resource",
+            RESOURCE,
+            "--run-id-claim",
+            "",
+        ])
+        .unwrap();
+        let error = cli.config().err().unwrap();
+        assert!(error.downcast_ref::<NoRunIdClaim>().is_some(), "{error}");
     }
 
     #[test]

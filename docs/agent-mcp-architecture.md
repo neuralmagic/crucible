@@ -1422,7 +1422,7 @@ with a stock OIDC provider:
 | `--user-claim` | `kube_user` | The claim that names the Kubernetes user |
 | `--user-prefix` | empty | The prefix of the user, as `--oidc-username-prefix` on the API server |
 | `--groups-claim` | `kube_groups` | The groups claim, with `--kube-authz token` |
-| `--run-id-claim` | `run_id` | The run claim of run tokens; empty for none |
+| `--run-id-claim` | `run_id` | The run claim of run tokens; empty for none, which is refused with `--run-issuer` |
 | `--namespace-claim` | `namespace` | The default namespace claim |
 | `--queue-verb` | `use` | `use`, or `get` where roles do not grant Kueue's custom verb |
 | `--ownership` | `managed` | `managed` or `rbac` |
