@@ -100,8 +100,8 @@ pub(crate) struct Whoami {
 pub(crate) struct Features {
     /// Runs get agent tools: the run page lists them and the banner names the defaults.
     pub agent_tools: bool,
-    /// People link cluster identities or sign in to MCP clients: the consent page and the
-    /// settings' identity panels.
+    /// People's cluster usernames matter here (people OAuth, cluster links, or agent tokens that
+    /// carry them): the consent page and the settings' identity panels.
     pub identities: bool,
 }
 

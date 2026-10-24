@@ -153,8 +153,10 @@ pub struct ApiState {
     pub(crate) agent_tools: bool,
     /// Where and for what agent tokens are minted, `None` when they are not.
     pub(crate) agent_tokens: Option<crate::runs::workpod::kueue::AgentTokens>,
-    /// Whether people sign in to MCP clients here or link cluster identities: what serves the
-    /// identity routes, the consent page and the settings' identity panels.
+    /// Whether people's cluster usernames matter here: people sign in to MCP clients, link through
+    /// a cluster's OAuth, or launch runs whose agent tokens carry them. What serves the identity
+    /// routes (linking, the administrator's override), the consent page and the settings' identity
+    /// panels.
     pub(crate) identities: bool,
     /// The TokenReview every cluster identity link is proven by.
     pub(crate) reviewer: Arc<dyn crate::identity::kube_links::ClusterReviewer>,
@@ -220,10 +222,10 @@ impl ApiState {
             deploy_profile: cfg.deploy_profile.clone(),
             profile_cache: cfg.profile_cache.clone(),
             agent_tools: cfg.issues_agent_tokens(),
+            identities: cfg.issues_agent_tokens(),
             agent_tokens: crate::runs::workpod::kueue::AgentTokens::from_cfg(cfg)
                 .ok()
                 .flatten(),
-            identities: false,
             clusters,
             control_port: cfg.control_port,
             config,
@@ -301,14 +303,16 @@ impl ApiState {
         links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
     ) -> Self {
         self.cluster_links = links;
-        self.identities = self.cluster_links.is_some() || self.people_issuer.is_some();
+        self.identities =
+            self.agent_tools || self.cluster_links.is_some() || self.people_issuer.is_some();
         self
     }
 
     /// Attach the issuer the consent page's decision mints codes from.
     pub fn with_people_issuer(mut self, issuer: Option<Arc<crate::agent_auth::AgentAuth>>) -> Self {
         self.people_issuer = issuer.filter(|i| i.people.is_some());
-        self.identities = self.cluster_links.is_some() || self.people_issuer.is_some();
+        self.identities =
+            self.agent_tools || self.cluster_links.is_some() || self.people_issuer.is_some();
         self
     }
 

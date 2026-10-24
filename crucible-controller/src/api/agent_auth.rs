@@ -1,6 +1,6 @@
 //! The routes agent tools and people's cluster identities add. [`crate::api::router`] mounts the
-//! identity routes only when people sign in to MCP clients or link cluster identities, and the
-//! agent tool routes only when the agent token issuer is configured.
+//! identity routes only when people's cluster usernames matter (people OAuth, cluster links, or
+//! agent tokens that carry them), and the agent tool routes only when agent tokens are minted.
 
 use crate::api::state::ApiState;
 use axum::Router;
@@ -112,6 +112,28 @@ mod tests {
     struct NoSink;
     impl crate::daemon::queue::OverrideSink for NoSink {
         fn submit(&self, _ov: crate::daemon::queue::Override) {}
+    }
+
+    /// A deployment that mints agent tokens and nothing else still serves the identity routes:
+    /// people link the usernames their runs' tokens carry, and an administrator sets the override.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn agent_tokens_alone_serve_the_identity_routes(pool: PgPool) {
+        let state = crate::api::state::ApiState {
+            agent_tools: true,
+            ..crate::api::state::ApiState::test(crate::Db::new(pool), Arc::new(NoSink))
+        }
+        .with_cluster_links(None)
+        .with_people_issuer(None);
+        assert!(state.identities);
+        let res = crate::api::router(state)
+            .oneshot(
+                Request::get("/api/me/cluster-identities")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(res.status(), StatusCode::NOT_FOUND);
     }
 
     /// Switched on, each feature's routes are served and documented in the served spec.
