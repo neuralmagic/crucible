@@ -78,7 +78,7 @@ pub fn people(
     pool: PgPool,
     profile: &crucible::deploy::DeployProfile,
 ) -> anyhow::Result<crate::agent_auth::people::People> {
-    use crate::agent_auth::people::{cimd::Cimd, clients::Clients};
+    use crate::agent_auth::people::{cimd::Cimd, clients::Clients, dynamic::Dcr};
     let directory = std::sync::Arc::new(ControllerDirectory::new(pool.clone(), profile));
     let cimd = config
         .cimd
@@ -86,7 +86,13 @@ pub fn people(
         .map(|policy| Cimd::new(policy, reqwest::Client::builder()))
         .transpose()?;
     Ok(crate::agent_auth::people::People {
-        clients: Clients::new(config.clients.clone(), cimd),
+        clients: Clients::new(
+            config.clients.clone(),
+            cimd,
+            config
+                .dcr
+                .map(|policy| std::sync::Arc::new(Dcr::new(pool.clone(), policy))),
+        ),
         config,
         grants: std::sync::Arc::new(crate::agent_auth::people::grants::PgGrantStore::new(pool)),
         subjects: directory.clone(),

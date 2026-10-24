@@ -1,11 +1,13 @@
 //! The public clients people may sign in with: the ones the operator registers (by default Claude
-//! Code, pi and Codex) and, when enabled, ones that publish a Client ID Metadata Document on an
-//! allowlisted host. A client is trusted only with the redirect URIs its registration or document
-//! names; nothing here registers a client at a person's request.
+//! Code, pi and Codex), ones that publish a Client ID Metadata Document on an allowlisted host, and
+//! native ones that registered themselves ([`crate::agent_auth::people::dynamic`]). A client is
+//! trusted only with the redirect URIs its registration or document names.
 
 use crate::agent_auth::people::cimd::{Cimd, CimdError, MetadataUrl};
+use crate::agent_auth::people::dynamic::Dcr;
 use serde::{Deserialize, Serialize};
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 use url::Url;
 
 pub const CLAUDE_CODE: &str = "claude-code";
@@ -17,24 +19,38 @@ const MAX_REGISTERED_ID: usize = 64;
 const MAX_NAME: usize = 100;
 const MAX_SERVER_ID: usize = 64;
 
-/// A client identifier: a name the operator registered, or the HTTPS URL of the client's metadata
-/// document.
+/// A client identifier: a name the operator registered, the HTTPS URL of the client's metadata
+/// document, or the id this controller issued to a client that registered itself.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub enum ClientId {
     Registered(RegisteredId),
     Metadata(MetadataUrl),
+    Dynamic(DynamicId),
 }
 
-/// A registered client's name: 1 to 64 of `A-Z a-z 0-9 . _ -`, so it can never look like a
-/// metadata document URL.
+/// Who vouches for a client: the operator, the host publishing its document, or nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientKind {
+    Registered,
+    Metadata,
+    Dynamic,
+}
+
+/// A registered client's name: 1 to 64 of `A-Z a-z 0-9 . _ -`, not starting `dyn-`, so it can
+/// never look like a metadata document URL or an issued id.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RegisteredId(String);
+
+/// An id issued at dynamic registration: `dyn-` and 16 to 64 base64url characters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DynamicId(String);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ClientIdError {
     #[error(
-        "client_id {0:?} is neither a registered name (1 to 64 of A-Z a-z 0-9 . _ -) nor an https URL"
+        "client_id {0:?} is neither a registered name (1 to 64 of A-Z a-z 0-9 . _ -), an issued dyn- id, nor an https URL"
     )]
     Shape(String),
     #[error(transparent)]
@@ -44,6 +60,7 @@ pub enum ClientIdError {
 impl RegisteredId {
     pub fn parse(raw: &str) -> Result<Self, ClientIdError> {
         let ok = (1..=MAX_REGISTERED_ID).contains(&raw.len())
+            && !raw.starts_with(DynamicId::PREFIX)
             && raw
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
@@ -54,26 +71,59 @@ impl RegisteredId {
     }
 }
 
+impl DynamicId {
+    pub const PREFIX: &'static str = "dyn-";
+
+    pub fn parse(raw: &str) -> Result<Self, ClientIdError> {
+        let ok = raw.strip_prefix(Self::PREFIX).is_some_and(|rest| {
+            (16..=64).contains(&rest.len())
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
+        match ok {
+            true => Ok(Self(raw.to_string())),
+            false => Err(ClientIdError::Shape(raw.to_string())),
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 impl ClientId {
     pub fn parse(raw: &str) -> Result<Self, ClientIdError> {
-        match raw.starts_with("https://") {
-            true => Ok(Self::Metadata(MetadataUrl::parse(raw)?)),
-            false => Ok(Self::Registered(RegisteredId::parse(raw)?)),
+        if raw.starts_with("https://") {
+            return Ok(Self::Metadata(MetadataUrl::parse(raw)?));
         }
+        if raw.starts_with(DynamicId::PREFIX) {
+            return Ok(Self::Dynamic(DynamicId::parse(raw)?));
+        }
+        Ok(Self::Registered(RegisteredId::parse(raw)?))
     }
 
     pub fn as_str(&self) -> &str {
         match self {
             Self::Registered(RegisteredId(id)) => id,
             Self::Metadata(url) => url.as_str(),
+            Self::Dynamic(id) => id.as_str(),
         }
     }
 
-    /// The host that publishes a metadata document client, `None` for a registered one.
+    pub fn kind(&self) -> ClientKind {
+        match self {
+            Self::Registered(_) => ClientKind::Registered,
+            Self::Metadata(_) => ClientKind::Metadata,
+            Self::Dynamic(_) => ClientKind::Dynamic,
+        }
+    }
+
+    /// The host that publishes a metadata document client, `None` for any other.
     pub fn host(&self) -> Option<&str> {
         match self {
-            Self::Registered(_) => None,
             Self::Metadata(url) => Some(url.host()),
+            Self::Registered(_) | Self::Dynamic(_) => None,
         }
     }
 }
@@ -221,6 +271,17 @@ pub struct RedirectRefused {
 impl RedirectUri {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// `host:port` the code is sent to, for the consent page.
+    pub fn origin(&self) -> String {
+        match Url::parse(&self.0) {
+            Ok(url) => match url.port_or_known_default() {
+                Some(port) => format!("{}:{port}", url.host_str().unwrap_or_default()),
+                None => url.host_str().unwrap_or_default().to_string(),
+            },
+            Err(_) => self.0.clone(),
+        }
     }
 
     pub(crate) fn with(&self, params: &[(&str, &str)]) -> String {
@@ -420,21 +481,45 @@ pub enum ClientError {
     MetadataOff(String),
     #[error(transparent)]
     Metadata(#[from] CimdError),
+    #[error("client_id {0:?} is not a live registration; register the client again")]
+    Expired(String),
+    #[error("reading client registrations: {0}")]
+    Store(String),
 }
 
-/// The registry and, when enabled, the metadata document resolver.
+/// The registry and, when enabled, the metadata document resolver and dynamic registrations.
 pub struct Clients {
     registered: Vec<Client>,
     cimd: Option<Cimd>,
+    dynamic: Option<Arc<Dcr>>,
 }
 
 impl Clients {
-    pub fn new(registered: Vec<Client>, cimd: Option<Cimd>) -> Self {
-        Self { registered, cimd }
+    pub fn new(registered: Vec<Client>, cimd: Option<Cimd>, dynamic: Option<Arc<Dcr>>) -> Self {
+        Self {
+            registered,
+            cimd,
+            dynamic,
+        }
     }
 
     pub fn metadata_documents(&self) -> bool {
         self.cimd.is_some()
+    }
+
+    pub fn dynamic(&self) -> Option<Arc<Dcr>> {
+        self.dynamic.clone()
+    }
+
+    async fn registration(&self, raw: &str, id: &DynamicId) -> Result<Client, ClientError> {
+        let dcr = self
+            .dynamic
+            .as_ref()
+            .ok_or_else(|| ClientError::Expired(raw.to_string()))?;
+        dcr.client(id, crate::clock::unix_secs())
+            .await
+            .map_err(|e| ClientError::Store(format!("{e:#}")))?
+            .ok_or_else(|| ClientError::Expired(raw.to_string()))
     }
 
     fn registered(&self, id: &ClientId) -> Option<&Client> {
@@ -456,12 +541,14 @@ impl Clients {
                     .ok_or_else(|| ClientError::MetadataOff(raw.to_string()))?;
                 Ok(cimd.client(url).await?)
             }
+            ClientId::Dynamic(dynamic) => self.registration(raw, dynamic).await,
         }
     }
 
     /// The client a token request names, when it is still one people may use. Nothing is fetched:
-    /// the grant the request redeems is bound to the client it was issued to.
-    pub fn admits(&self, raw: &str) -> Result<ClientId, ClientError> {
+    /// the grant the request redeems is bound to the client it was issued to. A registration's use
+    /// is stamped.
+    pub async fn admits(&self, raw: &str) -> Result<ClientId, ClientError> {
         let id = ClientId::parse(raw)?;
         match &id {
             ClientId::Registered(_) if self.registered(&id).is_none() => {
@@ -476,6 +563,10 @@ impl Clients {
                 cimd.admits(url)?;
                 Ok(id)
             }
+            ClientId::Dynamic(dynamic) => {
+                self.registration(raw, dynamic).await?;
+                Ok(id)
+            }
         }
     }
 
@@ -486,7 +577,7 @@ impl Clients {
             ClientId::Registered(_) => self
                 .registered(id)
                 .is_some_and(|c| c.allows_resource(resource)),
-            ClientId::Metadata(_) => true,
+            ClientId::Metadata(_) | ClientId::Dynamic(_) => true,
         }
     }
 }
@@ -662,9 +753,19 @@ mod tests {
             "a/b",
             "http://x.example/c",
             &"a".repeat(65),
+            "dyn-short",
+            "dyn-0123456789abcdef!",
         ] {
             assert!(ClientId::parse(bad).is_err(), "{bad:?}");
         }
+        assert!(matches!(
+            ClientId::parse("dyn-0123456789abcdef_-"),
+            Ok(ClientId::Dynamic(_))
+        ));
+        assert!(
+            RegisteredId::parse("dyn-0123456789abcdef").is_err(),
+            "a registry name cannot pose as an issued id"
+        );
         let id = ClientId::parse("https://pi.dev/client.json").unwrap();
         assert_eq!(id.host(), Some("pi.dev"));
         assert_eq!(
@@ -746,7 +847,7 @@ resources = ["https://kueue.example/mcp"]
 
     #[tokio::test]
     async fn without_metadata_documents_a_url_client_is_refused() {
-        let clients = Clients::new(builtin(), None);
+        let clients = Clients::new(builtin(), None, None);
         assert!(!clients.metadata_documents());
         assert_eq!(
             clients.resolve(CODEX).await.map(|c| c.name),
@@ -758,7 +859,7 @@ resources = ["https://kueue.example/mcp"]
             Err(ClientError::MetadataOff(_))
         ));
         assert!(matches!(
-            clients.admits(url),
+            clients.admits(url).await,
             Err(ClientError::MetadataOff(_))
         ));
         assert!(matches!(
@@ -766,9 +867,18 @@ resources = ["https://kueue.example/mcp"]
             Err(ClientError::Unknown(_))
         ));
         assert!(matches!(
-            clients.admits("someone-else"),
+            clients.admits("someone-else").await,
             Err(ClientError::Unknown(_))
         ));
-        assert!(clients.admits(PI).is_ok());
+        assert!(clients.admits(PI).await.is_ok());
+        let issued = "dyn-AAAAAAAAAAAAAAAAAAAAAA";
+        assert!(matches!(
+            clients.resolve(issued).await,
+            Err(ClientError::Expired(_))
+        ));
+        assert!(matches!(
+            clients.admits(issued).await,
+            Err(ClientError::Expired(_))
+        ));
     }
 }

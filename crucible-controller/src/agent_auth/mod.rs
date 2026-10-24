@@ -81,12 +81,13 @@ impl AgentAuth {
                     audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
                     clients = ?config.clients.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
                     cimd_hosts = ?config.cimd.as_ref().map(|c| c.hosts.as_slice()),
+                    dynamic_registration = config.dcr.is_some(),
                     access_ttl_secs = config.access_ttl_secs,
                     "issuing access tokens to people"
                 );
                 let people = make_people(config, pool.clone(), &profile)
                     .context("building the people grant")?;
-                people::grants::spawn_sweep(people.grants.clone());
+                people::grants::spawn_sweep(people.grants.clone(), people.clients.dynamic());
                 Some(people)
             }
         };
@@ -134,6 +135,10 @@ pub fn router(state: Arc<AgentAuth>) -> axum::Router {
         .route(issuer::TOKEN_PATH, axum::routing::post(token))
         .route(issuer::JWKS_PATH, axum::routing::get(jwks))
         .route(issuer::METADATA_PATH, axum::routing::get(metadata))
+        .route(
+            issuer::REGISTER_PATH,
+            axum::routing::post(people::dynamic::register),
+        )
         .with_state(state)
 }
 
@@ -441,6 +446,7 @@ async fn metadata(State(state): State<Arc<AgentAuth>>) -> Response {
     let people = state.people.as_ref().map(|p| issuer::PeopleMetadata {
         scopes: p.config.scopes(),
         client_id_metadata_documents: p.clients.metadata_documents(),
+        registration: p.clients.dynamic().is_some(),
     });
     Json(state.issuer.metadata(people.as_ref())).into_response()
 }

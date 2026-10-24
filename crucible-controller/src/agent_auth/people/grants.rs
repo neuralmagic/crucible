@@ -420,8 +420,12 @@ impl GrantStore for PgGrantStore {
     }
 }
 
-/// Delete expired grants every [`SWEEP_PERIOD`]. A failed sweep is logged and retried next period.
-pub fn spawn_sweep(grants: std::sync::Arc<dyn GrantStore>) {
+/// Delete expired grants, and idle dynamic registrations with theirs, every [`SWEEP_PERIOD`]. A
+/// failed sweep is logged and retried next period.
+pub fn spawn_sweep(
+    grants: std::sync::Arc<dyn GrantStore>,
+    dynamic: Option<std::sync::Arc<crate::agent_auth::people::dynamic::Dcr>>,
+) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_PERIOD);
         loop {
@@ -433,6 +437,13 @@ pub fn spawn_sweep(grants: std::sync::Arc<dyn GrantStore>) {
                 Ok(0) => {}
                 Ok(gone) => tracing::info!(gone, "people grants swept"),
                 Err(e) => tracing::warn!(error = %e, "sweeping people grants failed"),
+            }
+            if let Some(dynamic) = dynamic.as_ref() {
+                match dynamic.sweep(now).await {
+                    Ok(0) => {}
+                    Ok(gone) => tracing::info!(gone, "idle client registrations swept"),
+                    Err(e) => tracing::warn!(error = %e, "sweeping client registrations failed"),
+                }
             }
         }
     });

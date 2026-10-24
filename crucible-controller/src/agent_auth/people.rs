@@ -21,6 +21,7 @@
 pub mod cimd;
 pub mod clients;
 pub mod directory;
+pub mod dynamic;
 pub mod grants;
 
 use crate::agent_auth::AgentAuth;
@@ -29,6 +30,7 @@ use crate::agent_auth::people::cimd::{CIMD_HOSTS_ENV, CimdConfigError, CimdPolic
 use crate::agent_auth::people::clients::{
     CLIENTS_FILE_ENV, Client, ClientId, Clients, RedirectUri, RegistryError,
 };
+use crate::agent_auth::people::dynamic::{DCR_ENV, DcrConfigError, DcrPolicy};
 use crate::identity::api_key::constant_time_eq;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
@@ -78,6 +80,8 @@ pub enum PeopleConfigError {
     Clients(#[from] RegistryError),
     #[error(transparent)]
     Cimd(#[from] CimdConfigError),
+    #[error(transparent)]
+    Dcr(#[from] DcrConfigError),
 }
 
 /// `<cluster>:<resource url>=<scope> <scope> ...`
@@ -118,6 +122,8 @@ pub struct PeopleConfig {
     pub clients: Vec<Client>,
     /// Metadata document clients, off unless `CONTROLLER_PEOPLE_CIMD_HOSTS` names hosts.
     pub cimd: Option<CimdPolicy>,
+    /// Dynamic registration of loopback public clients, on unless `CONTROLLER_PEOPLE_DCR=false`.
+    pub dcr: Option<DcrPolicy>,
 }
 
 impl PeopleConfig {
@@ -147,6 +153,7 @@ impl PeopleConfig {
                 .filter(|s| (1..=3600).contains(s))
                 .ok_or(PeopleConfigError::AccessTtl(raw))?;
         }
+        config.dcr = DcrPolicy::from_lookup(std::env::var(DCR_ENV).ok())?;
         let file = std::env::var(CLIENTS_FILE_ENV)
             .ok()
             .filter(|p| !p.trim().is_empty());
@@ -201,6 +208,7 @@ impl PeopleConfig {
             access_ttl_secs: ACCESS_TTL_SECS,
             clients: clients::builtin(),
             cimd: None,
+            dcr: Some(DcrPolicy::default()),
         }))
     }
 
@@ -680,11 +688,11 @@ fn parse<T: serde::de::DeserializeOwned>(fields: Map<String, Value>) -> Result<T
         .map_err(|e| TokenError::InvalidRequest(e.to_string()))
 }
 
-fn client(people: &People, client_id: &str) -> Result<ClientId, TokenError> {
-    people
-        .clients
-        .admits(client_id)
-        .map_err(|e| TokenError::InvalidClient(e.to_string()))
+async fn client(people: &People, client_id: &str) -> Result<ClientId, TokenError> {
+    people.clients.admits(client_id).await.map_err(|e| match e {
+        clients::ClientError::Store(why) => TokenError::Server(why),
+        e => TokenError::InvalidClient(e.to_string()),
+    })
 }
 
 fn same_resource(requested: Option<&str>, granted: &str) -> Result<(), TokenError> {
@@ -716,7 +724,7 @@ pub(crate) async fn redeem_code(
     now: u64,
 ) -> Result<Response, TokenError> {
     let req: CodeRequest = parse(fields)?;
-    let client = client(people, &req.client_id)?;
+    let client = client(people, &req.client_id).await?;
     let grant = people.grants.redeem_code(&req.code, now).await?;
     if grant.approved.client_id != client {
         return Err(TokenError::InvalidGrant(format!(
@@ -759,7 +767,7 @@ pub(crate) async fn redeem_refresh(
     now: u64,
 ) -> Result<Response, TokenError> {
     let req: RefreshRequest = parse(fields)?;
-    let client = client(people, &req.client_id)?;
+    let client = client(people, &req.client_id).await?;
     let (family, next) = people
         .grants
         .rotate_refresh(&req.refresh_token, &client, now)
@@ -899,6 +907,7 @@ mod tests {
     use crate::agent_auth::people::cimd::testing::{DOC_HOST, DocServer, OTHER_HOST, document};
     use crate::agent_auth::people::cimd::{Cimd, CimdLimits, CimdPolicy};
     use crate::agent_auth::people::clients::{CLAUDE_CODE, CODEX, PI, builtin};
+    use crate::agent_auth::people::dynamic::Dcr;
     use crate::agent_auth::people::*;
     use crate::agent_auth::testing::{self, ISSUER, Spire};
     use crate::identity::kube_links::LinkSource;
@@ -932,7 +941,7 @@ mod tests {
     }
 
     fn clients() -> Clients {
-        Clients::new(builtin(), None)
+        Clients::new(builtin(), None, None)
     }
 
     fn params(pairs: &[(&str, &str)]) -> Map<String, Value> {
@@ -1125,7 +1134,7 @@ mod tests {
         let mut registry = builtin();
         registry[1].resources = Some(vec![EAST_KUEUE.into()]);
         let cfg = config().with_clients(registry.clone(), None).unwrap();
-        let restricted = Clients::new(registry, None);
+        let restricted = Clients::new(registry, None, None);
         let ask = |resource| {
             single_valued(request(&[
                 ("client_id", PI),
@@ -1255,11 +1264,12 @@ mod tests {
     }
 
     async fn harness(pool: &PgPool) -> Harness {
-        harness_with(pool, None).await
+        harness_with(pool, None, true).await
     }
 
-    /// The harness, resolving metadata document clients with `cimd` when given.
-    async fn harness_with(pool: &PgPool, cimd: Option<Cimd>) -> Harness {
+    /// The harness, resolving metadata document clients with `cimd` when given, and taking
+    /// dynamic registrations.
+    async fn harness_with(pool: &PgPool, cimd: Option<Cimd>, dcr: bool) -> Harness {
         let spire = Spire::start().await;
         let profile = format!(
             r#"{}
@@ -1281,7 +1291,11 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let loaded: crucible::deploy::DeployProfile = toml::from_str(&profile).unwrap();
         let mut people =
             crate::identity::people_directory::people(config(), pool.clone(), &loaded).unwrap();
-        people.clients = Clients::new(builtin(), cimd);
+        people.clients = Clients::new(
+            builtin(),
+            cimd,
+            dcr.then(|| Arc::new(Dcr::new(pool.clone(), DcrPolicy::default()))),
+        );
         auth.people = Some(people);
         let auth = Arc::new(auth);
         crate::identity::oidc::users::record_login(
@@ -2101,21 +2115,257 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             json!(["private_key_jwt", "none"])
         );
         assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
-        for absent in [
-            "registration_endpoint",
-            "client_id_metadata_document_supported",
-        ] {
-            assert!(doc.get(absent).is_none(), "{absent}: {doc}");
-        }
+        assert_eq!(
+            doc["registration_endpoint"],
+            format!("{ISSUER}{}", crate::agent_auth::issuer::REGISTER_PATH)
+        );
+        assert!(doc.get("client_id_metadata_document_supported").is_none());
         let agents_only = serde_json::to_value(h.auth.issuer.metadata(None)).unwrap();
         for absent in [
             "authorization_endpoint",
             "code_challenge_methods_supported",
             "authorization_response_iss_parameter_supported",
             "client_id_metadata_document_supported",
+            "registration_endpoint",
         ] {
             assert!(agents_only.get(absent).is_none(), "{absent}");
         }
+    }
+
+    /// With dynamic registration off, nothing advertises or answers it.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn without_dynamic_registration_nothing_registers(pool: PgPool) {
+        let h = harness_with(&pool, None, false).await;
+        let doc: Value = serde_json::from_str(
+            &send(&h.app, get(crate::agent_auth::issuer::METADATA_PATH, None))
+                .await
+                .body,
+        )
+        .unwrap();
+        assert!(doc.get("registration_endpoint").is_none(), "{doc}");
+        let (status, _) = register(&h.app, json!({"redirect_uris": [PI_REDIRECT]})).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    async fn register(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+        let reply = send(
+            app,
+            post_json(crate::agent_auth::issuer::REGISTER_PATH, None, body),
+        )
+        .await;
+        if reply.status == StatusCode::CREATED {
+            assert_eq!(
+                reply
+                    .headers
+                    .get(header::CACHE_CONTROL)
+                    .map(|v| v.to_str().unwrap()),
+                Some("no-store")
+            );
+        }
+        (reply.status, serde_json::from_str(&reply.body).unwrap())
+    }
+
+    /// The registration endpoint takes public clients with loopback redirects only.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn registration_accepts_only_public_loopback_clients(pool: PgPool) {
+        let h = harness(&pool).await;
+        for uri in [
+            "http://127.0.0.1:53120/callback",
+            "http://localhost:8765/callback",
+            "http://[::1]:40000/callback",
+            "http://127.0.0.1/callback",
+        ] {
+            let (status, body) = register(
+                &h.app,
+                json!({"client_name": "pi", "redirect_uris": [uri],
+                       "grant_types": ["authorization_code", "refresh_token"],
+                       "response_types": ["code"], "token_endpoint_auth_method": "none",
+                       "logo_uri": "https://ignored.example/logo.png"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{uri}: {body}");
+            assert!(body["client_id"].as_str().unwrap().starts_with("dyn-"));
+            assert_eq!(body["token_endpoint_auth_method"], "none");
+            assert_eq!(body["redirect_uris"], json!([uri]));
+            for absent in [
+                "client_secret",
+                "registration_access_token",
+                "registration_client_uri",
+            ] {
+                assert!(body.get(absent).is_none(), "{absent}");
+            }
+        }
+        for (body, error) in [
+            (
+                json!({"redirect_uris": ["https://app.example/callback"]}),
+                "invalid_redirect_uri",
+            ),
+            (
+                json!({"redirect_uris": ["com.example.app:/callback"]}),
+                "invalid_redirect_uri",
+            ),
+            (
+                json!({"redirect_uris": ["http://127.0.0.1:5000/callback#f"]}),
+                "invalid_redirect_uri",
+            ),
+            (json!({"redirect_uris": []}), "invalid_redirect_uri"),
+            (json!({"client_name": "x"}), "invalid_redirect_uri"),
+            (
+                json!({"redirect_uris": [PI_REDIRECT], "token_endpoint_auth_method": "client_secret_post"}),
+                "invalid_client_metadata",
+            ),
+            (
+                json!({"redirect_uris": [PI_REDIRECT], "grant_types": ["client_credentials"]}),
+                "invalid_client_metadata",
+            ),
+            (json!(["not", "an", "object"]), "invalid_client_metadata"),
+        ] {
+            let (status, reply) = register(&h.app, body.clone()).await;
+            assert_eq!(
+                (status, reply["error"].as_str()),
+                (StatusCode::BAD_REQUEST, Some(error)),
+                "{body}: {reply}"
+            );
+        }
+        let (status, body) = register(
+            &h.app,
+            json!({"client_name": format!("pi\n{}", "x".repeat(400)), "redirect_uris": [PI_REDIRECT]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let name = body["client_name"].as_str().unwrap();
+        assert_eq!(name.chars().count(), 100);
+        assert!(name.starts_with("pi x"), "{name}");
+    }
+
+    /// A self-registered client signs in like any other: any port on its redirect, its own path
+    /// only, consent marks it self-registered with where the code goes, and its grants are bound to
+    /// its id.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_self_registered_client_signs_in_bound_to_its_issued_id(pool: PgPool) {
+        let h = harness(&pool).await;
+        let (_, reg) = register(
+            &h.app,
+            json!({"client_name": "Claude Code", "redirect_uris": ["http://127.0.0.1:1/callback"]}),
+        )
+        .await;
+        let id = reg["client_id"].as_str().unwrap().to_string();
+        let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
+        let consent = consent_of(
+            &h,
+            &cookie,
+            &authorize_uri(&[
+                ("client_id", &id),
+                ("redirect_uri", "http://127.0.0.1:53120/callback"),
+                ("resource", EAST_KUEUE),
+            ]),
+        )
+        .await;
+        assert_eq!(consent["client_id"], id.as_str());
+        assert_eq!(consent["client_name"], "Claude Code");
+        assert_eq!(consent["client_kind"], "dynamic");
+        assert_eq!(consent["redirect_origin"], "127.0.0.1:53120");
+        for wrong in [
+            "http://127.0.0.1:53120/other",
+            "http://localhost:53120/callback",
+            "https://127.0.0.1:53120/callback",
+        ] {
+            let page = send(
+                &h.app,
+                get(
+                    &authorize_uri(&[("client_id", &id), ("redirect_uri", wrong)]),
+                    None,
+                ),
+            )
+            .await;
+            assert_eq!(page.status, StatusCode::BAD_REQUEST, "{wrong}");
+        }
+
+        let (status, body) = sign_in_as(&h, &cookie, &id, "http://127.0.0.1:41000/callback").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = claims_of(&h.auth, body["access_token"].as_str().unwrap(), EAST_KUEUE);
+        assert_eq!(claims["azp"], id.as_str());
+        let (status, next) = refresh_as(&h.app, &id, &body["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        let listed: Value =
+            serde_json::from_str(&send(&h.app, get("/api/me/mcp-sign-ins", None)).await.body)
+                .unwrap();
+        assert_eq!(listed["sign_ins"][0]["client_kind"], "dynamic");
+        assert_eq!(listed["sign_ins"][0]["client_name"], "Claude Code");
+
+        assert!(
+            refused(&refresh_as(&h.app, CLAUDE_CODE, &next["refresh_token"]).await),
+            "a registered client cannot redeem the self-registered one's token"
+        );
+        assert!(refused(
+            &refresh_as(&h.app, &id, &next["refresh_token"]).await
+        ));
+
+        let (_, other) = register(&h.app, json!({"redirect_uris": [PI_REDIRECT]})).await;
+        let other = other["client_id"].as_str().unwrap().to_string();
+        let parked = consent_id(
+            &h.app,
+            &authorize_uri(&[
+                ("client_id", &id),
+                ("redirect_uri", PI_REDIRECT),
+                ("resource", EAST_KUEUE),
+            ]),
+            &cookie,
+        )
+        .await;
+        let approved = decide_as(&h.app, Some(&cookie), &parked, "approve").await;
+        let code = query_of(&redirect_of(&approved))["code"].clone();
+        let (status, body) = token(
+            &h.app,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", PI_REDIRECT),
+                ("client_id", &other),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            "another registration cannot redeem its code: {body}"
+        );
+    }
+
+    /// A registration left unused past the idle limit stops refreshing and authorizing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_expired_registration_stops_refreshing(pool: PgPool) {
+        let h = harness(&pool).await;
+        let (_, reg) = register(&h.app, json!({"redirect_uris": [PI_REDIRECT]})).await;
+        let id = reg["client_id"].as_str().unwrap().to_string();
+        let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
+        let (status, body) = sign_in_as(&h, &cookie, &id, PI_REDIRECT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        sqlx::query("UPDATE people_dynamic_clients SET last_used_at = 0 WHERE client_id = $1")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (status, reply) = refresh_as(&h.app, &id, &body["refresh_token"]).await;
+        assert_eq!(
+            (status, reply["error"].as_str()),
+            (StatusCode::UNAUTHORIZED, Some("invalid_client"))
+        );
+        let page = send(
+            &h.app,
+            get(
+                &authorize_uri(&[("client_id", &id), ("redirect_uri", PI_REDIRECT)]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::BAD_REQUEST);
+        assert!(
+            page.body.contains("register the client again"),
+            "{}",
+            page.body
+        );
     }
 
     async fn sign_in_as(
@@ -2364,7 +2614,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     async fn a_metadata_document_client_signs_in_under_its_url(pool: PgPool) {
         let docs = doc_server().await;
         let cimd = Cimd::new(cimd_policy(&[DOC_HOST]), docs.builder()).unwrap();
-        let h = harness_with(&pool, Some(cimd)).await;
+        let h = harness_with(&pool, Some(cimd), true).await;
         let meta: Value = serde_json::from_str(
             &send(&h.app, get(crate::agent_auth::issuer::METADATA_PATH, None))
                 .await
@@ -2372,7 +2622,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         )
         .unwrap();
         assert_eq!(meta["client_id_metadata_document_supported"], true);
-        assert!(meta.get("registration_endpoint").is_none());
+        assert!(meta.get("registration_endpoint").is_some());
 
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
         let desk = docs.url(DOC_HOST, "/desk.json");

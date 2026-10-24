@@ -17,8 +17,9 @@ pub struct McpSignInDto {
     pub client_id: String,
     /// The client's name as the person saw it on the consent page.
     pub client_name: String,
-    /// The host that published the client's metadata document; absent for a registered client.
+    /// The host that published the client's metadata document; absent for any other client.
     pub client_host: Option<String>,
+    pub client_kind: crate::agent_auth::people::clients::ClientKind,
     pub resource: String,
     pub cluster: String,
     pub approved_at: String,
@@ -78,6 +79,7 @@ pub(crate) async fn list_mcp_sign_ins(
             .into_iter()
             .map(|g| McpSignInDto {
                 client_host: g.client_id.host().map(str::to_string),
+                client_kind: g.client_id.kind(),
                 client_id: g.client_id.to_string(),
                 client_name: g.client_name,
                 resource: g.resource,

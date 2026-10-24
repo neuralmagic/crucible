@@ -26,6 +26,8 @@ pub const TOKEN_PATH: &str = "/oauth/token";
 
 /// People's authorization endpoint.
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
+/// RFC 7591 registration, for loopback public clients only.
+pub const REGISTER_PATH: &str = "/oauth/register";
 pub const JWKS_PATH: &str = "/.well-known/jwks.json";
 pub const METADATA_PATH: &str = "/.well-known/oauth-authorization-server";
 
@@ -612,6 +614,8 @@ pub struct AuthorizationServerMetadata {
     pub authorization_endpoint: Option<String>,
     pub token_endpoint: String,
     pub jwks_uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub registration_endpoint: Option<String>,
     pub grant_types_supported: Vec<&'static str>,
     pub response_types_supported: Vec<&'static str>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -632,6 +636,8 @@ pub struct PeopleMetadata {
     pub scopes: Vec<String>,
     /// Whether an https `client_id` is resolved as a Client ID Metadata Document.
     pub client_id_metadata_documents: bool,
+    /// Whether loopback public clients may register themselves.
+    pub registration: bool,
 }
 
 /// A fresh random `jti`.
@@ -820,9 +826,8 @@ impl AgentIssuer {
         }
     }
 
-    /// The metadata document; `people` adds the authorization code grant for people's clients.
-    /// No registration endpoint is ever advertised: clients are registered by the operator or
-    /// publish a metadata document.
+    /// The metadata document; `people` adds the authorization code grant for people's clients and,
+    /// when they may register themselves, the registration endpoint.
     pub fn metadata(&self, people: Option<&PeopleMetadata>) -> AuthorizationServerMetadata {
         let mut scopes_supported = Vec::new();
         let people_scopes = people.into_iter().flat_map(|p| p.scopes.iter());
@@ -841,6 +846,7 @@ impl AgentIssuer {
             authorization_endpoint: None,
             token_endpoint: self.issuer.endpoint(TOKEN_PATH),
             jwks_uri: self.issuer.endpoint(JWKS_PATH),
+            registration_endpoint: None,
             grant_types_supported: Vec::new(),
             response_types_supported: Vec::new(),
             code_challenge_methods_supported: Vec::new(),
@@ -860,6 +866,9 @@ impl AgentIssuer {
         }
         if let Some(people) = people {
             metadata.client_id_metadata_document_supported = people.client_id_metadata_documents;
+            metadata.registration_endpoint = people
+                .registration
+                .then(|| self.issuer.endpoint(REGISTER_PATH));
             metadata.authorization_endpoint = Some(self.issuer.endpoint(AUTHORIZE_PATH));
             metadata
                 .grant_types_supported
@@ -1631,6 +1640,7 @@ mod tests {
         let doc = issuer.metadata(Some(&PeopleMetadata {
             scopes: people.scopes(),
             client_id_metadata_documents: false,
+            registration: false,
         }));
         assert_eq!(
             doc.grant_types_supported,

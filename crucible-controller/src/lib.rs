@@ -378,7 +378,10 @@ impl Surface {
                 None => std::future::pending().await,
             }
         };
-        let http = async move { stopped("http surface", axum::serve(http, router).await) };
+        let http = async move {
+            let peers = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+            stopped("http surface", axum::serve(http, peers).await)
+        };
         tokio::select! {
             e = http => e,
             e = hooks => e,

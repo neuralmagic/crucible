@@ -36,8 +36,12 @@ pub struct ConsentDto {
     pub client_id: String,
     /// The registry's name for the client, or the `client_name` its metadata document gives.
     pub client_name: String,
-    /// The host that published the client's metadata document; absent for a registered client.
+    /// The host that published the client's metadata document; absent for any other client.
     pub client_host: Option<String>,
+    /// Who vouches for the client: the operator, its document's host, or nobody (self-registered).
+    pub client_kind: crate::agent_auth::people::clients::ClientKind,
+    /// The `host:port` the code goes to.
+    pub redirect_origin: String,
     pub resource: String,
     pub scopes: Vec<String>,
     /// The login the token's `sub` will name.
@@ -97,6 +101,8 @@ pub(crate) async fn get_consent(
         client_id: r.client_id.to_string(),
         client_name: r.client_name.clone(),
         client_host: r.client_id.host().map(str::to_string),
+        client_kind: r.client_id.kind(),
+        redirect_origin: r.redirect.origin(),
         resource: r.resource.clone(),
         scopes: r.scopes.clone(),
         login,
