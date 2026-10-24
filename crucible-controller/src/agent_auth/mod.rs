@@ -57,7 +57,7 @@ impl AgentAuth {
             people::PeopleConfig,
             PgPool,
             &crucible::deploy::DeployProfile,
-        ) -> people::People,
+        ) -> anyhow::Result<people::People>,
     ) -> anyhow::Result<Option<Arc<Self>>> {
         use anyhow::Context;
         let Some(issuer_cfg) = issuer::AgentIssuerConfig::from_env()? else {
@@ -74,16 +74,22 @@ impl AgentAuth {
             true => placement::check_key_exposure(namespace.as_deref(), &profile)?,
         }
         let make_people = people;
-        let people = people::PeopleConfig::from_env()?.map(|config| {
-            tracing::info!(
-                audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
-                access_ttl_secs = config.access_ttl_secs,
-                "issuing access tokens to people"
-            );
-            let people = make_people(config, pool.clone(), &profile);
-            people::grants::spawn_sweep(people.grants.clone());
-            people
-        });
+        let people = match people::PeopleConfig::from_env()? {
+            None => None,
+            Some(config) => {
+                tracing::info!(
+                    audiences = ?config.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str())).collect::<Vec<_>>(),
+                    clients = ?config.clients.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+                    cimd_hosts = ?config.cimd.as_ref().map(|c| c.hosts.as_slice()),
+                    access_ttl_secs = config.access_ttl_secs,
+                    "issuing access tokens to people"
+                );
+                let people = make_people(config, pool.clone(), &profile)
+                    .context("building the people grant")?;
+                people::grants::spawn_sweep(people.grants.clone());
+                Some(people)
+            }
+        };
         if issuer_cfg.spire.is_empty() && people.is_none() {
             return Err(issuer::ConfigError::NoRecipients.into());
         }
@@ -432,12 +438,11 @@ async fn jwks(State(state): State<Arc<AgentAuth>>) -> Response {
 }
 
 async fn metadata(State(state): State<Arc<AgentAuth>>) -> Response {
-    Json(
-        state
-            .issuer
-            .metadata(state.people.as_ref().map(|p| p.config.scopes()).as_deref()),
-    )
-    .into_response()
+    let people = state.people.as_ref().map(|p| issuer::PeopleMetadata {
+        scopes: p.config.scopes(),
+        client_id_metadata_documents: p.clients.metadata_documents(),
+    });
+    Json(state.issuer.metadata(people.as_ref())).into_response()
 }
 
 #[cfg(test)]

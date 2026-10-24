@@ -1,11 +1,9 @@
 //! The authorization request parked on the caller's session: what the consent page shows (which
 //! client asks for which resource and scopes, and who the caller would act as on its cluster), and
-//! the decision that answers it with the client's loopback redirect.
+//! the decision that answers it with the client's registered redirect.
 
 use crate::agent_auth::people::directory::ClusterUser;
-use crate::agent_auth::people::{
-    Approved, CLIENT_ID, CODE_TTL_SECS, CodeGrant, PENDING_KEY, Pending,
-};
+use crate::agent_auth::people::{Approved, CODE_TTL_SECS, CodeGrant, PENDING_KEY, Pending};
 use crate::api::dto::{bad_request, conflict, forbidden, not_found, unavailable};
 use crate::api::state::{ApiState, AppError, ErrorBody, Json};
 use crate::identity::api::cluster_identities::no_subject;
@@ -36,6 +34,10 @@ pub struct ConsentQuery {
 pub struct ConsentDto {
     pub id: String,
     pub client_id: String,
+    /// The registry's name for the client, or the `client_name` its metadata document gives.
+    pub client_name: String,
+    /// The host that published the client's metadata document; absent for a registered client.
+    pub client_host: Option<String>,
     pub resource: String,
     pub scopes: Vec<String>,
     /// The login the token's `sub` will name.
@@ -92,7 +94,9 @@ pub(crate) async fn get_consent(
     let identity = identity_of(&state, &r.cluster, &rule, person).await?;
     Ok(Json(ConsentDto {
         id: pending.id.clone(),
-        client_id: CLIENT_ID.to_string(),
+        client_id: r.client_id.to_string(),
+        client_name: r.client_name.clone(),
+        client_host: r.client_id.host().map(str::to_string),
         resource: r.resource.clone(),
         scopes: r.scopes.clone(),
         login,
@@ -117,7 +121,7 @@ pub struct DecisionBody {
     pub decision: Verdict,
 }
 
-/// Where to send the browser: the client's loopback callback, with a code or an error.
+/// Where to send the browser: the client's registered callback, with a code or an error.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct DecisionDto {
     pub redirect_url: String,
@@ -193,6 +197,8 @@ pub(crate) async fn decide_consent(
     }
     let approved = Approved {
         sub: sub.to_string(),
+        client_id: r.client_id.clone(),
+        client_name: r.client_name.clone(),
         login: login.clone(),
         email,
         resource: r.resource.clone(),
@@ -222,7 +228,12 @@ pub(crate) async fn decide_consent(
     };
     match issued.grants.issue_code(&grant).await {
         Ok(code) => {
-            tracing::info!(login, resource = r.resource, "authorization code issued");
+            tracing::info!(
+                login,
+                client_id = r.client_id.as_str(),
+                resource = r.resource,
+                "authorization code issued"
+            );
             Ok(send_back(r.redirect.with(&[
                 ("code", code.as_str()),
                 ("state", r.state.as_str()),

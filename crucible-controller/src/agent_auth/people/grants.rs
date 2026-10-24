@@ -3,8 +3,10 @@
 //!
 //! A code starts a grant family; each refresh spends the family's live token and issues the next.
 //! Presenting a spent token again revokes the whole family (RFC 9700 §4.14.2): one of the two
-//! holders is not the client the person approved. Nothing here reads the host's own tables.
+//! holders is not the client the person approved. So does presenting a live one as a different
+//! client. Nothing here reads the host's own tables.
 
+use crate::agent_auth::people::clients::ClientId;
 use crate::agent_auth::people::{Approved, CodeGrant};
 use anyhow::Context;
 use base64::Engine;
@@ -30,6 +32,10 @@ pub enum GrantError {
     Reused,
     #[error("the approval behind this refresh token was revoked")]
     Revoked,
+    #[error(
+        "the refresh token was issued to client {issued}, not {presented}; its approval is revoked"
+    )]
+    WrongClient { issued: String, presented: String },
     #[error("drawing random bytes failed")]
     Random,
     #[error("timestamp {0} does not fit the store")]
@@ -43,6 +49,8 @@ pub enum GrantError {
 pub struct Family {
     pub id: String,
     pub sub: String,
+    pub client_id: ClientId,
+    pub client_name: String,
     pub resource: String,
     pub cluster: String,
     pub scopes: Vec<String>,
@@ -51,6 +59,8 @@ pub struct Family {
 /// One of a person's live approvals, for Settings to list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
+    pub client_id: ClientId,
+    pub client_name: String,
     pub resource: String,
     pub cluster: String,
     pub approved_at: u64,
@@ -76,6 +86,12 @@ fn secs(stored: i64) -> u64 {
     u64::try_from(stored).unwrap_or(0)
 }
 
+fn client_id(stored: &str) -> Result<ClientId, GrantError> {
+    ClientId::parse(stored)
+        .with_context(|| format!("decoding the stored client_id {stored:?}"))
+        .map_err(GrantError::Store)
+}
+
 /// Where codes and refresh token families live. Every method is single-statement or transactional,
 /// so any number of issuers can share one store.
 #[async_trait::async_trait]
@@ -85,11 +101,24 @@ pub trait GrantStore: Send + Sync {
     async fn redeem_code(&self, code: &str, now: u64) -> Result<CodeGrant, GrantError>;
     /// Start a family for `approved` and return its first refresh token.
     async fn issue_refresh(&self, approved: &Approved, now: u64) -> Result<String, GrantError>;
-    /// Spend `token` and issue its family's next one. A token already spent revokes the family.
-    async fn rotate_refresh(&self, token: &str, now: u64) -> Result<(Family, String), GrantError>;
+    /// Spend `token`, presented by `client`, and issue its family's next one. A token already spent,
+    /// or one issued to another client, revokes the family.
+    async fn rotate_refresh(
+        &self,
+        token: &str,
+        client: &ClientId,
+        now: u64,
+    ) -> Result<(Family, String), GrantError>;
     async fn revoke_family(&self, family: &str, now: u64) -> Result<(), GrantError>;
     /// Revoke every family and code of `sub`. Returns how many families.
     async fn revoke_subject(&self, sub: &str, now: u64) -> Result<u64, GrantError>;
+    /// Revoke every family and code of `sub` issued to `client`. Returns how many families.
+    async fn revoke_client(
+        &self,
+        sub: &str,
+        client: &ClientId,
+        now: u64,
+    ) -> Result<u64, GrantError>;
     /// `sub`'s live families, newest first.
     async fn live(&self, sub: &str, now: u64) -> Result<Vec<Summary>, GrantError>;
     /// Delete expired codes and dead families. Returns how many rows went.
@@ -145,11 +174,14 @@ impl GrantStore for PgGrantStore {
         let mut tx = self.pool.begin().await.context("opening the grant write")?;
         sqlx::query(
             "INSERT INTO people_grants
-               (id, sub, resource, cluster, scopes, created_at, last_used_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $6)",
+               (id, sub, client_id, client_name, resource, cluster, scopes, created_at,
+                last_used_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
         )
         .bind(&id)
         .bind(&approved.sub)
+        .bind(approved.client_id.as_str())
+        .bind(&approved.client_name)
         .bind(&approved.resource)
         .bind(&approved.cluster)
         .bind(serde_json::json!(approved.scopes))
@@ -162,7 +194,12 @@ impl GrantStore for PgGrantStore {
         Ok(token)
     }
 
-    async fn rotate_refresh(&self, token: &str, now: u64) -> Result<(Family, String), GrantError> {
+    async fn rotate_refresh(
+        &self,
+        token: &str,
+        client: &ClientId,
+        now: u64,
+    ) -> Result<(Family, String), GrantError> {
         let key = key_of(token);
         let mut tx = self.pool.begin().await.context("opening the refresh")?;
         let spent: Option<(String, i64)> = sqlx::query_as(
@@ -190,17 +227,41 @@ impl GrantStore for PgGrantStore {
             tracing::warn!(grant = grant_id, "refresh token reused; approval revoked");
             return Err(GrantError::Reused);
         };
-        let row: (String, String, String, serde_json::Value, i64, Option<i64>) = sqlx::query_as(
-            "SELECT sub, resource, cluster, scopes, created_at, revoked_at
+        type Row = (
+            String,
+            String,
+            String,
+            String,
+            String,
+            serde_json::Value,
+            i64,
+            Option<i64>,
+        );
+        let row: Row = sqlx::query_as(
+            "SELECT sub, client_id, client_name, resource, cluster, scopes, created_at, revoked_at
                FROM people_grants WHERE id = $1 FOR UPDATE",
         )
         .bind(&grant_id)
         .fetch_one(&mut *tx)
         .await
         .context("reading the approval")?;
-        let (sub, resource, cluster, scopes, created_at, revoked_at) = row;
+        let (sub, issued, client_name, resource, cluster, scopes, created_at, revoked_at) = row;
         if revoked_at.is_some() {
             return Err(GrantError::Revoked);
+        }
+        if issued != client.as_str() {
+            revoke_in(&mut tx, &grant_id, now).await?;
+            tx.commit().await.context("committing the revocation")?;
+            tracing::warn!(
+                grant = grant_id,
+                issued,
+                presented = client.as_str(),
+                "refresh token presented by another client; approval revoked"
+            );
+            return Err(GrantError::WrongClient {
+                issued,
+                presented: client.to_string(),
+            });
         }
         if secs(issued_at).saturating_add(REFRESH_IDLE_SECS) <= now
             || secs(created_at).saturating_add(REFRESH_ABSOLUTE_SECS) <= now
@@ -221,6 +282,8 @@ impl GrantStore for PgGrantStore {
             Family {
                 id: grant_id,
                 sub,
+                client_id: client_id(&issued)?,
+                client_name,
                 resource,
                 cluster,
                 scopes,
@@ -264,9 +327,49 @@ impl GrantStore for PgGrantStore {
         Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
     }
 
+    async fn revoke_client(
+        &self,
+        sub: &str,
+        client: &ClientId,
+        now: u64,
+    ) -> Result<u64, GrantError> {
+        let mut tx = self.pool.begin().await.context("opening the sign-out")?;
+        sqlx::query(
+            "DELETE FROM people_codes
+              WHERE sub = $1 AND grant_json -> 'approved' ->> 'client_id' = $2",
+        )
+        .bind(sub)
+        .bind(client.as_str())
+        .execute(&mut *tx)
+        .await
+        .context("dropping the client's outstanding codes")?;
+        let ids: Vec<String> = sqlx::query_scalar(
+            "UPDATE people_grants SET revoked_at = $3
+              WHERE sub = $1 AND client_id = $2 AND revoked_at IS NULL RETURNING id",
+        )
+        .bind(sub)
+        .bind(client.as_str())
+        .bind(at(now)?)
+        .fetch_all(&mut *tx)
+        .await
+        .context("revoking the client's approvals")?;
+        sqlx::query(
+            "DELETE FROM people_refresh_tokens
+              WHERE grant_id = ANY($1) AND used_at IS NULL",
+        )
+        .bind(&ids)
+        .execute(&mut *tx)
+        .await
+        .context("dropping the client's live refresh tokens")?;
+        tx.commit().await.context("committing the sign-out")?;
+        Ok(u64::try_from(ids.len()).unwrap_or(u64::MAX))
+    }
+
     async fn live(&self, sub: &str, now: u64) -> Result<Vec<Summary>, GrantError> {
-        let rows: Vec<(String, String, i64, i64)> = sqlx::query_as(
-            "SELECT g.resource, g.cluster, g.created_at, g.last_used_at FROM people_grants g
+        let rows: Vec<(String, String, String, String, i64, i64)> = sqlx::query_as(
+            "SELECT g.client_id, g.client_name, g.resource, g.cluster, g.created_at,
+                    g.last_used_at
+               FROM people_grants g
               WHERE g.sub = $1 AND g.revoked_at IS NULL AND g.created_at > $3
                 AND EXISTS (SELECT 1 FROM people_refresh_tokens t
                              WHERE t.grant_id = g.id AND t.used_at IS NULL AND t.issued_at > $2)
@@ -278,15 +381,20 @@ impl GrantStore for PgGrantStore {
         .fetch_all(&self.pool)
         .await
         .context("listing approvals")?;
-        Ok(rows
-            .into_iter()
-            .map(|(resource, cluster, created_at, last_used_at)| Summary {
-                resource,
-                cluster,
-                approved_at: secs(created_at),
-                last_used_at: secs(last_used_at),
-            })
-            .collect())
+        rows.into_iter()
+            .map(
+                |(client, client_name, resource, cluster, created_at, last_used_at)| {
+                    Ok(Summary {
+                        client_id: client_id(&client)?,
+                        client_name,
+                        resource,
+                        cluster,
+                        approved_at: secs(created_at),
+                        last_used_at: secs(last_used_at),
+                    })
+                },
+            )
+            .collect()
     }
 
     async fn sweep(&self, now: u64) -> Result<u64, GrantError> {
@@ -367,15 +475,26 @@ async fn revoke_in(
 
 #[cfg(test)]
 mod tests {
+    use crate::agent_auth::people::CodeChallenge;
+    use crate::agent_auth::people::clients::{CLAUDE_CODE, CODEX, builtin};
     use crate::agent_auth::people::grants::*;
-    use crate::agent_auth::people::{CodeChallenge, LoopbackRedirect};
 
     const SUB: &str = "sub-alice";
     const T0: u64 = 1_800_000_000;
 
+    fn claude() -> ClientId {
+        ClientId::parse(CLAUDE_CODE).unwrap()
+    }
+
     fn approved() -> Approved {
+        approved_for(CLAUDE_CODE, "Claude Code")
+    }
+
+    fn approved_for(client: &str, name: &str) -> Approved {
         Approved {
             sub: SUB.into(),
+            client_id: ClientId::parse(client).unwrap(),
+            client_name: name.into(),
             login: "alice".into(),
             email: None,
             resource: "https://kueue.example/mcp".into(),
@@ -385,9 +504,15 @@ mod tests {
     }
 
     fn code_grant(expires_at: u64) -> CodeGrant {
+        code_grant_for(approved(), expires_at)
+    }
+
+    fn code_grant_for(approved: Approved, expires_at: u64) -> CodeGrant {
         CodeGrant {
-            approved: approved(),
-            redirect: LoopbackRedirect::parse("http://127.0.0.1:8765/callback").unwrap(),
+            approved,
+            redirect: builtin()[0]
+                .redirect("http://localhost:8765/callback")
+                .unwrap(),
             challenge: CodeChallenge::parse(&"a".repeat(43)).unwrap(),
             expires_at,
         }
@@ -451,14 +576,14 @@ mod tests {
         let mut now = T0;
         while now + REFRESH_IDLE_SECS - 1 < T0 + REFRESH_ABSOLUTE_SECS {
             now += REFRESH_IDLE_SECS - 1;
-            let (family, next) = grants.rotate_refresh(&token, now).await.unwrap();
+            let (family, next) = grants.rotate_refresh(&token, &claude(), now).await.unwrap();
             assert_eq!(family.resource, "https://kueue.example/mcp");
             assert_eq!(family.scopes, ["kueue.read"]);
             token = next;
         }
         assert!(matches!(
             grants
-                .rotate_refresh(&token, T0 + REFRESH_ABSOLUTE_SECS)
+                .rotate_refresh(&token, &claude(), T0 + REFRESH_ABSOLUTE_SECS)
                 .await,
             Err(GrantError::Expired)
         ));
@@ -469,13 +594,15 @@ mod tests {
         let grants = PgGrantStore::new(pool);
         let token = grants.issue_refresh(&approved(), T0).await.unwrap();
         assert!(matches!(
-            grants.rotate_refresh(&token, T0 + REFRESH_IDLE_SECS).await,
+            grants
+                .rotate_refresh(&token, &claude(), T0 + REFRESH_IDLE_SECS)
+                .await,
             Err(GrantError::Expired)
         ));
         let fresh = grants.issue_refresh(&approved(), T0).await.unwrap();
         assert!(
             grants
-                .rotate_refresh(&fresh, T0 + REFRESH_IDLE_SECS - 1)
+                .rotate_refresh(&fresh, &claude(), T0 + REFRESH_IDLE_SECS - 1)
                 .await
                 .is_ok()
         );
@@ -486,18 +613,26 @@ mod tests {
         let grants = PgGrantStore::new(pool);
         let first = grants.issue_refresh(&approved(), T0).await.unwrap();
         let other = grants.issue_refresh(&approved(), T0).await.unwrap();
-        let (_, second) = grants.rotate_refresh(&first, T0 + 1).await.unwrap();
+        let (_, second) = grants
+            .rotate_refresh(&first, &claude(), T0 + 1)
+            .await
+            .unwrap();
         assert!(matches!(
-            grants.rotate_refresh(&first, T0 + 2).await,
+            grants.rotate_refresh(&first, &claude(), T0 + 2).await,
             Err(GrantError::Reused)
         ));
         assert!(matches!(
-            grants.rotate_refresh(&second, T0 + 3).await,
+            grants.rotate_refresh(&second, &claude(), T0 + 3).await,
             Err(GrantError::Unknown)
         ));
-        assert!(grants.rotate_refresh(&other, T0 + 3).await.is_ok());
+        assert!(
+            grants
+                .rotate_refresh(&other, &claude(), T0 + 3)
+                .await
+                .is_ok()
+        );
         assert!(matches!(
-            grants.rotate_refresh("never-issued", T0).await,
+            grants.rotate_refresh("never-issued", &claude(), T0).await,
             Err(GrantError::Unknown)
         ));
     }
@@ -512,7 +647,12 @@ mod tests {
         assert_eq!(grants.revoke_subject(SUB, T0).await.unwrap(), 2);
         assert!(grants.live(SUB, T0).await.unwrap().is_empty());
         for token in [&a, &b] {
-            assert!(grants.rotate_refresh(token, T0 + 1).await.is_err());
+            assert!(
+                grants
+                    .rotate_refresh(token, &claude(), T0 + 1)
+                    .await
+                    .is_err()
+            );
         }
         assert!(matches!(
             grants.redeem_code(&code, T0).await,
@@ -529,9 +669,12 @@ mod tests {
         let idle = grants.issue_refresh(&approved(), T0).await.unwrap();
         let live = grants.issue_refresh(&approved(), now - 100).await.unwrap();
         let revoked = grants.issue_refresh(&approved(), now - 100).await.unwrap();
-        grants.rotate_refresh(&revoked, now - 90).await.unwrap();
+        grants
+            .rotate_refresh(&revoked, &claude(), now - 90)
+            .await
+            .unwrap();
         assert!(matches!(
-            grants.rotate_refresh(&revoked, now - 80).await,
+            grants.rotate_refresh(&revoked, &claude(), now - 80).await,
             Err(GrantError::Reused)
         ));
         assert_eq!(
@@ -544,10 +687,88 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(families, 1);
-        assert!(grants.rotate_refresh(&live, now).await.is_ok());
+        assert!(grants.rotate_refresh(&live, &claude(), now).await.is_ok());
         assert!(matches!(
-            grants.rotate_refresh(&idle, now).await,
+            grants.rotate_refresh(&idle, &claude(), now).await,
             Err(GrantError::Unknown)
         ));
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_family_refreshes_only_for_its_client_and_another_client_revokes_it(pool: PgPool) {
+        let grants = PgGrantStore::new(pool);
+        let codex = ClientId::parse(CODEX).unwrap();
+        let first = grants
+            .issue_refresh(&approved_for(CODEX, "Codex"), T0)
+            .await
+            .unwrap();
+        let (family, second) = grants.rotate_refresh(&first, &codex, T0 + 1).await.unwrap();
+        assert_eq!(family.client_id, codex);
+        assert_eq!(family.client_name, "Codex");
+        assert!(matches!(
+            grants.rotate_refresh(&second, &claude(), T0 + 2).await,
+            Err(GrantError::WrongClient { ref issued, ref presented })
+                if issued == CODEX && presented == CLAUDE_CODE
+        ));
+        assert!(
+            matches!(
+                grants.rotate_refresh(&second, &codex, T0 + 3).await,
+                Err(GrantError::Reused)
+            ),
+            "the cross-client attempt spent the token and revoked the family"
+        );
+        assert!(grants.live(SUB, T0 + 3).await.unwrap().is_empty());
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn signing_one_client_out_keeps_the_others_and_their_codes(pool: PgPool) {
+        let grants = PgGrantStore::new(pool);
+        let codex = ClientId::parse(CODEX).unwrap();
+        let claude_token = grants.issue_refresh(&approved(), T0).await.unwrap();
+        let codex_token = grants
+            .issue_refresh(&approved_for(CODEX, "Codex"), T0 + 1)
+            .await
+            .unwrap();
+        let claude_code = grants.issue_code(&code_grant(T0 + 60)).await.unwrap();
+        let codex_code = grants
+            .issue_code(&code_grant_for(approved_for(CODEX, "Codex"), T0 + 60))
+            .await
+            .unwrap();
+        let live = grants.live(SUB, T0 + 1).await.unwrap();
+        assert_eq!(
+            live.iter()
+                .map(|s| (s.client_id.as_str(), s.client_name.as_str()))
+                .collect::<Vec<_>>(),
+            [(CODEX, "Codex"), (CLAUDE_CODE, "Claude Code")]
+        );
+        assert_eq!(grants.revoke_client(SUB, &codex, T0 + 2).await.unwrap(), 1);
+        assert_eq!(grants.revoke_client(SUB, &codex, T0 + 2).await.unwrap(), 0);
+        assert_eq!(
+            grants
+                .revoke_client("someone-else", &claude(), T0 + 2)
+                .await
+                .unwrap(),
+            0
+        );
+        assert!(
+            grants
+                .rotate_refresh(&codex_token, &codex, T0 + 3)
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            grants.redeem_code(&codex_code, T0 + 3).await,
+            Err(GrantError::Unknown)
+        ));
+        assert!(
+            grants
+                .rotate_refresh(&claude_token, &claude(), T0 + 3)
+                .await
+                .is_ok()
+        );
+        assert!(grants.redeem_code(&claude_code, T0 + 3).await.is_ok());
+        let live = grants.live(SUB, T0 + 3).await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].client_id, claude());
     }
 }

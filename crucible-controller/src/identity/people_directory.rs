@@ -72,17 +72,24 @@ impl LinkDirectory for ControllerDirectory {
 }
 
 /// The people grant as the controller runs it: grants in its Postgres, subjects and links read
-/// from its tables.
+/// from its tables, metadata documents fetched over the public internet.
 pub fn people(
     config: crate::agent_auth::people::PeopleConfig,
     pool: PgPool,
     profile: &crucible::deploy::DeployProfile,
-) -> crate::agent_auth::people::People {
+) -> anyhow::Result<crate::agent_auth::people::People> {
+    use crate::agent_auth::people::{cimd::Cimd, clients::Clients};
     let directory = std::sync::Arc::new(ControllerDirectory::new(pool.clone(), profile));
-    crate::agent_auth::people::People {
+    let cimd = config
+        .cimd
+        .clone()
+        .map(|policy| Cimd::new(policy, reqwest::Client::builder()))
+        .transpose()?;
+    Ok(crate::agent_auth::people::People {
+        clients: Clients::new(config.clients.clone(), cimd),
         config,
         grants: std::sync::Arc::new(crate::agent_auth::people::grants::PgGrantStore::new(pool)),
         subjects: directory.clone(),
         links: directory,
-    }
+    })
 }

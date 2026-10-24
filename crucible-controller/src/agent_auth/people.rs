@@ -1,5 +1,6 @@
-//! People's access tokens: RFC 6749 authorization code with RFC 7636 PKCE (S256 only) for one
-//! pre-registered public client, `claude-code`, on top of the controller's own browser login.
+//! People's access tokens: RFC 6749 authorization code with RFC 7636 PKCE (S256 only) for public
+//! clients ([`clients`]: registered ones, and metadata document ones when enabled), on top of the
+//! controller's own browser login.
 //!
 //! ```text
 //!  MCP client ──GET /oauth/authorize──▶ session? ──no──▶ /auth/login?rd=… ──▶ upstream OIDC
@@ -8,19 +9,26 @@
 //!                       303 /consent?id=… (SPA: links the cluster username when none is known)
 //!  browser ──POST /api/oauth/consent──▶ code: single use, 60 s, bound to client, redirect,
 //!                                        challenge, resource and login
-//!          ◀── {redirect_url: http://localhost:<port>/callback?code&state&iss}
+//!          ◀── {redirect_url: <the client's registered redirect>?code&state&iss}
 //!  MCP client ──POST /oauth/token (code, verifier)──▶ ES256: sub=login, aud=resource, kube_user
-//!             ──POST /oauth/token (refresh_token)──▶ rotated; reuse revokes the approval
+//!             ──POST /oauth/token (refresh_token)──▶ rotated; reuse, or another client presenting
+//!                                                     it, revokes the approval
 //! ```
 //!
 //! Codes and refresh tokens live in Postgres ([`grants`]), so any replica redeems what another
 //! issued. Every refresh re-reads the person and their cluster username.
 
+pub mod cimd;
+pub mod clients;
 pub mod directory;
 pub mod grants;
 
 use crate::agent_auth::AgentAuth;
 use crate::agent_auth::issuer::{AUTHORIZE_PATH, AgentIssuer, MintError, token_id};
+use crate::agent_auth::people::cimd::{CIMD_HOSTS_ENV, CimdConfigError, CimdPolicy};
+use crate::agent_auth::people::clients::{
+    CLIENTS_FILE_ENV, Client, ClientId, Clients, RedirectUri, RegistryError,
+};
 use crate::identity::api_key::constant_time_eq;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
@@ -30,12 +38,10 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use tower_sessions::Session;
 use url::Url;
 
-pub const CLIENT_ID: &str = "claude-code";
 pub const CODE_TTL_SECS: u64 = 60;
 /// An access token's lifetime unless `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` says otherwise.
 pub const ACCESS_TTL_SECS: u64 = 900;
@@ -68,6 +74,10 @@ pub enum PeopleConfigError {
         "CONTROLLER_PEOPLE_ACCESS_TTL_SECS {0:?} is not a whole number of seconds from 1 to 3600"
     )]
     AccessTtl(String),
+    #[error(transparent)]
+    Clients(#[from] RegistryError),
+    #[error(transparent)]
+    Cimd(#[from] CimdConfigError),
 }
 
 /// `<cluster>:<resource url>=<scope> <scope> ...`
@@ -104,6 +114,10 @@ impl std::str::FromStr for PersonAudience {
 pub struct PeopleConfig {
     pub audiences: Vec<PersonAudience>,
     pub access_ttl_secs: u64,
+    /// The registered clients: `CONTROLLER_PEOPLE_CLIENTS_FILE`, or Claude Code, pi and Codex.
+    pub clients: Vec<Client>,
+    /// Metadata document clients, off unless `CONTROLLER_PEOPLE_CIMD_HOSTS` names hosts.
+    pub cimd: Option<CimdPolicy>,
 }
 
 impl PeopleConfig {
@@ -133,7 +147,38 @@ impl PeopleConfig {
                 .filter(|s| (1..=3600).contains(s))
                 .ok_or(PeopleConfigError::AccessTtl(raw))?;
         }
-        Ok(Some(config))
+        let file = std::env::var(CLIENTS_FILE_ENV)
+            .ok()
+            .filter(|p| !p.trim().is_empty());
+        config
+            .with_clients(
+                clients::from_file(file.as_deref().map(str::trim))?,
+                CimdPolicy::from_lookup(std::env::var(CIMD_HOSTS_ENV).ok())?,
+            )
+            .map(Some)
+    }
+
+    /// This configuration with `clients` registered and `cimd` deciding metadata document
+    /// clients, refusing a client restricted to a resource that is no audience.
+    pub fn with_clients(
+        mut self,
+        clients: Vec<Client>,
+        cimd: Option<CimdPolicy>,
+    ) -> Result<Self, PeopleConfigError> {
+        for client in &clients {
+            for resource in client.resources.iter().flatten() {
+                if self.audience(resource).is_none() {
+                    return Err(RegistryError::Resource {
+                        client: client.id.to_string(),
+                        resource: resource.clone(),
+                    }
+                    .into());
+                }
+            }
+        }
+        self.clients = clients;
+        self.cimd = cimd;
+        Ok(self)
     }
 
     pub fn from_lookup(raw: Option<String>) -> Result<Option<Self>, PeopleConfigError> {
@@ -154,62 +199,13 @@ impl PeopleConfig {
         Ok(Some(Self {
             audiences,
             access_ttl_secs: ACCESS_TTL_SECS,
+            clients: clients::builtin(),
+            cimd: None,
         }))
     }
 
     pub fn audience(&self, resource: &str) -> Option<&PersonAudience> {
         self.audiences.iter().find(|a| a.resource == resource)
-    }
-}
-
-/// A native app's loopback redirect (RFC 8252 §7.3): `http`, host `localhost`, `127.0.0.1` or
-/// `[::1]`, an explicit port, path `/callback`, nothing else, in canonical form.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LoopbackRedirect(String);
-
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
-#[error(
-    "redirect_uri {0:?} is not http://localhost, 127.0.0.1 or [::1] with an explicit port and path /callback"
-)]
-pub struct NotLoopback(String);
-
-impl LoopbackRedirect {
-    pub fn parse(raw: &str) -> Result<Self, NotLoopback> {
-        let refused = || NotLoopback(raw.to_string());
-        let url = Url::parse(raw).map_err(|_| refused())?;
-        let loopback = match url.host() {
-            Some(url::Host::Domain(d)) => d == "localhost",
-            Some(url::Host::Ipv4(ip)) => ip == Ipv4Addr::LOCALHOST,
-            Some(url::Host::Ipv6(ip)) => ip == Ipv6Addr::LOCALHOST,
-            None => false,
-        };
-        let ok = url.scheme() == "http"
-            && loopback
-            && url.port().is_some_and(|p| p != 0)
-            && url.path() == "/callback"
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.as_str() == raw;
-        match ok {
-            true => Ok(Self(raw.to_string())),
-            false => Err(refused()),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub(crate) fn with(&self, params: &[(&str, &str)]) -> String {
-        match Url::parse(&self.0) {
-            Ok(mut url) => {
-                url.query_pairs_mut().extend_pairs(params);
-                url.to_string()
-            }
-            Err(_) => self.0.clone(),
-        }
     }
 }
 
@@ -255,10 +251,14 @@ impl CodeChallenge {
     }
 }
 
-/// What a person approved: who, for which resource on which cluster, with which scopes.
+/// What a person approved: who, through which client, for which resource on which cluster, with
+/// which scopes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Approved {
     pub sub: String,
+    pub client_id: ClientId,
+    /// The client's name as the person saw it on the consent page.
+    pub client_name: String,
     pub login: String,
     /// The email the login recorded, for clusters whose usernames are emails.
     pub email: Option<String>,
@@ -270,14 +270,16 @@ pub struct Approved {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeGrant {
     pub approved: Approved,
-    pub redirect: LoopbackRedirect,
+    pub redirect: RedirectUri,
     pub challenge: CodeChallenge,
     pub expires_at: u64,
 }
 
-/// The people half of the issuer: its audiences, where grants live, and what it asks its host.
+/// The people half of the issuer: its audiences and clients, where grants live, and what it asks
+/// its host.
 pub struct People {
     pub config: PeopleConfig,
+    pub clients: Clients,
     pub grants: Arc<dyn grants::GrantStore>,
     pub subjects: Arc<dyn directory::SubjectDirectory>,
     pub links: Arc<dyn directory::LinkDirectory>,
@@ -295,7 +297,7 @@ pub fn mint(
         "iss": issuer.issuer().as_str(),
         "sub": approved.login,
         "aud": approved.resource,
-        "azp": CLIENT_ID,
+        "azp": approved.client_id.as_str(),
         "iat": now,
         "nbf": now,
         "exp": now.saturating_add(ttl_secs),
@@ -332,7 +334,10 @@ struct AuthorizeQuery {
 /// A validated authorization request, parked on the session until the person decides.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorizeRequest {
-    pub redirect: LoopbackRedirect,
+    pub client_id: ClientId,
+    /// The registry's name for the client, or the `client_name` its metadata document gives.
+    pub client_name: String,
+    pub redirect: RedirectUri,
     pub state: String,
     pub challenge: CodeChallenge,
     pub resource: String,
@@ -346,27 +351,28 @@ pub struct AuthorizeRequest {
 pub enum AuthorizeError {
     Page(String),
     Redirect {
-        redirect: LoopbackRedirect,
+        redirect: RedirectUri,
         state: Option<String>,
         error: &'static str,
         description: String,
     },
 }
 
-/// Check an authorization request against the one client and the configured audiences.
-pub fn validate(
+/// Check an authorization request against its client and the configured audiences. A client that
+/// is not one people may use, or a redirect it did not register, is never redirected to.
+pub async fn validate(
     config: &PeopleConfig,
+    clients: &Clients,
     params: Map<String, Value>,
 ) -> Result<AuthorizeRequest, AuthorizeError> {
     let q: AuthorizeQuery = serde_json::from_value(Value::Object(params))
         .map_err(|e| AuthorizeError::Page(format!("malformed authorization request: {e}")))?;
-    if q.client_id.as_deref() != Some(CLIENT_ID) {
-        return Err(AuthorizeError::Page(format!(
-            "unknown client_id {:?}; the only client is {CLIENT_ID}",
-            q.client_id.unwrap_or_default()
-        )));
-    }
-    let redirect = LoopbackRedirect::parse(q.redirect_uri.as_deref().unwrap_or_default())
+    let client = clients
+        .resolve(q.client_id.as_deref().unwrap_or_default())
+        .await
+        .map_err(|e| AuthorizeError::Page(e.to_string()))?;
+    let redirect = client
+        .redirect(q.redirect_uri.as_deref().unwrap_or_default())
         .map_err(|e| AuthorizeError::Page(e.to_string()))?;
     let state = q.state.clone();
     let back = |error: &'static str, description: String| AuthorizeError::Redirect {
@@ -399,12 +405,18 @@ pub fn validate(
     let challenge = CodeChallenge::parse(q.code_challenge.as_deref().unwrap_or_default())
         .map_err(|e| back("invalid_request", e.to_string()))?;
     let resource = q.resource.unwrap_or_default();
-    let audience = config.audience(&resource).ok_or_else(|| {
-        back(
-            "invalid_target",
-            format!("resource {resource:?} is not one this issuer mints tokens for"),
-        )
-    })?;
+    let audience = config
+        .audience(&resource)
+        .filter(|a| client.allows_resource(&a.resource))
+        .ok_or_else(|| {
+            back(
+                "invalid_target",
+                format!(
+                    "resource {resource:?} is not one this issuer mints tokens for to {}",
+                    client.id
+                ),
+            )
+        })?;
     let unknown: Vec<&str> = q
         .scope
         .as_deref()
@@ -419,6 +431,8 @@ pub fn validate(
         ));
     }
     Ok(AuthorizeRequest {
+        client_id: client.id,
+        client_name: client.name,
         redirect,
         state,
         challenge,
@@ -489,7 +503,7 @@ fn refused_page(why: &str) -> Response {
 }
 
 fn redirect_error(
-    redirect: &LoopbackRedirect,
+    redirect: &RedirectUri,
     state: Option<&str>,
     issuer: &str,
     error: &str,
@@ -537,10 +551,11 @@ async fn authorize(
         return refused_page("this controller issues no tokens to people");
     };
     let issuer = auth.issuer.issuer().as_str();
-    let request = match single_valued(pairs)
-        .map_err(AuthorizeError::Page)
-        .and_then(|params| validate(&people.config, params))
-    {
+    let validated = match single_valued(pairs) {
+        Ok(params) => validate(&people.config, &people.clients, params).await,
+        Err(why) => Err(AuthorizeError::Page(why)),
+    };
+    let request = match validated {
         Ok(request) => request,
         Err(AuthorizeError::Page(why)) => {
             tracing::info!(reason = why, "authorization request refused");
@@ -665,13 +680,11 @@ fn parse<T: serde::de::DeserializeOwned>(fields: Map<String, Value>) -> Result<T
         .map_err(|e| TokenError::InvalidRequest(e.to_string()))
 }
 
-fn client(client_id: &str) -> Result<(), TokenError> {
-    match client_id == CLIENT_ID {
-        true => Ok(()),
-        false => Err(TokenError::InvalidClient(format!(
-            "client_id {client_id:?} is not {CLIENT_ID}"
-        ))),
-    }
+fn client(people: &People, client_id: &str) -> Result<ClientId, TokenError> {
+    people
+        .clients
+        .admits(client_id)
+        .map_err(|e| TokenError::InvalidClient(e.to_string()))
 }
 
 fn same_resource(requested: Option<&str>, granted: &str) -> Result<(), TokenError> {
@@ -687,7 +700,9 @@ impl From<grants::GrantError> for TokenError {
     fn from(e: grants::GrantError) -> Self {
         use grants::GrantError as G;
         match e {
-            G::Unknown | G::Expired | G::Reused | G::Revoked => Self::InvalidGrant(e.to_string()),
+            G::Unknown | G::Expired | G::Reused | G::Revoked | G::WrongClient { .. } => {
+                Self::InvalidGrant(e.to_string())
+            }
             G::Random | G::Clock(_) | G::Store(_) => Self::Server(format!("{e:#}")),
         }
     }
@@ -701,8 +716,14 @@ pub(crate) async fn redeem_code(
     now: u64,
 ) -> Result<Response, TokenError> {
     let req: CodeRequest = parse(fields)?;
-    client(&req.client_id)?;
+    let client = client(people, &req.client_id)?;
     let grant = people.grants.redeem_code(&req.code, now).await?;
+    if grant.approved.client_id != client {
+        return Err(TokenError::InvalidGrant(format!(
+            "the code was issued to client {}, not {client}",
+            grant.approved.client_id
+        )));
+    }
     if grant.redirect.as_str() != req.redirect_uri {
         return Err(TokenError::InvalidGrant(format!(
             "redirect_uri {:?} is not the one the code was issued to",
@@ -728,8 +749,9 @@ pub(crate) async fn redeem_code(
 }
 
 /// `grant_type=refresh_token`, rotating: the presented token is spent and the next one returned.
-/// The person is read again, so a deleted or refused account, a narrowed approval, or a changed
-/// cluster username takes effect here; any of those revokes the approval.
+/// A token presented by a client other than the one it was issued to revokes the approval. The
+/// person is read again, so a deleted or refused account, a narrowed approval, or a changed cluster
+/// username takes effect here; any of those revokes the approval.
 pub(crate) async fn redeem_refresh(
     auth: &AgentAuth,
     people: &People,
@@ -737,10 +759,10 @@ pub(crate) async fn redeem_refresh(
     now: u64,
 ) -> Result<Response, TokenError> {
     let req: RefreshRequest = parse(fields)?;
-    client(&req.client_id)?;
+    let client = client(people, &req.client_id)?;
     let (family, next) = people
         .grants
-        .rotate_refresh(&req.refresh_token, now)
+        .rotate_refresh(&req.refresh_token, &client, now)
         .await?;
     let refused = |why: String| async move {
         if let Err(e) = people.grants.revoke_family(&family.id, now).await {
@@ -749,6 +771,13 @@ pub(crate) async fn redeem_refresh(
         Err(TokenError::InvalidGrant(why))
     };
     same_resource(req.resource.as_deref(), &family.resource)?;
+    if !people.clients.allows_resource(&client, &family.resource) {
+        return refused(format!(
+            "client {client} may no longer hold tokens for {}",
+            family.resource
+        ))
+        .await;
+    }
     if let Some(scope) = req.scope.as_deref() {
         let wider: Vec<&str> = scope
             .split_whitespace()
@@ -770,6 +799,8 @@ pub(crate) async fn redeem_refresh(
     };
     let approved = Approved {
         sub: family.sub.clone(),
+        client_id: family.client_id.clone(),
+        client_name: family.client_name.clone(),
         login,
         email,
         resource: family.resource.clone(),
@@ -842,6 +873,7 @@ fn token_response(
 ) -> Response {
     tracing::info!(
         grant,
+        client_id = approved.client_id.as_str(),
         sub = approved.login,
         kube_user,
         cluster = approved.cluster,
@@ -864,6 +896,9 @@ fn token_response(
 
 #[cfg(test)]
 mod tests {
+    use crate::agent_auth::people::cimd::testing::{DOC_HOST, DocServer, OTHER_HOST, document};
+    use crate::agent_auth::people::cimd::{Cimd, CimdLimits, CimdPolicy};
+    use crate::agent_auth::people::clients::{CLAUDE_CODE, CODEX, PI, builtin};
     use crate::agent_auth::people::*;
     use crate::agent_auth::testing::{self, ISSUER, Spire};
     use crate::identity::kube_links::LinkSource;
@@ -878,7 +913,10 @@ mod tests {
     const PIRATE_KUEUE: &str = "https://crucible-kueue.apps.pirate.example/mcp";
     const EAST_KUEUE: &str = "https://crucible-kueue.apps.east.example/mcp";
     const WALDORF_KUEUE: &str = "http://localhost:8852/mcp";
+    const CLIENT_ID: &str = CLAUDE_CODE;
     const REDIRECT: &str = "http://localhost:8765/callback";
+    const PI_REDIRECT: &str = "http://127.0.0.1:8765/callback";
+    const CODEX_REDIRECT: &str = "http://127.0.0.1:51234/callback/3q2-7wAAAAAA";
     /// RFC 7636 appendix B.
     const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
@@ -891,6 +929,10 @@ mod tests {
         )))
         .unwrap()
         .unwrap()
+    }
+
+    fn clients() -> Clients {
+        Clients::new(builtin(), None)
     }
 
     fn params(pairs: &[(&str, &str)]) -> Map<String, Value> {
@@ -936,46 +978,6 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("&")
-    }
-
-    #[test]
-    fn only_canonical_loopback_callbacks_are_redirect_targets() {
-        for good in [
-            "http://localhost:8765/callback",
-            "http://127.0.0.1:49152/callback",
-            "http://[::1]:8765/callback",
-        ] {
-            assert_eq!(
-                LoopbackRedirect::parse(good).map(|r| r.as_str().to_string()),
-                Ok(good.to_string())
-            );
-        }
-        for bad in [
-            "https://localhost:8765/callback",
-            "http://localhost/callback",
-            "http://localhost:80/callback",
-            "http://localhost:0/callback",
-            "http://localhost:8765/",
-            "http://localhost:8765/callback/",
-            "http://localhost:8765/Callback",
-            "http://localhost:8765/x/../callback",
-            "http://localhost:8765/callback?x=1",
-            "http://localhost:8765/callback#f",
-            "http://user@localhost:8765/callback",
-            "http://LOCALHOST:8765/callback",
-            "http://localhost.evil.example:8765/callback",
-            "http://127.0.0.2:8765/callback",
-            "http://0.0.0.0:8765/callback",
-            "http://[::ffff:127.0.0.1]:8765/callback",
-            "http://evil.example/callback",
-            "custom-scheme://callback",
-            "",
-        ] {
-            assert!(
-                LoopbackRedirect::parse(bad).is_err(),
-                "{bad:?} must be refused"
-            );
-        }
     }
 
     #[test]
@@ -1032,10 +1034,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_valid_request_names_its_audience_cluster_and_every_scope_it_offers() {
+    #[tokio::test]
+    async fn a_valid_request_names_its_client_audience_cluster_and_every_scope_it_offers() {
         let r = validate(
             &config(),
+            &clients(),
             params(&[
                 ("response_type", "code"),
                 ("client_id", CLIENT_ID),
@@ -1048,24 +1051,30 @@ mod tests {
                 ("prompt", "consent"),
             ]),
         )
+        .await
         .unwrap();
+        assert_eq!(r.client_id.as_str(), CLAUDE_CODE);
+        assert_eq!(r.client_name, "Claude Code");
         assert_eq!(r.cluster, "pirate");
         assert_eq!(r.resource, PIRATE_KUEUE);
         assert_eq!(r.scopes, ["kueue.read", "kueue.submit"]);
         assert_eq!(r.state, "st-1");
     }
 
-    #[test]
-    fn bad_clients_and_redirects_are_shown_to_the_browser_never_redirected() {
+    #[tokio::test]
+    async fn bad_clients_and_redirects_are_shown_to_the_browser_never_redirected() {
         for edit in [
             ("client_id", "someone-else"),
             ("client_id", ""),
+            ("client_id", "https://chatgpt.com/oauth/codex/client.json"),
             ("redirect_uri", "https://evil.example/callback"),
             ("redirect_uri", "http://localhost:8765/other"),
+            ("redirect_uri", PI_REDIRECT),
+            ("redirect_uri", "http://localhost:8765/callback#frag"),
             ("redirect_uri", ""),
         ] {
             let pairs = request(&[edit]);
-            let got = validate(&config(), single_valued(pairs).unwrap());
+            let got = validate(&config(), &clients(), single_valued(pairs).unwrap()).await;
             assert!(
                 matches!(got, Err(AuthorizeError::Page(_))),
                 "{edit:?}: {got:?}"
@@ -1073,8 +1082,78 @@ mod tests {
         }
     }
 
-    #[test]
-    fn other_refusals_go_back_to_the_client_with_its_state() {
+    /// Each built-in client is held to the callback it actually sends, and borrowing another
+    /// client's id does not borrow its redirect.
+    #[tokio::test]
+    async fn each_builtin_client_is_held_to_its_own_redirect() {
+        for (client, good, bad) in [
+            (CLAUDE_CODE, REDIRECT, PI_REDIRECT),
+            (PI, PI_REDIRECT, REDIRECT),
+            (
+                CODEX,
+                CODEX_REDIRECT,
+                "http://localhost:51234/callback/3q2-7wAAAAAA",
+            ),
+            (CODEX, PI_REDIRECT, "http://127.0.0.1:51234/callback/a/b"),
+        ] {
+            let ok = validate(
+                &config(),
+                &clients(),
+                single_valued(request(&[("client_id", client), ("redirect_uri", good)])).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (ok.client_id.as_str(), ok.redirect.as_str()),
+                (client, good)
+            );
+            let refused = validate(
+                &config(),
+                &clients(),
+                single_valued(request(&[("client_id", client), ("redirect_uri", bad)])).unwrap(),
+            )
+            .await;
+            assert!(
+                matches!(refused, Err(AuthorizeError::Page(ref why)) if why.contains(client)),
+                "{client} {bad}: {refused:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_client_restricted_to_some_resources_is_refused_the_others() {
+        let mut registry = builtin();
+        registry[1].resources = Some(vec![EAST_KUEUE.into()]);
+        let cfg = config().with_clients(registry.clone(), None).unwrap();
+        let restricted = Clients::new(registry, None);
+        let ask = |resource| {
+            single_valued(request(&[
+                ("client_id", PI),
+                ("redirect_uri", PI_REDIRECT),
+                ("resource", resource),
+            ]))
+            .unwrap()
+        };
+        assert!(validate(&cfg, &restricted, ask(EAST_KUEUE)).await.is_ok());
+        assert!(matches!(
+            validate(&cfg, &restricted, ask(PIRATE_KUEUE)).await,
+            Err(AuthorizeError::Redirect {
+                error: "invalid_target",
+                ..
+            })
+        ));
+        let mut bad = builtin();
+        bad[0].resources = Some(vec!["https://nowhere.example/mcp".into()]);
+        assert!(matches!(
+            config().with_clients(bad, None),
+            Err(PeopleConfigError::Clients(
+                crate::agent_auth::people::clients::RegistryError::Resource { .. }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn other_refusals_go_back_to_the_client_with_its_state() {
         for (edit, want) in [
             (("resource", "https://other.example/mcp"), "invalid_target"),
             (("resource", ""), "invalid_target"),
@@ -1088,7 +1167,13 @@ mod tests {
             (("code_challenge", "short"), "invalid_request"),
             (("scope", "kueue.read buildit.build"), "invalid_scope"),
         ] {
-            match validate(&config(), single_valued(request(&[edit])).unwrap()) {
+            match validate(
+                &config(),
+                &clients(),
+                single_valued(request(&[edit])).unwrap(),
+            )
+            .await
+            {
                 Err(AuthorizeError::Redirect {
                     error,
                     state,
@@ -1107,8 +1192,10 @@ mod tests {
             assert!(matches!(
                 validate(
                     &config(),
+                    &clients(),
                     single_valued(request(&[("state", state)])).unwrap()
-                ),
+                )
+                .await,
                 Err(AuthorizeError::Redirect {
                     error: "invalid_request",
                     ..
@@ -1127,6 +1214,8 @@ mod tests {
     fn approved(resource: &str, cluster: &str) -> Approved {
         Approved {
             sub: SUB.into(),
+            client_id: ClientId::parse(CLIENT_ID).unwrap(),
+            client_name: "Claude Code".into(),
             login: "jordan".into(),
             email: Some("casey@example.com".into()),
             resource: resource.into(),
@@ -1138,7 +1227,7 @@ mod tests {
     fn code_grant(expires_at: u64) -> CodeGrant {
         CodeGrant {
             approved: approved(PIRATE_KUEUE, "pirate"),
-            redirect: LoopbackRedirect::parse(REDIRECT).unwrap(),
+            redirect: builtin()[0].redirect(REDIRECT).unwrap(),
             challenge: CodeChallenge::parse(CHALLENGE).unwrap(),
             expires_at,
         }
@@ -1166,6 +1255,11 @@ mod tests {
     }
 
     async fn harness(pool: &PgPool) -> Harness {
+        harness_with(pool, None).await
+    }
+
+    /// The harness, resolving metadata document clients with `cimd` when given.
+    async fn harness_with(pool: &PgPool, cimd: Option<Cimd>) -> Harness {
         let spire = Spire::start().await;
         let profile = format!(
             r#"{}
@@ -1185,11 +1279,10 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             panic!("the harness holds the only reference");
         };
         let loaded: crucible::deploy::DeployProfile = toml::from_str(&profile).unwrap();
-        auth.people = Some(crate::identity::people_directory::people(
-            config(),
-            pool.clone(),
-            &loaded,
-        ));
+        let mut people =
+            crate::identity::people_directory::people(config(), pool.clone(), &loaded).unwrap();
+        people.clients = Clients::new(builtin(), cimd);
+        auth.people = Some(people);
         let auth = Arc::new(auth);
         crate::identity::oidc::users::record_login(
             pool,
@@ -2008,13 +2101,361 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             json!(["private_key_jwt", "none"])
         );
         assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
+        for absent in [
+            "registration_endpoint",
+            "client_id_metadata_document_supported",
+        ] {
+            assert!(doc.get(absent).is_none(), "{absent}: {doc}");
+        }
         let agents_only = serde_json::to_value(h.auth.issuer.metadata(None)).unwrap();
         for absent in [
             "authorization_endpoint",
             "code_challenge_methods_supported",
             "authorization_response_iss_parameter_supported",
+            "client_id_metadata_document_supported",
         ] {
             assert!(agents_only.get(absent).is_none(), "{absent}");
         }
+    }
+
+    async fn sign_in_as(
+        h: &Harness,
+        cookie: &str,
+        client: &str,
+        redirect: &str,
+    ) -> (StatusCode, Value) {
+        let id = consent_id(
+            &h.app,
+            &authorize_uri(&[
+                ("client_id", client),
+                ("redirect_uri", redirect),
+                ("resource", EAST_KUEUE),
+            ]),
+            cookie,
+        )
+        .await;
+        let location = redirect_of(&decide_as(&h.app, Some(cookie), &id, "approve").await);
+        assert!(location.starts_with(&format!("{redirect}?")), "{location}");
+        let code = query_of(&location)["code"].clone();
+        token(
+            &h.app,
+            &[
+                ("grant_type", "authorization_code"),
+                ("code", &code),
+                ("redirect_uri", redirect),
+                ("client_id", client),
+                ("code_verifier", VERIFIER),
+            ],
+        )
+        .await
+    }
+
+    async fn refresh_as(app: &axum::Router, client: &str, refresh: &Value) -> (StatusCode, Value) {
+        token(
+            app,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh.as_str().unwrap()),
+                ("client_id", client),
+            ],
+        )
+        .await
+    }
+
+    async fn consent_of(h: &Harness, cookie: &str, uri: &str) -> Value {
+        let id = consent_id(&h.app, uri, cookie).await;
+        let read = send(
+            &h.app,
+            get(&format!("/api/oauth/consent?id={id}"), Some(cookie)),
+        )
+        .await;
+        assert_eq!(read.status, StatusCode::OK, "{}", read.body);
+        serde_json::from_str(&read.body).unwrap()
+    }
+
+    /// Claude Code, pi and Codex each sign in under their own id, with the callback each really
+    /// sends; the consent page names them, the token's `azp` is theirs, and each refreshes as itself.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn each_builtin_client_signs_in_as_itself(pool: PgPool) {
+        let h = harness(&pool).await;
+        let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
+        for (client, name, redirect) in [
+            (CLAUDE_CODE, "Claude Code", REDIRECT),
+            (PI, "pi", PI_REDIRECT),
+            (CODEX, "Codex", CODEX_REDIRECT),
+        ] {
+            let consent = consent_of(
+                &h,
+                &cookie,
+                &authorize_uri(&[
+                    ("client_id", client),
+                    ("redirect_uri", redirect),
+                    ("resource", EAST_KUEUE),
+                ]),
+            )
+            .await;
+            assert_eq!(consent["client_id"], client);
+            assert_eq!(consent["client_name"], name);
+            assert_eq!(consent["client_host"], Value::Null);
+
+            let (status, body) = sign_in_as(&h, &cookie, client, redirect).await;
+            assert_eq!(status, StatusCode::OK, "{client}: {body}");
+            let claims = claims_of(&h.auth, body["access_token"].as_str().unwrap(), EAST_KUEUE);
+            assert_eq!(claims["azp"], client);
+            let (status, next) = refresh_as(&h.app, client, &body["refresh_token"]).await;
+            assert_eq!(status, StatusCode::OK, "{client}: {next}");
+            let claims = claims_of(&h.auth, next["access_token"].as_str().unwrap(), EAST_KUEUE);
+            assert_eq!(claims["azp"], client);
+        }
+        let listed: Value =
+            serde_json::from_str(&send(&h.app, get("/api/me/mcp-sign-ins", None)).await.body)
+                .unwrap();
+        let mut names: Vec<&str> = listed["sign_ins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["client_name"].as_str().unwrap())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names, ["Claude Code", "Codex", "pi"]);
+    }
+
+    /// A code is bound to the client it was issued to: another registered client redeeming it is
+    /// refused, and the attempt spends the code.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_code_redeems_only_for_the_client_it_was_issued_to(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let redeem = |client: &'static str| {
+            let app = h.app.clone();
+            let code = code.clone();
+            async move {
+                token(
+                    &app,
+                    &[
+                        ("grant_type", "authorization_code"),
+                        ("code", &code),
+                        ("redirect_uri", REDIRECT),
+                        ("client_id", client),
+                        ("code_verifier", VERIFIER),
+                    ],
+                )
+                .await
+            }
+        };
+        let (status, body) = redeem(PI).await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::BAD_REQUEST, Some("invalid_grant")),
+            "{body}"
+        );
+        assert!(
+            refused(&redeem(CLAUDE_CODE).await),
+            "the cross-client try spent it"
+        );
+    }
+
+    /// A refresh token presented by another client revokes the approval: the rightful client's
+    /// token dies with it.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refresh_token_presented_by_another_client_revokes_the_approval(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (_, first) = code_exchange(&h.app, &code).await;
+        let (status, second) = refreshed(&h.app, &first["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert!(refused(
+            &refresh_as(&h.app, CODEX, &second["refresh_token"]).await
+        ));
+        assert!(
+            refused(&refreshed(&h.app, &second["refresh_token"]).await),
+            "the approval is gone for its own client too"
+        );
+        let unknown = refresh_as(&h.app, "someone-else", &second["refresh_token"]).await;
+        assert_eq!(
+            (unknown.0, unknown.1["error"].as_str()),
+            (StatusCode::UNAUTHORIZED, Some("invalid_client"))
+        );
+    }
+
+    /// Settings signs one client out and leaves the others signed in.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn signing_one_client_out_leaves_the_others(pool: PgPool) {
+        let h = harness(&pool).await;
+        let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
+        let (_, claude) = sign_in_as(&h, &cookie, CLAUDE_CODE, REDIRECT).await;
+        let (_, codex) = sign_in_as(&h, &cookie, CODEX, CODEX_REDIRECT).await;
+        let (_, codex_again) = sign_in_as(&h, &cookie, CODEX, PI_REDIRECT).await;
+        let delete = |query: &str| {
+            Request::delete(format!("/api/me/mcp-sign-ins{query}"))
+                .header("sec-fetch-site", "same-origin")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let out = send(&h.app, delete("?client_id=codex")).await;
+        assert_eq!(out.status, StatusCode::OK, "{}", out.body);
+        assert_eq!(
+            serde_json::from_str::<Value>(&out.body).unwrap()["revoked"],
+            2
+        );
+        assert!(refused(
+            &refresh_as(&h.app, CODEX, &codex["refresh_token"]).await
+        ));
+        assert!(refused(
+            &refresh_as(&h.app, CODEX, &codex_again["refresh_token"]).await
+        ));
+        let (status, _) = refresh_as(&h.app, CLAUDE_CODE, &claude["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "claude-code stays signed in");
+        let listed: Value =
+            serde_json::from_str(&send(&h.app, get("/api/me/mcp-sign-ins", None)).await.body)
+                .unwrap();
+        let clients: Vec<&str> = listed["sign_ins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["client_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(clients, [CLAUDE_CODE]);
+        let again = send(&h.app, delete("?client_id=codex")).await;
+        assert_eq!(
+            serde_json::from_str::<Value>(&again.body).unwrap()["revoked"],
+            0
+        );
+        let bad = send(&h.app, delete("?client_id=not%20an%20id")).await;
+        assert_eq!(bad.status, StatusCode::BAD_REQUEST, "{}", bad.body);
+    }
+
+    fn cimd_policy(hosts: &[&str]) -> CimdPolicy {
+        CimdPolicy {
+            hosts: hosts.iter().map(|h| h.to_string()).collect(),
+            limits: CimdLimits {
+                timeout: std::time::Duration::from_millis(500),
+                ..CimdLimits::default()
+            },
+        }
+    }
+
+    /// Publishes `/desk.json`, a public client of its own URL, and `/liar.json`, which names
+    /// `/desk.json` as its client_id.
+    async fn doc_server() -> DocServer {
+        let port = Arc::new(std::sync::OnceLock::<u16>::new());
+        let serve = |named: &'static str| {
+            let port = port.clone();
+            axum::routing::get(move || {
+                let port = port.get().copied().unwrap_or_default();
+                async move {
+                    let url = format!("https://{DOC_HOST}:{port}{named}");
+                    axum::Json(document(&url, "Desk Agent")).into_response()
+                }
+            })
+        };
+        let app = axum::Router::new()
+            .route("/desk.json", serve("/desk.json"))
+            .route("/liar.json", serve("/desk.json"));
+        let server = DocServer::start(app).await;
+        port.set(server.addr.port()).unwrap();
+        server
+    }
+
+    /// With metadata documents on, an allowlisted URL client signs in under its URL: the consent
+    /// page names it and the host that published it, the token's `azp` is the URL, and it refreshes
+    /// as itself. Another host, or a document naming another URL, is refused before any consent.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_metadata_document_client_signs_in_under_its_url(pool: PgPool) {
+        let docs = doc_server().await;
+        let cimd = Cimd::new(cimd_policy(&[DOC_HOST]), docs.builder()).unwrap();
+        let h = harness_with(&pool, Some(cimd)).await;
+        let meta: Value = serde_json::from_str(
+            &send(&h.app, get(crate::agent_auth::issuer::METADATA_PATH, None))
+                .await
+                .body,
+        )
+        .unwrap();
+        assert_eq!(meta["client_id_metadata_document_supported"], true);
+        assert!(meta.get("registration_endpoint").is_none());
+
+        let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
+        let desk = docs.url(DOC_HOST, "/desk.json");
+        let consent = consent_of(
+            &h,
+            &cookie,
+            &authorize_uri(&[
+                ("client_id", &desk),
+                ("redirect_uri", PI_REDIRECT),
+                ("resource", EAST_KUEUE),
+            ]),
+        )
+        .await;
+        assert_eq!(consent["client_id"], desk.as_str());
+        assert_eq!(consent["client_name"], "Desk Agent");
+        assert_eq!(consent["client_host"], DOC_HOST);
+
+        let (status, body) =
+            sign_in_as(&h, &cookie, &desk, "http://localhost:40001/callback").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claims = claims_of(&h.auth, body["access_token"].as_str().unwrap(), EAST_KUEUE);
+        assert_eq!(claims["azp"], desk.as_str());
+        let (status, next) = refresh_as(&h.app, &desk, &body["refresh_token"]).await;
+        assert_eq!(status, StatusCode::OK, "{next}");
+        assert!(refused(
+            &refresh_as(&h.app, CLAUDE_CODE, &next["refresh_token"]).await
+        ));
+
+        for (client, why) in [
+            (docs.url(OTHER_HOST, "/desk.json"), "is not on"),
+            (docs.url(DOC_HOST, "/liar.json"), "not its own URL"),
+            (docs.url(DOC_HOST, "/gone.json"), "answered 404"),
+        ] {
+            let page = send(
+                &h.app,
+                get(
+                    &authorize_uri(&[("client_id", &client), ("redirect_uri", PI_REDIRECT)]),
+                    Some(&cookie),
+                ),
+            )
+            .await;
+            assert_eq!(page.status, StatusCode::BAD_REQUEST, "{client}");
+            assert!(page.body.contains(why), "{client}: {}", page.body);
+        }
+        let wrong_redirect = send(
+            &h.app,
+            get(
+                &authorize_uri(&[("client_id", &desk), ("redirect_uri", CODEX_REDIRECT)]),
+                Some(&cookie),
+            ),
+        )
+        .await;
+        assert_eq!(wrong_redirect.status, StatusCode::BAD_REQUEST);
+    }
+
+    /// With metadata documents off (the default) a URL client_id is refused at authorize and at
+    /// the token endpoint, and nothing is fetched.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn without_metadata_documents_a_url_client_is_refused(pool: PgPool) {
+        let h = harness(&pool).await;
+        let url = "https://chatgpt.com/oauth/codex/client.json";
+        let page = send(
+            &h.app,
+            get(
+                &authorize_uri(&[("client_id", url), ("redirect_uri", PI_REDIRECT)]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(page.status, StatusCode::BAD_REQUEST);
+        assert!(page.body.contains("accepts none"), "{}", page.body);
+        let (status, body) = token(
+            &h.app,
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", "anything"),
+                ("client_id", url),
+            ],
+        )
+        .await;
+        assert_eq!(
+            (status, body["error"].as_str()),
+            (StatusCode::UNAUTHORIZED, Some("invalid_client"))
+        );
     }
 }

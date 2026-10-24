@@ -620,7 +620,18 @@ pub struct AuthorizationServerMetadata {
     pub token_endpoint_auth_signing_alg_values_supported: Vec<Algorithm>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub authorization_response_iss_parameter_supported: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub client_id_metadata_document_supported: bool,
     pub scopes_supported: Vec<String>,
+}
+
+/// What the people grant adds to the metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeopleMetadata {
+    /// Every scope a person's token may carry.
+    pub scopes: Vec<String>,
+    /// Whether an https `client_id` is resolved as a Client ID Metadata Document.
+    pub client_id_metadata_documents: bool,
 }
 
 /// A fresh random `jti`.
@@ -809,11 +820,12 @@ impl AgentIssuer {
         }
     }
 
-    /// The metadata document; `people`, the scopes people's tokens may carry, adds the
-    /// authorization code grant for people's clients.
-    pub fn metadata(&self, people: Option<&[String]>) -> AuthorizationServerMetadata {
+    /// The metadata document; `people` adds the authorization code grant for people's clients.
+    /// No registration endpoint is ever advertised: clients are registered by the operator or
+    /// publish a metadata document.
+    pub fn metadata(&self, people: Option<&PeopleMetadata>) -> AuthorizationServerMetadata {
         let mut scopes_supported = Vec::new();
-        let people_scopes = people.into_iter().flatten();
+        let people_scopes = people.into_iter().flat_map(|p| p.scopes.iter());
         for scope in self
             .audiences
             .iter()
@@ -835,6 +847,7 @@ impl AgentIssuer {
             token_endpoint_auth_methods_supported: Vec::new(),
             token_endpoint_auth_signing_alg_values_supported: Vec::new(),
             authorization_response_iss_parameter_supported: false,
+            client_id_metadata_document_supported: false,
             scopes_supported,
         };
         if self.serves_agents() {
@@ -845,7 +858,8 @@ impl AgentIssuer {
             metadata.token_endpoint_auth_signing_alg_values_supported =
                 crucible_mcp_auth::verify::ACCEPTED_ALGORITHMS.to_vec();
         }
-        if people.is_some() {
+        if let Some(people) = people {
+            metadata.client_id_metadata_document_supported = people.client_id_metadata_documents;
             metadata.authorization_endpoint = Some(self.issuer.endpoint(AUTHORIZE_PATH));
             metadata
                 .grant_types_supported
@@ -1614,7 +1628,10 @@ mod tests {
         )))
         .unwrap()
         .unwrap();
-        let doc = issuer.metadata(Some(&people.scopes()));
+        let doc = issuer.metadata(Some(&PeopleMetadata {
+            scopes: people.scopes(),
+            client_id_metadata_documents: false,
+        }));
         assert_eq!(
             doc.grant_types_supported,
             ["authorization_code", "refresh_token"]
