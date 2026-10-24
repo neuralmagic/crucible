@@ -1347,8 +1347,9 @@ The reviewer (`crucible-mcp-auth/src/kube.rs`) builds a SubjectAccessReview with
 
 The server serves the namespaces in `--namespace`, else every namespace that holds a LocalQueue.
 A caller can use a served namespace when its RBAC lets it list LocalQueues there
-(`crucible-kueue/src/namespaces.rs:87
-92`). Every tool call and both task methods resolve the
+(`crucible-kueue/src/namespaces.rs:97-115`). The answer is cached 30 seconds per identity
+(subject, `kube_user` and `kube_groups`), so a RoleBinding granted or removed shows in the usable
+list within 30 seconds; the per-call access checks are not cached. Every tool call and both task methods resolve the
 namespace they act in (the call's `namespace` argument, the token's `namespace` claim, or the task
 id's namespace) and refuse one the server does not serve with `not_found` and the list of usable
 namespaces, before anything reaches the API server (`served_caller`,

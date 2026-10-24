@@ -2125,6 +2125,7 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kube_quantity",
+ "moka",
  "reqwest",
  "rmcp",
  "rustls",

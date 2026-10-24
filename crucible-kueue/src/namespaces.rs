@@ -4,7 +4,7 @@
 
 use crate::kueue::{self, KueueVersion, LocalQueue};
 use crucible_mcp_auth::access::{AccessCheck, AccessReview};
-use crucible_mcp_auth::kube::USER_CLAIM;
+use crucible_mcp_auth::kube::{GROUPS_CLAIM, USER_CLAIM};
 use crucible_mcp_auth::principal::Principal;
 use kube::api::ListParams;
 use std::sync::Arc;
@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const DISCOVERY_TTL: Duration = Duration::from_secs(60);
+/// How long a caller's usable namespaces are reused; a new RoleBinding shows within this.
+const USABLE_TTL: Duration = Duration::from_secs(30);
 
 pub struct Namespaces {
     client: kube::Client,
@@ -19,6 +21,9 @@ pub struct Namespaces {
     configured: Vec<String>,
     reviewer: Option<Arc<dyn AccessReview>>,
     discovered: Mutex<Option<(Instant, Vec<String>)>>,
+    /// Each identity's usable namespaces, so a call that names none does not review every served
+    /// namespace again.
+    usable: moka::future::Cache<String, Vec<String>>,
 }
 
 impl Namespaces {
@@ -34,6 +39,10 @@ impl Namespaces {
             configured,
             reviewer,
             discovered: Mutex::new(None),
+            usable: moka::future::Cache::builder()
+                .max_capacity(10_000)
+                .time_to_live(USABLE_TTL)
+                .build(),
         }
     }
 
@@ -84,8 +93,24 @@ impl Namespaces {
 
     /// The served namespaces the caller may list LocalQueues in. A caller without a Kubernetes
     /// user, or a server without a reviewer, can use every served namespace.
+    /// Cached [`USABLE_TTL`] per identity (subject, user and groups).
     pub async fn usable(&self, principal: &Principal) -> Vec<String> {
-        usable(self.served().await, self.reviewer.as_deref(), principal).await
+        let reviewed = self.reviewer.is_some() && principal.claims.contains_key(USER_CLAIM);
+        if !reviewed {
+            return self.served().await;
+        }
+        let key = serde_json::json!([
+            principal.subject,
+            principal.claims.get(USER_CLAIM),
+            principal.claims.get(GROUPS_CLAIM),
+        ])
+        .to_string();
+        if let Some(hit) = self.usable.get(&key).await {
+            return hit;
+        }
+        let found = usable(self.served().await, self.reviewer.as_deref(), principal).await;
+        self.usable.insert(key, found.clone()).await;
+        found
     }
 }
 
@@ -148,6 +173,41 @@ mod tests {
         assert!(namespaces.serves("team-b").await);
         assert!(!namespaces.serves("kube-system").await);
         assert!(!namespaces.serves("team-a-other").await);
+    }
+
+    /// A reviewer that counts its reviews.
+    struct Counting(std::sync::atomic::AtomicUsize);
+
+    impl AccessReview for Counting {
+        fn review<'a>(&'a self, _: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let ok = check.namespace == "team-a";
+            Box::pin(async move { Ok(ok) })
+        }
+    }
+
+    /// One identity's usable namespaces are reviewed once and reused; another identity is
+    /// reviewed on its own.
+    #[tokio::test]
+    async fn usable_namespaces_are_reviewed_once_per_identity() {
+        crate::install_tls_provider();
+        let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
+        let client = kube::Client::try_from(config).unwrap();
+        let counting = Arc::new(Counting(Default::default()));
+        let namespaces = Namespaces::new(
+            client,
+            KueueVersion::default(),
+            vec!["team-a".into(), "team-b".into()],
+            Some(counting.clone()),
+        );
+        let alice = principal(json!({"sub": "a", "kube_user": "alice"}));
+        assert_eq!(namespaces.usable(&alice).await, ["team-a"]);
+        assert_eq!(namespaces.usable(&alice).await, ["team-a"]);
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+        namespaces
+            .usable(&principal(json!({"sub": "b", "kube_user": "bob"})))
+            .await;
+        assert_eq!(counting.0.load(std::sync::atomic::Ordering::SeqCst), 4);
     }
 
     /// RBAC that lets the caller list LocalQueues in `allowed` only.

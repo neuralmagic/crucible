@@ -31,6 +31,7 @@ sha2 = "0.10"
 toml = "0.8"
 thiserror.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+moka = { workspace = true, features = ["future"] }
 url.workspace = true
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
