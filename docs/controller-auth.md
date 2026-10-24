@@ -300,19 +300,133 @@ server accepts. The cluster's TokenReview names the owner; the token is dropped 
 | `GET /oauth/cluster-link/{cluster}/callback` | The cluster's redirect; lands on `/settings?linked=` or `?link_error=`. |
 | `DELETE /api/me/cluster-identities/{cluster}` | Unlink. |
 | `GET /api/oauth/consent?id=` | The authorization request parked on the session, for the consent page. |
-| `POST /api/oauth/consent` | Approve or deny it; answers the client's loopback redirect to navigate to. |
+| `POST /api/oauth/consent` | Approve or deny it; answers the client's redirect URI to navigate to. |
 
 API keys can read but never link or unlink.
 
+### MCP clients
+
+People sign in with public OAuth clients (no secret, PKCE S256 required). Each client has its own
+`client_id`, and every code, approval and refresh token is bound to the client it was issued to:
+redeeming a code as another client is `invalid_grant`, and presenting a refresh token as another
+client is `invalid_grant` and revokes that approval. Access tokens carry the client in `azp`.
+Without configuration, three clients are registered:
+
+| `client_id` | Name | Redirect URIs it may use |
+| --- | --- | --- |
+| `claude-code` | Claude Code | `http://localhost:<any port>/callback` |
+| `pi` | pi | `http://127.0.0.1:<any port>/callback` |
+| `codex` | Codex | `http://127.0.0.1:<any port>/callback` and `http://127.0.0.1:<any port>/callback/<server id>` |
+
+Redirect matching follows RFC 8252 §7.3. A registered `http` URI on a loopback host matches any
+port on that same host with the same path, and nothing else: no query, no fragment, no
+credentials, and the request's URI must already be in canonical form. `localhost`, `127.0.0.1` and
+`[::1]` are three different hosts. A client registered on `localhost` cannot use `127.0.0.1`, and
+the reverse. Any other registered URI must be `https` and matches only character for character.
+`http` on a host that is not a loopback host is never accepted. Codex adds a 12 character id of the
+MCP server to a pre-registered client's callback path. A registered path that ends in `/*` allows
+that one extra segment (1 to 64 of `A-Z a-z 0-9 - _`), and the built-in `codex` client uses it.
+
+To register other clients, or to change the built-in ones, point `CONTROLLER_PEOPLE_CLIENTS_FILE`
+at a TOML file. The file replaces the built-in list:
+
+```toml
+[[clients]]
+client_id = "claude-code"
+name = "Claude Code"
+redirect_uris = ["http://localhost/callback"]
+
+[[clients]]
+client_id = "codex"
+name = "Codex"
+redirect_uris = ["http://127.0.0.1/callback", "http://127.0.0.1/callback/*"]
+
+[[clients]]
+client_id = "lab-cli"
+name = "Lab CLI"
+redirect_uris = ["http://127.0.0.1/oauth/done"]
+resources = ["https://crucible-kueue.apps.spoke-a.example.com/mcp"]   # default: every audience
+```
+
+A registered `client_id` is 1 to 64 of `A-Z a-z 0-9 . _ -`, so it can never look like a URL. If
+you remove a client, or narrow its `resources`, its refreshes are refused from the next refresh.
+
+There is no registration endpoint (RFC 7591), and the metadata advertises none. A client that
+can only register itself dynamically gets a clear failure. Give it a registered `client_id`
+instead.
+
+#### Client ID Metadata Documents
+
+When `CONTROLLER_PEOPLE_CIMD_HOSTS` lists hosts, a `client_id` that is an `https://` URL on one
+of those hosts is resolved as an OAuth Client ID Metadata Document
+(draft-ietf-oauth-client-id-metadata-document, the MCP 2025-11-25 client registration). The
+metadata then advertises `client_id_metadata_document_supported: true`. This is off by
+default, and every URL `client_id` is refused when it is off. The controller fetches the
+document when it is asked to authorize and refuses the request, before any consent, unless all
+of these are true:
+
+- the URL is canonical `https` with a host name (not an IP address) and a path, and has no
+  credentials, query or fragment;
+- the host is on the allowlist, and resolves to a public address, never a loopback, private,
+  link-local or other RFC 6890 special-use address (with `HTTPS_PROXY` set, the proxy resolves
+  names, so this check moves to the proxy);
+- the answer is `200` (redirects are not followed), JSON, at most 5 KiB, within 5 seconds;
+- its `client_id` equals the URL exactly, it has a `client_name` and at least one
+  `redirect_uris` entry, `token_endpoint_auth_method` is `none`, it carries no `client_secret`,
+  and any `grant_types` or `response_types` include `authorization_code` and `code`.
+
+Its redirect URIs follow the same rules as registered ones. A loopback URI in a document matches
+any port, but a document cannot use `/*`. A valid document is cached for its `Cache-Control`
+`max-age` (minus `Age`), 5 minutes if it sends none, and 1 hour at most. A document with
+`no-store` or `no-cache`, and any refused document, is never cached. The token endpoint does not
+fetch anything. It checks that the URL's host is still allowed, and the grant it redeems is bound
+to that URL. The consent page and Settings show the document's `client_name` with the URL's
+host (for example "Codex (chatgpt.com)"), so a document cannot pass for a registered client.
+
+Codex publishes `https://chatgpt.com/oauth/codex/client.json` and pi publishes
+`https://pi.dev/oauth/client.json`. Allowlist `chatgpt.com` and `pi.dev` to accept them.
+
+#### Signing in from each tool
+
+Use the MCP server's URL, which is one of the `CONTROLLER_PEOPLE_AUDIENCES` resources. Each tool
+finds this controller through the server's protected resource metadata.
+
+```sh
+# Claude Code: then run /mcp in a session and choose Authenticate.
+claude mcp add --transport http --client-id claude-code crucible-kueue https://crucible-kueue.apps.spoke-a.example.com/mcp
+
+# pi
+pi mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp --oauth-client-id pi
+pi mcp login crucible-kueue
+
+# Codex
+codex mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp --oauth-client-id codex
+codex mcp login crucible-kueue
+```
+
+If `chatgpt.com` is on `CONTROLLER_PEOPLE_CIMD_HOSTS`, Codex can omit `--oauth-client-id`.
+`codex mcp login` (registration `auto`, or `--oauth-client-registration cimd`) then signs in as
+`https://chatgpt.com/oauth/codex/client.json`. If `chatgpt.com` is not on the list,
+`--oauth-client-registration auto` or `dcr` without a client id ends with "Dynamic client
+registration not supported". Tell Codex users to add `--oauth-client-id codex`. pi signs in under
+its document when its `mcp.json` entry has
+`"oauth": {"clientRegistration": "cimd", "callbackUrl": "http://127.0.0.1/callback"}` and `pi.dev`
+is allowlisted.
+
+pi used to borrow `claude-code`. Under `claude-code`, pi's `127.0.0.1` callback is now refused.
+Re-add the server with `--oauth-client-id pi` and sign in again. An existing pi approval keeps
+refreshing as `claude-code` until it expires or someone signs it out.
+
 ### The consent page
 
-`GET /oauth/authorize` from an MCP client (Claude Code, pi) parks the request on the browser session
-and sends the browser to `/consent?id=…` in the controller UI. The page shows the client, server,
+`GET /oauth/authorize` from an MCP client parks the request on the browser session and sends the
+browser to `/consent?id=…` in the controller UI. The page names the client (its registered name,
+or a metadata document's `client_name` with its host) and shows its `client_id`, the server,
 scopes and login, and the person's username on the server's cluster. A `link` cluster nobody has
 linked offers Link (and the paste box where the cluster has no OAuth) right there, and the sign-in
-lands back on the same page. Allow and Deny are a JSON call that returns the client's
-`http://localhost|127.0.0.1|[::1]:<port>/callback` URL with a code or an error; the page navigates to
-it. A request answers once, and only from the browser and person that started it.
+lands back on the same page. Allow and Deny are a JSON call that returns the client's redirect URI
+with a code or an error, and the page navigates to it. A request answers once, and only from the
+browser and person that started it.
 
 ### People's tokens and refresh
 
@@ -322,5 +436,6 @@ on use and the next one returned; presenting a spent one again revokes the whole
 approval dies after 14 days without a refresh or 90 days after it was granted. Every refresh reads
 the person again: a deleted account, one whose stored credential the identity provider refused,
 or a cluster username that was unlinked ends the approval, and a relink shows up in the next token.
-Settings → MCP clients lists the live approvals and signs every client out at once. Expired codes
-and approvals are swept hourly.
+Settings → MCP clients lists the live approvals by client. Each client has its own Sign out
+(`DELETE /api/me/mcp-sign-ins?client_id=<id>`), and one button signs every client out
+(`DELETE /api/me/mcp-sign-ins`). Expired codes and approvals are swept hourly.
