@@ -709,8 +709,9 @@ pub struct AgentGrant {
     pub run: BoundRun,
     pub audience: String,
     pub scopes: Vec<String>,
-    /// The `namespace` claim: the audience's default namespace.
-    pub namespace: Option<String>,
+    /// The `namespaces` claim, the audience's namespaces; the first is also the `namespace`
+    /// claim, the default.
+    pub namespaces: Vec<String>,
 }
 
 /// A minted token. Never printed.
@@ -940,8 +941,9 @@ impl AgentIssuer {
             if let Some(workdir) = &grant.run.workdir {
                 map.insert("workdir".into(), json!(workdir));
             }
-            if let Some(namespace) = &grant.namespace {
-                map.insert("namespace".into(), json!(namespace));
+            if let Some(default) = grant.namespaces.first() {
+                map.insert("namespace".into(), json!(default));
+                map.insert("namespaces".into(), json!(grant.namespaces));
             }
         }
         let access_token = self.sign(&claims)?;
@@ -1538,7 +1540,7 @@ mod tests {
         }
     }
 
-    fn grant(namespace: Option<&str>) -> AgentGrant {
+    fn grant(namespaces: &[&str]) -> AgentGrant {
         AgentGrant {
             sandbox: Sandbox {
                 spiffe_id: format!("{PREFIX}{POD}/sandbox/sbx-1"),
@@ -1552,7 +1554,7 @@ mod tests {
             run: run(Some("user:alice")),
             audience: KUEUE.into(),
             scopes: vec![SCOPE_READ.into(), SCOPE_SUBMIT.into()],
-            namespace: namespace.map(str::to_string),
+            namespaces: namespaces.iter().map(|n| n.to_string()).collect(),
         }
     }
 
@@ -1573,7 +1575,9 @@ mod tests {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
         let at = now();
-        let minted = issuer.mint(&grant(Some("crucible-kueue-e2e")), at).unwrap();
+        let minted = issuer
+            .mint(&grant(&["crucible-kueue-e2e", "team-b"]), at)
+            .unwrap();
         assert_eq!(minted.expires_in, MIN_TOKEN_TTL_SECS);
         assert_eq!(minted.scope, "kueue.read kueue.submit");
         let header = jsonwebtoken::decode_header(&minted.access_token).unwrap();
@@ -1599,6 +1603,7 @@ mod tests {
                 "workdir": "/sandbox/repo",
                 "scope": "kueue.read kueue.submit",
                 "namespace": "crucible-kueue-e2e",
+                "namespaces": ["crucible-kueue-e2e", "team-b"],
             })
         );
         let principal = crucible_mcp_auth::principal::Principal::from_claims(
@@ -1618,7 +1623,7 @@ mod tests {
         let issuer = testing::issuer(&spire, &EcKey::generate());
         let unlinked = AgentGrant {
             kube_user: None,
-            ..grant(None)
+            ..grant(&[])
         };
         let a = verified(
             &issuer,
@@ -1627,11 +1632,11 @@ mod tests {
         .await;
         let b = verified(
             &issuer,
-            &issuer.mint(&grant(None), now()).unwrap().access_token,
+            &issuer.mint(&grant(&[]), now()).unwrap().access_token,
         )
         .await;
         assert_ne!(a["jti"], b["jti"]);
-        for key in ["namespace", "queues", "role", "kube_user"] {
+        for key in ["namespace", "namespaces", "queues", "role", "kube_user"] {
             assert!(!a.contains_key(key), "{key}");
         }
     }
@@ -1642,7 +1647,7 @@ mod tests {
         let old = EcKey::generate();
         let new = EcKey::generate();
         let before = testing::issuer(&spire, &old);
-        let token = before.mint(&grant(None), now()).unwrap().access_token;
+        let token = before.mint(&grant(&[]), now()).unwrap().access_token;
         let mut cfg = testing::config(&new);
         cfg.previous_key = Some(SigningKey::from_pem(old.pem().as_bytes()).unwrap());
         let after = AgentIssuer::new(cfg, |_| {
@@ -1663,7 +1668,7 @@ mod tests {
             issued["sub"], "alice",
             "signed by the previous key, published still"
         );
-        let fresh = after.mint(&grant(None), now()).unwrap().access_token;
+        let fresh = after.mint(&grant(&[]), now()).unwrap().access_token;
         assert_eq!(
             jsonwebtoken::decode_header(&fresh).unwrap().kid.as_deref(),
             Some(after.key.kid()),

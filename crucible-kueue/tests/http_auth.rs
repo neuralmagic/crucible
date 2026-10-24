@@ -1,7 +1,8 @@
-//! The tasks extension's methods over HTTP, against the router a deployment serves, with a kube
-//! client whose API server never answers: a request the server refuses fails with its refusal,
-//! one it lets through fails only when it reaches Kubernetes. Access checks go to a reviewer that
-//! grants a fixed set of verbs in a fixed set of namespaces, standing in for the launcher's RBAC.
+//! Tools and the tasks extension's methods over HTTP, against the router a deployment serves, with
+//! a kube client whose API server never answers: a request the server refuses fails with its
+//! refusal, one it lets through fails only when it reaches Kubernetes. Access checks go to a
+//! reviewer that grants a fixed set of verbs in a fixed set of namespaces, standing in for the
+//! launcher's RBAC.
 
 use crucible_mcp_auth::access::{AccessCheck, AccessReview, ReviewFuture};
 use crucible_mcp_auth::policy::ToolPolicy;
@@ -10,8 +11,8 @@ use crucible_mcp_auth::principal::Principal;
 use crucible_mcp_auth::server::{ResourceServer, TrustedIssuer};
 use crucible_mcp_auth::testing::{self, JwksServer};
 use rmcp::model::{
-    CancelTaskParams, ClientCapabilities, ClientConfig, GetTaskParams, Implementation,
-    ProtocolVersion,
+    CallToolRequestParams, CancelTaskParams, ClientCapabilities, ClientConfig, GetTaskParams,
+    Implementation, ProtocolVersion,
 };
 use rmcp::service::{ClientLifecycleMode, ClientServiceExt, RoleClient, RunningService};
 use rmcp::transport::StreamableHttpClientTransport;
@@ -236,5 +237,158 @@ async fn a_person_is_refused_by_a_server_without_a_reviewer_whatever_their_claim
         assert_eq!(response.status(), 403, "{claims}");
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["error"], "insufficient_scope", "{body}");
+    }
+}
+
+/// Every verb any tool's access checks ask about.
+const ALL_VERBS: &[&str] = &["get", "list", "create", "update", "patch", "delete", "use"];
+
+/// A value `schema` accepts: its first enum or const value, or a placeholder of its type, with
+/// `$ref`s resolved against `root`. Objects get a Job manifest, the only object a tool takes.
+fn placeholder(schema: &Value, root: &Value) -> Value {
+    let schema = match schema.get("$ref").and_then(Value::as_str) {
+        Some(r) => root.pointer(r.trim_start_matches('#')).unwrap_or(schema),
+        None => schema,
+    };
+    if let Some(first) = schema
+        .get("enum")
+        .and_then(Value::as_array)
+        .and_then(|e| e.first())
+    {
+        return first.clone();
+    }
+    if let Some(value) = schema.get("const") {
+        return value.clone();
+    }
+    for key in ["oneOf", "anyOf"] {
+        let branch = schema
+            .get(key)
+            .and_then(Value::as_array)
+            .and_then(|branches| {
+                branches
+                    .iter()
+                    .find(|b| b.get("type").and_then(Value::as_str) != Some("null"))
+            });
+        if let Some(branch) = branch {
+            return placeholder(branch, root);
+        }
+    }
+    let ty = match schema.get("type") {
+        Some(Value::String(t)) => t.as_str(),
+        Some(Value::Array(types)) => types
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|t| *t != "null")
+            .unwrap_or("string"),
+        _ => "object",
+    };
+    match ty {
+        "string" => json!("x"),
+        "integer" | "number" => json!(1),
+        "boolean" => json!(false),
+        "array" => json!([]),
+        _ => json!({"apiVersion": "batch/v1", "kind": "Job", "metadata": {"name": "j"}}),
+    }
+}
+
+/// Arguments `tool` accepts, acting in `namespace`.
+fn arguments(tool: &rmcp::model::Tool, namespace: &str) -> serde_json::Map<String, Value> {
+    let root = Value::Object((*tool.input_schema).clone());
+    let mut args = serde_json::Map::new();
+    for name in root["required"].as_array().into_iter().flatten() {
+        let name = name.as_str().unwrap();
+        args.insert(name.into(), placeholder(&root["properties"][name], &root));
+    }
+    args.insert("namespace".into(), json!(namespace));
+    args
+}
+
+/// A refused tool call's text, or what it returned instead.
+async fn refusal(client: &Client, tool: &str, args: serde_json::Map<String, Value>) -> String {
+    let result = client
+        .call_tool(CallToolRequestParams::new(tool.to_string()).with_arguments(args))
+        .await;
+    match result {
+        Ok(r) if r.is_error == Some(true) => {
+            serde_json::to_value(&r).unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        }
+        other => format!("not refused: {other:?}"),
+    }
+}
+
+/// Each tool, called in a namespace the server does not serve, answers `not_found` before it
+/// reaches Kubernetes, however much RBAC allows there. A new tool that skips the namespace check
+/// fails here.
+#[tokio::test]
+async fn every_tool_refuses_a_namespace_the_server_does_not_serve() {
+    let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
+    let everything_elsewhere = Grants {
+        verbs: ALL_VERBS,
+        namespaces: &["elsewhere"],
+    };
+    let url = serve(&jwks, shipped_policy(), Some(everything_elsewhere)).await;
+    let client = connect(&url, &run_token(|_| {})).await;
+    let tools = client.list_all_tools().await.unwrap();
+    assert!(tools.len() >= 13, "{}", tools.len());
+    for tool in &tools {
+        let schema = &tool.input_schema;
+        assert!(
+            schema["properties"].get("namespace").is_some(),
+            "{} takes no namespace",
+            tool.name
+        );
+        let text = refusal(&client, &tool.name, arguments(tool, "elsewhere")).await;
+        assert!(
+            text.contains("not_found") && text.contains("elsewhere"),
+            "{}: {text}",
+            tool.name
+        );
+    }
+}
+
+/// A token's `namespaces` claim confines the run: a served namespace outside the claim is
+/// `not_found`, and so is everything when the claim and the served set share nothing.
+#[tokio::test]
+async fn the_namespaces_claim_confines_a_run_within_the_served_namespaces() {
+    let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
+    let both = Grants {
+        verbs: ALL_VERBS,
+        namespaces: &["team-e2e", "team-b", "other"],
+    };
+    let url = serve(&jwks, shipped_policy(), Some(both)).await;
+    let confined = run_token(|c| {
+        c.insert("namespaces".into(), json!(["team-e2e"]));
+    });
+    let client = connect(&url, &confined).await;
+    let args = |ns: &str| {
+        let mut m = serde_json::Map::new();
+        m.insert("namespace".into(), json!(ns));
+        m
+    };
+    let text = refusal(&client, "queues_list", args("team-b")).await;
+    assert!(
+        text.contains("not_found") && text.contains("team-b"),
+        "{text}"
+    );
+    let own = refusal(&client, "queues_list", args("team-e2e")).await;
+    assert!(
+        !own.contains("not_found"),
+        "the claimed namespace reaches Kubernetes: {own}"
+    );
+
+    let disjoint = run_token(|c| {
+        c.insert("namespace".into(), json!("other"));
+        c.insert("namespaces".into(), json!(["other"]));
+    });
+    let client = connect(&url, &disjoint).await;
+    for tool in ["queues_list", "workload_list"] {
+        let text = refusal(&client, tool, serde_json::Map::new()).await;
+        assert!(
+            text.contains("not_found") && text.contains("other"),
+            "{tool}: {text}"
+        );
     }
 }

@@ -2,7 +2,7 @@
 //! request and acts in the namespace the call names; past submit, mutations need an object this
 //! server created for the same run, unless the server runs with [`Ownership::Rbac`].
 
-use crate::caller::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
+use crate::caller::{ActError, Caller, Identity, NameError, Namespace, QueueName, Refusal};
 use crate::config::{Config, Labels, Ownership, QUEUE_LABEL};
 use crate::hardware;
 use crate::kinds;
@@ -349,11 +349,6 @@ fn identity(parts: &http::request::Parts) -> Result<&Identity, ToolError> {
         .ok_or(ToolError::NoCaller)
 }
 
-/// The request's identity acting in `namespace` (its own when `None`).
-fn caller(parts: &http::request::Parts, namespace: Option<&str>) -> Result<Caller, ToolError> {
-    Ok(identity(parts)?.in_namespace(namespace)?)
-}
-
 fn api_rejection(kind: WorkloadKind, err: kube::Error) -> ToolError {
     match err {
         kube::Error::Api(s) if (400..500).contains(&s.code) && s.code != 404 => {
@@ -663,24 +658,24 @@ impl KueueMcp {
     }
 
     /// The request's identity acting in `namespace` (its own when `None`), when this server serves
-    /// that namespace; otherwise `not_found`, naming the namespaces the caller can use.
+    /// that namespace and the token's `namespaces` claim names it; otherwise `not_found`, naming
+    /// the namespaces the caller can use.
     async fn served_caller(
         &self,
         parts: &http::request::Parts,
         namespace: Option<&str>,
     ) -> Result<Caller, ToolError> {
-        let c = caller(parts, namespace)?;
-        if self.namespaces.serves(c.namespace.as_str()).await {
-            return Ok(c);
+        match identity(parts)?.act_in(namespace, &self.namespaces).await {
+            Ok(c) => Ok(c),
+            Err(ActError::Refused(refusal)) => Err(refusal.into()),
+            Err(ActError::NotServed(namespace)) => Err(ToolError::NotServed {
+                namespace: namespace.to_string(),
+                usable: match parts.extensions.get::<Principal>() {
+                    Some(principal) => self.namespaces.usable(principal).await,
+                    None => Vec::new(),
+                },
+            }),
         }
-        let usable = match parts.extensions.get::<Principal>() {
-            Some(principal) => self.namespaces.usable(principal).await,
-            None => Vec::new(),
-        };
-        Err(ToolError::NotServed {
-            namespace: c.namespace.as_str().to_string(),
-            usable,
-        })
     }
 
     /// The caller a task request acts as, in the namespace its task id names. The guard has
@@ -1421,10 +1416,10 @@ impl KueueMcp {
         reply(
             self.explain(&parts, requested.as_deref(), async {
                 let id = identity(&parts)?;
-                let namespace = match id.in_namespace(args.namespace.as_deref()) {
+                let namespace = match self.served_caller(&parts, args.namespace.as_deref()).await {
                     Ok(c) => Some(c.namespace.to_string()),
-                    Err(Refusal::NamespaceRequired) => None,
-                    Err(e) => return Err(e.into()),
+                    Err(ToolError::Refused(Refusal::NamespaceRequired)) => None,
+                    Err(e) => return Err(e),
                 };
                 let usable = match parts.extensions.get::<Principal>() {
                     Some(p) => self.namespaces.usable(p).await,
@@ -2578,10 +2573,11 @@ mod tests {
         assert_eq!(replicas_of(&obj("u", Some(4))), 4);
     }
 
-    #[test]
-    fn a_request_without_an_authenticated_caller_is_refused() {
+    #[tokio::test]
+    async fn a_request_without_an_authenticated_caller_is_refused() {
         let (parts, _) = http::Request::new(()).into_parts();
-        assert!(matches!(caller(&parts, None), Err(ToolError::NoCaller)));
+        let refused = server_in(&["team-a"]).served_caller(&parts, None).await;
+        assert!(matches!(refused, Err(ToolError::NoCaller)));
     }
 
     #[test]
@@ -2867,6 +2863,7 @@ mod tests {
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: crate::caller::Launcher::parse("alice").unwrap(),
             kube_user: "alice".into(),
+            served: crate::caller::Served::for_test(),
         };
         assert_eq!(
             list_selector(ListFilter::Mine, &l, &r1),
@@ -2906,6 +2903,7 @@ mod tests {
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: crate::caller::Launcher::parse("alice").unwrap(),
             kube_user: "alice".into(),
+            served: crate::caller::Served::for_test(),
         };
         let with = |labels: Value| -> DynamicObject {
             serde_json::from_value(json!({"apiVersion": "batch/v1", "kind": "Job",

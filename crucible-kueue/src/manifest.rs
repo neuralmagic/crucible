@@ -1505,6 +1505,7 @@ mod tests {
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: Launcher::parse("alice").unwrap(),
             kube_user: "alice-k8s".into(),
+            served: crate::caller::Served::for_test(),
         }
     }
 

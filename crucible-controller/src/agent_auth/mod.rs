@@ -375,7 +375,6 @@ async fn issue(
         .issuer
         .audience(req.audience.as_deref(), &run.cluster)?;
     let launcher = issuer::launcher(&run)?;
-    let namespace = audience.namespaces.first().cloned();
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
     let resolved =
         crate::identity::cluster_identity::for_login(&state.pool, profile, &run.cluster, &launcher)
@@ -414,7 +413,7 @@ async fn issue(
         run,
         audience: audience.resource.clone(),
         scopes,
-        namespace,
+        namespaces: audience.namespaces.clone(),
     };
     let minted = state
         .issuer

@@ -2,11 +2,13 @@
 //! the namespaces holding a LocalQueue), narrowed to those where the caller's own RBAC lets it
 //! list LocalQueues.
 
+use crate::config::NAMESPACES_CLAIM;
 use crate::kueue::{self, KueueVersion, LocalQueue};
 use crucible_mcp_auth::access::{AccessCheck, AccessReview};
 use crucible_mcp_auth::kube::{GROUPS_CLAIM, USER_CLAIM};
 use crucible_mcp_auth::principal::Principal;
 use kube::api::ListParams;
+use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -91,24 +93,33 @@ impl Namespaces {
         self.served().await.iter().any(|n| n == namespace)
     }
 
-    /// The served namespaces the caller may list LocalQueues in. A caller without a Kubernetes
-    /// user, or a server without a reviewer, can use every served namespace.
-    /// Cached [`USABLE_TTL`] per identity (subject, user and groups).
+    /// The served namespaces the token's `namespaces` claim (if any) names and the caller may list
+    /// LocalQueues in. A caller without a Kubernetes user, or a server without a reviewer, can use
+    /// every such namespace. Cached [`USABLE_TTL`] per identity (subject, user, groups and claim).
     pub async fn usable(&self, principal: &Principal) -> Vec<String> {
+        let claimed = principal.claims.get(NAMESPACES_CLAIM).map(|v| match v {
+            Value::Array(items) => items.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
+            _ => Vec::new(),
+        });
+        let mut served = self.served().await;
+        if let Some(claimed) = &claimed {
+            served.retain(|n| claimed.contains(&n.as_str()));
+        }
         let reviewed = self.reviewer.is_some() && principal.claims.contains_key(USER_CLAIM);
         if !reviewed {
-            return self.served().await;
+            return served;
         }
         let key = serde_json::json!([
             principal.subject,
             principal.claims.get(USER_CLAIM),
             principal.claims.get(GROUPS_CLAIM),
+            claimed,
         ])
         .to_string();
         if let Some(hit) = self.usable.get(&key).await {
             return hit;
         }
-        let found = usable(self.served().await, self.reviewer.as_deref(), principal).await;
+        let found = usable(served, self.reviewer.as_deref(), principal).await;
         self.usable.insert(key, found.clone()).await;
         found
     }

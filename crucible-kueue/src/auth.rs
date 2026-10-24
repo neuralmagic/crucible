@@ -9,7 +9,7 @@
 //! [`ClaimMap`], applied before anything else reads the claims.
 
 use crate::caller::{Identity, NameError, Namespace};
-use crate::config::{self, ClaimMap, NAMESPACE_CLAIM, RUN_ID_CLAIM};
+use crate::config::{self, ClaimMap, NAMESPACE_CLAIM, NAMESPACES_CLAIM, RUN_ID_CLAIM};
 use crate::namespaces::Namespaces;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -57,6 +57,8 @@ pub enum ClaimError {
     RunFromPeopleIssuer,
     #[error("the token names no Kubernetes user (kube_user) to act as")]
     NoKubeUser,
+    #[error("token claim namespaces must be a list of namespace names")]
+    Namespaces,
 }
 
 impl Identity {
@@ -88,6 +90,17 @@ impl Identity {
             None | Some(Value::Null) => None,
             Some(_) => Some(Namespace::parse(claim(NAMESPACE_CLAIM)?)?),
         };
+        let namespaces = match principal.claims.get(NAMESPACES_CLAIM) {
+            None | Some(Value::Null) => None,
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|n| n.as_str().ok_or(ClaimError::Namespaces))
+                    .map(|n| Ok(Namespace::parse(n?)?))
+                    .collect::<Result<Vec<_>, ClaimError>>()?,
+            ),
+            Some(_) => return Err(ClaimError::Namespaces),
+        };
         let (run_id, actor) = match is_person {
             true => (config::run_id_of(&principal.subject)?, None),
             false => (
@@ -102,6 +115,7 @@ impl Identity {
             },
             run_id,
             namespace,
+            namespaces,
             launched_by: config::launcher_of(&principal.subject)?,
             kube_user,
             actor,
@@ -208,38 +222,43 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn a_run_acts_for_its_launcher_with_its_namespace_as_the_default() {
+    #[tokio::test]
+    async fn a_run_acts_for_its_launcher_with_its_namespace_as_the_default() {
         let identity = Identity::from_principal(&principal(realm_claims()), false).unwrap();
         assert_eq!(
             identity.actor.as_deref(),
             Some("spiffe://example.crucible/openshell/sandbox/s1")
         );
-        let c: Caller = identity.in_namespace(None).unwrap();
+        let ns = served(&["team-e2e", "team-b"]);
+        let c: Caller = identity.act_in(None, &ns).await.unwrap();
         assert_eq!(c.run_id.as_str(), "auth-spike");
         assert_eq!(c.namespace.as_str(), "team-e2e");
         assert_eq!(c.launched_by, Launcher::parse("alice").unwrap());
         assert_eq!(c.kube_user, "alice");
         assert_eq!(
             identity
-                .in_namespace(Some("team-b"))
+                .act_in(Some("team-b"), &ns)
+                .await
                 .unwrap()
                 .namespace
                 .as_str(),
             "team-b",
-            "the launcher's RBAC, not the token, decides whether it may act there"
+            "without a namespaces claim, the launcher's RBAC decides whether it may act there"
         );
     }
 
-    #[test]
-    fn a_persons_token_picks_its_namespace_and_owns_its_workloads_under_its_subject() {
+    #[tokio::test]
+    async fn a_persons_token_picks_its_namespace_and_owns_its_workloads_under_its_subject() {
         let identity = Identity::from_principal(&person(person_claims()), true).unwrap();
         assert_eq!(identity.actor, None);
+        let ns = served(&["team-a", "team-b"]);
         assert!(matches!(
-            identity.in_namespace(None),
-            Err(crate::caller::Refusal::NamespaceRequired)
+            identity.act_in(None, &ns).await,
+            Err(crate::caller::ActError::Refused(
+                crate::caller::Refusal::NamespaceRequired
+            ))
         ));
-        let c = identity.in_namespace(Some("team-b")).unwrap();
+        let c = identity.act_in(Some("team-b"), &ns).await.unwrap();
         assert_eq!(c.namespace.as_str(), "team-b");
         assert_eq!(c.run_id.as_str(), "3f1c9a2e-7b4d-4e8a-9c51-0d2e6f7a8b90");
         assert_eq!(
@@ -251,7 +270,7 @@ mod tests {
         with_default["namespace"] = json!("team-a");
         let identity = Identity::from_principal(&person(with_default), true).unwrap();
         assert_eq!(
-            identity.in_namespace(None).unwrap().namespace.as_str(),
+            identity.act_in(None, &ns).await.unwrap().namespace.as_str(),
             "team-a"
         );
     }
@@ -328,6 +347,7 @@ mod tests {
             groups: "groups".into(),
             run_id: None,
             namespace: "namespace".into(),
+            namespaces: "namespaces".into(),
         };
         let mut p = person(json!({
             "sub": "8c1f2e9a-4b7d", "preferred_username": "alice", "groups": ["ml"],
@@ -365,7 +385,11 @@ mod tests {
         assert_eq!(p.namespace.as_deref(), Some("ml-a"));
         assert_eq!(p.claims["namespace"], "ml-a");
         let id = Identity::from_principal(&p, true).unwrap();
-        assert_eq!(id.in_namespace(None).unwrap().namespace.as_str(), "ml-a");
+        let ns = served(&["ml-a"]);
+        assert_eq!(
+            id.act_in(None, &ns).await.unwrap().namespace.as_str(),
+            "ml-a"
+        );
 
         let mut two = person(json!({"sub": "p", "kube_user": "alice"}));
         default_namespace(&mut two, &served(&["ml-a", "ml-b"])).await;
@@ -401,14 +425,9 @@ mod tests {
             .route(
                 "/mcp",
                 axum::routing::post(|req: Request| async move {
-                    let caller = req
-                        .extensions()
-                        .get::<Identity>()
-                        .unwrap()
-                        .in_namespace(None)
-                        .unwrap();
+                    let identity = req.extensions().get::<Identity>().unwrap();
                     let principal = req.extensions().get::<Principal>().unwrap();
-                    format!("{} {}", caller.run_id, principal.subject)
+                    format!("{} {}", identity.run_id, principal.subject)
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(

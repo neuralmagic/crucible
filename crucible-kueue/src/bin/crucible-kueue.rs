@@ -128,6 +128,14 @@ struct Cli {
         default_value = "namespace"
     )]
     namespace_claim: String,
+    /// Claim listing the namespaces a token confines its caller to; a token without it is
+    /// confined only by the served namespaces and RBAC.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_NAMESPACES_CLAIM",
+        default_value = "namespaces"
+    )]
+    namespaces_claim: String,
     /// LocalQueue verb submitting needs: Kueue's `use`, or `get` where roles do not grant it.
     #[arg(
         long,
@@ -222,6 +230,7 @@ impl Cli {
                 groups: self.groups_claim.clone(),
                 run_id: (!self.run_id_claim.is_empty()).then(|| self.run_id_claim.clone()),
                 namespace: self.namespace_claim.clone(),
+                namespaces: self.namespaces_claim.clone(),
             },
             queue_verb: self.queue_verb,
             lifetimes: Lifetimes {

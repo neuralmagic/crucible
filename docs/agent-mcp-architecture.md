@@ -214,6 +214,7 @@ with the same key and the same `iss`.
 | `kube_user` | when known | always | The Kubernetes username on the cluster of the audience |
 | `kube_cluster` | the run's cluster | yes | The cluster the token acts on. A server started with `--cluster` refuses a token naming another, so a token for one cluster's URL does not work at the same URL on another |
 | `namespace` | when the audience names namespaces | absent | The audience's first namespace, the default for its server |
+| `namespaces` | when the audience names namespaces | absent | Every namespace of the audience. A server that reads it confines the caller to these namespaces, within those it serves |
 
 The agent token is built in `crucible-controller/src/agent_auth/issuer.rs:820`. The people token is
 built in `crucible-controller/src/agent_auth/people.rs:299`.
@@ -1373,9 +1374,12 @@ A caller can use a served namespace when its RBAC lets it list LocalQueues there
 (subject, `kube_user` and `kube_groups`), so a RoleBinding granted or removed shows in the usable
 list within 30 seconds; the per-call access checks are not cached. Every tool call and both task methods resolve the
 namespace they act in (the call's `namespace` argument, the token's `namespace` claim, or the task
-id's namespace) and refuse one the server does not serve with `not_found` and the list of usable
-namespaces, before anything reaches the API server (`served_caller`,
-`crucible-kueue/src/server.rs:667`). A server with no `--namespace` that cannot list LocalQueues
+id's namespace) and refuse one the server does not serve, or one the token's `namespaces` claim
+leaves out, with `not_found` and the list of usable namespaces, before anything reaches the API
+server. `Identity::act_in` (`crucible-kueue/src/caller.rs`) makes this check and is the only way to
+get a `Caller`, the type every tool acts with, so a tool cannot skip it. A test calls every tool
+the router lists in an unserved namespace and expects `not_found`
+(`crucible-kueue/tests/http_auth.rs`). The usable list is also cut to the claim. A server with no `--namespace` that cannot list LocalQueues
 cluster-wide serves nothing. It never passes on the API server message about the server's own
 account.
 
@@ -1450,6 +1454,7 @@ with a stock OIDC provider:
 | `--groups-claim` | `kube_groups` | The groups claim, with `--kube-authz token` |
 | `--run-id-claim` | `run_id` | The run claim of run tokens; empty for none, which is refused with `--run-issuer` |
 | `--namespace-claim` | `namespace` | The default namespace claim |
+| `--namespaces-claim` | `namespaces` | The claim listing the namespaces a token is confined to; a token without it is confined only by the served namespaces and RBAC |
 | `--queue-verb` | `use` | `use`, or `get` where roles do not grant Kueue's custom verb |
 | `--ownership` | `managed` | `managed` or `rbac` |
 | `--allowlist-profile` | `strict` | `strict`, `tenant`, or a TOML file |

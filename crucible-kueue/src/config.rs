@@ -19,6 +19,7 @@ pub const DEFAULT_MANAGER: &str = "crucible-kueue";
 /// Claims the server reads after [`ClaimMap::canonicalize`] has mapped the token's own.
 pub const RUN_ID_CLAIM: &str = "run_id";
 pub const NAMESPACE_CLAIM: &str = "namespace";
+pub const NAMESPACES_CLAIM: &str = "namespaces";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -272,7 +273,8 @@ impl Hardware {
     }
 }
 
-/// Which token claims name the caller's Kubernetes user, groups, run and default namespace.
+/// Which token claims name the caller's Kubernetes user, groups, run, default namespace and the
+/// namespaces it is confined to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimMap {
     pub user: String,
@@ -282,6 +284,7 @@ pub struct ClaimMap {
     /// `None`: no token names a run; every caller owns its workloads under its subject.
     pub run_id: Option<String>,
     pub namespace: String,
+    pub namespaces: String,
 }
 
 impl Default for ClaimMap {
@@ -292,13 +295,15 @@ impl Default for ClaimMap {
             groups: GROUPS_CLAIM.to_string(),
             run_id: Some(RUN_ID_CLAIM.to_string()),
             namespace: NAMESPACE_CLAIM.to_string(),
+            namespaces: NAMESPACES_CLAIM.to_string(),
         }
     }
 }
 
 impl ClaimMap {
     /// Rewrites the principal so the claims the guard, the access reviewer and the tools read
-    /// (`kube_user`, `kube_groups`, `run_id`, `namespace`) hold what the configured claims say.
+    /// (`kube_user`, `kube_groups`, `run_id`, `namespace`, `namespaces`) hold what the configured
+    /// claims say.
     /// A token cannot set a canonical claim itself unless it is the configured one.
     pub fn canonicalize(&self, principal: &mut Principal) {
         let claims = &mut principal.claims;
@@ -310,6 +315,7 @@ impl ClaimMap {
         let groups = claims.get(&self.groups).cloned();
         let run = self.run_id.as_ref().and_then(|c| claims.get(c).cloned());
         let namespace = claims.get(&self.namespace).cloned();
+        let namespaces = claims.get(&self.namespaces).cloned();
         let mut set = |key: &str, value: Option<Value>| match value {
             Some(v) => {
                 claims.insert(key.to_string(), v);
@@ -322,6 +328,7 @@ impl ClaimMap {
         set(GROUPS_CLAIM, groups);
         set(RUN_ID_CLAIM, run);
         set(NAMESPACE_CLAIM, namespace.clone());
+        set(NAMESPACES_CLAIM, namespaces);
         principal.namespace = namespace.and_then(|v| v.as_str().map(str::to_string));
     }
 }
@@ -404,6 +411,7 @@ mod tests {
             groups: "groups".into(),
             run_id: None,
             namespace: "default_namespace".into(),
+            namespaces: "allowed_namespaces".into(),
         };
         let mut p = principal(json!({
             "sub": "f3a1", "preferred_username": "alice", "groups": ["ml-team"],
