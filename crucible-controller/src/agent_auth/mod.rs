@@ -78,6 +78,7 @@ impl AgentAuth {
             false => placement::check_key_placement(namespace.as_deref(), &profile)?,
             true => placement::check_key_exposure(namespace.as_deref(), &profile)?,
         }
+        placement::check_spire_exposure(&issuer_cfg.spire, &profile)?;
         let make_people = people;
         let people = match people::PeopleConfig::from_env()? {
             None => None,

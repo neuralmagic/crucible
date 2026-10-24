@@ -156,7 +156,10 @@ where its supervisor runs, so with `CONTROLLER_AGENT_SPIRE` set the controller r
 unless the deploy profile runs each run's gateway in its own pod: `sandbox_driver = "kubernetes"`
 with `[cluster] sandbox_namespace`, which profile load refuses to share with the loop, rig, or
 crucible-kueue namespaces. It also refuses to start the issuer when its own namespace, where the
-signing key Secret is mounted from, is any of those namespaces. Its namespace is `POD_NAMESPACE`,
+signing key Secret is mounted from, is any of those namespaces or `[buildit] namespace` (the loop
+account can exec into any pod there), and when a SPIRE's namespace in `CONTROLLER_AGENT_SPIRE` is
+one pack code reaches (loop, rig, sandbox, buildit or crucible-kueue workload namespace), since a
+pod there could exec into the SPIRE server and mint any SVID. Its namespace is `POD_NAMESPACE`,
 else the service account's namespace file; a controller rendered by `crucible deploy render` runs
 in the loop namespace and so cannot hold the key.
 

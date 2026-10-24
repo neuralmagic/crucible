@@ -40,6 +40,63 @@ pub enum PlacementError {
         namespace: String,
         field: &'static str,
     },
+    #[error(
+        "cluster {cluster}'s SPIRE (CONTROLLER_AGENT_SPIRE) runs in {namespace:?}, which is also \
+         {field}; pack code that can exec into pods there could mint any SVID"
+    )]
+    SpireExposed {
+        cluster: String,
+        namespace: String,
+        field: &'static str,
+    },
+}
+
+/// The namespaces pack code can create or exec into pods in: loop pods, rigs, sandboxes, buildit's
+/// builder pods and crucible-kueue's workloads.
+fn pack_reachable(profile: &DeployProfile) -> Vec<(&'static str, &str)> {
+    let mut reachable = vec![
+        (
+            "cluster.loop_namespace",
+            profile.cluster.loop_namespace.as_str(),
+        ),
+        (
+            "cluster.rig_namespace",
+            profile.cluster.rig_namespace.as_str(),
+        ),
+        (
+            "cluster.sandbox_namespace",
+            profile.cluster.sandbox_namespace(),
+        ),
+    ];
+    if let Some(buildit) = &profile.buildit {
+        reachable.push(("buildit.namespace", buildit.namespace.as_str()));
+    }
+    if let Some(kueue) = &profile.kueue {
+        for workloads in &kueue.workload_namespaces {
+            reachable.push(("kueue.workload_namespaces", workloads.as_str()));
+        }
+    }
+    reachable
+}
+
+/// Refuse a SPIRE whose namespace (its OIDC discovery Service's, in `CONTROLLER_AGENT_SPIRE`) is
+/// one pack code reaches: a pod there can exec into the SPIRE server and mint any sandbox's SVID.
+pub fn check_spire_exposure(
+    spire: &[crate::agent_auth::issuer::ClusterSpire],
+    profile: &DeployProfile,
+) -> Result<(), PlacementError> {
+    let reachable = pack_reachable(profile);
+    for entry in spire {
+        let namespace = entry.discovery.namespace.as_str();
+        if let Some((field, _)) = reachable.iter().find(|(_, ns)| *ns == namespace) {
+            return Err(PlacementError::SpireExposed {
+                cluster: entry.cluster.clone(),
+                namespace: namespace.to_string(),
+                field,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The sandbox namespace agent tokens may vouch for, under a profile that isolates each run's
@@ -68,7 +125,8 @@ pub fn check_key_placement(
     check_key_exposure(controller_namespace, profile)
 }
 
-/// Refuse a controller whose namespace is one loop pods, rigs, sandboxes or crucible-kueue run in.
+/// Refuse a controller whose namespace is one loop pods, rigs, sandboxes, builder pods or
+/// crucible-kueue run in.
 /// The people-only issuer needs this and not [`check_key_placement`]'s sandbox isolation, since
 /// it vouches for no sandbox.
 pub fn check_key_exposure(
@@ -78,25 +136,9 @@ pub fn check_key_exposure(
     let namespace = controller_namespace
         .filter(|ns| !ns.is_empty())
         .ok_or(PlacementError::UnknownControllerNamespace)?;
-    let mut shared = vec![
-        (
-            "cluster.loop_namespace",
-            profile.cluster.loop_namespace.as_str(),
-        ),
-        (
-            "cluster.rig_namespace",
-            profile.cluster.rig_namespace.as_str(),
-        ),
-        (
-            "cluster.sandbox_namespace",
-            profile.cluster.sandbox_namespace(),
-        ),
-    ];
+    let mut shared = pack_reachable(profile);
     if let Some(kueue) = &profile.kueue {
         shared.push(("kueue.namespace", kueue.namespace.as_str()));
-        for workloads in &kueue.workload_namespaces {
-            shared.push(("kueue.workload_namespaces", workloads.as_str()));
-        }
     }
     match shared.into_iter().find(|(_, ns)| *ns == namespace) {
         Some((field, _)) => Err(PlacementError::KeyExposed {
@@ -176,10 +218,54 @@ mod tests {
                 "{namespace}"
             );
         }
+        let building = profile(&format!(
+            "{PROFILE}[buildit]\nnamespace = \"builds\"\nrun_issuer = \"http://ctl.ns.svc:8080\"\n"
+        ));
+        assert_eq!(
+            check_key_placement(Some("builds"), &building),
+            Err(PlacementError::KeyExposed {
+                namespace: "builds".into(),
+                field: "buildit.namespace",
+            }),
+            "the loop account can exec into any pod in buildit's namespace"
+        );
         let unplaced = profile(&PROFILE.replace("sandbox_namespace = \"sandboxes\"\n", ""));
         assert_eq!(
             check_key_placement(Some("crucible-controller"), &unplaced),
             Err(PlacementError::NoSandboxNamespace)
         );
+    }
+
+    #[test]
+    fn spire_must_run_where_no_pack_reachable_namespace_is() {
+        let building = profile(&format!(
+            "{PROFILE}[buildit]\nnamespace = \"builds\"\nrun_issuer = \"http://ctl.ns.svc:8080\"\n"
+        ));
+        let spire = |namespace: &str| -> crate::agent_auth::issuer::ClusterSpire {
+            format!("dev=https://oidc.example spiffe://td/openshell/gateway/ {namespace}/oidc:443")
+                .parse()
+                .unwrap()
+        };
+        assert_eq!(
+            check_spire_exposure(&[spire("spire-server")], &building),
+            Ok(())
+        );
+        for (namespace, field) in [
+            ("builds", "buildit.namespace"),
+            ("crucible-system", "cluster.loop_namespace"),
+            ("rig", "cluster.rig_namespace"),
+            ("sandboxes", "cluster.sandbox_namespace"),
+            ("crucible-kueue-e2e", "kueue.workload_namespaces"),
+        ] {
+            assert_eq!(
+                check_spire_exposure(&[spire(namespace)], &building),
+                Err(PlacementError::SpireExposed {
+                    cluster: "dev".into(),
+                    namespace: namespace.into(),
+                    field,
+                }),
+                "{namespace}"
+            );
+        }
     }
 }
