@@ -78,7 +78,7 @@ pub fn people(
     pool: PgPool,
     profile: &crucible::deploy::DeployProfile,
 ) -> anyhow::Result<crate::agent_auth::people::People> {
-    use crate::agent_auth::people::{cimd::Cimd, clients::Clients, dynamic::Dcr};
+    use crate::agent_auth::people::{cimd::Cimd, dynamic::Dcr, registry::Clients};
     let directory = std::sync::Arc::new(ControllerDirectory::new(pool.clone(), profile));
     let cimd = config
         .cimd

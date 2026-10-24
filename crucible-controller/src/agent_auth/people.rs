@@ -23,14 +23,16 @@ pub mod clients;
 pub mod directory;
 pub mod dynamic;
 pub mod grants;
+pub mod registry;
 
 use crate::agent_auth::AgentAuth;
 use crate::agent_auth::issuer::{AUTHORIZE_PATH, AgentIssuer, MintError, token_id};
 use crate::agent_auth::people::cimd::{CIMD_HOSTS_ENV, CimdConfigError, CimdPolicy};
 use crate::agent_auth::people::clients::{
-    CLIENTS_FILE_ENV, Client, ClientId, Clients, RedirectUri, RegistryError,
+    CLIENTS_FILE_ENV, Client, ClientId, RedirectUri, RegistryError,
 };
 use crate::agent_auth::people::dynamic::{DCR_ENV, DcrConfigError, DcrPolicy};
+use crate::agent_auth::people::registry::Clients;
 use crate::identity::api_key::constant_time_eq;
 use axum::extract::{Query, State};
 use axum::http::{HeaderValue, StatusCode, Uri, header};
@@ -690,7 +692,7 @@ fn parse<T: serde::de::DeserializeOwned>(fields: Map<String, Value>) -> Result<T
 
 async fn client(people: &People, client_id: &str) -> Result<ClientId, TokenError> {
     people.clients.admits(client_id).await.map_err(|e| match e {
-        clients::ClientError::Store(why) => TokenError::Server(why),
+        registry::ClientError::Store(why) => TokenError::Server(why),
         e => TokenError::InvalidClient(e.to_string()),
     })
 }

@@ -5,7 +5,7 @@
 //! cached for as long as its `Cache-Control` allows, within [`CimdLimits::max_ttl`].
 
 use crate::agent_auth::people::clients::{
-    Client, ClientId, RedirectRule, RuleSource, display_name,
+    Client, ClientId, MetadataUrl, MetadataUrlError, RedirectRule, RuleSource, display_name,
 };
 use reqwest::header::{AGE, CACHE_CONTROL, CONTENT_TYPE};
 use serde::Deserialize;
@@ -14,48 +14,12 @@ use std::time::Duration;
 use url::Url;
 
 pub const CIMD_HOSTS_ENV: &str = "CONTROLLER_PEOPLE_CIMD_HOSTS";
-const MAX_URL: usize = 2048;
 const CACHE_CAPACITY: u64 = 256;
-
-/// The HTTPS URL of a client's metadata document, in canonical form: a host name, a path, and no
-/// credentials, query or fragment. Compared character for character.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MetadataUrl(Url);
-
-impl MetadataUrl {
-    pub fn parse(raw: &str) -> Result<Self, CimdError> {
-        let bad = || CimdError::Url(raw.to_string());
-        let url = Url::parse(raw).map_err(|_| bad())?;
-        let ok = raw.len() <= MAX_URL
-            && url.scheme() == "https"
-            && matches!(url.host(), Some(url::Host::Domain(_)))
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url.query().is_none()
-            && url.fragment().is_none()
-            && url.path() != "/"
-            && url.as_str() == raw;
-        match ok {
-            true => Ok(Self(url)),
-            false => Err(bad()),
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-
-    pub fn host(&self) -> &str {
-        self.0.host_str().unwrap_or_default()
-    }
-}
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CimdError {
-    #[error(
-        "client_id {0:?} is not a canonical https URL with a host name and a path, without credentials, query or fragment"
-    )]
-    Url(String),
+    #[error(transparent)]
+    Url(#[from] MetadataUrlError),
     #[error("client metadata host {0:?} is not on {CIMD_HOSTS_ENV}")]
     Host(String),
     #[error("fetching client metadata {url}: {reason}")]
