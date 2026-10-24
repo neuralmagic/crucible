@@ -1342,9 +1342,14 @@ The reviewer (`crucible-mcp-auth/src/kube.rs`) builds a SubjectAccessReview with
 
 The server serves the namespaces in `--namespace`, else every namespace that holds a LocalQueue.
 A caller can use a served namespace when its RBAC lets it list LocalQueues there
-(`crucible-kueue/src/namespaces.rs:81`). A call in a namespace that the server does not serve
-answers `not_found` with the list of usable namespaces. It never passes on the API server message
-about the server's own account.
+(`crucible-kueue/src/namespaces.rs:87
+92`). Every tool call and both task methods resolve the
+namespace they act in (the call's `namespace` argument, the token's `namespace` claim, or the task
+id's namespace) and refuse one the server does not serve with `not_found` and the list of usable
+namespaces, before anything reaches the API server (`served_caller`,
+`crucible-kueue/src/server.rs:661`). A server with no `--namespace` that cannot list LocalQueues
+cluster-wide serves nothing. It never passes on the API server message about the server's own
+account.
 
 ### 7.8 Status rollup and the wait
 

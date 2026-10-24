@@ -72,7 +72,10 @@ async fn serve(jwks: &JwksServer, policy: ToolPolicy, grants: Option<Grants>) ->
             kueue: crucible_kueue::kueue::KueueVersion::default(),
             allowed_hosts: Vec::new(),
             kinds: crucible_kueue::manifest::WorkloadKind::ALL.to_vec(),
-            config: crucible_kueue::config::Config::default(),
+            config: crucible_kueue::config::Config {
+                namespaces: vec!["team-e2e".into(), "team-b".into()],
+                ..crucible_kueue::config::Config::default()
+            },
         },
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -147,6 +150,22 @@ async fn a_run_reaches_tasks_where_its_launcher_may_and_no_others() {
     assert!(foreign.contains("task-get"), "{foreign}");
     let foreign = cancel(&client, FOREIGN_TASK).await;
     assert!(foreign.contains("task-cancel"), "{foreign}");
+
+    let granted_elsewhere = serve(
+        &jwks,
+        shipped_policy(),
+        Some(Grants {
+            verbs: &["get", "update"],
+            namespaces: &["team-e2e", "elsewhere"],
+        }),
+    )
+    .await;
+    let client = connect(&granted_elsewhere, &run_token(|_| {})).await;
+    let elsewhere = get(&client, "elsewhere/Job/train/0b6f2c1e").await;
+    assert!(
+        elsewhere.contains("this server is not installed there") && !reached_kubernetes(&elsewhere),
+        "a namespace the server does not serve is refused whatever RBAC allows: {elsewhere}"
+    );
 
     let read_only = serve(
         &jwks,

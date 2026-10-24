@@ -76,6 +76,12 @@ impl Namespaces {
         found
     }
 
+    /// Whether this server serves `namespace`. A call anywhere else is refused before it reaches
+    /// the API server, whatever the caller's own RBAC there.
+    pub async fn serves(&self, namespace: &str) -> bool {
+        self.served().await.iter().any(|n| n == namespace)
+    }
+
     /// The served namespaces the caller may list LocalQueues in. A caller without a Kubernetes
     /// user, or a server without a reviewer, can use every served namespace.
     pub async fn usable(&self, principal: &Principal) -> Vec<String> {
@@ -125,6 +131,24 @@ mod tests {
     use crucible_mcp_auth::access::ReviewFuture;
     use crucible_mcp_auth::principal::Callers;
     use serde_json::{Value, json};
+
+    /// A configured server serves exactly its namespaces; nothing else is asked of the API server.
+    #[tokio::test]
+    async fn a_configured_server_serves_its_namespaces_and_no_other() {
+        crate::install_tls_provider();
+        let config = kube::Config::new("http://127.0.0.1:9".parse().unwrap());
+        let client = kube::Client::try_from(config).unwrap();
+        let namespaces = Namespaces::new(
+            client,
+            KueueVersion::default(),
+            vec!["team-a".into(), "team-b".into()],
+            None,
+        );
+        assert!(namespaces.serves("team-a").await);
+        assert!(namespaces.serves("team-b").await);
+        assert!(!namespaces.serves("kube-system").await);
+        assert!(!namespaces.serves("team-a-other").await);
+    }
 
     /// RBAC that lets the caller list LocalQueues in `allowed` only.
     struct Rbac(&'static [&'static str]);

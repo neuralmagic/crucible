@@ -656,16 +656,37 @@ impl KueueMcp {
         }
     }
 
-    /// The caller a task request acts as. The guard has already checked the method's scope and
-    /// RBAC on the task's object.
-    fn task_caller(
+    /// The request's identity acting in `namespace` (its own when `None`), when this server serves
+    /// that namespace; otherwise `not_found`, naming the namespaces the caller can use.
+    async fn served_caller(
+        &self,
+        parts: &http::request::Parts,
+        namespace: Option<&str>,
+    ) -> Result<Caller, ToolError> {
+        let c = caller(parts, namespace)?;
+        if self.namespaces.serves(c.namespace.as_str()).await {
+            return Ok(c);
+        }
+        let usable = match parts.extensions.get::<Principal>() {
+            Some(principal) => self.namespaces.usable(principal).await,
+            None => Vec::new(),
+        };
+        Err(ToolError::NotServed {
+            namespace: c.namespace.as_str().to_string(),
+            usable,
+        })
+    }
+
+    /// The caller a task request acts as, in the namespace its task id names. The guard has
+    /// already checked the method's scope and RBAC on the task's object.
+    async fn task_caller(
         &self,
         ctx: &RequestContext<RoleServer>,
         t: &TaskRef,
     ) -> Result<Caller, McpError> {
-        identity(request_parts(ctx).map_err(refused)?)
-            .map_err(refused)?
-            .in_namespace(t.namespace.as_deref())
+        let parts = request_parts(ctx).map_err(refused)?;
+        self.served_caller(parts, t.namespace.as_deref())
+            .await
             .map_err(refused)
     }
 
@@ -1448,7 +1469,9 @@ impl KueueMcp {
                 &parts,
                 requested.as_deref(),
                 async {
-                    let c = caller(&parts, args.namespace.as_deref())?;
+                    let c = self
+                        .served_caller(&parts, args.namespace.as_deref())
+                        .await?;
                     let all: Vec<LocalQueue> = kueue::list(
                         &self.client,
                         &self.kueue.local_queues(),
@@ -1494,7 +1517,7 @@ impl KueueMcp {
         let requested = args.namespace.clone();
         reply(
             self.explain(&parts, requested.as_deref(), async {
-                let c = caller(&parts, args.namespace.as_deref())?;
+                let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let lq = self.local_queue(&c, &args.queue).await?;
                 let cq = self.cluster_queue(&lq).await?;
                 let usage: BTreeMap<(String, String), (Value, Value)> = cq
@@ -1571,7 +1594,7 @@ impl KueueMcp {
         let requested = args.namespace.clone();
         reply(
             self.explain(&parts, requested.as_deref(), async {
-                let c = caller(&parts, args.namespace.as_deref())?;
+                let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let lq = self.local_queue(&c, &args.queue).await?;
                 let cq = self.cluster_queue(&lq).await?;
                 let nodes: Vec<Node> = Api::<Node>::all(self.client.clone())
@@ -1609,7 +1632,7 @@ impl KueueMcp {
         let requested = args.namespace.clone();
         reply(
             self.explain(&parts, requested.as_deref(), async {
-                let c = caller(&parts, args.namespace.as_deref())?;
+                let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let actor = identity(&parts)?.actor.as_deref();
                 let (n, cq) = self.plan(&c, &args.queue, args.manifest).await?;
                 self.create(&c, &n, actor, true).await?;
@@ -1667,7 +1690,7 @@ impl KueueMcp {
         let requested = args.namespace.clone();
         let submitted: Result<(Value, Option<Task>), ToolError> = async {
                 let parts = parts.ok_or(ToolError::NoCaller)?;
-                let c = caller(parts, args.namespace.as_deref())?;
+                let c = self.served_caller(parts, args.namespace.as_deref()).await?;
                 let actor = identity(parts)?.actor.as_deref();
                 let (n, _) = self.plan(&c, &args.queue, args.manifest).await?;
                 if n.plan_hash != args.plan_hash {
@@ -1736,7 +1759,9 @@ impl KueueMcp {
                 &parts,
                 requested.as_deref(),
                 async {
-                    let c = caller(&parts, args.namespace.as_deref())?;
+                    let c = self
+                        .served_caller(&parts, args.namespace.as_deref())
+                        .await?;
                     self.status(&c, args).await
                 }
                 .await,
@@ -1761,7 +1786,7 @@ impl KueueMcp {
         let requested = args.namespace.clone();
         reply(
             self.explain(&parts, requested.as_deref(), async {
-                let c = caller(&parts, args.namespace.as_deref())?;
+                let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let ns = c.namespace.as_str();
                 let labels = &self.config.labels;
                 let selector = list_selector(args.filter.unwrap_or_default(), labels, c.run_id.as_str());
@@ -1836,7 +1861,9 @@ impl KueueMcp {
                 &parts,
                 requested.as_deref(),
                 async {
-                    let c = caller(&parts, args.namespace.as_deref())?;
+                    let c = self
+                        .served_caller(&parts, args.namespace.as_deref())
+                        .await?;
                     let ns = c.namespace.as_str();
                     let obj = self.get_object(&c, args.kind, &args.name).await?;
                     let mut pods = self.pods_of(ns, args.kind, &obj).await?;
@@ -1959,7 +1986,7 @@ impl KueueMcp {
         let requested = args.namespace.clone();
         reply(
             self.explain(&parts, requested.as_deref(), async {
-                let c = caller(&parts, args.namespace.as_deref())?;
+                let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 if !args.kind.is_scalable() {
                     return Err(ToolError::NotScalable {
                         kind: args.kind.kind(),
@@ -2008,7 +2035,7 @@ impl KueueMcp {
                 &parts,
                 requested.as_deref(),
                 async {
-                    let c = caller(&parts, r.namespace.as_deref())?;
+                    let c = self.served_caller(&parts, r.namespace.as_deref()).await?;
                     self.set_active(&c, &r, false).await
                 }
                 .await,
@@ -2038,7 +2065,7 @@ impl KueueMcp {
                 &parts,
                 requested.as_deref(),
                 async {
-                    let c = caller(&parts, r.namespace.as_deref())?;
+                    let c = self.served_caller(&parts, r.namespace.as_deref()).await?;
                     self.set_active(&c, &r, true).await
                 }
                 .await,
@@ -2065,7 +2092,7 @@ impl KueueMcp {
         let requested = r.namespace.clone();
         reply(
             self.explain(&parts, requested.as_deref(), async {
-                let c = caller(&parts, r.namespace.as_deref())?;
+                let c = self.served_caller(&parts, r.namespace.as_deref()).await?;
                 self.owned_object(&c, r.kind, &r.name).await?;
                 self.dynamic(r.kind, c.namespace.as_str())
                     .delete(&r.name, &DeleteParams::background())
@@ -2166,7 +2193,7 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<GetTaskResult, McpError> {
         let t = parse_task(&request.task_id)?;
-        let c = self.task_caller(&ctx, &t)?;
+        let c = self.task_caller(&ctx, &t).await?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let detailed = self.detailed_task(&c, &t).await.map_err(internal)?;
         Ok(GetTaskResult::new(detailed))
@@ -2178,7 +2205,7 @@ impl ServerHandler for KueueMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<(), McpError> {
         let t = parse_task(&request.task_id)?;
-        let c = self.task_caller(&ctx, &t)?;
+        let c = self.task_caller(&ctx, &t).await?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
         let r = WorkloadRef {
             namespace: t.namespace.clone(),
