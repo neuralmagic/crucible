@@ -2,6 +2,7 @@ import type { components } from '../api/schema.d';
 
 export type McpSignInsDto = components['schemas']['McpSignInsDto'];
 export type McpSignInDto = components['schemas']['McpSignInDto'];
+export type ClientKind = components['schemas']['ClientKind'];
 
 /** One client's live approvals, for Settings to list and sign out together. */
 export interface ClientSignIns {
@@ -15,9 +16,14 @@ export function mcpSignInsShown(dto: McpSignInsDto): boolean {
   return dto.enabled;
 }
 
-/// What a client is called: its name, and for a metadata document client the host that published
-/// that name, so a self-described client cannot pass for a registered one.
-export function clientLabel(client: { client_name: string; client_host?: string | null }): string {
+/// What a client is called: its name, with the host that published a metadata document client's
+/// name, or a self-registered marker, so a self-described client cannot pass for a registered one.
+export function clientLabel(client: {
+  client_name: string;
+  client_host?: string | null;
+  client_kind: ClientKind;
+}): string {
+  if (client.client_kind === 'dynamic') return `${client.client_name} (self-registered)`;
   return client.client_host ? `${client.client_name} (${client.client_host})` : client.client_name;
 }
 

@@ -39,6 +39,10 @@ function Consent({ consent }: { consent: ConsentDto }) {
                 </span>
               )}
             </dd>
+            <dt className="text-ink-3">Returns to</dt>
+            <dd data-testid="consent-redirect" className="m-0 font-mono text-data text-ink-1">
+              {consent.redirect_origin}
+            </dd>
             <dt className="text-ink-3">Server</dt>
             <dd className="m-0 font-mono text-data text-ink-1">{consent.resource}</dd>
             <dt className="text-ink-3">Scopes</dt>

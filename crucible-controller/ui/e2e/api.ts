@@ -1205,12 +1205,16 @@ export const CLUSTER_IDENTITIES = [
 export const CONSENT_ID = 'c0ffee';
 /** A parked request from a client that published a metadata document instead of registering. */
 export const CIMD_CONSENT_ID = 'c1mdc1md';
+/** A parked request from a client that registered itself. */
+export const DYN_CONSENT_ID = 'd1nd1nd1';
 
 const CONSENT = {
   id: CONSENT_ID,
   client_id: 'claude-code',
   client_name: 'Claude Code',
   client_host: null,
+  client_kind: 'registered',
+  redirect_origin: 'localhost:8765',
   resource: 'http://localhost:8851/mcp',
   scopes: ['kueue.read', 'kueue.submit'],
   login: 'wren',
@@ -1222,6 +1226,17 @@ const CIMD_CONSENT = {
   client_id: 'https://chatgpt.com/oauth/codex/client.json',
   client_name: 'Codex',
   client_host: 'chatgpt.com',
+  client_kind: 'metadata',
+  redirect_origin: '127.0.0.1:53120',
+};
+
+const DYN_CONSENT = {
+  ...CONSENT,
+  id: DYN_CONSENT_ID,
+  client_id: 'dyn-AAAAAAAAAAAAAAAAAAAAAAAA',
+  client_name: 'Claude Code',
+  client_kind: 'dynamic',
+  redirect_origin: '127.0.0.1:53120',
 };
 
 /** The token a stand-in cluster accepts for wren on any `link` cluster. */
@@ -1238,15 +1253,27 @@ export async function stubApi(page: Page): Promise<void> {
       client_id: 'codex',
       client_name: 'Codex',
       client_host: null,
+      client_kind: 'registered',
       resource: 'http://localhost:8852/mcp',
       cluster: 'east',
       approved_at: '2026-10-09T12:00:00Z',
       last_used_at: '2026-10-09T12:30:00Z',
     },
     {
+      client_id: 'dyn-AAAAAAAAAAAAAAAAAAAAAAAA',
+      client_name: 'pi',
+      client_host: null,
+      client_kind: 'dynamic',
+      resource: 'http://localhost:8851/mcp',
+      cluster: 'pirate',
+      approved_at: '2026-10-09T09:00:00Z',
+      last_used_at: '2026-10-09T09:30:00Z',
+    },
+    {
       client_id: 'claude-code',
       client_name: 'Claude Code',
       client_host: null,
+      client_kind: 'registered',
       resource: 'http://localhost:8851/mcp',
       cluster: 'pirate',
       approved_at: '2026-10-09T10:00:00Z',
@@ -1354,7 +1381,8 @@ export async function stubApi(page: Page): Promise<void> {
       // The consent page: one parked request for pirate, decided once.
       if (path === '/api/oauth/consent' && route.request().method() === 'GET') {
         const id = new URL(route.request().url()).searchParams.get('id');
-        const parked = id === CONSENT_ID ? CONSENT : id === CIMD_CONSENT_ID ? CIMD_CONSENT : null;
+        const parked =
+          id === CONSENT_ID ? CONSENT : id === CIMD_CONSENT_ID ? CIMD_CONSENT : id === DYN_CONSENT_ID ? DYN_CONSENT : null;
         if (parked === null) {
           const body = JSON.stringify({ error: 'no authorization request is waiting under this id' });
           return route.fulfill({ status: 404, contentType: 'application/json', body });

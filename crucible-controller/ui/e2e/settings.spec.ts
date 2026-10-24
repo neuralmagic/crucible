@@ -77,6 +77,7 @@ test('MCP sign-ins are listed per client, and one client signs out alone', async
   await expect(codex).toContainText('http://localhost:8852/mcp');
   await expect(claude).toContainText('Claude Code');
   await expect(claude).toContainText('http://localhost:8851/mcp');
+  await expect(page.getByTestId('mcp-client-dyn-AAAAAAAAAAAAAAAAAAAAAAAA')).toContainText('pi (self-registered)');
   await page.getByRole('button', { name: 'Sign out Codex' }).click();
   await expect(page.getByText(/^Signed out Codex \(1 approval\)\./)).toBeVisible();
   await expect(codex).toHaveCount(0);
@@ -88,7 +89,7 @@ test('signing out MCP clients ends every approval at once', async ({ page }) => 
   const list = page.getByTestId('mcp-sign-ins');
   await expect(list).toContainText('http://localhost:8851/mcp');
   await page.getByRole('button', { name: 'Sign out MCP clients' }).click();
-  await expect(page.getByText(/^Signed out 2 MCP clients\./)).toBeVisible();
+  await expect(page.getByText(/^Signed out 3 MCP clients\./)).toBeVisible();
   await expect(page.getByText('No MCP client is signed in.')).toBeVisible();
   await expect(page.getByRole('button', { name: 'Sign out MCP clients' })).toBeDisabled();
 });

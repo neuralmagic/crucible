@@ -7,6 +7,8 @@ function consent(identity: Partial<ConsentDto['identity']> = {}, client: Partial
     client_id: 'claude-code',
     client_name: 'Claude Code',
     client_host: null,
+    client_kind: 'registered',
+    redirect_origin: 'localhost:8765',
     resource: 'http://localhost:8851/mcp',
     scopes: ['kueue.read', 'kueue.submit'],
     login: 'jordan',
@@ -31,6 +33,24 @@ describe('consentView', () => {
     expect(consentView(consent({}, { client_id: 'codex', client_name: 'Codex' })).title).toBe('Allow Codex?');
   });
 
+  it('marks a self-registered client and says where its code goes', () => {
+    const view = consentView(
+      consent(
+        {},
+        {
+          client_id: 'dyn-AAAAAAAAAAAAAAAAAAAAAAAA',
+          client_name: 'Claude Code',
+          client_kind: 'dynamic',
+          redirect_origin: '127.0.0.1:53120',
+        },
+      ),
+    );
+    expect(view.title).toBe('Allow Claude Code (self-registered)?');
+    expect(view.client).not.toBe('Claude Code');
+    expect(view.publisher).toMatch(/registered itself/);
+    expect(view.publisher).toMatch(/127\.0\.0\.1:53120/);
+  });
+
   it('names a metadata document client with the host that published it', () => {
     const view = consentView(
       consent(
@@ -39,6 +59,7 @@ describe('consentView', () => {
           client_id: 'https://chatgpt.com/oauth/codex/client.json',
           client_name: 'Codex',
           client_host: 'chatgpt.com',
+          client_kind: 'metadata',
         },
       ),
     );

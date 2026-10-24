@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
-import { CIMD_CONSENT_ID, CONSENT_ID, stubApi } from './api';
+import { CIMD_CONSENT_ID, CONSENT_ID, DYN_CONSENT_ID, stubApi } from './api';
 
 async function consent(page: Page, id = CONSENT_ID): Promise<void> {
   const crashes: string[] = [];
@@ -50,6 +50,14 @@ test.describe('the consent page', () => {
     await expect(page.getByTestId('consent-client')).toHaveText('Codex (chatgpt.com)');
     await expect(page.getByTestId('consent-request')).toContainText('https://chatgpt.com/oauth/codex/client.json');
     await expect(page.getByTestId('consent-publisher')).toContainText('chatgpt.com published this client');
+  });
+
+  test('a self-registered client is marked so, with where its code goes', async ({ page }) => {
+    await consent(page, DYN_CONSENT_ID);
+    await expect(page.getByRole('heading', { name: 'Allow Claude Code (self-registered)?' })).toBeVisible();
+    await expect(page.getByTestId('consent-client')).toHaveText('Claude Code (self-registered)');
+    await expect(page.getByTestId('consent-redirect')).toHaveText('127.0.0.1:53120');
+    await expect(page.getByTestId('consent-publisher')).toContainText('registered itself');
   });
 
   test('an id with nothing parked says so', async ({ page }) => {

@@ -20,9 +20,12 @@ export interface ConsentView {
 export function consentView(consent: ConsentDto): ConsentView {
   const client = clientLabel(consent);
   const title = `Allow ${client}?`;
-  const publisher = consent.client_host
-    ? `${consent.client_host} published this client and its name; this controller does not register it.`
-    : null;
+  const publisher =
+    consent.client_kind === 'dynamic'
+      ? `This client registered itself: nobody vouches for its name. The code goes to ${consent.redirect_origin} on your machine.`
+      : consent.client_host
+        ? `${consent.client_host} published this client and its name; this controller does not register it.`
+        : null;
   const shown = { title, client, publisher };
   const identity = consent.identity;
   if (identity.kube_user) return { ...shown, canApprove: true, blocked: null };
