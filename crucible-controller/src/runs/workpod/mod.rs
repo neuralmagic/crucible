@@ -29,12 +29,12 @@
 //! pod GC, [`gateway`] an isolated run's gateway pod, and [`globals`] the installable
 //! dispatcher/enqueue statics.
 
+pub(crate) mod agent_servers;
 mod core;
 mod dispatcher;
 pub mod gateway;
 mod globals;
 mod kube_dispatcher;
-pub(crate) mod kueue;
 mod markers;
 pub(crate) mod retry;
 mod run;

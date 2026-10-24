@@ -52,7 +52,6 @@ pub(crate) struct IdentityDoc;
         crate::identity::api::prefs::put_notice_prefs,
     ),
     components(schemas(
-        crate::runs::agent_tools::AgentServer,
         crate::runs::agent_tools::Defaults,
         crate::identity::api::prefs::NoticePrefsDto,
     ))

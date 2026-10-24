@@ -335,18 +335,6 @@ pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
     )
 }
 
-/// The provider carrying the sandbox's crucible-kueue access.
-pub const KUEUE_PROVIDER_NAME: &str = "crucible-kueue";
-
-/// The custom profile id backing [`KUEUE_PROVIDER_NAME`].
-pub const KUEUE_GRANT_PROFILE_ID: &str = "crucible-kueue-grant";
-
-/// The provider carrying the sandbox's buildit access.
-pub const BUILDIT_PROVIDER_NAME: &str = "buildit";
-
-/// The custom profile id backing [`BUILDIT_PROVIDER_NAME`].
-pub const BUILDIT_GRANT_PROFILE_ID: &str = "buildit-grant";
-
 /// An MCP server a sandbox reaches with controller-issued agent tokens.
 pub struct GrantedServer<'a> {
     pub profile_id: &'a str,
@@ -358,7 +346,7 @@ pub struct GrantedServer<'a> {
     pub url: &'a str,
     pub token_endpoint: &'a str,
     pub svid_audience: &'a str,
-    pub scopes: &'a [&'a str],
+    pub scopes: &'a [String],
 }
 
 /// A token-grant profile: one dynamic credential the supervisor obtains from the controller's
@@ -384,7 +372,7 @@ pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto:
                 token_endpoint: server.token_endpoint.to_string(),
                 audience: server.url.to_string(),
                 jwt_svid_audience: server.svid_audience.to_string(),
-                scopes: server.scopes.iter().map(|s| s.to_string()).collect(),
+                scopes: server.scopes.to_vec(),
                 ..Default::default()
             }),
             ..Default::default()

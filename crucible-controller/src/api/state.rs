@@ -152,7 +152,7 @@ pub struct ApiState {
     /// act for.
     pub(crate) agent_tools: bool,
     /// Where and for what agent tokens are minted, `None` when they are not.
-    pub(crate) agent_tokens: Option<crate::runs::workpod::kueue::AgentTokens>,
+    pub(crate) agent_tokens: Option<crate::runs::workpod::agent_servers::AgentTokens>,
     /// Whether people's cluster usernames matter here: people sign in to MCP clients, link through
     /// a cluster's OAuth, or launch runs whose agent tokens carry them. What serves the identity
     /// routes (linking, the administrator's override), the consent page and the settings' identity
@@ -223,7 +223,7 @@ impl ApiState {
             profile_cache: cfg.profile_cache.clone(),
             agent_tools: cfg.issues_agent_tokens(),
             identities: cfg.issues_agent_tokens(),
-            agent_tokens: crate::runs::workpod::kueue::AgentTokens::from_cfg(cfg)
+            agent_tokens: crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)
                 .ok()
                 .flatten(),
             clusters,

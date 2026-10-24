@@ -1486,7 +1486,8 @@ mod tests {
     fn an_audience_takes_its_token_needs_from_the_server_the_profile_describes() {
         let servers = toml::from_str::<crucible::deploy::DeployProfile>(PROFILE)
             .unwrap()
-            .agent_servers();
+            .agent_servers()
+            .unwrap();
         let kueue = kueue().described_by(&servers);
         assert!(kueue.requires_kube_user);
         assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);

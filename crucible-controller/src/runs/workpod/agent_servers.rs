@@ -1,20 +1,18 @@
-//! A run's access to the MCP servers that take agent tokens. A run dispatched onto one of the
-//! deploy profile's `[kueue]` clusters gets the server's MCP URL; one on a `[buildit]` cluster gets
-//! the issuer buildit trusts and where it may push, and the engine starts buildit in the loop pod.
-//! Either way the loop pod gets the controller's agent token endpoint and the audience its
-//! sandboxes' JWT-SVIDs are requested for, as plain env, and the engine turns each server into a
-//! token-grant provider: each sandbox's supervisor obtains its own token. Nothing secret is minted
-//! and nothing is recorded. A server is granted only where the issuer can mint its tokens: on a
-//! cluster whose SPIRE it trusts, for an audience it is configured with.
+//! A run's access to the MCP servers that take agent tokens: each server the deploy profile
+//! describes on the run's cluster ([`DeployProfile::agent_servers`]) whose tokens the issuer can
+//! mint there (its SPIRE is trusted and the server's URL is an audience), with the audience's
+//! scopes. The loop pod gets them as [`ENV_AGENT_SERVERS`], plus the controller's agent token
+//! endpoint and the audience its sandboxes' JWT-SVIDs are requested for, as plain env. The engine
+//! turns each server into a token-grant provider: each sandbox's supervisor obtains its own token.
+//! Nothing secret is minted and nothing is recorded.
+//!
+//! [`DeployProfile::agent_servers`]: crucible::deploy::DeployProfile::agent_servers
 
 use crate::agent_auth::issuer::{Audience, ClusterSpire, IssuerUrl, TOKEN_PATH, parse_list};
 use crate::secrets::deliver::Delivery;
 use anyhow::Context;
-use crucible::deploy::profile::{BuilditCfg, KueueCfg};
-use crucible_contract::buildit::{
-    ENV_BUILDIT_NAMESPACE, ENV_BUILDIT_PUSH_REPO, ENV_BUILDIT_RUN_ISSUER,
-};
-use crucible_contract::kueue::ENV_KUEUE_URL;
+use crucible::deploy::servers::ServerSpec;
+use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS};
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
 /// Where sandboxes get agent tokens and for what: the controller's issuer identifier (the SVID
@@ -64,57 +62,61 @@ impl AgentTokens {
     }
 }
 
-/// The loop pod's env for a run dispatched onto `cluster`, `None` when neither crucible-kueue nor
-/// buildit serves it.
+/// The servers in `servers` a run on `cluster` gets, each with the audience its tokens are minted
+/// for.
+pub fn granted<'a>(
+    servers: &'a [ServerSpec],
+    cluster: &str,
+    tokens: &'a AgentTokens,
+) -> Vec<(&'a ServerSpec, &'a Audience)> {
+    servers
+        .iter()
+        .filter(|s| s.serves(cluster))
+        .filter_map(|s| tokens.audience(cluster, &s.url).map(|a| (s, a)))
+        .collect()
+}
+
+/// The loop pod's env for a run dispatched onto `cluster`, `None` when no server serves it.
 pub fn access(
-    kueue: Option<&KueueCfg>,
-    buildit: Option<&BuilditCfg>,
+    servers: &[ServerSpec],
     cluster: &str,
     tokens: &AgentTokens,
 ) -> anyhow::Result<Option<Delivery>> {
-    let kueue = kueue.filter(|k| k.serves(cluster) && tokens.audience(cluster, &k.url()).is_some());
-    let buildit = buildit.filter(|b| {
-        b.serves(cluster)
-            && tokens
-                .audience(cluster, crucible_contract::buildit::URL)
-                .is_some()
-    });
-    if kueue.is_none() && buildit.is_none() {
+    let granted: Vec<AgentServer> = granted(servers, cluster, tokens)
+        .into_iter()
+        .map(|(s, a)| AgentServer {
+            name: s.name.clone(),
+            url: s.url.clone(),
+            scopes: a.scopes.clone(),
+            transport: s.transport.clone(),
+        })
+        .collect();
+    if granted.is_empty() {
         return Ok(None);
     }
-    let mut plain_env = vec![
-        (
-            ENV_AGENT_TOKEN_ENDPOINT.to_string(),
-            tokens.endpoint.clone(),
-        ),
-        (
-            ENV_AGENT_SVID_AUDIENCE.to_string(),
-            tokens.svid_audience.clone(),
-        ),
-    ];
-    if let Some(k) = kueue {
-        plain_env.push((ENV_KUEUE_URL.to_string(), k.url()));
-    }
-    if let Some(b) = buildit {
-        let issuer = b
-            .trusted_issuer()
-            .with_context(|| format!("deriving the key set URI of {}", b.run_issuer))?;
-        plain_env.push((ENV_BUILDIT_RUN_ISSUER.to_string(), issuer));
-        plain_env.push((ENV_BUILDIT_NAMESPACE.to_string(), b.namespace.to_string()));
-        if let Some(repo) = &b.push_repo {
-            plain_env.push((ENV_BUILDIT_PUSH_REPO.to_string(), repo.clone()));
-        }
-    }
+    let encoded = crucible_contract::agent_servers::encode(&granted)
+        .context("encoding the run's agent servers")?;
     Ok(Some(Delivery {
-        plain_env,
+        plain_env: vec![
+            (
+                ENV_AGENT_TOKEN_ENDPOINT.to_string(),
+                tokens.endpoint.clone(),
+            ),
+            (
+                ENV_AGENT_SVID_AUDIENCE.to_string(),
+                tokens.svid_audience.clone(),
+            ),
+            (ENV_AGENT_SERVERS.to_string(), encoded),
+        ],
         ..Delivery::default()
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::runs::workpod::kueue::*;
+    use crate::runs::workpod::agent_servers::*;
     use crucible::deploy::profile::DeployProfile;
+    use crucible_contract::agent_servers::{BuilditSite, LocalServer, Transport};
 
     const PROFILE: &str = r#"
         [cluster]
@@ -125,6 +127,9 @@ mod tests {
         [image]
         loop = "registry.example.com/crucible-loop:latest"
         pull_secret = "quay-pull"
+    "#;
+
+    const KUEUE: &str = r#"
         [kueue]
         image = "registry.example.com/crucible-kueue:latest"
         cluster = "pirate"
@@ -134,12 +139,14 @@ mod tests {
         kube_authz = "openshift"
     "#;
 
-    fn kueue() -> KueueCfg {
-        toml::from_str::<DeployProfile>(PROFILE)
-            .ok()
-            .and_then(|p| p.kueue)
-            .expect("profile parses")
-    }
+    const BUILDIT: &str = r#"
+        [buildit]
+        clusters = ["pirate", "waldorf"]
+        namespace = "crucible-builds"
+        run_issuer = "https://crucible.hub.example"
+        run_jwks_uri = "https://crucible-ext.hub.example/.well-known/jwks.json"
+        push_repo = "quay.io/example/crucible-smoke"
+    "#;
 
     const KUEUE_URL: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
     const SPIRE: &str = "pirate=https://oidc.pirate.example spiffe://pirate.example/openshell/gateway/ spire/oidc:443,\
@@ -166,18 +173,12 @@ mod tests {
         }
     }
 
-    fn profile(extra: &str) -> DeployProfile {
-        toml::from_str::<DeployProfile>(&format!("{PROFILE}{extra}")).expect("profile parses")
+    fn servers(tables: &str) -> Vec<ServerSpec> {
+        toml::from_str::<DeployProfile>(&format!("{PROFILE}{tables}"))
+            .expect("profile parses")
+            .agent_servers()
+            .expect("servers")
     }
-
-    const BUILDIT: &str = r#"
-        [buildit]
-        clusters = ["pirate", "waldorf"]
-        namespace = "crucible-builds"
-        run_issuer = "https://crucible.hub.example"
-        run_jwks_uri = "https://crucible-ext.hub.example/.well-known/jwks.json"
-        push_repo = "quay.io/example/crucible-smoke"
-    "#;
 
     fn env_of(d: &Delivery) -> std::collections::BTreeMap<&str, &str> {
         d.plain_env
@@ -186,75 +187,86 @@ mod tests {
             .collect()
     }
 
+    fn granted_servers(d: &Delivery) -> Vec<AgentServer> {
+        crucible_contract::agent_servers::decode(env_of(d)[ENV_AGENT_SERVERS]).unwrap()
+    }
+
+    fn names(d: &Delivery) -> Vec<String> {
+        granted_servers(d)
+            .into_iter()
+            .map(|s| s.name.to_string())
+            .collect()
+    }
+
     #[test]
     fn a_run_on_the_kueue_cluster_gets_the_server_and_the_token_endpoint_and_no_secret() {
-        let delivery = access(Some(&kueue()), None, "pirate", &tokens())
+        let delivery = access(&servers(KUEUE), "pirate", &tokens())
             .unwrap()
             .expect("access");
         assert!(delivery.is_empty(), "no Secret data: {delivery:?}");
         assert!(delivery.env.is_empty());
+        let env = env_of(&delivery);
         assert_eq!(
-            env_of(&delivery),
-            std::collections::BTreeMap::from([
-                (
-                    ENV_KUEUE_URL,
-                    "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp"
-                ),
-                (
-                    ENV_AGENT_TOKEN_ENDPOINT,
-                    "http://crucible-controller.crucible-system.svc:8080/oauth/token"
-                ),
-                (
-                    ENV_AGENT_SVID_AUDIENCE,
-                    "http://crucible-controller.crucible-system.svc:8080"
-                ),
-            ])
+            env.keys().copied().collect::<Vec<_>>(),
+            [
+                ENV_AGENT_SERVERS,
+                ENV_AGENT_SVID_AUDIENCE,
+                ENV_AGENT_TOKEN_ENDPOINT
+            ]
+        );
+        assert_eq!(
+            env[ENV_AGENT_TOKEN_ENDPOINT],
+            "http://crucible-controller.crucible-system.svc:8080/oauth/token"
+        );
+        assert_eq!(
+            env[ENV_AGENT_SVID_AUDIENCE],
+            "http://crucible-controller.crucible-system.svc:8080"
+        );
+        assert_eq!(
+            granted_servers(&delivery),
+            [AgentServer {
+                name: crucible_contract::agent_servers::ServerName::parse("kueue").unwrap(),
+                url: KUEUE_URL.into(),
+                scopes: vec!["kueue.read".into(), "kueue.submit".into()],
+                transport: Transport::Remote,
+            }]
         );
     }
 
     #[test]
-    fn a_run_elsewhere_gets_nothing() {
-        assert!(
-            access(Some(&kueue()), None, "hub", &tokens())
-                .unwrap()
-                .is_none()
-        );
-        assert!(access(None, None, "pirate", &tokens()).unwrap().is_none());
+    fn a_run_elsewhere_or_without_servers_gets_nothing() {
+        assert!(access(&servers(KUEUE), "hub", &tokens()).unwrap().is_none());
+        assert!(access(&[], "pirate", &tokens()).unwrap().is_none());
     }
 
     #[test]
     fn a_run_on_any_of_the_servers_clusters_gets_access() {
-        let both = toml::from_str::<DeployProfile>(&PROFILE.replace(
+        let both = servers(&KUEUE.replace(
             "cluster = \"pirate\"",
             "clusters = [\"pirate\", \"waldorf\"]",
-        ))
-        .ok()
-        .and_then(|p| p.kueue)
-        .expect("profile parses");
+        ));
         for cluster in ["pirate", "waldorf"] {
             assert!(
-                access(Some(&both), None, cluster, &tokens())
-                    .unwrap()
-                    .is_some(),
+                access(&both, cluster, &tokens()).unwrap().is_some(),
                 "{cluster}"
             );
         }
-        assert!(
-            access(Some(&both), None, "hub", &tokens())
-                .unwrap()
-                .is_none()
-        );
+        assert!(access(&both, "hub", &tokens()).unwrap().is_none());
     }
 
     #[test]
     fn a_server_the_issuer_cannot_mint_for_is_not_granted() {
-        let p = profile(BUILDIT);
+        let all = servers(&format!("{KUEUE}{BUILDIT}"));
         let no_spire = AgentTokens {
             clusters: vec!["waldorf".into()],
             ..tokens()
         };
+        assert_eq!(
+            names(&access(&all, "waldorf", &no_spire).unwrap().unwrap()),
+            ["buildit"]
+        );
         assert!(
-            access(p.kueue.as_ref(), None, "pirate", &no_spire)
+            access(&servers(KUEUE), "pirate", &no_spire)
                 .unwrap()
                 .is_none(),
             "no SPIRE for pirate, so no tokens for its sandboxes"
@@ -263,44 +275,33 @@ mod tests {
             audiences: vec![audience(KUEUE_URL, "kueue.read")],
             ..tokens()
         };
-        let env = access(p.kueue.as_ref(), p.buildit.as_ref(), "pirate", &no_audience)
-            .unwrap()
-            .expect("kueue");
-        let env = env_of(&env);
-        assert!(env.contains_key(ENV_KUEUE_URL));
-        assert!(
-            !env.contains_key(ENV_BUILDIT_RUN_ISSUER),
-            "buildit is no audience, so no buildit"
-        );
-        assert!(
-            access(None, p.buildit.as_ref(), "waldorf", &no_audience)
-                .unwrap()
-                .is_none()
-        );
+        let pirate = access(&all, "pirate", &no_audience).unwrap().unwrap();
+        assert_eq!(names(&pirate), ["kueue"], "buildit is no audience");
+        assert_eq!(granted_servers(&pirate)[0].scopes, ["kueue.read"]);
+        assert!(access(&all, "waldorf", &no_audience).unwrap().is_none());
     }
 
     #[test]
-    fn a_run_on_a_buildit_cluster_gets_the_issuer_buildit_trusts_and_its_push_repo() {
-        let p = profile(BUILDIT);
-        let on_waldorf = access(p.kueue.as_ref(), p.buildit.as_ref(), "waldorf", &tokens())
-            .unwrap()
-            .expect("buildit serves waldorf");
-        let env = env_of(&on_waldorf);
+    fn buildit_is_an_entry_served_in_the_loop_pod_with_its_issuer_and_push_repo() {
+        let all = servers(&format!("{KUEUE}{BUILDIT}"));
+        let on_waldorf = access(&all, "waldorf", &tokens()).unwrap().unwrap();
         assert_eq!(
-            env[ENV_BUILDIT_RUN_ISSUER],
-            "https://crucible.hub.example=https://crucible-ext.hub.example/.well-known/jwks.json"
+            granted_servers(&on_waldorf),
+            [AgentServer {
+                name: crucible_contract::agent_servers::ServerName::parse("buildit").unwrap(),
+                url: crucible_contract::buildit::URL.into(),
+                scopes: vec!["buildit.read".into(), "buildit.build".into()],
+                transport: Transport::Local(LocalServer::Buildit(BuilditSite {
+                    run_issuer: "https://crucible.hub.example=\
+                        https://crucible-ext.hub.example/.well-known/jwks.json"
+                        .into(),
+                    namespace: "crucible-builds".into(),
+                    push_repo: Some("quay.io/example/crucible-smoke".into()),
+                })),
+            }]
         );
-        assert_eq!(env[ENV_BUILDIT_PUSH_REPO], "quay.io/example/crucible-smoke");
-        assert_eq!(env[ENV_BUILDIT_NAMESPACE], "crucible-builds");
-        assert!(env.contains_key(ENV_AGENT_TOKEN_ENDPOINT));
-        assert!(!env.contains_key(ENV_KUEUE_URL), "kueue serves pirate only");
-        assert!(on_waldorf.env.is_empty() && on_waldorf.is_empty());
-
-        let on_pirate = access(p.kueue.as_ref(), p.buildit.as_ref(), "pirate", &tokens())
-            .unwrap()
-            .unwrap();
-        let env = env_of(&on_pirate);
-        assert!(env.contains_key(ENV_KUEUE_URL) && env.contains_key(ENV_BUILDIT_RUN_ISSUER));
+        let on_pirate = access(&all, "pirate", &tokens()).unwrap().unwrap();
+        assert_eq!(names(&on_pirate), ["kueue", "buildit"]);
         assert_eq!(
             on_pirate
                 .plain_env
@@ -310,24 +311,25 @@ mod tests {
             1,
             "the token endpoint once for both servers"
         );
+    }
 
-        let own = profile(
-            &BUILDIT
-                .replace(
-                    "run_jwks_uri = \"https://crucible-ext.hub.example/.well-known/jwks.json\"\n",
-                    "",
-                )
-                .replace("push_repo = \"quay.io/example/crucible-smoke\"\n", ""),
-        );
-        let env = access(None, own.buildit.as_ref(), "waldorf", &tokens())
-            .unwrap()
-            .unwrap();
-        let env = env_of(&env);
-        assert_eq!(
-            env[ENV_BUILDIT_RUN_ISSUER],
-            "https://crucible.hub.example=https://crucible.hub.example/.well-known/jwks.json"
-        );
-        assert!(!env.contains_key(ENV_BUILDIT_PUSH_REPO), "no repo, no push");
+    #[test]
+    fn a_third_server_from_the_profile_is_granted_like_the_others() {
+        let docs = r#"
+            [[agent_servers]]
+            name = "docs"
+            url = "https://docs.example/mcp"
+            cluster = "pirate"
+        "#;
+        let tokens = AgentTokens {
+            audiences: vec![audience("https://docs.example/mcp", "docs.read")],
+            ..tokens()
+        };
+        let delivery = access(&servers(docs), "pirate", &tokens).unwrap().unwrap();
+        let granted = granted_servers(&delivery);
+        assert_eq!(names(&delivery), ["docs"]);
+        assert_eq!(granted[0].scopes, ["docs.read"]);
+        assert_eq!(granted[0].transport, Transport::Remote);
     }
 
     #[test]

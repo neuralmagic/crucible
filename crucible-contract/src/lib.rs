@@ -6,6 +6,7 @@
 //! The crate depends on serde only, with no async runtime and no kube client.
 
 pub mod admission;
+pub mod agent_servers;
 pub mod artifact;
 pub mod ask;
 pub mod buildit;

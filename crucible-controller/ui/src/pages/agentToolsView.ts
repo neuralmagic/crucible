@@ -18,7 +18,7 @@ export interface AgentToolRow {
   url: string;
 }
 
-/** One row per granted server, kueue before buildit as the API orders them. */
+/** One row per granted server, by server name as the API orders them. */
 export function agentToolRows(tools: readonly AgentTool[]): AgentToolRow[] {
   return tools.map((t) => ({
     key: `${t.server}/${t.cluster}`,

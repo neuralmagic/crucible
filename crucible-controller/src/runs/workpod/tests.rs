@@ -5931,9 +5931,18 @@ async fn a_dispatch_onto_the_kueue_cluster_hands_the_loop_pod_the_token_endpoint
             .find(|e| e.name == name)
             .and_then(|e| e.value.as_deref())
     };
+    let servers = crucible_contract::agent_servers::decode(
+        value(crucible_contract::agent_servers::ENV_AGENT_SERVERS).unwrap_or_default(),
+    )?;
     assert_eq!(
-        value(crucible_contract::kueue::ENV_KUEUE_URL),
-        Some("http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp")
+        servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.url.as_str()))
+            .collect::<Vec<_>>(),
+        [(
+            "kueue",
+            "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp"
+        )]
     );
     assert_eq!(
         value(crucible_contract::sandbox::ENV_AGENT_TOKEN_ENDPOINT),
@@ -5943,13 +5952,11 @@ async fn a_dispatch_onto_the_kueue_cluster_hands_the_loop_pod_the_token_endpoint
         value(crucible_contract::sandbox::ENV_AGENT_SVID_AUDIENCE),
         Some(AGENT_ISSUER)
     );
-    assert_eq!(
-        env.iter()
-            .filter(|e| e.name.contains("KUEUE"))
-            .map(|e| e.name.as_str())
-            .collect::<Vec<_>>(),
-        [crucible_contract::kueue::ENV_KUEUE_URL],
-        "the server's URL and no token"
+    assert!(
+        !env.iter()
+            .any(|e| e.name.contains("KUEUE")
+                || e.value.as_deref().is_some_and(|v| v.contains("eyJ"))),
+        "the server's URL and no token: {env:?}"
     );
     assert!(
         !events.iter().any(|e| matches!(

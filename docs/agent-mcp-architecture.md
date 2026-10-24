@@ -344,7 +344,7 @@ sequenceDiagram
     C->>A: create gateway Service in sandbox namespace
     A-->>C: ClusterIP
     Note over C: mint run CA, server cert for the ClusterIP,<br/>loop and supervisor client certs, drop CA key
-    Note over C: run Secret gets loop client TLS, gateway URL,<br/>CRUCIBLE_AGENT_TOKEN_ENDPOINT, CRUCIBLE_AGENT_SVID_AUDIENCE,<br/>CRUCIBLE_KUEUE_URL, run_agent_tools row written
+    Note over C: run Secret gets loop client TLS, gateway URL,<br/>CRUCIBLE_AGENT_TOKEN_ENDPOINT, CRUCIBLE_AGENT_SVID_AUDIENCE,<br/>CRUCIBLE_AGENT_SERVERS, run_agent_tools row written
     C->>A: loop Service, NetworkPolicy, gateway pod, TLS Secrets owned by the gateway pod
     C->>A: create loop pod
     L->>G: health check over mTLS, register the CLI
@@ -375,16 +375,19 @@ The steps are these:
 1. Dispatch reserves the gateway. The Service comes first because its ClusterIP goes into the
    server certificate (`crucible-controller/src/runs/workpod/gateway.rs:184`).
 2. The controller folds the loop pod client material and the agent server access into the run
-   Secret before it renders the loop pod (`crucible-controller/src/runs/workpod/run.rs:809`,
-   `crucible-controller/src/runs/workpod/kueue.rs:63`). A server is granted only where the
+   Secret before it renders the loop pod (`crucible-controller/src/runs/workpod/run.rs:813`,
+   `access` in `crucible-controller/src/runs/workpod/agent_servers.rs`). A server is granted only where the
    issuer can mint its tokens: the run's cluster is in `CONTROLLER_AGENT_SPIRE`, and the server
-   URL is a resource in `CONTROLLER_AGENT_AUDIENCES` (`kueue.rs:52`). The run records the servers
-   that it got, with the scopes of the audience.
+   URL is a resource in `CONTROLLER_AGENT_AUDIENCES`
+   (`crucible-controller/src/runs/workpod/agent_servers.rs`, `granted`). The loop pod gets them as
+   one `CRUCIBLE_AGENT_SERVERS` list. The run records the servers that it got, with the scopes of
+   the audience.
 3. The gateway starts before the loop pod, so it boots while the loop pod schedules
    (`gateway.rs:256`).
 4. The engine reads `CRUCIBLE_OPENSHELL_GATEWAY_URL` and talks to the remote gateway over mTLS
-   (`crucible/src/openshell/gateway.rs:422-437`). It creates one token-grant provider for each server
-   (`crucible/src/openshell/run.rs:398`). A provider holds no secret and gives the sandbox no
+   (`crucible/src/openshell/gateway.rs:422-437`). It creates one token-grant provider, one egress
+   entry and one `.mcp.json` entry for each server in `CRUCIBLE_AGENT_SERVERS` the same way, after
+   starting a server whose transport is the loop pod (`crucible/src/openshell/agent_servers.rs`). A provider holds no secret and gives the sandbox no
    placeholder (`crucible/src/openshell/provider.rs:368`).
 5. After `CreateSandbox`, the engine binds the sandbox (`crucible/src/openshell/run.rs:469`). It
    binds only when the loop pod carries `CRUCIBLE_AGENT_TOKEN_ENDPOINT`. A failed bind does not
@@ -1463,24 +1466,28 @@ with a stock OIDC provider:
 
 ### 8.1 Where it runs
 
-`buildit` runs as a child process of the engine in each loop pod of a `[buildit]` cluster. The
-engine starts it when the loop pod has `CRUCIBLE_BUILDIT_RUN_ISSUER`
-(`crucible/src/openshell/buildit.rs:158`). It listens on port 8848. Sandboxes reach it at
-`http://host.openshell.internal:8848/mcp`, which is the loop Service. The supervisor injects a
-token for that audience on egress to that host and port only.
+`buildit` runs as a child process of the engine in each loop pod of a `[buildit]` cluster. It is
+an entry of `CRUCIBLE_AGENT_SERVERS` like any other, named `buildit`, whose transport is the loop
+pod (`local.buildit`, carrying its run issuer, builder namespace and push repository). The engine
+starts it before it creates the providers (`Granted::start_local`,
+`crucible/src/openshell/agent_servers.rs`), and gives it a provider, an egress entry and a
+`.mcp.json` entry the way it does every server. It listens on the port of its URL,
+`[buildit] url`, by default `http://host.openshell.internal:8848/mcp`, which is the loop Service.
+The supervisor injects a token for that audience on egress to that host and port only.
 
-The engine starts it with these arguments (`buildit.rs:127`):
+The engine starts it with these arguments (`Buildit::args`, `crucible/src/openshell/buildit.rs`):
 
 | Argument | Value |
 | --- | --- |
-| `--run-issuer` | `<issuer>=<jwks uri>` from `CRUCIBLE_BUILDIT_RUN_ISSUER` |
-| `--resource` | `http://host.openshell.internal:8848/mcp` |
-| `--allowed-host` | `host.openshell.internal` |
+| `--bind` | `0.0.0.0:<port of the URL>` |
+| `--run-issuer` | the entry's `<issuer>=<jwks uri>` |
+| `--resource` | the entry's URL |
+| `--allowed-host` | the URL's host |
 | `--tool-policy` | the shipped `buildit/deploy/buildit-policy.toml` |
 | `--run-id` | the loop pod name |
-| `--namespace` | `[buildit] namespace`, from `CRUCIBLE_BUILDIT_NAMESPACE` |
+| `--namespace` | the entry's builder namespace, `[buildit] namespace` |
 | `--insecure-jwks-http` | when the JWKS URI is plain http |
-| `--push-repo`, `--push-authfile` | when both `CRUCIBLE_BUILDIT_PUSH_REPO` and the loop pod push authfile exist |
+| `--push-repo`, `--push-authfile` | when the entry has a push repository and the loop pod has a push authfile |
 
 ### 8.2 Who may call it
 
@@ -1625,6 +1632,8 @@ tokens, the controller does not read them.
 | `[buildit] egress` | TCP 443 to `0.0.0.0/0` and `::/0` | `[{ cidr, ports = [443], except = [] }, ...]`: where builder pods may connect besides DNS (section 8.4). |
 | `[buildit] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
+| `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
+| `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry and its URL in `CONTROLLER_AGENT_AUDIENCES`. Names are unique, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |
 | `[cluster_link] external_url` | required | The controller URL as browsers reach it. https, or http to loopback. |
 | `[cluster_link] client_id` | `crucible-controller` | The `OAuthClient` name. |
@@ -1637,21 +1646,17 @@ The controller sets these. Do not set them by hand.
 
 | Variable | Set when | Read by |
 | --- | --- | --- |
-| `CRUCIBLE_AGENT_TOKEN_ENDPOINT` | The run gets `crucible-kueue` or `buildit` (see the next rows) | engine: token-grant providers, and the bind decision |
-| `CRUCIBLE_AGENT_SVID_AUDIENCE` | same | engine: `token_grant.jwt_svid_audience` |
-| `CRUCIBLE_KUEUE_URL` | The run is on a `[kueue]` cluster that is in `CONTROLLER_AGENT_SPIRE`, and the server URL is in `CONTROLLER_AGENT_AUDIENCES` | engine: provider endpoint, `.mcp.json` server `kueue` |
-| `CRUCIBLE_BUILDIT_RUN_ISSUER` | The run is on a `[buildit]` cluster that is in `CONTROLLER_AGENT_SPIRE`, and `http://host.openshell.internal:8848/mcp` is in `CONTROLLER_AGENT_AUDIENCES` | engine: starts `buildit` |
-| `CRUCIBLE_BUILDIT_NAMESPACE` | The run gets `buildit` | engine: `buildit --namespace`; required with `CRUCIBLE_BUILDIT_RUN_ISSUER` |
-| `CRUCIBLE_BUILDIT_PUSH_REPO` | The run gets `buildit` and `[buildit] push_repo` is set | engine: `buildit --push-repo`; refused without `CRUCIBLE_BUILDIT_RUN_ISSUER` |
+| `CRUCIBLE_AGENT_SERVERS` | The run gets at least one server: one the profile describes on the run's cluster (`[kueue]`, `[buildit]`, `[[agent_servers]]`), the cluster is in `CONTROLLER_AGENT_SPIRE`, and the server's URL is in `CONTROLLER_AGENT_AUDIENCES` | engine: a JSON list of `{name, url, scopes, transport}`; one provider, egress entry and `.mcp.json` entry each, and a start for a loop-pod transport |
+| `CRUCIBLE_AGENT_TOKEN_ENDPOINT` | with `CRUCIBLE_AGENT_SERVERS` | engine: token-grant providers, and the bind decision |
+| `CRUCIBLE_AGENT_SVID_AUDIENCE` | with `CRUCIBLE_AGENT_SERVERS` | engine: `token_grant.jwt_svid_audience` |
 | `CRUCIBLE_OPENSHELL_GATEWAY_URL` | Isolated profile | engine: remote gateway |
 | `CRUCIBLE_OPENSHELL_GATEWAY_TLS_DIR` | Isolated profile | engine: client material |
 | `CRUCIBLE_GATEWAY_*` | Isolated profile, gateway pod only | `crucible openshell-gateway` |
 
-The engine refuses a partial set: `CRUCIBLE_KUEUE_URL` without the token endpoint and audience
-fails the turn, and so does `CRUCIBLE_BUILDIT_RUN_ISSUER` without them or without
-`CRUCIBLE_BUILDIT_NAMESPACE`. `CRUCIBLE_BUILDIT_NAMESPACE` or `CRUCIBLE_BUILDIT_PUSH_REPO`
-without `CRUCIBLE_BUILDIT_RUN_ISSUER` fails the turn too, instead of running without buildit
-(`crucible/src/openshell/buildit.rs`, `BuilditAccessError::NoIssuer`).
+The engine refuses a partial set: servers without the token endpoint or the SVID audience fail
+the turn, and so does a list that does not parse or a server URL without an http(s) host and port
+(`AgentServersError`, `crucible/src/openshell/agent_servers.rs`). No list, or an empty one, gives
+the sandbox no provider, no egress entry and no `.mcp.json` entry.
 
 ### 9.4 crucible-kueue flags
 
@@ -2134,7 +2139,7 @@ The stack is single-tenant today in these places:
 | --- | --- | --- |
 | Token claims | `sub`, `kube_user`, run and sandbox; no team | Add a `team` claim from crucible teams at mint time (`issuer.rs:782`, `people.rs:299`). The tool policy already sees every claim, so CEL rules can use it at once |
 | Workload namespaces | `[kueue] workload_namespaces`, the same list for all runs on a cluster | A per-team list in the profile. Tokens already take their namespaces from the audience's description, and the server serves several with `--namespace` |
-| Push repository | One `[buildit] push_repo` | A per-team repository chosen at dispatch and carried in `CRUCIBLE_BUILDIT_PUSH_REPO` |
+| Push repository | One `[buildit] push_repo` | A per-team repository chosen at dispatch and carried in the buildit entry of `CRUCIBLE_AGENT_SERVERS` |
 | SPIFFE ID | `.../openshell/gateway/<gateway id>/sandbox/<sandbox id>` | A team segment from a label that the controller puts on the gateway pod. `CONTROLLER_AGENT_SPIRE` allows one gateway prefix per cluster, so the issuer must then parse the team after the prefix, or accept several prefixes |
 | Identity rules | One rule per cluster | Rules per group, so that one cluster can trust SSO usernames for some teams and links for others |
 | People clients | One client registry for the deployment, optional metadata documents, and self-registration. A client without `resources` can get every audience | Registry entries or `resources` per team |

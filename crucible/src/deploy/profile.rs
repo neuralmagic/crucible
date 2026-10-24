@@ -54,6 +54,9 @@ pub struct DeployProfile {
     /// buildit, started in each run's loop pod on the clusters it names.
     #[serde(default)]
     pub buildit: Option<BuilditCfg>,
+    /// Other MCP servers that take agent tokens, each `[[agent_servers]]`.
+    #[serde(default)]
+    pub agent_servers: Vec<AgentServerCfg>,
     /// The controller's OpenShift OAuth client, through which people link their username on a
     /// cluster without pasting a token.
     #[serde(default)]
@@ -307,6 +310,10 @@ pub struct BuilditCfg {
     /// (`[secrets] push_authfile`). Unset, buildit pushes nothing.
     #[serde(default)]
     pub push_repo: Option<String>,
+    /// The URL sandboxes reach buildit at; it listens on its port in the loop pod. Default
+    /// `http://host.openshell.internal:8848/mcp`.
+    #[serde(default)]
+    pub url: Option<url::Url>,
     /// Where builder pods may connect besides DNS, since a build's `RUN` steps run unsandboxed:
     /// the registries they pull from and push to. Default: TCP 443 anywhere.
     #[serde(default = "default_builder_egress")]
@@ -345,6 +352,22 @@ impl BuilditCfg {
         self.clusters.iter().any(|c| c == cluster)
     }
 
+    /// The port buildit listens on in the loop pod: its URL's.
+    pub fn port(&self) -> u16 {
+        self.url
+            .as_ref()
+            .and_then(url::Url::port_or_known_default)
+            .unwrap_or(crucible_contract::buildit::PORT)
+    }
+
+    /// The URL sandboxes reach buildit at.
+    pub fn url(&self) -> String {
+        match &self.url {
+            Some(url) => url.to_string(),
+            None => crucible_contract::buildit::URL.to_string(),
+        }
+    }
+
     /// `<issuer>=<jwks uri>`, as buildit's `--run-issuer` takes it.
     pub fn trusted_issuer(&self) -> Result<String, url::ParseError> {
         let jwks = match &self.run_jwks_uri {
@@ -356,6 +379,29 @@ impl BuilditCfg {
         };
         Ok(format!("{}={jwks}", self.run_issuer))
     }
+}
+
+/// An `[[agent_servers]]` entry: an MCP server that takes agent tokens, deployed by its operator.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentServerCfg {
+    /// The `.mcp.json` key the agent sees its tools under.
+    pub name: crucible_contract::agent_servers::ServerName,
+    /// Its MCP URL, the audience of its tokens. `CONTROLLER_AGENT_AUDIENCES` must list it.
+    pub url: url::Url,
+    /// The dispatch clusters whose runs get it: `clusters = [...]`, or `cluster = "..."`.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
+    /// Whether it authorizes as the token's `kube_user`, so no token is minted without one.
+    #[serde(default)]
+    pub requires_kube_user: bool,
+    /// The namespaces its tokens name, the first as the default.
+    #[serde(default)]
+    pub namespaces: Vec<KubeName>,
 }
 
 /// The source of a caller's groups for crucible-kueue's SubjectAccessReviews (`--kube-authz`).
@@ -930,6 +976,9 @@ impl DeployProfile {
         profile
             .check_cluster_names()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .agent_servers()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
         Ok(profile)
     }
 
@@ -942,6 +991,7 @@ impl DeployProfile {
         self.clusters
             .keys()
             .chain(tables.into_iter().flatten().flatten())
+            .chain(self.agent_servers.iter().flat_map(|s| &s.clusters))
             .try_for_each(|name| check_cluster_name(name))
     }
 

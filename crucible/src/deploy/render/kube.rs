@@ -1416,11 +1416,9 @@ exit $rc
                                 ..Default::default()
                             },
                         ])
-                        .chain(self.profile.buildit.as_ref().map(|_| {
+                        .chain(self.profile.buildit.as_ref().map(|b| {
                             networking::NetworkPolicyPort {
-                                port: Some(IntOrString::Int(
-                                    crucible_contract::buildit::PORT.into(),
-                                )),
+                                port: Some(IntOrString::Int(b.port().into())),
                                 protocol: Some("TCP".to_string()),
                                 ..Default::default()
                             }

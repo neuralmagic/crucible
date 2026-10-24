@@ -393,23 +393,18 @@ async fn try_turn(
         _ => false,
     };
 
-    // 2d. The run's crucible-kueue access: a token-grant provider whose tokens the sandbox's
-    //     supervisor obtains from the controller and injects on traffic to the server alone.
-    let kueue = crate::openshell::kueue::KueueAccess::from_env()
-        .context("reading the run's crucible-kueue access")?;
-    if let Some(k) = &kueue {
-        ensure_token_grant_provider(&gw, provider::KUEUE_PROVIDER_NAME, k.token_grant_profile())
-            .await?;
-    }
-    // 2e. The run's buildit, started in this pod, reached the same way.
-    let buildit = crate::openshell::buildit::BuilditAccess::from_env()
-        .context("reading the run's buildit access")?;
-    if let Some(b) = &buildit {
-        tokio::task::block_in_place(|| b.ensure_running()).context("starting the run's buildit")?;
+    // 2d. The run's MCP servers that take agent tokens: each a token-grant provider whose tokens
+    //     the sandbox's supervisor obtains from the controller and injects on traffic to that
+    //     server alone. One served in this pod is started first.
+    let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
+        .context("reading the run's agent servers")?;
+    for s in agent_servers.iter() {
+        tokio::task::block_in_place(|| s.start_local())
+            .with_context(|| format!("starting the run's {}", s.server.name))?;
         ensure_token_grant_provider(
             &gw,
-            provider::BUILDIT_PROVIDER_NAME,
-            b.token_grant_profile(),
+            &s.provider_name(),
+            agent_servers.token_grant_profile(s),
         )
         .await?;
     }
@@ -448,12 +443,7 @@ async fn try_turn(
     if broker_provider {
         providers.push(provider::BROKER_PROVIDER_NAME.to_string());
     }
-    if kueue.is_some() {
-        providers.push(provider::KUEUE_PROVIDER_NAME.to_string());
-    }
-    if buildit.is_some() {
-        providers.push(provider::BUILDIT_PROVIDER_NAME.to_string());
-    }
+    providers.extend(agent_servers.iter().map(|s| s.provider_name()));
     let sandbox_id = gw
         .create_sandbox(
             &name,
@@ -623,11 +613,7 @@ async fn try_turn(
             })
             .into_iter()
             .collect();
-        for ep in kueue
-            .iter()
-            .map(|k| k.egress_endpoint())
-            .chain(buildit.iter().map(|b| b.egress_endpoint()))
-        {
+        for ep in agent_servers.iter().map(|s| s.egress_endpoint()) {
             if !endpoints.contains(&ep) {
                 endpoints.push(ep);
             }
@@ -711,7 +697,10 @@ async fn try_turn(
         //     broker and the turn's `[mcp]` servers, loaded via `--mcp-config`). The URLs were
         //     resolved in step 4 so each URL and its egress entry agree. Each `[mcp]` server gets
         //     a fresh token naming this sandbox and its workdir.
-        let seed_token = match (broker_provider, broker_placeholder(kueue.is_some())) {
+        let seed_token = match (
+            broker_provider,
+            broker_placeholder(!agent_servers.is_empty()),
+        ) {
             (true, BrokerPlaceholder::Issued) => {
                 Some(issued_placeholder(&gw, &name, provider::BROKER_CRED_KEY, &cancel).await?)
             }
@@ -736,20 +725,11 @@ async fn try_turn(
             url,
             token: Some(token),
         }));
-        if let Some(k) = &kueue {
-            servers.push(McpServer {
-                name: crate::openshell::kueue::MCP_SERVER_NAME,
-                url: k.url(),
-                token: None,
-            });
-        }
-        if let Some(b) = &buildit {
-            servers.push(McpServer {
-                name: crate::openshell::buildit::MCP_SERVER_NAME,
-                url: b.url(),
-                token: None,
-            });
-        }
+        servers.extend(agent_servers.iter().map(|s| McpServer {
+            name: s.server.name.as_str(),
+            url: &s.server.url,
+            token: None,
+        }));
         let seeds = backend.seed_files(args, &servers, &sandbox_auth, &inference);
         for seed in &seeds {
             let seed_tmp = write_temp("seed", &seed.content).await?;

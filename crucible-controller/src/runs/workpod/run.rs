@@ -642,8 +642,12 @@ pub async fn dispatch_run(
          to the profile the loop-pod render reads",
     )?;
     let loaded = cfg.profile().await?;
-    let kueue_cfg = loaded.as_ref().and_then(|p| p.kueue.as_ref());
-    let buildit_cfg = loaded.as_ref().and_then(|p| p.buildit.as_ref());
+    let agent_servers = match loaded.as_ref() {
+        Some(p) => p
+            .agent_servers()
+            .context("reading the deploy profile's agent servers")?,
+        None => Vec::new(),
+    };
     let isolated = loaded
         .as_deref()
         .filter(|p| crucible::deploy::render::gateway::isolated(p));
@@ -806,18 +810,16 @@ pub async fn dispatch_run(
             .merge(extra)
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
     }
-    if let Some(tokens) = crate::runs::workpod::kueue::AgentTokens::from_cfg(cfg)?
+    if let Some(tokens) = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?
         && let Some(access) =
-            crate::runs::workpod::kueue::access(kueue_cfg, buildit_cfg, &cluster, &tokens)?
+            crate::runs::workpod::agent_servers::access(&agent_servers, &cluster, &tokens)?
     {
         delivery.merge(access).map_err(|e| {
             anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
         })?;
-        if let Some(loaded) = loaded.as_ref() {
-            crate::runs::agent_tools::grant(db, loaded, run_id, &cluster, &tokens)
-                .await
-                .context("recording the run's agent tools")?;
-        }
+        crate::runs::agent_tools::grant(db, &agent_servers, run_id, &cluster, &tokens)
+            .await
+            .context("recording the run's agent tools")?;
     }
     let reads_run = match &opts {
         RunRenderOpts::Playbook {

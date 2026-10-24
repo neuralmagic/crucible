@@ -278,7 +278,10 @@ POD=$(kc -n "$LOOP_NS" get pods -o json | jq -r '[.items[] | select(.metadata.la
 [ "$POD" != null ] || fail "no loop pod in $LOOP_NS"
 kueue_env=$(kc -n "$LOOP_NS" get pod "$POD" -o json \
     | jq -r '[.spec.containers[].env[]?.name | select(test("KUEUE"))] | join(",")')
-[ "$kueue_env" = CRUCIBLE_KUEUE_URL ] || fail "loop pod $POD has kueue env $kueue_env"
+[ -z "$kueue_env" ] || fail "loop pod $POD has kueue env $kueue_env"
+servers=$(kc -n "$LOOP_NS" get pod "$POD" -o json \
+    | jq -r '[.spec.containers[].env[]? | select(.name == "CRUCIBLE_AGENT_SERVERS") | .value][0] // "[]" | fromjson | [.[].name] | sort | join(",")')
+[ "$servers" = buildit,kueue ] || fail "loop pod $POD is granted servers [$servers], not buildit and kueue"
 kc -n "$LOOP_NS" get secrets -o json | jq -e '[.items[].data // {} | keys[] | select(test("KUEUE"))] | length == 0' >/dev/null \
     || fail "a Secret in $LOOP_NS carries a kueue key"
 

@@ -259,14 +259,15 @@ table.
 | `CONTROLLER_PEOPLE_CIMD_HOSTS` | Comma-separated host names (`chatgpt.com,pi.dev`) allowed to publish Client ID Metadata Documents. Set, an `https://` `client_id` on one of these hosts is fetched and accepted as a public client, and the metadata advertises `client_id_metadata_document_supported`. Unset (the default) refuses every URL `client_id`. The controller needs outbound HTTPS to these hosts; it honours `HTTPS_PROXY`. |
 
 A run dispatched onto one of the `[kueue]` clusters (`clusters = ["spoke-a", "spoke-b"]`, or
-`cluster = "spoke-a"`) gets the server's URL (`CRUCIBLE_KUEUE_URL`), the
-token endpoint (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`) and the issuer as SVID audience
-(`CRUCIBLE_AGENT_SVID_AUDIENCE`) as plain env. The engine registers a token-grant provider from
-them, so each sandbox's supervisor obtains its own token and injects it on traffic to the server
+`cluster = "spoke-a"`), or of any server the profile describes, gets each server's name, URL,
+scopes and transport (`CRUCIBLE_AGENT_SERVERS`), the token endpoint
+(`CRUCIBLE_AGENT_TOKEN_ENDPOINT`) and the issuer as SVID audience (`CRUCIBLE_AGENT_SVID_AUDIENCE`)
+as plain env. The engine registers a token-grant provider for each, so each sandbox's supervisor obtains its own token and injects it on traffic to the server
 alone; no token is minted per run. A server is granted only on a cluster in
 `CONTROLLER_AGENT_SPIRE` whose URL is in `CONTROLLER_AGENT_AUDIENCES`. The run records what it got,
-with the audience's scopes and, for crucible-kueue, the dispatcher's username there, and the run
-page shows it.
+with the audience's scopes and, for a server that acts as `kube_user` such as crucible-kueue, the
+dispatcher's username there, and the run page shows it. A third server needs an
+`[[agent_servers]]` entry and its URL in `CONTROLLER_AGENT_AUDIENCES`, nothing else.
 
 The deploy profile describes each server that takes agent tokens (`DeployProfile::agent_servers`):
 `[kueue]` needs a `kube_user` in every token and names `workload_namespaces`, the first as the

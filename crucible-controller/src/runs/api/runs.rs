@@ -151,9 +151,12 @@ pub(crate) async fn get_run(
 pub(crate) async fn get_agent_tool_defaults(
     State(state): State<ApiState>,
 ) -> Result<Response, AppError> {
-    let profile = state.profile().await?;
+    let servers = match state.profile().await? {
+        Some(profile) => profile.agent_servers().map_err(anyhow::Error::from)?,
+        None => Vec::new(),
+    };
     Ok(Json(crate::runs::agent_tools::defaults(
-        profile.as_deref(),
+        &servers,
         state.agent_tokens.as_ref(),
     ))
     .into_response())

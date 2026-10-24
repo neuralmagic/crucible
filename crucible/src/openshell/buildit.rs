@@ -1,23 +1,13 @@
-//! The run's buildit, started in the loop pod when the controller gave the run buildit access:
-//! it runs builder pods in the profile's buildit namespace from the run's own sandboxes, through the run's gateway, and
-//! takes only run tokens the controller issued for this run. The sandbox's supervisor obtains
-//! each token and injects it on traffic to buildit alone.
+//! The run's buildit, started in the loop pod when the controller granted the run a server served
+//! there by `buildit mcp`: it runs builder pods in the profile's buildit namespace from the run's
+//! own sandboxes, through the run's gateway, and takes only run tokens the controller issued for
+//! this run. Its grant, egress and `.mcp.json` entry are any agent server's
+//! ([`crate::openshell::agent_servers`]).
 
-use crate::openshell::provider;
 use anyhow::{Context, Result};
-use crucible_contract::buildit::{
-    ENV_BUILDIT_NAMESPACE, ENV_BUILDIT_PUSH_REPO, ENV_BUILDIT_RUN_ISSUER, PORT, SCOPE_BUILD,
-    SCOPE_READ, URL,
-};
-use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
+use crucible_contract::agent_servers::BuilditSite;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-/// The `.mcp.json` server name the agent sees buildit's tools under.
-pub const MCP_SERVER_NAME: &str = "buildit";
-
-/// The name sandboxes reach the loop pod by.
-const HOST: &str = "host.openshell.internal";
 
 const POLICY: &str = include_str!("../../../buildit/deploy/buildit-policy.toml");
 
@@ -34,25 +24,16 @@ struct BootTimeout {
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
-pub enum BuilditAccessError {
-    #[error("{ENV_BUILDIT_RUN_ISSUER} is set but {missing} is not; the controller sets both")]
-    Partial { missing: &'static str },
-    #[error("{set} is set but {ENV_BUILDIT_RUN_ISSUER} is not; the controller sets both")]
-    NoIssuer { set: &'static str },
-    #[error("{ENV_BUILDIT_RUN_ISSUER} {0:?} is not <issuer>=<jwks uri>")]
-    Issuer(String),
-}
+#[error("buildit's run issuer {0:?} is not <issuer>=<jwks uri>")]
+pub struct BadIssuer(String);
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct BuilditAccess {
-    /// `<issuer>=<jwks uri>`, buildit's `--run-issuer`.
-    trusted_issuer: String,
-    jwks_over_http: bool,
-    /// Where builder pods go.
-    namespace: String,
-    push_repo: Option<String>,
-    endpoint: String,
-    svid_audience: String,
+/// `buildit mcp` for one run: what the controller granted, served at `url` on `port`.
+pub struct Buildit<'a> {
+    pub site: &'a BuilditSite,
+    pub url: &'a str,
+    /// The name sandboxes reach the loop pod by.
+    pub host: &'a str,
+    pub port: u16,
 }
 
 /// What `buildit mcp` runs as for this run.
@@ -63,136 +44,66 @@ pub struct RunSite<'a> {
     pub push_authfile: Option<&'a str>,
 }
 
-impl BuilditAccess {
-    /// The access from the loop pod's environment; `None` when this run has none.
-    pub fn from_env() -> Result<Option<Self>, BuilditAccessError> {
-        let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
-        Self::from_values(
-            var(ENV_BUILDIT_RUN_ISSUER),
-            var(ENV_BUILDIT_NAMESPACE),
-            var(ENV_BUILDIT_PUSH_REPO),
-            var(ENV_AGENT_TOKEN_ENDPOINT),
-            var(ENV_AGENT_SVID_AUDIENCE),
-        )
-    }
-
-    fn from_values(
-        issuer: Option<String>,
-        namespace: Option<String>,
-        push_repo: Option<String>,
-        endpoint: Option<String>,
-        svid_audience: Option<String>,
-    ) -> Result<Option<Self>, BuilditAccessError> {
-        let Some(trusted_issuer) = issuer else {
-            return match (&namespace, &push_repo) {
-                (Some(_), _) => Err(BuilditAccessError::NoIssuer {
-                    set: ENV_BUILDIT_NAMESPACE,
-                }),
-                (None, Some(_)) => Err(BuilditAccessError::NoIssuer {
-                    set: ENV_BUILDIT_PUSH_REPO,
-                }),
-                (None, None) => Ok(None),
-            };
-        };
-        let namespace = namespace.ok_or(BuilditAccessError::Partial {
-            missing: ENV_BUILDIT_NAMESPACE,
-        })?;
-        let endpoint = endpoint.ok_or(BuilditAccessError::Partial {
-            missing: ENV_AGENT_TOKEN_ENDPOINT,
-        })?;
-        let svid_audience = svid_audience.ok_or(BuilditAccessError::Partial {
-            missing: ENV_AGENT_SVID_AUDIENCE,
-        })?;
-        let jwks = trusted_issuer
+impl Buildit<'_> {
+    /// `buildit mcp`'s arguments for `run`, reading its tool policy from `policy`.
+    pub fn args(&self, run: &RunSite<'_>, policy: &str) -> Result<Vec<String>, BadIssuer> {
+        let jwks = self
+            .site
+            .run_issuer
             .split_once('=')
             .and_then(|(_, jwks)| url::Url::parse(jwks).ok())
-            .ok_or_else(|| BuilditAccessError::Issuer(trusted_issuer.clone()))?;
-        Ok(Some(Self {
-            jwks_over_http: jwks.scheme() == "http",
-            trusted_issuer,
-            namespace,
-            push_repo,
-            endpoint,
-            svid_audience,
-        }))
-    }
-
-    pub fn url(&self) -> &'static str {
-        URL
-    }
-
-    /// The sandbox egress entry: HTTP-inspected, so the supervisor injects the token.
-    pub fn egress_endpoint(&self) -> String {
-        format!("{HOST}:{PORT}:full:rest")
-    }
-
-    /// The token-grant provider profile; its endpoint binds the injected token to buildit alone.
-    pub fn token_grant_profile(&self) -> openshell_core::proto::ProviderProfile {
-        provider::token_grant_profile(&provider::GrantedServer {
-            profile_id: provider::BUILDIT_GRANT_PROFILE_ID,
-            name: "buildit",
-            host: HOST,
-            port: PORT,
-            url: URL,
-            token_endpoint: &self.endpoint,
-            svid_audience: &self.svid_audience,
-            scopes: &[SCOPE_READ, SCOPE_BUILD],
-        })
-    }
-
-    /// `buildit mcp`'s arguments for `site`, reading its tool policy from `policy`.
-    pub fn args(&self, site: &RunSite<'_>, policy: &str) -> Vec<String> {
+            .ok_or_else(|| BadIssuer(self.site.run_issuer.clone()))?;
         let mut args: Vec<String> = [
             "mcp",
             "--bind",
-            &format!("0.0.0.0:{PORT}"),
+            &format!("0.0.0.0:{}", self.port),
             "--run-issuer",
-            &self.trusted_issuer,
+            &self.site.run_issuer,
             "--resource",
-            URL,
+            self.url,
             "--allowed-host",
-            HOST,
+            self.host,
             "--tool-policy",
             policy,
             "--run-id",
-            site.run_id,
+            run.run_id,
             "--namespace",
-            &self.namespace,
+            &self.site.namespace,
         ]
         .map(String::from)
         .to_vec();
-        if self.jwks_over_http {
+        if jwks.scheme() == "http" {
             args.push("--insecure-jwks-http".to_string());
         }
-        if let (Some(repo), Some(authfile)) = (&self.push_repo, site.push_authfile) {
+        if let (Some(repo), Some(authfile)) = (&self.site.push_repo, run.push_authfile) {
             args.extend(["--push-repo", repo, "--push-authfile", authfile].map(String::from));
         }
-        args
+        Ok(args)
     }
 
     /// Start buildit for this run unless it is already listening, and wait until it accepts
     /// connections. It is the loop pod's child for the run's lifetime, like the broker.
     pub fn ensure_running(&self) -> Result<()> {
-        let probe = format!("127.0.0.1:{PORT}");
+        let probe = format!("127.0.0.1:{}", self.port);
         if crate::control::broker::port_open(&probe) {
             return Ok(());
         }
         let run_id = std::env::var(crucible_contract::ENV_POD_NAME)
             .context("buildit needs the run pod's name to know its run")?;
         let push_authfile = std::env::var(ENV_PUSH_AUTHFILE).ok();
-        if self.push_repo.is_some() && push_authfile.is_none() {
+        if self.site.push_repo.is_some() && push_authfile.is_none() {
             tracing::warn!(
-                "{ENV_BUILDIT_PUSH_REPO} is set but the loop pod has no push authfile; buildit pushes nothing"
+                "buildit has a push repository but the loop pod has no push authfile; it pushes nothing"
             );
         }
         let policy = std::env::temp_dir().join("buildit-policy.toml");
         std::fs::write(&policy, POLICY).with_context(|| format!("writing {}", policy.display()))?;
-        let site = RunSite {
+        let run = RunSite {
             run_id: &run_id,
             push_authfile: push_authfile.as_deref(),
         };
         Command::new("buildit")
-            .args(self.args(&site, &policy.to_string_lossy()))
+            .args(self.args(&run, &policy.to_string_lossy())?)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -219,126 +130,33 @@ mod tests {
 
     const ISSUER: &str =
         "https://crucible.hub.example=https://crucible-ext.hub.example/.well-known/jwks.json";
-    const ENDPOINT: &str = "https://crucible-ext.hub.example/oauth/token";
-    const AUDIENCE: &str = "https://crucible.hub.example";
+    const URL: &str = "http://host.openshell.internal:8848/mcp";
 
-    fn access(push: Option<&str>) -> BuilditAccess {
-        BuilditAccess::from_values(
-            Some(ISSUER.into()),
-            Some("crucible-builds".into()),
-            push.map(str::to_string),
-            Some(ENDPOINT.into()),
-            Some(AUDIENCE.into()),
-        )
-        .unwrap()
-        .unwrap()
+    fn site(issuer: &str, push: Option<&str>) -> BuilditSite {
+        BuilditSite {
+            run_issuer: issuer.into(),
+            namespace: "crucible-builds".into(),
+            push_repo: push.map(str::to_string),
+        }
     }
 
-    #[test]
-    fn no_issuer_means_no_buildit_and_an_issuer_needs_the_token_endpoint() {
-        assert!(
-            BuilditAccess::from_values(
-                None,
-                None,
-                None,
-                Some(ENDPOINT.into()),
-                Some(AUDIENCE.into())
-            )
-            .unwrap()
-            .is_none()
-        );
-        assert_eq!(
-            BuilditAccess::from_values(
-                Some(ISSUER.into()),
-                Some("crucible-builds".into()),
-                None,
-                None,
-                Some(AUDIENCE.into())
-            ),
-            Err(BuilditAccessError::Partial {
-                missing: ENV_AGENT_TOKEN_ENDPOINT
-            })
-        );
-        assert_eq!(
-            BuilditAccess::from_values(
-                Some(ISSUER.into()),
-                None,
-                None,
-                Some(ENDPOINT.into()),
-                Some(AUDIENCE.into())
-            ),
-            Err(BuilditAccessError::Partial {
-                missing: ENV_BUILDIT_NAMESPACE
-            }),
-            "builder pods never fall back to the loop namespace"
-        );
-        assert!(matches!(
-            BuilditAccess::from_values(
-                Some("https://crucible.hub.example".into()),
-                Some("crucible-builds".into()),
-                None,
-                Some(ENDPOINT.into()),
-                Some(AUDIENCE.into())
-            ),
-            Err(BuilditAccessError::Issuer(_))
-        ));
-    }
-
-    #[test]
-    fn buildit_settings_without_an_issuer_are_refused_not_ignored() {
-        assert_eq!(
-            BuilditAccess::from_values(
-                None,
-                None,
-                Some("quay.io/team/agent".into()),
-                Some(ENDPOINT.into()),
-                Some(AUDIENCE.into())
-            ),
-            Err(BuilditAccessError::NoIssuer {
-                set: ENV_BUILDIT_PUSH_REPO
-            })
-        );
-        assert_eq!(
-            BuilditAccess::from_values(None, Some("crucible-builds".into()), None, None, None),
-            Err(BuilditAccessError::NoIssuer {
-                set: ENV_BUILDIT_NAMESPACE
-            })
-        );
-    }
-
-    #[test]
-    fn the_token_grant_is_bound_to_buildit_in_the_loop_pod_with_buildits_scopes() {
-        let a = access(None);
-        assert_eq!(
-            a.egress_endpoint(),
-            "host.openshell.internal:8848:full:rest"
-        );
-        let profile = a.token_grant_profile();
-        assert_eq!(profile.id, provider::BUILDIT_GRANT_PROFILE_ID);
-        let endpoint = &profile.endpoints[0];
-        assert_eq!(
-            (
-                endpoint.host.as_str(),
-                endpoint.port,
-                endpoint.protocol.as_str()
-            ),
-            ("host.openshell.internal", 8848, "rest")
-        );
-        let grant = profile.credentials[0].token_grant.as_ref().unwrap();
-        assert_eq!(grant.audience, "http://host.openshell.internal:8848/mcp");
-        assert_eq!(grant.token_endpoint, ENDPOINT);
-        assert_eq!(grant.jwt_svid_audience, AUDIENCE);
-        assert_eq!(grant.scopes, ["buildit.read", "buildit.build"]);
-        assert!(profile.credentials[0].env_vars.is_empty(), "no placeholder");
+    fn buildit(site: &BuilditSite) -> Buildit<'_> {
+        Buildit {
+            site,
+            url: URL,
+            host: "host.openshell.internal",
+            port: 8848,
+        }
     }
 
     #[test]
     fn buildit_serves_this_run_alone_and_pushes_only_with_a_repo_and_an_authfile() {
-        let site = RunSite {
+        let run = RunSite {
             run_id: "crucible-run-brave-otter",
             push_authfile: Some("/etc/quay/push.json"),
         };
-        let args = access(None).args(&site, "/tmp/policy.toml");
+        let plain = site(ISSUER, None);
+        let args = buildit(&plain).args(&run, "/tmp/policy.toml").unwrap();
         let flag = |args: &[String], f: &str| {
             args.iter()
                 .position(|a| a == f)
@@ -349,9 +167,10 @@ mod tests {
             Some("crucible-run-brave-otter")
         );
         assert_eq!(flag(&args, "--run-issuer").as_deref(), Some(ISSUER));
+        assert_eq!(flag(&args, "--resource").as_deref(), Some(URL));
         assert_eq!(
-            flag(&args, "--resource").as_deref(),
-            Some("http://host.openshell.internal:8848/mcp")
+            flag(&args, "--allowed-host").as_deref(),
+            Some("host.openshell.internal")
         );
         assert_eq!(
             flag(&args, "--namespace").as_deref(),
@@ -364,38 +183,74 @@ mod tests {
         );
         assert!(!args.contains(&"--insecure-jwks-http".to_string()));
 
-        let pushing = access(Some("quay.io/example/crucible-smoke")).args(&site, "/p");
+        let pushing = site(ISSUER, Some("quay.io/example/crucible-smoke"));
+        let args = buildit(&pushing).args(&run, "/p").unwrap();
         assert_eq!(
-            flag(&pushing, "--push-repo").as_deref(),
+            flag(&args, "--push-repo").as_deref(),
             Some("quay.io/example/crucible-smoke")
         );
         assert_eq!(
-            flag(&pushing, "--push-authfile").as_deref(),
+            flag(&args, "--push-authfile").as_deref(),
             Some("/etc/quay/push.json")
         );
         let no_authfile = RunSite {
             push_authfile: None,
-            ..site
+            ..run
         };
         assert!(
-            !access(Some("quay.io/example/crucible-smoke"))
+            !buildit(&pushing)
                 .args(&no_authfile, "/p")
+                .unwrap()
                 .contains(&"--push-repo".to_string())
         );
 
-        let plain = BuilditAccess::from_values(
-            Some("http://ctl.ns.svc:8080=http://ctl.ns.svc:8080/.well-known/jwks.json".into()),
-            Some("crucible-builds".into()),
+        let over_http = site(
+            "http://ctl.ns.svc:8080=http://ctl.ns.svc:8080/.well-known/jwks.json",
             None,
-            Some(ENDPOINT.into()),
-            Some(AUDIENCE.into()),
-        )
-        .unwrap()
-        .unwrap();
+        );
         assert!(
-            plain
+            buildit(&over_http)
                 .args(&no_authfile, "/p")
+                .unwrap()
                 .contains(&"--insecure-jwks-http".to_string())
+        );
+    }
+
+    #[test]
+    fn its_port_and_url_are_the_granted_ones() {
+        let s = site(ISSUER, None);
+        let elsewhere = Buildit {
+            site: &s,
+            url: "http://host.openshell.internal:9000/mcp",
+            host: "host.openshell.internal",
+            port: 9000,
+        };
+        let args = elsewhere
+            .args(
+                &RunSite {
+                    run_id: "r",
+                    push_authfile: None,
+                },
+                "/p",
+            )
+            .unwrap();
+        assert!(args.windows(2).any(|w| w == ["--bind", "0.0.0.0:9000"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--resource", "http://host.openshell.internal:9000/mcp"])
+        );
+    }
+
+    #[test]
+    fn an_issuer_without_a_key_set_uri_is_refused() {
+        let s = site("https://crucible.hub.example", None);
+        let run = RunSite {
+            run_id: "r",
+            push_authfile: None,
+        };
+        assert_eq!(
+            buildit(&s).args(&run, "/p"),
+            Err(BadIssuer("https://crucible.hub.example".into()))
         );
     }
 }

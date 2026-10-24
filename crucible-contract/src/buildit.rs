@@ -1,20 +1,11 @@
 //! Names the controller, the loop, and the per-run buildit server share.
 
-/// Loop-pod env naming the issuer buildit trusts for run tokens, as `<issuer>=<jwks uri>`. Its
-/// presence starts buildit for the run.
-pub const ENV_BUILDIT_RUN_ISSUER: &str = "CRUCIBLE_BUILDIT_RUN_ISSUER";
-
-/// Loop-pod env naming the namespace buildit runs its builder pods in, apart from the loop pods.
-pub const ENV_BUILDIT_NAMESPACE: &str = "CRUCIBLE_BUILDIT_NAMESPACE";
-
-/// Loop-pod env naming the one repository buildit pushes builds to; unset, it pushes nothing.
-pub const ENV_BUILDIT_PUSH_REPO: &str = "CRUCIBLE_BUILDIT_PUSH_REPO";
-
-/// The port buildit serves on in the loop pod.
-pub const PORT: u16 = 8848;
-
-/// The URL sandboxes reach buildit at, and the audience of the tokens it accepts.
+/// The URL sandboxes reach buildit at unless `[buildit] url` names another, and the audience of the
+/// tokens it accepts.
 pub const URL: &str = "http://host.openshell.internal:8848/mcp";
+
+/// The port in [`URL`], which buildit listens on in the loop pod.
+pub const PORT: u16 = 8848;
 
 /// OAuth scope to read builds' status and logs.
 pub const SCOPE_READ: &str = "buildit.read";
