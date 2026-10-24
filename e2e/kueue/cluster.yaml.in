@@ -1,0 +1,34 @@
+# The e2e's own workload namespace, its LocalQueue, and SVIDs for supervisors in its sandbox
+# namespace, all labelled crucible.dev/e2e=kueue so teardown finds them.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: @WORKLOAD_NS@
+  labels:
+    kueue.openshift.io/managed: "true"
+    crucible.dev/e2e: kueue
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: crucible-e2e
+  namespace: @WORKLOAD_NS@
+spec:
+  clusterQueue: crucible
+---
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: crucible-kueue-e2e-supervisor
+  labels:
+    crucible.dev/e2e: kueue
+spec:
+  className: zero-trust-workload-identity-manager-spire
+  jwtTtl: 5m
+  namespaceSelector:
+    matchLabels:
+      kubernetes.io/metadata.name: @SANDBOX_NS@
+  podSelector:
+    matchLabels:
+      openshell.ai/boundary-role: supervisor
+  spiffeIDTemplate: spiffe://{{ .TrustDomain }}/openshell/gateway/{{ index .PodMeta.Labels "openshell.ai/gateway-id" }}/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}

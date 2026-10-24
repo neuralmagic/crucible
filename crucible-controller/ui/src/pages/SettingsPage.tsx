@@ -2,8 +2,9 @@ import { useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { $api } from '../api/client';
 import { formatError } from '../api/errors';
+import { useIdentities } from '../api/lanes';
 import { viaLabel } from '../ownerContext';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   Button,
   Empty,
@@ -25,6 +26,9 @@ import {
   type KeyState,
 } from './settingsView';
 import { TextField, NumberInputField, CheckField, FormActions } from './formControls';
+import { clusterIdentitiesShown, linkOutcome, sortIdentities } from './clusterIdentitiesView';
+import { ClusterIdentityRow } from './ClusterIdentityRow';
+import { mcpSignInsShown, signedOutMessage } from './mcpSignInsView';
 
 const TONE: Record<CredentialState, StatusTone> = {
   absent: 'grey',
@@ -232,6 +236,110 @@ function ApiKeys() {
   );
 }
 
+function ClusterIdentities() {
+  const identities = $api.useQuery('get', '/api/me/cluster-identities');
+  const whoami = $api.useQuery('get', '/api/whoami');
+  const [search] = useSearchParams();
+  const outcome = linkOutcome(search);
+
+  if (identities.isError) {
+    return <Empty title="Cluster identities unavailable" description={formatError(identities.error)} />;
+  }
+  if (identities.isPending) {
+    return <LoadingBlock label="Loading cluster identities" />;
+  }
+  if (!clusterIdentitiesShown(identities.data, outcome !== null)) {
+    return null;
+  }
+  const readOnly = Boolean(whoami.data?.impersonation);
+  return (
+    <Section>
+      <SectionHeader
+        title="Cluster identities"
+        note="who you are on each cluster, for tools that check your Kubernetes permissions there"
+      />
+      <SectionBody>
+        <p className="text-body text-ink-2">
+          MCP servers act on a cluster as your username there, limited by its RBAC. Most clusters
+          take it from your SSO sign-in; the rest you link once by signing in to the cluster.
+        </p>
+        {outcome !== null && (
+          <p
+            data-testid="cluster-link-outcome"
+            className={outcome.ok ? 'mt-2 text-body text-ink-2' : 'mt-2 text-body text-red'}
+          >
+            {outcome.ok ? `Linked ${outcome.cluster}.` : outcome.message}
+          </p>
+        )}
+        <div className="mt-4">
+          {sortIdentities(identities.data).map((identity) => (
+            <ClusterIdentityRow key={identity.cluster} identity={identity} readOnly={readOnly} />
+          ))}
+        </div>
+      </SectionBody>
+    </Section>
+  );
+}
+
+/// The MCP clients signed in through this controller, and the switch that ends every approval.
+function McpSignIns() {
+  const qc = useQueryClient();
+  const signIns = $api.useQuery('get', '/api/me/mcp-sign-ins');
+  const signOut = $api.useMutation('delete', '/api/me/mcp-sign-ins');
+  const [outcome, setOutcome] = useState<string | null>(null);
+  if (signIns.isError) {
+    return <Empty title="MCP sign-ins unavailable" description={formatError(signIns.error)} />;
+  }
+  if (signIns.isPending) return <LoadingBlock label="Loading MCP sign-ins" />;
+  if (!mcpSignInsShown(signIns.data)) return null;
+  const live = signIns.data.sign_ins;
+  return (
+    <Section>
+      <SectionHeader
+        title="MCP clients"
+        note="tools on your machines that signed in here for a token to an MCP server"
+      />
+      <SectionBody>
+        {live.length === 0 ? (
+          <p className="m-0 text-body text-ink-3">No MCP client is signed in.</p>
+        ) : (
+          <dl data-testid="mcp-sign-ins" className="m-0 grid grid-cols-[1fr_max-content_max-content] gap-x-6 gap-y-1.5 font-mono text-data">
+            {live.map((s) => (
+              <div key={`${s.resource} ${s.approved_at}`} className="contents">
+                <dt className="text-ink">{s.resource}</dt>
+                <dd className="m-0 text-ink-2">{s.cluster}</dd>
+                <dd className="m-0 text-ink-3">last used {s.last_used_at}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        {outcome !== null && <p className="mt-2 text-body text-ink-2">{outcome}</p>}
+        {signOut.isError && <p className="mt-2 text-body text-red">{formatError(signOut.error)}</p>}
+        <div className="mt-3">
+          <Button
+            className="uppercase"
+            variant="filled"
+            disabled={live.length === 0 || signOut.isPending}
+            onClick={() => {
+              signOut.mutate(
+                {},
+                {
+                  onSuccess: (result) => {
+                    setOutcome(signedOutMessage(result.revoked));
+                    void qc.invalidateQueries();
+                  },
+                },
+              );
+            }}
+          >
+            {signOut.isPending ? 'Signing out…' : 'Sign out MCP clients'}
+          </Button>
+        </div>
+      </SectionBody>
+    </Section>
+  );
+}
+
 function Memberships() {
   const whoami = $api.useQuery('get', '/api/whoami');
   if (whoami.isError) {
@@ -268,6 +376,7 @@ function Memberships() {
 }
 
 export function SettingsPage() {
+  const identities = useIdentities() === true;
   return (
     <>
       <PageHeader
@@ -276,6 +385,8 @@ export function SettingsPage() {
         description="The credentials this controller holds on your behalf, and what stops working without them."
       />
       <Memberships />
+      {identities ? <ClusterIdentities /> : null}
+      {identities ? <McpSignIns /> : null}
       <OfflineCredential />
       <ApiKeys />
     </>

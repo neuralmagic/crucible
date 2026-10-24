@@ -188,6 +188,24 @@ pub async fn ingest_completion(db: &Db, cfg: &ControllerCfg, key: &str) -> Resul
     }
 }
 
+/// The deploy profile for collection's cleanup of the crucible-kueue record and an isolated
+/// gateway. A profile that cannot be read leaves the record to its expiry and the gateway to the
+/// gateway sweep rather than failing the collection.
+async fn collection_profile(
+    cfg: &ControllerCfg,
+) -> Option<std::sync::Arc<crucible::deploy::DeployProfile>> {
+    match cfg.profile().await {
+        Ok(profile) => profile,
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "reading the deploy profile for run pod cleanup failed"
+            );
+            None
+        }
+    }
+}
+
 /// Close the `running` run pod rows of `key` whose run already reached a terminal status: a
 /// collection that failed after the ingest leaves one behind, and nothing else revisits it.
 async fn close_left_over_run_pods(db: &Db, cfg: &ControllerCfg, key: &str) -> Result<()> {
@@ -202,6 +220,7 @@ async fn close_left_over_run_pods(db: &Db, cfg: &ControllerCfg, key: &str) -> Re
             db,
             crate::runs::workpod::active_dispatcher().as_ref(),
             &cfg.pod_namespace,
+            collection_profile(cfg).await.as_deref(),
             &pod,
             disposition,
         )
@@ -263,6 +282,7 @@ async fn settle_run(
             db,
             crate::runs::workpod::active_dispatcher().as_ref(),
             &cfg.pod_namespace,
+            collection_profile(cfg).await.as_deref(),
             pod,
             disposition,
         )

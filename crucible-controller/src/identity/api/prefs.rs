@@ -149,6 +149,57 @@ pub(crate) async fn put_editor_prefs(
     Ok(Json(body).into_response())
 }
 
+/// The notices' document: the newest revision of each notice the user has seen, so a notice shows
+/// once per change.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct NoticePrefsDto {
+    #[schema(value_type = std::collections::HashMap<String, serde_json::Value>)]
+    pub prefs: serde_json::Value,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/prefs/notices",
+    responses(
+        (status = 200, description = "The notice revisions the caller has seen; `{}` when none", body = NoticePrefsDto)
+    )
+)]
+pub(crate) async fn get_notice_prefs(
+    State(state): State<ApiState>,
+    bound: BoundSession,
+) -> Result<Json<NoticePrefsDto>, AppError> {
+    let prefs = get_document(&state, &bound, crate::identity::user_prefs::NOTICES_KIND).await?;
+    Ok(Json(NoticePrefsDto { prefs }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/prefs/notices",
+    request_body = NoticePrefsDto,
+    responses(
+        (status = 200, description = "Stored against the caller's identity", body = NoticePrefsDto),
+        (status = 403, description = "No identity on the request — prefs are per-user"),
+        (status = 413, description = "Request body exceeds the 16 KiB cap")
+    )
+)]
+pub(crate) async fn put_notice_prefs(
+    State(state): State<ApiState>,
+    bound: BoundSession,
+    Json(body): Json<NoticePrefsDto>,
+) -> Result<Response, AppError> {
+    if let Some(refusal) = put_document(
+        &state,
+        &bound,
+        crate::identity::user_prefs::NOTICES_KIND,
+        &body.prefs,
+    )
+    .await?
+    {
+        return Ok(refusal);
+    }
+    Ok(Json(body).into_response())
+}
+
 /// The pickers' document: what a user starred and how they last filtered, stored against their
 /// identity like the editor's settings so it follows them to a fresh browser.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]

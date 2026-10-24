@@ -9,9 +9,11 @@
 //! a single domain is a degenerate composite of one component, so it needs its own `[deploy]` block
 //! naming that one target (see [`render::RenderInput::from_manifest`]).
 
+pub mod cluster_link;
 mod controller;
+pub mod kueue;
 pub mod profile;
-mod render;
+pub mod render;
 
 pub use profile::DeployProfile;
 pub use render::{
@@ -116,6 +118,32 @@ pub fn render_turn_cmd(profile_path: &Path, opts: &render::TurnOpts) -> Result<(
     let profile = DeployProfile::load(profile_path)?;
     let yaml = render_turn(&profile, opts)?;
     print!("{yaml}");
+    Ok(())
+}
+
+/// Emit the crucible-kueue server's YAML, rendered from the profile's `[kueue]` table.
+pub fn render_kueue_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+    let profile = DeployProfile::load(profile_path)?;
+    print!("{}", kueue::render(&profile, opts)?);
+    Ok(())
+}
+
+/// Render the crucible-kueue server then server-side apply it.
+pub fn apply_kueue_cmd(profile_path: &Path, opts: &RenderOpts) -> Result<()> {
+    let profile = DeployProfile::load(profile_path)?;
+    let yaml = kueue::render(&profile, opts)?;
+    forge::kube::apply_yaml(&yaml).context("applying the rendered crucible-kueue deployment")
+}
+
+/// Emit the controller's `OAuthClient` for `cluster`, from the profile's `[cluster_link]` table. It
+/// is cluster-scoped on `cluster`, so it is never applied from here.
+pub fn render_cluster_link_cmd(
+    profile_path: &Path,
+    clusters_file: Option<&Path>,
+    cluster: &str,
+) -> Result<()> {
+    let profile = DeployProfile::load_with_fleet(profile_path, clusters_file)?;
+    print!("{}", cluster_link::render(&profile, cluster)?);
     Ok(())
 }
 

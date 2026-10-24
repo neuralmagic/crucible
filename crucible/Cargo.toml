@@ -76,7 +76,7 @@ tokio-util = "0.7"
 jiff = { version = "0.2", features = ["serde"] }
 # Turn-trace span hints: parse a candidate URL to scrub `user:pass@` userinfo without hand-rolling
 # authority slicing.
-url = "2"
+url = { version = "2", features = ["serde"] }
 # Host-side temp staging: the 0600 upload files (env/prompt/mcp/cred) and the scratch dir the
 # sandbox transcript downloads into, both auto-unlinked on drop instead of a hand-rolled guard.
 tempfile = "3"
@@ -94,7 +94,7 @@ flate2 = "1"
 tar = "0.4"
 # Deploy render: real Kubernetes object types (the rendered Pod/RoleBinding stay honest to the API)
 # serialized to YAML, plus forge's in-process registry digest resolver (no crane shell-out).
-k8s-openapi = { version = "0.28", features = ["v1_32"] }
+k8s-openapi.workspace = true
 serde_norway = "0.9"
 # The hermes harness's post-turn parity reader: hermes has no live event stream, so its result +
 # cost + tool spans are reconstructed from its SQLite `state.db`. Pinned to 0.32 so its

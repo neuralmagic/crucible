@@ -224,3 +224,103 @@ create or revoke keys. A key cannot create a replacement key or stay valid after
 Each rejection on the bearer path tells the cause: no header, not a key, a key of a different
 controller, expired, or revoked. If `crux whoami` answers `credential: bearer (anonymous)`,
 the string in the header does not start with `crk_`.
+
+## Cluster identities
+
+MCP servers that check Kubernetes permissions (SubjectAccessReview) need to know who a person is on
+the cluster they run on. People's access tokens carry it as `kube_user`, and Settings → Cluster
+identities lists every cluster the deploy profile knows, the rule that cluster uses, and the
+caller's username there. The deploy profile declares each cluster's rule:
+
+```toml
+[cluster]                                 # the hub
+identity = { claim = "login" }            # usernames are SSO logins
+
+[clusters.waldorf]
+kubeconfig_secret = "waldorf-kubeconfig"
+identity = { claim = "email" }            # the cluster's OIDC login uses the same email
+
+[clusters.pirate]
+kubeconfig_secret = "pirate-kubeconfig"
+identity = "link"                         # the default: each person proves it to the cluster
+```
+
+`prefix` puts the API server's OIDC username prefix in front of a claim
+(`{ claim = "login", prefix = "sso:" }`). A claim cluster shows the resolved name read-only. A
+`link` cluster shows Link, Relink and Unlink, and records only what the cluster itself said: the
+link's username, how it was proven, and when. The token used to prove it is never stored or logged.
+On the hub, an administrator's override (`PUT /api/users/{login}/kube-user`, audited, never
+self-applied) wins over the rule and shows as such; it is also what the person's runs act as there.
+
+### Linking through an OpenShift cluster's OAuth server
+
+The controller registers as a confidential `OAuthClient` on each cluster listed in the profile's
+`[cluster_link]` table. Link sends the browser to that cluster's authorize endpoint (read from
+`/.well-known/oauth-authorization-server` on its API server) with PKCE and a state bound to the
+person's session. The callback redeems the code for a `user:info` token, the cluster's TokenReview
+names its owner, the username is recorded, and the token is dropped.
+
+```toml
+[cluster_link]
+external_url = "https://crucible.apps.hub.example.com"
+openshift = ["pirate"]
+# client_id = "crucible-controller"
+# access_token_max_age_secs = 300
+```
+
+Render the client for one cluster, then create it there with a fresh secret, and give the same
+secret to the controller under the cluster's name:
+
+```sh
+crucible deploy render --profile profile.toml --cluster-link pirate > oauthclient-pirate.yaml
+secret=$(openssl rand -hex 32)
+oc --context pirate apply -f oauthclient-pirate.yaml
+oc --context pirate patch oauthclient crucible-controller --type merge -p "{\"secret\":\"$secret\"}"
+oc --context hub -n crucible-system create secret generic crucible-cluster-link \
+  --from-literal=pirate="$secret" --dry-run=client -o yaml | oc --context hub apply -f -
+```
+
+`OAuthClient` is cluster-scoped, so creating it needs cluster-admin on that cluster. Mount the
+`crucible-cluster-link` Secret into the controller and point `CONTROLLER_CLUSTER_LINK_SECRETS` at
+the directory: one file per cluster, named for it. A listed cluster without a file offers the paste
+fallback only. The controller's own credential on each cluster needs `tokenreviews` create
+(`system:auth-delegator`) to review the token, and the controller reaches the cluster's token
+endpoint (its `oauth-openshift` route) directly, not through the cluster's `proxy_url`.
+
+### Pasting a token
+
+A `link` cluster without OAuth takes a pasted `oc whoami -t` or an OIDC ID token the cluster's API
+server accepts. The cluster's TokenReview names the owner; the token is dropped the same way.
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/me/cluster-identities` | Every cluster's rule and the caller's username. |
+| `PUT /api/me/cluster-identities/{cluster}` | Link by pasted token. |
+| `POST /api/me/cluster-identities/{cluster}/link` | Start the OAuth link; browser sessions only. |
+| `GET /oauth/cluster-link/{cluster}/callback` | The cluster's redirect; lands on `/settings?linked=` or `?link_error=`. |
+| `DELETE /api/me/cluster-identities/{cluster}` | Unlink. |
+| `GET /api/oauth/consent?id=` | The authorization request parked on the session, for the consent page. |
+| `POST /api/oauth/consent` | Approve or deny it; answers the client's loopback redirect to navigate to. |
+
+API keys can read but never link or unlink.
+
+### The consent page
+
+`GET /oauth/authorize` from an MCP client (Claude Code, pi) parks the request on the browser session
+and sends the browser to `/consent?id=…` in the controller UI. The page shows the client, server,
+scopes and login, and the person's username on the server's cluster. A `link` cluster nobody has
+linked offers Link (and the paste box where the cluster has no OAuth) right there, and the sign-in
+lands back on the same page. Allow and Deny are a JSON call that returns the client's
+`http://localhost|127.0.0.1|[::1]:<port>/callback` URL with a code or an error; the page navigates to
+it. A request answers once, and only from the browser and person that started it.
+
+### People's tokens and refresh
+
+Access tokens last 15 minutes. Codes and refresh tokens live in Postgres, keyed by the SHA-256 of
+the secret, so every replica honours them and a restart signs nobody out. A refresh token is spent
+on use and the next one returned; presenting a spent one again revokes the whole approval. An
+approval dies after 14 days without a refresh or 90 days after it was granted. Every refresh reads
+the person again: a deleted account, one whose stored credential the identity provider refused,
+or a cluster username that was unlinked ends the approval, and a relink shows up in the next token.
+Settings → MCP clients lists the live approvals and signs every client out at once. Expired codes
+and approvals are swept hourly.

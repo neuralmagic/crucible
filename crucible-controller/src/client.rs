@@ -464,6 +464,38 @@ mod tests {
                 "0058_provider_price.sql",
                 "00ddcd9ea8ffacc4f7186269a85dc46af111222776abb123a43e56f86f3f81b1",
             ),
+            (
+                "0059_run_sandboxes.sql",
+                "65f1b33d83c4f9bf7047811efcaf8898208c784e859b2133b3bf7216abb34895",
+            ),
+            (
+                "0060_user_kube_user.sql",
+                "8f03e789adefc25ad41951d772428b75b4c08e4a09ff9f3f2a787eb308fd3064",
+            ),
+            (
+                "0061_run_sandbox_names.sql",
+                "9d1e7ddbfddf7767806c3f42a6dc4c7ba4053f83bce844a40201f750ac455982",
+            ),
+            (
+                "0062_dispatch_principal.sql",
+                "902a3238c9732bd900f4c95010f4713720029638a6d67aae29bbacbad795037d",
+            ),
+            (
+                "0063_run_sandbox_names_not_global.sql",
+                "aedd4a58621ce522f27c29ed58233696887d0c412e73c5c246da21127352bd37",
+            ),
+            (
+                "0064_kube_identity_links.sql",
+                "4794fdf9bccddabbc22cbc0ed0927eb2f5807d4c19b0014716ed585395ecd55f",
+            ),
+            (
+                "0065_people_grants.sql",
+                "10ca1735a5018f7954889b04aae599227e44d8739dce6ca9a20990f436817448",
+            ),
+            (
+                "0066_run_agent_tools.sql",
+                "de7a6111e23f2534b8dd32bee294dd005abbbf2745612ffcb379f17026c40486",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {
@@ -959,11 +991,11 @@ mod tests {
             sqlx::Postgres::database_exists(&url).await?,
             "connect creates the database"
         );
-        assert_eq!(crate::schema_version(&pool).await?, 58);
+        assert_eq!(crate::schema_version(&pool).await?, 66);
 
         // Idempotent: re-opening an already-migrated DB is a no-op, not an error.
         let pool2 = connect(&url).await?;
-        assert_eq!(crate::schema_version(&pool2).await?, 58);
+        assert_eq!(crate::schema_version(&pool2).await?, 66);
         pool.close().await;
         pool2.close().await;
         let _ = sqlx::Postgres::drop_database(&url).await;

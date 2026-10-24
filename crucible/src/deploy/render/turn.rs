@@ -293,6 +293,28 @@ fn checked_git_ref(r: &str) -> Result<&str, BadRepoRef> {
     Ok(r)
 }
 
+/// The turn pod's labels. Under isolated gateways it also names its run, which its gateway's
+/// NetworkPolicy admits it by.
+fn turn_labels(profile: &DeployProfile, opts: &TurnOpts) -> BTreeMap<String, String> {
+    let mut labels = BTreeMap::from([
+        (
+            crucible_contract::MANAGED_BY_KEY.to_string(),
+            crucible_contract::MANAGED_BY_VALUE.to_string(),
+        ),
+        (
+            "crucible.io/work-kind".to_string(),
+            opts.kind.label_value().to_string(),
+        ),
+    ]);
+    if crate::deploy::render::gateway::isolated(profile) {
+        labels.insert(
+            crate::deploy::render::gateway::RUN_LABEL.to_string(),
+            opts.name.clone(),
+        );
+    }
+    labels
+}
+
 #[tracing::instrument(skip_all, fields(turn_kind = ?opts.kind, issue = %opts.issue, pinned = opts.digests.is_some()), err)]
 pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     let image = pin_image(
@@ -577,16 +599,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
                 "sidecar.istio.io/inject".to_string(),
                 "false".to_string(),
             )])),
-            labels: Some(BTreeMap::from([
-                (
-                    crucible_contract::MANAGED_BY_KEY.to_string(),
-                    crucible_contract::MANAGED_BY_VALUE.to_string(),
-                ),
-                (
-                    "crucible.io/work-kind".to_string(),
-                    opts.kind.label_value().to_string(),
-                ),
-            ])),
+            labels: Some(turn_labels(profile, opts)),
             ..Default::default()
         },
         spec: Some(core::PodSpec {
@@ -824,6 +837,50 @@ mod tests {
             .find(|e| e.name == "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT")
             .and_then(|e| e.value.as_deref());
         assert_eq!(sandbox_sa, Some("autoresearch-sandbox"));
+    }
+
+    #[test]
+    fn an_isolated_turn_pod_names_its_run_for_its_gateways_network_policy() {
+        let render = |extra: &str| {
+            let profile: DeployProfile = toml::from_str(&format!(
+                r#"
+                [cluster]
+                loop_namespace = "autoresearch"
+                rig_namespace = "rig"
+                service_account = "autoresearch-publisher"
+                supervisor_image = "registry.example.com/openshell-supervisor:latest"
+                sandbox_driver = "kubernetes"
+                {extra}
+                [image]
+                loop = "ghcr.io/neuralmagic/crucible:latest"
+                pull_secret = "example-pull-secret"
+            "#
+            ))
+            .expect("profile parses");
+            let yaml = render_turn(
+                &profile,
+                &TurnOpts::new(
+                    TurnKind::Rank,
+                    "crucible-turn-owner-repo-42-abcd",
+                    "owner/repo#42",
+                    "https://github.com/owner/repo.git",
+                    "registry.example.com/epp-sandbox:latest",
+                ),
+            )
+            .expect("render turn");
+            pod_of(&yaml).metadata.labels.expect("labels")
+        };
+        let isolated = render(r#"sandbox_namespace = "sandboxes""#);
+        assert_eq!(
+            isolated
+                .get(crate::deploy::render::gateway::RUN_LABEL)
+                .map(String::as_str),
+            Some("crucible-turn-owner-repo-42-abcd")
+        );
+        assert!(
+            !render("").contains_key(crate::deploy::render::gateway::RUN_LABEL),
+            "an in-pod gateway needs no run label"
+        );
     }
 
     /// Under `sandbox_driver = "kubernetes"` a turn pod must thread the same `--compute-driver`

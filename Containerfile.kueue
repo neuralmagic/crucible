@@ -1,0 +1,34 @@
+# produces: ghcr.io/neuralmagic/crucible-kueue
+# The crucible-kueue MCP server: one per cluster, holding the Kubernetes credentials through
+# which sandboxed agents submit and watch Kueue workloads. Self-contained: compiles the one
+# crate in a builder stage, so a plain cluster build (buildit, forge) needs no CI pre-step.
+# glibc: builder and runtime share the UBI10 base.
+
+ARG VERSION=dev
+ARG REVISION=unknown
+
+FROM registry.access.redhat.com/ubi10/ubi:10.2 AS build
+RUN dnf install -y --nodocs gcc gcc-c++ make cmake perl git curl \
+    && dnf clean all
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo PATH=/usr/local/cargo/bin:$PATH
+RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path \
+    && cargo --version
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p crucible-kueue --bin crucible-kueue \
+    && cp target/release/crucible-kueue /crucible-kueue
+
+FROM registry.access.redhat.com/ubi10/ubi-minimal:10.2
+ARG VERSION
+ARG REVISION
+LABEL org.opencontainers.image.title="crucible-kueue" \
+      org.opencontainers.image.description="MCP server for sandboxed agents to submit and watch Kueue workloads" \
+      org.opencontainers.image.source="https://github.com/neuralmagic/crucible" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}"
+COPY --from=build /crucible-kueue /usr/local/bin/crucible-kueue
+RUN crucible-kueue --help >/dev/null
+USER 65532
+EXPOSE 8850
+ENTRYPOINT ["crucible-kueue"]

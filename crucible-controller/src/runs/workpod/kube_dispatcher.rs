@@ -1,7 +1,10 @@
 use crate::client::Db;
 use crate::runs::workpod::*;
 use anyhow::{Context, Result};
-use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use k8s_openapi::NamespaceResourceScope;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 /// The production cluster boundary: create/watch/logs/delete a work pod over the kube API,
@@ -37,7 +40,10 @@ impl PodDispatcher for KubePodDispatcher {
         let api: kube::Api<ConfigMap> = kube::Api::namespaced(client, namespace);
         api.create(&kube::api::PostParams::default(), &cm)
             .await
-            .context("creating the pack ConfigMap")?;
+            .with_context(|| {
+                let name = cm.metadata.name.as_deref().unwrap_or_default();
+                format!("creating ConfigMap {namespace}/{name}")
+            })?;
         Ok(())
     }
 
@@ -54,6 +60,102 @@ impl PodDispatcher for KubePodDispatcher {
             .await
             .context("creating the run Secret")?;
         Ok(())
+    }
+
+    async fn create_service(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        service: Service,
+    ) -> Result<Service> {
+        let client = self.clusters.client(cluster).await?;
+        let api: kube::Api<Service> = kube::Api::namespaced(client, namespace);
+        api.create(&kube::api::PostParams::default(), &service)
+            .await
+            .with_context(|| {
+                let name = service.metadata.name.as_deref().unwrap_or_default();
+                format!("creating Service {namespace}/{name}")
+            })
+    }
+
+    async fn create_network_policy(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        policy: NetworkPolicy,
+    ) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        let api: kube::Api<NetworkPolicy> = kube::Api::namespaced(client, namespace);
+        api.create(&kube::api::PostParams::default(), &policy)
+            .await
+            .with_context(|| {
+                let name = policy.metadata.name.as_deref().unwrap_or_default();
+                format!("creating NetworkPolicy {namespace}/{name}")
+            })?;
+        Ok(())
+    }
+
+    async fn delete_selected(&self, cluster: &str, namespace: &str, selector: &str) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        delete_selected_of::<NetworkPolicy>(&client, namespace, selector).await?;
+        delete_selected_of::<Pod>(&client, namespace, selector).await?;
+        delete_selected_of::<Service>(&client, namespace, selector).await?;
+        delete_selected_of::<Secret>(&client, namespace, selector).await
+    }
+
+    async fn delete_services(&self, cluster: &str, namespace: &str, selector: &str) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        delete_selected_of::<Service>(&client, namespace, selector).await
+    }
+
+    async fn delete_sandboxes(&self, cluster: &str, namespace: &str, selector: &str) -> Result<()> {
+        let client = self.clusters.client(cluster).await?;
+        for version in crate::agent_auth::directory::SANDBOX_VERSIONS {
+            let api = crate::agent_auth::directory::sandbox_api(&client, namespace, version);
+            let found = match api
+                .list_metadata(&kube::api::ListParams::default().labels(selector))
+                .await
+            {
+                Ok(found) => found,
+                Err(kube::Error::Api(s)) if s.code == 404 => continue,
+                Err(e) => {
+                    return Err(e).with_context(|| {
+                        format!("listing Sandboxes in {namespace} matching {selector}")
+                    });
+                }
+            };
+            for name in found.items.into_iter().filter_map(|o| o.metadata.name) {
+                match api
+                    .delete(&name, &kube::api::DeleteParams::background())
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(kube::Error::Api(s)) if s.code == 404 => {}
+                    Err(e) => {
+                        return Err(e)
+                            .with_context(|| format!("deleting Sandbox {namespace}/{name}"));
+                    }
+                }
+            }
+            return Ok(());
+        }
+        Ok(())
+    }
+
+    async fn selected_label_values(
+        &self,
+        cluster: &str,
+        namespace: &str,
+        selector: &str,
+        label: &str,
+    ) -> Result<BTreeSet<String>> {
+        let client = self.clusters.client(cluster).await?;
+        let mut values = BTreeSet::new();
+        values.extend(label_values_of::<Pod>(&client, namespace, selector, label).await?);
+        values.extend(label_values_of::<Service>(&client, namespace, selector, label).await?);
+        values.extend(label_values_of::<Secret>(&client, namespace, selector, label).await?);
+        values.extend(label_values_of::<NetworkPolicy>(&client, namespace, selector, label).await?);
+        Ok(values)
     }
 
     async fn await_terminal(
@@ -132,6 +234,65 @@ impl PodDispatcher for KubePodDispatcher {
     async fn pod_namespace(&self, cluster: &str, hub_namespace: &str) -> Result<String> {
         self.clusters.pod_namespace(cluster, hub_namespace).await
     }
+}
+
+/// Delete every `K` in `namespace` matching `selector`, one by one: not every kind serves
+/// `deletecollection`.
+async fn delete_selected_of<K>(client: &kube::Client, namespace: &str, selector: &str) -> Result<()>
+where
+    K: kube::Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+    K::DynamicType: Default,
+{
+    let api: kube::Api<K> = kube::Api::namespaced(client.clone(), namespace);
+    let kind = K::kind(&K::DynamicType::default()).to_string();
+    let found = api
+        .list_metadata(&kube::api::ListParams::default().labels(selector))
+        .await
+        .with_context(|| format!("listing {kind} in {namespace} matching {selector}"))?;
+    for name in found.items.into_iter().filter_map(|o| o.metadata.name) {
+        match api
+            .delete(&name, &kube::api::DeleteParams::background())
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(s)) if s.code == 404 => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("deleting {kind} {namespace}/{name}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn label_values_of<K>(
+    client: &kube::Client,
+    namespace: &str,
+    selector: &str,
+    label: &str,
+) -> Result<Vec<String>>
+where
+    K: kube::Resource<Scope = NamespaceResourceScope>
+        + Clone
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+    K::DynamicType: Default,
+{
+    let api: kube::Api<K> = kube::Api::namespaced(client.clone(), namespace);
+    let found = api
+        .list_metadata(&kube::api::ListParams::default().labels(selector))
+        .await
+        .with_context(|| {
+            let kind = K::kind(&K::DynamicType::default()).to_string();
+            format!("listing {kind} in {namespace} matching {selector}")
+        })?;
+    Ok(found
+        .items
+        .into_iter()
+        .filter_map(|o| o.metadata.labels?.remove(label))
+        .collect())
 }
 
 fn waiting_message(status: &k8s_openapi::api::core::v1::PodStatus) -> Option<String> {

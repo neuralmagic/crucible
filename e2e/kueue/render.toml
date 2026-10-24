@@ -1,0 +1,16 @@
+# A placeholder manifest for `crucible deploy render`: the e2e applies only the RBAC the profile
+# renders (the loop, gateway and sandbox-reader accounts), never the Pod this would launch.
+[repo]
+url = "https://github.com/owner/repo.git"
+
+[agent]
+backend = "openshell"
+goal = "render the profile's RBAC"
+sandbox_image = "registry.access.redhat.com/ubi9/ubi-minimal:latest"
+
+[judge]
+measure_cmd = "true"
+direction = "higher"
+objective = "score"
+
+[deploy]

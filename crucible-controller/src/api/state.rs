@@ -144,6 +144,22 @@ pub struct ApiState {
     pub(crate) cluster_policy: Arc<crate::runs::dispatch_target::ClusterPolicy>,
     /// The policy set in force (RFC-0003 C-POLICY), swapped whole by `activate`.
     pub(crate) policy: crate::authz::policy::ActivePolicy,
+    /// The deploy profile the cluster identity rules and agent tools are read from.
+    pub(crate) deploy_profile: Option<std::path::PathBuf>,
+    /// `deploy_profile`, read once.
+    pub(crate) profile_cache: crate::config::ProfileCache,
+    /// Whether the agent token issuer is configured: runs get agent tools, and dispatches record
+    /// who they act for.
+    pub(crate) agent_tools: bool,
+    /// Whether people sign in to MCP clients here or link cluster identities: what serves the
+    /// identity routes, the consent page and the settings' identity panels.
+    pub(crate) identities: bool,
+    /// The TokenReview every cluster identity link is proven by.
+    pub(crate) reviewer: Arc<dyn crate::identity::kube_links::ClusterReviewer>,
+    /// Linking through a cluster's OpenShift OAuth server; `None` without a `[cluster_link]` table.
+    pub(crate) cluster_links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
+    /// The issuer whose people grant the consent page decides; `None` when it serves no people.
+    pub(crate) people_issuer: Option<Arc<crate::agent_auth::AgentAuth>>,
 }
 
 impl ApiState {
@@ -196,6 +212,13 @@ impl ApiState {
             cluster_stats: Arc::new(crate::runs::cluster_stats::ClusterStats::new(
                 clusters.clone(),
             )),
+            reviewer: Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
+            cluster_links: None,
+            people_issuer: None,
+            deploy_profile: cfg.deploy_profile.clone(),
+            profile_cache: cfg.profile_cache.clone(),
+            agent_tools: cfg.issues_agent_tokens(),
+            identities: false,
             clusters,
             control_port: cfg.control_port,
             config,
@@ -259,6 +282,31 @@ impl ApiState {
         self
     }
 
+    /// The deploy profile, read once.
+    pub(crate) async fn profile(
+        &self,
+    ) -> anyhow::Result<Option<Arc<crucible::deploy::DeployProfile>>> {
+        self.profile_cache.get(self.deploy_profile.as_deref()).await
+    }
+
+    /// Attach the OpenShift OAuth link flow, built by the binary because reading its secrets can
+    /// fail.
+    pub fn with_cluster_links(
+        mut self,
+        links: Option<Arc<crate::identity::cluster_link::ClusterLinks>>,
+    ) -> Self {
+        self.cluster_links = links;
+        self.identities = self.cluster_links.is_some() || self.people_issuer.is_some();
+        self
+    }
+
+    /// Attach the issuer the consent page's decision mints codes from.
+    pub fn with_people_issuer(mut self, issuer: Option<Arc<crate::agent_auth::AgentAuth>>) -> Self {
+        self.people_issuer = issuer.filter(|i| i.people.is_some());
+        self.identities = self.cluster_links.is_some() || self.people_issuer.is_some();
+        self
+    }
+
     /// Attach the hub's Vault client. Built by the binary (the client reads its own environment
     /// and can fail), so assembling the state itself stays infallible.
     pub fn with_vault(mut self, vault: Option<Arc<crate::secrets::vault::VaultClient>>) -> Self {
@@ -312,6 +360,13 @@ impl ApiState {
             cluster_stats: Arc::new(crate::runs::cluster_stats::ClusterStats::new(
                 clusters.clone(),
             )),
+            reviewer: Arc::new(crate::identity::kube_links::KubeReviewer(clusters.clone())),
+            cluster_links: None,
+            people_issuer: None,
+            deploy_profile: None,
+            profile_cache: crate::config::ProfileCache::default(),
+            agent_tools: false,
+            identities: false,
             clusters,
             control_port: 7777,
             config: None,

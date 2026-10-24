@@ -14,10 +14,10 @@ use openshell_core::proto::{
     AddNetworkRule, ConfigureProviderRefreshRequest, CreateProviderRequest, CreateSandboxRequest,
     DeleteSandboxRequest, ExecSandboxRequest, FilesystemPolicy, GetProviderProfileRequest,
     GetProviderRequest, GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
-    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, NetworkBinary,
-    NetworkCredentialBinding, NetworkEndpoint, NetworkEnforcementMode, NetworkPolicyRule,
-    NetworkTlsMode, PolicyMergeOperation, PolicyStatus, Provider,
-    ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
+    GpuResourceRequirements, HealthRequest, ImportProviderProfilesRequest, McpOptions,
+    NetworkAccessPreset, NetworkBinary, NetworkCredentialBinding, NetworkEndpoint,
+    NetworkEnforcementMode, NetworkPolicyRule, NetworkTlsMode, PolicyMergeOperation, PolicyStatus,
+    Provider, ProviderCredentialRefreshStrategy, ProviderProfile, ProviderProfileDiagnostic,
     ProviderProfileImportItem, ResourceRequirements, RotateProviderCredentialRequest,
     SandboxCondition, SandboxLogLine, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     ServiceStatus, UpdateConfigRequest, UpdateProviderProfilesRequest, UpdateProviderRequest,
@@ -221,19 +221,14 @@ pub(crate) fn mtls_dir() -> Result<PathBuf> {
         .join("mtls"))
 }
 
-/// The gateway URL. Local, TLS+mTLS, on the fixed bind port.
-fn server_url() -> String {
-    format!("https://localhost:{GATEWAY_PORT}")
-}
-
 /// Build a lazily-connecting mTLS channel from the gateway's local certs. Lazy means no I/O,
 /// but `connect_lazy` still must run inside a tokio runtime context: the hyper executor it
 /// registers spawns tasks via the ambient handle and panics without one, must run inside the
 /// engine runtime context (the turn's `block_on` or a test runtime). Fails only when the certs
 /// are unreadable (e.g. the gateway has not generated them yet, the health probe treats that as
 /// "not up").
-fn build_channel() -> Result<Channel> {
-    let dir = mtls_dir()?;
+fn build_channel(dial: &GatewayDial) -> Result<Channel> {
+    let dir = &dial.tls_dir;
     let ca = std::fs::read(dir.join("ca.crt"))
         .with_context(|| format!("reading gateway CA cert in {}", dir.display()))?;
     let cert = std::fs::read(dir.join("tls.crt"))
@@ -243,12 +238,20 @@ fn build_channel() -> Result<Channel> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca))
         .identity(Identity::from_pem(cert, key));
-    let endpoint = Endpoint::from_shared(server_url())
+    let endpoint = Endpoint::from_shared(dial.endpoint.clone())
         .context("parsing gateway endpoint URL")?
         .connect_timeout(Duration::from_secs(10))
         .tls_config(tls)
         .context("configuring gateway mTLS")?;
     Ok(endpoint.connect_lazy())
+}
+
+/// Where a gateway is dialed: its URL, and the directory holding the client's mTLS material
+/// (`ca.crt`, `tls.crt`, `tls.key`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayDial {
+    pub endpoint: String,
+    pub tls_dir: std::path::PathBuf,
 }
 
 /// Wrap a channel in the OpenShell client. Edge auth is a no-op (the local gateway authenticates
@@ -274,8 +277,8 @@ impl HealthProbe {
     /// Build a probe, or `None` when the gateway certs are not present yet (nothing to probe).
     /// Must be called within a tokio runtime context, `build_channel`'s `connect_lazy` registers
     /// the hyper executor on the ambient runtime.
-    pub fn new() -> Option<Self> {
-        let channel = build_channel().ok()?;
+    pub fn new(dial: &GatewayDial) -> Option<Self> {
+        let channel = build_channel(dial).ok()?;
         Some(Self { channel })
     }
 
@@ -421,8 +424,8 @@ impl Gateway {
     /// booted and registered it, so the certs exist). Must be called within a tokio runtime
     /// context, `build_channel`'s `connect_lazy` registers the hyper executor on the ambient
     /// runtime.
-    pub fn connect() -> Result<Self> {
-        let channel = build_channel()?;
+    pub fn connect(dial: &GatewayDial) -> Result<Self> {
+        let channel = build_channel(dial)?;
         Ok(Self { channel })
     }
 
@@ -441,6 +444,7 @@ impl Gateway {
     }
 
     /// Create the sandbox and wait for it to reach `Ready`, deleting it if either step fails.
+    /// Returns the gateway-assigned sandbox id, when the gateway names one.
     /// `--no-auto-providers` is expressed by passing exactly the providers we manage (the gateway
     /// attaches only those). Labels ride the create request; the image lands on the template. No
     /// boot command is run, the sandbox stays up for a later [`Gateway::exec`], so the old
@@ -454,7 +458,7 @@ impl Gateway {
         labels: &[(String, String)],
         read_only_paths: &[String],
         resources: &crate::manifest::SandboxResources,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let driver_config = sandbox_driver_config(
             &env_json("CRUCIBLE_SANDBOX_HOST_ALIASES")?.unwrap_or_default(),
             &env_json(crate::openshell::placement::GPU_PLACEMENT_ENV)?.unwrap_or_default(),
@@ -496,7 +500,15 @@ impl Gateway {
         });
         let mut client = self.client();
         let created = match client.create_sandbox(request).await {
-            Ok(_) => self.wait_ready(name).await,
+            Ok(response) => {
+                let id = response
+                    .into_inner()
+                    .sandbox
+                    .and_then(|s| s.metadata)
+                    .map(|m| m.id)
+                    .filter(|id| !id.is_empty());
+                self.wait_ready(name).await.map(|()| id)
+            }
             Err(s) => Err(GrpcError::rpc(format!("create_sandbox({name})"))(s).into()),
         };
         if created.is_err()
@@ -1206,6 +1218,7 @@ fn sandbox_driver_config(
     if kubernetes.is_empty() {
         return Ok(None);
     }
+    check_driver_config(&kubernetes)?;
     let wrapped = serde_json::Map::from_iter([(
         "kubernetes".to_string(),
         serde_json::Value::Object(kubernetes),
@@ -1213,6 +1226,54 @@ fn sandbox_driver_config(
     Ok(Some(openshell_core::proto_struct::json_object_to_struct(
         wrapped,
     )?))
+}
+
+/// The `driver_config` fields crucible may send: placement and the agent container's resources.
+/// Volumes, volume mounts, and priority classes never leave this process, whoever asks.
+const DRIVER_CONFIG_POD_FIELDS: &[&str] = &[
+    "host_aliases",
+    "node_selector",
+    "tolerations",
+    "runtime_class_name",
+];
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("driver_config field {0} is not one crucible sends")]
+pub struct DriverConfigFieldRefused(pub String);
+
+/// Refuse a kubernetes `driver_config` holding anything outside [`DRIVER_CONFIG_POD_FIELDS`] and
+/// `containers.agent.resources`.
+fn check_driver_config(
+    kubernetes: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), DriverConfigFieldRefused> {
+    let refuse = |path: String| Err(DriverConfigFieldRefused(path));
+    for (key, value) in kubernetes {
+        match (key.as_str(), value) {
+            ("pod", serde_json::Value::Object(pod)) => {
+                if let Some(field) = pod
+                    .keys()
+                    .find(|f| !DRIVER_CONFIG_POD_FIELDS.contains(&f.as_str()))
+                {
+                    return refuse(format!("pod.{field}"));
+                }
+            }
+            ("containers", serde_json::Value::Object(containers)) => {
+                for (name, container) in containers {
+                    let fields = container.as_object().map(|c| c.keys().collect::<Vec<_>>());
+                    match (name.as_str(), fields) {
+                        ("agent", Some(fields)) => {
+                            if let Some(field) = fields.into_iter().find(|f| *f != "resources") {
+                                return refuse(format!("containers.agent.{field}"));
+                            }
+                        }
+                        _ => return refuse(format!("containers.{name}")),
+                    }
+                }
+            }
+            (other, _) => return refuse(other.to_string()),
+        }
+    }
+    Ok(())
 }
 
 /// The domain's declared paths ADDED to openshell's restrictive default, or `None` when it declared
@@ -1513,12 +1574,29 @@ pub enum EndpointProblem {
     PortRange,
     #[error("access must be read-only, read-write, or full")]
     Access,
-    #[error("protocol must be rest, websocket, or sql")]
+    #[error("protocol must be rest, websocket, sql, or mcp")]
     Protocol,
+    #[error("an mcp endpoint's access must be full (every known MCP method) or omitted")]
+    McpAccess,
     #[error("enforcement must be enforce or audit")]
     Enforcement,
     #[error("cannot set enforcement without a protocol")]
     EnforcementWithoutProtocol,
+}
+
+/// The MCP protocol revisions a `full` MCP endpoint accepts: every one the pinned OpenShell knows.
+const MCP_PROTOCOL_VERSIONS: [&str; 3] = ["2025-03-26", "2025-06-18", "2025-11-25"];
+
+/// An MCP endpoint that allows every known method, under any of [`MCP_PROTOCOL_VERSIONS`].
+fn full_mcp() -> McpOptions {
+    McpOptions {
+        allow_all_known_mcp_methods: Some(true),
+        versions: MCP_PROTOCOL_VERSIONS
+            .iter()
+            .map(|v| v.to_string())
+            .collect(),
+        ..McpOptions::default()
+    }
 }
 
 fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError> {
@@ -1546,7 +1624,7 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
     let enforcement = parts.get(4).copied().unwrap_or("").trim();
     let access_preset = openshell_policy::network_access_preset_from_str(access)
         .ok_or_else(|| reject(EndpointProblem::Access))?;
-    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql") {
+    if !protocol.is_empty() && !matches!(protocol, "rest" | "websocket" | "sql" | "mcp") {
         return Err(reject(EndpointProblem::Protocol));
     }
     let enforcement_mode = openshell_policy::network_enforcement_mode_from_str(enforcement)
@@ -1554,6 +1632,15 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
     if enforcement_mode != NetworkEnforcementMode::Unspecified && protocol.is_empty() {
         return Err(reject(EndpointProblem::EnforcementWithoutProtocol));
     }
+    // OpenShell rejects an MCP method wildcard, so `full` on an MCP endpoint is its
+    // method-profile switch rather than the generic `*` access preset.
+    let (access_preset, mcp) = match (protocol, access_preset) {
+        ("mcp", NetworkAccessPreset::Full | NetworkAccessPreset::Unspecified) => {
+            (NetworkAccessPreset::Unspecified, Some(full_mcp()))
+        }
+        ("mcp", _) => return Err(reject(EndpointProblem::McpAccess)),
+        (_, preset) => (preset, None),
+    };
     Ok(NetworkEndpoint {
         host: host.to_string(),
         port,
@@ -1561,6 +1648,7 @@ fn parse_endpoint_spec(spec: &str) -> Result<NetworkEndpoint, EndpointSpecError>
         protocol: protocol.to_string(),
         enforcement: enforcement_mode.into(),
         access: access_preset.into(),
+        mcp,
         ..NetworkEndpoint::default()
     })
 }
@@ -1670,7 +1758,12 @@ pYBZ
             .enable_all()
             .build()
             .unwrap();
-        let (probe, gateway) = rt.block_on(async { (HealthProbe::new(), Gateway::connect()) });
+        let dial = GatewayDial {
+            endpoint: format!("https://localhost:{GATEWAY_PORT}"),
+            tls_dir: mtls_dir().unwrap(),
+        };
+        let (probe, gateway) =
+            rt.block_on(async { (HealthProbe::new(&dial), Gateway::connect(&dial)) });
 
         unsafe {
             std::env::remove_var("XDG_CONFIG_HOME");
@@ -1935,6 +2028,83 @@ pYBZ
         assert!(parse_endpoint_spec("host:443:full:ftp").is_err());
         // enforcement without a protocol segment is rejected.
         assert!(parse_endpoint_spec("host:443:full::enforce").is_err());
+    }
+
+    #[test]
+    fn an_mcp_endpoint_with_full_access_allows_every_known_mcp_method() {
+        for spec in ["svc.ns.svc:8850:full:mcp", "svc.ns.svc:8850::mcp"] {
+            let ep = parse_endpoint_spec(spec).unwrap();
+            assert_eq!(ep.protocol, "mcp");
+            assert_eq!(ep.access(), NetworkAccessPreset::Unspecified);
+            assert_eq!(
+                ep.mcp.as_ref().and_then(|m| m.allow_all_known_mcp_methods),
+                Some(true)
+            );
+            assert_eq!(
+                ep.mcp.as_ref().map(|m| m.versions.clone()),
+                Some(MCP_PROTOCOL_VERSIONS.map(String::from).to_vec()),
+                "older MCP clients negotiate 2025-03-26"
+            );
+        }
+    }
+
+    #[test]
+    fn an_mcp_endpoint_refuses_a_partial_access_preset() {
+        for access in ["read-only", "read-write"] {
+            let err = parse_endpoint_spec(&format!("h:8850:{access}:mcp")).unwrap_err();
+            assert!(matches!(err.problem, EndpointProblem::McpAccess), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_bound_mcp_endpoint_keeps_its_protocol_and_passes_openshell_policy_validation() {
+        let binding = EndpointCredentialBinding {
+            host: "crucible-kueue.crucible-system.svc.cluster.local".to_string(),
+            port: 8850,
+            provider: "crucible-kueue".to_string(),
+        };
+        let ops = build_merge_operations(
+            &["/usr/local/bin/claude".to_string()],
+            &["crucible-kueue.crucible-system.svc.cluster.local:8850:full:mcp".to_string()],
+            std::slice::from_ref(&binding),
+        )
+        .unwrap();
+        let Some(MergeOp::AddRule(add)) = &ops[0].operation else {
+            panic!("expected an add-rule op");
+        };
+        let rule = add.rule.clone().unwrap();
+        let ep = &rule.endpoints[0];
+        assert_eq!(ep.protocol, "mcp");
+        assert_eq!(
+            ep.credential_binding.as_ref().map(|b| b.provider.as_str()),
+            Some("crucible-kueue")
+        );
+        let merged = openshell_policy::merge_policy(
+            openshell_policy::restrictive_default_policy(),
+            &[openshell_policy::PolicyMergeOp::AddRule {
+                rule_name: add.rule_name.clone(),
+                rule,
+            }],
+        )
+        .unwrap();
+        openshell_policy::validate_sandbox_policy(&merged.policy).unwrap();
+        let merged_ep = merged
+            .policy
+            .network_policies
+            .values()
+            .flat_map(|r| r.endpoints.iter())
+            .find(|e| e.port == 8850)
+            .expect("the kueue endpoint survives the merge");
+        assert_eq!(merged_ep.protocol, "mcp");
+        assert_eq!(
+            merged_ep
+                .mcp
+                .as_ref()
+                .and_then(|m| m.allow_all_known_mcp_methods),
+            Some(true),
+            "{merged_ep:?}"
+        );
+        assert!(merged_ep.credential_binding.is_some(), "{merged_ep:?}");
     }
 
     #[test]
@@ -2757,7 +2927,7 @@ pYBZ
 
     #[derive(Clone)]
     struct FakeGateway {
-        create: Result<(), tonic::Code>,
+        create: Result<&'static str, tonic::Code>,
         phase: SandboxPhase,
         deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
@@ -2818,7 +2988,20 @@ pYBZ
                         unary(
                             Unary(move |_: tonic::Request<CreateSandboxRequest>| async move {
                                 create
-                                    .map(|()| tonic::Response::new(SandboxResponse::default()))
+                                    .map(|id| {
+                                        tonic::Response::new(SandboxResponse {
+                                            sandbox: Some(Sandbox {
+                                                metadata: Some(
+                                                    openshell_core::proto::datamodel::v1::ObjectMeta {
+                                                        id: id.to_string(),
+                                                        ..Default::default()
+                                                    },
+                                                ),
+                                                ..Sandbox::default()
+                                            }),
+                                            ..SandboxResponse::default()
+                                        })
+                                    })
                                     .map_err(|code| tonic::Status::new(code, "create refused"))
                             }),
                             req,
@@ -2873,9 +3056,9 @@ pYBZ
     /// Drive `Gateway::create_sandbox` against a real gRPC server on a loopback port and return
     /// the create's outcome plus every name the server was asked to delete.
     fn create_against(
-        create: Result<(), tonic::Code>,
+        create: Result<&'static str, tonic::Code>,
         phase: SandboxPhase,
-    ) -> (Result<()>, Vec<String>) {
+    ) -> (Result<Option<String>>, Vec<String>) {
         let _guard = crate::test_support::env_lock();
         let deleted = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let fake = FakeGateway {
@@ -2916,7 +3099,7 @@ pYBZ
 
     #[test]
     fn a_sandbox_that_reaches_error_is_deleted() {
-        let (result, deleted) = create_against(Ok(()), SandboxPhase::Error);
+        let (result, deleted) = create_against(Ok("sbx-1"), SandboxPhase::Error);
         let err = result.expect_err("an Error-phase sandbox must fail the create");
         assert!(
             matches!(
@@ -2936,9 +3119,86 @@ pYBZ
     }
 
     #[test]
-    fn a_ready_sandbox_is_kept() {
-        let (result, deleted) = create_against(Ok(()), SandboxPhase::Ready);
-        assert!(result.is_ok(), "{:?}", result.err());
+    fn a_ready_sandbox_is_kept_and_its_id_returned() {
+        let (result, deleted) = create_against(Ok("sbx-1"), SandboxPhase::Ready);
+        assert_eq!(result.unwrap().as_deref(), Some("sbx-1"));
         assert!(deleted.is_empty(), "{deleted:?}");
+    }
+
+    #[test]
+    fn a_create_answered_without_an_id_is_kept_without_one() {
+        let (result, deleted) = create_against(Ok(""), SandboxPhase::Ready);
+        assert_eq!(result.unwrap(), None);
+        assert!(deleted.is_empty(), "{deleted:?}");
+    }
+
+    #[test]
+    fn driver_config_carries_only_placement_and_agent_resources() {
+        let resources = crate::manifest::SandboxResources {
+            gpus: 1,
+            cpu: Some(crate::manifest::Quantity::try_from("2".to_string()).unwrap()),
+            memory: Some(crate::manifest::Quantity::try_from("4Gi".to_string()).unwrap()),
+            node_selector: BTreeMap::from([("pool".to_string(), "gpu".to_string())]),
+        };
+        let gpu = crate::openshell::placement::GpuPlacement {
+            node_selector: BTreeMap::from([(
+                "nvidia.com/gpu.present".to_string(),
+                "true".to_string(),
+            )]),
+            tolerations: vec![k8s_openapi::api::core::v1::Toleration {
+                key: Some("nvidia.com/gpu".into()),
+                operator: Some("Exists".into()),
+                ..Default::default()
+            }],
+            runtime_class_name: Some("nvidia".into()),
+        };
+        let aliases = BTreeMap::from([("svc.example".to_string(), "10.0.0.9".to_string())]);
+        let built = sandbox_driver_config(&aliases, &gpu, &resources)
+            .unwrap()
+            .expect("a config");
+        let json = openshell_core::proto_struct::struct_to_json_object(&built);
+        let kubernetes = json["kubernetes"].as_object().expect("kubernetes table");
+        check_driver_config(kubernetes)
+            .expect("everything crucible builds passes its own allowlist");
+        assert_eq!(
+            kubernetes["pod"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            [
+                "host_aliases",
+                "node_selector",
+                "runtime_class_name",
+                "tolerations"
+            ]
+        );
+    }
+
+    #[test]
+    fn driver_config_volumes_mounts_and_priority_classes_are_refused() {
+        let cases = [
+            (serde_json::json!({"volumes": []}), "volumes"),
+            (
+                serde_json::json!({"pod": {"priority_class_name": "x"}}),
+                "pod.priority_class_name",
+            ),
+            (
+                serde_json::json!({"containers": {"agent": {"volume_mounts": []}}}),
+                "containers.agent.volume_mounts",
+            ),
+            (
+                serde_json::json!({"containers": {"sidecar": {}}}),
+                "containers.sidecar",
+            ),
+        ];
+        for (config, field) in cases {
+            let map = config.as_object().unwrap().clone();
+            assert_eq!(
+                check_driver_config(&map),
+                Err(DriverConfigFieldRefused(field.to_string())),
+                "{config}"
+            );
+        }
     }
 }

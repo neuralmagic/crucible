@@ -1,0 +1,49 @@
+# Deploy profile for the build-and-run e2e: a controller in @CTL_NS@ dispatches loop pods into
+# @LOOP_NS@, each run's gateway and sandboxes live in @SANDBOX_NS@, buildit runs in each loop pod
+# and pushes to @PUSH_REPO@, and the server in @KUEUE_NS@ takes Jobs in @WORKLOAD_NS@ through
+# LocalQueue crucible-e2e.
+[cluster]
+loop_namespace          = "@LOOP_NS@"
+rig_namespace           = "@LOOP_NS@"
+service_account         = "crucible-kueue-e2e-loop"
+sandbox_service_account = "crucible-sandbox"
+sandbox_namespace       = "@SANDBOX_NS@"
+sandbox_readers         = ["@CTL_NS@/crucible-controller"]
+sandbox_spiffe_socket   = "/spiffe-workload-api/spire-agent.sock"
+supervisor_image        = "@SUPERVISOR_IMAGE@"
+sandbox_driver          = "kubernetes"
+# The images are linux/amd64; the script lists every node of another architecture here.
+avoid_nodes             = [@AVOID_NODES@]
+# The controller loop pods reach: run evidence, and the sandbox binds agent tokens need.
+ingest_url              = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
+
+[image]
+loop        = "@LOOP_IMAGE@"
+pull_secret = "@PULL_SECRET@"
+
+# buildit pushes with this authfile; @PULL_SECRET@'s account may push to @PUSH_REPO@.
+[secrets]
+push_authfile = "@PULL_SECRET@"
+
+# Claude on an Anthropic Messages API endpoint; the key is a Secret on the cluster.
+[env]
+ANTHROPIC_BASE_URL = "@ANTHROPIC_BASE_URL@"
+
+[[secret_env]]
+name   = "ANTHROPIC_API_KEY"
+secret = "@ANTHROPIC_KEY_SECRET@"
+key    = "api-key"
+
+[kueue]
+image              = "@KUEUE_IMAGE@"
+cluster            = "hub"
+namespace          = "@KUEUE_NS@"
+workload_namespace = "@WORKLOAD_NS@"
+run_issuer         = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
+kube_authz         = "openshift"
+pull_secrets       = ["@PULL_SECRET@=@PUSH_REPO@"]
+
+[buildit]
+cluster    = "hub"
+run_issuer = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
+push_repo  = "@PUSH_REPO@"

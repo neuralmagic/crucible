@@ -135,6 +135,11 @@ impl ApprovalPoll {
         if crate::issues::store::record_approval(self.db.pool(), row.scope_id, &approval.by, &now)
             .await?
         {
+            if self.cfg.issues_agent_tokens()
+                && let Some(login) = self.authz.crucible_login(&approval.by)
+            {
+                crate::issues::store::request_dispatch(self.db.pool(), &row.key, login).await?;
+            }
             self.db
                 .events()
                 .append(&crate::event_log::Event::now(
@@ -1147,11 +1152,55 @@ mod tests {
             .unwrap();
         assert!(scope.is_approved(), "approved_at stamped");
         assert_eq!(scope.approved_by.as_deref(), Some("maint"));
+        let requested: Option<String> =
+            sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+                .bind("owner/repo#1")
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(
+            requested, None,
+            "a GitHub login nobody paired with a crucible login records no dispatcher"
+        );
         assert_eq!(
             *seen.lock().unwrap(),
             vec!["owner/repo#1"],
             "key enqueued for launch"
         );
+        Ok(())
+    }
+
+    /// A GitHub approver an operator paired with a crucible login is who the released dispatch
+    /// acts for.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_paired_github_approver_is_recorded_as_the_dispatcher(pool: PgPool) -> Result<()> {
+        let db = Db::new(pool);
+        let row = seed_awaiting(&db).await;
+        let server = MockServer::start().await;
+        mount_reviews_and_comments(
+            &server,
+            serde_json::json!([{"state": "APPROVED", "user": {"login": "Maint"}, "author_association": "MEMBER"}]),
+            serde_json::json!([]),
+        )
+        .await;
+        let poll = ApprovalPoll::new(
+            db.clone(),
+            crate::testing::cfg_from_args([
+                "ctl",
+                "--agent-issuer",
+                "https://crucible.example.com",
+            ]),
+            Authz::from_lookup(|var| {
+                (var == "CONTROLLER_GITHUB_LOGINS").then(|| "maint=alice".to_string())
+            }),
+        );
+        let enqueue = RecEnqueue(Arc::new(Mutex::new(Vec::new())));
+        assert!(poll.poll_one(&server.uri(), None, &row, &enqueue).await?);
+        let requested: Option<String> =
+            sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+                .bind("owner/repo#1")
+                .fetch_one(db.pool())
+                .await?;
+        assert_eq!(requested.as_deref(), Some("user:alice"));
         Ok(())
     }
 

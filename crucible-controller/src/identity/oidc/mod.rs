@@ -283,11 +283,12 @@ pub enum BridgeError {
     Response(#[from] axum::http::Error),
 }
 
-type BridgeFuture = Pin<Box<dyn Future<Output = Result<HttpResponse, BridgeError>> + Send>>;
+pub(crate) type BridgeFuture =
+    Pin<Box<dyn Future<Output = Result<HttpResponse, BridgeError>> + Send>>;
 
 /// `openidconnect` over this crate's own reqwest client. Redirects are never followed: an
 /// authorization server that 302s a token request is not one whose answer may be trusted.
-fn bridge(client: reqwest::Client) -> impl Fn(HttpRequest) -> BridgeFuture {
+pub(crate) fn bridge(client: reqwest::Client) -> impl Fn(HttpRequest) -> BridgeFuture {
     move |req: HttpRequest| {
         let client = client.clone();
         Box::pin(async move {

@@ -588,6 +588,7 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         rank_horizon_days: 0,
         grounded_executor: crucible_controller::GroundedExecutor::Local,
         deploy_profile: Some(state_dir.join("deploy-profile.toml")),
+        profile_cache: Default::default(),
         render_no_pin: true,
         grounded_sandbox_image: None,
         admins: vec![],
@@ -618,6 +619,8 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         jira_email: None,
         jira_api_token: None,
         public_url: None,
+        agent_issuer: None,
+        agent_token_endpoint: None,
         hooks_public_url: None,
         jira_emission_project: None,
         jira_emission_epic_type_id: None,
@@ -829,7 +832,8 @@ async fn full_chain_new_to_done_with_once_idempotence() -> Result<()> {
         completions,
         crucible_controller::authz::policy::ActivePolicy::default_set()
             .expect("the shipped default policy set loads"),
-    );
+    )
+    .await;
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let handle = {
         let shutdown = shutdown.clone();
@@ -1109,7 +1113,8 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
             completions1,
             crucible_controller::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
-        );
+        )
+        .await;
         let shutdown = shutdown1.clone();
         tokio::spawn(daemon::run(keys, daemon_cfg(), wiring, shutdown, None))
     };
@@ -1155,7 +1160,8 @@ async fn crash_recovery_reconciles_a_missed_completion() -> Result<()> {
             completions2,
             crucible_controller::authz::policy::ActivePolicy::default_set()
                 .expect("the shipped default policy set loads"),
-        );
+        )
+        .await;
         let shutdown = shutdown2.clone();
         tokio::spawn(daemon::run(keys, daemon_cfg(), wiring, shutdown, None))
     };
@@ -1225,7 +1231,9 @@ async fn kube_dispatcher_creates_a_stamped_run_pod_live() -> Result<()> {
     let cm_name_for_render = cm_name.clone();
     let (rendered, cm) = tokio::task::spawn_blocking(
         move || -> Result<(Pod, Option<k8s_openapi::api::core::v1::ConfigMap>)> {
-            let (mut pod, cm) = crucible_controller::render_run_docs(
+            let crucible_controller::RunDocs {
+                mut pod, pack: cm, ..
+            } = crucible_controller::render_run_docs(
                 &pack_out,
                 &profile,
                 &cm_name_for_render,
@@ -1237,6 +1245,7 @@ async fn kube_dispatcher_creates_a_stamped_run_pod_live() -> Result<()> {
                 },
                 Default::default(),
                 Some(std::sync::Arc::new(crucible::deploy::RegistryDigests)),
+                false,
             )?;
             crucible_controller::stamp_run_pod(
                 &mut pod,
@@ -1424,7 +1433,8 @@ async fn standing_launches_fire_through_one_sweep() -> Result<()> {
         completions,
         crucible_controller::authz::policy::ActivePolicy::default_set()
             .expect("the shipped default policy set loads"),
-    );
+    )
+    .await;
     let app = crucible_controller::api::router(crucible_controller::api::state::ApiState::new(
         db.clone(),
         Arc::new(crucible_controller::QueueOverrideSink::new(
@@ -1705,7 +1715,8 @@ async fn launch_rig(opts: RigOpts) -> Result<LaunchRig> {
         completions,
         crucible_controller::authz::policy::ActivePolicy::default_set()
             .expect("the shipped default policy set loads"),
-    );
+    )
+    .await;
     let app = crucible_controller::api::router(crucible_controller::api::state::ApiState::new(
         db.clone(),
         Arc::new(crucible_controller::QueueOverrideSink::new(

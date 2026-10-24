@@ -1,0 +1,37 @@
+[package]
+name = "crucible-mcp-auth"
+description = "OAuth resource-server layer for MCP servers: JWT validation, RFC 9728 metadata, and claims-based tool policy."
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+bytes = "1"
+cel = { workspace = true, features = ["json"] }
+http = "1"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+toml = "0.8"
+tracing = "0.1"
+url = { workspace = true, features = ["serde"] }
+k8s-openapi = { workspace = true, optional = true }
+kube = { workspace = true, features = ["client", "rustls-tls"], optional = true }
+serde_norway = { version = "0.9", optional = true }
+moka = { workspace = true, optional = true }
+
+[features]
+kube = ["dep:k8s-openapi", "dep:kube", "dep:moka"]
+testing = ["jsonwebtoken/use_pem"]
+e2e = ["testing", "kube", "dep:serde_norway", "reqwest/form"]
+
+[dev-dependencies]
+base64 = "0.22"
+http-body-util = "0.1"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+tower = { version = "0.5", features = ["util"] }

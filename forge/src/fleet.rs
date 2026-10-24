@@ -43,6 +43,67 @@ pub struct ClusterEntry {
     /// selecting a bastioned cluster is a render/check error until the tunnel lands.
     #[serde(default)]
     pub bastion: Option<BastionCfg>,
+    /// Where a person's Kubernetes username on this cluster comes from.
+    #[serde(default)]
+    pub identity: ClusterIdentity,
+}
+
+/// How the controller learns who a person is on a cluster. Declared by the operator, never
+/// inferred from what the cluster happens to answer.
+///
+/// ```toml
+/// identity = "link"                                # proven by the cluster's TokenReview
+/// identity = { claim = "email" }                   # the cluster trusts the same people by email
+/// identity = { claim = "login", prefix = "sso:" }  # an OIDC username prefix on the API server
+/// ```
+#[derive(Debug, Deserialize, Clone, Default, PartialEq, Eq)]
+#[serde(try_from = "RawIdentity")]
+pub enum ClusterIdentity {
+    /// Each person links their username by presenting a token the cluster's TokenReview accepts.
+    #[default]
+    Link,
+    Claim(ClaimIdentity),
+}
+
+/// The username is a claim the controller recorded at login, with the prefix the API server's
+/// OIDC authenticator puts in front of it.
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClaimIdentity {
+    pub claim: SsoClaim,
+    #[serde(default)]
+    pub prefix: String,
+}
+
+/// The login claims the controller records.
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum SsoClaim {
+    Login,
+    Email,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawIdentity {
+    Name(String),
+    Claim(ClaimIdentity),
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("identity {0:?} is not \"link\" or {{ claim = \"login\" | \"email\", prefix = \"...\" }}")]
+pub struct UnknownIdentity(String);
+
+impl TryFrom<RawIdentity> for ClusterIdentity {
+    type Error = UnknownIdentity;
+
+    fn try_from(raw: RawIdentity) -> Result<Self, Self::Error> {
+        match raw {
+            RawIdentity::Name(name) if name == "link" => Ok(Self::Link),
+            RawIdentity::Name(name) => Err(UnknownIdentity(name)),
+            RawIdentity::Claim(claim) => Ok(Self::Claim(claim)),
+        }
+    }
 }
 
 /// The `[clusters.<name>.bastion]` block (schema only until the tunnel is implemented).
@@ -267,5 +328,40 @@ mod tests {
             .expect_err("an explicit fleet file must exist");
         assert!(err.to_string().contains("does not exist"), "{err:#}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn identity_is_link_by_default_or_a_declared_login_claim_with_an_optional_prefix() {
+        let parse = |extra: &str| {
+            toml::from_str::<ClusterEntry>(&format!("kubeconfig_secret = \"k\"\n{extra}"))
+                .map(|e| e.identity)
+        };
+        assert_eq!(parse("").unwrap(), ClusterIdentity::Link);
+        assert_eq!(parse("identity = \"link\"").unwrap(), ClusterIdentity::Link);
+        assert_eq!(
+            parse("identity = { claim = \"email\" }").unwrap(),
+            ClusterIdentity::Claim(ClaimIdentity {
+                claim: SsoClaim::Email,
+                prefix: String::new()
+            })
+        );
+        assert_eq!(
+            parse("identity = { claim = \"login\", prefix = \"sso:\" }").unwrap(),
+            ClusterIdentity::Claim(ClaimIdentity {
+                claim: SsoClaim::Login,
+                prefix: "sso:".into()
+            })
+        );
+        for bad in [
+            "identity = \"linked\"",
+            "identity = \"sso-login\"",
+            "identity = { claim = \"groups\" }",
+            "identity = { claim = \"email\", prefx = \"x\" }",
+            "identity = { prefix = \"x\" }",
+            "identity = 7",
+        ] {
+            assert!(parse(bad).is_err(), "{bad} must be refused");
+        }
+        let err = parse("identity = \"linked\"").unwrap_err().to_string();
+        assert!(err.contains("\"linked\" is not \"link\""), "{err}");
     }
 }

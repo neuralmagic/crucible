@@ -1324,9 +1324,10 @@ exit $rc
     /// NetworkPolicy on the loop pod. Under `podman` the sandbox is nested inside the loop pod and
     /// reaches the broker over the pod-internal bridge (traffic a NetworkPolicy never sees), so this
     /// is a pure deny-all-ingress lockdown. Under `kubernetes` the sandbox is a sibling pod, so
-    /// gateway (:17670), broker (:8849), OTLP collector (:17671), and `[mcp]` server traffic becomes
-    /// real cluster networking. The policy then allows ingress **only** from sandbox pods, **only**
-    /// on those ports. Sandbox pods are
+    /// gateway (:17670), broker (:8849), OTLP collector (:17671), buildit (:8848, with `[buildit]`),
+    /// and `[mcp]` server traffic becomes
+    /// real cluster networking. The policy then allows ingress **only** from sandbox pods (in
+    /// `cluster.sandbox_namespace` when it is set), **only** on those ports. Sandbox pods are
     /// matched by either identity they may carry: the OpenShell managed-by label (the driver only
     /// stamps it on SPIFFE-enabled pods since the CRD path landed), or the agent-sandbox
     /// controller's name-hash label, which every Sandbox-CR pod gets. Dropping either selector
@@ -1342,6 +1343,15 @@ exit $rc
                 ..Default::default()
             }
         });
+        let cluster = &self.profile.cluster;
+        let sandbox_ns =
+            (cluster.sandbox_namespace() != cluster.loop_namespace).then(|| LabelSelector {
+                match_labels: Some(BTreeMap::from([(
+                    "kubernetes.io/metadata.name".to_string(),
+                    cluster.sandbox_namespace().to_string(),
+                )])),
+                ..Default::default()
+            });
         let ingress = match self.driver {
             ComputeDriver::Podman => None,
             ComputeDriver::Kubernetes => Some(vec![networking::NetworkPolicyIngressRule {
@@ -1354,6 +1364,7 @@ exit $rc
                             )])),
                             ..Default::default()
                         }),
+                        namespace_selector: sandbox_ns.clone(),
                         ..Default::default()
                     },
                     networking::NetworkPolicyPeer {
@@ -1365,37 +1376,48 @@ exit $rc
                             }]),
                             ..Default::default()
                         }),
+                        namespace_selector: sandbox_ns,
                         ..Default::default()
                     },
                 ]),
                 ports: Some(
-                    vec![
-                        networking::NetworkPolicyPort {
+                    (!crate::deploy::render::gateway::isolated(self.profile))
+                        .then_some(networking::NetworkPolicyPort {
                             port: Some(IntOrString::Int(GATEWAY_PORT.into())),
                             protocol: Some("TCP".to_string()),
                             ..Default::default()
-                        },
-                        networking::NetworkPolicyPort {
-                            // The manifest's `[agent.broker].bind` port, never a second constant: a
-                            // domain that moves the broker must not silently lose its ingress rule.
-                            port: Some(IntOrString::Int(broker_ingress_port(
-                                &self.input.agent.broker.bind,
-                            ))),
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        },
-                        networking::NetworkPolicyPort {
-                            // The turn's in-process OTLP collector; the agent's exporter posts here
-                            // from the sandbox. Rendered unconditionally: with telemetry off nothing
-                            // listens and the rule is inert.
-                            port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
-                            protocol: Some("TCP".to_string()),
-                            ..Default::default()
-                        },
-                    ]
-                    .into_iter()
-                    .chain(mcp_ports)
-                    .collect(),
+                        })
+                        .into_iter()
+                        .chain([
+                            networking::NetworkPolicyPort {
+                                // The manifest's `[agent.broker].bind` port, never a second constant: a
+                                // domain that moves the broker must not silently lose its ingress rule.
+                                port: Some(IntOrString::Int(broker_ingress_port(
+                                    &self.input.agent.broker.bind,
+                                ))),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            },
+                            networking::NetworkPolicyPort {
+                                // The turn's in-process OTLP collector; the agent's exporter posts here
+                                // from the sandbox. Rendered unconditionally: with telemetry off nothing
+                                // listens and the rule is inert.
+                                port: Some(IntOrString::Int(OTEL_COLLECTOR_PORT.into())),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            },
+                        ])
+                        .chain(self.profile.buildit.as_ref().map(|_| {
+                            networking::NetworkPolicyPort {
+                                port: Some(IntOrString::Int(
+                                    crucible_contract::buildit::PORT.into(),
+                                )),
+                                protocol: Some("TCP".to_string()),
+                                ..Default::default()
+                            }
+                        }))
+                        .chain(mcp_ports)
+                        .collect(),
                 ),
             }]),
         };
@@ -1436,7 +1458,7 @@ exit $rc
     /// The RBAC the kubernetes sandbox driver needs, matching OpenShell v0.1.2's helm chart for
     /// shared workspace mode with `allowDriverConfig` (`role.yaml`, `clusterrole.yaml`):
     ///
-    ///  1. A namespaced `Role` in the loop namespace: sandbox CRD verbs, event reads, the
+    ///  1. A namespaced `Role` in the sandbox namespace: sandbox CRD verbs, event reads, the
     ///     supervisor pod lifecycle, the boundary Service, bootstrap Secrets, the egress
     ///     NetworkPolicy, and PVC metadata reads for resource admission. Bootstrap Secret
     ///     creation also covers the client-TLS Secret each gateway boot publishes.
@@ -1445,8 +1467,16 @@ exit $rc
     ///     `runtimeclasses`/`priorityclasses`/`namespaces` reads admission and UID resolution do.
     ///  4. A `ClusterRoleBinding` granting it to the loop SA.
     fn sandbox_rbac(&self) -> Vec<SandboxRbacObject> {
-        let sa = &self.profile.cluster.service_account;
-        let ns = &self.profile.cluster.loop_namespace;
+        let sandbox_ns = self.profile.cluster.sandbox_namespace().to_string();
+        let isolated = crate::deploy::render::gateway::isolated(self.profile);
+        let gateway_sa = crate::deploy::render::gateway::GATEWAY_SERVICE_ACCOUNT.to_string();
+        let (sa, ns) = match isolated {
+            true => (&gateway_sa, &sandbox_ns),
+            false => (
+                &self.profile.cluster.service_account,
+                &self.profile.cluster.loop_namespace,
+            ),
+        };
         let role_name = format!("{sa}-sandbox");
         let cr_name = format!("{sa}-node-reader");
 
@@ -1455,7 +1485,7 @@ exit $rc
         let role = rbac::Role {
             metadata: ObjectMeta {
                 name: Some(role_name.clone()),
-                namespace: Some(ns.clone()),
+                namespace: Some(sandbox_ns.clone()),
                 ..Default::default()
             },
             rules: Some(vec![
@@ -1529,7 +1559,7 @@ exit $rc
 
         let rb = role_binding(
             role_name.clone(),
-            ns.clone(),
+            sandbox_ns.clone(),
             "Role",
             &role_name,
             sa.clone(),
@@ -1596,11 +1626,117 @@ exit $rc
             }]),
         };
 
-        vec![
+        let mut objects = Vec::new();
+        if isolated {
+            objects.push(SandboxRbacObject::ServiceAccount(core::ServiceAccount {
+                metadata: ObjectMeta {
+                    name: Some(gateway_sa.clone()),
+                    namespace: Some(sandbox_ns.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }));
+        }
+        objects.extend([
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(rb),
             SandboxRbacObject::ClusterRole(cr),
             SandboxRbacObject::ClusterRoleBinding(crb),
+        ]);
+        objects.extend(self.sandbox_reader_rbac());
+        objects
+    }
+
+    /// get/list on `Sandbox` resources in the sandbox namespace for `cluster.sandbox_readers`,
+    /// the identity the controller resolves a bound sandbox's name with; under isolated gateways
+    /// also what it starts, adopts, and tears down each run's gateway with. Nothing when either
+    /// is unset.
+    fn sandbox_reader_rbac(&self) -> Vec<SandboxRbacObject> {
+        let cluster = &self.profile.cluster;
+        let Some(ns) = cluster.sandbox_namespace.as_ref() else {
+            return Vec::new();
+        };
+        if cluster.sandbox_readers.is_empty() {
+            return Vec::new();
+        }
+        let rule = |group: &str, resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
+            api_groups: Some(vec![group.to_string()]),
+            resources: Some(resources.iter().map(|r| r.to_string()).collect()),
+            verbs: verbs.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
+        };
+        let isolated = crate::deploy::render::gateway::isolated(self.profile);
+        let mut sandbox_rules = vec![match isolated {
+            true => rule(
+                "agents.x-k8s.io",
+                &["sandboxes"],
+                &["get", "list", "patch", "delete"],
+            ),
+            false => rule("agents.x-k8s.io", &["sandboxes"], &["get", "list"]),
+        }];
+        if isolated {
+            sandbox_rules.extend([
+                rule("", &["pods"], &["get", "list", "create", "delete"]),
+                rule("", &["pods/finalizers"], &["update"]),
+                rule("", &["services", "secrets"], &["list", "create", "delete"]),
+                rule(
+                    "networking.k8s.io",
+                    &["networkpolicies"],
+                    &["list", "create", "delete"],
+                ),
+            ]);
+        }
+        let mut objects = self.reader_grant("crucible-sandbox-reader", ns.as_str(), sandbox_rules);
+        if isolated {
+            objects.extend(self.reader_grant(
+                "crucible-gateway-loop-services",
+                &cluster.loop_namespace,
+                vec![rule("", &["services"], &["list", "create", "delete"])],
+            ));
+        }
+        objects
+    }
+
+    /// A Role named `name` in `namespace` with `rules`, bound to `cluster.sandbox_readers`.
+    fn reader_grant(
+        &self,
+        name: &str,
+        namespace: &str,
+        rules: Vec<rbac::PolicyRule>,
+    ) -> Vec<SandboxRbacObject> {
+        let meta = || ObjectMeta {
+            name: Some(name.to_string()),
+            namespace: Some(namespace.to_string()),
+            ..Default::default()
+        };
+        let role = rbac::Role {
+            metadata: meta(),
+            rules: Some(rules),
+        };
+        let binding = rbac::RoleBinding {
+            metadata: meta(),
+            role_ref: rbac::RoleRef {
+                api_group: "rbac.authorization.k8s.io".to_string(),
+                kind: "Role".to_string(),
+                name: name.to_string(),
+            },
+            subjects: Some(
+                self.profile
+                    .cluster
+                    .sandbox_readers
+                    .iter()
+                    .map(|sa| rbac::Subject {
+                        kind: "ServiceAccount".to_string(),
+                        name: sa.name.to_string(),
+                        namespace: Some(sa.namespace.to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
+            ),
+        };
+        vec![
+            SandboxRbacObject::Role(role),
+            SandboxRbacObject::RoleBinding(binding),
         ]
     }
 }
@@ -1608,6 +1744,7 @@ exit $rc
 /// A typed wrapper so `sandbox_rbac()` can return a mixed vec of RBAC objects and they all
 /// serialize through one `serde_norway::to_string` call.
 enum SandboxRbacObject {
+    ServiceAccount(core::ServiceAccount),
     Role(rbac::Role),
     RoleBinding(rbac::RoleBinding),
     ClusterRole(rbac::ClusterRole),
@@ -1617,6 +1754,7 @@ enum SandboxRbacObject {
 impl serde::Serialize for SandboxRbacObject {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         match self {
+            Self::ServiceAccount(a) => a.serialize(s),
             Self::Role(r) => r.serialize(s),
             Self::RoleBinding(r) => r.serialize(s),
             Self::ClusterRole(r) => r.serialize(s),
@@ -1752,11 +1890,9 @@ pub(super) fn kubernetes_sandbox_env(
             ..Default::default()
         }),
     }];
-    // Sandboxes run in the loop/turn pod's own namespace. Keeps the NetworkPolicy a simple
-    // podSelector.
     env.push(plain(
         "CRUCIBLE_SANDBOX_NAMESPACE",
-        profile.cluster.loop_namespace.clone(),
+        profile.cluster.sandbox_namespace().to_string(),
     ));
     env.push(plain(
         "CRUCIBLE_SANDBOX_SERVICE_ACCOUNT",
@@ -1787,6 +1923,12 @@ pub(super) fn kubernetes_sandbox_env(
         env.push(plain(
             crate::openshell::placement::GPU_PLACEMENT_ENV,
             placement,
+        ));
+    }
+    if let Some(socket) = &profile.cluster.sandbox_spiffe_socket {
+        env.push(plain(
+            crate::openshell::gateway::SANDBOX_SPIFFE_SOCKET_ENV,
+            socket.clone(),
         ));
     }
     Ok(env)
@@ -3828,6 +3970,229 @@ mod tests {
         );
     }
 
+    /// A profile `sandbox_namespace` moves the sandboxes, the gateway's sandbox Role and its
+    /// binding there, and the loop pod admits sandbox traffic only from that namespace. The
+    /// binding's subject stays the loop SA in the loop namespace.
+    #[test]
+    fn an_isolated_gateway_leaves_the_loop_sa_no_verbs_in_the_sandbox_namespace() {
+        let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
+        let docs: Vec<serde_json::Value> = moved
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let names_loop_sa =
+            |d: &serde_json::Value| {
+                d["subjects"].as_array().into_iter().flatten().any(|s| {
+                    s["name"] == "autoresearch-publisher" && s["namespace"] == "autoresearch"
+                })
+            };
+        for d in &docs {
+            let kind = d["kind"].as_str().unwrap_or_default();
+            let grants_in_sandbox_ns = (kind == "RoleBinding"
+                && d["metadata"]["namespace"] == "crucible-sandboxes")
+                || kind == "ClusterRoleBinding";
+            assert!(
+                !(grants_in_sandbox_ns && names_loop_sa(d)),
+                "the loop SA is granted verbs that reach the sandbox namespace: {d}"
+            );
+        }
+        let netpol = docs
+            .iter()
+            .find(|d| d["kind"] == "NetworkPolicy")
+            .expect("netpol");
+        let ports: Vec<i64> = netpol["spec"]["ingress"][0]["ports"]
+            .as_array()
+            .expect("ports")
+            .iter()
+            .filter_map(|p| p["port"].as_i64())
+            .collect();
+        assert!(
+            !ports.contains(&i64::from(GATEWAY_PORT)),
+            "the gateway no longer listens in the loop pod: {ports:?}"
+        );
+
+        let shared = render_k8s(&k8s_profile(""));
+        assert!(
+            shared.contains("name: autoresearch-publisher-sandbox"),
+            "without a sandbox namespace the in-pod gateway keeps the loop SA's RBAC"
+        );
+    }
+
+    /// The controller's signing key Secret sits in the controller's own namespace, the one its
+    /// identity in `sandbox_readers` lives in. Nothing the loop render emits may let the loop SA
+    /// read Secrets there, or anywhere through a cluster-wide grant.
+    #[test]
+    fn the_loop_sa_is_never_granted_secrets_in_the_controller_namespace() {
+        for extra in [
+            "",
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_readers = [\"crucible-control/crucible-controller\"]",
+        ] {
+            let yaml = render_k8s(&k8s_profile(extra));
+            let docs: Vec<serde_json::Value> = yaml
+                .split("\n---\n")
+                .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+                .collect();
+            let names_loop_sa = |d: &serde_json::Value| {
+                d["subjects"].as_array().into_iter().flatten().any(|s| {
+                    s["name"] == "autoresearch-publisher" && s["namespace"] == "autoresearch"
+                })
+            };
+            let role_grants_secrets = |kind: &str, name: &serde_json::Value| {
+                docs.iter()
+                    .filter(|d| d["kind"] == kind && d["metadata"]["name"] == *name)
+                    .flat_map(|d| d["rules"].as_array().cloned().unwrap_or_default())
+                    .any(|rule| {
+                        rule["resources"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|r| r == "secrets" || r == "*")
+                    })
+            };
+            for d in docs.iter().filter(|d| names_loop_sa(d)) {
+                let kind = d["kind"].as_str().unwrap_or_default();
+                let role_kind = d["roleRef"]["kind"].as_str().unwrap_or_default();
+                let role = &d["roleRef"]["name"];
+                assert_ne!(
+                    d["metadata"]["namespace"], "crucible-control",
+                    "a binding for the loop SA in the controller namespace: {d}"
+                );
+                if kind == "ClusterRoleBinding" || role_kind == "ClusterRole" {
+                    assert!(
+                        !role_grants_secrets("ClusterRole", role),
+                        "a cluster role bound to the loop SA reaches Secrets: {d}"
+                    );
+                    assert!(
+                        !matches!(role.as_str(), Some("admin" | "edit" | "cluster-admin"))
+                            || d["metadata"]["namespace"] == "rig",
+                        "a built-in role bound to the loop SA outside the rig namespace: {d}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_spiffe_socket_reaches_the_gateway_only_when_the_profile_names_one() {
+        let without = render_k8s(&k8s_profile(""));
+        assert_eq!(
+            loop_pod_env(&without, "CRUCIBLE_SANDBOX_SPIFFE_SOCKET"),
+            None
+        );
+        let with = render_k8s(&k8s_profile(
+            r#"sandbox_spiffe_socket = "/spiffe-workload-api/spire-agent.sock""#,
+        ));
+        assert_eq!(
+            loop_pod_env(&with, "CRUCIBLE_SANDBOX_SPIFFE_SOCKET").as_deref(),
+            Some("/spiffe-workload-api/spire-agent.sock")
+        );
+    }
+
+    #[test]
+    fn a_sandbox_namespace_moves_the_sandboxes_and_their_rbac() {
+        let default = render_k8s(&k8s_profile(""));
+        assert_eq!(
+            loop_pod_env(&default, "CRUCIBLE_SANDBOX_NAMESPACE").as_deref(),
+            Some("autoresearch")
+        );
+        assert!(
+            !default.contains("kubernetes.io/metadata.name"),
+            "{default}"
+        );
+
+        let moved = render_k8s(&k8s_profile(r#"sandbox_namespace = "crucible-sandboxes""#));
+        assert_eq!(
+            loop_pod_env(&moved, "CRUCIBLE_SANDBOX_NAMESPACE").as_deref(),
+            Some("crucible-sandboxes")
+        );
+        let docs: Vec<serde_json::Value> = moved
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let named = |kind: &str| {
+            docs.iter()
+                .find(|d| {
+                    d["kind"] == kind
+                        && d["metadata"]["name"] == "crucible-openshell-gateway-sandbox"
+                })
+                .unwrap_or_else(|| panic!("no {kind}: {moved}"))
+        };
+        assert_eq!(named("Role")["metadata"]["namespace"], "crucible-sandboxes");
+        let binding = named("RoleBinding");
+        assert_eq!(binding["metadata"]["namespace"], "crucible-sandboxes");
+        assert_eq!(
+            binding["subjects"][0],
+            serde_json::json!({"kind": "ServiceAccount", "name": "crucible-openshell-gateway", "namespace": "crucible-sandboxes"})
+        );
+        assert!(
+            docs.iter().any(|d| d["kind"] == "ServiceAccount"
+                && d["metadata"]["name"] == "crucible-openshell-gateway"
+                && d["metadata"]["namespace"] == "crucible-sandboxes"),
+            "{moved}"
+        );
+        let netpol = docs
+            .iter()
+            .find(|d| d["kind"] == "NetworkPolicy")
+            .expect("netpol");
+        assert!(
+            !moved.contains("crucible-sandbox-reader"),
+            "no readers named, no reader RBAC: {moved}"
+        );
+        let read = render_k8s(&k8s_profile(
+            "sandbox_namespace = \"crucible-sandboxes\"\nsandbox_readers = [\"crucible-control/crucible-controller\"]",
+        ));
+        let read_docs: Vec<serde_json::Value> = read
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+            .collect();
+        let reader = |kind: &str| {
+            read_docs
+                .iter()
+                .find(|d| d["kind"] == kind && d["metadata"]["name"] == "crucible-sandbox-reader")
+                .unwrap_or_else(|| panic!("no reader {kind}: {read}"))
+        };
+        assert_eq!(
+            reader("Role")["metadata"]["namespace"],
+            "crucible-sandboxes"
+        );
+        assert_eq!(
+            reader("Role")["rules"],
+            serde_json::json!([
+                {"apiGroups": ["agents.x-k8s.io"], "resources": ["sandboxes"], "verbs": ["get", "list", "patch", "delete"]},
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["get", "list", "create", "delete"]},
+                {"apiGroups": [""], "resources": ["pods/finalizers"], "verbs": ["update"]},
+                {"apiGroups": [""], "resources": ["services", "secrets"], "verbs": ["list", "create", "delete"]},
+                {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": ["list", "create", "delete"]}
+            ]),
+            "the controller starts and tears down each run's gateway there"
+        );
+        let loop_services = read_docs
+            .iter()
+            .find(|d| {
+                d["kind"] == "Role" && d["metadata"]["name"] == "crucible-gateway-loop-services"
+            })
+            .unwrap_or_else(|| panic!("no loop Service Role: {read}"));
+        assert_eq!(loop_services["metadata"]["namespace"], "autoresearch");
+        assert_eq!(
+            loop_services["rules"],
+            serde_json::json!([{"apiGroups": [""], "resources": ["services"], "verbs": ["list", "create", "delete"]}])
+        );
+        assert_eq!(
+            reader("RoleBinding")["subjects"][0],
+            serde_json::json!({"kind": "ServiceAccount", "name": "crucible-controller", "namespace": "crucible-control"})
+        );
+        for peer in netpol["spec"]["ingress"][0]["from"]
+            .as_array()
+            .expect("peers")
+        {
+            assert_eq!(
+                peer["namespaceSelector"]["matchLabels"]["kubernetes.io/metadata.name"],
+                "crucible-sandboxes",
+                "{peer}"
+            );
+        }
+    }
+
     /// The sandbox driver config env vars are projected: namespace, service account, default
     /// image, image pull secrets, app armor profile.
     #[test]
@@ -4343,6 +4708,18 @@ mod tests {
             netpol.contains("port: 8850"),
             "mcp port in netpol: {netpol}"
         );
+        assert!(
+            !netpol.contains("port: 8848"),
+            "no buildit port without [buildit]: {netpol}"
+        );
+        let with_buildit =
+            k8s_profile("[buildit]\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n");
+        let yaml = render_k8s_manifest(&manifest, &with_buildit);
+        let netpol = yaml
+            .split("\n---\n")
+            .find(|d| d.contains("kind: NetworkPolicy"))
+            .expect("netpol doc");
+        assert!(netpol.contains("port: 8848"), "buildit port: {netpol}");
         // policyTypes still declares Ingress.
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");
         // No Egress lockdown.

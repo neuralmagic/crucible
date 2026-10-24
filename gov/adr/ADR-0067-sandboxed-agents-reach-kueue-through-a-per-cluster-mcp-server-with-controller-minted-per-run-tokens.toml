@@ -1,0 +1,107 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0067"
+title = "Sandboxed agents reach Kueue through a per-cluster MCP server with controller-minted per-run tokens"
+status = "proposed"
+date = "2026-10-08"
+refs = [
+    "ADR-0036",
+    "ADR-0053",
+    "RFC-0005",
+]
+
+[content]
+context = """
+Agents in OpenShell sandboxes need to run cluster work: a training Job, a RayJob, a LeaderWorkerSet, a serving Deployment, admitted and queued by Kueue. A Kubernetes credential cannot enter the sandbox, and a pack must not be able to pick the namespace or queue its run lands in.
+
+crucible-kueue is an MCP server (rmcp, streamable HTTP, stateless) that holds the Kubernetes credentials and exposes plan/submit/status/logs/stop/resume/delete over Job, RayJob, LeaderWorkerSet, Deployment and StatefulSet, plus queue, quota and hardware views. Each request carries a bearer token whose SHA-256 maps to one tenant: a namespace, a viewer or submitter role, and a LocalQueue allowlist. Every object it creates is labelled with the tenant's run id, and mutations past submit refuse objects another run created.
+
+What has to be decided is how a run gets a token, who decides its scope, how the server learns about it, and how the token reaches the agent without entering the sandbox.
+
+Constraints that shape the choice:
+
+- The broker already solves the last step: its per-run token is a static OpenShell provider credential, the sandbox's `.mcp.json` carries only the `openshell:resolve:env:` placeholder, and the policy endpoint's `credential_binding` limits resolution to the broker's host and port.
+- The controller already delivers per-run secrets to the loop pod through one owner-referenced Secret ([[ADR-0036]]).
+- On a spoke the loop pod's service account holds broad rights in its own namespace; a typical spoke grants it `edit` in crucible-system. Anything that namespace's write rights can create, a pack command task can create, since command tasks share the run supervisor's reach.
+- [[ADR-0053]] and [[RFC-0005]] describe per-run supervisor services started from an attested catalog. A queue-admission front door is cluster infrastructure shared by every run on the cluster, not a per-run process.
+- MultiKueue and remote clusters are out of scope: the server runs on the cluster whose Kueue admits the work, and sandboxes reach it in-cluster."""
+decision = """
+Run one crucible-kueue Deployment per cluster, rendered from the deploy profile's `[kueue]` table by `crucible deploy render|apply --kueue`, and make the controller the only authority that grants a run access to it.
+
+- **Scope comes from the profile.** `[kueue]` names the cluster the server runs on, its namespace, the workload namespace every token is scoped to, the role, the queue allowlist, the tenants namespace, and the service accounts allowed to write tenant records. A run dispatched onto any other cluster gets no grant.
+- **The controller mints at dispatch.** For each run it draws a 32-byte token, writes a tenant record (digest, run id, scope, expiry) as a labelled ConfigMap in the tenants namespace before the pod exists, and folds the token into the run's Secret delivery as `CRUCIBLE_KUEUE_TOKEN`, with the Service URL as plain `CRUCIBLE_KUEUE_URL`. The token is never agent-visible. The record is deleted when the run is collected or its launch fails, and its expiry (the playbook's wall-clock ceiling plus an hour, else the profile TTL) bounds a record nothing deleted.
+- **The server watches records.** It reflects the labelled ConfigMaps of the tenants namespace beside its optional static tenants file. A record that fails validation, collides with another record's digest, or shadows a static token never authenticates; until the first list completes, no record does.
+- **The tenants namespace is its own.** Only the listed writers may write ConfigMaps there and the server may only read them, so a loop pod's namespace rights never extend to minting tenants.
+- **The engine binds the token like the broker's.** When both variables are present it registers a static `crucible-kueue` provider holding the token, adds a policy endpoint for the Service host and port with protocol `mcp` and a `credential_binding` to that provider, and seeds `.mcp.json` with a `kueue` server whose `Authorization` header is the provider's placeholder. One variable without the other fails the turn.
+- **RBAC is split by scope.** Cluster-scoped reads (ClusterQueues, ResourceFlavors, nodes) are bound cluster-wide; namespaced workload verbs come from a ClusterRole bound only in the workload namespace."""
+consequences = """
+- A sandboxed agent submits cluster work with no Kubernetes credential in the sandbox, and the namespace, role and queues it gets are the operator's, not the pack's. The token resolves only on egress to the Service, so a leaked placeholder is useless and a leaked token is confined to one namespace and expires with its run.
+- Every run the controller dispatches onto the configured cluster gets the grant, whether or not a task needs it. Scoping the grant to the tasks that declare a need, as [[RFC-0005]] does for supervisor services, needs a manifest-level declaration that does not exist yet. Until then the grant is disclosed by the profile rather than by the pack.
+- Pack command tasks run with the loop pod's environment and can read the raw token. That is no wider than the reach command tasks already have under [[ADR-0053]]; the boundary this design draws is the sandbox.
+- The server's service account can create workloads in the workload namespace. If the server runs in a namespace where loop pods hold `edit`, as crucible-system typically does, a pack command task can start a pod under that service account and borrow those rights. Running the server in a namespace of its own closes this; the profile's `namespace` knob exists for that, and a deployment that keeps the server in crucible-system accepts the exposure.
+- Resources the agent creates through the server are bounded by Kueue quota, not by the run's cost ceiling.
+- The tenants namespace and its RBAC are new deployment surface the operator owns. A controller-signed per-run JWT would remove the records and the watch entirely, at the cost of key distribution to every server; it remains the planned replacement once more than one server consumes grants.
+- A crucible endpoint spec now accepts protocol `mcp`, where `full` access means every known MCP method, because OpenShell rejects the generic method wildcard on MCP endpoints."""
+
+[[content.alternatives]]
+text = "Per-cluster MCP server; the controller mints per-run tokens and records their digests in a controller-only namespace the server watches"
+status = "accepted"
+pros = [
+    "Scope is set by the operator's profile, never by the pack",
+    "Reuses the broker's placeholder and credential_binding hardening unchanged",
+    "Reuses the per-run Secret delivery and its pod-owned cleanup",
+    "The server stays stateless; records are plain Kubernetes objects an operator can inspect",
+]
+cons = [
+    "A separate namespace and RBAC to deploy",
+    "Records can outlive a controller crash until they expire",
+    "Every run on the cluster is granted, not only tasks that need it",
+]
+
+[[content.alternatives]]
+text = "The engine mints the token in the loop pod and writes the tenant record itself, as it does the broker token"
+status = "rejected"
+pros = [
+    "No controller change",
+    "Works for runs launched without a controller",
+]
+cons = [
+    "The loop pod would need write access to the records, so a pack command task could mint itself any namespace",
+    "Scope would be chosen by the least trusted party in the run",
+]
+rejection_reason = "It hands tenant creation to the process that runs pack code."
+
+[[content.alternatives]]
+text = "Run crucible-kueue as a per-run supervisor service under [[RFC-0005]]"
+status = "rejected"
+pros = [
+    "Credential held only for runs that declare the service",
+    "Fits the catalog and needs model already drafted",
+]
+cons = [
+    "Every run would carry a cluster-admin-shaped Kubernetes credential in its supervisor",
+    "One process per run for what is shared cluster infrastructure",
+    "[[RFC-0005]] is a draft with no implementation to build on",
+]
+rejection_reason = "Queue admission is shared cluster infrastructure; a per-run process would multiply the credential it exists to contain."
+
+[[content.alternatives]]
+text = "Controller-signed per-run JWTs the server verifies with the controller's public key"
+status = "rejected"
+pros = [
+    "No tenant records, watch, or tenants namespace",
+    "Scope travels in the signed claims",
+]
+cons = [
+    "Key distribution and rotation to every server",
+    "Revocation before expiry needs a deny list anyway",
+]
+rejection_reason = "More moving parts than one server needs today; kept as the replacement when grants span several servers."
+
+[[content.alternatives]]
+text = "Tenant records in the server's own namespace, crucible-system"
+status = "rejected"
+pros = ["One namespace to deploy"]
+cons = ["Where the loop pod's service account has edit in crucible-system, so pack code could write a record"]
+rejection_reason = "The namespace's write rights are the trust boundary for minting tenants."

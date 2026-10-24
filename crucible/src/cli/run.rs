@@ -103,6 +103,10 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         );
     }
 
+    if let Some(Cmd::OpenshellGateway) = cli.command {
+        return crate::openshell::gateway::serve();
+    }
+
     if let Some(Cmd::Ps { namespace, json }) = cli.command {
         return crate::cli::ps::run(namespace.as_deref(), json);
     }
@@ -343,9 +347,26 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 deploy::render_controller_cmd(&args.profile, &opts)
             };
         }
-        let manifest = args
-            .manifest
-            .context("--manifest is required unless --controller is set")?;
+        if let Some(cluster) = &args.cluster_link {
+            if apply {
+                return Err(deploy::cluster_link::ClusterLinkError::NoApply.into());
+            }
+            return deploy::render_cluster_link_cmd(
+                &args.profile,
+                args.clusters.as_deref(),
+                cluster,
+            );
+        }
+        if args.kueue {
+            return if apply {
+                deploy::apply_kueue_cmd(&args.profile, &opts)
+            } else {
+                deploy::render_kueue_cmd(&args.profile, &opts)
+            };
+        }
+        let manifest = args.manifest.context(
+            "--manifest is required unless --controller, --kueue or --cluster-link is set",
+        )?;
         return if apply {
             deploy::apply_cmd(&manifest, &args.profile, &opts)
         } else {

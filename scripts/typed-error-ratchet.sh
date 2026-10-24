@@ -10,10 +10,10 @@ set -euo pipefail
 readonly ALLOWED=0
 readonly ATTR='#![allow(clippy::disallowed_macros)]'
 
-# The control plane came in from its own repo with anyhow's macros throughout; those crates
+# The control plane and buildit came in from their own repos with anyhow's macros throughout; those crates
 # convert module by module and join the count when they are done.
 count=$(grep -rlF --include='*.rs' "$ATTR" . \
-    | grep -Ev '^./(third_party|crucible-controller|crux|xtask)/' \
+    | grep -Ev '^./(third_party|crucible-controller|crux|xtask|buildit)/' \
     | grep -c . || true)
 
 if [ "$count" -gt "$ALLOWED" ]; then

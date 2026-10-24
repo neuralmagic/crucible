@@ -7,7 +7,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use crucible_contract::Tier;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -600,6 +600,18 @@ pub struct ControllerCfg {
     /// comments. Unset ⇒ comments omit the link.
     #[arg(long = "public-url", env = "CONTROLLER_PUBLIC_URL")]
     pub public_url: Option<String>,
+    /// The agent token issuer identifier, the same `CONTROLLER_AGENT_ISSUER` the issuer serves
+    /// under. Runs on a `[kueue]` cluster get it as their sandboxes' SVID audience, and its token
+    /// endpoint for their token grants.
+    #[arg(long = "agent-issuer", env = "CONTROLLER_AGENT_ISSUER")]
+    pub agent_issuer: Option<String>,
+    /// Where sandbox supervisors reach the agent token endpoint when not at the issuer itself, for
+    /// a spoke that reaches the controller through a route.
+    #[arg(long = "agent-token-endpoint", env = "CONTROLLER_AGENT_TOKEN_ENDPOINT")]
+    pub agent_token_endpoint: Option<String>,
+    /// `deploy_profile`, read once on first use.
+    #[arg(skip)]
+    pub profile_cache: ProfileCache,
     /// The externally reachable base URL of the webhook delivery surface (e.g.
     /// `https://hooks.crucible.example.com`). A created webhook's delivery URL is built on it;
     /// unset ⇒ the API returns the delivery path alone.
@@ -788,7 +800,57 @@ fn parse_broker_contracts(raw: &str) -> Result<BrokerContracts, String> {
     Ok(BrokerContracts(out))
 }
 
+/// A deploy profile read once and shared by every clone of the config that holds it. A failed read
+/// is not cached, so the next caller tries again.
+#[derive(Clone, Default)]
+pub struct ProfileCache(
+    std::sync::Arc<tokio::sync::OnceCell<Option<std::sync::Arc<crucible::deploy::DeployProfile>>>>,
+);
+
+impl std::fmt::Debug for ProfileCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileCache")
+            .field("read", &self.0.initialized())
+            .finish()
+    }
+}
+
+impl ProfileCache {
+    /// The profile at `path`, with its fleet file folded in; `None` without a path.
+    pub async fn get(
+        &self,
+        path: Option<&Path>,
+    ) -> Result<Option<std::sync::Arc<crucible::deploy::DeployProfile>>> {
+        let profile = self
+            .0
+            .get_or_try_init(|| async {
+                let Some(path) = path.map(Path::to_path_buf) else {
+                    return Ok(None);
+                };
+                tokio::task::spawn_blocking(move || {
+                    crucible::deploy::DeployProfile::load_with_fleet(&path, None)
+                        .map(|p| Some(std::sync::Arc::new(p)))
+                })
+                .await
+                .context("joining the deploy profile read")?
+            })
+            .await?;
+        Ok(profile.clone())
+    }
+}
+
 impl ControllerCfg {
+    /// The deploy profile, read once.
+    pub async fn profile(&self) -> Result<Option<std::sync::Arc<crucible::deploy::DeployProfile>>> {
+        self.profile_cache.get(self.deploy_profile.as_deref()).await
+    }
+
+    /// Whether the agent token issuer is configured, which is what records who each dispatch acts
+    /// for.
+    pub fn issues_agent_tokens(&self) -> bool {
+        self.agent_issuer.is_some()
+    }
+
     /// How a pod render pins its image tags: the registry, unless `render_no_pin` is set.
     pub fn digest_resolver(&self) -> Option<std::sync::Arc<dyn crucible::deploy::DigestResolver>> {
         match self.render_no_pin {

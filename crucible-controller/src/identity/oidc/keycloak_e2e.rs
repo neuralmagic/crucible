@@ -302,6 +302,7 @@ async fn native_router_with(
                 credential_keys: keys,
                 proxy_prefix: "/oauth2".to_string(),
             },
+            issuer: None,
         },
         crate::spa::Source::Embedded,
     )
