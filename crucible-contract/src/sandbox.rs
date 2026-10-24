@@ -3,7 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Body of `POST /api/pods/{pod}/sandboxes`, authenticated by the pod's ingest token.
+/// Body of `POST /api/sandbox-bindings/runs/{run_id}` ([`binding_path`]), authenticated by the run's
+/// pod token.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxBinding {

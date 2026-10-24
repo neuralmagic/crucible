@@ -3,8 +3,9 @@
 [govctl]
 id = "ADR-0067"
 title = "Sandboxed agents reach Kueue through a per-cluster MCP server with controller-minted per-run tokens"
-status = "proposed"
+status = "superseded"
 date = "2026-10-08"
+superseded_by = "ADR-0068"
 refs = [
     "ADR-0036",
     "ADR-0053",

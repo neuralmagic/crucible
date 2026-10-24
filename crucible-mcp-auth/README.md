@@ -1,30 +1,17 @@
 # crucible-mcp-auth
 
 OAuth resource-server support for crucible's MCP servers. Sandboxed agents and people reach
-crucible-kueue and buildit with short-lived access tokens that name both the human and the
-sandbox. Each server validates them, publishes RFC 9728 metadata, and enforces a per-tool CEL
-policy over the token's claims. Agents never hold a credential.
+crucible-kueue and buildit with short-lived access tokens that the crucible controller issues and
+that name both the human and, for an agent, the sandbox. Each server validates them, publishes
+RFC 9728 metadata, checks every call against the access rules it declares in code
+(`access::AccessRules`: scopes, then SubjectAccessReviews as the caller's Kubernetes user), and
+applies an optional CEL tool policy over arguments. Agents never hold a credential.
 
-Status (2026-10-08):
-
-- **Proven on an OpenShift cluster.** SPIRE issues each OpenShell supervisor a SPIFFE ID. Keycloak exchanges that
-  JWT-SVID, sent exactly as OpenShell's provider `token_grant` sends it, for a 5-minute token with
-  `sub` = the launcher and `act.sub` = the sandbox. crucible-kueue accepts it, refuses a
-  policy-violating call by rule name, and stamps the launcher on the Job it creates.
-- **Built.** This crate, hooked into crucible-kueue and buildit (vendored into this workspace).
-- **Decided and built.** No per-run Keycloak clients and no dynamic client registration. Agent
-  tokens come from a token endpoint in the crucible controller, proven with a real SVID;
-  Keycloak stays for human logins.
-- **Built and proven on a cluster.** Kubernetes RBAC decides tool access through SubjectAccessReview:
-  a person acts as themselves, a run as its launcher. One crucible-kueue deployment serves agents
-  and people, and hosts can embed it.
-- **Proven with a person.** From a terminal Claude Code, a person logged in through OpenShift,
-  and the person-facing crucible-kueue behind its Route checked each call against their RBAC. It planned and ran a Job that printed `hello from kueue smoketest`.
-- **Open.** Sandboxes do not fetch tokens until the gateway wiring lands.
-
-A deployment needs SPIRE (with an OIDC discovery provider), a Keycloak realm with the
-`claude-code` client, the controller's agent token endpoint, and each MCP server's flags; the
-sections below describe each piece. Concrete manifests stay with the cluster that runs them.
+A deployment needs SPIRE (with an OIDC discovery provider) on each cluster whose sandboxes get
+tokens, the controller's issuer (`CONTROLLER_AGENT_*`, and `CONTROLLER_PEOPLE_AUDIENCES` for
+people), and each MCP server's flags. [docs/controller-deploy.md](../docs/controller-deploy.md)
+and [docs/controller-auth.md](../docs/controller-auth.md) cover configuration; this file covers
+the token model and what a server does with a token.
 
 ## Goals
 
@@ -46,8 +33,10 @@ server, and a token is good only for the server it names.
 
 ## Architecture
 
-Two issuers mint the same shape of token: the crucible controller for agents, Keycloak for people.
-Every MCP server trusts both and runs this crate.
+The crucible controller is the issuer for both kinds of caller: a token endpoint that sandbox
+supervisors reach with their JWT-SVIDs, and an authorization endpoint that people's MCP clients
+reach with a browser sign-in. Every MCP server trusts it and runs this crate. A server deployed
+outside crucible can trust any OIDC issuer for people instead (`--person-issuer`).
 
 ```mermaid
 flowchart LR
@@ -57,22 +46,21 @@ flowchart LR
         agent -->|MCP request, no token| sup
     end
     spire["SPIRE agent<br/>Workload API over CSI"]
-    ctl["crucible controller<br/>token endpoint (agent issuer)"]
-    kc["Keycloak realm crucible<br/>human issuer, OpenShift login"]
-    cc["Claude Code<br/>client claude-code, PKCE"]
+    ctl["crucible controller<br/>/oauth/token (agents)<br/>/oauth/authorize (people)"]
+    cc["MCP client (Claude Code)<br/>auth code + PKCE"]
     subgraph servers["MCP servers (crucible-mcp-auth)"]
         kueue["crucible-kueue :8850"]
-        buildit["buildit :8849"]
+        buildit["buildit :8848"]
     end
     k8s["Kubernetes + Kueue"]
 
     spire -->|JWT-SVID| sup
     sup -->|client_credentials + SVID| ctl
-    ctl -->|access token, 5 min| sup
+    ctl -->|access token| sup
     sup -->|Bearer, injected on egress| kueue
     sup -->|Bearer, injected on egress| buildit
-    cc -->|auth code + PKCE| kc
-    kc -->|access token| cc
+    cc -->|auth code + PKCE| ctl
+    ctl -->|access token| cc
     cc -->|Bearer| kueue
     kueue -->|own service account| k8s
     buildit -->|builder pods| k8s
@@ -82,11 +70,10 @@ flowchart LR
 | --- | --- | --- |
 | SPIRE (Zero Trust Workload Identity Manager) | Issues JWT-SVIDs to supervisor pods: `spiffe://<trust domain>/openshell/gateway/<gateway-id>/sandbox/<sandbox-id>` | `zero-trust-workload-identity-manager` |
 | OpenShell supervisor | Fetches the SVID, performs the token grant, injects the bearer on egress | per sandbox, the sandbox namespace |
-| Controller token endpoint | Agent issuer: verifies the SVID, maps sandbox to run, mints the token | crucible controller |
-| Keycloak realm `crucible` | Human issuer; also the issuer in the proven spike | its own namespace |
-| `crucible-mcp-auth` | Token validation, RFC 9728 metadata, tool policy | library in each MCP server |
-| crucible-kueue | Kueue workloads wherever the caller's Kubernetes user may act | `crucible-system` |
-| buildit | Image builds from the sandbox workspace | loop pod |
+| Controller issuer | Agents: verifies the SVID, maps sandbox to run, mints the token. People: signs them in, records consent, mints and refreshes their tokens | crucible controller |
+| `crucible-mcp-auth` | Token validation, RFC 9728 metadata, access rules, tool policy | library in each MCP server |
+| crucible-kueue | Kueue workloads wherever the caller's Kubernetes user may act | per cluster |
+| buildit | Image builds from the sandbox workspace | each run's loop pod |
 
 ## Sandbox identity
 
@@ -107,9 +94,9 @@ sequenceDiagram
     W-->>S: JWT-SVID, sub = spiffe://<trust domain>/openshell/gateway/<gw>/sandbox/<id>
     S->>T: POST grant_type=client_credentials<br/>client_assertion_type=jwt-bearer, client_assertion=SVID
     T->>T: verify SVID, map sandbox -> run, check audience allowlist
-    T-->>S: access_token (sub=launcher, act.sub=SPIFFE ID, aud, run claims), expires_in=300
+    T-->>S: access_token (sub=launcher, act.sub=SPIFFE ID, aud, run claims), expires_in=900
     S->>M: tools/call + Authorization: Bearer (cached until near expiry)
-    M->>M: validate token, apply tool policy
+    M->>M: validate token, access rules, tool policy
     M-->>S: result
     S-->>A: result
 ```
@@ -147,26 +134,20 @@ derived from the token endpoint; `jwt_svid_audience` overrides it when the endpo
 Service. Pod networks often cannot resolve the cluster's external Route hosts, so use in-cluster
 Service URLs.
 
-**What is proven: Keycloak.** Keycloak 26.6 `federated-jwt` accepts this request unchanged. The
-assertion's `iss` selects an identity provider and its `sub` selects the client whose
-`jwt.credential.sub` matches exactly. The assertion's `aud` must be exactly the realm issuer, and
-because SVIDs carry no `jti` the provider sets `supportsClientAssertionReuse`. A tampered SVID gets
-`invalid_client`.
+**The token endpoint.** The controller answers that request itself:
 
-**The controller token endpoint.** Exact subject matching means one Keycloak client per sandbox,
-created and deleted by the controller. That is too much moving state, so the controller answers the
-same request itself:
-
-1. Verify the SVID against SPIRE's keys: one audience, the controller issuer; subject under the
-   sandbox trust-domain path.
+1. Verify the SVID against the issuing cluster's SPIRE keys (`CONTROLLER_AGENT_SPIRE`): one
+   audience, the controller issuer; subject under that cluster's gateway prefix; at most 15 minutes
+   of life.
 2. Map the sandbox ID to its run. The engine binds the ID, with the sandbox name and workdir, after
    `create_sandbox`, authenticated by its run pod's own token; a sandbox bound by another pod is
-   refused, and so is one whose run pod is no longer running.
-3. Mint an ES256 token for the requested audience, if allowlisted, with the run's claims. Expiry is
-   5 minutes; keys are published at `/.well-known/jwks.json`.
+   refused, so is one whose run pod is no longer running, and so is an SVID whose gateway is not
+   the bound run's.
+3. Mint an ES256 token for the requested audience, if `CONTROLLER_AGENT_AUDIENCES` lists it, with the
+   run's claims and the scopes that audience grants. Tokens live 15 minutes by default (up to 30);
+   keys are published at `/.well-known/jwks.json`.
 
-Revocation is collecting the run: the endpoint stops minting and outstanding tokens expire within
-5 minutes.
+Revocation is collecting the run: the endpoint stops minting and outstanding tokens expire.
 
 ## Token shape
 
@@ -176,24 +157,23 @@ the run claims.
 
 | Claim | Agent token | Person token | Used for |
 | --- | --- | --- | --- |
-| `iss` | controller issuer (the realm in the spike) | Keycloak realm | which keys verify it |
-| `sub` | the launcher's login | the person's realm user ID | `crucible.dev/launched-by`, policy |
+| `iss` | controller issuer | controller issuer | which keys verify it |
+| `sub` | the login the run was dispatched for | the person's login | `crucible.dev/launched-by`, policy |
 | `act.sub` | `spiffe://<trust domain>/openshell/gateway/<gateway-id>/sandbox/<id>` | absent | audit, `crucible.dev/actor` |
 | `aud` | the MCP servers the run may call | the servers the requested scopes name | one must be this server |
-| `scope` | `kueue.read kueue.submit buildit.read buildit.build` | what Claude Code requested | per-tool checks |
+| `scope` | what `CONTROLLER_AGENT_AUDIENCES` grants the audience | what the client requested, within `CONTROLLER_PEOPLE_AUDIENCES` | per-tool checks |
 | `run_id` | run pod name | absent; the subject owns its workloads | ownership labels |
-| `kube_user` | the launcher's Kubernetes username | the person's OpenShift username | who RBAC asks about; required by crucible-kueue |
+| `kube_user` | the launcher's username on the run's cluster | the person's username on the server's cluster | who RBAC asks about; required by crucible-kueue |
 | `namespace` | from the run's grant | absent | crucible-kueue's default namespace |
 | `sandbox`, `workdir` | OpenShell sandbox name and workspace | absent | buildit's caller |
-| `exp` | 5 minutes | realm default | |
+| `exp` | 15 minutes by default | 15 minutes by default | |
 
-**Scopes carry audiences.** `kueue.read` and `kueue.submit` each add crucible-kueue's URLs to
-`aud`; the buildit scopes add buildit's. Requesting a scope is what binds a token to a server, so a
-crucible-kueue token is rejected by buildit despite a valid signature.
+**One audience per token.** A token is minted for one server's URL, with that audience's scopes,
+so a crucible-kueue token is rejected by buildit despite a valid signature.
 
 **Canonical resource URLs** are the URLs clients use:
 `http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp` for sandboxes,
-`http://host.openshell.internal:8849/mcp` for buildit in the loop pod, and `localhost` URLs for local
+`http://host.openshell.internal:8848/mcp` for buildit in the loop pod, and `localhost` URLs for local
 development.
 
 ## Resource server
@@ -286,8 +266,8 @@ flowchart TD
 pass. On `tools/list`, unconditional mutate paths are removed from each tool's `inputSchema` (the
 property and its `required` entry), for JSON and SSE responses alike.
 
-The CEL engine is the `cel` crate 0.15, one workspace pin shared with the controller's webhook
-transforms. JSON integers reach CEL as `int`, so `args.replicas <= 8` compares like with like. The
+The CEL engine is the `cel` crate at the workspace's pin, the one the controller's webhook
+transforms use. JSON integers reach CEL as `int`, so `args.replicas <= 8` compares like with like. The
 policy loads at startup; a rule that does not compile, or a key the format does not know (such as
 the old `scopes`, `authorize` or `unlisted`), stops the server.
 
@@ -320,68 +300,52 @@ shape (a compact JWT is never looked up as a static token); a tokens-file caller
 A unit test in each server fails if one of its tools has no scope in its access rules, so a new
 tool cannot ship silently refused.
 
-## People: Claude Code
+## People: MCP clients
 
-People log in through OpenShift into the realm with the pre-registered public client
-`claude-code` (auth code, PKCE S256, callback `http://localhost:8765/callback`).
+People's MCP clients (Claude Code, pi) sign in at the controller: `/oauth/authorize` with PKCE S256
+and a loopback redirect, a consent page in the controller's UI that names the server, the cluster
+and the username the token will carry, then `/oauth/token` for the code and for refresh.
+[docs/controller-auth.md](../docs/controller-auth.md) covers the flow, the routes and sign-out.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Claude Code
+    participant C as MCP client
     participant M as MCP server
-    participant K as Keycloak realm
-    participant O as OpenShift OAuth
+    participant X as crucible controller
     participant B as Browser
     C->>M: POST /mcp (no token)
     M-->>C: 401 resource_metadata=".../.well-known/oauth-protected-resource/mcp"
     C->>M: GET protected-resource metadata
-    M-->>C: authorization_servers = [realm]
-    C->>K: realm OIDC discovery
-    C->>B: open authorize URL (client_id=claude-code, PKCE, scope)
-    B->>K: authorize
-    K->>O: broker to openshift-v4
-    O-->>B: OpenShift login
-    B-->>K: code from OpenShift
-    K-->>B: redirect to localhost:8765/callback?code=...
+    M-->>C: authorization_servers = [controller issuer]
+    C->>X: authorization server metadata
+    C->>B: open /oauth/authorize (PKCE, resource, loopback redirect)
+    B->>X: signed-in session, consent page
+    X-->>B: redirect to the loopback callback with a code
     B-->>C: code
-    C->>K: token request (code + PKCE verifier)
-    K-->>C: access token (sub, kube_user, scope, aud)
+    C->>X: token request (code + PKCE verifier)
+    X-->>C: access token (sub, kube_user, scope, aud) and refresh token
     C->>M: POST /mcp + Bearer
     M-->>C: result
 ```
 
-```bash
-claude mcp add --transport http kueue https://<kueue host>/mcp --client-id claude-code --callback-port 8765
-```
-
-Claude Code follows the 401 to the protected-resource metadata, finds the realm's discovery
-document, and requests the scope the challenge names. `claude-code` grants `kueue.read` and
-`kueue.submit` by default, since Claude Code neither takes an OAuth scope flag nor steps up on a
-403. It sends the RFC 8707 `resource` and `prompt=consent`. When the cluster's ingress uses a
-private CA, start Claude Code with `NODE_EXTRA_CA_CERTS` pointing at it.
-
-The person-facing server is a crucible-kueue with only the realm as `--person-issuer`, the shipped policy,
-`--kube-authz openshift`, and a Route. Its service account needs `create` on
-`subjectaccessreviews`, `list` on `groups.user.openshift.io`, and the workload verbs in each
-namespace that holds a LocalQueue. No realm attributes are needed: RBAC on the person decides.
-`claude-code` grants both kueue scopes by default. Only the OpenShift login creates users, and it
-re-syncs usernames, so `kube_user` can be trusted.
-
-A person's token carries `kube_user` (their OpenShift username) and comes from a people issuer, so
-crucible-kueue treats it as a person: every call checked by RBAC as that user, and its workloads
-owned under its subject. A people issuer's token that carries `run_id` is refused.
+A server takes people's tokens from an issuer passed as `--person-issuer`; `crucible deploy render
+--kueue` adds the controller there with `[kueue] people = true`. A person's token carries their
+username on the server's cluster, by that cluster's identity rule, so crucible-kueue checks every
+call by RBAC as that user and owns their workloads under their subject. A people issuer's token
+that carries `run_id` is refused.
 
 ## Kubernetes authorization
 
-Kubernetes RBAC decides what a caller may touch. Policy `authorize` rules turn a tool call into
-SubjectAccessReviews; the server asks the API server, then acts with its own service account.
+Kubernetes RBAC decides what a caller may touch. The server's access rules (in code) turn a tool
+call into SubjectAccessReviews; the server asks the API server, then acts with its own service
+account.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant C as Caller
-    participant G as Guard (policy)
+    participant G as Guard
     participant R as SubjectAccessReviewer
     participant A as Kubernetes API
     participant K as crucible-kueue
@@ -395,7 +359,7 @@ sequenceDiagram
         K->>A: create the Job (own service account)
     else any check denied
         A-->>R: denied (never cached)
-        G-->>C: JSON-RPC -32001 naming the rule
+        G-->>C: JSON-RPC -32001 naming the check
     end
 ```
 
@@ -414,10 +378,9 @@ on the manifest's kind, in the call's `namespace` argument or else the token's `
 **Who is asked about.** `kube_user` names the Kubernetes user; a `system:` identity is refused, so
 no token can stand in for a node or the cluster. Groups come from OpenShift `Group` objects (cached
 a minute) or a `kube_groups` claim with `system:` groups dropped; `system:authenticated` is always
-added. People get `kube_user` from their username, which only the OpenShift login sets
-(registration and username edits off, re-synced on every login, first-login review off). Runs get
-their launcher's username from the controller, so a run can only do what its human could; a token
-without `kube_user` is refused.
+added. The controller resolves `kube_user` for people and runs alike from the cluster's identity
+rule (an SSO claim, a link the cluster itself proved, or an administrator's hub override), so a
+run can only do what its human could; a token without `kube_user` is refused.
 
 **Which namespace.** Every crucible-kueue tool takes an optional `namespace`, defaulting to the
 token's `namespace` claim; the access checks decide whether the caller may act there. Task ids carry
@@ -428,7 +391,7 @@ the namespace.
 | Caller | Token | Identity | Decided by |
 | --- | --- | --- | --- |
 | Sandboxed agent | controller-issued, `run_id` + `act.sub` + `kube_user` | the run's namespace by default | RBAC as the launcher |
-| Person (Claude Code) | Keycloak, `kube_user` | any namespace they name | RBAC as themselves |
+| Person (MCP client) | controller-issued, `kube_user` | any namespace they name | RBAC as themselves |
 
 People's tokens are accepted only when the server has a reviewer (`--kube-authz openshift|token`),
 and a call that needs checks is refused without one, so a misconfiguration cannot let a person act
@@ -453,10 +416,10 @@ file today, reviewable in a pull request, with rules that name themselves in eve
 **Wins available with what is built:**
 
 - **Delegation that cannot exceed the human.** A run's reach is its grant intersected with its
-  launcher's RBAC. Once run tokens carry `kube_user`, revoking someone's RoleBinding cuts off their
-  running agents within 30 seconds (the allow cache).
+  launcher's RBAC. Revoking someone's RoleBinding cuts off their running agents within 30 seconds
+  (the allow cache).
 - **Queues and namespaces as ordinary RBAC.** Platform teams grant GPU queues with RoleBindings and
-  Groups they already manage. No second permission system lives in Keycloak or crucible.
+  Groups they already manage. No second permission system lives in crucible.
 - **Server-owned arguments.** Mutate rules inject facts the client cannot forge: who launched it,
   which sandbox acted, which namespace. Every workload carries provenance an admission policy or a
   cost report can key on.
@@ -509,7 +472,7 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
 | Option | Why not |
 | --- | --- |
 | Dynamic client registration (RFC 7591) | OpenShell never registers; RFC 7591 cannot express "authenticated by an external issuer's subject"; still one client per sandbox, created by the untrusted side; deprecated in MCP 2026-07-28 |
-| Per-run Keycloak clients from the controller | Exact-subject matching forces a client per sandbox; create, bind, delete and sweep is too much moving state |
+| Per-run clients in an external IdP (Keycloak `federated-jwt`) | Exact-subject matching forces a client per sandbox; create, bind, delete and sweep is too much moving state |
 | Kubernetes service-account tokens | Every supervisor shares one service account, so no per-sandbox identity; OpenShell's `token_grant` speaks only SPIFFE, so the agent pod would hold the token; no human in the token |
 | Agents creating Jobs with their own kube access | Kueue has no per-user queue authorization beyond namespace RBAC; loses the plan/hash gate and manifest checks; large blast radius |
 | Impersonating the person | `impersonate` lets a server bug become privilege escalation; groups must be resolved anyway |
@@ -523,10 +486,8 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
   run, so the controller mints that run's token. The ClusterSPIFFEID must select only a dedicated
   sandbox namespace that nothing but the sandbox gateway can create pods in, and pack tasks must not
   hold `edit` there. The kueue workload namespace is rendered with Pod Security `restricted`.
-- **JWKS over https.** Serve Keycloak's in-cluster endpoint with a service-CA certificate and pass
-  that CA with `--jwks-ca`; plain http needs `--insecure-jwks-http` off loopback.
-- **Keycloak is a dependency** for human logins, and for agents until the controller endpoint lands.
-  Tokens last 5 minutes.
+- **JWKS over https.** Serve the issuer's key set over https with a certificate the server trusts
+  (`--jwks-ca` adds a CA); plain http needs `--insecure-jwks-http` off loopback.
 - **Fail-closed**: calls a server's access rules do not serve, checks that cannot be resolved or
   made, evaluation errors and non-boolean results refuse, and a policy rule that does not compile
   stops the server.
@@ -539,21 +500,11 @@ mode behind a Postgres temporal engine, and enforce once the language stabilizes
 | --- | --- |
 | this crate, unit tests | validation failures, algorithm confusion, key rotation and throttling, outage behavior, challenges, metadata, policy evaluation, mutation, stripping, schema hiding, SSE rewriting, access rules and review (allowed, denied, failed, no reviewer, checks over the final arguments), Kubernetes identity and SubjectAccessReview requests |
 | crucible-kueue, unit tests | claims to identity, default and per-call namespaces, `kube_user` required, person tokens, JWT-only authentication, launched-by label, every tool but `whoami` reviewed for people, namespaced task ids |
-| buildit, 60 unit tests | realm and tokens-file callers, refusals, challenges, launched-by label, a policy refusal over HTTP |
-| `crucible-controller/tests/kueue_oidc_e2e.rs` (cluster) | spike SVID to controller token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), another namespace refused by RBAC |
-| `buildit/tests/oidc_e2e.rs` (cluster) | the `buildit mcp` binary with a realm token: challenge, metadata, authenticated status, policy refusal |
+| buildit, unit tests | token and tokens-file callers, refusals, challenges, launched-by label, a policy refusal over HTTP |
+| `crucible-controller/tests/kueue_oidc_e2e.rs` (cluster) | a real SPIRE SVID to the controller's token to crucible-kueue: rule refusal, actor annotation, launched-by label, refusal once the run is collected, tampered SVID and foreign audience refused; a Deployment refused by Kubernetes RBAC for the launcher (`sar-e2e-rbac.yaml`), another namespace refused by RBAC |
+| `buildit/tests/oidc_e2e.rs` (cluster) | the `buildit mcp` binary with an external OIDC issuer's token: challenge, metadata, authenticated status, policy refusal |
+| `scripts/kueue-e2e.sh` (cluster) | the whole path in a cluster: a controller dispatches a pack whose agent builds an image with buildit and runs it through crucible-kueue, with tokens its supervisor obtained |
 
 The `testing` feature exposes real RSA keys, a loopback JWKS server and token minting for other
 servers' tests; `e2e` adds the cluster helpers (spike pod, token exchange), configured entirely from the
 environment.
-
-## Next steps
-
-1. Deploy the controller token endpoint (`CONTROLLER_AGENT_*` env, signing-key Secret).
-2. Gateway wiring: `provider_spiffe_workload_api_socket_path` in crucible's `gateway_toml()`,
-   `providers_v2_enabled`, the `token_grant` provider for each MCP server, and the OIDC flags rendered
-   into the server Deployments.
-3. The controller mints `kube_user` (the launcher's Kubernetes username) on run tokens.
-4. Render the person-facing deployment from crucible's deploy profile.
-5. Response capture in the guard and a per-run event log, then Cedar, then Dogwood (above).
-6. Keycloak TLS in-cluster; the gateway's driver credential out of pack code's reach.

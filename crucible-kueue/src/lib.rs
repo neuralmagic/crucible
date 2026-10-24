@@ -1,6 +1,6 @@
 //! `crucible-kueue`: an MCP server through which sandboxed agents submit, inspect, and control
 //! Kueue workloads. It holds the Kubernetes credentials; callers hold only an access token, a
-//! run's from the crucible controller or a person's from the crucible realm.
+//! run's or a person's, from the crucible controller or another OIDC issuer it trusts.
 
 pub mod access;
 pub mod auth;
@@ -38,7 +38,7 @@ pub fn install_tls_provider() {
 /// Everything a crucible-kueue app is built from. The binary fills it from flags; a host that
 /// embeds the server fills it in code.
 pub struct Options {
-    /// Validates every access token: runs' from the controller, people's from the realm.
+    /// Validates every access token, runs' and people's, against the issuers it trusts.
     pub oidc: Arc<ResourceServer>,
     /// Mutate and validate rules for tool arguments; [`ToolPolicy::default`] has none. Which
     /// calls exist, their scopes and their access checks are [`access::KueueRules`].

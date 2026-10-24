@@ -37,7 +37,8 @@ struct Cli {
         required_unless_present = "person_issuers"
     )]
     run_issuers: Vec<TrustedIssuer>,
-    /// Accept people's access tokens from an OAuth issuer (the realm), as `<issuer>=<jwks uri>`.
+    /// Accept people's access tokens from an OAuth issuer (the crucible controller, or another
+    /// OIDC issuer), as `<issuer>=<jwks uri>`.
     /// Repeatable; needs --kube-authz.
     #[arg(
         long = "person-issuer",

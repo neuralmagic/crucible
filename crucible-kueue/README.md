@@ -59,8 +59,8 @@ wanted replica is ready and admitted, never when scaled to zero).
 
 Every caller presents an OAuth access token; there are no static or per-run tenant tokens.
 `--run-issuer <issuer>=<jwks uri>` (repeatable) trusts an issuer of runs' tokens (the crucible
-controller), `--person-issuer` one of people's tokens (the crucible realm, which needs
-`--kube-authz`), and `--resource` names this server's canonical URLs, one of which a token's `aud`
+controller), `--person-issuer` one of people's tokens (the crucible controller again, or any OIDC
+issuer; needs `--kube-authz`), and `--resource` names this server's canonical URLs, one of which a token's `aud`
 must name. The issuer decides which kind a token is, never its claims. Every token needs
 `kube_user`; its `namespace` claim, if any, is only the default namespace. A run's `run_id` owns
 what it creates, its `sub` (the human the run acts for) is stamped on created workloads as

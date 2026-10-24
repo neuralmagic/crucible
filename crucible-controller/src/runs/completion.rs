@@ -188,9 +188,8 @@ pub async fn ingest_completion(db: &Db, cfg: &ControllerCfg, key: &str) -> Resul
     }
 }
 
-/// The deploy profile for collection's cleanup of the crucible-kueue record and an isolated
-/// gateway. A profile that cannot be read leaves the record to its expiry and the gateway to the
-/// gateway sweep rather than failing the collection.
+/// The deploy profile for collection's cleanup of an isolated gateway. A profile that cannot be
+/// read leaves the gateway to the gateway sweep rather than failing the collection.
 async fn collection_profile(
     cfg: &ControllerCfg,
 ) -> Option<std::sync::Arc<crucible::deploy::DeployProfile>> {

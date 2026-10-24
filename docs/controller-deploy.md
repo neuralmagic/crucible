@@ -152,12 +152,13 @@ error code
 and a fixed description; the reason is logged.
 
 **Sandbox placement.** A sandbox's SPIFFE ID is only as trustworthy as whoever can create pods
-where its supervisor runs, so the controller issues nothing until the deploy profile runs each
-run's gateway in its own pod: `sandbox_driver = "kubernetes"` with `[cluster] sandbox_namespace`,
-which profile load refuses to share with the loop, rig, or crucible-kueue namespaces. The
-controller refuses to start the issuer when its own namespace (`POD_NAMESPACE`), where the signing
-key Secret is mounted from, is any of those namespaces; a controller rendered by
-`crucible deploy render` runs in the loop namespace and so cannot hold the key.
+where its supervisor runs, so with `CONTROLLER_AGENT_SPIRE` set the controller refuses to start
+unless the deploy profile runs each run's gateway in its own pod: `sandbox_driver = "kubernetes"`
+with `[cluster] sandbox_namespace`, which profile load refuses to share with the loop, rig, or
+crucible-kueue namespaces. It also refuses to start the issuer when its own namespace, where the
+signing key Secret is mounted from, is any of those namespaces. Its namespace is `POD_NAMESPACE`,
+else the service account's namespace file; a controller rendered by `crucible deploy render` runs
+in the loop namespace and so cannot hold the key.
 
 **Gateway identity.** Each run's gateway has its own OpenShell gateway id, the run pod's name. The
 gateway stamps it as `openshell.ai/gateway-id` on every supervisor pod and Sandbox it creates, from
@@ -229,40 +230,48 @@ carry its own gateway id. The pinned OpenShell (3441f91) predates v0.1.2: superv
 pods, and nothing here depends on the sidecar supervisor topology or other v0.1.2 features.
 
 **`kube_user`.** Tokens carry the dispatcher's Kubernetes username on the run's cluster when the
-controller knows it, by the same rule people's tokens use there (Settings > Cluster identities); a
-server that sees it runs SubjectAccessReview as that user. On the hub's `link` rule it falls back
-to the username learned from the API server
-(`users/~`): when someone calls the API with a cluster token whose username equals their login
-exactly (filling an empty value only), or when a signed-in person links one with
-`PUT /api/me/kube-user` (`{"cluster_token": "<oc whoami -t>"}`). Another platform administrator
-can override it with `PUT /api/users/{login}/kube-user` (`{"kube_user": "<name>"}`, or `null` to
-clear it); the override is audited on `user:<login>`. `system:` identities are refused. crucible-kueue
-acts only as a token's `kube_user`, so a token carrying crucible-kueue scopes is refused when the
-username is unknown; other tokens are issued without the claim, logged at warn.
+controller knows it, by the same rule people's tokens use there (Settings > Cluster identities,
+[Cluster identities](controller-auth.md#cluster-identities)); a server that sees it runs
+SubjectAccessReview as that user. A `link` cluster's username is the one the person linked there.
+On the hub a platform administrator can override it with `PUT /api/users/{login}/kube-user`
+(`{"kube_user": "<name>"}`, or `null` to clear it); the override is audited on `user:<login>`, and
+no administrator sets their own. `system:` identities are refused. crucible-kueue acts only as a
+token's `kube_user`, so a token carrying crucible-kueue scopes is refused when the username is
+unknown; other tokens are issued without the claim, logged at warn. The linking and override routes
+are served whenever the controller mints agent tokens, people tokens, or has a `[cluster_link]`
+table.
 
 | Variable | Meaning |
 | --- | --- |
 | `CONTROLLER_AGENT_ISSUER` | The issuer identifier, an origin such as `http://crucible-controller.crucible-system.svc.cluster.local:8080`. Unset turns the endpoint off. Supervisors must request their SVID with exactly this audience (`token_grant.jwt_svid_audience`). |
 | `CONTROLLER_AGENT_SIGNING_KEY_FILE` | A PKCS#8 P-256 private key mounted from a Secret. The `kid` is its RFC 7638 thumbprint. |
+| `CONTROLLER_AGENT_SIGNING_KEY` | The same key inline, as PEM, in place of the file. |
 | `CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE` | Optional: the key before a rotation. It is published in the JWKS beside the current key, so tokens it signed keep verifying until they expire; nothing new is signed with it. Rotate by moving the current key here and mounting a new one, then drop this after one token lifetime. |
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | Agent token lifetime, 900 to 1800 seconds. Default 900. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | Where sandbox supervisors reach the token endpoint when not at the issuer itself (a spoke reaching the controller through a route). Default `<issuer>/oauth/token`. |
-| `CONTROLLER_AGENT_SPIRE` | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>` entries, one per cluster hosting isolated gateways (`hub` for the controller's own): the `iss` of that SPIRE's JWT-SVIDs, its gateway prefix (`spiffe://<trust domain>/openshell/gateway/`; supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`), and its OIDC discovery provider Service, whose `/keys` is read through that cluster's API server (over https, or http when the Service is prefixed `http://`). Each cluster and each issuer appears once. SVIDs must carry `iat` and live at most 15 minutes; SPIRE's upstream chart issues 1-hour JWT-SVIDs by default, so give the supervisors' ClusterSPIFFEID `jwtTTL: 5m`. |
-| `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. |
+| `CONTROLLER_AGENT_SPIRE` | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>` entries, one per cluster hosting isolated gateways (`hub` for the controller's own): the `iss` of that SPIRE's JWT-SVIDs, its gateway prefix (`spiffe://<trust domain>/openshell/gateway/`; supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`), and its OIDC discovery provider Service, whose `/keys` is read through that cluster's API server (over https, or http when the Service is prefixed `http://`). Each cluster and each issuer appears once. SVIDs must carry `iat` and live at most 15 minutes; SPIRE's upstream chart issues 1-hour JWT-SVIDs by default, so give the supervisors' ClusterSPIFFEID `jwtTtl: 5m`. Unset, the issuer mints no agent tokens and serves people only. |
+| `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. Required with `CONTROLLER_AGENT_SPIRE`. |
+| `CONTROLLER_PEOPLE_AUDIENCES` | Comma-separated `<cluster>:<resource url>=<scope> <scope>` entries: the MCP servers people's clients may get tokens for through `/oauth/authorize`, the cluster each acts on (whose identity rule gives the `kube_user`), and the scopes it grants. Unset turns people's tokens off. See [People's tokens](controller-auth.md#peoples-tokens-and-refresh). |
+| `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | People's access token lifetime, 1 to 3600 seconds. Default 900. |
 
-A run dispatched onto one of the `[kueue]` clusters (`clusters = ["pirate", "waldorf"]`, or
-`cluster = "pirate"`) gets the server's URL (`CRUCIBLE_KUEUE_URL`), the
+A run dispatched onto one of the `[kueue]` clusters (`clusters = ["spoke-a", "spoke-b"]`, or
+`cluster = "spoke-a"`) gets the server's URL (`CRUCIBLE_KUEUE_URL`), the
 token endpoint (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`) and the issuer as SVID audience
 (`CRUCIBLE_AGENT_SVID_AUDIENCE`) as plain env. The engine registers a token-grant provider from
 them, so each sandbox's supervisor obtains its own token and injects it on traffic to the server
-alone; no token is minted per run and nothing is recorded.
+alone; no token is minted per run. A server is granted only on a cluster in
+`CONTROLLER_AGENT_SPIRE` whose URL is in `CONTROLLER_AGENT_AUDIENCES`. The run records what it got,
+with the audience's scopes and, for crucible-kueue, the dispatcher's username there, and the run
+page shows it.
 
 The deploy profile's `[kueue] workload_namespace` is the `namespace` claim for runs on its clusters;
 a run elsewhere gets none. `[kueue] run_issuer` must equal `CONTROLLER_AGENT_ISSUER`: the rendered
 server trusts runs' tokens from it, fetching keys from `<run_issuer>/.well-known/jwks.json` unless
 `run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).
 `kube_authz` (`openshift` or `token`) is where the server takes a caller's groups for its
-SubjectAccessReviews. A token's scopes are what its audience lists here. For example:
+SubjectAccessReviews. With `people = true` the rendered server also accepts people's tokens from
+the same issuer (`--person-issuer`), for a deployment whose `CONTROLLER_PEOPLE_AUDIENCES` names it.
+A token's scopes are what its audience lists here. For example:
 
 ```bash
 CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,http://host.openshell.internal:8848/mcp=buildit.read buildit.build"
@@ -272,17 +281,18 @@ CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.lo
 pod on port 8848, and its sandboxes reach it at `http://host.openshell.internal:8848/mcp` with
 tokens their supervisors obtain like crucible-kueue's. buildit takes only tokens for that
 audience whose `run_id` is its own run, reads each build's context from the token's `sandbox`
-and `workdir` through the run's gateway, and runs builder pods in the loop namespace, so the loop
-service account needs `pods` create/get/list/delete and `pods/exec`, `pods/log` there. `push`
+and `workdir` through the run's gateway, and runs builder pods in the loop namespace; with
+`[buildit]` the loop render grants the loop service account `pods` create/get/list/watch/delete,
+`pods/exec` and `pods/log` there. `push`
 publishes a succeeded build to `push_repo` only, tagged `<sandbox>-<build_id>`, with the loop
 pod's `[secrets] push_authfile`; without either, buildit pushes nothing.
 
 ```toml
 [buildit]
-clusters     = ["pirate", "waldorf"]
+clusters     = ["spoke-a", "spoke-b"]
 run_issuer   = "https://crucible.example"          # CONTROLLER_AGENT_ISSUER
 run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
-push_repo    = "quay.io/org/crucible-smoke"         # optional
+push_repo    = "registry.example.com/team/crucible-smoke"  # optional
 ```
 
 ```bash

@@ -236,12 +236,12 @@ caller's username there. The deploy profile declares each cluster's rule:
 [cluster]                                 # the hub
 identity = { claim = "login" }            # usernames are SSO logins
 
-[clusters.waldorf]
-kubeconfig_secret = "waldorf-kubeconfig"
+[clusters.spoke-b]
+kubeconfig_secret = "spoke-b-kubeconfig"
 identity = { claim = "email" }            # the cluster's OIDC login uses the same email
 
-[clusters.pirate]
-kubeconfig_secret = "pirate-kubeconfig"
+[clusters.spoke-a]
+kubeconfig_secret = "spoke-a-kubeconfig"
 identity = "link"                         # the default: each person proves it to the cluster
 ```
 
@@ -263,7 +263,7 @@ names its owner, the username is recorded, and the token is dropped.
 ```toml
 [cluster_link]
 external_url = "https://crucible.apps.hub.example.com"
-openshift = ["pirate"]
+openshift = ["spoke-a"]
 # client_id = "crucible-controller"
 # access_token_max_age_secs = 300
 ```
@@ -272,12 +272,12 @@ Render the client for one cluster, then create it there with a fresh secret, and
 secret to the controller under the cluster's name:
 
 ```sh
-crucible deploy render --profile profile.toml --cluster-link pirate > oauthclient-pirate.yaml
+crucible deploy render --profile profile.toml --cluster-link spoke-a > oauthclient-spoke-a.yaml
 secret=$(openssl rand -hex 32)
-oc --context pirate apply -f oauthclient-pirate.yaml
-oc --context pirate patch oauthclient crucible-controller --type merge -p "{\"secret\":\"$secret\"}"
+oc --context spoke-a apply -f oauthclient-spoke-a.yaml
+oc --context spoke-a patch oauthclient crucible-controller --type merge -p "{\"secret\":\"$secret\"}"
 oc --context hub -n crucible-system create secret generic crucible-cluster-link \
-  --from-literal=pirate="$secret" --dry-run=client -o yaml | oc --context hub apply -f -
+  --from-literal=spoke-a="$secret" --dry-run=client -o yaml | oc --context hub apply -f -
 ```
 
 `OAuthClient` is cluster-scoped, so creating it needs cluster-admin on that cluster. Mount the
