@@ -1061,6 +1061,7 @@ export const ROUTES: Record<string, Json> = {
     proves_groups: true,
     acting_as: null,
     entitlements: ['autoresearch'],
+    features: { agent_tools: true, identities: true },
     teams: [
       { team: 'llm-d', role: 'maintainer', via: [{ kind: 'group', group: '/groups/platform', role: 'maintainer' }] },
       { team: 'platform-administrators', role: 'owner', via: [{ kind: 'rule', rule: 'configured-admins', role: 'owner' }] },
@@ -1202,13 +1203,25 @@ export const CLUSTER_IDENTITIES = [
 ];
 
 export const CONSENT_ID = 'c0ffee';
+/** A parked request from a client that published a metadata document instead of registering. */
+export const CIMD_CONSENT_ID = 'c1mdc1md';
 
 const CONSENT = {
   id: CONSENT_ID,
   client_id: 'claude-code',
+  client_name: 'Claude Code',
+  client_host: null,
   resource: 'http://localhost:8851/mcp',
   scopes: ['kueue.read', 'kueue.submit'],
   login: 'wren',
+};
+
+const CIMD_CONSENT = {
+  ...CONSENT,
+  id: CIMD_CONSENT_ID,
+  client_id: 'https://chatgpt.com/oauth/codex/client.json',
+  client_name: 'Codex',
+  client_host: 'chatgpt.com',
 };
 
 /** The token a stand-in cluster accepts for wren on any `link` cluster. */
@@ -1222,6 +1235,18 @@ export async function stubApi(page: Page): Promise<void> {
   let identities = CLUSTER_IDENTITIES.map((identity) => ({ ...identity }));
   let signIns = [
     {
+      client_id: 'codex',
+      client_name: 'Codex',
+      client_host: null,
+      resource: 'http://localhost:8852/mcp',
+      cluster: 'east',
+      approved_at: '2026-10-09T12:00:00Z',
+      last_used_at: '2026-10-09T12:30:00Z',
+    },
+    {
+      client_id: 'claude-code',
+      client_name: 'Claude Code',
+      client_host: null,
       resource: 'http://localhost:8851/mcp',
       cluster: 'pirate',
       approved_at: '2026-10-09T10:00:00Z',
@@ -1320,18 +1345,21 @@ export async function stubApi(page: Page): Promise<void> {
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ enabled: true, sign_ins: signIns }) });
       }
       if (path === '/api/me/mcp-sign-ins' && route.request().method() === 'DELETE') {
-        const revoked = signIns.length;
-        signIns = [];
+        const client = new URL(route.request().url()).searchParams.get('client_id');
+        const kept = signIns.filter((s) => client !== null && s.client_id !== client);
+        const revoked = signIns.length - kept.length;
+        signIns = kept;
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ revoked }) });
       }
       // The consent page: one parked request for pirate, decided once.
       if (path === '/api/oauth/consent' && route.request().method() === 'GET') {
         const id = new URL(route.request().url()).searchParams.get('id');
-        if (id !== CONSENT_ID) {
+        const parked = id === CONSENT_ID ? CONSENT : id === CIMD_CONSENT_ID ? CIMD_CONSENT : null;
+        if (parked === null) {
           const body = JSON.stringify({ error: 'no authorization request is waiting under this id' });
           return route.fulfill({ status: 404, contentType: 'application/json', body });
         }
-        const body = JSON.stringify({ ...CONSENT, identity: identities.find((i) => i.cluster === 'pirate') });
+        const body = JSON.stringify({ ...parked, identity: identities.find((i) => i.cluster === 'pirate') });
         return route.fulfill({ status: 200, contentType: 'application/json', body });
       }
       if (path === '/api/oauth/consent' && route.request().method() === 'POST') {

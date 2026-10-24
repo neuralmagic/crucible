@@ -30,7 +30,15 @@ function Consent({ consent }: { consent: ConsentDto }) {
         <SectionBody>
           <dl data-testid="consent-request" className="m-0 grid grid-cols-[max-content_1fr] gap-x-6 gap-y-1.5 text-body">
             <dt className="text-ink-3">Client</dt>
-            <dd className="m-0 font-mono text-data text-ink-1">{consent.client_id}</dd>
+            <dd className="m-0 text-ink-1">
+              <span data-testid="consent-client">{view.client}</span>
+              <span className="block font-mono text-data text-ink-3">{consent.client_id}</span>
+              {view.publisher !== null && (
+                <span data-testid="consent-publisher" className="block text-ink-2">
+                  {view.publisher}
+                </span>
+              )}
+            </dd>
             <dt className="text-ink-3">Server</dt>
             <dd className="m-0 font-mono text-data text-ink-1">{consent.resource}</dd>
             <dt className="text-ink-3">Scopes</dt>

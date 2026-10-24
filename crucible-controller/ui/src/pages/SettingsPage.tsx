@@ -28,7 +28,7 @@ import {
 import { TextField, NumberInputField, CheckField, FormActions } from './formControls';
 import { clusterIdentitiesShown, linkOutcome, sortIdentities } from './clusterIdentitiesView';
 import { ClusterIdentityRow } from './ClusterIdentityRow';
-import { mcpSignInsShown, signedOutMessage } from './mcpSignInsView';
+import { byClient, mcpSignInsShown, signedOutMessage, type ClientSignIns } from './mcpSignInsView';
 
 const TONE: Record<CredentialState, StatusTone> = {
   absent: 'grey',
@@ -281,7 +281,8 @@ function ClusterIdentities() {
   );
 }
 
-/// The MCP clients signed in through this controller, and the switch that ends every approval.
+/// The MCP clients signed in through this controller, each with its own sign-out, and the switch
+/// that ends every approval.
 function McpSignIns() {
   const qc = useQueryClient();
   const signIns = $api.useQuery('get', '/api/me/mcp-sign-ins');
@@ -293,6 +294,18 @@ function McpSignIns() {
   if (signIns.isPending) return <LoadingBlock label="Loading MCP sign-ins" />;
   if (!mcpSignInsShown(signIns.data)) return null;
   const live = signIns.data.sign_ins;
+  const clients = byClient(live);
+  const end = (client?: ClientSignIns) => {
+    signOut.mutate(
+      client ? { params: { query: { client_id: client.clientId } } } : {},
+      {
+        onSuccess: (result) => {
+          setOutcome(signedOutMessage(result.revoked, client?.label));
+          void qc.invalidateQueries();
+        },
+      },
+    );
+  };
   return (
     <Section>
       <SectionHeader
@@ -303,15 +316,36 @@ function McpSignIns() {
         {live.length === 0 ? (
           <p className="m-0 text-body text-ink-3">No MCP client is signed in.</p>
         ) : (
-          <dl data-testid="mcp-sign-ins" className="m-0 grid grid-cols-[1fr_max-content_max-content] gap-x-6 gap-y-1.5 font-mono text-data">
-            {live.map((s) => (
-              <div key={`${s.resource} ${s.approved_at}`} className="contents">
-                <dt className="text-ink">{s.resource}</dt>
-                <dd className="m-0 text-ink-2">{s.cluster}</dd>
-                <dd className="m-0 text-ink-3">last used {s.last_used_at}</dd>
+          <div data-testid="mcp-sign-ins" className="grid gap-4">
+            {clients.map((client) => (
+              <div key={client.clientId} data-testid={`mcp-client-${client.clientId}`}>
+                <div className="flex items-baseline justify-between gap-4">
+                  <span className="text-body text-ink">
+                    {client.label}
+                    <span className="ml-2 font-mono text-data text-ink-3">{client.clientId}</span>
+                  </span>
+                  <Button
+                    className="uppercase"
+                    variant="quiet"
+                    aria-label={`Sign out ${client.label}`}
+                    disabled={signOut.isPending}
+                    onClick={() => end(client)}
+                  >
+                    Sign out
+                  </Button>
+                </div>
+                <dl className="m-0 mt-1 grid grid-cols-[1fr_max-content_max-content] gap-x-6 gap-y-1.5 font-mono text-data">
+                  {client.signIns.map((s) => (
+                    <div key={`${s.resource} ${s.approved_at}`} className="contents">
+                      <dt className="text-ink">{s.resource}</dt>
+                      <dd className="m-0 text-ink-2">{s.cluster}</dd>
+                      <dd className="m-0 text-ink-3">last used {s.last_used_at}</dd>
+                    </div>
+                  ))}
+                </dl>
               </div>
             ))}
-          </dl>
+          </div>
         )}
         {outcome !== null && <p className="mt-2 text-body text-ink-2">{outcome}</p>}
         {signOut.isError && <p className="mt-2 text-body text-red">{formatError(signOut.error)}</p>}
@@ -320,17 +354,7 @@ function McpSignIns() {
             className="uppercase"
             variant="filled"
             disabled={live.length === 0 || signOut.isPending}
-            onClick={() => {
-              signOut.mutate(
-                {},
-                {
-                  onSuccess: (result) => {
-                    setOutcome(signedOutMessage(result.revoked));
-                    void qc.invalidateQueries();
-                  },
-                },
-              );
-            }}
+            onClick={() => end()}
           >
             {signOut.isPending ? 'Signing out…' : 'Sign out MCP clients'}
           </Button>

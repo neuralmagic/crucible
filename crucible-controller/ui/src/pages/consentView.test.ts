@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { consentPath, consentView, type ConsentDto } from './consentView';
 
-function consent(identity: Partial<ConsentDto['identity']> = {}): ConsentDto {
+function consent(identity: Partial<ConsentDto['identity']> = {}, client: Partial<ConsentDto> = {}): ConsentDto {
   return {
     id: 'abc',
     client_id: 'claude-code',
+    client_name: 'Claude Code',
+    client_host: null,
     resource: 'http://localhost:8851/mcp',
     scopes: ['kueue.read', 'kueue.submit'],
     login: 'jordan',
@@ -16,12 +18,33 @@ function consent(identity: Partial<ConsentDto['identity']> = {}): ConsentDto {
       linked_at: null,
       ...identity,
     },
+    ...client,
   };
 }
 
 describe('consentView', () => {
-  it('names the client asking', () => {
-    expect(consentView(consent()).title).toBe('Allow claude-code?');
+  it('names the registered client asking by its display name', () => {
+    const view = consentView(consent());
+    expect(view.title).toBe('Allow Claude Code?');
+    expect(view.client).toBe('Claude Code');
+    expect(view.publisher).toBeNull();
+    expect(consentView(consent({}, { client_id: 'codex', client_name: 'Codex' })).title).toBe('Allow Codex?');
+  });
+
+  it('names a metadata document client with the host that published it', () => {
+    const view = consentView(
+      consent(
+        {},
+        {
+          client_id: 'https://chatgpt.com/oauth/codex/client.json',
+          client_name: 'Codex',
+          client_host: 'chatgpt.com',
+        },
+      ),
+    );
+    expect(view.title).toBe('Allow Codex (chatgpt.com)?');
+    expect(view.client).toBe('Codex (chatgpt.com)');
+    expect(view.publisher).toMatch(/^chatgpt\.com published this client/);
   });
 
   it('holds Allow back until a link cluster names the person', () => {
