@@ -292,7 +292,12 @@ render grants the loop service account `pods` create/get/list/watch/delete, `pod
 loop pod and Secret. Create the namespace before the first run; builder pods run as its `default`
 service account, so on OpenShift bind that account to an SCC that admits them (uid 1000). The
 rights still let runs see each other's builder pods in that namespace, including a push's
-authfile while it is copied in; buildit under a service account of its own is the clean end state. `push`
+authfile while it is copied in; buildit under a service account of its own is the clean end state.
+A build's `RUN` steps run the agent's code unsandboxed in the builder pod, so the render also
+creates the `buildit-builders` NetworkPolicy there: no ingress, egress only to DNS and
+`[buildit] egress` (default TCP 443 anywhere). Policies match networks, not host names: list your
+registries' networks, or put the cluster's pod and service networks in `except`, to keep builds
+off in-cluster services. `push`
 publishes a succeeded build to `push_repo` only, tagged `<sandbox>-<build_id>`, with the loop
 pod's `[secrets] push_authfile`; without either, buildit pushes nothing.
 
@@ -300,6 +305,7 @@ pod's `[secrets] push_authfile`; without either, buildit pushes nothing.
 [buildit]
 clusters     = ["spoke-a", "spoke-b"]
 namespace    = "crucible-builds"                    # builder pods, apart from loop pods
+egress       = [{ cidr = "0.0.0.0/0", except = ["10.128.0.0/14", "172.30.0.0/16"] }]  # optional
 run_issuer   = "https://crucible.example"          # CONTROLLER_AGENT_ISSUER
 run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
 push_repo    = "registry.example.com/team/crucible-smoke"  # optional

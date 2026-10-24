@@ -273,6 +273,36 @@ pub struct BuilditCfg {
     /// (`[secrets] push_authfile`). Unset, buildit pushes nothing.
     #[serde(default)]
     pub push_repo: Option<String>,
+    /// Where builder pods may connect besides DNS, since a build's `RUN` steps run unsandboxed:
+    /// the registries they pull from and push to. Default: TCP 443 anywhere.
+    #[serde(default = "default_builder_egress")]
+    pub egress: Vec<BuilderEgress>,
+}
+
+/// An IP network builder pods may reach, on `ports`, less the networks in `except` (such as the
+/// cluster's pod and service networks).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderEgress {
+    pub cidr: String,
+    #[serde(default = "https_ports")]
+    pub ports: Vec<u16>,
+    #[serde(default)]
+    pub except: Vec<String>,
+}
+
+fn https_ports() -> Vec<u16> {
+    vec![443]
+}
+
+fn default_builder_egress() -> Vec<BuilderEgress> {
+    ["0.0.0.0/0", "::/0"]
+        .map(|cidr| BuilderEgress {
+            cidr: cidr.to_string(),
+            ports: https_ports(),
+            except: Vec::new(),
+        })
+        .to_vec()
 }
 
 impl BuilditCfg {

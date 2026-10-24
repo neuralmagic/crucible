@@ -1482,6 +1482,13 @@ the labels `buildit.dev/managed-by=mcp`, `buildit.dev/sandbox`, `buildit.dev/bui
 `--max-builds` (default 4) limits live builder pods per sandbox. The shipped policy caps a build at
 3600 seconds and a run at 1800 seconds; without a value they are 1800 and 600.
 
+Warning: A build's `RUN` steps and `buildit run` execute the agent's code in the builder pod, with
+no OpenShell sandbox around it. The loop render's NetworkPolicy `buildit-builders` in the buildit
+namespace admits no ingress to builder pods, and egress only to DNS (UDP and TCP 53 and 5353) and to
+`[buildit] egress`, by default TCP 443 anywhere, for the registries a build pulls from and pushes to.
+A NetworkPolicy matches IP networks, not host names: to keep `RUN` steps away from in-cluster
+services, list the registries' networks, or add the cluster's pod and service networks as `except`.
+
 ### 8.5 The push path
 
 `push` publishes a build that succeeded to one repository only: `--push-repo`, for example
@@ -1578,6 +1585,7 @@ tokens, the controller does not read them.
 | `[buildit] clusters` or `cluster` | `["hub"]` | The clusters whose runs get `buildit`. |
 | `[buildit] namespace` | required | Where builder pods run. Profile load refuses the loop, rig, sandbox, crucible-kueue and workload namespaces. |
 | `[buildit] run_issuer` | required | Must equal `CONTROLLER_AGENT_ISSUER`. |
+| `[buildit] egress` | TCP 443 to `0.0.0.0/0` and `::/0` | `[{ cidr, ports = [443], except = [] }, ...]`: where builder pods may connect besides DNS (section 8.4). |
 | `[buildit] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |

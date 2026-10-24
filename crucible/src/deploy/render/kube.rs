@@ -376,6 +376,11 @@ pub fn render(
         let yaml = serde_norway::to_string(&obj).context("serializing buildit RBAC")?;
         out.push_str(&format!("---\n{yaml}"));
     }
+    if let Some(policy) = r.builder_netpol() {
+        let yaml = serde_norway::to_string(&policy)
+            .context("serializing the builder pods' NetworkPolicy")?;
+        out.push_str(&format!("---\n{yaml}"));
+    }
     // Pack delivery: append the ConfigMap carrying the pack files. Last so a baked-domain render (no
     // pack) keeps its exact three-doc [pod, rbac, netpol] layout, the controller extracts by `kind`,
     // never by index, so ordering is free here.
@@ -1742,6 +1747,58 @@ exit $rc
         ]
     }
 
+    /// With `[buildit]`, the builder pods' NetworkPolicy in buildit's namespace: no ingress, and
+    /// egress only to DNS and `[buildit] egress`.
+    fn builder_netpol(&self) -> Option<networking::NetworkPolicy> {
+        let buildit = self.profile.buildit.as_ref()?;
+        let port = |port: u16, protocol: &str| networking::NetworkPolicyPort {
+            port: Some(IntOrString::Int(port.into())),
+            protocol: Some(protocol.to_string()),
+            ..Default::default()
+        };
+        let dns = networking::NetworkPolicyEgressRule {
+            ports: Some(
+                [53, 5353]
+                    .into_iter()
+                    .flat_map(|p| [port(p, "UDP"), port(p, "TCP")])
+                    .collect(),
+            ),
+            to: None,
+        };
+        let allowed = buildit
+            .egress
+            .iter()
+            .map(|e| networking::NetworkPolicyEgressRule {
+                ports: Some(e.ports.iter().map(|&p| port(p, "TCP")).collect()),
+                to: Some(vec![networking::NetworkPolicyPeer {
+                    ip_block: Some(networking::IPBlock {
+                        cidr: e.cidr.clone(),
+                        except: (!e.except.is_empty()).then(|| e.except.clone()),
+                    }),
+                    ..Default::default()
+                }]),
+            });
+        Some(networking::NetworkPolicy {
+            metadata: ObjectMeta {
+                name: Some(BUILDER_NETPOL.to_string()),
+                namespace: Some(buildit.namespace.to_string()),
+                ..Default::default()
+            },
+            spec: Some(networking::NetworkPolicySpec {
+                pod_selector: Some(LabelSelector {
+                    match_labels: Some(BTreeMap::from([(
+                        "buildit.dev/managed-by".to_string(),
+                        "mcp".to_string(),
+                    )])),
+                    ..Default::default()
+                }),
+                policy_types: Some(vec!["Ingress".to_string(), "Egress".to_string()]),
+                ingress: None,
+                egress: Some(std::iter::once(dns).chain(allowed).collect()),
+            }),
+        })
+    }
+
     /// A Role named `name` in `namespace` with `rules`, bound to `cluster.sandbox_readers`.
     fn reader_grant(
         &self,
@@ -1785,6 +1842,9 @@ exit $rc
         ]
     }
 }
+
+/// The builder pods' NetworkPolicy in `[buildit] namespace`.
+pub const BUILDER_NETPOL: &str = "buildit-builders";
 
 /// A typed wrapper so `sandbox_rbac()` can return a mixed vec of RBAC objects and they all
 /// serialize through one `serde_norway::to_string` call.
@@ -4793,6 +4853,49 @@ mod tests {
             !render_k8s_manifest(&manifest, &k8s_profile("")).contains("-buildit"),
             "no buildit rights without [buildit]"
         );
+        let builders = docs
+            .iter()
+            .find(|d| d["kind"] == "NetworkPolicy" && d["metadata"]["name"] == BUILDER_NETPOL)
+            .unwrap_or_else(|| panic!("the builder pods' NetworkPolicy: {yaml}"));
+        assert_eq!(builders["metadata"]["namespace"], "crucible-builds");
+        assert_eq!(
+            builders["spec"]["podSelector"]["matchLabels"]["buildit.dev/managed-by"],
+            "mcp"
+        );
+        assert_eq!(
+            builders["spec"]["policyTypes"],
+            serde_json::json!(["Ingress", "Egress"])
+        );
+        assert!(
+            builders["spec"].get("ingress").is_none(),
+            "no ingress at all"
+        );
+        let egress = builders["spec"]["egress"].as_array().unwrap();
+        assert_eq!(egress[0].get("to"), None, "DNS anywhere");
+        assert_eq!(
+            egress[1]["to"][0]["ipBlock"]["cidr"], "0.0.0.0/0",
+            "by default, TCP 443 anywhere"
+        );
+        assert_eq!(
+            egress[1]["ports"],
+            serde_json::json!([{"port": 443, "protocol": "TCP"}])
+        );
+        let narrowed = render_k8s_manifest(
+            &manifest,
+            &k8s_profile(
+                "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n\
+                 egress = [{ cidr = \"203.0.113.0/24\", except = [\"203.0.113.8/29\"] }]\n",
+            ),
+        );
+        let narrowed: serde_json::Value = serde_norway::Deserializer::from_str(&narrowed)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .find(|d| d["metadata"]["name"] == BUILDER_NETPOL)
+            .unwrap();
+        assert_eq!(
+            narrowed["spec"]["egress"][1]["to"][0]["ipBlock"],
+            serde_json::json!({"cidr": "203.0.113.0/24", "except": ["203.0.113.8/29"]})
+        );
+        assert_eq!(narrowed["spec"]["egress"].as_array().unwrap().len(), 2);
         let netpol = yaml
             .split("\n---\n")
             .find(|d| d.contains("kind: NetworkPolicy"))

@@ -186,7 +186,9 @@ if [ -n "${SANDBOX_SCC_ROLE:-}" ]; then
         --serviceaccount "$SANDBOX_NS:crucible-sandbox" --dry-run=client -o yaml | kc apply -f - >/dev/null
 fi
 "$BIN/crucible" deploy render --manifest "$ROOT/e2e/kueue/render.toml" --profile "$WORK/profile.toml" \
-    --no-pin 2>/dev/null | yq 'select(.kind != "Pod" and .kind != "NetworkPolicy")' > "$WORK/rendered.yaml"
+    --no-pin 2>/dev/null \
+    | yq 'select(.kind != "Pod" and (.kind != "NetworkPolicy" or .metadata.name == "buildit-builders"))' \
+    > "$WORK/rendered.yaml"
 e2e_scoped "$WORK/rendered.yaml" | kc apply -f - >/dev/null
 
 log "deploying crucible-kueue in $KUEUE_NS"
