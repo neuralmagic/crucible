@@ -4,7 +4,7 @@
 //! secret, or a scheduling escape from Kueue is refused by not being on the list.
 
 use crate::caller::{Caller, QueueName};
-use crate::config::{Config, Lifetimes, MANAGED_VALUE, QUEUE_LABEL};
+use crate::config::{Config, Lifetimes, QUEUE_LABEL};
 use kube::core::ApiResource;
 use kube_quantity::ParsedQuantity;
 use rmcp::schemars;
@@ -366,7 +366,7 @@ pub fn normalize(
     check_reserved(meta, "/metadata", &object_labels, cfg)?;
     let labels = object_entry(meta, "labels", "metadata.labels")?;
     set_label(labels, QUEUE_LABEL, queue.as_str())?;
-    set_label(labels, &l.managed_by, MANAGED_VALUE)?;
+    set_label(labels, &l.managed_by, l.manager.as_str())?;
     set_label(labels, &l.run_id, caller.run_id.as_str())?;
     set_label(labels, &l.owner_kind, caller.owner.as_str())?;
     set_label(labels, &l.launched_by, caller.launched_by.as_str())?;
@@ -1567,6 +1567,17 @@ mod tests {
             Some(&json!("train"))
         );
         assert!(o.pointer("/metadata/labels/crucible.dev~1run-id").is_none());
+        let managed = Config {
+            labels: crate::config::Labels::new("kueue-mcp.example.com")
+                .managed_as(crate::caller::Manager::parse("team-b-kueue").unwrap()),
+            ..Config::default()
+        };
+        let n = normalize(job(), &caller(), &queue(), &managed).unwrap();
+        assert_eq!(
+            n.object
+                .pointer("/metadata/labels/kueue-mcp.example.com~1managed-by"),
+            Some(&json!("team-b-kueue"))
+        );
         let mut forged = job();
         forged["metadata"]["annotations"] = json!({"kueue-mcp.example.com/actor": "x"});
         assert!(

@@ -6,7 +6,7 @@
 
 use crate::agent_auth::bindings::BoundRun;
 use crate::agent_auth::sandbox::{SandboxId, SandboxIdError};
-use crucible::deploy::profile::{KubeName, KueueCfg};
+use crucible::deploy::profile::{KubeName, KueueCfg, check_cluster_name};
 use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::verify::{TokenError, Verifier, unverified_issuer};
@@ -233,7 +233,8 @@ impl std::str::FromStr for ClusterSpire {
         let (name, port) = name_port.split_once(':').ok_or_else(bad)?;
         let kube_name = |v: &str| KubeName::try_from(v.to_string()).map_err(|_| bad());
         let cluster = cluster.trim();
-        if cluster.is_empty() || issuer.is_empty() {
+        check_cluster_name(cluster).map_err(|_| bad())?;
+        if issuer.is_empty() {
             return Err(bad());
         }
         Ok(Self {
@@ -280,13 +281,8 @@ impl std::str::FromStr for Audience {
                 let (cluster, rest) = raw
                     .split_once(':')
                     .ok_or_else(|| ConfigError::AudienceCluster(raw.to_string()))?;
-                let label = !cluster.is_empty()
-                    && cluster
-                        .chars()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-                if !label {
-                    return Err(ConfigError::AudienceCluster(raw.to_string()));
-                }
+                check_cluster_name(cluster)
+                    .map_err(|_| ConfigError::AudienceCluster(raw.to_string()))?;
                 (Some(cluster.to_string()), rest)
             }
         };
@@ -1264,6 +1260,33 @@ mod tests {
             "spoke-a",
         ] {
             assert!(bad.parse::<Audience>().is_err(), "{bad}");
+        }
+    }
+
+    /// Agent audiences, people audiences, SPIRE entries and the deploy profile accept the same
+    /// cluster names.
+    #[test]
+    fn every_cluster_setting_accepts_the_names_the_profile_accepts() {
+        for name in [
+            "hub", "pirate", "spoke-a", "a1", "", "Pirate", "spoke_a", "-a", "a-", "a.b",
+        ] {
+            let profile = crucible::deploy::profile::check_cluster_name(name).is_ok();
+            let agent = format!("{name}:http://a.example/mcp=s")
+                .parse::<Audience>()
+                .is_ok();
+            let person = format!("{name}:http://a.example/mcp=s")
+                .parse::<crate::agent_auth::people::PersonAudience>()
+                .is_ok();
+            let spire = format!(
+                "{name}=https://oidc.example spiffe://td/openshell/gateway/ spire/oidc:443"
+            )
+            .parse::<ClusterSpire>()
+            .is_ok();
+            assert_eq!(
+                (agent, person, spire),
+                (profile, profile, profile),
+                "{name:?}"
+            );
         }
     }
 

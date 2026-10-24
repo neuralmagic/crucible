@@ -3,6 +3,7 @@
 //! verb, batch lifetimes, and which node resources count as accelerators. [`Config::default`] is
 //! crucible's deployment.
 
+use crate::caller::Manager;
 use crate::caller::{Launcher, NameError, RunId};
 use crate::profile::Profile;
 use crucible_mcp_auth::kube::{GROUPS_CLAIM, USER_CLAIM};
@@ -12,8 +13,9 @@ use sha2::{Digest, Sha256};
 
 pub const DEFAULT_LABEL_DOMAIN: &str = "crucible.dev";
 pub const QUEUE_LABEL: &str = "kueue.x-k8s.io/queue-name";
-/// The value of the managed-by label on everything this server creates.
-pub const MANAGED_VALUE: &str = "crucible-kueue";
+/// The default value of the managed-by label on everything this server creates, and the field
+/// manager of its writes.
+pub const DEFAULT_MANAGER: &str = "crucible-kueue";
 /// Claims the server reads after [`ClaimMap::canonicalize`] has mapped the token's own.
 pub const RUN_ID_CLAIM: &str = "run_id";
 pub const NAMESPACE_CLAIM: &str = "namespace";
@@ -139,6 +141,9 @@ impl Default for Config {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Labels {
     pub domain: String,
+    /// The managed-by label's value and the field manager of every write. Two servers in one
+    /// cluster with different managers each see only their own objects as managed.
+    pub manager: Manager,
     pub managed_by: String,
     pub run_id: String,
     /// Whether `run_id` names a run or a person's subject.
@@ -159,6 +164,7 @@ impl Labels {
         let key = |name: &str| format!("{domain}/{name}");
         Self {
             domain: domain.to_string(),
+            manager: Manager::default(),
             managed_by: key("managed-by"),
             run_id: key("run-id"),
             owner_kind: key("owner-kind"),
@@ -169,6 +175,11 @@ impl Labels {
             actor: key("actor"),
             task_cancelled: key("task-cancelled"),
         }
+    }
+
+    /// The same keys, stamped and written as `manager`.
+    pub fn managed_as(self, manager: Manager) -> Self {
+        Self { manager, ..self }
     }
 }
 

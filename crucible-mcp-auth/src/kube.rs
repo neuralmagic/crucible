@@ -26,8 +26,10 @@ pub const USER_CLAIM: &str = "kube_user";
 /// Claim listing the caller's Kubernetes groups, when groups come from the token.
 pub const GROUPS_CLAIM: &str = "kube_groups";
 
-/// Groups every authenticated OpenShift OAuth user carries; RBAC often binds through them.
-const AUTHENTICATED: [&str; 2] = ["system:authenticated", "system:authenticated:oauth"];
+/// The group every authenticated user carries; RBAC often binds through it.
+const AUTHENTICATED: &str = "system:authenticated";
+/// The group OpenShift adds for a user who signed in through its OAuth server.
+const OPENSHIFT_OAUTH: &str = "system:authenticated:oauth";
 
 const ALLOW_TTL: Duration = Duration::from_secs(30);
 const GROUPS_TTL: Duration = Duration::from_secs(15);
@@ -78,7 +80,7 @@ pub fn kube_user(principal: &Principal) -> Result<String, KubeIdentityError> {
 }
 
 /// Groups from the token's `kube_groups`, without any `system:` group a token could use to claim
-/// cluster powers (`system:masters`), plus the authenticated groups.
+/// cluster powers (`system:masters`), plus `system:authenticated`.
 pub fn token_groups(principal: &Principal) -> Result<Vec<String>, KubeIdentityError> {
     let listed = match principal.claims.get(GROUPS_CLAIM) {
         None | Some(Value::Null) => Vec::new(),
@@ -94,6 +96,7 @@ pub fn token_groups(principal: &Principal) -> Result<Vec<String>, KubeIdentityEr
     };
     Ok(with_authenticated(
         listed.into_iter().filter(|g| !g.starts_with("system:")),
+        &[AUTHENTICATED],
     ))
 }
 
@@ -111,9 +114,18 @@ pub fn openshift_groups_of(groups: &[DynamicObject], user: &str) -> Vec<String> 
         .collect()
 }
 
-fn with_authenticated(groups: impl IntoIterator<Item = String>) -> Vec<String> {
+/// `user`'s groups when they come from OpenShift Group objects: those listing the user, plus the
+/// groups OpenShift gives every user signed in through its OAuth server.
+pub fn openshift_groups(groups: &[DynamicObject], user: &str) -> Vec<String> {
+    with_authenticated(
+        openshift_groups_of(groups, user),
+        &[AUTHENTICATED, OPENSHIFT_OAUTH],
+    )
+}
+
+fn with_authenticated(groups: impl IntoIterator<Item = String>, implied: &[&str]) -> Vec<String> {
     let mut all: Vec<String> = groups.into_iter().collect();
-    all.extend(AUTHENTICATED.map(String::from));
+    all.extend(implied.iter().map(|g| g.to_string()));
     all.sort();
     all.dedup();
     all
@@ -180,7 +192,7 @@ impl SubjectAccessReviewer {
             GroupSource::Token => token_groups(principal)?,
             GroupSource::OpenShift => {
                 let all = self.all_openshift_groups().await?;
-                with_authenticated(openshift_groups_of(&all, &user))
+                openshift_groups(&all, &user)
             }
         };
         Ok(KubeIdentity { user, groups })
@@ -307,19 +319,16 @@ mod tests {
     }
 
     #[test]
-    fn token_groups_drop_system_groups_and_add_the_authenticated_ones() {
+    fn token_groups_drop_system_groups_and_add_only_system_authenticated() {
         let p =
             principal(json!({"sub": "s", "kube_groups": ["ml-team", "system:masters", "ml-team"]}));
         assert_eq!(
             token_groups(&p).unwrap(),
-            [
-                "ml-team",
-                "system:authenticated",
-                "system:authenticated:oauth"
-            ]
+            ["ml-team", "system:authenticated"],
+            "an identity provider's token is not an OpenShift OAuth sign-in"
         );
         let none = principal(json!({"sub": "s"}));
-        assert_eq!(token_groups(&none).unwrap(), AUTHENTICATED);
+        assert_eq!(token_groups(&none).unwrap(), [AUTHENTICATED]);
         let bad = principal(json!({"sub": "s", "kube_groups": "ml-team"}));
         assert!(matches!(token_groups(&bad), Err(KubeIdentityError::Groups)));
     }
@@ -341,6 +350,14 @@ mod tests {
         ];
         assert_eq!(openshift_groups_of(&all, "alice"), ["ml-team"]);
         assert!(openshift_groups_of(&all, "dave").is_empty());
+        assert_eq!(
+            openshift_groups(&all, "alice"),
+            ["ml-team", AUTHENTICATED, OPENSHIFT_OAUTH]
+        );
+        assert_eq!(
+            openshift_groups(&all, "dave"),
+            [AUTHENTICATED, OPENSHIFT_OAUTH]
+        );
     }
 
     #[test]

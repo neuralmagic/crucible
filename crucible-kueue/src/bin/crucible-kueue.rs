@@ -1,6 +1,7 @@
 use anyhow::Context;
 use clap::{ArgAction, Parser};
 use crucible_kueue::access::{SCOPE_READ, SCOPE_SUBMIT};
+use crucible_kueue::caller::Manager;
 use crucible_kueue::config::{
     self, ClaimMap, Config, Hardware, Labels, Lifetimes, Ownership, PullSecret, QueueVerb,
 };
@@ -79,6 +80,15 @@ struct Cli {
     /// Domain of the labels and annotations the server stamps (`<domain>/run-id`, ...).
     #[arg(long, env = "CRUCIBLE_KUEUE_LABEL_DOMAIN", default_value = config::DEFAULT_LABEL_DOMAIN)]
     label_domain: String,
+    /// The managed-by label's value and the field manager of every write. Give each server in a
+    /// cluster its own, so each controls only its own objects.
+    #[arg(
+        long,
+        env = "CRUCIBLE_KUEUE_MANAGER",
+        default_value = config::DEFAULT_MANAGER,
+        value_parser = |v: &str| Manager::parse(v)
+    )]
+    manager: Manager,
     /// managed: callers control only what this server created for them. rbac: any workload of a
     /// served kind their RBAC permits.
     #[arg(
@@ -203,7 +213,7 @@ impl Cli {
             false => given.to_vec(),
         };
         Ok(Config {
-            labels: Labels::new(&self.label_domain),
+            labels: Labels::new(&self.label_domain).managed_as(self.manager.clone()),
             ownership: self.ownership,
             profile: Profile::load(&self.allowlist_profile)?,
             claims: ClaimMap {
@@ -424,6 +434,27 @@ mod tests {
         assert_eq!(got.hardware, want.hardware);
         assert_eq!(got.namespaces, want.namespaces);
         assert_eq!(got.pull_secrets, want.pull_secrets);
+    }
+
+    #[test]
+    fn the_manager_names_labels_and_writes_and_must_be_a_dns_label() {
+        let parse = |manager: &str| {
+            Cli::try_parse_from([
+                "crucible-kueue",
+                "--run-issuer",
+                "https://a.example=https://a.example/keys",
+                "--resource",
+                RESOURCE,
+                "--manager",
+                manager,
+            ])
+        };
+        let config = parse("team-b-kueue").unwrap().config().unwrap();
+        assert_eq!(config.labels.manager.as_str(), "team-b-kueue");
+        assert_eq!(config.labels.managed_by, "crucible.dev/managed-by");
+        for bad in ["", "Team_B", "a/b"] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

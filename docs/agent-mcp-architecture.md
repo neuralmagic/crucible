@@ -1350,9 +1350,10 @@ that name, or the pods cannot pull. `crucible deploy render --kueue` does not co
 The reviewer (`crucible-mcp-auth/src/kube.rs`) builds a SubjectAccessReview with:
 
 - `user`: the canonical `kube_user`, never a `system:` user;
-- `groups`: OpenShift `Group` objects that list the user (`--kube-authz openshift`), or the
-  `kube_groups` claim without `system:` entries (`--kube-authz token`), plus
-  `system:authenticated` and `system:authenticated:oauth`;
+- `groups`: OpenShift `Group` objects that list the user plus `system:authenticated` and
+  `system:authenticated:oauth` (`--kube-authz openshift`), or the `kube_groups` claim without
+  `system:` entries plus `system:authenticated` (`--kube-authz token`, where the token is not an
+  OpenShift OAuth sign-in);
 - the resource attributes of the access check.
 
 The server serves the namespaces in `--namespace`, else every namespace that holds a LocalQueue.
@@ -1432,6 +1433,7 @@ with a stock OIDC provider:
 | Flag | Default | Use |
 | --- | --- | --- |
 | `--label-domain` | `crucible.dev` | The domain of every stamped label and annotation |
+| `--manager` | `crucible-kueue` | The `<domain>/managed-by` value and the field manager of every write. Servers sharing a cluster each need their own, so each sees only its objects as managed |
 | `--user-claim` | `kube_user` | The claim that names the Kubernetes user |
 | `--user-prefix` | empty | The prefix of the user, as `--oidc-username-prefix` on the API server |
 | `--groups-claim` | `kube_groups` | The groups claim, with `--kube-authz token` |
@@ -1589,6 +1591,7 @@ tokens, the controller does not read them.
 | `[cluster] sandbox_spiffe_socket` | unset | The SPIFFE Workload API socket path that supervisors get through `csi.spiffe.io`. Unset: no socket, so no JWT-SVIDs. |
 | `[cluster] identity` | `"link"` | The hub identity rule. |
 | `[clusters.<name>] identity` | `"link"` | A spoke identity rule. |
+| cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE`, `CONTROLLER_AGENT_AUDIENCES` and `CONTROLLER_PEOPLE_AUDIENCES` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
 | `[cluster] aws_sandbox_role_arn` | unset | The AWS role that the gateway pod assumes for sandboxes. |
 | `[kueue] image` | required | The `crucible-kueue` image. |
 | `[kueue] clusters` or `cluster` | `["hub"]` | The clusters where the server runs. Runs on these clusters get `crucible-kueue` access. |

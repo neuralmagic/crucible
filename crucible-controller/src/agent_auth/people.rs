@@ -93,13 +93,7 @@ impl std::str::FromStr for PersonAudience {
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         let shape = || PeopleConfigError::Shape(raw.to_string());
         let (cluster, rest) = raw.trim().split_once(':').ok_or_else(shape)?;
-        let label = !cluster.is_empty()
-            && cluster
-                .chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
-        if !label {
-            return Err(shape());
-        }
+        crucible::deploy::profile::check_cluster_name(cluster).map_err(|_| shape())?;
         let (resource, scopes) = rest.split_once('=').unwrap_or((rest, ""));
         let resource = resource.trim();
         let ok = Url::parse(resource).is_ok_and(|u| {

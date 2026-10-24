@@ -66,6 +66,14 @@ macro_rules! dns_label_newtype {
 
 dns_label_newtype!(Namespace, "namespace");
 dns_label_newtype!(QueueName, "local queue");
+dns_label_newtype!(Manager, "manager name");
+
+impl Default for Manager {
+    /// `crucible-kueue`.
+    fn default() -> Self {
+        Self(crate::config::DEFAULT_MANAGER.to_string())
+    }
+}
 
 /// Run identifier stamped as a label on everything a caller creates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

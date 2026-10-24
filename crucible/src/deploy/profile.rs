@@ -98,6 +98,21 @@ impl std::fmt::Display for KubeName {
     }
 }
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "{0:?} is not a cluster name: a DNS-1123 label (lowercase alphanumerics and '-', 1-63 chars)"
+)]
+pub struct NotClusterName(pub String);
+
+/// Whether `name` can name a cluster: the hub, a `[clusters.<name>]` spoke, or a cluster in
+/// controller configuration. Every place that reads a cluster name checks it here, so a name one
+/// accepts the others accept too.
+pub fn check_cluster_name(name: &str) -> Result<(), NotClusterName> {
+    KubeName::try_from(name.to_string())
+        .map(|_| ())
+        .map_err(|_| NotClusterName(name.to_string()))
+}
+
 /// A ServiceAccount, written `namespace/name`.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(try_from = "String")]
@@ -893,7 +908,22 @@ impl DeployProfile {
         profile
             .check_namespaces()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .check_cluster_names()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
         Ok(profile)
+    }
+
+    /// Refuse a spoke, `[kueue]` or `[buildit]` cluster name [`check_cluster_name`] refuses.
+    pub fn check_cluster_names(&self) -> Result<(), NotClusterName> {
+        let tables = [
+            self.kueue.as_ref().map(|k| &k.clusters),
+            self.buildit.as_ref().map(|b| &b.clusters),
+        ];
+        self.clusters
+            .keys()
+            .chain(tables.into_iter().flatten().flatten())
+            .try_for_each(|name| check_cluster_name(name))
     }
 
     /// Refuse namespaces that must be separate trust domains but coincide: the crucible-kueue
@@ -964,6 +994,9 @@ impl DeployProfile {
         let mut profile = Self::load(path)?;
         if let Some(fleet_path) = FleetFile::resolve_path(path, clusters_override)? {
             FleetFile::load(&fleet_path)?.merge_into(&mut profile.clusters);
+            profile
+                .check_cluster_names()
+                .with_context(|| format!("validating fleet file {}", fleet_path.display()))?;
         }
         Ok(profile)
     }
@@ -1330,6 +1363,46 @@ mod tests {
             "#
         ))
         .expect("profile parses")
+    }
+
+    #[test]
+    fn cluster_names_are_dns_labels_everywhere_the_profile_names_one() {
+        for good in ["hub", "pirate", "spoke-a", "a1"] {
+            assert_eq!(check_cluster_name(good), Ok(()));
+        }
+        for bad in [
+            "",
+            "Pirate",
+            "spoke_a",
+            "-a",
+            "a-",
+            "a.b",
+            "a:b",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(
+                check_cluster_name(bad),
+                Err(NotClusterName(bad.to_string()))
+            );
+        }
+        let ok = kueue_profile(
+            "[clusters.spoke-a]\nkubeconfig_secret = \"s\"",
+            "workload_namespace = \"w\"\nclusters = [\"hub\", \"spoke-a\"]",
+        );
+        assert_eq!(ok.check_cluster_names(), Ok(()));
+        let spoke = kueue_profile(
+            "[clusters.Spoke_A]\nkubeconfig_secret = \"s\"",
+            "workload_namespace = \"w\"",
+        );
+        assert_eq!(
+            spoke.check_cluster_names(),
+            Err(NotClusterName("Spoke_A".into()))
+        );
+        let kueue = kueue_profile("", "workload_namespace = \"w\"\ncluster = \"east.1\"");
+        assert_eq!(
+            kueue.check_cluster_names(),
+            Err(NotClusterName("east.1".into()))
+        );
     }
 
     #[test]

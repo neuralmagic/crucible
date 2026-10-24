@@ -3,7 +3,7 @@
 //! server created for the same run, unless the server runs with [`Ownership::Rbac`].
 
 use crate::caller::{Caller, Identity, NameError, Namespace, QueueName, Refusal};
-use crate::config::{Config, Labels, MANAGED_VALUE, Ownership, QUEUE_LABEL};
+use crate::config::{Config, Labels, Ownership, QUEUE_LABEL};
 use crate::hardware;
 use crate::kinds;
 use crate::kueue::{
@@ -37,7 +37,6 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub const FIELD_MANAGER: &str = "crucible-kueue";
 const MAX_WORKLOADS_SHOWN: usize = 20;
 const MAX_REPLICAS: i64 = 1000;
 const MAX_LOG_PODS: usize = 4;
@@ -301,7 +300,7 @@ fn stamp(object: &mut DynamicObject, labels: &Labels, plan_hash: &str, actor: Op
 fn created_by(caller: &Caller, obj: &DynamicObject, labels: &Labels) -> bool {
     let set = obj.metadata.labels.as_ref();
     let label = |key: &str| set.and_then(|l| l.get(key)).map(String::as_str);
-    label(&labels.managed_by) == Some(MANAGED_VALUE)
+    label(&labels.managed_by) == Some(labels.manager.as_str())
         && label(&labels.run_id) == Some(caller.run_id.as_str())
         && label(&labels.owner_kind) == Some(caller.owner.as_str())
 }
@@ -523,14 +522,15 @@ pub enum ListFilter {
 fn list_selector(filter: ListFilter, labels: &Labels, caller: &Caller) -> String {
     match filter {
         ListFilter::Mine => format!(
-            "{}={MANAGED_VALUE},{}={},{}={}",
+            "{}={},{}={},{}={}",
             labels.managed_by,
+            labels.manager,
             labels.run_id,
             caller.run_id.as_str(),
             labels.owner_kind,
             caller.owner.as_str()
         ),
-        ListFilter::Managed => format!("{}={MANAGED_VALUE}", labels.managed_by),
+        ListFilter::Managed => format!("{}={}", labels.managed_by, labels.manager),
         ListFilter::All => QUEUE_LABEL.to_string(),
     }
 }
@@ -890,7 +890,7 @@ impl KueueMcp {
         stamp(&mut object, &self.config.labels, &n.plan_hash, actor);
         let pp = PostParams {
             dry_run,
-            field_manager: Some(FIELD_MANAGER.into()),
+            field_manager: Some(self.config.labels.manager.to_string()),
         };
         self.dynamic(n.kind, caller.namespace.as_str())
             .create(&pp, &object)
@@ -917,7 +917,7 @@ impl KueueMcp {
             .patch(
                 &r.name,
                 &PatchParams {
-                    field_manager: Some(FIELD_MANAGER.into()),
+                    field_manager: Some(self.config.labels.manager.to_string()),
                     ..PatchParams::default()
                 },
                 &Patch::Merge(patch),
@@ -1347,7 +1347,7 @@ impl KueueMcp {
             .patch(
                 name,
                 &PatchParams {
-                    field_manager: Some(FIELD_MANAGER.into()),
+                    field_manager: Some(self.config.labels.manager.to_string()),
                     ..PatchParams::default()
                 },
                 &Patch::Merge(json!({"metadata": {"annotations": {key: value}}})),
@@ -1832,7 +1832,7 @@ impl KueueMcp {
                             "kind": kind,
                             "name": name,
                             "run": o.metadata.labels.as_ref().and_then(|l| l.get(&labels.run_id)),
-                            "managed": o.metadata.labels.as_ref().and_then(|l| l.get(&labels.managed_by)).is_some_and(|v| v == MANAGED_VALUE),
+                            "managed": o.metadata.labels.as_ref().and_then(|l| l.get(&labels.managed_by)).is_some_and(|v| v == labels.manager.as_str()),
                             "queue": o.metadata.labels.as_ref().and_then(|l| l.get(QUEUE_LABEL)),
                             "phase": p.headline.phase,
                             "counts": p.counts,
@@ -2879,6 +2879,22 @@ mod tests {
         assert_eq!(
             list_selector(ListFilter::All, &l, &r1),
             "kueue.x-k8s.io/queue-name"
+        );
+        let other = Labels::new("crucible.dev")
+            .managed_as(crate::caller::Manager::parse("team-b-kueue").unwrap());
+        assert_eq!(
+            list_selector(ListFilter::Managed, &other, &r1),
+            "crucible.dev/managed-by=team-b-kueue"
+        );
+        let theirs: DynamicObject = serde_json::from_value(json!({"apiVersion": "batch/v1",
+            "kind": "Job", "metadata": {"name": "j", "labels": {
+                "crucible.dev/managed-by": "crucible-kueue", "crucible.dev/run-id": "r1",
+                "crucible.dev/owner-kind": "run"}}}))
+        .unwrap();
+        assert!(created_by(&r1, &theirs, &l));
+        assert!(
+            !created_by(&r1, &theirs, &other),
+            "another manager's object is not this server's"
         );
     }
 
