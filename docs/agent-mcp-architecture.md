@@ -29,7 +29,7 @@ Each term has one sense in this document.
 | audience | The MCP resource URL that a token is for. The `aud` claim holds it. |
 | authorization code | A single-use secret that the issuer gives to an MCP client after consent. It lives 60 seconds. |
 | bind record | One row in `run_sandboxes`. It connects a sandbox id to the run and the loop pod that created the sandbox. |
-| builder pod | A pod that `buildit` creates in the loop namespace to build and run one image. |
+| builder pod | A pod that `buildit` creates in the buildit namespace (`[buildit] namespace`) to build and run one image. |
 | buildit | The vendored image build MCP server. It runs as a child process in each loop pod. |
 | client ID | The OAuth `client_id` of an MCP client. It has one of three forms: a registered name, an `https://` metadata document URL, or a `dyn-` id that the issuer gave. The type is `ClientId` (`crucible-controller/src/agent_auth/people/clients.rs:24`). |
 | client registry | The list of registered clients: the built-in `claude-code`, `pi` and `codex`, or the clients in `CONTROLLER_PEOPLE_CLIENTS_FILE`. |
@@ -124,6 +124,8 @@ flowchart LR
         end
         subgraph LOOPNS["loop namespace (pack code)"]
             LOOP["loop pod<br/>engine, broker,<br/>buildit :8848"]
+        end
+        subgraph BUILDNS["buildit namespace"]
             BUILDER["builder pods"]
         end
         subgraph SBXNS["sandbox namespace (gateway SA only)"]
@@ -1026,7 +1028,7 @@ OTLP collector port. Turn sandboxes are never bound, so they get no agent tokens
 | loop | loop pod | `<run pod>` | controller | collection |
 | loop | run Secret | from `secret_name(<run pod>)` | controller | owner reference to the loop pod |
 | loop | loop Service | `<run pod>` (hashed if long) | controller `start` | `teardown` |
-| loop | builder pods | per build | `buildit` | `buildit clean`; the pod deadline stops them |
+| buildit | builder pods | per build | `buildit` | `buildit clean`; the pod deadline stops them |
 | sandbox | gateway Service | `<run pod>-gw` (hashed if long) | controller `reserve` | `teardown` |
 | sandbox | gateway NetworkPolicy | `<run pod>-gw` | controller `start` | `teardown` |
 | sandbox | gateway pod | `<run pod>-gw` | controller `start` | `teardown` |
@@ -1098,14 +1100,23 @@ traffic. These are the broker, the OTLP collector, `buildit` on 8848 with `[buil
 | controller identity | SPIRE | `services/proxy`: get | the operator |
 | controller identity | cluster | `tokenreviews`: create (`system:auth-delegator`), for links | the operator |
 | loop service account | sandbox | none under an isolated profile | loop render |
-| loop service account | loop | `pods`: create, delete, get, list, watch; `pods/exec`: create, get; `pods/log`: get. The Role and RoleBinding are `<service account>-buildit`, for `buildit` builder pods | loop render `buildit_rbac` with `[buildit]` (`kube.rs:1706`) |
+| loop service account | buildit | `pods`: create, delete, get, list, watch; `pods/exec`: create, get; `pods/log`: get. The Role and RoleBinding are `<service account>-buildit`, for `buildit` builder pods. None in the loop namespace | loop render `buildit_rbac` with `[buildit]` (`kube.rs:1707`) |
 
 Note: `pods/finalizers` update is necessary on OpenShift. The TLS Secrets have an owner reference
 with `blockOwnerDeletion` to the gateway pod, and the OpenShift owner-reference admission checks
 that right.
 
-Note: The loop render grants the builder pod rights only when the profile has `[buildit]`. The
-render does not depend on `sandbox_driver`.
+Note: The loop render grants the builder pod rights only when the profile has `[buildit]`, and
+only in `[buildit] namespace`. The render does not depend on `sandbox_driver`.
+
+Warning: The loop service account is shared by every run. Rights to create pods or exec into pods
+in the loop namespace would let one run's pack code reach another run's loop pod and run Secret:
+its gateway client certificate, pod token, push authfile and kubeconfig. It could also label a pod
+`crucible/run=<other run>` to pass that run's gateway NetworkPolicy. That is why builder pods live
+in a namespace of their own, which profile load refuses to share with the loop, rig, sandbox or
+crucible-kueue namespaces. The rights in the buildit namespace still let runs see each other's
+builder pods there, including a push's authfile while `buildit` streams it into the builder pod.
+The clean end state is `buildit` under a service account of its own.
 
 With `[cluster] aws_sandbox_role_arn`, the gateway pod gets its own projected token for the
 `sts.amazonaws.com` audience. The trust policy of that role must allow
@@ -1428,7 +1439,7 @@ The engine starts it with these arguments (`buildit.rs:127`):
 | `--allowed-host` | `host.openshell.internal` |
 | `--tool-policy` | the shipped `buildit/deploy/buildit-policy.toml` |
 | `--run-id` | the loop pod name |
-| `--namespace` | the loop namespace |
+| `--namespace` | `[buildit] namespace`, from `CRUCIBLE_BUILDIT_NAMESPACE` |
 | `--insecure-jwks-http` | when the JWKS URI is plain http |
 | `--push-repo`, `--push-authfile` | when both `CRUCIBLE_BUILDIT_PUSH_REPO` and the loop pod push authfile exist |
 
@@ -1458,7 +1469,7 @@ writes requested output paths back to `<workdir>/.buildit/<build id>/` in the sa
 
 ### 8.4 Builder pods
 
-Each build gets one builder pod in the loop namespace (`buildit/src/mcp.rs:971`). The pod has
+Each build gets one builder pod in the buildit namespace (`buildit/src/mcp.rs:971`). The pod has
 the labels `buildit.dev/managed-by=mcp`, `buildit.dev/sandbox`, `buildit.dev/build-id` and
 `crucible.dev/launched-by`. It runs `buildah` with `automountServiceAccountToken: false`,
 `enableServiceLinks: false` and an `activeDeadlineSeconds` of `--pod-deadline` (default 7200).
@@ -1559,6 +1570,7 @@ tokens, the controller does not read them.
 | `[kueue] pull_secrets` | `[]` | `name` or `name=registry` entries for `--pull-secret`. |
 | `[kueue] people` | `false` | `true` renders `--person-issuer` with the same issuer as `run_issuer`, so the server also accepts people tokens. Set it when `CONTROLLER_PEOPLE_AUDIENCES` names this server. |
 | `[buildit] clusters` or `cluster` | `["hub"]` | The clusters whose runs get `buildit`. |
+| `[buildit] namespace` | required | Where builder pods run. Profile load refuses the loop, rig, sandbox, crucible-kueue and workload namespaces. |
 | `[buildit] run_issuer` | required | Must equal `CONTROLLER_AGENT_ISSUER`. |
 | `[buildit] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
@@ -1578,6 +1590,7 @@ The controller sets these. Do not set them by hand.
 | `CRUCIBLE_AGENT_SVID_AUDIENCE` | same | engine: `token_grant.jwt_svid_audience` |
 | `CRUCIBLE_KUEUE_URL` | The run is on a `[kueue]` cluster that is in `CONTROLLER_AGENT_SPIRE`, and the server URL is in `CONTROLLER_AGENT_AUDIENCES` | engine: provider endpoint, `.mcp.json` server `kueue` |
 | `CRUCIBLE_BUILDIT_RUN_ISSUER` | The run is on a `[buildit]` cluster that is in `CONTROLLER_AGENT_SPIRE`, and `http://host.openshell.internal:8848/mcp` is in `CONTROLLER_AGENT_AUDIENCES` | engine: starts `buildit` |
+| `CRUCIBLE_BUILDIT_NAMESPACE` | The run gets `buildit` | engine: `buildit --namespace`; required with `CRUCIBLE_BUILDIT_RUN_ISSUER` |
 | `CRUCIBLE_BUILDIT_PUSH_REPO` | The run gets `buildit` and `[buildit] push_repo` is set | engine: `buildit --push-repo` |
 | `CRUCIBLE_OPENSHELL_GATEWAY_URL` | Isolated profile | engine: remote gateway |
 | `CRUCIBLE_OPENSHELL_GATEWAY_TLS_DIR` | Isolated profile | engine: client material |
@@ -1786,8 +1799,9 @@ in place.
 4. Render the loop RBAC with `crucible deploy render --manifest <render.toml> --profile <profile>`.
    Apply the ServiceAccount, Roles and bindings on each cluster.
 5. Grant the controller identity `get` on `services/proxy` in the SPIRE namespace of each cluster.
-6. With `[buildit]`, make sure that step 4 applied the Role and RoleBinding
-   `<service account>-buildit` in the loop namespace (section 6.6).
+6. With `[buildit]`, create `[buildit] namespace`, and make sure that step 4 applied the Role and
+   RoleBinding `<service account>-buildit` there (section 6.6). Builder pods run as that
+   namespace's `default` service account; on OpenShift bind it to an SCC that admits them.
 7. Render `crucible-kueue` with `crucible deploy render --kueue`. Apply it on each cluster in
    `[kueue] clusters`. Copy the declared pull secrets into the workload namespace. Create the
    LocalQueues.

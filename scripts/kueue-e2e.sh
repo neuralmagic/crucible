@@ -5,7 +5,7 @@
 # A controller from this checkout runs in the cluster (CTL_NS, with its own Postgres) and
 # dispatches a playbook launch of e2e/kueue/pack into LOOP_NS, with each run's OpenShell gateway
 # isolated in SANDBOX_NS and a crucible-kueue server of its own in KUEUE_NS. The engine starts
-# buildit in the loop pod and registers a token-grant provider for it and for crucible-kueue; the
+# buildit in the loop pod, with its builder pods in BUILD_NS, and registers a token-grant provider for it and for crucible-kueue; the
 # sandbox's supervisor fetches its JWT-SVID from SPIRE, exchanges it at the controller's token
 # endpoint, and injects each token on traffic to its server alone. The agent writes a program printing a nonce, builds and pushes it to
 # PUSH_REPO, and runs it as a Job. The script then checks the cluster and the controller, not the
@@ -51,6 +51,7 @@ set -euo pipefail
 CTL_NS=crucible-kueue-e2e-ctl
 LOOP_NS=crucible-kueue-e2e-loops
 KUEUE_NS=crucible-kueue-e2e-server
+BUILD_NS=crucible-kueue-e2e-builds
 SANDBOX_NS=${SANDBOX_NS:-crucible-kueue-e2e-sandboxes}
 WORKLOAD_NS=crucible-kueue-e2e-workloads
 E2E_LABEL=crucible.dev/e2e=kueue
@@ -95,7 +96,7 @@ e2e_scoped() {
                 .roleRef.name += "-kueue-e2e"
               else . end]}'
 }
-for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
+for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$BUILD_NS" "$SANDBOX_NS" "$WORKLOAD_NS"; do
     if kc get namespace "$ns" >/dev/null 2>&1 \
         && [ "$(kc get namespace "$ns" -o jsonpath='{.metadata.labels.crucible\.dev/e2e}')" != kueue ]; then
         log "FAIL: $ns exists and is not this e2e's"
@@ -129,6 +130,7 @@ fill() {
         -e "s|@CONTROLLER_IMAGE@|$CONTROLLER_IMAGE|g" -e "s|@SUPERVISOR_IMAGE@|$SUPERVISOR_IMAGE|g" \
         -e "s|@PULL_SECRET@|$PULL_SECRET|g" -e "s|@CTL_NS@|$CTL_NS|g" -e "s|@LOOP_NS@|$LOOP_NS|g" \
         -e "s|@SANDBOX_NS@|$SANDBOX_NS|g" -e "s|@WORKLOAD_NS@|$WORKLOAD_NS|g" -e "s|@KUEUE_NS@|$KUEUE_NS|g" \
+        -e "s|@BUILD_NS@|$BUILD_NS|g" \
         -e "s|@SPIRE_NS@|$SPIRE_NS|g" -e "s|@ISSUER@|$ISSUER|g" -e "s|@KUEUE_URL@|$KUEUE_URL|g" \
         -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
         -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@ANTHROPIC_BASE_URL@|$ANTHROPIC_BASE_URL|g" \
@@ -139,7 +141,7 @@ fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
 
 log "clearing what an earlier run left"
 teardown --timeout=300s
-for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$SANDBOX_NS"; do
+for ns in "$CTL_NS" "$LOOP_NS" "$KUEUE_NS" "$BUILD_NS" "$SANDBOX_NS"; do
     kc create namespace "$ns" --dry-run=client -o yaml | kc apply -f - >/dev/null
     kc label namespace "$ns" "$E2E_LABEL" --overwrite >/dev/null
 done

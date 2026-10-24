@@ -245,9 +245,9 @@ impl KueueCfg {
     }
 }
 
-/// The `[buildit]` table. A run on one of `clusters` starts buildit in its loop pod, which builds in
-/// the loop namespace for the run's own sandboxes, accepting their tokens from the controller's
-/// agent issuer.
+/// The `[buildit]` table. A run on one of `clusters` starts buildit in its loop pod, which runs
+/// builder pods in `namespace` for the run's own sandboxes, accepting their tokens from the
+/// controller's agent issuer.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuilditCfg {
@@ -258,6 +258,10 @@ pub struct BuilditCfg {
         deserialize_with = "one_or_many"
     )]
     pub clusters: Vec<String>,
+    /// Where builder pods run: a namespace of their own, never the loop, rig, sandbox or
+    /// crucible-kueue namespaces, since the rights to create and exec into them reach every pod
+    /// there.
+    pub namespace: KubeName,
     /// The controller's agent token issuer (`CONTROLLER_AGENT_ISSUER`), compared exactly with a
     /// token's `iss`.
     pub run_issuer: String,
@@ -875,6 +879,9 @@ impl DeployProfile {
         if let Some(sandbox) = &self.cluster.sandbox_namespace {
             guarded.push(("cluster.sandbox_namespace", sandbox.as_str()));
         }
+        if let Some(buildit) = &self.buildit {
+            guarded.push(("buildit.namespace", buildit.namespace.as_str()));
+        }
         for (i, &(first, ns)) in guarded.iter().enumerate() {
             let clash = hosts
                 .iter()
@@ -1346,6 +1353,35 @@ mod tests {
                     namespace: ns.to_string(),
                 }),
                 "{cluster} / {kueue}"
+            );
+        }
+    }
+
+    #[test]
+    fn buildits_namespace_is_its_own() {
+        let with_buildit = |ns: &str| {
+            kueue_profile(
+                r#"sandbox_namespace = "sandboxes""#,
+                &format!(
+                    "workload_namespace = \"workloads\"\n[buildit]\nnamespace = \"{ns}\"\nrun_issuer = \"http://crucible-controller.loops.svc:8080\""
+                ),
+            )
+            .check_namespaces()
+        };
+        assert_eq!(with_buildit("builds"), Ok(()));
+        for (ns, other) in [
+            ("loops", "cluster.loop_namespace"),
+            ("rig", "cluster.rig_namespace"),
+            ("kueue-server", "kueue.namespace"),
+            ("workloads", "kueue.workload_namespace"),
+            ("sandboxes", "cluster.sandbox_namespace"),
+        ] {
+            let refused = with_buildit(ns).expect_err(ns);
+            assert_eq!(refused.namespace, ns);
+            assert!(
+                [refused.first, refused.second].contains(&"buildit.namespace")
+                    && [refused.first, refused.second].contains(&other),
+                "{ns}: {refused:?}"
             );
         }
     }

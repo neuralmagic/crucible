@@ -388,6 +388,7 @@ mod tests {
         pull_secrets = ["quay-pull"]
         [buildit]
         clusters = ["waldorf"]
+        namespace = "crucible-builds"
         run_issuer = "https://crucible.hub.example"
         push_repo = "quay.io/org/smoke"
     "#;

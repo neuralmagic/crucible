@@ -4,6 +4,9 @@
 /// presence starts buildit for the run.
 pub const ENV_BUILDIT_RUN_ISSUER: &str = "CRUCIBLE_BUILDIT_RUN_ISSUER";
 
+/// Loop-pod env naming the namespace buildit runs its builder pods in, apart from the loop pods.
+pub const ENV_BUILDIT_NAMESPACE: &str = "CRUCIBLE_BUILDIT_NAMESPACE";
+
 /// Loop-pod env naming the one repository buildit pushes builds to; unset, it pushes nothing.
 pub const ENV_BUILDIT_PUSH_REPO: &str = "CRUCIBLE_BUILDIT_PUSH_REPO";
 

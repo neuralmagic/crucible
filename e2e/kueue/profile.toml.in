@@ -1,6 +1,6 @@
 # Deploy profile for the build-and-run e2e: a controller in @CTL_NS@ dispatches loop pods into
 # @LOOP_NS@, each run's gateway and sandboxes live in @SANDBOX_NS@, buildit runs in each loop pod
-# and pushes to @PUSH_REPO@, and the server in @KUEUE_NS@ takes Jobs in @WORKLOAD_NS@ through
+# with its builder pods in @BUILD_NS@ and pushes to @PUSH_REPO@, and the server in @KUEUE_NS@ takes Jobs in @WORKLOAD_NS@ through
 # LocalQueue crucible-e2e.
 [cluster]
 loop_namespace          = "@LOOP_NS@"
@@ -45,5 +45,6 @@ pull_secrets       = ["@PULL_SECRET@=@PUSH_REPO@"]
 
 [buildit]
 cluster    = "hub"
+namespace  = "@BUILD_NS@"
 run_issuer = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
 push_repo  = "@PUSH_REPO@"

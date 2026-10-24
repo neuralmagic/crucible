@@ -1,12 +1,13 @@
 //! The run's buildit, started in the loop pod when the controller gave the run buildit access:
-//! it builds in the loop namespace from the run's own sandboxes, through the run's gateway, and
+//! it runs builder pods in the profile's buildit namespace from the run's own sandboxes, through the run's gateway, and
 //! takes only run tokens the controller issued for this run. The sandbox's supervisor obtains
 //! each token and injects it on traffic to buildit alone.
 
 use crate::openshell::provider;
 use anyhow::{Context, Result};
 use crucible_contract::buildit::{
-    ENV_BUILDIT_PUSH_REPO, ENV_BUILDIT_RUN_ISSUER, PORT, SCOPE_BUILD, SCOPE_READ, URL,
+    ENV_BUILDIT_NAMESPACE, ENV_BUILDIT_PUSH_REPO, ENV_BUILDIT_RUN_ISSUER, PORT, SCOPE_BUILD,
+    SCOPE_READ, URL,
 };
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 use std::process::{Command, Stdio};
@@ -45,6 +46,8 @@ pub struct BuilditAccess {
     /// `<issuer>=<jwks uri>`, buildit's `--run-issuer`.
     trusted_issuer: String,
     jwks_over_http: bool,
+    /// Where builder pods go.
+    namespace: String,
     push_repo: Option<String>,
     endpoint: String,
     svid_audience: String,
@@ -55,8 +58,6 @@ pub struct BuilditAccess {
 pub struct RunSite<'a> {
     /// The run pod's name, the `run_id` claim of this run's tokens.
     pub run_id: &'a str,
-    /// Where builder pods go: the loop namespace.
-    pub namespace: &'a str,
     pub push_authfile: Option<&'a str>,
 }
 
@@ -66,6 +67,7 @@ impl BuilditAccess {
         let var = |k| std::env::var(k).ok().filter(|v: &String| !v.is_empty());
         Self::from_values(
             var(ENV_BUILDIT_RUN_ISSUER),
+            var(ENV_BUILDIT_NAMESPACE),
             var(ENV_BUILDIT_PUSH_REPO),
             var(ENV_AGENT_TOKEN_ENDPOINT),
             var(ENV_AGENT_SVID_AUDIENCE),
@@ -74,6 +76,7 @@ impl BuilditAccess {
 
     fn from_values(
         issuer: Option<String>,
+        namespace: Option<String>,
         push_repo: Option<String>,
         endpoint: Option<String>,
         svid_audience: Option<String>,
@@ -81,6 +84,9 @@ impl BuilditAccess {
         let Some(trusted_issuer) = issuer else {
             return Ok(None);
         };
+        let namespace = namespace.ok_or(BuilditAccessError::Partial {
+            missing: ENV_BUILDIT_NAMESPACE,
+        })?;
         let endpoint = endpoint.ok_or(BuilditAccessError::Partial {
             missing: ENV_AGENT_TOKEN_ENDPOINT,
         })?;
@@ -94,6 +100,7 @@ impl BuilditAccess {
         Ok(Some(Self {
             jwks_over_http: jwks.scheme() == "http",
             trusted_issuer,
+            namespace,
             push_repo,
             endpoint,
             svid_audience,
@@ -140,7 +147,7 @@ impl BuilditAccess {
             "--run-id",
             site.run_id,
             "--namespace",
-            site.namespace,
+            &self.namespace,
         ]
         .map(String::from)
         .to_vec();
@@ -162,8 +169,6 @@ impl BuilditAccess {
         }
         let run_id = std::env::var(crucible_contract::ENV_POD_NAME)
             .context("buildit needs the run pod's name to know its run")?;
-        let namespace = std::env::var("CRUCIBLE_POD_NAMESPACE")
-            .context("buildit needs the loop namespace for its builder pods")?;
         let push_authfile = std::env::var(ENV_PUSH_AUTHFILE).ok();
         if self.push_repo.is_some() && push_authfile.is_none() {
             tracing::warn!(
@@ -174,7 +179,6 @@ impl BuilditAccess {
         std::fs::write(&policy, POLICY).with_context(|| format!("writing {}", policy.display()))?;
         let site = RunSite {
             run_id: &run_id,
-            namespace: &namespace,
             push_authfile: push_authfile.as_deref(),
         };
         Command::new("buildit")
@@ -211,6 +215,7 @@ mod tests {
     fn access(push: Option<&str>) -> BuilditAccess {
         BuilditAccess::from_values(
             Some(ISSUER.into()),
+            Some("crucible-builds".into()),
             push.map(str::to_string),
             Some(ENDPOINT.into()),
             Some(AUDIENCE.into()),
@@ -222,19 +227,45 @@ mod tests {
     #[test]
     fn no_issuer_means_no_buildit_and_an_issuer_needs_the_token_endpoint() {
         assert!(
-            BuilditAccess::from_values(None, None, Some(ENDPOINT.into()), Some(AUDIENCE.into()))
-                .unwrap()
-                .is_none()
+            BuilditAccess::from_values(
+                None,
+                None,
+                None,
+                Some(ENDPOINT.into()),
+                Some(AUDIENCE.into())
+            )
+            .unwrap()
+            .is_none()
         );
         assert_eq!(
-            BuilditAccess::from_values(Some(ISSUER.into()), None, None, Some(AUDIENCE.into())),
+            BuilditAccess::from_values(
+                Some(ISSUER.into()),
+                Some("crucible-builds".into()),
+                None,
+                None,
+                Some(AUDIENCE.into())
+            ),
             Err(BuilditAccessError::Partial {
                 missing: ENV_AGENT_TOKEN_ENDPOINT
             })
         );
+        assert_eq!(
+            BuilditAccess::from_values(
+                Some(ISSUER.into()),
+                None,
+                None,
+                Some(ENDPOINT.into()),
+                Some(AUDIENCE.into())
+            ),
+            Err(BuilditAccessError::Partial {
+                missing: ENV_BUILDIT_NAMESPACE
+            }),
+            "builder pods never fall back to the loop namespace"
+        );
         assert!(matches!(
             BuilditAccess::from_values(
                 Some("https://crucible.hub.example".into()),
+                Some("crucible-builds".into()),
                 None,
                 Some(ENDPOINT.into()),
                 Some(AUDIENCE.into())
@@ -273,7 +304,6 @@ mod tests {
     fn buildit_serves_this_run_alone_and_pushes_only_with_a_repo_and_an_authfile() {
         let site = RunSite {
             run_id: "crucible-run-brave-otter",
-            namespace: "crucible-system",
             push_authfile: Some("/etc/quay/push.json"),
         };
         let args = access(None).args(&site, "/tmp/policy.toml");
@@ -293,7 +323,7 @@ mod tests {
         );
         assert_eq!(
             flag(&args, "--namespace").as_deref(),
-            Some("crucible-system")
+            Some("crucible-builds")
         );
         assert_eq!(flag(&args, "--bind").as_deref(), Some("0.0.0.0:8848"));
         assert!(
@@ -323,6 +353,7 @@ mod tests {
 
         let plain = BuilditAccess::from_values(
             Some("http://ctl.ns.svc:8080=http://ctl.ns.svc:8080/.well-known/jwks.json".into()),
+            Some("crucible-builds".into()),
             None,
             Some(ENDPOINT.into()),
             Some(AUDIENCE.into()),

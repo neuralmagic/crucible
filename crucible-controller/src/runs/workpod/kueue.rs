@@ -11,7 +11,9 @@ use crate::agent_auth::issuer::{Audience, ClusterSpire, IssuerUrl, TOKEN_PATH, p
 use crate::secrets::deliver::Delivery;
 use anyhow::Context;
 use crucible::deploy::profile::{BuilditCfg, KueueCfg};
-use crucible_contract::buildit::{ENV_BUILDIT_PUSH_REPO, ENV_BUILDIT_RUN_ISSUER};
+use crucible_contract::buildit::{
+    ENV_BUILDIT_NAMESPACE, ENV_BUILDIT_PUSH_REPO, ENV_BUILDIT_RUN_ISSUER,
+};
 use crucible_contract::kueue::ENV_KUEUE_URL;
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
@@ -94,6 +96,7 @@ pub fn access(
             .trusted_issuer()
             .with_context(|| format!("deriving the key set URI of {}", b.run_issuer))?;
         plain_env.push((ENV_BUILDIT_RUN_ISSUER.to_string(), issuer));
+        plain_env.push((ENV_BUILDIT_NAMESPACE.to_string(), b.namespace.to_string()));
         if let Some(repo) = &b.push_repo {
             plain_env.push((ENV_BUILDIT_PUSH_REPO.to_string(), repo.clone()));
         }
@@ -166,6 +169,7 @@ mod tests {
     const BUILDIT: &str = r#"
         [buildit]
         clusters = ["pirate", "waldorf"]
+        namespace = "crucible-builds"
         run_issuer = "https://crucible.hub.example"
         run_jwks_uri = "https://crucible-ext.hub.example/.well-known/jwks.json"
         push_repo = "quay.io/example/crucible-smoke"
@@ -283,6 +287,7 @@ mod tests {
             "https://crucible.hub.example=https://crucible-ext.hub.example/.well-known/jwks.json"
         );
         assert_eq!(env[ENV_BUILDIT_PUSH_REPO], "quay.io/example/crucible-smoke");
+        assert_eq!(env[ENV_BUILDIT_NAMESPACE], "crucible-builds");
         assert!(env.contains_key(ENV_AGENT_TOKEN_ENDPOINT));
         assert!(!env.contains_key(ENV_KUEUE_URL), "kueue serves pirate only");
         assert!(on_waldorf.env.is_empty() && on_waldorf.is_empty());

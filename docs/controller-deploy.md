@@ -285,15 +285,21 @@ CONTROLLER_AGENT_AUDIENCES="http://crucible-kueue.crucible-system.svc.cluster.lo
 pod on port 8848, and its sandboxes reach it at `http://host.openshell.internal:8848/mcp` with
 tokens their supervisors obtain like crucible-kueue's. buildit takes only tokens for that
 audience whose `run_id` is its own run, reads each build's context from the token's `sandbox`
-and `workdir` through the run's gateway, and runs builder pods in the loop namespace; with
-`[buildit]` the loop render grants the loop service account `pods` create/get/list/watch/delete,
-`pods/exec` and `pods/log` there. `push`
+and `workdir` through the run's gateway, and runs builder pods in `[buildit] namespace`, which
+profile load refuses to share with the loop, rig, sandbox or crucible-kueue namespaces. The loop
+render grants the loop service account `pods` create/get/list/watch/delete, `pods/exec` and
+`pods/log` there and nowhere else, since those rights in the loop namespace would reach every run's
+loop pod and Secret. Create the namespace before the first run; builder pods run as its `default`
+service account, so on OpenShift bind that account to an SCC that admits them (uid 1000). The
+rights still let runs see each other's builder pods in that namespace, including a push's
+authfile while it is copied in; buildit under a service account of its own is the clean end state. `push`
 publishes a succeeded build to `push_repo` only, tagged `<sandbox>-<build_id>`, with the loop
 pod's `[secrets] push_authfile`; without either, buildit pushes nothing.
 
 ```toml
 [buildit]
 clusters     = ["spoke-a", "spoke-b"]
+namespace    = "crucible-builds"                    # builder pods, apart from loop pods
 run_issuer   = "https://crucible.example"          # CONTROLLER_AGENT_ISSUER
 run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
 push_repo    = "registry.example.com/team/crucible-smoke"  # optional

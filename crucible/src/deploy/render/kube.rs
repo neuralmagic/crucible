@@ -1701,12 +1701,13 @@ exit $rc
         objects
     }
 
-    /// With `[buildit]`, the loop account's rights over buildit's builder pods in the loop namespace:
-    /// create, watch and delete them, exec into them, and read their logs.
+    /// With `[buildit]`, the loop account's rights over buildit's builder pods in buildit's own
+    /// namespace: create, watch and delete them, exec into them, and read their logs. None in the
+    /// loop namespace, where they would reach every run's loop pod and Secret.
     fn buildit_rbac(&self) -> Vec<SandboxRbacObject> {
-        if self.profile.buildit.is_none() {
+        let Some(buildit) = &self.profile.buildit else {
             return Vec::new();
-        }
+        };
         let cluster = &self.profile.cluster;
         let name = format!("{}-buildit", cluster.service_account);
         let rule = |resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
@@ -1718,7 +1719,7 @@ exit $rc
         let role = rbac::Role {
             metadata: ObjectMeta {
                 name: Some(name.clone()),
-                namespace: Some(cluster.loop_namespace.clone()),
+                namespace: Some(buildit.namespace.to_string()),
                 ..Default::default()
             },
             rules: Some(vec![
@@ -1729,7 +1730,7 @@ exit $rc
         };
         let binding = role_binding(
             name.clone(),
-            cluster.loop_namespace.clone(),
+            buildit.namespace.to_string(),
             "Role",
             &name,
             cluster.service_account.clone(),
@@ -4756,8 +4757,9 @@ mod tests {
             !netpol.contains("port: 8848"),
             "no buildit port without [buildit]: {netpol}"
         );
-        let with_buildit =
-            k8s_profile("[buildit]\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n");
+        let with_buildit = k8s_profile(
+            "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n",
+        );
         let yaml = render_k8s_manifest(&manifest, &with_buildit);
         let docs: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&yaml)
             .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
@@ -4770,7 +4772,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("a buildit {kind}: {yaml}"))
         };
         let role = named("Role");
-        assert_eq!(role["metadata"]["namespace"], "autoresearch");
+        assert_eq!(
+            role["metadata"]["namespace"], "crucible-builds",
+            "builder pod rights never land in the loop namespace"
+        );
         assert_eq!(
             role["rules"],
             serde_json::json!([
@@ -4780,6 +4785,7 @@ mod tests {
             ])
         );
         let binding = named("RoleBinding");
+        assert_eq!(binding["metadata"]["namespace"], "crucible-builds");
         assert_eq!(binding["roleRef"]["kind"], "Role");
         assert_eq!(binding["subjects"][0]["name"], "autoresearch-publisher");
         assert_eq!(binding["subjects"][0]["namespace"], "autoresearch");
