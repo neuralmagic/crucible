@@ -1390,11 +1390,13 @@ The server serves the namespaces in `--namespace`, else every namespace that hol
 A caller can use a served namespace when its RBAC lets it list LocalQueues there
 (`crucible-kueue/src/namespaces.rs:97-115`). The answer is cached 30 seconds per identity
 (subject, `kube_user` and `kube_groups`), so a RoleBinding granted or removed shows in the usable
-list within 30 seconds; the per-call access checks are not cached. Every tool call and both task methods resolve the
-namespace they act in (the call's `namespace` argument, the token's `namespace` claim, or the task
-id's namespace) and refuse one the server does not serve, or one the token's `namespaces` claim
-leaves out, with `not_found` and the list of usable namespaces, before anything reaches the API
-server. `Identity::act_in` (`crucible-kueue/src/caller.rs`) makes this check and is the only way to
+list within 30 seconds; the guard's per-call access decisions are cached as section 2.6 says. Every
+tool call and both task methods resolve the namespace they act in (the call's `namespace`
+argument, the token's `namespace` claim, or the task id's namespace) and refuse one the server
+does not serve, or one the token's `namespaces` claim leaves out, with `not_found` and the list of
+usable namespaces. The guard has already run the call's SubjectAccessReviews by then, so those
+reach the API server first; the check comes before the server reads or writes anything with its
+own account. `Identity::act_in` (`crucible-kueue/src/caller.rs`) makes this check and is the only way to
 get a `Caller`, the type every tool acts with, so a tool cannot skip it. A test calls every tool
 the router lists in an unserved namespace and expects `not_found`
 (`crucible-kueue/tests/http_auth.rs`). The usable list is also cut to the claim. A server with no `--namespace` that cannot list LocalQueues
