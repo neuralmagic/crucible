@@ -382,6 +382,11 @@ pub fn render(
             .context("serializing the builder pods' NetworkPolicy")?;
         out.push_str(&format!("---\n{yaml}"));
     }
+    if let Some(quota) = r.builder_quota() {
+        let yaml =
+            serde_norway::to_string(&quota).context("serializing the builder pods' quota")?;
+        out.push_str(&format!("---\n{yaml}"));
+    }
     if let Some((policy, binding)) = r.builder_admission()? {
         let policy = serde_norway::to_string(&policy)
             .context("serializing the builder pods' admission policy")?;
@@ -1809,6 +1814,29 @@ exit $rc
                 ingress: None,
                 egress: Some(std::iter::once(dns).chain(allowed).collect()),
             }),
+        })
+    }
+
+    /// With `[buildit]`, the builder namespace's ResourceQuota, `[buildit] quota`.
+    fn builder_quota(&self) -> Option<core::ResourceQuota> {
+        let buildit = self.profile.buildit.as_ref()?;
+        Some(core::ResourceQuota {
+            metadata: ObjectMeta {
+                name: Some(BUILDER_NETPOL.to_string()),
+                namespace: Some(buildit.namespace.to_string()),
+                ..Default::default()
+            },
+            spec: Some(core::ResourceQuotaSpec {
+                hard: Some(
+                    buildit
+                        .quota
+                        .iter()
+                        .map(|(k, v)| (k.clone(), Quantity(v.clone())))
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
         })
     }
 
@@ -5047,6 +5075,25 @@ mod tests {
             !render_k8s_manifest(&manifest, &k8s_profile("")).contains("ValidatingAdmissionPolicy"),
             "no policy without [buildit]"
         );
+        let quota = kind("ResourceQuota");
+        assert_eq!(quota["metadata"]["namespace"], "crucible-builds");
+        assert_eq!(
+            quota["spec"]["hard"],
+            serde_json::json!({"pods": "16", "requests.amd.com/gpu": "0", "requests.nvidia.com/gpu": "0"}),
+            "a few pods and no GPUs by default"
+        );
+        let sized = render_k8s_manifest(
+            &manifest,
+            &k8s_profile(
+                "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n\
+                 quota = { pods = \"4\" }\n",
+            ),
+        );
+        let sized: serde_json::Value = serde_norway::Deserializer::from_str(&sized)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .find(|d| d["kind"] == "ResourceQuota")
+            .unwrap();
+        assert_eq!(sized["spec"]["hard"], serde_json::json!({"pods": "4"}));
     }
 
     /// Under podman the render is byte-identical to before: no `--compute-driver` flag, no

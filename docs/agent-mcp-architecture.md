@@ -1548,8 +1548,11 @@ It admits a pod there only when:
 - it carries `buildit.dev/managed-by=mcp`;
 - it runs one container, `builder`, from `quay.io/buildah/stable:latest`, with no init or
   ephemeral containers;
-- the container is not privileged, adds no capabilities, runs as a non-root `runAsUser`, and keeps
-  its seccomp profile;
+- the container is not privileged, adds no capabilities, runs as a non-root `runAsUser`, does not
+  ask for seccomp `Unconfined`, keeps the default `/proc` mount, and sets no SELinux user, role or
+  type;
+- it sets no `nodeName` (on create), runtime class, system priority class, sysctls, or toleration
+  beyond the `not-ready` and `unreachable` ones admission gives every pod;
 - it shares no host network, PID or IPC namespace, and mounts only `emptyDir` volumes;
 - it runs as the `default` account with `automountServiceAccountToken: false`;
 - it reads no Secret or ConfigMap into its environment (`valueFrom`, `envFrom`) and names no
@@ -1557,7 +1560,14 @@ It admits a pod there only when:
 - AppArmor is set only as buildit sets it: the annotation for `builder`, `unconfined` (or the
   matching `appArmorProfile` field on that container).
 
-The policy needs Kubernetes 1.30 or later. buildit's tests evaluate its own builder pod against the
+The policy checks pod creates and updates, so an update cannot swap the image or the labels. It
+admits what admission defaults every pod with: those two tolerations, a cluster's global default
+PriorityClass, and an SELinux level an OpenShift SCC assigns. The policy needs Kubernetes 1.30 or
+later.
+
+The loop render also emits a ResourceQuota in the buildit namespace from `[buildit] quota`, by
+default 16 pods and no NVIDIA or AMD GPUs. Builder pods request no CPU or memory, so a quota on
+`requests.cpu` or `requests.memory` would refuse every one. buildit's tests evaluate its own builder pod against the
 same file and expect it to pass, and expect each escape above to fail
 (`the_builder_admission_policy_admits_buildits_pod_and_no_escape`, `buildit/src/mcp.rs`), so the
 policy and the builder cannot drift apart.
@@ -1674,6 +1684,7 @@ tokens, the controller does not read them.
 | `[buildit] egress` | TCP 443 to `0.0.0.0/0` and `::/0` | `[{ cidr, ports = [443], except = [] }, ...]`: where builder pods may connect besides DNS (section 8.4). |
 | `[buildit] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
+| `[buildit] quota` | `{ pods = "16", "requests.nvidia.com/gpu" = "0", "requests.amd.com/gpu" = "0" }` | The builder namespace's ResourceQuota `hard` limits. |
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
 | `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry and its URL in `CONTROLLER_AGENT_AUDIENCES`. Names are unique, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |

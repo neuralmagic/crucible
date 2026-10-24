@@ -79,7 +79,8 @@ cleanup() {
     rm -rf "$WORK"
 }
 teardown() {
-    kc delete clusterrolebinding,clusterrole,clusterspiffeid -l "$E2E_LABEL" --ignore-not-found >/dev/null || true
+    kc delete clusterrolebinding,clusterrole,clusterspiffeid,validatingadmissionpolicybinding,validatingadmissionpolicy \
+        -l "$E2E_LABEL" --ignore-not-found >/dev/null || true
     kc -n "$SPIRE_NS" delete rolebinding,role -l "$E2E_LABEL" --ignore-not-found >/dev/null || true
     kc delete namespace -l "$E2E_LABEL" --ignore-not-found "$@" >/dev/null || true
 }
@@ -91,6 +92,8 @@ e2e_scoped() {
         | {apiVersion: "v1", kind: "List", items: [.[] | select(. != null)
             | if (.kind | startswith("Cluster")) then
                 .metadata.name += "-kueue-e2e" | .metadata.labels["crucible.dev/e2e"] = "kueue"
+              elif (.kind | startswith("ValidatingAdmissionPolicy")) then
+                .metadata.labels["crucible.dev/e2e"] = "kueue"
               else . end
             | if (.roleRef.kind == "ClusterRole" and (.roleRef.name as $n | $roles | index($n))) then
                 .roleRef.name += "-kueue-e2e"

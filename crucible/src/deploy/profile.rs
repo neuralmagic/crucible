@@ -318,6 +318,11 @@ pub struct BuilditCfg {
     /// the registries they pull from and push to. Default: TCP 443 anywhere.
     #[serde(default = "default_builder_egress")]
     pub egress: Vec<BuilderEgress>,
+    /// The ResourceQuota `hard` limits of the builder namespace. Default: 16 pods and no GPUs.
+    /// Builder pods request no CPU or memory, so a `requests.cpu` or `requests.memory` limit would
+    /// refuse every one.
+    #[serde(default = "default_builder_quota")]
+    pub quota: BTreeMap<String, String>,
 }
 
 /// An IP network builder pods may reach, on `ports`, less the networks in `except` (such as the
@@ -334,6 +339,16 @@ pub struct BuilderEgress {
 
 fn https_ports() -> Vec<u16> {
     vec![443]
+}
+
+fn default_builder_quota() -> BTreeMap<String, String> {
+    [
+        ("pods", "16"),
+        ("requests.nvidia.com/gpu", "0"),
+        ("requests.amd.com/gpu", "0"),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .into()
 }
 
 fn default_builder_egress() -> Vec<BuilderEgress> {

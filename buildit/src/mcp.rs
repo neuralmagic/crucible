@@ -2611,9 +2611,16 @@ mod tests {
     /// Each validation of `deploy/builder-admission.yaml` against `pod`: the messages of those that
     /// refuse it.
     fn refused_by_admission(pod: &serde_json::Value) -> Vec<String> {
+        refused_on("CREATE", pod)
+    }
+
+    fn refused_on(operation: &str, pod: &serde_json::Value) -> Vec<String> {
         let policy: serde_json::Value =
             serde_norway::from_str(include_str!("../deploy/builder-admission.yaml")).unwrap();
         let object = crucible_mcp_auth::policy::cel_value(pod).unwrap();
+        let request =
+            crucible_mcp_auth::policy::cel_value(&serde_json::json!({"operation": operation}))
+                .unwrap();
         policy["spec"]["validations"]
             .as_array()
             .unwrap()
@@ -2622,6 +2629,7 @@ mod tests {
                 let program = cel::Program::compile(v["expression"].as_str().unwrap()).unwrap();
                 let mut context = cel::Context::default();
                 context.add_variable_from_value("object", object.clone());
+                context.add_variable_from_value("request", request.clone());
                 match program.execute(&context) {
                     Ok(cel::Value::Bool(true)) => None,
                     Ok(cel::Value::Bool(false)) => Some(v["message"].as_str().unwrap().to_string()),
@@ -2762,6 +2770,57 @@ mod tests {
                 }),
             ),
             (
+                "nodeName",
+                escape(&|p| p["spec"]["nodeName"] = serde_json::json!("node-1")),
+            ),
+            (
+                "a runtime class",
+                escape(&|p| p["spec"]["runtimeClassName"] = serde_json::json!("kata")),
+            ),
+            (
+                "a system priority class",
+                escape(&|p| {
+                    p["spec"]["priorityClassName"] = serde_json::json!("system-node-critical")
+                }),
+            ),
+            (
+                "a toleration",
+                escape(
+                    &|p| p["spec"]["tolerations"] = serde_json::json!([{"key": "node-role.kubernetes.io/control-plane", "operator": "Exists", "effect": "NoSchedule"}]),
+                ),
+            ),
+            (
+                "tolerate everything",
+                escape(&|p| p["spec"]["tolerations"] = serde_json::json!([{"operator": "Exists"}])),
+            ),
+            (
+                "a sysctl",
+                escape(
+                    &|p| p["spec"]["securityContext"] = serde_json::json!({"sysctls": [{"name": "kernel.shm_rmid_forced", "value": "0"}]}),
+                ),
+            ),
+            (
+                "an SELinux type",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["securityContext"]["seLinuxOptions"] =
+                        serde_json::json!({"type": "spc_t"})
+                }),
+            ),
+            (
+                "a pod SELinux user",
+                escape(&|p| {
+                    p["spec"]["securityContext"] =
+                        serde_json::json!({"seLinuxOptions": {"user": "system_u"}})
+                }),
+            ),
+            (
+                "an unmasked /proc",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["securityContext"]["procMount"] =
+                        serde_json::json!("Unmasked")
+                }),
+            ),
+            (
                 "a pull Secret",
                 escape(&|p| {
                     p["spec"]["imagePullSecrets"] = serde_json::json!([{"name": "quay-pull"}])
@@ -2816,6 +2875,36 @@ mod tests {
             refused_by_admission(&unconfined_field),
             Vec::<String>::new(),
             "the API server may mirror the annotation into the field"
+        );
+        let defaulted = escape(&|p| {
+            p["spec"]["tolerations"] = serde_json::json!([
+                {"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+                {"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+            ]);
+            p["spec"]["priorityClassName"] = serde_json::json!("default-priority");
+            p["spec"]["securityContext"] =
+                serde_json::json!({"seLinuxOptions": {"level": "s0:c26,c5"}});
+            p["spec"]["containers"][0]["securityContext"]["procMount"] =
+                serde_json::json!("Default");
+        });
+        assert_eq!(
+            refused_by_admission(&defaulted),
+            Vec::<String>::new(),
+            "what admission defaults every pod with"
+        );
+        let scheduled = escape(&|p| p["spec"]["nodeName"] = serde_json::json!("node-1"));
+        assert_eq!(
+            refused_on("UPDATE", &scheduled),
+            Vec::<String>::new(),
+            "a scheduled pod keeps its node on update"
+        );
+        let swapped = escape(&|p| {
+            p["spec"]["nodeName"] = serde_json::json!("node-1");
+            p["spec"]["containers"][0]["image"] = serde_json::json!("alpine");
+        });
+        assert!(
+            !refused_on("UPDATE", &swapped).is_empty(),
+            "an update cannot swap the image"
         );
     }
 
