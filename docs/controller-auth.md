@@ -351,9 +351,30 @@ resources = ["https://crucible-kueue.apps.spoke-a.example.com/mcp"]   # default:
 A registered `client_id` is 1 to 64 of `A-Z a-z 0-9 . _ -`, so it can never look like a URL. If
 you remove a client, or narrow its `resources`, its refreshes are refused from the next refresh.
 
-There is no registration endpoint (RFC 7591), and the metadata advertises none. A client that
-can only register itself dynamically gets a clear failure. Give it a registered `client_id`
-instead.
+#### Self-registered clients
+
+pi 1.x, Codex (registration `auto`) and Claude Code without `--client-id` register a client of
+their own before they sign in (RFC 7591). With people OAuth configured, the controller accepts
+such registrations at `POST /oauth/register` and advertises `registration_endpoint`.
+`CONTROLLER_PEOPLE_DCR=false` turns registration off and removes `registration_endpoint` from
+the metadata. Registration accepts only native public clients:
+
+- `token_endpoint_auth_method` is absent or `none`. No secret, registration access token or
+  management endpoint is issued;
+- `grant_types` stay within `authorization_code` and `refresh_token`, and `response_types` within
+  `code`;
+- every `redirect_uris` entry is `http` on `localhost`, `127.0.0.1` or `[::1]`, with no query,
+  fragment or credentials, and at most 8 entries. At authorize, any port on the registered host
+  with the registered path matches.
+
+The client gets a random `dyn-…` `client_id`. Its codes and refresh tokens are bound to that id
+like any other client's. The name it chose is cleaned and cut to 100 characters, and the consent
+page and Settings always show it as "<name> (self-registered)". The consent page also shows
+the `host:port` the code goes to. A registration unused for 30 days stops authorizing and
+refreshing, and the hourly sweep deletes it with its approvals. Each source address may register
+20 times an hour, and at most 10000 registrations live at once (`429` and `503` past those
+limits). The source is the TCP peer, or the last `X-Forwarded-For` hop when the peer has a
+private address, as behind the cluster router.
 
 #### Client ID Metadata Documents
 
@@ -391,37 +412,45 @@ Codex publishes `https://chatgpt.com/oauth/codex/client.json` and pi publishes
 Use the MCP server's URL, which is one of the `CONTROLLER_PEOPLE_AUDIENCES` resources. Each tool
 finds this controller through the server's protected resource metadata.
 
+With self-registration on (the default), no client options are needed:
+
 ```sh
 # Claude Code: then run /mcp in a session and choose Authenticate.
-claude mcp add --transport http --client-id claude-code crucible-kueue https://crucible-kueue.apps.spoke-a.example.com/mcp
+claude mcp add --transport http crucible-kueue https://crucible-kueue.apps.spoke-a.example.com/mcp
 
 # pi
-pi mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp --oauth-client-id pi
+pi mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp
 pi mcp login crucible-kueue
 
-# Codex
-codex mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp --oauth-client-id codex
+# Codex (mcp add starts the sign-in itself; mcp login repeats it)
+codex mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp
 codex mcp login crucible-kueue
 ```
 
-If `chatgpt.com` is on `CONTROLLER_PEOPLE_CIMD_HOSTS`, Codex can omit `--oauth-client-id`.
-`codex mcp login` (registration `auto`, or `--oauth-client-registration cimd`) then signs in as
-`https://chatgpt.com/oauth/codex/client.json`. If `chatgpt.com` is not on the list,
-`--oauth-client-registration auto` or `dcr` without a client id ends with "Dynamic client
-registration not supported". Tell Codex users to add `--oauth-client-id codex`. pi signs in under
-its document when its `mcp.json` entry has
+Each tool then signs in as a self-registered client. To sign in under the registered client
+instead, so that consent and Settings show the verified name, or when `CONTROLLER_PEOPLE_DCR=false`,
+pass the registered id: `claude mcp add --client-id claude-code …`,
+`pi mcp add … --oauth-client-id pi`, `codex mcp add … --oauth-client-id codex`. Without
+self-registration and without a client id, Codex ends with "Dynamic client registration not
+supported", and pi ends with "Authorization server does not support dynamic client
+registration".
+
+If `chatgpt.com` is on `CONTROLLER_PEOPLE_CIMD_HOSTS`, Codex in `auto` mode prefers its metadata
+document over registering, and signs in as `https://chatgpt.com/oauth/codex/client.json`. pi
+signs in under its document when its `mcp.json` entry has
 `"oauth": {"clientRegistration": "cimd", "callbackUrl": "http://127.0.0.1/callback"}` and `pi.dev`
 is allowlisted.
 
 pi used to borrow `claude-code`. Under `claude-code`, pi's `127.0.0.1` callback is now refused.
-Re-add the server with `--oauth-client-id pi` and sign in again. An existing pi approval keeps
-refreshing as `claude-code` until it expires or someone signs it out.
+Re-add the server without OAuth options (or with `--oauth-client-id pi`) and sign in again. An
+existing pi approval keeps refreshing as `claude-code` until it expires or someone signs it out.
 
 ### The consent page
 
 `GET /oauth/authorize` from an MCP client parks the request on the browser session and sends the
 browser to `/consent?id=…` in the controller UI. The page names the client (its registered name,
-or a metadata document's `client_name` with its host) and shows its `client_id`, the server,
+a metadata document's `client_name` with its host, or a self-registered client's chosen name
+marked "(self-registered)") and shows its `client_id`, the `host:port` the code goes to, the server,
 scopes and login, and the person's username on the server's cluster. A `link` cluster nobody has
 linked offers Link (and the paste box where the cluster has no OAuth) right there, and the sign-in
 lands back on the same page. Allow and Deny are a JSON call that returns the client's redirect URI
