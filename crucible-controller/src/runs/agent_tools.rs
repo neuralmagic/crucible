@@ -226,17 +226,7 @@ pub async fn attribute(
     if tools.is_empty() {
         return Ok(());
     }
-    let dispatched_by: Option<String> =
-        sqlx::query_scalar("SELECT dispatched_by FROM runs WHERE run_id = $1")
-            .bind(run_id)
-            .fetch_optional(db.pool())
-            .await
-            .context("reading who the run was dispatched for")?
-            .flatten();
-    let launcher = dispatched_by
-        .as_deref()
-        .and_then(|p| p.strip_prefix("user:"))
-        .filter(|login| !login.is_empty());
+    let principal = crate::authz::model::Principal::Run(run_id.to_string());
     let acting: Vec<ServerName> = profile
         .agent_servers()?
         .into_iter()
@@ -244,11 +234,13 @@ pub async fn attribute(
         .map(|s| s.name)
         .collect();
     for tool in tools.iter_mut().filter(|t| acting.contains(&t.server)) {
-        let Some(login) = launcher else { break };
-        if let crate::identity::cluster_identity::Resolution::Known { user, .. } =
-            crate::identity::cluster_identity::for_login(db.pool(), profile, &tool.cluster, login)
-                .await?
-        {
+        use crate::identity::cluster_identity::{PrincipalError, Resolution, for_principal};
+        let resolved = match for_principal(db.pool(), profile, &tool.cluster, &principal).await {
+            Ok(resolved) => resolved,
+            Err(PrincipalError::Db(e)) => return Err(e),
+            Err(_) => break,
+        };
+        if let Resolution::Known { user, .. } = resolved {
             tool.kube_user = Some(user.as_str().to_string());
             sqlx::query(
                 "UPDATE run_agent_tools SET kube_user = $3 WHERE run_id = $1 AND server = $2",

@@ -4,7 +4,15 @@
 //! On the hub an administrator's override wins. Otherwise a `{ claim, prefix }` cluster takes the
 //! claim the person's SSO login recorded, and a `link` cluster takes only what the person proved
 //! to that cluster.
+//!
+//! Issuance and grant records name who acts as an [`authz::model::Principal`]: [`for_principal`]
+//! resolves a person through their sign-in and a run through the person it was dispatched for, and
+//! refuses a group or a team, which have no username of their own yet. A team's own identity per
+//! cluster would be one more arm there.
+//!
+//! [`authz::model::Principal`]: crate::authz::model::Principal
 
+use crate::authz::model::Principal;
 use crate::identity::kube_identity::KubeUser;
 use crate::identity::kube_links::{self, LinkSource};
 use crate::runs::clusters::HUB_CLUSTER;
@@ -96,9 +104,59 @@ pub async fn resolve(
     Ok(from_claim(rule, cluster, person))
 }
 
-/// The username the person signed in as `login` acts as on `cluster`, under the deploy profile's
-/// rule for it. A login with no sign-in recorded has none.
-pub async fn for_login(
+/// Why a principal has no username on a cluster to resolve.
+#[derive(Debug, thiserror::Error)]
+pub enum PrincipalError {
+    #[error(
+        "{principal} has no username of its own on a cluster; only a person, or a run through the \
+         person it was dispatched for, has one"
+    )]
+    NoUsername { principal: String },
+    #[error("run {run_id} was dispatched for {dispatched_by:?}, not a person")]
+    Dispatcher {
+        run_id: String,
+        dispatched_by: Option<String>,
+    },
+    #[error(transparent)]
+    Db(#[from] anyhow::Error),
+}
+
+/// The username `principal` acts as on `cluster`, under the deploy profile's rule for it: a
+/// person's own, a run's dispatcher's. A login with no sign-in recorded has none.
+pub async fn for_principal(
+    pool: &PgPool,
+    profile: &crucible::deploy::DeployProfile,
+    cluster: &str,
+    principal: &Principal,
+) -> Result<Resolution, PrincipalError> {
+    match principal {
+        Principal::User(login) => Ok(for_login(pool, profile, cluster, login).await?),
+        Principal::Run(run_id) => {
+            let dispatched_by: Option<String> =
+                sqlx::query_scalar("SELECT dispatched_by FROM runs WHERE run_id = $1")
+                    .bind(run_id)
+                    .fetch_optional(pool)
+                    .await
+                    .context("reading who the run was dispatched for")?
+                    .flatten();
+            let dispatcher = dispatched_by.as_deref().map(Principal::parse);
+            match dispatcher {
+                Some(Ok(Principal::User(login))) => {
+                    Ok(for_login(pool, profile, cluster, &login).await?)
+                }
+                _ => Err(PrincipalError::Dispatcher {
+                    run_id: run_id.clone(),
+                    dispatched_by,
+                }),
+            }
+        }
+        Principal::Group(_) | Principal::Team(_) => Err(PrincipalError::NoUsername {
+            principal: principal.to_string(),
+        }),
+    }
+}
+
+async fn for_login(
     pool: &PgPool,
     profile: &crucible::deploy::DeployProfile,
     cluster: &str,
@@ -253,6 +311,109 @@ mod tests {
         assert_eq!(user.as_str(), "casey");
         assert_eq!(source, Source::Link(LinkSource::OpenshiftOauth));
         assert!(linked_at.is_some());
+    }
+
+    async fn run_dispatched_for(pool: &PgPool, run_id: &str, dispatched_by: &str) {
+        crate::issues::store::upsert_issue(
+            pool,
+            &crate::issues::model::NewIssue {
+                key: "owner/repo#1".into(),
+                repo: "owner/repo".into(),
+                priority: 5,
+                evidence_url: None,
+                title: None,
+                author: None,
+                body: None,
+                labels: Vec::new(),
+                upstream_updated_at: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::runs::store::insert_run(
+            pool,
+            &crate::NewRun {
+                run_id: run_id.into(),
+                scope: None,
+                issue: Some("owner/repo#1".into()),
+                identity_digest: None,
+                status: "running".into(),
+                pod: None,
+                session_uri: None,
+                best_score: None,
+                cost_usd: None,
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET dispatched_by = $2 WHERE run_id = $1")
+            .bind(run_id)
+            .bind(dispatched_by)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A person resolves through their sign-in and a run through the person it was dispatched
+    /// for; a group, a team, or a run dispatched for one has no username to resolve.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_principal_resolves_as_a_person_or_through_its_runs_dispatcher(pool: PgPool) {
+        signed_in(&pool).await;
+        let profile: crucible::deploy::DeployProfile = toml::from_str(
+            r#"
+            [cluster]
+            loop_namespace = "loops"
+            rig_namespace = "rig"
+            service_account = "crucible-spoke"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "pull"
+            [clusters.waldorf]
+            kubeconfig_secret = "w"
+            identity = { claim = "email", prefix = "oidc:" }
+            "#,
+        )
+        .unwrap();
+        let resolve = |p: Principal| {
+            let (pool, profile) = (pool.clone(), &profile);
+            async move { for_principal(&pool, profile, "waldorf", &p).await }
+        };
+        let alice = known("oidc:alice@example.com", Source::Rule);
+        assert_eq!(
+            resolve(Principal::user("alice").unwrap()).await.unwrap(),
+            alice
+        );
+        run_dispatched_for(&pool, "run-1", "user:alice").await;
+        assert_eq!(
+            resolve(Principal::Run("run-1".into())).await.unwrap(),
+            alice
+        );
+        run_dispatched_for(&pool, "run-2", "team:platform-administrators").await;
+        assert!(matches!(
+            resolve(Principal::Run("run-2".into())).await,
+            Err(PrincipalError::Dispatcher { .. })
+        ));
+        assert!(matches!(
+            resolve(Principal::Run("no-such-run".into())).await,
+            Err(PrincipalError::Dispatcher {
+                dispatched_by: None,
+                ..
+            })
+        ));
+        for no_username in [
+            Principal::platform(),
+            Principal::parse("group:/groups/ml").unwrap(),
+        ] {
+            assert!(matches!(
+                resolve(no_username).await,
+                Err(PrincipalError::NoUsername { .. })
+            ));
+        }
+        assert!(matches!(
+            resolve(Principal::user("bob").unwrap()).await.unwrap(),
+            Resolution::Unavailable(_)
+        ));
     }
 
     /// The override is the hub's alone: it beats the hub's rule and link, and no spoke sees it.

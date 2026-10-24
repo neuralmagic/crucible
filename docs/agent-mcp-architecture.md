@@ -952,9 +952,17 @@ The same function decides `kube_user` for every consumer:
 | Consumer | Person | Cluster | When |
 | --- | --- | --- | --- |
 | People token | The person who approves | The cluster of the audience in `CONTROLLER_PEOPLE_AUDIENCES` | At code exchange and at each refresh |
-| Agent token | The launcher, found by login in `users` | The cluster of the run | At each token request (`cluster_identity.rs:101`) |
-| Agent tools record | The person in `runs.dispatched_by` | The cluster of each `crucible-kueue` tool | After the launch commits the run row (`crucible-controller/src/runs/agent_tools.rs:283`) |
+| Agent token | The run's principal, `run:<id>`, resolved through the person in `runs.dispatched_by` | The cluster of the run | At each token request (`for_principal`) |
+| Agent tools record | The same `run:<id>` principal | The cluster of each tool whose server acts as `kube_user` | After the launch commits the run row (`attribute`, `crucible-controller/src/runs/agent_tools.rs`) |
 | Settings and consent pages | The caller | Each cluster of the profile | On each read |
+
+Issuance and the tools record name who acts as an `authz::model::Principal`, and
+`for_principal` (`crucible-controller/src/identity/cluster_identity.rs`) resolves it: a `user:`
+principal through their sign-in, a `run:` principal through the person it was dispatched for. A
+`group:` or `team:` principal, or a run dispatched for one, has no username of its own and is
+refused with a typed error (`PrincipalError`), which the token endpoint answers with
+`invalid_grant`. A team's own identity per cluster would be one more arm of `for_principal`; the
+tables would not change.
 
 A launcher that never logged in has no `users` row, so its `kube_user` is unavailable. Because the
 agent token resolves at each request, a new link applies to the next token of a run that is

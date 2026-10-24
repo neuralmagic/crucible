@@ -658,6 +658,8 @@ pub enum GrantError {
         run_id: String,
         dispatched_by: Option<String>,
     },
+    #[error("{0}")]
+    NoUsername(String),
 }
 
 /// The launcher a run's token acts for: the login of the person the run was dispatched for.

@@ -255,6 +255,7 @@ impl From<GrantError> for OAuthError {
             }
             GrantError::Scope { .. } => Self::InvalidScope(e.to_string()),
             GrantError::NoLauncher { .. }
+            | GrantError::NoUsername(_)
             | GrantError::NoKubeUser { .. }
             | GrantError::WrongCluster { .. } => Self::InvalidGrant(e.to_string()),
         }
@@ -380,10 +381,20 @@ async fn issue(
         .audience(req.audience.as_deref(), &run.cluster)?;
     let launcher = issuer::launcher(&run)?;
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
-    let resolved =
-        crate::identity::cluster_identity::for_login(&state.pool, profile, &run.cluster, &launcher)
-            .await
-            .map_err(|e| OAuthError::Server(format!("{e:#}")))?;
+    let principal = crate::authz::model::Principal::Run(run.run_id.clone());
+    let resolved = crate::identity::cluster_identity::for_principal(
+        &state.pool,
+        profile,
+        &run.cluster,
+        &principal,
+    )
+    .await
+    .map_err(|e| match e {
+        crate::identity::cluster_identity::PrincipalError::Db(e) => {
+            OAuthError::Server(format!("{e:#}"))
+        }
+        e => GrantError::NoUsername(e.to_string()).into(),
+    })?;
     let kube_user = match resolved {
         crate::identity::cluster_identity::Resolution::Known { user, .. } => Some(user),
         unknown => {
