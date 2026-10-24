@@ -202,7 +202,7 @@ with the same key and the same `iss`.
 | --- | --- | --- | --- |
 | `iss` | yes | yes | `CONTROLLER_AGENT_ISSUER`, an http(s) origin without a path |
 | `sub` | launcher login | person login | On whose behalf the call is made |
-| `aud` | yes | yes | One MCP resource URL, a string |
+| `aud` | yes | yes | One MCP resource URL. The issuer writes a string; a resource server also accepts an array and passes the token when any entry names one of its `--resource` URLs |
 | `iat`, `nbf`, `exp` | yes | yes | Issue time, start, expiry (Unix seconds) |
 | `jti` | yes | yes | 16 random bytes, hex |
 | `act` | `{"sub": "<SPIFFE ID>"}` | absent | The presenter: the sandbox supervisor |
@@ -317,6 +317,11 @@ it. So:
   Secret and PersistentVolumeClaim that a manifest names (`crucible-kueue/src/access.rs:149`).
 - A new RoleBinding applies on the next call, because denials are not cached. A removed
   permission can still allow calls for up to 30 seconds, because allowed decisions are cached.
+- The ceiling holds for what a call does, not for everything a read returns. Each read tool
+  checks the object it names (7.2), then answers with what the server reads with its own
+  account: `workload_status` adds the workload's pods, its Kueue Workloads and their events,
+  and `hardware_describe` adds the nodes behind a flavor. A caller who may `get` a Job sees
+  those even without RBAC on pods, Workloads, events or nodes.
 
 The issuer never decides what a person may do. It decides only who the person is on each
 cluster (section 5).
@@ -377,7 +382,7 @@ The steps are these:
 3. The gateway starts before the loop pod, so it boots while the loop pod schedules
    (`gateway.rs:256`).
 4. The engine reads `CRUCIBLE_OPENSHELL_GATEWAY_URL` and talks to the remote gateway over mTLS
-   (`crucible/src/openshell/gateway.rs:412`). It creates one token-grant provider for each server
+   (`crucible/src/openshell/gateway.rs:422-437`). It creates one token-grant provider for each server
    (`crucible/src/openshell/run.rs:398`). A provider holds no secret and gives the sandbox no
    placeholder (`crucible/src/openshell/provider.rs:368`).
 5. After `CreateSandbox`, the engine binds the sandbox (`crucible/src/openshell/run.rs:469`). It
@@ -1190,12 +1195,12 @@ The app is built in `crucible-kueue/src/lib.rs:62`:
    with no reviewer, and any token without `kube_user` (`auth.rs:68`). The refusal is a 403. A
    run's identity is its
    `run_id`; a person's is its `sub`. A value that is not a label value gets a hash suffix.
-5. The guard decides the request (`crucible-mcp-auth/src/guard.rs:45`). `initialize`, `ping`,
+5. The guard decides the request (`decide`, `crucible-mcp-auth/src/guard.rs:148`). `initialize`, `ping`,
    `server/discover`, `notifications/*` and responses to the server pass. `tools/list` passes and
    has injected parameters removed from each `inputSchema`. Every other method must be listed
    in `KueueRules`. JSON-RPC batches are refused.
 6. For a listed call, the guard checks the scope. For a tool, it then applies the tool policy.
-   It then sends each access check to the reviewer (`guard.rs:141`). The request goes on as the guard parsed and
+   It then sends each access check to the reviewer (`review`, `guard.rs:106`). The request goes on as the guard parsed and
    rewrote it.
 7. A refused tool call returns a tool result with `isError` and the text
    `{"status": "refused", "error", "retryable"}`, so the model can read the reason. Only an
@@ -1220,7 +1225,9 @@ The app is built in `crucible-kueue/src/lib.rs:62`:
 | `workload_delete` | `kueue.submit` | `delete` the workload |
 
 The namespace of each check is the call's `namespace` argument, else the token's `namespace`
-claim. Every tool takes an optional `namespace`.
+claim. Every tool takes an optional `namespace`. `tasks/get` and `tasks/cancel` take no
+`namespace`: they act in the namespace the task id names (7.9). Each check covers the object
+named; what a read returns beyond it is read with the server's account (2.6).
 
 Note: A unit test fails if a tool has no scope in `KueueRules`. A new tool cannot ship
 unchecked.
@@ -1356,7 +1363,7 @@ list within 30 seconds; the per-call access checks are not cached. Every tool ca
 namespace they act in (the call's `namespace` argument, the token's `namespace` claim, or the task
 id's namespace) and refuse one the server does not serve with `not_found` and the list of usable
 namespaces, before anything reaches the API server (`served_caller`,
-`crucible-kueue/src/server.rs:661`). A server with no `--namespace` that cannot list LocalQueues
+`crucible-kueue/src/server.rs:667`). A server with no `--namespace` that cannot list LocalQueues
 cluster-wide serves nothing. It never passes on the API server message about the server's own
 account.
 
@@ -1808,7 +1815,9 @@ token stays in its row with `used_at` until its approval goes, so a reuse is rec
 
 Note: `users.kube_user` is no longer written or read. An earlier design learned it passively from
 cluster tokens. The hub username now lives in `kube_identity_links` like any other cluster, plus
-the override.
+the override. The header comment in `migrations/0060_user_kube_user.sql` still describes that
+earlier design. It stays, because sqlx checksums each migration file and an edit would fail
+databases that already applied it.
 
 ## 11. Operations
 
