@@ -2123,3 +2123,35 @@ The stack is single-tenant today in these places:
 | Ownership | `managed` labels per run | `rbac` mode already lets a team control its own objects through RBAC |
 
 The ceiling stays the same in each case: a token can do at most what its `kube_user` can do.
+
+### 13.1 Follow-ups
+
+- Per-audience `requires_kube_user` and `namespace`. The token endpoint refuses a token without
+  a `kube_user` only when a scope is one of crucible-kueue's (`is_kueue_scope`,
+  `crucible-controller/src/agent_auth/issuer.rs:309`), and adds the `namespace` claim from
+  `[kueue]` to every token on that cluster (`default_namespace`, `issuer.rs:582`). Each
+  `CONTROLLER_AGENT_AUDIENCES` entry should say both itself, so a third server that checks RBAC
+  needs configuration, not a scope list in the issuer.
+- `AgentServer` (`crucible-controller/src/runs/agent_tools.rs:20`) is a closed enum of `kueue` and
+  `buildit`. A new MCP server needs a variant, its dispatch arm and its UI label. A server
+  descriptor from the deploy profile would make it data.
+- Team columns. `runs`, `run_agent_tools` and `people_grants` carry no team, so a team claim
+  (section 13 table) has nothing to read at mint time, and Settings cannot filter by team.
+- One `GatewayPrefix` per cluster (`issuer.rs:137`). `CONTROLLER_AGENT_SPIRE` accepts one SPIFFE
+  prefix for each cluster. A team segment in the SPIFFE ID needs several prefixes per cluster,
+  or a prefix template.
+- No replay tracking for client assertions. The token endpoint does not remember the JWT-SVID
+  assertions it accepts (`crucible-controller/src/agent_auth/issuer.rs`, `MAX_SVID_LIFETIME_SECS`),
+  and it should not:
+  - The SPIRE agent caches JWT-SVIDs per SPIFFE ID and audience, and returns the cached one until
+    it nears expiry (`FetchJWTSVID`, `pkg/agent/manager/manager.go` in spiffe/spire). A supervisor
+    that exchanges for several MCP audiences, or refreshes a token, presents the same assertion
+    again. Refusing a repeat would refuse those exchanges.
+  - SPIRE sets `jti` on a JWT-SVID only when the registration entry opts in
+    (`jwt_svid_include_jti`, which also bypasses that cache; `BuildWorkloadJWTSVIDClaims`,
+    `pkg/server/credtemplate/builder.go`). The JWT-SVID specification does not require it. Keying
+    replays on `jti` would refuse every assertion from a default entry.
+  - The assertion lives at most 900 seconds (SPIRE's default JWT-SVID TTL is 5 minutes), names
+    only this issuer as its audience, and is fetched from the Workload API socket that the
+    OpenShell driver hands to the sandbox supervisor
+    (`provider_spiffe_workload_api_socket_path`), not to the agent it sandboxes.
