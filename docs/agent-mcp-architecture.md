@@ -561,7 +561,9 @@ Metadata Document (draft-ietf-oauth-client-id-metadata-document). When it is uns
 `client_id` is refused (`ClientError::MetadataOff`).
 
 At `/oauth/authorize`, `Cimd::client` (`crucible-controller/src/agent_auth/people/cimd.rs:370`)
-returns a cached document or fetches it. The fetch (`cimd.rs:390`) has these rules:
+returns a cached document or fetches it, and only for a signed-in browser: a request naming a
+metadata document without a session goes to `/auth/login` first, so nobody can make the controller
+fetch without signing in. The fetch (`cimd.rs:390`) has these rules:
 
 - The host must be on the allowlist (`cimd.rs:362`).
 - The resolver gives only public addresses. It drops loopback, private, link-local and other

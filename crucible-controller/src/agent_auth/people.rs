@@ -565,6 +565,25 @@ async fn authorize(
         return refused_page("this controller issues no tokens to people");
     };
     let issuer = auth.issuer.issuer().as_str();
+    let to_login = || {
+        let here = uri
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or(AUTHORIZE_PATH);
+        let rd = percent_encoding::utf8_percent_encode(here, percent_encoding::NON_ALPHANUMERIC);
+        Redirect::to(&format!("/auth/login?rd={rd}")).into_response()
+    };
+    let signed = match signed_in(&session).await {
+        Ok(signed) => signed,
+        Err(e) => return session_failure(e),
+    };
+    let fetches = people.clients.metadata_documents()
+        && pairs.iter().any(|(k, v)| {
+            k == "client_id" && matches!(ClientId::parse(v), Ok(ClientId::Metadata(_)))
+        });
+    if signed.is_none() && fetches {
+        return to_login();
+    }
     let validated = match single_valued(pairs) {
         Ok(params) => validate(&people.config, &people.clients, params).await,
         Err(why) => Err(AuthorizeError::Page(why)),
@@ -585,18 +604,8 @@ async fn authorize(
             return redirect_error(&redirect, state.as_deref(), issuer, error, &description);
         }
     };
-    let claims = match signed_in(&session).await {
-        Ok(Some(claims)) => claims,
-        Ok(None) => {
-            let here = uri
-                .path_and_query()
-                .map(|p| p.as_str())
-                .unwrap_or(AUTHORIZE_PATH);
-            let rd =
-                percent_encoding::utf8_percent_encode(here, percent_encoding::NON_ALPHANUMERIC);
-            return Redirect::to(&format!("/auth/login?rd={rd}")).into_response();
-        }
-        Err(e) => return session_failure(e),
+    let Some(claims) = signed else {
+        return to_login();
     };
     let mut id = [0u8; 16];
     if aws_lc_rs::rand::fill(&mut id).is_err() {
@@ -2683,6 +2692,31 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         .unwrap();
         assert_eq!(meta["client_id_metadata_document_supported"], true);
         assert!(meta.get("registration_endpoint").is_some());
+
+        let unsigned = send(
+            &h.app,
+            get(
+                &authorize_uri(&[
+                    ("client_id", &docs.url(DOC_HOST, "/gone.json")),
+                    ("redirect_uri", PI_REDIRECT),
+                ]),
+                None,
+            ),
+        )
+        .await;
+        assert_eq!(
+            unsigned.status,
+            StatusCode::SEE_OTHER,
+            "nobody signed in: sent to sign in before the document is fetched (it would 404)"
+        );
+        assert!(
+            unsigned
+                .location
+                .as_deref()
+                .is_some_and(|l| l.starts_with("/auth/login")),
+            "{:?}",
+            unsigned.location
+        );
 
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
         let desk = docs.url(DOC_HOST, "/desk.json");
