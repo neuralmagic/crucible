@@ -1301,7 +1301,8 @@ way past Kueue. The object-level `spec` of each kind is also on a list, so field
 4. Set `metadata.namespace` to the caller namespace. Refuse another value.
 5. Refuse reserved labels and annotations that the profile does not allow (`manifest.rs:822`).
 6. Set the object labels: `kueue.x-k8s.io/queue-name`, `<domain>/managed-by=crucible-kueue`,
-   `<domain>/run-id`, `<domain>/launched-by`. A manifest value that conflicts is refused.
+   `<domain>/run-id`, `<domain>/owner-kind` (`run` or `person`), `<domain>/launched-by`. A
+   manifest value that conflicts is refused.
 7. With `--suspend` (default true), create Jobs and JobSets with `spec.suspend: true`, and
    PyTorchJobs with `spec.runPolicy.suspend: true`, for Kueue to start on admission.
 8. For batch kinds, add `activeDeadlineSeconds` (default 86400) and `ttlSecondsAfterFinished`
@@ -1396,7 +1397,7 @@ Serving kinds are never tasks. `workload_status` reports their `readiness` inste
 
 | Mode | Stop, resume, scale, delete |
 | --- | --- |
-| `managed` (default) | Only objects with `<domain>/managed-by=crucible-kueue` and the caller's `<domain>/run-id` |
+| `managed` (default) | Only objects with `<domain>/managed-by=crucible-kueue`, the caller's `<domain>/run-id` and the caller's kind in `<domain>/owner-kind`, so a person whose subject reads like a run id owns nothing of that run |
 | `rbac` | Any object of a served kind that the access checks allow |
 
 `workload_list` takes `filter`: `mine` (default, this run), `managed` (all objects of this

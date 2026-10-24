@@ -141,6 +141,8 @@ pub struct Labels {
     pub domain: String,
     pub managed_by: String,
     pub run_id: String,
+    /// Whether `run_id` names a run or a person's subject.
+    pub owner_kind: String,
     /// The human a delegated token acted for. Set from the caller, never the manifest.
     pub launched_by: String,
     /// On pod templates: the object the pod belongs to.
@@ -159,6 +161,7 @@ impl Labels {
             domain: domain.to_string(),
             managed_by: key("managed-by"),
             run_id: key("run-id"),
+            owner_kind: key("owner-kind"),
             launched_by: key("launched-by"),
             workload: key("workload"),
             plan_hash: key("plan-hash"),

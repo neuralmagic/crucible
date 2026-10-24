@@ -356,12 +356,19 @@ pub fn normalize(
         }
     }
     let l = &cfg.labels;
-    let object_labels = [QUEUE_LABEL, &l.managed_by, &l.run_id, &l.launched_by];
+    let object_labels = [
+        QUEUE_LABEL,
+        &l.managed_by,
+        &l.run_id,
+        &l.owner_kind,
+        &l.launched_by,
+    ];
     check_reserved(meta, "/metadata", &object_labels, cfg)?;
     let labels = object_entry(meta, "labels", "metadata.labels")?;
     set_label(labels, QUEUE_LABEL, queue.as_str())?;
     set_label(labels, &l.managed_by, MANAGED_VALUE)?;
     set_label(labels, &l.run_id, caller.run_id.as_str())?;
+    set_label(labels, &l.owner_kind, caller.owner.as_str())?;
     set_label(labels, &l.launched_by, caller.launched_by.as_str())?;
 
     if cfg.lifetimes.suspend {
@@ -1493,6 +1500,7 @@ mod tests {
 
     fn caller() -> Caller {
         Caller {
+            owner: crate::caller::OwnerKind::Run,
             run_id: RunId::parse("run-7").unwrap(),
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: Launcher::parse("alice").unwrap(),

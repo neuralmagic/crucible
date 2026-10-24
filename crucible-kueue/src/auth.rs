@@ -96,6 +96,10 @@ impl Identity {
             ),
         };
         Ok(Self {
+            owner: match is_person {
+                true => crate::caller::OwnerKind::Person,
+                false => crate::caller::OwnerKind::Run,
+            },
             run_id,
             namespace,
             launched_by: config::launcher_of(&principal.subject)?,

@@ -296,12 +296,14 @@ fn stamp(object: &mut DynamicObject, labels: &Labels, plan_hash: &str, actor: Op
     }
 }
 
-/// Whether `caller` created `obj`: this server's managed label and the caller's run label.
+/// Whether `caller` created `obj`: this server's managed label, and the caller's run label and
+/// kind of owner.
 fn created_by(caller: &Caller, obj: &DynamicObject, labels: &Labels) -> bool {
     let set = obj.metadata.labels.as_ref();
     let label = |key: &str| set.and_then(|l| l.get(key)).map(String::as_str);
     label(&labels.managed_by) == Some(MANAGED_VALUE)
         && label(&labels.run_id) == Some(caller.run_id.as_str())
+        && label(&labels.owner_kind) == Some(caller.owner.as_str())
 }
 
 /// Whether `caller` may stop, resume, scale or delete `obj`. Under [`Ownership::Rbac`] the access
@@ -518,11 +520,15 @@ pub enum ListFilter {
 }
 
 /// The label selector `filter` lists objects by.
-fn list_selector(filter: ListFilter, labels: &Labels, run: &str) -> String {
+fn list_selector(filter: ListFilter, labels: &Labels, caller: &Caller) -> String {
     match filter {
         ListFilter::Mine => format!(
-            "{}={MANAGED_VALUE},{}={run}",
-            labels.managed_by, labels.run_id
+            "{}={MANAGED_VALUE},{}={},{}={}",
+            labels.managed_by,
+            labels.run_id,
+            caller.run_id.as_str(),
+            labels.owner_kind,
+            caller.owner.as_str()
         ),
         ListFilter::Managed => format!("{}={MANAGED_VALUE}", labels.managed_by),
         ListFilter::All => QUEUE_LABEL.to_string(),
@@ -1789,7 +1795,7 @@ impl KueueMcp {
                 let c = self.served_caller(&parts, args.namespace.as_deref()).await?;
                 let ns = c.namespace.as_str();
                 let labels = &self.config.labels;
-                let selector = list_selector(args.filter.unwrap_or_default(), labels, c.run_id.as_str());
+                let selector = list_selector(args.filter.unwrap_or_default(), labels, &c);
                 let workloads = self.namespace_workloads(ns).await?;
                 let pods: Vec<Pod> = Api::<Pod>::namespaced(self.client.clone(), ns)
                     .list(&ListParams::default())
@@ -2855,16 +2861,23 @@ mod tests {
     #[test]
     fn list_filters_select_this_run_this_server_or_everything_queued() {
         let l = Labels::new("crucible.dev");
+        let r1 = Caller {
+            owner: crate::caller::OwnerKind::Run,
+            run_id: crate::caller::RunId::parse("r1").unwrap(),
+            namespace: Namespace::parse("team-a").unwrap(),
+            launched_by: crate::caller::Launcher::parse("alice").unwrap(),
+            kube_user: "alice".into(),
+        };
         assert_eq!(
-            list_selector(ListFilter::Mine, &l, "r1"),
-            "crucible.dev/managed-by=crucible-kueue,crucible.dev/run-id=r1"
+            list_selector(ListFilter::Mine, &l, &r1),
+            "crucible.dev/managed-by=crucible-kueue,crucible.dev/run-id=r1,crucible.dev/owner-kind=run"
         );
         assert_eq!(
-            list_selector(ListFilter::Managed, &l, "r1"),
+            list_selector(ListFilter::Managed, &l, &r1),
             "crucible.dev/managed-by=crucible-kueue"
         );
         assert_eq!(
-            list_selector(ListFilter::All, &l, "r1"),
+            list_selector(ListFilter::All, &l, &r1),
             "kueue.x-k8s.io/queue-name"
         );
     }
@@ -2872,6 +2885,7 @@ mod tests {
     #[test]
     fn only_rbac_ownership_lets_a_caller_control_what_it_did_not_create() {
         let caller = Caller {
+            owner: crate::caller::OwnerKind::Run,
             run_id: crate::caller::RunId::parse("r1").unwrap(),
             namespace: Namespace::parse("team-a").unwrap(),
             launched_by: crate::caller::Launcher::parse("alice").unwrap(),
@@ -2882,14 +2896,20 @@ mod tests {
                 "metadata": {"name": "j", "labels": labels}}))
             .unwrap()
         };
-        let mine =
-            with(json!({"crucible.dev/managed-by": "crucible-kueue", "crucible.dev/run-id": "r1"}));
-        let other_run =
-            with(json!({"crucible.dev/managed-by": "crucible-kueue", "crucible.dev/run-id": "r2"}));
+        let mine = with(json!({"crucible.dev/managed-by": "crucible-kueue",
+            "crucible.dev/run-id": "r1", "crucible.dev/owner-kind": "run"}));
+        let other_run = with(json!({"crucible.dev/managed-by": "crucible-kueue",
+            "crucible.dev/run-id": "r2", "crucible.dev/owner-kind": "run"}));
+        let person_named_r1 = with(json!({"crucible.dev/managed-by": "crucible-kueue",
+            "crucible.dev/run-id": "r1", "crucible.dev/owner-kind": "person"}));
         let kubectl = with(json!({}));
         let managed = Config::default();
         assert!(controls(&caller, &mine, &managed));
         assert!(!controls(&caller, &other_run, &managed));
+        assert!(
+            !controls(&caller, &person_named_r1, &managed),
+            "a person whose subject reads r1 owns nothing of run r1"
+        );
         assert!(!controls(&caller, &kubectl, &managed));
         let rbac = Config {
             ownership: Ownership::Rbac,

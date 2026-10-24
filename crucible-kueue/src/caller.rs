@@ -123,11 +123,29 @@ pub enum Refusal {
     Namespace(NameError),
 }
 
+/// Which kind of caller owns what it creates, so a person whose subject reads like a run id never
+/// owns that run's workloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnerKind {
+    Run,
+    Person,
+}
+
+impl OwnerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Person => "person",
+        }
+    }
+}
+
 /// Who a request comes from, before it names a namespace: a run (acting for its launcher) or a
 /// person. Either may name any namespace per call, its token's `namespace` claim being the
 /// default; the access checks decide whether it may act there.
 #[derive(Debug, Clone)]
 pub struct Identity {
+    pub owner: OwnerKind,
     pub run_id: RunId,
     pub namespace: Option<Namespace>,
     /// The human the request acts for, stamped on everything it creates.
@@ -147,6 +165,7 @@ impl Identity {
             (None, None) => return Err(Refusal::NamespaceRequired),
         };
         Ok(Caller {
+            owner: self.owner,
             run_id: self.run_id.clone(),
             namespace,
             launched_by: self.launched_by.clone(),
@@ -158,6 +177,7 @@ impl Identity {
 /// An [`Identity`] resolved to the one namespace a call acts in.
 #[derive(Debug, Clone)]
 pub struct Caller {
+    pub owner: OwnerKind,
     pub run_id: RunId,
     pub namespace: Namespace,
     pub launched_by: Launcher,
@@ -171,6 +191,7 @@ mod tests {
     #[test]
     fn an_identity_acts_in_the_named_namespace_or_its_default() {
         let mut identity = Identity {
+            owner: OwnerKind::Run,
             run_id: RunId::parse("r").unwrap(),
             namespace: Some(Namespace::parse("team-a").unwrap()),
             launched_by: Launcher::parse("alice").unwrap(),
