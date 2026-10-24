@@ -1616,13 +1616,16 @@ The controller sets these. Do not set them by hand.
 | `CRUCIBLE_KUEUE_URL` | The run is on a `[kueue]` cluster that is in `CONTROLLER_AGENT_SPIRE`, and the server URL is in `CONTROLLER_AGENT_AUDIENCES` | engine: provider endpoint, `.mcp.json` server `kueue` |
 | `CRUCIBLE_BUILDIT_RUN_ISSUER` | The run is on a `[buildit]` cluster that is in `CONTROLLER_AGENT_SPIRE`, and `http://host.openshell.internal:8848/mcp` is in `CONTROLLER_AGENT_AUDIENCES` | engine: starts `buildit` |
 | `CRUCIBLE_BUILDIT_NAMESPACE` | The run gets `buildit` | engine: `buildit --namespace`; required with `CRUCIBLE_BUILDIT_RUN_ISSUER` |
-| `CRUCIBLE_BUILDIT_PUSH_REPO` | The run gets `buildit` and `[buildit] push_repo` is set | engine: `buildit --push-repo` |
+| `CRUCIBLE_BUILDIT_PUSH_REPO` | The run gets `buildit` and `[buildit] push_repo` is set | engine: `buildit --push-repo`; refused without `CRUCIBLE_BUILDIT_RUN_ISSUER` |
 | `CRUCIBLE_OPENSHELL_GATEWAY_URL` | Isolated profile | engine: remote gateway |
 | `CRUCIBLE_OPENSHELL_GATEWAY_TLS_DIR` | Isolated profile | engine: client material |
 | `CRUCIBLE_GATEWAY_*` | Isolated profile, gateway pod only | `crucible openshell-gateway` |
 
 The engine refuses a partial set: `CRUCIBLE_KUEUE_URL` without the token endpoint and audience
-fails the turn, and so does `CRUCIBLE_BUILDIT_RUN_ISSUER` without them.
+fails the turn, and so does `CRUCIBLE_BUILDIT_RUN_ISSUER` without them or without
+`CRUCIBLE_BUILDIT_NAMESPACE`. `CRUCIBLE_BUILDIT_NAMESPACE` or `CRUCIBLE_BUILDIT_PUSH_REPO`
+without `CRUCIBLE_BUILDIT_RUN_ISSUER` fails the turn too, instead of running without buildit
+(`crucible/src/openshell/buildit.rs`, `BuilditAccessError::NoIssuer`).
 
 ### 9.4 crucible-kueue flags
 

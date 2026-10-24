@@ -37,6 +37,8 @@ struct BootTimeout {
 pub enum BuilditAccessError {
     #[error("{ENV_BUILDIT_RUN_ISSUER} is set but {missing} is not; the controller sets both")]
     Partial { missing: &'static str },
+    #[error("{set} is set but {ENV_BUILDIT_RUN_ISSUER} is not; the controller sets both")]
+    NoIssuer { set: &'static str },
     #[error("{ENV_BUILDIT_RUN_ISSUER} {0:?} is not <issuer>=<jwks uri>")]
     Issuer(String),
 }
@@ -82,7 +84,15 @@ impl BuilditAccess {
         svid_audience: Option<String>,
     ) -> Result<Option<Self>, BuilditAccessError> {
         let Some(trusted_issuer) = issuer else {
-            return Ok(None);
+            return match (&namespace, &push_repo) {
+                (Some(_), _) => Err(BuilditAccessError::NoIssuer {
+                    set: ENV_BUILDIT_NAMESPACE,
+                }),
+                (None, Some(_)) => Err(BuilditAccessError::NoIssuer {
+                    set: ENV_BUILDIT_PUSH_REPO,
+                }),
+                (None, None) => Ok(None),
+            };
         };
         let namespace = namespace.ok_or(BuilditAccessError::Partial {
             missing: ENV_BUILDIT_NAMESPACE,
@@ -272,6 +282,28 @@ mod tests {
             ),
             Err(BuilditAccessError::Issuer(_))
         ));
+    }
+
+    #[test]
+    fn buildit_settings_without_an_issuer_are_refused_not_ignored() {
+        assert_eq!(
+            BuilditAccess::from_values(
+                None,
+                None,
+                Some("quay.io/team/agent".into()),
+                Some(ENDPOINT.into()),
+                Some(AUDIENCE.into())
+            ),
+            Err(BuilditAccessError::NoIssuer {
+                set: ENV_BUILDIT_PUSH_REPO
+            })
+        );
+        assert_eq!(
+            BuilditAccess::from_values(None, Some("crucible-builds".into()), None, None, None),
+            Err(BuilditAccessError::NoIssuer {
+                set: ENV_BUILDIT_NAMESPACE
+            })
+        );
     }
 
     #[test]
