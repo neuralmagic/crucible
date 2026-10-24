@@ -30,12 +30,12 @@ pub const GROUPS_CLAIM: &str = "kube_groups";
 const AUTHENTICATED: [&str; 2] = ["system:authenticated", "system:authenticated:oauth"];
 
 const ALLOW_TTL: Duration = Duration::from_secs(30);
-const GROUPS_TTL: Duration = Duration::from_secs(60);
+const GROUPS_TTL: Duration = Duration::from_secs(15);
 
 /// Where a caller's groups come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GroupSource {
-    /// `user.openshift.io/v1` Group objects listing the user, read live (cached a minute).
+    /// `user.openshift.io/v1` Group objects listing the user, read live (cached 15 seconds).
     OpenShift,
     /// The token's `kube_groups` claim, for clusters whose identity provider issues the token.
     Token,

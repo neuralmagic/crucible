@@ -262,7 +262,7 @@ redirects.
 | Gateway certificates | run deadline in days, rounded up, plus 1 day; 30 days for a run without a deadline | `validity_days` |
 | JWKS cache | 600 seconds, refetch at most each 30 seconds | `Jwks::from_source` |
 | Allowed SAR decision cache | 30 seconds; denials are not cached | `ALLOW_TTL` |
-| OpenShift group cache | 60 seconds | `GROUPS_TTL` |
+| OpenShift group cache | 15 seconds, so a removed group stops allowing within 45 seconds together with the allow cache | `GROUPS_TTL` |
 
 ### 2.5 What each component verifies
 

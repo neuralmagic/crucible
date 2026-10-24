@@ -376,8 +376,7 @@ on the manifest's kind, in the call's `namespace` argument or else the token's `
 ```
 
 **Who is asked about.** `kube_user` names the Kubernetes user; a `system:` identity is refused, so
-no token can stand in for a node or the cluster. Groups come from OpenShift `Group` objects (cached
-a minute) or a `kube_groups` claim with `system:` groups dropped; `system:authenticated` is always
+no token can stand in for a node or the cluster. Groups come from OpenShift `Group` objects (cached 15 seconds) or a `kube_groups` claim with `system:` groups dropped; `system:authenticated` is always
 added. The controller resolves `kube_user` for people and runs alike from the cluster's identity
 rule (an SSO claim, a link the cluster itself proved, or an administrator's hub override), so a
 run can only do what its human could; a token without `kube_user` is refused.
