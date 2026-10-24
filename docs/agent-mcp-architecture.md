@@ -2173,43 +2173,56 @@ Note: A launch with a cluster token records no `users` row. The harness inserts 
 
 ## 13. Multitenancy later
 
-The stack is single-tenant today in these places:
+No API, token, configuration format or SPIFFE ID assumes a single tenant. Teams become a data
+change: nothing below needs a new shape, only values per team. Nothing here writes a team today,
+and every one of these defaults to the single-tenant behaviour.
 
-| Point | Today | Extension point |
+### 13.1 What is tenant-ready
+
+| Shape | Today's value | Where |
 | --- | --- | --- |
-| Token claims | `sub`, `kube_user`, run and sandbox; no team | Add a `team` claim from crucible teams at mint time (`issuer.rs:782`, `people.rs:299`). The tool policy already sees every claim, so CEL rules can use it at once |
-| Workload namespaces | `[kueue] workload_namespaces`, the same list for all runs on a cluster | A per-team list in the profile. Tokens already take their namespaces from the audience's description, and the server serves several with `--namespace` |
-| Push repository | One `[buildit] push_repo` | A per-team repository chosen at dispatch and carried in the buildit entry of `CRUCIBLE_AGENT_SERVERS` |
-| SPIFFE ID | `.../openshell/gateway/<gateway id>/sandbox/<sandbox id>` | A team segment from a label that the controller puts on the gateway pod. `CONTROLLER_AGENT_SPIRE` allows one gateway prefix per cluster, so the issuer must then parse the team after the prefix, or accept several prefixes |
-| Identity rules | One rule per cluster | Rules per group, so that one cluster can trust SSO usernames for some teams and links for others |
-| People clients | One client registry for the deployment, optional metadata documents, and self-registration. A client without `resources` can get every audience | Registry entries or `resources` per team |
-| Audience scopes | One scope list per audience | Scopes per team, still bounded by RBAC as `kube_user` |
-| Ownership | `managed` labels per run | `rbac` mode already lets a team control its own objects through RBAC |
+| Token needs per audience | Each audience carries `requires_kube_user` and `namespaces`, filled from the profile's server descriptions; the issuer names no server | `Audience::described_by`, `DeployProfile::agent_servers` |
+| Namespaces as a set | Tokens carry `namespaces` (the first is also `namespace`); crucible-kueue confines a caller to the claim within the namespaces it serves; `[kueue] workload_namespaces` is a list | `Identity::act_in`, `crucible-kueue/src/caller.rs` |
+| Open server list | `[kueue]`, `[buildit]` and any `[[agent_servers]]` reach the loop pod as one `CRUCIBLE_AGENT_SERVERS` list keyed by `ServerName`; buildit's URL is configuration | `crucible-contract/src/agent_servers.rs` |
+| Principal-shaped identity | Issuance and grant records resolve an `authz::model::Principal`; a person through their sign-in, a run through its dispatcher; groups and teams are refused with a typed error | `cluster_identity::for_principal` |
+| Tenant in the SPIFFE ID | A gateway prefix may hold one `{tenant}` segment; the default has none | `GatewayPrefix`, section 6.1 |
+| Cluster binding | Agent audiences may name a cluster, tokens carry `kube_cluster`, and a server started with `--cluster` refuses another's | section 2.2 |
+| One cluster-name rule | Profile spokes, server tables and every controller setting use `check_cluster_name` | `crucible/src/deploy/profile.rs` |
+| Several servers per cluster | crucible-kueue's managed-by value and field manager come from `--manager` | section 7.12 |
+
+### 13.2 What a team rollout still adds
+
+- A team per run and per person. `runs`, `run_agent_tools` and `people_grants` carry no team.
+  The controller already knows teams (`authz::model::Principal::Team`); dispatch would record the
+  run's team and the issuer would mint it as a `team` claim (`issuer.rs`, `people.rs`). The tool
+  policy sees every claim, so CEL rules can use it at once.
+- Values per team. Server descriptions, and so audiences' namespaces, `[buildit] push_repo` and
+  audience scopes, would be looked up by team as well as by URL and cluster. The shapes they fill
+  are already lists in tokens and in `CRUCIBLE_AGENT_SERVERS`.
+- A team's own identity. A `Team` arm in `for_principal` resolving the team's account on each
+  cluster, with storage for those accounts (the one schema change).
+- A tenant in each sandbox's SPIFFE ID. The gateway pod would carry a tenant label, the
+  ClusterSPIFFEID would put it before `gateway`, and the issuer would check the tenant it parses
+  against the run's team.
+- People. Client registry entries or `resources` per team, and identity rules per group, so one
+  cluster can trust SSO usernames for some teams and links for others.
 
 The ceiling stays the same in each case: a token can do at most what its `kube_user` can do.
 
-### 13.1 Follow-ups
+### 13.3 No replay tracking for client assertions
 
-- `AgentServer` (`crucible-controller/src/runs/agent_tools.rs:20`) is a closed enum of `kueue` and
-  `buildit`. A new MCP server needs a variant, its dispatch arm and its UI label. A server
-  descriptor from the deploy profile would make it data.
-- Team columns. `runs`, `run_agent_tools` and `people_grants` carry no team, so a team claim
-  (section 13 table) has nothing to read at mint time, and Settings cannot filter by team.
-- One `GatewayPrefix` per cluster (`issuer.rs:137`). `CONTROLLER_AGENT_SPIRE` accepts one SPIFFE
-  prefix for each cluster. A team segment in the SPIFFE ID needs several prefixes per cluster,
-  or a prefix template.
-- No replay tracking for client assertions. The token endpoint does not remember the JWT-SVID
-  assertions it accepts (`crucible-controller/src/agent_auth/issuer.rs`, `MAX_SVID_LIFETIME_SECS`),
-  and it should not:
-  - The SPIRE agent caches JWT-SVIDs per SPIFFE ID and audience, and returns the cached one until
-    it nears expiry (`FetchJWTSVID`, `pkg/agent/manager/manager.go` in spiffe/spire). A supervisor
-    that exchanges for several MCP audiences, or refreshes a token, presents the same assertion
-    again. Refusing a repeat would refuse those exchanges.
-  - SPIRE sets `jti` on a JWT-SVID only when the registration entry opts in
-    (`jwt_svid_include_jti`, which also bypasses that cache; `BuildWorkloadJWTSVIDClaims`,
-    `pkg/server/credtemplate/builder.go`). The JWT-SVID specification does not require it. Keying
-    replays on `jti` would refuse every assertion from a default entry.
-  - The assertion lives at most 900 seconds (SPIRE's default JWT-SVID TTL is 5 minutes), names
-    only this issuer as its audience, and is fetched from the Workload API socket that the
-    OpenShell driver hands to the sandbox supervisor
-    (`provider_spiffe_workload_api_socket_path`), not to the agent it sandboxes.
+The token endpoint does not remember the JWT-SVID assertions it accepts
+(`crucible-controller/src/agent_auth/issuer.rs`, `MAX_SVID_LIFETIME_SECS`), and it should not:
+
+- The SPIRE agent caches JWT-SVIDs per SPIFFE ID and audience, and returns the cached one until
+  it nears expiry (`FetchJWTSVID`, `pkg/agent/manager/manager.go` in spiffe/spire). A supervisor
+  that exchanges for several MCP audiences, or refreshes a token, presents the same assertion
+  again. Refusing a repeat would refuse those exchanges.
+- SPIRE sets `jti` on a JWT-SVID only when the registration entry opts in
+  (`jwt_svid_include_jti`, which also bypasses that cache; `BuildWorkloadJWTSVIDClaims`,
+  `pkg/server/credtemplate/builder.go`). The JWT-SVID specification does not require it. Keying
+  replays on `jti` would refuse every assertion from a default entry.
+- The assertion lives at most 900 seconds (SPIRE's default JWT-SVID TTL is 5 minutes), names
+  only this issuer as its audience, and is fetched from the Workload API socket that the
+  OpenShell driver hands to the sandbox supervisor
+  (`provider_spiffe_workload_api_socket_path`), not to the agent it sandboxes.
