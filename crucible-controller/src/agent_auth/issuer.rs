@@ -94,6 +94,8 @@ pub enum ConfigError {
         "CONTROLLER_AGENT_AUDIENCES entry {0:?} is not <cluster>:<url>=<scopes>; every agent audience names the cluster whose runs get it"
     )]
     AudienceCluster(String),
+    #[error("CONTROLLER_AGENT_AUDIENCES lists {resource} for cluster {cluster} twice")]
+    AudienceTwice { cluster: String, resource: String },
     #[error("{var} is set, but CONTROLLER_AGENT_ISSUER is not; it does nothing without the issuer")]
     NoIssuer { var: &'static str },
 }
@@ -513,6 +515,17 @@ impl AgentIssuerConfig {
         if !spire.is_empty() && audiences.is_empty() {
             return Err(ConfigError::NoAudiences);
         }
+        for (i, a) in audiences.iter().enumerate() {
+            if audiences[i + 1..]
+                .iter()
+                .any(|b| a.cluster == b.cluster && same_url(&a.resource, &b.resource))
+            {
+                return Err(ConfigError::AudienceTwice {
+                    cluster: a.cluster.clone(),
+                    resource: a.resource.clone(),
+                });
+            }
+        }
         Ok(Some(Self {
             issuer: IssuerUrl::parse(&issuer)?,
             signing_key,
@@ -521,6 +534,14 @@ impl AgentIssuerConfig {
             spire,
             audiences,
         }))
+    }
+}
+
+/// Whether `a` and `b` name the same URL once parsed, so `http://H:80/mcp` is `http://h/mcp`.
+pub(crate) fn same_url(a: &str, b: &str) -> bool {
+    match (Url::parse(a), Url::parse(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
     }
 }
 
@@ -1960,6 +1981,35 @@ mod tests {
                 "{var}={value}"
             );
         }
+    }
+
+    /// An audience listed twice for one cluster, however its URL is spelled, is refused; the same
+    /// URL on another cluster is another audience.
+    #[test]
+    fn an_audience_is_listed_once_per_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_file = dir.path().join("signing.pem");
+        std::fs::write(&key_file, EcKey::generate().pem()).unwrap();
+        let with = |audiences: &str| {
+            let mut vars = env(&key_file);
+            vars.insert("CONTROLLER_AGENT_AUDIENCES", audiences.to_string());
+            AgentIssuerConfig::from_lookup(lookup(&vars)).map(|_| ())
+        };
+        for twice in [
+            "dev:http://kueue.example/mcp=kueue.read,dev:http://kueue.example/mcp=kueue.submit",
+            "dev:http://kueue.example/mcp=kueue.read,dev:HTTP://Kueue.Example:80/mcp=kueue.read",
+        ] {
+            assert!(
+                matches!(with(twice), Err(ConfigError::AudienceTwice { cluster, .. }) if cluster == "dev"),
+                "{twice}"
+            );
+        }
+        assert!(
+            with(
+                "dev:http://kueue.example/mcp=kueue.read,spoke:http://kueue.example/mcp=kueue.read"
+            )
+            .is_ok()
+        );
     }
 
     /// Without SPIRE the issuer serves people only: no agent audiences are needed, the key may come
