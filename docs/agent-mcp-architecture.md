@@ -212,10 +212,10 @@ with the same key and the same `iss`.
 | `sandbox` | when known | absent | The sandbox name from its `Sandbox` resource |
 | `workdir` | when bound | absent | The workspace path inside the sandbox |
 | `kube_user` | when known | always | The Kubernetes username on the cluster of the audience |
-| `kube_cluster` | absent | yes | The cluster of the audience. No server reads it today |
+| `kube_cluster` | the run's cluster | yes | The cluster the token acts on. A server started with `--cluster` refuses a token naming another, so a token for one cluster's URL does not work at the same URL on another |
 | `namespace` | on a `[kueue]` cluster | absent | The default namespace for `crucible-kueue` |
 
-The agent token is built in `crucible-controller/src/agent_auth/issuer.rs:782`. The people token is
+The agent token is built in `crucible-controller/src/agent_auth/issuer.rs:820`. The people token is
 built in `crucible-controller/src/agent_auth/people.rs:299`.
 
 Note: Claims name identity only. There is no role and no queue list in a token. Each resource
@@ -409,9 +409,10 @@ The steps are these:
 7. The assertion has a numeric `iat`, not more than 30 seconds in the future.
 8. `exp` minus `iat` is not more than 900 seconds.
 9. `sub` is `<gateway prefix><gateway id>/sandbox/<sandbox id>` for the prefix of that cluster.
-10. The requested `audience` is one of `CONTROLLER_AGENT_AUDIENCES`.
-11. A bind record exists for the sandbox id, and its loop pod is in the `running` state.
-12. The cluster of the run is the cluster whose SPIRE signed the assertion.
+10. A bind record exists for the sandbox id, and its loop pod is in the `running` state.
+11. The cluster of the run is the cluster whose SPIRE signed the assertion.
+12. The requested `audience` is an entry of `CONTROLLER_AGENT_AUDIENCES` that serves the run's
+    cluster: one bound to that cluster, or a bare one.
 13. The gateway id in the SPIFFE ID is the gateway id of the bound loop pod.
 14. The run has a launcher (`dispatched_by` is `user:<login>`).
 15. Each requested scope is in the audience entry. A request with no scope gets all the scopes
@@ -1522,7 +1523,7 @@ never sees it. Without a push repository or without the authfile, `push` is refu
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | `900` | Agent token lifetime, 900 to 1800. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | `<issuer>/oauth/token` | Where supervisors reach the token endpoint, for a spoke that reaches the controller through a route. |
 | `CONTROLLER_AGENT_SPIRE` | unset | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. A run gets agent tools only on a cluster listed here. Unset: the issuer serves people only, mints no agent tokens, grants no agent tools and stamps no dispatchers. |
-| `CONTROLLER_AGENT_AUDIENCES` | unset | Comma-separated `<resource url>=<scope> <scope>`. Necessary with `CONTROLLER_AGENT_SPIRE`. A bare URL grants no scopes. A run gets a server only when the server URL is a resource here: the `crucible-kueue` Service URL `http://crucible-kueue.<namespace>.svc.<cluster domain>:8850/mcp`, or `http://host.openshell.internal:8848/mcp` for `buildit`. The run records the scopes of that entry. |
+| `CONTROLLER_AGENT_AUDIENCES` | unset | Comma-separated `[<cluster>:]<resource url>=<scope> <scope>`. Necessary with `CONTROLLER_AGENT_SPIRE`. A URL with no `=` grants no scopes. With `<cluster>:` the entry serves runs on that cluster only, and the same URL may appear once per cluster; without it the entry serves every cluster. A run gets a server only when the server URL is a resource here: the `crucible-kueue` Service URL `http://crucible-kueue.<namespace>.svc.<cluster domain>:8850/mcp`, or `http://host.openshell.internal:8848/mcp` for `buildit`. The run records the scopes of that entry. |
 | `CONTROLLER_PEOPLE_AUDIENCES` | unset | Comma-separated `<cluster>:<resource url>=<scope> <scope>`. Enables people tokens. Each resource once. |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | `900` | People token lifetime, 1 to 3600. |
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | unset | A TOML file of `[[clients]]` with `client_id`, `name`, `redirect_uris` and optional `resources`. It replaces the built-in `claude-code`, `pi` and `codex`. Unset: the built-in clients (section 4.1.2). |
@@ -1616,6 +1617,7 @@ Each flag also has a `CRUCIBLE_KUEUE_*` environment variable (`crucible-kueue/sr
 | `--run-issuer` | at least one of the two issuer flags | `<issuer>=<jwks uri>` of run tokens. |
 | `--person-issuer` | unset | `<issuer>=<jwks uri>` of people tokens. Needs `--resource` and `--kube-authz`. |
 | `--resource` | required | The canonical MCP URLs; `aud` must name one. |
+| `--cluster` | unset | The cluster this server acts on. A token's `kube_cluster` must name it. Unset: any cluster. Set it on each cluster when several serve the same URL. |
 | `--jwks-ca` | unset | Extra CA bundle for JWKS hosts. |
 | `--insecure-jwks-http` | false | Allows plain-http JWKS off loopback. |
 | `--tool-policy` | unset | The CEL tool policy file. |

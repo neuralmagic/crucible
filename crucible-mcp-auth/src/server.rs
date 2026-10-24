@@ -120,6 +120,9 @@ pub struct ResourceServerConfig {
     /// Advertised in the protected-resource metadata.
     pub scopes_supported: Vec<String>,
     pub resource_name: Option<String>,
+    /// The cluster this server acts on. When set, a token's `kube_cluster` must name it, so a
+    /// token minted for the same URL on another cluster is refused.
+    pub cluster: Option<String>,
 }
 
 pub struct ResourceServer {
@@ -222,6 +225,17 @@ impl ResourceServer {
         };
         let audiences: Vec<&str> = self.config.resources.iter().map(Url::as_str).collect();
         let claims = trusted.verifier.verify(token, &audiences).await?;
+        if let Some(expected) = &self.config.cluster {
+            let presented = claims
+                .get("kube_cluster")
+                .and_then(serde_json::Value::as_str);
+            if presented != Some(expected.as_str()) {
+                return Err(TokenError::Cluster {
+                    expected: expected.clone(),
+                    presented: presented.map(str::to_string),
+                });
+            }
+        }
         Ok(Principal::from_claims(claims, trusted.callers)?)
     }
 
@@ -450,6 +464,45 @@ mod tests {
         );
         assert_eq!(p.namespace.as_deref(), Some("team-e2e"));
         assert_eq!(p.claims["queues"], json!(["crucible-e2e"]));
+    }
+
+    /// A server bound to a cluster takes only tokens naming it in `kube_cluster`.
+    #[tokio::test]
+    async fn a_server_bound_to_a_cluster_refuses_tokens_for_another() {
+        let jwks = JwksServer::start(vec![jwk("a")]).await;
+        let mut config = testing::config(jwks.url.clone());
+        config.cluster = Some("spoke-a".into());
+        let rs = ResourceServer::with_jwks(config, |t| {
+            crate::jwks::Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
+                .with_timing(LONG, Duration::ZERO)
+        });
+        let for_cluster = |cluster: Option<&str>| {
+            with(run_claims(), |c| match cluster {
+                Some(cluster) => {
+                    c.insert("kube_cluster".into(), json!(cluster));
+                }
+                None => {
+                    c.remove("kube_cluster");
+                }
+            })
+        };
+        rs.validate(&sign("a", &for_cluster(Some("spoke-a"))))
+            .await
+            .unwrap();
+        for other in [Some("spoke-b"), None] {
+            assert!(
+                matches!(
+                    rs.validate(&sign("a", &for_cluster(other))).await,
+                    Err(TokenError::Cluster { .. })
+                ),
+                "{other:?}"
+            );
+        }
+        let (_jwks, unbound) = server_with(vec![jwk("a")]).await;
+        unbound
+            .validate(&sign("a", &for_cluster(Some("spoke-b"))))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

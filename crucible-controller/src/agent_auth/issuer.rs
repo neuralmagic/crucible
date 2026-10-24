@@ -88,6 +88,10 @@ pub enum ConfigError {
         path: String,
         source: jsonwebtoken::errors::Error,
     },
+    #[error(
+        "CONTROLLER_AGENT_AUDIENCES entry {0:?} is neither <url>=<scopes> nor <cluster>:<url>=<scopes>"
+    )]
+    AudienceCluster(String),
 }
 
 /// The controller's issuer identifier: an http(s) origin, compared to `iss` and `aud` as an exact
@@ -249,14 +253,41 @@ impl std::str::FromStr for ClusterSpire {
 pub struct Audience {
     /// The resource URL, compared to the requested `audience` as an exact string.
     pub resource: String,
+    /// The only cluster whose runs get tokens for it; `None` for runs on any cluster.
+    pub cluster: Option<String>,
     pub scopes: Vec<String>,
 }
 
-/// `<resource url>=<scope> <scope> ...`; a bare URL grants no scopes.
+impl Audience {
+    /// Whether a run on `cluster` may get tokens for this audience.
+    pub fn serves(&self, cluster: &str) -> bool {
+        self.cluster.as_deref().is_none_or(|c| c == cluster)
+    }
+}
+
+/// `[<cluster>:]<resource url>=<scope> <scope> ...`; a bare URL grants no scopes. Without a cluster
+/// the audience serves runs on every cluster.
 impl std::str::FromStr for Audience {
     type Err = ConfigError;
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let raw = raw.trim();
+        let (cluster, raw) = match raw.starts_with("http://") || raw.starts_with("https://") {
+            true => (None, raw),
+            false => {
+                let (cluster, rest) = raw
+                    .split_once(':')
+                    .ok_or_else(|| ConfigError::AudienceCluster(raw.to_string()))?;
+                let label = !cluster.is_empty()
+                    && cluster
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+                if !label {
+                    return Err(ConfigError::AudienceCluster(raw.to_string()));
+                }
+                (Some(cluster.to_string()), rest)
+            }
+        };
         let (resource, scopes) = raw.split_once('=').unwrap_or((raw, ""));
         let resource = resource.trim();
         Url::parse(resource).map_err(|source| ConfigError::Url {
@@ -266,6 +297,7 @@ impl std::str::FromStr for Audience {
         })?;
         Ok(Self {
             resource: resource.to_string(),
+            cluster,
             scopes: scopes.split_whitespace().map(str::to_string).collect(),
         })
     }
@@ -482,9 +514,10 @@ pub enum AssertionError {
 pub enum GrantError {
     #[error("no audience requested; ask for one of {allowed:?}")]
     NoAudience { allowed: Vec<String> },
-    #[error("audience {requested:?} is not one of {allowed:?}")]
+    #[error("audience {requested:?} is not one of {allowed:?} for runs on cluster {cluster}")]
     Audience {
         requested: String,
+        cluster: String,
         allowed: Vec<String>,
     },
     #[error(
@@ -756,17 +789,22 @@ impl AgentIssuer {
         })
     }
 
-    /// The requested audience, when it is an allowlisted MCP resource.
-    pub fn audience(&self, requested: Option<&str>) -> Result<&Audience, GrantError> {
-        let allowed = || self.audiences.iter().map(|a| a.resource.clone()).collect();
+    /// The requested audience, when it is an MCP resource allowlisted for runs on `cluster`.
+    pub fn audience(
+        &self,
+        requested: Option<&str>,
+        cluster: &str,
+    ) -> Result<&Audience, GrantError> {
+        let serving = || self.audiences.iter().filter(|a| a.serves(cluster));
+        let allowed = || serving().map(|a| a.resource.clone()).collect();
         let requested = requested
             .filter(|r| !r.is_empty())
             .ok_or_else(|| GrantError::NoAudience { allowed: allowed() })?;
-        self.audiences
-            .iter()
+        serving()
             .find(|a| a.resource == requested)
             .ok_or_else(|| GrantError::Audience {
                 requested: requested.to_string(),
+                cluster: cluster.to_string(),
                 allowed: allowed(),
             })
     }
@@ -792,6 +830,7 @@ impl AgentIssuer {
             "jti": jti,
             "act": {"sub": grant.sandbox.spiffe_id},
             "run_id": grant.run.pod_name,
+            "kube_cluster": grant.run.cluster,
             "scope": scope,
         });
         if let Some(map) = claims.as_object_mut() {
@@ -1124,23 +1163,85 @@ mod tests {
     async fn only_an_allowlisted_audience_is_granted() {
         let spire = Spire::start().await;
         let issuer = testing::issuer(&spire, &EcKey::generate());
-        assert_eq!(issuer.audience(Some(KUEUE)).unwrap().resource, KUEUE);
+        assert_eq!(issuer.audience(Some(KUEUE), "hub").unwrap().resource, KUEUE);
         assert_eq!(
-            issuer.audience(Some(BUILDIT)).unwrap().scopes,
+            issuer.audience(Some(BUILDIT), "hub").unwrap().scopes,
             ["buildit.read", "buildit.build"]
         );
         assert!(matches!(
-            issuer.audience(None),
+            issuer.audience(None, "hub"),
             Err(GrantError::NoAudience { .. })
         ));
         assert!(matches!(
-            issuer.audience(Some("")),
+            issuer.audience(Some(""), "hub"),
             Err(GrantError::NoAudience { .. })
         ));
         assert!(matches!(
-            issuer.audience(Some(&format!("{KUEUE}/"))),
+            issuer.audience(Some(&format!("{KUEUE}/")), "hub"),
             Err(GrantError::Audience { .. })
         ));
+    }
+
+    /// The issuer grants a cluster-bound audience only to runs on its cluster.
+    #[tokio::test]
+    async fn a_cluster_bound_audience_is_granted_on_its_cluster_only() {
+        let spire = Spire::start().await;
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.audiences = parse_list(&format!(
+            "spoke-a:{KUEUE}=kueue.read,{BUILDIT}=buildit.read"
+        ))
+        .unwrap();
+        let issuer = AgentIssuer::new(cfg, |_| {
+            crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        });
+        assert_eq!(
+            issuer.audience(Some(KUEUE), "spoke-a").unwrap().scopes,
+            ["kueue.read"]
+        );
+        match issuer.audience(Some(KUEUE), "spoke-b") {
+            Err(GrantError::Audience {
+                cluster, allowed, ..
+            }) => {
+                assert_eq!(cluster, "spoke-b");
+                assert_eq!(allowed, [BUILDIT], "only what spoke-b's runs may get");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(issuer.audience(Some(BUILDIT), "spoke-b").is_ok());
+    }
+
+    /// A cluster-bound audience serves runs on that cluster only, and the same URL can be bound
+    /// to each cluster on its own; a bare one serves every cluster.
+    #[test]
+    fn audiences_bind_to_a_cluster_or_serve_all() {
+        let url = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
+        let entries: Vec<Audience> = parse_list(&format!(
+            "spoke-a:{url}=kueue.read kueue.submit,spoke-b:{url}=kueue.read,{BUILDIT}=buildit.read"
+        ))
+        .unwrap();
+        assert_eq!(entries[0].cluster.as_deref(), Some("spoke-a"));
+        assert_eq!(entries[0].resource, url);
+        assert_eq!(entries[2].cluster, None);
+        let on = |cluster: &str| {
+            entries
+                .iter()
+                .find(|a| a.resource == url && a.serves(cluster))
+                .map(|a| a.scopes.clone())
+        };
+        assert_eq!(
+            on("spoke-a"),
+            Some(vec!["kueue.read".to_string(), "kueue.submit".to_string()])
+        );
+        assert_eq!(on("spoke-b"), Some(vec!["kueue.read".to_string()]));
+        assert_eq!(on("spoke-c"), None);
+        assert!(entries[2].serves("spoke-c"));
+        for bad in [
+            "Spoke:http://a.example/mcp",
+            ":http://a.example/mcp",
+            "spoke-a",
+        ] {
+            assert!(bad.parse::<Audience>().is_err(), "{bad}");
+        }
     }
 
     fn kueue() -> Audience {
@@ -1285,6 +1386,7 @@ mod tests {
                 "exp": at + MIN_TOKEN_TTL_SECS,
                 "act": {"sub": format!("{PREFIX}{POD}/sandbox/sbx-1")},
                 "run_id": "crucible-run-brave-otter",
+                "kube_cluster": "dev",
                 "sandbox": "ci-0123abcd",
                 "workdir": "/sandbox/repo",
                 "scope": "kueue.read kueue.submit",
@@ -1480,10 +1582,12 @@ mod tests {
             [
                 Audience {
                     resource: KUEUE.into(),
+                    cluster: None,
                     scopes: vec!["kueue.read".into(), "kueue.submit".into()],
                 },
                 Audience {
                     resource: BUILDIT.into(),
+                    cluster: None,
                     scopes: vec!["buildit.read".into(), "buildit.build".into()],
                 },
             ]

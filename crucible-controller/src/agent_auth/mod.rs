@@ -349,7 +349,6 @@ async fn issue(
             )) => OAuthError::Server(format!("SPIRE keys unavailable: {e}")),
             e => OAuthError::InvalidClient(e.to_string()),
         })?;
-    let audience = state.issuer.audience(req.audience.as_deref())?;
     let run = bindings::resolve(&state.pool, &sandbox.id)
         .await
         .map_err(|e| match e {
@@ -371,6 +370,9 @@ async fn issue(
             sandbox.id, sandbox.gateway, run.pod_name
         )));
     }
+    let audience = state
+        .issuer
+        .audience(req.audience.as_deref(), &run.cluster)?;
     let launcher = issuer::launcher(&run)?;
     let kueue = profile.kueue.as_ref();
     let namespace = kueue.and_then(|k| issuer::default_namespace(k, &run.cluster));
@@ -582,6 +584,7 @@ mod tests {
                 required_scopes: vec!["kueue.read".into()],
                 scopes_supported: Vec::new(),
                 resource_name: None,
+                cluster: None,
             },
             |t| crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), t.jwks_uri.clone()),
         );

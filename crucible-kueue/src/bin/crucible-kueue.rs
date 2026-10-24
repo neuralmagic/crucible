@@ -49,6 +49,10 @@ struct Cli {
         requires = "kube_authz"
     )]
     person_issuers: Vec<TrustedIssuer>,
+    /// The cluster this server acts on, as the issuer names it: a token's `kube_cluster` must
+    /// name it. Unset, tokens for any cluster the issuer names are accepted.
+    #[arg(long = "cluster", env = "CRUCIBLE_KUEUE_CLUSTER")]
+    cluster: Option<String>,
     /// This server's canonical MCP URLs; an access token's aud must name one.
     #[arg(
         long = "resource",
@@ -279,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
         required_scopes: vec![SCOPE_READ.to_string()],
         scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_SUBMIT.to_string()],
         resource_name: Some("crucible-kueue".to_string()),
+        cluster: cli.cluster,
     };
     let tls = JwksTls {
         ca_bundle: cli.jwks_ca,

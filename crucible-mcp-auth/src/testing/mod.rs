@@ -114,6 +114,7 @@ pub fn config(jwks_uri: Url) -> ResourceServerConfig {
         required_scopes: vec!["kueue.read".into()],
         scopes_supported: vec!["kueue.read".into(), "kueue.submit".into()],
         resource_name: Some("crucible-kueue".into()),
+        cluster: None,
     }
 }
 

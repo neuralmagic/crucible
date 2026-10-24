@@ -168,6 +168,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
                 required_scopes: vec![SCOPE_READ.to_string()],
                 scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
                 resource_name: Some("buildit".to_string()),
+                cluster: None,
             };
             let tls = JwksTls {
                 ca_bundle: args.jwks_ca,
@@ -1910,6 +1911,7 @@ mod tests {
             required_scopes: vec![SCOPE_READ.to_string()],
             scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
             resource_name: Some("buildit".to_string()),
+            cluster: None,
         };
         let broker = Broker {
             oidc: Some(Arc::new(
@@ -2333,6 +2335,7 @@ mod tests {
             required_scopes: vec![SCOPE_READ.to_string()],
             scopes_supported: vec![SCOPE_READ.to_string(), SCOPE_BUILD.to_string()],
             resource_name: Some("buildit".to_string()),
+            cluster: None,
         };
         let broker = Broker {
             oidc: Some(Arc::new(

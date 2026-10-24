@@ -331,6 +331,7 @@ async fn serve_kueue(kube: kube::Client, controller: &str) -> String {
         required_scopes: vec!["kueue.read".into()],
         scopes_supported: vec!["kueue.read".into(), "kueue.submit".into()],
         resource_name: Some("crucible-kueue".into()),
+        cluster: None,
     };
     let http = cluster::routes_http(cluster::ingress_ip());
     let server = ResourceServer::with_jwks(config, |t| Jwks::new(http.clone(), t.jwks_uri.clone()));

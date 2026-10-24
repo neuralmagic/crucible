@@ -55,7 +55,11 @@ impl AgentTokens {
         self.clusters
             .iter()
             .any(|c| c == cluster)
-            .then(|| self.audiences.iter().find(|a| a.resource == url))
+            .then(|| {
+                self.audiences
+                    .iter()
+                    .find(|a| a.resource == url && a.serves(cluster))
+            })
             .flatten()
     }
 }

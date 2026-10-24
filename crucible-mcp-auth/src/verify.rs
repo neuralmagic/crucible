@@ -39,6 +39,11 @@ pub enum TokenError {
     Rejected(jsonwebtoken::errors::Error),
     #[error(transparent)]
     Claims(#[from] ClaimsError),
+    #[error("token is for cluster {presented:?}, not {expected}")]
+    Cluster {
+        expected: String,
+        presented: Option<String>,
+    },
 }
 
 /// Verifies tokens minted by one issuer.
