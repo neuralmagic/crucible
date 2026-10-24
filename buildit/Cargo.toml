@@ -39,6 +39,7 @@ url.workspace = true
 
 
 [dev-dependencies]
+cel = { workspace = true, features = ["json"] }
 crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3.5", features = ["client", "transport-streamable-http-client-reqwest"] }

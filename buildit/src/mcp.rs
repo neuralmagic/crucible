@@ -2608,6 +2608,186 @@ mod tests {
         assert!(err.to_string().contains("--push-repo"), "{err:#}");
     }
 
+    /// Each validation of `deploy/builder-admission.yaml` against `pod`: the messages of those that
+    /// refuse it.
+    fn refused_by_admission(pod: &serde_json::Value) -> Vec<String> {
+        let policy: serde_json::Value =
+            serde_norway::from_str(include_str!("../deploy/builder-admission.yaml")).unwrap();
+        let object = crucible_mcp_auth::policy::cel_value(pod).unwrap();
+        policy["spec"]["validations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| {
+                let program = cel::Program::compile(v["expression"].as_str().unwrap()).unwrap();
+                let mut context = cel::Context::default();
+                context.add_variable_from_value("object", object.clone());
+                match program.execute(&context) {
+                    Ok(cel::Value::Bool(true)) => None,
+                    Ok(cel::Value::Bool(false)) => Some(v["message"].as_str().unwrap().to_string()),
+                    other => Some(format!("{}: {other:?}", v["expression"])),
+                }
+            })
+            .collect()
+    }
+
+    /// The builder namespace's admission policy admits the pod buildit makes, and nothing that
+    /// could reach the node from there.
+    #[tokio::test]
+    async fn the_builder_admission_policy_admits_buildits_pod_and_no_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let broker = broker(offline_client(), &tokens(dir.path(), ""), None);
+        let id = BuildId::parse("buildit-1").unwrap();
+        let pod = serde_json::to_value(broker.builder_pod(&sandbox_caller("sb-a"), &id).unwrap())
+            .unwrap();
+        assert_eq!(refused_by_admission(&pod), Vec::<String>::new());
+
+        let escape = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut p = pod.clone();
+            edit(&mut p);
+            p
+        };
+        let escapes: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "privileged",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["securityContext"]["privileged"] =
+                        serde_json::json!(true)
+                }),
+            ),
+            (
+                "added capability",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["securityContext"]["capabilities"] =
+                        serde_json::json!({"add": ["SYS_ADMIN"]})
+                }),
+            ),
+            (
+                "root",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["securityContext"]["runAsUser"] =
+                        serde_json::json!(0)
+                }),
+            ),
+            (
+                "no user",
+                escape(&|p| {
+                    p["spec"]["containers"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("securityContext");
+                }),
+            ),
+            (
+                "seccomp off",
+                escape(&|p| {
+                    p["spec"]["containers"][0]["securityContext"]["seccompProfile"] =
+                        serde_json::json!({"type": "Unconfined"})
+                }),
+            ),
+            (
+                "another image",
+                escape(&|p| p["spec"]["containers"][0]["image"] = serde_json::json!("alpine")),
+            ),
+            (
+                "a second container",
+                escape(&|p| {
+                    p["spec"]["containers"].as_array_mut().unwrap().push(
+                        serde_json::json!({"name": "x", "image": "quay.io/buildah/stable:latest"}),
+                    )
+                }),
+            ),
+            (
+                "an init container",
+                escape(&|p| {
+                    p["spec"]["initContainers"] =
+                        serde_json::json!([{"name": "x", "image": "quay.io/buildah/stable:latest"}])
+                }),
+            ),
+            (
+                "an ephemeral container",
+                escape(&|p| {
+                    p["spec"]["ephemeralContainers"] =
+                        serde_json::json!([{"name": "x", "image": "alpine"}])
+                }),
+            ),
+            (
+                "hostPath",
+                escape(&|p| {
+                    p["spec"]["volumes"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({"name": "root", "hostPath": {"path": "/"}}))
+                }),
+            ),
+            (
+                "hostNetwork",
+                escape(&|p| p["spec"]["hostNetwork"] = serde_json::json!(true)),
+            ),
+            (
+                "hostPID",
+                escape(&|p| p["spec"]["hostPID"] = serde_json::json!(true)),
+            ),
+            (
+                "hostIPC",
+                escape(&|p| p["spec"]["hostIPC"] = serde_json::json!(true)),
+            ),
+            (
+                "a token",
+                escape(&|p| p["spec"]["automountServiceAccountToken"] = serde_json::json!(true)),
+            ),
+            (
+                "another account",
+                escape(&|p| p["spec"]["serviceAccountName"] = serde_json::json!("crucible-spoke")),
+            ),
+            (
+                "no label",
+                escape(&|p| {
+                    p["metadata"]["labels"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("buildit.dev/managed-by");
+                }),
+            ),
+            (
+                "apparmor elsewhere",
+                escape(&|p| {
+                    p["metadata"]["annotations"]["container.apparmor.security.beta.kubernetes.io/x"] =
+                        serde_json::json!("unconfined")
+                }),
+            ),
+            (
+                "apparmor profile",
+                escape(&|p| {
+                    p["metadata"]["annotations"]["container.apparmor.security.beta.kubernetes.io/builder"] =
+                        serde_json::json!("localhost/anything")
+                }),
+            ),
+            (
+                "pod apparmor field",
+                escape(&|p| {
+                    p["spec"]["securityContext"] =
+                        serde_json::json!({"appArmorProfile": {"type": "Unconfined"}})
+                }),
+            ),
+        ];
+        for (name, escaped) in escapes {
+            assert!(
+                !refused_by_admission(&escaped).is_empty(),
+                "{name} was admitted"
+            );
+        }
+        let unconfined_field = escape(&|p| {
+            p["spec"]["containers"][0]["securityContext"]["appArmorProfile"] =
+                serde_json::json!({"type": "Unconfined"})
+        });
+        assert_eq!(
+            refused_by_admission(&unconfined_field),
+            Vec::<String>::new(),
+            "the API server may mirror the annotation into the field"
+        );
+    }
+
     #[tokio::test]
     async fn builder_pods_carry_no_credentials_and_end_at_the_deadline() {
         let dir = tempfile::tempdir().unwrap();

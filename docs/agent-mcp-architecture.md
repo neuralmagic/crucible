@@ -1537,6 +1537,38 @@ namespace admits no ingress to builder pods, and egress only to DNS (UDP and TCP
 A NetworkPolicy matches IP networks, not host names: to keep `RUN` steps away from in-cluster
 services, list the registries' networks, or add the cluster's pod and service networks as `except`.
 
+The loop account may create any pod in the buildit namespace, and builder pods need AppArmor
+unconfined, so that namespace cannot enforce Pod Security `baseline`. Without more, pack code could
+create a privileged pod, mount the node's `/` or join its network, and from the node reach every
+other run. The loop render therefore also emits a ValidatingAdmissionPolicy and its binding to the
+buildit namespace, both named `<namespace>-buildit-builders`, from
+`buildit/deploy/builder-admission.yaml` (`builder_admission`, `crucible/src/deploy/render/kube.rs`).
+It admits a pod there only when:
+
+- it carries `buildit.dev/managed-by=mcp`;
+- it runs one container, `builder`, from `quay.io/buildah/stable:latest`, with no init or
+  ephemeral containers;
+- the container is not privileged, adds no capabilities, runs as a non-root `runAsUser`, and keeps
+  its seccomp profile;
+- it shares no host network, PID or IPC namespace, and mounts only `emptyDir` volumes;
+- it runs as the `default` account with `automountServiceAccountToken: false`;
+- AppArmor is set only as buildit sets it: the annotation for `builder`, `unconfined` (or the
+  matching `appArmorProfile` field on that container).
+
+The policy needs Kubernetes 1.30 or later. buildit's tests evaluate its own builder pod against the
+same file and expect it to pass, and expect each escape above to fail
+(`the_builder_admission_policy_admits_buildits_pod_and_no_escape`, `buildit/src/mcp.rs`), so the
+policy and the builder cannot drift apart.
+
+On OpenShift, SCC admission does the same job when the builder pods' account (`default` in the
+buildit namespace) can use only an SCC no broader than this: `allowPrivilegedContainer: false`,
+`allowedCapabilities: []`, `allowHostNetwork`, `allowHostPID`, `allowHostIPC` and
+`allowHostDirVolumePlugin` false, `volumes: [emptyDir]`, `runAsUser: MustRunAsNonRoot`, and the
+unconfined AppArmor annotation allowed. Do not grant that account, or the loop account, `anyuid`
+or `privileged`; the loop account's pods in that namespace run as whatever account the pod names,
+so every account there needs the same bound. The ValidatingAdmissionPolicy applies on OpenShift
+too, so both hold.
+
 ### 8.5 The push path
 
 `push` publishes a build that succeeded to one repository only: `--push-repo`, for example

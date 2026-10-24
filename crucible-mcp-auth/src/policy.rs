@@ -399,7 +399,7 @@ fn evaluate(program: &Program, claims: &cel::Value, args: &Value) -> Result<cel:
 
 /// JSON to CEL with every integer that fits `int` as `int`, so `args.replicas <= 8` compares
 /// like with like (serde would make non-negative JSON integers `uint`).
-fn cel_value(v: &Value) -> Result<cel::Value, String> {
+pub fn cel_value(v: &Value) -> Result<cel::Value, String> {
     cel::to_value(CelJson(v)).map_err(|e| e.to_string())
 }
 

@@ -9,6 +9,7 @@ use crate::openshell::grpc::GATEWAY_PORT;
 use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{DELIVERY_BUDGET_BYTES, PackFilePath, encode_tarball, walk_dir};
 use forge::fleet::ClusterEntry;
+use k8s_openapi::api::admissionregistration::v1 as admission;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::networking::v1 as networking;
 use k8s_openapi::api::rbac::v1 as rbac;
@@ -380,6 +381,13 @@ pub fn render(
         let yaml = serde_norway::to_string(&policy)
             .context("serializing the builder pods' NetworkPolicy")?;
         out.push_str(&format!("---\n{yaml}"));
+    }
+    if let Some((policy, binding)) = r.builder_admission()? {
+        let policy = serde_norway::to_string(&policy)
+            .context("serializing the builder pods' admission policy")?;
+        let binding = serde_norway::to_string(&binding)
+            .context("serializing the builder pods' admission policy binding")?;
+        out.push_str(&format!("---\n{policy}---\n{binding}"));
     }
     // Pack delivery: append the ConfigMap carrying the pack files. Last so a baked-domain render (no
     // pack) keeps its exact three-doc [pod, rbac, netpol] layout, the controller extracts by `kind`,
@@ -1804,6 +1812,49 @@ exit $rc
         })
     }
 
+    /// With `[buildit]`, the ValidatingAdmissionPolicy that admits only buildit-shaped builder pods
+    /// (`buildit/deploy/builder-admission.yaml`), and its binding to buildit's namespace. Both are
+    /// cluster-scoped, named after the namespace.
+    fn builder_admission(
+        &self,
+    ) -> Result<
+        Option<(
+            admission::ValidatingAdmissionPolicy,
+            admission::ValidatingAdmissionPolicyBinding,
+        )>,
+    > {
+        let Some(buildit) = &self.profile.buildit else {
+            return Ok(None);
+        };
+        let name = format!("{}-{BUILDER_ADMISSION}", buildit.namespace);
+        let mut policy: admission::ValidatingAdmissionPolicy =
+            serde_norway::from_str(BUILDER_ADMISSION_POLICY)
+                .context("parsing buildit's builder admission policy")?;
+        policy.metadata.name = Some(name.clone());
+        let binding = admission::ValidatingAdmissionPolicyBinding {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                ..Default::default()
+            },
+            spec: Some(admission::ValidatingAdmissionPolicyBindingSpec {
+                policy_name: Some(name),
+                validation_actions: Some(vec!["Deny".to_string()]),
+                match_resources: Some(admission::MatchResources {
+                    namespace_selector: Some(LabelSelector {
+                        match_labels: Some(BTreeMap::from([(
+                            "kubernetes.io/metadata.name".to_string(),
+                            buildit.namespace.to_string(),
+                        )])),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+        };
+        Ok(Some((policy, binding)))
+    }
+
     /// A Role named `name` in `namespace` with `rules`, bound to `cluster.sandbox_readers`.
     fn reader_grant(
         &self,
@@ -1850,6 +1901,12 @@ exit $rc
 
 /// The builder pods' NetworkPolicy in `[buildit] namespace`.
 pub const BUILDER_NETPOL: &str = "buildit-builders";
+
+/// The suffix of the builder pods' admission policy and binding, after `[buildit] namespace`.
+pub const BUILDER_ADMISSION: &str = "buildit-builders";
+
+const BUILDER_ADMISSION_POLICY: &str =
+    include_str!("../../../../buildit/deploy/builder-admission.yaml");
 
 /// A typed wrapper so `sandbox_rbac()` can return a mixed vec of RBAC objects and they all
 /// serialize through one `serde_norway::to_string` call.
@@ -4940,6 +4997,56 @@ mod tests {
         assert!(netpol.contains("- Ingress"), "policyTypes: {netpol}");
         // No Egress lockdown.
         assert!(!netpol.contains("- Egress"), "no egress: {netpol}");
+    }
+
+    /// With `[buildit]`, the builder namespace gets the admission policy buildit ships, bound to
+    /// that namespace alone; without it, no policy.
+    #[test]
+    fn builder_pods_are_admitted_by_buildits_policy_in_its_namespace_only() {
+        let manifest = k8s_manifest();
+        let yaml = render_k8s_manifest(
+            &manifest,
+            &k8s_profile(
+                "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n",
+            ),
+        );
+        let docs: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&yaml)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .collect();
+        let kind = |k: &str| {
+            docs.iter()
+                .find(|d| d["kind"] == k)
+                .unwrap_or_else(|| panic!("no {k}: {yaml}"))
+        };
+        let policy = kind("ValidatingAdmissionPolicy");
+        let shipped: serde_json::Value = serde_norway::from_str(BUILDER_ADMISSION_POLICY).unwrap();
+        assert_eq!(
+            policy["metadata"]["name"],
+            "crucible-builds-buildit-builders"
+        );
+        assert_eq!(
+            policy["spec"], shipped["spec"],
+            "buildit's policy, unchanged"
+        );
+        assert_eq!(policy["spec"]["failurePolicy"], "Fail");
+        let binding = kind("ValidatingAdmissionPolicyBinding");
+        assert_eq!(
+            binding["metadata"]["name"],
+            "crucible-builds-buildit-builders"
+        );
+        assert_eq!(
+            binding["spec"],
+            serde_json::json!({
+                "policyName": "crucible-builds-buildit-builders",
+                "validationActions": ["Deny"],
+                "matchResources": {"namespaceSelector": {"matchLabels": {
+                    "kubernetes.io/metadata.name": "crucible-builds"}}},
+            })
+        );
+        assert!(
+            !render_k8s_manifest(&manifest, &k8s_profile("")).contains("ValidatingAdmissionPolicy"),
+            "no policy without [buildit]"
+        );
     }
 
     /// Under podman the render is byte-identical to before: no `--compute-driver` flag, no
