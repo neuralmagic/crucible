@@ -72,7 +72,7 @@ impl AgentAuth {
             &profile
                 .agent_servers()
                 .context("reading the deploy profile's agent servers")?,
-        );
+        )?;
         let namespace = placement::controller_namespace();
         match issuer_cfg.spire.is_empty() {
             false => placement::check_key_placement(namespace.as_deref(), &profile)?,

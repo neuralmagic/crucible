@@ -94,6 +94,11 @@ pub enum ConfigError {
         "CONTROLLER_AGENT_AUDIENCES entry {0:?} is not <cluster>:<url>=<scopes>; every agent audience names the cluster whose runs get it"
     )]
     AudienceCluster(String),
+    #[error(
+        "CONTROLLER_AGENT_AUDIENCES lists {resource} for cluster {cluster}, but the deploy profile \
+         describes no server there ([kueue], [buildit] or [[agent_servers]])"
+    )]
+    Undescribed { cluster: String, resource: String },
     #[error("CONTROLLER_AGENT_AUDIENCES lists {resource} for cluster {cluster} twice")]
     AudienceTwice { cluster: String, resource: String },
     #[error("{var} is set, but CONTROLLER_AGENT_ISSUER is not; it does nothing without the issuer")]
@@ -321,19 +326,23 @@ pub struct Audience {
 }
 
 impl Audience {
-    /// This audience with what the server at its URL needs in a token, as the deploy profile
-    /// describes the server. A URL no description names needs nothing.
-    pub fn described_by(self, servers: &[ServerSpec]) -> Self {
+    /// This audience with what the server at its URL on its cluster needs in a token, as the
+    /// deploy profile describes the server; an audience no description names is dead
+    /// configuration and refused.
+    pub fn described_by(self, servers: &[ServerSpec]) -> Result<Self, ConfigError> {
         let described = servers
             .iter()
-            .find(|s| s.url == self.resource && s.serves(&self.cluster));
+            .find(|s| same_url(&s.url, &self.resource) && s.serves(&self.cluster));
         match described {
-            Some(s) => Self {
+            Some(s) => Ok(Self {
                 requires_kube_user: s.requires_kube_user,
                 namespaces: s.namespaces.clone(),
                 ..self
-            },
-            None => self,
+            }),
+            None => Err(ConfigError::Undescribed {
+                cluster: self.cluster,
+                resource: self.resource,
+            }),
         }
     }
 
@@ -417,16 +426,16 @@ pub struct AgentIssuerConfig {
 
 impl AgentIssuerConfig {
     /// The same settings, each audience with the token needs of the server `servers` describe at
-    /// its URL.
-    pub fn described_by(self, servers: &[ServerSpec]) -> Self {
-        Self {
+    /// its URL on its cluster; an audience none describes is refused.
+    pub fn described_by(self, servers: &[ServerSpec]) -> Result<Self, ConfigError> {
+        Ok(Self {
             audiences: self
                 .audiences
                 .into_iter()
                 .map(|a| a.described_by(servers))
-                .collect(),
+                .collect::<Result<_, _>>()?,
             ..self
-        }
+        })
     }
 }
 
@@ -1518,27 +1527,34 @@ mod tests {
             .unwrap()
             .agent_servers()
             .unwrap();
-        let kueue = kueue().described_by(&servers);
+        let kueue = kueue().described_by(&servers).unwrap();
         assert!(kueue.requires_kube_user);
         assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);
-        let elsewhere: Audience = format!("hub:{KUEUE}=kueue.read").parse().unwrap();
-        let elsewhere = elsewhere.described_by(&servers);
+        let buildit = buildit().described_by(&servers).unwrap();
+        assert!(!buildit.requires_kube_user && buildit.namespaces.is_empty());
+        let respelled: Audience = format!(
+            "{CLUSTER}:{}=kueue.read",
+            KUEUE.replace("http://crucible-kueue", "HTTP://Crucible-Kueue")
+        )
+        .parse()
+        .unwrap();
         assert!(
-            !elsewhere.requires_kube_user && elsewhere.namespaces.is_empty(),
-            "the profile's server runs on {CLUSTER}, not hub"
+            respelled.described_by(&servers).unwrap().requires_kube_user,
+            "URLs are compared once parsed"
         );
         for undescribed in [
-            buildit(),
-            "dev:http://mcp.example/mcp=x.read"
-                .parse::<Audience>()
-                .unwrap(),
+            format!("hub:{KUEUE}=kueue.read"),
+            format!("{CLUSTER}:http://mcp.example/mcp=x.read"),
         ] {
-            let undescribed = undescribed.described_by(&servers);
-            assert!(!undescribed.requires_kube_user, "{}", undescribed.resource);
             assert!(
-                undescribed.namespaces.is_empty(),
-                "{}",
-                undescribed.resource
+                matches!(
+                    undescribed
+                        .parse::<Audience>()
+                        .unwrap()
+                        .described_by(&servers),
+                    Err(ConfigError::Undescribed { .. })
+                ),
+                "{undescribed}: the profile's servers are on {CLUSTER} only"
             );
         }
     }

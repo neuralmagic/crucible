@@ -218,9 +218,7 @@ mod tests {
                 "{namespace}"
             );
         }
-        let building = profile(&format!(
-            "{PROFILE}[buildit]\nnamespace = \"builds\"\nrun_issuer = \"http://ctl.ns.svc:8080\"\n"
-        ));
+        let building = profile(PROFILE);
         assert_eq!(
             check_key_placement(Some("builds"), &building),
             Err(PlacementError::KeyExposed {
@@ -238,9 +236,7 @@ mod tests {
 
     #[test]
     fn spire_must_run_where_no_pack_reachable_namespace_is() {
-        let building = profile(&format!(
-            "{PROFILE}[buildit]\nnamespace = \"builds\"\nrun_issuer = \"http://ctl.ns.svc:8080\"\n"
-        ));
+        let building = profile(PROFILE);
         let spire = |namespace: &str| -> crate::agent_auth::issuer::ClusterSpire {
             format!("dev=https://oidc.example spiffe://td/openshell/gateway/ {namespace}/oidc:443")
                 .parse()

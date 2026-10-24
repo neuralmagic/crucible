@@ -429,7 +429,9 @@ The steps are these:
 16. When the audience requires a `kube_user` (the profile describes its server as one that
     authorizes as `kube_user`, as `[kueue]` does), it is known for the launcher on the run's
     cluster. For other audiences, the token omits an unknown `kube_user`, and the controller logs
-    a warning (`Audience::described_by`, `crucible-controller/src/agent_auth/issuer.rs`).
+    a warning. Every audience is described: at startup the controller refuses one for which the
+    profile describes no server at that URL on that cluster, comparing URLs once parsed
+    (`Audience::described_by`, `crucible-controller/src/agent_auth/issuer.rs`).
 
 Note: Pack code holds the run CA's client certificate, so it can make its gateway create
 sandboxes and request a token for any audience on its run's cluster, with that audience's

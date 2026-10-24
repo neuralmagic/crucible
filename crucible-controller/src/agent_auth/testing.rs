@@ -42,6 +42,11 @@ namespace = "crucible-system"
 workload_namespace = "crucible-kueue-e2e"
 run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
 kube_authz = "openshift"
+[buildit]
+cluster = "dev"
+namespace = "builds"
+run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
+url = "http://host.openshell.internal:8849/mcp"
 "#;
 
 pub fn now() -> u64 {
@@ -307,7 +312,9 @@ pub fn agent_auth(
             .collect(),
         adopted: Default::default(),
     });
-    let described = config(&EcKey::generate()).described_by(&profile.agent_servers().unwrap());
+    let described = config(&EcKey::generate())
+        .described_by(&profile.agent_servers().unwrap())
+        .unwrap();
     let state = crate::agent_auth::AgentAuth {
         issuer: AgentIssuer::new(described, |_| {
             Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
