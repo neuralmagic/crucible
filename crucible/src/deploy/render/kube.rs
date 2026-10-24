@@ -1769,6 +1769,14 @@ exit $rc
     /// egress only to DNS and `[buildit] egress`.
     fn builder_netpol(&self) -> Option<networking::NetworkPolicy> {
         let buildit = self.profile.buildit.as_ref()?;
+        let unfenced = buildit.unfenced_egress();
+        if !unfenced.is_empty() {
+            tracing::warn!(
+                networks = ?unfenced,
+                "[buildit] egress reaches every address with no except: builds can reach the \
+                 API server and in-cluster services; except the cluster's pod and service networks"
+            );
+        }
         let port = |port: u16, protocol: &str| networking::NetworkPolicyPort {
             port: Some(IntOrString::Int(port.into())),
             protocol: Some(protocol.to_string()),

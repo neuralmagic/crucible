@@ -367,6 +367,17 @@ impl BuilditCfg {
         self.clusters.iter().any(|c| c == cluster)
     }
 
+    /// The `[buildit] egress` networks that reach every address (`0.0.0.0/0`, `::/0`) with no
+    /// `except`: builder pods' `RUN` steps can then reach the cluster's API server and in-cluster
+    /// services on those ports.
+    pub fn unfenced_egress(&self) -> Vec<&str> {
+        self.egress
+            .iter()
+            .filter(|e| e.except.is_empty() && matches!(e.cidr.as_str(), "0.0.0.0/0" | "::/0"))
+            .map(|e| e.cidr.as_str())
+            .collect()
+    }
+
     /// The port buildit listens on in the loop pod: its URL's.
     pub fn port(&self) -> u16 {
         self.url
@@ -1446,6 +1457,34 @@ mod tests {
             "#
         ))
         .expect("profile parses")
+    }
+
+    #[test]
+    fn builder_egress_to_everywhere_without_except_is_unfenced() {
+        let buildit = |extra: &str| -> BuilditCfg {
+            toml::from_str(&format!(
+                "namespace = \"builds\"\nrun_issuer = \"http://ctl.ns.svc:8080\"\n{extra}"
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            buildit("").unfenced_egress(),
+            ["0.0.0.0/0", "::/0"],
+            "the default"
+        );
+        assert!(
+            buildit(
+                "egress = [{ cidr = \"0.0.0.0/0\", except = [\"10.0.0.0/8\", \"172.30.0.0/16\"] }]"
+            )
+            .unfenced_egress()
+            .is_empty()
+        );
+        assert!(
+            buildit("egress = [{ cidr = \"203.0.113.0/24\" }]")
+                .unfenced_egress()
+                .is_empty(),
+            "a registry's network"
+        );
     }
 
     #[test]

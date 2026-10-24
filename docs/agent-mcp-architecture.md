@@ -1542,7 +1542,13 @@ no OpenShell sandbox around it. The loop render's NetworkPolicy `buildit-builder
 namespace admits no ingress to builder pods, and egress only to DNS (UDP and TCP 53 and 5353) and to
 `[buildit] egress`, by default TCP 443 anywhere, for the registries a build pulls from and pushes to.
 A NetworkPolicy matches IP networks, not host names: to keep `RUN` steps away from in-cluster
-services, list the registries' networks, or add the cluster's pod and service networks as `except`.
+services, list the registries' networks, or add as `except` the cluster's pod network, its service
+network (which holds the API server's ClusterIP, the `kubernetes` Service in `default`, such as
+`172.30.0.1` on OpenShift or `10.96.0.1` on kubeadm), and the API server's own addresses when it
+is reached outside the service network. The pod and service networks are in `oc get
+network.config cluster -o yaml` on OpenShift, or the kube-controller-manager's `--cluster-cidr`
+and `--service-cluster-ip-range`. The loop render logs a warning when an egress entry reaches
+`0.0.0.0/0` or `::/0` with no `except`, as the default does (`BuilditCfg::unfenced_egress`).
 
 The loop account may create any pod in the buildit namespace, and builder pods need AppArmor
 unconfined, so that namespace cannot enforce Pod Security `baseline`. Without more, pack code could
