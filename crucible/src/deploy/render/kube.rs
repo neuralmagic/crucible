@@ -372,6 +372,10 @@ pub fn render(
             out.push_str(&format!("---\n{yaml}"));
         }
     }
+    for obj in r.buildit_rbac() {
+        let yaml = serde_norway::to_string(&obj).context("serializing buildit RBAC")?;
+        out.push_str(&format!("---\n{yaml}"));
+    }
     // Pack delivery: append the ConfigMap carrying the pack files. Last so a baked-domain render (no
     // pack) keeps its exact three-doc [pod, rbac, netpol] layout, the controller extracts by `kind`,
     // never by index, so ordering is free here.
@@ -1695,6 +1699,46 @@ exit $rc
             ));
         }
         objects
+    }
+
+    /// With `[buildit]`, the loop account's rights over buildit's builder pods in the loop namespace:
+    /// create, watch and delete them, exec into them, and read their logs.
+    fn buildit_rbac(&self) -> Vec<SandboxRbacObject> {
+        if self.profile.buildit.is_none() {
+            return Vec::new();
+        }
+        let cluster = &self.profile.cluster;
+        let name = format!("{}-buildit", cluster.service_account);
+        let rule = |resources: &[&str], verbs: &[&str]| rbac::PolicyRule {
+            api_groups: Some(vec![String::new()]),
+            resources: Some(resources.iter().map(|r| r.to_string()).collect()),
+            verbs: verbs.iter().map(|v| v.to_string()).collect(),
+            ..Default::default()
+        };
+        let role = rbac::Role {
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                namespace: Some(cluster.loop_namespace.clone()),
+                ..Default::default()
+            },
+            rules: Some(vec![
+                rule(&["pods"], &["create", "delete", "get", "list", "watch"]),
+                rule(&["pods/exec"], &["create", "get"]),
+                rule(&["pods/log"], &["get"]),
+            ]),
+        };
+        let binding = role_binding(
+            name.clone(),
+            cluster.loop_namespace.clone(),
+            "Role",
+            &name,
+            cluster.service_account.clone(),
+            cluster.loop_namespace.clone(),
+        );
+        vec![
+            SandboxRbacObject::Role(role),
+            SandboxRbacObject::RoleBinding(binding),
+        ]
     }
 
     /// A Role named `name` in `namespace` with `rules`, bound to `cluster.sandbox_readers`.
@@ -4715,6 +4759,34 @@ mod tests {
         let with_buildit =
             k8s_profile("[buildit]\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n");
         let yaml = render_k8s_manifest(&manifest, &with_buildit);
+        let docs: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&yaml)
+            .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
+            .collect();
+        let named = |kind: &str| {
+            docs.iter()
+                .find(|d| {
+                    d["kind"] == kind && d["metadata"]["name"] == "autoresearch-publisher-buildit"
+                })
+                .unwrap_or_else(|| panic!("a buildit {kind}: {yaml}"))
+        };
+        let role = named("Role");
+        assert_eq!(role["metadata"]["namespace"], "autoresearch");
+        assert_eq!(
+            role["rules"],
+            serde_json::json!([
+                {"apiGroups": [""], "resources": ["pods"], "verbs": ["create", "delete", "get", "list", "watch"]},
+                {"apiGroups": [""], "resources": ["pods/exec"], "verbs": ["create", "get"]},
+                {"apiGroups": [""], "resources": ["pods/log"], "verbs": ["get"]},
+            ])
+        );
+        let binding = named("RoleBinding");
+        assert_eq!(binding["roleRef"]["kind"], "Role");
+        assert_eq!(binding["subjects"][0]["name"], "autoresearch-publisher");
+        assert_eq!(binding["subjects"][0]["namespace"], "autoresearch");
+        assert!(
+            !render_k8s_manifest(&manifest, &k8s_profile("")).contains("-buildit"),
+            "no buildit rights without [buildit]"
+        );
         let netpol = yaml
             .split("\n---\n")
             .find(|d| d.contains("kind: NetworkPolicy"))
