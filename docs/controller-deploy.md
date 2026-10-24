@@ -268,8 +268,10 @@ alone; no token is minted per run. A server is granted only on a cluster in
 with the audience's scopes and, for crucible-kueue, the dispatcher's username there, and the run
 page shows it.
 
-The deploy profile's `[kueue] workload_namespace` is the `namespace` claim for runs on its clusters;
-a run elsewhere gets none. `[kueue] run_issuer` must equal `CONTROLLER_AGENT_ISSUER`: the rendered
+The deploy profile describes each server that takes agent tokens (`DeployProfile::agent_servers`):
+`[kueue]` needs a `kube_user` in every token and names `workload_namespaces`, the first as the
+`namespace` claim, for runs on its clusters; `[buildit]` needs neither. An audience the profile does
+not describe gets no `kube_user` requirement and no namespace. `[kueue] run_issuer` must equal `CONTROLLER_AGENT_ISSUER`: the rendered
 server trusts runs' tokens from it, fetching keys from `<run_issuer>/.well-known/jwks.json` unless
 `run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).
 `kube_authz` (`openshift` or `token`) is where the server takes a caller's groups for its

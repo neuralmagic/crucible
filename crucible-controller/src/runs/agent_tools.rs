@@ -70,8 +70,8 @@ impl AgentTool {
 }
 
 fn kueue_tool(cfg: &KueueCfg, cluster: &str, scopes: &[String]) -> AgentTool {
-    let mut limits =
-        BTreeMap::from([("namespace".to_string(), cfg.workload_namespace.to_string())]);
+    let namespaces: Vec<&str> = cfg.workload_namespaces.iter().map(|n| n.as_str()).collect();
+    let mut limits = BTreeMap::from([("namespace".to_string(), namespaces.join(","))]);
     if !cfg.pull_secrets.is_empty() {
         limits.insert("pull_secrets".to_string(), cfg.pull_secrets.join(","));
     }

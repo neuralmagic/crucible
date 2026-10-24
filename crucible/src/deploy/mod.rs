@@ -14,6 +14,7 @@ mod controller;
 pub mod kueue;
 pub mod profile;
 pub mod render;
+pub mod servers;
 
 pub use profile::DeployProfile;
 pub use render::{

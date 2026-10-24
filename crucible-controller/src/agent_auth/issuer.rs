@@ -6,8 +6,8 @@
 
 use crate::agent_auth::bindings::BoundRun;
 use crate::agent_auth::sandbox::{SandboxId, SandboxIdError};
-use crucible::deploy::profile::{KubeName, KueueCfg, check_cluster_name};
-use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
+use crucible::deploy::profile::{KubeName, check_cluster_name};
+use crucible::deploy::servers::ServerSpec;
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::verify::{TokenError, Verifier, unverified_issuer};
 use jsonwebtoken::jwk::{Jwk, JwkSet, PublicKeyUse, ThumbprintHash};
@@ -310,9 +310,30 @@ pub struct Audience {
     /// The only cluster whose runs get tokens for it; `None` for runs on any cluster.
     pub cluster: Option<String>,
     pub scopes: Vec<String>,
+    /// Whether the server authorizes as the token's `kube_user`, so no token is minted without
+    /// one.
+    pub requires_kube_user: bool,
+    /// The namespaces a token names, the first as the default.
+    pub namespaces: Vec<String>,
 }
 
 impl Audience {
+    /// This audience with what the server at its URL needs in a token, as the deploy profile
+    /// describes the server. A URL no description names needs nothing.
+    pub fn described_by(self, servers: &[ServerSpec]) -> Self {
+        let described = servers.iter().find(|s| {
+            s.url == self.resource && self.cluster.as_deref().is_none_or(|c| s.serves(c))
+        });
+        match described {
+            Some(s) => Self {
+                requires_kube_user: s.requires_kube_user,
+                namespaces: s.namespaces.clone(),
+                ..self
+            },
+            None => self,
+        }
+    }
+
     /// Whether a run on `cluster` may get tokens for this audience.
     pub fn serves(&self, cluster: &str) -> bool {
         self.cluster.as_deref().is_none_or(|c| c == cluster)
@@ -348,13 +369,10 @@ impl std::str::FromStr for Audience {
             resource: resource.to_string(),
             cluster,
             scopes: scopes.split_whitespace().map(str::to_string).collect(),
+            requires_kube_user: false,
+            namespaces: Vec::new(),
         })
     }
-}
-
-/// Whether `scope` is one of crucible-kueue's, which it authorizes as the token's `kube_user`.
-pub(crate) fn is_kueue_scope(scope: &str) -> bool {
-    [SCOPE_READ, SCOPE_SUBMIT].contains(&scope)
 }
 
 /// A minted token's lifetime, within [`MIN_TOKEN_TTL_SECS`]..=[`MAX_TOKEN_TTL_SECS`].
@@ -397,6 +415,21 @@ pub struct AgentIssuerConfig {
     pub spire: Vec<ClusterSpire>,
     /// The MCP resources a token may be minted for.
     pub audiences: Vec<Audience>,
+}
+
+impl AgentIssuerConfig {
+    /// The same settings, each audience with the token needs of the server `servers` describe at
+    /// its URL.
+    pub fn described_by(self, servers: &[ServerSpec]) -> Self {
+        Self {
+            audiences: self
+                .audiences
+                .into_iter()
+                .map(|a| a.described_by(servers))
+                .collect(),
+            ..self
+        }
+    }
 }
 
 /// The settings that mean nothing without `CONTROLLER_AGENT_ISSUER`; one set without it is a
@@ -600,12 +633,13 @@ pub enum GrantError {
         grantable: Vec<String>,
     },
     #[error(
-        "launcher {launcher} has no known kubernetes username on cluster {cluster}, which crucible-kueue \
+        "launcher {launcher} has no known kubernetes username on cluster {cluster}, which {audience} \
          requires ({why}); link it under Settings > Cluster identities"
     )]
     NoKubeUser {
         launcher: String,
         cluster: String,
+        audience: String,
         why: String,
     },
     #[error(
@@ -624,14 +658,6 @@ pub enum GrantError {
         run_id: String,
         dispatched_by: Option<String>,
     },
-}
-
-/// The `namespace` claim, crucible-kueue's default namespace for a run's workloads: the deploy
-/// profile's `[kueue] workload_namespace` for a run on that table's cluster, `None` elsewhere.
-pub fn default_namespace(kueue: &KueueCfg, cluster: &str) -> Option<String> {
-    kueue
-        .serves(cluster)
-        .then(|| kueue.workload_namespace.to_string())
 }
 
 /// The launcher a run's token acts for: the login of the person the run was dispatched for.
@@ -683,7 +709,7 @@ pub struct AgentGrant {
     pub run: BoundRun,
     pub audience: String,
     pub scopes: Vec<String>,
-    /// The `namespace` claim, see [`default_namespace`].
+    /// The `namespace` claim: the audience's default namespace.
     pub namespace: Option<String>,
 }
 
@@ -1452,20 +1478,34 @@ mod tests {
         );
         let bare: Audience = KUEUE.parse().unwrap();
         assert!(granted_scopes(None, &bare).unwrap().is_empty());
-        assert!(is_kueue_scope(SCOPE_SUBMIT) && !is_kueue_scope("buildit.build"));
     }
 
     #[test]
-    fn the_default_namespace_comes_from_the_profile_only_on_its_cluster() {
-        let kueue = toml::from_str::<crucible::deploy::DeployProfile>(PROFILE)
+    fn an_audience_takes_its_token_needs_from_the_server_the_profile_describes() {
+        let servers = toml::from_str::<crucible::deploy::DeployProfile>(PROFILE)
             .unwrap()
-            .kueue
-            .unwrap();
-        assert_eq!(
-            default_namespace(&kueue, CLUSTER).as_deref(),
-            Some("crucible-kueue-e2e")
+            .agent_servers();
+        let kueue = kueue().described_by(&servers);
+        assert!(kueue.requires_kube_user);
+        assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);
+        let elsewhere: Audience = format!("hub:{KUEUE}=kueue.read").parse().unwrap();
+        let elsewhere = elsewhere.described_by(&servers);
+        assert!(
+            !elsewhere.requires_kube_user && elsewhere.namespaces.is_empty(),
+            "the profile's server runs on {CLUSTER}, not hub"
         );
-        assert_eq!(default_namespace(&kueue, "hub"), None);
+        for undescribed in [
+            buildit(),
+            "http://mcp.example/mcp=x.read".parse::<Audience>().unwrap(),
+        ] {
+            let undescribed = undescribed.described_by(&servers);
+            assert!(!undescribed.requires_kube_user, "{}", undescribed.resource);
+            assert!(
+                undescribed.namespaces.is_empty(),
+                "{}",
+                undescribed.resource
+            );
+        }
     }
 
     fn run(dispatched_by: Option<&str>) -> BoundRun {
@@ -1752,11 +1792,15 @@ mod tests {
                     resource: KUEUE.into(),
                     cluster: None,
                     scopes: vec!["kueue.read".into(), "kueue.submit".into()],
+                    requires_kube_user: false,
+                    namespaces: vec![],
                 },
                 Audience {
                     resource: BUILDIT.into(),
                     cluster: None,
                     scopes: vec!["buildit.read".into(), "buildit.build".into()],
+                    requires_kube_user: false,
+                    namespaces: vec![],
                 },
             ]
         );

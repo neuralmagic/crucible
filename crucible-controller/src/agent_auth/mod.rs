@@ -68,6 +68,7 @@ impl AgentAuth {
             .await
             .context("reading the deploy profile for the agent issuer")?
             .ok_or(placement::PlacementError::NoProfile)?;
+        let issuer_cfg = issuer_cfg.described_by(&profile.agent_servers());
         let namespace = placement::controller_namespace();
         match issuer_cfg.spire.is_empty() {
             false => placement::check_key_placement(namespace.as_deref(), &profile)?,
@@ -98,7 +99,7 @@ impl AgentAuth {
             issuer = issuer_cfg.issuer.as_str(),
             kid = issuer_cfg.signing_key.kid(),
             spire = ?issuer_cfg.spire.iter().map(|s| (s.cluster.as_str(), s.svid_issuer.as_str())).collect::<Vec<_>>(),
-            audiences = ?issuer_cfg.audiences.iter().map(|a| a.resource.as_str()).collect::<Vec<_>>(),
+            audiences = ?issuer_cfg.audiences.iter().map(|a| (a.resource.as_str(), a.requires_kube_user, a.namespaces.as_slice())).collect::<Vec<_>>(),
             "issuing agent access tokens"
         );
         let keys = |entry: &issuer::ClusterSpire| {
@@ -374,8 +375,7 @@ async fn issue(
         .issuer
         .audience(req.audience.as_deref(), &run.cluster)?;
     let launcher = issuer::launcher(&run)?;
-    let kueue = profile.kueue.as_ref();
-    let namespace = kueue.and_then(|k| issuer::default_namespace(k, &run.cluster));
+    let namespace = audience.namespaces.first().cloned();
     let scopes = issuer::granted_scopes(req.scope.as_deref(), audience)?;
     let resolved =
         crate::identity::cluster_identity::for_login(&state.pool, profile, &run.cluster, &launcher)
@@ -388,10 +388,11 @@ async fn issue(
                 crate::identity::cluster_identity::Resolution::Unavailable(why) => why,
                 _ => format!("{launcher} has not linked a username on {}", run.cluster),
             };
-            if scopes.iter().any(|s| issuer::is_kueue_scope(s)) {
+            if audience.requires_kube_user {
                 return Err(GrantError::NoKubeUser {
                     launcher: launcher.clone(),
                     cluster: run.cluster.clone(),
+                    audience: audience.resource.clone(),
                     why,
                 }
                 .into());

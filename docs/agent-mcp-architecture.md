@@ -74,7 +74,7 @@ Each term has one sense in this document.
 | token grant | The OpenShell provider credential type that tells a supervisor to get a token from a token endpoint with its JWT-SVID. |
 | tool policy | Optional CEL `validate` and `mutate` rules over tool arguments (`crucible-mcp-auth/src/policy.rs`). |
 | turn pod | A short pod for a grounded-rank or scope turn. Under an isolated profile it also gets a gateway pod. |
-| workload namespace | The namespace that `[kueue] workload_namespace` names. It is the default namespace of agent workloads. |
+| workload namespace | A namespace that `[kueue] workload_namespaces` names. The first is the default namespace of agent workloads. |
 
 ## 1. Overview
 
@@ -213,7 +213,7 @@ with the same key and the same `iss`.
 | `workdir` | when bound | absent | The workspace path inside the sandbox |
 | `kube_user` | when known | always | The Kubernetes username on the cluster of the audience |
 | `kube_cluster` | the run's cluster | yes | The cluster the token acts on. A server started with `--cluster` refuses a token naming another, so a token for one cluster's URL does not work at the same URL on another |
-| `namespace` | on a `[kueue]` cluster | absent | The default namespace for `crucible-kueue` |
+| `namespace` | when the audience names namespaces | absent | The audience's first namespace, the default for its server |
 
 The agent token is built in `crucible-controller/src/agent_auth/issuer.rs:820`. The people token is
 built in `crucible-controller/src/agent_auth/people.rs:299`.
@@ -422,8 +422,10 @@ The steps are these:
 14. The run has a launcher (`dispatched_by` is `user:<login>`).
 15. Each requested scope is in the audience entry. A request with no scope gets all the scopes
     of the entry.
-16. When a scope is a `kueue.*` scope, `kube_user` is known for the launcher on the run's cluster.
-    For other audiences, the token omits an unknown `kube_user`, and the controller logs a warning.
+16. When the audience requires a `kube_user` (the profile describes its server as one that
+    authorizes as `kube_user`, as `[kueue]` does), it is known for the launcher on the run's
+    cluster. For other audiences, the token omits an unknown `kube_user`, and the controller logs
+    a warning (`Audience::described_by`, `crucible-controller/src/agent_auth/issuer.rs`).
 
 The controller reads SPIRE keys through the API server Service proxy of each cluster, with the
 same client it dispatches with (`crucible-controller/src/agent_auth/spire.rs:21`). The path is
@@ -1605,7 +1607,7 @@ tokens, the controller does not read them.
 | `[kueue] image` | required | The `crucible-kueue` image. |
 | `[kueue] clusters` or `cluster` | `["hub"]` | The clusters where the server runs. Runs on these clusters get `crucible-kueue` access. |
 | `[kueue] namespace` | required | The server namespace. |
-| `[kueue] workload_namespace` | required | The `namespace` claim, and the only namespace where the server account has workload verbs. |
+| `[kueue] workload_namespaces` (or `workload_namespace` for one) | required, not empty | The namespaces crucible-kueue tokens name, the first as the `namespace` claim, and the only namespaces where the server account has workload verbs. Each gets its Namespace, RoleBinding and `--namespace`. |
 | `[kueue] run_issuer` | required | Must equal `CONTROLLER_AGENT_ISSUER`. |
 | `[kueue] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a server that cannot reach the issuer address. |
 | `[kueue] kube_authz` | required | `openshift` or `token`: where groups come from. |
@@ -2126,7 +2128,7 @@ The stack is single-tenant today in these places:
 | Point | Today | Extension point |
 | --- | --- | --- |
 | Token claims | `sub`, `kube_user`, run and sandbox; no team | Add a `team` claim from crucible teams at mint time (`issuer.rs:782`, `people.rs:299`). The tool policy already sees every claim, so CEL rules can use it at once |
-| Workload namespace | One `[kueue] workload_namespace` for all runs on a cluster | Choose the `namespace` claim per team in `issuer::default_namespace`. The server already serves several namespaces with `--namespace`, and RBAC decides each one |
+| Workload namespaces | `[kueue] workload_namespaces`, the same list for all runs on a cluster | A per-team list in the profile. Tokens already take their namespaces from the audience's description, and the server serves several with `--namespace` |
 | Push repository | One `[buildit] push_repo` | A per-team repository chosen at dispatch and carried in `CRUCIBLE_BUILDIT_PUSH_REPO` |
 | SPIFFE ID | `.../openshell/gateway/<gateway id>/sandbox/<sandbox id>` | A team segment from a label that the controller puts on the gateway pod. `CONTROLLER_AGENT_SPIRE` allows one gateway prefix per cluster, so the issuer must then parse the team after the prefix, or accept several prefixes |
 | Identity rules | One rule per cluster | Rules per group, so that one cluster can trust SSO usernames for some teams and links for others |
@@ -2138,12 +2140,6 @@ The ceiling stays the same in each case: a token can do at most what its `kube_u
 
 ### 13.1 Follow-ups
 
-- Per-audience `requires_kube_user` and `namespace`. The token endpoint refuses a token without
-  a `kube_user` only when a scope is one of crucible-kueue's (`is_kueue_scope`,
-  `crucible-controller/src/agent_auth/issuer.rs:309`), and adds the `namespace` claim from
-  `[kueue]` to every token on that cluster (`default_namespace`, `issuer.rs:582`). Each
-  `CONTROLLER_AGENT_AUDIENCES` entry should say both itself, so a third server that checks RBAC
-  needs configuration, not a scope list in the issuer.
 - `AgentServer` (`crucible-controller/src/runs/agent_tools.rs:20`) is a closed enum of `kueue` and
   `buildit`. A new MCP server needs a variant, its dispatch arm and its UI label. A server
   descriptor from the deploy profile would make it data.

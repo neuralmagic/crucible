@@ -305,8 +305,11 @@ pub fn agent_auth(
             .collect(),
         adopted: Default::default(),
     });
+    let described = config(&EcKey::generate()).described_by(&profile.agent_servers());
     let state = crate::agent_auth::AgentAuth {
-        issuer: issuer(spire, &EcKey::generate()),
+        issuer: AgentIssuer::new(described, |_| {
+            Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
+        }),
         pool: pool.clone(),
         profile,
         directory: directory.clone(),

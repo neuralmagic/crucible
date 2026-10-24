@@ -3,7 +3,7 @@
 //! are bound only in `workload_namespace`; cluster-wide it reads queues and nodes and reviews its
 //! callers' access.
 
-use crate::deploy::profile::{DeployProfile, KubeAuthz, KueueCfg};
+use crate::deploy::profile::{DeployProfile, KubeAuthz, KubeName, KueueCfg};
 use crate::deploy::render::{RenderOpts, pin_image};
 use anyhow::{Context, Result};
 use k8s_openapi::api::apps::v1 as apps;
@@ -36,7 +36,9 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
         docs.push(doc.with_context(|| format!("serializing the crucible-kueue {what}"))?);
         Ok(())
     };
-    push("workload Namespace", yaml(&workload_namespace(cfg)))?;
+    for namespace in &cfg.workload_namespaces {
+        push("workload Namespace", yaml(&workload_namespace(namespace)))?;
+    }
     push("ServiceAccount", yaml(&service_account(cfg)))?;
     push("Deployment", yaml(&deployment(cfg, &image, pull_secret)?))?;
     push("Service", yaml(&service(cfg)))?;
@@ -46,7 +48,12 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts) -> Result<String> {
         yaml(&cluster_role_binding(cfg)),
     )?;
     push("workload ClusterRole", yaml(&workload_cluster_role()))?;
-    push("workload RoleBinding", yaml(&workload_binding(cfg)))?;
+    for namespace in &cfg.workload_namespaces {
+        push(
+            "workload RoleBinding",
+            yaml(&workload_binding(cfg, namespace)),
+        )?;
+    }
     Ok(docs.join("---\n"))
 }
 
@@ -98,8 +105,8 @@ fn role_ref(kind: &str, name: &str) -> rbac::RoleRef {
 }
 
 /// Where agents' workloads run, under Pod Security `restricted`.
-fn workload_namespace(cfg: &KueueCfg) -> core::Namespace {
-    let mut metadata = meta(cfg.workload_namespace.as_str(), None);
+fn workload_namespace(namespace: &KubeName) -> core::Namespace {
+    let mut metadata = meta(namespace.as_str(), None);
     let labels = metadata.labels.get_or_insert_with(BTreeMap::new);
     labels.insert(
         "pod-security.kubernetes.io/enforce".to_string(),
@@ -135,9 +142,10 @@ fn args(cfg: &KueueCfg) -> Result<Vec<String>> {
         cfg.url(),
         "--kube-authz".to_string(),
         cfg.kube_authz.as_str().to_string(),
-        "--namespace".to_string(),
-        cfg.workload_namespace.to_string(),
     ];
+    for namespace in &cfg.workload_namespaces {
+        args.extend(["--namespace".to_string(), namespace.to_string()]);
+    }
     if cfg.people {
         args.extend([
             "--person-issuer".to_string(),
@@ -319,12 +327,9 @@ fn workload_cluster_role() -> rbac::ClusterRole {
     }
 }
 
-fn workload_binding(cfg: &KueueCfg) -> rbac::RoleBinding {
+fn workload_binding(cfg: &KueueCfg, namespace: &KubeName) -> rbac::RoleBinding {
     rbac::RoleBinding {
-        metadata: meta(
-            format!("{NAME}-workloads"),
-            Some(cfg.workload_namespace.as_str()),
-        ),
+        metadata: meta(format!("{NAME}-workloads"), Some(namespace.as_str())),
         role_ref: role_ref("ClusterRole", &format!("{NAME}-workloads")),
         subjects: Some(vec![server_subject(cfg)]),
     }
@@ -535,6 +540,37 @@ mod tests {
                 "cluster-wide, the server only reads and reviews: {rule}"
             );
         }
+    }
+
+    #[test]
+    fn each_workload_namespace_gets_its_namespace_binding_and_flag() {
+        let many = PROFILE.replace(
+            r#"workload_namespace = "crucible-kueue-e2e""#,
+            r#"workload_namespaces = ["team-a", "team-b"]"#,
+        );
+        let docs = docs(&many);
+        for ns in ["team-a", "team-b"] {
+            let namespace = find(&docs, "Namespace", ns);
+            assert_eq!(
+                namespace["metadata"]["labels"]["pod-security.kubernetes.io/enforce"],
+                "restricted"
+            );
+            assert!(docs.iter().any(|d| d["kind"] == "RoleBinding"
+                && d["metadata"]["name"] == "crucible-kueue-workloads"
+                && d["metadata"]["namespace"] == ns));
+        }
+        let args = args(&docs);
+        let served: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "--namespace")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(served, ["team-a", "team-b"]);
+        let empty = PROFILE.replace(
+            r#"workload_namespace = "crucible-kueue-e2e""#,
+            "workload_namespaces = []",
+        );
+        assert!(toml::from_str::<DeployProfile>(&empty).is_err());
     }
 
     #[test]

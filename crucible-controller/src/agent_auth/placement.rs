@@ -94,10 +94,9 @@ pub fn check_key_exposure(
     ];
     if let Some(kueue) = &profile.kueue {
         shared.push(("kueue.namespace", kueue.namespace.as_str()));
-        shared.push((
-            "kueue.workload_namespace",
-            kueue.workload_namespace.as_str(),
-        ));
+        for workloads in &kueue.workload_namespaces {
+            shared.push(("kueue.workload_namespaces", workloads.as_str()));
+        }
     }
     match shared.into_iter().find(|(_, ns)| *ns == namespace) {
         Some((field, _)) => Err(PlacementError::KeyExposed {
@@ -166,7 +165,7 @@ mod tests {
             ("crucible-system", "cluster.loop_namespace"),
             ("rig", "cluster.rig_namespace"),
             ("sandboxes", "cluster.sandbox_namespace"),
-            ("crucible-kueue-e2e", "kueue.workload_namespace"),
+            ("crucible-kueue-e2e", "kueue.workload_namespaces"),
         ] {
             assert_eq!(
                 check_key_placement(Some(namespace), &placed),

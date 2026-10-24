@@ -168,9 +168,11 @@ pub struct KueueCfg {
     pub clusters: Vec<String>,
     /// Namespace of the server's Deployment, Service, and ServiceAccount.
     pub namespace: KubeName,
-    /// The namespace a run's token names as its default, and the only one where the server's own
-    /// account holds workload verbs.
-    pub workload_namespace: KubeName,
+    /// The namespaces runs' tokens name, the first as the default, and the only ones where the
+    /// server's own account holds workload verbs: `workload_namespaces = [...]`, or
+    /// `workload_namespace = "..."` for one.
+    #[serde(alias = "workload_namespace", deserialize_with = "one_or_many_names")]
+    pub workload_namespaces: Vec<KubeName>,
     /// The controller's agent token issuer (`CONTROLLER_AGENT_ISSUER`), compared exactly with a
     /// token's `iss`.
     pub run_issuer: String,
@@ -216,6 +218,23 @@ fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D:
     };
     match list.is_empty() {
         true => Err(serde::de::Error::custom("names no cluster")),
+        false => Ok(list),
+    }
+}
+
+fn one_or_many_names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<KubeName>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(KubeName),
+        Many(Vec<KubeName>),
+    }
+    let list = match OneOrMany::deserialize(d)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    };
+    match list.is_empty() {
+        true => Err(serde::de::Error::custom("names no namespace")),
         false => Ok(list),
     }
 }
@@ -940,10 +959,9 @@ impl DeployProfile {
         ];
         if let Some(kueue) = &self.kueue {
             hosts.push(("kueue.namespace", kueue.namespace.as_str()));
-            guarded.push((
-                "kueue.workload_namespace",
-                kueue.workload_namespace.as_str(),
-            ));
+            for workloads in &kueue.workload_namespaces {
+                guarded.push(("kueue.workload_namespaces", workloads.as_str()));
+            }
         }
         if let Some(sandbox) = &self.cluster.sandbox_namespace {
             guarded.push(("cluster.sandbox_namespace", sandbox.as_str()));
@@ -1422,7 +1440,7 @@ mod tests {
                 "",
                 "workload_namespace = \"loops\"",
                 (
-                    "kueue.workload_namespace",
+                    "kueue.workload_namespaces",
                     "cluster.loop_namespace",
                     "loops",
                 ),
@@ -1430,13 +1448,13 @@ mod tests {
             (
                 "",
                 "workload_namespace = \"rig\"",
-                ("kueue.workload_namespace", "cluster.rig_namespace", "rig"),
+                ("kueue.workload_namespaces", "cluster.rig_namespace", "rig"),
             ),
             (
                 "",
                 "workload_namespace = \"kueue-server\"",
                 (
-                    "kueue.workload_namespace",
+                    "kueue.workload_namespaces",
                     "kueue.namespace",
                     "kueue-server",
                 ),
@@ -1453,7 +1471,11 @@ mod tests {
             (
                 "sandbox_namespace = \"w\"",
                 "workload_namespace = \"w\"",
-                ("kueue.workload_namespace", "cluster.sandbox_namespace", "w"),
+                (
+                    "kueue.workload_namespaces",
+                    "cluster.sandbox_namespace",
+                    "w",
+                ),
             ),
         ];
         for (cluster, kueue, (first, second, ns)) in cases {
@@ -1485,7 +1507,7 @@ mod tests {
             ("loops", "cluster.loop_namespace"),
             ("rig", "cluster.rig_namespace"),
             ("kueue-server", "kueue.namespace"),
-            ("workloads", "kueue.workload_namespace"),
+            ("workloads", "kueue.workload_namespaces"),
             ("sandboxes", "cluster.sandbox_namespace"),
         ] {
             let refused = with_buildit(ns).expect_err(ns);
