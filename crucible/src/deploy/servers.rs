@@ -45,6 +45,8 @@ pub enum ServerSpecError {
     },
     #[error("agent server {name}'s URL {url:?} is not an http(s) URL with a host")]
     Url { name: ServerName, url: String },
+    #[error("an agent server may not be named broker: its gateway provider would be the broker's")]
+    Broker,
     #[error("two agent servers are named {0}")]
     DuplicateName(ServerName),
     #[error("agent servers {first} and {second} both serve {url} on cluster {cluster}")]
@@ -136,6 +138,9 @@ impl DeployProfile {
                     url: s.url.clone(),
                 });
             }
+        }
+        if servers.iter().any(|s| s.name.as_str() == "broker") {
+            return Err(ServerSpecError::Broker);
         }
         for (i, a) in servers.iter().enumerate() {
             for b in &servers[i + 1..] {
@@ -308,6 +313,13 @@ mod tests {
             elsewhere.agent_servers().is_ok(),
             "same URL, another cluster"
         );
+        let broker = profile(&format!(
+            "{KUEUE_AND_BUILDIT}[[agent_servers]]\nname = \"broker\"\nurl = \"http://b.example/mcp\"\n"
+        ));
+        assert!(matches!(
+            broker.agent_servers(),
+            Err(ServerSpecError::Broker)
+        ));
         let ftp = profile(&format!(
             "{KUEUE_AND_BUILDIT}[[agent_servers]]\nname = \"files\"\nurl = \"ftp://files.example/mcp\"\n"
         ));

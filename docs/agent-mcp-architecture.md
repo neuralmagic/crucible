@@ -1693,7 +1693,7 @@ tokens, the controller does not read them.
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
 | `[buildit] quota` | `{ pods = "16", "requests.nvidia.com/gpu" = "0", "requests.amd.com/gpu" = "0" }` | The builder namespace's ResourceQuota `hard` limits. |
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
-| `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry and its URL in `CONTROLLER_AGENT_AUDIENCES`. Names are unique, and no two servers share a URL on a cluster. |
+| `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry and its URL in `CONTROLLER_AGENT_AUDIENCES`. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |
 | `[cluster_link] external_url` | required | The controller URL as browsers reach it. https, or http to loopback. |
 | `[cluster_link] client_id` | `crucible-controller` | The `OAuthClient` name. |
@@ -1716,7 +1716,9 @@ The controller sets these. Do not set them by hand.
 The engine refuses a partial set: servers without the token endpoint or the SVID audience fail
 the turn, and so does a list that does not parse or a server URL without an http(s) host and port
 (`AgentServersError`, `crucible/src/openshell/agent_servers.rs`). No list, or an empty one, gives
-the sandbox no provider, no egress entry and no `.mcp.json` entry.
+the sandbox no provider, no egress entry and no `.mcp.json` entry. A granted server named like the
+turn's broker or one of its `[mcp]` servers fails the turn with an error naming it, rather than one
+silently replacing the other in `.mcp.json` (`AgentServers::check_names`).
 
 ### 9.4 crucible-kueue flags
 

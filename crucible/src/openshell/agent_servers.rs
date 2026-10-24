@@ -10,6 +10,16 @@ use anyhow::Result;
 use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS, LocalServer, Transport};
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "the controller granted MCP server {name:?}, but this turn's {what} has that name too; \
+     rename one so `.mcp.json` and the gateway providers keep them apart"
+)]
+pub struct NameClash {
+    pub name: String,
+    pub what: &'static str,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AgentServersError {
     #[error("{ENV_AGENT_SERVERS} names servers but {missing} is not set; the controller sets both")]
@@ -134,6 +144,31 @@ impl AgentServers {
 
     pub fn iter(&self) -> impl Iterator<Item = &Granted> {
         self.servers.iter()
+    }
+
+    /// Refuse a granted server named like the turn's broker or one of its `[mcp]` servers: their
+    /// `.mcp.json` keys would collide, and a server named `broker` would share the broker's
+    /// gateway provider.
+    pub fn check_names<'a>(
+        &self,
+        broker: Option<&str>,
+        mcp: impl IntoIterator<Item = &'a str>,
+    ) -> Result<(), NameClash> {
+        let mcp: Vec<&str> = mcp.into_iter().collect();
+        for g in &self.servers {
+            let name = g.server.name.as_str();
+            let clash = |what| NameClash {
+                name: name.to_string(),
+                what,
+            };
+            if name == "broker" || broker == Some(name) {
+                return Err(clash("provisioning broker"));
+            }
+            if mcp.contains(&name) {
+                return Err(clash("[mcp] server"));
+            }
+        }
+        Ok(())
     }
 
     /// The token-grant provider profile for `granted`. Its endpoint binds the injected token to
@@ -287,6 +322,34 @@ mod tests {
             assert_eq!(grant.scopes, g.server.scopes);
             assert!(profile.credentials[0].env_vars.is_empty(), "no placeholder");
         }
+    }
+
+    #[test]
+    fn a_granted_server_may_not_share_a_name_with_the_broker_or_a_pack_server() {
+        let servers = granted(&[
+            server("kueue", KUEUE, Transport::Remote),
+            server("docs", "https://docs.example/mcp", Transport::Remote),
+        ]);
+        assert_eq!(servers.check_names(Some("crucible"), ["notes"]), Ok(()));
+        assert_eq!(
+            servers.check_names(Some("docs"), []),
+            Err(NameClash {
+                name: "docs".into(),
+                what: "provisioning broker"
+            })
+        );
+        assert_eq!(
+            servers.check_names(None, ["notes", "kueue"]),
+            Err(NameClash {
+                name: "kueue".into(),
+                what: "[mcp] server"
+            })
+        );
+        let broker = granted(&[server("broker", "https://b.example/mcp", Transport::Remote)]);
+        assert!(
+            broker.check_names(None, []).is_err(),
+            "crucible-broker is the broker's provider"
+        );
     }
 
     #[test]

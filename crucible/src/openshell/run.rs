@@ -398,6 +398,10 @@ async fn try_turn(
     //     server alone. One served in this pod is started first.
     let agent_servers = crate::openshell::agent_servers::AgentServers::from_env()
         .context("reading the run's agent servers")?;
+    agent_servers.check_names(
+        args.broker.enabled.then_some(args.broker.name.as_str()),
+        args.mcp.iter().map(|s| s.key.as_str()),
+    )?;
     for s in agent_servers.iter() {
         tokio::task::block_in_place(|| s.start_local())
             .with_context(|| format!("starting the run's {}", s.server.name))?;
