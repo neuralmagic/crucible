@@ -92,6 +92,8 @@ pub enum ConfigError {
         "CONTROLLER_AGENT_AUDIENCES entry {0:?} is neither <url>=<scopes> nor <cluster>:<url>=<scopes>"
     )]
     AudienceCluster(String),
+    #[error("{var} is set, but CONTROLLER_AGENT_ISSUER is not; it does nothing without the issuer")]
+    NoIssuer { var: &'static str },
 }
 
 /// The controller's issuer identifier: an http(s) origin, compared to `iss` and `aud` as an exact
@@ -350,9 +352,27 @@ pub struct AgentIssuerConfig {
     pub audiences: Vec<Audience>,
 }
 
+/// The settings that mean nothing without `CONTROLLER_AGENT_ISSUER`; one set without it is a
+/// configuration error rather than a silently disabled feature.
+const DEPENDENT_VARS: &[&str] = &[
+    "CONTROLLER_AGENT_SIGNING_KEY",
+    "CONTROLLER_AGENT_SIGNING_KEY_FILE",
+    "CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE",
+    "CONTROLLER_AGENT_TOKEN_TTL_SECS",
+    "CONTROLLER_AGENT_SPIRE",
+    "CONTROLLER_AGENT_AUDIENCES",
+    "CONTROLLER_AGENT_TOKEN_ENDPOINT",
+    "CONTROLLER_PEOPLE_AUDIENCES",
+    "CONTROLLER_PEOPLE_ACCESS_TTL_SECS",
+    "CONTROLLER_PEOPLE_CLIENTS_FILE",
+    "CONTROLLER_PEOPLE_CIMD_HOSTS",
+    "CONTROLLER_PEOPLE_DCR",
+    "CONTROLLER_PEOPLE_TRUSTED_PROXIES",
+];
+
 impl AgentIssuerConfig {
     /// The issuer's configuration from `CONTROLLER_AGENT_*`, `None` when
-    /// `CONTROLLER_AGENT_ISSUER` is unset. A partial configuration is an error. Without
+    /// `CONTROLLER_AGENT_ISSUER` and every setting that needs it are unset. A partial configuration is an error. Without
     /// `CONTROLLER_AGENT_SPIRE` the issuer mints no agent tokens and serves people only. The
     /// signing key is `CONTROLLER_AGENT_SIGNING_KEY` (PEM) or the file
     /// `CONTROLLER_AGENT_SIGNING_KEY_FILE` names.
@@ -363,7 +383,10 @@ impl AgentIssuerConfig {
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>, ConfigError> {
         let get = |var: &str| get(var).filter(|v| !v.trim().is_empty());
         let Some(issuer) = get("CONTROLLER_AGENT_ISSUER") else {
-            return Ok(None);
+            return match DEPENDENT_VARS.iter().find(|var| get(var).is_some()) {
+                Some(var) => Err(ConfigError::NoIssuer { var }),
+                None => Ok(None),
+            };
         };
         let need = |var: &'static str| get(var).ok_or(ConfigError::Missing { var });
         let read = |path: String| {
@@ -1631,6 +1654,18 @@ mod tests {
             AgentIssuerConfig::from_lookup(|_| None).unwrap().is_none(),
             "no issuer, no endpoint"
         );
+        for var in DEPENDENT_VARS {
+            let mut orphaned = vars.clone();
+            orphaned.remove("CONTROLLER_AGENT_ISSUER");
+            orphaned.insert(*var, "x".to_string());
+            assert!(
+                matches!(
+                    AgentIssuerConfig::from_lookup(lookup(&orphaned)),
+                    Err(ConfigError::NoIssuer { .. })
+                ),
+                "{var} without the issuer starts nothing silently"
+            );
+        }
 
         for missing in [
             "CONTROLLER_AGENT_SIGNING_KEY_FILE",

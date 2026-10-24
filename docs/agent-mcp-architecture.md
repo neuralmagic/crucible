@@ -1548,6 +1548,8 @@ never sees it. Without a push repository or without the authfile, `push` is refu
 
 The issuer refuses to start when any of these is true:
 
+- Any other `CONTROLLER_AGENT_*` or `CONTROLLER_PEOPLE_*` variable is set, but
+  `CONTROLLER_AGENT_ISSUER` is not.
 - `CONTROLLER_AGENT_ISSUER` is set, but neither `CONTROLLER_AGENT_SPIRE` nor
   `CONTROLLER_PEOPLE_AUDIENCES` is set.
 - `CONTROLLER_AGENT_SPIRE` is set and the profile is not isolated.
