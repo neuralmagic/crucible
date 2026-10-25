@@ -995,6 +995,12 @@ ID from pod metadata. If pack code can create a pod in the sandbox namespace, it
 SPIFFE ID of any sandbox. When the gateway runs inside the loop pod, the loop service account
 needs pod rights in the sandbox namespace. Pack code runs as that account.
 
+Profile load refuses a `loop_namespace` that is the sandbox namespace, but loop pods run where the
+controller's `CONTROLLER_POD_NAMESPACE` (hub) or a spoke kubeconfig's context namespace puts them.
+So dispatch checks the namespace each run's loop pod actually lands in, and refuses a run with an
+isolated gateway whose loop pod would run in the sandbox namespace, in that cluster's SPIRE
+namespace, or on the hub in the controller's own (`check_loop_namespace`).
+
 So under an isolated profile, the controller starts each run's gateway in a pod of its own, as
 `crucible-openshell-gateway`. That account is the only identity with sandbox rights in the
 sandbox namespace. The gateway stamps its gateway id on every supervisor and `Sandbox` that it

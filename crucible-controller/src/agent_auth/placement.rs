@@ -49,6 +49,15 @@ pub enum PlacementError {
         namespace: String,
         field: &'static str,
     },
+    #[error(
+        "cluster {cluster}'s loop pods run in {namespace:?}, which is also {what}; pack code there \
+         could reach what agent tokens rest on, so runs with isolated gateways are not dispatched"
+    )]
+    LoopExposed {
+        cluster: String,
+        namespace: String,
+        what: String,
+    },
 }
 
 /// The namespaces pack code can create or exec into pods in: loop pods, rigs, sandboxes, buildit's
@@ -97,6 +106,43 @@ pub fn check_spire_exposure(
         }
     }
     Ok(())
+}
+
+/// Refuse a run whose loop pod would land, on `cluster`, in a namespace agent tokens rest on: the
+/// sandbox namespace (pack code could create a pod claiming any sandbox's SPIFFE ID), that
+/// cluster's SPIRE (it could exec in and mint any SVID), or on the hub the controller's own (it
+/// holds the signing key). The profile's `loop_namespace` is checked at load,
+/// but loop pods run where the controller's pod namespace or a spoke kubeconfig puts them.
+pub fn check_loop_namespace(
+    cluster: &str,
+    loop_namespace: &str,
+    profile: &DeployProfile,
+    spire: &[crate::agent_auth::issuer::ClusterSpire],
+    controller_namespace: Option<&str>,
+) -> Result<(), PlacementError> {
+    let mut guarded: Vec<(String, &str)> = vec![(
+        "cluster.sandbox_namespace".to_string(),
+        profile.cluster.sandbox_namespace(),
+    )];
+    for entry in spire.iter().filter(|s| s.cluster == cluster) {
+        guarded.push((
+            "the namespace of its SPIRE (CONTROLLER_AGENT_SPIRE)".to_string(),
+            entry.discovery.namespace.as_str(),
+        ));
+    }
+    if cluster == crate::runs::clusters::HUB_CLUSTER
+        && let Some(own) = controller_namespace.filter(|ns| !ns.is_empty())
+    {
+        guarded.push(("the controller's own namespace".to_string(), own));
+    }
+    match guarded.into_iter().find(|(_, ns)| *ns == loop_namespace) {
+        Some((what, _)) => Err(PlacementError::LoopExposed {
+            cluster: cluster.to_string(),
+            namespace: loop_namespace.to_string(),
+            what,
+        }),
+        None => Ok(()),
+    }
 }
 
 /// The sandbox namespace agent tokens may vouch for, under a profile that isolates each run's
@@ -263,5 +309,60 @@ mod tests {
                 "{namespace}"
             );
         }
+    }
+
+    #[test]
+    fn loop_pods_must_not_land_where_agent_tokens_rest() {
+        let placed = profile(PROFILE);
+        let spire: Vec<crate::agent_auth::issuer::ClusterSpire> = vec![
+            "east=https://oidc.example spiffe://td/openshell/gateway/ spire-east/oidc:443"
+                .parse()
+                .unwrap(),
+        ];
+        let check = |cluster: &str, namespace: &str| {
+            check_loop_namespace(
+                cluster,
+                namespace,
+                &placed,
+                &spire,
+                Some("crucible-controller"),
+            )
+        };
+        assert_eq!(check("hub", "crucible-system"), Ok(()));
+        assert_eq!(check("east", "loops"), Ok(()));
+        for (cluster, namespace, what) in [
+            ("east", "sandboxes", "cluster.sandbox_namespace"),
+            ("hub", "sandboxes", "cluster.sandbox_namespace"),
+            (
+                "east",
+                "spire-east",
+                "the namespace of its SPIRE (CONTROLLER_AGENT_SPIRE)",
+            ),
+            (
+                "hub",
+                "crucible-controller",
+                "the controller's own namespace",
+            ),
+        ] {
+            assert_eq!(
+                check(cluster, namespace),
+                Err(PlacementError::LoopExposed {
+                    cluster: cluster.into(),
+                    namespace: namespace.into(),
+                    what: what.into(),
+                }),
+                "{cluster}/{namespace}"
+            );
+        }
+        assert_eq!(
+            check("hub", "spire-east"),
+            Ok(()),
+            "another cluster's SPIRE namespace is a different namespace"
+        );
+        assert_eq!(
+            check("east", "crucible-controller"),
+            Ok(()),
+            "the signing key lives on the hub"
+        );
     }
 }

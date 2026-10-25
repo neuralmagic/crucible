@@ -863,6 +863,18 @@ pub async fn dispatch_run(
     let namespace = dispatcher
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
+    if let Some(isolated) = isolated {
+        let spire: Vec<crate::agent_auth::issuer::ClusterSpire> =
+            crate::agent_auth::issuer::parse_list(cfg.agent_spire.as_deref().unwrap_or_default())
+                .context("reading CONTROLLER_AGENT_SPIRE")?;
+        crate::agent_auth::placement::check_loop_namespace(
+            &cluster,
+            &namespace,
+            isolated,
+            &spire,
+            crate::agent_auth::placement::controller_namespace().as_deref(),
+        )?;
+    }
     // An isolated gateway's Service address goes into its server certificate, and the loop pod's
     // client material into the run Secret, so both precede the render.
     let mut gateway = None;
