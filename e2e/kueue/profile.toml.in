@@ -12,6 +12,7 @@ sandbox_readers         = ["@CTL_NS@/crucible-controller"]
 sandbox_spiffe_socket   = "/spiffe-workload-api/spire-agent.sock"
 supervisor_image        = "@SUPERVISOR_IMAGE@"
 sandbox_driver          = "kubernetes"
+platform                = "@PLATFORM@"
 # The images are linux/amd64; the script lists every node of another architecture here.
 avoid_nodes             = [@AVOID_NODES@]
 # The controller loop pods reach: run evidence, and the sandbox binds agent tokens need.
@@ -40,7 +41,6 @@ cluster            = "hub"
 namespace          = "@KUEUE_NS@"
 workload_namespace = "@WORKLOAD_NS@"
 run_issuer         = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
-kube_authz         = "openshift"
 pull_secrets       = ["@PULL_SECRET@=@PUSH_REPO@"]
 
 [buildit]

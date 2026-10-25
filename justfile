@@ -178,12 +178,28 @@ revise-loop-e2e:
 # supervisor obtained: a controller in the cluster dispatches e2e/kueue/pack, and the script checks
 # the issued token, the Job and the agent's whoami (scenario in the script header). Images come
 # from Containerfile.runtime-selfcontained, Containerfile.controller-selfcontained on top of it, and
-# Containerfile.kueue, built from this checkout. KEEP=1 leaves everything behind.
-kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo anthropic_base_url anthropic_key_secret sandbox_scc_role="" loop_scc_role="":
+# Containerfile.kueue, built from this checkout. KEEP=1 leaves everything behind. It runs on
+# OpenShift or plain Kubernetes (detected); the script header lists the per-platform values the
+# environment may set (PLATFORM, SPIRE_NS, CLUSTER_QUEUE, ANTHROPIC_KEY_FILE, ...).
+kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo anthropic_base_url anthropic_key_secret="" sandbox_scc_role="" loop_scc_role="":
     CONTEXT={{context}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} PULL_SECRET={{pull_secret}} PUSH_REPO={{push_repo}} \
         ANTHROPIC_BASE_URL={{anthropic_base_url}} ANTHROPIC_KEY_SECRET={{anthropic_key_secret}} \
         SANDBOX_SCC_ROLE={{sandbox_scc_role}} LOOP_SCC_ROLE={{loop_scc_role}} scripts/kueue-e2e.sh
+
+# kueue-e2e on pirate (OpenShift): the EnMaaS key is the crucible-system Secret crucible-enmaas.
+kueue-e2e-pirate loop_image kueue_image controller_image:
+    just kueue-e2e crucible-system/api-openshift-nm-rdu4-corp-redhat-com:6443/wseaton \
+        {{loop_image}} {{kueue_image}} {{controller_image}} quay-wseaton-pull \
+        quay.io/wseaton/crucible-smoke https://api.enmaas.devshift.net crucible-enmaas \
+        crucible-openshell-sandbox-scc crucible-buildah-loop-scc
+
+# kueue-e2e on waldorf (Kubernetes): its ClusterQueue is crucible-queue, and the EnMaaS key comes
+# from ~/.config/enmass, loaded into the e2e's own Secret.
+kueue-e2e-waldorf loop_image kueue_image controller_image:
+    CLUSTER_QUEUE=crucible-queue ANTHROPIC_KEY_FILE=$HOME/.config/enmass \
+        just kueue-e2e coreweave-waldorf {{loop_image}} {{kueue_image}} {{controller_image}} \
+        quay-wseaton-pull quay.io/wseaton/crucible-smoke https://api.enmaas.devshift.net
 
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
 # the full production submit/stream/parse path and print the typed result JSON. `cluster` is a

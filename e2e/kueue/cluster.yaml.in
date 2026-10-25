@@ -5,16 +5,15 @@ kind: Namespace
 metadata:
   name: @WORKLOAD_NS@
   labels:
-    kueue.openshift.io/managed: "true"
     crucible.dev/e2e: kueue
 ---
-apiVersion: kueue.x-k8s.io/v1beta2
+apiVersion: kueue.x-k8s.io/@KUEUE_API@
 kind: LocalQueue
 metadata:
   name: crucible-e2e
   namespace: @WORKLOAD_NS@
 spec:
-  clusterQueue: crucible
+  clusterQueue: @CLUSTER_QUEUE@
 ---
 apiVersion: spire.spiffe.io/v1alpha1
 kind: ClusterSPIFFEID
@@ -23,7 +22,7 @@ metadata:
   labels:
     crucible.dev/e2e: kueue
 spec:
-  className: zero-trust-workload-identity-manager-spire
+  className: @SPIRE_CLASS@
   jwtTtl: 5m
   namespaceSelector:
     matchLabels:
