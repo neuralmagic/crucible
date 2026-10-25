@@ -56,6 +56,10 @@
 # accounts to (an SCC giving the loop pod a writable home).
 # BUILDER_SCC_ROLE (default LOOP_SCC_ROLE) is bound to BUILD_NS's default account, which buildit's
 # builder pods run as; the builder admission policy still bounds what those pods may be.
+# PACK names the pack to launch, default e2e/kueue/pack (the smoke pack above); MAX_COST and
+# MAX_TIME bound its launch (3, 30m). Every pack's prompts get the placeholders filled. The Job,
+# nonce and whoami checks are the smoke pack's; any other pack passes when the controller reports
+# its playbook run done, and every pack gets the token, isolation and leak checks.
 # KEEP=1 leaves everything behind.
 set -euo pipefail
 
@@ -78,6 +82,8 @@ SANDBOX_NS=${SANDBOX_NS:-crucible-kueue-e2e-sandboxes}
 WORKLOAD_NS=crucible-kueue-e2e-workloads
 E2E_LABEL=crucible.dev/e2e=kueue
 CLUSTER_QUEUE=${CLUSTER_QUEUE:-crucible}
+MAX_COST=${MAX_COST:-3}
+MAX_TIME=${MAX_TIME:-30m}
 CTL_PSA=${CTL_PSA:-baseline}
 KUEUE_PSA=${KUEUE_PSA:-restricted}
 LOOP_PSA=${LOOP_PSA:-baseline}
@@ -88,6 +94,9 @@ JOB=crucible-smoke-${NONCE:0:8}
 TIMEOUT_SECS=${TIMEOUT_SECS:-1800}
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PACK=$(cd "${PACK:-$ROOT/e2e/kueue/pack}" && pwd)
+SMOKE=0
+[ "$PACK" = "$ROOT/e2e/kueue/pack" ] && SMOKE=1
 WORK=$(mktemp -d)
 kc() { kubectl --context "$CONTEXT" "$@"; }
 log() { printf '[kueue-e2e] %s\n' "$*" >&2; }
@@ -359,13 +368,29 @@ kc -n "$CTL_NS" exec deploy/postgres -- psql -q -U crucible -d crucible -v ON_ER
      SELECT sub, 'hub', '$LAUNCHER', 'token-review', '$NOW' FROM users WHERE login = '$LAUNCHER'
      ON CONFLICT (sub, cluster) DO UPDATE SET kube_user = EXCLUDED.kube_user" >/dev/null
 
-log "launching e2e/kueue/pack with nonce $NONCE"
-cp -R "$ROOT/e2e/kueue/pack" "$WORK/pack"
-fill "$ROOT/e2e/kueue/pack/prompts/smoke.md" > "$WORK/pack/prompts/smoke.md"
-crux draft-create kueue-e2e --description "build-and-run e2e" >/dev/null
+log "launching $PACK with nonce $NONCE"
+cp -R "$PACK" "$WORK/pack"
+if [ -d "$PACK/prompts" ]; then
+    for prompt in "$PACK"/prompts/*; do
+        [ -f "$prompt" ] && fill "$prompt" > "$WORK/pack/prompts/$(basename "$prompt")"
+    done
+fi
+crux draft-create kueue-e2e --description "kueue e2e: $(basename "$PACK")" >/dev/null
 crux draft-push kueue-e2e "$WORK/pack" --base-version 1 >/dev/null
-crux draft-launch kueue-e2e --max-cost 3 --max-time 30m >/dev/null
+crux draft-launch kueue-e2e --max-cost "$MAX_COST" --max-time "$MAX_TIME" >/dev/null
 
+# The run's loop pod, once it runs: its name is the run's gateway id.
+loop_pod() {
+    kc -n "$LOOP_NS" get pods -o json \
+        | jq -r '[.items[] | select(.metadata.labels["crucible/run"]) | select(.status.phase == "Running")][0].metadata.name // empty'
+}
+# The launch's terminal status, or nothing while it runs.
+launch_ended() {
+    crux playbook-runs --json 2>/dev/null \
+        | jq -r '.[0] | select(.status | IN("done", "parked", "failed", "finished", "cancelled")) | "\(.status)\t\(.parked_reason // "")"'
+}
+
+if [ "$SMOKE" = 1 ]; then
 log "waiting for Job $WORKLOAD_NS/$JOB to succeed"
 deadline=$((SECONDS + TIMEOUT_SECS))
 while :; do
@@ -396,10 +421,21 @@ IMAGE=$(jq -r '.spec.template.spec.containers[0].image' <<<"$job")
 kc -n "$WORKLOAD_NS" logs "job/$JOB" | grep -qx "crucible-smoke-ok $NONCE" \
     || fail "Job $JOB's log does not carry the nonce: $(kc -n "$WORKLOAD_NS" logs "job/$JOB" | tail -5)"
 log "Job $JOB ran $IMAGE and printed the nonce"
+POD=$(loop_pod)
+[ -n "$POD" ] || fail "no running loop pod in $LOOP_NS"
+else
+log "waiting for the run's loop pod"
+deadline=$((SECONDS + TIMEOUT_SECS))
+until POD=$(loop_pod) && [ -n "$POD" ]; do
+    ended=$(launch_ended) || ended=
+    [ -z "$ended" ] || fail "the run ended (${ended%%$'\t'*}) before its loop pod ran: ${ended#*$'\t'}"
+    [ $SECONDS -lt $deadline ] || fail "no loop pod ran within ${TIMEOUT_SECS}s"
+    sleep 10
+done
+RUN=$POD
+fi
 
 log "checking the loop pod carries no kueue token"
-POD=$(kc -n "$LOOP_NS" get pods -o json | jq -r '[.items[] | select(.metadata.labels["crucible/run"])][0].metadata.name')
-[ "$POD" != null ] || fail "no loop pod in $LOOP_NS"
 kueue_env=$(kc -n "$LOOP_NS" get pod "$POD" -o json \
     | jq -r '[.spec.containers[].env[]?.name | select(test("KUEUE"))] | join(",")')
 [ -z "$kueue_env" ] || fail "loop pod $POD has kueue env $kueue_env"
@@ -410,9 +446,9 @@ kc -n "$LOOP_NS" get secrets -o json | jq -e '[.items[].data // {} | keys[] | se
     || fail "a Secret in $LOOP_NS carries a kueue key"
 
 log "waiting for the run to finish"
-deadline=$((SECONDS + 900))
-until crux playbook-runs --json | jq -e '.[0].status | IN("done", "parked", "failed", "finished", "cancelled")' >/dev/null; do
-    [ $SECONDS -lt $deadline ] || fail "the run did not finish"
+deadline=$((SECONDS + TIMEOUT_SECS))
+until ended=$(launch_ended) && [ -n "$ended" ]; do
+    [ $SECONDS -lt $deadline ] || fail "the run did not finish within ${TIMEOUT_SECS}s"
     sleep 10
 done
 CRUN=$(crux runs --json | jq -r '.[0].run_id')
@@ -430,6 +466,7 @@ for aud in "$KUEUE_URL" "http://host.openshell.internal:8848/mcp"; do
     log "issued: $issued"
 done
 
+if [ "$SMOKE" = 1 ]; then
 log "checking the agent's whoami"
 whoami=$(python3 - "$WORK/run-log.json" <<'EOF'
 import json, sys
@@ -453,6 +490,12 @@ EOF
 [ "$(jq -r .run_id <<<"$whoami")" = "$RUN" ] || fail "whoami names another run: $whoami"
 [ "$(jq -r .kube_user <<<"$whoami")" = "$LAUNCHER" ] || fail "whoami names another kube_user: $whoami"
 log "whoami: $whoami"
+else
+    case ${ended%%$'\t'*} in
+        done | finished) log "the run of $(basename "$PACK") ended ${ended%%$'\t'*}" ;;
+        *) fail "the run of $(basename "$PACK") ended ${ended%%$'\t'*}: ${ended#*$'\t'}" ;;
+    esac
+fi
 
 if grep -q CRUCIBLE_KUEUE_TOKEN "$WORK/controller.log" "$WORK/run-log.json"; then
     fail "a static kueue token appears in the run's logs"

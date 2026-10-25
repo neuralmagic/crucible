@@ -2232,6 +2232,12 @@ Security labels). A kubeconfig without a static token has its exec credential pl
 launch token. `just kueue-e2e-pirate` and `just kueue-e2e-waldorf` hold each cluster's values; the
 script header lists them all.
 
+`PACK=<dir>` (a `pack` argument to each recipe) launches another pack instead of the smoke pack,
+bounded by `MAX_COST` and `MAX_TIME`. Its prompts get the same placeholders filled. The Job,
+nonce and `whoami` checks belong to the smoke pack; another pack passes when the controller
+reports its playbook run `done`, and every pack gets the token issuance, loop isolation and leak
+checks.
+
 The harness runs beside a live deployment on the same cluster:
 
 - It uses its own namespaces, which carry the label `crucible.dev/e2e=kueue`.
