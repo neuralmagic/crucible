@@ -198,7 +198,7 @@ kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/p
 # pack compiled in both variants.
 optimize-loop-test:
     python3 -m unittest discover -s examples/optimize-loop/verify
-    SQLX_OFFLINE=true cargo test -q -p crucible --lib the_optimize_loop_example_compiles_both_variants
+    SQLX_OFFLINE=true cargo test -q -p crucible --test optimize_loop_example
 
 # examples/optimize-loop on <name> through the kueue e2e's harness: the agent builds, benchmarks
 # on Kueue and iterates, and the pack's verify task checks its report against the evidence. params
