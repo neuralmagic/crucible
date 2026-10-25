@@ -78,7 +78,7 @@ SANDBOX_NS=${SANDBOX_NS:-crucible-kueue-e2e-sandboxes}
 WORKLOAD_NS=crucible-kueue-e2e-workloads
 E2E_LABEL=crucible.dev/e2e=kueue
 CLUSTER_QUEUE=${CLUSTER_QUEUE:-crucible}
-CTL_PSA=${CTL_PSA:-restricted}
+CTL_PSA=${CTL_PSA:-baseline}
 KUEUE_PSA=${KUEUE_PSA:-restricted}
 LOOP_PSA=${LOOP_PSA:-baseline}
 SANDBOX_PSA=${SANDBOX_PSA:-privileged}
