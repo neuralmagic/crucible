@@ -49,6 +49,20 @@ fn the_login_prefers_preferred_username_then_email_then_the_subject() {
     assert_eq!(login(None, None), "b8c2-uuid-subject");
 }
 
+/// An email the issuer marks unverified is no identity: a user who set someone else's address on an
+/// IdP that allows it must not become that person on an email-claim cluster, or log in as them.
+#[test]
+fn an_email_the_issuer_marks_unverified_is_dropped() {
+    let email = || Some("alice@example.com".to_string());
+    assert_eq!(verified_email(email(), Some(true)), email());
+    assert_eq!(
+        verified_email(email(), None),
+        email(),
+        "absent counts as verified, as the Kubernetes OIDC authenticator treats it"
+    );
+    assert_eq!(verified_email(email(), Some(false)), None);
+}
+
 /// A JWT is the issuer's word; a cluster token is the API server's. The guard must never hand one
 /// to the other's validator.
 #[test]

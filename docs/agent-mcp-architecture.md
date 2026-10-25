@@ -903,7 +903,7 @@ A spoke rule is `[clusters.<name>] identity`. A cluster without a rule is `link`
 | --- | --- | --- |
 | `link` | `identity = "link"` | What the cluster's TokenReview said for a cluster token that the person gave |
 | claim | `identity = { claim = "login" }` | The SSO login of the person |
-| claim | `identity = { claim = "email" }` | The email that the SSO login recorded |
+| claim | `identity = { claim = "email" }` | The email that the SSO login recorded; one the IdP marks `email_verified: false` is not recorded, as the Kubernetes OIDC authenticator refuses it |
 | claim with prefix | `identity = { claim = "login", prefix = "sso:" }` | The prefix, then the claim, as the API server's `--oidc-username-prefix` makes it |
 
 Use a claim rule only when the cluster API server trusts the same SSO for the same people. Use
