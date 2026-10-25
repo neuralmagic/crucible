@@ -1763,7 +1763,8 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         assert_eq!(body["identity"]["source"], "rule");
     }
 
-    /// Error pages carry no form, so nothing they render can post anywhere.
+    /// Error pages carry no form, so nothing they render can post anywhere, and no page may frame
+    /// them.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_refused_request_renders_a_page_that_posts_nowhere(pool: PgPool) {
         let h = harness(&pool).await;
@@ -1777,6 +1778,8 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             .unwrap()
             .to_string();
         assert!(csp.contains("form-action 'none'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert_eq!(refused.headers[header::X_FRAME_OPTIONS], "DENY");
         assert!(!refused.body.contains("<form"), "{}", refused.body);
     }
 

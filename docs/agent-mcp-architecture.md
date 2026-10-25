@@ -787,7 +787,8 @@ The steps are these:
    A session whose group refresh failed counts as no session.
 6. The request waits on the session under a random id. The consent page shows it only to the
    same browser and the same person. The page names the client and shows the `host:port` that
-   the code goes to (section 4.1.5).
+   the code goes to (section 4.1.5). No page may frame it: every SPA response and the authorize
+   page send `X-Frame-Options: DENY` and `Content-Security-Policy: frame-ancestors 'none'`.
 7. The approval resolves `kube_user` for the cluster of the audience. An unlinked `link` cluster
    answers 409. The controller parks the request on the session again, so the page can link
    and try again.
