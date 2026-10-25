@@ -1161,6 +1161,12 @@ With `[cluster] aws_sandbox_role_arn`, the gateway pod gets its own projected to
 `sts.amazonaws.com` audience. The trust policy of that role must allow
 `system:serviceaccount:<sandbox namespace>:crucible-openshell-gateway`.
 
+Pod admission in these namespaces depends on the cluster's platform (section 11.2). The gateway
+and loop pods set no UID: on OpenShift the namespace's SCC assigns one, and on plain Kubernetes
+they run as their image's user, root, so their namespaces enforce Pod Security `baseline` there.
+OpenShell's sandbox and supervisor pods set their own non-root UID, drop every capability and use
+`RuntimeDefault` seccomp, so they would pass `restricted` on either platform.
+
 ### 6.7 Push-only clusters and directly reachable clusters
 
 The controller creates gateway objects, reads `Sandbox` resources and reads SPIRE keys through
@@ -1975,8 +1981,7 @@ the server account:
   - the seven kinds: create, get, list, patch, delete;
   - `pods`, `pods/log`, `events`: get, list.
 
-The workload namespace has the label `pod-security.kubernetes.io/enforce: restricted` and
-`kueue.openshift.io/managed: "true"`.
+The workload namespace's labels follow the cluster's platform (section 11.2.1).
 
 Each person, or the launcher of each run, needs RBAC for what they do. A minimum Role for one
 queue is this:
@@ -2008,6 +2013,30 @@ rules:
 
 Note: `use` is a verb that only `crucible-kueue` asks about. Where a cluster cannot grant it, run
 the server with `--queue-verb get`.
+
+### 11.2.1 OpenShift and plain Kubernetes
+
+Each cluster declares its distribution in its own profile entry, `[cluster] platform` for the hub
+and `[clusters.<name>] platform` for a spoke (`kubernetes` by default). A render for a cluster
+reads only that cluster's entry, so one OpenShift hub can dispatch to an OpenShift spoke and a
+Kubernetes spoke, each rendered for itself; the hub's own platform affects only what is rendered
+for the hub, and the Argo chart handles the hub's ingress and deploy.
+
+| | `platform = "openshift"` (pirate, 4.22) | `platform = "kubernetes"` (waldorf, 1.35) |
+| --- | --- | --- |
+| Pod admission | SCCs, which the operator grants: the sandbox account an SCC for OpenShell's supervisor, the loop account one that gives its pod a writable home, and the buildit namespace's `default` account one for rootless buildah (pirate: `crucible-buildah-loop`, which allows privileged pods; the builder admission policy is the bound) | Pod Security labels, which the operator sets: loop, rig, sandbox and workload namespaces `baseline`, crucible-kueue's namespace `restricted`, the buildit namespace `privileged`, with the builder admission policy as the guard |
+| crucible-kueue workload namespace (rendered) | `pod-security.kubernetes.io/enforce: restricted` (SCCs fill in its fields) and `kueue.openshift.io/managed: "true"` | `enforce: baseline`; no Kueue label: upstream Kueue manages what its `managedJobsNamespaceSelector` admits |
+| crucible-kueue `kube_authz` default | `openshift`: the user's Group objects, plus `system:authenticated` and `system:authenticated:oauth` | `token`: the token's `kube_groups` claim, plus `system:authenticated` |
+| Kubernetes usernames | OAuth usernames (`wseaton`) | what the API server's OIDC mapping makes them, such as an email; labels carry it in label-safe form, its safe characters and a hash |
+| Cluster-token bearer auth (`CONTROLLER_KUBE_USER_AUTH`) | `SelfSubjectReview` | `SelfSubjectReview` |
+| Cluster links | TokenReview paste, or the OpenShift OAuth flow (`[cluster_link]`, an `OAuthClient`) | TokenReview paste only |
+| SPIRE | Zero Trust Workload Identity Manager; its OIDC discovery Service over https on 443 | upstream SPIRE Helm chart; its discovery Service over http on 80 (`http://` before the namespace in `CONTROLLER_AGENT_SPIRE`); a ClusterSPIFFEID must name spire-controller-manager's `className` when it watches no classless entries |
+| Builder admission policy | enforced (OpenShift 4.17+) | enforced (1.30+) |
+
+`crucible-kueue`'s own pod sets every field `restricted` asks for, `RuntimeDefault` seccomp
+included, so its namespace can enforce `restricted` on either platform. API discovery tells the
+platforms apart by `security.openshift.io` (the SCC API); `config.openshift.io` is no evidence, as
+other distributions serve it.
 
 ### 11.3 SPIRE requirements
 
@@ -2191,7 +2220,17 @@ pushes it with `buildit`, and runs it as a Job through `crucible-kueue`. The scr
 - the Job carries the run, launcher and queue labels, and uses only the e2e pull secret;
 - the Job runs an image pushed by digest, succeeded, and printed the nonce;
 - the agent's `whoami` named the same run and `kube_user`;
-- no kueue token appeared in the loop pod env, its Secrets or any log.
+- no kueue token appeared in the loop pod env, its Secrets or any log;
+- the builder admission policy refuses a privileged pod in the buildit namespace.
+
+It runs on OpenShift and plain Kubernetes alike. It detects the platform (`security.openshift.io`
+served or not, or `PLATFORM`) and derives the rest from it, each value overridable: SPIRE's
+namespace, discovery Service, trust domain and JWT issuer (the Zero Trust Workload Identity
+Manager's resources, or the upstream `spire-server` ConfigMap), the ClusterSPIFFEID class, the
+profile's `platform`, the served Kueue API version, and pod admission (SCC role bindings, or Pod
+Security labels). A kubeconfig without a static token has its exec credential plugin run for the
+launch token. `just kueue-e2e-pirate` and `just kueue-e2e-waldorf` hold each cluster's values; the
+script header lists them all.
 
 The harness runs beside a live deployment on the same cluster:
 
