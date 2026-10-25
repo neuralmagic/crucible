@@ -268,6 +268,10 @@ fn deployment(
                 drop: Some(vec!["ALL".to_string()]),
                 ..Default::default()
             }),
+            seccomp_profile: Some(core::SeccompProfile {
+                type_: "RuntimeDefault".to_string(),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         ..Default::default()
@@ -569,6 +573,18 @@ mod tests {
 
     /// A hub on OpenShift dispatching to an OpenShift spoke and a plain Kubernetes spoke renders
     /// each spoke's server for that spoke's platform, never the hub's.
+    /// The server's pod passes Pod Security `restricted` without an SCC to fill fields in.
+    #[test]
+    fn the_server_pod_meets_restricted_pod_security_on_its_own() {
+        let docs = docs(PROFILE);
+        let c = &find(&docs, "Deployment", "crucible-kueue")["spec"]["template"]["spec"]["containers"]
+            [0]["securityContext"];
+        assert_eq!(c["allowPrivilegeEscalation"], false);
+        assert_eq!(c["runAsNonRoot"], true);
+        assert_eq!(c["capabilities"]["drop"], serde_json::json!(["ALL"]));
+        assert_eq!(c["seccompProfile"]["type"], "RuntimeDefault");
+    }
+
     #[test]
     fn one_profile_renders_each_cluster_for_its_own_platform() {
         let fleet = profile(
