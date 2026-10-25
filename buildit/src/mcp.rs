@@ -364,13 +364,35 @@ pub struct Caller {
     pub launched_by: Option<Launcher>,
 }
 
-/// A realm token's `sub`, kept as a label value.
+/// A realm token's `sub` as a label value: itself when it is one, else its label-safe characters
+/// with a hash of the whole appended, so an email subject (`alice@example.com`) still labels its
+/// builds and two subjects never share a label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Launcher(String);
 
 impl Launcher {
-    pub fn parse(raw: &str) -> Option<Self> {
-        is_label_value(raw).then(|| Self(raw.to_string()))
+    pub fn of(raw: &str) -> Self {
+        if is_label_value(raw) {
+            return Self(raw.to_string());
+        }
+        use sha2::Digest;
+        let hash: String = sha2::Sha256::digest(raw.as_bytes())[..5]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let kept: String = raw
+            .chars()
+            .map(|c| match c {
+                'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' | '.' => c,
+                _ => '-',
+            })
+            .take(63 - hash.len() - 1)
+            .collect();
+        let kept = kept.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        match kept.is_empty() {
+            true => Self(hash),
+            false => Self(format!("{kept}-{hash}")),
+        }
     }
 
     pub fn as_str(&self) -> &str {
@@ -397,8 +419,6 @@ pub enum ClaimError {
     Sandbox(String),
     #[error("token claim workdir {0:?} is not an absolute, normal path")]
     Workdir(String),
-    #[error("token subject {0:?} is not a label value")]
-    Subject(String),
     #[error("sandbox {0} has no workdir and BROKER_SANDBOX_WORKDIR is unset")]
     NoWorkdir(String),
     #[error("buildit serves runs only, not people's tokens")]
@@ -860,8 +880,7 @@ impl Broker {
         let workspace = self
             .workspace(workdir)
             .ok_or_else(|| ClaimError::NoWorkdir(sandbox.as_str().to_string()))?;
-        let launched_by = Launcher::parse(&principal.subject)
-            .ok_or_else(|| ClaimError::Subject(principal.subject.clone()))?;
+        let launched_by = Launcher::of(&principal.subject);
         Ok(Caller {
             sandbox,
             workspace,
@@ -1988,14 +2007,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn realm_tokens_without_a_usable_sandbox_or_subject_are_forbidden() {
+    async fn realm_tokens_without_a_usable_sandbox_are_forbidden() {
         let dir = tempfile::tempdir().unwrap();
         let (_jwks, broker) = realm_broker(&tokens(dir.path(), "")).await;
         let cases = [
             ("sandbox", None),
             ("sandbox", Some(serde_json::json!("not a name"))),
             ("workdir", Some(serde_json::json!("relative/path"))),
-            ("sub", Some(serde_json::json!("alice@example.com"))),
         ];
         for (key, value) in cases {
             let mut claims = realm_claims();
@@ -2017,6 +2035,20 @@ mod tests {
                 "{key} = {value:?}"
             );
         }
+        let mut email = realm_claims();
+        email["sub"] = serde_json::json!("alice@example.com");
+        let caller = broker
+            .authenticate(&bearer_header(&crucible_mcp_auth::testing::sign(
+                "a", &email,
+            )))
+            .await
+            .unwrap();
+        let launcher = caller.0.launched_by.unwrap();
+        assert!(
+            launcher.as_str().starts_with("alice-example.com-"),
+            "a subject that is no label value is kept as a label-safe one: {}",
+            launcher.as_str()
+        );
     }
 
     #[tokio::test]
@@ -2906,6 +2938,30 @@ mod tests {
             !refused_on("UPDATE", &swapped).is_empty(),
             "an update cannot swap the image"
         );
+    }
+
+    #[test]
+    fn a_subject_that_is_no_label_value_still_labels_its_builds_distinctly() {
+        assert_eq!(Launcher::of("alice").as_str(), "alice");
+        let email = Launcher::of("weaton@redhat.com");
+        assert!(
+            crate::sandbox::is_label_value(email.as_str()),
+            "{}",
+            email.as_str()
+        );
+        assert!(
+            email.as_str().starts_with("weaton-redhat.com-"),
+            "{}",
+            email.as_str()
+        );
+        assert_ne!(email, Launcher::of("weaton#redhat.com"));
+        let long = Launcher::of(&format!("{}@example.com", "a".repeat(80)));
+        assert!(
+            crate::sandbox::is_label_value(long.as_str()),
+            "{}",
+            long.as_str()
+        );
+        assert!(crate::sandbox::is_label_value(Launcher::of("@@@").as_str()));
     }
 
     #[tokio::test]
