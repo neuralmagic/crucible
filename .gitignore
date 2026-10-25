@@ -35,3 +35,6 @@ images/generated/
 
 # Lean build output for the Veil models.
 formal/.lake/
+
+# Per-cluster e2e values (just kueue-e2e-cluster); the *.env.example files are committed.
+e2e/kueue/clusters/*.env

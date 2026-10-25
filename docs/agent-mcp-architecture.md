@@ -2022,12 +2022,12 @@ reads only that cluster's entry, so one OpenShift hub can dispatch to an OpenShi
 Kubernetes spoke, each rendered for itself; the hub's own platform affects only what is rendered
 for the hub, and the Argo chart handles the hub's ingress and deploy.
 
-| | `platform = "openshift"` (pirate, 4.22) | `platform = "kubernetes"` (waldorf, 1.35) |
+| | `platform = "openshift"` (tested on OpenShift 4.22) | `platform = "kubernetes"` (tested on Kubernetes 1.35) |
 | --- | --- | --- |
-| Pod admission | SCCs, which the operator grants: the sandbox account an SCC for OpenShell's supervisor, the loop account one that gives its pod a writable home, and the buildit namespace's `default` account one for rootless buildah (pirate: `crucible-buildah-loop`, which allows privileged pods; the builder admission policy is the bound) | Pod Security labels, which the operator sets: loop, rig, sandbox and workload namespaces `baseline`, crucible-kueue's namespace `restricted`, the buildit namespace `privileged`, with the builder admission policy as the guard |
+| Pod admission | SCCs, which the operator grants: the sandbox account an SCC for OpenShell's supervisor, the loop account one that gives its pod a writable home, and the buildit namespace's `default` account one for rootless buildah (an SCC broad enough for buildah may allow privileged pods; the builder admission policy is the bound) | Pod Security labels, which the operator sets: loop, rig, sandbox and workload namespaces `baseline`, crucible-kueue's namespace `restricted`, the buildit namespace `privileged`, with the builder admission policy as the guard |
 | crucible-kueue workload namespace (rendered) | `pod-security.kubernetes.io/enforce: restricted` (SCCs fill in its fields) and `kueue.openshift.io/managed: "true"` | `enforce: baseline`; no Kueue label: upstream Kueue manages what its `managedJobsNamespaceSelector` admits |
 | crucible-kueue `kube_authz` default | `openshift`: the user's Group objects, plus `system:authenticated` and `system:authenticated:oauth` | `token`: the token's `kube_groups` claim, plus `system:authenticated` |
-| Kubernetes usernames | OAuth usernames (`wseaton`) | what the API server's OIDC mapping makes them, such as an email; labels carry it in label-safe form, its safe characters and a hash |
+| Kubernetes usernames | OAuth usernames (`alice`) | what the API server's OIDC mapping makes them, such as an email; labels carry it in label-safe form, its safe characters and a hash |
 | Cluster-token bearer auth (`CONTROLLER_KUBE_USER_AUTH`) | `SelfSubjectReview` | `SelfSubjectReview` |
 | Cluster links | TokenReview paste, or the OpenShift OAuth flow (`[cluster_link]`, an `OAuthClient`) | TokenReview paste only |
 | SPIRE | Zero Trust Workload Identity Manager; its OIDC discovery Service over https on 443 | upstream SPIRE Helm chart; its discovery Service over http on 80 (`http://` before the namespace in `CONTROLLER_AGENT_SPIRE`); a ClusterSPIFFEID must name spire-controller-manager's `className` when it watches no classless entries |
@@ -2229,8 +2229,9 @@ namespace, discovery Service, trust domain and JWT issuer (the Zero Trust Worklo
 Manager's resources, or the upstream `spire-server` ConfigMap), the ClusterSPIFFEID class, the
 profile's `platform`, the served Kueue API version, and pod admission (SCC role bindings, or Pod
 Security labels). A kubeconfig without a static token has its exec credential plugin run for the
-launch token. `just kueue-e2e-pirate` and `just kueue-e2e-waldorf` hold each cluster's values; the
-script header lists them all.
+launch token. `just kueue-e2e-cluster <name>` reads a cluster's values from
+`e2e/kueue/clusters/<name>.env`, which git ignores; `openshift.env.example` and
+`kubernetes.env.example` show what each platform needs, and the script header lists every value.
 
 `PACK=<dir>` (a `pack` argument to each recipe) launches another pack instead of the smoke pack,
 bounded by `MAX_COST` and `MAX_TIME`. Its prompts get the same placeholders filled. The Job,
