@@ -2233,11 +2233,12 @@ launch token. `just kueue-e2e-cluster <name>` reads a cluster's values from
 `e2e/kueue/clusters/<name>.env`, which git ignores; `openshift.env.example` and
 `kubernetes.env.example` show what each platform needs, and the script header lists every value.
 
-`PACK=<dir>` (a `pack` argument to each recipe) launches another pack instead of the smoke pack,
-bounded by `MAX_COST` and `MAX_TIME`. Its prompts get the same placeholders filled. The Job,
-nonce and `whoami` checks belong to the smoke pack; another pack passes when the controller
-reports its playbook run `done`, and every pack gets the token issuance, loop isolation and leak
-checks.
+`PACK=<dir>` (a `pack` argument to the recipes) launches another pack instead of the smoke pack,
+bounded by `MAX_COST`, `MAX_TIME` and `TIMEOUT_SECS`, with `PARAMS` as its `--params`. Its prompts
+get the same placeholders filled. The Job, nonce and `whoami` checks belong to the smoke pack;
+another pack passes when its run left at least one Job in the workload namespace and the plan's
+`RESULT_TASK` (default `verify`) ended `pass`. Every pack gets the token issuance, loop isolation
+and leak checks.
 
 The harness runs beside a live deployment on the same cluster:
 

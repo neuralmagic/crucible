@@ -56,10 +56,12 @@
 # accounts to (an SCC giving the loop pod a writable home).
 # BUILDER_SCC_ROLE (default LOOP_SCC_ROLE) is bound to BUILD_NS's default account, which buildit's
 # builder pods run as; the builder admission policy still bounds what those pods may be.
-# PACK names the pack to launch, default e2e/kueue/pack (the smoke pack above); MAX_COST and
-# MAX_TIME bound its launch (3, 30m). Every pack's prompts get the placeholders filled. The Job,
-# nonce and whoami checks are the smoke pack's; any other pack passes when the controller reports
-# its playbook run done, and every pack gets the token, isolation and leak checks.
+# PACK names the pack to launch, default e2e/kueue/pack (the smoke pack above); MAX_COST, MAX_TIME
+# and TIMEOUT_SECS bound it (3, 30m, 1800), and PARAMS (a JSON object of strings) is passed as its
+# --params. Prompts that carry @NONCE@ or the other placeholders get them filled. The Job, nonce
+# and whoami checks are the smoke pack's. Any other pack passes when its run left at least one Job
+# in the workload namespace and the plan's RESULT_TASK (default verify) ended pass. Every pack gets
+# the token, isolation and leak checks.
 # KEEP=1 leaves everything behind.
 set -euo pipefail
 
@@ -84,6 +86,8 @@ E2E_LABEL=crucible.dev/e2e=kueue
 CLUSTER_QUEUE=${CLUSTER_QUEUE:-crucible}
 MAX_COST=${MAX_COST:-3}
 MAX_TIME=${MAX_TIME:-30m}
+PARAMS=${PARAMS:-}
+RESULT_TASK=${RESULT_TASK:-verify}
 CTL_PSA=${CTL_PSA:-baseline}
 KUEUE_PSA=${KUEUE_PSA:-restricted}
 LOOP_PSA=${LOOP_PSA:-baseline}
@@ -377,7 +381,8 @@ if [ -d "$PACK/prompts" ]; then
 fi
 crux draft-create kueue-e2e --description "kueue e2e: $(basename "$PACK")" >/dev/null
 crux draft-push kueue-e2e "$WORK/pack" --base-version 1 >/dev/null
-crux draft-launch kueue-e2e --max-cost "$MAX_COST" --max-time "$MAX_TIME" >/dev/null
+crux draft-launch kueue-e2e --max-cost "$MAX_COST" --max-time "$MAX_TIME" \
+    ${PARAMS:+--params "$PARAMS"} >/dev/null
 
 # The run's loop pod, once it runs: its name is the run's gateway id.
 loop_pod() {
@@ -491,10 +496,13 @@ EOF
 [ "$(jq -r .kube_user <<<"$whoami")" = "$LAUNCHER" ] || fail "whoami names another kube_user: $whoami"
 log "whoami: $whoami"
 else
-    case ${ended%%$'\t'*} in
-        done | finished) log "the run of $(basename "$PACK") ended ${ended%%$'\t'*}" ;;
-        *) fail "the run of $(basename "$PACK") ended ${ended%%$'\t'*}: ${ended#*$'\t'}" ;;
-    esac
+    jobs=$(kc -n "$WORKLOAD_NS" get jobs -l "crucible.dev/run-id=$RUN" -o name | wc -l | tr -d ' ')
+    [ "$jobs" -ge 1 ] || fail "the run of $(basename "$PACK") left no Job in $WORKLOAD_NS (it ended ${ended%%$'\t'*})"
+    crux graph "$CRUN" --json > "$WORK/graph.json"
+    result=$(jq -r --arg t "$RESULT_TASK" '[.results[]? | select(.task == $t)] | last | .status // empty' "$WORK/graph.json")
+    [ "$result" = pass ] \
+        || fail "the run of $(basename "$PACK") ended ${ended%%$'\t'*} with $RESULT_TASK ${result:-never run}; see $WORK/graph.json"
+    log "the run of $(basename "$PACK") left $jobs Job(s) in $WORKLOAD_NS and $RESULT_TASK passed"
 fi
 
 if grep -q CRUCIBLE_KUEUE_TOKEN "$WORK/controller.log" "$WORK/run-log.json"; then
