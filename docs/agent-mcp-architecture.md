@@ -99,6 +99,11 @@ server a SubjectAccessReview as `kube_user`. So the person's own RBAC is the cei
 gateway runs in a pod of its own in the sandbox namespace. So pack code cannot create a
 supervisor with the SPIFFE ID of another run.
 
+`examples/optimize-loop` is a worked playbook on these servers: the agent builds with `buildit`,
+benchmarks as Kueue Jobs through `crucible-kueue` and iterates, and a deterministic verifier checks
+its report against crucible-kueue's replies and the push registry (see [the
+example](./examples/optimize-loop.md)).
+
 ### 1.3 Components and trust boundaries
 
 ```mermaid

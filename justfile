@@ -200,10 +200,12 @@ optimize-loop-test:
     python3 -m unittest discover -s examples/optimize-loop/verify
     SQLX_OFFLINE=true cargo test -q -p crucible --lib the_optimize_loop_example_compiles_both_variants
 
-# examples/optimize-loop on pirate through the kueue e2e's harness: the agent builds, benchmarks
-# on Kueue and iterates, and the pack's verify task checks its report against the evidence.
-optimize-loop-e2e-pirate loop_image kueue_image controller_image:
-    PACK=examples/optimize-loop just kueue-e2e-pirate {{loop_image}} {{kueue_image}} {{controller_image}}
+# examples/optimize-loop on <name> through the kueue e2e's harness: the agent builds, benchmarks
+# on Kueue and iterates, and the pack's verify task checks its report against the evidence. params
+# is the launch's --params, e.g. '{"gpu": "true"}'.
+optimize-loop-e2e name loop_image kueue_image controller_image params="":
+    MAX_COST=10 MAX_TIME=120m TIMEOUT_SECS=9000 PARAMS='{{params}}' \
+        just kueue-e2e-cluster {{name}} {{loop_image}} {{kueue_image}} {{controller_image}} examples/optimize-loop
 
 # Launch examples/optimize-loop on a running controller whose runs get buildit and crucible-kueue,
 # and wait for the verify task's verdict (scripts/optimize-loop.sh).

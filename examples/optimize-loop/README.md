@@ -70,10 +70,14 @@ and the wall-clock check make that cost more than the optimization.
 ```sh
 just optimize-loop-test                     # the verifier's tests and the pack's compile
 just optimize-loop <context> <controller namespace> [gpu] [rounds] [min_speedup]
-just optimize-loop-e2e-pirate <loop image> <kueue image> <controller image>
+just optimize-loop-e2e <cluster> <loop image> <kueue image> <controller image> [params]
 ```
 
 `just optimize-loop` launches the pack as a draft on a running controller whose runs are granted
 `buildit` with a push repository and `crucible-kueue`, and waits for the verdict. Its Jobs request
 1 CPU and 256Mi, limited alike, on `amd64` nodes. The GPU variant needs a queue with NVIDIA GPU
 flavors and pulls a PyTorch CUDA base image; it has not been run live.
+
+`just optimize-loop-e2e` runs the pack through the kueue e2e harness on a cluster whose values are
+in `e2e/kueue/clusters/<cluster>.env`, with a $10 and 120-minute bound, and passes when the run
+left Jobs in the workload namespace and `verify` ended `pass`.
