@@ -194,6 +194,23 @@ kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/p
         PACK={{pack}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
         CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
 
+# The verifier of examples/optimize-loop against real report, evidence and image files, and the
+# pack compiled in both variants.
+optimize-loop-test:
+    python3 -m unittest discover -s examples/optimize-loop/verify
+    SQLX_OFFLINE=true cargo test -q -p crucible --lib the_optimize_loop_example_compiles_both_variants
+
+# examples/optimize-loop on pirate through the kueue e2e's harness: the agent builds, benchmarks
+# on Kueue and iterates, and the pack's verify task checks its report against the evidence.
+optimize-loop-e2e-pirate loop_image kueue_image controller_image:
+    PACK=examples/optimize-loop just kueue-e2e-pirate {{loop_image}} {{kueue_image}} {{controller_image}}
+
+# Launch examples/optimize-loop on a running controller whose runs get buildit and crucible-kueue,
+# and wait for the verify task's verdict (scripts/optimize-loop.sh).
+optimize-loop context ctl_ns gpu="false" rounds="3" min_speedup="5":
+    CONTEXT={{context}} CTL_NS={{ctl_ns}} GPU={{gpu}} ROUNDS={{rounds}} MIN_SPEEDUP={{min_speedup}} \
+        scripts/optimize-loop.sh
+
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
 # the full production submit/stream/parse path and print the typed result JSON. `cluster` is a
 # [clusters.<name>] entry in the deploy profile; pass `context` to run it against a local
