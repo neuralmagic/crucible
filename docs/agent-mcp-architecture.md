@@ -279,6 +279,10 @@ Every resource server verifies a token through `ResourceServer::validate`
 
 1. The header algorithm is asymmetric (RS, PS, ES or EdDSA). `HS*` and `none` never verify.
 2. The header has a `kid`, and the JWKS of the issuer has that key.
+   Under an issuer trusted for runs (the controller), the header `typ` is `at+jwt` (RFC 9068
+   §2.1), for a run's token and a person's alike. The controller types every access token it
+   mints, so an ID token, an assertion or any other JWT under its `iss` and key is refused. An
+   issuer trusted only for people, such as an OIDC realm, is not held to it.
 3. The algorithm of the key, when the JWK declares one, is the header algorithm.
 4. The signature is correct.
 5. `iss` is exactly a trusted issuer string. There is no URL normalization.
@@ -286,6 +290,11 @@ Every resource server verifies a token through `ResourceServer::validate`
 7. `exp` and `nbf` hold, with 30 seconds of leeway.
 8. `exp`, `iss`, `aud` and `sub` are present.
 9. The token has every scope in `required_scopes` (`kueue.read` or `buildit.read`).
+
+Note: the controller started typing its access tokens and the servers started requiring it in
+the same change. A live hub and its spokes need the controller and crucible-kueue/buildit rolled
+together: servers built with the check refuse an older controller's untyped tokens. An older
+server ignores `typ`, so rolling the controller first is safe.
 
 The configuration of each trusted issuer says whom its tokens stand for: runs or people
 (`Callers`). When one issuer is trusted for both, a token with `act` is a run token and a token

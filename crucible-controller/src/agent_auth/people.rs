@@ -1482,6 +1482,11 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     }
 
     fn claims_of(auth: &AgentAuth, token: &str, aud: &str) -> Map<String, Value> {
+        assert_eq!(
+            jsonwebtoken::decode_header(token).unwrap().typ.as_deref(),
+            Some("at+jwt"),
+            "a person's access token is typed like a run's"
+        );
         let jwk = auth.issuer.jwks().keys.remove(0);
         let key = jsonwebtoken::DecodingKey::from_jwk(&jwk).unwrap();
         let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);

@@ -50,9 +50,16 @@ pub fn run_claims() -> Value {
     })
 }
 
+/// `claims` signed as the crucible controller signs an access token, typed `at+jwt`.
 pub fn sign(key: &str, claims: &Value) -> String {
+    sign_typed(key, claims, Some(crate::verify::ACCESS_TOKEN_TYP))
+}
+
+/// `claims` signed with `typ` in the header, or none.
+pub fn sign_typed(key: &str, claims: &Value, typ: Option<&str>) -> String {
     let mut header = Header::new(Algorithm::RS256);
     header.kid = Some(format!("key-{key}"));
+    header.typ = typ.map(str::to_string);
     jsonwebtoken::encode(&header, claims, &signing_key(key)).unwrap()
 }
 

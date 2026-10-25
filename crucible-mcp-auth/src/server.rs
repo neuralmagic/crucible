@@ -182,13 +182,29 @@ impl ResourceServer {
     }
 
     /// A server whose key sets `jwks` builds, one per configured issuer.
+    ///
+    /// An issuer trusted for runs is the crucible controller, which types every access token it
+    /// mints, so every token under its `iss` must carry `typ: at+jwt`, a person's included. An
+    /// issuer trusted only for people (an OIDC realm) is not held to it.
     pub fn with_jwks(config: ResourceServerConfig, jwks: impl Fn(&TrustedIssuer) -> Jwks) -> Self {
+        let mints_run_tokens = |issuer: &str| {
+            config
+                .issuers
+                .iter()
+                .any(|t| t.issuer == issuer && t.callers == Callers::Runs)
+        };
         let issuers = config
             .issuers
             .iter()
-            .map(|trusted| Issuer {
-                verifier: Verifier::new(trusted.issuer.clone(), jwks(trusted)),
-                callers: trusted.callers,
+            .map(|trusted| {
+                let verifier = Verifier::new(trusted.issuer.clone(), jwks(trusted));
+                Issuer {
+                    verifier: match mints_run_tokens(&trusted.issuer) {
+                        true => verifier.typed_access_tokens(),
+                        false => verifier,
+                    },
+                    callers: trusted.callers,
+                }
             })
             .collect();
         Self { config, issuers }
@@ -581,6 +597,7 @@ mod tests {
         let (_jwks, rs) = server_with(vec![jwk("a")]).await;
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some("key-a".into());
+        header.typ = Some(crate::verify::ACCESS_TOKEN_TYP.into());
         let forged =
             jsonwebtoken::encode(&header, &run_claims(), &testing::signing_key("b")).unwrap();
         let err = rs.validate(&forged).await.unwrap_err();
@@ -1113,6 +1130,43 @@ mod tests {
             rs.validate(&sign("b", &run_claims())).await.is_err(),
             "the choice of issuer entry never skips the signature"
         );
+    }
+
+    /// The controller types its access tokens, so under an issuer trusted for runs an untyped JWT
+    /// (an ID token, an assertion) is refused, a person's token included; a realm trusted only for
+    /// people is not held to it.
+    #[tokio::test]
+    async fn an_issuer_trusted_for_runs_accepts_only_typed_access_tokens() {
+        let realm = JwksServer::start(vec![jwk("a")]).await;
+        let controller = JwksServer::start(vec![jwk("b")]).await;
+        let mut cfg = testing::config(realm.url.clone());
+        cfg.issuers[0].callers = Callers::People;
+        for callers in [Callers::Runs, Callers::People] {
+            cfg.issuers.push(TrustedIssuer {
+                issuer: CONTROLLER.to_string(),
+                jwks_uri: controller.url.clone(),
+                callers,
+            });
+        }
+        let rs = ResourceServer::with_jwks(cfg, |t| {
+            Jwks::new(reqwest::Client::new(), t.jwks_uri.clone())
+        });
+        let person = with(from_controller(), |c| {
+            c.remove("act");
+        });
+        for claims in [from_controller(), person] {
+            rs.validate(&sign("b", &claims)).await.unwrap();
+            for typ in [None, Some("JWT")] {
+                let err = rs
+                    .validate(&testing::sign_typed("b", &claims, typ))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(err, TokenError::Typ(_)), "{typ:?}: {err}");
+            }
+        }
+        rs.validate(&testing::sign_typed("a", &run_claims(), Some("JWT")))
+            .await
+            .expect("a realm token typed JWT, as Keycloak types its own");
     }
 
     #[tokio::test]

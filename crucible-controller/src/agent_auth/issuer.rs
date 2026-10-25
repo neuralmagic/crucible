@@ -935,10 +935,11 @@ impl AgentIssuer {
             })
     }
 
-    /// Sign `claims` with the issuer's key.
+    /// Sign `claims` with the issuer's key, as a JWT access token (`typ: at+jwt`).
     pub fn sign(&self, claims: &Value) -> Result<String, MintError> {
         let mut header = Header::new(Algorithm::ES256);
         header.kid = Some(self.key.kid.clone());
+        header.typ = Some(crucible_mcp_auth::verify::ACCESS_TOKEN_TYP.to_string());
         Ok(jsonwebtoken::encode(&header, claims, &self.key.key)?)
     }
 
@@ -1614,6 +1615,7 @@ mod tests {
             ISSUER,
             crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), jwks),
         )
+        .typed_access_tokens()
         .verify(token, &[KUEUE])
         .await
         .unwrap()
@@ -1632,6 +1634,7 @@ mod tests {
         let header = jsonwebtoken::decode_header(&minted.access_token).unwrap();
         assert_eq!(header.alg, Algorithm::ES256);
         assert_eq!(header.kid.as_deref(), Some(issuer.key.kid()));
+        assert_eq!(header.typ.as_deref(), Some("at+jwt"), "RFC 9068 §2.1");
         let mut claims = verified(&issuer, &minted.access_token).await;
         let jti = claims.remove("jti").unwrap();
         assert_eq!(jti.as_str().unwrap().len(), 2 * JTI_BYTES);

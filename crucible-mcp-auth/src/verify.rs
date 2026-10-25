@@ -5,6 +5,10 @@ use crate::principal::ClaimsError;
 use jsonwebtoken::{Algorithm, Validation};
 use serde_json::{Map, Value};
 
+/// The JOSE `typ` of a JWT access token (RFC 9068 §2.1), which the crucible controller stamps on
+/// every access token it mints so no other JWT under its `iss` and key passes for one.
+pub const ACCESS_TOKEN_TYP: &str = "at+jwt";
+
 /// Clock skew tolerated on `exp` and `nbf`.
 pub const LEEWAY_SECS: u64 = 30;
 
@@ -33,6 +37,8 @@ pub enum TokenError {
     AlgorithmMismatch { token: Algorithm, key: Algorithm },
     #[error("token issuer {0:?} is not trusted")]
     UnknownIssuer(String),
+    #[error("token typ {0:?} is not at+jwt: this issuer's access tokens are typed")]
+    Typ(Option<String>),
     #[error(transparent)]
     Key(#[from] JwksError),
     #[error("token rejected: {0}")]
@@ -50,6 +56,7 @@ pub enum TokenError {
 pub struct Verifier {
     issuer: String,
     jwks: Jwks,
+    typed: bool,
 }
 
 impl Verifier {
@@ -58,7 +65,15 @@ impl Verifier {
         Self {
             issuer: issuer.into(),
             jwks,
+            typed: false,
         }
+    }
+
+    /// Require `typ: at+jwt` (RFC 9068 §4, RFC 8725 §3.11), for an issuer that types its access
+    /// tokens: an ID token, an assertion or any other JWT it signs is then refused.
+    pub fn typed_access_tokens(mut self) -> Self {
+        self.typed = true;
+        self
     }
 
     pub fn issuer(&self) -> &str {
@@ -77,6 +92,9 @@ impl Verifier {
             return Err(TokenError::Algorithm(header.alg));
         }
         let kid = header.kid.ok_or(TokenError::NoKid)?;
+        if self.typed && !is_access_token_typ(header.typ.as_deref()) {
+            return Err(TokenError::Typ(header.typ));
+        }
         let key = self.jwks.key(&kid).await?;
         if let Some(key_alg) = key.algorithm
             && key_alg != header.alg
@@ -96,6 +114,15 @@ impl Verifier {
             .map_err(TokenError::Rejected)?;
         Ok(data.claims)
     }
+}
+
+/// `typ` names a media type, compared without case, and may drop its `application/` prefix (RFC
+/// 7515 §4.1.9).
+fn is_access_token_typ(typ: Option<&str>) -> bool {
+    typ.is_some_and(|t| {
+        let t = t.to_ascii_lowercase();
+        t == ACCESS_TOKEN_TYP || t.strip_prefix("application/") == Some(ACCESS_TOKEN_TYP)
+    })
 }
 
 /// The claims of a compact JWS, read without verifying anything. Only for choosing which
@@ -158,5 +185,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, TokenError::Rejected(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_typed_issuer_accepts_only_access_tokens() {
+        let jwks = JwksServer::start(vec![jwk("a")]).await;
+        let verifier = Verifier::new(
+            testing::ISSUER,
+            Jwks::new(reqwest::Client::new(), jwks.url.clone()),
+        )
+        .typed_access_tokens();
+        for typ in [Some("at+jwt"), Some("AT+JWT"), Some("application/at+jwt")] {
+            verifier
+                .verify(
+                    &testing::sign_typed("a", &run_claims(), typ),
+                    &[testing::RESOURCE_SVC],
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{typ:?}: {e}"));
+        }
+        for typ in [None, Some("JWT"), Some("id+jwt"), Some("at+jwt+x")] {
+            let err = verifier
+                .verify(
+                    &testing::sign_typed("a", &run_claims(), typ),
+                    &[testing::RESOURCE_SVC],
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, TokenError::Typ(_)), "{typ:?}: {err}");
+        }
+        let untyped = Verifier::new(
+            testing::ISSUER,
+            Jwks::new(reqwest::Client::new(), jwks.url.clone()),
+        );
+        untyped
+            .verify(
+                &testing::sign_typed("a", &run_claims(), Some("JWT")),
+                &[testing::RESOURCE_SVC],
+            )
+            .await
+            .expect("an issuer that does not type its tokens is not held to it");
     }
 }
