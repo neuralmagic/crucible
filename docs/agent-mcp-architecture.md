@@ -2242,8 +2242,8 @@ launch token. `just kueue-e2e-cluster <name>` reads a cluster's values from
 bounded by `MAX_COST`, `MAX_TIME` and `TIMEOUT_SECS`, with `PARAMS` as its `--params`. Its prompts
 get the same placeholders filled. The Job, nonce and `whoami` checks belong to the smoke pack;
 another pack passes when its run left at least one Job in the workload namespace and the plan's
-`RESULT_TASK` (default `verify`) ended `pass`. Every pack gets the token issuance, loop isolation
-and leak checks.
+`RESULT_TASK` (default `verify`) ended `pass`, and the harness prints that task's output from the
+graph API either way. Every pack gets the token issuance, loop isolation and leak checks.
 
 The harness runs beside a live deployment on the same cluster:
 

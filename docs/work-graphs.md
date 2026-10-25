@@ -121,6 +121,11 @@ The output of a task is JSON. It becomes the input of the task's dependents.
   fails it. A `threshold` with a `direction` compares the numeric `score` (`lower` is `<=`,
   `higher` is `>=`). Without a threshold, a successful command passes unless `pass` is false.
 
+The controller keeps each attempt's output with the run's task results, and a failing attempt's
+too, such as an evaluate's verdict with `pass = false`. `crux graph <run>` prints what each task's
+latest attempt emitted, `crux graph <run> --json` (`GET /api/runs/{run_id}/graph`) returns every
+attempt's `output`, and the run view's task panel shows it as the task's payload.
+
 `top_k` reads a finite numeric `score` from each input, so an upstream task that ranks must
 emit a score. You can declare this: `emits = ["score"]` on an `agent`, `command`, or `evaluate`
 task names the fields that its JSON output must contain. Before the run starts, validation

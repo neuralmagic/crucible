@@ -80,4 +80,6 @@ flavors and pulls a PyTorch CUDA base image; it has not been run live.
 
 `just optimize-loop-e2e` runs the pack through the kueue e2e harness on a cluster whose values are
 in `e2e/kueue/clusters/<cluster>.env`, with a $10 and 120-minute bound, and passes when the run
-left Jobs in the workload namespace and `verify` ended `pass`.
+left Jobs in the workload namespace and `verify` ended `pass`. Both recipes print the verdict
+(speedup, baseline, best, each round's Jobs), which the controller keeps with the run's task
+results; [the docs page](../../docs/examples/optimize-loop.md) says where else it shows up.
