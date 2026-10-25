@@ -23,6 +23,19 @@ evaluate task then checks the report against those replies, against the registry
 loop pod's push authfile), and against its own reference answer, computes the speedup itself, and
 passes only above `min_speedup`. The pack's README lists every check.
 
+## Where the numbers show up
+
+`verify` prints its verdict as its result: `pass`, `speedup` (also its `score`), `baseline` and
+`best` (each a Job, its image and the ops/s the evidence gave), `rounds` (each round's Jobs with
+their measured ops/s and p50, or why one was rejected, and the round's best), and any `failures`.
+A failing verdict keeps everything it measured. The controller stores it as the task's output on
+the run's task results, so it outlives the loop pod:
+
+- `crux graph <run>` prints it under the task table, and `crux graph <run> --json` returns each
+  attempt's whole `output`;
+- the run view's `verify` task panel shows it as the task's payload;
+- `just optimize-loop` and `just optimize-loop-e2e` print it when the run ends, pass or fail.
+
 ## Launch it
 
 ```sh

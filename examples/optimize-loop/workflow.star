@@ -58,7 +58,7 @@ verify = evaluate(
     name = "verify",
     run = "python3 verify/verify.py verify",
     depends_on = [optimize, collect],
-    emits = {"speedup": "number", "baseline": "object", "best": "object"},
+    emits = {"speedup": "number", "baseline": "object", "best": "object", "rounds": "list"},
 )
 
 workflow(type = "playbook", tasks = [optimize, gate, collect, verify], result = verify)

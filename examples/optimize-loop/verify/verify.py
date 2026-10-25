@@ -507,6 +507,7 @@ class Verdict:
     speedup: float | None = None
     baseline: dict[str, object] | None = None
     best: dict[str, object] | None = None
+    rounds: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -519,6 +520,7 @@ class Verdict:
             "speedup": self.speedup if self.speedup is not None else 0.0,
             "baseline": self.baseline or {},
             "best": self.best or {},
+            "rounds": self.rounds,
             "rejected": self.rejected,
             "failures": self.failures,
         }
@@ -553,6 +555,7 @@ def verify(
             v.rejected[c.job] = "wrong answer"
             continue
         measured[c.job] = observed
+    v.rounds = _rounds(report, measured, v.rejected)
     if v.failures:
         return v
     base = baseline[0]
@@ -594,6 +597,29 @@ def verify(
     if v.speedup < p.min_speedup:
         v.failures.append(f"speedup {v.speedup:.2f}x is under the {p.min_speedup:g}x threshold")
     return v
+
+
+def _rounds(
+    report: Report, measured: dict[str, dict[str, object]], rejected: dict[str, str]
+) -> list[dict[str, object]]:
+    """Each round's Jobs as the evidence measured them, round 0 the baseline."""
+    out: list[dict[str, object]] = []
+    for r in sorted({c.round for c in report.jobs}):
+        jobs: list[dict[str, object]] = []
+        for c in (c for c in report.jobs if c.round == r):
+            if c.job in measured:
+                jobs.append(
+                    {
+                        "job": c.job,
+                        "ops_per_s": _f(measured[c.job], "ops_per_s"),
+                        "p50_ms": _f(measured[c.job], "p50_ms"),
+                    }
+                )
+            else:
+                jobs.append({"job": c.job, "rejected": rejected.get(c.job, "not backed by the evidence")})
+        best = max((j["ops_per_s"] for j in jobs if "ops_per_s" in j), default=None)
+        out.append({"round": r, "best_ops_per_s": best, "jobs": jobs})
+    return out
 
 
 def _f(result: dict[str, object], key: str) -> float:

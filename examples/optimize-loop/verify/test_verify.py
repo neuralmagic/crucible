@@ -230,6 +230,24 @@ class VerifierTest(unittest.TestCase):
         line = verdict.line()
         self.assertIs(line["pass"], True)
         self.assertAlmostEqual(float(line["score"]), 100.0)  # type: ignore[arg-type]
+        rounds = line["rounds"]
+        assert isinstance(rounds, list)
+        self.assertEqual([x["round"] for x in rounds], [0, 1, 2])
+        self.assertEqual([j["job"] for j in rounds[1]["jobs"]], ["ol-r1-map", "ol-r1-sort"])
+        self.assertEqual(rounds[1]["best_ops_per_s"], r.result("ol-r1-map")["ops_per_s"])
+        self.assertEqual(rounds[0]["jobs"][0]["p50_ms"], 2000)
+        self.assertEqual(json.loads(json.dumps(line)), line, "the verdict is one JSON line")
+
+    def test_a_failing_verdict_still_carries_the_rounds_it_measured(self) -> None:
+        r, report = standard(self.layout)
+        wrong = r.result("ol-r2-prealloc") | {"checksum": "f" * 64}
+        r.set_result("ol-r2-prealloc", wrong)
+        r.jobs[3]["checksum"] = "f" * 64
+        rounds = check(r, report, self.layout).line()["rounds"]
+        assert isinstance(rounds, list)
+        self.assertEqual(rounds[2]["jobs"], [{"job": "ol-r2-prealloc", "rejected": "wrong answer"}])
+        self.assertIsNone(rounds[2]["best_ops_per_s"])
+        self.assertEqual(rounds[1]["best_ops_per_s"], r.result("ol-r1-map")["ops_per_s"])
 
     def test_a_doctored_checksum_is_refused(self) -> None:
         r, report = standard(self.layout)

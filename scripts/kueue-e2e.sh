@@ -60,8 +60,8 @@
 # and TIMEOUT_SECS bound it (3, 30m, 1800), and PARAMS (a JSON object of strings) is passed as its
 # --params. Prompts that carry @NONCE@ or the other placeholders get them filled. The Job, nonce
 # and whoami checks are the smoke pack's. Any other pack passes when its run left at least one Job
-# in the workload namespace and the plan's RESULT_TASK (default verify) ended pass. Every pack gets
-# the token, isolation and leak checks.
+# in the workload namespace and the plan's RESULT_TASK (default verify) ended pass; that task's
+# output is printed either way. Every pack gets the token, isolation and leak checks.
 # KEEP=1 leaves everything behind.
 set -euo pipefail
 
@@ -496,10 +496,12 @@ EOF
 [ "$(jq -r .kube_user <<<"$whoami")" = "$LAUNCHER" ] || fail "whoami names another kube_user: $whoami"
 log "whoami: $whoami"
 else
+    crux graph "$CRUN" --json > "$WORK/graph.json"
+    last=$(jq -c --arg t "$RESULT_TASK" '[.results[]? | select(.task == $t)] | last // {}' "$WORK/graph.json")
+    log "$RESULT_TASK output: $(jq -c '.output // "none"' <<<"$last")"
+    result=$(jq -r '.status // empty' <<<"$last")
     jobs=$(kc -n "$WORKLOAD_NS" get jobs -l "crucible.dev/run-id=$RUN" -o name | wc -l | tr -d ' ')
     [ "$jobs" -ge 1 ] || fail "the run of $(basename "$PACK") left no Job in $WORKLOAD_NS (it ended ${ended%%$'\t'*})"
-    crux graph "$CRUN" --json > "$WORK/graph.json"
-    result=$(jq -r --arg t "$RESULT_TASK" '[.results[]? | select(.task == $t)] | last | .status // empty' "$WORK/graph.json")
     [ "$result" = pass ] \
         || fail "the run of $(basename "$PACK") ended ${ended%%$'\t'*} with $RESULT_TASK ${result:-never run}; see $WORK/graph.json"
     log "the run of $(basename "$PACK") left $jobs Job(s) in $WORKLOAD_NS and $RESULT_TASK passed"
