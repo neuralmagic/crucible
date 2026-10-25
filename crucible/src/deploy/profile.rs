@@ -183,8 +183,11 @@ pub struct KueueCfg {
     /// a server that cannot reach the issuer's own address names a route here.
     #[serde(default)]
     pub run_jwks_uri: Option<url::Url>,
-    /// Where the server takes a caller's groups from for its SubjectAccessReviews.
-    pub kube_authz: KubeAuthz,
+    /// Where the server takes a caller's groups from for its SubjectAccessReviews. Default: the
+    /// cluster's OpenShift Group objects on `platform = "openshift"`, the token's `kube_groups`
+    /// claim elsewhere.
+    #[serde(default)]
+    pub kube_authz: Option<KubeAuthz>,
     /// The cluster's DNS domain. The sandbox proxy resolves names without the pod's search list,
     /// so the Service is addressed by its fully qualified name.
     #[serde(default = "default_cluster_domain")]
@@ -253,6 +256,14 @@ impl KueueCfg {
     /// Whether a server runs on dispatch cluster `cluster`.
     pub fn serves(&self, cluster: &str) -> bool {
         self.clusters.iter().any(|c| c == cluster)
+    }
+
+    /// `kube_authz`, or the default for a cluster on `platform`.
+    pub fn kube_authz(&self, platform: forge::fleet::Platform) -> KubeAuthz {
+        self.kube_authz.unwrap_or(match platform {
+            forge::fleet::Platform::Openshift => KubeAuthz::Openshift,
+            forge::fleet::Platform::Kubernetes => KubeAuthz::Token,
+        })
     }
 
     /// The Service DNS name sandboxes reach the server at, and the Host the server accepts.
@@ -696,6 +707,10 @@ pub struct Cluster {
     /// theirs on `[clusters.<name>]`.
     #[serde(default)]
     pub identity: ClusterIdentity,
+    /// The distribution this, the hub cluster, runs: `kubernetes` (default) or `openshift`.
+    /// Spokes declare theirs on `[clusters.<name>]`.
+    #[serde(default)]
+    pub platform: forge::fleet::Platform,
 }
 
 /// `[cluster].host_aliases`, checked against the rules the kubernetes driver applies to a
@@ -1059,6 +1074,19 @@ impl DeployProfile {
             }
         }
         Ok(())
+    }
+
+    /// The platform of `cluster`: the hub's from `[cluster]`, a spoke's from its `[clusters.<name>]`
+    /// entry, `kubernetes` for a cluster the profile does not know.
+    pub fn platform(&self, cluster: &str) -> forge::fleet::Platform {
+        match cluster {
+            HUB_CLUSTER => self.cluster.platform,
+            spoke => self
+                .clusters
+                .get(spoke)
+                .map(|entry| entry.platform)
+                .unwrap_or_default(),
+        }
     }
 
     /// The identity rule of `cluster`: the hub's from `[cluster]`, a spoke's from its

@@ -6,6 +6,7 @@
 use crate::deploy::profile::{DeployProfile, KubeAuthz, KubeName, KueueCfg};
 use crate::deploy::render::{RenderOpts, pin_image};
 use anyhow::{Context, Result};
+use forge::fleet::Platform;
 use k8s_openapi::api::apps::v1 as apps;
 use k8s_openapi::api::core::v1 as core;
 use k8s_openapi::api::rbac::v1 as rbac;
@@ -62,6 +63,8 @@ fn render_cluster<'a>(
 pub fn render(profile: &DeployProfile, opts: &RenderOpts, cluster: Option<&str>) -> Result<String> {
     let cfg = profile.kueue.as_ref().ok_or(MissingKueueTable)?;
     let cluster = render_cluster(cfg, cluster)?;
+    let platform = profile.platform(cluster);
+    let authz = cfg.kube_authz(platform);
     let image = pin_image(opts.digests.as_deref(), "crucible-kueue image", &cfg.image)?;
     let pull_secret = profile.image.pull_secret.as_str();
     let mut docs = Vec::new();
@@ -70,15 +73,18 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, cluster: Option<&str>)
         Ok(())
     };
     for namespace in &cfg.workload_namespaces {
-        push("workload Namespace", yaml(&workload_namespace(namespace)))?;
+        push(
+            "workload Namespace",
+            yaml(&workload_namespace(namespace, platform)),
+        )?;
     }
     push("ServiceAccount", yaml(&service_account(cfg)))?;
     push(
         "Deployment",
-        yaml(&deployment(cfg, cluster, &image, pull_secret)?),
+        yaml(&deployment(cfg, cluster, authz, &image, pull_secret)?),
     )?;
     push("Service", yaml(&service(cfg)))?;
-    push("cluster ClusterRole", yaml(&cluster_role(cfg.kube_authz)))?;
+    push("cluster ClusterRole", yaml(&cluster_role(authz)))?;
     push(
         "cluster ClusterRoleBinding",
         yaml(&cluster_role_binding(cfg)),
@@ -140,15 +146,24 @@ fn role_ref(kind: &str, name: &str) -> rbac::RoleRef {
     }
 }
 
-/// Where agents' workloads run, under Pod Security `restricted`.
-fn workload_namespace(namespace: &KubeName) -> core::Namespace {
+/// Where agents' workloads run. On OpenShift, under Pod Security `restricted` (its SCCs fill in
+/// the fields `restricted` asks for) and the Red Hat build of Kueue's managed label. On plain
+/// Kubernetes, under `baseline`: nothing fills those fields in, and an agent's pod template rarely
+/// sets them; upstream Kueue manages any namespace its `managedJobsNamespaceSelector` admits.
+fn workload_namespace(namespace: &KubeName, platform: Platform) -> core::Namespace {
     let mut metadata = meta(namespace.as_str(), None);
     let labels = metadata.labels.get_or_insert_with(BTreeMap::new);
+    let enforce = match platform {
+        Platform::Openshift => {
+            labels.insert(KUEUE_MANAGED_LABEL.to_string(), "true".to_string());
+            "restricted"
+        }
+        Platform::Kubernetes => "baseline",
+    };
     labels.insert(
         "pod-security.kubernetes.io/enforce".to_string(),
-        "restricted".to_string(),
+        enforce.to_string(),
     );
-    labels.insert(KUEUE_MANAGED_LABEL.to_string(), "true".to_string());
     core::Namespace {
         metadata,
         ..Default::default()
@@ -163,7 +178,7 @@ fn service_account(cfg: &KueueCfg) -> core::ServiceAccount {
     }
 }
 
-fn args(cfg: &KueueCfg, cluster: &str) -> Result<Vec<String>> {
+fn args(cfg: &KueueCfg, cluster: &str, authz: KubeAuthz) -> Result<Vec<String>> {
     let jwks = cfg
         .run_jwks_uri()
         .with_context(|| format!("deriving the key set URI of {}", cfg.run_issuer))?;
@@ -177,7 +192,7 @@ fn args(cfg: &KueueCfg, cluster: &str) -> Result<Vec<String>> {
         "--resource".to_string(),
         cfg.url(),
         "--kube-authz".to_string(),
-        cfg.kube_authz.as_str().to_string(),
+        authz.as_str().to_string(),
         "--cluster".to_string(),
         cluster.to_string(),
     ];
@@ -202,6 +217,7 @@ fn args(cfg: &KueueCfg, cluster: &str) -> Result<Vec<String>> {
 fn deployment(
     cfg: &KueueCfg,
     cluster: &str,
+    authz: KubeAuthz,
     image: &str,
     pull_secret: &str,
 ) -> Result<apps::Deployment> {
@@ -224,7 +240,7 @@ fn deployment(
         name: NAME.to_string(),
         image: Some(image.to_string()),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        args: Some(args(cfg, cluster)?),
+        args: Some(args(cfg, cluster, authz)?),
         env: Some(vec![env("RUST_LOG", "info".to_string())]),
         ports: Some(vec![core::ContainerPort {
             name: Some(PORT_NAME.to_string()),
@@ -552,16 +568,53 @@ mod tests {
     }
 
     #[test]
-    fn the_workload_namespace_enforces_restricted_pod_security_and_opts_into_kueue() {
-        let docs = docs(PROFILE);
-        let ns = find(&docs, "Namespace", "crucible-kueue-e2e");
+    fn the_workload_namespace_and_the_groups_source_follow_the_clusters_platform() {
+        let openshift = PROFILE.replace(
+            "[kueue]",
+            "[clusters.pirate]\nkubeconfig_secret = \"k\"\nplatform = \"openshift\"\n[kueue]",
+        );
+        let without_authz = |text: &str| text.replace("kube_authz = \"openshift\"", "");
+        let on_openshift = docs(&without_authz(&openshift));
+        let ns = find(&on_openshift, "Namespace", "crucible-kueue-e2e");
         assert_eq!(
-            ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"],
-            "restricted"
+            ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"], "restricted",
+            "OpenShift's SCCs fill in what restricted asks for"
         );
         assert_eq!(
             ns["metadata"]["labels"]["kueue.openshift.io/managed"], "true",
             "OpenShift's Kueue admits workloads only in namespaces carrying it"
+        );
+        let a = args(&on_openshift);
+        assert!(
+            a.windows(2).any(|w| w == ["--kube-authz", "openshift"]),
+            "{a:?}"
+        );
+
+        let on_kubernetes = docs(&without_authz(PROFILE));
+        let ns = find(&on_kubernetes, "Namespace", "crucible-kueue-e2e");
+        assert_eq!(
+            ns["metadata"]["labels"]["pod-security.kubernetes.io/enforce"], "baseline",
+            "nothing fills in restricted's fields on plain Kubernetes"
+        );
+        assert!(
+            ns["metadata"]["labels"]
+                .get("kueue.openshift.io/managed")
+                .is_none()
+        );
+        let a = args(&on_kubernetes);
+        assert!(
+            a.windows(2).any(|w| w == ["--kube-authz", "token"]),
+            "{a:?}"
+        );
+        let rules =
+            find(&on_kubernetes, "ClusterRole", "crucible-kueue-cluster")["rules"].to_string();
+        assert!(!rules.contains("user.openshift.io"), "{rules}");
+        let explicit = docs(&openshift);
+        assert!(
+            args(&explicit)
+                .windows(2)
+                .any(|w| w == ["--kube-authz", "openshift"]),
+            "an explicit kube_authz wins"
         );
     }
 
@@ -634,7 +687,7 @@ mod tests {
             let namespace = find(&docs, "Namespace", ns);
             assert_eq!(
                 namespace["metadata"]["labels"]["pod-security.kubernetes.io/enforce"],
-                "restricted"
+                "baseline"
             );
             assert!(docs.iter().any(|d| d["kind"] == "RoleBinding"
                 && d["metadata"]["name"] == "crucible-kueue-workloads"

@@ -46,6 +46,19 @@ pub struct ClusterEntry {
     /// Where a person's Kubernetes username on this cluster comes from.
     #[serde(default)]
     pub identity: ClusterIdentity,
+    /// The Kubernetes distribution the cluster runs.
+    #[serde(default)]
+    pub platform: Platform,
+}
+
+/// The Kubernetes distribution a cluster runs, for what a render may assume of it: OpenShift's
+/// SCCs, Group objects and Kueue operator, or none of them.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    #[default]
+    Kubernetes,
+    Openshift,
 }
 
 /// How the controller learns who a person is on a cluster. Declared by the operator, never

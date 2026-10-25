@@ -1681,6 +1681,7 @@ tokens, the controller does not read them.
 | `[cluster] sandbox_spiffe_socket` | unset | The SPIFFE Workload API socket path that supervisors get through `csi.spiffe.io`. Unset: no socket, so no JWT-SVIDs. |
 | `[cluster] identity` | `"link"` | The hub identity rule. |
 | `[clusters.<name>] identity` | `"link"` | A spoke identity rule. |
+| `[cluster] platform`, `[clusters.<name>] platform` | `"kubernetes"` | `kubernetes` or `openshift`: the distribution the hub or a spoke runs. It decides what a render may assume of the cluster (section 11.2). |
 | cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE`, `CONTROLLER_AGENT_AUDIENCES` and `CONTROLLER_PEOPLE_AUDIENCES` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
 | `[cluster] aws_sandbox_role_arn` | unset | The AWS role that the gateway pod assumes for sandboxes. |
 | `[kueue] image` | required | The `crucible-kueue` image. |
@@ -1689,7 +1690,7 @@ tokens, the controller does not read them.
 | `[kueue] workload_namespaces` (or `workload_namespace` for one) | required, not empty | The namespaces crucible-kueue tokens name, the first as the `namespace` claim, and the only namespaces where the server account has workload verbs. Each gets its Namespace, RoleBinding and `--namespace`. |
 | `[kueue] run_issuer` | required | Must equal `CONTROLLER_AGENT_ISSUER`. |
 | `[kueue] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a server that cannot reach the issuer address. |
-| `[kueue] kube_authz` | required | `openshift` or `token`: where groups come from. |
+| `[kueue] kube_authz` | `openshift` on an OpenShift cluster, `token` elsewhere | `openshift` (the cluster's Group objects) or `token` (the token's `kube_groups`): where groups come from. |
 | `[kueue] cluster_domain` | `cluster.local` | The cluster DNS domain of the Service name. |
 | `[kueue] pull_secrets` | `[]` | `name` or `name=registry` entries for `--pull-secret`. |
 | `[kueue] people` | `false` | `true` renders `--person-issuer` with the same issuer as `run_issuer`, so the server also accepts people tokens. Set it when `CONTROLLER_PEOPLE_AUDIENCES` names this server. |
