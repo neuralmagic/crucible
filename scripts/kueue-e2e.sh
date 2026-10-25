@@ -502,7 +502,29 @@ else
     result=$(jq -r --arg t "$RESULT_TASK" '[.results[]? | select(.task == $t)] | last | .status // empty' "$WORK/graph.json")
     [ "$result" = pass ] \
         || fail "the run of $(basename "$PACK") ended ${ended%%$'\t'*} with $RESULT_TASK ${result:-never run}; see $WORK/graph.json"
-    log "the run of $(basename "$PACK") left $jobs Job(s) in $WORKLOAD_NS and $RESULT_TASK passed"
+    output=$(python3 - "$WORK/run-log.json" "$RESULT_TASK" <<'EOF'
+import json, sys
+text, task = open(sys.argv[1]).read(), sys.argv[2]
+decoder = json.JSONDecoder()
+for _ in range(3):
+    found = None
+    for line in text.splitlines():
+        start = line.find('{"kind":"task_result"')
+        if start == -1:
+            continue
+        try:
+            event, _ = decoder.raw_decode(line, start)
+        except ValueError:
+            continue
+        if event.get("task") == task and event.get("output") is not None:
+            found = event["output"]
+    if found is not None:
+        print(json.dumps(found, separators=(",", ":")))
+        sys.exit(0)
+    text = text.encode().decode("unicode_escape")
+EOF
+)
+    log "the run of $(basename "$PACK") left $jobs Job(s) in $WORKLOAD_NS and $RESULT_TASK passed: ${output:-no output in the run log}"
 fi
 
 if grep -q CRUCIBLE_KUEUE_TOKEN "$WORK/controller.log" "$WORK/run-log.json"; then
