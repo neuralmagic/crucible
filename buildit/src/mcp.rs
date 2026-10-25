@@ -2943,18 +2943,18 @@ mod tests {
     #[test]
     fn a_subject_that_is_no_label_value_still_labels_its_builds_distinctly() {
         assert_eq!(Launcher::of("alice").as_str(), "alice");
-        let email = Launcher::of("weaton@redhat.com");
+        let email = Launcher::of("alice@example.com");
         assert!(
             crate::sandbox::is_label_value(email.as_str()),
             "{}",
             email.as_str()
         );
         assert!(
-            email.as_str().starts_with("weaton-redhat.com-"),
+            email.as_str().starts_with("alice-example.com-"),
             "{}",
             email.as_str()
         );
-        assert_ne!(email, Launcher::of("weaton#redhat.com"));
+        assert_ne!(email, Launcher::of("alice#example.com"));
         let long = Launcher::of(&format!("{}@example.com", "a".repeat(80)));
         assert!(
             crate::sandbox::is_label_value(long.as_str()),

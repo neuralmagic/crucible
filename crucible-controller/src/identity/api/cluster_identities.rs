@@ -544,7 +544,7 @@ mod tests {
 
     const SUB: &str = "sub-alice";
 
-    /// The hub's usernames are SSO logins, waldorf's are prefixed emails, pirate links through
+    /// The hub's usernames are SSO logins, k8s's are prefixed emails, ocp links through
     /// its OAuth server.
     fn profile() -> String {
         format!(
@@ -558,15 +558,15 @@ identity = {{ claim = "login" }}
 [image]
 loop = "registry.example.com/crucible-loop:latest"
 pull_secret = "quay-pull"
-[clusters.pirate]
-kubeconfig_secret = "pirate-kubeconfig"
+[clusters.ocp]
+kubeconfig_secret = "ocp-kubeconfig"
 identity = "link"
-[clusters.waldorf]
-kubeconfig_secret = "waldorf-kubeconfig"
+[clusters.k8s]
+kubeconfig_secret = "k8s-kubeconfig"
 identity = {{ claim = "email", prefix = "oidc:" }}
 [cluster_link]
 external_url = "{EXTERNAL}"
-openshift = ["pirate"]
+openshift = ["ocp"]
 "#
         )
     }
@@ -575,7 +575,7 @@ openshift = ["pirate"]
         pool: PgPool,
         state: ApiState,
         store: tower_sessions_sqlx_store::PostgresStore,
-        pirate_base: String,
+        ocp_base: String,
         _dir: tempfile::TempDir,
     }
 
@@ -596,23 +596,19 @@ openshift = ["pirate"]
         )
         .await
         .unwrap();
-        let Fleet { links, pirate, dir } = fleet(true).await;
+        let Fleet { links, ocp, dir } = fleet(true).await;
         let path = dir.path().join("profile.toml");
         std::fs::write(&path, profile()).unwrap();
         let mut tokens: Vec<(String, String, String)> = (1..=5)
             .map(|n| {
                 (
-                    "pirate".to_string(),
+                    "ocp".to_string(),
                     format!("sha256~for-code-{n}"),
                     "casey".to_string(),
                 )
             })
             .collect();
-        tokens.push((
-            "pirate".into(),
-            "sha256~pasted".into(),
-            "casey-pasted".into(),
-        ));
+        tokens.push(("ocp".into(), "sha256~pasted".into(), "casey-pasted".into()));
         let reviewer = Clusters::with(
             &tokens
                 .iter()
@@ -631,7 +627,7 @@ openshift = ["pirate"]
             pool,
             state,
             store,
-            pirate_base: pirate.base,
+            ocp_base: ocp.base,
             _dir: dir,
         }
     }
@@ -719,18 +715,18 @@ openshift = ["pirate"]
                 .collect()
         }
 
-        /// Start a pirate link in a fresh browser session and sign in at the cluster: the
+        /// Start a ocp link in a fresh browser session and sign in at the cluster: the
         /// session cookie and the callback query the cluster sent the browser back with.
-        async fn signed_in_at_pirate(&self) -> (String, String) {
-            self.signed_in_at_pirate_from(json!({})).await
+        async fn signed_in_at_ocp(&self) -> (String, String) {
+            self.signed_in_at_ocp_from(json!({})).await
         }
 
-        async fn signed_in_at_pirate_from(&self, body: Value) -> (String, String) {
+        async fn signed_in_at_ocp_from(&self, body: Value) -> (String, String) {
             let started = self
                 .send(
                     AuthPath::Session,
                     "POST",
-                    "/api/me/cluster-identities/pirate/link",
+                    "/api/me/cluster-identities/ocp/link",
                     None,
                     Some(body),
                 )
@@ -738,7 +734,7 @@ openshift = ["pirate"]
             assert_eq!(started.status, StatusCode::OK, "{}", started.body);
             let cookie = started.cookie.expect("the link is parked on a session");
             let url = url::Url::parse(started.body["authorize_url"].as_str().unwrap()).unwrap();
-            assert!(url.as_str().starts_with(&self.pirate_base));
+            assert!(url.as_str().starts_with(&self.ocp_base));
             let callback = authorize_in_browser(&url).await;
             let query = url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("code", callback.code.as_deref().unwrap())
@@ -788,14 +784,14 @@ openshift = ["pirate"]
                    "kube_user": "alice", "source": "rule", "linked_at": null})
         );
         assert_eq!(
-            ids["waldorf"],
-            json!({"cluster": "waldorf",
+            ids["k8s"],
+            json!({"cluster": "k8s",
                    "rule": {"kind": "claim", "claim": "email", "prefix": "oidc:"},
                    "kube_user": "oidc:alice@example.com", "source": "rule", "linked_at": null})
         );
         assert_eq!(
-            ids["pirate"],
-            json!({"cluster": "pirate", "rule": {"kind": "link", "oauth": true},
+            ids["ocp"],
+            json!({"cluster": "ocp", "rule": {"kind": "link", "oauth": true},
                    "kube_user": null, "source": null, "linked_at": null})
         );
     }
@@ -803,14 +799,14 @@ openshift = ["pirate"]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn signing_in_at_the_cluster_links_the_name_it_reviews_and_keeps_no_token(pool: PgPool) {
         let h = harness(pool).await;
-        let (cookie, query) = h.signed_in_at_pirate().await;
-        let done = h.callback("pirate", &cookie, &query).await;
+        let (cookie, query) = h.signed_in_at_ocp().await;
+        let done = h.callback("ocp", &cookie, &query).await;
         assert_eq!(done.status, StatusCode::SEE_OTHER);
-        assert_eq!(done.location.as_deref(), Some("/settings?linked=pirate"));
-        let pirate = &h.identities().await["pirate"];
-        assert_eq!(pirate["kube_user"], "casey");
-        assert_eq!(pirate["source"], "openshift-oauth");
-        assert!(pirate["linked_at"].is_string());
+        assert_eq!(done.location.as_deref(), Some("/settings?linked=ocp"));
+        let ocp = &h.identities().await["ocp"];
+        assert_eq!(ocp["kube_user"], "casey");
+        assert_eq!(ocp["source"], "openshift-oauth");
+        assert!(ocp["linked_at"].is_string());
         let stored: Vec<String> = sqlx::query_scalar(
             "SELECT concat_ws(' ', sub, cluster, kube_user, source, linked_at) FROM kube_identity_links",
         )
@@ -823,58 +819,58 @@ openshift = ["pirate"]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_callback_with_a_forged_state_links_nothing(pool: PgPool) {
         let h = harness(pool).await;
-        let (cookie, query) = h.signed_in_at_pirate().await;
+        let (cookie, query) = h.signed_in_at_ocp().await;
         let forged = query.replace("state=", "state=forged");
-        let done = h.callback("pirate", &cookie, &forged).await;
+        let done = h.callback("ocp", &cookie, &forged).await;
         assert_eq!(
             done.location.as_deref(),
             Some("/settings?link_error=state-mismatch")
         );
-        assert_eq!(h.identities().await["pirate"]["kube_user"], Value::Null);
+        assert_eq!(h.identities().await["ocp"]["kube_user"], Value::Null);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_callback_on_another_clusters_path_links_nothing(pool: PgPool) {
         let h = harness(pool).await;
-        let (cookie, query) = h.signed_in_at_pirate().await;
-        let done = h.callback("waldorf", &cookie, &query).await;
+        let (cookie, query) = h.signed_in_at_ocp().await;
+        let done = h.callback("k8s", &cookie, &query).await;
         assert_eq!(
             done.location.as_deref(),
             Some("/settings?link_error=wrong-cluster")
         );
         let ids = h.identities().await;
-        assert_eq!(ids["pirate"]["kube_user"], Value::Null);
-        assert_eq!(ids["waldorf"]["source"], "rule");
+        assert_eq!(ids["ocp"]["kube_user"], Value::Null);
+        assert_eq!(ids["k8s"]["source"], "rule");
     }
 
     /// The parked link is spent by its first callback, so replaying the redirect finds nothing.
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_replayed_callback_finds_no_link_to_finish(pool: PgPool) {
         let h = harness(pool).await;
-        let (cookie, query) = h.signed_in_at_pirate().await;
-        let first = h.callback("pirate", &cookie, &query).await;
-        assert_eq!(first.location.as_deref(), Some("/settings?linked=pirate"));
+        let (cookie, query) = h.signed_in_at_ocp().await;
+        let first = h.callback("ocp", &cookie, &query).await;
+        assert_eq!(first.location.as_deref(), Some("/settings?linked=ocp"));
         h.send(
             AuthPath::Session,
             "DELETE",
-            "/api/me/cluster-identities/pirate",
+            "/api/me/cluster-identities/ocp",
             None,
             None,
         )
         .await;
-        let replay = h.callback("pirate", &cookie, &query).await;
+        let replay = h.callback("ocp", &cookie, &query).await;
         assert_eq!(
             replay.location.as_deref(),
             Some("/settings?link_error=no-flow")
         );
-        assert_eq!(h.identities().await["pirate"]["kube_user"], Value::Null);
+        assert_eq!(h.identities().await["ocp"]["kube_user"], Value::Null);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_callback_without_a_started_link_links_nothing(pool: PgPool) {
         let h = harness(pool).await;
         let done = h
-            .callback("pirate", "crucible_session=none", "code=code-1&state=x")
+            .callback("ocp", "crucible_session=none", "code=code-1&state=x")
             .await;
         assert_eq!(
             done.location.as_deref(),
@@ -885,16 +881,16 @@ openshift = ["pirate"]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn unlinking_forgets_the_cluster_and_only_a_link_cluster_unlinks(pool: PgPool) {
         let h = harness(pool).await;
-        let (cookie, query) = h.signed_in_at_pirate().await;
-        h.callback("pirate", &cookie, &query).await;
+        let (cookie, query) = h.signed_in_at_ocp().await;
+        h.callback("ocp", &cookie, &query).await;
         let unlinked = |cluster| h.unlink(AuthPath::Session, cluster);
-        assert_eq!(unlinked("pirate").await, StatusCode::NO_CONTENT);
-        assert_eq!(h.identities().await["pirate"]["kube_user"], Value::Null);
-        assert_eq!(unlinked("pirate").await, StatusCode::NOT_FOUND);
-        assert_eq!(unlinked("waldorf").await, StatusCode::CONFLICT);
+        assert_eq!(unlinked("ocp").await, StatusCode::NO_CONTENT);
+        assert_eq!(h.identities().await["ocp"]["kube_user"], Value::Null);
+        assert_eq!(unlinked("ocp").await, StatusCode::NOT_FOUND);
+        assert_eq!(unlinked("k8s").await, StatusCode::CONFLICT);
         assert_eq!(unlinked("elsewhere").await, StatusCode::NOT_FOUND);
         assert_eq!(
-            h.unlink(AuthPath::ApiKey, "pirate").await,
+            h.unlink(AuthPath::ApiKey, "ocp").await,
             StatusCode::FORBIDDEN
         );
     }
@@ -902,22 +898,20 @@ openshift = ["pirate"]
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_pasted_token_links_through_the_clusters_token_review(pool: PgPool) {
         let h = harness(pool).await;
-        let linked = h
-            .put_token(AuthPath::Session, "pirate", "sha256~pasted")
-            .await;
+        let linked = h.put_token(AuthPath::Session, "ocp", "sha256~pasted").await;
         assert_eq!(linked.status, StatusCode::OK, "{}", linked.body);
         assert_eq!(linked.body["kube_user"], "casey-pasted");
         assert_eq!(linked.body["source"], "token-review");
         for (path, cluster, token, want) in [
             (
                 AuthPath::Session,
-                "pirate",
+                "ocp",
                 "sha256~nope",
                 StatusCode::BAD_REQUEST,
             ),
             (
                 AuthPath::Session,
-                "waldorf",
+                "k8s",
                 "sha256~pasted",
                 StatusCode::CONFLICT,
             ),
@@ -929,7 +923,7 @@ openshift = ["pirate"]
             ),
             (
                 AuthPath::ApiKey,
-                "pirate",
+                "ocp",
                 "sha256~pasted",
                 StatusCode::FORBIDDEN,
             ),
@@ -937,22 +931,19 @@ openshift = ["pirate"]
             let reply = h.put_token(path, cluster, token).await;
             assert_eq!(reply.status, want, "{cluster} {token}: {}", reply.body);
         }
-        assert_eq!(h.identities().await["pirate"]["kube_user"], "casey-pasted");
+        assert_eq!(h.identities().await["ocp"]["kube_user"], "casey-pasted");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_cluster_sign_in_starts_only_from_a_browser_on_a_link_cluster(pool: PgPool) {
         let h = harness(pool).await;
         assert_eq!(
-            h.start(AuthPath::ApiKey, "pirate").await,
+            h.start(AuthPath::ApiKey, "ocp").await,
             StatusCode::FORBIDDEN
         );
+        assert_eq!(h.start(AuthPath::Jwt, "ocp").await, StatusCode::FORBIDDEN);
         assert_eq!(
-            h.start(AuthPath::Jwt, "pirate").await,
-            StatusCode::FORBIDDEN
-        );
-        assert_eq!(
-            h.start(AuthPath::Session, "waldorf").await,
+            h.start(AuthPath::Session, "k8s").await,
             StatusCode::CONFLICT
         );
         assert_eq!(
@@ -979,7 +970,7 @@ openshift = ["pirate"]
         let ids = h.identities().await;
         assert_eq!(ids["hub"]["kube_user"], "alice-admin");
         assert_eq!(ids["hub"]["source"], "override");
-        assert_eq!(ids["waldorf"]["source"], "rule");
+        assert_eq!(ids["k8s"]["source"], "rule");
     }
 
     /// Linking from the consent page lands back on it, with the outcome appended.
@@ -987,13 +978,10 @@ openshift = ["pirate"]
     async fn a_link_started_elsewhere_lands_back_where_it_started(pool: PgPool) {
         let h = harness(pool).await;
         let (cookie, query) = h
-            .signed_in_at_pirate_from(json!({"return_to": "/consent?id=abc"}))
+            .signed_in_at_ocp_from(json!({"return_to": "/consent?id=abc"}))
             .await;
-        let done = h.callback("pirate", &cookie, &query).await;
-        assert_eq!(
-            done.location.as_deref(),
-            Some("/consent?id=abc&linked=pirate")
-        );
+        let done = h.callback("ocp", &cookie, &query).await;
+        assert_eq!(done.location.as_deref(), Some("/consent?id=abc&linked=ocp"));
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -1011,7 +999,7 @@ openshift = ["pirate"]
                 .send(
                     AuthPath::Session,
                     "POST",
-                    "/api/me/cluster-identities/pirate/link",
+                    "/api/me/cluster-identities/ocp/link",
                     None,
                     Some(json!({"return_to": bad})),
                 )
@@ -1041,17 +1029,17 @@ openshift = ["pirate"]
             .await;
         assert_eq!(listed.status, StatusCode::NOT_FOUND);
         assert_eq!(
-            h.put_token(AuthPath::Session, "pirate", "sha256~pasted")
+            h.put_token(AuthPath::Session, "ocp", "sha256~pasted")
                 .await
                 .status,
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            h.unlink(AuthPath::Session, "pirate").await,
+            h.unlink(AuthPath::Session, "ocp").await,
             StatusCode::NOT_FOUND
         );
         assert_eq!(
-            h.start(AuthPath::Session, "pirate").await,
+            h.start(AuthPath::Session, "ocp").await,
             StatusCode::NOT_FOUND
         );
     }

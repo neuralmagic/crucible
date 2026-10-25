@@ -535,7 +535,7 @@ mod tests {
             login: "alice".into(),
             email: None,
             resource: "https://kueue.example/mcp".into(),
-            cluster: "pirate".into(),
+            cluster: "ocp".into(),
             scopes: vec!["kueue.read".into()],
         }
     }

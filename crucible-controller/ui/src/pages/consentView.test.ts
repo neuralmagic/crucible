@@ -13,7 +13,7 @@ function consent(identity: Partial<ConsentDto['identity']> = {}, client: Partial
     scopes: ['kueue.read', 'kueue.submit'],
     login: 'jordan',
     identity: {
-      cluster: 'pirate',
+      cluster: 'ocp',
       rule: { kind: 'link', oauth: true },
       kube_user: null,
       source: null,
@@ -71,7 +71,7 @@ describe('consentView', () => {
   it('holds Allow back until a link cluster names the person', () => {
     const view = consentView(consent());
     expect(view.canApprove).toBe(false);
-    expect(view.blocked).toBe('Link your username on pirate first.');
+    expect(view.blocked).toBe('Link your username on ocp first.');
   });
 
   it('allows once the cluster names who the person acts as', () => {
@@ -82,10 +82,10 @@ describe('consentView', () => {
 
   it('says a claim cluster with no value is for an administrator, not a link', () => {
     const view = consentView(
-      consent({ cluster: 'waldorf', rule: { kind: 'claim', claim: 'email', prefix: null } }),
+      consent({ cluster: 'k8s', rule: { kind: 'claim', claim: 'email', prefix: null } }),
     );
     expect(view.canApprove).toBe(false);
-    expect(view.blocked).toMatch(/no email for waldorf/);
+    expect(view.blocked).toMatch(/no email for k8s/);
   });
 });
 

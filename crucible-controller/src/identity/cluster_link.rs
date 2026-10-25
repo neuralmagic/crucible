@@ -496,7 +496,7 @@ pub(crate) mod testing {
 
     pub(crate) struct Fleet {
         pub(crate) links: ClusterLinks,
-        pub(crate) pirate: OpenShift,
+        pub(crate) ocp: OpenShift,
         pub(crate) dir: tempfile::TempDir,
     }
 
@@ -544,43 +544,43 @@ current-context: {cluster}
         .unwrap();
     }
 
-    /// `pirate` links through OAuth; `waldorf` is connected with a secret too; `nosecret` is
+    /// `ocp` links through OAuth; `k8s` is connected with a secret too; `nosecret` is
     /// connected but has no OAuthClient secret mounted.
     pub(crate) async fn fleet(s256: bool) -> Fleet {
         let external = ExternalUrl::parse(EXTERNAL).unwrap();
         let redirect_for = |cluster: &str| external.callback(cluster).unwrap().to_string();
-        let pirate = serve(|base| OpenShift {
+        let ocp = serve(|base| OpenShift {
             base,
             s256,
-            redirect: redirect_for("pirate"),
+            redirect: redirect_for("ocp"),
             issued: Arc::default(),
         })
         .await;
-        let waldorf = serve(|base| OpenShift {
+        let k8s = serve(|base| OpenShift {
             base,
             s256: true,
-            redirect: redirect_for("waldorf"),
+            redirect: redirect_for("k8s"),
             issued: Arc::default(),
         })
         .await;
         let dir = tempfile::tempdir().unwrap();
-        register(dir.path(), "pirate", &pirate.base);
-        register(dir.path(), "waldorf", &waldorf.base);
-        register(dir.path(), "nosecret", &waldorf.base);
+        register(dir.path(), "ocp", &ocp.base);
+        register(dir.path(), "k8s", &k8s.base);
+        register(dir.path(), "nosecret", &k8s.base);
         let secrets = dir.path().join("secrets");
         std::fs::create_dir_all(&secrets).unwrap();
-        std::fs::write(secrets.join("pirate"), format!("{SECRET}\n")).unwrap();
-        std::fs::write(secrets.join("waldorf"), SECRET).unwrap();
+        std::fs::write(secrets.join("ocp"), format!("{SECRET}\n")).unwrap();
+        std::fs::write(secrets.join("k8s"), SECRET).unwrap();
         let clusters = Arc::new(ClusterClients::new(Some(dir.path().join("clusters"))));
         let cfg = LinkCfg {
             client_id: DEFAULT_CLIENT_ID.to_string(),
             external_url: ExternalUrl::parse(EXTERNAL).unwrap(),
             secrets,
-            openshift: vec!["pirate".into(), "waldorf".into(), "nosecret".into()],
+            openshift: vec!["ocp".into(), "k8s".into(), "nosecret".into()],
         };
         Fleet {
             links: ClusterLinks::new(cfg, clusters).unwrap(),
-            pirate,
+            ocp,
             dir,
         }
     }
@@ -658,28 +658,28 @@ mod tests {
     #[tokio::test]
     async fn a_link_redeems_the_code_the_cluster_issued_for_this_browser() {
         let f = fleet(true).await;
-        assert!(f.links.offers("pirate"));
-        let (url, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        assert!(f.links.offers("ocp"));
+        let (url, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let q: HashMap<String, String> = url.query_pairs().into_owned().collect();
         assert!(
             url.as_str()
-                .starts_with(&format!("{}/oauth/authorize?", f.pirate.base))
+                .starts_with(&format!("{}/oauth/authorize?", f.ocp.base))
         );
         assert_eq!(q["client_id"], DEFAULT_CLIENT_ID);
         assert_eq!(
             q["redirect_uri"],
-            "https://crucible.example.com/console/oauth/cluster-link/pirate/callback"
+            "https://crucible.example.com/console/oauth/cluster-link/ocp/callback"
         );
         assert_eq!(q["scope"], "user:info");
         assert_eq!(q["code_challenge_method"], "S256");
         assert!(!q.contains_key("client_secret"));
-        assert_eq!(pending.cluster, "pirate");
+        assert_eq!(pending.cluster, "ocp");
         assert_eq!(pending.sub, "sub-alice");
 
         let callback = authorize_in_browser(&url).await;
         let token = f
             .links
-            .finish(Some(pending), "sub-alice", "pirate", callback, now())
+            .finish(Some(pending), "sub-alice", "ocp", callback, now())
             .await
             .unwrap();
         assert_eq!(token.expose(), "sha256~for-code-1");
@@ -688,19 +688,13 @@ mod tests {
     #[tokio::test]
     async fn a_callback_whose_state_differs_is_refused_before_the_code_is_spent() {
         let f = fleet(true).await;
-        let (url, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        let (url, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let mut callback = authorize_in_browser(&url).await;
         let code = callback.code.clone();
         callback.state = Some("forged".to_string());
         assert_eq!(
             f.links
-                .finish(
-                    Some(pending.clone()),
-                    "sub-alice",
-                    "pirate",
-                    callback,
-                    now()
-                )
+                .finish(Some(pending.clone()), "sub-alice", "ocp", callback, now())
                 .await
                 .unwrap_err(),
             LinkFlowError::StateMismatch
@@ -711,13 +705,13 @@ mod tests {
         };
         assert_eq!(
             f.links
-                .finish(Some(pending), "sub-alice", "pirate", missing, now())
+                .finish(Some(pending), "sub-alice", "ocp", missing, now())
                 .await
                 .unwrap_err(),
             LinkFlowError::StateMismatch
         );
         assert_eq!(
-            f.pirate.issued.lock().unwrap().codes.len(),
+            f.ocp.issued.lock().unwrap().codes.len(),
             1,
             "the code was never redeemed"
         );
@@ -726,16 +720,16 @@ mod tests {
     #[tokio::test]
     async fn a_callback_arriving_for_another_cluster_is_refused() {
         let f = fleet(true).await;
-        let (url, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        let (url, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let callback = authorize_in_browser(&url).await;
         assert_eq!(
             f.links
-                .finish(Some(pending), "sub-alice", "waldorf", callback, now())
+                .finish(Some(pending), "sub-alice", "k8s", callback, now())
                 .await
                 .unwrap_err(),
             LinkFlowError::WrongCluster {
-                started: "pirate".into(),
-                answered: "waldorf".into()
+                started: "ocp".into(),
+                answered: "k8s".into()
             }
         );
     }
@@ -743,11 +737,11 @@ mod tests {
     #[tokio::test]
     async fn a_callback_arriving_as_another_person_is_refused() {
         let f = fleet(true).await;
-        let (url, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        let (url, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let callback = authorize_in_browser(&url).await;
         assert_eq!(
             f.links
-                .finish(Some(pending), "sub-mallory", "pirate", callback, now())
+                .finish(Some(pending), "sub-mallory", "ocp", callback, now())
                 .await
                 .unwrap_err(),
             LinkFlowError::WrongPerson
@@ -759,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn a_replayed_callback_is_refused() {
         let f = fleet(true).await;
-        let (url, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        let (url, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let callback = authorize_in_browser(&url).await;
         let replay = Callback {
             code: callback.code.clone(),
@@ -767,18 +761,12 @@ mod tests {
             ..Callback::default()
         };
         f.links
-            .finish(
-                Some(pending.clone()),
-                "sub-alice",
-                "pirate",
-                callback,
-                now(),
-            )
+            .finish(Some(pending.clone()), "sub-alice", "ocp", callback, now())
             .await
             .unwrap();
         assert_eq!(
             f.links
-                .finish(None, "sub-alice", "pirate", replay, now())
+                .finish(None, "sub-alice", "ocp", replay, now())
                 .await
                 .unwrap_err(),
             LinkFlowError::NoFlow
@@ -790,13 +778,13 @@ mod tests {
         };
         let err = f
             .links
-            .finish(Some(pending), "sub-alice", "pirate", reused, now())
+            .finish(Some(pending), "sub-alice", "ocp", reused, now())
             .await
             .unwrap_err();
         assert_eq!(
             err,
             LinkFlowError::Exchange {
-                cluster: "pirate".into(),
+                cluster: "ocp".into(),
                 detail: "invalid_grant".into()
             }
         );
@@ -806,16 +794,16 @@ mod tests {
     async fn a_link_older_than_ten_minutes_is_refused() {
         let f = fleet(true).await;
         let started = now();
-        let (url, pending) = f.links.start("sub-alice", "pirate", started).await.unwrap();
+        let (url, pending) = f.links.start("sub-alice", "ocp", started).await.unwrap();
         let callback = authorize_in_browser(&url).await;
         let late = started + FLOW_TTL + jiff::SignedDuration::from_secs(1);
         assert_eq!(
             f.links
-                .finish(Some(pending), "sub-alice", "pirate", callback, late)
+                .finish(Some(pending), "sub-alice", "ocp", callback, late)
                 .await
                 .unwrap_err(),
             LinkFlowError::Expired {
-                cluster: "pirate".into()
+                cluster: "ocp".into()
             }
         );
     }
@@ -823,7 +811,7 @@ mod tests {
     #[tokio::test]
     async fn the_clusters_refusal_is_reported_and_nothing_is_redeemed() {
         let f = fleet(true).await;
-        let (_, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        let (_, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let state = pending.state.clone();
         let callback = Callback {
             state: Some(state),
@@ -833,11 +821,11 @@ mod tests {
         };
         assert_eq!(
             f.links
-                .finish(Some(pending), "sub-alice", "pirate", callback, now())
+                .finish(Some(pending), "sub-alice", "ocp", callback, now())
                 .await
                 .unwrap_err(),
             LinkFlowError::Refused {
-                cluster: "pirate".into(),
+                cluster: "ocp".into(),
                 error: "access_denied the user denied the request".into()
             }
         );
@@ -846,19 +834,19 @@ mod tests {
     #[tokio::test]
     async fn a_wrong_client_secret_fails_the_exchange_without_echoing_the_code() {
         let f = fleet(true).await;
-        let (url, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        let (url, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let callback = authorize_in_browser(&url).await;
         let code = callback.code.clone().unwrap();
-        std::fs::write(f.links.cfg.secrets.join("pirate"), "rotated-elsewhere").unwrap();
+        std::fs::write(f.links.cfg.secrets.join("ocp"), "rotated-elsewhere").unwrap();
         let err = f
             .links
-            .finish(Some(pending), "sub-alice", "pirate", callback, now())
+            .finish(Some(pending), "sub-alice", "ocp", callback, now())
             .await
             .unwrap_err();
         assert_eq!(
             err,
             LinkFlowError::Exchange {
-                cluster: "pirate".into(),
+                cluster: "ocp".into(),
                 detail: "invalid_client".into()
             }
         );
@@ -873,7 +861,7 @@ mod tests {
     async fn only_connected_clusters_with_a_mounted_secret_offer_a_link() {
         let f = fleet(true).await;
         assert!(!f.links.offers("nosecret"));
-        assert!(!f.links.offers("../secrets/pirate"));
+        assert!(!f.links.offers("../secrets/ocp"));
         assert_eq!(
             f.links
                 .start("sub-alice", "nosecret", now())
@@ -883,7 +871,7 @@ mod tests {
                 cluster: "nosecret".into()
             }
         );
-        for unknown in ["elsewhere", "../secrets/pirate", "pirate/../waldorf"] {
+        for unknown in ["elsewhere", "../secrets/ocp", "ocp/../k8s"] {
             assert_eq!(
                 f.links
                     .start("sub-alice", unknown, now())
@@ -901,12 +889,9 @@ mod tests {
     async fn a_cluster_without_s256_is_refused_before_the_browser_leaves() {
         let f = fleet(false).await;
         assert_eq!(
-            f.links
-                .start("sub-alice", "pirate", now())
-                .await
-                .unwrap_err(),
+            f.links.start("sub-alice", "ocp", now()).await.unwrap_err(),
             LinkFlowError::NoS256 {
-                cluster: "pirate".into()
+                cluster: "ocp".into()
             }
         );
     }
@@ -914,13 +899,13 @@ mod tests {
     #[tokio::test]
     async fn neither_the_token_nor_the_verifier_reaches_a_debug_string() {
         let f = fleet(true).await;
-        let (url, pending) = f.links.start("sub-alice", "pirate", now()).await.unwrap();
+        let (url, pending) = f.links.start("sub-alice", "ocp", now()).await.unwrap();
         let shown = format!("{pending:?}");
         assert!(!shown.contains(&pending.pkce_verifier) && !shown.contains(&pending.state));
         let callback = authorize_in_browser(&url).await;
         let token = f
             .links
-            .finish(Some(pending), "sub-alice", "pirate", callback, now())
+            .finish(Some(pending), "sub-alice", "ocp", callback, now())
             .await
             .unwrap();
         assert_eq!(format!("{token:?}"), "ClusterToken(<redacted>)");

@@ -1191,10 +1191,10 @@ export const CLUSTER_IDENTITIES = [
     source: 'rule',
     linked_at: null,
   },
-  { cluster: 'pirate', rule: { kind: 'link', oauth: true }, kube_user: null, source: null, linked_at: null },
+  { cluster: 'ocp', rule: { kind: 'link', oauth: true }, kube_user: null, source: null, linked_at: null },
   { cluster: 'rig', rule: { kind: 'link', oauth: false }, kube_user: null, source: null, linked_at: null },
   {
-    cluster: 'waldorf',
+    cluster: 'k8s',
     rule: { kind: 'claim', claim: 'email', prefix: null },
     kube_user: 'wren@example.com',
     source: 'rule',
@@ -1265,7 +1265,7 @@ export async function stubApi(page: Page): Promise<void> {
       client_host: null,
       client_kind: 'dynamic',
       resource: 'http://localhost:8851/mcp',
-      cluster: 'pirate',
+      cluster: 'ocp',
       approved_at: '2026-10-09T09:00:00Z',
       last_used_at: '2026-10-09T09:30:00Z',
     },
@@ -1275,7 +1275,7 @@ export async function stubApi(page: Page): Promise<void> {
       client_host: null,
       client_kind: 'registered',
       resource: 'http://localhost:8851/mcp',
-      cluster: 'pirate',
+      cluster: 'ocp',
       approved_at: '2026-10-09T10:00:00Z',
       last_used_at: '2026-10-09T11:00:00Z',
     },
@@ -1378,7 +1378,7 @@ export async function stubApi(page: Page): Promise<void> {
         signIns = kept;
         return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ revoked }) });
       }
-      // The consent page: one parked request for pirate, decided once.
+      // The consent page: one parked request for ocp, decided once.
       if (path === '/api/oauth/consent' && route.request().method() === 'GET') {
         const id = new URL(route.request().url()).searchParams.get('id');
         const parked =
@@ -1387,15 +1387,15 @@ export async function stubApi(page: Page): Promise<void> {
           const body = JSON.stringify({ error: 'no authorization request is waiting under this id' });
           return route.fulfill({ status: 404, contentType: 'application/json', body });
         }
-        const body = JSON.stringify({ ...parked, identity: identities.find((i) => i.cluster === 'pirate') });
+        const body = JSON.stringify({ ...parked, identity: identities.find((i) => i.cluster === 'ocp') });
         return route.fulfill({ status: 200, contentType: 'application/json', body });
       }
       if (path === '/api/oauth/consent' && route.request().method() === 'POST') {
         const sent: unknown = JSON.parse(route.request().postData() ?? '{}');
         const decision = typeof sent === 'object' && sent !== null && 'decision' in sent ? sent.decision : null;
-        const pirate = identities.find((i) => i.cluster === 'pirate');
-        if (decision === 'approve' && !pirate?.kube_user) {
-          const body = JSON.stringify({ error: 'link your username on pirate first' });
+        const ocp = identities.find((i) => i.cluster === 'ocp');
+        if (decision === 'approve' && !ocp?.kube_user) {
+          const body = JSON.stringify({ error: 'link your username on ocp first' });
           return route.fulfill({ status: 409, contentType: 'application/json', body });
         }
         const origin = new URL(route.request().url()).origin;

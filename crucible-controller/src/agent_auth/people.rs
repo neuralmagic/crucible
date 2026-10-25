@@ -945,9 +945,9 @@ mod tests {
     use std::collections::HashMap;
     use tower::ServiceExt;
 
-    const PIRATE_KUEUE: &str = "https://crucible-kueue.apps.pirate.example/mcp";
+    const OCP_KUEUE: &str = "https://crucible-kueue.apps.ocp.example/mcp";
     const EAST_KUEUE: &str = "https://crucible-kueue.apps.east.example/mcp";
-    const WALDORF_KUEUE: &str = "http://localhost:8852/mcp";
+    const K8S_KUEUE: &str = "http://localhost:8852/mcp";
     const CLIENT_ID: &str = CLAUDE_CODE;
     const REDIRECT: &str = "http://localhost:8765/callback";
     const PI_REDIRECT: &str = "http://127.0.0.1:8765/callback";
@@ -959,8 +959,8 @@ mod tests {
 
     fn config() -> PeopleConfig {
         PeopleConfig::from_lookup(Some(format!(
-            "pirate:{PIRATE_KUEUE}=kueue.read kueue.submit, east:{EAST_KUEUE}=kueue.read, \
-             waldorf:{WALDORF_KUEUE}=kueue.read, nowhere:https://unlisted.example/mcp=kueue.read"
+            "ocp:{OCP_KUEUE}=kueue.read kueue.submit, east:{EAST_KUEUE}=kueue.read, \
+             k8s:{K8S_KUEUE}=kueue.read, nowhere:https://unlisted.example/mcp=kueue.read"
         )))
         .unwrap()
         .unwrap()
@@ -988,7 +988,7 @@ mod tests {
             ("code_challenge", CHALLENGE),
             ("code_challenge_method", "S256"),
             ("state", "st-1"),
-            ("resource", PIRATE_KUEUE),
+            ("resource", OCP_KUEUE),
         ]
         .iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1045,10 +1045,10 @@ mod tests {
     fn audiences_parse_as_cluster_resource_and_scopes() {
         let cfg = config();
         assert_eq!(
-            cfg.audience(PIRATE_KUEUE),
+            cfg.audience(OCP_KUEUE),
             Some(&PersonAudience {
-                resource: PIRATE_KUEUE.into(),
-                cluster: "pirate".into(),
+                resource: OCP_KUEUE.into(),
+                cluster: "ocp".into(),
                 scopes: vec!["kueue.read".into(), "kueue.submit".into()],
             })
         );
@@ -1058,11 +1058,11 @@ mod tests {
             Err(PeopleConfigError::Empty)
         );
         for (raw, want) in [
-            (PIRATE_KUEUE.to_string(), "Resource"),
-            ("Pirate:https://a.example/mcp".to_string(), "Shape"),
-            ("pirate:ftp://a.example/mcp".to_string(), "Resource"),
-            ("pirate:https://a.example/mcp#x".to_string(), "Resource"),
-            (format!("a:{PIRATE_KUEUE},b:{PIRATE_KUEUE}"), "Duplicate"),
+            (OCP_KUEUE.to_string(), "Resource"),
+            ("Ocp:https://a.example/mcp".to_string(), "Shape"),
+            ("ocp:ftp://a.example/mcp".to_string(), "Resource"),
+            ("ocp:https://a.example/mcp#x".to_string(), "Resource"),
+            (format!("a:{OCP_KUEUE},b:{OCP_KUEUE}"), "Duplicate"),
         ] {
             let err = PeopleConfig::from_lookup(Some(raw.clone())).unwrap_err();
             assert!(format!("{err:?}").starts_with(want), "{raw}: {err:?}");
@@ -1081,7 +1081,7 @@ mod tests {
                 ("code_challenge", CHALLENGE),
                 ("code_challenge_method", "S256"),
                 ("state", "st-1"),
-                ("resource", PIRATE_KUEUE),
+                ("resource", OCP_KUEUE),
                 ("scope", "openid kueue.read offline_access"),
                 ("prompt", "consent"),
             ]),
@@ -1090,8 +1090,8 @@ mod tests {
         .unwrap();
         assert_eq!(r.client_id.as_str(), CLAUDE_CODE);
         assert_eq!(r.client_name, "Claude Code");
-        assert_eq!(r.cluster, "pirate");
-        assert_eq!(r.resource, PIRATE_KUEUE);
+        assert_eq!(r.cluster, "ocp");
+        assert_eq!(r.resource, OCP_KUEUE);
         assert_eq!(r.scopes, ["kueue.read", "kueue.submit"]);
         assert_eq!(r.state, "st-1");
     }
@@ -1171,7 +1171,7 @@ mod tests {
         };
         assert!(validate(&cfg, &restricted, ask(EAST_KUEUE)).await.is_ok());
         assert!(matches!(
-            validate(&cfg, &restricted, ask(PIRATE_KUEUE)).await,
+            validate(&cfg, &restricted, ask(OCP_KUEUE)).await,
             Err(AuthorizeError::Redirect {
                 error: "invalid_target",
                 ..
@@ -1261,7 +1261,7 @@ mod tests {
 
     fn code_grant(expires_at: u64) -> CodeGrant {
         CodeGrant {
-            approved: approved(PIRATE_KUEUE, "pirate"),
+            approved: approved(OCP_KUEUE, "ocp"),
             redirect: builtin()[0].redirect(REDIRECT).unwrap(),
             challenge: CodeChallenge::parse(CHALLENGE).unwrap(),
             expires_at,
@@ -1299,13 +1299,13 @@ mod tests {
         let spire = Spire::start().await;
         let profile = format!(
             r#"{}
-[clusters.pirate]
-kubeconfig_secret = "pirate-kubeconfig"
+[clusters.ocp]
+kubeconfig_secret = "ocp-kubeconfig"
 [clusters.east]
 kubeconfig_secret = "east-kubeconfig"
 identity = {{ claim = "login" }}
-[clusters.waldorf]
-kubeconfig_secret = "waldorf-kubeconfig"
+[clusters.k8s]
+kubeconfig_secret = "k8s-kubeconfig"
 identity = {{ claim = "email", prefix = "oidc:" }}
 "#,
             testing::PROFILE
@@ -1477,8 +1477,8 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         body["redirect_url"].as_str().unwrap().to_string()
     }
 
-    fn link_pirate() -> Clusters {
-        Clusters::with(&[("pirate", "sha256~pirate", "casey")])
+    fn link_ocp() -> Clusters {
+        Clusters::with(&[("ocp", "sha256~ocp", "casey")])
     }
 
     fn claims_of(auth: &AgentAuth, token: &str, aud: &str) -> Map<String, Value> {
@@ -1530,16 +1530,16 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let unlinked = decide_as(&h.app, Some(&cookie), &id, "approve").await;
         assert_eq!(unlinked.status, StatusCode::CONFLICT);
         assert!(
-            unlinked.body.contains("link your username on pirate first"),
+            unlinked.body.contains("link your username on ocp first"),
             "{}",
             unlinked.body
         );
         crate::identity::kube_links::link(
             &pool,
-            &link_pirate(),
+            &link_ocp(),
             SUB,
-            "pirate",
-            "sha256~pirate",
+            "ocp",
+            "sha256~ocp",
             LinkSource::OpenshiftOauth,
         )
         .await
@@ -1575,22 +1575,18 @@ identity = {{ claim = "email", prefix = "oidc:" }}
                 ("redirect_uri", REDIRECT),
                 ("client_id", CLIENT_ID),
                 ("code_verifier", VERIFIER),
-                ("resource", PIRATE_KUEUE),
+                ("resource", OCP_KUEUE),
             ],
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["token_type"], "Bearer");
         assert_eq!(body["expires_in"], ACCESS_TTL_SECS);
-        let claims = claims_of(
-            &h.auth,
-            body["access_token"].as_str().unwrap(),
-            PIRATE_KUEUE,
-        );
+        let claims = claims_of(&h.auth, body["access_token"].as_str().unwrap(), OCP_KUEUE);
         assert_eq!(claims["sub"], "jordan");
-        assert_eq!(claims["aud"], PIRATE_KUEUE);
+        assert_eq!(claims["aud"], OCP_KUEUE);
         assert_eq!(claims["kube_user"], "casey");
-        assert_eq!(claims["kube_cluster"], "pirate");
+        assert_eq!(claims["kube_cluster"], "ocp");
         assert_eq!(claims["azp"], CLIENT_ID);
         assert_eq!(claims["scope"], "kueue.read kueue.submit");
         assert_eq!(
@@ -1648,12 +1644,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     ) {
         let h = harness(&pool).await;
         let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
-        let id = consent_id(
-            &h.app,
-            &authorize_uri(&[("resource", WALDORF_KUEUE)]),
-            &cookie,
-        )
-        .await;
+        let id = consent_id(&h.app, &authorize_uri(&[("resource", K8S_KUEUE)]), &cookie).await;
         let approved = decide_as(&h.app, Some(&cookie), &id, "approve").await;
         let code = query_of(&redirect_of(&approved))["code"].clone();
         let (status, body) = token(
@@ -1668,13 +1659,9 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let claims = claims_of(
-            &h.auth,
-            body["access_token"].as_str().unwrap(),
-            WALDORF_KUEUE,
-        );
+        let claims = claims_of(&h.auth, body["access_token"].as_str().unwrap(), K8S_KUEUE);
         assert_eq!(claims["kube_user"], "oidc:casey@example.com");
-        assert_eq!(claims["kube_cluster"], "waldorf");
+        assert_eq!(claims["kube_cluster"], "k8s");
 
         let id = consent_id(
             &h.app,
@@ -1760,22 +1747,17 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         assert_eq!(consent.status, StatusCode::OK, "{}", consent.body);
         let body: Value = serde_json::from_str(&consent.body).unwrap();
         assert_eq!(body["client_id"], CLIENT_ID);
-        assert_eq!(body["resource"], PIRATE_KUEUE);
+        assert_eq!(body["resource"], OCP_KUEUE);
         assert_eq!(body["scopes"], json!(["kueue.read", "kueue.submit"]));
         assert_eq!(body["login"], "jordan");
         assert_eq!(
             body["identity"],
-            json!({"cluster": "pirate", "rule": {"kind": "link", "oauth": false},
+            json!({"cluster": "ocp", "rule": {"kind": "link", "oauth": false},
                    "kube_user": null, "source": null, "linked_at": null})
         );
         assert_eq!(read("0000".into()).await.status, StatusCode::NOT_FOUND);
 
-        let id = consent_id(
-            &h.app,
-            &authorize_uri(&[("resource", WALDORF_KUEUE)]),
-            &cookie,
-        )
-        .await;
+        let id = consent_id(&h.app, &authorize_uri(&[("resource", K8S_KUEUE)]), &cookie).await;
         let body: Value = serde_json::from_str(&read(id).await.body).unwrap();
         assert_eq!(body["identity"]["kube_user"], "oidc:casey@example.com");
         assert_eq!(body["identity"]["source"], "rule");
@@ -1801,9 +1783,9 @@ identity = {{ claim = "email", prefix = "oidc:" }}
     async fn issued_code(h: &Harness, pool: &PgPool) -> String {
         crate::identity::kube_links::link(
             pool,
-            &Clusters::with(&[("pirate", "t", "casey")]),
+            &Clusters::with(&[("ocp", "t", "casey")]),
             SUB,
-            "pirate",
+            "ocp",
             "t",
             LinkSource::TokenReview,
         )
@@ -1957,17 +1939,13 @@ identity = {{ claim = "email", prefix = "oidc:" }}
                 ("grant_type", "refresh_token"),
                 ("refresh_token", first["refresh_token"].as_str().unwrap()),
                 ("client_id", CLIENT_ID),
-                ("resource", PIRATE_KUEUE),
+                ("resource", OCP_KUEUE),
             ],
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{second}");
         assert_ne!(second["refresh_token"], first["refresh_token"]);
-        let claims = claims_of(
-            &h.auth,
-            second["access_token"].as_str().unwrap(),
-            PIRATE_KUEUE,
-        );
+        let claims = claims_of(&h.auth, second["access_token"].as_str().unwrap(), OCP_KUEUE);
         assert_eq!(claims["kube_user"], "casey");
         let wider = token(
             &h.app,
@@ -2043,11 +2021,7 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let code = issued_code(&a, &pool).await;
         let (status, on_b) = code_exchange(&b.app, &code).await;
         assert_eq!(status, StatusCode::OK, "{on_b}");
-        let claims = claims_of(
-            &b.auth,
-            on_b["access_token"].as_str().unwrap(),
-            PIRATE_KUEUE,
-        );
+        let claims = claims_of(&b.auth, on_b["access_token"].as_str().unwrap(), OCP_KUEUE);
         assert_eq!(claims["kube_user"], "casey");
         let (status, on_a) = refreshed(&a.app, &on_b["refresh_token"]).await;
         assert_eq!(status, StatusCode::OK, "{on_a}");
@@ -2066,9 +2040,9 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         let (_, first) = code_exchange(&h.app, &code).await;
         crate::identity::kube_links::link(
             &pool,
-            &Clusters::with(&[("pirate", "t2", "casey-next")]),
+            &Clusters::with(&[("ocp", "t2", "casey-next")]),
             SUB,
-            "pirate",
+            "ocp",
             "t2",
             LinkSource::OpenshiftOauth,
         )
@@ -2076,14 +2050,10 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         .unwrap();
         let (status, second) = refreshed(&h.app, &first["refresh_token"]).await;
         assert_eq!(status, StatusCode::OK, "{second}");
-        let claims = claims_of(
-            &h.auth,
-            second["access_token"].as_str().unwrap(),
-            PIRATE_KUEUE,
-        );
+        let claims = claims_of(&h.auth, second["access_token"].as_str().unwrap(), OCP_KUEUE);
         assert_eq!(claims["kube_user"], "casey-next");
         assert!(
-            crate::identity::kube_links::unlink(&pool, SUB, "pirate")
+            crate::identity::kube_links::unlink(&pool, SUB, "ocp")
                 .await
                 .unwrap()
         );
@@ -2136,8 +2106,8 @@ identity = {{ claim = "email", prefix = "oidc:" }}
         assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
         let listed: Value = serde_json::from_str(&listed.body).unwrap();
         assert_eq!(listed["enabled"], true);
-        assert_eq!(listed["sign_ins"][0]["resource"], PIRATE_KUEUE);
-        assert_eq!(listed["sign_ins"][0]["cluster"], "pirate");
+        assert_eq!(listed["sign_ins"][0]["resource"], OCP_KUEUE);
+        assert_eq!(listed["sign_ins"][0]["cluster"], "ocp");
         let out = send(
             &h.app,
             Request::delete("/api/me/mcp-sign-ins")

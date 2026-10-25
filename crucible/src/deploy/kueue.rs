@@ -414,7 +414,7 @@ mod tests {
         pull_secret = "quay-pull"
         [kueue]
         image = "registry.example.com/crucible-kueue:latest"
-        cluster = "pirate"
+        cluster = "ocp"
         namespace = "crucible-system"
         workload_namespace = "crucible-kueue-e2e"
         run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
@@ -468,7 +468,7 @@ mod tests {
                 "--kube-authz",
                 "openshift",
                 "--cluster",
-                "pirate",
+                "ocp",
                 "--namespace",
                 "crucible-kueue-e2e",
                 "--insecure-jwks-http",
@@ -589,12 +589,12 @@ mod tests {
     fn one_profile_renders_each_cluster_for_its_own_platform() {
         let fleet = profile(
             &PROFILE
-                .replace("cluster = \"pirate\"", "clusters = [\"pirate\", \"waldorf\"]")
+                .replace("cluster = \"ocp\"", "clusters = [\"ocp\", \"k8s\"]")
                 .replace("kube_authz = \"openshift\"", "")
                 .replace(
                     "[kueue]",
-                    "[clusters.pirate]\nkubeconfig_secret = \"p\"\nplatform = \"openshift\"\n\
-                     [clusters.waldorf]\nkubeconfig_secret = \"w\"\nplatform = \"kubernetes\"\n[kueue]",
+                    "[clusters.ocp]\nkubeconfig_secret = \"p\"\nplatform = \"openshift\"\n\
+                     [clusters.k8s]\nkubeconfig_secret = \"w\"\nplatform = \"kubernetes\"\n[kueue]",
                 )
                 .replace("[cluster]\n", "[cluster]\nplatform = \"openshift\"\n"),
         );
@@ -605,34 +605,34 @@ mod tests {
                 .map(|d| serde_norway::from_str(d).unwrap())
                 .collect()
         };
-        let pirate = rendered("pirate");
-        let waldorf = rendered("waldorf");
+        let ocp = rendered("ocp");
+        let k8s = rendered("k8s");
         let labels = |docs: &[serde_json::Value]| {
             find(docs, "Namespace", "crucible-kueue-e2e")["metadata"]["labels"].clone()
         };
         assert_eq!(
-            labels(&pirate)["pod-security.kubernetes.io/enforce"],
+            labels(&ocp)["pod-security.kubernetes.io/enforce"],
             "restricted"
         );
-        assert_eq!(labels(&pirate)["kueue.openshift.io/managed"], "true");
+        assert_eq!(labels(&ocp)["kueue.openshift.io/managed"], "true");
         assert_eq!(
-            labels(&waldorf)["pod-security.kubernetes.io/enforce"],
+            labels(&k8s)["pod-security.kubernetes.io/enforce"],
             "baseline"
         );
-        assert!(labels(&waldorf).get("kueue.openshift.io/managed").is_none());
+        assert!(labels(&k8s).get("kueue.openshift.io/managed").is_none());
         let authz = |docs: &[serde_json::Value]| {
             let a = args(docs);
             a.windows(2)
                 .find(|w| w[0] == "--kube-authz")
                 .map(|w| w[1].clone())
         };
-        assert_eq!(authz(&pirate).as_deref(), Some("openshift"));
+        assert_eq!(authz(&ocp).as_deref(), Some("openshift"));
         assert_eq!(
-            authz(&waldorf).as_deref(),
+            authz(&k8s).as_deref(),
             Some("token"),
-            "the hub is OpenShift; waldorf is not"
+            "the hub is OpenShift; k8s is not"
         );
-        for docs in [&pirate, &waldorf] {
+        for docs in [&ocp, &k8s] {
             assert!(
                 !docs
                     .iter()
@@ -646,7 +646,7 @@ mod tests {
     fn the_workload_namespace_and_the_groups_source_follow_the_clusters_platform() {
         let openshift = PROFILE.replace(
             "[kueue]",
-            "[clusters.pirate]\nkubeconfig_secret = \"k\"\nplatform = \"openshift\"\n[kueue]",
+            "[clusters.ocp]\nkubeconfig_secret = \"k\"\nplatform = \"openshift\"\n[kueue]",
         );
         let without_authz = |text: &str| text.replace("kube_authz = \"openshift\"", "");
         let on_openshift = docs(&without_authz(&openshift));
@@ -724,24 +724,21 @@ mod tests {
         };
         assert_eq!(
             cluster_flag(&args(&docs(PROFILE))).as_deref(),
-            Some("pirate"),
+            Some("ocp"),
             "the only cluster"
         );
-        let two = profile(&PROFILE.replace(
-            "cluster = \"pirate\"",
-            "clusters = [\"pirate\", \"waldorf\"]",
-        ));
-        let rendered = render(&two, &RenderOpts::default(), Some("waldorf")).unwrap();
+        let two = profile(&PROFILE.replace("cluster = \"ocp\"", "clusters = [\"ocp\", \"k8s\"]"));
+        let rendered = render(&two, &RenderOpts::default(), Some("k8s")).unwrap();
         let docs: Vec<serde_json::Value> = rendered
             .split("---\n")
             .map(|d| serde_norway::from_str(d).unwrap())
             .collect();
-        assert_eq!(cluster_flag(&args(&docs)).as_deref(), Some("waldorf"));
+        assert_eq!(cluster_flag(&args(&docs)).as_deref(), Some("k8s"));
         let several = render(&two, &RenderOpts::default(), None).unwrap_err();
         assert_eq!(
             several.downcast_ref::<KueueClusterError>(),
             Some(&KueueClusterError::Several {
-                clusters: vec!["pirate".into(), "waldorf".into()]
+                clusters: vec!["ocp".into(), "k8s".into()]
             })
         );
         let elsewhere = render(&two, &RenderOpts::default(), Some("east")).unwrap_err();
@@ -849,7 +846,7 @@ mod tests {
 
     #[test]
     fn the_server_defaults_to_the_hub() {
-        let cfg = profile(PROFILE.replace("cluster = \"pirate\"\n", "").as_str())
+        let cfg = profile(PROFILE.replace("cluster = \"ocp\"\n", "").as_str())
             .kueue
             .unwrap();
         assert_eq!(cfg.clusters, ["hub"]);
@@ -862,20 +859,17 @@ mod tests {
     #[test]
     fn the_server_may_run_on_several_clusters() {
         let one = profile(PROFILE).kueue.unwrap();
-        assert!(one.serves("pirate") && !one.serves("waldorf") && !one.serves("hub"));
+        assert!(one.serves("ocp") && !one.serves("k8s") && !one.serves("hub"));
         let many = profile(
             PROFILE
-                .replace(
-                    "cluster = \"pirate\"",
-                    "clusters = [\"pirate\", \"waldorf\"]",
-                )
+                .replace("cluster = \"ocp\"", "clusters = [\"ocp\", \"k8s\"]")
                 .as_str(),
         )
         .kueue
         .unwrap();
-        assert!(many.serves("pirate") && many.serves("waldorf") && !many.serves("hub"));
+        assert!(many.serves("ocp") && many.serves("k8s") && !many.serves("hub"));
         let none = toml::from_str::<crate::deploy::profile::DeployProfile>(
-            &PROFILE.replace("cluster = \"pirate\"", "clusters = []"),
+            &PROFILE.replace("cluster = \"ocp\"", "clusters = []"),
         );
         assert!(none.is_err(), "a [kueue] table on no cluster is refused");
     }

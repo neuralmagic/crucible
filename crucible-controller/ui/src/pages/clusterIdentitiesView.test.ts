@@ -10,7 +10,7 @@ import {
 
 function linkCluster(over: Partial<ClusterIdentityDto> = {}): ClusterIdentityDto {
   return {
-    cluster: 'pirate',
+    cluster: 'ocp',
     rule: { kind: 'link', oauth: true },
     kube_user: null,
     source: null,
@@ -115,18 +115,18 @@ describe('identityView', () => {
 describe('sortIdentities', () => {
   it('puts clusters waiting on a link first, then orders by name', () => {
     const sorted = sortIdentities([
-      ruleCluster({ cluster: 'waldorf' }),
+      ruleCluster({ cluster: 'k8s' }),
       linkCluster({ cluster: 'zeta', kube_user: 'z', source: 'token-review' }),
       ruleCluster({ cluster: 'east' }),
-      linkCluster({ cluster: 'pirate' }),
+      linkCluster({ cluster: 'ocp' }),
     ]);
-    expect(sorted.map((i) => i.cluster)).toEqual(['pirate', 'east', 'waldorf', 'zeta']);
+    expect(sorted.map((i) => i.cluster)).toEqual(['ocp', 'east', 'k8s', 'zeta']);
   });
 });
 
 describe('linkOutcome', () => {
   it('reports the cluster a link just completed for', () => {
-    expect(linkOutcome(new URLSearchParams('linked=pirate'))).toEqual({ ok: true, cluster: 'pirate' });
+    expect(linkOutcome(new URLSearchParams('linked=ocp'))).toEqual({ ok: true, cluster: 'ocp' });
   });
 
   it('maps a known error code to its sentence', () => {

@@ -80,8 +80,8 @@ mod tests {
     fn callbacks_join_under_the_controller_urls_path() {
         let root = ExternalUrl::parse("https://crucible.example.com").unwrap();
         assert_eq!(
-            root.callback("pirate").unwrap().as_str(),
-            "https://crucible.example.com/oauth/cluster-link/pirate/callback"
+            root.callback("ocp").unwrap().as_str(),
+            "https://crucible.example.com/oauth/cluster-link/ocp/callback"
         );
         let prefixed = ExternalUrl::parse("https://h.example/app").unwrap();
         assert_eq!(
@@ -119,16 +119,7 @@ mod tests {
     #[test]
     fn a_cluster_name_that_could_leave_the_callback_path_is_refused() {
         let url = ExternalUrl::parse("https://crucible.example.com").unwrap();
-        for bad in [
-            "",
-            "../x",
-            "a/b",
-            "Pirate",
-            "-a",
-            "a-",
-            "a?b",
-            &"a".repeat(64),
-        ] {
+        for bad in ["", "../x", "a/b", "Ocp", "-a", "a-", "a?b", &"a".repeat(64)] {
             assert_eq!(
                 url.callback(bad),
                 Err(ExternalUrlError::Cluster(bad.into())),

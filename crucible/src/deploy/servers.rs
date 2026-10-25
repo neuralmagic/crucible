@@ -180,14 +180,14 @@ mod tests {
     const KUEUE_AND_BUILDIT: &str = r#"
         [kueue]
         image = "registry.example.com/crucible-kueue:latest"
-        clusters = ["pirate", "waldorf"]
+        clusters = ["ocp", "k8s"]
         namespace = "kueue-server"
         workload_namespaces = ["team-a", "team-b"]
         run_issuer = "http://crucible-controller.loops.svc:8080"
         kube_authz = "openshift"
         pull_secrets = ["quay-pull"]
         [buildit]
-        cluster = "pirate"
+        cluster = "ocp"
         namespace = "builds"
         run_issuer = "http://crucible-controller.loops.svc:8080"
         push_repo = "quay.io/team/agent"
@@ -215,7 +215,7 @@ mod tests {
                 ServerSpec {
                     name: name("kueue"),
                     url: "http://crucible-kueue.kueue-server.svc.cluster.local:8850/mcp".into(),
-                    clusters: vec!["pirate".into(), "waldorf".into()],
+                    clusters: vec!["ocp".into(), "k8s".into()],
                     requires_kube_user: true,
                     namespaces: vec!["team-a".into(), "team-b".into()],
                     transport: Transport::Remote,
@@ -227,7 +227,7 @@ mod tests {
                 ServerSpec {
                     name: name("buildit"),
                     url: crucible_contract::buildit::URL.into(),
-                    clusters: vec!["pirate".into()],
+                    clusters: vec!["ocp".into()],
                     requires_kube_user: false,
                     namespaces: vec![],
                     transport: Transport::Local(LocalServer::Buildit(BuilditSite {
@@ -241,7 +241,7 @@ mod tests {
                 },
             ]
         );
-        assert!(servers[0].serves("waldorf") && !servers[1].serves("waldorf"));
+        assert!(servers[0].serves("k8s") && !servers[1].serves("k8s"));
     }
 
     #[test]
@@ -262,7 +262,7 @@ mod tests {
             [[agent_servers]]
             name = "vault-mcp"
             url = "https://vault-mcp.tools.svc:8443/mcp"
-            clusters = ["pirate"]
+            clusters = ["ocp"]
             requires_kube_user = true
             namespaces = ["team-a"]
             [[agent_servers]]
@@ -277,7 +277,7 @@ mod tests {
             ServerSpec {
                 name: name("vault-mcp"),
                 url: "https://vault-mcp.tools.svc:8443/mcp".into(),
-                clusters: vec!["pirate".into()],
+                clusters: vec!["ocp".into()],
                 requires_kube_user: true,
                 namespaces: vec!["team-a".into()],
                 transport: Transport::Remote,
@@ -298,12 +298,12 @@ mod tests {
             Err(ServerSpecError::DuplicateName(n)) if n.as_str() == "kueue"
         ));
         let shared = profile(&format!(
-            "{KUEUE_AND_BUILDIT}[[agent_servers]]\nname = \"other\"\ncluster = \"waldorf\"\n\
+            "{KUEUE_AND_BUILDIT}[[agent_servers]]\nname = \"other\"\ncluster = \"k8s\"\n\
              url = \"http://crucible-kueue.kueue-server.svc.cluster.local:8850/mcp\"\n"
         ));
         assert!(matches!(
             shared.agent_servers(),
-            Err(ServerSpecError::DuplicateUrl { cluster, .. }) if cluster == "waldorf"
+            Err(ServerSpecError::DuplicateUrl { cluster, .. }) if cluster == "k8s"
         ));
         let elsewhere = profile(&format!(
             "{KUEUE_AND_BUILDIT}[[agent_servers]]\nname = \"other\"\ncluster = \"east\"\n\

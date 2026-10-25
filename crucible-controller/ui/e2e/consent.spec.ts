@@ -10,7 +10,7 @@ async function consent(page: Page, id = CONSENT_ID): Promise<void> {
   expect(crashes, `uncaught exceptions on /consent:\n${crashes.join('\n')}`).toEqual([]);
 }
 
-const pirate = (page: Page) => page.getByTestId('cluster-identity-pirate');
+const ocp = (page: Page) => page.getByTestId('cluster-identity-ocp');
 const allow = (page: Page) => page.getByRole('button', { name: 'Allow' });
 
 test.describe('the consent page', () => {
@@ -25,15 +25,15 @@ test.describe('the consent page', () => {
     await expect(request).toContainText('kueue.read kueue.submit');
     await expect(request).toContainText('wren');
     await expect(allow(page)).toBeDisabled();
-    await expect(page.getByTestId('consent-blocked')).toHaveText('Link your username on pirate first.');
+    await expect(page.getByTestId('consent-blocked')).toHaveText('Link your username on ocp first.');
   });
 
   test('links the cluster inline, lands back on the same request, and Allow sends the browser to the client', async ({ page }) => {
     await consent(page);
-    await pirate(page).getByRole('button', { name: 'Link pirate' }).click();
-    await expect(page).toHaveURL(new RegExp(`/consent\\?id=${CONSENT_ID}&linked=pirate$`));
-    await expect(page.getByTestId('cluster-link-outcome')).toHaveText('Linked pirate.');
-    await expect(pirate(page).getByTestId('kube-user')).toHaveText('wren-k8s');
+    await ocp(page).getByRole('button', { name: 'Link ocp' }).click();
+    await expect(page).toHaveURL(new RegExp(`/consent\\?id=${CONSENT_ID}&linked=ocp$`));
+    await expect(page.getByTestId('cluster-link-outcome')).toHaveText('Linked ocp.');
+    await expect(ocp(page).getByTestId('kube-user')).toHaveText('wren-k8s');
     await allow(page).click();
     await expect(page).toHaveURL(/\/client-callback\?code=c1&state=st$/);
   });

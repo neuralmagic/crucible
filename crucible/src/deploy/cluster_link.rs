@@ -122,14 +122,14 @@ mod tests {
         [image]
         loop = "registry.example.com/crucible-loop:latest"
         pull_secret = "quay-pull"
-        [clusters.pirate]
-        kubeconfig_secret = "pirate-kubeconfig"
-        [clusters.waldorf]
-        kubeconfig_secret = "waldorf-kubeconfig"
+        [clusters.ocp]
+        kubeconfig_secret = "ocp-kubeconfig"
+        [clusters.k8s]
+        kubeconfig_secret = "k8s-kubeconfig"
         identity = { claim = "email" }
         [cluster_link]
         external_url = "https://crucible.apps.hub.example.com"
-        openshift = ["pirate", "hub", "gone", "waldorf"]
+        openshift = ["ocp", "hub", "gone", "k8s"]
     "#;
 
     fn profile(text: &str) -> DeployProfile {
@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn the_oauth_client_redirects_only_to_this_clusters_callback_and_asks_only_user_info() {
         assert_eq!(
-            rendered("pirate"),
+            rendered("ocp"),
             serde_json::json!({
                 "apiVersion": "oauth.openshift.io/v1",
                 "kind": "OAuthClient",
@@ -153,7 +153,7 @@ mod tests {
                 },
                 "grantMethod": "auto",
                 "redirectURIs": [
-                    "https://crucible.apps.hub.example.com/oauth/cluster-link/pirate/callback"
+                    "https://crucible.apps.hub.example.com/oauth/cluster-link/ocp/callback"
                 ],
                 "scopeRestrictions": [{"literals": ["user:info"]}],
                 "accessTokenMaxAgeSeconds": 300
@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn no_secret_is_ever_rendered() {
-        let yaml = render(&profile(PROFILE), "pirate").unwrap();
+        let yaml = render(&profile(PROFILE), "ocp").unwrap();
         assert!(!yaml.contains("secret"), "{yaml}");
     }
 
@@ -178,7 +178,7 @@ mod tests {
             "client_id = \"crucible-staging\"\n        access_token_max_age_secs = 120\n        openshift = [",
         );
         let doc: serde_json::Value =
-            serde_norway::from_str(&render(&profile(&text), "pirate").unwrap()).unwrap();
+            serde_norway::from_str(&render(&profile(&text), "ocp").unwrap()).unwrap();
         assert_eq!(doc["metadata"]["name"], "crucible-staging");
         assert_eq!(doc["accessTokenMaxAgeSeconds"], 120);
     }
@@ -191,12 +191,7 @@ mod tests {
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::NotListed {
                 cluster: "east".into(),
-                listed: vec![
-                    "pirate".into(),
-                    "hub".into(),
-                    "gone".into(),
-                    "waldorf".into()
-                ]
+                listed: vec!["ocp".into(), "hub".into(), "gone".into(), "k8s".into()]
             })
         );
         let err = render(&p, "gone").unwrap_err();
@@ -210,11 +205,11 @@ mod tests {
 
     #[test]
     fn a_cluster_whose_usernames_follow_the_sso_login_gets_no_oauth_client() {
-        let err = render(&profile(PROFILE), "waldorf").unwrap_err();
+        let err = render(&profile(PROFILE), "k8s").unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::NotLinkCluster {
-                cluster: "waldorf".into()
+                cluster: "k8s".into()
             })
         );
     }
@@ -222,13 +217,13 @@ mod tests {
     #[test]
     fn a_profile_without_the_table_or_with_a_plain_http_url_is_refused() {
         let bare = PROFILE.split("[cluster_link]").next().unwrap().to_string();
-        let err = render(&profile(&bare), "pirate").unwrap_err();
+        let err = render(&profile(&bare), "ocp").unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::MissingTable)
         );
         let http = PROFILE.replace("https://crucible", "http://crucible");
-        let err = format!("{:#}", render(&profile(&http), "pirate").unwrap_err());
+        let err = format!("{:#}", render(&profile(&http), "ocp").unwrap_err());
         assert!(err.contains("must be https"), "{err}");
     }
 

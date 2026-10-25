@@ -1454,7 +1454,7 @@ mod tests {
     #[test]
     fn every_cluster_setting_accepts_the_names_the_profile_accepts() {
         for name in [
-            "hub", "pirate", "spoke-a", "a1", "", "Pirate", "spoke_a", "-a", "a-", "a.b",
+            "hub", "ocp", "spoke-a", "a1", "", "Ocp", "spoke_a", "-a", "a-", "a.b",
         ] {
             let profile = crucible::deploy::profile::check_cluster_name(name).is_ok();
             let agent = format!("{name}:http://a.example/mcp=s")
@@ -1884,8 +1884,8 @@ mod tests {
             cfg.spire[1].discovery.keys_path(),
             "/api/v1/namespaces/spire-system/services/https:spire-oidc:8443/proxy/keys"
         );
-        let plain: ClusterSpire = "waldorf=https://oidc-discovery.waldorf.crucible \
-             spiffe://waldorf.crucible/openshell/gateway/ \
+        let plain: ClusterSpire = "k8s=https://oidc-discovery.k8s.crucible \
+             spiffe://k8s.crucible/openshell/gateway/ \
              http://spire-server/spire-spiffe-oidc-discovery-provider:80"
             .parse()
             .unwrap();
@@ -2046,7 +2046,7 @@ mod tests {
         });
         assert!(!issuer.serves_agents());
         let people = crate::agent_auth::people::PeopleConfig::from_lookup(Some(format!(
-            "pirate:{KUEUE}=kueue.read"
+            "ocp:{KUEUE}=kueue.read"
         )))
         .unwrap()
         .unwrap();

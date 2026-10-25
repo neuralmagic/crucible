@@ -8,7 +8,7 @@ export const AGENT_TOOLS_NOTICE = 'agent_tools';
 
 export interface AgentToolRow {
   key: string;
-  /** `kueue on pirate` */
+  /** `kueue on ocp` */
   title: string;
   /** `as casey`, or empty when the server acts as no Kubernetes user. */
   identity: string;

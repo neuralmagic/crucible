@@ -132,7 +132,7 @@ mod tests {
     const KUEUE: &str = r#"
         [kueue]
         image = "registry.example.com/crucible-kueue:latest"
-        cluster = "pirate"
+        cluster = "ocp"
         namespace = "crucible-system"
         workload_namespace = "crucible-kueue-e2e"
         run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
@@ -141,7 +141,7 @@ mod tests {
 
     const BUILDIT: &str = r#"
         [buildit]
-        clusters = ["pirate", "waldorf"]
+        clusters = ["ocp", "k8s"]
         namespace = "crucible-builds"
         run_issuer = "https://crucible.hub.example"
         run_jwks_uri = "https://crucible-ext.hub.example/.well-known/jwks.json"
@@ -149,12 +149,12 @@ mod tests {
     "#;
 
     const KUEUE_URL: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
-    const SPIRE: &str = "pirate=https://oidc.pirate.example spiffe://pirate.example/openshell/gateway/ spire/oidc:443,\
-         waldorf=https://oidc.waldorf.example spiffe://waldorf.example/openshell/gateway/ spire/oidc:443";
+    const SPIRE: &str = "ocp=https://oidc.ocp.example spiffe://ocp.example/openshell/gateway/ spire/oidc:443,\
+         k8s=https://oidc.k8s.example spiffe://k8s.example/openshell/gateway/ spire/oidc:443";
 
-    /// `resource` with `scopes` for runs on pirate and on waldorf.
+    /// `resource` with `scopes` for runs on ocp and on k8s.
     fn audience(resource: &str, scopes: &str) -> Vec<Audience> {
-        ["pirate", "waldorf"]
+        ["ocp", "k8s"]
             .map(|c| {
                 format!("{c}:{resource}={scopes}")
                     .parse()
@@ -167,7 +167,7 @@ mod tests {
         AgentTokens {
             svid_audience: "http://crucible-controller.crucible-system.svc:8080".into(),
             endpoint: "http://crucible-controller.crucible-system.svc:8080/oauth/token".into(),
-            clusters: vec!["pirate".into(), "waldorf".into()],
+            clusters: vec!["ocp".into(), "k8s".into()],
             audiences: [
                 audience(KUEUE_URL, "kueue.read kueue.submit"),
                 audience(
@@ -206,7 +206,7 @@ mod tests {
 
     #[test]
     fn a_run_on_the_kueue_cluster_gets_the_server_and_the_token_endpoint_and_no_secret() {
-        let delivery = access(&servers(KUEUE), "pirate", &tokens())
+        let delivery = access(&servers(KUEUE), "ocp", &tokens())
             .unwrap()
             .expect("access");
         assert!(delivery.is_empty(), "no Secret data: {delivery:?}");
@@ -242,16 +242,13 @@ mod tests {
     #[test]
     fn a_run_elsewhere_or_without_servers_gets_nothing() {
         assert!(access(&servers(KUEUE), "hub", &tokens()).unwrap().is_none());
-        assert!(access(&[], "pirate", &tokens()).unwrap().is_none());
+        assert!(access(&[], "ocp", &tokens()).unwrap().is_none());
     }
 
     #[test]
     fn a_run_on_any_of_the_servers_clusters_gets_access() {
-        let both = servers(&KUEUE.replace(
-            "cluster = \"pirate\"",
-            "clusters = [\"pirate\", \"waldorf\"]",
-        ));
-        for cluster in ["pirate", "waldorf"] {
+        let both = servers(&KUEUE.replace("cluster = \"ocp\"", "clusters = [\"ocp\", \"k8s\"]"));
+        for cluster in ["ocp", "k8s"] {
             assert!(
                 access(&both, cluster, &tokens()).unwrap().is_some(),
                 "{cluster}"
@@ -264,35 +261,33 @@ mod tests {
     fn a_server_the_issuer_cannot_mint_for_is_not_granted() {
         let all = servers(&format!("{KUEUE}{BUILDIT}"));
         let no_spire = AgentTokens {
-            clusters: vec!["waldorf".into()],
+            clusters: vec!["k8s".into()],
             ..tokens()
         };
         assert_eq!(
-            names(&access(&all, "waldorf", &no_spire).unwrap().unwrap()),
+            names(&access(&all, "k8s", &no_spire).unwrap().unwrap()),
             ["buildit"]
         );
         assert!(
-            access(&servers(KUEUE), "pirate", &no_spire)
-                .unwrap()
-                .is_none(),
-            "no SPIRE for pirate, so no tokens for its sandboxes"
+            access(&servers(KUEUE), "ocp", &no_spire).unwrap().is_none(),
+            "no SPIRE for ocp, so no tokens for its sandboxes"
         );
         let no_audience = AgentTokens {
             audiences: audience(KUEUE_URL, "kueue.read"),
             ..tokens()
         };
-        let pirate = access(&all, "pirate", &no_audience).unwrap().unwrap();
-        assert_eq!(names(&pirate), ["kueue"], "buildit is no audience");
-        assert_eq!(granted_servers(&pirate)[0].scopes, ["kueue.read"]);
-        assert!(access(&all, "waldorf", &no_audience).unwrap().is_none());
+        let ocp = access(&all, "ocp", &no_audience).unwrap().unwrap();
+        assert_eq!(names(&ocp), ["kueue"], "buildit is no audience");
+        assert_eq!(granted_servers(&ocp)[0].scopes, ["kueue.read"]);
+        assert!(access(&all, "k8s", &no_audience).unwrap().is_none());
     }
 
     #[test]
     fn buildit_is_an_entry_served_in_the_loop_pod_with_its_issuer_and_push_repo() {
         let all = servers(&format!("{KUEUE}{BUILDIT}"));
-        let on_waldorf = access(&all, "waldorf", &tokens()).unwrap().unwrap();
+        let on_k8s = access(&all, "k8s", &tokens()).unwrap().unwrap();
         assert_eq!(
-            granted_servers(&on_waldorf),
+            granted_servers(&on_k8s),
             [AgentServer {
                 name: crucible_contract::agent_servers::ServerName::parse("buildit").unwrap(),
                 url: crucible_contract::buildit::URL.into(),
@@ -306,10 +301,10 @@ mod tests {
                 })),
             }]
         );
-        let on_pirate = access(&all, "pirate", &tokens()).unwrap().unwrap();
-        assert_eq!(names(&on_pirate), ["kueue", "buildit"]);
+        let on_ocp = access(&all, "ocp", &tokens()).unwrap().unwrap();
+        assert_eq!(names(&on_ocp), ["kueue", "buildit"]);
         assert_eq!(
-            on_pirate
+            on_ocp
                 .plain_env
                 .iter()
                 .filter(|(k, _)| k == ENV_AGENT_TOKEN_ENDPOINT)
@@ -325,13 +320,13 @@ mod tests {
             [[agent_servers]]
             name = "docs"
             url = "https://docs.example/mcp"
-            cluster = "pirate"
+            cluster = "ocp"
         "#;
         let tokens = AgentTokens {
             audiences: audience("https://docs.example/mcp", "docs.read"),
             ..tokens()
         };
-        let delivery = access(&servers(docs), "pirate", &tokens).unwrap().unwrap();
+        let delivery = access(&servers(docs), "ocp", &tokens).unwrap().unwrap();
         let granted = granted_servers(&delivery);
         assert_eq!(names(&delivery), ["docs"]);
         assert_eq!(granted[0].scopes, ["docs.read"]);
@@ -346,8 +341,8 @@ mod tests {
             crate::testing::cfg_from_args(args)
         };
         let audiences = format!(
-            "pirate:{KUEUE_URL}=kueue.read kueue.submit,waldorf:{KUEUE_URL}=kueue.read kueue.submit,\
-             pirate:{b}=buildit.read buildit.build,waldorf:{b}=buildit.read buildit.build",
+            "ocp:{KUEUE_URL}=kueue.read kueue.submit,k8s:{KUEUE_URL}=kueue.read kueue.submit,\
+             ocp:{b}=buildit.read buildit.build,k8s:{b}=buildit.read buildit.build",
             b = crucible_contract::buildit::URL
         );
         assert_eq!(AgentTokens::from_cfg(&cfg(&[])).unwrap(), None);

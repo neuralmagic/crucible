@@ -17,22 +17,22 @@ test.describe('cluster identities', () => {
     await settings(page);
     await expect(row(page, 'hub')).toContainText('SSO login');
     await expect(row(page, 'hub').getByTestId('kube-user')).toHaveText('wren');
-    await expect(row(page, 'waldorf').getByTestId('kube-user')).toHaveText('wren@example.com');
-    for (const cluster of ['hub', 'waldorf']) {
+    await expect(row(page, 'k8s').getByTestId('kube-user')).toHaveText('wren@example.com');
+    for (const cluster of ['hub', 'k8s']) {
       await expect(row(page, cluster).getByRole('button')).toHaveCount(0);
     }
-    await expect(row(page, 'pirate')).toContainText('NOT LINKED');
-    await expect(row(page, 'pirate').getByRole('button', { name: 'Link pirate' })).toBeVisible();
+    await expect(row(page, 'ocp')).toContainText('NOT LINKED');
+    await expect(row(page, 'ocp').getByRole('button', { name: 'Link ocp' })).toBeVisible();
   });
 
   test('linking signs in at the cluster and lands back linked', async ({ page }) => {
     await settings(page);
-    await row(page, 'pirate').getByRole('button', { name: 'Link pirate' }).click();
-    await expect(page).toHaveURL(/\/settings\?linked=pirate$/);
-    await expect(page.getByTestId('cluster-link-outcome')).toHaveText('Linked pirate.');
-    await expect(row(page, 'pirate').getByTestId('kube-user')).toHaveText('wren-k8s');
-    await expect(row(page, 'pirate')).toContainText('Proven by signing in to the cluster');
-    await expect(row(page, 'pirate').getByRole('button', { name: 'Relink pirate' })).toBeVisible();
+    await row(page, 'ocp').getByRole('button', { name: 'Link ocp' }).click();
+    await expect(page).toHaveURL(/\/settings\?linked=ocp$/);
+    await expect(page.getByTestId('cluster-link-outcome')).toHaveText('Linked ocp.');
+    await expect(row(page, 'ocp').getByTestId('kube-user')).toHaveText('wren-k8s');
+    await expect(row(page, 'ocp')).toContainText('Proven by signing in to the cluster');
+    await expect(row(page, 'ocp').getByRole('button', { name: 'Relink ocp' })).toBeVisible();
   });
 
   test('a cluster without OAuth takes a pasted token, and a refused one says why', async ({ page }) => {
@@ -52,11 +52,11 @@ test.describe('cluster identities', () => {
 
   test('unlinking forgets the username', async ({ page }) => {
     await settings(page);
-    await row(page, 'pirate').getByRole('button', { name: 'Link pirate' }).click();
-    await expect(row(page, 'pirate').getByTestId('kube-user')).toHaveText('wren-k8s');
-    await row(page, 'pirate').getByRole('button', { name: 'Unlink' }).click();
-    await expect(row(page, 'pirate')).toContainText('NOT LINKED');
-    await expect(row(page, 'pirate').getByRole('button', { name: 'Unlink' })).toHaveCount(0);
+    await row(page, 'ocp').getByRole('button', { name: 'Link ocp' }).click();
+    await expect(row(page, 'ocp').getByTestId('kube-user')).toHaveText('wren-k8s');
+    await row(page, 'ocp').getByRole('button', { name: 'Unlink' }).click();
+    await expect(row(page, 'ocp')).toContainText('NOT LINKED');
+    await expect(row(page, 'ocp').getByRole('button', { name: 'Unlink' })).toHaveCount(0);
   });
 
   test('a failed callback names the problem in a fixed sentence, never the query text', async ({ page }) => {

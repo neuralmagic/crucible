@@ -161,8 +161,8 @@ impl TryFrom<String> for ServiceAccountRef {
 pub struct KueueCfg {
     /// The server image, a tag the renderer resolves to `@sha256:…`.
     pub image: String,
-    /// The dispatch clusters the server runs on, `hub` or spoke names: `clusters = ["pirate",
-    /// "waldorf"]`, or `cluster = "pirate"` for one.
+    /// The dispatch clusters the server runs on, `hub` or spoke names: `clusters = ["east",
+    /// "west"]`, or `cluster = "east"` for one.
     #[serde(
         default = "hub_clusters",
         alias = "cluster",
@@ -1517,12 +1517,12 @@ mod tests {
 
     #[test]
     fn cluster_names_are_dns_labels_everywhere_the_profile_names_one() {
-        for good in ["hub", "pirate", "spoke-a", "a1"] {
+        for good in ["hub", "ocp", "spoke-a", "a1"] {
             assert_eq!(check_cluster_name(good), Ok(()));
         }
         for bad in [
             "",
-            "Pirate",
+            "Ocp",
             "spoke_a",
             "-a",
             "a-",

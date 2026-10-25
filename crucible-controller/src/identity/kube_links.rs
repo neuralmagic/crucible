@@ -284,20 +284,20 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_reviewed_token_records_the_username_the_cluster_named(pool: PgPool) {
-        let clusters = Clusters::with(&[("pirate", "sha256~pirate", "casey")]);
+        let clusters = Clusters::with(&[("ocp", "sha256~ocp", "casey")]);
         let user = link(
             &pool,
             &clusters,
             "sub-1",
-            "pirate",
-            " sha256~pirate\n",
+            "ocp",
+            " sha256~ocp\n",
             LinkSource::TokenReview,
         )
         .await
         .unwrap();
         assert_eq!(user.as_str(), "casey");
         assert_eq!(
-            get(&pool, "sub-1", "pirate").await.unwrap(),
+            get(&pool, "sub-1", "ocp").await.unwrap(),
             Some(KubeUser::parse("casey").unwrap())
         );
         let links = list(&pool, "sub-1").await.unwrap();
@@ -318,27 +318,27 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_token_from_another_cluster_links_nothing(pool: PgPool) {
         let clusters = Clusters::with(&[
-            ("pirate", "sha256~pirate", "casey"),
+            ("ocp", "sha256~ocp", "casey"),
             ("east", "sha256~east", "jordan"),
         ]);
         let err = link(
             &pool,
             &clusters,
             "sub-1",
-            "pirate",
+            "ocp",
             "sha256~east",
             LinkSource::TokenReview,
         )
         .await
         .unwrap_err();
         assert!(matches!(err, LinkError::NotAuthenticated { .. }), "{err}");
-        assert_eq!(get(&pool, "sub-1", "pirate").await.unwrap(), None);
+        assert_eq!(get(&pool, "sub-1", "ocp").await.unwrap(), None);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn system_identities_and_unreachable_clusters_link_nothing(pool: PgPool) {
         let mut clusters = Clusters::with(&[(
-            "pirate",
+            "ocp",
             "sa-token",
             "system:serviceaccount:crucible-system:crucible-kueue",
         )]);
@@ -346,7 +346,7 @@ mod tests {
             &pool,
             &clusters,
             "sub-1",
-            "pirate",
+            "ocp",
             "sa-token",
             LinkSource::TokenReview,
         )
@@ -356,33 +356,33 @@ mod tests {
             matches!(err, LinkError::User(KubeUserError::System(_))),
             "{err}"
         );
-        clusters.down.push("pirate".into());
+        clusters.down.push("ocp".into());
         let err = link(
             &pool,
             &clusters,
             "sub-1",
-            "pirate",
+            "ocp",
             "sa-token",
             LinkSource::TokenReview,
         )
         .await
         .unwrap_err();
         assert!(matches!(err, LinkError::Unreachable { .. }), "{err}");
-        assert_eq!(get(&pool, "sub-1", "pirate").await.unwrap(), None);
+        assert_eq!(get(&pool, "sub-1", "ocp").await.unwrap(), None);
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn relinking_replaces_the_username_per_cluster(pool: PgPool) {
         let clusters = Clusters::with(&[
-            ("pirate", "t1", "casey"),
-            ("pirate", "t2", "casey2"),
+            ("ocp", "t1", "casey"),
+            ("ocp", "t2", "casey2"),
             ("east", "t3", "jordan"),
         ]);
         link(
             &pool,
             &clusters,
             "sub-1",
-            "pirate",
+            "ocp",
             "t1",
             LinkSource::TokenReview,
         )
@@ -402,7 +402,7 @@ mod tests {
             &pool,
             &clusters,
             "sub-1",
-            "pirate",
+            "ocp",
             "t2",
             LinkSource::TokenReview,
         )
@@ -418,7 +418,7 @@ mod tests {
             links,
             [
                 ("east".to_string(), "jordan".to_string()),
-                ("pirate".to_string(), "casey2".to_string())
+                ("ocp".to_string(), "casey2".to_string())
             ]
         );
     }
@@ -431,12 +431,12 @@ mod tests {
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn unlinking_forgets_one_cluster_and_keeps_the_others(pool: PgPool) {
-        let clusters = Clusters::with(&[("pirate", "t1", "casey"), ("east", "t2", "jordan")]);
+        let clusters = Clusters::with(&[("ocp", "t1", "casey"), ("east", "t2", "jordan")]);
         link(
             &pool,
             &clusters,
             "sub-1",
-            "pirate",
+            "ocp",
             "t1",
             LinkSource::OpenshiftOauth,
         )
@@ -452,12 +452,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(unlink(&pool, "sub-1", "pirate").await.unwrap());
+        assert!(unlink(&pool, "sub-1", "ocp").await.unwrap());
         assert!(
-            !unlink(&pool, "sub-1", "pirate").await.unwrap(),
+            !unlink(&pool, "sub-1", "ocp").await.unwrap(),
             "nothing left to unlink"
         );
-        assert_eq!(get(&pool, "sub-1", "pirate").await.unwrap(), None);
+        assert_eq!(get(&pool, "sub-1", "ocp").await.unwrap(), None);
         let left = list(&pool, "sub-1").await.unwrap();
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].cluster, "east");
@@ -509,12 +509,12 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_spoke_link_leaves_the_hub_username_alone(pool: PgPool) {
         signed_in(&pool, "sub-alice", "alice").await;
-        let clusters = Clusters::with(&[("pirate", "t1", "casey")]);
+        let clusters = Clusters::with(&[("ocp", "t1", "casey")]);
         link(
             &pool,
             &clusters,
             "sub-alice",
-            "pirate",
+            "ocp",
             "t1",
             LinkSource::TokenReview,
         )

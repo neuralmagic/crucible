@@ -229,12 +229,12 @@ mod tests {
     async fn a_claim_rule_reads_the_login_or_the_email_behind_its_prefix(pool: PgPool) {
         let email = claim(SsoClaim::Email, "");
         assert_eq!(
-            resolve(&pool, "waldorf", &email, ALICE).await.unwrap(),
+            resolve(&pool, "k8s", &email, ALICE).await.unwrap(),
             known("alice@example.com", Source::Rule)
         );
         let login = claim(SsoClaim::Login, "sso:");
         assert_eq!(
-            resolve(&pool, "waldorf", &login, ALICE).await.unwrap(),
+            resolve(&pool, "k8s", &login, ALICE).await.unwrap(),
             known("sso:alice", Source::Rule)
         );
     }
@@ -249,10 +249,10 @@ mod tests {
             claim: SsoClaim::Email,
             prefix: String::new(),
         };
-        let Resolution::Unavailable(why) = from_claim(&rule, "waldorf", no_email) else {
+        let Resolution::Unavailable(why) = from_claim(&rule, "k8s", no_email) else {
             panic!("an absent email resolves to nothing");
         };
-        assert!(why.contains("waldorf") && why.contains("email"), "{why}");
+        assert!(why.contains("k8s") && why.contains("email"), "{why}");
         let system = ClaimIdentity {
             claim: SsoClaim::Login,
             prefix: "system:".into(),
@@ -274,7 +274,7 @@ mod tests {
             ..ALICE
         };
         assert!(matches!(
-            from_claim(&rule, "waldorf", empty),
+            from_claim(&rule, "k8s", empty),
             Resolution::Unavailable(_)
         ));
     }
@@ -282,17 +282,17 @@ mod tests {
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
     async fn a_link_cluster_is_unlinked_until_the_cluster_names_the_person(pool: PgPool) {
         assert_eq!(
-            resolve(&pool, "pirate", &ClusterIdentity::Link, ALICE)
+            resolve(&pool, "ocp", &ClusterIdentity::Link, ALICE)
                 .await
                 .unwrap(),
             Resolution::Unlinked
         );
-        let clusters = Clusters::with(&[("pirate", "t1", "casey")]);
+        let clusters = Clusters::with(&[("ocp", "t1", "casey")]);
         kube_links::link(
             &pool,
             &clusters,
             ALICE.sub,
-            "pirate",
+            "ocp",
             "t1",
             LinkSource::OpenshiftOauth,
         )
@@ -302,7 +302,7 @@ mod tests {
             user,
             source,
             linked_at,
-        } = resolve(&pool, "pirate", &ClusterIdentity::Link, ALICE)
+        } = resolve(&pool, "ocp", &ClusterIdentity::Link, ALICE)
             .await
             .unwrap()
         else {
@@ -369,7 +369,7 @@ mod tests {
             [image]
             loop = "registry.example.com/crucible-loop:latest"
             pull_secret = "pull"
-            [clusters.waldorf]
+            [clusters.k8s]
             kubeconfig_secret = "w"
             identity = { claim = "email", prefix = "oidc:" }
             "#,
@@ -377,7 +377,7 @@ mod tests {
         .unwrap();
         let resolve = |p: Principal| {
             let (pool, profile) = (pool.clone(), &profile);
-            async move { for_principal(&pool, profile, "waldorf", &p).await }
+            async move { for_principal(&pool, profile, "k8s", &p).await }
         };
         let alice = known("oidc:alice@example.com", Source::Rule);
         assert_eq!(
@@ -434,7 +434,7 @@ mod tests {
             );
         }
         assert_eq!(
-            resolve(&pool, "pirate", &ClusterIdentity::Link, ALICE)
+            resolve(&pool, "ocp", &ClusterIdentity::Link, ALICE)
                 .await
                 .unwrap(),
             Resolution::Unlinked

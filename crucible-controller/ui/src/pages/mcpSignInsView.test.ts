@@ -14,7 +14,7 @@ function signIn(
     client_host,
     client_kind,
     resource,
-    cluster: 'pirate',
+    cluster: 'ocp',
     approved_at: '2026-10-09T10:00:00Z',
     last_used_at: '2026-10-09T11:00:00Z',
   };

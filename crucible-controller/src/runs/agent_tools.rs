@@ -31,7 +31,7 @@ pub struct AgentTool {
 }
 
 impl AgentTool {
-    /// `granted kueue/pirate as casey (kueue.read kueue.submit)`, the run's event line.
+    /// `granted kueue/ocp as casey (kueue.read kueue.submit)`, the run's event line.
     pub fn summary(&self) -> String {
         let user = match &self.kube_user {
             Some(user) => format!(" as {user}"),
@@ -309,19 +309,19 @@ mod tests {
         [image]
         loop = "registry.example.com/crucible-loop:latest"
         pull_secret = "quay-pull"
-        [clusters.waldorf]
-        kubeconfig_secret = "waldorf-kubeconfig"
+        [clusters.k8s]
+        kubeconfig_secret = "k8s-kubeconfig"
         identity = { claim = "email", prefix = "oidc:" }
         [kueue]
         image = "registry.example.com/crucible-kueue:latest"
-        clusters = ["pirate", "waldorf"]
+        clusters = ["ocp", "k8s"]
         namespace = "crucible-system"
         workload_namespace = "crucible-kueue-e2e"
         run_issuer = "https://crucible.hub.example"
         kube_authz = "openshift"
         pull_secrets = ["quay-pull"]
         [buildit]
-        clusters = ["waldorf"]
+        clusters = ["k8s"]
         namespace = "crucible-builds"
         run_issuer = "https://crucible.hub.example"
         push_repo = "quay.io/org/smoke"
@@ -342,7 +342,7 @@ mod tests {
             svid_audience: "https://crucible.hub.example".into(),
             endpoint: "https://crucible.hub.example/oauth/token".into(),
             clusters: clusters.iter().map(|c| c.to_string()).collect(),
-            audiences: ["pirate", "waldorf"]
+            audiences: ["ocp", "k8s"]
                 .iter()
                 .flat_map(|c| {
                     [
@@ -361,53 +361,50 @@ mod tests {
     #[test]
     fn a_run_gets_the_servers_its_cluster_runs_with_the_issuers_scopes_and_limits() {
         let p = servers(PROFILE);
-        let all = tokens(&["pirate", "waldorf"], "kueue.read kueue.submit");
-        let on_waldorf = granted(&p, "waldorf", &all);
+        let all = tokens(&["ocp", "k8s"], "kueue.read kueue.submit");
+        let on_k8s = granted(&p, "k8s", &all);
         assert_eq!(
-            on_waldorf
-                .iter()
-                .map(|t| t.server.as_str())
-                .collect::<Vec<_>>(),
+            on_k8s.iter().map(|t| t.server.as_str()).collect::<Vec<_>>(),
             ["buildit", "kueue"],
             "by name"
         );
-        let kueue = &on_waldorf[1];
+        let kueue = &on_k8s[1];
         assert_eq!(kueue.kube_user, None, "filled in from the run's principal");
         assert_eq!(kueue.scopes, ["kueue.read", "kueue.submit"]);
         assert_eq!(kueue.limits["namespace"], "crucible-kueue-e2e");
         assert_eq!(kueue.limits["pull_secrets"], "quay-pull");
-        let buildit = &on_waldorf[0];
+        let buildit = &on_k8s[0];
         assert_eq!(buildit.url, "http://host.openshell.internal:8848/mcp");
         assert_eq!(buildit.limits["push_repo"], "quay.io/org/smoke");
         assert_eq!(
             buildit.summary(),
-            "granted buildit/waldorf (buildit.read buildit.build)"
+            "granted buildit/k8s (buildit.read buildit.build)"
         );
 
-        let read_only = tokens(&["pirate", "waldorf"], "kueue.read");
+        let read_only = tokens(&["ocp", "k8s"], "kueue.read");
         assert_eq!(
-            granted(&p, "waldorf", &read_only)[1].scopes,
+            granted(&p, "k8s", &read_only)[1].scopes,
             ["kueue.read"],
             "the scopes the issuer mints, not a fixed set"
         );
-        let on_pirate = granted(&p, "pirate", &all);
-        assert_eq!(on_pirate.len(), 1, "buildit serves waldorf only");
+        let on_ocp = granted(&p, "ocp", &all);
+        assert_eq!(on_ocp.len(), 1, "buildit serves k8s only");
         assert!(granted(&p, "hub", &all).is_empty());
         assert!(
-            granted(&p, "waldorf", &tokens(&["pirate"], "kueue.read")).is_empty(),
-            "no SPIRE for waldorf, so nothing its sandboxes could get tokens for"
+            granted(&p, "k8s", &tokens(&["ocp"], "kueue.read")).is_empty(),
+            "no SPIRE for k8s, so nothing its sandboxes could get tokens for"
         );
     }
 
     #[test]
     fn the_defaults_revision_changes_exactly_when_the_granted_set_does() {
-        let all = tokens(&["pirate", "waldorf"], "kueue.read kueue.submit");
+        let all = tokens(&["ocp", "k8s"], "kueue.read kueue.submit");
         let base = defaults(&servers(PROFILE), Some(&all));
         assert_eq!(base, defaults(&servers(PROFILE), Some(&all)), "stable");
         assert_eq!(base.revision.len(), 16);
         assert_eq!(
             base.changelog,
-            "Runs now include buildit on waldorf and kueue on pirate, waldorf tools."
+            "Runs now include buildit on k8s and kueue on k8s, ocp tools."
         );
         let reworded = PROFILE.replace(
             "image = \"registry.example.com/crucible-kueue:latest\"",
@@ -419,10 +416,7 @@ mod tests {
             "a new server image grants nothing new"
         );
         for changed in [
-            PROFILE.replace(
-                "clusters = [\"waldorf\"]",
-                "clusters = [\"pirate\", \"waldorf\"]",
-            ),
+            PROFILE.replace("clusters = [\"k8s\"]", "clusters = [\"ocp\", \"k8s\"]"),
             PROFILE.replace(
                 "push_repo = \"quay.io/org/smoke\"",
                 "push_repo = \"quay.io/org/other\"",
@@ -438,7 +432,7 @@ mod tests {
         assert_ne!(
             defaults(
                 &servers(PROFILE),
-                Some(&tokens(&["pirate", "waldorf"], "kueue.read"))
+                Some(&tokens(&["ocp", "k8s"], "kueue.read"))
             )
             .revision,
             base.revision,
@@ -508,8 +502,8 @@ mod tests {
             .unwrap();
         }
         let p = profile(PROFILE);
-        let all = tokens(&["pirate", "waldorf"], "kueue.read kueue.submit");
-        let tools = grant(&db, &servers(PROFILE), "run-1", "waldorf", &all)
+        let all = tokens(&["ocp", "k8s"], "kueue.read kueue.submit");
+        let tools = grant(&db, &servers(PROFILE), "run-1", "k8s", &all)
             .await
             .unwrap();
         assert_eq!(tools.len(), 2);
@@ -525,7 +519,7 @@ mod tests {
         assert_eq!(
             recorded[1].kube_user.as_deref(),
             Some("oidc:alice@example.com"),
-            "the username waldorf's rule gives alice"
+            "the username k8s's rule gives alice"
         );
         assert_eq!(
             recorded[0].kube_user, None,
@@ -536,8 +530,8 @@ mod tests {
         assert_eq!(
             reasons,
             [
-                "granted buildit/waldorf (buildit.read buildit.build)",
-                "granted kueue/waldorf as oidc:alice@example.com (kueue.read kueue.submit)"
+                "granted buildit/k8s (buildit.read buildit.build)",
+                "granted kueue/k8s as oidc:alice@example.com (kueue.read kueue.submit)"
             ]
         );
         assert!(
@@ -546,7 +540,7 @@ mod tests {
                 .all(|e| e.evidence.as_deref() == Some("run-1"))
         );
 
-        grant(&db, &servers(PROFILE), "run-2", "waldorf", &all)
+        grant(&db, &servers(PROFILE), "run-2", "k8s", &all)
             .await
             .unwrap();
         run_dispatched_for(&pool, "run-2", "user:bob").await;
@@ -559,7 +553,7 @@ mod tests {
             "a redispatch for bob acts as bob"
         );
 
-        grant(&db, &servers(PROFILE), "run-3", "pirate", &all)
+        grant(&db, &servers(PROFILE), "run-3", "ocp", &all)
             .await
             .unwrap();
         run_dispatched_for(&pool, "run-3", "platform").await;

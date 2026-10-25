@@ -10,7 +10,7 @@ import {
 function tool(over: Partial<AgentTool> = {}): AgentTool {
   return {
     server: 'kueue',
-    cluster: 'pirate',
+    cluster: 'ocp',
     url: 'http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp',
     kube_user: 'casey',
     scopes: ['kueue.read', 'kueue.submit'],
@@ -22,7 +22,7 @@ function tool(over: Partial<AgentTool> = {}): AgentTool {
 function defaults(over: Partial<AgentToolDefaults> = {}): AgentToolDefaults {
   return {
     revision: 'abc123',
-    changelog: 'Runs now include kueue on pirate tools.',
+    changelog: 'Runs now include kueue on ocp tools.',
     tools: [tool({ kube_user: null })],
     ...over,
   };
@@ -32,8 +32,8 @@ describe('agentToolRows', () => {
   it('names each server, who it acts as, its scopes and its limits in name order', () => {
     expect(agentToolRows([tool()])).toEqual([
       {
-        key: 'kueue/pirate',
-        title: 'kueue on pirate',
+        key: 'kueue/ocp',
+        title: 'kueue on ocp',
         identity: 'as casey',
         scopes: 'kueue.read kueue.submit',
         limits: 'namespace crucible-kueue-e2e · pull_secrets quay-pull',
@@ -57,9 +57,9 @@ describe('agentToolRows', () => {
 
 describe('agentToolsNotice', () => {
   it('announces a revision the person has not seen', () => {
-    expect(agentToolsNotice(defaults(), {})).toBe('Runs now include kueue on pirate tools.');
+    expect(agentToolsNotice(defaults(), {})).toBe('Runs now include kueue on ocp tools.');
     expect(agentToolsNotice(defaults(), { [AGENT_TOOLS_NOTICE]: 'older' })).toBe(
-      'Runs now include kueue on pirate tools.',
+      'Runs now include kueue on ocp tools.',
     );
   });
 
