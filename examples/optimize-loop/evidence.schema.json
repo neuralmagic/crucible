@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["list", "jobs"],
+  "properties": {
+    "list": {
+      "type": "object",
+      "required": ["workloads"],
+      "properties": {"workloads": {"type": "array"}}
+    },
+    "jobs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["status", "logs"],
+        "properties": {
+          "status": {"type": "object"},
+          "logs": {"type": "object"}
+        }
+      }
+    }
+  }
+}
