@@ -433,6 +433,9 @@ dto! {
         pub agent: Option<TaskAgentDto> = r.agent.map(TaskAgentDto::from),
         /// The repair turns the attempt took, in order; their cost is part of `cost_usd`.
         pub repairs: Vec<TaskRepairDto> = r.repairs.into_iter().map(TaskRepairDto::from).collect(),
+        /// What the attempt emitted: a passing attempt's product, or the record a failing one left
+        /// (an evaluate's verdict). Null when it emitted nothing.
+        pub output: Option<serde_json::Value>,
     }
 }
 

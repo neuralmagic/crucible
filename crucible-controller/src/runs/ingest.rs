@@ -123,9 +123,9 @@ struct TaskResultWire {
     cost_usd: f64,
     #[serde(default)]
     secs: f64,
-    /// What the task emitted, verbatim. Folded into [`ParsedRun::result`] rather than into the
-    /// `task_results` row: it is the run's product, and a schedule's cursor reads a field of it
-    /// after a successful run.
+    /// What the task emitted, verbatim. Kept on the attempt's `task_results` row, and a passing
+    /// attempt's is folded into [`ParsedRun::result`]: it is the run's product, and a schedule's
+    /// cursor reads a field of it after a successful run.
     #[serde(default)]
     output: Option<serde_json::Value>,
     /// The external results the engine parsed off the attempt's declared `link`/`links` fields,
@@ -454,10 +454,11 @@ fn parse_session(content: &str) -> ParsedRun {
                 if task.is_empty() {
                     continue;
                 }
-                if let Some(output) = output.filter(|o| !o.is_null())
+                let output = output.filter(|o| !o.is_null());
+                if let Some(output) = &output
                     && status == "pass"
                 {
-                    run.result.insert(task.clone(), output);
+                    run.result.insert(task.clone(), output.clone());
                 }
                 run.task_results.push(TaskResult {
                     iter: iter.into(),
@@ -473,6 +474,7 @@ fn parse_session(content: &str) -> ParsedRun {
                     links: crucible_contract::decode_links(&links),
                     agent: serde_json::from_value(agent).ok(),
                     repairs: crucible_contract::session::TaskRepair::decode_all(&repairs),
+                    output,
                 });
             }
             Ev::Shutdown { outcome, reason } => {
@@ -916,6 +918,7 @@ mod tests {
     /// A playbook run's product is what its tasks emitted: each passing task's `output`, keyed by
     /// task name, which is the document a schedule's cursor addresses. A retried task's last
     /// attempt wins, a failed one contributes nothing, and a log without outputs leaves it empty.
+    /// Every attempt's row keeps the output it emitted, failing or not.
     #[test]
     fn parse_folds_passing_task_outputs_into_the_run_result() {
         let log = [
@@ -941,6 +944,22 @@ mod tests {
             parsed.task_results.len(),
             5,
             "every attempt is still ledgered"
+        );
+        let outputs: Vec<Option<serde_json::Value>> = parsed
+            .task_results
+            .iter()
+            .map(|r| r.output.clone())
+            .collect();
+        assert_eq!(
+            outputs,
+            [
+                Some(serde_json::json!({"newest_created_at": "2026-08-01T00:00:00Z"})),
+                Some(serde_json::json!({"newest_created_at": "2026-08-23T00:00:00Z", "seen": 4})),
+                Some(serde_json::json!("done")),
+                None,
+                None,
+            ],
+            "each attempt keeps its own output, the failed one's included, and null is none"
         );
 
         assert!(

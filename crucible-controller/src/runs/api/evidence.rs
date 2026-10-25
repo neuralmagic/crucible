@@ -43,8 +43,8 @@ pub struct TaskEvidenceDto {
     /// Summed across the task's recorded attempts.
     pub cost_usd: Option<f64>,
     pub secs: Option<f64>,
-    /// The payload the task emitted, from the run's session log; null for a task that emitted none
-    /// and for a run whose session is not stored.
+    /// The payload the task emitted, from the run's session log, or from its latest recorded
+    /// attempt when no session is stored; null for a task that emitted none.
     pub payload: Option<serde_json::Value>,
     pub files: Vec<EvidenceFileDto>,
     /// True when the run is still going and the task has reported nothing terminal — the panel says
@@ -120,7 +120,10 @@ pub(crate) async fn get_task_evidence(
             .or_else(|| (!mine.is_empty()).then(|| i64::try_from(mine.len()).unwrap_or(i64::MAX))),
         cost_usd: summed(|r| r.cost_usd),
         secs: summed(|r| r.secs),
-        payload: from_session.and_then(|s| s.payload),
+        payload: match from_session {
+            Some(s) => s.payload,
+            None => latest.and_then(|r| r.output.clone()),
+        },
         files: files.into_iter().map(EvidenceFileDto::from).collect(),
         running: latest.is_none() && run.status == "running",
     })
