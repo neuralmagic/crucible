@@ -170,9 +170,7 @@ impl Jwks {
                     let found = keys.get(kid).cloned();
                     cache.keys = keys;
                     cache.fetched_at = cache.attempted_at;
-                    if let Some(key) = found {
-                        return Ok(key);
-                    }
+                    return found.ok_or_else(|| JwksError::UnknownKid(kid.to_string()));
                 }
                 Err(error) if stale.is_some() => {
                     tracing::warn!(%error, kid, "JWKS refresh failed; keeping the cached key");

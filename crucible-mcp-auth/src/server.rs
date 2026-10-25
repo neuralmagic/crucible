@@ -677,6 +677,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_key_the_issuer_dropped_is_refused_on_the_refetch_that_drops_it() {
+        let jwks = JwksServer::start(vec![jwk("a"), jwk("b")]).await;
+        let rs = testing::resource_server(&jwks, Duration::ZERO, Duration::ZERO);
+        rs.validate(&sign("a", &run_claims())).await.unwrap();
+        *jwks.keys.write().await = vec![jwk("b")];
+        let err = rs.validate(&sign("a", &run_claims())).await.unwrap_err();
+        assert!(
+            matches!(err, TokenError::Key(JwksError::UnknownKid(_))),
+            "{err}"
+        );
+        rs.validate(&sign("b", &run_claims())).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn an_issuer_outage_keeps_cached_keys_and_fails_closed_on_new_ones() {
         let jwks = JwksServer::start(vec![jwk("a")]).await;
         let rs = testing::resource_server(&jwks, Duration::ZERO, Duration::ZERO);
