@@ -81,7 +81,7 @@ CLUSTER_QUEUE=${CLUSTER_QUEUE:-crucible}
 CTL_PSA=${CTL_PSA:-baseline}
 KUEUE_PSA=${KUEUE_PSA:-restricted}
 LOOP_PSA=${LOOP_PSA:-baseline}
-SANDBOX_PSA=${SANDBOX_PSA:-privileged}
+SANDBOX_PSA=${SANDBOX_PSA:-baseline}
 WORKLOAD_PSA=${WORKLOAD_PSA:-baseline}
 NONCE=$(openssl rand -hex 12)
 JOB=crucible-smoke-${NONCE:0:8}
@@ -91,6 +91,18 @@ ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=$(mktemp -d)
 kc() { kubectl --context "$CONTEXT" "$@"; }
 log() { printf '[kueue-e2e] %s\n' "$*" >&2; }
+# A name as crucible-kueue labels it: itself when it is a label value, else its label-safe
+# characters and a hash of the whole (an email username, on clusters whose OIDC names people so).
+label_safe() {
+    if [[ $1 =~ ^[A-Za-z0-9]([A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$ ]]; then
+        printf '%s' "$1"
+        return
+    fi
+    local hash kept
+    hash=$(printf '%s' "$1" | openssl dgst -sha256 -r | cut -c1-10)
+    kept=$(printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-52 | sed -E 's/^[^A-Za-z0-9]+//; s/[^A-Za-z0-9]+$//')
+    if [ -n "$kept" ]; then printf '%s-%s' "$kept" "$hash"; else printf '%s' "$hash"; fi
+}
 fail() { log "FAIL: $*"; exit 1; }
 
 FORWARD_PID=
@@ -372,7 +384,7 @@ done
 RUN=$(jq -r '.metadata.labels["crucible.dev/run-id"]' <<<"$job")
 [ "$(jq -r '.metadata.labels["crucible.dev/managed-by"]' <<<"$job")" = crucible-kueue ] \
     || fail "Job $JOB was not created by crucible-kueue"
-[ "$(jq -r '.metadata.labels["crucible.dev/launched-by"]' <<<"$job")" = "$LAUNCHER" ] \
+[ "$(jq -r '.metadata.labels["crucible.dev/launched-by"]' <<<"$job")" = "$(label_safe "$LAUNCHER")" ] \
     || fail "Job $JOB was not launched for $LAUNCHER"
 [ "$(jq -r '.metadata.labels["kueue.x-k8s.io/queue-name"]' <<<"$job")" = crucible-e2e ] \
     || fail "Job $JOB was not queued through crucible-e2e"
