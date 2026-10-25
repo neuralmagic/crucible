@@ -859,6 +859,14 @@ Every refresh reads the person again (`crucible-controller/src/identity/people_d
   revokes the approval.
 - An unlinked cluster username revokes the approval. A new link appears in the next token.
 
+Warning: A refresh does not ask the upstream identity provider. A person deactivated there keeps
+refreshing until something else refuses them: a stored offline credential the SSO then refuses,
+the 14-day idle limit, or the 90-day cap on an approval (`REFRESH_IDLE_SECS`,
+`REFRESH_ABSOLUTE_SECS` in `crucible-controller/src/agent_auth/people/grants.rs`). Without a
+stored credential (`CONTROLLER_CREDENTIAL_KEY` unset, or a person who never stored one), nothing
+else does. To cut a person off sooner, delete their `users` row, which also drops their stored
+credential and API keys.
+
 Warning: A client that retries a refresh after a lost response presents a spent token. The
 controller treats that as reuse and revokes the approval. The person must approve the client
 again.
@@ -1640,6 +1648,12 @@ The authfile is the loop pod's `[secrets] push_authfile` Secret, mounted in the 
 (`FORGE_AUTHFILE`). `buildit` reads it on each push and streams it to the builder pod over exec
 stdin (`buildit/src/mcp.rs:479`, `mcp.rs:1089`). The builder pod never mounts it, and the sandbox
 never sees it. Without a push repository or without the authfile, `push` is refused.
+
+Warning: the push runs in the same builder pod as the agent's build steps and `run` commands, as
+the same user, and nothing stops a process a step left behind when `push` starts. Such a process
+could read the authfile while the push holds it, then push to any tag, or any repository the
+credential reaches. Until the push moves to a container of its own, give `[secrets]
+push_authfile` a credential scoped to the one push repository.
 
 ## 9. Configuration reference and feature flags
 
