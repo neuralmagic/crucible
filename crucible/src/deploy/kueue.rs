@@ -567,6 +567,65 @@ mod tests {
         );
     }
 
+    /// A hub on OpenShift dispatching to an OpenShift spoke and a plain Kubernetes spoke renders
+    /// each spoke's server for that spoke's platform, never the hub's.
+    #[test]
+    fn one_profile_renders_each_cluster_for_its_own_platform() {
+        let fleet = profile(
+            &PROFILE
+                .replace("cluster = \"pirate\"", "clusters = [\"pirate\", \"waldorf\"]")
+                .replace("kube_authz = \"openshift\"", "")
+                .replace(
+                    "[kueue]",
+                    "[clusters.pirate]\nkubeconfig_secret = \"p\"\nplatform = \"openshift\"\n\
+                     [clusters.waldorf]\nkubeconfig_secret = \"w\"\nplatform = \"kubernetes\"\n[kueue]",
+                )
+                .replace("[cluster]\n", "[cluster]\nplatform = \"openshift\"\n"),
+        );
+        let rendered = |cluster: &str| -> Vec<serde_json::Value> {
+            render(&fleet, &RenderOpts::default(), Some(cluster))
+                .unwrap()
+                .split("---\n")
+                .map(|d| serde_norway::from_str(d).unwrap())
+                .collect()
+        };
+        let pirate = rendered("pirate");
+        let waldorf = rendered("waldorf");
+        let labels = |docs: &[serde_json::Value]| {
+            find(docs, "Namespace", "crucible-kueue-e2e")["metadata"]["labels"].clone()
+        };
+        assert_eq!(
+            labels(&pirate)["pod-security.kubernetes.io/enforce"],
+            "restricted"
+        );
+        assert_eq!(labels(&pirate)["kueue.openshift.io/managed"], "true");
+        assert_eq!(
+            labels(&waldorf)["pod-security.kubernetes.io/enforce"],
+            "baseline"
+        );
+        assert!(labels(&waldorf).get("kueue.openshift.io/managed").is_none());
+        let authz = |docs: &[serde_json::Value]| {
+            let a = args(docs);
+            a.windows(2)
+                .find(|w| w[0] == "--kube-authz")
+                .map(|w| w[1].clone())
+        };
+        assert_eq!(authz(&pirate).as_deref(), Some("openshift"));
+        assert_eq!(
+            authz(&waldorf).as_deref(),
+            Some("token"),
+            "the hub is OpenShift; waldorf is not"
+        );
+        for docs in [&pirate, &waldorf] {
+            assert!(
+                !docs
+                    .iter()
+                    .any(|d| d.to_string().contains("securitycontextconstraints")),
+                "SCC grants are the operator's, on either platform"
+            );
+        }
+    }
+
     #[test]
     fn the_workload_namespace_and_the_groups_source_follow_the_clusters_platform() {
         let openshift = PROFILE.replace(

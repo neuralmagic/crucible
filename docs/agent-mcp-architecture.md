@@ -1681,7 +1681,7 @@ tokens, the controller does not read them.
 | `[cluster] sandbox_spiffe_socket` | unset | The SPIFFE Workload API socket path that supervisors get through `csi.spiffe.io`. Unset: no socket, so no JWT-SVIDs. |
 | `[cluster] identity` | `"link"` | The hub identity rule. |
 | `[clusters.<name>] identity` | `"link"` | A spoke identity rule. |
-| `[cluster] platform`, `[clusters.<name>] platform` | `"kubernetes"` | `kubernetes` or `openshift`: the distribution the hub or a spoke runs. It decides what a render may assume of the cluster (section 11.2). |
+| `[cluster] platform`, `[clusters.<name>] platform` | `"kubernetes"` | `kubernetes` or `openshift`: the distribution the hub or a spoke runs. It decides what a render may assume of the cluster (section 11.2). Each cluster's render reads that cluster's own entry: an OpenShift hub dispatching to an OpenShift spoke and a Kubernetes spoke renders each spoke for its own platform, and nothing applies the hub's platform to a spoke. The hub's own platform affects only what is rendered for the hub itself; its ingress and deploy are the Argo chart's. |
 | cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE`, `CONTROLLER_AGENT_AUDIENCES` and `CONTROLLER_PEOPLE_AUDIENCES` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
 | `[cluster] aws_sandbox_role_arn` | unset | The AWS role that the gateway pod assumes for sandboxes. |
 | `[kueue] image` | required | The `crucible-kueue` image. |
