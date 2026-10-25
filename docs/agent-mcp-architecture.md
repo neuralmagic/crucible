@@ -803,10 +803,15 @@ The steps are these:
    and try again.
 8. The code is 32 random bytes, base64url. Postgres stores only its SHA-256. The stored grant
    names the client ID and the client name.
-9. The token endpoint admits the client ID without a fetch (`registry.rs:87`). It deletes the
-   code in the same statement that reads it, so a code works once on any replica
-   (`crucible-controller/src/agent_auth/people/grants.rs:157`). A code issued to another client
-   ID is `invalid_grant` (`redeem_code`, `people.rs:722`). The code is spent all the same.
+9. The token endpoint admits the client ID without a fetch (`registry.rs:87`). It marks the code
+   spent under a row lock, so a code works once on any replica (`redeem_code` in
+   `crucible-controller/src/agent_auth/people/grants.rs`). A code issued to another client ID is
+   `invalid_grant` (`redeem_code`, `people.rs`). The code is spent all the same. The approval the
+   redemption starts is recorded against the code, and a spent code stays a day past its expiry.
+   Presented again by the client it was issued to, it is `invalid_grant` and revokes that approval,
+   so the refresh token the first redemption issued stops working (OAuth 2.1 §4.1.3, RFC 9700
+   §4.5.3); a replay that lands before the approval starts stops it from starting. Presented by
+   another client, it is only unknown, so a code someone saw cannot revoke a person's approval.
 
 Note: Claude Code does not step up after a 403. So a person always gets every scope that the
 audience lists. Requested scopes outside that list are refused; the OIDC scopes `openid`,

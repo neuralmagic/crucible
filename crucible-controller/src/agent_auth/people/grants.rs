@@ -4,7 +4,8 @@
 //! A code starts a grant family; each refresh spends the family's live token and issues the next.
 //! Presenting a spent token again revokes the whole family (RFC 9700 §4.14.2): one of the two
 //! holders is not the client the person approved. So does presenting a live one as a different
-//! client. Nothing here reads the host's own tables.
+//! client, and so does presenting a spent code again as the client it was issued to (OAuth 2.1
+//! §4.1.3). Nothing here reads the host's own tables.
 
 use crate::agent_auth::people::clients::ClientId;
 use crate::agent_auth::people::{Approved, CodeGrant};
@@ -18,6 +19,8 @@ use sqlx::PgPool;
 pub const REFRESH_IDLE_SECS: u64 = 14 * 24 * 3600;
 /// A family dies this long after the approval, however often it was refreshed.
 pub const REFRESH_ABSOLUTE_SECS: u64 = 90 * 24 * 3600;
+/// How long a code stays after it expires, spent or not, so a replay is still recognised.
+pub const CODE_KEPT_SECS: u64 = 24 * 3600;
 /// How often expired codes and families are deleted.
 pub const SWEEP_PERIOD: std::time::Duration = std::time::Duration::from_secs(3600);
 const SECRET_BYTES: usize = 32;
@@ -30,6 +33,8 @@ pub enum GrantError {
     Expired,
     #[error("the refresh token was already used; every token of its approval is revoked")]
     Reused,
+    #[error("the code was already used; what it issued is revoked")]
+    CodeReused,
     #[error("the approval behind this refresh token was revoked")]
     Revoked,
     #[error(
@@ -111,10 +116,25 @@ fn client_id(stored: &str) -> Result<ClientId, GrantError> {
 #[async_trait::async_trait]
 pub trait GrantStore: Send + Sync {
     async fn issue_code(&self, grant: &CodeGrant) -> Result<String, GrantError>;
-    /// The code's grant, consumed whether or not it is still valid.
-    async fn redeem_code(&self, code: &str, now: u64) -> Result<CodeGrant, GrantError>;
+    /// The code's grant, spent whether or not it is still valid. A spent code presented again by
+    /// `client`, the client it was issued to, revokes the family its redemption started and stops
+    /// one from starting; presented by any other client, it is just unknown.
+    async fn redeem_code(
+        &self,
+        code: &str,
+        client: &ClientId,
+        now: u64,
+    ) -> Result<CodeGrant, GrantError>;
     /// Start a family for `approved` and return its first refresh token.
     async fn issue_refresh(&self, approved: &Approved, now: u64) -> Result<String, GrantError>;
+    /// [`GrantStore::issue_refresh`] for the redemption of `code`, which the family is recorded
+    /// against; refused when the code was replayed meanwhile.
+    async fn issue_refresh_for_code(
+        &self,
+        code: &str,
+        approved: &Approved,
+        now: u64,
+    ) -> Result<String, GrantError>;
     /// Spend `token`, presented by `client`, and issue its family's next one. A token already spent,
     /// or one issued to another client, revokes the family.
     async fn rotate_refresh(
@@ -180,42 +200,92 @@ impl GrantStore for PgGrantStore {
         Ok(code)
     }
 
-    async fn redeem_code(&self, code: &str, now: u64) -> Result<CodeGrant, GrantError> {
-        let row: Option<(serde_json::Value, i64)> = sqlx::query_as(
-            "DELETE FROM people_codes WHERE key = $1 RETURNING grant_json, expires_at",
+    async fn redeem_code(
+        &self,
+        code: &str,
+        client: &ClientId,
+        now: u64,
+    ) -> Result<CodeGrant, GrantError> {
+        let key = key_of(code);
+        let mut tx = self.pool.begin().await.context("opening the redemption")?;
+        type Row = (serde_json::Value, i64, Option<i64>, Option<String>);
+        let row: Option<Row> = sqlx::query_as(
+            "SELECT grant_json, expires_at, redeemed_at, grant_id FROM people_codes
+              WHERE key = $1 FOR UPDATE",
         )
-        .bind(&key_of(code)[..])
-        .fetch_optional(&self.pool)
+        .bind(&key[..])
+        .fetch_optional(&mut *tx)
         .await
-        .context("redeeming an authorization code")?;
-        let (json, expires_at) = row.ok_or(GrantError::Unknown)?;
+        .context("reading an authorization code")?;
+        let (json, expires_at, redeemed_at, grant_id) = row.ok_or(GrantError::Unknown)?;
+        let grant: CodeGrant =
+            serde_json::from_value(json).context("decoding a stored code grant")?;
+        if redeemed_at.is_some() {
+            if grant.approved.client_id != *client {
+                return Err(GrantError::Unknown);
+            }
+            sqlx::query("UPDATE people_codes SET reused_at = $2 WHERE key = $1")
+                .bind(&key[..])
+                .bind(at(now)?)
+                .execute(&mut *tx)
+                .await
+                .context("marking a replayed code")?;
+            if let Some(grant_id) = &grant_id {
+                revoke_in(&mut tx, grant_id, now).await?;
+            }
+            tx.commit().await.context("committing the revocation")?;
+            tracing::warn!(
+                grant = grant_id.as_deref().unwrap_or("none yet"),
+                "authorization code replayed; what it issued is revoked"
+            );
+            return Err(GrantError::CodeReused);
+        }
+        sqlx::query("UPDATE people_codes SET redeemed_at = $2 WHERE key = $1")
+            .bind(&key[..])
+            .bind(at(now)?)
+            .execute(&mut *tx)
+            .await
+            .context("spending an authorization code")?;
+        tx.commit().await.context("committing the redemption")?;
         if secs(expires_at) <= now {
             return Err(GrantError::Expired);
         }
-        Ok(serde_json::from_value(json).context("decoding a stored code grant")?)
+        Ok(grant)
     }
 
     async fn issue_refresh(&self, approved: &Approved, now: u64) -> Result<String, GrantError> {
-        let (id, _) = new_secret()?;
         let mut tx = self.pool.begin().await.context("opening the grant write")?;
-        sqlx::query(
-            "INSERT INTO people_grants
-               (id, sub, client_id, client_name, resource, cluster, scopes, created_at,
-                last_used_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
-        )
-        .bind(&id)
-        .bind(&approved.sub)
-        .bind(approved.client_id.as_str())
-        .bind(&approved.client_name)
-        .bind(&approved.resource)
-        .bind(&approved.cluster)
-        .bind(serde_json::json!(approved.scopes))
-        .bind(at(now)?)
-        .execute(&mut *tx)
-        .await
-        .context("storing an approval")?;
-        let token = issue_token(&mut tx, &id, now).await?;
+        let (_, token) = start_family(&mut tx, approved, now).await?;
+        tx.commit().await.context("committing the approval")?;
+        Ok(token)
+    }
+
+    async fn issue_refresh_for_code(
+        &self,
+        code: &str,
+        approved: &Approved,
+        now: u64,
+    ) -> Result<String, GrantError> {
+        let key = key_of(code);
+        let mut tx = self.pool.begin().await.context("opening the grant write")?;
+        let reused: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT reused_at FROM people_codes WHERE key = $1 FOR UPDATE")
+                .bind(&key[..])
+                .fetch_optional(&mut *tx)
+                .await
+                .context("reading the redeemed code")?;
+        match reused {
+            Some(None) => {}
+            Some(Some(_)) => return Err(GrantError::CodeReused),
+            None => return Err(GrantError::Unknown),
+        }
+        let (id, token) = start_family(&mut tx, approved, now).await?;
+        sqlx::query("UPDATE people_codes SET grant_id = $2 WHERE key = $1")
+            .bind(&key[..])
+            .bind(&id)
+            .execute(&mut *tx)
+            .await
+            .context("recording the approval against its code")?;
         tx.commit().await.context("committing the approval")?;
         Ok(token)
     }
@@ -425,7 +495,7 @@ impl GrantStore for PgGrantStore {
 
     async fn sweep(&self, now: u64) -> Result<u64, GrantError> {
         let codes = sqlx::query("DELETE FROM people_codes WHERE expires_at <= $1")
-            .bind(at(now)?)
+            .bind(at(now.saturating_sub(CODE_KEPT_SECS))?)
             .execute(&self.pool)
             .await
             .context("sweeping codes")?
@@ -473,6 +543,34 @@ pub fn spawn_sweep(
             }
         }
     });
+}
+
+/// Insert a family for `approved` and its first refresh token, returning both.
+async fn start_family(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    approved: &Approved,
+    now: u64,
+) -> Result<(String, String), GrantError> {
+    let (id, _) = new_secret()?;
+    sqlx::query(
+        "INSERT INTO people_grants
+           (id, sub, client_id, client_name, resource, cluster, scopes, created_at,
+            last_used_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)",
+    )
+    .bind(&id)
+    .bind(&approved.sub)
+    .bind(approved.client_id.as_str())
+    .bind(&approved.client_name)
+    .bind(&approved.resource)
+    .bind(&approved.cluster)
+    .bind(serde_json::json!(approved.scopes))
+    .bind(at(now)?)
+    .execute(&mut **tx)
+    .await
+    .context("storing an approval")?;
+    let token = issue_token(tx, &id, now).await?;
+    Ok((id, token))
 }
 
 async fn issue_token(
@@ -561,30 +659,88 @@ mod tests {
         let code = grants.issue_code(&code_grant(T0 + 60)).await.unwrap();
         assert!(code.len() >= 43);
         assert_eq!(
-            grants.redeem_code(&code, T0).await.unwrap().approved,
+            grants
+                .redeem_code(&code, &claude(), T0)
+                .await
+                .unwrap()
+                .approved,
             approved()
         );
         assert!(matches!(
-            grants.redeem_code(&code, T0).await,
-            Err(GrantError::Unknown)
+            grants.redeem_code(&code, &claude(), T0).await,
+            Err(GrantError::CodeReused)
         ));
         let code = grants.issue_code(&code_grant(T0 + 60)).await.unwrap();
         assert!(matches!(
-            grants.redeem_code(&code, T0 + 60).await,
+            grants.redeem_code(&code, &claude(), T0 + 60).await,
             Err(GrantError::Expired)
         ));
         assert!(
             matches!(
-                grants.redeem_code(&code, T0).await,
-                Err(GrantError::Unknown)
+                grants.redeem_code(&code, &claude(), T0).await,
+                Err(GrantError::CodeReused)
             ),
             "an expired code is spent too"
         );
-        let stored: Vec<Vec<u8>> = sqlx::query_scalar("SELECT key FROM people_codes")
-            .fetch_all(&pool)
+        assert!(
+            matches!(
+                grants.redeem_code("never-issued", &claude(), T0).await,
+                Err(GrantError::Unknown)
+            ),
+            "a code never issued is unknown"
+        );
+    }
+
+    /// A spent code presented again by its own client revokes the approval its redemption started
+    /// (OAuth 2.1 §4.1.3); presented by another client it is only unknown, so no one else can
+    /// revoke a person's approval with a code they saw.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_replayed_code_revokes_what_its_redemption_issued(pool: PgPool) {
+        let grants = PgGrantStore::new(pool.clone());
+        let codex = ClientId::parse(CODEX).unwrap();
+        let code = grants.issue_code(&code_grant(T0 + 60)).await.unwrap();
+        let grant = grants.redeem_code(&code, &claude(), T0).await.unwrap();
+        let refresh = grants
+            .issue_refresh_for_code(&code, &grant.approved, T0)
             .await
             .unwrap();
-        assert!(stored.is_empty());
+        assert!(matches!(
+            grants.redeem_code(&code, &codex, T0 + 1).await,
+            Err(GrantError::Unknown)
+        ));
+        let (_, refresh) = grants
+            .rotate_refresh(&refresh, &claude(), T0 + 1)
+            .await
+            .expect("another client's replay revokes nothing");
+        assert!(matches!(
+            grants.redeem_code(&code, &claude(), T0 + 2).await,
+            Err(GrantError::CodeReused)
+        ));
+        assert!(matches!(
+            grants.rotate_refresh(&refresh, &claude(), T0 + 3).await,
+            Err(GrantError::Unknown)
+        ));
+        assert!(grants.live(SUB, T0 + 3).await.unwrap().is_empty());
+    }
+
+    /// A replay that lands between a code's redemption and its first refresh token stops the
+    /// approval from starting at all.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_replay_before_the_approval_starts_stops_it(pool: PgPool) {
+        let grants = PgGrantStore::new(pool.clone());
+        let code = grants.issue_code(&code_grant(T0 + 60)).await.unwrap();
+        let grant = grants.redeem_code(&code, &claude(), T0).await.unwrap();
+        assert!(matches!(
+            grants.redeem_code(&code, &claude(), T0).await,
+            Err(GrantError::CodeReused)
+        ));
+        assert!(matches!(
+            grants
+                .issue_refresh_for_code(&code, &grant.approved, T0)
+                .await,
+            Err(GrantError::CodeReused)
+        ));
+        assert!(grants.live(SUB, T0).await.unwrap().is_empty());
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -692,7 +848,7 @@ mod tests {
             );
         }
         assert!(matches!(
-            grants.redeem_code(&code, T0).await,
+            grants.redeem_code(&code, &claude(), T0).await,
             Err(GrantError::Unknown)
         ));
         assert_eq!(grants.revoke_subject(SUB, T0).await.unwrap(), 0);
@@ -703,6 +859,7 @@ mod tests {
         let grants = PgGrantStore::new(pool.clone());
         let now = T0 + REFRESH_IDLE_SECS + 10;
         grants.issue_code(&code_grant(T0 + 60)).await.unwrap();
+        grants.issue_code(&code_grant(now - 100)).await.unwrap();
         let idle = grants.issue_refresh(&approved(), T0).await.unwrap();
         let live = grants.issue_refresh(&approved(), now - 100).await.unwrap();
         let revoked = grants.issue_refresh(&approved(), now - 100).await.unwrap();
@@ -717,7 +874,15 @@ mod tests {
         assert_eq!(
             grants.sweep(now).await.unwrap(),
             3,
-            "the expired code, the idle family and the revoked one"
+            "the long-expired code, the idle family and the revoked one"
+        );
+        let codes: i64 = sqlx::query_scalar("SELECT count(*) FROM people_codes")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            codes, 1,
+            "a code expired within a day stays, so a replay is recognised"
         );
         let families: i64 = sqlx::query_scalar("SELECT count(*) FROM people_grants")
             .fetch_one(&pool)
@@ -794,7 +959,7 @@ mod tests {
                 .is_err()
         );
         assert!(matches!(
-            grants.redeem_code(&codex_code, T0 + 3).await,
+            grants.redeem_code(&codex_code, &codex, T0 + 3).await,
             Err(GrantError::Unknown)
         ));
         assert!(
@@ -803,7 +968,12 @@ mod tests {
                 .await
                 .is_ok()
         );
-        assert!(grants.redeem_code(&claude_code, T0 + 3).await.is_ok());
+        assert!(
+            grants
+                .redeem_code(&claude_code, &claude(), T0 + 3)
+                .await
+                .is_ok()
+        );
         let live = grants.live(SUB, T0 + 3).await.unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].client_id, claude());

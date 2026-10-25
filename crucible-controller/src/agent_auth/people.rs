@@ -717,9 +717,12 @@ impl From<grants::GrantError> for TokenError {
     fn from(e: grants::GrantError) -> Self {
         use grants::GrantError as G;
         match e {
-            G::Unknown | G::Expired | G::Reused | G::Revoked | G::WrongClient { .. } => {
-                Self::InvalidGrant(e.to_string())
-            }
+            G::Unknown
+            | G::Expired
+            | G::Reused
+            | G::CodeReused
+            | G::Revoked
+            | G::WrongClient { .. } => Self::InvalidGrant(e.to_string()),
             G::Overreach(grants::Overreach::Resource(why)) => Self::InvalidTarget(why),
             G::Overreach(grants::Overreach::Scope(why)) => Self::InvalidGrant(why),
             G::Random | G::Clock(_) | G::Store(_) => Self::Server(format!("{e:#}")),
@@ -736,7 +739,7 @@ pub(crate) async fn redeem_code(
 ) -> Result<Response, TokenError> {
     let req: CodeRequest = parse(fields)?;
     let client = client(people, &req.client_id).await?;
-    let grant = people.grants.redeem_code(&req.code, now).await?;
+    let grant = people.grants.redeem_code(&req.code, &client, now).await?;
     if grant.approved.client_id != client {
         return Err(TokenError::InvalidGrant(format!(
             "the code was issued to client {}, not {client}",
@@ -756,7 +759,10 @@ pub(crate) async fn redeem_code(
     same_resource(req.resource.as_deref(), &grant.approved.resource)?;
     let approved = grant.approved;
     let (access_token, kube_user) = access(auth, people, &approved, now).await?;
-    let refresh_token = people.grants.issue_refresh(&approved, now).await?;
+    let refresh_token = people
+        .grants
+        .issue_refresh_for_code(&req.code, &approved, now)
+        .await?;
     Ok(token_response(
         "authorization_code",
         &approved,
@@ -1934,6 +1940,20 @@ identity = {{ claim = "email", prefix = "oidc:" }}
 
     fn refused(reply: &(StatusCode, Value)) -> bool {
         reply.0 == StatusCode::BAD_REQUEST && reply.1["error"] == "invalid_grant"
+    }
+
+    /// A code redeemed twice was seen by someone else: the second redemption is refused and the
+    /// refresh token the first one issued stops working (OAuth 2.1 §4.1.3, RFC 9700 §4.5.3).
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn redeeming_a_code_twice_revokes_what_the_first_redemption_issued(pool: PgPool) {
+        let h = harness(&pool).await;
+        let code = issued_code(&h, &pool).await;
+        let (status, first) = code_exchange(&h.app, &code).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let replay = code_exchange(&h.app, &code).await;
+        assert!(refused(&replay), "{replay:?}");
+        let after = refreshed(&h.app, &first["refresh_token"]).await;
+        assert!(refused(&after), "{after:?}");
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
