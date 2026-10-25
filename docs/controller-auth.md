@@ -370,8 +370,9 @@ the metadata. Registration accepts only native public clients:
 The client gets a random `dyn-…` `client_id`. Its codes and refresh tokens are bound to that id
 like any other client's. The name it chose is cleaned and cut to 100 characters, and the consent
 page and Settings always show it as "<name> (self-registered)". The consent page also shows
-the `host:port` the code goes to. A registration unused for 30 days stops authorizing and
-refreshing, and the hourly sweep deletes it with its approvals. Each source address may register
+the `host:port` the code goes to. A registration that has made no successful token exchange (a
+code or a refresh) for 30 days stops authorizing and refreshing, and the hourly sweep deletes it
+with its approvals. Naming it to `/oauth/authorize`, signed in or not, does not keep it alive. Each source address may register
 20 times an hour, and about 10000 registrations live at once (`429` and `503` past those
 limits; concurrent registrations on several replicas can go slightly over the cap). The source is
 the TCP peer, or the last `X-Forwarded-For` hop when the peer is in

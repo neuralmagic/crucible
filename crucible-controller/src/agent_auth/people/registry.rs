@@ -82,8 +82,7 @@ impl Clients {
     }
 
     /// The client a token request names, when it is still one people may use. Nothing is fetched:
-    /// the grant the request redeems is bound to the client it was issued to. A registration's use
-    /// is stamped.
+    /// the grant the request redeems is bound to the client it was issued to.
     pub async fn admits(&self, raw: &str) -> Result<ClientId, ClientError> {
         let id = ClientId::parse(raw)?;
         match &id {
@@ -103,6 +102,18 @@ impl Clients {
                 self.registration(raw, dynamic).await?;
                 Ok(id)
             }
+        }
+    }
+
+    /// Stamp a self-registered client's use, after a token exchange it made succeeded; nothing for
+    /// any other client.
+    pub async fn used(&self, id: &ClientId, now: u64) -> Result<(), ClientError> {
+        match (id, &self.dynamic) {
+            (ClientId::Dynamic(dynamic), Some(dcr)) => dcr
+                .used(dynamic, now)
+                .await
+                .map_err(|e| ClientError::Store(format!("{e:#}"))),
+            _ => Ok(()),
         }
     }
 

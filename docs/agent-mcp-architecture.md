@@ -259,7 +259,7 @@ redirects.
 | People token | 1 to 3600 seconds, default 900 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` |
 | Authorization code | 60 seconds, single use | `CODE_TTL_SECS` |
 | Refresh token chain | dies 14 days after the last refresh, or 90 days after approval | `REFRESH_IDLE_SECS`, `REFRESH_ABSOLUTE_SECS` |
-| Self-registered client | dies 30 days after its last use, with its approvals | `DcrPolicy::idle` |
+| Self-registered client | dies 30 days after its last successful token exchange (a code or a refresh), with its approvals; naming it to `/oauth/authorize` does not count | `DcrPolicy::idle` |
 | Registration rate window | 20 registrations for each source address in each hour | `DcrPolicy::per_source`, `DcrPolicy::window` |
 | Metadata document cache | the `Cache-Control` `max-age` minus `Age`, 300 seconds without `max-age`, at most 3600 seconds | `CimdLimits` |
 | JWT-SVID assertion | at most 900 seconds from `iat` to `exp` | `MAX_SVID_LIFETIME_SECS` |
@@ -1951,7 +1951,7 @@ deletes the approvals of a `dyn-` client ID that has no row.
 | `0065_people_grants` | Tables `people_codes`, `people_grants`, `people_refresh_tokens`, with indexes on `sub` and `grant_id` | `PgGrantStore` (`crucible-controller/src/agent_auth/people/grants.rs`) | `PgGrantStore` |
 | `0066_run_agent_tools` | Table `run_agent_tools`, PK (`run_id`, `server`) | `agent_tools::grant` at dispatch (`crucible-controller/src/runs/agent_tools.rs:263`); `agent_tools::attribute` sets `kube_user` after the run row is committed (`agent_tools.rs:283`) | the run DTO and the issue DTO, for the run tools panel |
 | `0067_people_grant_clients` | Columns `people_grants.client_id` and `people_grants.client_name`, `NOT NULL`. Rows from before get `claude-code` and `Claude Code`. Index on (`sub`, `client_id`) | `PgGrantStore::issue_refresh` | `rotate_refresh` (the client check), `live` (Settings), `revoke_client` |
-| `0068_people_dynamic_clients` | Table `people_dynamic_clients`: `client_id` (PK), `client_name`, `redirect_uris`, `created_at`, `last_used_at`; index on `last_used_at` | `Dcr::register`; `Dcr::client` stamps `last_used_at` (`crucible-controller/src/agent_auth/people/dynamic.rs:287`, `dynamic.rs:345`) | `Dcr::client` at authorize and token; `Dcr::sweep` deletes idle rows |
+| `0068_people_dynamic_clients` | Table `people_dynamic_clients`: `client_id` (PK), `client_name`, `redirect_uris`, `created_at`, `last_used_at`; index on `last_used_at` | `Dcr::register`; `Dcr::used` stamps `last_used_at` after a successful code or refresh exchange (`crucible-controller/src/agent_auth/people/dynamic.rs`) | `Dcr::client` at authorize and token, without stamping; `Dcr::sweep` deletes idle rows |
 
 Secrets in `people_codes` and `people_refresh_tokens` are stored only as SHA-256. A spent refresh
 token stays in its row with `used_at` until its approval goes, so a reuse is recognized.

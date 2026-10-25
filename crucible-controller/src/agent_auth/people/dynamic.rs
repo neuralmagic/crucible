@@ -364,15 +364,14 @@ impl Dcr {
         })
     }
 
-    /// The registration behind `id` while it is live, stamping its use.
+    /// The registration behind `id` while it is live. Looking it up is no use of it: anyone can
+    /// name a client to `/oauth/authorize`, so only [`Dcr::used`] keeps it alive.
     pub async fn client(&self, id: &DynamicId, now: u64) -> anyhow::Result<Option<Client>> {
         let row: Option<(String, serde_json::Value)> = sqlx::query_as(
-            "UPDATE people_dynamic_clients SET last_used_at = $2
-              WHERE client_id = $1 AND last_used_at > $3
-          RETURNING client_name, redirect_uris",
+            "SELECT client_name, redirect_uris FROM people_dynamic_clients
+              WHERE client_id = $1 AND last_used_at > $2",
         )
         .bind(id.as_str())
-        .bind(i64::try_from(now).context("the clock does not fit the store")?)
         .bind(self.cutoff(now)?)
         .fetch_optional(&self.pool)
         .await
@@ -391,6 +390,21 @@ impl Dcr {
             redirects,
             resources: None,
         }))
+    }
+
+    /// Stamp a live registration's use, after a token exchange it took part in succeeded.
+    pub async fn used(&self, id: &DynamicId, now: u64) -> anyhow::Result<()> {
+        sqlx::query(
+            "UPDATE people_dynamic_clients SET last_used_at = $2
+              WHERE client_id = $1 AND last_used_at > $3",
+        )
+        .bind(id.as_str())
+        .bind(i64::try_from(now).context("the clock does not fit the store")?)
+        .bind(self.cutoff(now)?)
+        .execute(&self.pool)
+        .await
+        .context("stamping a dynamic client's use")?;
+        Ok(())
     }
 
     /// Delete registrations idle past the limit and the approvals issued to them. Returns how many
@@ -735,11 +749,18 @@ mod tests {
         let r = registered(&dcr, &["http://127.0.0.1:5000/callback"], T0).await;
         let id = DynamicId::parse(&r.client_id).unwrap();
         let idle = DcrPolicy::default().idle.as_secs();
+        assert!(dcr.client(&id, T0 + idle - 1).await.unwrap().is_some());
         assert!(
-            dcr.client(&id, T0 + idle - 1).await.unwrap().is_some(),
-            "use slides the window"
+            dcr.client(&id, T0 + idle).await.unwrap().is_none(),
+            "looking a registration up does not keep it alive"
         );
-        assert!(dcr.client(&id, T0 + 2 * idle - 2).await.unwrap().is_some());
+        let r = registered(&dcr, &["http://127.0.0.1:5000/callback"], T0).await;
+        let id = DynamicId::parse(&r.client_id).unwrap();
+        dcr.used(&id, T0 + idle - 1).await.unwrap();
+        assert!(
+            dcr.client(&id, T0 + 2 * idle - 2).await.unwrap().is_some(),
+            "a token exchange slides the window"
+        );
         assert!(dcr.client(&id, T0 + 3 * idle).await.unwrap().is_none());
         sqlx::query(
             "INSERT INTO people_grants (id, sub, client_id, client_name, resource, cluster, scopes,
@@ -750,7 +771,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        assert_eq!(dcr.sweep(T0 + 3 * idle).await.unwrap(), 1);
+        assert_eq!(
+            dcr.sweep(T0 + 3 * idle).await.unwrap(),
+            2,
+            "both registrations, each idle past the limit"
+        );
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM people_grants")
             .fetch_one(&pool)
             .await

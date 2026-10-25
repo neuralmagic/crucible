@@ -730,6 +730,14 @@ impl From<grants::GrantError> for TokenError {
     }
 }
 
+/// Keep a self-registered client alive after a token exchange it made succeeded. A failed stamp
+/// costs the client idle time, not the tokens it was just issued.
+async fn stamp_use(people: &People, client: &ClientId, now: u64) {
+    if let Err(e) = people.clients.used(client, now).await {
+        tracing::warn!(error = %e, client = %client, "stamping a client's use");
+    }
+}
+
 /// `grant_type=authorization_code`.
 pub(crate) async fn redeem_code(
     auth: &AgentAuth,
@@ -763,6 +771,7 @@ pub(crate) async fn redeem_code(
         .grants
         .issue_refresh_for_code(&req.code, &approved, now)
         .await?;
+    stamp_use(people, &client, now).await;
     Ok(token_response(
         "authorization_code",
         &approved,
@@ -854,6 +863,7 @@ pub(crate) async fn redeem_refresh(
         }
         Err(e) => return Err(e),
     };
+    stamp_use(people, &client, now).await;
     Ok(token_response(
         "refresh_token",
         &approved,
@@ -2392,6 +2402,43 @@ identity = {{ claim = "email", prefix = "oidc:" }}
             (StatusCode::BAD_REQUEST, Some("invalid_grant")),
             "another registration cannot redeem its code: {body}"
         );
+    }
+
+    /// Anyone can name a self-registered client to `/oauth/authorize`, signed in or not, so that
+    /// keeps it no longer alive; a token exchange it makes does.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn only_a_token_exchange_keeps_a_registration_alive(pool: PgPool) {
+        let h = harness(&pool).await;
+        let (_, reg) = register(&h.app, json!({"redirect_uris": [PI_REDIRECT]})).await;
+        let id = reg["client_id"].as_str().unwrap().to_string();
+        let stamp = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT last_used_at FROM people_dynamic_clients WHERE client_id = $1",
+            )
+            .bind(&id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let old = crate::clock::unix_secs() as i64 - 3600;
+        sqlx::query("UPDATE people_dynamic_clients SET last_used_at = $2 WHERE client_id = $1")
+            .bind(&id)
+            .bind(old)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let uri = authorize_uri(&[("client_id", &id), ("redirect_uri", PI_REDIRECT)]);
+        send(&h.app, get(&uri, None)).await;
+        let cookie = send(&h.app, get("/test/login", None)).await.cookie.unwrap();
+        send(&h.app, get(&uri, Some(&cookie))).await;
+        assert_eq!(
+            stamp().await,
+            old,
+            "authorizing is no use of the registration"
+        );
+        let (status, body) = sign_in_as(&h, &cookie, &id, PI_REDIRECT).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(stamp().await > old, "the code exchange is");
     }
 
     /// A registration left unused past the idle limit stops refreshing and authorizing.
