@@ -12,8 +12,8 @@
 //! | workload_logs                         | kueue.read   | `get` pods/log                         |
 //! | workload_plan, workload_submit        | kueue.submit | `use` (or `get`) the localqueue, `create` the kind, `get` each Secret and PVC it names |
 //! | workload_scale                        | kueue.submit | `update` the workload's scale          |
-//! | workload_stop, workload_resume        | kueue.submit | `update` the workload                  |
-//! | tasks/cancel                          | kueue.submit | `update` the workload                  |
+//! | workload_stop, workload_resume        | kueue.submit | `update` the workload; `patch` kueue workloads unless it scales |
+//! | tasks/cancel                          | kueue.submit | `update` the workload; `patch` kueue workloads unless it scales |
 //! | workload_delete                       | kueue.submit | `delete` the workload                  |
 //!
 //! The namespace checked is the call's `namespace` argument, else the token's `namespace` claim.
@@ -118,6 +118,23 @@ impl Checks<'_> {
         name: &str,
     ) -> AccessCheck {
         self.check(rule, message, (group(kind), kind.plural(), ""), verb, name)
+    }
+
+    /// Stopping, resuming or cancelling a kind that does not scale patches its Kueue `Workload`'s
+    /// `spec.active`, so the caller must be able to patch Workloads too. Its name is Kueue's, not
+    /// known before the call, so the check covers the namespace's Workloads.
+    fn with_activation(
+        &self,
+        check: AccessCheck,
+        rule: &str,
+        message: &str,
+        kind: WorkloadKind,
+    ) -> Vec<AccessCheck> {
+        let mut checks = vec![check];
+        if !kind.is_scalable() {
+            checks.push(self.check(rule, message, (KUEUE_GROUP, "workloads", ""), "patch", ""));
+        }
+        checks
     }
 }
 
@@ -286,23 +303,15 @@ fn tool_checks(
         }
         "workload_stop" => {
             let kind = kind(tool, "workload-update", args.get("kind"))?;
-            vec![c.workload(
-                "workload-update",
-                "you may not stop this workload",
-                kind,
-                "update",
-                name,
-            )]
+            let message = "you may not stop this workload";
+            let update = c.workload("workload-update", message, kind, "update", name);
+            c.with_activation(update, "workload-activate", message, kind)
         }
         "workload_resume" => {
             let kind = kind(tool, "workload-update", args.get("kind"))?;
-            vec![c.workload(
-                "workload-update",
-                "you may not resume this workload",
-                kind,
-                "update",
-                name,
-            )]
+            let message = "you may not resume this workload";
+            let update = c.workload("workload-update", message, kind, "update", name);
+            c.with_activation(update, "workload-activate", message, kind)
         }
         "workload_delete" => {
             let kind = kind(tool, "workload-delete", args.get("kind"))?;
@@ -354,7 +363,11 @@ fn method_checks(
             .clone()
             .unwrap_or_else(|| default_namespace.to_string()),
     };
-    Ok(vec![c.workload(rule, message, task.kind, verb, &task.name)])
+    let check = c.workload(rule, message, task.kind, verb, &task.name);
+    Ok(match method {
+        "tasks/cancel" => c.with_activation(check, "task-activate", message, task.kind),
+        _ => vec![check],
+    })
 }
 
 #[cfg(test)]
@@ -533,8 +546,44 @@ mod tests {
             .unwrap();
         assert_eq!(
             shown(cancel),
-            ["task-cancel batch/jobs/ update ns=team-c name=train"]
+            [
+                "task-cancel batch/jobs/ update ns=team-c name=train",
+                "task-activate kueue.x-k8s.io/workloads/ patch ns=team-c name=",
+            ]
         );
+    }
+
+    /// Stopping or resuming a Job patches its Kueue Workload with the server's account, so the
+    /// caller must be able to patch Workloads; a Deployment is scaled instead and needs no more.
+    #[test]
+    fn stopping_or_resuming_a_job_also_checks_patching_its_kueue_workload() {
+        for tool in ["workload_stop", "workload_resume"] {
+            let job = tool_checks_for(
+                &person(),
+                tool,
+                json!({"namespace": "team-a", "kind": "Job", "name": "train"}),
+            )
+            .unwrap();
+            assert_eq!(
+                shown(job),
+                [
+                    "workload-update batch/jobs/ update ns=team-a name=train",
+                    "workload-activate kueue.x-k8s.io/workloads/ patch ns=team-a name=",
+                ],
+                "{tool}"
+            );
+            let deployment = tool_checks_for(
+                &person(),
+                tool,
+                json!({"namespace": "team-a", "kind": "Deployment", "name": "serve"}),
+            )
+            .unwrap();
+            assert_eq!(
+                shown(deployment),
+                ["workload-update apps/deployments/ update ns=team-a name=serve"],
+                "{tool}"
+            );
+        }
     }
 
     #[test]

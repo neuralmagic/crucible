@@ -1262,7 +1262,7 @@ The app is built in `crucible-kueue/src/lib.rs:62`:
 | `workload_logs` | `kueue.read` | `get` `pods/log` |
 | `workload_plan`, `workload_submit` | `kueue.submit` | `use` (or `get`) the LocalQueue, `create` the kind, `get` each Secret and PVC the manifest names |
 | `workload_scale` | `kueue.submit` | `update` the `scale` subresource |
-| `workload_stop`, `workload_resume`, `tasks/cancel` | `kueue.submit` | `update` the workload |
+| `workload_stop`, `workload_resume`, `tasks/cancel` | `kueue.submit` | `update` the workload, and `patch` Kueue Workloads in the namespace for a kind that does not scale (its Workload's `spec.active` is patched) |
 | `workload_delete` | `kueue.submit` | `delete` the workload |
 
 The namespace of each check is the call's `namespace` argument, else the token's `namespace`

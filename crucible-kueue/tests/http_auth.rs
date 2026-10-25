@@ -41,9 +41,9 @@ impl AccessReview for Grants {
     }
 }
 
-/// The launcher may read and update workloads in team-e2e only.
+/// The launcher may read, update and patch workloads in team-e2e only.
 const TEAM_E2E: Grants = Grants {
-    verbs: &["get", "update"],
+    verbs: &["get", "update", "patch"],
     namespaces: &["team-e2e"],
 };
 
@@ -180,6 +180,22 @@ async fn a_run_reaches_tasks_where_its_launcher_may_and_no_others() {
     let client = connect(&read_only, &run_token(|_| {})).await;
     let refused = cancel(&client, OWN_TASK).await;
     assert!(refused.contains("task-cancel"), "{refused}");
+
+    let no_workload_patch = serve(
+        &jwks,
+        shipped_policy(),
+        Some(Grants {
+            verbs: &["get", "update"],
+            namespaces: &["team-e2e"],
+        }),
+    )
+    .await;
+    let client = connect(&no_workload_patch, &run_token(|_| {})).await;
+    let refused = cancel(&client, OWN_TASK).await;
+    assert!(
+        refused.contains("task-activate") && !reached_kubernetes(&refused),
+        "cancelling patches the Job's Kueue Workload, so the launcher must be able to: {refused}"
+    );
 }
 
 #[tokio::test]
