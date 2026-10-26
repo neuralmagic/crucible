@@ -1699,7 +1699,63 @@ push_authfile` a credential scoped to the one push repository.
 
 ## 9. Configuration reference and feature flags
 
-### 9.1 Controller environment
+### 9.1 Minimal configuration
+
+An operator states what only they can decide: which clusters get which servers, where agents'
+workloads go, whether people get tokens, and where builds may be pushed. The controller
+environment adds the issuer and its key:
+
+```sh
+CONTROLLER_AGENT_ISSUER=https://crucible.example.com
+CONTROLLER_AGENT_SIGNING_KEY_FILE=/etc/crucible/agent-signing/key.pem
+CONTROLLER_DEPLOY_PROFILE=/etc/crucible/profile/profile.toml
+```
+
+```toml
+[cluster]
+# ...the keys every profile has (loop_namespace, service_account, supervisor_image, ...), plus:
+sandbox_namespace = "crucible-sandboxes"
+sandbox_readers   = ["crucible-system/crucible-controller"]
+
+[kueue]
+clusters            = ["pirate", "waldorf"]
+workload_namespaces = ["crucible-kueue-e2e"]
+people              = true
+people_urls         = { pirate = "https://kueue.pirate.example.com/mcp" }
+
+[buildit]
+clusters  = ["pirate", "waldorf"]
+push_repo = "quay.io/example/crucible-smoke"
+```
+
+`people_urls` is needed once `people` covers more than one cluster: every cluster's server has the
+same Service URL, and a person's token names its cluster by URL, so all but one cluster need a URL
+of their own. `deploy render --kueue` also needs `[kueue] image`.
+
+### 9.2 Derived values
+
+| Value | Source |
+| --- | --- |
+| Agent token resources and their scopes | The servers in `[kueue]`, `[buildit]` and `[[agent_servers]]` (`Audience::of`) |
+| People resources | `[kueue] people` with `people_urls`, and `[[agent_servers]] people` |
+| Each cluster's SPIRE: SVID issuer, gateway prefix, key Service | Discovered from the cluster (section 6.9) |
+| The run token issuer `crucible-kueue` and `buildit` trust, and their sandboxes' SVID audience | `CONTROLLER_AGENT_ISSUER` |
+| The key set URI servers fetch | `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json` |
+| The token endpoint supervisors call | `<CONTROLLER_AGENT_ISSUER>/oauth/token` |
+| Each cluster's platform | Detected: OpenShift serves `security.openshift.io` |
+| `crucible-kueue`'s group source (`--kube-authz`) | The cluster's platform |
+| `crucible-kueue`'s Service URL | `[kueue] namespace` and `cluster_domain` |
+| `crucible-kueue`'s extra `--resource` and `--allowed-host` | `[kueue] people_urls` |
+| The cluster link callback base | `CONTROLLER_AGENT_ISSUER` |
+| The sandbox compute driver | `kubernetes` with a `sandbox_namespace` |
+| The sandbox service account | `crucible-sandbox` with a `sandbox_namespace` |
+| The supervisors' SPIFFE socket | `/spiffe-workload-api/spire-agent.sock`, delivered only with a run's agent servers |
+| The SPIRE reader RBAC (`crucible-spire-reader`) | Rendered for `sandbox_readers` on each cluster's platform |
+| The server and builder namespaces | `crucible-kueue` and `crucible-builds` |
+
+Every other key and variable in sections 9.3 and 9.4 is an override with the default shown.
+
+### 9.3 Overrides: controller environment
 
 | Variable | Default | What it does |
 | --- | --- | --- |
@@ -1743,7 +1799,7 @@ The issuer refuses to start when any of these is true:
 The three client variables apply only when the deploy profile serves people. Without people
 tokens, the controller does not read them.
 
-### 9.2 Deploy profile keys
+### 9.4 Overrides: deploy profile keys
 
 | Key | Default | What it does |
 | --- | --- | --- |
@@ -1781,7 +1837,7 @@ tokens, the controller does not read them.
 | `[cluster_link] openshift` | required | The `link` clusters that link through their OAuth server. |
 | `[cluster_link] access_token_max_age_secs` | `300` | The lifetime of the `user:info` token. |
 
-### 9.3 Loop pod and gateway pod environment
+### 9.5 Loop pod and gateway pod environment
 
 The controller sets these. Do not set them by hand.
 
@@ -1801,7 +1857,7 @@ the sandbox no provider, no egress entry and no `.mcp.json` entry. A granted ser
 turn's broker or one of its `[mcp]` servers fails the turn with an error naming it, rather than one
 silently replacing the other in `.mcp.json` (`AgentServers::check_names`).
 
-### 9.4 crucible-kueue flags
+### 9.6 crucible-kueue flags
 
 Each flag also has a `CRUCIBLE_KUEUE_*` environment variable (`crucible-kueue/src/bin/crucible-kueue.rs:16`).
 
@@ -1836,7 +1892,7 @@ the pull secrets
 Note: People tokens and agent tokens have the same `iss`. A server that trusts the issuer as both
 kinds treats a token with `act` as a run and a token without `act` as a person.
 
-### 9.5 buildit flags
+### 9.7 buildit flags
 
 | Flag | Default | What it does |
 | --- | --- | --- |
@@ -1853,7 +1909,7 @@ kinds treats a token with `act` as a run and a token without `act` as a person.
 `buildit` also accepts an older tokens file. `buildit` never reads a compact JWT as a tokens-file
 token.
 
-### 9.6 What stays inert
+### 9.8 What stays inert
 
 With no agent or people configuration, the controller does none of the work in this document. A
 test boots the controller with a deploy profile and no agent configuration and checks this
@@ -1870,7 +1926,7 @@ test boots the controller with a deploy profile and no agent configuration and c
 | `/api/agent-tools`, `/api/agent-clusters`, `/api/prefs/notices` | no agent tokens: no issuer, or no agent clusters (`ControllerCfg::issues_agent_tokens`) | Not routed |
 | Gateway sweep | profile not isolated | Not registered |
 | Grants sweep, registration sweep | no people tokens; the registration sweep also when registration is off | Not started |
-| Loop pod env and token-grant providers | no agent tokens, or the run gets no server (section 9.3) | Not set, so the engine creates none and binds nothing |
+| Loop pod env and token-grant providers | no agent tokens, or the run gets no server (section 9.5) | Not set, so the engine creates none and binds nothing |
 | `issues.dispatch_requested_by`, `runs.dispatched_by` | no agent tokens | Not written |
 | `run_agent_tools` | no agent tokens, or the run gets no server | Not written, and not read for run pages |
 | `run_sandboxes` | no bind requests | Not written |
@@ -2013,7 +2069,7 @@ in place.
    LocalQueues.
 7. Grant people their queues with ordinary RBAC (section 11.2).
 8. Create the issuer key Secret in the controller namespace. Mount it in each replica.
-9. Set the controller environment (section 9.1). Each cluster an agent server serves has its
+9. Set the controller environment (section 9.1, overrides in 9.3). Each cluster an agent server serves has its
     SPIRE discovered; check `GET /api/agent-clusters` after the restart.
     Make sure that loop pods reach the controller at `[cluster] ingest_url`. Restart the
     controller.
@@ -2125,7 +2181,7 @@ other distributions serve it.
 To disable the feature with no data change, do these steps:
 
 1. Unset `CONTROLLER_AGENT_ISSUER` and `CONTROLLER_AGENT_SPIRE`.
-2. Restart the controller. The routes, tasks, env and writes in section 9.6 stop.
+2. Restart the controller. The routes, tasks, env and writes in section 9.8 stop.
 3. Remove `[kueue]` and `[buildit]` from the profile if new runs must not get the servers.
 4. Delete the gateway objects that remain in the sandbox namespace by label
    `crucible.dev/role=openshell-gateway`, if the sweep no longer runs.

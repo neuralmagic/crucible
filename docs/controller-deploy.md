@@ -246,6 +246,12 @@ unknown; other tokens are issued without the claim, logged at warn. The linking 
 are served whenever the controller mints agent tokens, people tokens, or has a `[cluster_link]`
 table.
 
+The issuer needs `CONTROLLER_AGENT_ISSUER`, a signing key and the deploy profile. Audiences, people
+resources, each cluster's SPIRE and platform, the servers' trusted issuer and the cluster link
+callback are derived from those; the rest of the table is overrides. See
+[Minimal configuration](agent-mcp-architecture.md#91-minimal-configuration) and the derived values
+beside it.
+
 | Variable | Meaning |
 | --- | --- |
 | `CONTROLLER_AGENT_ISSUER` | The issuer identifier, an origin such as `http://crucible-controller.crucible-system.svc.cluster.local:8080`. Unset turns the endpoint off. Supervisors must request their SVID with exactly this audience (`token_grant.jwt_svid_audience`). |
