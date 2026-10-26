@@ -362,6 +362,22 @@ pub(crate) enum StatesGraph {
     Plan,
 }
 
+/// `crucible deploy render --kueue --platform`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum KueuePlatform {
+    Kubernetes,
+    Openshift,
+}
+
+impl From<KueuePlatform> for forge::fleet::Platform {
+    fn from(p: KueuePlatform) -> Self {
+        match p {
+            KueuePlatform::Kubernetes => Self::Kubernetes,
+            KueuePlatform::Openshift => Self::Openshift,
+        }
+    }
+}
+
 /// `crucible deploy <render|apply>`: emit the deployment YAML, or render-and-`kubectl apply`.
 #[derive(clap::Subcommand)]
 pub(crate) enum DeployAction {
@@ -486,6 +502,10 @@ pub(crate) struct DeployArgs {
     /// the server takes.
     #[arg(long, value_name = "URL", requires = "kueue")]
     pub issuer: Option<String>,
+    /// With `--kueue`, the cluster's platform (`kubernetes` or `openshift`), over the profile's
+    /// `platform` key; a render does not ask the cluster.
+    #[arg(long, value_enum, requires = "kueue")]
+    pub platform: Option<KueuePlatform>,
     /// Render the controller's OpenShift `OAuthClient` for this cluster from the profile's
     /// `[cluster_link]` table, no `--manifest` needed. Render only: it is cluster-scoped on that
     /// cluster, so apply it there yourself.

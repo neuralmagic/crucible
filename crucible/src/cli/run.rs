@@ -364,6 +364,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                     .issuer
                     .as_deref()
                     .context("--kueue needs --issuer, the controller's agent issuer")?,
+                platform: args.platform.map(Into::into),
             };
             return if apply {
                 deploy::apply_kueue_cmd(&args.profile, &opts, &target)

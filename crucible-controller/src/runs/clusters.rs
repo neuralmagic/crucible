@@ -144,6 +144,24 @@ impl ClusterClients {
         Ok(self.client(cluster).await?.default_namespace().to_string())
     }
 
+    /// `cluster`'s platform: what `profile` states for it, else what its API server serves.
+    pub async fn platform(
+        &self,
+        profile: &crucible::deploy::DeployProfile,
+        cluster: &str,
+    ) -> Result<forge::fleet::Platform> {
+        if let Some(stated) = profile.platform(cluster) {
+            return Ok(stated);
+        }
+        let groups = self
+            .client(cluster)
+            .await?
+            .list_api_groups()
+            .await
+            .with_context(|| format!("listing the API groups of `{cluster}`"))?;
+        Ok(platform_of(groups.groups.iter().map(|g| g.name.as_str())))
+    }
+
     fn target(&self, cluster: &str) -> Result<forge::kube::KubeTarget> {
         if cluster == HUB_CLUSTER {
             return Ok(forge::kube::KubeTarget::Ambient);
@@ -167,6 +185,17 @@ impl ClusterClients {
             context: None,
             proxy_url: None,
         })
+    }
+}
+
+/// The API group only OpenShift serves: its SecurityContextConstraints.
+const OPENSHIFT_GROUP: &str = "security.openshift.io";
+
+/// The distribution a cluster serving the API `groups` runs.
+pub fn platform_of<'a>(groups: impl IntoIterator<Item = &'a str>) -> forge::fleet::Platform {
+    match groups.into_iter().any(|g| g == OPENSHIFT_GROUP) {
+        true => forge::fleet::Platform::Openshift,
+        false => forge::fleet::Platform::Kubernetes,
     }
 }
 
@@ -287,5 +316,20 @@ current-context: wharf
         let cc = ClusterClients::new(Some(dir.path().to_path_buf()));
         let ns = cc.pod_namespace("wharf", "autoresearch").await.unwrap();
         assert_eq!(ns, "crucible-loops");
+    }
+
+    /// A cluster serving OpenShift's SCC group is OpenShift; anything else is Kubernetes.
+    #[test]
+    fn the_platform_is_what_the_api_server_serves() {
+        use forge::fleet::Platform;
+        assert_eq!(
+            platform_of(["apps", "security.openshift.io", "route.openshift.io"]),
+            Platform::Openshift
+        );
+        assert_eq!(
+            platform_of(["apps", "kueue.x-k8s.io"]),
+            Platform::Kubernetes
+        );
+        assert_eq!(platform_of([]), Platform::Kubernetes);
     }
 }

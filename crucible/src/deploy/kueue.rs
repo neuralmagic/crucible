@@ -67,12 +67,18 @@ pub struct KueueTarget<'a> {
     pub cluster: Option<&'a str>,
     /// The controller's agent issuer (`CONTROLLER_AGENT_ISSUER`), whose tokens the server takes.
     pub issuer: &'a str,
+    /// The cluster's platform, when the render cannot ask it: over the profile's `platform`, which
+    /// is over `kubernetes`.
+    pub platform: Option<Platform>,
 }
 
 pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) -> Result<String> {
     let cfg = profile.kueue.as_ref().ok_or(MissingKueueTable)?;
     let cluster = render_cluster(cfg, target.cluster)?;
-    let platform = profile.platform(cluster);
+    let platform = target
+        .platform
+        .or_else(|| profile.platform(cluster))
+        .unwrap_or_default();
     let authz = cfg.kube_authz(platform);
     let image = pin_image(opts.digests.as_deref(), "crucible-kueue image", &cfg.image)?;
     let pull_secret = profile.image.pull_secret.as_str();
@@ -457,6 +463,7 @@ mod tests {
         KueueTarget {
             cluster,
             issuer: ISSUER,
+            platform: None,
         }
     }
 

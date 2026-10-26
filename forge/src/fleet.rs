@@ -46,9 +46,10 @@ pub struct ClusterEntry {
     /// Where a person's Kubernetes username on this cluster comes from.
     #[serde(default)]
     pub identity: ClusterIdentity,
-    /// The Kubernetes distribution the cluster runs.
+    /// The Kubernetes distribution the cluster runs, when it should not be detected: the
+    /// controller asks the cluster, and a render without cluster access takes `--platform`.
     #[serde(default)]
-    pub platform: Platform,
+    pub platform: Option<Platform>,
 }
 
 /// The Kubernetes distribution a cluster runs, for what a render may assume of it: OpenShift's

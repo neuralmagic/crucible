@@ -725,10 +725,10 @@ pub struct Cluster {
     /// theirs on `[clusters.<name>]`.
     #[serde(default)]
     pub identity: ClusterIdentity,
-    /// The distribution this, the hub cluster, runs: `kubernetes` (default) or `openshift`.
-    /// Spokes declare theirs on `[clusters.<name>]`.
+    /// The distribution this, the hub cluster, runs, when it should not be detected: `kubernetes`
+    /// or `openshift`. Spokes state theirs on `[clusters.<name>]`.
     #[serde(default)]
-    pub platform: forge::fleet::Platform,
+    pub platform: Option<forge::fleet::Platform>,
 }
 
 /// `[cluster].host_aliases`, checked against the rules the kubernetes driver applies to a
@@ -1097,16 +1097,12 @@ impl DeployProfile {
         Ok(())
     }
 
-    /// The platform of `cluster`: the hub's from `[cluster]`, a spoke's from its `[clusters.<name>]`
-    /// entry, `kubernetes` for a cluster the profile does not know.
-    pub fn platform(&self, cluster: &str) -> forge::fleet::Platform {
+    /// The platform the profile states for `cluster`: the hub's on `[cluster]`, a spoke's on its
+    /// `[clusters.<name>]` entry. `None` when it states none, for the cluster to be asked.
+    pub fn platform(&self, cluster: &str) -> Option<forge::fleet::Platform> {
         match cluster {
             HUB_CLUSTER => self.cluster.platform,
-            spoke => self
-                .clusters
-                .get(spoke)
-                .map(|entry| entry.platform)
-                .unwrap_or_default(),
+            spoke => self.clusters.get(spoke).and_then(|entry| entry.platform),
         }
     }
 
