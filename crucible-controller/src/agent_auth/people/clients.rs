@@ -390,7 +390,7 @@ pub enum RegistryError {
         source: BadRedirectRule,
     },
     #[error(
-        "client {client} names resource {resource:?}, which CONTROLLER_PEOPLE_AUDIENCES does not"
+        "client {client} names resource {resource:?}, which the deploy profile serves people at nowhere"
     )]
     Resource { client: String, resource: String },
 }

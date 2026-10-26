@@ -558,7 +558,7 @@ Without configuration, the registry has three clients (`clients.rs:448`):
 `client_id`, `name`, `redirect_uris` and an optional `resources` list. The file replaces the
 built-in list, so list the built-in clients too if you want to keep them (`clients.rs:479`). The
 controller does not start when the file is malformed, when it lists no client or one client
-twice, or when a `resources` entry is not in `CONTROLLER_PEOPLE_AUDIENCES`
+twice, or when a `resources` entry is not a people resource
 (`crucible-controller/src/agent_auth/people.rs:172`). Without `resources`, a client can get tokens
 for every audience.
 
@@ -626,7 +626,7 @@ a document cannot look like a registered client. Codex publishes
 pi 1.x, Codex and Claude Code without a client id register a client before they sign in
 (RFC 7591). The controller accepts these registrations at `POST /oauth/register`
 (`crucible-controller/src/agent_auth/people/dynamic.rs:422`). Registration is on by default when
-`CONTROLLER_PEOPLE_AUDIENCES` is set. `CONTROLLER_PEOPLE_DCR=false` turns it off.
+the deploy profile serves people. `CONTROLLER_PEOPLE_DCR=false` turns it off.
 
 ```mermaid
 sequenceDiagram
@@ -783,8 +783,8 @@ The steps are these:
      set. It is absent otherwise.
 3. `/oauth/authorize` (`crucible-controller/src/agent_auth/people.rs:554`) resolves the client
    (section 4.1) and matches `redirect_uri` against its redirect rules. `state` is required, at
-   most 1024 characters. The method must be `S256`. `resource` must be one of
-   `CONTROLLER_PEOPLE_AUDIENCES`, and a registered client with `resources` must list it
+   most 1024 characters. The method must be `S256`. `resource` must be
+   a people resource of the deploy profile (`DeployProfile::people_resources`), and a registered client with `resources` must list it
    (`validate`, `people.rs:373`).
 4. An unknown client, a refused metadata document, an expired registration or a bad redirect gives
    an error page. The controller never redirects to a URI that the client did not register. When
@@ -985,7 +985,7 @@ The same function decides `kube_user` for every consumer:
 
 | Consumer | Person | Cluster | When |
 | --- | --- | --- | --- |
-| People token | The person who approves | The cluster of the audience in `CONTROLLER_PEOPLE_AUDIENCES` | At code exchange and at each refresh |
+| People token | The person who approves | The cluster of the people resource | At code exchange and at each refresh |
 | Agent token | The launcher the bound run names (`user:<login>` from `runs.dispatched_by`, read once with the binding), so `sub` and `kube_user` name the same person | The cluster of the run | At each token request (`for_principal`) |
 | Agent tools record | The same `run:<id>` principal | The cluster of each tool whose server acts as `kube_user` | After the launch commits the run row (`attribute`, `crucible-controller/src/runs/agent_tools.rs`) |
 | Settings and consent pages | The caller | Each cluster of the profile | On each read |
@@ -1682,7 +1682,6 @@ push_authfile` a credential scoped to the one push repository.
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | `900` | Agent token lifetime, 900 to 1800. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | `<issuer>/oauth/token` | Where supervisors reach the token endpoint, for a spoke that reaches the controller through a route. |
 | `CONTROLLER_AGENT_SPIRE` | unset | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. The prefix may hold one `{tenant}` segment (section 6.1). The SPIRE Service's namespace must not be one pack code reaches (loop, rig, sandbox, `[buildit] namespace`, crucible-kueue workload namespaces), or the controller does not start (`check_spire_exposure`). A run gets agent tools only on a cluster listed here. Unset: the issuer serves people only, mints no agent tokens, grants no agent tools and stamps no dispatchers. |
-| `CONTROLLER_PEOPLE_AUDIENCES` | unset | Comma-separated `<cluster>:<resource url>=<scope> <scope>`. Enables people tokens. Each resource once. |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | `900` | People token lifetime, 1 to 3600. |
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | unset | A TOML file of `[[clients]]` with `client_id`, `name`, `redirect_uris` and optional `resources`. It replaces the built-in `claude-code`, `pi` and `codex`. Unset: the built-in clients (section 4.1.2). |
 | `CONTROLLER_PEOPLE_CIMD_HOSTS` | unset | Comma-separated host names that may publish Client ID Metadata Documents. Unset: every URL `client_id` is refused (section 4.1.3). The controller needs outbound HTTPS to these hosts. It honours `HTTPS_PROXY`. |
@@ -1699,11 +1698,11 @@ The issuer refuses to start when any of these is true:
 
 - Any other `CONTROLLER_AGENT_*` or `CONTROLLER_PEOPLE_*` variable is set, but
   `CONTROLLER_AGENT_ISSUER` is not.
-- `CONTROLLER_AGENT_ISSUER` is set, but neither `CONTROLLER_AGENT_SPIRE` nor
-  `CONTROLLER_PEOPLE_AUDIENCES` is set.
+- `CONTROLLER_AGENT_ISSUER` is set, but neither is `CONTROLLER_AGENT_SPIRE` nor does the
+  profile serve people.
 - `CONTROLLER_AGENT_SPIRE` is set and the profile is not isolated.
 - `CONTROLLER_PEOPLE_CLIENTS_FILE` cannot be read, is not a valid `[[clients]]` list, or names a
-  `resources` entry that is not in `CONTROLLER_PEOPLE_AUDIENCES`.
+  `resources` entry that is not a people resource.
 - `CONTROLLER_PEOPLE_CIMD_HOSTS` is set and lists no host, or an entry that is not a host name.
 - `CONTROLLER_PEOPLE_DCR` is not one of the values above.
 - `CONTROLLER_PEOPLE_TRUSTED_PROXIES` has an entry that is not an IP network or address.
@@ -1711,7 +1710,7 @@ The issuer refuses to start when any of these is true:
   namespace.
 - A value does not parse.
 
-The three client variables apply only when `CONTROLLER_PEOPLE_AUDIENCES` is set. Without people
+The three client variables apply only when the deploy profile serves people. Without people
 tokens, the controller does not read them.
 
 ### 9.2 Deploy profile keys
@@ -1726,7 +1725,7 @@ tokens, the controller does not read them.
 | `[cluster] identity` | `"link"` | The hub identity rule. |
 | `[clusters.<name>] identity` | `"link"` | A spoke identity rule. |
 | `[cluster] platform`, `[clusters.<name>] platform` | `"kubernetes"` | `kubernetes` or `openshift`: the distribution the hub or a spoke runs. It decides what a render may assume of the cluster (section 11.2). Each cluster's render reads that cluster's own entry: an OpenShift hub dispatching to an OpenShift spoke and a Kubernetes spoke renders each spoke for its own platform, and nothing applies the hub's platform to a spoke. The hub's own platform affects only what is rendered for the hub itself; its ingress and deploy are the Argo chart's. |
-| cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE` and `CONTROLLER_PEOPLE_AUDIENCES` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
+| cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
 | `[cluster] aws_sandbox_role_arn` | unset | The AWS role that the gateway pod assumes for sandboxes. |
 | `[kueue] image` | required | The `crucible-kueue` image. |
 | `[kueue] clusters` or `cluster` | `["hub"]` | The clusters where the server runs. Runs on these clusters get `crucible-kueue` access. |
@@ -1736,7 +1735,8 @@ tokens, the controller does not read them.
 | `[kueue] kube_authz` | `openshift` on an OpenShift cluster, `token` elsewhere | `openshift` (the cluster's Group objects) or `token` (the token's `kube_groups`): where groups come from. |
 | `[kueue] cluster_domain` | `cluster.local` | The cluster DNS domain of the Service name. |
 | `[kueue] pull_secrets` | `[]` | `name` or `name=registry` entries for `--pull-secret`. |
-| `[kueue] people` | `false` | `true` renders `--person-issuer` with the controller's agent issuer, so the server also accepts people tokens. Set it when `CONTROLLER_PEOPLE_AUDIENCES` names this server. |
+| `[kueue] people` | `false` | `true` serves people's MCP clients too: each cluster's server is a people resource, and the render adds `--person-issuer` with the controller's agent issuer. |
+| `[kueue] people_urls` | each cluster's Service URL | `{ <cluster> = "<url>" }`: where people reach the server on a cluster (a route, a port-forward). A person's token names its cluster by this URL, so `people` on several clusters needs one per cluster; profile load refuses two clusters at one URL. The render serves it as another `--resource` and `--allowed-host`. |
 | `[buildit] clusters` or `cluster` | `["hub"]` | The clusters whose runs get `buildit`. |
 | `[buildit] namespace` | required | Where builder pods run. Profile load refuses the loop, rig, sandbox, crucible-kueue and workload namespaces. |
 | `[buildit] egress` | TCP 443 to `0.0.0.0/0` and `::/0` | `[{ cidr, ports = [443], except = [] }, ...]`: where builder pods may connect besides DNS (section 8.4). |
@@ -1833,7 +1833,7 @@ test boots the controller with a deploy profile and no agent configuration and c
 | --- | --- | --- |
 | `/oauth/token`, `/.well-known/jwks.json`, `/.well-known/oauth-authorization-server` | `CONTROLLER_AGENT_ISSUER` unset | Not routed (`crucible-controller/src/lib.rs:304`) |
 | `/api/sandbox-bindings/runs/{run_id}` | same | Not routed |
-| `/oauth/authorize` | `CONTROLLER_PEOPLE_AUDIENCES` unset | Not routed (`crucible-controller/src/lib.rs:138`) |
+| `/oauth/authorize` | the profile serves people nowhere | Not routed (`crucible-controller/src/lib.rs:138`) |
 | `/oauth/register` | issuer unset | Not routed. With the issuer set and people tokens or registration off, it answers 404 `invalid_request` |
 | Metadata document fetches | `CONTROLLER_PEOPLE_CIMD_HOSTS` unset | No outbound request; every URL `client_id` is refused |
 | Identity routes: cluster identities, link, callback, consent, MCP sign-ins, hub override | no agent tokens, no people tokens and no `[cluster_link]` | Not routed, not in the OpenAPI document (`crucible-controller/src/api/mod.rs:672`) |
@@ -1988,8 +1988,8 @@ in place.
     `CONTROLLER_AGENT_SPIRE`.
     Make sure that loop pods reach the controller at `[cluster] ingest_url`. Restart the
     controller.
-11. For people tokens: set `CONTROLLER_AUTH_MODE=native` and `CONTROLLER_PEOPLE_AUDIENCES`. Set
-    `[kueue] people = true`, render `crucible-kueue` again, and expose it on a Route. To change
+11. For people tokens: set `CONTROLLER_AUTH_MODE=native` and `[kueue] people = true` (with
+    `people_urls` where people reach a cluster's server by a route), render `crucible-kueue` again, and expose it on a Route. To change
     the clients, set `CONTROLLER_PEOPLE_CLIENTS_FILE`, `CONTROLLER_PEOPLE_CIMD_HOSTS` or
     `CONTROLLER_PEOPLE_DCR` (section 4.1).
 12. For OAuth links: render `crucible deploy render --cluster-link <cluster>` and apply it on that
@@ -2092,7 +2092,7 @@ other distributions serve it.
 
 To disable the feature with no data change, do these steps:
 
-1. Unset `CONTROLLER_AGENT_ISSUER`, `CONTROLLER_PEOPLE_AUDIENCES` and `CONTROLLER_AGENT_SPIRE`.
+1. Unset `CONTROLLER_AGENT_ISSUER` and `CONTROLLER_AGENT_SPIRE`.
 2. Restart the controller. The routes, tasks, env and writes in section 9.6 stop.
 3. Remove `[kueue]` and `[buildit]` from the profile if new runs must not get the servers.
 4. Delete the gateway objects that remain in the sandbox namespace by label

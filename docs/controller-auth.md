@@ -412,7 +412,8 @@ Codex publishes `https://chatgpt.com/oauth/codex/client.json` and pi publishes
 
 #### Signing in from each tool
 
-Use the MCP server's URL, which is one of the `CONTROLLER_PEOPLE_AUDIENCES` resources. Each tool
+Use the MCP server's URL, a people resource of the deploy profile (`[kueue] people`, at its
+Service URL or its `people_urls` entry). Each tool
 finds this controller through the server's protected resource metadata.
 
 With self-registration on (the default), no client options are needed:

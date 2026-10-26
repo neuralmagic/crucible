@@ -42,7 +42,7 @@ pub struct AgentAuth {
     /// namespace, read once at startup.
     pub profile: Arc<crucible::deploy::DeployProfile>,
     pub directory: Arc<dyn directory::SandboxDirectory>,
-    /// The authorization code grant for people, when `CONTROLLER_PEOPLE_AUDIENCES` is set.
+    /// The authorization code grant for people, when the deploy profile serves people somewhere.
     pub people: Option<people::People>,
 }
 
@@ -80,7 +80,7 @@ impl AgentAuth {
         }
         placement::check_spire_exposure(&issuer_cfg.spire, &profile)?;
         let make_people = people;
-        let people = match people::PeopleConfig::from_env()? {
+        let people = match people::PeopleConfig::from_env(&profile)? {
             None => None,
             Some(config) => {
                 tracing::info!(

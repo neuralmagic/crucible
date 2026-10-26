@@ -63,7 +63,7 @@ pub enum ConfigError {
     NoSpire,
     #[error(
         "CONTROLLER_AGENT_ISSUER is set but neither CONTROLLER_AGENT_SPIRE (agent tokens) nor \
-         CONTROLLER_PEOPLE_AUDIENCES (people's tokens) says whom it issues to"
+         a deploy profile server with `people = true` (people's tokens) says whom it issues to"
     )]
     NoRecipients,
     #[error(
@@ -393,7 +393,6 @@ const DEPENDENT_VARS: &[&str] = &[
     "CONTROLLER_AGENT_TOKEN_TTL_SECS",
     "CONTROLLER_AGENT_SPIRE",
     "CONTROLLER_AGENT_TOKEN_ENDPOINT",
-    "CONTROLLER_PEOPLE_AUDIENCES",
     "CONTROLLER_PEOPLE_ACCESS_TTL_SECS",
     "CONTROLLER_PEOPLE_CLIENTS_FILE",
     "CONTROLLER_PEOPLE_CIMD_HOSTS",
@@ -1361,22 +1360,19 @@ mod tests {
         assert!(!buildit.requires_kube_user && buildit.namespaces.is_empty());
     }
 
-    /// People audiences, SPIRE entries and the deploy profile accept the same cluster names.
+    /// SPIRE entries and the deploy profile accept the same cluster names.
     #[test]
     fn every_cluster_setting_accepts_the_names_the_profile_accepts() {
         for name in [
             "hub", "ocp", "spoke-a", "a1", "", "Ocp", "spoke_a", "-a", "a-", "a.b",
         ] {
             let profile = crucible::deploy::profile::check_cluster_name(name).is_ok();
-            let person = format!("{name}:http://a.example/mcp=s")
-                .parse::<crate::agent_auth::people::PersonAudience>()
-                .is_ok();
             let spire = format!(
                 "{name}=https://oidc.example spiffe://td/openshell/gateway/ spire/oidc:443"
             )
             .parse::<ClusterSpire>()
             .is_ok();
-            assert_eq!((person, spire), (profile, profile), "{name:?}");
+            assert_eq!(spire, profile, "{name:?}");
         }
     }
 
@@ -1849,10 +1845,13 @@ mod tests {
             panic!("no SPIRE to read keys from")
         });
         assert!(!issuer.serves_agents());
-        let people = crate::agent_auth::people::PeopleConfig::from_lookup(Some(format!(
-            "ocp:{KUEUE}=kueue.read"
-        )))
-        .unwrap()
+        let people = crate::agent_auth::people::PeopleConfig::new(vec![
+            crate::agent_auth::people::PersonAudience {
+                resource: KUEUE.into(),
+                cluster: "ocp".into(),
+                scopes: vec!["kueue.read".into()],
+            },
+        ])
         .unwrap();
         let doc = issuer.metadata(Some(&PeopleMetadata {
             scopes: people.scopes(),

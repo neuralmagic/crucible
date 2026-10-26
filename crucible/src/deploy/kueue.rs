@@ -217,6 +217,19 @@ fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result
     }
     if cfg.people {
         args.extend(["--person-issuer".to_string(), format!("{issuer}={jwks}")]);
+        let people = cfg.people_url(cluster);
+        if people != cfg.url() {
+            let host = url::Url::parse(&people)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .with_context(|| format!("[kueue] people_urls entry {people} names no host"))?;
+            args.extend([
+                "--resource".to_string(),
+                people,
+                "--allowed-host".to_string(),
+                host,
+            ]);
+        }
     }
     for secret in &cfg.pull_secrets {
         args.extend(["--pull-secret".to_string(), secret.clone()]);
@@ -543,6 +556,31 @@ mod tests {
                  http://crucible-controller.crucible-system.svc.cluster.local:8080/.well-known/jwks.json"
             )
         );
+    }
+
+    /// A people URL other than the Service URL is served too: people's tokens name it.
+    #[test]
+    fn a_people_url_is_another_resource_and_host() {
+        let flag = |args: &[String], name: &str| -> Vec<String> {
+            args.windows(2)
+                .filter(|w| w[0] == name)
+                .map(|w| w[1].clone())
+                .collect()
+        };
+        let plain = args(&docs(&PROFILE.replace("[kueue]", "[kueue]\npeople = true")));
+        assert_eq!(flag(&plain, "--resource").len(), 1, "the Service URL alone");
+        let routed = args(&docs(&PROFILE.replace(
+            "[kueue]",
+            "[kueue]\npeople = true\npeople_urls = { ocp = \"https://kueue.ocp.example/mcp\" }",
+        )));
+        assert_eq!(
+            flag(&routed, "--resource"),
+            [
+                "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp",
+                "https://kueue.ocp.example/mcp"
+            ]
+        );
+        assert!(flag(&routed, "--allowed-host").contains(&"kueue.ocp.example".to_string()));
     }
 
     #[test]

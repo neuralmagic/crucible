@@ -70,6 +70,15 @@ impl ServerSpec {
     }
 }
 
+/// An MCP resource people's clients may get tokens for, on one cluster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeopleResource {
+    /// The URL people's clients reach it at, a person's token's `aud`.
+    pub url: String,
+    pub cluster: String,
+    pub scopes: Vec<String>,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServerSpecError {
     #[error(transparent)]
@@ -80,6 +89,17 @@ pub enum ServerSpecError {
     Broker,
     #[error("two agent servers are named {0}")]
     DuplicateName(ServerName),
+    #[error(
+        "people would reach {url} on clusters {first} and {second}; a person's token names its \
+         cluster by its URL, so give each cluster its own ([kueue] people_urls for crucible-kueue)"
+    )]
+    PeopleUrlTwice {
+        url: String,
+        first: String,
+        second: String,
+    },
+    #[error("[kueue] people_urls names cluster {0}, which is not one of [kueue] clusters")]
+    PeopleUrlCluster(String),
     #[error("agent servers {first} and {second} both serve {url} on cluster {cluster}")]
     DuplicateUrl {
         first: ServerName,
@@ -196,6 +216,53 @@ impl DeployProfile {
             }
         }
         Ok(servers)
+    }
+}
+
+impl DeployProfile {
+    /// Every resource people's MCP clients may get tokens for: each `[kueue]` cluster's server
+    /// under `people = true`, and each `[[agent_servers]]` entry with `people`, on each of its
+    /// clusters. No two share a URL.
+    pub fn people_resources(&self) -> Result<Vec<PeopleResource>, ServerSpecError> {
+        let mut resources = Vec::new();
+        if let Some(k) = &self.kueue {
+            if let Some(stray) = k.people_urls.keys().find(|c| !k.serves(c)) {
+                return Err(ServerSpecError::PeopleUrlCluster(stray.clone()));
+            }
+            if k.people {
+                for cluster in &k.clusters {
+                    resources.push(PeopleResource {
+                        url: k.people_url(cluster),
+                        cluster: cluster.clone(),
+                        scopes: [
+                            crucible_contract::kueue::SCOPE_READ,
+                            crucible_contract::kueue::SCOPE_SUBMIT,
+                        ]
+                        .map(String::from)
+                        .to_vec(),
+                    });
+                }
+            }
+        }
+        for s in self.agent_servers.iter().filter(|s| s.people) {
+            for cluster in &s.clusters {
+                resources.push(PeopleResource {
+                    url: s.url.to_string(),
+                    cluster: cluster.clone(),
+                    scopes: s.scopes.clone(),
+                });
+            }
+        }
+        for (i, a) in resources.iter().enumerate() {
+            if let Some(b) = resources[i + 1..].iter().find(|b| b.url == a.url) {
+                return Err(ServerSpecError::PeopleUrlTwice {
+                    url: a.url.clone(),
+                    first: a.cluster.clone(),
+                    second: b.cluster.clone(),
+                });
+            }
+        }
+        Ok(resources)
     }
 }
 
@@ -401,5 +468,77 @@ mod tests {
             "{BASE}[[agent_servers]]\nname = \"Docs\"\nurl = \"http://x/mcp\"\nscopes = []\n"
         );
         assert!(toml::from_str::<DeployProfile>(&bad_name).is_err());
+    }
+
+    /// People reach crucible-kueue on each of its clusters at its Service URL, or where
+    /// `people_urls` says; two clusters at one URL would be one resource, so that is refused.
+    #[test]
+    fn people_resources_come_from_the_tables_that_serve_people() {
+        assert!(
+            profile(KUEUE_AND_BUILDIT)
+                .people_resources()
+                .unwrap()
+                .is_empty()
+        );
+        let one = profile(&KUEUE_AND_BUILDIT.replace(
+            "clusters = [\"ocp\", \"k8s\"]",
+            "clusters = [\"ocp\"]\npeople = true",
+        ));
+        assert_eq!(
+            one.people_resources().unwrap(),
+            [PeopleResource {
+                url: "http://crucible-kueue.kueue-server.svc.cluster.local:8850/mcp".into(),
+                cluster: "ocp".into(),
+                scopes: vec!["kueue.read".into(), "kueue.submit".into()],
+            }]
+        );
+        let both = KUEUE_AND_BUILDIT.replace(
+            "clusters = [\"ocp\", \"k8s\"]",
+            "clusters = [\"ocp\", \"k8s\"]\npeople = true",
+        );
+        assert!(matches!(
+            profile(&both).people_resources(),
+            Err(ServerSpecError::PeopleUrlTwice { .. })
+        ));
+        let routed = profile(&both.replace(
+            "people = true",
+            "people = true\npeople_urls = { ocp = \"https://kueue.ocp.example/mcp\" }",
+        ));
+        let urls: Vec<(String, String)> = routed
+            .people_resources()
+            .unwrap()
+            .into_iter()
+            .map(|r| (r.cluster, r.url))
+            .collect();
+        assert_eq!(
+            urls,
+            [
+                ("ocp".into(), "https://kueue.ocp.example/mcp".into()),
+                (
+                    "k8s".into(),
+                    "http://crucible-kueue.kueue-server.svc.cluster.local:8850/mcp".into()
+                ),
+            ]
+        );
+        assert!(matches!(
+            profile(&both.replace(
+                "people = true",
+                "people = true\npeople_urls = { east = \"https://kueue.east.example/mcp\" }",
+            ))
+            .people_resources(),
+            Err(ServerSpecError::PeopleUrlCluster(c)) if c == "east"
+        ));
+        let docs = profile(
+            "[[agent_servers]]\nname = \"docs\"\nurl = \"https://docs.example/mcp\"\n\
+             scopes = [\"docs.read\"]\npeople = true\n",
+        );
+        assert_eq!(
+            docs.people_resources().unwrap(),
+            [PeopleResource {
+                url: "https://docs.example/mcp".into(),
+                cluster: "hub".into(),
+                scopes: vec!["docs.read".into()],
+            }]
+        );
     }
 }

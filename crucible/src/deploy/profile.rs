@@ -195,10 +195,16 @@ pub struct KueueCfg {
     /// registry (a host or host/path prefix).
     #[serde(default)]
     pub pull_secrets: Vec<String>,
-    /// Also accept people's tokens from the same issuer: set when `CONTROLLER_PEOPLE_AUDIENCES`
-    /// names this server, so people's MCP clients reach it as themselves.
+    /// Also serve people's MCP clients, with tokens from the same issuer: each cluster's server is
+    /// then a resource people may get tokens for.
     #[serde(default)]
     pub people: bool,
+    /// Where people's MCP clients reach the server, by cluster, when not at its Service URL (a
+    /// route, or a port-forward): `people_urls = { east = "https://kueue.east.example/mcp" }`.
+    /// A person's token names its cluster by this URL, so `people` on several clusters needs a
+    /// distinct one for each.
+    #[serde(default)]
+    pub people_urls: BTreeMap<String, url::Url>,
 }
 
 /// The dispatch name of the controller's own cluster.
@@ -277,6 +283,15 @@ impl KueueCfg {
     /// The MCP endpoint URL handed to the loop pod.
     pub fn url(&self) -> String {
         format!("http://{}:{}/mcp", self.service_host(), Self::PORT)
+    }
+
+    /// Where people's MCP clients reach the server on `cluster`: its `people_urls` entry, else
+    /// the Service URL.
+    pub fn people_url(&self, cluster: &str) -> String {
+        match self.people_urls.get(cluster) {
+            Some(url) => url.to_string(),
+            None => self.url(),
+        }
     }
 
     /// The key set URI of `issuer`, the controller's agent issuer: `run_jwks_uri`, or the
@@ -439,6 +454,9 @@ pub struct AgentServerCfg {
     /// The namespaces its tokens name, the first as the default.
     #[serde(default)]
     pub namespaces: Vec<KubeName>,
+    /// Also a resource people's MCP clients may get tokens for, at `url` on each cluster.
+    #[serde(default)]
+    pub people: bool,
 }
 
 /// The source of a caller's groups for crucible-kueue's SubjectAccessReviews (`--kube-authz`).
@@ -1019,6 +1037,9 @@ impl DeployProfile {
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
             .agent_servers()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .people_resources()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         Ok(profile)
     }

@@ -8,7 +8,7 @@ RFC 9728 metadata, checks every call against the access rules it declares in cod
 applies an optional CEL tool policy over arguments. Agents never hold a credential.
 
 A deployment needs SPIRE (with an OIDC discovery provider) on each cluster whose sandboxes get
-tokens, the controller's issuer (`CONTROLLER_AGENT_*`, and `CONTROLLER_PEOPLE_AUDIENCES` for
+tokens, the controller's issuer (`CONTROLLER_AGENT_*`, and `[kueue] people` in its deploy profile for
 people), and each MCP server's flags. [docs/controller-deploy.md](../docs/controller-deploy.md)
 and [docs/controller-auth.md](../docs/controller-auth.md) cover configuration; this file covers
 the token model and what a server does with a token.
@@ -161,7 +161,7 @@ the run claims.
 | `sub` | the login the run was dispatched for | the person's login | `crucible.dev/launched-by`, policy |
 | `act.sub` | `spiffe://<trust domain>/openshell/gateway/<gateway-id>/sandbox/<id>` | absent | audit, `crucible.dev/actor` |
 | `aud` | the MCP servers the run may call | the servers the requested scopes name | one must be this server |
-| `scope` | the scopes of the server the deploy profile describes at the audience | what the client requested, within `CONTROLLER_PEOPLE_AUDIENCES` | per-tool checks |
+| `scope` | the scopes of the server the deploy profile describes at the audience | what the client requested, within the people resource's scopes | per-tool checks |
 | `run_id` | run pod name | absent; the subject owns its workloads | ownership labels |
 | `kube_user` | the launcher's username on the run's cluster | the person's username on the server's cluster | who RBAC asks about; required by crucible-kueue |
 | `namespace` | from the run's grant | absent | crucible-kueue's default namespace |

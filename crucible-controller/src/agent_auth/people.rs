@@ -44,7 +44,6 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tower_sessions::Session;
-use url::Url;
 
 pub const CODE_TTL_SECS: u64 = 60;
 /// An access token's lifetime unless `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` says otherwise.
@@ -66,14 +65,8 @@ pub struct PersonAudience {
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PeopleConfigError {
-    #[error("CONTROLLER_PEOPLE_AUDIENCES entry {0:?} is not <cluster>:<resource url>=<scope> ...")]
-    Shape(String),
-    #[error("CONTROLLER_PEOPLE_AUDIENCES resource {0:?} is not an http(s) URL without a fragment")]
-    Resource(String),
-    #[error("CONTROLLER_PEOPLE_AUDIENCES names resource {0:?} twice")]
-    Duplicate(String),
-    #[error("CONTROLLER_PEOPLE_AUDIENCES is set but lists no audience")]
-    Empty,
+    #[error("reading the deploy profile's people resources: {0}")]
+    Profile(String),
     #[error(
         "CONTROLLER_PEOPLE_ACCESS_TTL_SECS {0:?} is not a whole number of seconds from 1 to 3600"
     )]
@@ -84,30 +77,6 @@ pub enum PeopleConfigError {
     Cimd(#[from] CimdConfigError),
     #[error(transparent)]
     Dcr(#[from] DcrConfigError),
-}
-
-/// `<cluster>:<resource url>=<scope> <scope> ...`
-impl std::str::FromStr for PersonAudience {
-    type Err = PeopleConfigError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let shape = || PeopleConfigError::Shape(raw.to_string());
-        let (cluster, rest) = raw.trim().split_once(':').ok_or_else(shape)?;
-        crucible::deploy::profile::check_cluster_name(cluster).map_err(|_| shape())?;
-        let (resource, scopes) = rest.split_once('=').unwrap_or((rest, ""));
-        let resource = resource.trim();
-        let ok = Url::parse(resource).is_ok_and(|u| {
-            matches!(u.scheme(), "http" | "https") && u.host().is_some() && u.fragment().is_none()
-        });
-        if !ok {
-            return Err(PeopleConfigError::Resource(resource.to_string()));
-        }
-        Ok(Self {
-            resource: resource.to_string(),
-            cluster: cluster.to_string(),
-            scopes: scopes.split_whitespace().map(str::to_string).collect(),
-        })
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,11 +103,24 @@ impl PeopleConfig {
         scopes
     }
 
-    /// `CONTROLLER_PEOPLE_AUDIENCES`, comma separated; `None` when unset.
-    pub fn from_env() -> Result<Option<Self>, PeopleConfigError> {
-        let Some(mut config) =
-            Self::from_lookup(std::env::var("CONTROLLER_PEOPLE_AUDIENCES").ok())?
-        else {
+    /// People's tokens for the resources `profile` serves people at, with the other settings
+    /// from `CONTROLLER_PEOPLE_*`; `None` when the profile serves people nowhere.
+    pub fn from_env(
+        profile: &crucible::deploy::DeployProfile,
+    ) -> Result<Option<Self>, PeopleConfigError> {
+        let resources = profile
+            .people_resources()
+            .map_err(|e| PeopleConfigError::Profile(e.to_string()))?;
+        let Some(mut config) = Self::new(
+            resources
+                .into_iter()
+                .map(|r| PersonAudience {
+                    resource: r.url,
+                    cluster: r.cluster,
+                    scopes: r.scopes,
+                })
+                .collect(),
+        ) else {
             return Ok(None);
         };
         if let Ok(raw) = std::env::var("CONTROLLER_PEOPLE_ACCESS_TTL_SECS") {
@@ -188,28 +170,16 @@ impl PeopleConfig {
         Ok(self)
     }
 
-    pub fn from_lookup(raw: Option<String>) -> Result<Option<Self>, PeopleConfigError> {
-        let Some(raw) = raw.filter(|r| !r.trim().is_empty()) else {
-            return Ok(None);
-        };
-        let mut audiences: Vec<PersonAudience> = Vec::new();
-        for entry in raw.split(',').filter(|e| !e.trim().is_empty()) {
-            let audience: PersonAudience = entry.parse()?;
-            if audiences.iter().any(|a| a.resource == audience.resource) {
-                return Err(PeopleConfigError::Duplicate(audience.resource));
-            }
-            audiences.push(audience);
-        }
-        if audiences.is_empty() {
-            return Err(PeopleConfigError::Empty);
-        }
-        Ok(Some(Self {
+    /// People's tokens for `audiences` with every other setting at its default; `None` when
+    /// there are none.
+    pub fn new(audiences: Vec<PersonAudience>) -> Option<Self> {
+        (!audiences.is_empty()).then(|| Self {
             audiences,
             access_ttl_secs: ACCESS_TTL_SECS,
             clients: clients::builtin(),
             cimd: None,
             dcr: Some(DcrPolicy::default()),
-        }))
+        })
     }
 
     pub fn audience(&self, resource: &str) -> Option<&PersonAudience> {
@@ -960,6 +930,7 @@ mod tests {
     use sqlx::PgPool;
     use std::collections::HashMap;
     use tower::ServiceExt;
+    use url::Url;
 
     const OCP_KUEUE: &str = "https://crucible-kueue.apps.ocp.example/mcp";
     const EAST_KUEUE: &str = "https://crucible-kueue.apps.east.example/mcp";
@@ -973,12 +944,21 @@ mod tests {
     const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
     const SUB: &str = "f:sso:jordan";
 
+    fn audience(cluster: &str, resource: &str, scopes: &str) -> PersonAudience {
+        PersonAudience {
+            resource: resource.into(),
+            cluster: cluster.into(),
+            scopes: scopes.split_whitespace().map(str::to_string).collect(),
+        }
+    }
+
     fn config() -> PeopleConfig {
-        PeopleConfig::from_lookup(Some(format!(
-            "ocp:{OCP_KUEUE}=kueue.read kueue.submit, east:{EAST_KUEUE}=kueue.read, \
-             k8s:{K8S_KUEUE}=kueue.read, nowhere:https://unlisted.example/mcp=kueue.read"
-        )))
-        .unwrap()
+        PeopleConfig::new(vec![
+            audience("ocp", OCP_KUEUE, "kueue.read kueue.submit"),
+            audience("east", EAST_KUEUE, "kueue.read"),
+            audience("k8s", K8S_KUEUE, "kueue.read"),
+            audience("nowhere", "https://unlisted.example/mcp", "kueue.read"),
+        ])
         .unwrap()
     }
 
@@ -1057,32 +1037,28 @@ mod tests {
         }
     }
 
+    /// People's audiences are the resources the deploy profile serves people at, each on its
+    /// cluster; a profile that serves people nowhere turns people's tokens off.
     #[test]
-    fn audiences_parse_as_cluster_resource_and_scopes() {
-        let cfg = config();
+    fn people_audiences_come_from_the_profile() {
+        let base = crate::agent_auth::testing::PROFILE;
+        let without: crucible::deploy::DeployProfile = toml::from_str(base).unwrap();
+        assert_eq!(PeopleConfig::from_env(&without), Ok(None));
+        let with: crucible::deploy::DeployProfile = toml::from_str(&base.replace(
+            "cluster = \"dev\"\nnamespace = \"crucible-system\"",
+            "cluster = \"dev\"\npeople = true\nnamespace = \"crucible-system\"",
+        ))
+        .unwrap();
+        let cfg = PeopleConfig::from_env(&with).unwrap().unwrap();
         assert_eq!(
-            cfg.audience(OCP_KUEUE),
-            Some(&PersonAudience {
-                resource: OCP_KUEUE.into(),
-                cluster: "ocp".into(),
-                scopes: vec!["kueue.read".into(), "kueue.submit".into()],
-            })
+            cfg.audiences,
+            [audience(
+                "dev",
+                crate::agent_auth::testing::KUEUE,
+                "kueue.read kueue.submit"
+            )]
         );
-        assert_eq!(PeopleConfig::from_lookup(None), Ok(None));
-        assert_eq!(
-            PeopleConfig::from_lookup(Some(" , ".into())),
-            Err(PeopleConfigError::Empty)
-        );
-        for (raw, want) in [
-            (OCP_KUEUE.to_string(), "Resource"),
-            ("Ocp:https://a.example/mcp".to_string(), "Shape"),
-            ("ocp:ftp://a.example/mcp".to_string(), "Resource"),
-            ("ocp:https://a.example/mcp#x".to_string(), "Resource"),
-            (format!("a:{OCP_KUEUE},b:{OCP_KUEUE}"), "Duplicate"),
-        ] {
-            let err = PeopleConfig::from_lookup(Some(raw.clone())).unwrap_err();
-            assert!(format!("{err:?}").starts_with(want), "{raw}: {err:?}");
-        }
+        assert_eq!(PeopleConfig::new(Vec::new()), None);
     }
 
     #[tokio::test]
