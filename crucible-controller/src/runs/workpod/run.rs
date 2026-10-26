@@ -797,8 +797,7 @@ pub async fn dispatch_run(
                 rows.push(row);
                 values.push(value);
             }
-            let by_the_app =
-                crate::secrets::minter::any_bound(&rows, crate::secrets::minter::Minter::GithubApp);
+            let by_the_app = crate::secrets::minter::any_github_app(&rows);
             (
                 crate::secrets::deliver::assemble(&mints, &rows, &values)?,
                 by_the_app,

@@ -117,6 +117,8 @@ export type RegisterMode = 'value' | 'reference' | 'mint';
 export const MINTERS = ['github-app'] as const;
 export type Minter = (typeof MINTERS)[number];
 
+const GITHUB_LOGIN = /^(?!-)[A-Za-z0-9-]{1,39}(?<!-)$/;
+
 export interface RegisterForm {
   name: string;
   owner: string;
@@ -128,6 +130,8 @@ export interface RegisterForm {
   credentials: CredentialEntry[];
   reference: string;
   minter: Minter;
+  /// The GitHub account a `github-app` token is issued for; empty is the home installation.
+  mintAccount: string;
   vaultToken: string;
   /// Whether the writer has acknowledged that an agent-visible value can end up in a PR.
   acknowledged: boolean;
@@ -144,6 +148,7 @@ export function emptyRegisterForm(owner: string): RegisterForm {
     credentials: emptyCredentials(),
     reference: '',
     minter: 'github-app',
+    mintAccount: '',
     vaultToken: '',
     acknowledged: false,
   };
@@ -214,6 +219,10 @@ export function registerErrors(form: RegisterForm): Map<string, string> {
     if (form.kind !== 'opaque') {
       errors.set('kind', `a ${form.kind} secret cannot be minted; a minter issues an opaque token`);
     }
+    const account = form.mintAccount.trim();
+    if (account.length > 0 && !GITHUB_LOGIN.test(account)) {
+      errors.set('mintAccount', 'a GitHub login is letters, digits, and inner hyphens, at most 39');
+    }
   } else {
     if (form.reference.trim().length === 0) {
       errors.set('reference', 'a reference is a vault://<mount>/<path>#<key> pointer');
@@ -250,7 +259,10 @@ export function registerBody(form: RegisterForm): RegisterSecretBody {
     const value = form.kind === 'inference_api_key' ? credentialsValue(form.credentials) : form.value;
     return { ...base, value };
   }
-  if (form.mode === 'mint') return { ...base, mint: form.minter };
+  if (form.mode === 'mint') {
+    const account = form.mintAccount.trim();
+    return { ...base, mint: account.length > 0 ? `${form.minter}/${account}` : form.minter };
+  }
   return { ...base, reference: form.reference.trim(), vault_token: form.vaultToken.trim() };
 }
 
