@@ -174,6 +174,45 @@ kind-e2e:
 revise-loop-e2e:
     scripts/revise-loop-e2e.sh
 
+# End-to-end proof that a sandboxed agent reaches crucible-kueue with an agent token its own
+# supervisor obtained: a controller in the cluster dispatches e2e/kueue/pack, and the script checks
+# the issued token, the Job and the agent's whoami (scenario in the script header). Images come
+# from Containerfile.runtime-selfcontained, Containerfile.controller-selfcontained on top of it, and
+# Containerfile.kueue, built from this checkout. KEEP=1 leaves everything behind. It runs on
+# OpenShift or plain Kubernetes (detected); the script header lists the per-platform values the
+# environment may set (PLATFORM, SPIRE_NS, CLUSTER_QUEUE, ANTHROPIC_KEY_FILE, ...).
+kueue-e2e context loop_image kueue_image controller_image pull_secret push_repo anthropic_base_url anthropic_key_secret="" sandbox_scc_role="" loop_scc_role="" pack="e2e/kueue/pack":
+    PACK={{pack}} CONTEXT={{context}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
+        CONTROLLER_IMAGE={{controller_image}} PULL_SECRET={{pull_secret}} PUSH_REPO={{push_repo}} \
+        ANTHROPIC_BASE_URL={{anthropic_base_url}} ANTHROPIC_KEY_SECRET={{anthropic_key_secret}} \
+        SANDBOX_SCC_ROLE={{sandbox_scc_role}} LOOP_SCC_ROLE={{loop_scc_role}} scripts/kueue-e2e.sh
+
+# kueue-e2e with a cluster's values from e2e/kueue/clusters/<name>.env (git-ignored; copy
+# openshift.env.example or kubernetes.env.example). Pass pack= to launch another pack.
+kueue-e2e-cluster name loop_image kueue_image controller_image pack="e2e/kueue/pack":
+    set -a && . e2e/kueue/clusters/{{name}}.env && set +a && \
+        PACK={{pack}} LOOP_IMAGE={{loop_image}} KUEUE_IMAGE={{kueue_image}} \
+        CONTROLLER_IMAGE={{controller_image}} scripts/kueue-e2e.sh
+
+# The verifier of examples/optimize-loop against real report, evidence and image files, and the
+# pack compiled in both variants.
+optimize-loop-test:
+    python3 -m unittest discover -s examples/optimize-loop/verify
+    SQLX_OFFLINE=true cargo test -q -p crucible --test optimize_loop_example
+
+# examples/optimize-loop on <name> through the kueue e2e's harness: the agent builds, benchmarks
+# on Kueue and iterates, and the pack's verify task checks its report against the evidence. params
+# is the launch's --params, e.g. '{"gpu": "true"}'.
+optimize-loop-e2e name loop_image kueue_image controller_image params="":
+    MAX_COST=10 MAX_TIME=120m TIMEOUT_SECS=9000 PARAMS='{{params}}' \
+        just kueue-e2e-cluster {{name}} {{loop_image}} {{kueue_image}} {{controller_image}} examples/optimize-loop
+
+# Launch examples/optimize-loop on a running controller whose runs get buildit and crucible-kueue,
+# and wait for the verify task's verdict (scripts/optimize-loop.sh).
+optimize-loop context ctl_ns gpu="false" rounds="3" min_speedup="5":
+    CONTEXT={{context}} CTL_NS={{ctl_ns}} GPU={{gpu}} ROUNDS={{rounds}} MIN_SPEEDUP={{min_speedup}} \
+        scripts/optimize-loop.sh
+
 # Spoke smoketest (hub-spoke delegated jobs): submit a CPU-only sentinel Job to <cluster> through
 # the full production submit/stream/parse path and print the typed result JSON. `cluster` is a
 # [clusters.<name>] entry in the deploy profile; pass `context` to run it against a local
@@ -213,3 +252,35 @@ route-serving-forward namespace="weaton-dev" context="coreweave-waldorf":
 # Remove the deployment and free its GPU.
 route-serving-down namespace="weaton-dev" context="coreweave-waldorf":
     kubectl --context {{context}} -n {{namespace}} delete deploy/dgemma-systemone svc/dgemma-systemone --ignore-not-found
+
+# Prepare a cluster for the gateway isolation e2e (crucible-controller/tests/kueue_gateway_e2e.rs): the
+# profile's loop and sandbox namespaces, its pull secret copied from `pull_from`, the loop and
+# sandbox service accounts (the sandbox one bound to `scc_role`, the ClusterRole granting the
+# sandbox SCC), and the gateway RBAC the profile renders.
+gateway-e2e-setup context profile manifest pull_from scc_role:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kc() { oc --context "{{context}}" "$@"; }
+    read -r loop_ns sandbox_ns loop_sa sandbox_sa pull < <(python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); k = c["cluster"]; print(k["loop_namespace"], k["sandbox_namespace"], k["service_account"], k["sandbox_service_account"], c["image"]["pull_secret"])' "{{profile}}")
+    for ns in "$loop_ns" "$sandbox_ns"; do
+        kc create namespace "$ns" --dry-run=client -o yaml | kc apply -f -
+        kc get secret "$pull" -n "{{pull_from}}" -o json \
+            | jq 'del(.metadata.namespace, .metadata.resourceVersion, .metadata.uid, .metadata.creationTimestamp, .metadata.ownerReferences, .metadata.managedFields)' \
+            | kc apply -n "$ns" -f -
+    done
+    kc create serviceaccount "$loop_sa" -n "$loop_ns" --dry-run=client -o yaml | kc apply -f -
+    kc create serviceaccount "$sandbox_sa" -n "$sandbox_ns" --dry-run=client -o yaml | kc apply -f -
+    kc create rolebinding "$sandbox_sa-scc" -n "$sandbox_ns" --clusterrole "{{scc_role}}" \
+        --serviceaccount "$sandbox_ns:$sandbox_sa" --dry-run=client -o yaml | kc apply -f -
+    cargo run -q -p crucible -- deploy render --manifest "{{manifest}}" --profile "{{profile}}" --no-pin \
+        | yq 'select(.kind != "Pod" and .kind != "NetworkPolicy")' | kc apply -f -
+
+# Remove what gateway-e2e-setup created: both namespaces and the rendered cluster-scoped RBAC.
+gateway-e2e-teardown context profile manifest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    kc() { oc --context "{{context}}" "$@"; }
+    cargo run -q -p crucible -- deploy render --manifest "{{manifest}}" --profile "{{profile}}" --no-pin \
+        | yq 'select(.kind == "ClusterRole" or .kind == "ClusterRoleBinding")' | kc delete --ignore-not-found -f -
+    read -r loop_ns sandbox_ns < <(python3 -c 'import sys, tomllib; k = tomllib.load(open(sys.argv[1], "rb"))["cluster"]; print(k["loop_namespace"], k["sandbox_namespace"])' "{{profile}}")
+    kc delete namespace "$loop_ns" "$sandbox_ns" --ignore-not-found

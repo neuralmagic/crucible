@@ -327,6 +327,33 @@ pub async fn attribute_run(ex: impl PgExecutor<'_>, run_id: &str) -> Result<()> 
     Ok(())
 }
 
+/// Stamp the principal a run is dispatched for: whoever asked for this dispatch of the issue
+/// ([`crate::issues::store::request_dispatch`]), else the owner the run is attributed to. The
+/// request is consumed in the same statement, so it applies to exactly the dispatch it asked for
+/// and a later schedule or auto-dispatch acts for the owner again.
+pub async fn stamp_dispatcher(ex: impl PgExecutor<'_>, run_id: &str) -> Result<()> {
+    sqlx::query(
+        "WITH requested AS (
+             SELECT i.key, i.dispatch_requested_by
+               FROM issues i JOIN runs r ON r.issue = i.key
+              WHERE r.run_id = $1
+                FOR UPDATE OF i
+         ), consumed AS (
+             UPDATE issues SET dispatch_requested_by = NULL
+              WHERE key IN (SELECT key FROM requested)
+         )
+         UPDATE runs SET dispatched_by = COALESCE(
+             (SELECT dispatch_requested_by FROM requested),
+             attributed_to)
+          WHERE run_id = $1",
+    )
+    .bind(run_id)
+    .execute(ex)
+    .await
+    .context("stamping a run's dispatcher")?;
+    Ok(())
+}
+
 #[tracing::instrument(name = "db.insert_run", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", run_id = %run.run_id), err)]
 pub async fn insert_run(ex: impl PgExecutor<'_>, run: &NewRun) -> Result<()> {
     // Upsert on `run_id`: the launch path records the run at `running`, and the pod-completion edge

@@ -1,0 +1,29 @@
+# optimize-loop: an agent builds a slow program with the run's buildit, benchmarks it as Kueue
+# Jobs on a fixed budget, and iterates; a deterministic verifier then checks its report against
+# crucible-kueue's replies and the registry. See README.md.
+[workspace]
+inject = [
+    "verify/verify.py",
+    "app/main.go",
+    "app/go.mod",
+    "app/Containerfile",
+    { src = "app/topk.go", dst = "app/topk.go", frozen = false },
+    "gpu/bench.py",
+    "gpu/Containerfile",
+    { src = "gpu/kernel.py", dst = "gpu/kernel.py", frozen = false },
+]
+
+[agent]
+backend       = "openshell"
+harness       = "claude"
+model         = "claude-sonnet-5"
+sandbox_image = "ghcr.io/neuralmagic/sandbox-go-cgo-cc@sha256:33cc058e97a0f9fded61d6c2a4584cc189854a0c6e0576215e8f6c0ba2a44628"
+goal          = "Make the program faster without changing its answer, measured on Kueue."
+
+# The images are linux/amd64.
+[agent.resources]
+node_selector = { "kubernetes.io/arch" = "amd64" }
+
+[workflow]
+type = "playbook"
+file = "workflow.star"

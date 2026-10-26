@@ -1,0 +1,133 @@
+//! `crucible-kueue`: an MCP server through which sandboxed agents submit, inspect, and control
+//! Kueue workloads. It holds the Kubernetes credentials; callers hold only an access token, a
+//! run's or a person's, from the crucible controller or another OIDC issuer it trusts.
+
+pub mod access;
+pub mod auth;
+pub mod caller;
+pub mod config;
+pub mod hardware;
+pub mod kinds;
+pub mod kueue;
+pub mod manifest;
+pub mod namespaces;
+pub mod profile;
+pub mod quantity;
+pub mod report;
+pub mod server;
+pub mod status;
+pub mod task;
+
+use crucible_mcp_auth::access::AccessReview;
+use crucible_mcp_auth::guard::PolicyGuard;
+use crucible_mcp_auth::policy::ToolPolicy;
+use crucible_mcp_auth::server::ResourceServer;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::never::NeverSessionManager,
+};
+use std::sync::Arc;
+
+pub const MCP_PATH: &str = "/mcp";
+
+/// Selects aws-lc-rs as the process TLS provider. Several rustls backends are linked in, so rustls
+/// refuses to pick one; call this before building the first kube client.
+pub fn install_tls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+/// Everything a crucible-kueue app is built from. The binary fills it from flags; a host that
+/// embeds the server fills it in code.
+pub struct Options {
+    /// Validates every access token, runs' and people's, against the issuers it trusts.
+    pub oidc: Arc<ResourceServer>,
+    /// Mutate and validate rules for tool arguments; [`ToolPolicy::default`] has none. Which
+    /// calls exist, their scopes and their access checks are [`access::KueueRules`].
+    pub policy: ToolPolicy,
+    /// Reviews access checks (Kubernetes RBAC) for callers carrying a Kubernetes user. People's
+    /// tokens are accepted only with a reviewer.
+    pub reviewer: Option<Arc<dyn AccessReview>>,
+    /// Host header values to accept besides loopback, e.g. the Service DNS name.
+    pub allowed_hosts: Vec<String>,
+    /// The Kueue API version the cluster serves; see [`kueue::KueueVersion::discover`].
+    pub kueue: kueue::KueueVersion,
+    /// The served kinds the cluster has installed; see [`kinds::installed`].
+    pub kinds: Vec<manifest::WorkloadKind>,
+    /// Labels, ownership, allowlist, claim names, queue verb, lifetimes and hardware.
+    /// [`config::Config::default`] is crucible's deployment.
+    pub config: config::Config,
+}
+
+/// The HTTP app: the MCP endpoint behind authentication and the guard; plus an
+/// unauthenticated `/healthz` and the RFC 9728 protected-resource metadata.
+pub fn router(client: kube::Client, options: Options) -> axum::Router {
+    let Options {
+        oidc,
+        policy,
+        reviewer,
+        allowed_hosts,
+        kueue,
+        kinds,
+        config,
+    } = options;
+    let people = reviewer.is_some();
+    let namespaces = Arc::new(namespaces::Namespaces::new(
+        client.clone(),
+        kueue,
+        config.namespaces.clone(),
+        reviewer.clone(),
+    ));
+    let auth = auth::Auth {
+        oidc: oidc.clone(),
+        people,
+        claims: config.claims.clone(),
+        namespaces: namespaces.clone(),
+    };
+    let rules = access::KueueRules {
+        queue_verb: config.queue_verb,
+    };
+    let cfg = Arc::new(config);
+    let kinds = Arc::new(kinds);
+    let extra_hosts = &allowed_hosts;
+    let mut config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(false)
+        .with_json_response(true);
+    for host in extra_hosts {
+        if !config.allowed_hosts.contains(host) {
+            config.allowed_hosts.push(host.clone());
+        }
+    }
+    let service: StreamableHttpService<server::KueueMcp, NeverSessionManager> =
+        StreamableHttpService::new(
+            move || {
+                Ok(server::KueueMcp::new(
+                    client.clone(),
+                    kueue,
+                    cfg.clone(),
+                    kinds.clone(),
+                    namespaces.clone(),
+                ))
+            },
+            Arc::new(NeverSessionManager::default()),
+            config,
+        );
+    let guard = PolicyGuard {
+        rules: Arc::new(rules),
+        policy,
+        server: Some(oidc.clone()),
+        reviewer,
+    };
+    let mcp = axum::Router::new()
+        .fallback_service(service)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(guard),
+            crucible_mcp_auth::guard::enforce,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::new(auth),
+            auth::authenticate,
+        ));
+    axum::Router::new()
+        .nest_service(MCP_PATH, mcp)
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
+        .merge(crucible_mcp_auth::metadata::router(oidc))
+}

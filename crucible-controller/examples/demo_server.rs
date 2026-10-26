@@ -66,7 +66,7 @@ async fn main() -> anyhow::Result<()> {
         &cfg,
     );
     let surface =
-        crucible_controller::Surface::bind(state, addr, cfg.session_secure_cookies).await?;
+        crucible_controller::Surface::bind(state, addr, cfg.session_secure_cookies, None).await?;
     Err(surface.serve().await.into())
 }
 

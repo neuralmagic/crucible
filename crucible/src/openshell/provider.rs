@@ -310,8 +310,8 @@ pub const BROKER_PROVIDER_NAME: &str = "crucible-broker";
 /// The custom (crucible-imported) profile id backing [`BROKER_PROVIDER_NAME`].
 pub const BROKER_PROFILE_ID: &str = "crucible-broker";
 
-/// The credential env key the profile declares; also the placeholder key the sandbox's
-/// `.mcp.json` header resolves through.
+/// The credential env key the profile declares; the gateway issues the sandbox its placeholder
+/// under this name.
 pub const BROKER_CRED_KEY: &str = "BROKER_TOKEN";
 
 /// The placeholder the sandbox sends in place of the broker token.
@@ -326,15 +326,84 @@ pub fn broker_token_placeholder() -> String {
 /// The endpointless `crucible-broker` profile: one required bearer credential, no endpoints, no
 /// refresh (the token is per-run static).
 pub fn broker_profile() -> openshell_core::proto::ProviderProfile {
+    bearer_profile(
+        BROKER_PROFILE_ID,
+        "Crucible broker",
+        "Per-run bearer token for the loop-pod provisioning broker",
+        "Broker bearer token",
+        BROKER_CRED_KEY,
+    )
+}
+
+/// An MCP server a sandbox reaches with controller-issued agent tokens.
+pub struct GrantedServer<'a> {
+    pub profile_id: &'a str,
+    /// The server's name in the profile's descriptions.
+    pub name: &'a str,
+    pub host: &'a str,
+    pub port: u16,
+    /// The server's MCP URL, the audience of its tokens.
+    pub url: &'a str,
+    pub token_endpoint: &'a str,
+    pub svid_audience: &'a str,
+    pub scopes: &'a [String],
+}
+
+/// A token-grant profile: one dynamic credential the supervisor obtains from the controller's
+/// `token_endpoint` with a JWT-SVID for `svid_audience`, requesting a token whose audience is the
+/// server's `url`, and injects as a bearer header on traffic to `host:port` alone. It holds no
+/// secret and gives the sandbox no placeholder.
+pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto::ProviderProfile {
+    use openshell_core::proto::{
+        NetworkAccessPreset, NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile,
+        ProviderProfileCategory, ProviderProfileCredential,
+    };
+    ProviderProfile {
+        id: server.profile_id.to_string(),
+        display_name: format!("{} (agent token)", server.name),
+        description: format!("{} access with controller-issued agent tokens", server.name),
+        category: ProviderProfileCategory::Agent as i32,
+        credentials: vec![ProviderProfileCredential {
+            name: "token".to_string(),
+            description: format!("Agent access token for {}", server.name),
+            auth_style: "bearer".to_string(),
+            header_name: "authorization".to_string(),
+            token_grant: Some(ProviderCredentialTokenGrant {
+                token_endpoint: server.token_endpoint.to_string(),
+                audience: server.url.to_string(),
+                jwt_svid_audience: server.svid_audience.to_string(),
+                scopes: server.scopes.to_vec(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }],
+        endpoints: vec![NetworkEndpoint {
+            host: server.host.to_string(),
+            port: u32::from(server.port),
+            protocol: "rest".to_string(),
+            access: NetworkAccessPreset::Full as i32,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }
+}
+
+fn bearer_profile(
+    id: &str,
+    display_name: &str,
+    description: &str,
+    credential_description: &str,
+    env_var: &str,
+) -> openshell_core::proto::ProviderProfile {
     openshell_core::proto::ProviderProfile {
-        id: BROKER_PROFILE_ID.to_string(),
-        display_name: "Crucible broker".to_string(),
-        description: "Per-run bearer token for the loop-pod provisioning broker".to_string(),
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        description: description.to_string(),
         category: openshell_core::proto::ProviderProfileCategory::Agent as i32,
         credentials: vec![openshell_core::proto::ProviderProfileCredential {
             name: "token".to_string(),
-            description: "Broker bearer token".to_string(),
-            env_vars: vec![BROKER_CRED_KEY.to_string()],
+            description: credential_description.to_string(),
+            env_vars: vec![env_var.to_string()],
             required: true,
             ..Default::default()
         }],
@@ -501,6 +570,25 @@ mod tests {
         assert_eq!(PROVIDER_NAME, "ci-gcp");
         assert_eq!(PROVIDER_TYPE, "google-cloud");
         assert_eq!(CRED_KEY, "GCP_ADC_ACCESS_TOKEN");
+    }
+
+    #[test]
+    fn the_broker_profile_is_an_endpointless_bearer_credential_on_its_own_key() {
+        let profile = broker_profile();
+        assert_eq!(profile.id, BROKER_PROFILE_ID);
+        assert!(
+            profile.endpoints.is_empty(),
+            "the policy's credential_binding is the boundary"
+        );
+        let [credential] = profile.credentials.as_slice() else {
+            panic!("one credential: {:?}", profile.credentials);
+        };
+        assert_eq!(credential.env_vars, vec![BROKER_CRED_KEY.to_string()]);
+        assert!(credential.required);
+        assert_eq!(
+            broker_profile().credentials[0].description,
+            "Broker bearer token"
+        );
     }
 
     #[test]

@@ -71,10 +71,12 @@ jsonschema.workspace = true
 # Scratch-database URL derivation for `db verify`/`db rebuild` (swap the database name in the
 # ledger URL); already in the tree via reqwest.
 url = "2"
+# The proxies whose X-Forwarded-For a client registration trusts.
+ipnet = "2"
 # The daemon's pod watch (lane D only — no other crate needs the async kube client;
 # `forge::kube` is the sync, block_on-wrapped client the rest of the engine uses).
-kube = { version = "4.0", default-features = false, features = ["client", "runtime", "rustls-tls"] }
-k8s-openapi = { version = "0.28", features = ["v1_32"] }
+kube = { workspace = true, features = ["client", "runtime", "rustls-tls"] }
+k8s-openapi.workspace = true
 futures-util = "0.3"
 # Parse the rendered loop-pod YAML in the kube launch path (the maintained serde_yaml fork the
 # `crucible`/`forge` deploy renderers already use) so the launcher can stamp the issue-key
@@ -87,6 +89,8 @@ rustls = "0.23"
 # The TLS listener behind the redemption Route's reencrypt hop (`tls.rs`). rustls' own async
 # adapter; already in the tree at this version via kube's rustls stack, so it adds no new build.
 tokio-rustls = { version = "0.26", default-features = false }
+# Mints each isolated run gateway's CA, server, and client certificates.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
 # Triage's GitHub client (async — crucible/src/scope.rs's `goal_from_issue` is the sync sibling).
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 # The MCP host answers its own API calls by calling the api router as a `tower::Service` — the
@@ -97,17 +101,21 @@ tower = { version = "0.5", features = ["util"] }
 rmcp = { version = "3.6", features = ["server", "macros", "transport-streamable-http-server"] }
 # The tool surface, written once and hosted over either wire.
 crux = { path = "../crux" }
+# Verifies sandbox JWT-SVIDs at the agent token endpoint against SPIRE's JWKS.
+crucible-mcp-auth = { path = "../crucible-mcp-auth" }
 # Building and draining the synthetic requests the MCP host hands its own router.
 http = "1"
 http-body-util = "0.1"
 # Signs the GitHub App's RS256 JWT (github_app.rs) — the credential exchanged for the pack-PR
-# installation token. Already in the workspace tree via oci-client, so this adds no new build.
+# installation token — and the agent access tokens (agent_auth). The version crucible-mcp-auth
+# verifies with.
 jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 # The OIDC relying party: discovery, the authorization-code + PKCE request, the token exchange, and
 # ID token validation against the issuer's JWKS. `default-features = false` drops its bundled
 # reqwest 0.12 — the HTTP calls run on this crate's own reqwest 0.13 client through the
 # `AsyncHttpClient` closure in `oidc::http_client`, so no second http/tls generation enters the tree.
 openidconnect = { version = "4", default-features = false }
+oauth2 = { version = "5", default-features = false }
 # The HTTP API (lane F): default features give the Json/Form extractors the frozen routes need
 # (API clients POST JSON).
 axum = "0.8"
@@ -219,6 +227,10 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dev-dependencies]
 tempfile = "3"
+# The kueue e2e suites: crucible-kueue served against this controller's agent token endpoint.
+crucible-kueue = { path = "../crucible-kueue" }
+crucible-mcp-auth = { path = "../crucible-mcp-auth", features = ["e2e"] }
+rmcp = { version = "3.6", features = ["client", "transport-streamable-http-client-reqwest"] }
 # `Builder::start_paused` for the virtual-clock tests.
 tokio = { workspace = true, features = ["test-util"] }
 # Fake-GitHub HTTP server for the triage fetch tests (work plan sanctions it).

@@ -1,9 +1,10 @@
-//! Cluster-token bearer auth: resolve a presented bearer to an OpenShift username.
+//! Cluster-token bearer auth: resolve a presented bearer to the cluster's username for it.
 //!
 //! The bearer guard's second path (after the static `CONTROLLER_API_TOKEN`): a caller presents
-//! their own cluster token (`oc whoami -t`) and this module asks the own-cluster API who that
-//! token belongs to, via `GET /apis/user.openshift.io/v1/users/~` — the self-view every
-//! authenticated OpenShift user can read. The call authenticates AS the presented token, so no
+//! their own cluster token (`oc whoami -t`, or what a kubeconfig exec plugin returns) and this
+//! module asks the own-cluster API who that token belongs to, via a `SelfSubjectReview`
+//! (`POST /apis/authentication.k8s.io/v1/selfsubjectreviews`) — the self-view every authenticated
+//! user can make, on OpenShift and plain Kubernetes alike. The call authenticates AS the presented token, so no
 //! extra RBAC is granted to the controller's service account, and a revoked or expired token
 //! stops working the moment the API server says so (modulo the short cache below).
 //!
@@ -83,7 +84,7 @@ impl VerdictExpiry {
 
 pub(crate) struct KubeUserAuth {
     http: reqwest::Client,
-    /// The `users/~` URL, fully formed.
+    /// The `selfsubjectreviews` URL, fully formed.
     url: String,
     /// sha256(token) → verdict. Raw tokens never sit in memory beyond the request that carried them.
     cache: moka::sync::Cache<[u8; 32], Cached>,
@@ -126,7 +127,7 @@ impl KubeUserAuth {
         Ok(KubeUserAuth {
             http: builder.build()?,
             url: format!(
-                "{}/apis/user.openshift.io/v1/users/~",
+                "{}/apis/authentication.k8s.io/v1/selfsubjectreviews",
                 base.trim_end_matches('/')
             ),
             cache: moka::sync::Cache::builder()
@@ -169,45 +170,50 @@ impl KubeUserAuth {
     async fn ask(&self, token: &str) -> Result<String, LookupError> {
         let resp = self
             .http
-            .get(&self.url)
+            .post(&self.url)
             .bearer_auth(token)
             .header("accept", "application/json")
+            .json(&serde_json::json!({
+                "apiVersion": "authentication.k8s.io/v1",
+                "kind": "SelfSubjectReview",
+            }))
             .send()
             .await
-            .map_err(|e| LookupError::Unavailable(format!("GET users/~: {e}")))?;
+            .map_err(|e| LookupError::Unavailable(format!("POST selfsubjectreviews: {e}")))?;
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
             return Err(LookupError::Unauthorized);
         }
         if !status.is_success() {
-            // A 404 here means no user.openshift.io API (vanilla k8s) — misconfiguration, and one
-            // that must not quietly turn into "every token is invalid".
+            // An API server without SelfSubjectReview (before 1.28) is a misconfiguration that must
+            // not quietly turn into "every token is invalid".
             return Err(LookupError::Unavailable(format!(
-                "users/~ returned {status}"
+                "selfsubjectreviews returned {status}"
             )));
         }
         let body: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| LookupError::Unavailable(format!("parsing users/~: {e}")))?;
+            .map_err(|e| LookupError::Unavailable(format!("parsing selfsubjectreviews: {e}")))?;
         let name = body
-            .get("metadata")
-            .and_then(|m| m.get("name"))
+            .pointer("/status/userInfo/username")
             .and_then(|n| n.as_str())
             .map(str::trim)
             .filter(|n| !n.is_empty())
-            .ok_or_else(|| LookupError::Unavailable("users/~ answered without a name".into()))?;
+            .ok_or_else(|| {
+                LookupError::Unavailable("selfsubjectreviews answered without a username".into())
+            })?;
         Ok(name.to_string())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::identity::kube_user::*;
     use axum::Json;
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::get;
+    use axum::routing::post;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -225,8 +231,9 @@ mod tests {
                 .unwrap_or_default();
             match auth.strip_prefix("Bearer ") {
                 Some("sha256~good") => (
-                    StatusCode::OK,
-                    Json(serde_json::json!({"metadata": {"name": "wynn"}})),
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({"kind": "SelfSubjectReview",
+                        "status": {"userInfo": {"username": "wynn", "groups": ["system:authenticated"]}}})),
                 ),
                 Some("sha256~nameless") => (StatusCode::OK, Json(serde_json::json!({}))),
                 _ => (
@@ -236,7 +243,10 @@ mod tests {
             }
         }
         let app = axum::Router::new()
-            .route("/apis/user.openshift.io/v1/users/~", get(users_me))
+            .route(
+                "/apis/authentication.k8s.io/v1/selfsubjectreviews",
+                post(users_me),
+            )
             .with_state(hits);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await

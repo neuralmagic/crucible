@@ -283,11 +283,12 @@ pub enum BridgeError {
     Response(#[from] axum::http::Error),
 }
 
-type BridgeFuture = Pin<Box<dyn Future<Output = Result<HttpResponse, BridgeError>> + Send>>;
+pub(crate) type BridgeFuture =
+    Pin<Box<dyn Future<Output = Result<HttpResponse, BridgeError>> + Send>>;
 
 /// `openidconnect` over this crate's own reqwest client. Redirects are never followed: an
 /// authorization server that 302s a token request is not one whose answer may be trusted.
-fn bridge(client: reqwest::Client) -> impl Fn(HttpRequest) -> BridgeFuture {
+pub(crate) fn bridge(client: reqwest::Client) -> impl Fn(HttpRequest) -> BridgeFuture {
     move |req: HttpRequest| {
         let client = client.clone();
         Box::pin(async move {
@@ -458,6 +459,8 @@ struct AccessTokenClaims {
     preferred_username: Option<String>,
     #[serde(default)]
     email: Option<String>,
+    #[serde(default)]
+    email_verified: Option<bool>,
     #[serde(flatten)]
     groups: GroupClaims,
     /// Present on an ID token and never on an access token; a second, independent reason to refuse.
@@ -500,10 +503,11 @@ impl OidcProvider {
                 "the JWT was minted for {azp:?}, not for this deployment's device-flow client"
             )));
         }
+        let email = verified_email(claims.email, claims.email_verified);
         Ok(VerifiedClaims {
-            login: login_from(&claims.preferred_username, &claims.email, &claims.sub),
+            login: login_from(&claims.preferred_username, &email, &claims.sub),
             sub: claims.sub,
-            email: claims.email,
+            email,
             groups: claims.groups.normalized(),
         })
     }
@@ -568,6 +572,13 @@ impl OidcProvider {
 /// The name every role list, ownership check, and `user:` principal is spelled in:
 /// `preferred_username`, falling back to `email`, falling back to the opaque subject. Normalized
 /// like the role lists so a login is comparable however the issuer cased it.
+/// The email a login may be known by: none when the issuer says it is unverified, which an
+/// email-claim cluster rule would otherwise hand to Kubernetes as the person's username. An absent
+/// `email_verified` counts as verified, as the Kubernetes OIDC authenticator treats it.
+fn verified_email(email: Option<String>, verified: Option<bool>) -> Option<String> {
+    email.filter(|_| verified != Some(false))
+}
+
 fn login_from(preferred: &Option<String>, email: &Option<String>, sub: &str) -> String {
     preferred
         .as_deref()
@@ -819,7 +830,10 @@ fn claims_from(
     let claims = id_token
         .claims(&discovered.client.id_token_verifier(), nonce)
         .map_err(|e| OidcError::rejected(format!("the ID token did not validate: {e}")))?;
-    let email = claims.email().map(|e| e.as_str().to_string());
+    let email = verified_email(
+        claims.email().map(|e| e.as_str().to_string()),
+        claims.email_verified(),
+    );
     let preferred = claims.preferred_username().map(|u| u.as_str().to_string());
     let sub = claims.subject().as_str().to_string();
     Ok(VerifiedClaims {

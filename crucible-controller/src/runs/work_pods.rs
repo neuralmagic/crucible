@@ -412,6 +412,14 @@ pub async fn work_pods_in_states(
     rows.iter().map(decode_work_pod).collect()
 }
 
+/// Every cluster a work pod has been dispatched onto.
+pub async fn work_pod_clusters(ex: impl PgExecutor<'_>) -> Result<Vec<String>> {
+    sqlx::query_scalar("SELECT DISTINCT cluster FROM work_pods ORDER BY cluster")
+        .fetch_all(ex)
+        .await
+        .context("work_pod_clusters")
+}
+
 /// The `running` run pod rows of `issue_key` whose run already left `running`, as
 /// `(pod_name, run status)`.
 #[tracing::instrument(name = "db.terminal_runs_with_running_pods", skip_all, fields(otel.kind = "client", span.type = "sql", db.system = "postgresql", issue_key = %issue_key), err)]

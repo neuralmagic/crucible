@@ -129,11 +129,54 @@ pub(crate) async fn get_run(
     let candidates = crate::runs::store::list_candidates_for_run(state.db.pool(), &run_id).await?;
     let transport_losses =
         crate::runs::task_results::count_transport_losses(state.db.pool(), &run_id).await?;
+    let agent_tools = match state.agent_tools {
+        true => crate::runs::agent_tools::for_run(state.db.pool(), &run_id).await?,
+        false => Vec::new(),
+    };
     let detail = RunDetail {
         run: RunDto::from_parts(run, issue_key, repo, agent, transport_losses),
         candidates: candidates.into_iter().map(CandidateDto::from).collect(),
+        agent_tools,
     };
     Ok(Json(detail).into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agent-tools",
+    responses(
+        (status = 200, description = "The MCP servers runs get by default, and the revision naming that set", body = crate::runs::agent_tools::Defaults)
+    )
+)]
+pub(crate) async fn get_agent_tool_defaults(
+    State(state): State<ApiState>,
+) -> Result<Response, AppError> {
+    let servers = match state.profile().await? {
+        Some(profile) => profile.agent_servers().map_err(anyhow::Error::from)?,
+        None => Vec::new(),
+    };
+    Ok(Json(crate::runs::agent_tools::defaults(
+        &servers,
+        state.agent_tokens.as_ref(),
+    ))
+    .into_response())
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/agent-clusters",
+    responses(
+        (status = 200, description = "Each agent cluster: whether its SPIRE is trusted, and why not", body = Vec<crate::agent_auth::discovery::AgentCluster>)
+    )
+)]
+pub(crate) async fn get_agent_clusters(State(state): State<ApiState>) -> Response {
+    let clusters = match state.agent_tokens.as_ref() {
+        Some(tokens) => {
+            crate::agent_auth::discovery::agent_clusters(&tokens.clusters, &tokens.spire)
+        }
+        None => Vec::new(),
+    };
+    Json(clusters).into_response()
 }
 
 /// `GET /api/runs/{run_id}/graph` — the run's newest admitted work graph plus every task attempt
