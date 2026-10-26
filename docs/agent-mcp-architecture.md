@@ -336,6 +336,11 @@ it. So:
   events with the server's account, and show each only when `kube_user` may `get` and `list`
   it in the namespace. A part the caller may not read is left out, and the reply's `omitted`
   names it and why (`crucible-kueue/src/access.rs`, `StatusPart`).
+- `hardware_describe` is a deliberate exception. It checks `get` on the LocalQueue, then reads
+  the nodes behind the queue's flavors with the server's account, so an agent can pick a flavor
+  and a GPU product without RBAC on nodes. Anyone allowed to use a queue therefore sees, for
+  the nodes its flavors select, how many there are and how many are schedulable per GPU product
+  (from their product labels), and their accelerator capacity. Node names are not returned.
 
 The issuer never decides what a person may do. It decides only who the person is on each
 cluster (section 5).
