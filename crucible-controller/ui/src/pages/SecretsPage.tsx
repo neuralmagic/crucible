@@ -350,15 +350,25 @@ function RegisterSection({ owners, preferred }: { owners: readonly PickOption[];
           <SectionBody>
             {errors.has('kind') && <Note>{errors.get('kind')}</Note>}
             {form.mode === 'mint' ? (
-              <SelectField
-                id="secret-minter"
-                label="Minter"
-                required
-                value={form.minter}
-                onChange={(minter) => { setForm({ ...form, minter: optionValue(MINTER_OPTIONS, minter, 'github-app') }); }}
-                options={MINTER_OPTIONS}
-                hint="Nothing is stored. Every dispatch that binds this gets a credential issued then, and it lives no longer than the run."
-              />
+              <FormGrid>
+                <SelectField
+                  id="secret-minter"
+                  label="Minter"
+                  required
+                  value={form.minter}
+                  onChange={(minter) => { setForm({ ...form, minter: optionValue(MINTER_OPTIONS, minter, 'github-app') }); }}
+                  options={MINTER_OPTIONS}
+                  hint="Nothing is stored. Every dispatch that binds this gets a credential issued then, and it lives no longer than the run."
+                />
+                <TextField
+                  id="secret-mint-account"
+                  label="GitHub account"
+                  mono
+                  value={form.mintAccount}
+                  onChange={(mintAccount) => { setForm({ ...form, mintAccount }); }}
+                  error={errors.get('mintAccount') ?? null}
+                />
+              </FormGrid>
             ) : form.mode === 'value' && form.kind === 'inference_api_key' ? (
               <CredentialRows
                 idPrefix="secret"
