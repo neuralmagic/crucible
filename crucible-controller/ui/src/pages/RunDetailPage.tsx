@@ -13,9 +13,11 @@ import { flowEnrichedMessage, validTraceId } from './flowEnriched';
 import { MarkdownView } from './MarkdownView';
 import { flowThemeStyle, injectFlowTheme } from './flowTheme';
 import { AgentProviderTag } from './ProviderIcon';
+import { RunAgentTools } from './RunAgentTools';
 import { RunLinks } from './RunLinks';
 import { useLiveEvents } from '../api/useLiveEvents';
 import { formatError } from '../api/errors';
+import { useAgentTools } from '../api/lanes';
 import { LiveSession } from '../live/LiveSession';
 import { useAppBrand, useAppTheme } from '../appTheme';
 import {
@@ -110,6 +112,7 @@ export function RunDetailPage() {
   // score surface is off for it rather than rendered empty.
   const isPlaybook = runId.startsWith('playbook_');
 
+  const agentTools = useAgentTools() === true;
   const runDetail = $api.useQuery('get', '/api/runs/{run_id}', {
     params: { path: { run_id: runId } },
   });
@@ -242,6 +245,7 @@ export function RunDetailPage() {
       )}
 
       <RunLinks runId={runId} />
+      {agentTools ? <RunAgentTools tools={runDetail.data?.agent_tools ?? []} /> : null}
 
       {isLiveRun && (
         <Section>

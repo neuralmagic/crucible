@@ -224,3 +224,253 @@ create or revoke keys. A key cannot create a replacement key or stay valid after
 Each rejection on the bearer path tells the cause: no header, not a key, a key of a different
 controller, expired, or revoked. If `crux whoami` answers `credential: bearer (anonymous)`,
 the string in the header does not start with `crk_`.
+
+## Cluster identities
+
+MCP servers that check Kubernetes permissions (SubjectAccessReview) need to know who a person is on
+the cluster they run on. People's access tokens carry it as `kube_user`, and Settings → Cluster
+identities lists every cluster the deploy profile knows, the rule that cluster uses, and the
+caller's username there. The deploy profile declares each cluster's rule:
+
+```toml
+[cluster]                                 # the hub
+identity = { claim = "login" }            # usernames are SSO logins
+
+[clusters.spoke-b]
+kubeconfig_secret = "spoke-b-kubeconfig"
+identity = { claim = "email" }            # the cluster's OIDC login uses the same email
+
+[clusters.spoke-a]
+kubeconfig_secret = "spoke-a-kubeconfig"
+identity = "link"                         # the default: each person proves it to the cluster
+```
+
+`prefix` puts the API server's OIDC username prefix in front of a claim
+(`{ claim = "login", prefix = "sso:" }`). A claim cluster shows the resolved name read-only. A
+`link` cluster shows Link, Relink and Unlink, and records only what the cluster itself said: the
+link's username, how it was proven, and when. The token used to prove it is never stored or logged.
+On the hub, an administrator's override (`PUT /api/users/{login}/kube-user`, audited, never
+self-applied) wins over the rule and shows as such; it is also what the person's runs act as there.
+
+### Linking through an OpenShift cluster's OAuth server
+
+The controller registers as a confidential `OAuthClient` on each cluster listed in the profile's
+`[cluster_link]` table. Link sends the browser to that cluster's authorize endpoint (read from
+`/.well-known/oauth-authorization-server` on its API server) with PKCE and a state bound to the
+person's session. The callback redeems the code for a `user:info` token, the cluster's TokenReview
+names its owner, the username is recorded, and the token is dropped.
+
+```toml
+[cluster_link]
+openshift = ["spoke-a"]
+# external_url = "https://crucible.apps.hub.example.com"  # default: CONTROLLER_AGENT_ISSUER
+# client_id = "crucible-controller"
+# access_token_max_age_secs = 300
+```
+
+The callback sits under the agent issuer, `CONTROLLER_AGENT_ISSUER`, unless `external_url` names
+another URL browsers reach the controller at. Render the client for one cluster, then create it
+there with a fresh secret, and give the same secret to the controller under the cluster's name:
+
+```sh
+crucible deploy render --profile profile.toml --cluster-link spoke-a \
+  --issuer https://crucible.apps.hub.example.com > oauthclient-spoke-a.yaml
+secret=$(openssl rand -hex 32)
+oc --context spoke-a apply -f oauthclient-spoke-a.yaml
+oc --context spoke-a patch oauthclient crucible-controller --type merge -p "{\"secret\":\"$secret\"}"
+oc --context hub -n crucible-system create secret generic crucible-cluster-link \
+  --from-literal=spoke-a="$secret" --dry-run=client -o yaml | oc --context hub apply -f -
+```
+
+`OAuthClient` is cluster-scoped, so creating it needs cluster-admin on that cluster. Mount the
+`crucible-cluster-link` Secret into the controller and point `CONTROLLER_CLUSTER_LINK_SECRETS` at
+the directory: one file per cluster, named for it. A listed cluster without a file offers the paste
+fallback only. The controller's own credential on each cluster needs `tokenreviews` create
+(`system:auth-delegator`) to review the token, and the controller reaches the cluster's token
+endpoint (its `oauth-openshift` route) directly, not through the cluster's `proxy_url`.
+
+### Pasting a token
+
+A `link` cluster without OAuth takes a pasted `oc whoami -t` or an OIDC ID token the cluster's API
+server accepts. The cluster's TokenReview names the owner; the token is dropped the same way.
+
+| Route | What it does |
+| --- | --- |
+| `GET /api/me/cluster-identities` | Every cluster's rule and the caller's username. |
+| `PUT /api/me/cluster-identities/{cluster}` | Link by pasted token. |
+| `POST /api/me/cluster-identities/{cluster}/link` | Start the OAuth link; browser sessions only. |
+| `GET /oauth/cluster-link/{cluster}/callback` | The cluster's redirect; lands on `/settings?linked=` or `?link_error=`. |
+| `DELETE /api/me/cluster-identities/{cluster}` | Unlink. |
+| `GET /api/oauth/consent?id=` | The authorization request parked on the session, for the consent page. |
+| `POST /api/oauth/consent` | Approve or deny it; answers the client's redirect URI to navigate to. |
+
+API keys can read but never link or unlink.
+
+### MCP clients
+
+People sign in with public OAuth clients (no secret, PKCE S256 required). Each client has its own
+`client_id`, and every code, approval and refresh token is bound to the client it was issued to:
+redeeming a code as another client is `invalid_grant`, and presenting a refresh token as another
+client is `invalid_grant` and revokes that approval. Access tokens carry the client in `azp`.
+Without configuration, three clients are registered:
+
+| `client_id` | Name | Redirect URIs it may use |
+| --- | --- | --- |
+| `claude-code` | Claude Code | `http://localhost:<any port>/callback` |
+| `pi` | pi | `http://127.0.0.1:<any port>/callback` |
+| `codex` | Codex | `http://127.0.0.1:<any port>/callback` and `http://127.0.0.1:<any port>/callback/<server id>` |
+
+Redirect matching follows RFC 8252 §7.3. A registered `http` URI on a loopback host matches any
+port on that same host with the same path, and nothing else: no query, no fragment, no
+credentials, and the request's URI must already be in canonical form. `localhost`, `127.0.0.1` and
+`[::1]` are three different hosts. A client registered on `localhost` cannot use `127.0.0.1`, and
+the reverse. Any other registered URI must be `https` and matches only character for character.
+`http` on a host that is not a loopback host is never accepted. Codex adds a 12 character id of the
+MCP server to a pre-registered client's callback path. A registered path that ends in `/*` allows
+that one extra segment (1 to 64 of `A-Z a-z 0-9 - _`), and the built-in `codex` client uses it.
+
+To register other clients, or to change the built-in ones, point `CONTROLLER_PEOPLE_CLIENTS_FILE`
+at a TOML file. The file replaces the built-in list:
+
+```toml
+[[clients]]
+client_id = "claude-code"
+name = "Claude Code"
+redirect_uris = ["http://localhost/callback"]
+
+[[clients]]
+client_id = "codex"
+name = "Codex"
+redirect_uris = ["http://127.0.0.1/callback", "http://127.0.0.1/callback/*"]
+
+[[clients]]
+client_id = "lab-cli"
+name = "Lab CLI"
+redirect_uris = ["http://127.0.0.1/oauth/done"]
+resources = ["https://crucible-kueue.apps.spoke-a.example.com/mcp"]   # default: every audience
+```
+
+A registered `client_id` is 1 to 64 of `A-Z a-z 0-9 . _ -`, so it can never look like a URL. If
+you remove a client, or narrow its `resources`, its refreshes are refused from the next refresh.
+
+#### Self-registered clients
+
+pi 1.x, Codex (registration `auto`) and Claude Code without `--client-id` register a client of
+their own before they sign in (RFC 7591). With people OAuth configured, the controller accepts
+such registrations at `POST /oauth/register` and advertises `registration_endpoint`.
+`CONTROLLER_PEOPLE_DCR=false` turns registration off and removes `registration_endpoint` from
+the metadata. Registration accepts only native public clients:
+
+- `token_endpoint_auth_method` is absent or `none`. No secret, registration access token or
+  management endpoint is issued;
+- `grant_types` stay within `authorization_code` and `refresh_token`, and `response_types` within
+  `code`;
+- every `redirect_uris` entry is `http` on `localhost`, `127.0.0.1` or `[::1]`, with no query,
+  fragment or credentials, and at most 8 entries. At authorize, any port on the registered host
+  with the registered path matches.
+
+The client gets a random `dyn-…` `client_id`. Its codes and refresh tokens are bound to that id
+like any other client's. The name it chose is cleaned and cut to 100 characters, and the consent
+page and Settings always show it as "<name> (self-registered)". The consent page also shows
+the `host:port` the code goes to. A registration that has made no successful token exchange (a
+code or a refresh) for 30 days stops authorizing and refreshing, and the hourly sweep deletes it
+with its approvals. Naming it to `/oauth/authorize`, signed in or not, does not keep it alive. Each source address may register
+20 times an hour, and about 10000 registrations live at once (`429` and `503` past those
+limits; concurrent registrations on several replicas can go slightly over the cap). The source is
+the TCP peer, or the last `X-Forwarded-For` hop when the peer is in
+`CONTROLLER_PEOPLE_TRUSTED_PROXIES` (the networks the cluster router connects from). Without that
+setting every registration behind a router counts against the router's address.
+
+#### Client ID Metadata Documents
+
+When `CONTROLLER_PEOPLE_CIMD_HOSTS` lists hosts, a `client_id` that is an `https://` URL on one
+of those hosts is resolved as an OAuth Client ID Metadata Document
+(draft-ietf-oauth-client-id-metadata-document, the MCP 2025-11-25 client registration). The
+metadata then advertises `client_id_metadata_document_supported: true`. This is off by
+default, and every URL `client_id` is refused when it is off. The controller fetches the
+document when it is asked to authorize and refuses the request, before any consent, unless all
+of these are true:
+
+- the URL is canonical `https` with a host name (not an IP address) and a path, and has no
+  credentials, query or fragment;
+- the host is on the allowlist, and resolves to a public address, never a loopback, private,
+  link-local or other RFC 6890 special-use address (with `HTTPS_PROXY` set, the proxy resolves
+  names, so this check moves to the proxy);
+- the answer is `200` (redirects are not followed), JSON, at most 5 KiB, within 5 seconds;
+- its `client_id` equals the URL exactly, it has a `client_name` and at least one
+  `redirect_uris` entry, `token_endpoint_auth_method` is `none`, it carries no `client_secret`,
+  and any `grant_types` or `response_types` include `authorization_code` and `code`.
+
+Its redirect URIs follow the same rules as registered ones. A loopback URI in a document matches
+any port, but a document cannot use `/*`. A valid document is cached for its `Cache-Control`
+`max-age` (minus `Age`), 5 minutes if it sends none, and 1 hour at most. A document with
+`no-store` or `no-cache`, and any refused document, is never cached. The token endpoint does not
+fetch anything. It checks that the URL's host is still allowed, and the grant it redeems is bound
+to that URL. The consent page and Settings show the document's `client_name` with the URL's
+host (for example "Codex (chatgpt.com)"), so a document cannot pass for a registered client.
+
+Codex publishes `https://chatgpt.com/oauth/codex/client.json` and pi publishes
+`https://pi.dev/oauth/client.json`. Allowlist `chatgpt.com` and `pi.dev` to accept them.
+
+#### Signing in from each tool
+
+Use the MCP server's URL, a people resource of the deploy profile (`[kueue] people`, at its
+Service URL or its `people_urls` entry). Each tool
+finds this controller through the server's protected resource metadata.
+
+With self-registration on (the default), no client options are needed:
+
+```sh
+# Claude Code: then run /mcp in a session and choose Authenticate.
+claude mcp add --transport http crucible-kueue https://crucible-kueue.apps.spoke-a.example.com/mcp
+
+# pi
+pi mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp
+pi mcp login crucible-kueue
+
+# Codex (mcp add starts the sign-in itself; mcp login repeats it)
+codex mcp add crucible-kueue --url https://crucible-kueue.apps.spoke-a.example.com/mcp
+codex mcp login crucible-kueue
+```
+
+Each tool then signs in as a self-registered client. To sign in under the registered client
+instead, so that consent and Settings show the verified name, or when `CONTROLLER_PEOPLE_DCR=false`,
+pass the registered id: `claude mcp add --client-id claude-code …`,
+`pi mcp add … --oauth-client-id pi`, `codex mcp add … --oauth-client-id codex`. Without
+self-registration and without a client id, Codex ends with "Dynamic client registration not
+supported", and pi ends with "Authorization server does not support dynamic client
+registration".
+
+If `chatgpt.com` is on `CONTROLLER_PEOPLE_CIMD_HOSTS`, Codex in `auto` mode prefers its metadata
+document over registering, and signs in as `https://chatgpt.com/oauth/codex/client.json`. pi
+signs in under its document when its `mcp.json` entry has
+`"oauth": {"clientRegistration": "cimd", "callbackUrl": "http://127.0.0.1/callback"}` and `pi.dev`
+is allowlisted.
+
+pi used to borrow `claude-code`. Under `claude-code`, pi's `127.0.0.1` callback is now refused.
+Re-add the server without OAuth options (or with `--oauth-client-id pi`) and sign in again. An
+existing pi approval keeps refreshing as `claude-code` until it expires or someone signs it out.
+
+### The consent page
+
+`GET /oauth/authorize` from an MCP client parks the request on the browser session and sends the
+browser to `/consent?id=…` in the controller UI. The page names the client (its registered name,
+a metadata document's `client_name` with its host, or a self-registered client's chosen name
+marked "(self-registered)") and shows its `client_id`, the `host:port` the code goes to, the server,
+scopes and login, and the person's username on the server's cluster. A `link` cluster nobody has
+linked offers Link (and the paste box where the cluster has no OAuth) right there, and the sign-in
+lands back on the same page. Allow and Deny are a JSON call that returns the client's redirect URI
+with a code or an error, and the page navigates to it. A request answers once, and only from the
+browser and person that started it.
+
+### People's tokens and refresh
+
+Access tokens last 15 minutes. Codes and refresh tokens live in Postgres, keyed by the SHA-256 of
+the secret, so every replica honours them and a restart signs nobody out. A refresh token is spent
+on use and the next one returned; presenting a spent one again revokes the whole approval. An
+approval dies after 14 days without a refresh or 90 days after it was granted. Every refresh reads
+the person again: a deleted account, one whose stored credential the identity provider refused,
+or a cluster username that was unlinked ends the approval, and a relink shows up in the next token.
+Settings → MCP clients lists the live approvals by client. Each client has its own Sign out
+(`DELETE /api/me/mcp-sign-ins?client_id=<id>`), and one button signs every client out
+(`DELETE /api/me/mcp-sign-ins`). Expired codes and approvals are swept hourly.

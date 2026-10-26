@@ -306,6 +306,9 @@ pub struct TaskResult {
     pub agent: Option<crucible_contract::session::TaskAgent>,
     /// The repair turns the attempt took, in order. Their cost is part of `cost_usd`.
     pub repairs: Vec<crucible_contract::session::TaskRepair>,
+    /// What the attempt emitted: a passing attempt's product, or the record a failing one left
+    /// (an evaluate's verdict). `None` when it emitted nothing.
+    pub output: Option<serde_json::Value>,
 }
 
 /// The sort column for `GET /api/runs` (the leaderboard). `Created` orders by `run_id`, whose

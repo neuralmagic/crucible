@@ -293,6 +293,9 @@ pub struct TaskResult {
     pub cost_usd: Option<f64>,
     #[serde(default)]
     pub secs: Option<f64>,
+    /// What the attempt emitted: a passing attempt's product, or the record a failing one left.
+    #[serde(default)]
+    pub output: Option<serde_json::Value>,
 }
 
 /// `GET /api/version`: which build is answering.

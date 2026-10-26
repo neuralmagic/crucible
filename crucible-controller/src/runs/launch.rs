@@ -304,6 +304,9 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         )
         .await?;
         crate::runs::store::attribute_run(&mut *tx, &run_id).await?;
+        if cfg.issues_agent_tokens() {
+            crate::runs::store::stamp_dispatcher(&mut *tx, &run_id).await?;
+        }
         crate::runs::store::set_run_dispatch(&mut *tx, &run_id, dispatch).await?;
         crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
         crate::runs::store::set_run_image(&mut *tx, &run_id, &image).await?;
@@ -312,6 +315,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         crate::event_log::insert(&mut *tx, &ev).await?;
         tx.commit().await?;
         db.events().publish(&ev);
+        crate::runs::agent_tools::attribute_launched(db, cfg, &issue.key, &run_id).await;
     }
     // The subprocess is supervised out of band, exactly as the pod watch drives a pod's
     // completion — and only once the run row it will fold into is committed.

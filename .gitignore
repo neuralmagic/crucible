@@ -6,6 +6,7 @@ target/
 *.log
 # Example domains: the engine creates a workspace + state under each example's manifest dir.
 examples/*/workspace/
+e2e/*/pack/workspace/
 examples/*/state/
 # Python noise.
 __pycache__/
@@ -34,3 +35,6 @@ images/generated/
 
 # Lean build output for the Veil models.
 formal/.lake/
+
+# Per-cluster e2e values (just kueue-e2e-cluster); the *.env.example files are committed.
+e2e/kueue/clusters/*.env

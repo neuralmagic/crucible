@@ -487,8 +487,33 @@ pub fn graph(run_id: &str, g: &dto::RunGraph) -> String {
         )
     );
     out.push_str(&outputs_block(g));
+    out.push_str(&emitted(&order, g));
     out.push_str(&full_notes(&order, g));
     out
+}
+
+/// What each task's latest attempt emitted, an evaluate's verdict among them, one compact line
+/// each. A long one is cut; `--json` has every attempt's whole output.
+fn emitted(order: &[String], g: &dto::RunGraph) -> String {
+    let lines: Vec<String> = order
+        .iter()
+        .filter_map(|name| {
+            let output = g
+                .results
+                .iter()
+                .rfind(|r| &r.task == name)?
+                .output
+                .as_ref()?;
+            Some(format!(
+                "  {name}: {}\n",
+                truncate(&output.to_string(), 500)
+            ))
+        })
+        .collect();
+    match lines.is_empty() {
+        true => String::new(),
+        false => format!("\nemitted\n{}", lines.concat()),
+    }
 }
 
 /// The notes the table had to cut, in full. A failed run's cause is usually the longest note it
@@ -2278,6 +2303,34 @@ mod tests {
         assert_eq!(
             out.lines().next().expect("header"),
             "run 0192run  plan v3  4 tasks  2 iterations"
+        );
+    }
+
+    /// The latest attempt's output is printed under the table, a failing verdict included, and a
+    /// task whose latest attempt emitted nothing gets no line.
+    #[test]
+    fn graph_prints_what_each_tasks_latest_attempt_emitted() {
+        let g: dto::RunGraph = serde_json::from_str(
+            r#"{"plan_version":1,
+              "tasks":[
+                {"name":"build","kind":"command","depends_on":[],"session":"s","needs":"all","required":true},
+                {"name":"verify","kind":"evaluate","depends_on":["build"],"session":"s","needs":"all","required":true}],
+              "results":[
+                {"iter":0,"task":"build","status":"pass","note":"","output":{"image":"old"}},
+                {"iter":1,"task":"build","status":"pass","note":""},
+                {"iter":0,"task":"verify","status":"fail","note":"","output":{"pass":false,"speedup":3.2}},
+                {"iter":1,"task":"verify","status":"pass","note":"","output":{"pass":true,"speedup":7.5}}]}"#,
+        )
+        .expect("parse");
+        let out = graph("r", &g);
+        let block = out.split("\nemitted\n").nth(1).expect("an emitted block");
+        assert_eq!(
+            block, "  verify: {\"pass\":true,\"speedup\":7.5}\n",
+            "{out}"
+        );
+        assert!(
+            !graph("0192run", &run_graph()).contains("emitted"),
+            "nothing emitted, no block"
         );
     }
 

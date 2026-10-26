@@ -52,6 +52,8 @@ use crucible::{deploy, duration, errors, exposure, flow, manifest, outputs, turn
 mod openshell {
     pub use crucible::openshell::{gateway, grpc, policy};
 
+    pub mod agent_servers;
+    pub mod buildit;
     pub mod provider;
     pub mod run;
     pub mod sandbox;

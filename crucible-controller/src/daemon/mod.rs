@@ -89,7 +89,7 @@ pub use crucible_contract::MANAGED_BY_SELECTOR;
 /// integration harness both call this, so the daemon under test IS the assembled daemon — the
 /// harness substitutes only the two cluster edges ([`CompletionStream`] and the
 /// [`crate::runs::workpod::PodDispatcher`]).
-pub fn assemble(
+pub async fn assemble(
     db: &crate::client::Db,
     cfg: &crate::config::ControllerCfg,
     queue: WorkQueue,
@@ -132,7 +132,8 @@ pub fn assemble(
         let cfg = rec_cfg.clone();
         let store = overrides.clone();
         Box::pin(async move {
-            crate::daemon::overrides::apply_pending(&db, &store, &key.0).await?;
+            crate::daemon::overrides::apply_pending(&db, &store, &key.0, cfg.issues_agent_tokens())
+                .await?;
             crate::issues::reconcile::reconcile(&db, &cfg, &key.0).await
         })
     });
@@ -167,7 +168,6 @@ pub fn assemble(
             db.pool().clone(),
         )),
     ]));
-    #[allow(unused_mut)]
     let mut sources: Vec<Arc<dyn DiscoverySource>> = vec![
         Arc::new(trigger_sweep(vec![Arc::new(
             crate::launches::watches::WatchTrigger::new(crate::launches::jira::trackers(
@@ -177,6 +177,7 @@ pub fn assemble(
         Arc::new(crate::launches::webhooks::trigger::WebhookHousekeeping::new(db.clone())),
         Arc::new(crate::runs::workpod::RunPodResync::new(db.clone())),
     ];
+    sources.extend(agent_sources(db, cfg).await);
     #[cfg(feature = "autoresearch")]
     if cfg.autoresearch_enabled() {
         // The approvals: the upstream watermark poll re-drives changed rows through reconcile (so
@@ -247,6 +248,31 @@ pub fn assemble(
         launches: Some(launches),
         verify: Some(verify),
         reenqueue_all,
+    }
+}
+
+/// The sources the deploy profile's agent features add: the sweep of isolated gateways, only when
+/// the profile isolates them. A profile that cannot be read keeps the sweep, which rereads it.
+pub(crate) async fn agent_sources(
+    db: &crate::client::Db,
+    cfg: &crate::config::ControllerCfg,
+) -> Vec<Arc<dyn DiscoverySource>> {
+    let isolated = match cfg.profile().await {
+        Ok(profile) => profile.is_some_and(|p| crucible::deploy::render::gateway::isolated(&p)),
+        Err(e) => {
+            tracing::warn!(
+                error = format!("{e:#}"),
+                "reading the deploy profile failed; the gateway sweep runs and rereads it"
+            );
+            true
+        }
+    };
+    match isolated {
+        true => vec![Arc::new(crate::runs::workpod::GatewaySweep::new(
+            db.clone(),
+            cfg.clone(),
+        ))],
+        false => Vec::new(),
     }
 }
 

@@ -55,8 +55,8 @@ pub(crate) async fn upsert_task_result(
     let repairs = serde_json::to_value(&result.repairs).context("encoding the repair turns")?;
     sqlx::query!(
         r#"
-        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links, agent, repairs)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        INSERT INTO run_task_results (run_id, iter, task, status, note, cost_usd, secs, blocked, links, agent, repairs, output)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (run_id, iter, task) DO UPDATE SET
             status = excluded.status,
             note = excluded.note,
@@ -65,7 +65,8 @@ pub(crate) async fn upsert_task_result(
             blocked = excluded.blocked,
             links = excluded.links,
             agent = excluded.agent,
-            repairs = excluded.repairs
+            repairs = excluded.repairs,
+            output = excluded.output
         "#,
         run_id,
         result.iter,
@@ -78,6 +79,7 @@ pub(crate) async fn upsert_task_result(
         links,
         agent,
         repairs,
+        result.output,
     )
     .execute(ex)
     .await
@@ -117,7 +119,7 @@ pub(crate) async fn list_task_results(
     let rows = sqlx::query!(
         r#"
         SELECT iter AS "iter!: i64", task AS "task!", status AS "status!", note AS "note!",
-               cost_usd, secs, blocked, links AS "links!", agent, repairs AS "repairs!"
+               cost_usd, secs, blocked, links AS "links!", agent, repairs AS "repairs!", output
         FROM run_task_results WHERE run_id = $1 ORDER BY iter, task
         "#,
         run_id,
@@ -149,6 +151,7 @@ pub(crate) async fn list_task_results(
                 links,
                 agent,
                 repairs: crucible_contract::session::TaskRepair::decode_all(&r.repairs),
+                output: r.output,
             })
         })
         .collect()
@@ -184,6 +187,7 @@ mod tests {
             links: Vec::new(),
             agent: None,
             repairs: Vec::new(),
+            output: None,
         }
     }
 
@@ -357,6 +361,48 @@ mod tests {
             rows[0].repairs.len(),
             1,
             "the unreadable entry dropped out alone"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn an_attempts_output_round_trips_failing_or_passing_and_a_retry_replaces_it(
+        pool: PgPool,
+    ) -> Result<()> {
+        let verdict = serde_json::json!({"pass": false, "score": 3.2, "failures": ["under 5x"]});
+        upsert_task_result(
+            &pool,
+            "run-6",
+            &TaskResult {
+                output: Some(verdict.clone()),
+                ..result(0, "verify", "fail")
+            },
+        )
+        .await?;
+        upsert_task_result(&pool, "run-6", &result(0, "build", "pass")).await?;
+        let rows = list_task_results(&pool, "run-6").await?;
+        assert_eq!(
+            rows[1].output.as_ref(),
+            Some(&verdict),
+            "a failing verdict is kept"
+        );
+        assert_eq!(rows[0].output, None, "a task that emitted nothing");
+
+        let passed = serde_json::json!({"pass": true, "score": 7.5, "speedup": 7.5});
+        upsert_task_result(
+            &pool,
+            "run-6",
+            &TaskResult {
+                output: Some(passed.clone()),
+                ..result(0, "verify", "pass")
+            },
+        )
+        .await?;
+        let rows = list_task_results(&pool, "run-6").await?;
+        assert_eq!(
+            rows[1].output.as_ref(),
+            Some(&passed),
+            "the retry's output replaced it"
         );
         Ok(())
     }

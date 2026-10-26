@@ -17,6 +17,7 @@ tar = "0.4"
 # External-result links: scheme/host/path parsing for the urls a task reports, so the engine and
 # the controller refuse the same ones.
 url.workspace = true
+thiserror.workspace = true
 percent-encoding.workspace = true
 # Schema-typed emits: the engine checks a task's output and the controller reads the same
 # schema off the admitted plan. No default features, so a `$ref` never fetches.

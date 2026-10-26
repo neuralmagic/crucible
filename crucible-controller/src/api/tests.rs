@@ -1232,6 +1232,7 @@ async fn run_graph_serves_the_links_a_task_reported(pool: PgPool) -> Result<()> 
             links,
             agent: None,
             repairs: Vec::new(),
+            output: None,
         },
     )
     .await?;
@@ -1283,6 +1284,7 @@ async fn run_graph_serves_what_each_agent_task_ran_on(pool: PgPool) -> Result<()
                 links: Vec::new(),
                 agent,
                 repairs: Vec::new(),
+                output: None,
             },
         )
         .await?;
@@ -1331,6 +1333,7 @@ async fn run_graph_returns_newest_plan_or_404(pool: PgPool) -> Result<()> {
                 links: Vec::new(),
                 agent: None,
                 repairs: Vec::new(),
+                output: None,
             },
         )
         .await?;
@@ -4640,7 +4643,7 @@ async fn adopt_authoritative_scenario_persists_the_flag(pool: PgPool) -> Result<
     );
 
     // The detail DTO carries the flag out to the SPA.
-    let detail = crate::api::dto::issue_detail(&db, &key)
+    let detail = crate::api::dto::issue_detail(&db, &key, false)
         .await?
         .expect("issue detail");
     assert!(
@@ -5153,6 +5156,76 @@ async fn approve_scenario_stamps_approved_at(pool: PgPool) -> Result<()> {
     let events = db.events().read_for_key("scenario:approve-1").await?;
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].actor.as_deref(), Some("wren"));
+    let requested: Option<String> =
+        sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+            .bind("scenario:approve-1")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(
+        requested, None,
+        "without the agent token issuer an approval records no dispatcher"
+    );
+    Ok(())
+}
+
+/// With the agent token issuer configured, the approval's dispatch acts for the approver.
+#[cfg(feature = "autoresearch")]
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn with_the_issuer_an_approval_dispatches_for_the_approver(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool);
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("scenario:approve-1")).await?;
+    sqlx::query("UPDATE issues SET input_kind = 'scenario' WHERE key = $1")
+        .bind("scenario:approve-1")
+        .execute(db.pool())
+        .await?;
+    let scope_id = crate::issues::store::insert_scope(
+        db.pool(),
+        &crate::issues::model::NewScope {
+            issue: "scenario:approve-1".to_string(),
+            pack_digest: Some("v1:deadbeef".to_string()),
+            check_outcome: Some("OK".to_string()),
+        },
+    )
+    .await?;
+    let app = router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec!["wren".to_string()], vec![], vec![]),
+        agent_tools: true,
+        ..ApiState::test(db.clone(), Arc::new(Recorder::default()))
+    });
+
+    let res = app
+        .oneshot(
+            HttpRequest::post("/api/scenarios/scenario%3Aapprove-1/approve")
+                .header("x-auth-request-user", "wren")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await?;
+    let v: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(v["scope_id"], scope_id);
+    assert_eq!(v["approved_by"], "wren");
+    assert!(v["approved_at"].as_str().is_some());
+
+    let scope = crate::issues::store::latest_scope_for_issue(db.pool(), "scenario:approve-1")
+        .await?
+        .expect("scope");
+    assert!(scope.is_approved());
+    assert_eq!(scope.approved_by.as_deref(), Some("wren"));
+
+    let events = db.events().read_for_key("scenario:approve-1").await?;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].actor.as_deref(), Some("wren"));
+    let requested: Option<String> =
+        sqlx::query_scalar("SELECT dispatch_requested_by FROM issues WHERE key = $1")
+            .bind("scenario:approve-1")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(
+        requested.as_deref(),
+        Some("user:wren"),
+        "the approval's dispatch acts for the approver"
+    );
     Ok(())
 }
 
@@ -5724,6 +5797,7 @@ async fn app_with_sessions(db: Db, pool: PgPool) -> Router {
                 credential_keys: None,
                 proxy_prefix: "/oauth2".to_string(),
             },
+            issuer: None,
         },
         crate::spa::Source::Embedded,
     )
@@ -9934,6 +10008,7 @@ async fn evidence_rig(db: &Db, scratch: &std::path::Path) -> Result<()> {
                 links: Vec::new(),
                 agent: None,
                 repairs: Vec::new(),
+                output: None,
             },
         )
         .await?;
@@ -10005,6 +10080,88 @@ async fn task_evidence_serves_the_payload_note_and_captured_files(pool: PgPool) 
     assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
     let (status, no_run) = get_json_value(&app, "/api/runs/nobody/tasks/scan/evidence").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{no_run}");
+    Ok(())
+}
+
+/// What an attempt emitted is part of the run's stored result: the graph serves each attempt's
+/// output, a failing evaluate's verdict included, and with no session stored the evidence payload
+/// is the latest attempt's.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn run_graph_and_evidence_serve_each_attempts_output(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool);
+    crate::runs::store::insert_run(
+        db.pool(),
+        &NewRun {
+            run_id: "run-out".to_string(),
+            scope: None,
+            issue: None,
+            identity_digest: None,
+            status: "succeeded".to_string(),
+            pod: None,
+            session_uri: None,
+            best_score: None,
+            cost_usd: None,
+        },
+    )
+    .await?;
+    let plan = r#"[{"name":"build","kind":"command","depends_on":[],"session":"","needs":"all","required":true},
+                   {"name":"verify","kind":"evaluate","depends_on":["build"],"session":"","needs":"all","required":true}]"#;
+    crate::runs::task_results::upsert_run_plan(db.pool(), "run-out", 1, plan).await?;
+    let failed = serde_json::json!({"pass": false, "score": 3.2, "failures": ["under 5x"]});
+    let passed = serde_json::json!({"pass": true, "score": 7.5, "speedup": 7.5});
+    for (iter, task, status, output) in [
+        (0_i64, "build", "pass", None),
+        (0, "verify", "fail", Some(failed.clone())),
+        (1, "verify", "pass", Some(passed.clone())),
+    ] {
+        crate::runs::task_results::upsert_task_result(
+            db.pool(),
+            "run-out",
+            &crate::runs::model::TaskResult {
+                iter,
+                task: task.to_string(),
+                status: status.to_string(),
+                note: String::new(),
+                cost_usd: None,
+                secs: None,
+                blocked: None,
+                links: Vec::new(),
+                agent: None,
+                repairs: Vec::new(),
+                output,
+            },
+        )
+        .await?;
+    }
+    let app = router(ApiState {
+        scratch_dir: dir.path().to_path_buf(),
+        ..ApiState::test(db, Arc::new(Recorder::default()))
+    });
+
+    let (st, v) = get_json_object(&app, "/api/runs/run-out/graph").await;
+    assert_eq!(st, StatusCode::OK);
+    let results = v["results"].as_array().expect("results");
+    let output = |iter: i64, task: &str| {
+        results
+            .iter()
+            .find(|r| r["iter"] == iter && r["task"] == task)
+            .map(|r| r["output"].clone())
+            .unwrap_or_else(|| panic!("no {task} at {iter}: {v}"))
+    };
+    assert_eq!(
+        output(0, "build"),
+        serde_json::Value::Null,
+        "emitted nothing"
+    );
+    assert_eq!(output(0, "verify"), failed, "the failing verdict is kept");
+    assert_eq!(output(1, "verify"), passed);
+
+    let (st, ev) = get_json_value(&app, "/api/runs/run-out/tasks/verify/evidence").await;
+    assert_eq!(st, StatusCode::OK, "{ev}");
+    assert_eq!(
+        ev["payload"], passed,
+        "no session stored, so the latest attempt's output"
+    );
     Ok(())
 }
 
