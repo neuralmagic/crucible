@@ -176,11 +176,9 @@ pub struct KueueCfg {
     /// `workload_namespace = "..."` for one.
     #[serde(alias = "workload_namespace", deserialize_with = "one_or_many_names")]
     pub workload_namespaces: Vec<KubeName>,
-    /// The controller's agent token issuer (`CONTROLLER_AGENT_ISSUER`), compared exactly with a
-    /// token's `iss`.
-    pub run_issuer: String,
-    /// Where the server fetches the issuer's keys. Default `<run_issuer>/.well-known/jwks.json`;
-    /// a server that cannot reach the issuer's own address names a route here.
+    /// Where the server fetches the agent issuer's keys. Default
+    /// `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json`; a server that cannot reach the issuer's
+    /// own address names a route here.
     #[serde(default)]
     pub run_jwks_uri: Option<url::Url>,
     /// Where the server takes a caller's groups from for its SubjectAccessReviews. Default: the
@@ -281,21 +279,27 @@ impl KueueCfg {
         format!("http://{}:{}/mcp", self.service_host(), Self::PORT)
     }
 
-    /// The issuer's key set URI: `run_jwks_uri`, or the issuer's own.
-    pub fn run_jwks_uri(&self) -> Result<url::Url, url::ParseError> {
-        match &self.run_jwks_uri {
-            Some(uri) => Ok(uri.clone()),
-            None => url::Url::parse(&format!(
-                "{}/.well-known/jwks.json",
-                self.run_issuer.trim_end_matches('/')
-            )),
-        }
+    /// The key set URI of `issuer`, the controller's agent issuer: `run_jwks_uri`, or the
+    /// issuer's own.
+    pub fn run_jwks_uri(&self, issuer: &str) -> Result<url::Url, url::ParseError> {
+        jwks_uri(issuer, self.run_jwks_uri.as_ref())
+    }
+}
+
+/// The key set URI of `issuer`: `over`, or the issuer's own `/.well-known/jwks.json`.
+pub fn jwks_uri(issuer: &str, over: Option<&url::Url>) -> Result<url::Url, url::ParseError> {
+    match over {
+        Some(uri) => Ok(uri.clone()),
+        None => url::Url::parse(&format!(
+            "{}/.well-known/jwks.json",
+            issuer.trim_end_matches('/')
+        )),
     }
 }
 
 /// The `[buildit]` table. A run on one of `clusters` starts buildit in its loop pod, which runs
 /// builder pods in `namespace` for the run's own sandboxes, accepting their tokens from the
-/// controller's agent issuer.
+/// controller's agent issuer (`CONTROLLER_AGENT_ISSUER`).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuilditCfg {
@@ -310,11 +314,9 @@ pub struct BuilditCfg {
     /// crucible-kueue namespaces, since the rights to create and exec into them reach every pod
     /// there.
     pub namespace: KubeName,
-    /// The controller's agent token issuer (`CONTROLLER_AGENT_ISSUER`), compared exactly with a
-    /// token's `iss`.
-    pub run_issuer: String,
-    /// Where buildit fetches the issuer's keys. Default `<run_issuer>/.well-known/jwks.json`; a
-    /// loop pod that cannot reach the issuer's own address names a route here.
+    /// Where buildit fetches the agent issuer's keys. Default
+    /// `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json`; a loop pod that cannot reach the issuer's
+    /// own address names a route here.
     #[serde(default)]
     pub run_jwks_uri: Option<url::Url>,
     /// The one repository builds may be pushed to, with the loop pod's push authfile
@@ -405,16 +407,11 @@ impl BuilditCfg {
         }
     }
 
-    /// `<issuer>=<jwks uri>`, as buildit's `--run-issuer` takes it.
-    pub fn trusted_issuer(&self) -> Result<String, url::ParseError> {
-        let jwks = match &self.run_jwks_uri {
-            Some(uri) => uri.clone(),
-            None => url::Url::parse(&format!(
-                "{}/.well-known/jwks.json",
-                self.run_issuer.trim_end_matches('/')
-            ))?,
-        };
-        Ok(format!("{}={jwks}", self.run_issuer))
+    /// `<issuer>=<jwks uri>` for `issuer`, the controller's agent issuer, as buildit's
+    /// `--run-issuer` takes it.
+    pub fn trusted_issuer(&self, issuer: &str) -> Result<String, url::ParseError> {
+        let jwks = jwks_uri(issuer, self.run_jwks_uri.as_ref())?;
+        Ok(format!("{issuer}={jwks}"))
     }
 }
 
@@ -1479,7 +1476,6 @@ mod tests {
             [kueue]
             image = "registry.example.com/crucible-kueue:latest"
             namespace = "kueue-server"
-            run_issuer = "http://crucible-controller.loops.svc:8080"
             kube_authz = "openshift"
             {kueue_extra}
             "#
@@ -1490,10 +1486,7 @@ mod tests {
     #[test]
     fn builder_egress_to_everywhere_without_except_is_unfenced() {
         let buildit = |extra: &str| -> BuilditCfg {
-            toml::from_str(&format!(
-                "namespace = \"builds\"\nrun_issuer = \"http://ctl.ns.svc:8080\"\n{extra}"
-            ))
-            .unwrap()
+            toml::from_str(&format!("namespace = \"builds\"\n{extra}")).unwrap()
         };
         assert_eq!(
             buildit("").unfenced_egress(),
@@ -1628,9 +1621,7 @@ mod tests {
         let with_buildit = |ns: &str| {
             kueue_profile(
                 r#"sandbox_namespace = "sandboxes""#,
-                &format!(
-                    "workload_namespace = \"workloads\"\n[buildit]\nnamespace = \"{ns}\"\nrun_issuer = \"http://crucible-controller.loops.svc:8080\""
-                ),
+                &format!("workload_namespace = \"workloads\"\n[buildit]\nnamespace = \"{ns}\""),
             )
             .check_namespaces()
         };

@@ -40,12 +40,10 @@ image = "registry.example.com/crucible-kueue:latest"
 cluster = "dev"
 namespace = "crucible-system"
 workload_namespace = "crucible-kueue-e2e"
-run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
 kube_authz = "openshift"
 [buildit]
 cluster = "dev"
 namespace = "builds"
-run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
 url = "http://host.openshell.internal:8849/mcp"
 "#;
 

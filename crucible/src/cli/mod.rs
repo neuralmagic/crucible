@@ -482,6 +482,10 @@ pub(crate) struct DeployArgs {
     /// `--cluster` and accepts only tokens for that cluster. Required when the table names several.
     #[arg(long, value_name = "CLUSTER", requires = "kueue")]
     pub kueue_cluster: Option<String>,
+    /// With `--kueue`, the controller's agent issuer (its `CONTROLLER_AGENT_ISSUER`), whose tokens
+    /// the server takes.
+    #[arg(long, value_name = "URL", requires = "kueue")]
+    pub issuer: Option<String>,
     /// Render the controller's OpenShift `OAuthClient` for this cluster from the profile's
     /// `[cluster_link]` table, no `--manifest` needed. Render only: it is cluster-scoped on that
     /// cluster, so apply it there yourself.

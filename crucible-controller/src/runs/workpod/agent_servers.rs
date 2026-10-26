@@ -84,13 +84,17 @@ pub fn access(
 ) -> anyhow::Result<Option<Delivery>> {
     let granted: Vec<AgentServer> = granted(servers, cluster, tokens)
         .into_iter()
-        .map(|(s, a)| AgentServer {
-            name: s.name.clone(),
-            url: s.url.clone(),
-            scopes: a.scopes.clone(),
-            transport: s.transport.clone(),
+        .map(|(s, a)| {
+            Ok(AgentServer {
+                name: s.name.clone(),
+                url: s.url.clone(),
+                scopes: a.scopes.clone(),
+                transport: s.transport(&tokens.svid_audience).with_context(|| {
+                    format!("deriving {}'s key set URI from the agent issuer", s.name)
+                })?,
+            })
         })
-        .collect();
+        .collect::<anyhow::Result<_>>()?;
     if granted.is_empty() {
         return Ok(None);
     }
@@ -135,7 +139,6 @@ mod tests {
         cluster = "ocp"
         namespace = "crucible-system"
         workload_namespace = "crucible-kueue-e2e"
-        run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
         kube_authz = "openshift"
     "#;
 
@@ -143,7 +146,6 @@ mod tests {
         [buildit]
         clusters = ["ocp", "k8s"]
         namespace = "crucible-builds"
-        run_issuer = "https://crucible.hub.example"
         run_jwks_uri = "https://crucible-ext.hub.example/.well-known/jwks.json"
         push_repo = "quay.io/example/crucible-smoke"
     "#;
@@ -293,9 +295,10 @@ mod tests {
                 url: crucible_contract::buildit::URL.into(),
                 scopes: vec!["buildit.read".into(), "buildit.build".into()],
                 transport: Transport::Local(LocalServer::Buildit(BuilditSite {
-                    run_issuer: "https://crucible.hub.example=\
-                        https://crucible-ext.hub.example/.well-known/jwks.json"
-                        .into(),
+                    run_issuer: format!(
+                        "{}=https://crucible-ext.hub.example/.well-known/jwks.json",
+                        tokens().svid_audience
+                    ),
                     namespace: "crucible-builds".into(),
                     push_repo: Some("quay.io/example/crucible-smoke".into()),
                 })),

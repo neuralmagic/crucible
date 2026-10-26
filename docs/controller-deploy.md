@@ -274,9 +274,9 @@ dispatcher's username there, and the run page shows it. A third server needs an
 
 The deploy profile describes each server that takes agent tokens (`DeployProfile::agent_servers`):
 `[kueue]` needs a `kube_user` in every token and names `workload_namespaces`, the first as the
-`namespace` claim, for runs on its clusters; `[buildit]` needs neither. An agent audience the profile describes no server for, on its cluster, stops the controller at startup. `[kueue] run_issuer` must equal `CONTROLLER_AGENT_ISSUER`: the rendered
-server trusts runs' tokens from it, fetching keys from `<run_issuer>/.well-known/jwks.json` unless
-`run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).
+`namespace` claim, for runs on its clusters; `[buildit]` needs neither. An agent audience the profile describes no server for, on its cluster, stops the controller at startup. The rendered server trusts runs' tokens from the controller's
+`CONTROLLER_AGENT_ISSUER` (`crucible deploy render --kueue --issuer <it>`), fetching keys from
+`<issuer>/.well-known/jwks.json` unless `run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).
 `kube_authz` (`openshift` or `token`) is where the server takes a caller's groups for its
 SubjectAccessReviews. With `people = true` the rendered server also accepts people's tokens from
 the same issuer (`--person-issuer`), for a deployment whose `CONTROLLER_PEOPLE_AUDIENCES` names it.
@@ -311,7 +311,6 @@ pod's `[secrets] push_authfile`; without either, buildit pushes nothing.
 clusters     = ["spoke-a", "spoke-b"]
 namespace    = "crucible-builds"                    # builder pods, apart from loop pods
 egress       = [{ cidr = "0.0.0.0/0", except = ["10.128.0.0/14", "172.30.0.0/16"] }]  # optional
-run_issuer   = "https://crucible.example"          # CONTROLLER_AGENT_ISSUER
 run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
 push_repo    = "registry.example.com/team/crucible-smoke"  # optional
 ```

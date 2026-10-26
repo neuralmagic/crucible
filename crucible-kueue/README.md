@@ -174,8 +174,8 @@ The lists are `pod`, `container`, `resources`, `volume_sources`, `projected_sour
 The deploy profile's `[kueue]` table renders the Deployment, Service, ServiceAccount, and RBAC:
 
 ```bash
-crucible deploy render --kueue --profile <profile.toml>
-crucible deploy apply --kueue --profile <profile.toml>
+crucible deploy render --kueue --issuer <CONTROLLER_AGENT_ISSUER> --profile <profile.toml>
+crucible deploy apply --kueue --issuer <CONTROLLER_AGENT_ISSUER> --profile <profile.toml>
 ```
 
 The server's identity gets get/list on `clusterqueues`, `resourceflavors`, and `nodes`
@@ -183,7 +183,7 @@ cluster-wide; in the workload namespace only, get/list on `localqueues`, get/lis
 `workloads`, get/list on `localqueues/pendingworkloads` in `visibility.kueue.x-k8s.io`,
 create/get/list/patch/delete on each submittable kind under its own API group, and get/list on pods, `pods/log`, and
 events (discovery of the kinds needs no grant); cluster-wide it may also create `subjectaccessreviews` and, with `kube_authz = "openshift"`,
-list `groups.user.openshift.io`. The server trusts runs' tokens from `run_issuer` (the controller's
+list `groups.user.openshift.io`. The server trusts runs' tokens from `--issuer` (the controller's
 `CONTROLLER_AGENT_ISSUER`) with keys from `run_jwks_uri` (default the issuer's
 `/.well-known/jwks.json`; a plain-http URI adds `--insecure-jwks-http`), and its `--resource` is
 its Service URL. `--allowed-host` is set to the Service DNS name. The image is `Containerfile.kueue` at the repository root.

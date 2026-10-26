@@ -23,7 +23,7 @@ const APP_LABEL: &str = "app.kubernetes.io/name";
 #[derive(Debug, thiserror::Error)]
 #[error(
     "rendering crucible-kueue needs a [kueue] table in the deploy profile (image, namespace, \
-     workload_namespace, run_issuer, kube_authz)"
+     workload_namespaces)"
 )]
 pub struct MissingKueueTable;
 
@@ -60,9 +60,18 @@ fn render_cluster<'a>(
 }
 
 /// The server's objects for `cluster` (see [`render_cluster`]) as one multi-document YAML string.
-pub fn render(profile: &DeployProfile, opts: &RenderOpts, cluster: Option<&str>) -> Result<String> {
+/// What a crucible-kueue render needs beyond the profile.
+#[derive(Debug, Clone, Copy)]
+pub struct KueueTarget<'a> {
+    /// The `[kueue] clusters` entry to render for; required when the table names several.
+    pub cluster: Option<&'a str>,
+    /// The controller's agent issuer (`CONTROLLER_AGENT_ISSUER`), whose tokens the server takes.
+    pub issuer: &'a str,
+}
+
+pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) -> Result<String> {
     let cfg = profile.kueue.as_ref().ok_or(MissingKueueTable)?;
-    let cluster = render_cluster(cfg, cluster)?;
+    let cluster = render_cluster(cfg, target.cluster)?;
     let platform = profile.platform(cluster);
     let authz = cfg.kube_authz(platform);
     let image = pin_image(opts.digests.as_deref(), "crucible-kueue image", &cfg.image)?;
@@ -81,7 +90,14 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, cluster: Option<&str>)
     push("ServiceAccount", yaml(&service_account(cfg)))?;
     push(
         "Deployment",
-        yaml(&deployment(cfg, cluster, authz, &image, pull_secret)?),
+        yaml(&deployment(
+            cfg,
+            cluster,
+            target.issuer,
+            authz,
+            &image,
+            pull_secret,
+        )?),
     )?;
     push("Service", yaml(&service(cfg)))?;
     push("cluster ClusterRole", yaml(&cluster_role(authz)))?;
@@ -178,17 +194,17 @@ fn service_account(cfg: &KueueCfg) -> core::ServiceAccount {
     }
 }
 
-fn args(cfg: &KueueCfg, cluster: &str, authz: KubeAuthz) -> Result<Vec<String>> {
+fn args(cfg: &KueueCfg, cluster: &str, issuer: &str, authz: KubeAuthz) -> Result<Vec<String>> {
     let jwks = cfg
-        .run_jwks_uri()
-        .with_context(|| format!("deriving the key set URI of {}", cfg.run_issuer))?;
+        .run_jwks_uri(issuer)
+        .with_context(|| format!("deriving the key set URI of {issuer}"))?;
     let mut args = vec![
         "--bind".to_string(),
         format!("0.0.0.0:{}", KueueCfg::PORT),
         "--allowed-host".to_string(),
         cfg.service_host(),
         "--run-issuer".to_string(),
-        format!("{}={jwks}", cfg.run_issuer),
+        format!("{issuer}={jwks}"),
         "--resource".to_string(),
         cfg.url(),
         "--kube-authz".to_string(),
@@ -200,10 +216,7 @@ fn args(cfg: &KueueCfg, cluster: &str, authz: KubeAuthz) -> Result<Vec<String>> 
         args.extend(["--namespace".to_string(), namespace.to_string()]);
     }
     if cfg.people {
-        args.extend([
-            "--person-issuer".to_string(),
-            format!("{}={jwks}", cfg.run_issuer),
-        ]);
+        args.extend(["--person-issuer".to_string(), format!("{issuer}={jwks}")]);
     }
     for secret in &cfg.pull_secrets {
         args.extend(["--pull-secret".to_string(), secret.clone()]);
@@ -217,6 +230,7 @@ fn args(cfg: &KueueCfg, cluster: &str, authz: KubeAuthz) -> Result<Vec<String>> 
 fn deployment(
     cfg: &KueueCfg,
     cluster: &str,
+    issuer: &str,
     authz: KubeAuthz,
     image: &str,
     pull_secret: &str,
@@ -240,7 +254,7 @@ fn deployment(
         name: NAME.to_string(),
         image: Some(image.to_string()),
         image_pull_policy: Some("IfNotPresent".to_string()),
-        args: Some(args(cfg, cluster, authz)?),
+        args: Some(args(cfg, cluster, issuer, authz)?),
         env: Some(vec![env("RUST_LOG", "info".to_string())]),
         ports: Some(vec![core::ContainerPort {
             name: Some(PORT_NAME.to_string()),
@@ -417,7 +431,6 @@ mod tests {
         cluster = "ocp"
         namespace = "crucible-system"
         workload_namespace = "crucible-kueue-e2e"
-        run_issuer = "http://crucible-controller.crucible-system.svc.cluster.local:8080"
         kube_authz = "openshift"
     "#;
 
@@ -425,8 +438,17 @@ mod tests {
         toml::from_str(text).unwrap()
     }
 
+    const ISSUER: &str = "http://crucible-controller.crucible-system.svc.cluster.local:8080";
+
+    fn target(cluster: Option<&str>) -> KueueTarget<'_> {
+        KueueTarget {
+            cluster,
+            issuer: ISSUER,
+        }
+    }
+
     fn docs(text: &str) -> Vec<serde_json::Value> {
-        let yaml = render(&profile(text), &RenderOpts::default(), None).unwrap();
+        let yaml = render(&profile(text), &RenderOpts::default(), &target(None)).unwrap();
         yaml.split("---\n")
             .map(|d| serde_norway::from_str(d).unwrap())
             .collect()
@@ -599,7 +621,7 @@ mod tests {
                 .replace("[cluster]\n", "[cluster]\nplatform = \"openshift\"\n"),
         );
         let rendered = |cluster: &str| -> Vec<serde_json::Value> {
-            render(&fleet, &RenderOpts::default(), Some(cluster))
+            render(&fleet, &RenderOpts::default(), &target(Some(cluster)))
                 .unwrap()
                 .split("---\n")
                 .map(|d| serde_norway::from_str(d).unwrap())
@@ -728,20 +750,20 @@ mod tests {
             "the only cluster"
         );
         let two = profile(&PROFILE.replace("cluster = \"ocp\"", "clusters = [\"ocp\", \"k8s\"]"));
-        let rendered = render(&two, &RenderOpts::default(), Some("k8s")).unwrap();
+        let rendered = render(&two, &RenderOpts::default(), &target(Some("k8s"))).unwrap();
         let docs: Vec<serde_json::Value> = rendered
             .split("---\n")
             .map(|d| serde_norway::from_str(d).unwrap())
             .collect();
         assert_eq!(cluster_flag(&args(&docs)).as_deref(), Some("k8s"));
-        let several = render(&two, &RenderOpts::default(), None).unwrap_err();
+        let several = render(&two, &RenderOpts::default(), &target(None)).unwrap_err();
         assert_eq!(
             several.downcast_ref::<KueueClusterError>(),
             Some(&KueueClusterError::Several {
                 clusters: vec!["ocp".into(), "k8s".into()]
             })
         );
-        let elsewhere = render(&two, &RenderOpts::default(), Some("east")).unwrap_err();
+        let elsewhere = render(&two, &RenderOpts::default(), &target(Some("east"))).unwrap_err();
         assert!(matches!(
             elsewhere.downcast_ref::<KueueClusterError>(),
             Some(KueueClusterError::NotServed { .. })
@@ -826,7 +848,7 @@ mod tests {
     #[test]
     fn a_profile_without_kueue_refuses_to_render() {
         let without = PROFILE.split("[kueue]").next().unwrap();
-        let err = render(&profile(without), &RenderOpts::default(), None).unwrap_err();
+        let err = render(&profile(without), &RenderOpts::default(), &target(None)).unwrap_err();
         assert!(err.downcast_ref::<MissingKueueTable>().is_some());
     }
 

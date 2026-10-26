@@ -1734,17 +1734,15 @@ tokens, the controller does not read them.
 | `[kueue] clusters` or `cluster` | `["hub"]` | The clusters where the server runs. Runs on these clusters get `crucible-kueue` access. |
 | `[kueue] namespace` | required | The server namespace. |
 | `[kueue] workload_namespaces` (or `workload_namespace` for one) | required, not empty | The namespaces crucible-kueue tokens name, the first as the `namespace` claim, and the only namespaces where the server account has workload verbs. Each gets its Namespace, RoleBinding and `--namespace`. |
-| `[kueue] run_issuer` | required | Must equal `CONTROLLER_AGENT_ISSUER`. |
-| `[kueue] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a server that cannot reach the issuer address. |
+| `[kueue] run_jwks_uri` | `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json` | For a server that cannot reach the issuer address. |
 | `[kueue] kube_authz` | `openshift` on an OpenShift cluster, `token` elsewhere | `openshift` (the cluster's Group objects) or `token` (the token's `kube_groups`): where groups come from. |
 | `[kueue] cluster_domain` | `cluster.local` | The cluster DNS domain of the Service name. |
 | `[kueue] pull_secrets` | `[]` | `name` or `name=registry` entries for `--pull-secret`. |
-| `[kueue] people` | `false` | `true` renders `--person-issuer` with the same issuer as `run_issuer`, so the server also accepts people tokens. Set it when `CONTROLLER_PEOPLE_AUDIENCES` names this server. |
+| `[kueue] people` | `false` | `true` renders `--person-issuer` with the controller's agent issuer, so the server also accepts people tokens. Set it when `CONTROLLER_PEOPLE_AUDIENCES` names this server. |
 | `[buildit] clusters` or `cluster` | `["hub"]` | The clusters whose runs get `buildit`. |
 | `[buildit] namespace` | required | Where builder pods run. Profile load refuses the loop, rig, sandbox, crucible-kueue and workload namespaces. |
-| `[buildit] run_issuer` | required | Must equal `CONTROLLER_AGENT_ISSUER`. |
 | `[buildit] egress` | TCP 443 to `0.0.0.0/0` and `::/0` | `[{ cidr, ports = [443], except = [] }, ...]`: where builder pods may connect besides DNS (section 8.4). |
-| `[buildit] run_jwks_uri` | `<run_issuer>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
+| `[buildit] run_jwks_uri` | `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
 | `[buildit] quota` | `{ pods = "16", "requests.nvidia.com/gpu" = "0", "requests.amd.com/gpu" = "0" }` | The builder namespace's ResourceQuota `hard` limits. |
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
@@ -1800,7 +1798,7 @@ Each flag also has a `CRUCIBLE_KUEUE_*` environment variable (`crucible-kueue/sr
 | `--accelerator-resource`, `--accelerator-product-label` | NVIDIA, AMD, Habana, TPU names | What `hardware_describe` counts. |
 | other generic flags | section 7.12 | |
 
-`crucible deploy render --kueue [--kueue-cluster <name>]` renders the server for one `[kueue]
+`crucible deploy render --kueue --issuer <CONTROLLER_AGENT_ISSUER> [--kueue-cluster <name>]` renders the server for one `[kueue]
 clusters` entry (the only one, or the one named) with `--run-issuer`, `--resource`,
 `--allowed-host`, `--kube-authz`, `--cluster <name>`, `--namespace` for each workload namespace and
 the pull secrets

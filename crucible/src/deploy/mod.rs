@@ -126,10 +126,10 @@ pub fn render_turn_cmd(profile_path: &Path, opts: &render::TurnOpts) -> Result<(
 pub fn render_kueue_cmd(
     profile_path: &Path,
     opts: &RenderOpts,
-    cluster: Option<&str>,
+    target: &kueue::KueueTarget,
 ) -> Result<()> {
     let profile = DeployProfile::load(profile_path)?;
-    print!("{}", kueue::render(&profile, opts, cluster)?);
+    print!("{}", kueue::render(&profile, opts, target)?);
     Ok(())
 }
 
@@ -137,10 +137,10 @@ pub fn render_kueue_cmd(
 pub fn apply_kueue_cmd(
     profile_path: &Path,
     opts: &RenderOpts,
-    cluster: Option<&str>,
+    target: &kueue::KueueTarget,
 ) -> Result<()> {
     let profile = DeployProfile::load(profile_path)?;
-    let yaml = kueue::render(&profile, opts, cluster)?;
+    let yaml = kueue::render(&profile, opts, target)?;
     forge::kube::apply_yaml(&yaml).context("applying the rendered crucible-kueue deployment")
 }
 

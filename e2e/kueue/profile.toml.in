@@ -40,11 +40,9 @@ image              = "@KUEUE_IMAGE@"
 cluster            = "hub"
 namespace          = "@KUEUE_NS@"
 workload_namespace = "@WORKLOAD_NS@"
-run_issuer         = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
 pull_secrets       = ["@PULL_SECRET@=@PUSH_REPO@"]
 
 [buildit]
 cluster    = "hub"
 namespace  = "@BUILD_NS@"
-run_issuer = "http://crucible-controller.@CTL_NS@.svc.cluster.local:8080"
 push_repo  = "@PUSH_REPO@"

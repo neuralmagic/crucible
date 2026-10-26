@@ -317,13 +317,11 @@ mod tests {
         clusters = ["ocp", "k8s"]
         namespace = "crucible-system"
         workload_namespace = "crucible-kueue-e2e"
-        run_issuer = "https://crucible.hub.example"
         kube_authz = "openshift"
         pull_secrets = ["quay-pull"]
         [buildit]
         clusters = ["k8s"]
         namespace = "crucible-builds"
-        run_issuer = "https://crucible.hub.example"
         push_repo = "quay.io/org/smoke"
     "#;
 

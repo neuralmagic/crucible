@@ -217,7 +217,6 @@ image = "registry.example.com/crucible-kueue:latest"
 cluster = "dev"
 namespace = "crucible-system"
 workload_namespace = "{}"
-run_issuer = "{CONTROLLER}"
 kube_authz = "openshift"
 "#,
             env.namespace

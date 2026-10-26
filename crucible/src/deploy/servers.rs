@@ -22,9 +22,23 @@ pub struct ServerSpec {
     pub requires_kube_user: bool,
     /// The namespaces a token for the server names, the first as the default. Empty: none.
     pub namespaces: Vec<String>,
-    pub transport: Transport,
+    pub hosting: Hosting,
     /// What bounds it beyond its scopes, as the run page shows it.
     pub limits: BTreeMap<String, String>,
+}
+
+/// Where a server runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hosting {
+    /// Somewhere sandboxes reach over the network.
+    Remote,
+    /// `buildit mcp` in the loop pod, building in `namespace` and pushing to `push_repo` only.
+    Buildit {
+        namespace: String,
+        push_repo: Option<String>,
+        /// Where it fetches the agent issuer's keys, when not from the issuer itself.
+        run_jwks_uri: Option<url::Url>,
+    },
 }
 
 impl ServerSpec {
@@ -32,17 +46,32 @@ impl ServerSpec {
     pub fn serves(&self, cluster: &str) -> bool {
         self.clusters.iter().any(|c| c == cluster)
     }
+
+    /// Where the server runs, as the loop pod is told, trusting `issuer`, the controller's agent
+    /// issuer.
+    pub fn transport(&self, issuer: &str) -> Result<Transport, url::ParseError> {
+        Ok(match &self.hosting {
+            Hosting::Remote => Transport::Remote,
+            Hosting::Buildit {
+                namespace,
+                push_repo,
+                run_jwks_uri,
+            } => {
+                let jwks = crate::deploy::profile::jwks_uri(issuer, run_jwks_uri.as_ref())?;
+                Transport::Local(LocalServer::Buildit(BuilditSite {
+                    run_issuer: format!("{issuer}={jwks}"),
+                    namespace: namespace.clone(),
+                    push_repo: push_repo.clone(),
+                }))
+            }
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum ServerSpecError {
     #[error(transparent)]
     Name(#[from] NotServerName),
-    #[error("[buildit] run_issuer {issuer:?} gives no key set URI: {source}")]
-    Issuer {
-        issuer: String,
-        source: url::ParseError,
-    },
     #[error("agent server {name}'s URL {url:?} is not an http(s) URL with a host")]
     Url { name: ServerName, url: String },
     #[error("an agent server may not be named broker: its gateway provider would be the broker's")]
@@ -86,28 +115,22 @@ impl DeployProfile {
                 clusters: k.clusters.clone(),
                 requires_kube_user: true,
                 namespaces,
-                transport: Transport::Remote,
+                hosting: Hosting::Remote,
                 limits,
             });
         }
         if let Some(b) = &self.buildit {
-            let run_issuer = b
-                .trusted_issuer()
-                .map_err(|source| ServerSpecError::Issuer {
-                    issuer: b.run_issuer.clone(),
-                    source,
-                })?;
             servers.push(ServerSpec {
                 name: ServerName::parse("buildit")?,
                 url: b.url(),
                 clusters: b.clusters.clone(),
                 requires_kube_user: false,
                 namespaces: Vec::new(),
-                transport: Transport::Local(LocalServer::Buildit(BuilditSite {
-                    run_issuer,
+                hosting: Hosting::Buildit {
                     namespace: b.namespace.to_string(),
                     push_repo: b.push_repo.clone(),
-                })),
+                    run_jwks_uri: b.run_jwks_uri.clone(),
+                },
                 limits: b
                     .push_repo
                     .iter()
@@ -124,7 +147,7 @@ impl DeployProfile {
                 requires_kube_user: s.requires_kube_user,
                 limits: namespace_limit(&namespaces),
                 namespaces,
-                transport: Transport::Remote,
+                hosting: Hosting::Remote,
             });
         }
         for s in &servers {
@@ -183,13 +206,11 @@ mod tests {
         clusters = ["ocp", "k8s"]
         namespace = "kueue-server"
         workload_namespaces = ["team-a", "team-b"]
-        run_issuer = "http://crucible-controller.loops.svc:8080"
         kube_authz = "openshift"
         pull_secrets = ["quay-pull"]
         [buildit]
         cluster = "ocp"
         namespace = "builds"
-        run_issuer = "http://crucible-controller.loops.svc:8080"
         push_repo = "quay.io/team/agent"
     "#;
 
@@ -218,7 +239,7 @@ mod tests {
                     clusters: vec!["ocp".into(), "k8s".into()],
                     requires_kube_user: true,
                     namespaces: vec!["team-a".into(), "team-b".into()],
-                    transport: Transport::Remote,
+                    hosting: Hosting::Remote,
                     limits: BTreeMap::from([
                         ("namespace".into(), "team-a,team-b".into()),
                         ("pull_secrets".into(), "quay-pull".into()),
@@ -230,18 +251,47 @@ mod tests {
                     clusters: vec!["ocp".into()],
                     requires_kube_user: false,
                     namespaces: vec![],
-                    transport: Transport::Local(LocalServer::Buildit(BuilditSite {
-                        run_issuer: "http://crucible-controller.loops.svc:8080=\
-                            http://crucible-controller.loops.svc:8080/.well-known/jwks.json"
-                            .into(),
+                    hosting: Hosting::Buildit {
                         namespace: "builds".into(),
                         push_repo: Some("quay.io/team/agent".into()),
-                    })),
+                        run_jwks_uri: None,
+                    },
                     limits: BTreeMap::from([("push_repo".into(), "quay.io/team/agent".into())]),
                 },
             ]
         );
         assert!(servers[0].serves("k8s") && !servers[1].serves("k8s"));
+    }
+
+    /// buildit trusts the controller's agent issuer, which the controller supplies: the profile
+    /// names it nowhere, and a key set route overrides only where its keys are fetched.
+    #[test]
+    fn buildit_trusts_the_issuer_it_is_handed() {
+        let issuer = "https://crucible.hub.example";
+        let servers = profile(KUEUE_AND_BUILDIT).agent_servers().unwrap();
+        assert_eq!(servers[0].transport(issuer).unwrap(), Transport::Remote);
+        assert_eq!(
+            servers[1].transport(issuer).unwrap(),
+            Transport::Local(LocalServer::Buildit(BuilditSite {
+                run_issuer: format!("{issuer}={issuer}/.well-known/jwks.json"),
+                namespace: "builds".into(),
+                push_repo: Some("quay.io/team/agent".into()),
+            }))
+        );
+        let routed = profile(&KUEUE_AND_BUILDIT.replace(
+            "push_repo = ",
+            "run_jwks_uri = \"https://route.example/jwks.json\"\npush_repo = ",
+        ))
+        .agent_servers()
+        .unwrap();
+        let Transport::Local(LocalServer::Buildit(site)) = routed[1].transport(issuer).unwrap()
+        else {
+            panic!("buildit runs in the loop pod")
+        };
+        assert_eq!(
+            site.run_issuer,
+            format!("{issuer}=https://route.example/jwks.json")
+        );
     }
 
     #[test]
@@ -280,7 +330,7 @@ mod tests {
                 clusters: vec!["ocp".into()],
                 requires_kube_user: true,
                 namespaces: vec!["team-a".into()],
-                transport: Transport::Remote,
+                hosting: Hosting::Remote,
                 limits: BTreeMap::from([("namespace".into(), "team-a".into())]),
             }
         );

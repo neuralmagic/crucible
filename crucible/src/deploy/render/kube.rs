@@ -4945,9 +4945,7 @@ mod tests {
             !netpol.contains("port: 8848"),
             "no buildit port without [buildit]: {netpol}"
         );
-        let with_buildit = k8s_profile(
-            "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n",
-        );
+        let with_buildit = k8s_profile("[buildit]\nnamespace = \"crucible-builds\"\n");
         let yaml = render_k8s_manifest(&manifest, &with_buildit);
         let docs: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&yaml)
             .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
@@ -5011,7 +5009,7 @@ mod tests {
         let narrowed = render_k8s_manifest(
             &manifest,
             &k8s_profile(
-                "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n\
+                "[buildit]\nnamespace = \"crucible-builds\"\n\
                  egress = [{ cidr = \"203.0.113.0/24\", except = [\"203.0.113.8/29\"] }]\n",
             ),
         );
@@ -5042,9 +5040,7 @@ mod tests {
         let manifest = k8s_manifest();
         let yaml = render_k8s_manifest(
             &manifest,
-            &k8s_profile(
-                "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n",
-            ),
+            &k8s_profile("[buildit]\nnamespace = \"crucible-builds\"\n"),
         );
         let docs: Vec<serde_json::Value> = serde_norway::Deserializer::from_str(&yaml)
             .map(|d| <serde_json::Value as serde::Deserialize>::deserialize(d).unwrap())
@@ -5093,7 +5089,7 @@ mod tests {
         let sized = render_k8s_manifest(
             &manifest,
             &k8s_profile(
-                "[buildit]\nnamespace = \"crucible-builds\"\nrun_issuer = \"http://crucible-controller.ns.svc:8080\"\n\
+                "[buildit]\nnamespace = \"crucible-builds\"\n\
                  quota = { pods = \"4\" }\n",
             ),
         );

@@ -329,7 +329,7 @@ done
 log "the builder admission policy refuses a privileged pod in $BUILD_NS"
 
 log "deploying crucible-kueue in $KUEUE_NS"
-"$BIN/crucible" deploy render --kueue --no-pin --profile "$WORK/profile.toml" 2>/dev/null \
+"$BIN/crucible" deploy render --kueue --issuer "$ISSUER" --no-pin --profile "$WORK/profile.toml" 2>/dev/null \
     | yq 'select(.kind != "Namespace")' > "$WORK/kueue.yaml"
 e2e_scoped "$WORK/kueue.yaml" | kc apply -f - >/dev/null
 
