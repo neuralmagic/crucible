@@ -15,9 +15,14 @@ use std::collections::BTreeMap;
 pub enum ClusterLinkError {
     #[error(
         "rendering an OAuthClient needs a [cluster_link] table in the deploy profile \\
-         (external_url, openshift)"
+         (openshift)"
     )]
     MissingTable,
+    #[error(
+        "[cluster_link] sets no external_url, and no agent issuer was given to default it to \
+         (--issuer)"
+    )]
+    NoBrowserUrl,
     #[error("[cluster_link].openshift does not list {cluster:?}; it lists {listed:?}")]
     NotListed {
         cluster: String,
@@ -54,14 +59,18 @@ struct ScopeRestriction {
     literals: Vec<&'static str>,
 }
 
-/// The `OAuthClient` to create on `cluster`, as YAML.
-pub fn render(profile: &DeployProfile, cluster: &str) -> Result<String> {
+/// The `OAuthClient` to create on `cluster`, as YAML. `issuer` is the controller's agent issuer,
+/// its browser URL when `[cluster_link]` sets no `external_url`.
+pub fn render(profile: &DeployProfile, cluster: &str, issuer: Option<&str>) -> Result<String> {
     let cfg = profile
         .cluster_link
         .as_ref()
         .ok_or(ClusterLinkError::MissingTable)?;
     let cluster = listed(profile, cfg, cluster)?;
-    let callback = ExternalUrl::parse(&cfg.external_url)
+    let url = cfg
+        .browser_url(issuer)
+        .ok_or(ClusterLinkError::NoBrowserUrl)?;
+    let callback = ExternalUrl::parse(url)
         .and_then(|url| url.callback(cluster.as_str()))
         .context("[cluster_link].external_url")?;
     let client = OAuthClient {
@@ -137,7 +146,7 @@ mod tests {
     }
 
     fn rendered(cluster: &str) -> serde_json::Value {
-        serde_norway::from_str(&render(&profile(PROFILE), cluster).unwrap()).unwrap()
+        serde_norway::from_str(&render(&profile(PROFILE), cluster, None).unwrap()).unwrap()
     }
 
     #[test]
@@ -167,7 +176,7 @@ mod tests {
 
     #[test]
     fn no_secret_is_ever_rendered() {
-        let yaml = render(&profile(PROFILE), "ocp").unwrap();
+        let yaml = render(&profile(PROFILE), "ocp", None).unwrap();
         assert!(!yaml.contains("secret"), "{yaml}");
     }
 
@@ -178,7 +187,7 @@ mod tests {
             "client_id = \"crucible-staging\"\n        access_token_max_age_secs = 120\n        openshift = [",
         );
         let doc: serde_json::Value =
-            serde_norway::from_str(&render(&profile(&text), "ocp").unwrap()).unwrap();
+            serde_norway::from_str(&render(&profile(&text), "ocp", None).unwrap()).unwrap();
         assert_eq!(doc["metadata"]["name"], "crucible-staging");
         assert_eq!(doc["accessTokenMaxAgeSeconds"], 120);
     }
@@ -186,7 +195,7 @@ mod tests {
     #[test]
     fn a_cluster_the_table_does_not_list_or_the_fleet_does_not_know_is_refused() {
         let p = profile(PROFILE);
-        let err = render(&p, "east").unwrap_err();
+        let err = render(&p, "east", None).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::NotListed {
@@ -194,7 +203,7 @@ mod tests {
                 listed: vec!["ocp".into(), "hub".into(), "gone".into(), "k8s".into()]
             })
         );
-        let err = render(&p, "gone").unwrap_err();
+        let err = render(&p, "gone", None).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::UnknownCluster {
@@ -205,7 +214,7 @@ mod tests {
 
     #[test]
     fn a_cluster_whose_usernames_follow_the_sso_login_gets_no_oauth_client() {
-        let err = render(&profile(PROFILE), "k8s").unwrap_err();
+        let err = render(&profile(PROFILE), "k8s", None).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::NotLinkCluster {
@@ -217,14 +226,49 @@ mod tests {
     #[test]
     fn a_profile_without_the_table_or_with_a_plain_http_url_is_refused() {
         let bare = PROFILE.split("[cluster_link]").next().unwrap().to_string();
-        let err = render(&profile(&bare), "ocp").unwrap_err();
+        let err = render(&profile(&bare), "ocp", None).unwrap_err();
         assert_eq!(
             err.downcast_ref::<ClusterLinkError>(),
             Some(&ClusterLinkError::MissingTable)
         );
         let http = PROFILE.replace("https://crucible", "http://crucible");
-        let err = format!("{:#}", render(&profile(&http), "ocp").unwrap_err());
+        let err = format!("{:#}", render(&profile(&http), "ocp", None).unwrap_err());
         assert!(err.contains("must be https"), "{err}");
+    }
+
+    #[test]
+    fn without_an_external_url_the_callback_sits_under_the_agent_issuer() {
+        let text = PROFILE.replace(
+            "external_url = \"https://crucible.apps.hub.example.com\"\n",
+            "",
+        );
+        let err = render(&profile(&text), "ocp", None).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<ClusterLinkError>(),
+            Some(&ClusterLinkError::NoBrowserUrl)
+        );
+        let doc: serde_json::Value = serde_norway::from_str(
+            &render(&profile(&text), "ocp", Some("https://crucible.example.com")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["redirectURIs"][0],
+            "https://crucible.example.com/oauth/cluster-link/ocp/callback"
+        );
+        let doc: serde_json::Value = serde_norway::from_str(
+            &render(
+                &profile(PROFILE),
+                "ocp",
+                Some("https://crucible.example.com"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc["redirectURIs"][0],
+            "https://crucible.apps.hub.example.com/oauth/cluster-link/ocp/callback",
+            "a stated external_url wins"
+        );
     }
 
     #[test]

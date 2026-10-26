@@ -483,8 +483,8 @@ impl KubeAuthz {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClusterLinkCfg {
-    /// The controller's URL as people's browsers reach it.
-    pub external_url: String,
+    /// The controller's URL as people's browsers reach it, when it is not the agent issuer.
+    pub external_url: Option<String>,
     /// The `OAuthClient` name, the controller's client id on every cluster.
     #[serde(default = "cluster_link_client_id")]
     pub client_id: KubeName,
@@ -493,6 +493,14 @@ pub struct ClusterLinkCfg {
     /// Lifetime of the access token a link redeems. The controller drops it after one review.
     #[serde(default = "cluster_link_token_age")]
     pub access_token_max_age_secs: u32,
+}
+
+impl ClusterLinkCfg {
+    /// The controller's URL as people's browsers reach it: `external_url`, or else the agent
+    /// issuer.
+    pub fn browser_url<'a>(&'a self, issuer: Option<&'a str>) -> Option<&'a str> {
+        self.external_url.as_deref().or(issuer)
+    }
 }
 
 fn cluster_link_client_id() -> KubeName {

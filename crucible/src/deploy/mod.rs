@@ -151,9 +151,10 @@ pub fn render_cluster_link_cmd(
     profile_path: &Path,
     clusters_file: Option<&Path>,
     cluster: &str,
+    issuer: Option<&str>,
 ) -> Result<()> {
     let profile = DeployProfile::load_with_fleet(profile_path, clusters_file)?;
-    print!("{}", cluster_link::render(&profile, cluster)?);
+    print!("{}", cluster_link::render(&profile, cluster, issuer)?);
     Ok(())
 }
 

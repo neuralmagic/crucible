@@ -1776,7 +1776,7 @@ tokens, the controller does not read them.
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
 | `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `scopes` (default none), `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |
-| `[cluster_link] external_url` | required | The controller URL as browsers reach it. https, or http to loopback. |
+| `[cluster_link] external_url` | `CONTROLLER_AGENT_ISSUER` | The controller URL as browsers reach it. https, or http to loopback. Without either, cluster links refuse to start. |
 | `[cluster_link] client_id` | `crucible-controller` | The `OAuthClient` name. |
 | `[cluster_link] openshift` | required | The `link` clusters that link through their OAuth server. |
 | `[cluster_link] access_token_max_age_secs` | `300` | The lifetime of the `user:info` token. |

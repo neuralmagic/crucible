@@ -355,6 +355,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
                 &args.profile,
                 args.clusters.as_deref(),
                 cluster,
+                args.issuer.as_deref(),
             );
         }
         if args.kueue {

@@ -262,17 +262,19 @@ names its owner, the username is recorded, and the token is dropped.
 
 ```toml
 [cluster_link]
-external_url = "https://crucible.apps.hub.example.com"
 openshift = ["spoke-a"]
+# external_url = "https://crucible.apps.hub.example.com"  # default: CONTROLLER_AGENT_ISSUER
 # client_id = "crucible-controller"
 # access_token_max_age_secs = 300
 ```
 
-Render the client for one cluster, then create it there with a fresh secret, and give the same
-secret to the controller under the cluster's name:
+The callback sits under the agent issuer, `CONTROLLER_AGENT_ISSUER`, unless `external_url` names
+another URL browsers reach the controller at. Render the client for one cluster, then create it
+there with a fresh secret, and give the same secret to the controller under the cluster's name:
 
 ```sh
-crucible deploy render --profile profile.toml --cluster-link spoke-a > oauthclient-spoke-a.yaml
+crucible deploy render --profile profile.toml --cluster-link spoke-a \
+  --issuer https://crucible.apps.hub.example.com > oauthclient-spoke-a.yaml
 secret=$(openssl rand -hex 32)
 oc --context spoke-a apply -f oauthclient-spoke-a.yaml
 oc --context spoke-a patch oauthclient crucible-controller --type merge -p "{\"secret\":\"$secret\"}"

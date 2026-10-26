@@ -91,13 +91,19 @@ pub struct LinkCfg {
 }
 
 impl LinkCfg {
+    /// `issuer` is the agent issuer, the browser URL when the table sets no `external_url`.
     pub fn from_profile(
         table: &crucible::deploy::profile::ClusterLinkCfg,
+        issuer: Option<&str>,
         secrets: PathBuf,
-    ) -> Result<Self, crucible_contract::cluster_link::ExternalUrlError> {
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+        let url = table.browser_url(issuer).context(
+            "[cluster_link] sets no external_url, and CONTROLLER_AGENT_ISSUER is not set to default it to",
+        )?;
         Ok(Self {
             client_id: table.client_id.to_string(),
-            external_url: ExternalUrl::parse(&table.external_url)?,
+            external_url: ExternalUrl::parse(url).context("[cluster_link] browser URL")?,
             secrets,
             openshift: table.openshift.iter().map(|c| c.to_string()).collect(),
         })
@@ -170,8 +176,11 @@ impl ClusterLinks {
         let secrets = std::env::var("CONTROLLER_CLUSTER_LINK_SECRETS").context(
             "the deploy profile has a [cluster_link] table, so CONTROLLER_CLUSTER_LINK_SECRETS must name the mounted client secrets",
         )?;
-        let cfg = LinkCfg::from_profile(table, PathBuf::from(secrets))
-            .context("[cluster_link].external_url")?;
+        let cfg = LinkCfg::from_profile(
+            table,
+            cfg.agent_issuer.as_deref().filter(|v| !v.is_empty()),
+            PathBuf::from(secrets),
+        )?;
         tracing::info!(
             clusters = ?cfg.openshift,
             client_id = cfg.client_id,
@@ -652,6 +661,33 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn the_browser_url_is_the_agent_issuer_unless_the_table_names_one() {
+        let table = |text: &str| -> crucible::deploy::profile::ClusterLinkCfg {
+            toml::from_str(text).unwrap()
+        };
+        let bare = table(r#"openshift = ["ocp"]"#);
+        let issuer = Some("https://crucible.example.com");
+        let cfg = LinkCfg::from_profile(&bare, issuer, PathBuf::new()).unwrap();
+        assert_eq!(
+            cfg.external_url.callback("ocp").unwrap().as_str(),
+            "https://crucible.example.com/oauth/cluster-link/ocp/callback"
+        );
+        let err = LinkCfg::from_profile(&bare, None, PathBuf::new()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("CONTROLLER_AGENT_ISSUER"),
+            "{err:#}"
+        );
+        let stated = table(&format!(
+            "external_url = \"{EXTERNAL}\"\nopenshift = [\"ocp\"]"
+        ));
+        let cfg = LinkCfg::from_profile(&stated, issuer, PathBuf::new()).unwrap();
+        assert_eq!(
+            cfg.external_url.callback("ocp").unwrap().as_str(),
+            "https://crucible.example.com/console/oauth/cluster-link/ocp/callback"
         );
     }
 
