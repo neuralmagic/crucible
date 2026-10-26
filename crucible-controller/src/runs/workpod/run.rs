@@ -811,8 +811,16 @@ pub async fn dispatch_run(
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
     }
     if let Some(tokens) = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?
-        && let Some(access) =
-            crate::runs::workpod::agent_servers::access(&agent_servers, &cluster, &tokens)?
+        && let Some(access) = crate::runs::workpod::agent_servers::access(
+            &agent_servers,
+            &cluster,
+            &tokens,
+            loaded
+                .as_deref()
+                .map_or(crucible::deploy::profile::DEFAULT_SPIFFE_SOCKET, |p| {
+                    p.cluster.spiffe_socket()
+                }),
+        )?
     {
         delivery.merge(access).map_err(|e| {
             anyhow::anyhow!("folding the agent servers' access into the run's: {e}")

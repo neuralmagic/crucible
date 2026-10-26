@@ -202,7 +202,7 @@ sleep 1800
                     env("CRUCIBLE_SANDBOX_IMAGE_PULL_SECRETS", pull_secret),
                     env(
                         "CRUCIBLE_SANDBOX_SPIFFE_SOCKET",
-                        cluster.sandbox_spiffe_socket.as_deref().unwrap(),
+                        cluster.spiffe_socket(),
                     ),
                     env("OPENSHELL_SUPERVISOR_IMAGE", &cluster.supervisor_image),
                 ],

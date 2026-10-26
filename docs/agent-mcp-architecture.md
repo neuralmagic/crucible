@@ -1751,7 +1751,7 @@ tokens, the controller does not read them.
 | `[cluster] sandbox_namespace` | unset | The other half. Unset: sandboxes live in the loop namespace and no agent tokens are issued. |
 | `[cluster] sandbox_service_account` | `crucible-sandbox` with a sandbox namespace, else the loop's | The account sandbox pods run as. Under isolated gateways it is never the loop's account, which does not exist in the sandbox namespace. |
 | `[cluster] sandbox_readers` | `[]` | `namespace/name` service accounts that get the controller rights in section 6.6. |
-| `[cluster] sandbox_spiffe_socket` | unset | The SPIFFE Workload API socket path that supervisors get through `csi.spiffe.io`. Unset: no socket, so no JWT-SVIDs. |
+| `[cluster] sandbox_spiffe_socket` | `/spiffe-workload-api/spire-agent.sock` | The SPIFFE Workload API socket path that supervisors get through `csi.spiffe.io`. The controller delivers it only to runs that get agent servers, since the CSI driver runs only where SPIRE does. |
 | `[cluster] identity` | `"link"` | The hub identity rule. |
 | `[clusters.<name>] identity` | `"link"` | A spoke identity rule. |
 | `[cluster] platform`, `[clusters.<name>] platform` | detected | `kubernetes` or `openshift`, over what is detected: the controller asks each cluster's API server (OpenShift serves `security.openshift.io`), and a render without cluster access takes `crucible deploy render --platform`, then this key, then `kubernetes`. The distribution the hub or a spoke runs. It decides what a render may assume of the cluster (section 11.2). Each cluster's render reads that cluster's own entry: an OpenShift hub dispatching to an OpenShift spoke and a Kubernetes spoke renders each spoke for its own platform, and nothing applies the hub's platform to a spoke. The hub's own platform affects only what is rendered for the hub itself; its ingress and deploy are the Argo chart's. |
@@ -1768,7 +1768,7 @@ tokens, the controller does not read them.
 | `[kueue] people` | `false` | `true` serves people's MCP clients too: each cluster's server is a people resource, and the render adds `--person-issuer` with the controller's agent issuer. |
 | `[kueue] people_urls` | each cluster's Service URL | `{ <cluster> = "<url>" }`: where people reach the server on a cluster (a route, a port-forward). A person's token names its cluster by this URL, so `people` on several clusters needs one per cluster; profile load refuses two clusters at one URL. The render serves it as another `--resource` and `--allowed-host`. |
 | `[buildit] clusters` or `cluster` | `["hub"]` | The clusters whose runs get `buildit`. |
-| `[buildit] namespace` | required | Where builder pods run. Profile load refuses the loop, rig, sandbox, crucible-kueue and workload namespaces. |
+| `[buildit] namespace` | `crucible-builds` | Where builder pods run. Profile load refuses the loop, rig, sandbox, crucible-kueue and workload namespaces. |
 | `[buildit] egress` | TCP 443 to `0.0.0.0/0` and `::/0` | `[{ cidr, ports = [443], except = [] }, ...]`: where builder pods may connect besides DNS (section 8.4). |
 | `[buildit] run_jwks_uri` | `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json` | For a loop pod that cannot reach the issuer address. |
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
@@ -2001,28 +2001,28 @@ in place.
 2. On each cluster that hosts runs, install SPIRE with the OIDC discovery provider. Add a
    ClusterSPIFFEID for supervisor pods in the sandbox namespace, with `jwtTtl: 5m` and the
    template in section 6.1.
-3. In the deploy profile, set `sandbox_driver = "kubernetes"`, `sandbox_namespace`,
-   `sandbox_readers` and `sandbox_spiffe_socket`.
+3. In the deploy profile, set `sandbox_driver = "kubernetes"`, `sandbox_namespace` and
+   `sandbox_readers`.
 4. Render the loop RBAC with `crucible deploy render --manifest <render.toml> --profile <profile>`.
-   Apply the ServiceAccount, Roles and bindings on each cluster.
-5. Grant the controller identity `get` on `services/proxy` in the SPIRE namespace of each cluster.
-6. With `[buildit]`, create `[buildit] namespace`, and make sure that step 4 applied the Role and
+   Apply the ServiceAccount, Roles and bindings on each cluster. They include
+   `crucible-spire-reader`, which lets `sandbox_readers` discover the cluster's SPIRE (section 6.9).
+5. With `[buildit]`, create `[buildit] namespace`, and make sure that step 4 applied the Role and
    RoleBinding `<service account>-buildit` there (section 6.6). Builder pods run as that
    namespace's `default` service account; on OpenShift bind it to an SCC that admits them.
-7. Render `crucible-kueue` with `crucible deploy render --kueue`. Apply it on each cluster in
+6. Render `crucible-kueue` with `crucible deploy render --kueue`. Apply it on each cluster in
    `[kueue] clusters`. Copy the declared pull secrets into the workload namespace. Create the
    LocalQueues.
-8. Grant people their queues with ordinary RBAC (section 11.2).
-9. Create the issuer key Secret in the controller namespace. Mount it in each replica.
-10. Set the controller environment (section 9.1). Each cluster an agent server serves has its
+7. Grant people their queues with ordinary RBAC (section 11.2).
+8. Create the issuer key Secret in the controller namespace. Mount it in each replica.
+9. Set the controller environment (section 9.1). Each cluster an agent server serves has its
     SPIRE discovered; check `GET /api/agent-clusters` after the restart.
     Make sure that loop pods reach the controller at `[cluster] ingest_url`. Restart the
     controller.
-11. For people tokens: set `CONTROLLER_AUTH_MODE=native` and `[kueue] people = true` (with
+10. For people tokens: set `CONTROLLER_AUTH_MODE=native` and `[kueue] people = true` (with
     `people_urls` where people reach a cluster's server by a route), render `crucible-kueue` again, and expose it on a Route. To change
     the clients, set `CONTROLLER_PEOPLE_CLIENTS_FILE`, `CONTROLLER_PEOPLE_CIMD_HOSTS` or
     `CONTROLLER_PEOPLE_DCR` (section 4.1).
-12. For OAuth links: render `crucible deploy render --cluster-link <cluster>` and apply it on that
+11. For OAuth links: render `crucible deploy render --cluster-link <cluster> --issuer <issuer>` and apply it on that
     cluster with a new secret. Put the same secret in the `CONTROLLER_CLUSTER_LINK_SECRETS`
     directory under the cluster name.
 

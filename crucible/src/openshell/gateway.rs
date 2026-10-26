@@ -402,7 +402,8 @@ pub const SERVE_GRPC_ENDPOINT_ENV: &str = "CRUCIBLE_GATEWAY_GRPC_ENDPOINT";
 pub const SERVE_HOST_IP_ENV: &str = "CRUCIBLE_GATEWAY_HOST_IP";
 /// The run's gateway id, which supervisor SPIFFE IDs are derived from.
 pub const SERVE_GATEWAY_ID_ENV: &str = "CRUCIBLE_GATEWAY_ID";
-/// The SPIFFE Workload API socket path supervisors get (`[cluster] sandbox_spiffe_socket`).
+/// The SPIFFE Workload API socket path supervisors get, delivered with a run's agent servers
+/// (`[cluster] sandbox_spiffe_socket`).
 pub const SANDBOX_SPIFFE_SOCKET_ENV: &str = "CRUCIBLE_SANDBOX_SPIFFE_SOCKET";
 pub const SERVE_CLIENT_TLS_SECRET_ENV: &str = "CRUCIBLE_GATEWAY_CLIENT_TLS_SECRET";
 pub const SERVE_SERVER_TLS_DIR_ENV: &str = "CRUCIBLE_GATEWAY_SERVER_TLS_DIR";

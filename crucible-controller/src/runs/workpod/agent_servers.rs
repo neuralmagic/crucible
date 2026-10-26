@@ -12,6 +12,7 @@ use crate::agent_auth::issuer::{IssuerUrl, TOKEN_PATH, parse_list};
 use crate::secrets::deliver::Delivery;
 use anyhow::Context;
 use crucible::deploy::servers::ServerSpec;
+use crucible::openshell::gateway::SANDBOX_SPIFFE_SOCKET_ENV;
 use crucible_contract::agent_servers::{AgentServer, ENV_AGENT_SERVERS};
 use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOINT};
 
@@ -70,10 +71,13 @@ pub fn granted<'a>(
 }
 
 /// The loop pod's env for a run dispatched onto `cluster`, `None` when no server serves it.
+/// `socket` is the SPIFFE Workload API path its supervisors mount, only when they get servers:
+/// the CSI driver that serves it runs only where SPIRE does.
 pub fn access(
     servers: &[ServerSpec],
     cluster: &str,
     tokens: &AgentTokens,
+    socket: &str,
 ) -> anyhow::Result<Option<Delivery>> {
     let granted: Vec<AgentServer> = granted(servers, cluster, tokens)
         .into_iter()
@@ -104,6 +108,7 @@ pub fn access(
                 tokens.svid_audience.clone(),
             ),
             (ENV_AGENT_SERVERS.to_string(), encoded),
+            (SANDBOX_SPIFFE_SOCKET_ENV.to_string(), socket.to_string()),
         ],
         ..Delivery::default()
     }))
@@ -114,6 +119,8 @@ mod tests {
     use crate::runs::workpod::agent_servers::*;
     use crucible::deploy::profile::DeployProfile;
     use crucible_contract::agent_servers::{BuilditSite, LocalServer, Transport};
+
+    const SOCKET: &str = "/run/spire/agent.sock";
 
     const PROFILE: &str = r#"
         [cluster]
@@ -183,7 +190,7 @@ mod tests {
 
     #[test]
     fn a_run_on_the_kueue_cluster_gets_the_server_and_the_token_endpoint_and_no_secret() {
-        let delivery = access(&servers(KUEUE), "ocp", &tokens())
+        let delivery = access(&servers(KUEUE), "ocp", &tokens(), SOCKET)
             .unwrap()
             .expect("access");
         assert!(delivery.is_empty(), "no Secret data: {delivery:?}");
@@ -194,9 +201,11 @@ mod tests {
             [
                 ENV_AGENT_SERVERS,
                 ENV_AGENT_SVID_AUDIENCE,
-                ENV_AGENT_TOKEN_ENDPOINT
+                ENV_AGENT_TOKEN_ENDPOINT,
+                SANDBOX_SPIFFE_SOCKET_ENV,
             ]
         );
+        assert_eq!(env[SANDBOX_SPIFFE_SOCKET_ENV], SOCKET);
         assert_eq!(
             env[ENV_AGENT_TOKEN_ENDPOINT],
             "http://crucible-controller.crucible-system.svc:8080/oauth/token"
@@ -218,8 +227,12 @@ mod tests {
 
     #[test]
     fn a_run_elsewhere_or_without_servers_gets_nothing() {
-        assert!(access(&servers(KUEUE), "hub", &tokens()).unwrap().is_none());
-        assert!(access(&[], "ocp", &tokens()).unwrap().is_none());
+        assert!(
+            access(&servers(KUEUE), "hub", &tokens(), SOCKET)
+                .unwrap()
+                .is_none()
+        );
+        assert!(access(&[], "ocp", &tokens(), SOCKET).unwrap().is_none());
     }
 
     #[test]
@@ -227,11 +240,11 @@ mod tests {
         let both = servers(&KUEUE.replace("cluster = \"ocp\"", "clusters = [\"ocp\", \"k8s\"]"));
         for cluster in ["ocp", "k8s"] {
             assert!(
-                access(&both, cluster, &tokens()).unwrap().is_some(),
+                access(&both, cluster, &tokens(), SOCKET).unwrap().is_some(),
                 "{cluster}"
             );
         }
-        assert!(access(&both, "hub", &tokens()).unwrap().is_none());
+        assert!(access(&both, "hub", &tokens(), SOCKET).unwrap().is_none());
     }
 
     #[test]
@@ -242,11 +255,13 @@ mod tests {
             ..tokens()
         };
         assert_eq!(
-            names(&access(&all, "k8s", &no_spire).unwrap().unwrap()),
+            names(&access(&all, "k8s", &no_spire, SOCKET).unwrap().unwrap()),
             ["buildit"]
         );
         assert!(
-            access(&servers(KUEUE), "ocp", &no_spire).unwrap().is_none(),
+            access(&servers(KUEUE), "ocp", &no_spire, SOCKET)
+                .unwrap()
+                .is_none(),
             "no SPIRE for ocp, so no tokens for its sandboxes"
         );
     }
@@ -254,7 +269,7 @@ mod tests {
     #[test]
     fn buildit_is_an_entry_served_in_the_loop_pod_with_its_issuer_and_push_repo() {
         let all = servers(&format!("{KUEUE}{BUILDIT}"));
-        let on_k8s = access(&all, "k8s", &tokens()).unwrap().unwrap();
+        let on_k8s = access(&all, "k8s", &tokens(), SOCKET).unwrap().unwrap();
         assert_eq!(
             granted_servers(&on_k8s),
             [AgentServer {
@@ -271,7 +286,7 @@ mod tests {
                 })),
             }]
         );
-        let on_ocp = access(&all, "ocp", &tokens()).unwrap().unwrap();
+        let on_ocp = access(&all, "ocp", &tokens(), SOCKET).unwrap().unwrap();
         assert_eq!(names(&on_ocp), ["kueue", "buildit"]);
         assert_eq!(
             on_ocp
@@ -293,7 +308,9 @@ mod tests {
             scopes = ["docs.read"]
             cluster = "ocp"
         "#;
-        let delivery = access(&servers(docs), "ocp", &tokens()).unwrap().unwrap();
+        let delivery = access(&servers(docs), "ocp", &tokens(), SOCKET)
+            .unwrap()
+            .unwrap();
         let granted = granted_servers(&delivery);
         assert_eq!(names(&delivery), ["docs"]);
         assert_eq!(granted[0].scopes, ["docs.read"]);
@@ -362,16 +379,19 @@ mod tests {
             ..tokens()
         };
         tokens.spire.enable(["k8s".to_string()]);
-        assert!(access(&all, "k8s", &tokens).unwrap().is_none(), "pending");
+        assert!(
+            access(&all, "k8s", &tokens, SOCKET).unwrap().is_none(),
+            "pending"
+        );
         let spire: crate::agent_auth::cluster_spire::ClusterSpire =
             "k8s=https://oidc.k8s.example spiffe://k8s.example/openshell/gateway/ spire/oidc:443"
                 .parse()
                 .unwrap();
         tokens.spire.set("k8s", SpireState::Ready(spire));
         assert_eq!(
-            names(&access(&all, "k8s", &tokens).unwrap().unwrap()),
+            names(&access(&all, "k8s", &tokens, SOCKET).unwrap().unwrap()),
             ["buildit"]
         );
-        assert!(access(&all, "ocp", &tokens).unwrap().is_none());
+        assert!(access(&all, "ocp", &tokens, SOCKET).unwrap().is_none());
     }
 }

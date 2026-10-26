@@ -6,10 +6,8 @@
 loop_namespace          = "@LOOP_NS@"
 rig_namespace           = "@LOOP_NS@"
 service_account         = "crucible-kueue-e2e-loop"
-sandbox_service_account = "crucible-sandbox"
 sandbox_namespace       = "@SANDBOX_NS@"
 sandbox_readers         = ["@CTL_NS@/crucible-controller"]
-sandbox_spiffe_socket   = "/spiffe-workload-api/spire-agent.sock"
 supervisor_image        = "@SUPERVISOR_IMAGE@"
 sandbox_driver          = "kubernetes"
 platform                = "@PLATFORM@"

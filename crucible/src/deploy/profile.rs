@@ -327,7 +327,8 @@ pub struct BuilditCfg {
     pub clusters: Vec<String>,
     /// Where builder pods run: a namespace of their own, never the loop, rig, sandbox or
     /// crucible-kueue namespaces, since the rights to create and exec into them reach every pod
-    /// there.
+    /// there. Default `crucible-builds`.
+    #[serde(default = "default_builder_namespace")]
     pub namespace: KubeName,
     /// Where buildit fetches the agent issuer's keys. Default
     /// `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json`; a loop pod that cannot reach the issuer's
@@ -503,6 +504,10 @@ impl ClusterLinkCfg {
     }
 }
 
+fn default_builder_namespace() -> KubeName {
+    KubeName("crucible-builds".to_string())
+}
+
 fn cluster_link_client_id() -> KubeName {
     KubeName(crucible_contract::cluster_link::DEFAULT_CLIENT_ID.to_string())
 }
@@ -650,8 +655,8 @@ pub struct Cluster {
     #[serde(default)]
     pub sandbox_readers: Vec<ServiceAccountRef>,
     /// The SPIFFE Workload API socket path the OpenShell driver mounts (`csi.spiffe.io`) into
-    /// supervisor pods, so supervisors can fetch the JWT-SVIDs they exchange for agent tokens.
-    /// Unset mounts none.
+    /// the supervisor pods of runs that get agent servers, so supervisors can fetch the JWT-SVIDs
+    /// they exchange for agent tokens. Default [`DEFAULT_SPIFFE_SOCKET`].
     #[serde(default)]
     pub sandbox_spiffe_socket: Option<String>,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
@@ -836,6 +841,10 @@ impl SandboxHostAliases {
 /// The service account sandbox pods run as under isolated gateways when the profile names none.
 pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT: &str = "crucible-sandbox";
 
+/// Where supervisors find the SPIFFE Workload API: the SPIRE agent's socket name under both the
+/// upstream chart and the Zero Trust Workload Identity Manager.
+pub const DEFAULT_SPIFFE_SOCKET: &str = "/spiffe-workload-api/spire-agent.sock";
+
 /// Where the OpenShell image workflow pushes the sandbox runtime image, tagged `sha-<rev>`.
 pub const SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/neuralmagic/openshell-sandbox";
 
@@ -855,6 +864,14 @@ impl Cluster {
         self.sandbox_namespace
             .as_ref()
             .map_or(self.loop_namespace.as_str(), KubeName::as_str)
+    }
+
+    /// The SPIFFE Workload API socket path supervisors get: `sandbox_spiffe_socket`, else
+    /// [`DEFAULT_SPIFFE_SOCKET`].
+    pub fn spiffe_socket(&self) -> &str {
+        self.sandbox_spiffe_socket
+            .as_deref()
+            .unwrap_or(DEFAULT_SPIFFE_SOCKET)
     }
 
     /// The service account sandbox pods run as: `sandbox_service_account`, else

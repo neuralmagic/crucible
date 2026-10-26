@@ -218,8 +218,9 @@ Grounded-rank and scope turns get a gateway of their own the same way, with cert
 the turn's deadline; a failed launch tears it down, and the gateway sweep removes it once the
 turn's row closes. Turn sandboxes are never bound, so they get no agent tokens.
 
-Supervisors get the SPIFFE Workload API (the `csi.spiffe.io` driver) only when the profile names
-`[cluster] sandbox_spiffe_socket`, for example `/spiffe-workload-api/spire-agent.sock`.
+Supervisors of runs that get agent servers mount the SPIFFE Workload API (the `csi.spiffe.io`
+driver) at `/spiffe-workload-api/spire-agent.sock`; `[cluster] sandbox_spiffe_socket` names another
+path. Runs without agent servers mount none, so a cluster without SPIRE still starts sandboxes.
 
 With `[cluster] aws_sandbox_role_arn`, the gateway pod assumes that role with an STS-audienced
 token for its own service account, as the in-pod gateway does with the loop pod's, so the role's
