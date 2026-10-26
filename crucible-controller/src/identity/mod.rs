@@ -4,7 +4,12 @@
 pub(crate) mod api;
 pub mod api_key;
 pub mod auth;
+pub mod cluster_identity;
+pub mod cluster_link;
+pub mod kube_identity;
+pub mod kube_links;
 pub mod kube_user;
 pub mod oidc;
+pub mod people_directory;
 pub mod session;
 pub mod user_prefs;

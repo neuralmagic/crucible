@@ -901,9 +901,77 @@ static AUTORESEARCH_BINDINGS: &[Binding] = &[
     bind("POST", "/api/packs/launch", R::Playbook, V::Launch, Route),
 ];
 
+/// The cluster identity, consent and MCP sign-in routes, served when people sign in to MCP clients
+/// or link cluster identities.
+static IDENTITY_BINDINGS: &[Binding] = &[
+    bind(
+        "GET",
+        "/api/me/cluster-identities",
+        R::UserPrefs,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "PUT",
+        "/api/me/cluster-identities/{cluster}",
+        R::UserPrefs,
+        V::Update,
+        Route,
+    ),
+    bind(
+        "DELETE",
+        "/api/me/cluster-identities/{cluster}",
+        R::UserPrefs,
+        V::Update,
+        Route,
+    ),
+    bind(
+        "POST",
+        "/api/me/cluster-identities/{cluster}/link",
+        R::UserPrefs,
+        V::Update,
+        Route,
+    ),
+    bind("GET", "/api/oauth/consent", R::UserPrefs, V::Read, Route),
+    bind("GET", "/api/me/mcp-sign-ins", R::UserPrefs, V::Read, Route),
+    bind(
+        "DELETE",
+        "/api/me/mcp-sign-ins",
+        R::UserPrefs,
+        V::Update,
+        Route,
+    ),
+    bind("POST", "/api/oauth/consent", R::UserPrefs, V::Update, Route),
+    bind(
+        "GET",
+        "/oauth/cluster-link/{cluster}/callback",
+        R::UserPrefs,
+        V::Update,
+        Route,
+    ),
+    bind(
+        "PUT",
+        "/api/users/{login}/kube-user",
+        R::Platform,
+        V::Update,
+        Platform,
+    ),
+];
+
+/// The agent tool routes, served when the agent token issuer is configured.
+static AGENT_TOOL_BINDINGS: &[Binding] = &[
+    bind("GET", "/api/prefs/notices", R::UserPrefs, V::Read, Route),
+    bind("PUT", "/api/prefs/notices", R::UserPrefs, V::Update, Route),
+    bind("GET", "/api/agent-tools", R::Platform, V::Read, Route),
+    bind("GET", "/api/agent-clusters", R::Platform, V::Read, Route),
+];
+
 /// Every binding this build serves.
 pub fn bindings() -> impl Iterator<Item = &'static Binding> {
-    let core = BINDINGS.iter();
+    let core = BINDINGS
+        .iter()
+        .chain(IDENTITY_BINDINGS)
+        .chain(AGENT_TOOL_BINDINGS);
     #[cfg(feature = "autoresearch")]
     let core = core.chain(AUTORESEARCH_BINDINGS.iter());
     core

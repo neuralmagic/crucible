@@ -4,12 +4,23 @@ use anyhow::Context;
 use anyhow::Result;
 #[cfg(feature = "autoresearch")]
 use crucible::deploy::{DeployProfile, DigestResolver, render_turn};
-use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret};
+use k8s_openapi::api::core::v1::{ConfigMap, Pod, Secret, Service};
+use k8s_openapi::api::networking::v1::NetworkPolicy;
+use std::collections::BTreeSet;
 #[cfg(feature = "autoresearch")]
 use std::path::Path;
 #[cfg(feature = "autoresearch")]
 use std::sync::Arc;
 use std::time::Duration;
+
+/// A create the dispatcher has no implementation for.
+#[derive(Debug, thiserror::Error)]
+pub enum Unsupported {
+    #[error("this dispatcher creates no Services")]
+    Services,
+    #[error("this dispatcher creates no NetworkPolicies")]
+    NetworkPolicies,
+}
 
 /// The cluster boundary every work kind is dispatched over: create a pod, wait for it to go terminal,
 /// read its logs, delete it. Async end to end — every call is awaited on the daemon's runtime (the
@@ -39,6 +50,67 @@ pub trait PodDispatcher: Send + Sync {
     /// collected by the cluster when the pod goes.
     async fn create_secret(&self, _cluster: &str, _namespace: &str, _secret: Secret) -> Result<()> {
         Ok(())
+    }
+    /// Create a Service, returning it as the API server stored it, its `spec.clusterIP` assigned.
+    /// Only an isolated run gateway needs one, so the default refuses.
+    async fn create_service(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _service: Service,
+    ) -> Result<Service> {
+        Err(Unsupported::Services.into())
+    }
+    /// Create a NetworkPolicy. Only an isolated run gateway needs one, so the default refuses.
+    async fn create_network_policy(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _policy: NetworkPolicy,
+    ) -> Result<()> {
+        Err(Unsupported::NetworkPolicies.into())
+    }
+    /// Delete the Pods, Services, Secrets, and NetworkPolicies in `namespace` that match the label
+    /// `selector`. Nothing matching is success. The default no-ops.
+    async fn delete_selected(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _selector: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Delete the Services in `namespace` that match the label `selector`, and nothing else: a run
+    /// gateway leaves only its loop Service in the loop namespace, where the controller may touch
+    /// Services alone. Nothing matching is success. The default no-ops.
+    async fn delete_services(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _selector: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Delete the OpenShell `Sandbox` resources in `namespace` that match the label `selector`.
+    /// Nothing matching is success. The default no-ops.
+    async fn delete_sandboxes(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _selector: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// The values of `label` on the Pods, Services, Secrets, and NetworkPolicies in `namespace`
+    /// that match the label `selector`. The default finds none.
+    async fn selected_label_values(
+        &self,
+        _cluster: &str,
+        _namespace: &str,
+        _selector: &str,
+        _label: &str,
+    ) -> Result<BTreeSet<String>> {
+        Ok(BTreeSet::new())
     }
     async fn await_terminal(
         &self,

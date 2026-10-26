@@ -257,7 +257,7 @@ pub(crate) struct DecisionAnswerDto {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub(crate) struct DecisionDto {
+pub(crate) struct DecisionRequestDto {
     pub id: String,
     pub run_id: String,
     pub task: String,
@@ -290,7 +290,7 @@ fn state_name(status: &RequestStatus) -> &'static str {
     }
 }
 
-fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
+fn dto(d: store::Decision, can_answer: bool) -> DecisionRequestDto {
     let answer = match &d.status {
         RequestStatus::Answered { answer } => Some(DecisionAnswerDto {
             labels: answer
@@ -304,7 +304,7 @@ fn dto(d: store::Decision, can_answer: bool) -> DecisionDto {
         }),
         _ => None,
     };
-    DecisionDto {
+    DecisionRequestDto {
         state: state_name(&d.status).to_owned(),
         questions: d
             .questions
@@ -404,7 +404,7 @@ pub(crate) async fn list_decisions(State(state): State<ApiState>, caller: Caller
     path = "/api/decisions/{id}",
     params(("id" = String, Path, description = "Decision request id")),
     responses(
-        (status = 200, description = "The request and its evidence", body = DecisionDto),
+        (status = 200, description = "The request and its evidence", body = DecisionRequestDto),
         (status = 404, description = "No such request", body = ErrorBody)
     )
 )]
@@ -481,7 +481,7 @@ fn checked(
     params(("id" = String, Path, description = "Decision request id")),
     request_body = DecisionAnswerBody,
     responses(
-        (status = 200, description = "The request, answered", body = DecisionDto),
+        (status = 200, description = "The request, answered", body = DecisionRequestDto),
         (status = 403, description = "The caller may not approve this run", body = ErrorBody),
         (status = 404, description = "No such request", body = ErrorBody),
         (status = 409, description = "The request is closed, or the evidence changed", body = ErrorBody),

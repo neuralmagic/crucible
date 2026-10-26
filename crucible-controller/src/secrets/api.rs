@@ -176,14 +176,30 @@ pub struct RegisterSecretBody {
     /// A `vault://<mount>/<path>#<key>` pointer at a path someone else owns.
     #[serde(default)]
     pub reference: Option<String>,
-    /// A minter name (`github-app`): nothing is stored, and the bytes are issued at every
-    /// dispatch instead.
+    /// A minter name (`github-app`, or `github-app/<owner>` for the App's installation on another
+    /// account): nothing is stored, and the bytes are issued at every dispatch instead.
     #[serde(default)]
     pub mint: Option<String>,
     /// The registrant's own Vault token, used for one verification read of `reference` and then
     /// dropped. Required in reference mode; never stored.
     #[serde(default)]
     pub vault_token: Option<String>,
+}
+
+/// A token for an account the App is not installed on could never be issued, so the registration
+/// is refused while someone is watching rather than at the first dispatch.
+async fn check_installed(
+    state: &ApiState,
+    owner: &crate::secrets::github_app::GithubOwner,
+) -> Option<Response> {
+    let app = state.pack_pr_app.as_ref()?;
+    match app.installation_of(owner).await {
+        Ok(Some(_)) => None,
+        Ok(None) => Some(unprocessable(format!(
+            "the GitHub App is not installed on {owner}"
+        ))),
+        Err(e) => Some(unavailable(format!("{e:#}"))),
+    }
 }
 
 /// An inference key's bytes are read back as [`crate::secrets::credentials::Credentials`] at every
@@ -422,6 +438,11 @@ pub(crate) async fn register_secret(
         },
         None => None,
     };
+    if let Some(crate::secrets::minter::Minter::GithubApp(Some(owner))) = &mint
+        && let Some(refusal) = check_installed(&state, owner).await
+    {
+        return refusal;
+    }
     // A minted secret stores no bytes, so its registration needs no Vault client.
     let (mode, vault_path, client) = match mint {
         Some(minter) => {

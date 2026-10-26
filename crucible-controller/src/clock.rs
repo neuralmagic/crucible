@@ -15,3 +15,8 @@ pub(crate) fn now_rfc3339() -> String {
 pub(crate) fn today_utc() -> String {
     jiff::Timestamp::now().strftime("%Y-%m-%d").to_string()
 }
+
+/// Current instant as Unix seconds; an instant before the epoch reads as 0.
+pub(crate) fn unix_secs() -> u64 {
+    u64::try_from(jiff::Timestamp::now().as_second()).unwrap_or(0)
+}

@@ -2,6 +2,7 @@
 //! land on, the live relay, the evidence uploads and log scrape that bring the session back, the run's
 //! artifacts and evidence, and the completion edge that folds it into the ledger.
 
+pub mod agent_tools;
 pub(crate) mod api;
 pub mod artifacts;
 pub mod blob_store;

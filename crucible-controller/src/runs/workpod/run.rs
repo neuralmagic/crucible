@@ -41,6 +41,7 @@ use std::time::Duration;
 /// Everything the blocking half of a dispatch needs: render the run's pod and pack ConfigMap, then
 /// stamp the pod with what the controller knows about the run.
 struct RunPodRender {
+    isolated: bool,
     pack: std::path::PathBuf,
     pack_digest: TreeDigest,
     inputs: RunInputs,
@@ -60,16 +61,21 @@ struct RunPodRender {
 }
 
 impl RunPodRender {
-    fn render(self) -> Result<(Pod, Option<ConfigMap>)> {
-        let (mut pod, cm) = render_run_docs(
+    fn render(self) -> Result<RunDocs> {
+        let RunDocs {
+            mut pod,
+            pack,
+            sandbox_ports,
+        } = render_run_docs(
             &self.pack,
             &self.profile,
             &self.pod_name,
             &self.opts,
             self.inputs,
             self.digests,
+            self.isolated,
         )?;
-        check_delivered_tree(cm.as_ref(), &self.pack_digest)?;
+        check_delivered_tree(pack.as_ref(), &self.pack_digest)?;
         stamp_run_pod(
             &mut pod,
             &self.pod_name,
@@ -93,7 +99,11 @@ impl RunPodRender {
             stamp_git_identity(&mut pod, who);
         }
         crate::secrets::deliver::stamp(&mut pod, &self.secret_name, &self.delivery);
-        Ok((pod, cm))
+        Ok(RunDocs {
+            pod,
+            pack,
+            sandbox_ports,
+        })
     }
 }
 
@@ -144,6 +154,14 @@ impl RunRenderOpts {
             max_cost: eff.run_max_cost,
             pr_repo: cfg.pr_repo_for(repo),
             agent,
+        }
+    }
+
+    /// The run's wall-clock ceiling in seconds, when it states one.
+    pub(crate) fn max_time_secs(&self) -> Option<u64> {
+        match self {
+            RunRenderOpts::Loop { .. } => None,
+            RunRenderOpts::Playbook { max_time, .. } => Some(max_time.secs()),
         }
     }
 
@@ -229,7 +247,8 @@ impl RunRenderOpts {
 /// runs it under `spawn_blocking`. `pod_name` is the run's pod: the render names the run after it,
 /// so its state is its own, and names the pack ConfigMap `<pod>-pack`, so the CM and
 /// the pod volume that references it never drift. `opts` carries the per-kind run knobs
-/// ([`RunRenderOpts`]), and `inputs` the per-run files delivered beside the pack.
+/// ([`RunRenderOpts`]), and `inputs` the per-run files delivered beside the pack. `isolated` reads the
+/// sandbox ports an isolated gateway's loop Service needs.
 pub fn render_run_docs(
     pack_out: &Path,
     profile_path: &Path,
@@ -237,14 +256,15 @@ pub fn render_run_docs(
     opts: &RunRenderOpts,
     inputs: RunInputs,
     digests: Option<Arc<dyn DigestResolver>>,
-) -> Result<(Pod, Option<ConfigMap>)> {
+    isolated: bool,
+) -> Result<RunDocs> {
     let manifest = pack_out.join("crucible.toml");
     let yaml = render_yaml(
         &manifest,
         profile_path,
         &opts.render_opts(pod_name, inputs, digests)?,
     )?;
-    extract_run_docs(&yaml)
+    extract_run_docs(&yaml, isolated)
 }
 
 /// Per-run files delivered beside a pack's tree, keyed by the pack-relative path a run reads them
@@ -287,13 +307,24 @@ fn check_delivered_tree(cm: Option<&ConfigMap>, expected: &TreeDigest) -> Result
     Ok(())
 }
 
-/// Pull the `Pod` and (optional) `ConfigMap` documents out of a (possibly multi-doc) rendered
-/// manifest — the loop pod, its RBAC/NetworkPolicy, and, under pack delivery, the pack ConfigMap. A
-/// baked-domain render carries no ConfigMap, so `None` is the backward-compatible case. The Pod is
-/// required; its absence is a render bug.
-fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
+/// What the controller takes from a loop-run render.
+#[derive(Debug)]
+pub struct RunDocs {
+    pub pod: Pod,
+    /// The pack ConfigMap, under pack delivery.
+    pub pack: Option<ConfigMap>,
+    /// The ports the loop pod's NetworkPolicy admits sandbox traffic on.
+    pub sandbox_ports: Vec<u16>,
+}
+
+/// Pull the `Pod`, (optional) `ConfigMap`, and, when `isolated`, the loop NetworkPolicy's ingress
+/// ports out of a (possibly multi-doc) rendered manifest — the loop pod, its RBAC/NetworkPolicy,
+/// and, under pack delivery, the pack ConfigMap. A baked-domain render carries no ConfigMap, so
+/// `None` is the backward-compatible case. The Pod is required; its absence is a render bug.
+fn extract_run_docs(yaml: &str, isolated: bool) -> Result<RunDocs> {
     let mut pod = None;
     let mut cm = None;
+    let mut sandbox_ports = Vec::new();
     for doc in serde_norway::Deserializer::from_str(yaml) {
         let value = serde_norway::Value::deserialize(doc).context("parsing a rendered YAML doc")?;
         match value.get("kind").and_then(|k| k.as_str()) {
@@ -309,11 +340,42 @@ fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
                         .context("decoding the rendered pack ConfigMap")?,
                 );
             }
+            Some("NetworkPolicy") if isolated => {
+                let policy = serde_norway::from_value::<
+                    k8s_openapi::api::networking::v1::NetworkPolicy,
+                >(value)
+                .context("decoding the rendered loop NetworkPolicy")?;
+                sandbox_ports.extend(ingress_ports(&policy)?);
+            }
             _ => {}
         }
     }
     let pod = pod.context("the rendered manifest contained no Pod document")?;
-    Ok((pod, cm))
+    sandbox_ports.sort_unstable();
+    sandbox_ports.dedup();
+    Ok(RunDocs {
+        pod,
+        pack: cm,
+        sandbox_ports,
+    })
+}
+
+fn ingress_ports(policy: &k8s_openapi::api::networking::v1::NetworkPolicy) -> Result<Vec<u16>> {
+    use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
+    policy
+        .spec
+        .iter()
+        .flat_map(|s| s.ingress.iter().flatten())
+        .flat_map(|rule| rule.ports.iter().flatten())
+        .filter_map(|p| p.port.as_ref())
+        .map(|port| match port {
+            IntOrString::Int(n) => u16::try_from(*n)
+                .with_context(|| format!("the loop NetworkPolicy admits port {n}, out of range")),
+            IntOrString::String(name) => {
+                bail!("the loop NetworkPolicy admits the named port {name:?}; only numbered ports are served")
+            }
+        })
+        .collect()
 }
 
 /// Stamp the controller-owned metadata onto the rendered pack ConfigMap so it is GC'd, selectable, and
@@ -324,24 +386,11 @@ fn extract_run_docs(yaml: &str) -> Result<(Pod, Option<ConfigMap>)> {
 /// bespoke cleanup — the CM's lifetime is glued to the pod's. The render already set the CM's name +
 /// namespace to the run-unique values, so this only adds ownership + selectors.
 fn stamp_run_configmap(cm: &mut ConfigMap, pod: &Pod, issue_key: &str) {
-    stamp_managed_meta(&mut cm.metadata, issue_key, owner_reference_to_pod(pod));
-}
-
-/// An ownerReference pointing at a just-created pod (its UID populated by the API server), for
-/// cascade-GC'ing the pack ConfigMap with the pod. `None` when the pod has no name/UID yet (a fake
-/// dispatcher that doesn't stamp a UID) — the CM is still created, just not cascade-owned, and the
-/// managed-by selector keeps it sweepable.
-fn owner_reference_to_pod(pod: &Pod) -> Option<OwnerReference> {
-    let name = pod.metadata.name.clone().filter(|s| !s.is_empty())?;
-    let uid = pod.metadata.uid.clone().filter(|s| !s.is_empty())?;
-    Some(OwnerReference {
-        api_version: "v1".to_string(),
-        kind: "Pod".to_string(),
-        name,
-        uid,
-        controller: Some(true),
-        block_owner_deletion: Some(true),
-    })
+    stamp_managed_meta(
+        &mut cm.metadata,
+        issue_key,
+        crate::runs::workpod::gateway::owner_reference_to_pod(pod),
+    );
 }
 
 /// Stamp the controller-owned metadata onto a rendered loop-run pod: override its object name with
@@ -503,6 +552,12 @@ pub enum RunAdmission {
     ContractRejected,
 }
 
+/// Whether the hub can only receive pushes from a cluster, and so cannot create a run's gateway
+/// there: it holds a push token for it and no client of its own.
+pub(crate) fn push_only(pushes: bool, reaches: bool) -> bool {
+    pushes && !reaches
+}
+
 /// What a dispatch needs to resolve the run's secrets: the scope whose bindings apply, who is
 /// launching, and what content the launch runs. `None` at a call site means the launch resolves no
 /// bindings at all — an import test-fire, which has no scope to bind against.
@@ -586,6 +641,16 @@ pub async fn dispatch_run(
         "dispatch_run needs a deploy profile: set CONTROLLER_DEPLOY_PROFILE (or --deploy-profile) \
          to the profile the loop-pod render reads",
     )?;
+    let loaded = cfg.profile().await?;
+    let agent_servers = match loaded.as_ref() {
+        Some(p) => p
+            .agent_servers()
+            .context("reading the deploy profile's agent servers")?,
+        None => Vec::new(),
+    };
+    let isolated = loaded
+        .as_deref()
+        .filter(|p| crucible::deploy::render::gateway::isolated(p));
 
     let targets: Vec<crate::runs::contract::DispatchTarget> =
         crate::runs::contract::profile_target(&profile)
@@ -636,6 +701,16 @@ pub async fn dispatch_run(
     };
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
+    if isolated.is_some()
+        && push_only(
+            crate::runs::cluster_push::PushTokens::from_env()?.pushes_for(&cluster),
+            crate::runs::clusters::ClusterClients::new(cfg.clusters_dir.clone()).reaches(&cluster),
+        )
+    {
+        return Err(
+            crate::runs::workpod::gateway::DispatchError::PushOnlyCluster { cluster }.into(),
+        );
+    }
     // The inference document and the models' keys, resolved and read before the row insert so a
     // refusal leaves no work-pod row behind; a variable the scope's own bindings also claim is
     // refused the same way once both are known.
@@ -722,8 +797,7 @@ pub async fn dispatch_run(
                 rows.push(row);
                 values.push(value);
             }
-            let by_the_app =
-                crate::secrets::minter::any_bound(&rows, crate::secrets::minter::Minter::GithubApp);
+            let by_the_app = crate::secrets::minter::any_github_app(&rows);
             (
                 crate::secrets::deliver::assemble(&mints, &rows, &values)?,
                 by_the_app,
@@ -734,6 +808,25 @@ pub async fn dispatch_run(
         delivery
             .merge(extra)
             .map_err(|e| anyhow::anyhow!("folding the provider's delivery into the run's: {e}"))?;
+    }
+    if let Some(tokens) = crate::runs::workpod::agent_servers::AgentTokens::from_cfg(cfg)?
+        && let Some(access) = crate::runs::workpod::agent_servers::access(
+            &agent_servers,
+            &cluster,
+            &tokens,
+            loaded
+                .as_deref()
+                .map_or(crucible::deploy::profile::DEFAULT_SPIFFE_SOCKET, |p| {
+                    p.cluster.spiffe_socket()
+                }),
+        )?
+    {
+        delivery.merge(access).map_err(|e| {
+            anyhow::anyhow!("folding the agent servers' access into the run's: {e}")
+        })?;
+        crate::runs::agent_tools::grant(db, &agent_servers, run_id, &cluster, &tokens)
+            .await
+            .context("recording the run's agent tools")?;
     }
     let reads_run = match &opts {
         RunRenderOpts::Playbook {
@@ -777,7 +870,46 @@ pub async fn dispatch_run(
     let namespace = dispatcher
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
+    if let Some(isolated) = isolated {
+        let mut spire: Vec<crate::agent_auth::cluster_spire::ClusterSpire> =
+            crate::agent_auth::issuer::parse_list(cfg.agent_spire.as_deref().unwrap_or_default())
+                .context("reading CONTROLLER_AGENT_SPIRE")?;
+        spire.extend(cfg.spire.ready());
+        crate::agent_auth::placement::check_loop_namespace(
+            &cluster,
+            &namespace,
+            isolated,
+            &spire,
+            crate::agent_auth::placement::controller_namespace().as_deref(),
+        )?;
+    }
+    // An isolated gateway's Service address goes into its server certificate, and the loop pod's
+    // client material into the run Secret, so both precede the render.
+    let mut gateway = None;
+    let reserved: Result<()> = match isolated {
+        Some(gateway_profile) => {
+            match crate::runs::workpod::gateway::RunGateway::reserve(
+                dispatcher.as_ref(),
+                &cluster,
+                gateway_profile,
+                &pod_name,
+                opts.max_time_secs(),
+            )
+            .await
+            {
+                Ok(reserved) => delivery
+                    .merge(reserved.loop_delivery())
+                    .map(|()| gateway = Some(reserved))
+                    .map_err(|e| {
+                        anyhow::anyhow!("folding the gateway client material into the run's: {e}")
+                    }),
+                Err(e) => Err(e),
+            }
+        }
+        None => Ok(()),
+    };
     let job = RunPodRender {
+        isolated: isolated.is_some(),
         pack: pack.path().to_path_buf(),
         pack_digest: pack.digest().clone(),
         inputs,
@@ -797,16 +929,24 @@ pub async fn dispatch_run(
     };
     // The render reads the pack and pins images, so it stays on a blocking thread; the pod + CM
     // creates are plain async kube calls awaited here.
-    let rendered = tokio::task::spawn_blocking(move || job.render())
-        .await
-        .context("joining the loop-run render task")?;
+    let rendered = match reserved {
+        Ok(()) => tokio::task::spawn_blocking(move || job.render())
+            .await
+            .context("joining the loop-run render task")?,
+        Err(e) => Err(e),
+    };
+
     let issue_for_cm = issue_key.to_string();
     // Create the pod FIRST (so its UID exists to owner-ref the CM to), then the CM. A pack pod waits
     // in ContainerCreating on its init-container's ConfigMap mount until the CM lands a beat later; the
     // CM owner-ref'd to the pod means k8s cascade-GCs it whenever the pod is deleted, so no delete site
     // needs to know the CM exists.
     let created = match rendered {
-        Ok((mut pod, cm)) => {
+        Ok(RunDocs {
+            mut pod,
+            pack: cm,
+            sandbox_ports,
+        }) => {
             // Pin the run pod's image(s) to the digests the pack's builds produced, so the measurement
             // can never run on a stale or half-built image. A no-op for a build-free pack (empty map)
             // — the static manifest image stands.
@@ -814,11 +954,28 @@ pub async fn dispatch_run(
             // Inject this dispatch's W3C trace context so the loop pod's engine re-roots its `run`
             // span under it (a no-op when the controller isn't exporting spans).
             crate::runs::workpod::trace::inject_dispatch_context(&mut pod);
-            match dispatcher
-                .create(&cluster, &namespace, pod)
-                .await
-                .context("creating the loop-run pod")
-            {
+            let gateway_started = match gateway.as_ref() {
+                Some(gateway) => {
+                    gateway
+                        .start(
+                            dispatcher.as_ref(),
+                            &cluster,
+                            &namespace,
+                            &pod,
+                            &sandbox_ports,
+                        )
+                        .await
+                }
+                None => Ok(()),
+            };
+            let loop_pod_created = match gateway_started {
+                Ok(()) => dispatcher
+                    .create(&cluster, &namespace, pod)
+                    .await
+                    .context("creating the loop-run pod"),
+                Err(e) => Err(e),
+            };
+            match loop_pod_created {
                 Ok(created_pod) => {
                     if let Some(uid) = created_pod
                         .metadata
@@ -877,6 +1034,22 @@ pub async fn dispatch_run(
             })
         }
         Err(e) => {
+            if let Some(profile) = isolated
+                && let Err(cleanup) = crate::runs::workpod::gateway::teardown(
+                    dispatcher.as_ref(),
+                    &cluster,
+                    profile,
+                    &pod_name,
+                    &namespace,
+                )
+                .await
+            {
+                tracing::warn!(
+                    error = format!("{cleanup:#}"),
+                    pod_name,
+                    "a failed launch left its gateway; the gateway sweep removes it"
+                );
+            }
             crate::runs::pod_token::revoke(
                 db.pool(),
                 &crate::runs::pod_token::Subject::Run(run_id.to_string()),
@@ -937,6 +1110,7 @@ pub async fn collect_run_pod(
     db: &Db,
     dispatcher: &dyn PodDispatcher,
     hub_namespace: &str,
+    profile: Option<&crucible::deploy::DeployProfile>,
     pod_name: &str,
     disposition: RunDisposition,
 ) -> Result<()> {
@@ -954,10 +1128,21 @@ pub async fn collect_run_pod(
         None,
     )
     .await?;
-    if let Some(ns) =
-        crate::runs::workpod::row_namespace(dispatcher, &row.cluster, hub_namespace).await
+    let ns = crate::runs::workpod::row_namespace(dispatcher, &row.cluster, hub_namespace).await;
+    if let Some(ns) = ns.as_deref() {
+        let _ = dispatcher.delete(&row.cluster, ns, pod_name).await;
+    }
+    if let Some(profile) = profile.filter(|p| crucible::deploy::render::gateway::isolated(p))
+        && let Some(ns) = ns.as_deref()
+        && let Err(e) =
+            crate::runs::workpod::gateway::teardown(dispatcher, &row.cluster, profile, pod_name, ns)
+                .await
     {
-        let _ = dispatcher.delete(&row.cluster, &ns, pod_name).await;
+        tracing::warn!(
+            error = format!("{e:#}"),
+            pod_name,
+            "deleting the run's gateway failed; the gateway sweep removes it"
+        );
     }
     Ok(())
 }
@@ -1198,10 +1383,12 @@ pub(crate) async fn dispatch_grounded_rank(
         &spec,
         spec::GroundedRankSpec.pod_noun(),
         &profile,
+        &cfg.profile_cache,
         cfg.digest_resolver(),
         &cluster,
         &namespace,
         &delivery,
+        GROUNDED_RANK_TIMEOUT,
     )
     .await?
     {

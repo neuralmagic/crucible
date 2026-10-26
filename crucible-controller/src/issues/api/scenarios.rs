@@ -709,7 +709,19 @@ pub(crate) async fn approve_scenario(
     match crate::issues::store::record_approval(state.db.pool(), scope.id, &actor, &approved_at)
         .await
     {
-        Ok(true) => {}
+        Ok(true) => {
+            if state.agent_tools
+                && let Some(login) = identity.as_deref()
+                && let Err(e) =
+                    crate::issues::store::request_dispatch(state.db.pool(), &key, login).await
+            {
+                tracing::warn!(
+                    issue_key = %key,
+                    error = format!("{e:#}"),
+                    "recording who the approved dispatch acts for failed; it acts for the run's owner"
+                );
+            }
+        }
         // `approved_at IS NOT NULL` already — someone beat this caller to the stamp. Report the
         // stamp that actually landed instead of a fabricated 200, and skip the audit event: the
         // ledger already has the real approval.

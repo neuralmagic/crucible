@@ -17,6 +17,7 @@ use utoipa_axum::routes;
 pub mod state;
 use state::*;
 
+mod agent_auth;
 #[cfg(feature = "autoresearch")]
 mod autoresearch;
 
@@ -199,11 +200,13 @@ pub(crate) mod tests;
     components(schemas(
         system::Health,
         system::Whoami,
+        system::Features,
         crate::identity::auth::Role,
         system::AccessDto,
         crate::identity::api::prefs::PrefsDto,
         crate::identity::api::prefs::EditorPrefsDto,
         crate::identity::api::prefs::PickerPrefsDto,
+        crate::runs::agent_tools::AgentTool,
         dto::Overview,
         dto::StatusCount,
         dto::TierCount,
@@ -402,8 +405,9 @@ struct ApiDoc;
 
 /// Return the OpenAPI spec as JSON. Can be called without a running server for typegen workflows.
 pub(crate) fn openapi_spec() -> anyhow::Result<String> {
-    #[allow(unused_mut)]
     let mut doc = ApiDoc::openapi();
+    doc.merge(agent_auth::IdentityDoc::openapi());
+    doc.merge(agent_auth::AgentToolsDoc::openapi());
     #[cfg(feature = "autoresearch")]
     doc.merge(autoresearch::AutoresearchDoc::openapi());
     Ok(doc.to_json()?)
@@ -671,7 +675,18 @@ pub fn router(state: ApiState) -> Router {
     } else {
         router
     };
-    let (router, api) = router.split_for_parts();
+    let router = match state.identities {
+        true => agent_auth::identity_routes(router),
+        false => router,
+    };
+    let (router, mut api) = router.split_for_parts();
+    let router = match state.agent_tools {
+        true => {
+            api.merge(agent_auth::AgentToolsDoc::openapi());
+            agent_auth::agent_tool_routes(router)
+        }
+        false => router,
+    };
 
     router
         // The artifact proxy is a catch-all (`{*path}` captures `diffs/<file>`, which carries a

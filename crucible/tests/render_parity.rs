@@ -82,6 +82,7 @@ fn deploy_render_matches_render_yaml() {
             harness: Some(Harness::Hermes),
             model: Some("hermes-4-70b".to_string()),
             playbook: None,
+            platform: None,
         },
     )
     .expect("library render");
@@ -176,6 +177,7 @@ fn deploy_render_pack_playbook_matches_render_yaml() {
                 ]),
                 rerun: None,
             }),
+            platform: None,
         },
     )
     .expect("library render");

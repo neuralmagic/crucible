@@ -89,8 +89,20 @@ pub(crate) struct Whoami {
     acting_as: Option<crate::authz::model::TeamSlug>,
     /// The lanes the subject may see and use.
     entitlements: Vec<crate::authz::entitlement::Entitlement>,
+    /// What this deployment has switched on.
+    features: Features,
     /// Set while a platform administrator's session views as this user.
     impersonation: Option<crate::identity::session::Impersonation>,
+}
+
+/// Optional features a deployment switches on, so the SPA renders and fetches only what is served.
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+pub(crate) struct Features {
+    /// Runs get agent tools: the run page lists them and the banner names the defaults.
+    pub agent_tools: bool,
+    /// People's cluster usernames matter here (people OAuth, cluster links, or agent tokens that
+    /// carry them): the consent page and the settings' identity panels.
+    pub identities: bool,
 }
 
 #[utoipa::path(
@@ -126,6 +138,10 @@ pub(crate) async fn whoami(
         teams,
         acting_as: caller.acting_as.as_ref().map(|acting| acting.team.clone()),
         entitlements: crate::authz::entitlement::of(&state, &caller),
+        features: Features {
+            agent_tools: state.agent_tools,
+            identities: state.identities,
+        },
         impersonation: impersonation.map(|axum::Extension(view)| view),
     })
 }

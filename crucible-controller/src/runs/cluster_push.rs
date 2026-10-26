@@ -54,6 +54,11 @@ impl PushTokens {
         self.0.is_empty()
     }
 
+    /// Whether `cluster` reports by push: the hub holds a push credential for it.
+    pub fn pushes_for(&self, cluster: &str) -> bool {
+        self.0.values().any(|c| c == cluster)
+    }
+
     /// The cluster this bearer token pushes for, if it is a configured push credential.
     fn cluster_for(&self, bearer: &str) -> Option<&str> {
         self.0.get(bearer).map(String::as_str)

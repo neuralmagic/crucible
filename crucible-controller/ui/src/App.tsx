@@ -9,7 +9,7 @@ import {
 } from 'react';
 import { Route, Routes, Link, NavLink, Navigate, useLocation } from 'react-router-dom';
 import { $api } from './api/client';
-import { useAutoresearch } from './api/lanes';
+import { useAgentTools, useAutoresearch, useIdentities } from './api/lanes';
 import { budgetPercent, budgetState, usd, yourSpendToday, type BudgetState } from './budget';
 import { cn, ErrorBoundary, Spinner, Status, Tooltip } from './ui';
 import { useDeviceFlag } from './useDeviceFlag';
@@ -17,6 +17,7 @@ import { relativeTime } from './pages/journeyView';
 import { DisplayPrefs } from './DisplayPrefs';
 import { IdentityBadge } from './IdentityBadge';
 import { OwnerSwitcher } from './OwnerSwitcher';
+import { AgentToolsBanner } from './AgentToolsBanner';
 import { AutopilotBanner } from './AutopilotBanner';
 import { ViewAsBanner } from './ViewAsBanner';
 import { CommandPalette } from './palette/CommandPalette';
@@ -75,6 +76,7 @@ const PolicyPage = page(() => import('./pages/PolicyPage'), 'PolicyPage');
 const SecretsPage = page(() => import('./pages/SecretsPage'), 'SecretsPage');
 const ProvidersPage = page(() => import('./pages/ProvidersPage'), 'ProvidersPage');
 const SettingsPage = page(() => import('./pages/SettingsPage'), 'SettingsPage');
+const ConsentPage = page(() => import('./pages/ConsentPage'), 'ConsentPage');
 const TeamsPage = page(() => import('./pages/TeamsPage'), 'TeamsPage');
 const TeamDetailPage = page(() => import('./pages/TeamDetailPage'), 'TeamDetailPage');
 const TeamMembersPage = page(() => import('./pages/TeamDetailPage'), 'TeamMembersPage');
@@ -477,6 +479,8 @@ export function App() {
   const [collapsed, toggleRail] = useRailCollapsed();
   const autoresearch = useAutoresearch() === true;
   const { pathname } = useLocation();
+  const agentTools = useAgentTools() === true;
+  const identities = useIdentities() === true;
 
   return (
     <div className="flex h-screen min-h-0 flex-col">
@@ -508,6 +512,7 @@ export function App() {
       <ViewAsBanner />
       <DatasheetStrip />
       {autoresearch ? <AutopilotBanner /> : null}
+      {agentTools ? <AgentToolsBanner /> : null}
 
       <div className="flex min-h-0 flex-1">
         <CategoryRail collapsed={collapsed} onToggle={toggleRail} />
@@ -560,6 +565,7 @@ export function App() {
             <Route path="/secrets" element={<SecretsPage />} />
             <Route path="/providers" element={<ProvidersPage />} />
             <Route path="/settings" element={<SettingsPage />} />
+            {identities ? <Route path="/consent" element={<ConsentPage />} /> : null}
             <Route path="/teams" element={<TeamsPage />} />
             <Route path="/teams/:slug" element={<TeamDetailPage />} />
             <Route path="/teams/:slug/members" element={<TeamMembersPage />} />

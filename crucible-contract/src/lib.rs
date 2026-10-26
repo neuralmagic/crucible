@@ -6,8 +6,11 @@
 //! The crate depends on serde only, with no async runtime and no kube client.
 
 pub mod admission;
+pub mod agent_servers;
 pub mod artifact;
 pub mod ask;
+pub mod buildit;
+pub mod cluster_link;
 pub mod decision;
 pub mod decision_request;
 pub mod emits;
@@ -17,6 +20,7 @@ pub mod history;
 pub mod identity;
 pub mod inference;
 pub mod json;
+pub mod kueue;
 pub mod link;
 pub mod markers;
 pub mod mcp;
@@ -24,6 +28,7 @@ pub mod outputs;
 pub mod pack_tree;
 pub mod refine;
 pub mod report;
+pub mod sandbox;
 pub mod scope;
 pub mod session;
 pub mod tier;

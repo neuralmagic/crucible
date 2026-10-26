@@ -26,10 +26,13 @@
 //! spec described above, [`scrape`] the log/marker scraping, [`dispatcher`] the [`PodDispatcher`]
 //! trait boundary, [`run`] the `WorkKind::Run` section (the full autoresearch loop pod folded onto
 //! the primitive), [`kube_dispatcher`] the [`KubePodDispatcher`], [`sweep`] the failed/timed-out
-//! pod GC, and [`globals`] the installable dispatcher/enqueue statics.
+//! pod GC, [`gateway`] an isolated run's gateway pod, and [`globals`] the installable
+//! dispatcher/enqueue statics.
 
+pub(crate) mod agent_servers;
 mod core;
 mod dispatcher;
+pub mod gateway;
 mod globals;
 mod kube_dispatcher;
 mod markers;
@@ -77,14 +80,15 @@ pub(crate) use sweep::*;
 
 pub use core::{WorkKind, WorkPodState};
 pub use dispatcher::PodDispatcher;
+pub(crate) use gateway::GatewaySweep;
 pub use globals::{
     install_contracts, install_dispatcher, install_enqueue, reset_contracts, reset_dispatcher,
     reset_enqueue,
 };
 pub use kube_dispatcher::{KubePodDispatcher, reconcile_on_startup};
 pub use run::{
-    LaunchSecrets, RunAdmission, RunDisposition, RunRenderOpts, collect_run_pod, dispatch_run,
-    render_run_docs, run_pod_name, stamp_run_pod,
+    LaunchSecrets, RunAdmission, RunDisposition, RunDocs, RunRenderOpts, collect_run_pod,
+    dispatch_run, render_run_docs, run_pod_name, stamp_run_pod,
 };
 #[cfg(feature = "autoresearch")]
 pub use run::{ScopeOutcome, dispatch_scope};

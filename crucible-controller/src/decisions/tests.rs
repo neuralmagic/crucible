@@ -698,7 +698,7 @@ async fn the_decision_schemas_shadow_no_other_schema(pool: PgPool) {
     assert_eq!(status, StatusCode::OK);
     let schemas = &spec["components"]["schemas"];
     for name in [
-        "DecisionDto",
+        "DecisionRequestDto",
         "DecisionsDto",
         "DecisionSummaryDto",
         "DecisionQuestionDto",
@@ -715,5 +715,11 @@ async fn the_decision_schemas_shadow_no_other_schema(pool: PgPool) {
             .get("name")
             .is_some(),
         "the task-evidence file schema is intact"
+    );
+    assert!(
+        schemas["DecisionRequestDto"]["properties"]
+            .get("can_answer")
+            .is_some(),
+        "the decision request schema is intact"
     );
 }

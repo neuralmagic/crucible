@@ -9,7 +9,7 @@
 
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
-use forge::fleet::{ClusterEntry, FleetFile};
+use forge::fleet::{ClusterEntry, ClusterIdentity, FleetFile};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -48,6 +48,480 @@ pub struct DeployProfile {
     /// (`clusters.toml` beside the profile); a local block overrides the fleet file on conflict.
     #[serde(default)]
     pub clusters: BTreeMap<String, ClusterEntry>,
+    /// The crucible-kueue MCP server: where it runs, and the scope each run's token gets.
+    #[serde(default)]
+    pub kueue: Option<KueueCfg>,
+    /// buildit, started in each run's loop pod on the clusters it names.
+    #[serde(default)]
+    pub buildit: Option<BuilditCfg>,
+    /// Other MCP servers that take agent tokens, each `[[agent_servers]]`.
+    #[serde(default)]
+    pub agent_servers: Vec<AgentServerCfg>,
+    /// The controller's OpenShift OAuth client, through which people link their username on a
+    /// cluster without pasting a token.
+    #[serde(default)]
+    pub cluster_link: Option<ClusterLinkCfg>,
+}
+
+/// A Kubernetes object or namespace name: a DNS-1123 label.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct KubeName(String);
+
+#[derive(Debug, thiserror::Error)]
+#[error("{0:?} is not a DNS-1123 label (lowercase alphanumerics and '-', 1-63 chars)")]
+pub struct NotKubeName(String);
+
+impl TryFrom<String> for KubeName {
+    type Error = NotKubeName;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let ok = (1..=63).contains(&value.len())
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !value.starts_with('-')
+            && !value.ends_with('-');
+        match ok {
+            true => Ok(Self(value)),
+            false => Err(NotKubeName(value)),
+        }
+    }
+}
+
+impl KubeName {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for KubeName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "{0:?} is not a cluster name: a DNS-1123 label (lowercase alphanumerics and '-', 1-63 chars)"
+)]
+pub struct NotClusterName(pub String);
+
+/// Whether `name` can name a cluster: the hub, a `[clusters.<name>]` spoke, or a cluster in
+/// controller configuration. Every place that reads a cluster name checks it here, so a name one
+/// accepts the others accept too.
+pub fn check_cluster_name(name: &str) -> Result<(), NotClusterName> {
+    KubeName::try_from(name.to_string())
+        .map(|_| ())
+        .map_err(|_| NotClusterName(name.to_string()))
+}
+
+/// A ServiceAccount, written `namespace/name`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct ServiceAccountRef {
+    pub namespace: KubeName,
+    pub name: KubeName,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ServiceAccountRefError {
+    #[error("service account {0:?} is not written namespace/name")]
+    Shape(String),
+    #[error("service account {whole:?}: {source}")]
+    Name {
+        whole: String,
+        #[source]
+        source: NotKubeName,
+    },
+}
+
+impl TryFrom<String> for ServiceAccountRef {
+    type Error = ServiceAccountRefError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let Some((ns, name)) = value.split_once('/') else {
+            return Err(ServiceAccountRefError::Shape(value));
+        };
+        let name_err = |source| ServiceAccountRefError::Name {
+            whole: value.clone(),
+            source,
+        };
+        Ok(Self {
+            namespace: KubeName::try_from(ns.to_string()).map_err(name_err)?,
+            name: KubeName::try_from(name.to_string()).map_err(name_err)?,
+        })
+    }
+}
+
+/// The `[kueue]` table. The server on each of `clusters` accepts runs' tokens from the controller's
+/// agent issuer and acts for each as its `kube_user`, as Kubernetes RBAC decides.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KueueCfg {
+    /// The server image, a tag the renderer resolves to `@sha256:…`. Only `deploy render --kueue`
+    /// reads it.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// The dispatch clusters the server runs on, `hub` or spoke names: `clusters = ["east",
+    /// "west"]`, or `cluster = "east"` for one.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
+    /// Namespace of the server's Deployment, Service, and ServiceAccount. Default
+    /// `crucible-kueue`.
+    #[serde(default = "default_kueue_namespace")]
+    pub namespace: KubeName,
+    /// The namespaces runs' tokens name, the first as the default, and the only ones where the
+    /// server's own account holds workload verbs: `workload_namespaces = [...]`, or
+    /// `workload_namespace = "..."` for one.
+    #[serde(alias = "workload_namespace", deserialize_with = "one_or_many_names")]
+    pub workload_namespaces: Vec<KubeName>,
+    /// Where the server fetches the agent issuer's keys. Default
+    /// `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json`; a server that cannot reach the issuer's
+    /// own address names a route here.
+    #[serde(default)]
+    pub run_jwks_uri: Option<url::Url>,
+    /// Where the server takes a caller's groups from for its SubjectAccessReviews. Default: the
+    /// cluster's OpenShift Group objects on `platform = "openshift"`, the token's `kube_groups`
+    /// claim elsewhere.
+    #[serde(default)]
+    pub kube_authz: Option<KubeAuthz>,
+    /// The cluster's DNS domain. The sandbox proxy resolves names without the pod's search list,
+    /// so the Service is addressed by its fully qualified name.
+    #[serde(default = "default_cluster_domain")]
+    pub cluster_domain: String,
+    /// Image pull secrets in the workload namespace that agents' pod templates may name, each
+    /// `name` or `name=registry`; the server adds a secret to any pod whose image is on its
+    /// registry (a host or host/path prefix).
+    #[serde(default)]
+    pub pull_secrets: Vec<String>,
+    /// Also serve people's MCP clients, with tokens from the same issuer: each cluster's server is
+    /// then a resource people may get tokens for.
+    #[serde(default)]
+    pub people: bool,
+    /// Where people's MCP clients reach the server, by cluster, when not at its Service URL (a
+    /// route, or a port-forward): `people_urls = { east = "https://kueue.east.example/mcp" }`.
+    /// A person's token names its cluster by this URL, so `people` on several clusters needs a
+    /// distinct one for each.
+    #[serde(default)]
+    pub people_urls: BTreeMap<String, url::Url>,
+}
+
+/// The dispatch name of the controller's own cluster.
+pub const HUB_CLUSTER: &str = "hub";
+
+fn hub_clusters() -> Vec<String> {
+    vec![HUB_CLUSTER.to_string()]
+}
+
+/// A string or a non-empty list of strings.
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    let list = match OneOrMany::deserialize(d)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    };
+    match list.is_empty() {
+        true => Err(serde::de::Error::custom("names no cluster")),
+        false => Ok(list),
+    }
+}
+
+fn one_or_many_names<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<KubeName>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(KubeName),
+        Many(Vec<KubeName>),
+    }
+    let list = match OneOrMany::deserialize(d)? {
+        OneOrMany::One(one) => vec![one],
+        OneOrMany::Many(many) => many,
+    };
+    match list.is_empty() {
+        true => Err(serde::de::Error::custom("names no namespace")),
+        false => Ok(list),
+    }
+}
+
+fn default_cluster_domain() -> String {
+    "cluster.local".to_string()
+}
+
+impl KueueCfg {
+    pub const SERVICE_NAME: &str = "crucible-kueue";
+    pub const PORT: u16 = 8850;
+
+    /// Whether a server runs on dispatch cluster `cluster`.
+    pub fn serves(&self, cluster: &str) -> bool {
+        self.clusters.iter().any(|c| c == cluster)
+    }
+
+    /// `kube_authz`, or the default for a cluster on `platform`.
+    pub fn kube_authz(&self, platform: forge::fleet::Platform) -> KubeAuthz {
+        self.kube_authz.unwrap_or(match platform {
+            forge::fleet::Platform::Openshift => KubeAuthz::Openshift,
+            forge::fleet::Platform::Kubernetes => KubeAuthz::Token,
+        })
+    }
+
+    /// The Service DNS name sandboxes reach the server at, and the Host the server accepts.
+    pub fn service_host(&self) -> String {
+        format!(
+            "{}.{}.svc.{}",
+            Self::SERVICE_NAME,
+            self.namespace,
+            self.cluster_domain
+        )
+    }
+
+    /// The MCP endpoint URL handed to the loop pod.
+    pub fn url(&self) -> String {
+        format!("http://{}:{}/mcp", self.service_host(), Self::PORT)
+    }
+
+    /// Where people's MCP clients reach the server on `cluster`: its `people_urls` entry, else
+    /// the Service URL.
+    pub fn people_url(&self, cluster: &str) -> String {
+        match self.people_urls.get(cluster) {
+            Some(url) => url.to_string(),
+            None => self.url(),
+        }
+    }
+
+    /// The key set URI of `issuer`, the controller's agent issuer: `run_jwks_uri`, or the
+    /// issuer's own.
+    pub fn run_jwks_uri(&self, issuer: &str) -> Result<url::Url, url::ParseError> {
+        jwks_uri(issuer, self.run_jwks_uri.as_ref())
+    }
+}
+
+/// The key set URI of `issuer`: `over`, or the issuer's own `/.well-known/jwks.json`.
+pub fn jwks_uri(issuer: &str, over: Option<&url::Url>) -> Result<url::Url, url::ParseError> {
+    match over {
+        Some(uri) => Ok(uri.clone()),
+        None => url::Url::parse(&format!(
+            "{}/.well-known/jwks.json",
+            issuer.trim_end_matches('/')
+        )),
+    }
+}
+
+/// The `[buildit]` table. A run on one of `clusters` starts buildit in its loop pod, which runs
+/// builder pods in `namespace` for the run's own sandboxes, accepting their tokens from the
+/// controller's agent issuer (`CONTROLLER_AGENT_ISSUER`).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilditCfg {
+    /// The dispatch clusters whose runs get buildit: `clusters = [...]`, or `cluster = "..."`.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
+    /// Where builder pods run: a namespace of their own, never the loop, rig, sandbox or
+    /// crucible-kueue namespaces, since the rights to create and exec into them reach every pod
+    /// there. Default `crucible-builds`.
+    #[serde(default = "default_builder_namespace")]
+    pub namespace: KubeName,
+    /// Where buildit fetches the agent issuer's keys. Default
+    /// `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json`; a loop pod that cannot reach the issuer's
+    /// own address names a route here.
+    #[serde(default)]
+    pub run_jwks_uri: Option<url::Url>,
+    /// The one repository builds may be pushed to, with the loop pod's push authfile
+    /// (`[secrets] push_authfile`). Unset, buildit pushes nothing.
+    #[serde(default)]
+    pub push_repo: Option<String>,
+    /// The URL sandboxes reach buildit at; it listens on its port in the loop pod. Default
+    /// `http://host.openshell.internal:8848/mcp`.
+    #[serde(default)]
+    pub url: Option<url::Url>,
+    /// Where builder pods may connect besides DNS, since a build's `RUN` steps run unsandboxed:
+    /// the registries they pull from and push to. Default: TCP 443 anywhere.
+    #[serde(default = "default_builder_egress")]
+    pub egress: Vec<BuilderEgress>,
+    /// The ResourceQuota `hard` limits of the builder namespace. Default: 16 pods and no GPUs.
+    /// Builder pods request no CPU or memory, so a `requests.cpu` or `requests.memory` limit would
+    /// refuse every one.
+    #[serde(default = "default_builder_quota")]
+    pub quota: BTreeMap<String, String>,
+}
+
+/// An IP network builder pods may reach, on `ports`, less the networks in `except` (such as the
+/// cluster's pod and service networks).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderEgress {
+    pub cidr: String,
+    #[serde(default = "https_ports")]
+    pub ports: Vec<u16>,
+    #[serde(default)]
+    pub except: Vec<String>,
+}
+
+fn https_ports() -> Vec<u16> {
+    vec![443]
+}
+
+fn default_builder_quota() -> BTreeMap<String, String> {
+    [
+        ("pods", "16"),
+        ("requests.nvidia.com/gpu", "0"),
+        ("requests.amd.com/gpu", "0"),
+    ]
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .into()
+}
+
+fn default_builder_egress() -> Vec<BuilderEgress> {
+    ["0.0.0.0/0", "::/0"]
+        .map(|cidr| BuilderEgress {
+            cidr: cidr.to_string(),
+            ports: https_ports(),
+            except: Vec::new(),
+        })
+        .to_vec()
+}
+
+impl BuilditCfg {
+    /// Whether runs on dispatch cluster `cluster` get buildit.
+    pub fn serves(&self, cluster: &str) -> bool {
+        self.clusters.iter().any(|c| c == cluster)
+    }
+
+    /// The `[buildit] egress` networks that reach every address (`0.0.0.0/0`, `::/0`) with no
+    /// `except`: builder pods' `RUN` steps can then reach the cluster's API server and in-cluster
+    /// services on those ports.
+    pub fn unfenced_egress(&self) -> Vec<&str> {
+        self.egress
+            .iter()
+            .filter(|e| e.except.is_empty() && matches!(e.cidr.as_str(), "0.0.0.0/0" | "::/0"))
+            .map(|e| e.cidr.as_str())
+            .collect()
+    }
+
+    /// The port buildit listens on in the loop pod: its URL's.
+    pub fn port(&self) -> u16 {
+        self.url
+            .as_ref()
+            .and_then(url::Url::port_or_known_default)
+            .unwrap_or(crucible_contract::buildit::PORT)
+    }
+
+    /// The URL sandboxes reach buildit at.
+    pub fn url(&self) -> String {
+        match &self.url {
+            Some(url) => url.to_string(),
+            None => crucible_contract::buildit::URL.to_string(),
+        }
+    }
+
+    /// `<issuer>=<jwks uri>` for `issuer`, the controller's agent issuer, as buildit's
+    /// `--run-issuer` takes it.
+    pub fn trusted_issuer(&self, issuer: &str) -> Result<String, url::ParseError> {
+        let jwks = jwks_uri(issuer, self.run_jwks_uri.as_ref())?;
+        Ok(format!("{issuer}={jwks}"))
+    }
+}
+
+/// An `[[agent_servers]]` entry: an MCP server that takes agent tokens, deployed by its operator.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentServerCfg {
+    /// The `.mcp.json` key the agent sees its tools under.
+    pub name: crucible_contract::agent_servers::ServerName,
+    /// Its MCP URL, the audience of its tokens.
+    pub url: url::Url,
+    /// The scopes its tokens are minted with. Default: none.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The dispatch clusters whose runs get it: `clusters = [...]`, or `cluster = "..."`.
+    #[serde(
+        default = "hub_clusters",
+        alias = "cluster",
+        deserialize_with = "one_or_many"
+    )]
+    pub clusters: Vec<String>,
+    /// Whether it authorizes as the token's `kube_user`, so no token is minted without one.
+    #[serde(default)]
+    pub requires_kube_user: bool,
+    /// The namespaces its tokens name, the first as the default.
+    #[serde(default)]
+    pub namespaces: Vec<KubeName>,
+    /// Also a resource people's MCP clients may get tokens for, at `url` on each cluster.
+    #[serde(default)]
+    pub people: bool,
+}
+
+/// The source of a caller's groups for crucible-kueue's SubjectAccessReviews (`--kube-authz`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KubeAuthz {
+    /// OpenShift Group objects.
+    Openshift,
+    /// The token's `kube_groups` claim.
+    Token,
+}
+
+impl KubeAuthz {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Openshift => "openshift",
+            Self::Token => "token",
+        }
+    }
+}
+
+/// The `[cluster_link]` table: one `OAuthClient` per cluster in `openshift`, whose only redirect is
+/// the controller's callback for that cluster.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClusterLinkCfg {
+    /// The controller's URL as people's browsers reach it, when it is not the agent issuer.
+    pub external_url: Option<String>,
+    /// The `OAuthClient` name, the controller's client id on every cluster.
+    #[serde(default = "cluster_link_client_id")]
+    pub client_id: KubeName,
+    /// Clusters whose OAuth server links people: `hub` or `[clusters.<name>]` entries.
+    pub openshift: Vec<KubeName>,
+    /// Lifetime of the access token a link redeems. The controller drops it after one review.
+    #[serde(default = "cluster_link_token_age")]
+    pub access_token_max_age_secs: u32,
+}
+
+impl ClusterLinkCfg {
+    /// The controller's URL as people's browsers reach it: `external_url`, or else the agent
+    /// issuer.
+    pub fn browser_url<'a>(&'a self, issuer: Option<&'a str>) -> Option<&'a str> {
+        self.external_url.as_deref().or(issuer)
+    }
+}
+
+fn default_kueue_namespace() -> KubeName {
+    KubeName("crucible-kueue".to_string())
+}
+
+fn default_builder_namespace() -> KubeName {
+    KubeName("crucible-builds".to_string())
+}
+
+fn cluster_link_client_id() -> KubeName {
+    KubeName(crucible_contract::cluster_link::DEFAULT_CLIENT_ID.to_string())
+}
+
+fn cluster_link_token_age() -> u32 {
+    300
 }
 
 /// Per-cluster substrate facts for the codegen measure jobs: the namespace/queue/PVCs/ceiling the
@@ -176,6 +650,23 @@ pub struct Cluster {
     /// pod the loop SA's token creates.
     #[serde(default)]
     pub sandbox_service_account: Option<String>,
+    /// Namespace OpenShell sandbox and supervisor pods run in. It must be one no loop pod or pack
+    /// can create pods in: a pod there carrying another sandbox's id annotation would be issued
+    /// that sandbox's SPIFFE ID. Unset puts sandboxes in `loop_namespace`, and the controller
+    /// then issues no agent tokens.
+    #[serde(default)]
+    pub sandbox_namespace: Option<KubeName>,
+    /// Identities (`namespace/name`) granted get/list on OpenShell `Sandbox` resources in
+    /// `sandbox_namespace`: the controller's own identity on this cluster, which reads a bound
+    /// sandbox's name from them and, under isolated gateways, starts and tears down each run's
+    /// gateway there.
+    #[serde(default)]
+    pub sandbox_readers: Vec<ServiceAccountRef>,
+    /// The SPIFFE Workload API socket path the OpenShell driver mounts (`csi.spiffe.io`) into
+    /// the supervisor pods of runs that get agent servers, so supervisors can fetch the JWT-SVIDs
+    /// they exchange for agent tokens. Default [`DEFAULT_SPIFFE_SOCKET`].
+    #[serde(default)]
+    pub sandbox_spiffe_socket: Option<String>,
     /// The in-cluster kubeconfig configmap mounted at `/etc/kube` (points kubectl at the API server +
     /// the projected token).
     #[serde(default = "default_kubeconfig_configmap")]
@@ -199,9 +690,10 @@ pub struct Cluster {
     #[serde(default)]
     pub aws_sandbox_role_arn: Option<String>,
     /// The OpenShell compute driver for the sandbox: `podman` nests it inside the loop pod
-    /// (laptop/EC2); `kubernetes` schedules it as a sibling pod in-cluster.
+    /// (laptop/EC2); `kubernetes` schedules it as a sibling pod in-cluster. Default `kubernetes`
+    /// with a `sandbox_namespace`, else `podman`; see [`Cluster::sandbox_driver`].
     #[serde(default)]
-    pub sandbox_driver: ComputeDriver,
+    pub sandbox_driver: Option<ComputeDriver>,
     /// Nodes the cluster operator has marked bad (e.g. broken CNI); rendered as a required
     /// nodeAffinity `NotIn` on `kubernetes.io/hostname` for every pod this profile renders.
     #[serde(default)]
@@ -251,6 +743,14 @@ pub struct Cluster {
     /// only to GPU sandboxes. Takes effect under `sandbox_driver = "kubernetes"`.
     #[serde(default)]
     pub gpu_sandbox: crate::openshell::placement::GpuPlacement,
+    /// Where a person's Kubernetes username on this, the hub cluster, comes from. Spokes declare
+    /// theirs on `[clusters.<name>]`.
+    #[serde(default)]
+    pub identity: ClusterIdentity,
+    /// The distribution this, the hub cluster, runs, when it should not be detected: `kubernetes`
+    /// or `openshift`. Spokes state theirs on `[clusters.<name>]`.
+    #[serde(default)]
+    pub platform: Option<forge::fleet::Platform>,
 }
 
 /// `[cluster].host_aliases`, checked against the rules the kubernetes driver applies to a
@@ -347,6 +847,13 @@ impl SandboxHostAliases {
     }
 }
 
+/// The service account sandbox pods run as under isolated gateways when the profile names none.
+pub const DEFAULT_SANDBOX_SERVICE_ACCOUNT: &str = "crucible-sandbox";
+
+/// Where supervisors find the SPIFFE Workload API: the SPIRE agent's socket name under both the
+/// upstream chart and the Zero Trust Workload Identity Manager.
+pub const DEFAULT_SPIFFE_SOCKET: &str = "/spiffe-workload-api/spire-agent.sock";
+
 /// Where the OpenShell image workflow pushes the sandbox runtime image, tagged `sha-<rev>`.
 pub const SANDBOX_RUNTIME_IMAGE_REPO: &str = "ghcr.io/neuralmagic/openshell-sandbox";
 
@@ -361,13 +868,51 @@ impl Cluster {
         }
     }
 
-    /// The service account sandbox pods run as: `sandbox_service_account`, else the loop's.
-    pub fn sandbox_service_account(&self) -> &str {
-        self.sandbox_service_account
+    /// The namespace sandbox and supervisor pods run in: `sandbox_namespace`, else the loop's.
+    pub fn sandbox_namespace(&self) -> &str {
+        self.sandbox_namespace
+            .as_ref()
+            .map_or(self.loop_namespace.as_str(), KubeName::as_str)
+    }
+
+    /// The compute driver sandboxes run under: `sandbox_driver`, else `kubernetes` when sandboxes
+    /// have a namespace of their own (only that driver can put them there), else `podman`.
+    pub fn sandbox_driver(&self) -> ComputeDriver {
+        match (self.sandbox_driver, &self.sandbox_namespace) {
+            (Some(driver), _) => driver,
+            (None, Some(_)) => ComputeDriver::Kubernetes,
+            (None, None) => ComputeDriver::default(),
+        }
+    }
+
+    /// The SPIFFE Workload API socket path supervisors get: `sandbox_spiffe_socket`, else
+    /// [`DEFAULT_SPIFFE_SOCKET`].
+    pub fn spiffe_socket(&self) -> &str {
+        self.sandbox_spiffe_socket
             .as_deref()
-            .unwrap_or(&self.service_account)
+            .unwrap_or(DEFAULT_SPIFFE_SOCKET)
+    }
+
+    /// The service account sandbox pods run as: `sandbox_service_account`, else
+    /// [`DEFAULT_SANDBOX_SERVICE_ACCOUNT`] under isolated gateways (sandboxes in a namespace of
+    /// their own, where the loop's account does not exist), else the loop's.
+    pub fn sandbox_service_account(&self) -> &str {
+        let isolated =
+            self.sandbox_driver() == ComputeDriver::Kubernetes && self.sandbox_namespace.is_some();
+        match (&self.sandbox_service_account, isolated) {
+            (Some(sa), _) => sa,
+            (None, true) => DEFAULT_SANDBOX_SERVICE_ACCOUNT,
+            (None, false) => &self.service_account,
+        }
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "[cluster] sets sandbox_namespace with sandbox_driver = \"podman\", which nests sandboxes \
+     in the loop pod; drop sandbox_driver, since a sandbox namespace means the kubernetes driver"
+)]
+pub struct PodmanSandboxNamespace;
 
 /// No sandbox runtime image to render: the profile names none and the build has no OpenShell rev.
 #[derive(Debug, thiserror::Error)]
@@ -520,11 +1065,127 @@ pub struct Secrets {
     pub push_authfile: Option<String>,
 }
 
+/// Two profile fields that must name different namespaces name the same one.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("{first} and {second} are both {namespace:?}; they must be different namespaces")]
+pub struct NamespaceOverlap {
+    pub first: &'static str,
+    pub second: &'static str,
+    pub namespace: String,
+}
+
 impl DeployProfile {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading deploy profile {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("parsing deploy profile {}", path.display()))
+        let profile: Self = toml::from_str(&text)
+            .with_context(|| format!("parsing deploy profile {}", path.display()))?;
+        profile
+            .check_namespaces()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .check_sandbox_driver()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .check_cluster_names()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .agent_servers()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
+            .people_resources()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        Ok(profile)
+    }
+
+    /// Refuse a sandbox namespace under the podman driver, which nests sandboxes in the loop pod.
+    pub fn check_sandbox_driver(&self) -> Result<(), PodmanSandboxNamespace> {
+        match (self.cluster.sandbox_driver, &self.cluster.sandbox_namespace) {
+            (Some(ComputeDriver::Podman), Some(_)) => Err(PodmanSandboxNamespace),
+            _ => Ok(()),
+        }
+    }
+
+    /// Refuse a spoke, `[kueue]` or `[buildit]` cluster name [`check_cluster_name`] refuses.
+    pub fn check_cluster_names(&self) -> Result<(), NotClusterName> {
+        let tables = [
+            self.kueue.as_ref().map(|k| &k.clusters),
+            self.buildit.as_ref().map(|b| &b.clusters),
+        ];
+        self.clusters
+            .keys()
+            .chain(tables.into_iter().flatten().flatten())
+            .chain(self.agent_servers.iter().flat_map(|s| &s.clusters))
+            .try_for_each(|name| check_cluster_name(name))
+    }
+
+    /// Refuse namespaces that must be separate trust domains but coincide: the crucible-kueue
+    /// workload namespace and the sandbox namespace, each apart from where loop pods, rigs, and
+    /// the crucible-kueue server run, and from each other.
+    pub fn check_namespaces(&self) -> Result<(), NamespaceOverlap> {
+        let mut guarded: Vec<(&'static str, &str)> = Vec::new();
+        let mut hosts: Vec<(&'static str, &str)> = vec![
+            (
+                "cluster.loop_namespace",
+                self.cluster.loop_namespace.as_str(),
+            ),
+            ("cluster.rig_namespace", self.cluster.rig_namespace.as_str()),
+        ];
+        if let Some(kueue) = &self.kueue {
+            hosts.push(("kueue.namespace", kueue.namespace.as_str()));
+            for workloads in &kueue.workload_namespaces {
+                guarded.push(("kueue.workload_namespaces", workloads.as_str()));
+            }
+        }
+        if let Some(sandbox) = &self.cluster.sandbox_namespace {
+            guarded.push(("cluster.sandbox_namespace", sandbox.as_str()));
+        }
+        if let Some(buildit) = &self.buildit {
+            guarded.push(("buildit.namespace", buildit.namespace.as_str()));
+        }
+        for (i, &(first, ns)) in guarded.iter().enumerate() {
+            let clash = hosts
+                .iter()
+                .chain(guarded[i + 1..].iter())
+                .find(|(_, other)| *other == ns);
+            if let Some(&(second, _)) = clash {
+                return Err(NamespaceOverlap {
+                    first,
+                    second,
+                    namespace: ns.to_string(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// The platform the profile states for `cluster`: the hub's on `[cluster]`, a spoke's on its
+    /// `[clusters.<name>]` entry. `None` when it states none, for the cluster to be asked.
+    pub fn platform(&self, cluster: &str) -> Option<forge::fleet::Platform> {
+        match cluster {
+            HUB_CLUSTER => self.cluster.platform,
+            spoke => self.clusters.get(spoke).and_then(|entry| entry.platform),
+        }
+    }
+
+    /// The identity rule of `cluster`: the hub's from `[cluster]`, a spoke's from its
+    /// `[clusters.<name>]` entry. `None` for a cluster the profile does not know.
+    pub fn cluster_identity(&self, cluster: &str) -> Option<&ClusterIdentity> {
+        match cluster {
+            HUB_CLUSTER => Some(&self.cluster.identity),
+            spoke => self.clusters.get(spoke).map(|entry| &entry.identity),
+        }
+    }
+
+    /// Every cluster the profile knows with its identity rule: the hub, then spokes by name.
+    pub fn cluster_identities(&self) -> Vec<(&str, &ClusterIdentity)> {
+        std::iter::once((HUB_CLUSTER, &self.cluster.identity))
+            .chain(
+                self.clusters
+                    .iter()
+                    .map(|(name, entry)| (name.as_str(), &entry.identity)),
+            )
+            .collect()
     }
 
     /// Load the profile and fold in the fleet file's `[clusters.<name>]` entries. The fleet file
@@ -534,6 +1195,9 @@ impl DeployProfile {
         let mut profile = Self::load(path)?;
         if let Some(fleet_path) = FleetFile::resolve_path(path, clusters_override)? {
             FleetFile::load(&fleet_path)?.merge_into(&mut profile.clusters);
+            profile
+                .check_cluster_names()
+                .with_context(|| format!("validating fleet file {}", fleet_path.display()))?;
         }
         Ok(profile)
     }
@@ -877,5 +1541,271 @@ mod tests {
         );
         let p: DeployProfile = toml::from_str(&text).expect("parses");
         assert!(p.measure_cluster().expect("valid").is_some());
+    }
+
+    fn kueue_profile(cluster_extra: &str, kueue_extra: &str) -> DeployProfile {
+        toml::from_str(&format!(
+            r#"
+            [cluster]
+            loop_namespace = "loops"
+            rig_namespace = "rig"
+            service_account = "crucible-spoke"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            {cluster_extra}
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "pull"
+            [kueue]
+            image = "registry.example.com/crucible-kueue:latest"
+            namespace = "kueue-server"
+            kube_authz = "openshift"
+            {kueue_extra}
+            "#
+        ))
+        .expect("profile parses")
+    }
+
+    #[test]
+    fn builder_egress_to_everywhere_without_except_is_unfenced() {
+        let buildit = |extra: &str| -> BuilditCfg {
+            toml::from_str(&format!("namespace = \"builds\"\n{extra}")).unwrap()
+        };
+        assert_eq!(
+            buildit("").unfenced_egress(),
+            ["0.0.0.0/0", "::/0"],
+            "the default"
+        );
+        assert!(
+            buildit(
+                "egress = [{ cidr = \"0.0.0.0/0\", except = [\"10.0.0.0/8\", \"172.30.0.0/16\"] }]"
+            )
+            .unfenced_egress()
+            .is_empty()
+        );
+        assert!(
+            buildit("egress = [{ cidr = \"203.0.113.0/24\" }]")
+                .unfenced_egress()
+                .is_empty(),
+            "a registry's network"
+        );
+    }
+
+    #[test]
+    fn cluster_names_are_dns_labels_everywhere_the_profile_names_one() {
+        for good in ["hub", "ocp", "spoke-a", "a1"] {
+            assert_eq!(check_cluster_name(good), Ok(()));
+        }
+        for bad in [
+            "",
+            "Ocp",
+            "spoke_a",
+            "-a",
+            "a-",
+            "a.b",
+            "a:b",
+            &"a".repeat(64),
+        ] {
+            assert_eq!(
+                check_cluster_name(bad),
+                Err(NotClusterName(bad.to_string()))
+            );
+        }
+        let ok = kueue_profile(
+            "[clusters.spoke-a]\nkubeconfig_secret = \"s\"",
+            "workload_namespace = \"w\"\nclusters = [\"hub\", \"spoke-a\"]",
+        );
+        assert_eq!(ok.check_cluster_names(), Ok(()));
+        let spoke = kueue_profile(
+            "[clusters.Spoke_A]\nkubeconfig_secret = \"s\"",
+            "workload_namespace = \"w\"",
+        );
+        assert_eq!(
+            spoke.check_cluster_names(),
+            Err(NotClusterName("Spoke_A".into()))
+        );
+        let kueue = kueue_profile("", "workload_namespace = \"w\"\ncluster = \"east.1\"");
+        assert_eq!(
+            kueue.check_cluster_names(),
+            Err(NotClusterName("east.1".into()))
+        );
+    }
+
+    #[test]
+    fn separate_namespaces_pass_the_overlap_check() {
+        kueue_profile(
+            r#"sandbox_namespace = "sandboxes""#,
+            r#"workload_namespace = "workloads""#,
+        )
+        .check_namespaces()
+        .expect("all distinct");
+    }
+
+    #[test]
+    fn a_guarded_namespace_shared_with_another_is_refused_naming_both_fields() {
+        let cases = [
+            (
+                "",
+                "workload_namespace = \"loops\"",
+                (
+                    "kueue.workload_namespaces",
+                    "cluster.loop_namespace",
+                    "loops",
+                ),
+            ),
+            (
+                "",
+                "workload_namespace = \"rig\"",
+                ("kueue.workload_namespaces", "cluster.rig_namespace", "rig"),
+            ),
+            (
+                "",
+                "workload_namespace = \"kueue-server\"",
+                (
+                    "kueue.workload_namespaces",
+                    "kueue.namespace",
+                    "kueue-server",
+                ),
+            ),
+            (
+                "sandbox_namespace = \"loops\"",
+                "workload_namespace = \"w\"",
+                (
+                    "cluster.sandbox_namespace",
+                    "cluster.loop_namespace",
+                    "loops",
+                ),
+            ),
+            (
+                "sandbox_namespace = \"w\"",
+                "workload_namespace = \"w\"",
+                (
+                    "kueue.workload_namespaces",
+                    "cluster.sandbox_namespace",
+                    "w",
+                ),
+            ),
+        ];
+        for (cluster, kueue, (first, second, ns)) in cases {
+            assert_eq!(
+                kueue_profile(cluster, kueue).check_namespaces(),
+                Err(NamespaceOverlap {
+                    first,
+                    second,
+                    namespace: ns.to_string(),
+                }),
+                "{cluster} / {kueue}"
+            );
+        }
+    }
+
+    #[test]
+    fn buildits_namespace_is_its_own() {
+        let with_buildit = |ns: &str| {
+            kueue_profile(
+                r#"sandbox_namespace = "sandboxes""#,
+                &format!("workload_namespace = \"workloads\"\n[buildit]\nnamespace = \"{ns}\""),
+            )
+            .check_namespaces()
+        };
+        assert_eq!(with_buildit("builds"), Ok(()));
+        for (ns, other) in [
+            ("loops", "cluster.loop_namespace"),
+            ("rig", "cluster.rig_namespace"),
+            ("kueue-server", "kueue.namespace"),
+            ("workloads", "kueue.workload_namespaces"),
+            ("sandboxes", "cluster.sandbox_namespace"),
+        ] {
+            let refused = with_buildit(ns).expect_err(ns);
+            assert_eq!(refused.namespace, ns);
+            assert!(
+                [refused.first, refused.second].contains(&"buildit.namespace")
+                    && [refused.first, refused.second].contains(&other),
+                "{ns}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sandbox_namespace_means_the_kubernetes_driver() {
+        let driver = |extra: &str| {
+            kueue_profile(extra, "workload_namespace = \"w\"")
+                .cluster
+                .sandbox_driver()
+        };
+        assert_eq!(driver(""), ComputeDriver::Podman);
+        assert_eq!(
+            driver(r#"sandbox_namespace = "sandboxes""#),
+            ComputeDriver::Kubernetes
+        );
+        assert_eq!(
+            driver(r#"sandbox_driver = "kubernetes""#),
+            ComputeDriver::Kubernetes,
+            "sandboxes in the loop namespace"
+        );
+        let both = kueue_profile(
+            "sandbox_namespace = \"sandboxes\"\nsandbox_driver = \"kubernetes\"",
+            "workload_namespace = \"w\"",
+        );
+        assert_eq!(both.check_sandbox_driver().ok(), Some(()));
+        let nested = kueue_profile(
+            "sandbox_namespace = \"sandboxes\"\nsandbox_driver = \"podman\"",
+            "workload_namespace = \"w\"",
+        );
+        assert!(nested.check_sandbox_driver().is_err());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [cluster]
+            loop_namespace = "loops"
+            rig_namespace = "rig"
+            service_account = "crucible-spoke"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            sandbox_namespace = "sandboxes"
+            sandbox_driver = "podman"
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "pull"
+            "#,
+        )
+        .expect("write");
+        let Err(err) = DeployProfile::load(&path) else {
+            panic!("a sandbox namespace under the podman driver loaded");
+        };
+        assert!(
+            err.chain()
+                .any(|e| e.downcast_ref::<PodmanSandboxNamespace>().is_some()),
+            "{err:#}"
+        );
+    }
+
+    #[test]
+    fn loading_a_profile_runs_the_overlap_check() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [cluster]
+            loop_namespace = "loops"
+            rig_namespace = "rig"
+            service_account = "crucible-spoke"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            sandbox_namespace = "rig"
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "pull"
+            "#,
+        )
+        .expect("write");
+        let Err(err) = DeployProfile::load(&path) else {
+            panic!("a sandbox namespace equal to the rig namespace loaded");
+        };
+        assert!(
+            err.chain()
+                .any(|e| e.downcast_ref::<NamespaceOverlap>().is_some()),
+            "{err:#}"
+        );
     }
 }

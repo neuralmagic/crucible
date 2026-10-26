@@ -31,7 +31,7 @@ import {
   sandboxedDocument,
 } from './decisions';
 
-type DecisionDto = components['schemas']['DecisionDto'];
+type DecisionRequestDto = components['schemas']['DecisionRequestDto'];
 type DecisionFileDto = components['schemas']['DecisionFileDto'];
 
 const TONE: Record<string, StatusTone> = {
@@ -70,7 +70,7 @@ function useNow(): number {
   return now;
 }
 
-function Decision({ d }: { d: DecisionDto }) {
+function Decision({ d }: { d: DecisionRequestDto }) {
   const now = useNow();
   const launch = d.launch_key ? (
     <Link className="text-blue" to={`/playbook-runs/${encodeURIComponent(d.launch_key)}`}>
@@ -159,7 +159,7 @@ function Decision({ d }: { d: DecisionDto }) {
   );
 }
 
-function Answer({ d }: { d: DecisionDto }) {
+function Answer({ d }: { d: DecisionRequestDto }) {
   const queryClient = useQueryClient();
   const [labels, setLabels] = useState<Record<string, string[]>>({});
   const [note, setNote] = useState('');
@@ -288,7 +288,7 @@ const CHOSEN: Record<LabelTone, string> = {
   neutral: 'border-ink bg-ink text-surface',
 };
 
-function kindOf(d: DecisionDto, question: string): string | undefined {
+function kindOf(d: DecisionRequestDto, question: string): string | undefined {
   return d.questions.find((q) => q.id === question)?.kind;
 }
 

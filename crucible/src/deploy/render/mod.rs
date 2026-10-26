@@ -16,6 +16,7 @@
 //! WorkPod turn renderer), the two share only the profile-derived helpers (`resources`,
 //! `secret_env_vars`, `node_avoid_affinity`) and a handful of mount-path consts.
 
+pub mod gateway;
 mod kube;
 mod turn;
 
