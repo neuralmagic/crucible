@@ -693,22 +693,14 @@ impl Gateway {
         provider_type: &str,
         project: &str,
         region: &str,
-    ) -> Result<()> {
+    ) -> Result<ProviderCreate> {
         let mut provider = build_provider(name, cred_key, token);
         provider.r#type = provider_type.to_string();
         provider.config = HashMap::from([
             ("project_id".to_string(), project.to_string()),
             ("region".to_string(), region.to_string()),
         ]);
-        let mut client = self.client();
-        client
-            .create_provider(create_provider_request(provider))
-            .await
-            .map(|_| ())
-            // The token is in the request body, not this message; but keep any surfaced
-            // error clean regardless.
-            .map_err(GrpcError::rpc(format!("create_provider({name})")))
-            .map_err(Into::into)
+        self.register_provider(provider).await
     }
 
     /// Register a provider carrying one static credential and no config
@@ -722,88 +714,94 @@ impl Gateway {
         cred_key: &str,
         token: &str,
         provider_type: &str,
-    ) -> Result<()> {
+    ) -> Result<ProviderCreate> {
         let mut provider = build_provider(name, cred_key, token);
         provider.r#type = provider_type.to_string();
-        let mut client = self.client();
-        client
-            .create_provider(create_provider_request(provider))
-            .await
-            .map(|_| ())
-            .map_err(GrpcError::rpc(format!("create_provider({name})")))
-            .map_err(Into::into)
+        self.register_provider(provider).await
     }
 
     /// Make the workspace's custom provider profile `profile.id` equal `profile`: import it when
     /// absent (`ImportProviderProfiles`), leave it when it already matches, and replace it
     /// otherwise (`UpdateProviderProfiles`, guarded by the stored resource version). Import is
-    /// create-only, so the read decides which write applies. A response that reports the profile
-    /// was not written fails with its diagnostics.
+    /// create-only, so the read decides which write applies. Turns sharing a gateway run this
+    /// concurrently: a write that loses to another turn's re-reads and starts over, up to
+    /// [`PROFILE_WRITE_ATTEMPTS`] writes. A response that reports the profile was not written
+    /// fails with its diagnostics.
     #[tracing::instrument(skip_all, fields(rpc = "ensure_provider_profile", profile = profile.id.as_str()))]
     pub async fn ensure_provider_profile(&self, profile: ProviderProfile) -> Result<()> {
         let id = profile.id.clone();
         let mut client = self.client();
-        let stored = match client
-            .get_provider_profile(scoped(GetProviderProfileRequest {
-                id: id.clone(),
-                ..Default::default()
-            }))
-            .await
-        {
-            Ok(resp) => resp.into_inner().profile,
-            Err(s) if s.code() == tonic::Code::NotFound => None,
-            Err(s) => return Err(GrpcError::rpc(format!("get_provider_profile({id})"))(s).into()),
-        };
         let item = ProviderProfileImportItem {
             profile: Some(profile.clone()),
             source: PROFILE_SOURCE.to_string(),
         };
-        let diagnostics = match stored {
-            None => {
-                let resp = client
-                    .import_provider_profiles(scoped(ImportProviderProfilesRequest {
-                        profiles: vec![item],
-                        ..Default::default()
-                    }))
-                    .await
-                    .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))?
-                    .into_inner();
-                if resp.imported {
-                    return Ok(());
+        let mut stored = get_provider_profile(&mut client, &id).await?;
+        for _ in 0..PROFILE_WRITE_ATTEMPTS {
+            stored = match stored {
+                Some(stored) if same_profile(&stored, &profile) => return Ok(()),
+                None => {
+                    let resp = client
+                        .import_provider_profiles(scoped(ImportProviderProfilesRequest {
+                            profiles: vec![item.clone()],
+                            ..Default::default()
+                        }))
+                        .await
+                        .map_err(GrpcError::rpc(format!("import_provider_profiles({id})")))?
+                        .into_inner();
+                    if resp.imported {
+                        return Ok(());
+                    }
+                    match get_provider_profile(&mut client, &id).await? {
+                        None => return Err(profile_rejected(id, &resp.diagnostics)),
+                        imported => imported,
+                    }
                 }
-                resp.diagnostics
-            }
-            Some(stored) if same_profile(&stored, &profile) => return Ok(()),
-            Some(stored) => {
-                let resp = client
-                    .update_provider_profiles(scoped(UpdateProviderProfilesRequest {
-                        profile: Some(item),
-                        expected_resource_version: stored.resource_version,
-                        id: id.clone(),
-                        ..Default::default()
-                    }))
-                    .await
-                    .map_err(GrpcError::rpc(format!("update_provider_profiles({id})")))?
-                    .into_inner();
-                if resp.updated {
-                    return Ok(());
+                Some(stored) => {
+                    match client
+                        .update_provider_profiles(scoped(UpdateProviderProfilesRequest {
+                            profile: Some(item.clone()),
+                            expected_resource_version: stored.resource_version,
+                            id: id.clone(),
+                            ..Default::default()
+                        }))
+                        .await
+                    {
+                        Ok(resp) if resp.get_ref().updated => return Ok(()),
+                        Ok(resp) => {
+                            return Err(profile_rejected(id, &resp.into_inner().diagnostics));
+                        }
+                        Err(s)
+                            if matches!(s.code(), tonic::Code::Aborted | tonic::Code::NotFound) =>
+                        {
+                            get_provider_profile(&mut client, &id).await?
+                        }
+                        Err(s) => {
+                            return Err(GrpcError::rpc(format!("update_provider_profiles({id})"))(
+                                s,
+                            )
+                            .into());
+                        }
+                    }
                 }
-                resp.diagnostics
-            }
-        };
-        Err(GrpcError::ProfileRejected {
-            id,
-            diagnostics: render_diagnostics(&diagnostics),
+            };
         }
-        .into())
+        match stored {
+            Some(stored) if same_profile(&stored, &profile) => Ok(()),
+            _ => Err(GrpcError::ProfileContended {
+                id,
+                attempts: PROFILE_WRITE_ATTEMPTS,
+            }
+            .into()),
+        }
     }
 
     /// Register a provider whose credentials are gateway-minted (`CreateProvider` with an EMPTY
     /// credentials map): the refresh worker populates them once a refresh is configured. `r#type`
     /// names a provider profile (e.g. `aws-s3`), whose SigV4-signed egress endpoints attach with
-    /// the provider, no hand-authored policy rule.
+    /// the provider, no hand-authored policy rule. A provider already registered under `name` is
+    /// left as it is.
     #[tracing::instrument(skip_all, fields(rpc = "create_provider", provider = name))]
-    pub async fn create_minted_provider(&self, name: &str, provider_type: &str) -> Result<()> {
+    pub async fn ensure_minted_provider(&self, name: &str, provider_type: &str) -> Result<()> {
         let provider = Provider {
             metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
                 name: name.to_string(),
@@ -812,13 +810,28 @@ impl Gateway {
             r#type: provider_type.to_string(),
             ..Default::default()
         };
+        self.register_provider(provider).await.map(|_| ())
+    }
+
+    /// `CreateProvider`, reporting a name another caller already registered as
+    /// [`ProviderCreate::AlreadyExists`] rather than an error.
+    async fn register_provider(&self, provider: Provider) -> Result<ProviderCreate> {
+        let name = provider
+            .metadata
+            .as_ref()
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
         let mut client = self.client();
-        client
+        match client
             .create_provider(create_provider_request(provider))
             .await
-            .map(|_| ())
-            .map_err(GrpcError::rpc(format!("create_provider({name})")))
-            .map_err(Into::into)
+        {
+            Ok(_) => Ok(ProviderCreate::Created),
+            Err(s) if s.code() == tonic::Code::AlreadyExists => Ok(ProviderCreate::AlreadyExists),
+            // The token is in the request body, not this message; but keep any surfaced
+            // error clean regardless.
+            Err(s) => Err(GrpcError::rpc(format!("create_provider({name})"))(s).into()),
+        }
     }
 
     /// Point a credential's refresh at a gateway-side mint (`ConfigureProviderRefresh`).
@@ -1135,6 +1148,41 @@ fn create_provider_request(mut provider: Provider) -> CreateProviderRequest {
 
 /// The import source the gateway records on crucible's profiles.
 const PROFILE_SOURCE: &str = "crucible";
+
+/// How many profile writes [`Gateway::ensure_provider_profile`] makes before giving up on a
+/// profile other callers keep changing.
+const PROFILE_WRITE_ATTEMPTS: u32 = 4;
+
+/// What `CreateProvider` did with a provider name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCreate {
+    Created,
+    /// Another caller registered the name first; the gateway kept theirs.
+    AlreadyExists,
+}
+
+/// The workspace's provider profile `id`, `None` when the gateway has none.
+async fn get_provider_profile(client: &mut Client, id: &str) -> Result<Option<ProviderProfile>> {
+    match client
+        .get_provider_profile(scoped(GetProviderProfileRequest {
+            id: id.to_string(),
+            ..Default::default()
+        }))
+        .await
+    {
+        Ok(resp) => Ok(resp.into_inner().profile),
+        Err(s) if s.code() == tonic::Code::NotFound => Ok(None),
+        Err(s) => Err(GrpcError::rpc(format!("get_provider_profile({id})"))(s).into()),
+    }
+}
+
+fn profile_rejected(id: String, diagnostics: &[ProviderProfileDiagnostic]) -> anyhow::Error {
+    GrpcError::ProfileRejected {
+        id,
+        diagnostics: render_diagnostics(diagnostics),
+    }
+    .into()
+}
 
 /// Whether the gateway's stored profile already says what `wanted` says. The fields the gateway
 /// sets on its side (resource version, provenance, visibility) are not part of the comparison.
@@ -1517,6 +1565,8 @@ pub enum GrpcError {
     SandboxStillExists { name: String, seconds: u64 },
     #[error("provider profile '{id}' was not written: {diagnostics}")]
     ProfileRejected { id: String, diagnostics: String },
+    #[error("provider profile '{id}' kept changing under {attempts} writes")]
+    ProfileContended { id: String, attempts: u32 },
     #[error("policy version {version} failed to load: {load_error}")]
     PolicyLoadFailed { version: u32, load_error: String },
     #[error("timed out waiting for policy version {version} to load on '{name}'")]
@@ -1704,7 +1754,11 @@ impl LineSplitter {
 }
 
 #[cfg(test)]
+pub(crate) mod in_process;
+
+#[cfg(test)]
 mod tests {
+    use crate::openshell::grpc::in_process::{ProfileGateway, Unary, Writes, unary};
     use crate::openshell::grpc::*;
     use openshell_core::proto::NetworkAccessPreset;
 
@@ -2932,34 +2986,6 @@ pYBZ
         deleted: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
-    struct Unary<F>(F);
-
-    impl<Req, Resp, F, Fut> tonic::server::UnaryService<Req> for Unary<F>
-    where
-        F: FnMut(tonic::Request<Req>) -> Fut,
-        Fut: std::future::Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
-    {
-        type Response = Resp;
-        type Future = Fut;
-        fn call(&mut self, request: tonic::Request<Req>) -> Fut {
-            (self.0)(request)
-        }
-    }
-
-    async fn unary<Req, Resp, S>(
-        service: S,
-        req: tonic::codegen::http::Request<tonic::body::Body>,
-    ) -> tonic::codegen::http::Response<tonic::body::Body>
-    where
-        Req: tonic_prost::prost::Message + Default + Send + 'static,
-        Resp: tonic_prost::prost::Message + Send + 'static,
-        S: tonic::server::UnaryService<Req, Response = Resp>,
-    {
-        tonic::server::Grpc::new(tonic_prost::ProstCodec::<Resp, Req>::default())
-            .unary(service, req)
-            .await
-    }
-
     impl tonic::server::NamedService for FakeGateway {
         const NAME: &'static str = "openshell.v1.OpenShell";
     }
@@ -3130,6 +3156,213 @@ pYBZ
         let (result, deleted) = create_against(Ok(""), SandboxPhase::Ready);
         assert_eq!(result.unwrap(), None);
         assert!(deleted.is_empty(), "{deleted:?}");
+    }
+
+    const TURNS: usize = 12;
+
+    /// A token-grant profile shaped like the ones turns import for their MCP servers.
+    fn grant_profile(description: &str) -> ProviderProfile {
+        use openshell_core::proto::{
+            ProviderCredentialTokenGrant, ProviderCredentialTokenGrantType,
+            ProviderProfileCategory, ProviderProfileCredential,
+        };
+        ProviderProfile {
+            id: "kueue-grant".into(),
+            display_name: "kueue (agent token)".into(),
+            description: description.into(),
+            category: ProviderProfileCategory::Agent as i32,
+            credentials: vec![ProviderProfileCredential {
+                name: "token".into(),
+                auth_style: "bearer".into(),
+                header_name: "authorization".into(),
+                token_grant: Some(ProviderCredentialTokenGrant {
+                    grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
+                    token_endpoint: "http://controller.example.svc:8080/oauth/token".into(),
+                    audience: "http://kueue.example.svc:8850/mcp".into(),
+                    jwt_svid_audience: "http://controller.example.svc:8080".into(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            endpoints: vec![NetworkEndpoint {
+                host: "kueue.example.svc".into(),
+                port: 8850,
+                protocol: "rest".into(),
+                access: NetworkAccessPreset::Full as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Run `TURNS` copies of `call` against `gw` at once and assert every one succeeded.
+    async fn all_succeed<F, Fut>(gw: &Gateway, call: F)
+    where
+        F: Fn(Gateway) -> Fut,
+        Fut: std::future::Future<Output = Result<()>> + Send + 'static,
+    {
+        let mut turns = tokio::task::JoinSet::new();
+        for _ in 0..TURNS {
+            turns.spawn(call(gw.clone()));
+        }
+        while let Some(joined) = turns.join_next().await {
+            let result = joined.expect("turn task panicked");
+            assert!(result.is_ok(), "{:#}", result.unwrap_err());
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_first_imports_converge_on_one_write() {
+        let profile = grant_profile("Kueue access with controller-issued agent tokens");
+        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gw = gateway.serve().await;
+        all_succeed(&gw, |gw| {
+            let profile = profile.clone();
+            async move { gw.ensure_provider_profile(profile).await }
+        })
+        .await;
+        assert_eq!(
+            gateway.writes(),
+            Writes {
+                profile_imports: 1,
+                ..Writes::default()
+            }
+        );
+        let stored = gateway.profile("kueue-grant").expect("profile imported");
+        assert!(same_profile(&stored, &profile));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_updates_of_a_stale_profile_converge_on_one_write() {
+        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        gateway.seed_profile(grant_profile("an older description"));
+        let profile = grant_profile("the current description");
+        let gw = gateway.serve().await;
+        all_succeed(&gw, |gw| {
+            let profile = profile.clone();
+            async move { gw.ensure_provider_profile(profile).await }
+        })
+        .await;
+        let writes = gateway.writes();
+        assert_eq!(writes.profile_updates, 1, "{writes:?}");
+        assert_eq!(writes.profile_conflicts as usize, TURNS - 1, "{writes:?}");
+        assert_eq!(writes.profile_imports, 0, "{writes:?}");
+        let stored = gateway.profile("kueue-grant").expect("profile kept");
+        assert!(same_profile(&stored, &profile));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stored_token_grant_profile_matches_without_a_write() {
+        let profile = grant_profile("Kueue access with controller-issued agent tokens");
+        let gateway = ProfileGateway::new();
+        gateway.seed_profile(profile.clone());
+        let gw = gateway.serve().await;
+        all_succeed(&gw, |gw| {
+            let profile = profile.clone();
+            async move { gw.ensure_provider_profile(profile).await }
+        })
+        .await;
+        assert_eq!(gateway.writes(), Writes::default());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_profile_that_keeps_changing_fails_after_bounded_writes() {
+        let gateway = ProfileGateway::new().with_rival_writer();
+        gateway.seed_profile(grant_profile("an older description"));
+        let gw = gateway.serve().await;
+        let err = gw
+            .ensure_provider_profile(grant_profile("the current description"))
+            .await
+            .expect_err("a profile rewritten after every read never converges");
+        assert!(
+            matches!(
+                err.downcast_ref::<GrpcError>(),
+                Some(GrpcError::ProfileContended { id, attempts })
+                    if id == "kueue-grant" && *attempts == PROFILE_WRITE_ATTEMPTS
+            ),
+            "{err:#}"
+        );
+        assert_eq!(
+            gateway.writes(),
+            Writes {
+                profile_conflicts: PROFILE_WRITE_ATTEMPTS,
+                ..Writes::default()
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_rejected_import_fails_with_its_diagnostics() {
+        let gateway = ProfileGateway::new().rejecting_imports();
+        let gw = gateway.serve().await;
+        let err = gw
+            .ensure_provider_profile(grant_profile("Kueue access"))
+            .await
+            .expect_err("an import the gateway refused writes nothing");
+        assert!(
+            matches!(
+                err.downcast_ref::<GrpcError>(),
+                Some(GrpcError::ProfileRejected { id, diagnostics })
+                    if id == "kueue-grant" && diagnostics.contains("rejected by validation")
+            ),
+            "{err:#}"
+        );
+        assert!(gateway.profile("kueue-grant").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn parallel_turns_on_a_fresh_gateway_share_one_token_grant_provider() {
+        let gateway = ProfileGateway::new().hold_first_reads(TURNS);
+        let gw = gateway.serve().await;
+        all_succeed(&gw, |gw| async move {
+            gw.ensure_provider_profile(grant_profile("Kueue access"))
+                .await?;
+            gw.ensure_minted_provider("kueue", "kueue-grant").await
+        })
+        .await;
+        assert_eq!(
+            gateway.writes(),
+            Writes {
+                profile_imports: 1,
+                provider_creates: 1,
+                ..Writes::default()
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_minted_providers_converge_on_one_create() {
+        let gateway = ProfileGateway::new();
+        let gw = gateway.serve().await;
+        all_succeed(&gw, |gw| async move {
+            gw.ensure_minted_provider("kueue", "kueue-grant").await
+        })
+        .await;
+        assert_eq!(
+            gateway.writes(),
+            Writes {
+                provider_creates: 1,
+                ..Writes::default()
+            }
+        );
+        assert!(gateway.has_provider("kueue"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn creating_a_taken_provider_name_reports_it() {
+        let gateway = ProfileGateway::new();
+        gateway.seed_provider("broker");
+        let gw = gateway.serve().await;
+        let taken = gw
+            .create_static_provider("broker", "BROKER_TOKEN", "t", "crucible-broker")
+            .await
+            .unwrap();
+        assert_eq!(taken, ProviderCreate::AlreadyExists);
+        let fresh = gw
+            .create_static_provider("other", "BROKER_TOKEN", "t", "crucible-broker")
+            .await
+            .unwrap();
+        assert_eq!(fresh, ProviderCreate::Created);
     }
 
     #[test]
