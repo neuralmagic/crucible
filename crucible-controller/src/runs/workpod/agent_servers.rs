@@ -146,6 +146,7 @@ mod tests {
         [buildit]
         clusters = ["ocp", "k8s"]
         namespace = "crucible-builds"
+        queue = "builders"
         run_jwks_uri = "https://crucible-ext.hub.example/.well-known/jwks.json"
         push_repo = "quay.io/example/crucible-smoke"
     "#;
@@ -283,6 +284,7 @@ mod tests {
                     ),
                     namespace: "crucible-builds".into(),
                     push_repo: Some("quay.io/example/crucible-smoke".into()),
+                    queue: Some("builders".into()),
                 })),
             }]
         );

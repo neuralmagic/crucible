@@ -34,9 +34,11 @@ pub struct ServerSpec {
 pub enum Hosting {
     /// Somewhere sandboxes reach over the network.
     Remote,
-    /// `buildit mcp` in the loop pod, building in `namespace` and pushing to `push_repo` only.
+    /// `buildit mcp` in the loop pod, building in `namespace`, submitting to Kueue's `queue`, and
+    /// pushing to `push_repo` only.
     Buildit {
         namespace: String,
+        queue: Option<String>,
         push_repo: Option<String>,
         /// Where it fetches the agent issuer's keys, when not from the issuer itself.
         run_jwks_uri: Option<url::Url>,
@@ -56,6 +58,7 @@ impl ServerSpec {
             Hosting::Remote => Transport::Remote,
             Hosting::Buildit {
                 namespace,
+                queue,
                 push_repo,
                 run_jwks_uri,
             } => {
@@ -64,6 +67,7 @@ impl ServerSpec {
                     run_issuer: format!("{issuer}={jwks}"),
                     namespace: namespace.clone(),
                     push_repo: push_repo.clone(),
+                    queue: queue.clone(),
                 }))
             }
         })
@@ -162,14 +166,17 @@ impl DeployProfile {
                 namespaces: Vec::new(),
                 hosting: Hosting::Buildit {
                     namespace: b.namespace.to_string(),
+                    queue: b.queue.as_ref().map(ToString::to_string),
                     push_repo: b.push_repo.clone(),
                     run_jwks_uri: b.run_jwks_uri.clone(),
                 },
-                limits: b
-                    .push_repo
-                    .iter()
-                    .map(|repo| ("push_repo".to_string(), repo.clone()))
-                    .collect(),
+                limits: [
+                    ("push_repo", b.push_repo.clone()),
+                    ("queue", b.queue.as_ref().map(ToString::to_string)),
+                ]
+                .into_iter()
+                .filter_map(|(k, v)| Some((k.to_string(), v?)))
+                .collect(),
             });
         }
         for s in &self.agent_servers {
@@ -293,6 +300,7 @@ mod tests {
         [buildit]
         cluster = "ocp"
         namespace = "builds"
+        queue = "builders"
         push_repo = "quay.io/team/agent"
     "#;
 
@@ -337,10 +345,14 @@ mod tests {
                     namespaces: vec![],
                     hosting: Hosting::Buildit {
                         namespace: "builds".into(),
+                        queue: Some("builders".into()),
                         push_repo: Some("quay.io/team/agent".into()),
                         run_jwks_uri: None,
                     },
-                    limits: BTreeMap::from([("push_repo".into(), "quay.io/team/agent".into())]),
+                    limits: BTreeMap::from([
+                        ("push_repo".into(), "quay.io/team/agent".into()),
+                        ("queue".into(), "builders".into()),
+                    ]),
                 },
             ]
         );
@@ -360,6 +372,7 @@ mod tests {
                 run_issuer: format!("{issuer}={issuer}/.well-known/jwks.json"),
                 namespace: "builds".into(),
                 push_repo: Some("quay.io/team/agent".into()),
+                queue: Some("builders".into()),
             }))
         );
         let routed = profile(&KUEUE_AND_BUILDIT.replace(
@@ -495,6 +508,7 @@ mod tests {
             servers[1].hosting,
             Hosting::Buildit {
                 namespace: "crucible-builds".into(),
+                queue: None,
                 push_repo: Some("quay.io/example/crucible-smoke".into()),
                 run_jwks_uri: None,
             }

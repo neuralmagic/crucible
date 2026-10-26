@@ -308,7 +308,9 @@ creates the `buildit-builders` NetworkPolicy there: no ingress, egress only to D
 registries' networks, or put the cluster's pod and service networks in `except`, to keep builds
 off in-cluster services. `push`
 publishes a succeeded build to `push_repo` only, tagged `<sandbox>-<build_id>`, with the loop
-pod's `[secrets] push_authfile`; without either, buildit pushes nothing.
+pod's `[secrets] push_authfile`; without either, buildit pushes nothing. `queue` submits builder
+pods to that Kueue LocalQueue in `namespace`; set it where Kueue manages the namespace and holds
+pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minutes and fail.
 
 ```toml
 [buildit]
@@ -317,6 +319,7 @@ namespace    = "crucible-builds"                    # builder pods, apart from l
 egress       = [{ cidr = "0.0.0.0/0", except = ["10.128.0.0/14", "172.30.0.0/16"] }]  # optional
 run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
 push_repo    = "registry.example.com/team/crucible-smoke"  # optional
+queue        = "crucible-builds"                    # optional, a Kueue LocalQueue in namespace
 ```
 
 ```bash
