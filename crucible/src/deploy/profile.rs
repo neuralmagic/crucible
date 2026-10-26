@@ -356,6 +356,10 @@ pub struct BuilditCfg {
     /// refuse every one.
     #[serde(default = "default_builder_quota")]
     pub quota: BTreeMap<String, String>,
+    /// The Kueue LocalQueue in `namespace` builder pods are submitted to. Needed where Kueue
+    /// manages the namespace and holds pods that name no queue.
+    #[serde(default)]
+    pub queue: Option<KubeName>,
 }
 
 /// An IP network builder pods may reach, on `ports`, less the networks in `except` (such as the

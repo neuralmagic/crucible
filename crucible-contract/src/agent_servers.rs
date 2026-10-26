@@ -103,6 +103,9 @@ pub struct BuilditSite {
     /// The one repository it pushes to; none, it pushes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_repo: Option<String>,
+    /// The Kueue LocalQueue its builder pods are submitted to; none, they carry no queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
 }
 
 /// `servers` as [`ENV_AGENT_SERVERS`] carries them.
@@ -150,6 +153,7 @@ mod tests {
                     run_issuer: "https://hub.example=https://hub.example/jwks".into(),
                     namespace: "builds".into(),
                     push_repo: None,
+                    queue: Some("builders".into()),
                 })),
             },
         ];

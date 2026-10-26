@@ -174,6 +174,16 @@ pod labels, so a restarted server keeps serving them, and a sandbox only sees
 its own. Builder pods mount no service account token and end at
 `--pod-deadline`; a sandbox may hold `--max-builds` live ones.
 
+`--queue` submits builder pods to a Kueue LocalQueue (the
+`kueue.x-k8s.io/queue-name` label), for namespaces Kueue manages; where it
+holds pods that name no queue, builds need one. `build` waits up to 10 minutes
+for Kueue to lift the pod's scheduling gate, then deletes the pod and fails
+naming the queue. Time spent queued counts against neither `timeout_s` nor
+the pod deadline. `deploy/builder-admission.yaml` lets the update that admits a
+pod add its ResourceFlavor's tolerations and refuses tolerations otherwise.
+Builder pods request what `--request` gives them, so a ClusterQueue counts
+nothing against its quota for builds without requests.
+
 ```sh
 MCP_TOKENS_FILE=/run/crucible/buildit.tokens buildit mcp
 BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored   # e2e on a disposable cluster
