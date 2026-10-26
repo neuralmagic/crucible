@@ -503,9 +503,9 @@ pub(crate) struct DeployArgs {
     /// when `[cluster_link]` sets no `external_url`.
     #[arg(long, value_name = "URL", requires = "issuer_user")]
     pub issuer: Option<String>,
-    /// With `--kueue`, the cluster's platform (`kubernetes` or `openshift`), over the profile's
+    /// The platform (`kubernetes` or `openshift`) of the cluster rendered for, over the profile's
     /// `platform` key; a render does not ask the cluster.
-    #[arg(long, value_enum, requires = "kueue")]
+    #[arg(long, value_enum, conflicts_with_all = ["controller", "cluster_link"])]
     pub platform: Option<KueuePlatform>,
     /// Render the controller's OpenShift `OAuthClient` for this cluster from the profile's
     /// `[cluster_link]` table, no `--manifest` needed. Render only: it is cluster-scoped on that

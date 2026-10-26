@@ -333,6 +333,7 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
             harness: args.harness,
             model: args.model.clone(),
             playbook,
+            platform: args.platform.map(Into::into),
         };
         if args.controller {
             // Deprecated in favor of the `crucible-controller` Helm chart (the one packaging path).

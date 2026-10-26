@@ -137,6 +137,9 @@ pub struct RenderOpts {
     /// Playbook launch: the wrapper runs `crucible plan run` over the manifest's `[workflow]` rather
     /// than the agent loop. `None` renders the loop.
     pub playbook: Option<PlaybookLaunch>,
+    /// The platform of the cluster rendered for, over `[cluster] platform`: a render does not ask
+    /// the cluster.
+    pub platform: Option<forge::fleet::Platform>,
 }
 
 impl Default for RenderOpts {
@@ -151,6 +154,7 @@ impl Default for RenderOpts {
             harness: None,
             model: None,
             playbook: None,
+            platform: None,
         }
     }
 }
@@ -1678,7 +1682,7 @@ exit $rc
     /// Under isolated gateways, what `cluster.sandbox_readers` reads the cluster's SPIRE with:
     /// its JWT keys through the API server's Service proxy, and the resources discovery reads its
     /// trust domain and JWT issuer from (the operator's on OpenShift, the chart's ConfigMap
-    /// elsewhere). The platform is `[cluster] platform`, `kubernetes` unless it says otherwise.
+    /// elsewhere). The platform is `--platform`, else `[cluster] platform`, else `kubernetes`.
     fn spire_reader_rbac(&self) -> Vec<SandboxRbacObject> {
         let cluster = &self.profile.cluster;
         if !crate::deploy::render::gateway::isolated(self.profile)
@@ -1686,7 +1690,7 @@ exit $rc
         {
             return Vec::new();
         }
-        let platform = cluster.platform.unwrap_or_default();
+        let platform = self.opts.platform.or(cluster.platform).unwrap_or_default();
         let at = crate::deploy::spire::discovery_location(platform);
         let rule = |group: &str, resource: &str, names: Vec<String>| rbac::PolicyRule {
             api_groups: Some(vec![group.to_string()]),
@@ -2300,6 +2304,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2459,6 +2464,7 @@ mod tests {
                     harness: None,
                     model: None,
                     playbook: None,
+                    platform: None,
                 },
             )
             .expect("render")
@@ -2504,6 +2510,7 @@ mod tests {
                     harness,
                     model: model.map(str::to_string),
                     playbook: None,
+                    platform: None,
                 },
             )
             .expect("render")
@@ -2545,6 +2552,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2660,6 +2668,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2778,6 +2787,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -2835,6 +2845,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render")
@@ -3027,6 +3038,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3483,6 +3495,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3578,6 +3591,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3688,6 +3702,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3803,6 +3818,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -3854,6 +3870,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         ) {
             Err(e) => e,
@@ -3962,6 +3979,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render")
@@ -4148,6 +4166,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: None,
+                platform: None,
             },
         )
         .expect("render");
@@ -4333,6 +4352,30 @@ mod tests {
             ]
         );
         assert!(ocp.iter().any(|d| d["kind"] == "ClusterRoleBinding"));
+
+        let profile = k8s_profile(&format!("{readers}\nplatform = \"openshift\""));
+        let manifest = k8s_manifest();
+        let input = RenderInput::from_manifest(&manifest, "alpha").expect("render input");
+        let flagged = render(
+            input,
+            std::path::Path::new("/opt/crucible/domains/alpha"),
+            "crucible.toml",
+            &profile,
+            &RenderOpts {
+                platform: Some(forge::fleet::Platform::Kubernetes),
+                ..RenderOpts::default()
+            },
+        )
+        .expect("render");
+        let role: serde_json::Value = flagged
+            .split("\n---\n")
+            .map(|d| serde_norway::from_str::<serde_json::Value>(d).expect("yaml doc"))
+            .find(|d| d["metadata"]["name"] == SPIRE_READER && d["kind"] == "Role")
+            .expect("a Role");
+        assert_eq!(
+            role["metadata"]["namespace"], "spire-server",
+            "--platform wins over the profile's platform"
+        );
 
         assert!(
             docs("sandbox_namespace = \"crucible-sandboxes\"").is_empty(),
@@ -5532,6 +5575,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: Some(playbook),
+                platform: None,
             },
         )
         .expect("render")
@@ -5572,6 +5616,7 @@ mod tests {
                     harness,
                     model: model.map(str::to_string),
                     playbook: Some(playbook_launch()),
+                    platform: None,
                 },
             )
             .expect("render")
@@ -5862,6 +5907,7 @@ mod tests {
                 harness: None,
                 model: None,
                 playbook: Some(playbook_launch()),
+                platform: None,
             },
         )
         .expect("render");
