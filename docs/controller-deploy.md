@@ -311,6 +311,11 @@ publishes a succeeded build to `push_repo` only, tagged `<sandbox>-<build_id>`, 
 pod's `[secrets] push_authfile`; without either, buildit pushes nothing. `queue` submits builder
 pods to that Kueue LocalQueue in `namespace`; set it where Kueue manages the namespace and holds
 pods that name no queue (`manageJobsWithoutQueueName`), or builds wait 10 minutes and fail.
+`[buildit.builders]` sizes builder pods on every cluster: `node_arch` (their `kubernetes.io/arch`),
+`max_builds` live per sandbox, `pod_deadline_secs`, and `requests`/`limits`.
+`[buildit.cluster_builders.<cluster>]` replaces any of those on one cluster, so a mixed-architecture cluster can pin its builds. Without
+`node_arch`, builder pods run on the loop pod's architecture; unset limits are buildit's defaults
+(4 builds, 7200 s, no requests or limits).
 
 ```toml
 [buildit]
@@ -320,6 +325,15 @@ egress       = [{ cidr = "0.0.0.0/0", except = ["10.128.0.0/14", "172.30.0.0/16"
 run_jwks_uri = "https://crucible-ext.example/.well-known/jwks.json"  # optional
 push_repo    = "registry.example.com/team/crucible-smoke"  # optional
 queue        = "crucible-builds"                    # optional, a Kueue LocalQueue in namespace
+
+[buildit.builders]                                  # optional
+max_builds        = 2
+pod_deadline_secs = 3600
+requests          = { cpu = "8" }
+limits            = { cpu = "32" }
+
+[buildit.cluster_builders.spoke-b]                  # optional, per cluster
+node_arch = "amd64"
 ```
 
 ```bash

@@ -5,7 +5,7 @@
 
 use crate::deploy::profile::DeployProfile;
 use crucible_contract::agent_servers::{
-    BuilditSite, LocalServer, NotServerName, ServerName, Transport,
+    BuilderPods, BuilditSite, LocalServer, NotServerName, ServerName, Transport,
 };
 use std::collections::BTreeMap;
 
@@ -42,6 +42,8 @@ pub enum Hosting {
         push_repo: Option<String>,
         /// Where it fetches the agent issuer's keys, when not from the issuer itself.
         run_jwks_uri: Option<url::Url>,
+        /// Its builder pods on each of the server's clusters.
+        builders: BTreeMap<String, BuilderPods>,
     },
 }
 
@@ -51,9 +53,9 @@ impl ServerSpec {
         self.clusters.iter().any(|c| c == cluster)
     }
 
-    /// Where the server runs, as the loop pod is told, trusting `issuer`, the controller's agent
-    /// issuer.
-    pub fn transport(&self, issuer: &str) -> Result<Transport, url::ParseError> {
+    /// Where the server runs, as a loop pod on `cluster` is told, trusting `issuer`, the
+    /// controller's agent issuer.
+    pub fn transport(&self, issuer: &str, cluster: &str) -> Result<Transport, url::ParseError> {
         Ok(match &self.hosting {
             Hosting::Remote => Transport::Remote,
             Hosting::Buildit {
@@ -61,6 +63,7 @@ impl ServerSpec {
                 queue,
                 push_repo,
                 run_jwks_uri,
+                builders,
             } => {
                 let jwks = crate::deploy::profile::jwks_uri(issuer, run_jwks_uri.as_ref())?;
                 Transport::Local(LocalServer::Buildit(BuilditSite {
@@ -68,6 +71,7 @@ impl ServerSpec {
                     namespace: namespace.clone(),
                     push_repo: push_repo.clone(),
                     queue: queue.clone(),
+                    builders: builders.get(cluster).cloned().unwrap_or_default(),
                 }))
             }
         })
@@ -104,6 +108,8 @@ pub enum ServerSpecError {
     },
     #[error("[kueue] people_urls names cluster {0}, which is not one of [kueue] clusters")]
     PeopleUrlCluster(String),
+    #[error("[buildit] cluster_builders names cluster {0}, which is not one of [buildit] clusters")]
+    BuilderCluster(String),
     #[error("agent servers {first} and {second} both serve {url} on cluster {cluster}")]
     DuplicateUrl {
         first: ServerName,
@@ -152,6 +158,9 @@ impl DeployProfile {
             });
         }
         if let Some(b) = &self.buildit {
+            if let Some(stray) = b.cluster_builders.keys().find(|c| !b.serves(c)) {
+                return Err(ServerSpecError::BuilderCluster(stray.clone()));
+            }
             servers.push(ServerSpec {
                 name: ServerName::parse("buildit")?,
                 url: b.url(),
@@ -169,6 +178,11 @@ impl DeployProfile {
                     queue: b.queue.as_ref().map(ToString::to_string),
                     push_repo: b.push_repo.clone(),
                     run_jwks_uri: b.run_jwks_uri.clone(),
+                    builders: b
+                        .clusters
+                        .iter()
+                        .map(|c| (c.clone(), b.builders_on(c)))
+                        .collect(),
                 },
                 limits: [
                     ("push_repo", b.push_repo.clone()),
@@ -348,6 +362,7 @@ mod tests {
                         queue: Some("builders".into()),
                         push_repo: Some("quay.io/team/agent".into()),
                         run_jwks_uri: None,
+                        builders: BTreeMap::from([("ocp".into(), BuilderPods::default())]),
                     },
                     limits: BTreeMap::from([
                         ("push_repo".into(), "quay.io/team/agent".into()),
@@ -365,14 +380,18 @@ mod tests {
     fn buildit_trusts_the_issuer_it_is_handed() {
         let issuer = "https://crucible.hub.example";
         let servers = profile(KUEUE_AND_BUILDIT).agent_servers().unwrap();
-        assert_eq!(servers[0].transport(issuer).unwrap(), Transport::Remote);
         assert_eq!(
-            servers[1].transport(issuer).unwrap(),
+            servers[0].transport(issuer, "ocp").unwrap(),
+            Transport::Remote
+        );
+        assert_eq!(
+            servers[1].transport(issuer, "ocp").unwrap(),
             Transport::Local(LocalServer::Buildit(BuilditSite {
                 run_issuer: format!("{issuer}={issuer}/.well-known/jwks.json"),
                 namespace: "builds".into(),
                 push_repo: Some("quay.io/team/agent".into()),
                 queue: Some("builders".into()),
+                builders: BuilderPods::default(),
             }))
         );
         let routed = profile(&KUEUE_AND_BUILDIT.replace(
@@ -381,7 +400,8 @@ mod tests {
         ))
         .agent_servers()
         .unwrap();
-        let Transport::Local(LocalServer::Buildit(site)) = routed[1].transport(issuer).unwrap()
+        let Transport::Local(LocalServer::Buildit(site)) =
+            routed[1].transport(issuer, "ocp").unwrap()
         else {
             panic!("buildit runs in the loop pod")
         };
@@ -389,6 +409,92 @@ mod tests {
             site.run_issuer,
             format!("{issuer}=https://route.example/jwks.json")
         );
+    }
+
+    fn builders(spec: &ServerSpec, cluster: &str) -> BuilderPods {
+        match spec
+            .transport("https://crucible.hub.example", cluster)
+            .unwrap()
+        {
+            Transport::Local(LocalServer::Buildit(site)) => site.builders,
+            Transport::Remote => panic!("buildit runs in the loop pod"),
+        }
+    }
+
+    /// A mixed-architecture cluster pins its builder pods' architecture while every cluster
+    /// shares the rest of `builders`; a cluster setting replaces the default one whole.
+    #[test]
+    fn builder_pods_come_from_builders_and_each_cluster_s_overrides() {
+        use crucible_contract::agent_servers::NodeArch;
+        use std::num::NonZeroU32;
+        let servers = profile(
+            r#"
+            [buildit]
+            clusters = ["east", "west", "north"]
+            [buildit.builders]
+            max_builds = 2
+            pod_deadline_secs = 3600
+            requests = { cpu = "8" }
+            limits = { cpu = "32" }
+            [buildit.cluster_builders.west]
+            node_arch = "amd64"
+            [buildit.cluster_builders.north]
+            node_arch = "arm64"
+            limits = { cpu = "16", memory = "32Gi" }
+            "#,
+        )
+        .agent_servers()
+        .unwrap();
+        let shared = BuilderPods {
+            node_arch: None,
+            max_builds: NonZeroU32::new(2),
+            pod_deadline_secs: NonZeroU32::new(3600),
+            requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
+            limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+        };
+        assert_eq!(builders(&servers[0], "east"), shared);
+        assert_eq!(
+            builders(&servers[0], "west"),
+            BuilderPods {
+                node_arch: Some(NodeArch::Amd64),
+                ..shared.clone()
+            }
+        );
+        assert_eq!(
+            builders(&servers[0], "north"),
+            BuilderPods {
+                node_arch: Some(NodeArch::Arm64),
+                limits: Some(BTreeMap::from([
+                    ("cpu".into(), "16".into()),
+                    ("memory".into(), "32Gi".into()),
+                ])),
+                ..shared.clone()
+            }
+        );
+        assert_eq!(builders(&servers[0], "south"), BuilderPods::default());
+    }
+
+    #[test]
+    fn builder_pods_refuse_strays_and_bad_values() {
+        assert!(matches!(
+            profile(
+                "[buildit]\nclusters = [\"east\"]\n\
+                 [buildit.cluster_builders.west]\nnode_arch = \"amd64\"\n"
+            )
+            .agent_servers(),
+            Err(ServerSpecError::BuilderCluster(c)) if c == "west"
+        ));
+        for bad in [
+            "node_arch = \"x86_64\"",
+            "max_builds = 0",
+            "pod_deadline_secs = 0",
+            "max_builds = -1",
+            "cpu = \"8\"",
+            "requests = { cpu = 8 }",
+        ] {
+            let raw = format!("{BASE}[buildit]\n[buildit.builders]\n{bad}\n");
+            assert!(toml::from_str::<DeployProfile>(&raw).is_err(), "{bad}");
+        }
     }
 
     #[test]
@@ -511,6 +617,11 @@ mod tests {
                 queue: None,
                 push_repo: Some("quay.io/example/crucible-smoke".into()),
                 run_jwks_uri: None,
+                builders: servers[1]
+                    .clusters
+                    .iter()
+                    .map(|c| (c.clone(), BuilderPods::default()))
+                    .collect(),
             }
         );
         assert_eq!(p.people_resources().unwrap().len(), 2);
