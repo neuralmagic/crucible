@@ -470,6 +470,50 @@ mod tests {
         assert!(toml::from_str::<DeployProfile>(&bad_name).is_err());
     }
 
+    /// The tables an operator writes name only clusters, workload namespaces, people and the push
+    /// repository; namespaces, URLs and hosting are derived.
+    #[test]
+    fn the_minimal_tables_derive_the_rest() {
+        let minimal = r#"
+        [kueue]
+        clusters = ["pirate", "waldorf"]
+        workload_namespaces = ["crucible-kueue-e2e"]
+        people = true
+        people_urls = { pirate = "https://kueue.pirate.example/mcp" }
+        [buildit]
+        clusters = ["pirate", "waldorf"]
+        push_repo = "quay.io/example/crucible-smoke"
+        "#;
+        let p = profile(minimal);
+        let servers = p.agent_servers().unwrap();
+        assert_eq!(
+            servers[0].url,
+            "http://crucible-kueue.crucible-kueue.svc.cluster.local:8850/mcp"
+        );
+        assert_eq!(servers[0].clusters, ["pirate", "waldorf"]);
+        assert_eq!(
+            servers[1].hosting,
+            Hosting::Buildit {
+                namespace: "crucible-builds".into(),
+                push_repo: Some("quay.io/example/crucible-smoke".into()),
+                run_jwks_uri: None,
+            }
+        );
+        assert_eq!(p.people_resources().unwrap().len(), 2);
+        let one_url = profile(&minimal.replace(
+            "people_urls = { pirate = \"https://kueue.pirate.example/mcp\" }\n",
+            "",
+        ));
+        assert!(
+            matches!(
+                one_url.people_resources(),
+                Err(ServerSpecError::PeopleUrlTwice { .. })
+            ),
+            "every cluster's server has the same Service URL, so people on two clusters need \
+             people_urls to tell them apart"
+        );
+    }
+
     /// People reach crucible-kueue on each of its clusters at its Service URL, or where
     /// `people_urls` says; two clusters at one URL would be one resource, so that is refused.
     #[test]

@@ -159,8 +159,10 @@ impl TryFrom<String> for ServiceAccountRef {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KueueCfg {
-    /// The server image, a tag the renderer resolves to `@sha256:…`.
-    pub image: String,
+    /// The server image, a tag the renderer resolves to `@sha256:…`. Only `deploy render --kueue`
+    /// reads it.
+    #[serde(default)]
+    pub image: Option<String>,
     /// The dispatch clusters the server runs on, `hub` or spoke names: `clusters = ["east",
     /// "west"]`, or `cluster = "east"` for one.
     #[serde(
@@ -169,7 +171,9 @@ pub struct KueueCfg {
         deserialize_with = "one_or_many"
     )]
     pub clusters: Vec<String>,
-    /// Namespace of the server's Deployment, Service, and ServiceAccount.
+    /// Namespace of the server's Deployment, Service, and ServiceAccount. Default
+    /// `crucible-kueue`.
+    #[serde(default = "default_kueue_namespace")]
     pub namespace: KubeName,
     /// The namespaces runs' tokens name, the first as the default, and the only ones where the
     /// server's own account holds workload verbs: `workload_namespaces = [...]`, or
@@ -502,6 +506,10 @@ impl ClusterLinkCfg {
     pub fn browser_url<'a>(&'a self, issuer: Option<&'a str>) -> Option<&'a str> {
         self.external_url.as_deref().or(issuer)
     }
+}
+
+fn default_kueue_namespace() -> KubeName {
+    KubeName("crucible-kueue".to_string())
 }
 
 fn default_builder_namespace() -> KubeName {

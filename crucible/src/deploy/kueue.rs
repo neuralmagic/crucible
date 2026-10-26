@@ -22,10 +22,14 @@ const APP_LABEL: &str = "app.kubernetes.io/name";
 
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "rendering crucible-kueue needs a [kueue] table in the deploy profile (image, namespace, \
+    "rendering crucible-kueue needs a [kueue] table in the deploy profile (image, \
      workload_namespaces)"
 )]
 pub struct MissingKueueTable;
+
+#[derive(Debug, thiserror::Error)]
+#[error("rendering crucible-kueue needs [kueue] image, the server image to run")]
+pub struct NoKueueImage;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum KueueClusterError {
@@ -80,7 +84,8 @@ pub fn render(profile: &DeployProfile, opts: &RenderOpts, target: &KueueTarget) 
         .or_else(|| profile.platform(cluster))
         .unwrap_or_default();
     let authz = cfg.kube_authz(platform);
-    let image = pin_image(opts.digests.as_deref(), "crucible-kueue image", &cfg.image)?;
+    let image = cfg.image.as_deref().ok_or(NoKueueImage)?;
+    let image = pin_image(opts.digests.as_deref(), "crucible-kueue image", image)?;
     let pull_secret = profile.image.pull_secret.as_str();
     let mut docs = Vec::new();
     let mut push = |what: &str, doc: Result<String, serde_norway::Error>| -> Result<()> {
@@ -895,6 +900,24 @@ mod tests {
         let without = PROFILE.split("[kueue]").next().unwrap();
         let err = render(&profile(without), &RenderOpts::default(), &target(None)).unwrap_err();
         assert!(err.downcast_ref::<MissingKueueTable>().is_some());
+        let imageless = PROFILE.replace(
+            "image = \"registry.example.com/crucible-kueue:latest\"\n",
+            "",
+        );
+        assert_ne!(imageless, PROFILE);
+        let err = render(&profile(&imageless), &RenderOpts::default(), &target(None)).unwrap_err();
+        assert!(err.downcast_ref::<NoKueueImage>().is_some(), "{err:#}");
+    }
+
+    #[test]
+    fn the_server_namespace_defaults_to_crucible_kueue() {
+        let unnamed = PROFILE.replace(
+            "namespace = \"crucible-system\"\n        workload",
+            "workload",
+        );
+        assert_ne!(unnamed, PROFILE);
+        let kueue = profile(&unnamed).kueue.unwrap();
+        assert_eq!(kueue.namespace.as_str(), "crucible-kueue");
     }
 
     #[test]

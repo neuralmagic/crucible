@@ -1757,9 +1757,9 @@ tokens, the controller does not read them.
 | `[cluster] platform`, `[clusters.<name>] platform` | detected | `kubernetes` or `openshift`, over what is detected: the controller asks each cluster's API server (OpenShift serves `security.openshift.io`), and a render without cluster access takes `crucible deploy render --platform`, then this key, then `kubernetes`. The distribution the hub or a spoke runs. It decides what a render may assume of the cluster (section 11.2). Each cluster's render reads that cluster's own entry: an OpenShift hub dispatching to an OpenShift spoke and a Kubernetes spoke renders each spoke for its own platform, and nothing applies the hub's platform to a spoke. The hub's own platform affects only what is rendered for the hub itself; its ingress and deploy are the Argo chart's. |
 | cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
 | `[cluster] aws_sandbox_role_arn` | unset | The AWS role that the gateway pod assumes for sandboxes. |
-| `[kueue] image` | required | The `crucible-kueue` image. |
+| `[kueue] image` | required by `deploy render --kueue` | The `crucible-kueue` image. The controller does not read it. |
 | `[kueue] clusters` or `cluster` | `["hub"]` | The clusters where the server runs. Runs on these clusters get `crucible-kueue` access. |
-| `[kueue] namespace` | required | The server namespace. |
+| `[kueue] namespace` | `crucible-kueue` | The server namespace. |
 | `[kueue] workload_namespaces` (or `workload_namespace` for one) | required, not empty | The namespaces crucible-kueue tokens name, the first as the `namespace` claim, and the only namespaces where the server account has workload verbs. Each gets its Namespace, RoleBinding and `--namespace`. |
 | `[kueue] run_jwks_uri` | `<CONTROLLER_AGENT_ISSUER>/.well-known/jwks.json` | For a server that cannot reach the issuer address. |
 | `[kueue] kube_authz` | `openshift` on an OpenShift cluster, `token` elsewhere | `openshift` (the cluster's Group objects) or `token` (the token's `kube_groups`): where groups come from. |
