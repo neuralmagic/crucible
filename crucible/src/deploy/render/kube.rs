@@ -350,7 +350,7 @@ pub fn render(
         opts,
         image,
         sandbox_image,
-        driver: profile.cluster.sandbox_driver,
+        driver: profile.cluster.sandbox_driver(),
         spoke,
     };
 
@@ -367,7 +367,7 @@ pub fn render(
     }
     // Under the kubernetes driver the gateway SA needs sandbox CRD RBAC + a ClusterRole for
     // tokenreviews and node reads.
-    if profile.cluster.sandbox_driver == ComputeDriver::Kubernetes {
+    if profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes {
         for obj in r.sandbox_rbac() {
             let yaml = serde_norway::to_string(&obj).context("serializing sandbox RBAC")?;
             out.push_str(&format!("---\n{yaml}"));
@@ -5376,7 +5376,7 @@ mod tests {
         )
         .expect("podman profile");
         assert_eq!(
-            podman_profile.cluster.sandbox_driver,
+            podman_profile.cluster.sandbox_driver(),
             ComputeDriver::Podman,
             "default is podman"
         );
@@ -5396,7 +5396,7 @@ mod tests {
         )
         .expect("k8s profile");
         assert_eq!(
-            k8s_profile.cluster.sandbox_driver,
+            k8s_profile.cluster.sandbox_driver(),
             ComputeDriver::Kubernetes,
         );
     }

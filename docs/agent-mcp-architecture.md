@@ -42,7 +42,7 @@ Each term has one sense in this document.
 | gateway id | The OpenShell id of one gateway. It is the loop pod name, hashed when longer than 63 characters. The label `openshell.ai/gateway-id` carries it. |
 | hub | The cluster where the controller runs. Its dispatch name is `hub`. |
 | identity rule | The rule in the deploy profile that tells how the controller learns `kube_user` on one cluster: `link` or `{ claim, prefix }`. |
-| isolated profile | A deploy profile with `sandbox_driver = "kubernetes"` and a `sandbox_namespace`. Each run then gets a gateway pod of its own (`crucible/src/deploy/render/gateway.rs:55`). |
+| isolated profile | A deploy profile with a `sandbox_namespace`, which means the kubernetes driver. Each run then gets a gateway pod of its own (`crucible/src/deploy/render/gateway.rs:55`). |
 | issuer | The OAuth authorization server inside the controller. `CONTROLLER_AGENT_ISSUER` is its identifier. |
 | issuer key | The ES256 private key that signs every token. |
 | JWKS | A JSON Web Key Set: the public keys that verify signatures. |
@@ -1747,7 +1747,7 @@ tokens, the controller does not read them.
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `[cluster] sandbox_driver` | per profile | `kubernetes` is one half of an isolated profile. |
+| `[cluster] sandbox_driver` | `kubernetes` with a `sandbox_namespace`, else `podman` | Set only for sandboxes in the loop namespace under the kubernetes driver. Profile load refuses `podman` with a `sandbox_namespace`. |
 | `[cluster] sandbox_namespace` | unset | The other half. Unset: sandboxes live in the loop namespace and no agent tokens are issued. |
 | `[cluster] sandbox_service_account` | `crucible-sandbox` with a sandbox namespace, else the loop's | The account sandbox pods run as. Under isolated gateways it is never the loop's account, which does not exist in the sandbox namespace. |
 | `[cluster] sandbox_readers` | `[]` | `namespace/name` service accounts that get the controller rights in section 6.6. |
@@ -2001,8 +2001,7 @@ in place.
 2. On each cluster that hosts runs, install SPIRE with the OIDC discovery provider. Add a
    ClusterSPIFFEID for supervisor pods in the sandbox namespace, with `jwtTtl: 5m` and the
    template in section 6.1.
-3. In the deploy profile, set `sandbox_driver = "kubernetes"`, `sandbox_namespace` and
-   `sandbox_readers`.
+3. In the deploy profile, set `sandbox_namespace` and `sandbox_readers`.
 4. Render the loop RBAC with `crucible deploy render --manifest <render.toml> --profile <profile>`.
    Apply the ServiceAccount, Roles and bindings on each cluster. They include
    `crucible-spire-reader`, which lets `sandbox_readers` discover the cluster's SPIRE (section 6.9).

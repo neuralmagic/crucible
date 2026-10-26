@@ -18,9 +18,8 @@ pub enum PlacementError {
     )]
     NoSandboxNamespace,
     #[error(
-        "the deploy profile does not run each run's gateway in its own pod (sandbox_driver = \
-         \"kubernetes\" with a sandbox_namespace); agent tokens need supervisor pods only a run's \
-         own gateway could have created"
+        "the deploy profile runs each run's gateway in the loop pod (sandbox_driver = \"podman\"); \
+         agent tokens need supervisor pods only a run's own gateway could have created"
     )]
     SharedGateway,
     #[error(
@@ -229,7 +228,10 @@ mod tests {
             sandbox_namespace(Some(&profile(PROFILE))).map(|ns| ns.as_str()),
             Ok("sandboxes")
         );
-        let in_pod = profile(&PROFILE.replace("sandbox_driver = \"kubernetes\"\n", ""));
+        let in_pod = profile(&PROFILE.replace(
+            "sandbox_driver = \"kubernetes\"",
+            "sandbox_driver = \"podman\"",
+        ));
         assert_eq!(
             sandbox_namespace(Some(&in_pod)),
             Err(PlacementError::SharedGateway),

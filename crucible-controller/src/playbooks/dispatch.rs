@@ -231,7 +231,7 @@ impl DispatchCapability {
         let kubernetes_driver = cfg.deploy_profile.as_deref().is_some_and(|path| {
             match crucible::deploy::DeployProfile::load(path) {
                 Ok(profile) => {
-                    profile.cluster.sandbox_driver
+                    profile.cluster.sandbox_driver()
                         == crucible::openshell::gateway::ComputeDriver::Kubernetes
                 }
                 Err(e) => {

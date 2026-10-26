@@ -9,7 +9,6 @@ service_account         = "crucible-kueue-e2e-loop"
 sandbox_namespace       = "@SANDBOX_NS@"
 sandbox_readers         = ["@CTL_NS@/crucible-controller"]
 supervisor_image        = "@SUPERVISOR_IMAGE@"
-sandbox_driver          = "kubernetes"
 platform                = "@PLATFORM@"
 # The images are linux/amd64; the script lists every node of another architecture here.
 avoid_nodes             = [@AVOID_NODES@]

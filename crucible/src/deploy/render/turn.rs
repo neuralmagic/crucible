@@ -346,7 +346,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // with the podman driver's default (see the `--compute-driver` flag below), nests a pull of
     // `sandbox_image` through the authfile path instead of the kubelet's `imagePullSecrets`, and
     // never creates a `Sandbox` CR.
-    if profile.cluster.sandbox_driver == ComputeDriver::Kubernetes {
+    if profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes {
         env.extend(kubernetes_sandbox_env(profile, &sandbox_image)?);
     }
     // The GitHub / gate / Vertex-project env the profile carries (rank-grounded fetches the issue
@@ -405,7 +405,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
     // subcommand synthesizes a fresh `Args` (`Cli::parse_from(["crucible"])`) that always defaults
     // to the podman compute driver, so the gateway resolves `sandbox_image` through the nested
     // podman/authfile path instead of the kubelet's `imagePullSecrets` and never creates a Sandbox.
-    let sandboxed = match profile.cluster.sandbox_driver {
+    let sandboxed = match profile.cluster.sandbox_driver() {
         ComputeDriver::Kubernetes => vec!["--compute-driver=kubernetes".to_string()],
         ComputeDriver::Podman => Vec::new(),
     };
@@ -583,7 +583,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
         command: Some(vec!["crucible".to_string()]),
         args: Some(argv),
         security_context: crate::deploy::render::kube::agent_security_context(
-            profile.cluster.sandbox_driver,
+            profile.cluster.sandbox_driver(),
         ),
         env: Some(env),
         volume_mounts: Some(mounts),
@@ -611,7 +611,7 @@ pub fn render_turn(profile: &DeployProfile, opts: &TurnOpts) -> Result<String> {
             // no mounted kubeconfig like the loop pod does, so it needs the automounted token; podman
             // never touches the API and stays tokenless.
             automount_service_account_token: Some(
-                profile.cluster.sandbox_driver == ComputeDriver::Kubernetes,
+                profile.cluster.sandbox_driver() == ComputeDriver::Kubernetes,
             ),
             restart_policy: Some("Never".to_string()),
             affinity: node_avoid_affinity(profile),

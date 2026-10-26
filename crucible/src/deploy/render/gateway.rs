@@ -53,7 +53,7 @@ const GATEWAY_HOME: &str = "/var/lib/openshell-gateway";
 /// Whether this profile runs each run's gateway in its own pod: only under the kubernetes driver
 /// with a dedicated sandbox namespace.
 pub fn isolated(profile: &DeployProfile) -> bool {
-    profile.cluster.sandbox_driver == crate::openshell::gateway::ComputeDriver::Kubernetes
+    profile.cluster.sandbox_driver() == crate::openshell::gateway::ComputeDriver::Kubernetes
         && profile.cluster.sandbox_namespace.is_some()
 }
 
@@ -548,7 +548,7 @@ mod tests {
     fn only_a_kubernetes_profile_with_a_sandbox_namespace_isolates_its_gateways() {
         assert!(isolated(&isolated_profile()));
         assert!(!isolated(&profile("")));
-        let podman: DeployProfile = toml::from_str(
+        let placed: DeployProfile = toml::from_str(
             r#"
             [cluster]
             loop_namespace = "loops"
@@ -562,7 +562,13 @@ mod tests {
             "#,
         )
         .expect("profile");
-        assert!(!isolated(&podman), "podman nests sandboxes in the loop pod");
+        assert!(
+            isolated(&placed),
+            "a sandbox namespace means the kubernetes driver"
+        );
+        let mut nested = placed;
+        nested.cluster.sandbox_driver = Some(crate::openshell::gateway::ComputeDriver::Podman);
+        assert!(!isolated(&nested), "podman nests sandboxes in the loop pod");
     }
 
     #[test]

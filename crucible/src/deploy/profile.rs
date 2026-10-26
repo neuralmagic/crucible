@@ -682,9 +682,10 @@ pub struct Cluster {
     #[serde(default)]
     pub aws_sandbox_role_arn: Option<String>,
     /// The OpenShell compute driver for the sandbox: `podman` nests it inside the loop pod
-    /// (laptop/EC2); `kubernetes` schedules it as a sibling pod in-cluster.
+    /// (laptop/EC2); `kubernetes` schedules it as a sibling pod in-cluster. Default `kubernetes`
+    /// with a `sandbox_namespace`, else `podman`; see [`Cluster::sandbox_driver`].
     #[serde(default)]
-    pub sandbox_driver: ComputeDriver,
+    pub sandbox_driver: Option<ComputeDriver>,
     /// Nodes the cluster operator has marked bad (e.g. broken CNI); rendered as a required
     /// nodeAffinity `NotIn` on `kubernetes.io/hostname` for every pod this profile renders.
     #[serde(default)]
@@ -866,6 +867,16 @@ impl Cluster {
             .map_or(self.loop_namespace.as_str(), KubeName::as_str)
     }
 
+    /// The compute driver sandboxes run under: `sandbox_driver`, else `kubernetes` when sandboxes
+    /// have a namespace of their own (only that driver can put them there), else `podman`.
+    pub fn sandbox_driver(&self) -> ComputeDriver {
+        match (self.sandbox_driver, &self.sandbox_namespace) {
+            (Some(driver), _) => driver,
+            (None, Some(_)) => ComputeDriver::Kubernetes,
+            (None, None) => ComputeDriver::default(),
+        }
+    }
+
     /// The SPIFFE Workload API socket path supervisors get: `sandbox_spiffe_socket`, else
     /// [`DEFAULT_SPIFFE_SOCKET`].
     pub fn spiffe_socket(&self) -> &str {
@@ -878,8 +889,8 @@ impl Cluster {
     /// [`DEFAULT_SANDBOX_SERVICE_ACCOUNT`] under isolated gateways (sandboxes in a namespace of
     /// their own, where the loop's account does not exist), else the loop's.
     pub fn sandbox_service_account(&self) -> &str {
-        let isolated = self.sandbox_driver == crate::openshell::gateway::ComputeDriver::Kubernetes
-            && self.sandbox_namespace.is_some();
+        let isolated =
+            self.sandbox_driver() == ComputeDriver::Kubernetes && self.sandbox_namespace.is_some();
         match (&self.sandbox_service_account, isolated) {
             (Some(sa), _) => sa,
             (None, true) => DEFAULT_SANDBOX_SERVICE_ACCOUNT,
@@ -887,6 +898,13 @@ impl Cluster {
         }
     }
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "[cluster] sets sandbox_namespace with sandbox_driver = \"podman\", which nests sandboxes \
+     in the loop pod; drop sandbox_driver, since a sandbox namespace means the kubernetes driver"
+)]
+pub struct PodmanSandboxNamespace;
 
 /// No sandbox runtime image to render: the profile names none and the build has no OpenShell rev.
 #[derive(Debug, thiserror::Error)]
@@ -1058,6 +1076,9 @@ impl DeployProfile {
             .check_namespaces()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
+            .check_sandbox_driver()
+            .with_context(|| format!("validating deploy profile {}", path.display()))?;
+        profile
             .check_cluster_names()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         profile
@@ -1067,6 +1088,14 @@ impl DeployProfile {
             .people_resources()
             .with_context(|| format!("validating deploy profile {}", path.display()))?;
         Ok(profile)
+    }
+
+    /// Refuse a sandbox namespace under the podman driver, which nests sandboxes in the loop pod.
+    pub fn check_sandbox_driver(&self) -> Result<(), PodmanSandboxNamespace> {
+        match (self.cluster.sandbox_driver, &self.cluster.sandbox_namespace) {
+            (Some(ComputeDriver::Podman), Some(_)) => Err(PodmanSandboxNamespace),
+            _ => Ok(()),
+        }
     }
 
     /// Refuse a spoke, `[kueue]` or `[buildit]` cluster name [`check_cluster_name`] refuses.
@@ -1686,6 +1715,61 @@ mod tests {
                 "{ns}: {refused:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_sandbox_namespace_means_the_kubernetes_driver() {
+        let driver = |extra: &str| {
+            kueue_profile(extra, "workload_namespace = \"w\"")
+                .cluster
+                .sandbox_driver()
+        };
+        assert_eq!(driver(""), ComputeDriver::Podman);
+        assert_eq!(
+            driver(r#"sandbox_namespace = "sandboxes""#),
+            ComputeDriver::Kubernetes
+        );
+        assert_eq!(
+            driver(r#"sandbox_driver = "kubernetes""#),
+            ComputeDriver::Kubernetes,
+            "sandboxes in the loop namespace"
+        );
+        let both = kueue_profile(
+            "sandbox_namespace = \"sandboxes\"\nsandbox_driver = \"kubernetes\"",
+            "workload_namespace = \"w\"",
+        );
+        assert_eq!(both.check_sandbox_driver().ok(), Some(()));
+        let nested = kueue_profile(
+            "sandbox_namespace = \"sandboxes\"\nsandbox_driver = \"podman\"",
+            "workload_namespace = \"w\"",
+        );
+        assert!(nested.check_sandbox_driver().is_err());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("profile.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [cluster]
+            loop_namespace = "loops"
+            rig_namespace = "rig"
+            service_account = "crucible-spoke"
+            supervisor_image = "registry.example.com/openshell-supervisor:latest"
+            sandbox_namespace = "sandboxes"
+            sandbox_driver = "podman"
+            [image]
+            loop = "registry.example.com/crucible-loop:latest"
+            pull_secret = "pull"
+            "#,
+        )
+        .expect("write");
+        let Err(err) = DeployProfile::load(&path) else {
+            panic!("a sandbox namespace under the podman driver loaded");
+        };
+        assert!(
+            err.chain()
+                .any(|e| e.downcast_ref::<PodmanSandboxNamespace>().is_some()),
+            "{err:#}"
+        );
     }
 
     #[test]

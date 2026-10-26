@@ -153,8 +153,8 @@ and a fixed description; the reason is logged.
 
 **Sandbox placement.** A sandbox's SPIFFE ID is only as trustworthy as whoever can create pods
 where its supervisor runs, so with agent clusters the controller refuses to start
-unless the deploy profile runs each run's gateway in its own pod: `sandbox_driver = "kubernetes"`
-with `[cluster] sandbox_namespace`, which profile load refuses to share with the loop, rig, or
+unless the deploy profile runs each run's gateway in its own pod: `[cluster] sandbox_namespace`
+(which means the kubernetes driver), which profile load refuses to share with the loop, rig, or
 crucible-kueue namespaces. It also refuses to start the issuer when its own namespace, where the
 signing key Secret is mounted from, is any of those namespaces or `[buildit] namespace` (the loop
 account can exec into any pod there), and when a SPIRE's namespace in `CONTROLLER_AGENT_SPIRE` is
