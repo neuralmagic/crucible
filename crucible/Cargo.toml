@@ -58,7 +58,7 @@ nix = { version = "0.31.3", features = ["fs", "signal"] }
 # AWS_ROLE_ARN + the projected token). The loop is sync, so `publish` owns a small
 # block_on runtime; the rest of the loop never touches tokio.
 aws-config = { version = "1", optional = true }
-aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["sigv4a", "http-1x", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", optional = true, default-features = false, features = ["http-1x", "default-https-client", "rt-tokio"] }
 # `sync` (Notify) backs the autopilot daemon's graceful-shutdown signal. `process` runs the
 # surviving openshell CLI upload/download as cancellable async children inside the turn.
 tokio = { version = "1", features = [

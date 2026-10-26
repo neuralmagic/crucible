@@ -58,7 +58,7 @@ impl RegistryProvider {
         minter: crate::secrets::minter::Minter,
     ) -> Result<String, ProviderError> {
         match minter {
-            crate::secrets::minter::Minter::GithubApp => {
+            crate::secrets::minter::Minter::GithubApp(owner) => {
                 let app = self
                     .github_app
                     .as_ref()
@@ -66,7 +66,7 @@ impl RegistryProvider {
                         name: row.name.to_string(),
                         backend: "a configured GitHub App",
                     })?;
-                app.token_for_one_consumer()
+                app.token_for_one_consumer(owner.as_ref())
                     .await
                     .map_err(|source| ProviderError::Backend {
                         name: row.name.to_string(),
@@ -196,7 +196,7 @@ mod tests {
     fn minted_row(name: &str) -> SecretRow {
         SecretRow {
             mode: crate::secrets::SecretMode::Minted,
-            vault_path: crate::secrets::minter::Minter::GithubApp.uri(),
+            vault_path: crate::secrets::minter::Minter::GithubApp(None).uri(),
             current_version: None,
             ..row(name)
         }
@@ -235,6 +235,55 @@ mod tests {
             provider.value_of(&minted_row("pr_token")).await.unwrap(),
             "ghs_for_this_run"
         );
+    }
+
+    /// A secret minted for another account is issued through that account's installation, not the
+    /// home one.
+    #[tokio::test]
+    async fn an_owner_scoped_secret_is_issued_through_that_owners_installation() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .and(wiremock::matchers::path("/app/installations"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                    {"id": 99, "account": {"login": "neuralmagic"}},
+                    {"id": 4242, "account": {"login": "red-hat-data-services"}},
+                ])),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path(
+                "/app/installations/4242/access_tokens",
+            ))
+            .respond_with(
+                wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                    "token": "ghs_for_rhds",
+                    "expires_at": jiff::Timestamp::from_second(
+                        jiff::Timestamp::now().as_second() + 3600,
+                    )
+                    .unwrap()
+                    .to_string(),
+                })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let app = crate::secrets::github_app::GithubAppTokenSource::new(
+            "4210340",
+            "99",
+            crate::secrets::github_app::testkey::write_test_key(dir.path()),
+            server.uri(),
+        );
+        let provider = RegistryProvider::installed(None, Some(app)).expect("an app is a backend");
+        let row = SecretRow {
+            vault_path: "mint://github-app/red-hat-data-services".to_string(),
+            ..minted_row("pr_token")
+        };
+
+        assert_eq!(provider.value_of(&row).await.unwrap(), "ghs_for_rhds");
     }
 
     /// Two runs must not share a credential, and must not be served the controller's cached one.

@@ -248,6 +248,19 @@ describe('registerBody', () => {
     expect('value' in body).toBe(false);
     expect('vault_token' in body).toBe(false);
   });
+
+  it('names the GitHub account a minted token is issued for', () => {
+    const body = registerBody(form({ mode: 'mint', minter: 'github-app', mintAccount: ' red-hat-data-services ' }));
+    expect(body).toMatchObject({ mint: 'github-app/red-hat-data-services' });
+  });
+
+  it('refuses a GitHub account that is not a login', () => {
+    for (const bad of ['-lead', 'trail-', 'a/b', 'has space', 'x'.repeat(40)]) {
+      expect(registerErrors(form({ mode: 'mint', mintAccount: bad })).has('mintAccount'), bad).toBe(true);
+    }
+    expect(registerErrors(form({ mode: 'mint', mintAccount: 'x'.repeat(39) })).size).toBe(0);
+    expect(registerErrors(form({ mode: 'mint', mintAccount: '' })).size).toBe(0);
+  });
 });
 
 describe('the bind form', () => {

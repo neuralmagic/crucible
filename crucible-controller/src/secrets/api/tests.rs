@@ -334,6 +334,148 @@ async fn a_minted_secret_must_be_an_opaque_run_credential(pool: PgPool) {
     assert!(store::list(&pool, None).await.expect("list").is_empty());
 }
 
+/// The registry router with the GitHub App pointed at `server`, which lists the App on
+/// `neuralmagic` and `red-hat-data-services`.
+async fn app_with_installations(
+    pool: PgPool,
+    server: &wiremock::MockServer,
+    key_dir: &std::path::Path,
+) -> Router {
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/app/installations"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(json!([
+            {"id": 99, "account": {"login": "neuralmagic"}},
+            {"id": 4242, "account": {"login": "red-hat-data-services"}},
+        ])))
+        .mount(server)
+        .await;
+    router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec![], vec!["alice".into()], vec![]),
+        pack_pr_app: Some(crate::secrets::github_app::GithubAppTokenSource::new(
+            "4210340",
+            "99",
+            crate::secrets::github_app::testkey::write_test_key(key_dir),
+            server.uri(),
+        )),
+        ..ApiState::test(Db::new(pool), Arc::new(NoSink))
+    })
+}
+
+fn mint_body(mint: &str) -> Value {
+    json!({"name": "pr-token", "kind": "opaque", "mint": mint})
+}
+
+/// A secret minted for another account stores that account in its source.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_minted_secret_can_name_the_account_it_is_issued_for(pool: PgPool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = wiremock::MockServer::start().await;
+    let app = app_with_installations(pool.clone(), &server, dir.path()).await;
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/Red-Hat-Data-Services")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        body["vault_path"], "mint://github-app/red-hat-data-services",
+        "{body}"
+    );
+}
+
+/// An account the App is not installed on could never be issued a token.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_minted_secret_for_an_account_without_the_app_is_refused(pool: PgPool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = wiremock::MockServer::start().await;
+    let app = app_with_installations(pool.clone(), &server, dir.path()).await;
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/acme")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not installed on acme"),
+        "{body}"
+    );
+    assert!(store::list(&pool, None).await.expect("list").is_empty());
+}
+
+/// GitHub being unreachable is not the registrant's mistake.
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_failed_installation_lookup_is_unavailable(pool: PgPool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/app/installations"))
+        .respond_with(wiremock::ResponseTemplate::new(502))
+        .mount(&server)
+        .await;
+    let app = router(ApiState {
+        roles: crate::identity::auth::Roles::new(vec![], vec!["alice".into()], vec![]),
+        pack_pr_app: Some(crate::secrets::github_app::GithubAppTokenSource::new(
+            "4210340",
+            "99",
+            crate::secrets::github_app::testkey::write_test_key(dir.path()),
+            server.uri(),
+        )),
+        ..ApiState::test(Db::new(pool.clone()), Arc::new(NoSink))
+    });
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/red-hat-data-services")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    assert!(store::list(&pool, None).await.expect("list").is_empty());
+}
+
+#[sqlx::test(migrator = "crate::MIGRATOR")]
+async fn a_minted_secret_with_a_malformed_account_is_refused(pool: PgPool) {
+    let app = app(pool.clone(), None);
+    let (status, body) = call(
+        &app,
+        as_user(
+            "POST",
+            "/api/secrets",
+            "alice",
+            &[],
+            Some(mint_body("github-app/not a login")),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not a GitHub login"),
+        "{body}"
+    );
+}
+
 /// The three sources are exclusive, and an unknown minter is refused by name.
 #[sqlx::test(migrator = "crate::MIGRATOR")]
 async fn a_registration_names_exactly_one_source(pool: PgPool) {
