@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::backend::{Backend, PodOpts, Resources};
 use crate::logs::{LOG_DIR, Log, LogName, MAX_READ, Page, Query};
-use crate::pod::BuilderPod;
+use crate::pod::{BuilderPod, KUEUE_GATE, Release};
 use crate::sandbox::{RESULTS_DIR, RelPath, SandboxDir, SandboxName, Workspace, is_label_value};
 use crate::step::{self, Fetch, Published, Snapshot, Status};
 use crate::task::{self, Progress, TaskRef};
@@ -53,6 +53,8 @@ const LABEL_SANDBOX: &str = "buildit.dev/sandbox";
 const LABEL_BUILD_ID: &str = "buildit.dev/build-id";
 /// The person a realm token acted for, on every builder pod it starts.
 const LABEL_LAUNCHED_BY: &str = "crucible.dev/launched-by";
+/// The Kueue LocalQueue a builder pod is submitted to.
+const LABEL_QUEUE: &str = "kueue.x-k8s.io/queue-name";
 
 /// Scope that lets a token read build status and logs.
 pub const SCOPE_READ: &str = "buildit.read";
@@ -60,6 +62,7 @@ pub const SCOPE_READ: &str = "buildit.read";
 pub const SCOPE_BUILD: &str = "buildit.build";
 
 const POD_READY: Duration = Duration::from_secs(180);
+const ADMISSION: Duration = Duration::from_secs(600);
 const DEFAULT_BUILD_TIMEOUT_S: u64 = 1800;
 const DEFAULT_RUN_TIMEOUT_S: u64 = 600;
 const FROM_TIMEOUT: Duration = Duration::from_secs(300);
@@ -136,6 +139,10 @@ pub struct McpArgs {
     /// Schedule builder pods only on nodes of this architecture (kubernetes.io/arch)
     #[arg(long)]
     pub node_arch: Option<String>,
+    /// Kueue LocalQueue in the builder namespace that builder pods are submitted to. A build waits
+    /// up to 10 minutes for admission
+    #[arg(long, env = "MCP_QUEUE")]
+    pub queue: Option<String>,
     /// Resource requests for builder pods, repeatable: --request cpu=2
     #[arg(long = "request", value_name = "KEY=QTY", value_parser = crate::parse_kv)]
     pub requests: Vec<(String, String)>,
@@ -159,6 +166,11 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
     let namespace = args
         .namespace
         .unwrap_or_else(|| client.default_namespace().to_string());
+    if let Some(q) = &args.queue
+        && !is_label_value(q)
+    {
+        bail!("queue {q:?} is not a label value");
+    }
     let oidc = match args.run_issuers.is_empty() {
         true => None,
         false => {
@@ -206,6 +218,7 @@ pub async fn serve(client: kube::Client, args: McpArgs) -> Result<()> {
         deadline_secs: args.pod_deadline,
         max_builds: args.max_builds,
         node_arch: args.node_arch,
+        queue: args.queue,
         run_id: args.run_id,
         push: match (args.push_repo, args.push_authfile) {
             (Some(repo), Some(authfile)) => Some(PushTarget::new(repo, authfile)?),
@@ -464,6 +477,7 @@ pub struct Broker {
     deadline_secs: i64,
     max_builds: usize,
     node_arch: Option<String>,
+    queue: Option<String>,
     run_id: Option<String>,
     push: Option<PushTarget>,
 }
@@ -679,6 +693,29 @@ fn build_limit(requested: Duration, deadline_secs: i64, used: Duration) -> Resul
         );
     }
     Ok(requested.min(left))
+}
+
+// a build whose pod never left its scheduling gates
+fn held(id: &BuildId, gates: &[String], queue: Option<&str>) -> anyhow::Error {
+    let waited = ADMISSION.as_secs();
+    let kueue = gates.iter().any(|g| g == KUEUE_GATE);
+    match queue {
+        Some(q) if kueue => anyhow!(
+            "Kueue did not admit build {} from LocalQueue {q} within {waited}s: the queue is \
+             missing or its ClusterQueue has no room; build again later",
+            id.0
+        ),
+        None if kueue => anyhow!(
+            "Kueue holds build {}'s pod and buildit submits to no LocalQueue: the builder \
+             namespace is Kueue-managed, so buildit needs --queue",
+            id.0
+        ),
+        _ => anyhow!(
+            "build {}'s pod was still held by scheduling gates {} after {waited}s",
+            id.0,
+            gates.join(", ")
+        ),
+    }
 }
 
 fn alive(pod: &Pod) -> bool {
@@ -1008,6 +1045,9 @@ impl Broker {
         if let Some(launcher) = &caller.launched_by {
             labels.insert(LABEL_LAUNCHED_BY.to_string(), launcher.as_str().to_string());
         }
+        if let Some(queue) = &self.queue {
+            labels.insert(LABEL_QUEUE.to_string(), queue.clone());
+        }
         let spec = pod.spec.get_or_insert_default();
         spec.active_deadline_seconds = Some(self.deadline_secs);
         spec.automount_service_account_token = Some(false);
@@ -1065,7 +1105,6 @@ impl Broker {
             context.as_str(),
             tarball.len() / 1024
         );
-        let created = Instant::now();
         let pod = BuilderPod::create_from(
             self.client.clone(),
             &self.namespace,
@@ -1073,12 +1112,16 @@ impl Broker {
         )
         .await?;
         let built = async {
+            if let Release::Held(gates) = pod.wait_ungated(ADMISSION).await? {
+                return Err(held(&id, &gates, self.queue.as_deref()));
+            }
+            let admitted = Instant::now();
             pod.wait_ready(POD_READY).await?;
             pod.exec_capture(&Backend::Buildah.setup_command()).await?;
             pod.exec_with_stdin(&Backend::Buildah.untar_command(), &tarball)
                 .await?;
             let requested = timeout(p.timeout_s, DEFAULT_BUILD_TIMEOUT_S);
-            let limit = build_limit(requested, self.deadline_secs, created.elapsed())?;
+            let limit = build_limit(requested, self.deadline_secs, admitted.elapsed())?;
             let args = step::build_args(limit, &bud);
             let mirror = Some(step::CONTAINER_STDOUT);
             step::launch(&pod, LogName::Build, mirror, &[], args).await?;
@@ -1733,10 +1776,10 @@ mod tests {
     use k8s_openapi::api::core::v1::Pod;
 
     use crate::mcp::{
-        Broker, BuildId, BuildParams, BuilditMcp, BuilditRules, Caller, Launcher, LogsParams,
-        MCP_PATH, PodView, PushParams, PushTarget, ResourceServer, ResourceServerConfig, Response,
-        SCOPE_BUILD, SCOPE_READ, StatusCode, TokenLine, ToolPolicy, TrustedIssuer, bud_argv,
-        build_limit, parse_tokens, push_argv, router, unpack,
+        Broker, BuildId, BuildParams, BuilditMcp, BuilditRules, Caller, KUEUE_GATE, LABEL_QUEUE,
+        Launcher, LogsParams, MCP_PATH, PodView, PushParams, PushTarget, ResourceServer,
+        ResourceServerConfig, Response, SCOPE_BUILD, SCOPE_READ, StatusCode, TokenLine, ToolPolicy,
+        TrustedIssuer, bud_argv, build_limit, held, parse_tokens, push_argv, router, unpack,
     };
     use crate::sandbox::{RelPath, SandboxDir, SandboxName, Workspace};
     use crate::step::{State, Status};
@@ -1765,6 +1808,7 @@ mod tests {
             deadline_secs,
             max_builds: 4,
             node_arch: None,
+            queue: None,
             run_id: None,
             push: None,
         })
@@ -2643,13 +2687,23 @@ mod tests {
     /// Each validation of `deploy/builder-admission.yaml` against `pod`: the messages of those that
     /// refuse it.
     fn refused_by_admission(pod: &serde_json::Value) -> Vec<String> {
-        refused_on("CREATE", pod)
+        refused_on("CREATE", &serde_json::Value::Null, pod)
     }
 
-    fn refused_on(operation: &str, pod: &serde_json::Value) -> Vec<String> {
+    /// The same, for an update of `old` to `pod`.
+    fn refused_on_update(old: &serde_json::Value, pod: &serde_json::Value) -> Vec<String> {
+        refused_on("UPDATE", old, pod)
+    }
+
+    fn refused_on(
+        operation: &str,
+        old: &serde_json::Value,
+        pod: &serde_json::Value,
+    ) -> Vec<String> {
         let policy: serde_json::Value =
             serde_norway::from_str(include_str!("../deploy/builder-admission.yaml")).unwrap();
         let object = crucible_mcp_auth::policy::cel_value(pod).unwrap();
+        let old_object = crucible_mcp_auth::policy::cel_value(old).unwrap();
         let request =
             crucible_mcp_auth::policy::cel_value(&serde_json::json!({"operation": operation}))
                 .unwrap();
@@ -2661,6 +2715,7 @@ mod tests {
                 let program = cel::Program::compile(v["expression"].as_str().unwrap()).unwrap();
                 let mut context = cel::Context::default();
                 context.add_variable_from_value("object", object.clone());
+                context.add_variable_from_value("oldObject", old_object.clone());
                 context.add_variable_from_value("request", request.clone());
                 match program.execute(&context) {
                     Ok(cel::Value::Bool(true)) => None,
@@ -2926,7 +2981,7 @@ mod tests {
         );
         let scheduled = escape(&|p| p["spec"]["nodeName"] = serde_json::json!("node-1"));
         assert_eq!(
-            refused_on("UPDATE", &scheduled),
+            refused_on_update(&pod, &scheduled),
             Vec::<String>::new(),
             "a scheduled pod keeps its node on update"
         );
@@ -2935,9 +2990,81 @@ mod tests {
             p["spec"]["containers"][0]["image"] = serde_json::json!("alpine");
         });
         assert!(
-            !refused_on("UPDATE", &swapped).is_empty(),
+            !refused_on_update(&pod, &swapped).is_empty(),
             "an update cannot swap the image"
         );
+    }
+
+    /// A builder pod submitted to a LocalQueue carries its name, and the policy admits both what
+    /// Kueue's webhook makes of it and the update that admits it with its flavor's node labels and
+    /// tolerations. No other update or create may add a toleration.
+    #[tokio::test]
+    async fn kueue_may_queue_and_admit_builder_pods_and_nothing_else_adds_tolerations() {
+        let dir = tempfile::tempdir().unwrap();
+        let caller = sandbox_caller("sb-a");
+        let id = BuildId::parse("buildit-1").unwrap();
+        let plain = broker(offline_client(), &tokens(dir.path(), ""), None)
+            .builder_pod(&caller, &id)
+            .unwrap();
+        assert!(!plain.metadata.labels.unwrap().contains_key(LABEL_QUEUE));
+        let queued = Broker {
+            queue: Some("builds".to_string()),
+            ..Arc::into_inner(broker(offline_client(), &tokens(dir.path(), ""), None)).unwrap()
+        };
+        let mut gated = serde_json::to_value(queued.builder_pod(&caller, &id).unwrap()).unwrap();
+        assert_eq!(gated["metadata"]["labels"][LABEL_QUEUE], "builds");
+
+        gated["metadata"]["labels"]["kueue.x-k8s.io/managed"] = serde_json::json!("true");
+        gated["metadata"]["finalizers"] = serde_json::json!(["kueue.x-k8s.io/managed"]);
+        gated["spec"]["schedulingGates"] = serde_json::json!([{"name": KUEUE_GATE}]);
+        assert_eq!(refused_by_admission(&gated), Vec::<String>::new());
+
+        let flavored = |p: &mut serde_json::Value| {
+            p["metadata"]["annotations"]["kueue.x-k8s.io/workload"] = serde_json::json!("pod-x");
+            p["spec"]["nodeSelector"] = serde_json::json!({"pool": "builders"});
+            p["spec"]["tolerations"] = serde_json::json!([
+                {"key": "pool", "operator": "Equal", "value": "builders", "effect": "NoSchedule"},
+            ]);
+        };
+        let mut admitted = gated.clone();
+        flavored(&mut admitted);
+        admitted["spec"]["schedulingGates"] = serde_json::json!([]);
+        assert_eq!(
+            refused_on_update(&gated, &admitted),
+            Vec::<String>::new(),
+            "Kueue lifts its gate and adds the flavor"
+        );
+        let mut regated = gated.clone();
+        flavored(&mut regated);
+        assert!(
+            !refused_on_update(&gated, &regated).is_empty(),
+            "tolerations come only with the lifted gate"
+        );
+        assert!(
+            !refused_on_update(&admitted, &admitted).is_empty(),
+            "an admitted pod's later updates keep the default tolerations rule"
+        );
+        let mut created = gated.clone();
+        flavored(&mut created);
+        assert!(
+            !refused_by_admission(&created).is_empty(),
+            "a pod cannot arrive with tolerations, gated or not"
+        );
+    }
+
+    #[test]
+    fn a_build_kueue_never_admits_names_its_queue_or_the_missing_flag() {
+        let id = BuildId::parse("buildit-1").unwrap();
+        let kueue = [KUEUE_GATE.to_string()];
+        let queued = held(&id, &kueue, Some("builds")).to_string();
+        assert!(
+            queued.contains("LocalQueue builds") && queued.contains("600s"),
+            "{queued}"
+        );
+        let unqueued = held(&id, &kueue, None).to_string();
+        assert!(unqueued.contains("--queue"), "{unqueued}");
+        let other = held(&id, &["example.com/hold".to_string()], Some("builds")).to_string();
+        assert!(other.contains("example.com/hold"), "{other}");
     }
 
     #[test]

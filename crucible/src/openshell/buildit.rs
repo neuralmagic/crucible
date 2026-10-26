@@ -75,6 +75,9 @@ impl Buildit<'_> {
         if jwks.scheme() == "http" {
             args.push("--insecure-jwks-http".to_string());
         }
+        if let Some(queue) = &self.site.queue {
+            args.extend(["--queue", queue].map(String::from));
+        }
         if let (Some(repo), Some(authfile)) = (&self.site.push_repo, run.push_authfile) {
             args.extend(["--push-repo", repo, "--push-authfile", authfile].map(String::from));
         }
@@ -137,6 +140,7 @@ mod tests {
             run_issuer: issuer.into(),
             namespace: "crucible-builds".into(),
             push_repo: push.map(str::to_string),
+            queue: None,
         }
     }
 
@@ -182,6 +186,15 @@ mod tests {
             "no repo: {args:?}"
         );
         assert!(!args.contains(&"--insecure-jwks-http".to_string()));
+        assert!(!args.contains(&"--queue".to_string()), "no queue: {args:?}");
+        let queued = BuilditSite {
+            queue: Some("builders".into()),
+            ..plain.clone()
+        };
+        assert_eq!(
+            flag(&buildit(&queued).args(&run, "/p").unwrap(), "--queue").as_deref(),
+            Some("builders")
+        );
 
         let pushing = site(ISSUER, Some("quay.io/example/crucible-smoke"));
         let args = buildit(&pushing).args(&run, "/p").unwrap();
