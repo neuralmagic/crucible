@@ -933,22 +933,25 @@ async fn ensure_provider(gw: &Gateway, token: &str, project: &str, region: &str)
     gw.ensure_provider_profile(provider::google_cloud_profile())
         .await
         .context("importing the google-cloud provider profile")?;
-    if gw.provider_exists(provider::PROVIDER_NAME).await {
-        gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
+    if !gw.provider_exists(provider::PROVIDER_NAME).await
+        && gw
+            .create_provider(
+                provider::PROVIDER_NAME,
+                provider::CRED_KEY,
+                token,
+                provider::PROVIDER_TYPE,
+                project,
+                region,
+            )
             .await
-            .context("updating the Vertex provider token")
-    } else {
-        gw.create_provider(
-            provider::PROVIDER_NAME,
-            provider::CRED_KEY,
-            token,
-            provider::PROVIDER_TYPE,
-            project,
-            region,
-        )
-        .await
-        .context("creating the Vertex provider")
+            .context("creating the Vertex provider")?
+            == grpc::ProviderCreate::Created
+    {
+        return Ok(());
     }
+    gw.update_provider(provider::PROVIDER_NAME, provider::CRED_KEY, token)
+        .await
+        .context("updating the Vertex provider token")
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1043,15 +1046,18 @@ async fn ensure_static_provider(gw: &Gateway, p: &StaticProvider, token: &str) -
     gw.ensure_provider_profile(p.profile.clone())
         .await
         .with_context(|| format!("importing the {} provider profile", p.name))?;
-    if gw.provider_exists(p.name).await {
-        gw.update_provider(p.name, p.cred_key, token)
+    if !gw.provider_exists(p.name).await
+        && gw
+            .create_static_provider(p.name, p.cred_key, token, &profile_id)
             .await
-            .with_context(|| format!("updating the {} provider token", p.name))
-    } else {
-        gw.create_static_provider(p.name, p.cred_key, token, &profile_id)
-            .await
-            .with_context(|| format!("creating the {} provider", p.name))
+            .with_context(|| format!("creating the {} provider", p.name))?
+            == grpc::ProviderCreate::Created
+    {
+        return Ok(());
     }
+    gw.update_provider(p.name, p.cred_key, token)
+        .await
+        .with_context(|| format!("updating the {} provider token", p.name))
 }
 
 /// Import a token-grant profile and create its provider `name`, which holds no secret: the
@@ -1066,12 +1072,9 @@ async fn ensure_token_grant_provider(
     gw.ensure_provider_profile(profile)
         .await
         .with_context(|| format!("importing the {name} token-grant profile"))?;
-    if !gw.provider_exists(name).await {
-        gw.create_minted_provider(name, &profile_id)
-            .await
-            .with_context(|| format!("creating the {name} token-grant provider"))?;
-    }
-    Ok(())
+    gw.ensure_minted_provider(name, &profile_id)
+        .await
+        .with_context(|| format!("creating the {name} token-grant provider"))
 }
 
 /// Idempotent AWS provider setup: import the `aws-s3` profile, create the provider if absent,
@@ -1085,11 +1088,9 @@ async fn ensure_aws_provider(gw: &Gateway, role_arn: &str) -> Result<()> {
     gw.ensure_provider_profile(provider::aws_s3_profile())
         .await
         .context("importing the aws-s3 provider profile")?;
-    if !gw.provider_exists(provider::AWS_PROVIDER_NAME).await {
-        gw.create_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
-            .await
-            .context("creating the aws-s3 provider")?;
-    }
+    gw.ensure_minted_provider(provider::AWS_PROVIDER_NAME, provider::AWS_PROVIDER_TYPE)
+        .await
+        .context("creating the aws-s3 provider")?;
     let mut material = std::collections::HashMap::from([
         ("role_arn".to_string(), role_arn.to_string()),
         ("session_name".to_string(), "crucible-sandbox".to_string()),
