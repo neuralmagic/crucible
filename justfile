@@ -34,6 +34,7 @@ install-tools:
 
 # Build the whole Rust workspace, the scored loop included.
 build-loop:
+    cd crucible-controller/ui && bun install --frozen-lockfile && bun run build
     cargo build --release --features crucible/autoresearch
 
 # Score the agent-stream decoder (examples/selfhost's gate): ns/line over the synthetic corpus.
