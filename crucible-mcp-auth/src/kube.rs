@@ -292,6 +292,7 @@ mod tests {
             resource: "localqueues".into(),
             subresource: String::new(),
             verb: "use".into(),
+            or_verbs: Vec::new(),
             namespace: "team-a".into(),
             name: "crucible-e2e".into(),
         }

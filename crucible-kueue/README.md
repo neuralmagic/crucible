@@ -82,6 +82,13 @@ shipped policy is
 [deploy/kueue-policy.toml](deploy/kueue-policy.toml); the auth design and the e2e's configuration
 are in [crucible-mcp-auth](../crucible-mcp-auth/README.md).
 
+Any caller who may use a queue can discover its hardware. `hardware_describe` and
+`queue_describe` need only `get` or the submit verb (`use`) on the LocalQueue, and
+`hardware_describe` reads the nodes behind the queue's flavors with the server's own account, so
+no RBAC on nodes is needed: it answers each flavor's node labels and taints, node counts per GPU
+product and their accelerator capacity, never node names. `tests/http_auth.rs` and
+`tests/cluster_e2e.rs` hold this.
+
 ## Generic Kueue MCP
 
 Nothing in the server needs crucible. For a cluster whose users sign in with an OIDC provider

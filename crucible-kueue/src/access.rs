@@ -6,7 +6,7 @@
 //! |---------------------------------------|--------------|----------------------------------------|
 //! | whoami                                | kueue.read   | none                                   |
 //! | queues_list                           | kueue.read   | `list` localqueues                     |
-//! | queue_describe, hardware_describe     | kueue.read   | `get` the localqueue                   |
+//! | queue_describe, hardware_describe     | kueue.read   | `get` or `use` the localqueue          |
 //! | workload_status, tasks/get            | kueue.read   | `get` the workload                     |
 //! | workload_list                         | kueue.read   | `list` kueue workloads                 |
 //! | workload_logs                         | kueue.read   | `get` pods/log                         |
@@ -66,6 +66,7 @@ impl StatusPart {
                 resource: resource.into(),
                 subresource: String::new(),
                 verb: verb.into(),
+                or_verbs: Vec::new(),
                 namespace: namespace.into(),
                 name: String::new(),
             })
@@ -160,6 +161,7 @@ impl Checks<'_> {
             resource: resource.to_string(),
             subresource: subresource.to_string(),
             verb: verb.to_string(),
+            or_verbs: Vec::new(),
             namespace: self.namespace.clone(),
             name: name.to_string(),
         }
@@ -273,13 +275,19 @@ fn tool_checks(
             "list",
             "",
         )],
-        "queue_describe" | "hardware_describe" => vec![c.check(
-            "queue-get",
-            "you may not read this LocalQueue",
-            queues,
-            "get",
-            text(args, "queue"),
-        )],
+        "queue_describe" | "hardware_describe" => {
+            let mut check = c.check(
+                "queue-get",
+                "you may neither read nor use this LocalQueue",
+                queues,
+                "get",
+                text(args, "queue"),
+            );
+            if queue_verb != QueueVerb::Get {
+                check.or_verbs.push(queue_verb.as_str().to_string());
+            }
+            vec![check]
+        }
         "workload_status" => {
             let kind = kind(tool, "workload-get", args.get("kind"))?;
             vec![c.workload(
@@ -529,6 +537,39 @@ mod tests {
             shown(checks)[0],
             "queue-use kueue.x-k8s.io/localqueues/ get ns=team-b name=gpu"
         );
+    }
+
+    /// Anyone who may submit to a queue may describe it and its hardware: the one check is `get`
+    /// on the LocalQueue or the verb submitting needs, and nothing about nodes, pods or Workloads.
+    #[test]
+    fn describing_a_queue_needs_get_or_the_verb_that_submits_to_it() {
+        for tool in ["queue_describe", "hardware_describe"] {
+            let args = json!({"namespace": "team-b", "queue": "gpu"});
+            let checks = tool_checks_for(&person(), tool, args.clone()).unwrap();
+            assert_eq!(
+                shown(checks.clone()),
+                ["queue-get kueue.x-k8s.io/localqueues/ get ns=team-b name=gpu"],
+                "{tool}"
+            );
+            assert_eq!(checks[0].or_verbs, ["use"], "{tool}");
+
+            let Value::Object(args) = args else {
+                unreachable!()
+            };
+            let get_only = KueueRules {
+                queue_verb: QueueVerb::Get,
+            }
+            .checks(
+                &Call::Tool {
+                    name: tool,
+                    args: &args,
+                },
+                &person(),
+            )
+            .unwrap();
+            assert_eq!(get_only.len(), 1, "{tool}");
+            assert!(get_only[0].or_verbs.is_empty(), "{tool}");
+        }
     }
 
     #[test]

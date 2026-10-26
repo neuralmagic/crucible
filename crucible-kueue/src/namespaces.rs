@@ -148,6 +148,7 @@ pub async fn usable(
             resource: "localqueues".into(),
             subresource: String::new(),
             verb: "list".into(),
+            or_verbs: Vec::new(),
             namespace: namespace.clone(),
             name: String::new(),
         };

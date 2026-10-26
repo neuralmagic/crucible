@@ -408,3 +408,41 @@ async fn the_namespaces_claim_confines_a_run_within_the_served_namespaces() {
         );
     }
 }
+
+/// Any caller who may submit to a queue can discover its hardware: `use` on the LocalQueue is
+/// enough for `hardware_describe` and `queue_describe`, with no RBAC on nodes, pods or Kueue
+/// Workloads. Without `get` or `use` on the queue, both are refused.
+#[tokio::test]
+async fn a_caller_who_may_use_a_queue_may_describe_it_and_its_hardware() {
+    let jwks = JwksServer::start(vec![testing::jwk("a")]).await;
+    let submitter = Grants {
+        verbs: &["use", "create"],
+        namespaces: &["team-e2e"],
+    };
+    let url = serve(&jwks, shipped_policy(), Some(submitter)).await;
+    let client = connect(&url, &run_token(|_| {})).await;
+    let mut args = serde_json::Map::new();
+    args.insert("namespace".into(), json!("team-e2e"));
+    args.insert("queue".into(), json!("gpu"));
+    for tool in ["hardware_describe", "queue_describe"] {
+        let text = refusal(&client, tool, args.clone()).await;
+        assert!(
+            !text.contains("refused"),
+            "{tool} passes the guard and fails only at the unreachable API server: {text}"
+        );
+    }
+
+    let creator = Grants {
+        verbs: &["create"],
+        namespaces: &["team-e2e"],
+    };
+    let url = serve(&jwks, shipped_policy(), Some(creator)).await;
+    let client = connect(&url, &run_token(|_| {})).await;
+    for tool in ["hardware_describe", "queue_describe"] {
+        let text = refusal(&client, tool, args.clone()).await;
+        assert!(
+            text.contains("refused by access check queue-get"),
+            "{tool}: {text}"
+        );
+    }
+}

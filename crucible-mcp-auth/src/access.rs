@@ -55,8 +55,24 @@ pub struct AccessCheck {
     pub resource: String,
     pub subresource: String,
     pub verb: String,
+    /// Verbs that allow the check too when `verb` does not.
+    pub or_verbs: Vec<String>,
     pub namespace: String,
     pub name: String,
+}
+
+impl AccessCheck {
+    /// The check as asked of the API server for each verb that allows it: `verb`, then each of
+    /// `or_verbs`.
+    pub fn each_verb(&self) -> impl Iterator<Item = AccessCheck> + '_ {
+        std::iter::once(&self.verb)
+            .chain(&self.or_verbs)
+            .map(|verb| AccessCheck {
+                verb: verb.clone(),
+                or_verbs: Vec::new(),
+                ..self.clone()
+            })
+    }
 }
 
 /// A server's rules for the calls it serves.
@@ -84,7 +100,22 @@ pub enum ReviewError {
 }
 
 /// Decides an [`AccessCheck`] for a principal: `Ok(true)` allows, `Ok(false)` denies, an error
-/// refuses the call too.
+/// refuses the call too. A reviewer decides `verb` alone; [`allows`] adds `or_verbs`.
 pub trait AccessReview: Send + Sync {
     fn review<'a>(&'a self, principal: &'a Principal, check: &'a AccessCheck) -> ReviewFuture<'a>;
+}
+
+/// Whether `reviewer` allows `check` for `principal` under `verb` or any of `or_verbs`, asked in
+/// that order. An error before any verb allows it is the answer.
+pub async fn allows(
+    reviewer: &dyn AccessReview,
+    principal: &Principal,
+    check: &AccessCheck,
+) -> Result<bool, ReviewError> {
+    for each in check.each_verb() {
+        if reviewer.review(principal, &each).await? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }

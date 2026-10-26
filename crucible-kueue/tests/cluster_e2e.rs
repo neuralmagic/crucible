@@ -1557,3 +1557,101 @@ async fn a_reader_without_pod_rbac_gets_the_status_without_pods() {
     .await;
     assert_eq!(deleted["status"], "ok", "{deleted:#}");
 }
+
+/// Agents can always discover the hardware behind a queue they may submit to: a user with only
+/// `use` on the LocalQueue and `create` on Jobs, and no RBAC on nodes, gets the same
+/// `hardware_describe` and `queue_describe` answers as the e2e user.
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_submitter_without_node_rbac_discovers_the_queues_hardware() {
+    use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
+    use kube::api::{Api, DeleteParams, PostParams};
+
+    let env = env();
+    let run = unique("e2e-hw");
+    let url = serve(&env).await;
+    let user = format!("{run}-submitter");
+    let kube = kube_client(&env).await;
+    let rule = |group: &str, resource: &str, verb: &str| PolicyRule {
+        api_groups: Some(vec![group.into()]),
+        resources: Some(vec![resource.into()]),
+        verbs: vec![verb.into()],
+        ..Default::default()
+    };
+    let roles: Api<Role> = Api::namespaced(kube.clone(), &env.namespace);
+    let bindings: Api<RoleBinding> = Api::namespaced(kube.clone(), &env.namespace);
+    let meta = kube::api::ObjectMeta {
+        name: Some(user.clone()),
+        ..Default::default()
+    };
+    roles
+        .create(
+            &PostParams::default(),
+            &Role {
+                metadata: meta.clone(),
+                rules: Some(vec![
+                    rule("kueue.x-k8s.io", "localqueues", "use"),
+                    rule("batch", "jobs", "create"),
+                ]),
+            },
+        )
+        .await
+        .unwrap();
+    bindings
+        .create(
+            &PostParams::default(),
+            &RoleBinding {
+                metadata: meta,
+                role_ref: RoleRef {
+                    api_group: "rbac.authorization.k8s.io".into(),
+                    kind: "Role".into(),
+                    name: user.clone(),
+                },
+                subjects: Some(vec![Subject {
+                    api_group: Some("rbac.authorization.k8s.io".into()),
+                    kind: "User".into(),
+                    name: user.clone(),
+                    ..Default::default()
+                }]),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut claims = token_claims(&env, &run, "kueue.read kueue.submit");
+    let map = claims.as_object_mut().unwrap();
+    for key in ["kube_groups", "groups"] {
+        map.remove(key);
+    }
+    let user_claim = match env.mode {
+        Mode::Crucible => "kube_user",
+        Mode::Tenant => "preferred_username",
+    };
+    map.insert(user_claim.into(), json!(user));
+    let submitter = connect(&url, &testing::sign("a", &claims)).await.unwrap();
+    let admin = connect(&url, &viewer(&env, &run)).await.unwrap();
+
+    let hw = call(&submitter, "hardware_describe", json!({"queue": env.queue})).await;
+    assert_eq!(hw["status"], "ok", "{hw:#}");
+    let flavors = hw["flavors"].as_array().unwrap();
+    assert!(!flavors.is_empty(), "{hw:#}");
+    for f in flavors {
+        for key in ["node_labels", "gpu_products", "matching_nodes", "provides"] {
+            assert!(f.get(key).is_some(), "{key} missing: {f:#}");
+        }
+    }
+    let full = call(&admin, "hardware_describe", json!({"queue": env.queue})).await;
+    assert_eq!(
+        hw, full,
+        "the submitter sees exactly what the e2e user sees"
+    );
+
+    let described = call(&submitter, "queue_describe", json!({"queue": env.queue})).await;
+    assert_eq!(described["status"], "ok", "{described:#}");
+
+    bindings
+        .delete(&user, &DeleteParams::default())
+        .await
+        .unwrap();
+    roles.delete(&user, &DeleteParams::default()).await.unwrap();
+}

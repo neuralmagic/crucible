@@ -336,11 +336,14 @@ it. So:
   events with the server's account, and show each only when `kube_user` may `get` and `list`
   it in the namespace. A part the caller may not read is left out, and the reply's `omitted`
   names it and why (`crucible-kueue/src/access.rs`, `StatusPart`).
-- `hardware_describe` is a deliberate exception. It checks `get` on the LocalQueue, then reads
-  the nodes behind the queue's flavors with the server's account, so an agent can pick a flavor
-  and a GPU product without RBAC on nodes. Anyone allowed to use a queue therefore sees, for
-  the nodes its flavors select, how many there are and how many are schedulable per GPU product
-  (from their product labels), and their accelerator capacity. Node names are not returned.
+- Any caller who may use a queue can discover its hardware. This is a guarantee, and a
+  deliberate exception to the ceiling: `hardware_describe` and `queue_describe` check only
+  `get` or the submit verb (`use`) on the LocalQueue, and `hardware_describe` reads the nodes
+  behind the queue's flavors with the server's account, so an agent can pick a flavor and a GPU
+  product without RBAC on nodes. It returns each flavor's node labels and taints, and for the
+  nodes those select, how many there are and how many are schedulable per GPU product, and
+  their accelerator capacity. Node names are not returned. Tests hold the guarantee
+  (`crucible-kueue/tests/http_auth.rs`, and `cluster_e2e.rs` against a cluster).
 
 The issuer never decides what a person may do. It decides only who the person is on each
 cluster (section 5).
@@ -1316,7 +1319,7 @@ The app is built in `crucible-kueue/src/lib.rs:62`:
 | --- | --- | --- |
 | `whoami` | `kueue.read` | none |
 | `queues_list` | `kueue.read` | `list` `localqueues` |
-| `queue_describe`, `hardware_describe` | `kueue.read` | `get` the LocalQueue |
+| `queue_describe`, `hardware_describe` | `kueue.read` | `get` or `use` (the submit verb) the LocalQueue |
 | `workload_status`, `tasks/get` | `kueue.read` | `get` the workload; each of Kueue `workloads`, `pods` and `events` is shown only with `get` and `list` on it |
 | `workload_list` | `kueue.read` | `list` Kueue `workloads` |
 | `workload_logs` | `kueue.read` | `get` `pods/log` |

@@ -116,7 +116,7 @@ async fn review(
                 error: "this server has no access reviewer".to_string(),
             });
         };
-        match reviewer.review(principal, check).await {
+        match crate::access::allows(reviewer, principal, check).await {
             Ok(true) => {}
             Ok(false) => {
                 return Err(Refusal::Denied {
@@ -416,6 +416,7 @@ mod tests {
                 resource: resource.into(),
                 subresource: String::new(),
                 verb: verb.into(),
+                or_verbs: Vec::new(),
                 namespace: namespace.into(),
                 name: name.into(),
             };
@@ -942,6 +943,46 @@ mod tests {
             body["error"]["message"],
             "tasks/cancel refused by access check workloads-update: you may not update this"
         );
+    }
+
+    /// A check with `or_verbs` passes when its verb or any of them is allowed, asked in order; a
+    /// review error before any verb allows it is the answer.
+    #[tokio::test]
+    async fn a_check_passes_on_its_verb_or_any_of_its_alternatives() {
+        let principal = kube_user("kueue.read");
+        let check = AccessCheck {
+            tool: "hardware_describe".into(),
+            rule: "queue-get".into(),
+            message: "m".into(),
+            group: "kueue.x-k8s.io".into(),
+            resource: "localqueues".into(),
+            subresource: String::new(),
+            verb: "get".into(),
+            or_verbs: vec!["use".into()],
+            namespace: "team-a".into(),
+            name: "gpu".into(),
+        };
+        let verdict = |verbs: &'static [&'static str], broken: bool| {
+            let check = check.clone();
+            let principal = principal.clone();
+            async move {
+                crate::access::allows(&Verbs { verbs, broken }, &principal, &check)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        };
+        assert_eq!(verdict(&["get"], false).await, Ok(true));
+        assert_eq!(verdict(&["use"], false).await, Ok(true));
+        assert_eq!(verdict(&["list"], false).await, Ok(false));
+        assert_eq!(
+            verdict(&[], true).await,
+            Err("the API server is unreachable".into())
+        );
+        assert_eq!(
+            check.each_verb().map(|c| c.verb).collect::<Vec<_>>(),
+            ["get", "use"]
+        );
+        assert!(check.each_verb().all(|c| c.or_verbs.is_empty()));
     }
 
     /// A token whose Kubernetes user is empty or a `system:` identity is refused for good: the
