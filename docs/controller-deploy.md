@@ -152,7 +152,7 @@ error code
 and a fixed description; the reason is logged.
 
 **Sandbox placement.** A sandbox's SPIFFE ID is only as trustworthy as whoever can create pods
-where its supervisor runs, so with `CONTROLLER_AGENT_SPIRE` set the controller refuses to start
+where its supervisor runs, so with agent clusters the controller refuses to start
 unless the deploy profile runs each run's gateway in its own pod: `sandbox_driver = "kubernetes"`
 with `[cluster] sandbox_namespace`, which profile load refuses to share with the loop, rig, or
 crucible-kueue namespaces. It also refuses to start the issuer when its own namespace, where the
@@ -173,8 +173,9 @@ ClusterSPIFFEID to the sandbox namespace and build the ID from that label and th
 spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/gateway/{{ index .PodMeta.Labels "openshell.ai/gateway-id" }}/sandbox/{{ index .PodMeta.Annotations "openshell.ai/sandbox-id" }}'
 ```
 
-Each cluster's `CONTROLLER_AGENT_SPIRE` entry names its gateway prefix, everything before the
-gateway id (`spiffe://<trust domain>/openshell/gateway/`). The controller reads that SPIRE's
+Each cluster's gateway prefix is everything before the gateway id
+(`spiffe://<trust domain>/openshell/gateway/`, from its discovered trust domain, or its
+`CONTROLLER_AGENT_SPIRE` entry). The controller reads that SPIRE's
 keys from its OIDC discovery provider through the cluster's API server Service proxy, with the
 same client it dispatches with, so its identity on each cluster needs `get` on `services/proxy`
 in SPIRE's namespace. The `iss` of an SVID picks the cluster whose keys verify it, and a token is
@@ -252,7 +253,7 @@ table.
 | `CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE` | Optional: the key before a rotation. It is published in the JWKS beside the current key, so tokens it signed keep verifying until they expire; nothing new is signed with it. Rotate by moving the current key here and mounting a new one, then drop this after one token lifetime. |
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | Agent token lifetime, 900 to 1800 seconds. Default 900. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | Where sandbox supervisors reach the token endpoint when not at the issuer itself (a spoke reaching the controller through a route). Default `<issuer>/oauth/token`. |
-| `CONTROLLER_AGENT_SPIRE` | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>` entries, one per cluster hosting isolated gateways (`hub` for the controller's own): the `iss` of that SPIRE's JWT-SVIDs, its gateway prefix (`spiffe://<trust domain>/openshell/gateway/`; supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`; one path segment may be `{tenant}`, as in `spiffe://<trust domain>/openshell/{tenant}/gateway/`, to match IDs with a DNS-label tenant there), and its OIDC discovery provider Service, whose `/keys` is read through that cluster's API server (over https, or http when the Service is prefixed `http://`). Each cluster and each issuer appears once. SVIDs must carry `iat` and live at most 15 minutes; SPIRE's upstream chart issues 1-hour JWT-SVIDs by default, so give the supervisors' ClusterSPIFFEID `jwtTtl: 5m`. Unset, the issuer mints no agent tokens and serves people only. |
+| `CONTROLLER_AGENT_SPIRE` | Optional: by default each cluster an agent server serves has its SPIRE discovered through the controller's own cluster client (OpenShift: the Zero Trust Workload Identity Manager's `ZeroTrustWorkloadIdentityManager` and `SpireOIDCDiscoveryProvider` named `cluster`, its discovery Service in `zero-trust-workload-identity-manager` on https:443; elsewhere: the `spire-server` ConfigMap's `server.conf`, its discovery Service in `spire-server` on http:80), and `GET /api/agent-clusters` shows each cluster's state. For a SPIRE installed elsewhere, comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>` entries (`hub` for the controller's own): the `iss` of that SPIRE's JWT-SVIDs, its gateway prefix (`spiffe://<trust domain>/openshell/gateway/`; supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`; one path segment may be `{tenant}`, as in `spiffe://<trust domain>/openshell/{tenant}/gateway/`, to match IDs with a DNS-label tenant there), and its OIDC discovery provider Service, whose `/keys` is read through that cluster's API server (over https, or http when the Service is prefixed `http://`). Each cluster and each issuer appears once. SVIDs must carry `iat` and live at most 15 minutes; SPIRE's upstream chart issues 1-hour JWT-SVIDs by default, so give the supervisors' ClusterSPIFFEID `jwtTtl: 5m`. |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | People's access token lifetime, 1 to 3600 seconds. Default 900. |
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | A TOML file of `[[clients]]` (`client_id`, `name`, `redirect_uris`, optional `resources`): the public clients people may sign in with. It replaces the built-in `claude-code`, `pi` and `codex`, so list those too to keep them. Unset keeps the built-ins. A malformed file, or a `resources` entry that is no people resource, stops the controller at startup. See [MCP clients](controller-auth.md#mcp-clients). |
 | `CONTROLLER_PEOPLE_DCR` | `false` turns off self-registration (`POST /oauth/register`, RFC 7591, loopback public clients only), and the metadata then advertises no `registration_endpoint`. On by default when the deploy profile serves people, which is what lets pi, Codex and Claude Code sign in without a client id. Registrations idle for 30 days are deleted; each source address may register 20 times an hour, and about 10000 live at once (a soft cap across replicas). See [Self-registered clients](controller-auth.md#self-registered-clients). |
@@ -264,8 +265,8 @@ A run dispatched onto one of the `[kueue]` clusters (`clusters = ["spoke-a", "sp
 scopes and transport (`CRUCIBLE_AGENT_SERVERS`), the token endpoint
 (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`) and the issuer as SVID audience (`CRUCIBLE_AGENT_SVID_AUDIENCE`)
 as plain env. The engine registers a token-grant provider for each, so each sandbox's supervisor obtains its own token and injects it on traffic to the server
-alone; no token is minted per run. A server is granted only on a cluster in
-`CONTROLLER_AGENT_SPIRE`. The run records what it got, with the server's scopes and, for a server
+alone; no token is minted per run. A server is granted only on a cluster whose SPIRE
+the issuer trusts. The run records what it got, with the server's scopes and, for a server
 that acts as `kube_user` such as crucible-kueue, the dispatcher's username there, and the run page
 shows it. A third server needs an `[[agent_servers]]` entry with its `url` and `scopes`, nothing
 else.

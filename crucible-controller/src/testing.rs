@@ -103,6 +103,7 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         grounded_executor: crucible_controller::GroundedExecutor::Local,
         deploy_profile: None,
         profile_cache: Default::default(),
+        spire: Default::default(),
         render_no_pin: true,
         grounded_sandbox_image: None,
         admins: vec![],

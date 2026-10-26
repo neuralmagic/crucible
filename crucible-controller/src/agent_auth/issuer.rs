@@ -5,8 +5,8 @@
 //! claims.
 
 use crate::agent_auth::bindings::BoundRun;
+use crate::agent_auth::cluster_spire::{ClusterSpire, SpireDirectory, SpireError};
 use crate::agent_auth::sandbox::{SandboxId, SandboxIdError};
-use crucible::deploy::profile::{KubeName, check_cluster_name};
 use crucible::deploy::servers::ServerSpec;
 use crucible_mcp_auth::jwks::Jwks;
 use crucible_mcp_auth::verify::{TokenError, Verifier, unverified_issuer};
@@ -15,6 +15,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fmt;
+use std::sync::Arc;
 use url::Url;
 
 /// The bounds of a minted access token's lifetime: long enough that a sandbox fetches one per
@@ -55,10 +56,8 @@ pub enum ConfigError {
          so its metadata sits at /.well-known/oauth-authorization-server"
     )]
     IssuerShape(String),
-    #[error(
-        "gateway prefix {0:?} must be a spiffe:// URI ending in /, with at most one {{tenant}} path segment"
-    )]
-    Prefix(String),
+    #[error(transparent)]
+    Spire(#[from] SpireError),
     #[error("CONTROLLER_AGENT_SPIRE names no cluster's SPIRE")]
     NoSpire,
     #[error(
@@ -66,11 +65,6 @@ pub enum ConfigError {
          a deploy profile server with `people = true` (people's tokens) says whom it issues to"
     )]
     NoRecipients,
-    #[error(
-        "CONTROLLER_AGENT_SPIRE entry {0:?} is not \
-         <cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>"
-    )]
-    SpireEntry(String),
     #[error("CONTROLLER_AGENT_SPIRE names {0:?} twice; each cluster and each SVID issuer once")]
     SpireTwice(String),
     #[error(
@@ -125,71 +119,6 @@ impl IssuerUrl {
     }
 }
 
-/// The SPIFFE ID path under which every sandbox supervisor's ID sits, ending in `/`. The rest of
-/// the ID is `<gateway id>/sandbox/<sandbox id>`, both read from labels the gateway that created
-/// the supervisor pod stamped. One path segment may be `{tenant}`, matching a DNS-1123 label:
-///
-/// ```text
-///   spiffe://td/openshell/gateway/            spiffe://td/openshell/gateway/<gw>/sandbox/<id>
-///   spiffe://td/openshell/{tenant}/gateway/   spiffe://td/openshell/<tenant>/gateway/<gw>/sandbox/<id>
-///   └──────── head ──────┘└ tail ─┘
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GatewayPrefix {
-    raw: String,
-    /// Everything before `{tenant}`, or the whole prefix without one.
-    head: String,
-    /// Everything after `{tenant}/`, when the prefix has one.
-    tail: Option<String>,
-}
-
-const TENANT_SEGMENT: &str = "/{tenant}/";
-
-impl GatewayPrefix {
-    pub fn parse(raw: &str) -> Result<Self, ConfigError> {
-        let bad = || ConfigError::Prefix(raw.to_string());
-        let path = raw.strip_prefix("spiffe://").ok_or_else(bad)?;
-        if path.is_empty() || !raw.ends_with('/') {
-            return Err(bad());
-        }
-        let (head, tail) = match raw.split_once(TENANT_SEGMENT) {
-            Some((head, tail)) => (format!("{head}/"), Some(tail.to_string())),
-            None => (raw.to_string(), None),
-        };
-        let trust_domain = head
-            .strip_prefix("spiffe://")
-            .and_then(|p| p.split('/').next());
-        let braces = |v: &str| v.contains(['{', '}']);
-        if trust_domain.is_none_or(str::is_empty)
-            || braces(&head)
-            || tail.as_deref().is_some_and(braces)
-        {
-            return Err(bad());
-        }
-        Ok(Self {
-            raw: raw.to_string(),
-            head,
-            tail,
-        })
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.raw
-    }
-
-    /// The tenant (when the prefix has a `{tenant}` segment) and the rest of `spiffe_id` after the
-    /// prefix; `None` when the ID is not under it.
-    pub fn split<'a>(&self, spiffe_id: &'a str) -> Option<(Option<&'a str>, &'a str)> {
-        let rest = spiffe_id.strip_prefix(self.head.as_str())?;
-        let Some(tail) = &self.tail else {
-            return Some((None, rest));
-        };
-        let (tenant, rest) = rest.split_once('/')?;
-        KubeName::try_from(tenant.to_string()).ok()?;
-        Some((Some(tenant), rest.strip_prefix(tail.as_str())?))
-    }
-}
-
 /// The ES256 key minted tokens are signed with, and its public half as published.
 pub struct SigningKey {
     kid: String,
@@ -220,79 +149,6 @@ impl fmt::Debug for SigningKey {
         f.debug_struct("SigningKey")
             .field("kid", &self.kid)
             .finish_non_exhaustive()
-    }
-}
-
-/// A cluster's SPIRE OIDC discovery provider Service. Its key set is read through that cluster's
-/// API server Service proxy with the controller's own client for the cluster, so it needs no
-/// route of its own.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DiscoveryService {
-    /// Whether the Service serves TLS: `http://` before the namespace says it does not.
-    pub tls: bool,
-    pub namespace: KubeName,
-    pub name: KubeName,
-    pub port: u16,
-}
-
-impl DiscoveryService {
-    /// The API server path of the provider's JWKS.
-    pub fn keys_path(&self) -> String {
-        let scheme = match self.tls {
-            true => "https",
-            false => "http",
-        };
-        format!(
-            "/api/v1/namespaces/{}/services/{scheme}:{}:{}/proxy/keys",
-            self.namespace, self.name, self.port
-        )
-    }
-}
-
-/// One cluster's SPIRE, trusted for the SVIDs of sandboxes whose runs it hosts:
-/// `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClusterSpire {
-    pub cluster: String,
-    /// The `iss` of its JWT-SVIDs, compared as an exact string.
-    pub svid_issuer: String,
-    /// `spiffe://<its trust domain>/openshell/gateway/`.
-    pub gateway_prefix: GatewayPrefix,
-    pub discovery: DiscoveryService,
-}
-
-impl std::str::FromStr for ClusterSpire {
-    type Err = ConfigError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let bad = || ConfigError::SpireEntry(raw.to_string());
-        let (cluster, rest) = raw.split_once('=').ok_or_else(bad)?;
-        let [issuer, prefix, service] = rest.split_whitespace().collect::<Vec<_>>()[..] else {
-            return Err(bad());
-        };
-        let (tls, service) = match service.strip_prefix("http://") {
-            Some(rest) => (false, rest),
-            None => (true, service),
-        };
-        let (namespace, name_port) = service.split_once('/').ok_or_else(bad)?;
-        let (name, port) = name_port.split_once(':').ok_or_else(bad)?;
-        let kube_name = |v: &str| KubeName::try_from(v.to_string()).map_err(|_| bad());
-        let cluster = cluster.trim();
-        check_cluster_name(cluster).map_err(|_| bad())?;
-        if issuer.is_empty() {
-            return Err(bad());
-        }
-        Ok(Self {
-            cluster: cluster.to_string(),
-            svid_issuer: issuer.to_string(),
-            gateway_prefix: GatewayPrefix::parse(prefix)?,
-            discovery: DiscoveryService {
-                tls,
-                namespace: kube_name(namespace)?,
-                name: kube_name(name)?,
-                port: port.parse().map_err(|_| bad())?,
-            },
-        })
     }
 }
 
@@ -472,13 +328,15 @@ impl AgentIssuerConfig {
 }
 
 /// The comma-separated entries of a `CONTROLLER_AGENT_*` list.
-pub fn parse_list<T: std::str::FromStr<Err = ConfigError>>(
-    raw: &str,
-) -> Result<Vec<T>, ConfigError> {
+pub fn parse_list<T>(raw: &str) -> Result<Vec<T>, ConfigError>
+where
+    T: std::str::FromStr,
+    T::Err: Into<ConfigError>,
+{
     raw.split(',')
         .map(str::trim)
         .filter(|e| !e.is_empty())
-        .map(str::parse)
+        .map(|e| e.parse().map_err(Into::into))
         .collect()
 }
 
@@ -729,32 +587,43 @@ pub struct AgentIssuer {
     key: SigningKey,
     previous_key: Option<SigningKey>,
     ttl: TokenTtl,
-    spire: Vec<TrustedSpire>,
+    /// The SPIRE `CONTROLLER_AGENT_SPIRE` names.
+    stated: Vec<Arc<TrustedSpire>>,
+    /// The SPIRE discovery has read, a verifier for each made on first use from `keys`.
+    directory: SpireDirectory,
+    discovered: std::sync::Mutex<Vec<Arc<TrustedSpire>>>,
+    keys: Option<KeySource>,
     audiences: Vec<Audience>,
 }
 
+/// Each cluster's SPIRE key set.
+type KeySource = Box<dyn Fn(&ClusterSpire) -> Jwks + Send + Sync>;
+
 struct TrustedSpire {
-    cluster: String,
-    svid_issuer: String,
-    gateway_prefix: GatewayPrefix,
+    spire: ClusterSpire,
     svids: Verifier,
+}
+
+fn trusted(entry: &ClusterSpire, keys: &dyn Fn(&ClusterSpire) -> Jwks) -> Arc<TrustedSpire> {
+    Arc::new(TrustedSpire {
+        spire: entry.clone(),
+        svids: Verifier::new(entry.svid_issuer.clone(), keys(entry)),
+    })
 }
 
 impl AgentIssuer {
     /// `keys` gives each cluster's SPIRE key set.
     pub fn new(cfg: AgentIssuerConfig, keys: impl Fn(&ClusterSpire) -> Jwks) -> Self {
-        let spire = cfg
+        let stated = cfg
             .spire
             .iter()
-            .map(|entry| TrustedSpire {
-                cluster: entry.cluster.clone(),
-                svid_issuer: entry.svid_issuer.clone(),
-                gateway_prefix: entry.gateway_prefix.clone(),
-                svids: Verifier::new(entry.svid_issuer.clone(), keys(entry)),
-            })
+            .map(|entry| trusted(entry, &keys))
             .collect();
         Self {
-            spire,
+            stated,
+            directory: SpireDirectory::default(),
+            discovered: Default::default(),
+            keys: None,
             issuer: cfg.issuer,
             key: cfg.signing_key,
             previous_key: cfg.previous_key,
@@ -763,13 +632,54 @@ impl AgentIssuer {
         }
     }
 
+    /// This issuer, also trusting the SPIRE `directory` discovers, its keys from `keys`.
+    pub fn discovering(
+        self,
+        directory: SpireDirectory,
+        keys: impl Fn(&ClusterSpire) -> Jwks + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            directory,
+            keys: Some(Box::new(keys)),
+            ..self
+        }
+    }
+
     pub fn issuer(&self) -> &IssuerUrl {
         &self.issuer
     }
 
-    /// Whether any cluster's SPIRE is trusted, and so whether agent tokens are minted at all.
+    /// Whether agent tokens are minted at all: some cluster's SPIRE is named, or discovery looks
+    /// for some.
     pub fn serves_agents(&self) -> bool {
-        !self.spire.is_empty()
+        !self.stated.is_empty() || self.directory.enabled()
+    }
+
+    /// The trusted SPIRE whose JWT-SVIDs `svid_issuer` signs.
+    fn spire_of(&self, svid_issuer: &str) -> Option<Arc<TrustedSpire>> {
+        if let Some(stated) = self
+            .stated
+            .iter()
+            .find(|s| s.spire.svid_issuer == svid_issuer)
+        {
+            return Some(stated.clone());
+        }
+        let found = self
+            .directory
+            .ready()
+            .into_iter()
+            .find(|s| s.svid_issuer == svid_issuer)?;
+        let mut cache = self
+            .discovered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.iter().find(|t| t.spire == found) {
+            return Some(cached.clone());
+        }
+        let fresh = trusted(&found, self.keys.as_deref()?);
+        cache.retain(|t| t.spire.cluster != found.cluster);
+        cache.push(fresh.clone());
+        Some(fresh)
     }
 
     /// The sandbox a JWT-SVID client assertion identifies. The SVID must verify against the keys
@@ -778,12 +688,11 @@ impl AgentIssuer {
     pub async fn sandbox(&self, assertion: &str) -> Result<Sandbox, AssertionError> {
         let issuer = self.issuer.as_str();
         let claimed = unverified_issuer(assertion)?;
-        let spire = self
-            .spire
-            .iter()
-            .find(|s| s.svid_issuer == claimed)
+        let trusted = self
+            .spire_of(&claimed)
             .ok_or(AssertionError::UnknownSpire(claimed))?;
-        let claims = spire.svids.verify(assertion, &[issuer]).await?;
+        let spire = &trusted.spire;
+        let claims = trusted.svids.verify(assertion, &[issuer]).await?;
         let aud = claims.get("aud").cloned().unwrap_or(Value::Null);
         let single = match &aud {
             Value::String(a) => a == issuer,
@@ -968,10 +877,12 @@ impl AgentIssuer {
 
 #[cfg(test)]
 mod tests {
+    use crate::agent_auth::cluster_spire::{DiscoveryService, GatewayPrefix};
     use crate::agent_auth::issuer::*;
     use crate::agent_auth::testing::{
         self, BUILDIT, CLUSTER, EcKey, ISSUER, KUEUE, POD, PREFIX, PROFILE, Spire, now, serve_jwks,
     };
+    use crucible::deploy::profile::KubeName;
     use crucible_contract::kueue::{SCOPE_READ, SCOPE_SUBMIT};
     use std::collections::HashMap;
 
@@ -998,41 +909,37 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_gateway_prefix_may_hold_one_tenant_segment() {
-        let plain = GatewayPrefix::parse("spiffe://td/openshell/gateway/").unwrap();
-        assert_eq!(
-            plain.split("spiffe://td/openshell/gateway/gw/sandbox/s"),
-            Some((None, "gw/sandbox/s"))
-        );
-        assert_eq!(
-            plain.split("spiffe://td/openshell/team-a/gateway/gw/sandbox/s"),
-            None
-        );
-        let tenanted = GatewayPrefix::parse("spiffe://td/openshell/{tenant}/gateway/").unwrap();
-        assert_eq!(
-            tenanted.split("spiffe://td/openshell/team-a/gateway/gw/sandbox/s"),
-            Some((Some("team-a"), "gw/sandbox/s"))
-        );
-        for outside in [
-            "spiffe://td/openshell/gateway/gw/sandbox/s",
-            "spiffe://td/openshell/Team_A/gateway/gw/sandbox/s",
-            "spiffe://td/openshell/team-a/other/gateway/gw/sandbox/s",
-            "spiffe://other/openshell/team-a/gateway/gw/sandbox/s",
-        ] {
-            assert_eq!(tenanted.split(outside), None, "{outside}");
-        }
-        for bad in [
-            "spiffe://td/openshell/gateway",
-            "https://td/openshell/gateway/",
-            "spiffe:///openshell/gateway/",
-            "spiffe://td/openshell/{tenant}/{tenant}/gateway/",
-            "spiffe://td/openshell/x{tenant}/gateway/",
-            "spiffe://td/openshell/{team}/gateway/",
-            "spiffe://{tenant}/gateway/",
-        ] {
-            assert!(GatewayPrefix::parse(bad).is_err(), "{bad}");
-        }
+    /// A cluster's SPIRE that discovery has read is trusted like a stated one, from the moment it
+    /// is read; one still pending or found wanting signs nothing the issuer accepts.
+    #[tokio::test]
+    async fn a_discovered_spire_is_trusted_once_read() {
+        use crate::agent_auth::cluster_spire::SpireState;
+        let spire = Spire::start().await;
+        let mut cfg = testing::config(&EcKey::generate());
+        cfg.spire.clear();
+        let directory = SpireDirectory::default();
+        let uri = spire.jwks_uri.clone();
+        let issuer = AgentIssuer::new(cfg, |_| -> Jwks { panic!("nothing is stated") })
+            .discovering(directory.clone(), move |_| {
+                Jwks::new(reqwest::Client::new(), uri.clone())
+            });
+        assert!(!issuer.serves_agents());
+        directory.enable([CLUSTER.to_string()]);
+        assert!(issuer.serves_agents(), "discovery is looking");
+        let svid = spire.svid(&Spire::claims("sbx-1"));
+        assert!(matches!(
+            issuer.sandbox(&svid).await,
+            Err(AssertionError::UnknownSpire(_))
+        ));
+        directory.set(CLUSTER, SpireState::Unavailable("not read".into()));
+        assert!(matches!(
+            issuer.sandbox(&svid).await,
+            Err(AssertionError::UnknownSpire(_))
+        ));
+        directory.set(CLUSTER, SpireState::Ready(testing::cluster_spire()));
+        let sandbox = issuer.sandbox(&svid).await.unwrap();
+        assert_eq!(sandbox.cluster, CLUSTER);
+        assert_eq!(sandbox.id.as_str(), "sbx-1");
     }
 
     #[tokio::test]

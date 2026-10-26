@@ -391,7 +391,8 @@ The steps are these:
 2. The controller folds the loop pod client material and the agent server access into the run
    Secret before it renders the loop pod (`crucible-controller/src/runs/workpod/run.rs:813`,
    `access` in `crucible-controller/src/runs/workpod/agent_servers.rs`). A server is granted only where the
-   issuer can mint its tokens: the run's cluster is in `CONTROLLER_AGENT_SPIRE`
+   issuer can mint its tokens: it trusts the run's cluster's SPIRE, discovered or named in
+   `CONTROLLER_AGENT_SPIRE`
    (`crucible-controller/src/runs/workpod/agent_servers.rs`, `granted`). The loop pod gets them as
    one `CRUCIBLE_AGENT_SERVERS` list. The run records the servers that it got, with the scopes of
    the audience.
@@ -420,7 +421,8 @@ The steps are these:
 
 `issue` (`crucible-controller/src/agent_auth/mod.rs:314`) does these checks in this order:
 
-1. The issuer trusts at least one cluster SPIRE (`CONTROLLER_AGENT_SPIRE`).
+1. The issuer mints agent tokens: the profile isolates gateways and describes a server, or
+   `CONTROLLER_AGENT_SPIRE` names a cluster.
 2. The deploy profile is isolated and names a sandbox namespace
    (`crucible-controller/src/agent_auth/placement.rs:48`).
 3. `grant_type` is `client_credentials`.
@@ -463,7 +465,7 @@ controller log as `agent token refused` with `reason` and the `user_agent`.
 
 | Case | Error | HTTP |
 | --- | --- | --- |
-| No `CONTROLLER_AGENT_SPIRE` (people-only issuer) | `unsupported_grant_type` | 400 |
+| No agent clusters (a people-only issuer) | `unsupported_grant_type` | 400 |
 | Profile not isolated, or no sandbox namespace | `unauthorized_client` | 400 |
 | Malformed form, repeated field, unknown field | `invalid_request` | 400 |
 | Wrong assertion type, unknown SPIRE `iss`, bad signature, wrong `aud`, no `iat`, future `iat` | `invalid_client` | 401 |
@@ -1035,7 +1037,8 @@ spiffeIDTemplate: 'spiffe://{{ .TrustDomain }}/openshell/gateway/{{ index .PodMe
 
 The token endpoint then refuses an SVID whose gateway id is not the bound run's gateway id.
 
-The gateway prefix in `CONTROLLER_AGENT_SPIRE` may hold one `{tenant}` path segment, such as
+A gateway prefix is `spiffe://<trust domain>/openshell/gateway/` for a discovered SPIRE. One named
+in `CONTROLLER_AGENT_SPIRE` may hold one `{tenant}` path segment, such as
 `spiffe://<trust domain>/openshell/{tenant}/gateway/`. It then matches IDs of the form
 `spiffe://<trust domain>/openshell/<tenant>/gateway/<gateway id>/sandbox/<sandbox id>`, where
 `<tenant>` is a DNS-1123 label, for a ClusterSPIFFEID that puts a tenant label of the gateway pod
@@ -1223,8 +1226,8 @@ sandboxes of that spoke get no tokens until the spoke is reachable again.
 | Sandboxes and supervisors | Sandbox namespace | Loop namespace |
 | Sandbox RBAC | `crucible-openshell-gateway` | The loop service account |
 | Loop NetworkPolicy | No gateway port | Admits sandbox pods on 17670 |
-| Agent tokens with `CONTROLLER_AGENT_SPIRE` set | Issued | The controller does not start (`PlacementError`) |
-| Token endpoint without `CONTROLLER_AGENT_SPIRE` | `unsupported_grant_type` | `unsupported_grant_type` |
+| Agent tokens | Issued on each cluster whose SPIRE the issuer trusts | Not issued; with `CONTROLLER_AGENT_SPIRE` set, the controller does not start (`PlacementError`) |
+| Token endpoint without agent clusters | `unsupported_grant_type` | `unsupported_grant_type` |
 | Bind route | Served | 409: the profile names no sandbox namespace |
 | Gateway sweep | Registered | Not registered |
 | Push-only dispatch | Refused | Allowed |
@@ -1232,6 +1235,31 @@ sandboxes of that spoke get no tokens until the spoke is reachable again.
 
 Profile load also refuses a sandbox namespace that is the loop namespace, the rig namespace, the
 `crucible-kueue` namespace or the workload namespace (`crucible/src/deploy/profile.rs:859`).
+
+### 6.9 SPIRE discovery
+
+The issuer verifies a sandbox's JWT-SVID against the SPIRE of the cluster that issued it, so it
+needs each agent cluster's JWT issuer, trust domain and the Service its keys are read through. It
+finds them itself (`crucible-controller/src/agent_auth/discovery.rs`), through the same cluster
+client it dispatches with, for every cluster an agent server serves:
+
+| Platform | Trust domain and JWT issuer | Keys |
+| --- | --- | --- |
+| OpenShift (serves `security.openshift.io`) | `spec.trustDomain` of the `ZeroTrustWorkloadIdentityManager` and `spec.jwtIssuer` of the `SpireOIDCDiscoveryProvider`, both named `cluster` (`operator.openshift.io/v1alpha1`) | `spire-spiffe-oidc-discovery-provider` in `zero-trust-workload-identity-manager`, https:443 |
+| Kubernetes | `server.trust_domain` and `server.jwt_issuer` in the `server.conf` of ConfigMap `spire-server/spire-server` (the upstream chart) | `spire-spiffe-oidc-discovery-provider` in `spire-server`, http:80 |
+
+The gateway prefix is `spiffe://<trust domain>/openshell/gateway/`. Discovery runs at startup and
+each minute for every cluster not yet read, and every ten minutes for all of them. A cluster it
+cannot read, or whose SPIRE runs in a namespace pack code reaches, has agents off: its runs get no
+agent servers, the issuer refuses its SVIDs, the controller logs why, and `GET
+/api/agent-clusters` reports each cluster as `ready`, `pending` or `unavailable` with the reason.
+`CONTROLLER_AGENT_SPIRE` names a SPIRE installed anywhere else and replaces discovery for that
+cluster.
+
+The run render grants the identities in `[cluster] sandbox_readers` what discovery reads, as
+`crucible-spire-reader`: get on `services/proxy` for the discovery Service in SPIRE's namespace,
+and the `spire-server` ConfigMap on Kubernetes, or a ClusterRole for the two operator resources
+named `cluster` on OpenShift.
 
 ## 7. crucible-kueue internals
 
@@ -1681,7 +1709,7 @@ push_authfile` a credential scoped to the one push repository.
 | `CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE` | unset | The previous issuer key. The JWKS publishes it; it signs nothing. |
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | `900` | Agent token lifetime, 900 to 1800. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | `<issuer>/oauth/token` | Where supervisors reach the token endpoint, for a spoke that reaches the controller through a route. |
-| `CONTROLLER_AGENT_SPIRE` | unset | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. The prefix may hold one `{tenant}` segment (section 6.1). The SPIRE Service's namespace must not be one pack code reaches (loop, rig, sandbox, `[buildit] namespace`, crucible-kueue workload namespaces), or the controller does not start (`check_spire_exposure`). A run gets agent tools only on a cluster listed here. Unset: the issuer serves people only, mints no agent tokens, grants no agent tools and stamps no dispatchers. |
+| `CONTROLLER_AGENT_SPIRE` | discovered | An override for a cluster whose SPIRE is not where its platform's installer puts it: comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. The prefix may hold one `{tenant}` segment (section 6.1). Every other cluster an agent server serves has its SPIRE discovered (section 6.9). A SPIRE whose namespace pack code reaches is refused: a named one stops the controller, a discovered one leaves agents off on its cluster. |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | `900` | People token lifetime, 1 to 3600. |
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | unset | A TOML file of `[[clients]]` with `client_id`, `name`, `redirect_uris` and optional `resources`. It replaces the built-in `claude-code`, `pi` and `codex`. Unset: the built-in clients (section 4.1.2). |
 | `CONTROLLER_PEOPLE_CIMD_HOSTS` | unset | Comma-separated host names that may publish Client ID Metadata Documents. Unset: every URL `client_id` is refused (section 4.1.3). The controller needs outbound HTTPS to these hosts. It honours `HTTPS_PROXY`. |
@@ -1698,9 +1726,11 @@ The issuer refuses to start when any of these is true:
 
 - Any other `CONTROLLER_AGENT_*` or `CONTROLLER_PEOPLE_*` variable is set, but
   `CONTROLLER_AGENT_ISSUER` is not.
-- `CONTROLLER_AGENT_ISSUER` is set, but neither is `CONTROLLER_AGENT_SPIRE` nor does the
-  profile serve people.
+- `CONTROLLER_AGENT_ISSUER` is set, but there are no agent clusters (no isolated profile with an
+  agent server, and no `CONTROLLER_AGENT_SPIRE`) and the profile serves people nowhere.
 - `CONTROLLER_AGENT_SPIRE` is set and the profile is not isolated.
+- A cluster whose SPIRE cannot be discovered does not stop the controller: agents are off there,
+  `GET /api/agent-clusters` says why, and discovery tries again each minute.
 - `CONTROLLER_PEOPLE_CLIENTS_FILE` cannot be read, is not a valid `[[clients]]` list, or names a
   `resources` entry that is not a people resource.
 - `CONTROLLER_PEOPLE_CIMD_HOSTS` is set and lists no host, or an entry that is not a host name.
@@ -1757,7 +1787,7 @@ The controller sets these. Do not set them by hand.
 
 | Variable | Set when | Read by |
 | --- | --- | --- |
-| `CRUCIBLE_AGENT_SERVERS` | The run gets at least one server: one the profile describes on the run's cluster (`[kueue]`, `[buildit]`, `[[agent_servers]]`), and the cluster is in `CONTROLLER_AGENT_SPIRE` | engine: a JSON list of `{name, url, scopes, transport}`; one provider, egress entry and `.mcp.json` entry each, and a start for a loop-pod transport |
+| `CRUCIBLE_AGENT_SERVERS` | The run gets at least one server: one the profile describes on the run's cluster (`[kueue]`, `[buildit]`, `[[agent_servers]]`), and the issuer trusts the cluster's SPIRE | engine: a JSON list of `{name, url, scopes, transport}`; one provider, egress entry and `.mcp.json` entry each, and a start for a loop-pod transport |
 | `CRUCIBLE_AGENT_TOKEN_ENDPOINT` | with `CRUCIBLE_AGENT_SERVERS` | engine: token-grant providers, and the bind decision |
 | `CRUCIBLE_AGENT_SVID_AUDIENCE` | with `CRUCIBLE_AGENT_SERVERS` | engine: `token_grant.jwt_svid_audience` |
 | `CRUCIBLE_OPENSHELL_GATEWAY_URL` | Isolated profile | engine: remote gateway |
@@ -1837,7 +1867,7 @@ test boots the controller with a deploy profile and no agent configuration and c
 | `/oauth/register` | issuer unset | Not routed. With the issuer set and people tokens or registration off, it answers 404 `invalid_request` |
 | Metadata document fetches | `CONTROLLER_PEOPLE_CIMD_HOSTS` unset | No outbound request; every URL `client_id` is refused |
 | Identity routes: cluster identities, link, callback, consent, MCP sign-ins, hub override | no agent tokens, no people tokens and no `[cluster_link]` | Not routed, not in the OpenAPI document (`crucible-controller/src/api/mod.rs:672`) |
-| `/api/agent-tools`, `/api/prefs/notices` | no agent tokens: issuer or `CONTROLLER_AGENT_SPIRE` unset (`crucible-controller/src/config.rs:858`) | Not routed |
+| `/api/agent-tools`, `/api/agent-clusters`, `/api/prefs/notices` | no agent tokens: no issuer, or no agent clusters (`ControllerCfg::issues_agent_tokens`) | Not routed |
 | Gateway sweep | profile not isolated | Not registered |
 | Grants sweep, registration sweep | no people tokens; the registration sweep also when registration is off | Not started |
 | Loop pod env and token-grant providers | no agent tokens, or the run gets no server (section 9.3) | Not set, so the engine creates none and binds nothing |
@@ -1984,8 +2014,8 @@ in place.
    LocalQueues.
 8. Grant people their queues with ordinary RBAC (section 11.2).
 9. Create the issuer key Secret in the controller namespace. Mount it in each replica.
-10. Set the controller environment (section 9.1). Put each cluster that hosts runs in
-    `CONTROLLER_AGENT_SPIRE`.
+10. Set the controller environment (section 9.1). Each cluster an agent server serves has its
+    SPIRE discovered; check `GET /api/agent-clusters` after the restart.
     Make sure that loop pods reach the controller at `[cluster] ingest_url`. Restart the
     controller.
 11. For people tokens: set `CONTROLLER_AUTH_MODE=native` and `[kueue] people = true` (with
@@ -2085,10 +2115,11 @@ other distributions serve it.
 - The SPIFFE ID must be `<gateway prefix><gateway id>/sandbox/<sandbox id>`. Scope the
   ClusterSPIFFEID to the sandbox namespace.
 - The discovery provider must serve `/keys`. The controller reads it through the API server
-  Service proxy. Name the Service in `CONTROLLER_AGENT_SPIRE` as `<namespace>/<service>:<port>`,
-  with `http://` first when the Service serves plain http.
-- `CONTROLLER_AGENT_SPIRE` names the SVID `iss` of each cluster exactly. Each cluster needs its own
-  SVID issuer. The controller refuses one issuer for two clusters.
+  Service proxy. Discovery reads it at the platform's default; an install elsewhere is named in
+  `CONTROLLER_AGENT_SPIRE` as `<namespace>/<service>:<port>`, with `http://` first when the
+  Service serves plain http.
+- Each cluster needs its own SVID issuer: a token request is matched to its cluster by the SVID's
+  `iss`.
 
 ### 11.4 Rollback
 
@@ -2186,7 +2217,7 @@ COMMIT;
 | Every token request is `invalid_grant` with `reason` "bound to no run" | The loop pod never bound its sandboxes: no `ingest_url` in the profile, or no route to the controller | Set `[cluster] ingest_url` to an address loop pods reach; on a spoke expose `/api/sandbox-bindings` and `/oauth/token` |
 | `invalid_grant` with a reason about `kube_user` | The launcher has no username on the run's cluster | Link it in Settings, set a claim rule, or set the hub override |
 | The first isolated run parks with a 403 on the server TLS Secret | The controller identity lacks `pods/finalizers` update in the sandbox namespace | Re-render and apply the loop RBAC |
-| `server_error` with `SPIRE keys unavailable` | No `services/proxy` get in the SPIRE namespace, or a wrong Service in `CONTROLLER_AGENT_SPIRE` | Grant the right; check the namespace, name, port and scheme |
+| `server_error` with `SPIRE keys unavailable` | No `services/proxy` get in the SPIRE namespace, or a SPIRE outside its platform's default namespace with no `CONTROLLER_AGENT_SPIRE` entry | Grant the right; check the namespace, name, port and scheme |
 | A people token gets 403 from `crucible-kueue` | The server trusts the issuer only as `--run-issuer` | Add the same issuer as `--person-issuer` |
 | A refresh suddenly returns `invalid_grant` | Reuse detection after a retried refresh, an unlinked username, or a refresh token presented as another client | Approve the client again; check the controller log for the reason |
 | A refresh returns `invalid_client` | The client registry no longer lists the client, the metadata host is no longer allowlisted, or the registration was idle for 30 days | Register the client again, or sign in under a registered client |

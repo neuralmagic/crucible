@@ -16,7 +16,9 @@
 //! alone, and the JWKS and metadata documents are public.
 
 pub mod bindings;
+pub mod cluster_spire;
 pub mod directory;
+pub mod discovery;
 pub mod issuer;
 pub mod people;
 pub mod placement;
@@ -68,15 +70,17 @@ impl AgentAuth {
             .await
             .context("reading the deploy profile for the agent issuer")?
             .ok_or(placement::PlacementError::NoProfile)?;
-        let issuer_cfg = issuer_cfg.serving(
-            &profile
-                .agent_servers()
-                .context("reading the deploy profile's agent servers")?,
-        );
+        let servers = profile
+            .agent_servers()
+            .context("reading the deploy profile's agent servers")?;
+        let issuer_cfg = issuer_cfg.serving(&servers);
+        // Agent tokens need each run's gateway isolated in a sandbox namespace and a server to
+        // mint for; each such server's clusters then have their SPIRE discovered.
+        let agents = !servers.is_empty() && placement::sandbox_namespace(Some(&profile)).is_ok();
         let namespace = placement::controller_namespace();
-        match issuer_cfg.spire.is_empty() {
-            false => placement::check_key_placement(namespace.as_deref(), &profile)?,
-            true => placement::check_key_exposure(namespace.as_deref(), &profile)?,
+        match agents || !issuer_cfg.spire.is_empty() {
+            true => placement::check_key_placement(namespace.as_deref(), &profile)?,
+            false => placement::check_key_exposure(namespace.as_deref(), &profile)?,
         }
         placement::check_spire_exposure(&issuer_cfg.spire, &profile)?;
         let make_people = people;
@@ -97,24 +101,42 @@ impl AgentAuth {
                 Some(people)
             }
         };
-        if issuer_cfg.spire.is_empty() && people.is_none() {
+        if !agents && issuer_cfg.spire.is_empty() && people.is_none() {
             return Err(issuer::ConfigError::NoRecipients.into());
+        }
+        let mut discovering: Vec<String> = servers
+            .iter()
+            .flat_map(|s| s.clusters.iter().cloned())
+            .filter(|c| !issuer_cfg.spire.iter().any(|s| &s.cluster == c))
+            .collect();
+        discovering.sort();
+        discovering.dedup();
+        if agents {
+            cfg.spire.enable(discovering.iter().cloned());
+            if !discovering.is_empty() {
+                discovery::spawn(cfg.spire.clone(), clusters.clone(), profile.clone());
+            }
         }
         tracing::info!(
             issuer = issuer_cfg.issuer.as_str(),
             kid = issuer_cfg.signing_key.kid(),
             spire = ?issuer_cfg.spire.iter().map(|s| (s.cluster.as_str(), s.svid_issuer.as_str())).collect::<Vec<_>>(),
-            audiences = ?issuer_cfg.audiences.iter().map(|a| (a.resource.as_str(), a.requires_kube_user, a.namespaces.as_slice())).collect::<Vec<_>>(),
+            discovering = ?discovering,
+            audiences = ?issuer_cfg.audiences.iter().map(|a| (a.resource.as_str(), a.cluster.as_str(), a.requires_kube_user)).collect::<Vec<_>>(),
             "issuing agent access tokens"
         );
-        let keys = |entry: &issuer::ClusterSpire| {
-            crucible_mcp_auth::jwks::Jwks::from_source(Arc::new(spire::ProxyKeys::new(
-                clusters.clone(),
-                entry,
-            )))
+        let proxy_keys = |clusters: Arc<crate::runs::clusters::ClusterClients>| {
+            move |entry: &cluster_spire::ClusterSpire| {
+                crucible_mcp_auth::jwks::Jwks::from_source(Arc::new(spire::ProxyKeys::new(
+                    clusters.clone(),
+                    entry,
+                )))
+            }
         };
+        let issuer = AgentIssuer::new(issuer_cfg, proxy_keys(clusters.clone()))
+            .discovering(cfg.spire.clone(), proxy_keys(clusters.clone()));
         Ok(Some(Arc::new(Self {
-            issuer: AgentIssuer::new(issuer_cfg, keys),
+            issuer,
             pool,
             profile,
             directory: Arc::new(directory::KubeDirectory(clusters)),

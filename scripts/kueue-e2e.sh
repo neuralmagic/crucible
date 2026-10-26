@@ -34,9 +34,8 @@
 # It runs on OpenShift and on plain Kubernetes. PLATFORM (openshift or kubernetes) defaults to
 # what API discovery finds: OpenShift serves security.openshift.io (its SCCs). Each value below
 # defaults by platform and can be set on its own:
-#   SPIRE_NS         zero-trust-workload-identity-manager | spire-server
-#   SPIRE_DISCOVERY  <SPIRE_NS>/spire-spiffe-oidc-discovery-provider:443 |
-#                    http://<SPIRE_NS>/spire-spiffe-oidc-discovery-provider:80
+#   SPIRE_NS         zero-trust-workload-identity-manager | spire-server, where the controller
+#                    discovers SPIRE too (it reads the same resources the script does)
 #   TRUST_DOMAIN, SVID_ISSUER   the Zero Trust Workload Identity Manager's resources | the
 #                    spire-server ConfigMap's server.trust_domain and server.jwt_issuer
 #   SPIRE_CLASS      zero-trust-workload-identity-manager-spire | spire-controller-manager's
@@ -135,16 +134,20 @@ teardown() {
     [ -z "${SPIRE_NS:-}" ] || kc -n "$SPIRE_NS" delete rolebinding,role -l "$E2E_LABEL" --ignore-not-found >/dev/null || true
     kc delete namespace -l "$E2E_LABEL" --ignore-not-found "$@" >/dev/null || true
 }
-# Name a render's cluster-scoped objects for the e2e and label them, and point bindings at the
-# renamed ClusterRoles, so nothing collides with a live deployment's objects of the same name.
+# Name a render's cluster-scoped objects, and its objects in SPIRE's namespace, for the e2e and
+# label them, and point bindings at the renamed roles, so nothing collides with a live
+# deployment's objects of the same name.
 e2e_scoped() {
-    yq -o=json -I=0 '.' "$1" | jq -s '
+    yq -o=json -I=0 '.' "$1" | jq -s --arg spire "$SPIRE_NS" '
         ([.[] | select(.kind == "ClusterRole") | .metadata.name]) as $roles
         | {apiVersion: "v1", kind: "List", items: [.[] | select(. != null)
             | if (.kind | startswith("Cluster")) then
                 .metadata.name += "-kueue-e2e" | .metadata.labels["crucible.dev/e2e"] = "kueue"
               elif (.kind | startswith("ValidatingAdmissionPolicy")) then
                 .metadata.labels["crucible.dev/e2e"] = "kueue"
+              elif (.metadata.namespace == $spire) then
+                .metadata.name += "-kueue-e2e" | .metadata.labels["crucible.dev/e2e"] = "kueue"
+                | if (.roleRef.kind == "Role") then .roleRef.name += "-kueue-e2e" else . end
               else . end
             | if (.roleRef.kind == "ClusterRole" and (.roleRef.name as $n | $roles | index($n))) then
                 .roleRef.name += "-kueue-e2e"
@@ -172,7 +175,6 @@ fi
 case $PLATFORM in
     openshift)
         : "${SPIRE_NS:=zero-trust-workload-identity-manager}"
-        : "${SPIRE_DISCOVERY:=$SPIRE_NS/spire-spiffe-oidc-discovery-provider:443}"
         : "${SPIRE_CLASS:=zero-trust-workload-identity-manager-spire}"
         : "${TRUST_DOMAIN:=$(kc get zerotrustworkloadidentitymanager cluster -o jsonpath='{.spec.trustDomain}' 2>/dev/null || true)}"
         : "${SVID_ISSUER:=$(kc get spireoidcdiscoveryprovider cluster -o jsonpath='{.spec.jwtIssuer}' 2>/dev/null || true)}"
@@ -180,7 +182,6 @@ case $PLATFORM in
         ;;
     kubernetes)
         : "${SPIRE_NS:=spire-server}"
-        : "${SPIRE_DISCOVERY:=http://$SPIRE_NS/spire-spiffe-oidc-discovery-provider:80}"
         server_conf=$(kc -n "$SPIRE_NS" get configmap spire-server -o jsonpath='{.data.server\.conf}' 2>/dev/null || true)
         [ -n "$server_conf" ] || server_conf='{}'
         : "${TRUST_DOMAIN:=$(jq -r '.server.trust_domain // empty' <<<"$server_conf")}"
@@ -233,7 +234,7 @@ fill() {
         -e "s|@LAUNCHER@|$LAUNCHER|g" -e "s|@AVOID_NODES@|$AVOID_NODES|g" \
         -e "s|@PUSH_REPO@|$PUSH_REPO|g" -e "s|@ANTHROPIC_BASE_URL@|$ANTHROPIC_BASE_URL|g" \
         -e "s|@ANTHROPIC_KEY_SECRET@|$ANTHROPIC_KEY_SECRET|g" -e "s|@NONCE@|$NONCE|g" -e "s|@NONCE_SHORT@|${NONCE:0:8}|g" \
-        -e "s|@AGENT_SPIRE@|hub=$SVID_ISSUER $GATEWAY_PREFIX $SPIRE_DISCOVERY|g" "$1"
+        "$1"
 }
 fill "$ROOT/e2e/kueue/profile.toml.in" > "$WORK/profile.toml"
 

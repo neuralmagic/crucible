@@ -61,35 +61,6 @@ subjects:
     name: crucible-controller
     namespace: @CTL_NS@
 ---
-# SPIRE's JWT authorities, read through the API server's Service proxy.
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: crucible-kueue-e2e-spire-keys
-  namespace: @SPIRE_NS@
-  labels:
-    crucible.dev/e2e: kueue
-rules:
-  - apiGroups: [""]
-    resources: [services/proxy]
-    verbs: [get]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: crucible-kueue-e2e-spire-keys
-  namespace: @SPIRE_NS@
-  labels:
-    crucible.dev/e2e: kueue
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: crucible-kueue-e2e-spire-keys
-subjects:
-  - kind: ServiceAccount
-    name: crucible-controller
-    namespace: @CTL_NS@
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -170,7 +141,6 @@ spec:
             - {name: CONTROLLER_SCRATCH_DIR, value: /var/lib/crucible/scratch}
             - {name: CONTROLLER_AGENT_ISSUER, value: "@ISSUER@"}
             - {name: CONTROLLER_AGENT_SIGNING_KEY_FILE, value: /etc/crucible/keys/agent-signing.pem}
-            - {name: CONTROLLER_AGENT_SPIRE, value: "@AGENT_SPIRE@"}
             - {name: REGISTRY_AUTH_FILE, value: /etc/crucible/registry/.dockerconfigjson}
             - {name: RUST_LOG, value: info}
           ports: [{containerPort: 8080, name: api}]

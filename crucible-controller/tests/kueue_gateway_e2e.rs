@@ -21,9 +21,10 @@ use base64::Engine;
 use crucible::deploy::DeployProfile;
 use crucible_controller::PodDispatcher;
 use crucible_controller::agent_auth::bindings::{self, Binding};
+use crucible_controller::agent_auth::cluster_spire::ClusterSpire;
 use crucible_controller::agent_auth::directory::{KubeDirectory, SandboxDirectory};
 use crucible_controller::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, Audience, ClusterSpire, IssuerUrl, SigningKey,
+    AgentIssuer, AgentIssuerConfig, Audience, IssuerUrl, SigningKey,
 };
 use crucible_controller::agent_auth::sandbox::SandboxId;
 use crucible_controller::agent_auth::spire::ProxyKeys;

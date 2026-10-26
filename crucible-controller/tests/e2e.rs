@@ -589,6 +589,7 @@ fn test_cfg(state_dir: &Path, repos: Vec<String>) -> ControllerCfg {
         grounded_executor: crucible_controller::GroundedExecutor::Local,
         deploy_profile: Some(state_dir.join("deploy-profile.toml")),
         profile_cache: Default::default(),
+        spire: Default::default(),
         render_no_pin: true,
         grounded_sandbox_image: None,
         admins: vec![],

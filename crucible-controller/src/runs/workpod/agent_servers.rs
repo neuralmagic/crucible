@@ -7,7 +7,8 @@
 //!
 //! [`DeployProfile::agent_servers`]: crucible::deploy::DeployProfile::agent_servers
 
-use crate::agent_auth::issuer::{ClusterSpire, IssuerUrl, TOKEN_PATH, parse_list};
+use crate::agent_auth::cluster_spire::ClusterSpire;
+use crate::agent_auth::issuer::{IssuerUrl, TOKEN_PATH, parse_list};
 use crate::secrets::deliver::Delivery;
 use anyhow::Context;
 use crucible::deploy::servers::ServerSpec;
@@ -16,12 +17,15 @@ use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOI
 
 /// Where sandboxes get agent tokens and for what: the controller's issuer identifier (the SVID
 /// audience), the token endpoint supervisors reach (the issuer's own unless an operator routed it
-/// elsewhere), and the clusters whose SPIRE the issuer trusts.
+/// elsewhere), and the clusters whose SPIRE the issuer trusts: those `CONTROLLER_AGENT_SPIRE`
+/// names, and those discovery has read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTokens {
     pub svid_audience: String,
     pub endpoint: String,
+    /// The clusters `CONTROLLER_AGENT_SPIRE` names.
     pub clusters: Vec<String>,
+    pub spire: crate::agent_auth::cluster_spire::SpireDirectory,
 }
 
 impl AgentTokens {
@@ -41,12 +45,14 @@ impl AgentTokens {
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| issuer.endpoint(TOKEN_PATH)),
             clusters: spire.into_iter().map(|s| s.cluster).collect(),
+            spire: cfg.spire.clone(),
         }))
     }
 
     /// Whether the issuer mints tokens for runs on `cluster`: it trusts that cluster's SPIRE.
     pub fn mints_on(&self, cluster: &str) -> bool {
         self.clusters.iter().any(|c| c == cluster)
+            || self.spire.ready().iter().any(|s| s.cluster == cluster)
     }
 }
 
@@ -146,6 +152,7 @@ mod tests {
             svid_audience: "http://crucible-controller.crucible-system.svc:8080".into(),
             endpoint: "http://crucible-controller.crucible-system.svc:8080/oauth/token".into(),
             clusters: vec!["ocp".into(), "k8s".into()],
+            spire: Default::default(),
         }
     }
 
@@ -343,5 +350,28 @@ mod tests {
             ]))
             .is_err()
         );
+    }
+
+    /// A cluster discovery has read gets the servers that serve it; one it has not read does not.
+    #[test]
+    fn a_discovered_cluster_gets_its_servers_once_read() {
+        use crate::agent_auth::cluster_spire::SpireState;
+        let all = servers(&format!("{KUEUE}{BUILDIT}"));
+        let tokens = AgentTokens {
+            clusters: Vec::new(),
+            ..tokens()
+        };
+        tokens.spire.enable(["k8s".to_string()]);
+        assert!(access(&all, "k8s", &tokens).unwrap().is_none(), "pending");
+        let spire: crate::agent_auth::cluster_spire::ClusterSpire =
+            "k8s=https://oidc.k8s.example spiffe://k8s.example/openshell/gateway/ spire/oidc:443"
+                .parse()
+                .unwrap();
+        tokens.spire.set("k8s", SpireState::Ready(spire));
+        assert_eq!(
+            names(&access(&all, "k8s", &tokens).unwrap().unwrap()),
+            ["buildit"]
+        );
+        assert!(access(&all, "ocp", &tokens).unwrap().is_none());
     }
 }

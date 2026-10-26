@@ -338,6 +338,7 @@ mod tests {
             svid_audience: "https://crucible.hub.example".into(),
             endpoint: "https://crucible.hub.example/oauth/token".into(),
             clusters: clusters.iter().map(|c| c.to_string()).collect(),
+            spire: Default::default(),
         }
     }
 

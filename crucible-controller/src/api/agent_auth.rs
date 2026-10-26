@@ -48,11 +48,13 @@ pub(crate) struct IdentityDoc;
 #[openapi(
     paths(
         crate::runs::api::runs::get_agent_tool_defaults,
+        crate::runs::api::runs::get_agent_clusters,
         crate::identity::api::prefs::get_notice_prefs,
         crate::identity::api::prefs::put_notice_prefs,
     ),
     components(schemas(
         crate::runs::agent_tools::Defaults,
+        crate::agent_auth::discovery::AgentCluster,
         crate::identity::api::prefs::NoticePrefsDto,
     ))
 )]
@@ -97,6 +99,10 @@ pub(crate) fn agent_tool_routes(router: Router<ApiState>) -> Router<ApiState> {
         .route(
             "/api/agent-tools",
             get(crate::runs::api::runs::get_agent_tool_defaults),
+        )
+        .route(
+            "/api/agent-clusters",
+            get(crate::runs::api::runs::get_agent_clusters),
         )
 }
 

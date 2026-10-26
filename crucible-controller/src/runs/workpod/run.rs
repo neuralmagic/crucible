@@ -864,9 +864,10 @@ pub async fn dispatch_run(
         .pod_namespace(&cluster, &cfg.pod_namespace)
         .await?;
     if let Some(isolated) = isolated {
-        let spire: Vec<crate::agent_auth::issuer::ClusterSpire> =
+        let mut spire: Vec<crate::agent_auth::cluster_spire::ClusterSpire> =
             crate::agent_auth::issuer::parse_list(cfg.agent_spire.as_deref().unwrap_or_default())
                 .context("reading CONTROLLER_AGENT_SPIRE")?;
+        spire.extend(cfg.spire.ready());
         crate::agent_auth::placement::check_loop_namespace(
             &cluster,
             &namespace,

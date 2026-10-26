@@ -1,7 +1,7 @@
 //! A cluster SPIRE's JWT authorities, read from its OIDC discovery provider through the cluster's
 //! API server Service proxy with the controller's own client for that cluster.
 
-use crate::agent_auth::issuer::ClusterSpire;
+use crate::agent_auth::cluster_spire::ClusterSpire;
 use crate::runs::clusters::ClusterClients;
 use crucible_mcp_auth::jwks::{FetchFuture, KeySource, KeySourceError};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
@@ -76,7 +76,7 @@ impl KeySource for ProxyKeys {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent_auth::issuer::ClusterSpire;
+    use crate::agent_auth::cluster_spire::ClusterSpire;
     use crate::agent_auth::spire::*;
     use axum::http::StatusCode;
 

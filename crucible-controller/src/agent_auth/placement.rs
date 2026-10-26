@@ -91,7 +91,7 @@ fn pack_reachable(profile: &DeployProfile) -> Vec<(&'static str, &str)> {
 /// Refuse a SPIRE whose namespace (its OIDC discovery Service's, in `CONTROLLER_AGENT_SPIRE`) is
 /// one pack code reaches: a pod there can exec into the SPIRE server and mint any sandbox's SVID.
 pub fn check_spire_exposure(
-    spire: &[crate::agent_auth::issuer::ClusterSpire],
+    spire: &[crate::agent_auth::cluster_spire::ClusterSpire],
     profile: &DeployProfile,
 ) -> Result<(), PlacementError> {
     let reachable = pack_reachable(profile);
@@ -117,7 +117,7 @@ pub fn check_loop_namespace(
     cluster: &str,
     loop_namespace: &str,
     profile: &DeployProfile,
-    spire: &[crate::agent_auth::issuer::ClusterSpire],
+    spire: &[crate::agent_auth::cluster_spire::ClusterSpire],
     controller_namespace: Option<&str>,
 ) -> Result<(), PlacementError> {
     let mut guarded: Vec<(String, &str)> = vec![(
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn spire_must_run_where_no_pack_reachable_namespace_is() {
         let building = profile(PROFILE);
-        let spire = |namespace: &str| -> crate::agent_auth::issuer::ClusterSpire {
+        let spire = |namespace: &str| -> crate::agent_auth::cluster_spire::ClusterSpire {
             format!("dev=https://oidc.example spiffe://td/openshell/gateway/ {namespace}/oidc:443")
                 .parse()
                 .unwrap()
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn loop_pods_must_not_land_where_agent_tokens_rest() {
         let placed = profile(PROFILE);
-        let spire: Vec<crate::agent_auth::issuer::ClusterSpire> = vec![
+        let spire: Vec<crate::agent_auth::cluster_spire::ClusterSpire> = vec![
             "east=https://oidc.example spiffe://td/openshell/gateway/ spire-east/oidc:443"
                 .parse()
                 .unwrap(),

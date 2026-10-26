@@ -136,7 +136,7 @@ Service URLs.
 
 **The token endpoint.** The controller answers that request itself:
 
-1. Verify the SVID against the issuing cluster's SPIRE keys (`CONTROLLER_AGENT_SPIRE`): one
+1. Verify the SVID against the issuing cluster's SPIRE keys (discovered per cluster): one
    audience, the controller issuer; subject under that cluster's gateway prefix; at most 15 minutes
    of life.
 2. Map the sandbox ID to its run. The engine binds the ID, with the sandbox name and workdir, after

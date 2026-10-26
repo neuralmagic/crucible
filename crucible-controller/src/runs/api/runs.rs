@@ -162,6 +162,23 @@ pub(crate) async fn get_agent_tool_defaults(
     .into_response())
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/agent-clusters",
+    responses(
+        (status = 200, description = "Each agent cluster: whether its SPIRE is trusted, and why not", body = Vec<crate::agent_auth::discovery::AgentCluster>)
+    )
+)]
+pub(crate) async fn get_agent_clusters(State(state): State<ApiState>) -> Response {
+    let clusters = match state.agent_tokens.as_ref() {
+        Some(tokens) => {
+            crate::agent_auth::discovery::agent_clusters(&tokens.clusters, &tokens.spire)
+        }
+        None => Vec::new(),
+    };
+    Json(clusters).into_response()
+}
+
 /// `GET /api/runs/{run_id}/graph` — the run's newest admitted work graph plus every task attempt
 /// folded against it. A 404 covers both an unknown run and a run that never admitted a plan (every
 /// run logged before the work-graph executor existed), which is what lets the SPA hide the panel

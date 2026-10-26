@@ -3,9 +3,8 @@
 //! sandboxes to.
 
 use crate::agent_auth::bindings::Binding;
-use crate::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, Audience, ClusterSpire, IssuerUrl, SigningKey,
-};
+use crate::agent_auth::cluster_spire::ClusterSpire;
+use crate::agent_auth::issuer::{AgentIssuer, AgentIssuerConfig, Audience, IssuerUrl, SigningKey};
 use crate::agent_auth::sandbox::SandboxId;
 use base64::Engine;
 use crucible_mcp_auth::jwks::Jwks;

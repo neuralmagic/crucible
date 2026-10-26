@@ -954,6 +954,7 @@ static AGENT_TOOL_BINDINGS: &[Binding] = &[
     bind("GET", "/api/prefs/notices", R::UserPrefs, V::Read, Route),
     bind("PUT", "/api/prefs/notices", R::UserPrefs, V::Update, Route),
     bind("GET", "/api/agent-tools", R::Platform, V::Read, Route),
+    bind("GET", "/api/agent-clusters", R::Platform, V::Read, Route),
 ];
 
 /// Every binding this build serves.

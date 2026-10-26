@@ -609,13 +609,17 @@ pub struct ControllerCfg {
     /// a spoke that reaches the controller through a route.
     #[arg(long = "agent-token-endpoint", env = "CONTROLLER_AGENT_TOKEN_ENDPOINT")]
     pub agent_token_endpoint: Option<String>,
-    /// The clusters whose sandboxes get agent tokens, the same `CONTROLLER_AGENT_SPIRE` the issuer
-    /// verifies their JWT-SVIDs by. Unset, the issuer serves people only and runs get no tools.
+    /// SPIRE entries for clusters whose SPIRE discovery cannot find
+    /// (`<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`, comma
+    /// separated); every other agent cluster's SPIRE is discovered ([`Self::spire`]).
     #[arg(long = "agent-spire", env = "CONTROLLER_AGENT_SPIRE")]
     pub agent_spire: Option<String>,
     /// `deploy_profile`, read once on first use.
     #[arg(skip)]
     pub profile_cache: ProfileCache,
+    /// Each agent cluster's SPIRE as discovery last found it, shared by the issuer and dispatch.
+    #[arg(skip)]
+    pub spire: crate::agent_auth::cluster_spire::SpireDirectory,
     /// The externally reachable base URL of the webhook delivery surface (e.g.
     /// `https://hooks.crucible.example.com`). A created webhook's delivery URL is built on it;
     /// unset ⇒ the API returns the delivery path alone.
@@ -850,10 +854,11 @@ impl ControllerCfg {
     }
 
     /// Whether the issuer mints agent tokens for some cluster's sandboxes, which is what gives runs
-    /// agent tools and records who each dispatch acts for.
+    /// agent tools and records who each dispatch acts for: an issuer, and agent clusters, named by
+    /// `CONTROLLER_AGENT_SPIRE` or found by the issuer at startup ([`Self::spire`]).
     pub fn issues_agent_tokens(&self) -> bool {
         let set = |v: &Option<String>| v.as_deref().is_some_and(|v| !v.trim().is_empty());
-        set(&self.agent_issuer) && set(&self.agent_spire)
+        set(&self.agent_issuer) && (set(&self.agent_spire) || self.spire.enabled())
     }
 
     /// How a pod render pins its image tags: the registry, unless `render_no_pin` is set.

@@ -541,6 +541,7 @@ mod tests {
             (Method::GET, "/api/oauth/consent"),
             (Method::POST, "/api/oauth/consent"),
             (Method::GET, "/api/agent-tools"),
+            (Method::GET, "/api/agent-clusters"),
             (Method::GET, "/api/prefs/notices"),
             (Method::PUT, "/api/prefs/notices"),
         ];

@@ -1671,6 +1671,81 @@ exit $rc
             SandboxRbacObject::ClusterRoleBinding(crb),
         ]);
         objects.extend(self.sandbox_reader_rbac());
+        objects.extend(self.spire_reader_rbac());
+        objects
+    }
+
+    /// Under isolated gateways, what `cluster.sandbox_readers` reads the cluster's SPIRE with:
+    /// its JWT keys through the API server's Service proxy, and the resources discovery reads its
+    /// trust domain and JWT issuer from (the operator's on OpenShift, the chart's ConfigMap
+    /// elsewhere). The platform is `[cluster] platform`, `kubernetes` unless it says otherwise.
+    fn spire_reader_rbac(&self) -> Vec<SandboxRbacObject> {
+        let cluster = &self.profile.cluster;
+        if !crate::deploy::render::gateway::isolated(self.profile)
+            || cluster.sandbox_readers.is_empty()
+        {
+            return Vec::new();
+        }
+        let platform = cluster.platform.unwrap_or_default();
+        let at = crate::deploy::spire::discovery_location(platform);
+        let rule = |group: &str, resource: &str, names: Vec<String>| rbac::PolicyRule {
+            api_groups: Some(vec![group.to_string()]),
+            resources: Some(vec![resource.to_string()]),
+            resource_names: Some(names),
+            verbs: vec!["get".to_string()],
+            ..Default::default()
+        };
+        let mut rules = vec![rule(
+            "",
+            "services/proxy",
+            vec![at.service.to_string(), at.proxy_name()],
+        )];
+        if platform == forge::fleet::Platform::Kubernetes {
+            rules.push(rule(
+                "",
+                "configmaps",
+                vec![crate::deploy::spire::SERVER_CONFIGMAP.to_string()],
+            ));
+        }
+        let mut objects = self.reader_grant(SPIRE_READER, at.namespace, rules);
+        if platform == forge::fleet::Platform::Openshift {
+            let object = vec![crate::deploy::spire::OPERATOR_OBJECT.to_string()];
+            let role = rbac::ClusterRole {
+                metadata: ObjectMeta {
+                    name: Some(SPIRE_READER.to_string()),
+                    ..Default::default()
+                },
+                rules: Some(vec![
+                    rule(
+                        crate::deploy::spire::OPERATOR_GROUP,
+                        crate::deploy::spire::TRUST_DOMAIN_KIND.1,
+                        object.clone(),
+                    ),
+                    rule(
+                        crate::deploy::spire::OPERATOR_GROUP,
+                        crate::deploy::spire::JWT_ISSUER_KIND.1,
+                        object,
+                    ),
+                ]),
+                ..Default::default()
+            };
+            let binding = rbac::ClusterRoleBinding {
+                metadata: ObjectMeta {
+                    name: Some(SPIRE_READER.to_string()),
+                    ..Default::default()
+                },
+                role_ref: rbac::RoleRef {
+                    api_group: "rbac.authorization.k8s.io".to_string(),
+                    kind: "ClusterRole".to_string(),
+                    name: SPIRE_READER.to_string(),
+                },
+                subjects: Some(self.reader_subjects()),
+            };
+            objects.extend([
+                SandboxRbacObject::ClusterRole(role),
+                SandboxRbacObject::ClusterRoleBinding(binding),
+            ]);
+        }
         objects
     }
 
@@ -1914,26 +1989,32 @@ exit $rc
                 kind: "Role".to_string(),
                 name: name.to_string(),
             },
-            subjects: Some(
-                self.profile
-                    .cluster
-                    .sandbox_readers
-                    .iter()
-                    .map(|sa| rbac::Subject {
-                        kind: "ServiceAccount".to_string(),
-                        name: sa.name.to_string(),
-                        namespace: Some(sa.namespace.to_string()),
-                        ..Default::default()
-                    })
-                    .collect(),
-            ),
+            subjects: Some(self.reader_subjects()),
         };
         vec![
             SandboxRbacObject::Role(role),
             SandboxRbacObject::RoleBinding(binding),
         ]
     }
+
+    /// `cluster.sandbox_readers` as RBAC subjects.
+    fn reader_subjects(&self) -> Vec<rbac::Subject> {
+        self.profile
+            .cluster
+            .sandbox_readers
+            .iter()
+            .map(|sa| rbac::Subject {
+                kind: "ServiceAccount".to_string(),
+                name: sa.name.to_string(),
+                namespace: Some(sa.namespace.to_string()),
+                ..Default::default()
+            })
+            .collect()
+    }
 }
+
+/// The Role (in SPIRE's namespace) and ClusterRole the controller reads a cluster's SPIRE with.
+pub const SPIRE_READER: &str = "crucible-spire-reader";
 
 /// The builder pods' NetworkPolicy in `[buildit] namespace`.
 pub const BUILDER_NETPOL: &str = "buildit-builders";
@@ -4204,6 +4285,65 @@ mod tests {
             Some("team-sandbox")
         );
         assert!(named.contains("name: team-sandbox\n"), "{named}");
+    }
+
+    /// The controller discovers each cluster's SPIRE, so its identity on the cluster may read the
+    /// resources discovery reads and the keys, and nothing else of SPIRE's.
+    #[test]
+    fn the_sandbox_reader_may_read_its_clusters_spire() {
+        let readers = "sandbox_namespace = \"crucible-sandboxes\"\n\
+                       sandbox_readers = [\"crucible-control/crucible-controller\"]";
+        let docs = |extra: &str| -> Vec<serde_json::Value> {
+            render_k8s(&k8s_profile(extra))
+                .split("\n---\n")
+                .map(|d| serde_norway::from_str(d).expect("yaml doc"))
+                .filter(|d: &serde_json::Value| d["metadata"]["name"] == SPIRE_READER)
+                .collect()
+        };
+        let k8s = docs(readers);
+        let role = k8s.iter().find(|d| d["kind"] == "Role").expect("a Role");
+        assert_eq!(role["metadata"]["namespace"], "spire-server");
+        assert_eq!(
+            role["rules"],
+            serde_json::json!([
+                {"apiGroups": [""], "resources": ["services/proxy"], "verbs": ["get"],
+                 "resourceNames": ["spire-spiffe-oidc-discovery-provider",
+                                   "http:spire-spiffe-oidc-discovery-provider:80"]},
+                {"apiGroups": [""], "resources": ["configmaps"], "verbs": ["get"],
+                 "resourceNames": ["spire-server"]},
+            ])
+        );
+        assert!(k8s.iter().all(|d| d["kind"] != "ClusterRole"));
+        let binding = k8s.iter().find(|d| d["kind"] == "RoleBinding").unwrap();
+        assert_eq!(binding["subjects"][0]["name"], "crucible-controller");
+
+        let ocp = docs(&format!("{readers}\nplatform = \"openshift\""));
+        let role = ocp.iter().find(|d| d["kind"] == "Role").unwrap();
+        assert_eq!(
+            role["metadata"]["namespace"],
+            "zero-trust-workload-identity-manager"
+        );
+        assert_eq!(role["rules"].as_array().unwrap().len(), 1, "keys only");
+        let cluster_role = ocp.iter().find(|d| d["kind"] == "ClusterRole").unwrap();
+        let resources: Vec<&str> = cluster_role["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["resources"][0].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            resources,
+            [
+                "zerotrustworkloadidentitymanagers",
+                "spireoidcdiscoveryproviders"
+            ]
+        );
+        assert!(ocp.iter().any(|d| d["kind"] == "ClusterRoleBinding"));
+
+        assert!(
+            docs("sandbox_namespace = \"crucible-sandboxes\"").is_empty(),
+            "no reader, no grant"
+        );
     }
 
     #[test]
