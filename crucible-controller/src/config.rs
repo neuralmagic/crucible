@@ -613,10 +613,6 @@ pub struct ControllerCfg {
     /// verifies their JWT-SVIDs by. Unset, the issuer serves people only and runs get no tools.
     #[arg(long = "agent-spire", env = "CONTROLLER_AGENT_SPIRE")]
     pub agent_spire: Option<String>,
-    /// The MCP servers agent tokens may be minted for and their scopes, the same
-    /// `CONTROLLER_AGENT_AUDIENCES` the issuer grants from.
-    #[arg(long = "agent-audiences", env = "CONTROLLER_AGENT_AUDIENCES")]
-    pub agent_audiences: Option<String>,
     /// `deploy_profile`, read once on first use.
     #[arg(skip)]
     pub profile_cache: ProfileCache,

@@ -59,8 +59,6 @@ pub enum ConfigError {
         "gateway prefix {0:?} must be a spiffe:// URI ending in /, with at most one {{tenant}} path segment"
     )]
     Prefix(String),
-    #[error("CONTROLLER_AGENT_AUDIENCES names no MCP resource")]
-    NoAudiences,
     #[error("CONTROLLER_AGENT_SPIRE names no cluster's SPIRE")]
     NoSpire,
     #[error(
@@ -90,17 +88,6 @@ pub enum ConfigError {
         path: String,
         source: jsonwebtoken::errors::Error,
     },
-    #[error(
-        "CONTROLLER_AGENT_AUDIENCES entry {0:?} is not <cluster>:<url>=<scopes>; every agent audience names the cluster whose runs get it"
-    )]
-    AudienceCluster(String),
-    #[error(
-        "CONTROLLER_AGENT_AUDIENCES lists {resource} for cluster {cluster}, but the deploy profile \
-         describes no server there ([kueue], [buildit] or [[agent_servers]])"
-    )]
-    Undescribed { cluster: String, resource: String },
-    #[error("CONTROLLER_AGENT_AUDIENCES lists {resource} for cluster {cluster} twice")]
-    AudienceTwice { cluster: String, resource: String },
     #[error("{var} is set, but CONTROLLER_AGENT_ISSUER is not; it does nothing without the issuer")]
     NoIssuer { var: &'static str },
 }
@@ -326,59 +313,21 @@ pub struct Audience {
 }
 
 impl Audience {
-    /// This audience with what the server at its URL on its cluster needs in a token, as the
-    /// deploy profile describes the server; an audience no description names is dead
-    /// configuration and refused.
-    pub fn described_by(self, servers: &[ServerSpec]) -> Result<Self, ConfigError> {
-        let described = servers
-            .iter()
-            .find(|s| same_url(&s.url, &self.resource) && s.serves(&self.cluster));
-        match described {
-            Some(s) => Ok(Self {
-                requires_kube_user: s.requires_kube_user,
-                namespaces: s.namespaces.clone(),
-                ..self
-            }),
-            None => Err(ConfigError::Undescribed {
-                cluster: self.cluster,
-                resource: self.resource,
-            }),
-        }
+    /// The audience each of `server`'s clusters' runs get tokens for: its URL, scopes and token
+    /// needs, as the deploy profile describes it.
+    pub fn of(server: &ServerSpec) -> impl Iterator<Item = Audience> + '_ {
+        server.clusters.iter().map(|cluster| Audience {
+            resource: server.url.clone(),
+            cluster: cluster.clone(),
+            scopes: server.scopes.clone(),
+            requires_kube_user: server.requires_kube_user,
+            namespaces: server.namespaces.clone(),
+        })
     }
 
     /// Whether a run on `cluster` may get tokens for this audience.
     pub fn serves(&self, cluster: &str) -> bool {
         self.cluster == cluster
-    }
-}
-
-/// `<cluster>:<resource url>=<scope> <scope> ...`; a URL without `=` grants no scopes.
-impl std::str::FromStr for Audience {
-    type Err = ConfigError;
-
-    fn from_str(raw: &str) -> Result<Self, Self::Err> {
-        let raw = raw.trim();
-        let (cluster, raw) = raw
-            .split_once(':')
-            .filter(|(cluster, rest)| {
-                check_cluster_name(cluster).is_ok() && !rest.starts_with("//")
-            })
-            .ok_or_else(|| ConfigError::AudienceCluster(raw.to_string()))?;
-        let cluster = cluster.to_string();
-        let (resource, scopes) = raw.split_once('=').unwrap_or((raw, ""));
-        let resource = resource.trim();
-        Url::parse(resource).map_err(|source| ConfigError::Url {
-            var: "CONTROLLER_AGENT_AUDIENCES",
-            value: resource.to_string(),
-            source,
-        })?;
-        Ok(Self {
-            resource: resource.to_string(),
-            cluster,
-            scopes: scopes.split_whitespace().map(str::to_string).collect(),
-            requires_kube_user: false,
-            namespaces: Vec::new(),
-        })
     }
 }
 
@@ -420,22 +369,18 @@ pub struct AgentIssuerConfig {
     pub token_ttl: TokenTtl,
     /// Each cluster's SPIRE, by cluster and by SVID issuer unique.
     pub spire: Vec<ClusterSpire>,
-    /// The MCP resources a token may be minted for.
+    /// The MCP resources a token may be minted for: every server the deploy profile describes, on
+    /// each of its clusters ([`AgentIssuerConfig::serving`]).
     pub audiences: Vec<Audience>,
 }
 
 impl AgentIssuerConfig {
-    /// The same settings, each audience with the token needs of the server `servers` describe at
-    /// its URL on its cluster; an audience none describes is refused.
-    pub fn described_by(self, servers: &[ServerSpec]) -> Result<Self, ConfigError> {
-        Ok(Self {
-            audiences: self
-                .audiences
-                .into_iter()
-                .map(|a| a.described_by(servers))
-                .collect::<Result<_, _>>()?,
+    /// The same settings, minting for every server `servers` describe, each on its clusters.
+    pub fn serving(self, servers: &[ServerSpec]) -> Self {
+        Self {
+            audiences: servers.iter().flat_map(Audience::of).collect(),
             ..self
-        })
+        }
     }
 }
 
@@ -447,7 +392,6 @@ const DEPENDENT_VARS: &[&str] = &[
     "CONTROLLER_AGENT_PREVIOUS_SIGNING_KEY_FILE",
     "CONTROLLER_AGENT_TOKEN_TTL_SECS",
     "CONTROLLER_AGENT_SPIRE",
-    "CONTROLLER_AGENT_AUDIENCES",
     "CONTROLLER_AGENT_TOKEN_ENDPOINT",
     "CONTROLLER_PEOPLE_AUDIENCES",
     "CONTROLLER_PEOPLE_ACCESS_TTL_SECS",
@@ -517,40 +461,14 @@ impl AgentIssuerConfig {
                 }
             }
         }
-        let audiences: Vec<Audience> = match spire.is_empty() {
-            true => Vec::new(),
-            false => parse_list(&need("CONTROLLER_AGENT_AUDIENCES")?)?,
-        };
-        if !spire.is_empty() && audiences.is_empty() {
-            return Err(ConfigError::NoAudiences);
-        }
-        for (i, a) in audiences.iter().enumerate() {
-            if audiences[i + 1..]
-                .iter()
-                .any(|b| a.cluster == b.cluster && same_url(&a.resource, &b.resource))
-            {
-                return Err(ConfigError::AudienceTwice {
-                    cluster: a.cluster.clone(),
-                    resource: a.resource.clone(),
-                });
-            }
-        }
         Ok(Some(Self {
             issuer: IssuerUrl::parse(&issuer)?,
             signing_key,
             previous_key,
             token_ttl,
             spire,
-            audiences,
+            audiences: Vec::new(),
         }))
-    }
-}
-
-/// Whether `a` and `b` name the same URL once parsed, so `http://H:80/mcp` is `http://h/mcp`.
-pub(crate) fn same_url(a: &str, b: &str) -> bool {
-    match (Url::parse(a), Url::parse(b)) {
-        (Ok(a), Ok(b)) => a == b,
-        _ => a == b,
     }
 }
 
@@ -1387,10 +1305,10 @@ mod tests {
     async fn a_cluster_bound_audience_is_granted_on_its_cluster_only() {
         let spire = Spire::start().await;
         let mut cfg = testing::config(&EcKey::generate());
-        cfg.audiences = parse_list(&format!(
-            "spoke-a:{KUEUE}=kueue.read,spoke-b:{BUILDIT}=buildit.read"
-        ))
-        .unwrap();
+        cfg.audiences = vec![
+            testing::audience("spoke-a", KUEUE, "kueue.read"),
+            testing::audience("spoke-b", BUILDIT, "buildit.read"),
+        ];
         let issuer = AgentIssuer::new(cfg, |_| {
             crucible_mcp_auth::jwks::Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())
         });
@@ -1410,57 +1328,46 @@ mod tests {
         assert!(issuer.audience(Some(BUILDIT), "spoke-b").is_ok());
     }
 
-    /// An audience serves runs on its cluster only, and the same URL can be bound to each cluster
-    /// on its own. An entry without a cluster is refused.
+    /// Every server the profile describes is an audience on each of its clusters, with its scopes
+    /// and token needs; the same URL on two clusters is two audiences.
     #[test]
-    fn every_audience_binds_to_one_cluster() {
-        let url = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
-        let entries: Vec<Audience> = parse_list(&format!(
-            "spoke-a:{url}=kueue.read kueue.submit,spoke-b:{url}=kueue.read"
+    fn every_server_is_an_audience_on_each_of_its_clusters() {
+        let servers = toml::from_str::<crucible::deploy::DeployProfile>(&PROFILE.replace(
+            "cluster = \"dev\"\nnamespace = \"crucible-system\"",
+            "clusters = [\"spoke-a\", \"spoke-b\"]\nnamespace = \"crucible-system\"",
         ))
+        .unwrap()
+        .agent_servers()
         .unwrap();
-        assert_eq!(entries[0].cluster, "spoke-a");
-        assert_eq!(entries[0].resource, url);
+        let cfg = testing::config(&EcKey::generate()).serving(&servers);
         let on = |cluster: &str| {
-            entries
+            cfg.audiences
                 .iter()
-                .find(|a| a.resource == url && a.serves(cluster))
-                .map(|a| a.scopes.clone())
+                .find(|a| a.resource == KUEUE && a.serves(cluster))
         };
-        assert_eq!(
-            on("spoke-a"),
-            Some(vec!["kueue.read".to_string(), "kueue.submit".to_string()])
-        );
-        assert_eq!(on("spoke-b"), Some(vec!["kueue.read".to_string()]));
-        assert_eq!(on("spoke-c"), None);
-        for bad in [
-            "http://a.example/mcp=kueue.read",
-            "https://a.example/mcp",
-            "Spoke:http://a.example/mcp",
-            ":http://a.example/mcp",
-            "spoke-a",
-        ] {
-            assert!(
-                matches!(
-                    bad.parse::<Audience>(),
-                    Err(ConfigError::AudienceCluster(_))
-                ),
-                "{bad}"
-            );
+        for cluster in ["spoke-a", "spoke-b"] {
+            let kueue = on(cluster).unwrap_or_else(|| panic!("no kueue audience on {cluster}"));
+            assert_eq!(kueue.scopes, [SCOPE_READ, SCOPE_SUBMIT]);
+            assert!(kueue.requires_kube_user);
+            assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);
         }
+        assert!(on("spoke-c").is_none());
+        let buildit = cfg
+            .audiences
+            .iter()
+            .find(|a| a.resource == BUILDIT)
+            .unwrap();
+        assert_eq!(buildit.scopes, ["buildit.read", "buildit.build"]);
+        assert!(!buildit.requires_kube_user && buildit.namespaces.is_empty());
     }
 
-    /// Agent audiences, people audiences, SPIRE entries and the deploy profile accept the same
-    /// cluster names.
+    /// People audiences, SPIRE entries and the deploy profile accept the same cluster names.
     #[test]
     fn every_cluster_setting_accepts_the_names_the_profile_accepts() {
         for name in [
             "hub", "ocp", "spoke-a", "a1", "", "Ocp", "spoke_a", "-a", "a-", "a.b",
         ] {
             let profile = crucible::deploy::profile::check_cluster_name(name).is_ok();
-            let agent = format!("{name}:http://a.example/mcp=s")
-                .parse::<Audience>()
-                .is_ok();
             let person = format!("{name}:http://a.example/mcp=s")
                 .parse::<crate::agent_auth::people::PersonAudience>()
                 .is_ok();
@@ -1469,24 +1376,16 @@ mod tests {
             )
             .parse::<ClusterSpire>()
             .is_ok();
-            assert_eq!(
-                (agent, person, spire),
-                (profile, profile, profile),
-                "{name:?}"
-            );
+            assert_eq!((person, spire), (profile, profile), "{name:?}");
         }
     }
 
     fn kueue() -> Audience {
-        format!("{CLUSTER}:{KUEUE}=kueue.read kueue.submit")
-            .parse()
-            .unwrap()
+        testing::audience(CLUSTER, KUEUE, "kueue.read kueue.submit")
     }
 
     fn buildit() -> Audience {
-        format!("{CLUSTER}:{BUILDIT}=buildit.read buildit.build")
-            .parse()
-            .unwrap()
+        testing::audience(CLUSTER, BUILDIT, "buildit.read buildit.build")
     }
 
     #[test]
@@ -1518,46 +1417,8 @@ mod tests {
             granted_scopes(Some("kueue.read"), &buildit()).is_err(),
             "a scope another audience lists is not grantable here"
         );
-        let bare: Audience = format!("{CLUSTER}:{KUEUE}").parse().unwrap();
+        let bare = testing::audience(CLUSTER, KUEUE, "");
         assert!(granted_scopes(None, &bare).unwrap().is_empty());
-    }
-
-    #[test]
-    fn an_audience_takes_its_token_needs_from_the_server_the_profile_describes() {
-        let servers = toml::from_str::<crucible::deploy::DeployProfile>(PROFILE)
-            .unwrap()
-            .agent_servers()
-            .unwrap();
-        let kueue = kueue().described_by(&servers).unwrap();
-        assert!(kueue.requires_kube_user);
-        assert_eq!(kueue.namespaces, ["crucible-kueue-e2e"]);
-        let buildit = buildit().described_by(&servers).unwrap();
-        assert!(!buildit.requires_kube_user && buildit.namespaces.is_empty());
-        let respelled: Audience = format!(
-            "{CLUSTER}:{}=kueue.read",
-            KUEUE.replace("http://crucible-kueue", "HTTP://Crucible-Kueue")
-        )
-        .parse()
-        .unwrap();
-        assert!(
-            respelled.described_by(&servers).unwrap().requires_kube_user,
-            "URLs are compared once parsed"
-        );
-        for undescribed in [
-            format!("hub:{KUEUE}=kueue.read"),
-            format!("{CLUSTER}:http://mcp.example/mcp=x.read"),
-        ] {
-            assert!(
-                matches!(
-                    undescribed
-                        .parse::<Audience>()
-                        .unwrap()
-                        .described_by(&servers),
-                    Err(ConfigError::Undescribed { .. })
-                ),
-                "{undescribed}: the profile's servers are on {CLUSTER} only"
-            );
-        }
     }
 
     fn run(dispatched_by: Option<&str>) -> BoundRun {
@@ -1824,12 +1685,6 @@ mod tests {
                     testing::SVID_ISSUER
                 ),
             ),
-            (
-                "CONTROLLER_AGENT_AUDIENCES",
-                format!(
-                    "{CLUSTER}:{KUEUE}=kueue.read kueue.submit, {CLUSTER}:{BUILDIT}=buildit.read buildit.build,"
-                ),
-            ),
         ])
     }
 
@@ -1844,24 +1699,9 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(cfg.issuer.as_str(), ISSUER, "the trailing slash is dropped");
-        assert_eq!(
-            cfg.audiences,
-            [
-                Audience {
-                    resource: KUEUE.into(),
-                    cluster: CLUSTER.into(),
-                    scopes: vec!["kueue.read".into(), "kueue.submit".into()],
-                    requires_kube_user: false,
-                    namespaces: vec![],
-                },
-                Audience {
-                    resource: BUILDIT.into(),
-                    cluster: CLUSTER.into(),
-                    scopes: vec!["buildit.read".into(), "buildit.build".into()],
-                    requires_kube_user: false,
-                    namespaces: vec![],
-                },
-            ]
+        assert!(
+            cfg.audiences.is_empty(),
+            "audiences come from the deploy profile's servers, not the environment"
         );
         assert_eq!(
             cfg.spire,
@@ -1915,20 +1755,12 @@ mod tests {
             );
         }
 
-        for missing in [
-            "CONTROLLER_AGENT_SIGNING_KEY_FILE",
-            "CONTROLLER_AGENT_AUDIENCES",
-        ] {
-            let mut partial = vars.clone();
-            partial.remove(missing);
-            assert!(
-                matches!(
-                    AgentIssuerConfig::from_lookup(lookup(&partial)),
-                    Err(ConfigError::Missing { var }) if var == missing
-                ),
-                "{missing}"
-            );
-        }
+        let mut keyless = vars.clone();
+        keyless.remove("CONTROLLER_AGENT_SIGNING_KEY_FILE");
+        assert!(matches!(
+            AgentIssuerConfig::from_lookup(lookup(&keyless)),
+            Err(ConfigError::Missing { var }) if var == "CONTROLLER_AGENT_SIGNING_KEY_FILE"
+        ));
 
         let spire = |entry: &str| format!("{CLUSTER}={entry}");
         let twice = format!(
@@ -1985,8 +1817,6 @@ mod tests {
             ),
             ("CONTROLLER_AGENT_ISSUER", "http://controller.svc:8080/?x=1"),
             ("CONTROLLER_AGENT_ISSUER", "spiffe://example.crucible"),
-            ("CONTROLLER_AGENT_AUDIENCES", " , "),
-            ("CONTROLLER_AGENT_AUDIENCES", "dev:not a url=kueue.read"),
             (
                 "CONTROLLER_AGENT_SIGNING_KEY_FILE",
                 "/nonexistent/signing.pem",
@@ -2000,35 +1830,6 @@ mod tests {
                 "{var}={value}"
             );
         }
-    }
-
-    /// An audience listed twice for one cluster, however its URL is spelled, is refused; the same
-    /// URL on another cluster is another audience.
-    #[test]
-    fn an_audience_is_listed_once_per_cluster() {
-        let dir = tempfile::tempdir().unwrap();
-        let key_file = dir.path().join("signing.pem");
-        std::fs::write(&key_file, EcKey::generate().pem()).unwrap();
-        let with = |audiences: &str| {
-            let mut vars = env(&key_file);
-            vars.insert("CONTROLLER_AGENT_AUDIENCES", audiences.to_string());
-            AgentIssuerConfig::from_lookup(lookup(&vars)).map(|_| ())
-        };
-        for twice in [
-            "dev:http://kueue.example/mcp=kueue.read,dev:http://kueue.example/mcp=kueue.submit",
-            "dev:http://kueue.example/mcp=kueue.read,dev:HTTP://Kueue.Example:80/mcp=kueue.read",
-        ] {
-            assert!(
-                matches!(with(twice), Err(ConfigError::AudienceTwice { cluster, .. }) if cluster == "dev"),
-                "{twice}"
-            );
-        }
-        assert!(
-            with(
-                "dev:http://kueue.example/mcp=kueue.read,spoke:http://kueue.example/mcp=kueue.read"
-            )
-            .is_ok()
-        );
     }
 
     /// Without SPIRE the issuer serves people only: no agent audiences are needed, the key may come

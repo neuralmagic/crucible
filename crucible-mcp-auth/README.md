@@ -143,8 +143,8 @@ Service URLs.
    `create_sandbox`, authenticated by its run pod's own token; a sandbox bound by another pod is
    refused, so is one whose run pod is no longer running, and so is an SVID whose gateway is not
    the bound run's.
-3. Mint an ES256 token for the requested audience, if `CONTROLLER_AGENT_AUDIENCES` lists it, with the
-   run's claims and the scopes that audience grants. Tokens live 15 minutes by default (up to 30);
+3. Mint an ES256 token for the requested audience, if the deploy profile describes a server at that
+   URL on the run's cluster, with the run's claims and that server's scopes. Tokens live 15 minutes by default (up to 30);
    keys are published at `/.well-known/jwks.json`.
 
 Revocation is collecting the run: the endpoint stops minting and outstanding tokens expire.
@@ -161,7 +161,7 @@ the run claims.
 | `sub` | the login the run was dispatched for | the person's login | `crucible.dev/launched-by`, policy |
 | `act.sub` | `spiffe://<trust domain>/openshell/gateway/<gateway-id>/sandbox/<id>` | absent | audit, `crucible.dev/actor` |
 | `aud` | the MCP servers the run may call | the servers the requested scopes name | one must be this server |
-| `scope` | what `CONTROLLER_AGENT_AUDIENCES` grants the audience | what the client requested, within `CONTROLLER_PEOPLE_AUDIENCES` | per-tool checks |
+| `scope` | the scopes of the server the deploy profile describes at the audience | what the client requested, within `CONTROLLER_PEOPLE_AUDIENCES` | per-tool checks |
 | `run_id` | run pod name | absent; the subject owns its workloads | ownership labels |
 | `kube_user` | the launcher's username on the run's cluster | the person's username on the server's cluster | who RBAC asks about; required by crucible-kueue |
 | `namespace` | from the run's grant | absent | crucible-kueue's default namespace |

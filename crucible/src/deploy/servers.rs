@@ -15,6 +15,8 @@ pub struct ServerSpec {
     pub name: ServerName,
     /// The canonical MCP URL, a token's `aud`.
     pub url: String,
+    /// The scopes its tokens are minted with.
+    pub scopes: Vec<String>,
     /// The dispatch clusters whose runs get the server.
     pub clusters: Vec<String>,
     /// Whether the server authorizes as the token's `kube_user`, so a token without one is
@@ -112,6 +114,12 @@ impl DeployProfile {
             servers.push(ServerSpec {
                 name: ServerName::parse("kueue")?,
                 url: k.url(),
+                scopes: [
+                    crucible_contract::kueue::SCOPE_READ,
+                    crucible_contract::kueue::SCOPE_SUBMIT,
+                ]
+                .map(String::from)
+                .to_vec(),
                 clusters: k.clusters.clone(),
                 requires_kube_user: true,
                 namespaces,
@@ -123,6 +131,12 @@ impl DeployProfile {
             servers.push(ServerSpec {
                 name: ServerName::parse("buildit")?,
                 url: b.url(),
+                scopes: [
+                    crucible_contract::buildit::SCOPE_READ,
+                    crucible_contract::buildit::SCOPE_BUILD,
+                ]
+                .map(String::from)
+                .to_vec(),
                 clusters: b.clusters.clone(),
                 requires_kube_user: false,
                 namespaces: Vec::new(),
@@ -143,6 +157,7 @@ impl DeployProfile {
             servers.push(ServerSpec {
                 name: s.name.clone(),
                 url: s.url.to_string(),
+                scopes: s.scopes.clone(),
                 clusters: s.clusters.clone(),
                 requires_kube_user: s.requires_kube_user,
                 limits: namespace_limit(&namespaces),
@@ -236,6 +251,7 @@ mod tests {
                 ServerSpec {
                     name: name("kueue"),
                     url: "http://crucible-kueue.kueue-server.svc.cluster.local:8850/mcp".into(),
+                    scopes: vec!["kueue.read".into(), "kueue.submit".into()],
                     clusters: vec!["ocp".into(), "k8s".into()],
                     requires_kube_user: true,
                     namespaces: vec!["team-a".into(), "team-b".into()],
@@ -248,6 +264,7 @@ mod tests {
                 ServerSpec {
                     name: name("buildit"),
                     url: crucible_contract::buildit::URL.into(),
+                    scopes: vec!["buildit.read".into(), "buildit.build".into()],
                     clusters: vec!["ocp".into()],
                     requires_kube_user: false,
                     namespaces: vec![],
@@ -312,12 +329,14 @@ mod tests {
             [[agent_servers]]
             name = "vault-mcp"
             url = "https://vault-mcp.tools.svc:8443/mcp"
+            scopes = ["vault.read"]
             clusters = ["ocp"]
             requires_kube_user = true
             namespaces = ["team-a"]
             [[agent_servers]]
             name = "docs"
             url = "http://docs.example/mcp"
+            scopes = []
             "#,
         )
         .agent_servers()
@@ -327,6 +346,7 @@ mod tests {
             ServerSpec {
                 name: name("vault-mcp"),
                 url: "https://vault-mcp.tools.svc:8443/mcp".into(),
+                scopes: vec!["vault.read".into()],
                 clusters: vec!["ocp".into()],
                 requires_kube_user: true,
                 namespaces: vec!["team-a".into()],
@@ -341,7 +361,7 @@ mod tests {
     #[test]
     fn names_are_unique_and_no_two_servers_share_a_url_on_a_cluster() {
         let twice = profile(&format!(
-            "{KUEUE_AND_BUILDIT}[[agent_servers]]\nname = \"kueue\"\nurl = \"http://x/mcp\"\n"
+            "{KUEUE_AND_BUILDIT}[[agent_servers]]\nname = \"kueue\"\nurl = \"http://x/mcp\"\nscopes = []\n"
         ));
         assert!(matches!(
             twice.agent_servers(),
@@ -377,8 +397,9 @@ mod tests {
             ftp.agent_servers(),
             Err(ServerSpecError::Url { .. })
         ));
-        let bad_name =
-            format!("{BASE}[[agent_servers]]\nname = \"Docs\"\nurl = \"http://x/mcp\"\n");
+        let bad_name = format!(
+            "{BASE}[[agent_servers]]\nname = \"Docs\"\nurl = \"http://x/mcp\"\nscopes = []\n"
+        );
         assert!(toml::from_str::<DeployProfile>(&bad_name).is_err());
     }
 }

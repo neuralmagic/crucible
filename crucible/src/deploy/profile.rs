@@ -421,8 +421,11 @@ impl BuilditCfg {
 pub struct AgentServerCfg {
     /// The `.mcp.json` key the agent sees its tools under.
     pub name: crucible_contract::agent_servers::ServerName,
-    /// Its MCP URL, the audience of its tokens. `CONTROLLER_AGENT_AUDIENCES` must list it.
+    /// Its MCP URL, the audience of its tokens.
     pub url: url::Url,
+    /// The scopes its tokens are minted with. Default: none.
+    #[serde(default)]
+    pub scopes: Vec<String>,
     /// The dispatch clusters whose runs get it: `clusters = [...]`, or `cluster = "..."`.
     #[serde(
         default = "hub_clusters",

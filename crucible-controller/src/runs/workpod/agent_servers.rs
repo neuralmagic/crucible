@@ -1,14 +1,13 @@
 //! A run's access to the MCP servers that take agent tokens: each server the deploy profile
 //! describes on the run's cluster ([`DeployProfile::agent_servers`]) whose tokens the issuer can
-//! mint there (its SPIRE is trusted and the server's URL is an audience), with the audience's
-//! scopes. The loop pod gets them as [`ENV_AGENT_SERVERS`], plus the controller's agent token
+//! mint there (its SPIRE is trusted), with the server's scopes. The loop pod gets them as [`ENV_AGENT_SERVERS`], plus the controller's agent token
 //! endpoint and the audience its sandboxes' JWT-SVIDs are requested for, as plain env. The engine
 //! turns each server into a token-grant provider: each sandbox's supervisor obtains its own token.
 //! Nothing secret is minted and nothing is recorded.
 //!
 //! [`DeployProfile::agent_servers`]: crucible::deploy::DeployProfile::agent_servers
 
-use crate::agent_auth::issuer::{Audience, ClusterSpire, IssuerUrl, TOKEN_PATH, parse_list};
+use crate::agent_auth::issuer::{ClusterSpire, IssuerUrl, TOKEN_PATH, parse_list};
 use crate::secrets::deliver::Delivery;
 use anyhow::Context;
 use crucible::deploy::servers::ServerSpec;
@@ -17,19 +16,17 @@ use crucible_contract::sandbox::{ENV_AGENT_SVID_AUDIENCE, ENV_AGENT_TOKEN_ENDPOI
 
 /// Where sandboxes get agent tokens and for what: the controller's issuer identifier (the SVID
 /// audience), the token endpoint supervisors reach (the issuer's own unless an operator routed it
-/// elsewhere), the clusters whose SPIRE the issuer trusts, and the audiences it mints for.
+/// elsewhere), and the clusters whose SPIRE the issuer trusts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTokens {
     pub svid_audience: String,
     pub endpoint: String,
     pub clusters: Vec<String>,
-    pub audiences: Vec<Audience>,
 }
 
 impl AgentTokens {
-    /// From the controller's `CONTROLLER_AGENT_ISSUER`, `CONTROLLER_AGENT_SPIRE`,
-    /// `CONTROLLER_AGENT_AUDIENCES` and optional `CONTROLLER_AGENT_TOKEN_ENDPOINT`; `None` when
-    /// the controller mints no agent tokens.
+    /// From the controller's `CONTROLLER_AGENT_ISSUER`, `CONTROLLER_AGENT_SPIRE` and optional
+    /// `CONTROLLER_AGENT_TOKEN_ENDPOINT`; `None` when the controller mints no agent tokens.
     pub fn from_cfg(cfg: &crate::config::ControllerCfg) -> anyhow::Result<Option<Self>> {
         if !cfg.issues_agent_tokens() {
             return Ok(None);
@@ -44,36 +41,26 @@ impl AgentTokens {
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| issuer.endpoint(TOKEN_PATH)),
             clusters: spire.into_iter().map(|s| s.cluster).collect(),
-            audiences: parse_list(cfg.agent_audiences.as_deref().unwrap_or_default())?,
         }))
     }
 
-    /// The audience a run on `cluster` gets tokens for at `url`, when the issuer can mint them.
-    pub fn audience(&self, cluster: &str, url: &str) -> Option<&Audience> {
-        self.clusters
-            .iter()
-            .any(|c| c == cluster)
-            .then(|| {
-                self.audiences
-                    .iter()
-                    .find(|a| a.resource == url && a.serves(cluster))
-            })
-            .flatten()
+    /// Whether the issuer mints tokens for runs on `cluster`: it trusts that cluster's SPIRE.
+    pub fn mints_on(&self, cluster: &str) -> bool {
+        self.clusters.iter().any(|c| c == cluster)
     }
 }
 
-/// The servers in `servers` a run on `cluster` gets, each with the audience its tokens are minted
-/// for.
+/// The servers in `servers` a run on `cluster` gets: those serving it, when the issuer mints
+/// tokens there.
 pub fn granted<'a>(
     servers: &'a [ServerSpec],
     cluster: &str,
-    tokens: &'a AgentTokens,
-) -> Vec<(&'a ServerSpec, &'a Audience)> {
-    servers
-        .iter()
-        .filter(|s| s.serves(cluster))
-        .filter_map(|s| tokens.audience(cluster, &s.url).map(|a| (s, a)))
-        .collect()
+    tokens: &AgentTokens,
+) -> Vec<&'a ServerSpec> {
+    match tokens.mints_on(cluster) {
+        true => servers.iter().filter(|s| s.serves(cluster)).collect(),
+        false => Vec::new(),
+    }
 }
 
 /// The loop pod's env for a run dispatched onto `cluster`, `None` when no server serves it.
@@ -84,11 +71,11 @@ pub fn access(
 ) -> anyhow::Result<Option<Delivery>> {
     let granted: Vec<AgentServer> = granted(servers, cluster, tokens)
         .into_iter()
-        .map(|(s, a)| {
+        .map(|s| {
             Ok(AgentServer {
                 name: s.name.clone(),
                 url: s.url.clone(),
-                scopes: a.scopes.clone(),
+                scopes: s.scopes.clone(),
                 transport: s.transport(&tokens.svid_audience).with_context(|| {
                     format!("deriving {}'s key set URI from the agent issuer", s.name)
                 })?,
@@ -154,30 +141,11 @@ mod tests {
     const SPIRE: &str = "ocp=https://oidc.ocp.example spiffe://ocp.example/openshell/gateway/ spire/oidc:443,\
          k8s=https://oidc.k8s.example spiffe://k8s.example/openshell/gateway/ spire/oidc:443";
 
-    /// `resource` with `scopes` for runs on ocp and on k8s.
-    fn audience(resource: &str, scopes: &str) -> Vec<Audience> {
-        ["ocp", "k8s"]
-            .map(|c| {
-                format!("{c}:{resource}={scopes}")
-                    .parse()
-                    .expect("audience parses")
-            })
-            .to_vec()
-    }
-
     fn tokens() -> AgentTokens {
         AgentTokens {
             svid_audience: "http://crucible-controller.crucible-system.svc:8080".into(),
             endpoint: "http://crucible-controller.crucible-system.svc:8080/oauth/token".into(),
             clusters: vec!["ocp".into(), "k8s".into()],
-            audiences: [
-                audience(KUEUE_URL, "kueue.read kueue.submit"),
-                audience(
-                    crucible_contract::buildit::URL,
-                    "buildit.read buildit.build",
-                ),
-            ]
-            .concat(),
         }
     }
 
@@ -274,14 +242,6 @@ mod tests {
             access(&servers(KUEUE), "ocp", &no_spire).unwrap().is_none(),
             "no SPIRE for ocp, so no tokens for its sandboxes"
         );
-        let no_audience = AgentTokens {
-            audiences: audience(KUEUE_URL, "kueue.read"),
-            ..tokens()
-        };
-        let ocp = access(&all, "ocp", &no_audience).unwrap().unwrap();
-        assert_eq!(names(&ocp), ["kueue"], "buildit is no audience");
-        assert_eq!(granted_servers(&ocp)[0].scopes, ["kueue.read"]);
-        assert!(access(&all, "k8s", &no_audience).unwrap().is_none());
     }
 
     #[test]
@@ -323,13 +283,10 @@ mod tests {
             [[agent_servers]]
             name = "docs"
             url = "https://docs.example/mcp"
+            scopes = ["docs.read"]
             cluster = "ocp"
         "#;
-        let tokens = AgentTokens {
-            audiences: audience("https://docs.example/mcp", "docs.read"),
-            ..tokens()
-        };
-        let delivery = access(&servers(docs), "ocp", &tokens).unwrap().unwrap();
+        let delivery = access(&servers(docs), "ocp", &tokens()).unwrap().unwrap();
         let granted = granted_servers(&delivery);
         assert_eq!(names(&delivery), ["docs"]);
         assert_eq!(granted[0].scopes, ["docs.read"]);
@@ -343,11 +300,6 @@ mod tests {
             args.extend_from_slice(extra);
             crate::testing::cfg_from_args(args)
         };
-        let audiences = format!(
-            "ocp:{KUEUE_URL}=kueue.read kueue.submit,k8s:{KUEUE_URL}=kueue.read kueue.submit,\
-             ocp:{b}=buildit.read buildit.build,k8s:{b}=buildit.read buildit.build",
-            b = crucible_contract::buildit::URL
-        );
         assert_eq!(AgentTokens::from_cfg(&cfg(&[])).unwrap(), None);
         assert_eq!(
             AgentTokens::from_cfg(&cfg(&[
@@ -363,8 +315,6 @@ mod tests {
             "http://crucible-controller.crucible-system.svc:8080/",
             "--agent-spire",
             SPIRE,
-            "--agent-audiences",
-            &audiences,
         ]))
         .unwrap()
         .expect("tokens");
@@ -374,8 +324,6 @@ mod tests {
             "http://crucible-controller.crucible-system.svc:8080",
             "--agent-spire",
             SPIRE,
-            "--agent-audiences",
-            &audiences,
             "--agent-token-endpoint",
             "https://crucible.hub.example/oauth/token",
         ]))

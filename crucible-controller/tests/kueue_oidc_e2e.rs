@@ -19,7 +19,7 @@
 use base64::Engine;
 use crucible_controller::agent_auth::bindings::{self, Binding};
 use crucible_controller::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, IssuerUrl, SigningKey,
+    AgentIssuer, AgentIssuerConfig, Audience, IssuerUrl, SigningKey,
 };
 use crucible_controller::agent_auth::sandbox::SandboxId;
 use crucible_controller::agent_auth::{AgentAuth, router as agent_router};
@@ -237,11 +237,13 @@ kube_authz = "openshift"
             .parse()
             .unwrap(),
         ],
-        audiences: vec![
-            format!("{RESOURCE}=kueue.read kueue.submit")
-                .parse()
-                .unwrap(),
-        ],
+        audiences: vec![Audience {
+            resource: RESOURCE.to_string(),
+            cluster: "dev".to_string(),
+            scopes: vec!["kueue.read".into(), "kueue.submit".into()],
+            requires_kube_user: false,
+            namespaces: Vec::new(),
+        }],
     };
     let jwks_uri = Url::parse(&format!("{}/keys", cluster::spire())).unwrap();
     let keys = |_: &_| {

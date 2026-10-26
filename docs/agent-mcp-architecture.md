@@ -391,8 +391,7 @@ The steps are these:
 2. The controller folds the loop pod client material and the agent server access into the run
    Secret before it renders the loop pod (`crucible-controller/src/runs/workpod/run.rs:813`,
    `access` in `crucible-controller/src/runs/workpod/agent_servers.rs`). A server is granted only where the
-   issuer can mint its tokens: the run's cluster is in `CONTROLLER_AGENT_SPIRE`, and the server
-   URL is a resource in `CONTROLLER_AGENT_AUDIENCES`
+   issuer can mint its tokens: the run's cluster is in `CONTROLLER_AGENT_SPIRE`
    (`crucible-controller/src/runs/workpod/agent_servers.rs`, `granted`). The loop pod gets them as
    one `CRUCIBLE_AGENT_SERVERS` list. The run records the servers that it got, with the scopes of
    the audience.
@@ -434,8 +433,8 @@ The steps are these:
 9. `sub` is `<gateway prefix><gateway id>/sandbox/<sandbox id>` for the prefix of that cluster.
 10. A bind record exists for the sandbox id, and its loop pod is in the `running` state.
 11. The cluster of the run is the cluster whose SPIRE signed the assertion.
-12. The requested `audience` is an entry of `CONTROLLER_AGENT_AUDIENCES` bound to the run's
-    cluster.
+12. The requested `audience` is the URL of a server the deploy profile describes on the run's
+    cluster (`Audience::of`).
 13. The gateway id in the SPIFFE ID is the gateway id of the bound loop pod.
 14. The run has a launcher (`dispatched_by` is `user:<login>`).
 15. Each requested scope is in the audience entry. A request with no scope gets all the scopes
@@ -1683,7 +1682,6 @@ push_authfile` a credential scoped to the one push repository.
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | `900` | Agent token lifetime, 900 to 1800. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | `<issuer>/oauth/token` | Where supervisors reach the token endpoint, for a spoke that reaches the controller through a route. |
 | `CONTROLLER_AGENT_SPIRE` | unset | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>`. Each cluster and each SVID issuer once. The prefix may hold one `{tenant}` segment (section 6.1). The SPIRE Service's namespace must not be one pack code reaches (loop, rig, sandbox, `[buildit] namespace`, crucible-kueue workload namespaces), or the controller does not start (`check_spire_exposure`). A run gets agent tools only on a cluster listed here. Unset: the issuer serves people only, mints no agent tokens, grants no agent tools and stamps no dispatchers. |
-| `CONTROLLER_AGENT_AUDIENCES` | unset | Comma-separated `<cluster>:<resource url>=<scope> <scope>`. Necessary with `CONTROLLER_AGENT_SPIRE`. A URL with no `=` grants no scopes. Each entry serves runs on its cluster only, and the same URL may appear once per cluster (URLs compared once parsed); an entry without a cluster, or a second entry for one URL and cluster, stops the controller. A run gets a server only when the server URL is a resource here: the `crucible-kueue` Service URL `http://crucible-kueue.<namespace>.svc.<cluster domain>:8850/mcp`, or `http://host.openshell.internal:8848/mcp` for `buildit`. The run records the scopes of that entry. |
 | `CONTROLLER_PEOPLE_AUDIENCES` | unset | Comma-separated `<cluster>:<resource url>=<scope> <scope>`. Enables people tokens. Each resource once. |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | `900` | People token lifetime, 1 to 3600. |
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | unset | A TOML file of `[[clients]]` with `client_id`, `name`, `redirect_uris` and optional `resources`. It replaces the built-in `claude-code`, `pi` and `codex`. Unset: the built-in clients (section 4.1.2). |
@@ -1728,7 +1726,7 @@ tokens, the controller does not read them.
 | `[cluster] identity` | `"link"` | The hub identity rule. |
 | `[clusters.<name>] identity` | `"link"` | A spoke identity rule. |
 | `[cluster] platform`, `[clusters.<name>] platform` | `"kubernetes"` | `kubernetes` or `openshift`: the distribution the hub or a spoke runs. It decides what a render may assume of the cluster (section 11.2). Each cluster's render reads that cluster's own entry: an OpenShift hub dispatching to an OpenShift spoke and a Kubernetes spoke renders each spoke for its own platform, and nothing applies the hub's platform to a spoke. The hub's own platform affects only what is rendered for the hub itself; its ingress and deploy are the Argo chart's. |
-| cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE`, `CONTROLLER_AGENT_AUDIENCES` and `CONTROLLER_PEOPLE_AUDIENCES` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
+| cluster names | | `hub`, each `[clusters.<name>]`, `[kueue]`/`[buildit] clusters` and the cluster in `CONTROLLER_AGENT_SPIRE` and `CONTROLLER_PEOPLE_AUDIENCES` are DNS-1123 labels, all checked by one function (`check_cluster_name`, `crucible/src/deploy/profile.rs`). |
 | `[cluster] aws_sandbox_role_arn` | unset | The AWS role that the gateway pod assumes for sandboxes. |
 | `[kueue] image` | required | The `crucible-kueue` image. |
 | `[kueue] clusters` or `cluster` | `["hub"]` | The clusters where the server runs. Runs on these clusters get `crucible-kueue` access. |
@@ -1746,7 +1744,7 @@ tokens, the controller does not read them.
 | `[buildit] push_repo` | unset | The one repository for `push`. Unset: `push` is refused. |
 | `[buildit] quota` | `{ pods = "16", "requests.nvidia.com/gpu" = "0", "requests.amd.com/gpu" = "0" }` | The builder namespace's ResourceQuota `hard` limits. |
 | `[buildit] url` | `http://host.openshell.internal:8848/mcp` | The URL sandboxes reach buildit at, the audience of its tokens. It listens on this port in the loop pod, and the loop pod's ingress opens it. |
-| `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry and its URL in `CONTROLLER_AGENT_AUDIENCES`. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
+| `[[agent_servers]]` | none | Another MCP server that takes agent tokens: `name` (its `.mcp.json` key, a DNS label), `url`, `scopes` (default none), `clusters` (default `["hub"]`), `requires_kube_user` (default false) and `namespaces` (default none). It needs only this entry. Names are unique and never `broker`, and no two servers share a URL on a cluster. |
 | `[secrets] push_authfile` | unset | The Secret that holds the push authfile, mounted in the loop pod. |
 | `[cluster_link] external_url` | required | The controller URL as browsers reach it. https, or http to loopback. |
 | `[cluster_link] client_id` | `crucible-controller` | The `OAuthClient` name. |
@@ -1759,7 +1757,7 @@ The controller sets these. Do not set them by hand.
 
 | Variable | Set when | Read by |
 | --- | --- | --- |
-| `CRUCIBLE_AGENT_SERVERS` | The run gets at least one server: one the profile describes on the run's cluster (`[kueue]`, `[buildit]`, `[[agent_servers]]`), the cluster is in `CONTROLLER_AGENT_SPIRE`, and the server's URL is in `CONTROLLER_AGENT_AUDIENCES` | engine: a JSON list of `{name, url, scopes, transport}`; one provider, egress entry and `.mcp.json` entry each, and a start for a loop-pod transport |
+| `CRUCIBLE_AGENT_SERVERS` | The run gets at least one server: one the profile describes on the run's cluster (`[kueue]`, `[buildit]`, `[[agent_servers]]`), and the cluster is in `CONTROLLER_AGENT_SPIRE` | engine: a JSON list of `{name, url, scopes, transport}`; one provider, egress entry and `.mcp.json` entry each, and a start for a loop-pod transport |
 | `CRUCIBLE_AGENT_TOKEN_ENDPOINT` | with `CRUCIBLE_AGENT_SERVERS` | engine: token-grant providers, and the bind decision |
 | `CRUCIBLE_AGENT_SVID_AUDIENCE` | with `CRUCIBLE_AGENT_SERVERS` | engine: `token_grant.jwt_svid_audience` |
 | `CRUCIBLE_OPENSHELL_GATEWAY_URL` | Isolated profile | engine: remote gateway |
@@ -1986,8 +1984,8 @@ in place.
    LocalQueues.
 8. Grant people their queues with ordinary RBAC (section 11.2).
 9. Create the issuer key Secret in the controller namespace. Mount it in each replica.
-10. Set the controller environment (section 9.1). Put each server URL that runs get in
-    `CONTROLLER_AGENT_AUDIENCES`, and each cluster that hosts runs in `CONTROLLER_AGENT_SPIRE`.
+10. Set the controller environment (section 9.1). Put each cluster that hosts runs in
+    `CONTROLLER_AGENT_SPIRE`.
     Make sure that loop pods reach the controller at `[cluster] ingest_url`. Restart the
     controller.
 11. For people tokens: set `CONTROLLER_AUTH_MODE=native` and `CONTROLLER_PEOPLE_AUDIENCES`. Set

@@ -52,12 +52,12 @@ pub fn granted(servers: &[ServerSpec], cluster: &str, tokens: &AgentTokens) -> V
     let mut tools: Vec<AgentTool> =
         crate::runs::workpod::agent_servers::granted(servers, cluster, tokens)
             .into_iter()
-            .map(|(s, a)| AgentTool {
+            .map(|s| AgentTool {
                 server: s.name.clone(),
                 cluster: cluster.to_string(),
                 url: s.url.clone(),
                 kube_user: None,
-                scopes: a.scopes.clone(),
+                scopes: s.scopes.clone(),
                 limits: s.limits.clone(),
             })
             .collect();
@@ -333,33 +333,18 @@ mod tests {
         profile(text).agent_servers().expect("servers")
     }
 
-    const KUEUE_URL: &str = "http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp";
-
-    fn tokens(clusters: &[&str], kueue_scopes: &str) -> AgentTokens {
+    fn tokens(clusters: &[&str]) -> AgentTokens {
         AgentTokens {
             svid_audience: "https://crucible.hub.example".into(),
             endpoint: "https://crucible.hub.example/oauth/token".into(),
             clusters: clusters.iter().map(|c| c.to_string()).collect(),
-            audiences: ["ocp", "k8s"]
-                .iter()
-                .flat_map(|c| {
-                    [
-                        format!("{c}:{KUEUE_URL}={kueue_scopes}"),
-                        format!(
-                            "{c}:{}=buildit.read buildit.build",
-                            crucible_contract::buildit::URL
-                        ),
-                    ]
-                })
-                .map(|a| a.parse().unwrap())
-                .collect(),
         }
     }
 
     #[test]
     fn a_run_gets_the_servers_its_cluster_runs_with_the_issuers_scopes_and_limits() {
         let p = servers(PROFILE);
-        let all = tokens(&["ocp", "k8s"], "kueue.read kueue.submit");
+        let all = tokens(&["ocp", "k8s"]);
         let on_k8s = granted(&p, "k8s", &all);
         assert_eq!(
             on_k8s.iter().map(|t| t.server.as_str()).collect::<Vec<_>>(),
@@ -379,24 +364,18 @@ mod tests {
             "granted buildit/k8s (buildit.read buildit.build)"
         );
 
-        let read_only = tokens(&["ocp", "k8s"], "kueue.read");
-        assert_eq!(
-            granted(&p, "k8s", &read_only)[1].scopes,
-            ["kueue.read"],
-            "the scopes the issuer mints, not a fixed set"
-        );
         let on_ocp = granted(&p, "ocp", &all);
         assert_eq!(on_ocp.len(), 1, "buildit serves k8s only");
         assert!(granted(&p, "hub", &all).is_empty());
         assert!(
-            granted(&p, "k8s", &tokens(&["ocp"], "kueue.read")).is_empty(),
+            granted(&p, "k8s", &tokens(&["ocp"])).is_empty(),
             "no SPIRE for k8s, so nothing its sandboxes could get tokens for"
         );
     }
 
     #[test]
     fn the_defaults_revision_changes_exactly_when_the_granted_set_does() {
-        let all = tokens(&["ocp", "k8s"], "kueue.read kueue.submit");
+        let all = tokens(&["ocp", "k8s"]);
         let base = defaults(&servers(PROFILE), Some(&all));
         assert_eq!(base, defaults(&servers(PROFILE), Some(&all)), "stable");
         assert_eq!(base.revision.len(), 16);
@@ -427,15 +406,6 @@ mod tests {
                 "{changed}"
             );
         }
-        assert_ne!(
-            defaults(
-                &servers(PROFILE),
-                Some(&tokens(&["ocp", "k8s"], "kueue.read"))
-            )
-            .revision,
-            base.revision,
-            "fewer scopes is a different set"
-        );
         for none in [defaults(&[], Some(&all)), defaults(&servers(PROFILE), None)] {
             assert!(none.tools.is_empty());
             assert_eq!(none.changelog, "Runs get no MCP servers by default.");
@@ -500,7 +470,7 @@ mod tests {
             .unwrap();
         }
         let p = profile(PROFILE);
-        let all = tokens(&["ocp", "k8s"], "kueue.read kueue.submit");
+        let all = tokens(&["ocp", "k8s"]);
         let tools = grant(&db, &servers(PROFILE), "run-1", "k8s", &all)
             .await
             .unwrap();

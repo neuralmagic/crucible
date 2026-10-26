@@ -68,11 +68,11 @@ impl AgentAuth {
             .await
             .context("reading the deploy profile for the agent issuer")?
             .ok_or(placement::PlacementError::NoProfile)?;
-        let issuer_cfg = issuer_cfg.described_by(
+        let issuer_cfg = issuer_cfg.serving(
             &profile
                 .agent_servers()
                 .context("reading the deploy profile's agent servers")?,
-        )?;
+        );
         let namespace = placement::controller_namespace();
         match issuer_cfg.spire.is_empty() {
             false => placement::check_key_placement(namespace.as_deref(), &profile)?,

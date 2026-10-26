@@ -4,7 +4,7 @@
 
 use crate::agent_auth::bindings::Binding;
 use crate::agent_auth::issuer::{
-    AgentIssuer, AgentIssuerConfig, ClusterSpire, IssuerUrl, SigningKey,
+    AgentIssuer, AgentIssuerConfig, Audience, ClusterSpire, IssuerUrl, SigningKey,
 };
 use crate::agent_auth::sandbox::SandboxId;
 use base64::Engine;
@@ -155,13 +155,20 @@ pub fn config(signing: &EcKey) -> AgentIssuerConfig {
         token_ttl: Default::default(),
         spire: vec![cluster_spire()],
         audiences: vec![
-            format!("{CLUSTER}:{KUEUE}=kueue.read kueue.submit")
-                .parse()
-                .unwrap(),
-            format!("{CLUSTER}:{BUILDIT}=buildit.read buildit.build")
-                .parse()
-                .unwrap(),
+            audience(CLUSTER, KUEUE, "kueue.read kueue.submit"),
+            audience(CLUSTER, BUILDIT, "buildit.read buildit.build"),
         ],
+    }
+}
+
+/// An audience for runs on `cluster` at `resource` with `scopes`, needing no `kube_user`.
+pub fn audience(cluster: &str, resource: &str, scopes: &str) -> Audience {
+    Audience {
+        resource: resource.to_string(),
+        cluster: cluster.to_string(),
+        scopes: scopes.split_whitespace().map(str::to_string).collect(),
+        requires_kube_user: false,
+        namespaces: Vec::new(),
     }
 }
 
@@ -310,9 +317,7 @@ pub fn agent_auth(
             .collect(),
         adopted: Default::default(),
     });
-    let described = config(&EcKey::generate())
-        .described_by(&profile.agent_servers().unwrap())
-        .unwrap();
+    let described = config(&EcKey::generate()).serving(&profile.agent_servers().unwrap());
     let state = crate::agent_auth::AgentAuth {
         issuer: AgentIssuer::new(described, |_| {
             Jwks::new(reqwest::Client::new(), spire.jwks_uri.clone())

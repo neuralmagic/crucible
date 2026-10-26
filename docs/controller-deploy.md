@@ -253,7 +253,6 @@ table.
 | `CONTROLLER_AGENT_TOKEN_TTL_SECS` | Agent token lifetime, 900 to 1800 seconds. Default 900. |
 | `CONTROLLER_AGENT_TOKEN_ENDPOINT` | Where sandbox supervisors reach the token endpoint when not at the issuer itself (a spoke reaching the controller through a route). Default `<issuer>/oauth/token`. |
 | `CONTROLLER_AGENT_SPIRE` | Comma-separated `<cluster>=<svid issuer> <gateway prefix> [http://]<namespace>/<service>:<port>` entries, one per cluster hosting isolated gateways (`hub` for the controller's own): the `iss` of that SPIRE's JWT-SVIDs, its gateway prefix (`spiffe://<trust domain>/openshell/gateway/`; supervisor IDs are `<prefix><gateway id>/sandbox/<sandbox id>`; one path segment may be `{tenant}`, as in `spiffe://<trust domain>/openshell/{tenant}/gateway/`, to match IDs with a DNS-label tenant there), and its OIDC discovery provider Service, whose `/keys` is read through that cluster's API server (over https, or http when the Service is prefixed `http://`). Each cluster and each issuer appears once. SVIDs must carry `iat` and live at most 15 minutes; SPIRE's upstream chart issues 1-hour JWT-SVIDs by default, so give the supervisors' ClusterSPIFFEID `jwtTtl: 5m`. Unset, the issuer mints no agent tokens and serves people only. |
-| `CONTROLLER_AGENT_AUDIENCES` | Comma-separated `<cluster>:<resource url>=<scope> <scope>` entries: the MCP resources a token may be issued for (anything else is `invalid_target`) and the scopes a token for each may carry. Every entry names the one cluster whose runs get it, so the same in-cluster URL is a separate entry per cluster; an entry without a cluster stops the controller. Agent tokens carry the run's cluster as `kube_cluster`, and crucible-kueue takes `--cluster <name>` (required with `--run-issuer`), so it refuses tokens for another cluster's server at the same URL. Required with `CONTROLLER_AGENT_SPIRE`. |
 | `CONTROLLER_PEOPLE_AUDIENCES` | Comma-separated `<cluster>:<resource url>=<scope> <scope>` entries: the MCP servers people's clients may get tokens for through `/oauth/authorize`, the cluster each acts on (whose identity rule gives the `kube_user`), and the scopes it grants. Unset turns people's tokens off. See [People's tokens](controller-auth.md#peoples-tokens-and-refresh). |
 | `CONTROLLER_PEOPLE_ACCESS_TTL_SECS` | People's access token lifetime, 1 to 3600 seconds. Default 900. |
 | `CONTROLLER_PEOPLE_CLIENTS_FILE` | A TOML file of `[[clients]]` (`client_id`, `name`, `redirect_uris`, optional `resources`): the public clients people may sign in with. It replaces the built-in `claude-code`, `pi` and `codex`, so list those too to keep them. Unset keeps the built-ins. A malformed file, or a `resources` entry missing from `CONTROLLER_PEOPLE_AUDIENCES`, stops the controller at startup. See [MCP clients](controller-auth.md#mcp-clients). |
@@ -267,24 +266,21 @@ scopes and transport (`CRUCIBLE_AGENT_SERVERS`), the token endpoint
 (`CRUCIBLE_AGENT_TOKEN_ENDPOINT`) and the issuer as SVID audience (`CRUCIBLE_AGENT_SVID_AUDIENCE`)
 as plain env. The engine registers a token-grant provider for each, so each sandbox's supervisor obtains its own token and injects it on traffic to the server
 alone; no token is minted per run. A server is granted only on a cluster in
-`CONTROLLER_AGENT_SPIRE` whose URL is in `CONTROLLER_AGENT_AUDIENCES`. The run records what it got,
-with the audience's scopes and, for a server that acts as `kube_user` such as crucible-kueue, the
-dispatcher's username there, and the run page shows it. A third server needs an
-`[[agent_servers]]` entry and its URL in `CONTROLLER_AGENT_AUDIENCES`, nothing else.
+`CONTROLLER_AGENT_SPIRE`. The run records what it got, with the server's scopes and, for a server
+that acts as `kube_user` such as crucible-kueue, the dispatcher's username there, and the run page
+shows it. A third server needs an `[[agent_servers]]` entry with its `url` and `scopes`, nothing
+else.
 
 The deploy profile describes each server that takes agent tokens (`DeployProfile::agent_servers`):
 `[kueue]` needs a `kube_user` in every token and names `workload_namespaces`, the first as the
-`namespace` claim, for runs on its clusters; `[buildit]` needs neither. An agent audience the profile describes no server for, on its cluster, stops the controller at startup. The rendered server trusts runs' tokens from the controller's
+`namespace` claim, for runs on its clusters; `[buildit]` needs neither. Each server's URL on each
+of its clusters is an agent audience, with its scopes: `kueue.read kueue.submit` for crucible-kueue
+and `buildit.read buildit.build` for buildit. The rendered server trusts runs' tokens from the controller's
 `CONTROLLER_AGENT_ISSUER` (`crucible deploy render --kueue --issuer <it>`), fetching keys from
 `<issuer>/.well-known/jwks.json` unless `run_jwks_uri` names another URI (a route, for a server that cannot reach the issuer's address).
 `kube_authz` (`openshift` or `token`) is where the server takes a caller's groups for its
 SubjectAccessReviews. With `people = true` the rendered server also accepts people's tokens from
 the same issuer (`--person-issuer`), for a deployment whose `CONTROLLER_PEOPLE_AUDIENCES` names it.
-A token's scopes are what its audience lists here. For example:
-
-```bash
-CONTROLLER_AGENT_AUDIENCES="spoke-a:http://crucible-kueue.crucible-system.svc.cluster.local:8850/mcp=kueue.read kueue.submit,spoke-a:http://host.openshell.internal:8848/mcp=buildit.read buildit.build"
-```
 
 **buildit.** A run dispatched onto one of the `[buildit]` clusters starts `buildit mcp` in its loop
 pod on port 8848, and its sandboxes reach it at `http://host.openshell.internal:8848/mcp` with
