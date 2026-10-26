@@ -102,3 +102,38 @@ cons = [
     "Spokes the hub reaches only through their API server need another route",
 ]
 rejection_reason = "The controller already holds an authenticated client for every cluster it dispatches to."
+
+[[content.alternatives]]
+text = "crucible-kueue acts with its own service account and checks each call with a SubjectAccessReview as kube_user"
+status = "accepted"
+pros = [
+    "The server's own account bounds what any token can reach, whatever the caller's RBAC",
+    "The person's RBAC is the ceiling for every call, decided by the API server",
+    "The server adds its pull secret, ownership labels and field manager to what it creates",
+]
+cons = [
+    "Every call's access checks are modelled by hand in crucible-kueue's access.rs, and a call it models wrong is allowed or refused wrongly",
+    "Allowed decisions are cached for 30 seconds, so a removed permission can still allow calls that long",
+    "hardware_describe reads nodes with the server's account, an exception to the ceiling kept so agents can pick a flavor and GPU product",
+]
+
+[[content.alternatives]]
+text = "Pass the agent's token through to the Kubernetes API server"
+status = "rejected"
+pros = ["Kubernetes authorizes every request itself; no checks to model"]
+cons = [
+    "The MCP authorization spec forbids passing a token through to another resource, since its audience names this server",
+    "The API server would trust the issuer only with an OIDC authenticator configured on every spoke",
+    "A leaked token would be a Kubernetes credential, not a crucible-kueue one",
+]
+rejection_reason = "It breaks audience binding and turns every agent token into a cluster credential."
+
+[[content.alternatives]]
+text = "Impersonate kube_user for every Kubernetes call"
+status = "rejected"
+pros = ["Kubernetes authorizes each request as the person, with no checks to model"]
+cons = [
+    "The server needs impersonate on users and groups, which RBAC cannot scope to a dynamic set of people, so a compromised server acts as anyone",
+    "Objects would be created as the person, losing the pull secret, ownership labels and field manager the server adds",
+]
+rejection_reason = "Unscoped impersonation makes the server's account worth every user's rights."
