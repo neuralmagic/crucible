@@ -87,6 +87,11 @@ impl Namespaces {
         found
     }
 
+    /// The reviewer callers' Kubernetes access is checked with, if this server has one.
+    pub fn reviewer(&self) -> Option<&dyn AccessReview> {
+        self.reviewer.as_deref()
+    }
+
     /// Whether this server serves `namespace`. A call anywhere else is refused before it reaches
     /// the API server, whatever the caller's own RBAC there.
     pub async fn serves(&self, namespace: &str) -> bool {

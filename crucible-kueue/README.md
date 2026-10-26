@@ -33,7 +33,9 @@ that did not answer). The auth guard answers a refused tool call the same way.
 estimate while pending, pod counts by state, up to five pods with problems (stuck, failed,
 restarted, unschedulable) with their exit code and termination message, recent events of the
 object, its Workloads and those pods, and a `next_action`. `detail: "full"` adds every
-Workload's conditions, the object's full status and every pod. `until`
+Workload's conditions, the object's full status and every pod. A caller whose Kubernetes user
+may not `get` and `list` Kueue Workloads, pods or events in the namespace gets the report
+without that part, and `omitted` says which parts were left out and why. `until`
 (`admitted`/`running`/`ready`/`finished`) waits on the server for up to `timeout_seconds` (max
 50) and stops early once the workload settles short of it or a pod is stuck.
 

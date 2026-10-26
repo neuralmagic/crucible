@@ -1409,3 +1409,151 @@ async fn naming_a_namespace_the_server_does_not_serve_lists_the_ones_it_does() {
     );
     assert!(!error.contains("system:serviceaccount"), "{wrong:#}");
 }
+
+#[tokio::test]
+#[ignore = "needs a cluster with Kueue; see the module docs"]
+async fn a_reader_without_pod_rbac_gets_the_status_without_pods() {
+    use k8s_openapi::api::rbac::v1::{PolicyRule, Role, RoleBinding, RoleRef, Subject};
+    use kube::api::{Api, DeleteParams, PostParams};
+
+    let env = env();
+    let run = unique("e2e-jobs-only");
+    let url = serve(&env).await;
+    let agent = connect(&url, &submitter(&env, &run)).await.unwrap();
+    let name = unique("jobs-only");
+    submit(&agent, &env.queue, &job(&name, "sleep 20")).await;
+    wait_for_phase(
+        &agent,
+        &name,
+        &["admitted", "finished"],
+        Duration::from_secs(180),
+    )
+    .await;
+
+    let user = format!("{run}-reader");
+    let kube = kube_client(&env).await;
+    let rule = |group: &str, resource: &str, verbs: &[&str]| PolicyRule {
+        api_groups: Some(vec![group.into()]),
+        resources: Some(vec![resource.into()]),
+        verbs: verbs.iter().map(|v| v.to_string()).collect(),
+        ..Default::default()
+    };
+    let roles: Api<Role> = Api::namespaced(kube.clone(), &env.namespace);
+    let bindings: Api<RoleBinding> = Api::namespaced(kube.clone(), &env.namespace);
+    let meta = kube::api::ObjectMeta {
+        name: Some(user.clone()),
+        ..Default::default()
+    };
+    roles
+        .create(
+            &PostParams::default(),
+            &Role {
+                metadata: meta.clone(),
+                rules: Some(vec![
+                    rule("batch", "jobs", &["get"]),
+                    rule("kueue.x-k8s.io", "localqueues", &["list"]),
+                ]),
+            },
+        )
+        .await
+        .unwrap();
+    bindings
+        .create(
+            &PostParams::default(),
+            &RoleBinding {
+                metadata: meta,
+                role_ref: RoleRef {
+                    api_group: "rbac.authorization.k8s.io".into(),
+                    kind: "Role".into(),
+                    name: user.clone(),
+                },
+                subjects: Some(vec![Subject {
+                    api_group: Some("rbac.authorization.k8s.io".into()),
+                    kind: "User".into(),
+                    name: user.clone(),
+                    ..Default::default()
+                }]),
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut claims = token_claims(&env, &format!("{run}-reader"), "kueue.read");
+    let map = claims.as_object_mut().unwrap();
+    for key in ["kube_groups", "groups"] {
+        map.remove(key);
+    }
+    let user_claim = match env.mode {
+        Mode::Crucible => "kube_user",
+        Mode::Tenant => "preferred_username",
+    };
+    map.insert(user_claim.into(), json!(user));
+    let reader = connect(&url, &testing::sign("a", &claims)).await.unwrap();
+
+    for detail in ["summary", "full"] {
+        let s = call(
+            &reader,
+            "workload_status",
+            json!({"kind": "Job", "name": name, "detail": detail}),
+        )
+        .await;
+        assert_eq!(s["status"], "ok", "{s:#}");
+        assert_eq!(s["name"], name.as_str(), "{s:#}");
+        assert!(
+            s.get("object_status").is_some(),
+            "the Job's own status: {s:#}"
+        );
+        for hidden in [
+            "pods",
+            "problem_pods",
+            "pod_list",
+            "phase",
+            "workloads",
+            "next_action",
+            "events",
+        ] {
+            assert!(s.get(hidden).is_none(), "{hidden} shown: {s:#}");
+        }
+        let omitted: Vec<&str> = s["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["part"].as_str().unwrap())
+            .collect();
+        assert_eq!(omitted, ["workloads", "pods", "events"], "{s:#}");
+        let reasons = s["omitted"].to_string();
+        assert!(
+            reasons.contains(&format!(
+                "you may not get and list pods in namespace {}",
+                env.namespace
+            )),
+            "{s:#}"
+        );
+    }
+
+    let own = call(
+        &agent,
+        "workload_status",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert_eq!(own["status"], "ok", "{own:#}");
+    assert!(own.get("omitted").is_none(), "{own:#}");
+    assert!(
+        own.get("pods").is_some() && own.get("phase").is_some(),
+        "{own:#}"
+    );
+
+    bindings
+        .delete(&user, &DeleteParams::default())
+        .await
+        .unwrap();
+    roles.delete(&user, &DeleteParams::default()).await.unwrap();
+    let deleted = call(
+        &agent,
+        "workload_delete",
+        json!({"kind": "Job", "name": name}),
+    )
+    .await;
+    assert_eq!(deleted["status"], "ok", "{deleted:#}");
+}

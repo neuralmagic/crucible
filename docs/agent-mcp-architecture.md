@@ -332,11 +332,10 @@ it. So:
   Secret and PersistentVolumeClaim that a manifest names (`crucible-kueue/src/access.rs:149`).
 - A new RoleBinding applies on the next call, because denials are not cached. A removed
   permission can still allow calls for up to 30 seconds, because allowed decisions are cached.
-- The ceiling holds for what a call does, not for everything a read returns. Each read tool
-  checks the object it names (7.2), then answers with what the server reads with its own
-  account: `workload_status` adds the workload's pods, its Kueue Workloads and their events,
-  and `hardware_describe` adds the nodes behind a flavor. A caller who may `get` a Job sees
-  those even without RBAC on pods, Workloads, events or nodes.
+- `workload_status` and `tasks/get` read the workload's Kueue Workloads, its pods and their
+  events with the server's account, and show each only when `kube_user` may `get` and `list`
+  it in the namespace. A part the caller may not read is left out, and the reply's `omitted`
+  names it and why (`crucible-kueue/src/access.rs`, `StatusPart`).
 
 The issuer never decides what a person may do. It decides only who the person is on each
 cluster (section 5).
@@ -1313,7 +1312,7 @@ The app is built in `crucible-kueue/src/lib.rs:62`:
 | `whoami` | `kueue.read` | none |
 | `queues_list` | `kueue.read` | `list` `localqueues` |
 | `queue_describe`, `hardware_describe` | `kueue.read` | `get` the LocalQueue |
-| `workload_status`, `tasks/get` | `kueue.read` | `get` the workload |
+| `workload_status`, `tasks/get` | `kueue.read` | `get` the workload; each of Kueue `workloads`, `pods` and `events` is shown only with `get` and `list` on it |
 | `workload_list` | `kueue.read` | `list` Kueue `workloads` |
 | `workload_logs` | `kueue.read` | `get` `pods/log` |
 | `workload_plan`, `workload_submit` | `kueue.submit` | `use` (or `get`) the LocalQueue, `create` the kind, `get` each Secret and PVC the manifest names |
@@ -1481,7 +1480,10 @@ phase furthest from the run state, with counts for each phase. So `pending` with
 `workload_status` reports the phase and the reason. While the workload waits, it also reports
 the queue position and a new fit estimate. It then reports pod counts, up to five problem pods
 with exit messages, recent events and a `next_action`. `detail: "full"` adds all conditions,
-the object status and every pod.
+the object status and every pod. For a caller with a `kube_user`, the Workload fields (phase,
+counts, queue position, fit, readiness, `next_action`), the pod fields and the events each need
+`get` and `list` on Kueue `workloads`, `pods` and `events` in the namespace; a part without them
+is left out and listed under `omitted` with the reason.
 
 With `until` (`admitted`, `running`, `ready` or `finished`) the server waits for up to
 `timeout_seconds`, at most 50, and polls each 2 seconds (`crucible-kueue/src/server.rs:1228`).

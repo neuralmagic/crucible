@@ -17,6 +17,10 @@
 //! | workload_delete                       | kueue.submit | `delete` the workload                  |
 //!
 //! The namespace checked is the call's `namespace` argument, else the token's `namespace` claim.
+//!
+//! workload_status reads more than the workload with the server's own account: its Kueue
+//! Workloads, its pods and their events. Each [`StatusPart`] is in the reply only when the caller
+//! may `get` and `list` it in the namespace; the reply names each part it leaves out and why.
 
 use crate::config::QueueVerb;
 use crate::manifest::WorkloadKind;
@@ -26,6 +30,58 @@ use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::policy::Refusal;
 use crucible_mcp_auth::principal::Principal;
 use serde_json::{Map, Value};
+
+/// What a workload_status report reads besides the workload itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPart {
+    /// The Kueue Workloads: phase, admission, queue position, fit.
+    Workloads,
+    /// The pods: counts, problem pods, the pod list.
+    Pods,
+    /// Events on the workload, its Workloads and its pods.
+    Events,
+}
+
+impl StatusPart {
+    pub const ALL: [Self; 3] = [Self::Workloads, Self::Pods, Self::Events];
+
+    fn target(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Workloads => (KUEUE_GROUP, "workloads"),
+            Self::Pods => ("", "pods"),
+            Self::Events => ("", "events"),
+        }
+    }
+
+    /// `get` and `list` on the part's resource in `namespace`.
+    pub fn checks(self, namespace: &str) -> Vec<AccessCheck> {
+        let (group, resource) = self.target();
+        ["get", "list"]
+            .map(|verb| AccessCheck {
+                tool: "workload_status".into(),
+                rule: format!("{resource}-{verb}"),
+                message: format!("you may not {verb} {resource} in this namespace"),
+                group: group.into(),
+                resource: resource.into(),
+                subresource: String::new(),
+                verb: verb.into(),
+                namespace: namespace.into(),
+                name: String::new(),
+            })
+            .to_vec()
+    }
+
+    /// Why the part is left out when the caller may not read it.
+    pub fn denied(self, namespace: &str) -> String {
+        let (group, resource) = self.target();
+        let resource = match group {
+            "" => resource.to_string(),
+            group => format!("{resource}.{group}"),
+        };
+        format!("you may not get and list {resource} in namespace {namespace}")
+    }
+}
 
 /// The scope reading tools need.
 pub const SCOPE_READ: &str = "kueue.read";

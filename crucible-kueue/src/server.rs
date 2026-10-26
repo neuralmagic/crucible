@@ -2,6 +2,7 @@
 //! request and acts in the namespace the call names; past submit, mutations need an object this
 //! server created for the same run, unless the server runs with [`Ownership::Rbac`].
 
+use crate::access::StatusPart;
 use crate::caller::{ActError, Caller, Identity, NameError, Namespace, QueueName, Refusal};
 use crate::config::{Config, Labels, Ownership, QUEUE_LABEL};
 use crate::hardware;
@@ -14,6 +15,8 @@ use crate::namespaces::{self, Namespaces};
 use crate::report::{self, Detail, Situation, Until, WaitEnd};
 use crate::status::{self, Phase, Readiness, Rollup};
 use crate::task::{self, Outcome, TaskRef};
+use crucible_mcp_auth::access::AccessReview;
+use crucible_mcp_auth::kube::USER_CLAIM;
 use crucible_mcp_auth::principal::Principal;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
 use kube::api::{
@@ -197,6 +200,89 @@ fn reply(result: Result<Value, ToolError>) -> CallToolResult {
 }
 
 /// One read of a workload: the object, its pods, and the Workloads Kueue tracks it as.
+/// The report keys each part fills.
+fn part_keys(part: StatusPart) -> &'static [&'static str] {
+    match part {
+        StatusPart::Workloads => &[
+            "phase",
+            "reason",
+            "message",
+            "workload_counts",
+            "next_action",
+            "readiness",
+            "queue_position",
+            "admitted_to",
+            "fit",
+            "workloads",
+            "workloads_total",
+        ],
+        StatusPart::Pods => &["pods", "problem_pods", "problem_pods_total", "pod_list"],
+        StatusPart::Events => &["events"],
+    }
+}
+
+/// Removes what `omitted` leaves out of a status report and says so under `omitted`.
+fn withhold(body: &mut Value, omitted: &[Omitted]) {
+    let Some(fields) = body.as_object_mut() else {
+        return;
+    };
+    for o in omitted {
+        for key in part_keys(o.part) {
+            fields.remove(*key);
+        }
+    }
+    if !omitted.is_empty() {
+        fields.insert("omitted".into(), json!(omitted));
+    }
+}
+
+/// A part of a workload_status report left out, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Omitted {
+    pub part: StatusPart,
+    pub reason: String,
+}
+
+/// The parts of a status report the caller may not read in `namespace`. A caller without a
+/// Kubernetes user, or a server without a reviewer, reads every part. A check the reviewer could
+/// not make leaves its part out too.
+pub async fn omitted_parts(
+    reviewer: Option<&dyn AccessReview>,
+    principal: Option<&Principal>,
+    namespace: &str,
+) -> Vec<Omitted> {
+    let (Some(reviewer), Some(principal)) = (reviewer, principal) else {
+        return Vec::new();
+    };
+    if !principal.claims.contains_key(USER_CLAIM) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for part in StatusPart::ALL {
+        let mut reason = None;
+        for check in part.checks(namespace) {
+            match reviewer.review(principal, &check).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    reason = Some(part.denied(namespace));
+                    break;
+                }
+                Err(e) => {
+                    reason = Some(format!(
+                        "your access to {} could not be checked: {e}",
+                        check.resource
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(reason) = reason {
+            out.push(Omitted { part, reason });
+        }
+    }
+    out
+}
+
 struct Snapshot {
     object: DynamicObject,
     pods: Vec<Pod>,
@@ -1090,38 +1176,53 @@ impl KueueMcp {
         name: &str,
         snap: &Snapshot,
         detail: Detail,
+        omitted: &[Omitted],
     ) -> Value {
         let ns = c.namespace.as_str();
+        let reads = |part: StatusPart| !omitted.iter().any(|o| o.part == part);
+        let (workloads_read, pods_read) = (reads(StatusPart::Workloads), reads(StatusPart::Pods));
         let head = &snap.rollup.headline;
         let readiness = snap.readiness(kind);
-        let pending: Vec<&Workload> = snap
-            .workloads
-            .iter()
-            .filter(|w| status::phase(Some(w)).phase == Phase::Pending)
-            .collect();
+        let pending: Vec<&Workload> = match workloads_read {
+            true => snap
+                .workloads
+                .iter()
+                .filter(|w| status::phase(Some(w)).phase == Phase::Pending)
+                .collect(),
+            false => Vec::new(),
+        };
         let (queue_position, position) = self.queue_positions(ns, &pending).await;
-        let fit = match head.phase {
-            Phase::Pending => Some(self.refit(c, kind, snap).await),
+        let fit = match (workloads_read, head.phase) {
+            (true, Phase::Pending) => Some(self.refit(c, kind, snap).await),
             _ => None,
         };
-        let problems = report::problem_pods(kind, &snap.pods);
+        let problems = match pods_read {
+            true => report::problem_pods(kind, &snap.pods),
+            false => Vec::new(),
+        };
         let mut names = vec![name];
-        names.extend(
-            snap.workloads
-                .iter()
-                .take(3)
-                .map(|w| w.metadata.name.as_str()),
-        );
-        match problems.is_empty() {
-            true => names.extend(snap.pods.iter().take(2).map(report::pod_name)),
-            false => names.extend(
+        if workloads_read {
+            names.extend(
+                snap.workloads
+                    .iter()
+                    .take(3)
+                    .map(|w| w.metadata.name.as_str()),
+            );
+        }
+        match (pods_read, problems.is_empty()) {
+            (false, _) => {}
+            (true, true) => names.extend(snap.pods.iter().take(2).map(report::pod_name)),
+            (true, false) => names.extend(
                 problems
                     .iter()
                     .take(MAX_PROBLEM_PODS)
                     .map(|p| p.name.as_str()),
             ),
         }
-        let events = self.events_for(ns, &names).await;
+        let events = match reads(StatusPart::Events) {
+            true => Some(self.events_for(ns, &names).await),
+            false => None,
+        };
         let retention_seconds = snap
             .object
             .data
@@ -1192,14 +1293,15 @@ impl KueueMcp {
         set(
             "events",
             match (events, detail) {
-                (Err(e), _) => json!(format!("unavailable: {e}")),
-                (Ok(ev), Detail::Summary) => json!(
+                (None, _) => Value::Null,
+                (Some(Err(e)), _) => json!(format!("unavailable: {e}")),
+                (Some(Ok(ev)), Detail::Summary) => json!(
                     ev[ev.len().saturating_sub(keep)..]
                         .iter()
                         .map(EventLine::line)
                         .collect::<Vec<_>>()
                 ),
-                (Ok(ev), Detail::Full) => json!(ev[ev.len().saturating_sub(keep)..]),
+                (Some(Ok(ev)), Detail::Full) => json!(ev[ev.len().saturating_sub(keep)..]),
             },
         );
         match detail {
@@ -1243,11 +1345,18 @@ impl KueueMcp {
                 );
             }
         }
+        withhold(&mut body, omitted);
         body
     }
 
-    /// workload_status: one report, or with `until` the report once the wait ends.
-    async fn status(&self, c: &Caller, args: StatusArgs) -> Result<Value, ToolError> {
+    /// workload_status: one report, or with `until` the report once the wait ends. `omitted` are
+    /// the parts the caller may not read, left out of the report.
+    async fn status(
+        &self,
+        c: &Caller,
+        args: StatusArgs,
+        omitted: &[Omitted],
+    ) -> Result<Value, ToolError> {
         let started = Instant::now();
         let timeout = Duration::from_secs(
             args.timeout_seconds
@@ -1297,6 +1406,7 @@ impl KueueMcp {
                 &args.name,
                 &snap,
                 args.detail.unwrap_or_default(),
+                omitted,
             )
             .await;
         if !wait.is_null() {
@@ -1354,8 +1464,14 @@ impl KueueMcp {
         Ok(())
     }
 
-    /// A batch workload's task state.
-    async fn detailed_task(&self, c: &Caller, t: &TaskRef) -> Result<DetailedTask, ToolError> {
+    /// A batch workload's task state. A completed task carries the status report, less the parts
+    /// in `omitted`.
+    async fn detailed_task(
+        &self,
+        c: &Caller,
+        t: &TaskRef,
+        omitted: &[Omitted],
+    ) -> Result<DetailedTask, ToolError> {
         let snap = self.snapshot(c, t.kind, &t.name).await?;
         let full = serde_json::to_value(&snap.object).map_err(|source| KubeError::Decode {
             what: format!("{} {}", t.kind.kind(), t.name),
@@ -1385,7 +1501,7 @@ impl KueueMcp {
             ),
             Outcome::Completed { failed, message } => {
                 let report = self
-                    .report(c, t.kind, &t.name, &snap, Detail::Summary)
+                    .report(c, t.kind, &t.name, &snap, Detail::Summary, omitted)
                     .await;
                 let result = text_result(&task::completed_body(failed, &message, report), failed);
                 let result = match serde_json::to_value(result) {
@@ -1763,7 +1879,13 @@ impl KueueMcp {
                     let c = self
                         .served_caller(&parts, args.namespace.as_deref())
                         .await?;
-                    self.status(&c, args).await
+                    let omitted = omitted_parts(
+                        self.namespaces.reviewer(),
+                        parts.extensions.get::<Principal>(),
+                        c.namespace.as_str(),
+                    )
+                    .await;
+                    self.status(&c, args, &omitted).await
                 }
                 .await,
             )
@@ -2196,7 +2318,18 @@ impl ServerHandler for KueueMcp {
         let t = parse_task(&request.task_id)?;
         let c = self.task_caller(&ctx, &t).await?;
         let (t, _) = self.task_object(&c, &request.task_id).await?;
-        let detailed = self.detailed_task(&c, &t).await.map_err(internal)?;
+        let omitted = omitted_parts(
+            self.namespaces.reviewer(),
+            request_parts(&ctx)
+                .ok()
+                .and_then(|p| p.extensions.get::<Principal>()),
+            c.namespace.as_str(),
+        )
+        .await;
+        let detailed = self
+            .detailed_task(&c, &t, &omitted)
+            .await
+            .map_err(internal)?;
         Ok(GetTaskResult::new(detailed))
     }
 
@@ -2216,7 +2349,7 @@ impl ServerHandler for KueueMcp {
         self.owned_object(&c, t.kind, &t.name)
             .await
             .map_err(refused)?;
-        let current = self.detailed_task(&c, &t).await.map_err(internal)?;
+        let current = self.detailed_task(&c, &t, &[]).await.map_err(internal)?;
         if current.status().is_terminal() {
             return Ok(());
         }
@@ -2279,6 +2412,161 @@ mod tests {
                 .unwrap()
                 .contains_key("crucible.dev/actor")
         );
+    }
+
+    /// Allows a check when its resource and verb are granted, in any namespace.
+    struct Grants(&'static [(&'static str, &'static str)]);
+
+    impl AccessReview for Grants {
+        fn review<'a>(
+            &'a self,
+            _: &'a Principal,
+            check: &'a crucible_mcp_auth::access::AccessCheck,
+        ) -> crucible_mcp_auth::access::ReviewFuture<'a> {
+            let allowed = self
+                .0
+                .contains(&(check.resource.as_str(), check.verb.as_str()));
+            Box::pin(async move { Ok(allowed) })
+        }
+    }
+
+    /// Refuses every check without deciding it.
+    struct Down;
+
+    impl AccessReview for Down {
+        fn review<'a>(
+            &'a self,
+            _: &'a Principal,
+            _: &'a crucible_mcp_auth::access::AccessCheck,
+        ) -> crucible_mcp_auth::access::ReviewFuture<'a> {
+            Box::pin(async {
+                Err(crucible_mcp_auth::access::ReviewError::Unavailable(
+                    "the API server did not answer".into(),
+                ))
+            })
+        }
+    }
+
+    fn person(kube_user: Option<&str>) -> Principal {
+        let mut claims = serde_json::Map::new();
+        if let Some(user) = kube_user {
+            claims.insert(USER_CLAIM.into(), json!(user));
+        }
+        Principal {
+            subject: "alice".into(),
+            actor_chain: Vec::new(),
+            client_id: None,
+            namespace: Some("team-a".into()),
+            scopes: ["kueue.read".to_string()].into(),
+            claims,
+            callers: Callers::People,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_status_part_is_shown_only_when_the_caller_may_get_and_list_it() {
+        let alice = person(Some("alice"));
+        let jobs_only = Grants(&[("jobs", "get")]);
+        let omitted = omitted_parts(Some(&jobs_only), Some(&alice), "team-a").await;
+        assert_eq!(
+            omitted.iter().map(|o| o.part).collect::<Vec<_>>(),
+            StatusPart::ALL
+        );
+        assert_eq!(
+            omitted[1].reason,
+            "you may not get and list pods in namespace team-a"
+        );
+        assert_eq!(
+            omitted[0].reason,
+            "you may not get and list workloads.kueue.x-k8s.io in namespace team-a"
+        );
+
+        let get_only = Grants(&[("pods", "get"), ("events", "get"), ("events", "list")]);
+        let omitted = omitted_parts(Some(&get_only), Some(&alice), "team-a").await;
+        assert_eq!(
+            omitted.iter().map(|o| o.part).collect::<Vec<_>>(),
+            [StatusPart::Workloads, StatusPart::Pods],
+            "get without list is not enough"
+        );
+
+        let all = Grants(&[
+            ("workloads", "get"),
+            ("workloads", "list"),
+            ("pods", "get"),
+            ("pods", "list"),
+            ("events", "get"),
+            ("events", "list"),
+        ]);
+        assert!(
+            omitted_parts(Some(&all), Some(&alice), "team-a")
+                .await
+                .is_empty()
+        );
+
+        let down = omitted_parts(Some(&Down), Some(&alice), "team-a").await;
+        assert_eq!(down.len(), 3);
+        assert!(
+            down[1]
+                .reason
+                .starts_with("your access to pods could not be checked"),
+            "{down:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caller_without_a_kubernetes_user_reads_every_part() {
+        let nobody = Grants(&[]);
+        let run = person(None);
+        assert!(
+            omitted_parts(Some(&nobody), Some(&run), "team-a")
+                .await
+                .is_empty()
+        );
+        assert!(
+            omitted_parts(None, Some(&person(Some("alice"))), "team-a")
+                .await
+                .is_empty()
+        );
+        assert!(
+            omitted_parts(Some(&nobody), None, "team-a")
+                .await
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn withholding_removes_every_key_a_part_fills_and_says_why() {
+        let full = || {
+            json!({
+                "kind": "Job", "name": "train", "object_status": {"active": 1},
+                "phase": "admitted", "reason": "Admitted", "message": "m",
+                "workload_counts": {"admitted": 1}, "next_action": "wait", "readiness": {},
+                "queue_position": [], "admitted_to": {}, "fit": {}, "workloads": [],
+                "workloads_total": 1, "pods": {"total": 1}, "problem_pods": [],
+                "problem_pods_total": 9, "pod_list": [], "events": [],
+            })
+        };
+        let mut nothing_hidden = full();
+        withhold(&mut nothing_hidden, &[]);
+        assert_eq!(nothing_hidden, full());
+
+        let mut body = full();
+        let omitted: Vec<Omitted> = StatusPart::ALL
+            .into_iter()
+            .map(|part| Omitted {
+                part,
+                reason: "no".into(),
+            })
+            .collect();
+        withhold(&mut body, &omitted);
+        let keys: Vec<&str> = body
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["kind", "name", "object_status", "omitted"]);
+        assert_eq!(body["omitted"][1], json!({"part": "pods", "reason": "no"}));
     }
 
     /// A reply's `isError` and its JSON text.
