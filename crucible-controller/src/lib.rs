@@ -41,6 +41,7 @@ pub mod metrics;
 pub mod model;
 mod oidc_mirror;
 pub mod playbooks;
+pub mod provenance;
 pub mod runs;
 pub mod secrets;
 mod spa;
@@ -296,6 +297,7 @@ impl Surface {
         };
 
         let router = guarded
+            .merge(provenance::api::keys_router(state.clone()))
             .merge(api::metrics::router(state))
             .merge(push_router)
             .merge(mcp_router)

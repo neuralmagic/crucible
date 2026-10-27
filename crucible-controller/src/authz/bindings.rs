@@ -207,6 +207,28 @@ pub static BINDINGS: &[Binding] = &[
     bind("GET", "/api/runs/{run_id}/graph", R::Run, V::Read, Route),
     bind(
         "GET",
+        "/api/runs/{run_id}/provenance",
+        R::Run,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "GET",
+        "/api/provenance/envelopes/{digest}",
+        R::Run,
+        V::Read,
+        Route,
+    ),
+    bind(
+        "GET",
+        "/api/provenance/commits/{sha}",
+        R::Run,
+        V::Read,
+        Route,
+    ),
+    bind("POST", "/api/provenance/verify", R::Run, V::Read, Route),
+    bind(
+        "GET",
         "/api/runs/{run_id}/tasks/{task}/evidence",
         R::Run,
         V::Read,

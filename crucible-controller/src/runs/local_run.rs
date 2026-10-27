@@ -37,6 +37,7 @@ pub struct LocalRun {
     dir: PathBuf,
     run_id: String,
     deadline: Duration,
+    signer: Option<std::sync::Arc<crucible_contract::provenance::Signer>>,
 }
 
 /// The process group a local run's engine leads, holding everything it spawned. Dropped armed, it
@@ -251,6 +252,13 @@ pub(crate) async fn start(
         crucible_contract::ENV_RUN_NAME.to_string(),
         run_id.to_string(),
     ));
+    env.retain(|(name, _)| name != crucible_contract::provenance::ENV_PROVENANCE);
+    if let Some(provenance) = opts.dispatch_provenance(crate::runs::clusters::HUB_CLUSTER) {
+        env.push((
+            crucible_contract::provenance::ENV_PROVENANCE.to_string(),
+            serde_json::to_string(&provenance).context("encoding the dispatch provenance")?,
+        ));
+    }
     let child = tokio::process::Command::new(&bin)
         .args(&argv)
         .current_dir(&pack)
@@ -271,6 +279,7 @@ pub(crate) async fn start(
         dir,
         run_id: run_id.to_string(),
         deadline,
+        signer: cfg.provenance.clone(),
     }))
 }
 
@@ -285,6 +294,7 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
         dir,
         run_id,
         deadline,
+        signer,
     } = run;
     let mut tail = Vec::new();
     let mut streams = tokio::task::JoinSet::new();
@@ -343,7 +353,9 @@ pub async fn supervise(db: Db, key: String, run: LocalRun) {
     }
     if let Err(e) = complete(&db, &key, &run_id, &session).await {
         tracing::warn!(%key, %run_id, error = %format!("{e:#}"), "ingesting a local run failed");
+        return;
     }
+    crate::runs::completion::attest(&db, signer.as_deref(), &run_id).await;
 }
 
 /// Store the session a local run published as its artifact, as the pod path does, then fold it.
@@ -589,6 +601,7 @@ mod tests {
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
             rerun: None,
+            provenance: Default::default(),
         };
         assert_eq!(playbook.tracker_item("playbook:fences:0199"), None);
         let looped = RunRenderOpts::Loop {
@@ -614,6 +627,7 @@ mod tests {
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
             rerun: None,
+            provenance: Default::default(),
         };
         assert_eq!(
             run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts),
@@ -647,6 +661,7 @@ mod tests {
                 model: Some("gpt-5.6-luna".to_string()),
             },
             rerun: None,
+            provenance: Default::default(),
         };
         let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
         assert_eq!(

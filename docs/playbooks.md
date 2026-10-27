@@ -182,6 +182,36 @@ Only http and https URLs are valid. Any other value fails the task. The engine r
 host and path of each URL to name it (`github`, a pull request, `#123`). The run and task
 views show a provider mark that links to the URL.
 
+### Signed provenance for a pushed commit
+
+A task that pushes a commit can report it as a commit link with the full SHA, beside the
+pull request it opened:
+
+```json
+{"commit": "https://github.com/acme/widget/commit/0123456789abcdef0123456789abcdef01234567", "pr": "https://github.com/acme/widget/pull/7"}
+```
+
+When a controller with a signing key ingests the finished run, it signs one statement for each
+commit link a passing task reported. The statement is an in-toto statement in a DSSE envelope,
+and its subject is the commit. It records the run, the task, the playbook, the admitted plan's
+digest, the agent tasks upstream of the push with their harness and model, the provider, sandbox
+image and cluster the run was dispatched with, the command and evaluate tasks upstream of the push
+with how each ended, and the pull request in the same repository. Each of these comes from the
+controller's own records of the run, not from the task's output. A GitHub
+(`/<owner>/<repo>/commit/<sha>`) or GitLab (`/<project>/-/commit/<sha>`) link names a commit; an
+abbreviated SHA names none. A rerun that pushes the same commit gets its own statement.
+
+A command or evaluate task reads what runs it from the `provenance` entry of the inputs JSON:
+
+```json
+{"run": "20261027T120000Z-x", "task": "push", "cluster": "east", "provider": "p", "sandbox_image": "registry.example/sandbox@sha256:…", "agents": {"author": {"harness": "claude", "model": "…"}}}
+```
+
+A pusher can put the opaque reference `Crucible-Provenance: sha256:<envelope digest>` in a pull
+request description. Keep it out of the commit, so the same change still produces the same SHA
+on every rerun. `crux verify <digest|sha>` checks the envelope digest, the key id, the signature,
+and the subject.
+
 ## If the run is interrupted
 
 `plan run --resume` continues the run in `state/`:

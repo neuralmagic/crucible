@@ -1087,3 +1087,9 @@ mod tests {
         }
     }
 }
+
+/// One stored commit statement, as `GET /api/provenance/commits/{sha}` lists it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProvenanceStatement {
+    pub digest: String,
+}

@@ -191,12 +191,21 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         inference,
         exposure,
     });
+    let provenance = crucible_contract::provenance::DispatchProvenance {
+        cluster: None,
+        provider: dispatch.as_ref().map(|d| d.provider.id.clone()),
+        sandbox_image: crate::provenance::pinned_image(
+            image.reference.as_deref(),
+            image.digest.as_deref(),
+        ),
+    };
     let opts = crate::runs::workpod::RunRenderOpts::Playbook {
         params: launch.params,
         max_cost: launch.max_cost,
         max_time: launch.max_time,
         agent,
         rerun: launch.rerun,
+        provenance: provenance.clone(),
     };
     let started = match cfg.playbook_executor {
         PlaybookExecutor::Pod => {
@@ -310,6 +319,15 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         crate::runs::store::set_run_dispatch(&mut *tx, &run_id, dispatch).await?;
         crate::runs::store::set_run_location(&mut *tx, &run_id, &location).await?;
         crate::runs::store::set_run_image(&mut *tx, &run_id, &image).await?;
+        crate::provenance::set_dispatch_provenance(
+            &mut *tx,
+            &run_id,
+            &crucible_contract::provenance::DispatchProvenance {
+                cluster: Some(location.cluster.clone()),
+                ..provenance
+            },
+        )
+        .await?;
         crate::runs::names::set(&mut *tx, &run_id, &name).await?;
         let ev = Event::now(&issue.key, "new", "running", Some(reason), Some(&run_id));
         crate::event_log::insert(&mut *tx, &ev).await?;

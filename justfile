@@ -168,6 +168,10 @@ state-docs:
 gov-docs:
     govctl render rfc
 
+# Write a PKCS#8 PEM ed25519 commit provenance key (CONTROLLER_PROVENANCE_KEY_PATH), for local use.
+provenance-dev-key path="provenance-dev.pem":
+    openssl genpkey -algorithm ed25519 -out {{path}}
+
 # Run the pre-commit hooks over the whole tree (prek: https://github.com/j178/prek).
 hooks:
     prek run --all-files

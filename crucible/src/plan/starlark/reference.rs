@@ -7,7 +7,9 @@
 
 use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
-use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
+use crate::plan::ir::{
+    HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, PROVENANCE_INPUT, REVISION_INPUT,
+};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
@@ -777,6 +779,15 @@ pub fn reserved_inputs() -> Vec<Reserved> {
             "object",
             "Every declared parameter's bound value under its name, in its declared type, and \
              `{}` where the source declares none, in a command or evaluate task only.",
+        ),
+        Reserved::new(
+            PROVENANCE_INPUT,
+            "object",
+            "What runs the task, as `{\"run\": str, \"task\": str, \"cluster\", \
+             \"provider\", \"sandbox_image\", \"agents\": {task: {\"harness\", \"model\"}}}`: \
+             the run and task from the engine, the cluster, provider and sandbox image digest the \
+             controller resolved at dispatch, each absent where it named none, and every agent \
+             task's harness and model. In a command or evaluate task only.",
         ),
         Reserved::new(
             REVISION_INPUT,

@@ -688,6 +688,7 @@ pub fn run(
     let history = SeriesHistory::from_env()?;
     let run_name = std::env::var(crucible_contract::ENV_RUN_NAME).ok();
     let run = run_name.as_deref().unwrap_or("local");
+    let dispatch_provenance = crate::plan::provenance::RunProvenance::dispatch_from_env()?;
 
     // Either the plan was handed to us, or the manifest names the graph and we compile it.
     let mut evidence: Option<crate::args::Paths> = None;
@@ -960,6 +961,17 @@ pub fn run(
             observe(&task, result);
         }
     }
+    let agents = agent_args.as_ref().map_or_else(Vec::new, |args| {
+        plan.tasks_topo()
+            .filter_map(|task| {
+                Some((
+                    task.name.clone(),
+                    crate::plan::harness::resolved_agent(args, task)?,
+                ))
+            })
+            .collect()
+    });
+    let provenance = crate::plan::provenance::RunProvenance::new(run, dispatch_provenance, agents);
     let out = execute(
         &plan,
         &substrate,
@@ -968,6 +980,7 @@ pub fn run(
             history: Some(&history),
             early_completion: playbook,
             prior: prior.as_ref(),
+            provenance: Some(&provenance),
             ..ExecCfg::default()
         },
         runner.as_mut(),

@@ -7810,6 +7810,111 @@ async fn a_local_playbook_launch_runs_a_subprocess_into_the_ordinary_ledger(
     Ok(())
 }
 
+/// A launch hands its engine the provenance the dispatch resolved, records it on the run, and once
+/// the run reports a pushed commit, signs a statement for it from those records.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_local_launch_that_pushes_a_commit_gets_a_signed_statement(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let handed = dir.path().join("handed-provenance.json");
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let session = [
+        r#"{"v":1,"kind":"plan_admitted","plan_version":1,"reason":"","budget_usd":3.5,"tasks":[{"name":"push","kind":"command","depends_on":[]}]}"#.to_string(),
+        format!(
+            r##"{{"v":1,"kind":"task_result","task":"push","status":"pass","plan_version":1,"task_kind":"command","iter":0,"attempts":1,"cost_usd":0.0,"note":"","secs":1.0,"links":[{{"url":"https://github.com/acme/widget/commit/{sha}","provider":"github","kind":"commit","label":"0123456"}},{{"url":"https://github.com/acme/widget/pull/3","provider":"github","kind":"pull_request","label":"#3"}}]}}"##
+        ),
+        r#"{"v":1,"kind":"shutdown","outcome":"finished","reason":"graph complete"}"#.to_string(),
+    ]
+    .join("\n");
+    let bin = dir.path().join("crucible-local-engine");
+    crate::testing::write_exec(
+        &bin,
+        &format!(
+            "#!/bin/sh\nprintf '%s' \"$CRUCIBLE_PROVENANCE\" > {}\nmkdir -p state\ncat > state/session.jsonl <<'LOG'\n{session}\nLOG\n",
+            handed.display()
+        ),
+    );
+    unsafe {
+        std::env::set_var("CRUCIBLE_BIN", &bin);
+    }
+    let signer = std::sync::Arc::new(crucible_contract::provenance::Signer::from_seed(&[5; 32]));
+    let cfg = ControllerCfg {
+        playbook_executor: crucible_controller::PlaybookExecutor::Local,
+        provenance: Some(signer.clone()),
+        ..cfg_with(dir.path(), Profile::default())
+    };
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-c";
+    seed_registered_playbook(&db, "survey").await;
+    adopt_launch(&db, key, 3.5).await;
+
+    let res = reconcile(&db, &cfg, key).await;
+    unsafe {
+        std::env::remove_var("CRUCIBLE_BIN");
+    }
+    res?;
+
+    let mut statements = Vec::new();
+    for _ in 0..100 {
+        statements = crate::provenance::statements_for_commit(db.pool(), sha).await?;
+        if !statements.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(statements.len(), 1, "the pushed commit was signed once");
+
+    let hub = crucible_contract::provenance::DispatchProvenance {
+        cluster: Some(crate::runs::clusters::HUB_CLUSTER.to_string()),
+        provider: None,
+        sandbox_image: None,
+    };
+    let handed: crucible_contract::provenance::DispatchProvenance =
+        serde_json::from_str(&std::fs::read_to_string(&handed)?)?;
+    assert_eq!(handed, hub, "the engine was handed the dispatch provenance");
+    let recorded: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT dispatch_provenance FROM runs")
+            .fetch_one(db.pool())
+            .await?;
+    assert_eq!(recorded, Some(serde_json::to_value(&hub)?));
+
+    let bytes = crate::provenance::envelope(db.pool(), &statements[0].digest)
+        .await?
+        .expect("stored");
+    let commit = crucible_contract::provenance::CommitSha::parse(sha)?;
+    let verified = crucible_contract::provenance::verify(
+        &bytes,
+        &signer.key_set(),
+        crucible_contract::provenance::Expect {
+            digest: Some(&statements[0].digest),
+            commit: Some(&commit),
+            repository: Some("https://github.com/acme/widget"),
+        },
+    )?;
+    let p = verified.statement.predicate;
+    assert_eq!(p.run, statements[0].run_id);
+    assert_eq!(
+        p.playbook,
+        Some(crucible_contract::provenance::PlaybookRef {
+            id: "survey".into(),
+            draft_version: None,
+        })
+    );
+    let schema: String = sqlx::query_scalar("SELECT schema_digest FROM playbook_launches")
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(
+        p.schema,
+        Some(schema),
+        "the schema the launch was validated against"
+    );
+    assert_eq!(p.cluster, hub.cluster);
+    assert_eq!(
+        p.pull_request.as_deref(),
+        Some("https://github.com/acme/widget/pull/3")
+    );
+    Ok(())
+}
+
 /// A local run whose engine dies without publishing a session parks the launch with the
 /// supervisor's account, rather than leaving the row `running` forever.
 #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]

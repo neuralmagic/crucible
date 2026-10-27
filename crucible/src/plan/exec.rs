@@ -278,6 +278,9 @@ pub struct ExecCfg<'a> {
     /// How many lanes of one dispatch run at once. It bounds what lanes already in flight can
     /// spend past the cost ceiling.
     pub width: NonZeroUsize,
+    /// What command and evaluate tasks receive under [`crate::plan::ir::PROVENANCE_INPUT`]. `None`
+    /// gives them none.
+    pub provenance: Option<&'a crate::plan::provenance::RunProvenance>,
 }
 
 impl Default for ExecCfg<'_> {
@@ -289,6 +292,7 @@ impl Default for ExecCfg<'_> {
             early_completion: false,
             prior: None,
             width: crate::plan::admission::DEFAULT_WIDTH,
+            provenance: None,
         }
     }
 }
@@ -381,6 +385,15 @@ impl ExecCfg<'_> {
             None => crate::plan::history::empty_input(),
         };
         inputs.insert(TaskName(HISTORY_INPUT.to_string()), history);
+    }
+
+    /// Write the reserved provenance input for a command or evaluate task.
+    fn add_provenance(&self, t: &Task, inputs: &mut BTreeMap<TaskName, Value>) {
+        if let Some(provenance) = self.provenance
+            && matches!(t.task, TaskKind::Command { .. } | TaskKind::Evaluate { .. })
+        {
+            provenance.add(t, inputs);
+        }
     }
 }
 
@@ -1044,6 +1057,7 @@ pub fn execute(
             let producers = file_producers(plan, t, &results, &*runner);
             let mut inputs = inputs_for(plan, t, &results, &producers);
             cfg.add_history(t, &mut inputs);
+            cfg.add_provenance(t, &mut inputs);
             if t.stage == Stage::Epilogue {
                 inputs.insert(
                     TaskName(OUTCOME_INPUT.to_string()),
@@ -2077,6 +2091,7 @@ where
                         Ok(()) => {
                             let mut inputs = inputs_for(plan, t, &view, &producers);
                             cfg.add_history(t, &mut inputs);
+                            cfg.add_provenance(t, &mut inputs);
                             if t.stage == Stage::Epilogue {
                                 inputs.insert(
                                     TaskName(OUTCOME_INPUT.to_string()),
@@ -9421,6 +9436,56 @@ mod tests {
 
         assert_eq!(params_of(&r.seen_values["summarize"]), None);
         assert_eq!(r.seen_inputs["summarize"], vec!["fetch".to_string()]);
+    }
+
+    #[test]
+    fn command_and_evaluate_tasks_receive_the_provenance_and_an_agent_does_not() {
+        let plan = valid(
+            vec![
+                task("fetch", &[], "any", true),
+                agent_task("author", &["fetch"]),
+                evaluate_task("check", &["author"]),
+            ],
+            10.0,
+        );
+        let provenance = crate::plan::provenance::RunProvenance::new(
+            "run-1",
+            crucible_contract::provenance::DispatchProvenance {
+                cluster: Some("east".into()),
+                ..Default::default()
+            },
+            [],
+        );
+        let mut r = ScriptRunner::new();
+        execute(
+            &plan,
+            &any_substrate(),
+            ExecCfg {
+                provenance: Some(&provenance),
+                ..ExecCfg::default()
+            },
+            &mut r,
+            |_, _| {},
+        );
+        let of = |t: &str| {
+            r.seen_values[t]
+                .get(&TaskName(crate::plan::ir::PROVENANCE_INPUT.to_string()))
+                .cloned()
+        };
+        assert_eq!(
+            of("fetch"),
+            Some(json!({"run": "run-1", "task": "fetch", "cluster": "east", "agents": {}}))
+        );
+        assert_eq!(of("check").map(|p| p["task"].clone()), Some(json!("check")));
+        assert_eq!(of("author"), None);
+    }
+
+    #[test]
+    fn without_a_provenance_no_task_receives_one() {
+        let plan = valid(vec![task("fetch", &[], "any", true)], 10.0);
+        let mut r = ScriptRunner::new();
+        run_plan(&plan, &mut r);
+        assert_eq!(r.seen_inputs["fetch"], vec![PARAMS_INPUT.to_string()]);
     }
 
     /// A settled consumer's params is the reserved input, not a dependency entry wrapping it.

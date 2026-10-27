@@ -58,6 +58,7 @@ struct RunPodRender {
     git_identity: Option<crate::secrets::github_app::BotIdentity>,
     secret_name: String,
     delivery: crate::secrets::deliver::Delivery,
+    provenance: Option<String>,
 }
 
 impl RunPodRender {
@@ -94,6 +95,13 @@ impl RunPodRender {
         }
         if let Some(url) = self.public_url.as_deref() {
             set_container_env(&mut pod, "CRUCIBLE_UI_BASE_URL", url.trim_end_matches('/'));
+        }
+        if let Some(provenance) = self.provenance.as_deref() {
+            set_container_env(
+                &mut pod,
+                crucible_contract::provenance::ENV_PROVENANCE,
+                provenance,
+            );
         }
         if let Some(who) = self.git_identity.as_ref() {
             stamp_git_identity(&mut pod, who);
@@ -137,6 +145,8 @@ pub enum RunRenderOpts {
         agent: AgentSelection,
         /// The finished run this launch reruns.
         rerun: Option<crate::launches::model::RerunOf>,
+        /// The provider and sandbox image the launch resolved; the dispatch adds the cluster.
+        provenance: crucible_contract::provenance::DispatchProvenance,
     },
 }
 
@@ -169,6 +179,23 @@ impl RunRenderOpts {
     pub(crate) fn agent(&self) -> &AgentSelection {
         match self {
             RunRenderOpts::Loop { agent, .. } | RunRenderOpts::Playbook { agent, .. } => agent,
+        }
+    }
+
+    /// What the run is handed as [`crucible_contract::provenance::ENV_PROVENANCE`] once it lands
+    /// on `cluster`. `None` for the scored loop.
+    pub(crate) fn dispatch_provenance(
+        &self,
+        cluster: &str,
+    ) -> Option<crucible_contract::provenance::DispatchProvenance> {
+        match self {
+            RunRenderOpts::Loop { .. } => None,
+            RunRenderOpts::Playbook { provenance, .. } => {
+                Some(crucible_contract::provenance::DispatchProvenance {
+                    cluster: Some(cluster.to_owned()),
+                    ..provenance.clone()
+                })
+            }
         }
     }
 
@@ -701,6 +728,11 @@ pub async fn dispatch_run(
     };
 
     let cluster = crate::runs::workpod::issue_dispatch_cluster(db, cfg, issue_key).await?;
+    let provenance = opts
+        .dispatch_provenance(&cluster)
+        .map(|p| serde_json::to_string(&p))
+        .transpose()
+        .context("encoding the dispatch provenance")?;
     if isolated.is_some()
         && push_only(
             crate::runs::cluster_push::PushTokens::from_env()?.pushes_for(&cluster),
@@ -926,6 +958,7 @@ pub async fn dispatch_run(
         git_identity,
         secret_name: secret_name.clone(),
         delivery: delivery.clone(),
+        provenance,
     };
     // The render reads the pack and pins images, so it stays on a blocking thread; the pod + CM
     // creates are plain async kube calls awaited here.
