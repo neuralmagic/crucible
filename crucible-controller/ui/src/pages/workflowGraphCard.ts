@@ -182,6 +182,12 @@ export function fanoutLine(state: FanOutState): string {
   return parts.join(' · ');
 }
 
+/// How many instances a mapped task came to: the items it was spread over, or the instances that
+/// started when the run cannot say how many items there were.
+export function fanoutCount(state: FanOutState): number {
+  return state.items ?? state.started;
+}
+
 /// The fan-out's own rows in the task panel, listed above the run's.
 export function fanoutRows(state: FanOutState): DetailRow[] {
   return [

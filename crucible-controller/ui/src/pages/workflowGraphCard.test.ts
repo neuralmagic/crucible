@@ -4,6 +4,7 @@ import {
   decisionLines,
   decisionRows,
   detailRows,
+  fanoutCount,
   fanoutLine,
   fanoutRows,
   kindGlyph,
@@ -238,6 +239,12 @@ describe('what a run made of a mapped task', () => {
     ...overrides,
   });
   const failed = (count: number) => [{ status: 'fail', count }];
+
+  it('counts a fan-out by its items, or by what started when the items are unknown', () => {
+    expect(fanoutCount(spread())).toBe(4);
+    expect(fanoutCount(spread({ items: 0, started: 0 }))).toBe(0);
+    expect(fanoutCount(spread({ items: null, started: 3 }))).toBe(3);
+  });
 
   it('reads what passed against what went in', () => {
     expect(fanoutLine(spread())).toBe('4 · 4 passed');

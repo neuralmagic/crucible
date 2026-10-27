@@ -38,8 +38,6 @@ import {
   isPill,
   layoutWorkflow,
   LINK_STRIP,
-  STACK_CARDS,
-  STACK_STEP,
   type LaidOutEdge,
   type LaidOutNode,
   type LayoutDirection,
@@ -52,6 +50,7 @@ import {
   decisionLines,
   decisionRows,
   detailRows,
+  fanoutCount,
   fanoutLine,
   fanoutRows,
   kindGlyph,
@@ -270,24 +269,6 @@ function TaskCard({ id }: NodeProps) {
   return (
     <>
       <Handle type="target" position={ports.in} isConnectable={false} className="opacity-0" />
-      {/* A mapped task is drawn as the deck of instances it becomes at run time. */}
-      {fanout !== null &&
-        Array.from({ length: STACK_CARDS }, (_, i) => (
-          <span
-            key={i}
-            aria-hidden
-            className={cn(
-              'absolute inset-0 border border-rule-hard',
-              route ? 'bg-sunk' : 'bg-raised'
-            )}
-            style={{
-              transform: `translate(${(STACK_CARDS - i) * STACK_STEP}px, ${
-                (STACK_CARDS - i) * STACK_STEP
-              }px)`,
-              opacity: dim ? 0.2 : 1,
-            }}
-          />
-        ))}
       <button
         type="button"
         data-task={node.name}
@@ -343,6 +324,11 @@ function TaskCard({ id }: NodeProps) {
           >
             {node.name}
           </span>
+          {spread !== null && (
+            <span data-count={node.name} className="shrink-0 font-mono text-label text-ink-2">
+              ×{fanoutCount(spread)}
+            </span>
+          )}
           {runtime !== null && <StatusDot runtime={runtime} />}
         </span>
 
@@ -406,7 +392,6 @@ function InstanceRow({ laid }: { laid: LaidOutNode }) {
   const links = view.links.get(node.name) ?? null;
   const link = links?.kind === 'links' ? (links.links[0] ?? null) : null;
   const ports = PORTS[view.direction];
-  const stack = STACK_CARDS * STACK_STEP;
 
   return (
     <>
@@ -418,7 +403,7 @@ function InstanceRow({ laid }: { laid: LaidOutNode }) {
           style={{
             left: -INSTANCE_INDENT / 2,
             width: INSTANCE_INDENT / 2,
-            top: -(INSTANCE_GAP + (instance.index === 0 ? stack : INSTANCE_H / 2)),
+            top: -(INSTANCE_GAP + (instance.index === 0 ? 0 : INSTANCE_H / 2)),
             bottom: INSTANCE_H / 2,
             opacity: dim ? 0.2 : 1,
           }}

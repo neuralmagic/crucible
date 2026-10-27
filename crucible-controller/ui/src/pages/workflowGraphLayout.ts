@@ -83,11 +83,8 @@ const LABEL_CHAR = 6.1;
 const LABEL_PAD = 12;
 const ROW_GAP = 12;
 const PAD = 10;
-/// Offset of each card behind a mapped task, and how many are drawn.
-export const STACK_STEP = 4;
 const BEND_GUTTER = 14;
 const BEND_GAP = 12;
-export const STACK_CARDS = 2;
 /// An instance row: its height, its width top down, how far it is indented under its deck left to
 /// right, and the gap between rows.
 export const INSTANCE_H = 24;
@@ -460,7 +457,6 @@ export function layoutWorkflow(
   // Left to right the rows hang under the card, indented; top down they sit beside it, centred
   // on it, so no edge into or out of a row runs through the card or another row.
   const instanceInset = direction === 'LR' ? INSTANCE_INDENT : (NODE_H - INSTANCE_H) / 2;
-  const stack = STACK_CARDS * STACK_STEP;
 
   const byName = new Map(graph.nodes.map((n) => [n.name, n]));
   const sizeOf = (name: string): Along => {
@@ -471,13 +467,10 @@ export function layoutWorkflow(
     const width = pillWidth(name, pills.trailing.get(name) ?? 0);
     return direction === 'LR' ? [width, PILL_H] : [PILL_H, width];
   };
-  const stackOf = (name: string): number => ((byName.get(name)?.fanout ?? null) === null ? 0 : stack);
   const extentOf = (head: string): number =>
-    sizeOf(head)[1] +
-    stackOf(head) +
-    (members.get(head)?.length ?? 0) * (instanceAcross + INSTANCE_GAP);
+    sizeOf(head)[1] + (members.get(head)?.length ?? 0) * (instanceAcross + INSTANCE_GAP);
   const memberOffset = (deck: string, index: number): number =>
-    sizeOf(deck)[1] + stackOf(deck) + INSTANCE_GAP + index * (instanceAcross + INSTANCE_GAP);
+    sizeOf(deck)[1] + INSTANCE_GAP + index * (instanceAcross + INSTANCE_GAP);
   const middleOffset = (name: string): number => {
     const deck = deckOf(name);
     if (deck === null) return sizeOf(name)[1] / 2;
@@ -541,7 +534,7 @@ export function layoutWorkflow(
       const bendCount = layer.filter((c) => !byName.has(c)).length;
       const reach = bendCount === 0 ? bottomOf(layer) : laneAt(layer) + (bendCount - 1) * BEND_GAP;
       return Math.max(most, reach);
-    }, PAD + acrossSize + stack) + PAD;
+    }, PAD + acrossSize) + PAD;
 
   const gaps = layers.slice(1).map(() => LAYER_GAP);
   for (const edge of drawn) {
