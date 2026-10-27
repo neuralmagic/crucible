@@ -844,6 +844,51 @@ describe('pills', () => {
   });
 });
 
+/// scan -> fix narrows notes, but scan -> triage -> fix already orders the two: the edge is
+/// plumbing, drawn on demand like its label. One that carries a when or a join is not.
+describe('implied edges', () => {
+  const doc = (overrides: Partial<WorkflowGraphDoc['edges'][number]>): WorkflowGraphDoc => ({
+    workflow_type: 'playbook',
+    result: null,
+    nodes: [task('scan'), task('triage'), task('fix'), task('side')],
+    edges: [
+      edge('scan', 'triage'),
+      edge('triage', 'fix'),
+      edge('scan', 'fix', { keyed: ['notes'], ...overrides }),
+      edge('scan', 'side', { keyed: ['notes'] }),
+    ],
+  });
+  const implied = (layout: ReturnType<typeof layoutWorkflow>, from: string, to: string) =>
+    layout.edges.find((e) => e.from === from && e.to === to)?.implied;
+
+  it('marks an edge a longer path already implies when it carries only plumbing', () => {
+    const layout = layoutWorkflow(doc({}));
+    expect(implied(layout, 'scan', 'fix')).toBe(true);
+    expect(implied(layout, 'scan', 'triage')).toBe(false);
+    expect(implied(layout, 'triage', 'fix')).toBe(false);
+    expect(implied(layout, 'scan', 'side')).toBe(false);
+  });
+
+  it('keeps an implied edge drawn when it carries a when or a join', () => {
+    const when = { route: 'scan', question: 'tier', labels: ['high'] };
+    expect(implied(layoutWorkflow(doc({ when })), 'scan', 'fix')).toBe(false);
+    expect(implied(layoutWorkflow(doc({ join: 'passed' })), 'scan', 'fix')).toBe(false);
+    expect(implied(layoutWorkflow(doc({ join: 'settled' })), 'scan', 'fix')).toBe(false);
+  });
+
+  /// An instance's edge is read at its deck: a row-to-row edge is implied only if the decks are.
+  it('reads reachability between decks, not between instance rows', () => {
+    const over = { over_task: 'scan', over_field: 'items', max_fanout: null };
+    const run: WorkflowGraphDoc = {
+      workflow_type: 'run',
+      result: null,
+      nodes: [task('scan'), task('gate', { fanout: over }), task('fix', { fanout: over }), task('gate[a]'), task('fix[a]')],
+      edges: [edge('scan', 'gate'), edge('gate[a]', 'fix[a]', { aligned: true }), edge('gate', 'gate[a]')],
+    };
+    expect(implied(layoutWorkflow(run), 'gate[a]', 'fix[a]')).toBe(false);
+  });
+});
+
 /// What an edge carries is plumbing: shown on demand, so it never widens a gutter.
 describe('plumbing labels', () => {
   it('leaves a gutter narrow for an edge that only narrows a field or stages a file', () => {

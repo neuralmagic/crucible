@@ -601,6 +601,7 @@ function PlanEdge({ id }: EdgeProps) {
   const fade = dim ? 0.15 : untaken ? 0.45 : 1;
   const double = laid.aligned && !untaken;
   const plumbing = lit || view.hoveredEdge === id ? laid.plumbing : null;
+  if (laid.implied && !lit) return null;
 
   return (
     <>

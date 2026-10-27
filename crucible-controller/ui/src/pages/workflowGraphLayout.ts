@@ -45,6 +45,9 @@ export interface LaidOutEdge {
   required: boolean;
   /// Both ends map over the same list, so each instance reads its counterpart, not the fold.
   aligned: boolean;
+  /// A longer path already orders the two ends and the edge says nothing but plumbing, so it is
+  /// drawn only while traced.
+  implied: boolean;
 }
 
 export interface WorkflowLayout {
@@ -631,6 +634,25 @@ export function layoutWorkflow(
     return [leaving ? along + length : along, across + breadth / 2];
   };
 
+  const next = new Map<string, Set<string>>();
+  for (const edge of drawn) {
+    const [head, tail] = [headOf(edge.from), headOf(edge.to)];
+    next.set(head, (next.get(head) ?? new Set()).add(tail));
+  }
+  // Whether `to` is reachable from `from` without the direct step between them.
+  const roundabout = (from: string, to: string): boolean => {
+    const pending = [...(next.get(from) ?? [])].filter((name) => name !== to);
+    const seen = new Set<string>([from]);
+    while (pending.length > 0) {
+      const name = pending.pop();
+      if (name === undefined || seen.has(name)) continue;
+      if (name === to) return true;
+      seen.add(name);
+      pending.push(...(next.get(name) ?? []));
+    }
+    return false;
+  };
+
   const laidEdges: LaidOutEdge[] = [];
   drawn.forEach((edge, i) => {
     const from = placed.get(edge.from);
@@ -694,6 +716,11 @@ export function layoutWorkflow(
       labelY,
       required: edge.required,
       aligned: edge.aligned,
+      implied:
+        edgeWhen(edge) === null &&
+        edge.join !== 'passed' &&
+        edge.join !== 'settled' &&
+        roundabout(headOf(edge.from), headOf(edge.to)),
     });
   });
 
