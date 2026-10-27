@@ -43,17 +43,23 @@ export function SectionHeader({ title, note, actions, className }: SectionHeader
 export interface FoldSectionProps {
   title: ReactNode;
   note?: ReactNode;
+  /** Trailing slot that stays on the header line while the section is closed. */
+  actions?: ReactNode;
   children: ReactNode;
   className?: string;
 }
 
 /** A section that starts closed: its header is the toggle. */
-export function FoldSection({ title, note, children, className }: FoldSectionProps) {
-  return (
+export function FoldSection({ title, note, actions, children, className }: FoldSectionProps) {
+  const fold = (
     <details data-ui="section" className={cn('group border-b border-rule-hard', className)}>
       <summary
         data-ui="section-header"
-        className={cn(HEADER, 'cursor-pointer list-none select-none [&::-webkit-details-marker]:hidden')}
+        className={cn(
+          HEADER,
+          'cursor-pointer list-none select-none [&::-webkit-details-marker]:hidden',
+          actions !== undefined && 'min-h-11',
+        )}
       >
         <span aria-hidden className="text-ink-3 transition-transform group-open:rotate-90">
           {'\u25b8'}
@@ -63,6 +69,13 @@ export function FoldSection({ title, note, children, className }: FoldSectionPro
       </summary>
       {children}
     </details>
+  );
+  if (actions === undefined) return fold;
+  return (
+    <div className="relative">
+      {fold}
+      <span className="absolute top-0 right-4.5 flex h-11 items-center gap-2">{actions}</span>
+    </div>
   );
 }
 

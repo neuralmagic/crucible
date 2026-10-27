@@ -278,6 +278,7 @@ test.describe('the launch view', () => {
     });
     await ready(page, LAUNCH);
 
+    await page.locator('summary', { hasText: 'Rerun' }).click();
     const tasks = page.getByTestId('rerun-tasks');
     await expect(tasks.locator('li[data-state="reused"]')).toHaveCount(2);
     await expect(tasks.locator('li[data-state="reruns"]')).toContainText('rank');
@@ -323,6 +324,7 @@ test.describe('the launch view', () => {
     });
     await ready(page, LAUNCH);
 
+    await page.locator('summary', { hasText: 'Rerun' }).click();
     const tasks = page.getByTestId('rerun-tasks');
     await expect(tasks.locator('li[data-state="changed"]')).toContainText('discover');
     await expect(page.getByRole('button', { name: /^Rerun \d/ })).toBeDisabled();

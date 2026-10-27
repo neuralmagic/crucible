@@ -13,6 +13,7 @@ import {
   relaunchPath,
   rerunLaunchBody,
   rerunRows,
+  rerunSummary,
   withTask,
 } from './launchView';
 
@@ -114,6 +115,20 @@ describe('launchWallSecs', () => {
     expect(launchWallSecs([ev('new', 'new', '2026-10-27T02:00:00Z')])).toBeNull();
     expect(launchWallSecs([])).toBeNull();
     expect(launchWallSecs([ev('new', 'running', 'soon'), ev('running', 'done', 'later')])).toBeNull();
+  });
+});
+
+describe('rerunSummary', () => {
+  const row = (task: string, state: 'reused' | 'reruns' | 'changed') => ({ task, state, costUsd: null });
+
+  it('says all reused when nothing would run again', () => {
+    expect(rerunSummary([row('a', 'reused'), row('b', 'reused')])).toBe('2 tasks · all reused');
+  });
+
+  it('counts each state otherwise, leaving out the ones at zero', () => {
+    expect(rerunSummary([row('a', 'reused'), row('b', 'reruns'), row('c', 'reruns')])).toBe('3 tasks · 1 reused · 2 rerun');
+    expect(rerunSummary([row('a', 'changed')])).toBe('1 task · 1 changed');
+    expect(rerunSummary([])).toBe('0 tasks');
   });
 });
 

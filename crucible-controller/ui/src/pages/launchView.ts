@@ -147,6 +147,20 @@ export interface RerunRow {
 
 /// A rerun's tasks as the panel lists them: what is reused in the order the parent settled it,
 /// then what runs again, then any reused task that changed since the parent.
+/** A rerun preview in one line: how many tasks, and how many of each are reused, rerun or changed. */
+export function rerunSummary(rows: readonly RerunRow[]): string {
+  const tasks = `${rows.length} ${rows.length === 1 ? 'task' : 'tasks'}`;
+  const count = (state: RerunState) => rows.filter((row) => row.state === state).length;
+  const reused = count('reused');
+  if (rows.length > 0 && reused === rows.length) return `${tasks} · all reused`;
+  const parts: [number, string][] = [
+    [reused, 'reused'],
+    [count('reruns'), 'rerun'],
+    [count('changed'), 'changed'],
+  ];
+  return [tasks, ...parts.filter(([n]) => n > 0).map(([n, word]) => `${n} ${word}`)].join(' · ');
+}
+
 export function rerunRows(preview: RerunPreview): RerunRow[] {
   return [
     ...preview.reused.map((r) => ({ task: r.task, state: 'reused' as const, costUsd: r.cost_usd })),
