@@ -9,6 +9,8 @@ import {
   fanoutRows,
   kindGlyph,
   metaFor,
+  pillChip,
+  pillChipChars,
   runsLine,
   runtimeLine,
   runtimeRows,
@@ -434,5 +436,32 @@ describe('the one status signal', () => {
     expect(kindGlyph(task('a', { kind: 'route', fanout: over }))).toBe(
       kindGlyph(task('a', { kind: 'route' }))
     );
+  });
+});
+
+describe('pillChip', () => {
+  const jira = (key: string) => ({ url: `https://tracker.example.com/browse/${key}`, provider: 'jira', kind: 'issue', label: key });
+  const pr = { url: 'https://github.com/example/repo-a/pull/9', provider: 'github', kind: 'pull_request', label: '#9' };
+
+  it('keeps a lone link as the chip it is', () => {
+    expect(pillChip({ kind: 'links', links: [pr] })).toEqual({ kind: 'link', link: pr });
+    expect(pillChipChars(pillChip({ kind: 'links', links: [pr] }))).toBe(5);
+  });
+
+  it('counts several links under the mark they share', () => {
+    const chip = pillChip({ kind: 'links', links: [jira('ITEM-1306'), jira('ITEM-1307')] });
+    expect(chip).toEqual({ kind: 'count', provider: 'jira', count: 2 });
+    expect(pillChipChars(chip)).toBe(4);
+  });
+
+  it('counts mixed links under no one provider', () => {
+    expect(pillChip({ kind: 'links', links: [jira('ITEM-1306'), pr] })).toEqual({ kind: 'count', provider: '', count: 2 });
+  });
+
+  it('draws nothing for no links or a deck count', () => {
+    expect(pillChip(null)).toBeNull();
+    expect(pillChip({ kind: 'links', links: [] })).toBeNull();
+    expect(pillChip({ kind: 'counts', counts: [{ provider: 'jira', count: 2 }] })).toBeNull();
+    expect(pillChipChars(null)).toBe(0);
   });
 });

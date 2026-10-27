@@ -38,6 +38,7 @@ import {
   isPill,
   layoutWorkflow,
   LINK_STRIP,
+  PILL_NOTE_CHAR,
   type LaidOutEdge,
   type LaidOutNode,
   type LayoutDirection,
@@ -55,6 +56,8 @@ import {
   fanoutRows,
   kindGlyph,
   metaFor,
+  pillChip,
+  pillChipChars,
   runsLine,
   runtimeLine,
   runtimeRows,
@@ -448,8 +451,8 @@ function InstanceRow({ laid }: { laid: LaidOutNode }) {
   );
 }
 
-/// The room a pill keeps for the link chip drawn over its end, in characters of its note.
-const PILL_LINK_CHROME = 3;
+/// Pixels between a pill's name and the chip drawn over its end, plus the chip's inset.
+const PILL_CHIP_GAP = 14;
 
 /// A plain command task in a run, drawn as one line: how it ended, its name, and what its attempts
 /// cost when that is anything worth saying.
@@ -460,8 +463,7 @@ function TaskPill({ laid }: { laid: LaidOutNode }) {
   const dim = view.lit !== null && !view.lit.has(node.name);
   const runtime = view.runtime.get(node.name) ?? null;
   const ran = runtime === null ? null : runtimeLine(runtime);
-  const links = view.links.get(node.name) ?? null;
-  const link = links?.kind === 'links' ? (links.links[0] ?? null) : null;
+  const chip = pillChip(view.links.get(node.name) ?? null);
   const ports = PORTS[view.direction];
 
   return (
@@ -477,13 +479,17 @@ function TaskPill({ laid }: { laid: LaidOutNode }) {
           if (event.currentTarget.matches(':focus-visible')) view.onTrace(node.name);
         }}
         onBlur={() => view.onTrace(null)}
-        style={{ opacity: dim ? 0.2 : 1, transition: 'opacity 120ms linear' }}
+        style={{
+          opacity: dim ? 0.2 : 1,
+          transition: 'opacity 120ms linear',
+          paddingRight:
+            chip === null ? undefined : Math.ceil(pillChipChars(chip) * PILL_NOTE_CHAR) + PILL_CHIP_GAP,
+        }}
         className={cn(
           'flex h-full w-full items-center gap-1.5 overflow-hidden bg-raised px-2.5 text-left font-mono leading-none',
           advisory ? 'border border-dashed border-rule-hard' : 'border border-ink-3',
           laid.isResult && 'border-2 border-ink',
           runtime !== null && MARK_BORDER[statusMark(runtime)],
-          link !== null && 'pr-12',
           view.picked === node.name && 'outline-2 outline-offset-2 outline-blue'
         )}
       >
@@ -504,13 +510,24 @@ function TaskPill({ laid }: { laid: LaidOutNode }) {
           </span>
         )}
       </button>
-      {link !== null && (
+      {chip !== null && (
         <span
           data-node-links={node.name}
           style={{ opacity: dim ? 0.2 : 1 }}
           className="pointer-events-none absolute inset-y-0 right-2 flex items-center"
         >
-          <ExternalLinkChip link={link} className="pointer-events-auto border-b-0 text-micro" />
+          {chip.kind === 'link' ? (
+            <ExternalLinkChip link={chip.link} className="pointer-events-auto border-b-0 text-micro" />
+          ) : (
+            <span
+              data-link-count={chip.count}
+              aria-label={`${chip.count} links`}
+              className="inline-flex items-center gap-1 font-mono text-micro text-ink-2"
+            >
+              <ExternalLinkMark provider={chip.provider} />
+              {chip.count}
+            </span>
+          )}
         </span>
       )}
       <Handle type="source" position={ports.out} isConnectable={false} className="opacity-0" />
@@ -752,9 +769,7 @@ function GraphCanvas({
     for (const node of graph.nodes) {
       const state = runtime.get(node.name);
       const note = state === undefined ? null : runtimeLine(state);
-      const drawn = links?.get(node.name);
-      const first = drawn?.kind === 'links' ? drawn.links[0] : undefined;
-      const linked = first === undefined ? 0 : first.label.length + PILL_LINK_CHROME;
+      const linked = pillChipChars(pillChip(links?.get(node.name) ?? null));
       const chars = (note?.length ?? 0) + linked;
       if (chars > 0) trailing.set(node.name, chars);
     }

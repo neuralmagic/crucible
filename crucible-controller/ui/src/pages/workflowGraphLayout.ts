@@ -77,7 +77,7 @@ export const NODE_H = 78;
 export const PILL_H = 26;
 export const PILL_MIN_W = 72;
 const PILL_CHAR = 7.3;
-const PILL_NOTE_CHAR = 6.1;
+export const PILL_NOTE_CHAR = 6.1;
 const PILL_CHROME = 38;
 export const LINK_STRIP = 14;
 /// Gap between layers, along the direction the graph runs, and between the cards of one layer.

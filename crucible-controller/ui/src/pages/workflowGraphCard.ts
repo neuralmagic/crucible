@@ -2,7 +2,8 @@
 // kept out of the renderer so the mapping is testable without a flow.
 
 import { formatCost } from './runReport';
-import type { FanOutState, RouteDecision, TaskRuntime } from './taskGraph';
+import type { ExternalLinkRef } from '../ui';
+import type { FanOutState, NodeLinks, RouteDecision, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
 
 /// A field the wire may carry as absent, null, or a string.
@@ -215,4 +216,25 @@ export function runtimeRows(runtime: TaskRuntime): DetailRow[] {
     { label: 'cost', value: formatCost(runtime.costUsd) },
     { label: 'took', value: runtime.secs === null ? '—' : formatSecs(runtime.secs) },
   ];
+}
+
+/// The chip drawn over a pill's end: its one link as it is, several as a count under one mark (the
+/// provider's, when they share one). The links themselves are on the run's header.
+export type PillChip =
+  | { kind: 'link'; link: ExternalLinkRef }
+  | { kind: 'count'; provider: string; count: number };
+
+export function pillChip(drawn: NodeLinks | null): PillChip | null {
+  if (drawn === null || drawn.kind !== 'links') return null;
+  const [first, second] = drawn.links;
+  if (first === undefined) return null;
+  if (second === undefined) return { kind: 'link', link: first };
+  const shared = drawn.links.every((link) => link.provider === first.provider);
+  return { kind: 'count', provider: shared ? first.provider : '', count: drawn.links.length };
+}
+
+/// The room a pill chip takes, in characters of the pill's note: its text plus the mark and gaps.
+export function pillChipChars(chip: PillChip | null): number {
+  if (chip === null) return 0;
+  return (chip.kind === 'link' ? chip.link.label.length : String(chip.count).length) + 3;
 }
