@@ -37,10 +37,10 @@ lsp-install:
     cargo install --locked --path crucible-lsp
     crucible-lsp --version
 
-# Package the VS Code extension and install it into `code`.
-vscode-install:
+# Package the VS Code extension and install it with an editor's CLI: `code`, `cursor`, `codium`...
+vscode-install editor="code":
     cd editors/vscode && bun install --frozen-lockfile && bun run check && bun run build && bun run package
-    code --install-extension editors/vscode/crucible-starlark.vsix --force
+    {{editor}} --install-extension editors/vscode/crucible-starlark.vsix --force
 
 # Install the Claude Code plugin for `crucible-lsp`. A running session needs `/reload-plugins`.
 claude-install:

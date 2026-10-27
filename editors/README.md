@@ -6,12 +6,28 @@ the errors `crucible` would give you.
 
 ## Install the server
 
+Download it from the latest [release](https://github.com/neuralmagic/crucible/releases). Each
+release has a tarball per platform with all the crucible binaries; you only need `crucible-lsp`.
+On an Apple silicon Mac:
+
+```bash
+gh release download --repo neuralmagic/crucible --pattern 'crucible-*-aarch64-apple-darwin.tar.gz'
+tar -xzf crucible-*-aarch64-apple-darwin.tar.gz ./crucible-lsp
+mv crucible-lsp ~/.local/bin/
+```
+
+On Linux, use the `x86_64-unknown-linux-gnu` tarball. Put `crucible-lsp` anywhere on your PATH.
+If you downloaded the tarball in a browser on macOS, clear the quarantine flag first:
+`xattr -d com.apple.quarantine crucible-lsp`.
+
+To build it from a checkout instead:
+
 ```bash
 just lsp-install
 ```
 
-This installs `crucible-lsp` into `~/.cargo/bin`. Every editor below starts it from there. Run it
-again after you pull changes to the workflow language.
+This installs `crucible-lsp` into `~/.cargo/bin`. Run it again after you pull changes to the
+workflow language.
 
 ## Neovim (0.11+)
 
@@ -29,15 +45,23 @@ return {
 Then add `vim.lsp.enable("crucible_lsp")` to `init.lua`. Neovim already treats `*.star` files as
 `starlark`. For syntax highlighting, install the tree-sitter parser with `:TSInstall starlark`.
 
-## VS Code
+## VS Code and its forks
+
+Each release also has the extension, `crucible-starlark-<version>.vsix`. Install it with your
+editor's command line tool:
 
 ```bash
-just vscode-install
+gh release download --repo neuralmagic/crucible --pattern 'crucible-starlark-*.vsix'
+code --install-extension crucible-starlark-*.vsix
 ```
 
-This builds the extension in `editors/vscode` and installs it. It adds syntax highlighting for
-`*.star` files and starts `crucible-lsp`. To use a different build of the server, set
-`crucible.server.path`.
+The same file works in Cursor (`cursor`), Windsurf (`windsurf`), VSCodium (`codium`), code-server,
+and openvscode-server; use their command instead of `code`, or **Install from VSIX...** in the
+Extensions view. To build it from a checkout: `just vscode-install` (or `just vscode-install
+cursor`, and so on).
+
+The extension adds syntax highlighting for `*.star` files and starts `crucible-lsp` from your
+PATH. To use a different build of the server, set `crucible.server.path`.
 
 ## Claude Code (CLI and desktop)
 
@@ -45,9 +69,10 @@ This builds the extension in `editors/vscode` and installs it. It adds syntax hi
 just claude-install
 ```
 
-This installs a Claude Code plugin that starts `crucible-lsp` for `.star` files. Claude then sees
-errors and warnings after each edit, and can look up definitions, references, and symbols. New
-sessions pick it up automatically; in a session that is already open, run `/reload-plugins`.
+Run this from a checkout of this repository. It installs a Claude Code plugin that starts
+`crucible-lsp` for `.star` files. Claude then sees errors and warnings after each edit, and can
+look up definitions, references, and symbols. New sessions pick it up automatically; in a session
+that is already open, run `/reload-plugins`.
 
 The plugin is installed from this checkout's path. If you delete the checkout, run
 `just claude-install` again from the one you keep.
