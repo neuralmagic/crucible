@@ -142,11 +142,18 @@ export function selectRunFile(
     return hit === undefined ? { state: 'missing', key: requested } : { state: 'found', file: hit };
   }
   const rank = (e: RunFile) => order.indexOf(e.task);
-  const report = entries
+  const captured = entries.filter((e) => e.size_bytes !== 0);
+  const report = captured
     .filter((e) => e.path.toLowerCase() === 'report.md')
     .reduce<RunFile | undefined>((best, e) => (best === undefined || rank(e) > rank(best) ? e : best), undefined);
-  const fallback = report ?? entries.find((e) => inlineKind(e.path) === 'markdown') ?? entries[0];
+  const fallback =
+    report ?? captured.find((e) => inlineKind(e.path) === 'markdown') ?? captured[0] ?? entries[0];
   return fallback === undefined ? { state: 'empty' } : { state: 'found', file: fallback };
+}
+
+/** The files worth listing: an empty capture is left out unless it is the one open. */
+export function listedFiles(entries: readonly RunFile[], openKey: string | null): RunFile[] {
+  return entries.filter((e) => e.size_bytes !== 0 || e.key === openKey);
 }
 
 /**

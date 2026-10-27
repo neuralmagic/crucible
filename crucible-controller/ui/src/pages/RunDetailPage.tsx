@@ -74,6 +74,7 @@ import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView
 import {
   downloadName,
   imageMimeType,
+  listedFiles,
   parseRunFilePath,
   prettyJson,
   producerOf,
@@ -1321,13 +1322,15 @@ function FilesPanel({
   }
 
   const selectedKey = selection.state === 'found' ? selection.file.key : null;
+  const listed = listedFiles(entries, selectedKey);
+  const empty = entries.length - listed.length;
 
   return (
     <div ref={anchor}>
       <Section>
         <SectionHeader
           title="Files"
-          note={`${entries.length} files`}
+          note={`${listed.length} files${empty > 0 ? ` · ${empty} empty` : ''}`}
           actions={
             selection.state === 'found' && (
               <CopyLinkButton route={{ launchKey, runId, fileKey: selection.file.key }} />
@@ -1346,7 +1349,7 @@ function FilesPanel({
             minSize="3rem"
             className="overflow-y-auto bg-surface"
           >
-            {entries.map((e) => (
+            {listed.map((e) => (
               <div
                 key={e.key}
                 className={cn(
