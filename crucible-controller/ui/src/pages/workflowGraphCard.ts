@@ -22,6 +22,26 @@ export function badgeFor(node: WorkflowGraphNode): string {
   return 'TASK';
 }
 
+/// The glyph a card shows for what runs the task; `badgeFor` is its name.
+export function kindGlyph(node: WorkflowGraphNode): string {
+  if (node.kind === 'route') return '◇';
+  if ((node.fanout ?? null) !== null) return '≡';
+  if (node.kind === 'agent') return '✦';
+  if (node.kind === 'command') return '›';
+  if (node.kind === 'engine') return '⚙';
+  return '·';
+}
+
+/// How a node's status dot reads: passed, failed, not reached yet in a run still going, or ended
+/// some other way (skipped, blocked, not taken, never ran).
+export type StatusMark = 'pass' | 'fail' | 'active' | 'idle';
+
+export function statusMark(runtime: TaskRuntime): StatusMark {
+  if (runtime.tone === 'pass') return 'pass';
+  if (runtime.tone === 'fail') return 'fail';
+  return runtime.status === 'pending' ? 'active' : 'idle';
+}
+
 /// One line of secondary text, or none. A mapped task says what it maps over, since that is what
 /// makes it many tasks; otherwise where it runs. What it emits is drawn as chips beside it.
 export function metaFor(node: WorkflowGraphNode): string | null {
@@ -117,15 +137,17 @@ export function sourceFor(node: WorkflowGraphNode): { label: string; body: strin
   return null;
 }
 
-/// A run's node state, as the card's status line reads it: where the task ended, how many attempts
-/// it took, and what those attempts cost.
+/// A run's node state, as the card's status line reads it: the iteration it ended in when that was
+/// a retry, how many attempts it took, and what those attempts cost and took. A zero says nothing,
+/// so it is left out, and a task with nothing to say has no line.
 export function runtimeLine(runtime: TaskRuntime): string | null {
   if (!runtime.reported) return null;
-  const parts = [`iter ${runtime.latestIter}`];
+  const parts: string[] = [];
+  if (runtime.latestIter > 0) parts.push(`iter ${runtime.latestIter}`);
   if (runtime.attempts > 1) parts.push(`${runtime.attempts} attempts`);
-  if (runtime.costUsd !== null) parts.push(formatCost(runtime.costUsd));
-  if (runtime.secs !== null) parts.push(formatSecs(runtime.secs));
-  return parts.join(' · ');
+  if (runtime.costUsd !== null && runtime.costUsd > 0) parts.push(formatCost(runtime.costUsd));
+  if (runtime.secs !== null && runtime.secs > 0) parts.push(formatSecs(runtime.secs));
+  return parts.length === 0 ? null : parts.join(' · ');
 }
 
 /// The width to read a fan-out against, or null when there is none to read it against. A run

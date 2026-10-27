@@ -31,13 +31,14 @@ export interface LaidOutEdge {
   to: string;
   /// Cubics through the gutter between each pair of layers the edge spans.
   path: string;
-  /// What rides the edge: `passed` when the consumer joins on it, and the files the
-  /// producer stages into the consumer (`ISSUES.md`, `TRIAGE.md +1`), dot-separated.
+  /// How the consumer joins on the edge: `passed` or `settled`.
   label: string | null;
-  /// What the consumer reads off the edge rather than what rides it: its `when` (`tier: high|low`)
-  /// and the fields it narrows to each instance (`notes[item]`), dot-separated. Data, so drawn in
-  /// its own case.
+  /// The route answers the consumer runs on (`tier: high|low`). Data, so drawn in its own case.
   reads: string | null;
+  /// What the edge carries: the fields the consumer narrows to each instance (`notes[item]`) and
+  /// the files the producer stages into it (`ISSUES.md`, `TRIAGE.md +1`), dot-separated. Shown
+  /// only while the edge is traced or hovered.
+  plumbing: string | null;
   labelX: number;
   labelY: number;
   /// The consumer's flag: an edge into an advisory task is itself advisory.
@@ -58,16 +59,24 @@ export interface WorkflowLayout {
   crossings: number;
 }
 
-/// Every task is drawn in the same box: the card holds a badge, the name, what the task runs, what
-/// it maps over and what it emits, and a uniform box is what keeps the layers readable. The foot
-/// of the box is kept clear of text for what the task linked out to.
-export const NODE_W = 176;
-export const NODE_H = 86;
+/// Every task is drawn in the same box: the card holds its name, what the task runs, what it maps
+/// over and what it emits, and a uniform box is what keeps the layers readable. The foot of the
+/// box is kept clear of text for what the task linked out to.
+export const NODE_W = 156;
+export const NODE_H = 78;
+/// A plain command task in a run says only its name and how it ended, on one line, in a box as
+/// wide as that line: the advance of a character of its name (12px mono) and of its trailing
+/// note (10px mono), and what the dot and the padding take.
+export const PILL_H = 26;
+export const PILL_MIN_W = 72;
+const PILL_CHAR = 7.3;
+const PILL_NOTE_CHAR = 6.1;
+const PILL_CHROME = 38;
 export const LINK_STRIP = 14;
 /// Gap between layers, along the direction the graph runs, and between the cards of one layer.
-const LAYER_GAP = 44;
-/// Advance of one character of an edge label (9px mono), and the label's own padding.
-const LABEL_CHAR = 5.6;
+export const LAYER_GAP = 32;
+/// Advance of one character of an edge label (10px mono), and the label's own padding.
+const LABEL_CHAR = 6.1;
 const LABEL_PAD = 12;
 const ROW_GAP = 12;
 const PAD = 10;
@@ -85,11 +94,12 @@ export const INSTANCE_GAP = 4;
 
 /// The zoom a fitted graph is clamped to: below the floor its text is unreadable, so a long graph
 /// is shown from its start and panned instead.
-export const FIT_MIN_ZOOM = 0.85;
+export const FIT_MIN_ZOOM = 0.7;
 export const FIT_MAX_ZOOM = 1.35;
 /// Room the fit leaves around the graph; the top clears the toolbar.
 const FIT_PAD = { top: 40, right: 12, bottom: 12, left: 12 };
 const FRAME_MIN_H = 240;
+const FRAME_PANEL_H = 480;
 
 export interface Viewport {
   x: number;
@@ -117,15 +127,17 @@ export function fitViewport(
 }
 
 /// The heights the in-page frame may take: enough to hold the graph at the legible floor, and no
-/// more than it needs at the largest zoom.
-export function frameHeights(graph: { width: number; height: number }): {
-  min: number;
-  max: number;
-} {
+/// more than it needs at the largest zoom. An open task panel shares the frame and needs room to
+/// read evidence in, however short the graph beside it.
+export function frameHeights(
+  graph: { width: number; height: number },
+  panel: boolean
+): { min: number; max: number } {
   const pad = FIT_PAD.top + FIT_PAD.bottom;
+  const floor = panel ? FRAME_PANEL_H : FRAME_MIN_H;
   return {
-    min: Math.max(FRAME_MIN_H, Math.ceil(graph.height * FIT_MIN_ZOOM + pad)),
-    max: Math.max(FRAME_MIN_H, Math.ceil(graph.height * FIT_MAX_ZOOM + pad)),
+    min: Math.max(floor, Math.ceil(graph.height * FIT_MIN_ZOOM + pad)),
+    max: Math.max(floor, Math.ceil(graph.height * FIT_MAX_ZOOM + pad)),
   };
 }
 
@@ -321,23 +333,36 @@ function bendPrefix(names: Iterable<string>): string {
   return prefix;
 }
 
-/// What the consumer reads off an edge: the answers its `when` runs on, then each field it narrows
-/// to the instance's own entry.
-export function edgeReads(edge: WorkflowGraphEdge): string[] {
+/// The route answers an edge's consumer runs on, as its label reads them.
+export function edgeWhen(edge: WorkflowGraphEdge): string | null {
   const when = edge.when ?? null;
-  return [
-    ...(when === null ? [] : [`${when.question}: ${when.labels.join('|')}`]),
-    ...edge.keyed.map((field) => `${field}[item]`),
-  ];
+  return when === null ? null : `${when.question}: ${when.labels.join('|')}`;
+}
+
+/// Plain command tasks drawn as pills, and the characters each one trails its name with (its
+/// figures, its link), by task name.
+export interface PillOptions {
+  trailing: ReadonlyMap<string, number>;
+}
+
+/// Whether a node is drawn as a one-line pill: a plain command task, once the graph is a run's.
+export function isPill(node: WorkflowGraphNode, pills: PillOptions | null): boolean {
+  return pills !== null && node.kind === 'command' && (node.fanout ?? null) === null;
+}
+
+/// How wide a pill is: its name and whatever trails it, within a floor and a card's width.
+export function pillWidth(name: string, trailing: number): number {
+  const text = name.length * PILL_CHAR + (trailing > 0 ? trailing * PILL_NOTE_CHAR + 6 : 0);
+  return Math.min(NODE_W, Math.max(PILL_MIN_W, Math.ceil(text + PILL_CHROME)));
 }
 
 /// The gutter an edge's label needs. Left to right, a label sits across the gutter its last
-/// segment is drawn in, so that gutter widens to hold its `when` or narrowed-field label; top down
-/// it lies along it.
+/// segment is drawn in, so that gutter widens to hold its `when` label; top down it lies along it.
+/// What the edge carries is shown only on demand and is drawn over whatever it lands on.
 function labelGap(edge: WorkflowGraphEdge, direction: LayoutDirection): number {
   if (direction === 'TD') return LAYER_GAP;
-  const reads = edgeReads(edge).join(' · ');
-  if (reads === '') return LAYER_GAP;
+  const reads = edgeWhen(edge);
+  if (reads === null) return LAYER_GAP;
   const chars = reads.length + (edge.join === 'all' ? 0 : 8);
   // The label is centred past the middle of the gutter, so the gap is a little over its width.
   return Math.max(LAYER_GAP, Math.ceil(chars * LABEL_CHAR * 1.15) + LABEL_PAD);
@@ -353,7 +378,8 @@ function labelGap(edge: WorkflowGraphEdge, direction: LayoutDirection): number {
 /// only turned into x and y at the end, so the two directions are the same picture transposed.
 export function layoutWorkflow(
   graph: WorkflowGraphDoc,
-  direction: LayoutDirection = 'LR'
+  direction: LayoutDirection = 'LR',
+  { pills = null }: { pills?: PillOptions | null } = {}
 ): WorkflowLayout {
   const known = new Set(graph.nodes.map((n) => n.name));
   const edges = graph.edges.filter((e) => known.has(e.from) && known.has(e.to));
@@ -431,17 +457,28 @@ export function layoutWorkflow(
   // on it, so no edge into or out of a row runs through the card or another row.
   const instanceInset = direction === 'LR' ? INSTANCE_INDENT : (NODE_H - INSTANCE_H) / 2;
   const stack = STACK_CARDS * STACK_STEP;
-  const extentOf = (head: string): number =>
-    acrossSize + stack + (members.get(head)?.length ?? 0) * (instanceAcross + INSTANCE_GAP);
 
   const byName = new Map(graph.nodes.map((n) => [n.name, n]));
-  const memberOffset = (index: number): number =>
-    acrossSize + stack + INSTANCE_GAP + index * (instanceAcross + INSTANCE_GAP);
+  const sizeOf = (name: string): Along => {
+    const node = byName.get(name);
+    if (node === undefined || pills === null || !isPill(node, pills)) {
+      return [alongSize, acrossSize];
+    }
+    const width = pillWidth(name, pills.trailing.get(name) ?? 0);
+    return direction === 'LR' ? [width, PILL_H] : [PILL_H, width];
+  };
+  const stackOf = (name: string): number => ((byName.get(name)?.fanout ?? null) === null ? 0 : stack);
+  const extentOf = (head: string): number =>
+    sizeOf(head)[1] +
+    stackOf(head) +
+    (members.get(head)?.length ?? 0) * (instanceAcross + INSTANCE_GAP);
+  const memberOffset = (deck: string, index: number): number =>
+    sizeOf(deck)[1] + stackOf(deck) + INSTANCE_GAP + index * (instanceAcross + INSTANCE_GAP);
   const middleOffset = (name: string): number => {
     const deck = deckOf(name);
-    if (deck === null) return acrossSize / 2;
+    if (deck === null) return sizeOf(name)[1] / 2;
     const index = (members.get(deck) ?? []).findIndex((m) => m.name === name);
-    return memberOffset(Math.max(0, index)) + instanceAcross / 2;
+    return memberOffset(deck, Math.max(0, index)) + instanceAcross / 2;
   };
 
   // Each card sits level with the median of what feeds it straight from the layer before; the
@@ -508,12 +545,18 @@ export function layoutWorkflow(
     if (gap < 0 || gap >= gaps.length) continue;
     gaps[gap] = Math.max(gaps[gap] ?? LAYER_GAP, labelGap(edge, direction));
   }
+  // A layer is as deep as its deepest card; a shallower one is centred in it.
+  const depths = layers.map((layer) =>
+    Math.max(PILL_H, ...layer.filter((c) => byName.has(c)).map((c) => sizeOf(c)[0]))
+  );
   const alongAt: number[] = [];
   layers.forEach((_, layerNo) => {
     const before = alongAt[layerNo - 1];
-    alongAt.push(before === undefined ? PAD : before + alongSize + (gaps[layerNo - 1] ?? LAYER_GAP));
+    const depth = depths[layerNo - 1] ?? alongSize;
+    alongAt.push(before === undefined ? PAD : before + depth + (gaps[layerNo - 1] ?? LAYER_GAP));
   });
-  const alongExtent = (alongAt[alongAt.length - 1] ?? PAD) + alongSize + PAD;
+  const alongExtent =
+    (alongAt[alongAt.length - 1] ?? PAD) + (depths[depths.length - 1] ?? alongSize) + PAD;
 
   const place = (
     node: WorkflowGraphNode,
@@ -544,15 +587,18 @@ export function layoutWorkflow(
   layers.forEach((layer, layerNo) => {
     const cards = layer.filter((c) => byName.has(c));
     const layerBends = layer.filter((c) => !byName.has(c));
-    const along = alongAt[layerNo] ?? PAD;
+    const start = alongAt[layerNo] ?? PAD;
+    const depth = depths[layerNo] ?? alongSize;
     layerBends.forEach((name, k) => {
-      bends.set(name, [along + alongSize / 2, laneAt(layer) + k * BEND_GAP]);
+      bends.set(name, [start + depth / 2, laneAt(layer) + k * BEND_GAP]);
     });
     cards.forEach((name, order) => {
       const node = byName.get(name);
       if (node === undefined) return;
       const across = topOf.get(name) ?? PAD;
-      const card = place(node, layerNo, order, [along, across], [alongSize, acrossSize], null);
+      const size = sizeOf(name);
+      const along = start + (depth - size[0]) / 2;
+      const card = place(node, layerNo, order, [along, across], size, null);
       placed.set(name, card);
       nodes.push(card);
       (members.get(name) ?? []).forEach((member, index) => {
@@ -560,7 +606,7 @@ export function layoutWorkflow(
           member,
           layerNo,
           order,
-          [along + instanceInset, across + memberOffset(index)],
+          [along + instanceInset, across + memberOffset(name, index)],
           [instanceAlong, instanceAcross],
           { deck: name, index }
         );
@@ -617,18 +663,18 @@ export function layoutWorkflow(
         : files.length === 1
           ? files[0]
           : `${files[0]} +${files.length - 1}`;
-    const joinLabel = edge.join === 'passed' || edge.join === 'settled' ? edge.join : null;
-    const parts = [joinLabel, fileLabel].filter(
-      (part): part is string => part !== null
-    );
+    const plumbing = [
+      ...edge.keyed.map((field) => `${field}[item]`),
+      ...(fileLabel === undefined || fileLabel === null ? [] : [fileLabel]),
+    ];
     const [labelX, labelY] = toXY(direction, [label[0], label[1] - (direction === 'LR' ? 7 : 0)]);
-    const reads = edgeReads(edge);
     laidEdges.push({
       from: edge.from,
       to: edge.to,
       path,
-      label: parts.length === 0 ? null : parts.join(' · '),
-      reads: reads.length === 0 ? null : reads.join(' · '),
+      label: edge.join === 'passed' || edge.join === 'settled' ? edge.join : null,
+      reads: edgeWhen(edge),
+      plumbing: plumbing.length === 0 ? null : plumbing.join(' · '),
       labelX,
       labelY,
       required: edge.required,

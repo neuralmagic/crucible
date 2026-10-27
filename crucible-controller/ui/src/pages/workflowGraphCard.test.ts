@@ -6,11 +6,13 @@ import {
   detailRows,
   fanoutLine,
   fanoutRows,
+  kindGlyph,
   metaFor,
   runsLine,
   runtimeLine,
   runtimeRows,
   sourceFor,
+  statusMark,
 } from './workflowGraphCard';
 import type { FanOutState, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
@@ -193,6 +195,16 @@ function rowValue(runtime: TaskRuntime, label: string): string | undefined {
 }
 
 describe('what a run adds to the card', () => {
+  /// A first attempt that cost nothing has nothing to say: no `iter 0`, no `$0.00`, no line.
+  it('leaves out a zero iteration, a zero cost and a zero duration', () => {
+    expect(runtimeLine(ran({ latestIter: 0 }))).toBeNull();
+    expect(runtimeLine(ran({ latestIter: 0, costUsd: 0, secs: 0 }))).toBeNull();
+    expect(runtimeLine(ran({ latestIter: 0, costUsd: -0 }))).toBeNull();
+    expect(runtimeLine(ran({ latestIter: 0, costUsd: 0.12 }))).toBe('$0.12');
+    expect(runtimeLine(ran({ latestIter: 1, costUsd: 0 }))).toBe('iter 1');
+    expect(runtimeLine(ran({ latestIter: 0, attempts: 2 }))).toBe('2 attempts');
+  });
+
   it('states the iteration, and the rest only when there is something to state', () => {
     expect(runtimeLine(ran())).toBe('iter 2');
     expect(runtimeLine(ran({ attempts: 3, costUsd: 0.75, secs: 42 }))).toBe(
@@ -386,5 +398,33 @@ describe('a fan-out a when partitioned', () => {
 
   it('spells the not-taken count out in the panel', () => {
     expect(fanoutRows(state).find((row) => row.label === 'not taken')?.value).toBe('38');
+  });
+});
+
+describe('the one status signal', () => {
+  it('marks how a task ended, or that the run has not reached it yet', () => {
+    expect(statusMark(ran())).toBe('pass');
+    expect(statusMark(ran({ tone: 'fail', status: 'fail' }))).toBe('fail');
+    expect(statusMark(ran({ tone: 'fail', status: 'transport' }))).toBe('fail');
+    expect(statusMark(ran({ tone: 'none', status: 'pending', reported: false }))).toBe('active');
+    for (const status of ['never ran', 'skipped', 'blocked', 'not_taken']) {
+      expect(statusMark(ran({ tone: 'none', status }))).toBe('idle');
+    }
+  });
+
+  it('gives every kind of task its own glyph, a mapped one the map glyph', () => {
+    const over = { over_task: 'a', over_field: 'b', max_fanout: null };
+    const glyphs = [
+      kindGlyph(task('a', { kind: 'route' })),
+      kindGlyph(task('a', { kind: 'agent', fanout: over })),
+      kindGlyph(task('a', { kind: 'agent' })),
+      kindGlyph(task('a', { kind: 'command' })),
+      kindGlyph(task('a', { kind: 'engine' })),
+      kindGlyph(task('a', { kind: 'other' })),
+    ];
+    expect(new Set(glyphs).size).toBe(glyphs.length);
+    expect(kindGlyph(task('a', { kind: 'route', fanout: over }))).toBe(
+      kindGlyph(task('a', { kind: 'route' }))
+    );
   });
 });

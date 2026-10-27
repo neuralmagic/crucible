@@ -21,9 +21,10 @@ test.describe('the run task graph', () => {
 
     const graph = page.getByTestId('workflow-graph');
     await expect(graph).toBeVisible();
-    // Instances hang off their mapped task and become the producers for its downstream edge; the
-    // seventh edge reaches the marker for a revision that stored no exposure.
-    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(7);
+    // Instances are rows under their mapped task, which places them with no edge of their own, and
+    // become the producers for its downstream edge; the fifth edge reaches the marker for a
+    // revision that stored no exposure.
+    await expect(graph.locator('.react-flow__edges path.react-flow__edge-path')).toHaveCount(5);
 
     const read = graph.locator('[data-task="read"]');
     await expect(read).toContainText('pass');
@@ -34,8 +35,13 @@ test.describe('the run task graph', () => {
 
     const failed = graph.locator('[data-task="summarize[flashinfer]"]');
     await expect(failed).toContainText('fail');
+    await expect(failed).toHaveAttribute('data-status', 'fail');
+    await expect(failed.locator('[data-mark="fail"]')).toBeVisible();
     await expect(graph.locator('[data-task="summarize[paged-attention]"]')).toContainText('pass');
-    await expect(page.getByText('red = failed')).toBeVisible();
+    await expect(read.locator('[data-mark="pass"]')).toBeVisible();
+    // The status is the colour and the dot, not a word; the glyph says what runs the task.
+    await expect(read.getByText('pass', { exact: true })).toBeHidden();
+    await expect(page.getByText('red = failed')).toHaveCount(0);
   });
 
   /// A mapped route reads as a decision, tallies what its instances answered, and the fix aligned
@@ -49,13 +55,21 @@ test.describe('the run task graph', () => {
     await expect(route).toContainText('DECIDE');
     await expect(route).toContainText('over scan.items ≤120');
     await expect(route).toContainText('tier: skip 2 · high 1 · low 1');
-    await expect(graph.locator('[data-task="triage[a]"]')).toContainText('tier: high');
+    await expect(graph.locator('[data-task="triage[a]"]')).toContainText('high');
     await expect(graph.locator('[data-task="fix"]')).toContainText(
       '4 · 1 passed · 2 not taken · 1 failed'
     );
-    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'tier: high|low' }).first()).toBeVisible();
-    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'notes[item]' }).first()).toBeVisible();
-    await expect(page.getByText('double line = per element')).toBeVisible();
+    // Each paired edge carries the answer that let its instance through; the deck-to-deck edge,
+    // which would say it again, is not drawn.
+    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'tier: high' }).first()).toBeVisible();
+    await expect(graph.locator('[data-edge-label]').filter({ hasText: 'tier: high|low' })).toHaveCount(0);
+    // What an edge carries shows only while it is traced.
+    await expect(graph.locator('[data-plumbing]')).toHaveCount(0);
+    await graph.locator('[data-task="fix"]').hover();
+    await expect(graph.locator('[data-plumbing]').filter({ hasText: 'notes[item]' }).first()).toBeVisible();
+    await page.mouse.move(0, 0);
+    await expect(graph.locator('[data-plumbing]')).toHaveCount(0);
+    await expect(page.getByText('double line = per element')).toHaveCount(0);
 
     await route.click();
     const panel = page.getByRole('complementary', { name: 'Task triage' });
@@ -75,7 +89,7 @@ test.describe('the run task graph', () => {
     await expect(deck).toContainText('over read.papers ≤8');
     await expect(graph.locator('[data-task="summarize[flashinfer]"]')).toContainText('CMD');
     await expect(graph.locator('[data-task="read"]')).toContainText('AGENT');
-    await expect(page.getByText('MAP = mapped over a producer field')).toBeVisible();
+    await expect(page.getByText('MAP = mapped over a producer field')).toHaveCount(0);
   });
 
   /// The case the badge exists for: a mapped agent task whose deck runs nothing itself.

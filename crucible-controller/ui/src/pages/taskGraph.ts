@@ -470,12 +470,13 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
     // declared task node and making the consumer look like their sibling.
     const producers = instances.get(edge.from) ?? [edge.from];
     // An aligned edge whose consumer has expanded too is read per element: each instance pairs
-    // with its counterpart, and the deck-to-deck edge keeps what the consumer reads off it.
+    // with its counterpart and carries the answer its route gave, in place of the deck-to-deck
+    // edge, which would say the same thing again.
     const paired = edge.aligned
       ? pairedInstances(edge, producers, latest, source.decisions)
       : [];
     if (paired.length > 0) {
-      edges.push(edge, ...paired);
+      edges.push(...paired);
       for (const pair of paired) pairedTargets.add(pair.to);
       continue;
     }

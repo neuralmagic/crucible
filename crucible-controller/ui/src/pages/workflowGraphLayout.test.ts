@@ -1,17 +1,22 @@
 import { describe, expect, it } from 'vitest';
 import {
   countCrossings,
-  edgeReads,
+  edgeWhen,
   FIT_MAX_ZOOM,
   FIT_MIN_ZOOM,
   fitViewport,
   frameHeights,
   INSTANCE_H,
   INSTANCE_INDENT,
+  isPill,
+  LAYER_GAP,
   layoutWorkflow,
   mappedFrom,
   NODE_H,
   NODE_W,
+  PILL_H,
+  PILL_MIN_W,
+  pillWidth,
   type WorkflowGraphDoc,
   type WorkflowGraphNode,
 } from './workflowGraphLayout';
@@ -195,11 +200,13 @@ describe('ordering within a layer', () => {
 });
 
 describe('what the marks say', () => {
-  it('labels an edge with the join and the files the producer stages', () => {
+  it('labels an edge with its join, and keeps the files the producer stages as plumbing', () => {
     const layout = layoutWorkflow(PACK);
     const joining = layout.edges.find((e) => e.to === 'final');
-    expect(joining?.label).toBe('passed · out.json');
+    expect(joining?.label).toBe('passed');
+    expect(joining?.plumbing).toBe('out.json');
     expect(layout.edges.find((e) => e.to === 'fan')?.label).toBeNull();
+    expect(layout.edges.find((e) => e.to === 'fan')?.plumbing).toBeNull();
     expect(layout.edges.find((e) => e.to === 'check')?.required).toBe(false);
   });
 
@@ -210,7 +217,7 @@ describe('what the marks say', () => {
       nodes: [task('src', { emits_files: ['A.md', 'B.md', 'C.md'] }), task('sink')],
       edges: [edge('src', 'sink')],
     };
-    expect(layoutWorkflow(doc).edges[0]?.label).toBe('A.md +2');
+    expect(layoutWorkflow(doc).edges[0]?.plumbing).toBe('A.md +2');
   });
 
   it('marks the result task', () => {
@@ -413,8 +420,9 @@ describe('what an edge reads', () => {
   });
 
   it('labels a narrowed edge with the field each instance reads its entry of', () => {
-    expect(laid('scan', 'fix').reads).toBe('notes[item]');
-    expect(edgeReads(edge('a', 'b', { keyed: ['x', 'y'] }))).toEqual(['x[item]', 'y[item]']);
+    expect(laid('scan', 'fix').reads).toBeNull();
+    expect(laid('scan', 'fix').plumbing).toBe('notes[item]');
+    expect(edgeWhen(edge('a', 'b', { keyed: ['x', 'y'] }))).toBeNull();
   });
 
   /// Left to right the label lies across the gutter, so the gutter holds it rather than letting
@@ -425,11 +433,11 @@ describe('what an edge reads', () => {
     const x = (layout: ReturnType<typeof layoutWorkflow>, name: string) =>
       layout.nodes.find((n) => n.node.name === name)?.x ?? 0;
     const gap = x(wide, 'fix') - x(wide, 'triage') - NODE_W;
-    expect(x(plain, 'fix') - x(plain, 'triage') - NODE_W).toBe(44);
+    expect(x(plain, 'fix') - x(plain, 'triage') - NODE_W).toBe(LAYER_GAP);
     expect(gap).toBeGreaterThan('tier: high|low'.length * 5.6);
     const down = layoutWorkflow(routed, 'TD');
     const y = (name: string) => down.nodes.find((n) => n.node.name === name)?.y ?? 0;
-    expect(y('fix') - y('triage') - NODE_H).toBe(44);
+    expect(y('fix') - y('triage') - NODE_H).toBe(LAYER_GAP);
   });
 
   it('carries which edges are read per element', () => {
@@ -584,11 +592,11 @@ describe('gutters and labels', () => {
 
   it('sizes each gutter to the labels drawn in it, not to the widest in the graph', () => {
     const layout = layoutWorkflow(doc);
-    expect(x(layout, 'triage') - x(layout, 'seed') - NODE_W).toBe(44);
+    expect(x(layout, 'triage') - x(layout, 'seed') - NODE_W).toBe(LAYER_GAP);
     expect(x(layout, 'fix') - x(layout, 'triage') - NODE_W).toBeGreaterThan(
       'tier: high|low'.length * 5.6
     );
-    expect(x(layout, 'report') - x(layout, 'fix') - NODE_W).toBe(44);
+    expect(x(layout, 'report') - x(layout, 'fix') - NODE_W).toBe(LAYER_GAP);
   });
 
   it('centres a label in the gutter before the task that reads it', () => {
@@ -684,10 +692,125 @@ describe('fitting the view', () => {
   });
 
   it('sizes the frame to hold the graph at the floor and no more than it needs at the top', () => {
-    expect(frameHeights({ width: 2000, height: 354 })).toEqual({
+    expect(frameHeights({ width: 2000, height: 354 }, false)).toEqual({
       min: Math.ceil(354 * FIT_MIN_ZOOM + 52),
       max: Math.ceil(354 * FIT_MAX_ZOOM + 52),
     });
-    expect(frameHeights({ width: 400, height: 40 })).toEqual({ min: 240, max: 240 });
+    expect(frameHeights({ width: 400, height: 40 }, false)).toEqual({ min: 240, max: 240 });
+  });
+
+  /// The task panel opens inside the frame, so a short graph must not leave it a sliver.
+  it('gives an open task panel room to read in, however short the graph', () => {
+    expect(frameHeights({ width: 400, height: 40 }, true)).toEqual({ min: 480, max: 480 });
+    const tall = frameHeights({ width: 400, height: 900 }, true);
+    expect(tall).toEqual(frameHeights({ width: 400, height: 900 }, false));
+  });
+});
+
+/// A run draws a plain command task as a pill sized to what it says; a mapped, routed or agent
+/// task keeps its card, and a compiled plan keeps every card.
+describe('pills', () => {
+  const over = { over_task: 'seed', over_field: 'items', max_fanout: null };
+  const doc: WorkflowGraphDoc = {
+    workflow_type: 'run',
+    result: null,
+    nodes: [
+      task('seed'),
+      task('triage', { kind: 'route', fanout: over }),
+      task('fan', { fanout: over }),
+      task('think', { kind: 'agent' }),
+      task('report'),
+    ],
+    edges: [
+      edge('seed', 'triage'),
+      edge('seed', 'fan'),
+      edge('seed', 'think'),
+      edge('triage', 'report'),
+      edge('fan', 'report'),
+      edge('think', 'report'),
+    ],
+  };
+  const PILLS = { trailing: new Map<string, number>() };
+  const at = (layout: ReturnType<typeof layoutWorkflow>, name: string) => {
+    const found = layout.nodes.find((n) => n.node.name === name);
+    if (found === undefined) throw new Error(`${name} is not in the layout`);
+    return found;
+  };
+
+  it('pills only a plain command task, and only when asked', () => {
+    expect(isPill(task('a'), PILLS)).toBe(true);
+    expect(isPill(task('a'), null)).toBe(false);
+    expect(isPill(task('a', { fanout: over }), PILLS)).toBe(false);
+    expect(isPill(task('a', { kind: 'route' }), PILLS)).toBe(false);
+    expect(isPill(task('a', { kind: 'agent' }), PILLS)).toBe(false);
+  });
+
+  it('sizes a pill to its name and what trails it, between a floor and a card', () => {
+    expect(pillWidth('ab', 0)).toBe(PILL_MIN_W);
+    expect(pillWidth('decision_audit', 0)).toBeGreaterThan(pillWidth('report', 0));
+    expect(pillWidth('report', 6)).toBeGreaterThan(pillWidth('report', 0));
+    expect(pillWidth('x'.repeat(80), 40)).toBe(NODE_W);
+  });
+
+  it('draws pills one line high and keeps cards for everything else', () => {
+    const layout = layoutWorkflow(doc, 'LR', { pills: PILLS });
+    expect([at(layout, 'seed').width, at(layout, 'seed').height]).toEqual([
+      pillWidth('seed', 0),
+      PILL_H,
+    ]);
+    for (const name of ['triage', 'fan', 'think']) {
+      expect([at(layout, name).width, at(layout, name).height]).toEqual([NODE_W, NODE_H]);
+    }
+    const plan = layoutWorkflow(doc);
+    expect([at(plan, 'seed').width, at(plan, 'seed').height]).toEqual([NODE_W, NODE_H]);
+  });
+
+  it('widens a pill for the figures it trails', () => {
+    const plain = layoutWorkflow(doc, 'LR', { pills: PILLS });
+    const costed = layoutWorkflow(doc, 'LR', { pills: { trailing: new Map([['report', 5]]) } });
+    expect(at(costed, 'report').width).toBe(pillWidth('report', 5));
+    expect(at(costed, 'report').width).toBeGreaterThan(at(plain, 'report').width);
+  });
+
+  /// A layer of pills is only as deep as its widest pill, which is what makes a run graph short.
+  it('makes a layer of pills shallower than a layer of cards, and centres a pill among cards', () => {
+    const pilled = layoutWorkflow(doc, 'LR', { pills: PILLS });
+    const carded = layoutWorkflow(doc);
+    expect(at(pilled, 'triage').x - at(carded, 'triage').x).toBe(pillWidth('seed', 0) - NODE_W);
+    expect(pilled.width).toBeLessThan(carded.width);
+    const mixed = layoutWorkflow(
+      { ...doc, nodes: [...doc.nodes, task('side')], edges: [...doc.edges, edge('seed', 'side')] },
+      'LR',
+      { pills: PILLS }
+    );
+    const side = at(mixed, 'side');
+    expect(side.x + side.width / 2).toBe(at(mixed, 'think').x + NODE_W / 2);
+  });
+
+  it('turns a pill on its side top down', () => {
+    const layout = layoutWorkflow(doc, 'TD', { pills: PILLS });
+    expect([at(layout, 'seed').width, at(layout, 'seed').height]).toEqual([
+      pillWidth('seed', 0),
+      PILL_H,
+    ]);
+    expect(at(layout, 'triage').y).toBe(at(layout, 'seed').y + PILL_H + LAYER_GAP);
+  });
+});
+
+/// What an edge carries is plumbing: shown on demand, so it never widens a gutter.
+describe('plumbing labels', () => {
+  it('leaves a gutter narrow for an edge that only narrows a field or stages a file', () => {
+    const doc: WorkflowGraphDoc = {
+      workflow_type: 'playbook',
+      result: null,
+      nodes: [task('scan', { emits_files: ['NOTES.md'] }), task('fix')],
+      edges: [edge('scan', 'fix', { keyed: ['notes', 'lanes'] })],
+    };
+    const layout = layoutWorkflow(doc);
+    const [scan, fix] = ['scan', 'fix'].map((name) => layout.nodes.find((n) => n.node.name === name));
+    expect((fix?.x ?? 0) - (scan?.x ?? 0) - NODE_W).toBe(LAYER_GAP);
+    expect(layout.edges[0]?.plumbing).toBe('notes[item] · lanes[item] · NOTES.md');
+    expect(layout.edges[0]?.reads).toBeNull();
+    expect(layout.edges[0]?.label).toBeNull();
   });
 });
