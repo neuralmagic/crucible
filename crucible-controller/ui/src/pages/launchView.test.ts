@@ -4,6 +4,7 @@ import {
   detailPath,
   dispatchTone,
   graphRunId,
+  launchVersion,
   originLabel,
   originLinks,
   relaunchPath,
@@ -67,6 +68,14 @@ describe('originLinks', () => {
     const links = originLinks(detail({}, { origin: 'schedule', schedule: 'nightly' }));
     expect(links.map((l) => l.label)).toEqual(['pack', 'schedule']);
     expect(links[1]).toEqual({ label: 'schedule', value: 'nightly', to: null });
+  });
+});
+
+describe('launchVersion', () => {
+  it('names a draft launch by its save and a registered one by its schema digest', () => {
+    expect(launchVersion({ draft_version: 126, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('draft v126');
+    expect(launchVersion({ draft_version: null, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('8484c6b8284c');
+    expect(launchVersion({ schema_digest: 'deadbeef' })).toBe('deadbeef');
   });
 });
 

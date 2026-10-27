@@ -4,6 +4,7 @@
 import type { components } from '../api/schema';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
+type PlaybookRun = components['schemas']['PlaybookRunDto'];
 type DispatchState = components['schemas']['DispatchState'];
 
 /// A launch key addresses itself: `playbook:{pack}:{uuidv7}`. Its detail is the launch view, never
@@ -46,6 +47,14 @@ const ORIGIN_LABEL: Record<string, string> = {
 /** How the launch is described in one word: its origin, spelled for a reader. */
 export function originLabel(origin: string): string {
   return ORIGIN_LABEL[origin] ?? origin;
+}
+
+/** The pack a launch froze: a draft's save number, else the schema digest it was admitted under. */
+export function launchVersion(launch: Pick<PlaybookRun, 'draft_version' | 'schema_digest'>): string {
+  if (launch.draft_version !== null && launch.draft_version !== undefined) {
+    return `draft v${launch.draft_version}`;
+  }
+  return launch.schema_digest.replace(/^sha256:/, '').slice(0, 12);
 }
 
 /// Where a launch came from, as links back. A draft launch points at the studio that fired it, any

@@ -345,7 +345,7 @@ test.describe('external results', () => {
     await stubApi(page);
     await ready(page, RUN);
 
-    const section = sectionOf(page, 'Links');
+    const section = page.getByTestId('run-links');
     await expect(section.getByRole('link')).toHaveCount(6);
 
     const pr = section.getByRole('link', { name: /#412/ });
