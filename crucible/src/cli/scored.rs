@@ -234,7 +234,7 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
                 .clone()
                 .or_else(|| repo.path.clone())
                 .with_context(|| format!("component `{}` [repo] needs url or path", c.name))?;
-            crate::cli::workspace::clone_repo(&src, repo.git_ref.as_deref(), &c.workspace)
+            crate::cli::workspace::clone_repo(&src, repo.git_ref.as_ref(), &c.workspace)
                 .with_context(|| format!("cloning component `{}`", c.name))?;
         }
         vcs::ensure_repo(&c.workspace)

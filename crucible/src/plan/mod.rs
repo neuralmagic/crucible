@@ -14,6 +14,7 @@ pub mod rerun;
 pub mod resume;
 pub mod route;
 pub mod runner;
+pub mod settings;
 pub mod starlark;
 pub mod term_img;
 pub mod workflow;

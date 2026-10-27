@@ -759,6 +759,7 @@ fn constructor(
             resolved_from: None,
             params: BTreeMap::new(),
             history_record,
+            launch: Default::default(),
         };
         workflow.validate()?;
         return Ok(Value::Workflow(workflow));
@@ -1202,6 +1203,7 @@ fn default_autoresearch(mut extras: Vec<Task>) -> Result<WorkflowCfg> {
         resolved_from: None,
         params: BTreeMap::new(),
         history_record: None,
+        launch: Default::default(),
     };
     workflow.validate()?;
     Ok(workflow)
@@ -3758,6 +3760,31 @@ workflow(type = "custom", tasks = [a], result = a)
             &compile_source(conflict, &pack.join("workflow.star"), &pack).unwrap_err(),
         );
         assert!(err.contains("one conversation under one config"), "{err}");
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn a_harness_or_effort_no_turn_can_read_fails_the_compile() {
+        let pack = temp_pack("agent-knobs");
+        for (source, needle) in [
+            (
+                "a = agent(name = \"a\", prompt = \"p\", effort = \"extreme\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets effort \"extreme\"",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", harness = \"gpt\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets harness \"gpt\"",
+            ),
+            (
+                "s = session(name = \"s\", effort = \"hgih\")\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets effort \"hgih\"",
+            ),
+        ] {
+            let err = crate::errors::report(
+                &compile_source(source, &pack.join("workflow.star"), &pack).unwrap_err(),
+            );
+            assert!(err.contains(needle), "{source}: {err}");
+        }
         let _ = std::fs::remove_dir_all(&pack);
     }
 

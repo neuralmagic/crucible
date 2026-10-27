@@ -704,11 +704,17 @@ pub fn run(
             (_, Some(m)) => {
                 let state = crate::cli::setup::state_dir(m);
                 let resumed = resume.then(|| RunStart::read(&state)).transpose()?;
+                let start = if resume || rerun.is_some() {
+                    crate::cli::setup::Start::Continues
+                } else {
+                    crate::cli::setup::Start::Fresh
+                };
                 let (mut prepared, loaded) = crate::cli::setup::prep_plan_runner_with_params(
                     m,
                     params,
                     compute_driver,
                     agent,
+                    start,
                 )?;
                 let session_log = prepared.paths.session_log.clone();
                 agent_args = Some(prepared.args.clone());

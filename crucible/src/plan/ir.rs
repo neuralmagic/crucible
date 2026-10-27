@@ -724,6 +724,13 @@ pub enum PlanError {
     EmptyTaskName { index: usize },
     #[error("duplicate task name {task:?}")]
     DuplicateTask { task: String },
+    #[error("task {task:?} sets {knob} {got:?}, which is not {expected}")]
+    UnknownAgentKnob {
+        task: String,
+        knob: &'static str,
+        got: String,
+        expected: &'static str,
+    },
     #[error("task {task:?} depends on itself")]
     SelfDependency { task: String },
     #[error("task {task:?} depends on unknown task {dependency:?}")]
@@ -1231,6 +1238,34 @@ fn answerable_types(question: &Question) -> String {
     }
 }
 
+/// A harness or effort a turn could not read, refused before anything runs.
+fn check_agent_knobs(t: &Task) -> Result<(), PlanError> {
+    use crate::plan::settings::{EFFORT_NAMES, HARNESS_NAMES, parse_effort, parse_harness};
+    let TaskKind::Agent {
+        harness, effort, ..
+    } = &t.task
+    else {
+        return Ok(());
+    };
+    let unknown = |knob, got: &String, expected| PlanError::UnknownAgentKnob {
+        task: t.name.0.clone(),
+        knob,
+        got: got.clone(),
+        expected,
+    };
+    if let Some(h) = harness
+        && parse_harness(h).is_none()
+    {
+        return Err(unknown("harness", h, HARNESS_NAMES));
+    }
+    if let Some(e) = effort
+        && parse_effort(e).is_none()
+    {
+        return Err(unknown("effort", e, EFFORT_NAMES));
+    }
+    Ok(())
+}
+
 impl Plan {
     /// Parse JSON without validating it.
     pub fn from_json_str(s: &str) -> Result<Plan> {
@@ -1296,6 +1331,7 @@ impl Plan {
                     task: t.name.0.clone(),
                 });
             }
+            check_agent_knobs(t)?;
         }
         for t in &self.tasks {
             let task = || t.name.0.clone();
@@ -2604,6 +2640,45 @@ mod tests {
             vec!["z", "m", "a"],
             "ties break in declaration order"
         );
+    }
+
+    #[test]
+    fn a_harness_or_effort_no_turn_can_read_is_refused_at_validation() {
+        let knobbed = |harness: Option<&str>, effort: Option<&str>| Task {
+            task: TaskKind::Agent {
+                prompt: "p".into(),
+                harness: harness.map(str::to_owned),
+                model: Some("any-model-string".into()),
+                effort: effort.map(str::to_owned),
+                sandbox: None,
+            },
+            ..agent("a", &[])
+        };
+        assert_eq!(
+            plan(vec![knobbed(Some("gpt"), None)])
+                .validate()
+                .unwrap_err(),
+            PlanError::UnknownAgentKnob {
+                task: "a".into(),
+                knob: "harness",
+                got: "gpt".into(),
+                expected: "claude, hermes, codex, opencode or pi",
+            }
+        );
+        assert_eq!(
+            plan(vec![knobbed(None, Some("extreme"))])
+                .validate()
+                .unwrap_err(),
+            PlanError::UnknownAgentKnob {
+                task: "a".into(),
+                knob: "effort",
+                got: "extreme".into(),
+                expected: "low, medium, high, xhigh or max",
+            }
+        );
+        plan(vec![knobbed(Some("OpenCode"), Some("XHigh"))])
+            .validate()
+            .expect("read case-insensitively, as a turn reads them");
     }
 
     #[test]

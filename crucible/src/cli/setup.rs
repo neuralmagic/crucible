@@ -5,6 +5,7 @@ use crate::agent::harness::HarnessRuntime;
 use crate::args::Args;
 use crate::control::broker;
 use crate::manifest;
+use crate::plan::settings::Setting;
 use anyhow::{Context, Result};
 use crucible_vcs::vcs;
 use std::path::Path;
@@ -119,6 +120,16 @@ pub(crate) fn pin_agent(args: &mut Args, agent: &manifest::AgentCfg) -> Result<m
         );
     }
     Ok(harness)
+}
+
+/// A launch that sets one setting for every agent task through both its agent flags and a
+/// `*.<setting>` value.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the launch sets every agent task's {setting} twice, as a flag and as *.{setting}; pass one"
+)]
+pub(crate) struct LaunchSettingTwice {
+    setting: Setting,
 }
 
 /// A pack asked for sandbox resources on a backend that runs no sandbox, so they would be dropped.
@@ -301,7 +312,62 @@ pub(crate) fn prep_plan_runner(
         &std::collections::BTreeMap::new(),
         crate::openshell::gateway::ComputeDriver::Podman,
         crate::args::AgentOverride::default(),
+        Start::Fresh,
     )
+}
+
+/// Whether a run checks out its own workspace or continues one an earlier run started (a resume
+/// or a rerun), whose recorded commit decides the checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Start {
+    Fresh,
+    Continues,
+}
+
+/// A launch ref on a workspace that already exists, which a fresh run would not check out.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "repo.ref {git_ref} needs a fresh checkout, but {} already exists; remove it or launch \
+     without repo.ref",
+    .workspace.display()
+)]
+pub(crate) struct LaunchRefNeedsFreshWorkspace {
+    git_ref: manifest::GitRef,
+    workspace: std::path::PathBuf,
+}
+
+/// A launched commit that no branch or tag the pack admits contains.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "repo.ref {commit} is on no branch or tag [repo.overrides].refs admits; the branches and tags \
+     holding it are [{}]",
+    .on.join(", ")
+)]
+pub(crate) struct PinOutsideAllowedRefs {
+    commit: manifest::GitRef,
+    on: Vec<String>,
+}
+
+/// Keep a freshly cloned commit only when a branch or tag the pack admits holds it; otherwise
+/// remove the clone, so no later run reuses it.
+fn check_pinned_commit(
+    workspace: &Path,
+    commit: &manifest::GitRef,
+    gate: &manifest::RepoOverridesCfg,
+) -> Result<()> {
+    let refusal: anyhow::Error = match crate::cli::workspace::refs_containing(workspace, commit) {
+        Ok(on) if on.iter().any(|name| gate.allows(name)) => return Ok(()),
+        Ok(on) => PinOutsideAllowedRefs {
+            commit: commit.clone(),
+            on,
+        }
+        .into(),
+        Err(e) => e.into(),
+    };
+    if let Err(e) = std::fs::remove_dir_all(workspace) {
+        tracing::warn!(workspace = %workspace.display(), error = %e, "removing a refused clone");
+    }
+    Err(refusal)
 }
 
 /// Put a resumed run's workspace back to the commit it started from, with the manifest's injects
@@ -380,16 +446,45 @@ pub(crate) fn prep_plan_runner_with_params(
     params: &std::collections::BTreeMap<String, String>,
     compute_driver: crate::openshell::gateway::ComputeDriver,
     agent: crate::args::AgentOverride,
+    start: Start,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
+    if let Some(all) = m.workflow.as_ref().and_then(|w| w.launch.all()) {
+        for (setting, flag, value) in [
+            (
+                Setting::Harness,
+                agent.harness.is_some(),
+                all.harness.is_some(),
+            ),
+            (Setting::Model, agent.model.is_some(), all.model.is_some()),
+        ] {
+            if flag && value {
+                return Err(LaunchSettingTwice { setting }.into());
+            }
+        }
+    }
     let workspace = manifest_dir.join(&m.workspace.dir);
     let state = state_dir(manifest_path);
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
     let p = crate::args::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
-    if !workspace.exists() {
+    let launched_ref = m.workflow.as_ref().and_then(|w| w.launch.repo_ref());
+    if workspace.exists() {
+        if let Some(r) = launched_ref
+            && start == Start::Fresh
+        {
+            return Err(LaunchRefNeedsFreshWorkspace {
+                git_ref: r.clone(),
+                workspace,
+            }
+            .into());
+        }
+    } else {
         crate::cli::workspace::manifest_setup(&m, &manifest_dir, &workspace)?;
+        if let Some(commit) = launched_ref.filter(|r| r.is_commit()) {
+            check_pinned_commit(&workspace, commit, &m.repo.overrides)?;
+        }
         for (src, dst, _frozen) in m.resolved_injects(&manifest_dir, &workspace)? {
             manifest::apply_inject(&src, &dst)
                 .context("applying [workspace].inject after setup")?;
@@ -421,7 +516,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let frozen = frozen_projection(
         &m,
         m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
-        params,
+        &crate::plan::settings::split(params).0,
         &p.session_log,
     )?;
     apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;

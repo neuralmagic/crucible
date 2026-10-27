@@ -59,9 +59,14 @@ fn hash_seed(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<String> {
 /// it again would add nothing and would move every existing run's digest. A manifest naming
 /// `[workflow].file` carries only a path, and two entirely different graphs behind the same
 /// path would otherwise share a digest, which is the one thing the comparability key must never
-/// allow.
+/// allow. Launch settings rewrite an inline graph's tasks without touching the text, so a graph
+/// they changed is hashed too.
 fn workflow_graph_text(m: &manifest::Manifest) -> Result<String> {
-    let Some(workflow) = m.workflow.as_ref().filter(|w| w.resolved_from_file()) else {
+    let Some(workflow) = m
+        .workflow
+        .as_ref()
+        .filter(|w| w.resolved_from_file() || !w.launch.is_empty())
+    else {
         return Ok(String::new());
     };
     serde_json::to_string(workflow).context("serializing the compiled workflow for run identity")
@@ -463,6 +468,50 @@ mod tests {
         assert!(
             workflow_graph_text(&bare).expect("graph text").is_empty(),
             "an inline or absent graph appends nothing to the hash"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Launch settings rewrite an inline graph's tasks and leave the manifest text alone, so two
+    /// launches that set different values must not share a digest.
+    #[test]
+    fn launch_settings_reach_an_inline_graphs_digest() {
+        let dir = tempdir();
+        init_repo(&dir);
+        fs::write(
+            dir.join("crucible.toml"),
+            "[repo]\npath = \".\"\n[agent]\nbackend = \"command\"\nagent_cmd = \"true\"\ngoal = \"g\"\n\
+             [agent.overrides]\nallow = [\"model\"]\n\
+             [workflow]\ntype = \"playbook\"\n[[workflow.task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"\n",
+        )
+        .expect("write manifest");
+        let resolved = |pairs: &[(&str, &str)]| {
+            let mut m = manifest::Manifest::load(&dir.join("crucible.toml")).expect("load");
+            let params = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            m.resolve_workflow_with(&dir, &params).expect("resolve");
+            let digest = for_manifest(&dir.join("crucible.toml"), &dir, &dir, &m)
+                .expect("identity")
+                .digest;
+            (digest, workflow_graph_text(&m).expect("graph text"))
+        };
+
+        let (unset, graph) = resolved(&[]);
+        assert!(
+            graph.is_empty(),
+            "an inline graph no launch changed appends nothing, so its digest does not move"
+        );
+        let (opus, _) = resolved(&[("a.model", "claude-opus-5-5")]);
+        let (sonnet, _) = resolved(&[("a.model", "claude-sonnet-5-5")]);
+        assert_ne!(unset, opus, "a launch value is not the pack's default");
+        assert_ne!(opus, sonnet, "two launch values are not comparable");
+        assert_eq!(
+            opus,
+            resolved(&[("a.model", "claude-opus-5-5")]).0,
+            "the same launch value stays comparable with itself"
         );
 
         let _ = fs::remove_dir_all(&dir);
