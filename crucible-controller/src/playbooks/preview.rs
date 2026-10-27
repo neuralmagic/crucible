@@ -87,7 +87,7 @@ fn effective(
         let Some(property) = properties.and_then(|p| p.get(name)) else {
             continue;
         };
-        if let Some(value) = crate::playbooks::param_placeholder::placeholder(name, property) {
+        if let Some(value) = crucible::plan::starlark::placeholder::placeholder(name, property) {
             out.insert(name.to_string(), value);
         }
     }

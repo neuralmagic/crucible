@@ -5,9 +5,10 @@
 
 pub mod error;
 mod globals;
-mod idents;
+pub mod idents;
 mod loader;
 pub mod params;
+pub mod placeholder;
 pub mod reference;
 mod values;
 
@@ -34,7 +35,7 @@ use crate::plan::param::ParamValue;
 use crate::plan::starlark::error::{
     CompileError, MAX_CALLSTACK, MAX_CONSTRUCTED_TASKS, MAX_EVAL_HEAP_BYTES, MAX_EVAL_TICKS,
     MAX_LOAD_MODULES, MAX_NESTING_DEPTH, MAX_PROMPT_BYTES, MAX_SCHEMA_BYTES, MAX_SOURCE_BYTES,
-    MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, SourceAnchor,
+    MAX_TASKS, MAX_TOTAL_EMBED_BYTES, MAX_TOTAL_SOURCE_BYTES, Site, SourceAnchor,
 };
 use crate::plan::starlark::values::{SchemaFile, SessionDecl, WorkflowValue};
 use crate::plan::workflow::{WorkflowCfg, WorkflowType};
@@ -465,12 +466,28 @@ impl CompileError {
     /// Where the error was found, if it was located. A consumer places a marker from this rather
     /// than parsing the `file:line:col` out of the rendered message.
     pub fn anchor(&self) -> Option<SourceAnchor> {
+        self.anchors().into_iter().next()
+    }
+
+    /// Every place the error was found.
+    pub fn anchors(&self) -> Vec<SourceAnchor> {
         match self {
             CompileError::At { at, inner } => {
-                Some(inner.anchor().unwrap_or_else(|| SourceAnchor::from(at)))
+                let inner = inner.anchors();
+                if inner.is_empty() {
+                    vec![SourceAnchor::from(at)]
+                } else {
+                    inner
+                }
             }
-            CompileError::Parse { at, .. } => at.clone(),
-            _ => None,
+            CompileError::Parse { at, .. } => at.iter().cloned().collect(),
+            CompileError::DroppedTasks { sites }
+            | CompileError::LateSessionDeclaration { sites }
+            | CompileError::UnboundSessions { sites } => sites
+                .iter()
+                .map(|site| SourceAnchor::from(&site.at))
+                .collect(),
+            _ => Vec::new(),
         }
     }
 
@@ -2446,28 +2463,32 @@ fn compile_source_here(
     })??;
     let context = state.into_context();
     let included: BTreeSet<&str> = workflow.tasks.iter().map(|t| t.name.0.as_str()).collect();
-    let dropped: Vec<String> = context
+    let site = |name: &String, at: &FileSpan| Site {
+        name: name.clone(),
+        at: at.clone(),
+    };
+    let dropped: Vec<Site> = context
         .constructed_tasks
         .iter()
         .filter(|(name, _)| !included.contains(name.as_str()))
-        .map(|(name, site)| format!("{name:?} ({site})"))
+        .map(|(name, at)| site(name, at))
         .collect();
     if !dropped.is_empty() {
         return Err(CompileError::DroppedTasks { sites: dropped });
     }
     if !context.sessions.is_empty() && !context.string_session_refs.is_empty() {
-        let refs: Vec<String> = context
+        let refs: Vec<Site> = context
             .string_session_refs
             .iter()
-            .map(|(name, site)| format!("{name:?} ({site})"))
+            .map(|(name, at)| site(name, at))
             .collect();
         return Err(CompileError::LateSessionDeclaration { sites: refs });
     }
-    let unbound: Vec<String> = context
+    let unbound: Vec<Site> = context
         .sessions
         .iter()
         .filter(|(name, _)| !context.bound_sessions.contains(*name))
-        .map(|(name, (_, site))| format!("{name:?} ({site})"))
+        .map(|(name, (_, at))| site(name, at))
         .collect();
     if !unbound.is_empty() {
         return Err(CompileError::UnboundSessions { sites: unbound });
@@ -2502,7 +2523,7 @@ fn budgets(eval: &mut Evaluator<'_, '_, '_>) -> Result<()> {
 /// (`not not not x`, `1 + 1 + 1`, `1 if c else 1 if c else 1` all recurse and none of them
 /// bracket). Over-counting only refuses sources no author writes: a real statement is a handful
 /// of operators inside two or three brackets.
-pub(crate) fn reject_deep_nesting(source: &str, filename: &Path) -> Result<()> {
+pub fn reject_deep_nesting(source: &str, filename: &Path) -> Result<()> {
     let mut depth: usize = 0;
     let mut operators: usize = 0;
     let mut line: usize = 1;
@@ -2637,7 +2658,7 @@ fn catching_panics<T>(evaluate: impl FnOnce() -> T) -> Result<T> {
 /// The globals one lane sees. The scored constructors are not merely refused for a playbook,
 /// they are absent, so `measure` in a playbook is an unknown name rather than a name that
 /// compiles and fails validation later.
-fn lane_globals(lane: WorkflowType) -> Globals {
+pub fn lane_globals(lane: WorkflowType) -> Globals {
     let builder = GlobalsBuilder::standard().with(globals::common);
     match lane {
         WorkflowType::Playbook => builder.with(globals::routed).build(),
@@ -2646,7 +2667,8 @@ fn lane_globals(lane: WorkflowType) -> Globals {
     }
 }
 
-fn dialect() -> Dialect {
+/// The dialect every workflow source and loaded module is parsed with.
+pub fn dialect() -> Dialect {
     Dialect {
         enable_top_level_stmt: true,
         enable_load_reexport: false,

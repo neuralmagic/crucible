@@ -9,7 +9,6 @@ use crate::plan::exec::DeclaredStatus;
 use crate::plan::ir::KEPT_INPUT;
 use crate::plan::ir::{HISTORY_INPUT, ITEM_INPUT, OUTCOME_INPUT, PARAMS_INPUT, REVISION_INPUT};
 use crate::plan::ir::{MAX_FANOUT_CEILING, MAX_REPAIR_CEILING, MAX_ROUNDS_CEILING};
-#[cfg(test)]
 use crate::plan::workflow::WorkflowType;
 use crucible_contract::decision::UNCERTAIN;
 use crucible_contract::history::MAX_HISTORY_DEPTH;
@@ -26,8 +25,7 @@ pub enum Lane {
 }
 
 impl Lane {
-    #[cfg(test)]
-    fn includes(self, workflow: WorkflowType) -> bool {
+    pub fn includes(self, workflow: WorkflowType) -> bool {
         match self {
             Lane::Common => true,
             Lane::Scored => workflow != WorkflowType::Playbook,
@@ -347,7 +345,12 @@ pub fn functions() -> Vec<Function> {
             positional: None,
             kwargs: vec![
                 name_kwarg(),
-                Kwarg::new("destination", "str", "The configured sink to publish to."),
+                Kwarg::new(
+                    "destination",
+                    "dict",
+                    "The sink to publish to, as `{\"kind\": \"slack\"}`. The controller holds \
+                     its endpoint and credential.",
+                ),
                 Kwarg::new(
                     "template",
                     "str",

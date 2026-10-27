@@ -142,7 +142,7 @@ Publish a rendered template to a controller-configured destination. The workflow
 | Argument | Type | Purpose |
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
-| `destination` | `str` | The configured sink to publish to. |
+| `destination` | `dict` | The sink to publish to, as `{"kind": "slack"}`. The controller holds its endpoint and credential. |
 | `template` | `str` | Pack file rendered into the card body. Reads `verdict`, `spent_usd`, `passed`, `failed`, `tasks` (first 20), `run`, `run_url`, and `result`. Every inserted value is escaped for Slack. |
 | `result` | `task` | The task whose declared fields the card and `result.output` carry; `result.status` alone when it did not pass. |
 | `severity_field` | `str` | A declared field of `result` whose value ("good", "warning", "danger") picks the card accent; any other value is neutral. |

@@ -10,7 +10,6 @@ pub mod imports;
 pub mod pack_migration;
 pub mod pack_trees;
 pub mod packs;
-pub mod param_placeholder;
 pub mod plan_graph;
 pub mod preflight;
 pub mod preview;
