@@ -5,7 +5,9 @@ use std::path::Path;
 use serde_json::Value;
 
 fn version(manifest: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(manifest);
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join(manifest);
     let text = std::fs::read_to_string(&path).expect("manifest");
     let json: Value = serde_json::from_str(&text).expect("manifest is JSON");
     json["version"].as_str().expect("version").to_owned()
