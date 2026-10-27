@@ -68,6 +68,7 @@ import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
 import { RunTaskGraph, type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
 import { RunTaskGrid } from './RunTaskGrid';
+import { planOrder } from './runGrid';
 import { absoluteTime, relativeTime } from './journeyView';
 import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView';
 import {
@@ -1265,7 +1266,8 @@ function FilesPanel({
     return out;
   }, [graph.data]);
   const entries = listing.data?.files ?? [];
-  const selection = selectRunFile(entries, fileKey);
+  const order = useMemo(() => planOrder(graph.data?.tasks ?? []), [graph.data]);
+  const selection = selectRunFile(entries, fileKey, order);
   const anchor = useRef<HTMLDivElement>(null);
   const anchored = useRef(false);
   const openedOnDeepLink = useRef(fileKey !== null);

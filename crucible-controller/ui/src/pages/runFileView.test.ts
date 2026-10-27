@@ -181,6 +181,15 @@ describe('selectRunFile', () => {
     expect(selectRunFile(entries, null)).toEqual({ state: 'found', file: entries[1] });
   });
 
+  it('picks the report of the task latest in plan order', () => {
+    const early = file({ key: 'apply/REPORT.md', path: 'REPORT.md', task: 'apply' });
+    const sink = file({ key: 'report/REPORT.md', path: 'REPORT.md', task: 'report' });
+    const stray = file({ key: 'gone/REPORT.md', path: 'REPORT.md', task: 'gone' });
+    expect(selectRunFile([early, sink, stray], null, ['apply', 'report'])).toEqual({ state: 'found', file: sink });
+    expect(selectRunFile([sink, early], null, ['report', 'apply'])).toEqual({ state: 'found', file: early });
+    expect(selectRunFile([stray, early], null, [])).toEqual({ state: 'found', file: stray });
+  });
+
   it('falls back to any markdown, then to the first entry', () => {
     const md = file({ key: 'a/NOTES.md', path: 'NOTES.md' });
     const json = file({ key: 'a/x.json', path: 'x.json' });

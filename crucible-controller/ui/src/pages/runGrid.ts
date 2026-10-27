@@ -70,7 +70,7 @@ export interface RunGrid {
 /// order so a plan whose tasks are independent reads the way its author wrote it. A dependency cycle
 /// the planner let through leaves tasks unemitted; they follow in declaration order rather than
 /// vanishing from the grid.
-function planOrder(tasks: PlanTask[]): string[] {
+export function planOrder(tasks: PlanTask[]): string[] {
   const known = new Set(tasks.map((t) => t.name));
   const pending = new Map(
     tasks.map((t) => [t.name, new Set(t.depends_on.filter((dep) => known.has(dep)))]),
