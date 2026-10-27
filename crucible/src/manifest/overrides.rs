@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 
-use crate::plan::settings::{Setting, is_model_name};
+use crate::manifest::launch::{Setting, is_model_name};
 
 /// `[agent.overrides]`: the agent settings a launch may set on the workflow's agent tasks.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -42,8 +42,8 @@ pub fn validate(cfg: &AgentOverridesCfg) -> Result<(), OverridesError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::manifest::launch::Setting;
     use crate::manifest::overrides::{AgentOverridesCfg, OverridesError, validate};
-    use crate::plan::settings::Setting;
 
     fn parse(toml: &str) -> AgentOverridesCfg {
         toml::from_str(toml).expect("parses")

@@ -67,6 +67,8 @@ pub fn load(path: &Path) -> Result<ValidPlan> {
     } else {
         Plan::from_json_str(&src)?
     };
+    crate::manifest::launch::check_agent_knobs(&plan.tasks)
+        .with_context(|| format!("validating plan {}", path.display()))?;
     plan.validate()
         .with_context(|| format!("validating plan {}", path.display()))
 }
@@ -1088,6 +1090,26 @@ mod tests {
         depends_on = ["propose"]
         needs = "gpu"
     "#;
+
+    /// A plan file carries its own tasks, so its harness and effort are checked as it loads.
+    #[test]
+    fn a_plan_file_naming_a_harness_no_turn_can_read_is_refused() {
+        let dir = crate::testing::tempdir("plan-file-knobs");
+        let file = dir.join("plan.toml");
+        std::fs::write(
+            &file,
+            SRC.replace("prompt = \"go\"", "prompt = \"go\"\nharness = \"gpt\""),
+        )
+        .unwrap();
+        let err = load(&file).map(|_| ()).expect_err("refused");
+        assert!(
+            format!("{err:#}").contains("sets harness \"gpt\""),
+            "{err:#}"
+        );
+        std::fs::write(&file, SRC).unwrap();
+        load(&file).expect("a plan with no knobs set loads");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// How a pack spells its graph is not a launcher's business. An undeclared `--param` is a
     /// mistake against the inline spelling exactly as it is against the file-backed one, and

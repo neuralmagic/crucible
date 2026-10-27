@@ -174,11 +174,6 @@ pub enum SettingsError {
     },
 }
 
-/// Whether a supplied name addresses a setting rather than a declared parameter.
-pub fn is_address(name: &str) -> bool {
-    name.contains('.')
-}
-
 /// Supplied values as (declared parameters, setting addresses).
 pub fn split(
     supplied: &BTreeMap<String, String>,
@@ -186,7 +181,7 @@ pub fn split(
     supplied
         .iter()
         .map(|(name, value)| (name.clone(), value.clone()))
-        .partition(|(name, _)| !is_address(name))
+        .partition(|(name, _)| !crate::plan::param::is_address(name))
 }
 
 /// A harness name, read the way a turn reads it.
@@ -199,8 +194,47 @@ pub fn parse_effort(raw: &str) -> Option<ReasoningEffort> {
     <ReasoningEffort as clap::ValueEnum>::from_str(raw, true).ok()
 }
 
-pub const HARNESS_NAMES: &str = "claude, hermes, codex, opencode or pi";
-pub const EFFORT_NAMES: &str = "low, medium, high, xhigh or max";
+const HARNESS_NAMES: &str = "claude, hermes, codex, opencode or pi";
+const EFFORT_NAMES: &str = "low, medium, high, xhigh or max";
+
+/// A harness or effort an agent task sets that no turn could read.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("task {task:?} sets {knob} {got:?}, which is not {expected}")]
+pub struct UnknownAgentKnob {
+    task: String,
+    knob: &'static str,
+    got: String,
+    expected: &'static str,
+}
+
+/// Refuse a harness or effort no turn could read, before anything runs.
+pub fn check_agent_knobs(tasks: &[Task]) -> Result<(), UnknownAgentKnob> {
+    for task in tasks {
+        let TaskKind::Agent {
+            harness, effort, ..
+        } = &task.task
+        else {
+            continue;
+        };
+        let unknown = |knob, got: &String, expected| UnknownAgentKnob {
+            task: task.name.0.clone(),
+            knob,
+            got: got.clone(),
+            expected,
+        };
+        if let Some(h) = harness
+            && parse_harness(h).is_none()
+        {
+            return Err(unknown("harness", h, HARNESS_NAMES));
+        }
+        if let Some(e) = effort
+            && parse_effort(e).is_none()
+        {
+            return Err(unknown("effort", e, EFFORT_NAMES));
+        }
+    }
+    Ok(())
+}
 const MODEL_SHAPE: &str = "a model name: letters, digits and . _ - : / @ [ ], not starting with -";
 
 /// A model name that reaches a harness as exactly one argument.
@@ -402,9 +436,11 @@ fn check_target(
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::manifest::launch::{
+        LaunchSettings, Setting, SettingsError, check_agent_knobs, split,
+    };
     use crate::manifest::{AgentOverridesCfg, GitRef, Harness, ReasoningEffort, RepoOverridesCfg};
     use crate::plan::ir::{Task, TaskKind};
-    use crate::plan::settings::{LaunchSettings, Setting, SettingsError, split};
     use crate::plan::workflow::WorkflowCfg;
 
     fn supplied(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -766,5 +802,33 @@ mod tests {
         LaunchSettings::default()
             .check_ref(&RepoOverridesCfg::default())
             .expect("no ref, nothing to check");
+    }
+
+    #[test]
+    fn check_agent_knobs_names_the_task_the_setting_and_the_choices() {
+        let tasks = |knobs: &str| {
+            toml::from_str::<WorkflowCfg>(&format!(
+                "[[task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"\n{knobs}\n\
+                 [[task]]\nname = \"b\"\nkind = \"command\"\ncommand = \"true\"\n"
+            ))
+            .expect("parses")
+            .tasks
+        };
+        assert_eq!(
+            check_agent_knobs(&tasks("harness = \"gpt\"")).map_err(|e| e.to_string()),
+            Err("task \"a\" sets harness \"gpt\", which is not claude, hermes, codex, opencode or pi".into())
+        );
+        assert_eq!(
+            check_agent_knobs(&tasks("effort = \"extreme\"")).map_err(|e| e.to_string()),
+            Err(
+                "task \"a\" sets effort \"extreme\", which is not low, medium, high, xhigh or max"
+                    .into()
+            )
+        );
+        check_agent_knobs(&tasks(
+            "harness = \"OpenCode\"\neffort = \"XHigh\"\nmodel = \"anything\"",
+        ))
+        .expect("read case-insensitively; a model is not checked here");
+        check_agent_knobs(&tasks("")).expect("nothing set");
     }
 }

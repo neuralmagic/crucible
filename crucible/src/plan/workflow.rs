@@ -8,7 +8,6 @@ use crate::plan::ir::{
     EngineOp, Join, KEPT_INPUT, Plan, PlanBudget, PlanError, Stage, Task, TaskKind, TaskName,
 };
 use crate::plan::param::ParamValue;
-use crate::plan::settings::LaunchSettings;
 
 /// Names used only by the compatibility template.
 const LEGACY_NAMES: [&str; 4] = ["propose", "apply", "measure", "decide"];
@@ -268,13 +267,6 @@ pub struct WorkflowCfg {
     /// Every declared parameter's value as compilation bound it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub params: BTreeMap<String, ParamValue>,
-    /// The agent settings the launch set, already written onto `tasks`. Never read from TOML.
-    #[serde(
-        default,
-        skip_deserializing,
-        skip_serializing_if = "LaunchSettings::is_empty"
-    )]
-    pub launch: LaunchSettings,
     #[serde(rename = "task", default)]
     pub tasks: Vec<Task>,
 }

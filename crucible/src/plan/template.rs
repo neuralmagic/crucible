@@ -95,7 +95,6 @@ pub(crate) fn iteration_template(
         resolved_from: None,
         params: std::collections::BTreeMap::new(),
         history_record: None,
-        launch: Default::default(),
     };
     workflow
         .admit(caps)

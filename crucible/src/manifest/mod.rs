@@ -8,6 +8,7 @@ mod capability;
 mod deploy;
 mod git_ref;
 mod judge;
+pub mod launch;
 pub mod mcp;
 mod measure;
 mod openshell;
@@ -335,6 +336,10 @@ pub struct Manifest {
     /// MCP servers by `[mcp.<key>]`, started on the loop pod.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpCfg>,
+    /// What the launch set, already applied to `repo` and the workflow's tasks. Never read from
+    /// TOML.
+    #[serde(skip)]
+    pub launch: launch::LaunchSettings,
 }
 
 /// A single-repo run's publish-on-keep config: the fork the kept commits are pushed to as a draft PR.
@@ -978,6 +983,7 @@ fn validate_common(c: CommonCfg<'_>) -> Result<()> {
     search::validate_search(c.search)?;
     if let Some(w) = c.workflow {
         w.validate()?;
+        launch::check_agent_knobs(&w.tasks)?;
         validate_task_sandboxes(c.agent, w)?;
     }
     match c.judge {
@@ -1155,8 +1161,8 @@ impl Manifest {
         manifest_dir: &Path,
         params: &std::collections::BTreeMap<String, String>,
     ) -> Result<()> {
-        let (declared_params, addressed) = crate::plan::settings::split(params);
-        let launch = crate::plan::settings::LaunchSettings::parse(&addressed)?;
+        let (declared_params, addressed) = launch::split(params);
+        let launch = launch::LaunchSettings::parse(&addressed)?;
         let Some(workflow) = &mut self.workflow else {
             return refuse_unconsumable(params);
         };
@@ -1175,7 +1181,7 @@ impl Manifest {
             refuse_unconsumable(&declared_params)?;
             if !launch.is_empty() {
                 launch.apply(&mut workflow.tasks, &self.agent.overrides)?;
-                workflow.launch = launch;
+                self.launch = launch;
             }
             return Ok(());
         }
@@ -1195,8 +1201,10 @@ impl Manifest {
         let mut resolved = compiled.workflow;
         resolved.resolved_from = Some(file);
         launch.apply(&mut resolved.tasks, &self.agent.overrides)?;
-        resolved.launch = launch;
         self.workflow = Some(resolved);
+        if !launch.is_empty() {
+            self.launch = launch;
+        }
         self.validate()?;
         Ok(())
     }
@@ -2549,18 +2557,20 @@ mod tests {
         );
         let workflow = serde_json::to_value(m.workflow.as_ref().expect("workflow")).expect("json");
         assert_eq!(workflow["params"]["topic"], "sinks");
+        let launched = serde_json::to_value(&m.launch).expect("json");
         assert_eq!(
-            workflow["launch"],
+            launched,
             serde_json::json!({"agents": {"*": {"effort": "high"}, "review": {"model": "launched"}}})
         );
 
         m.resolve_workflow(&dir)
             .expect("resolving again is a no-op");
         assert_eq!(
-            serde_json::to_value(m.workflow.as_ref().expect("workflow")).expect("json")["launch"],
-            workflow["launch"],
+            serde_json::to_value(&m.launch).expect("json"),
+            launched,
             "resolving again keeps what the launch set"
         );
+        assert_eq!(agent_knobs(&m, "review").0, Some("launched".into()));
 
         let mut plain: Manifest = toml::from_str(&task_manifest(GATED_SOURCE)).expect("parses");
         plain.resolve_workflow(&dir).expect("resolves");
@@ -2569,10 +2579,7 @@ mod tests {
             (Some("authored".into()), None)
         );
         assert!(
-            serde_json::to_value(plain.workflow.as_ref().expect("workflow"))
-                .expect("json")
-                .get("launch")
-                .is_none(),
+            plain.launch.is_empty(),
             "a launch that set nothing records nothing"
         );
 
@@ -2668,8 +2675,8 @@ mod tests {
             m.repo.git_ref.as_ref().map(GitRef::as_str),
             Some("refs/heads/feature/x")
         );
-        let record = serde_json::to_value(m.workflow.as_ref().expect("workflow")).expect("json");
-        assert_eq!(record["launch"]["ref"], "refs/heads/feature/x");
+        let record = serde_json::to_value(&m.launch).expect("json");
+        assert_eq!(record["ref"], "refs/heads/feature/x");
 
         let err = toml::from_str::<Manifest>(&manifest("workspace"))
             .expect("parses")
@@ -2697,6 +2704,60 @@ mod tests {
             unset.repo.git_ref.as_ref().map(GitRef::as_str),
             Some("main"),
             "without a launch value the written ref stands"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A harness or effort no turn can read fails the manifest, whether the graph was compiled or
+    /// carried inline, before any task runs.
+    #[test]
+    fn a_harness_or_effort_no_turn_can_read_fails_validation() {
+        let dir = tempdir("agent-knobs");
+        for (source, needle) in [
+            (
+                "a = agent(name = \"a\", prompt = \"p\", effort = \"extreme\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets effort \"extreme\", which is not low, medium, high, xhigh or max",
+            ),
+            (
+                "a = agent(name = \"a\", prompt = \"p\", harness = \"gpt\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets harness \"gpt\", which is not claude, hermes, codex, opencode or pi",
+            ),
+            (
+                "s = session(name = \"s\", effort = \"hgih\")\na = agent(name = \"a\", prompt = \"p\", session = s)\nworkflow(type = \"playbook\", tasks = [a])\n",
+                "sets effort \"hgih\"",
+            ),
+        ] {
+            std::fs::write(dir.join("graph.star"), source).expect("write source");
+            let err = toml::from_str::<Manifest>(&task_manifest(
+                "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"",
+            ))
+            .expect("parses")
+            .resolve_workflow(&dir)
+            .expect_err("refused");
+            assert!(format!("{err:#}").contains(needle), "{source}: {err:#}");
+        }
+        std::fs::write(
+            dir.join("graph.star"),
+            "a = agent(name = \"a\", prompt = \"p\", harness = \"OpenCode\", effort = \"XHigh\")\nworkflow(type = \"playbook\", tasks = [a])\n",
+        )
+        .expect("write source");
+        toml::from_str::<Manifest>(&task_manifest(
+            "[workflow]\ntype = \"playbook\"\nfile = \"graph.star\"",
+        ))
+        .expect("parses")
+        .resolve_workflow(&dir)
+        .expect("read case-insensitively, as a turn reads them");
+
+        let inline = "[workflow]\ntype = \"playbook\"\n\
+             [[workflow.task]]\nname = \"a\"\nkind = \"agent\"\nprompt = \"p\"\neffort = \"extreme\"";
+        let err = toml::from_str::<Manifest>(&task_manifest(inline))
+            .expect("parses")
+            .validate()
+            .expect_err("an inline graph is checked at load");
+        assert!(
+            format!("{err:#}").contains("sets effort \"extreme\""),
+            "{err:#}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -5,7 +5,7 @@ use crate::agent::harness::HarnessRuntime;
 use crate::args::Args;
 use crate::control::broker;
 use crate::manifest;
-use crate::plan::settings::Setting;
+use crate::manifest::launch::Setting;
 use anyhow::{Context, Result};
 use crucible_vcs::vcs;
 use std::path::Path;
@@ -451,7 +451,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let mut m = manifest::Manifest::load_frozen(manifest_path)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
-    if let Some(all) = m.workflow.as_ref().and_then(|w| w.launch.all()) {
+    if let Some(all) = m.launch.all() {
         for (setting, flag, value) in [
             (
                 Setting::Harness,
@@ -469,7 +469,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let state = state_dir(manifest_path);
     let skills = m.agent.toolbox_dir.as_ref().map(|d| manifest_dir.join(d));
     let p = crate::args::Paths::for_manifest(workspace.clone(), state, &manifest_dir, skills);
-    let launched_ref = m.workflow.as_ref().and_then(|w| w.launch.repo_ref());
+    let launched_ref = m.launch.repo_ref();
     if workspace.exists() {
         if let Some(r) = launched_ref
             && start == Start::Fresh
@@ -516,7 +516,7 @@ pub(crate) fn prep_plan_runner_with_params(
     let frozen = frozen_projection(
         &m,
         m.publish.as_ref().and_then(|p| p.pr_repo.as_deref()),
-        &crate::plan::settings::split(params).0,
+        &manifest::launch::split(params).0,
         &p.session_log,
     )?;
     apply_agent_cfg(&mut args, &m.agent, &m.secrets, &p.workspace, &frozen)?;

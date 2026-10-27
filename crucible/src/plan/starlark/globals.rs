@@ -284,7 +284,6 @@ fn call<'v>(
                         resolved_from: None,
                         params: BTreeMap::new(),
                         history_record: None,
-                        launch: Default::default(),
                     };
                     workflow.validate()?;
                     Ok(dsl::Value::Workflow(workflow))

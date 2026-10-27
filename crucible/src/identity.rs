@@ -60,12 +60,12 @@ fn hash_seed(manifest_dir: &Path, seed_diff: Option<&str>) -> Result<String> {
 /// `[workflow].file` carries only a path, and two entirely different graphs behind the same
 /// path would otherwise share a digest, which is the one thing the comparability key must never
 /// allow. Launch settings rewrite an inline graph's tasks without touching the text, so a graph
-/// they changed is hashed too.
+/// a launch changed is hashed too.
 fn workflow_graph_text(m: &manifest::Manifest) -> Result<String> {
     let Some(workflow) = m
         .workflow
         .as_ref()
-        .filter(|w| w.resolved_from_file() || !w.launch.is_empty())
+        .filter(|w| w.resolved_from_file() || !m.launch.is_empty())
     else {
         return Ok(String::new());
     };
