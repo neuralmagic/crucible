@@ -249,6 +249,62 @@ pub async fn run_files(c: &Client, run_id: &str, as_json: bool) -> Result<String
     Ok(render::run_files(run_id, &listing))
 }
 
+/// Verify every statement `target` names: an envelope digest, or a full commit sha and each
+/// statement whose subject it is. Each envelope is checked here, against `keys` when given and the
+/// controller's published key set otherwise. Any failure fails the call.
+pub async fn verify(
+    c: &Client,
+    target: &str,
+    repository: Option<&str>,
+    keys: Option<&Path>,
+) -> Result<String> {
+    use crucible_contract::provenance::{CommitSha, EnvelopeDigest, Expect, KeySet};
+    let keys: KeySet = match keys {
+        Some(path) => serde_json::from_str(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("reading the key set {}", path.display()))?,
+        )
+        .with_context(|| format!("parsing the key set {}", path.display()))?,
+        None => c.provenance_keys().await?,
+    };
+    let (digests, commit) = match (EnvelopeDigest::parse(target), CommitSha::parse(target)) {
+        (Ok(digest), _) => (vec![digest], None),
+        (_, Ok(sha)) => {
+            let listed: Vec<dto::ProvenanceStatement> = c.commit_statements(sha.as_str()).await?;
+            let digests = listed
+                .iter()
+                .map(|s| EnvelopeDigest::parse(&s.digest))
+                .collect::<Result<Vec<_>, _>>()?;
+            if digests.is_empty() {
+                bail!("no statement names commit {sha}");
+            }
+            (digests, Some(sha))
+        }
+        _ => bail!("{target:?} is neither an envelope digest nor a full commit sha"),
+    };
+    let mut lines = Vec::with_capacity(digests.len());
+    let mut failed = false;
+    for digest in &digests {
+        let bytes = c.envelope(digest.as_str()).await?;
+        let checked = crucible_contract::provenance::verify(
+            &bytes,
+            &keys,
+            Expect {
+                digest: Some(digest),
+                commit: commit.as_ref(),
+                repository,
+            },
+        );
+        failed |= checked.is_err();
+        lines.push(render::verification(digest, &checked));
+    }
+    let out = lines.join("");
+    match failed {
+        true => bail!("{out}"),
+        false => Ok(out),
+    }
+}
+
 /// Fetch one captured file. With `out`, write it there and say so; without, print it, which is only
 /// honest for text — a file that is not UTF-8 says so and names `--out` rather than spraying bytes
 /// at a terminal.

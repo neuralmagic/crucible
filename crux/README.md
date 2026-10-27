@@ -162,6 +162,18 @@ times would otherwise print twelve copies of the same verdict. `(any)` means the
 *one* dependency passes, so a red dependency above it is not necessarily what is blocking it.
 `--mermaid` emits a flowchart.
 
+### `verify`
+
+```
+$ crux verify 0123456789abcdef0123456789abcdef01234567 --repo https://github.com/acme/widget
+$ crux verify sha256:9f2c… --keys keys.json
+```
+
+Checks a pushed commit's signed provenance: each statement for a full commit SHA, or the one an
+envelope digest names. Each envelope's digest, key id, signature and subject are checked here,
+against the controller's published key set or the one `--keys` names. Exits non-zero when any
+envelope fails.
+
 ### Drafts: `draft-create` / `draft-pull` / `draft-push` / `draft-preview` / `draft-launch` / `draft-graduate` / `draft-delete`
 
 ```

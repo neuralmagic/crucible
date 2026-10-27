@@ -2955,3 +2955,58 @@ mod tests {
         assert_eq!(providers(&[]), "no providers registered\n");
     }
 }
+
+/// One envelope's verification: `ok` with what the statement records, or `FAIL` with the step.
+pub fn verification(
+    digest: &crucible_contract::provenance::EnvelopeDigest,
+    checked: &Result<
+        crucible_contract::provenance::Verified,
+        crucible_contract::provenance::VerifyFailure,
+    >,
+) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    match checked {
+        Ok(v) => {
+            let p = &v.statement.predicate;
+            let subject = v.statement.subject.first();
+            let _ = writeln!(out, "ok   {digest}");
+            if let Some(s) = subject {
+                let _ = writeln!(out, "  commit   {} {}", s.name, s.digest.git_commit);
+            }
+            let _ = writeln!(out, "  keyid    {}", v.keyid);
+            let _ = writeln!(out, "  run      {} task {} iter {}", p.run, p.task, p.iter);
+            if let Some(pb) = &p.playbook {
+                let draft = pb
+                    .draft_version
+                    .map(|d| format!(" draft {d}"))
+                    .unwrap_or_default();
+                let _ = writeln!(out, "  playbook {}{draft}", pb.id);
+            }
+            for a in &p.agents {
+                let _ = writeln!(out, "  agent    {} {} {}", a.task, a.harness, a.model);
+            }
+            for (label, value) in [
+                ("provider", &p.provider),
+                ("image", &p.sandbox_image),
+                ("cluster", &p.cluster),
+                ("plan", &p.plan),
+                ("schema", &p.schema),
+                ("pr", &p.pull_request),
+            ] {
+                if let Some(value) = value {
+                    let _ = writeln!(out, "  {label:<8} {value}");
+                }
+            }
+            for c in &p.checks {
+                let _ = writeln!(out, "  check    {} {}", c.task, c.status);
+            }
+            let _ = writeln!(out, "  signed   {}", p.signed_at);
+        }
+        Err(f) => {
+            let _ = writeln!(out, "FAIL {digest}");
+            let _ = writeln!(out, "  {:?}: {}", f.step, f.detail);
+        }
+    }
+    out
+}

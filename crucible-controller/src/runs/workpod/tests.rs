@@ -2995,6 +2995,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
             rerun: None,
+            provenance: Default::default(),
         },
         None,
     )
@@ -3008,6 +3009,91 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
             .iter()
             .all(Option::is_none),
         "a launch with no upstream item addresses no tracker item"
+    );
+    Ok(())
+}
+
+/// A playbook pod is handed what the dispatch resolved, with the cluster it landed on; a loop pod,
+/// which pushes nothing a statement covers, is handed nothing.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_playbook_pod_carries_its_dispatch_provenance(pool: sqlx::PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let tmp = tempfile::tempdir()?;
+    let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
+    let db = Db::new(pool);
+    let cfg = pod_cfg(&profile, "img");
+    let resolved = crucible_contract::provenance::DispatchProvenance {
+        cluster: None,
+        provider: Some("registry-provider".to_string()),
+        sandbox_image: Some(format!(
+            "registry.example/sandbox@sha256:{}",
+            "b".repeat(64)
+        )),
+    };
+
+    let (dispatcher, pods) = WrapperRecorder::new();
+    let out = dispatch_run(
+        &db,
+        &cfg,
+        dispatcher,
+        "playbook:survey:0199c0de-7c2c-71a5-8000-1",
+        "playbook_survey_0199c0de-42",
+        &materialized(crate::testing::fixtures::write_playbook_pack(
+            &tmp.path().join("playbook"),
+            crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
+        )),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::Playbook {
+            params: vec![
+                ("depth".to_string(), "--deep".to_string()),
+                ("topic".to_string(), "attention sinks".to_string()),
+            ],
+            max_cost: 3.5,
+            max_time: crate::model::MaxTime::parse("30m").expect("duration"),
+            agent: AgentSelection::default(),
+            rerun: None,
+            provenance: resolved.clone(),
+        },
+        None,
+    )
+    .await?;
+    let RunAdmission::Launched { location, .. } = out else {
+        panic!("expected a launch, got {out:?}");
+    };
+    let handed = only_pod_env(&pods, crucible_contract::provenance::ENV_PROVENANCE);
+    assert!(!handed.is_empty());
+    for value in handed {
+        let doc: crucible_contract::provenance::DispatchProvenance =
+            serde_json::from_str(value.as_deref().expect("a value"))?;
+        assert_eq!(
+            doc,
+            crucible_contract::provenance::DispatchProvenance {
+                cluster: Some(location.cluster.clone()),
+                ..resolved.clone()
+            }
+        );
+    }
+
+    let (dispatcher, pods) = WrapperRecorder::new();
+    dispatch_run(
+        &db,
+        &cfg,
+        dispatcher,
+        "owner/repo#7",
+        "owner_repo_7-42",
+        &materialized(crate::testing::fixtures::write_loop_pack(tmp.path())),
+        &BTreeMap::new(),
+        None,
+        RunRenderOpts::for_loop(&cfg, "owner/repo", AgentSelection::default()),
+        None,
+    )
+    .await?;
+    assert!(
+        only_pod_env(&pods, crucible_contract::provenance::ENV_PROVENANCE)
+            .iter()
+            .all(Option::is_none),
+        "a loop pod is handed no provenance"
     );
     Ok(())
 }
@@ -3369,6 +3455,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::from_resolved(resolved.as_ref()),
             rerun: None,
+            provenance: Default::default(),
         },
         None,
     )
@@ -3533,6 +3620,7 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
             rerun: None,
+            provenance: Default::default(),
         },
         None,
     )
@@ -3613,6 +3701,7 @@ async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) ->
                 run: "playbook_survey_0199c0de-42".to_string(),
                 from: vec!["draft".to_string()],
             }),
+            provenance: Default::default(),
         },
         None,
     )

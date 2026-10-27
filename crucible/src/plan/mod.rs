@@ -9,6 +9,7 @@ pub mod history;
 pub mod ir;
 pub mod machine;
 pub mod param;
+pub mod provenance;
 pub mod record;
 pub mod rerun;
 pub mod resume;

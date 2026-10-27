@@ -486,6 +486,10 @@ pub struct ControllerCfg {
     /// (an `Arc` inside), so every `cfg.clone()` shares the one token cache.
     #[arg(skip)]
     pub github_app: Option<crate::secrets::github_app::GithubAppTokenSource>,
+    /// The key commit provenance is signed with, threaded in after parsing from
+    /// `CONTROLLER_PROVENANCE_KEY_PATH`. `None` signs nothing.
+    #[arg(skip)]
+    pub provenance: Option<std::sync::Arc<crucible_contract::provenance::Signer>>,
     /// How scope-propose turns run: `pod` (dispatch a WorkPod), `local` (shell `crucible scope`
     /// in-process, the compatible default), or `disabled` (skip autopilot scoping). `local` is the
     /// default so existing deploys keep working without config changes.

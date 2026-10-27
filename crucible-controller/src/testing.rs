@@ -118,6 +118,7 @@ pub(crate) fn cfg_with(state_dir: &std::path::Path) -> crate::config::Controller
         overrides_namespace: None,
         overrides: None,
         github_app: None,
+        provenance: None,
         scope_executor: crucible_controller::ScopeExecutor::Local,
         scope_sandbox_image: None,
         pr_repo_map: Vec::new(),

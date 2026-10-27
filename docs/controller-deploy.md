@@ -341,6 +341,23 @@ openssl ecparam -genkey -noout -name prime256v1 | openssl pkcs8 -topk8 -nocrypt 
 oc create secret generic crucible-agent-signing-key --from-file=agent-signing.pem
 ```
 
+## Commit provenance
+
+Set `CONTROLLER_PROVENANCE_KEY_PATH` to a PKCS#8 PEM ed25519 key, mounted from a Secret, and the
+controller signs a statement for each commit a finished run reports pushing. A key that is set and
+does not load fails startup. Without one the controller signs nothing, and the key set and
+verification routes answer 503. `just provenance-dev-key` writes a key for local use:
+
+```sh
+openssl genpkey -algorithm ed25519 -out provenance.pem
+oc create secret generic crucible-provenance-key --from-file=provenance.pem
+```
+
+`GET /api/provenance/keys` serves the public key set without a token, so anyone handed an
+envelope can check it. `GET /api/provenance/envelopes/{digest}` serves an envelope byte for byte,
+`GET /api/provenance/commits/{sha}` lists every statement for a commit, and
+`POST /api/provenance/verify` checks them against the controller's key.
+
 ## Observability
 
 - `/metrics` serves Prometheus text on the API port.

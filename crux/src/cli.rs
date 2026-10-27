@@ -388,6 +388,19 @@ enum Command {
         out: Option<std::path::PathBuf>,
     },
 
+    /// Check a commit's signed provenance: an envelope digest, or a full commit sha and every
+    /// statement for it. Exits non-zero when any envelope fails.
+    Verify {
+        /// `sha256:<hex>` envelope digest, or a full commit sha.
+        target: String,
+        /// The repository the statement's subject must name.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Verify against this key set file instead of the controller's published one.
+        #[arg(long)]
+        keys: Option<std::path::PathBuf>,
+    },
+
     /// The broker contract names this controller accepts.
     Contracts {
         #[arg(long)]
@@ -798,6 +811,9 @@ pub async fn run() -> Result<()> {
         Command::RunFiles { run_id, json } => ops::run_files(&client, &run_id, json).await?,
         Command::RunFile { run_id, key, out } => {
             ops::run_file(&client, &run_id, &key, out.as_deref()).await?
+        }
+        Command::Verify { target, repo, keys } => {
+            ops::verify(&client, &target, repo.as_deref(), keys.as_deref()).await?
         }
         Command::Contracts { json } => ops::contracts(&client, json).await?,
         Command::Approve { key, json } => ops::approve(&client, &key, json).await?,

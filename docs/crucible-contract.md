@@ -847,6 +847,13 @@ table estimate when it reports nothing, and any other model costs nothing whatev
 reports. A `price` on a `decision` binding fails the run. An engine older than 1.19.0 refuses a
 document that carries a price as an unknown field.
 
+An orchestrator that dispatches a run sets `CRUCIBLE_PROVENANCE` (contract 1.20.0) to
+`crucible_contract::provenance::DispatchProvenance`: `{"cluster","provider","sandbox_image"}`,
+each omitted where it resolved none, the image by digest. An unknown field fails the run before
+any task. The engine gives every command and evaluate task the reserved input `provenance`:
+those fields, plus `run`, `task`, and `agents`, each agent task's resolved `{"harness","model"}`
+by name. With no `CRUCIBLE_PROVENANCE` the input carries only what the engine knows.
+
 An orchestrator that starts a run of a launch series supplies the series' earlier terminal runs
 as one JSON document in `CRUCIBLE_HISTORY` (contract 1.9.0), typed as
 `crucible_contract::history::SuppliedHistory`: `{"version":1,"records":[record]}`, the most

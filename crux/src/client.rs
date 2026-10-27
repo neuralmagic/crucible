@@ -363,6 +363,28 @@ impl Client {
         Ok(bytes)
     }
 
+    pub async fn provenance_keys(&self) -> Result<crucible_contract::provenance::KeySet> {
+        self.get("/api/provenance/keys").await
+    }
+
+    pub async fn commit_statements<T: DeserializeOwned>(&self, sha: &str) -> Result<T> {
+        self.get(&format!("/api/provenance/commits/{}", encode(sha)))
+            .await
+    }
+
+    /// An envelope's stored bytes, untouched: its digest is over exactly these.
+    pub async fn envelope(&self, digest: &str) -> Result<Vec<u8>> {
+        let path = format!("/api/provenance/envelopes/{}", encode(digest));
+        let (status, bytes) = self.transport.get_bytes(&path).await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "GET {path} failed: {status}: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        Ok(bytes)
+    }
+
     pub async fn contracts<T: DeserializeOwned>(&self) -> Result<T> {
         self.get("/api/config/broker-contracts").await
     }

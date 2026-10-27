@@ -1993,6 +1993,8 @@ dependencies = [
 name = "crucible-contract"
 version = "0.5.1"
 dependencies = [
+ "base64 0.23.1",
+ "ed25519-dalek",
  "flate2",
  "jsonschema",
  "percent-encoding",
@@ -2026,6 +2028,7 @@ dependencies = [
  "crucible-mcp-auth",
  "crux",
  "ctrlc",
+ "ed25519-dalek",
  "flate2",
  "forge",
  "futures-util",

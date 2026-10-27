@@ -273,6 +273,7 @@ async fn settle_run(
         &crate::runs::pod_token::Subject::Run(run.run_id.clone()),
     )
     .await?;
+    attest(db, cfg.provenance.as_deref(), &run.run_id).await;
     // The run's session is ingested and its cost booked (once, in `complete_run`'s ingest):
     // close the WorkPod ledger row + GC the run pod. Best-effort — a leaked pod is swept
     // later, never fatal to the completion.
@@ -290,6 +291,18 @@ async fn settle_run(
         tracing::warn!(pod_name = %pod, issue_key = %key, error = format!("{e:#}"), "workpod: collecting run pod failed (continuing)");
     }
     Ok(true)
+}
+
+/// Sign the commits a completed run reported pushing, logging a failure.
+pub(crate) async fn attest(
+    db: &Db,
+    signer: Option<&crucible_contract::provenance::Signer>,
+    run_id: &str,
+) {
+    let Some(signer) = signer else { return };
+    if let Err(e) = crate::provenance::attest_run(db.pool(), signer, run_id).await {
+        tracing::warn!(%run_id, error = format!("{e:#}"), "signing the run's commit provenance failed");
+    }
 }
 
 /// Locate a run's published session log: its recorded `session_uri` if it names the artifact store

@@ -28,14 +28,17 @@ pub const PARAMS_INPUT: &str = "params";
 /// The reserved input a revised task receives its reviewer's last verdict under, from its second
 /// round on.
 pub const REVISION_INPUT: &str = "revision";
+/// The reserved input every command and evaluate task receives the run's provenance under.
+pub const PROVENANCE_INPUT: &str = "provenance";
 /// Every key the engine writes into a task's inputs itself. A dependency named after one of
 /// them would have its entry overwritten, so [`crate::plan::ir::Plan::validate`] refuses it.
-pub const RESERVED_INPUTS: [&str; 6] = [
+pub const RESERVED_INPUTS: [&str; 7] = [
     HISTORY_INPUT,
     ITEM_INPUT,
     KEPT_INPUT,
     OUTCOME_INPUT,
     PARAMS_INPUT,
+    PROVENANCE_INPUT,
     REVISION_INPUT,
 ];
 
