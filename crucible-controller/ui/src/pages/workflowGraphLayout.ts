@@ -98,7 +98,7 @@ export const FIT_MIN_ZOOM = 0.7;
 export const FIT_MAX_ZOOM = 1.35;
 /// Room the fit leaves around the graph; the top clears the toolbar.
 const FIT_PAD = { top: 40, right: 12, bottom: 12, left: 12 };
-const FRAME_MIN_H = 240;
+const FRAME_MIN_H = 200;
 const FRAME_PANEL_H = 480;
 
 export interface Viewport {
@@ -126,19 +126,20 @@ export function fitViewport(
   };
 }
 
-/// The heights the in-page frame may take: enough to hold the graph at the legible floor, and no
-/// more than it needs at the largest zoom. An open task panel shares the frame and needs room to
-/// read evidence in, however short the graph beside it.
-export function frameHeights(
+/// The height of the in-page frame: the graph at the zoom the frame's width lets it fit at, so a
+/// frame is neither taller than its graph needs nor too short to show it whole. An open task panel
+/// shares the frame and needs room to read evidence in, however short the graph beside it.
+export function frameHeight(
   graph: { width: number; height: number },
+  width: number,
   panel: boolean
-): { min: number; max: number } {
-  const pad = FIT_PAD.top + FIT_PAD.bottom;
-  const floor = panel ? FRAME_PANEL_H : FRAME_MIN_H;
-  return {
-    min: Math.max(floor, Math.ceil(graph.height * FIT_MIN_ZOOM + pad)),
-    max: Math.max(floor, Math.ceil(graph.height * FIT_MAX_ZOOM + pad)),
-  };
+): number {
+  const zoom = Math.min(
+    FIT_MAX_ZOOM,
+    Math.max(FIT_MIN_ZOOM, (width - FIT_PAD.left - FIT_PAD.right) / Math.max(1, graph.width))
+  );
+  const fitted = Math.ceil(graph.height * zoom + FIT_PAD.top + FIT_PAD.bottom);
+  return Math.max(panel ? FRAME_PANEL_H : FRAME_MIN_H, fitted);
 }
 
 /// The mapped task an instance came from. The executor names an instance `node[item]` and a

@@ -33,7 +33,7 @@ import { cn, ExternalLinkChip, ExternalLinkMark, Split, SplitHandle, SplitPane }
 import { useDeviceFlag } from '../useDeviceFlag';
 import {
   fitViewport,
-  frameHeights,
+  frameHeight,
   INSTANCE_GAP,
   INSTANCE_H,
   INSTANCE_INDENT,
@@ -142,6 +142,9 @@ const KIND_RULE: Record<string, string> = {
   engine: 'bg-amber',
   route: 'bg-ink',
 };
+
+/// The frame's border, top and bottom: its height is set border to border, the graph's inside it.
+const FRAME_BORDER = 2;
 
 /// Which way the graph runs is a per-device choice: a wide screen reads left to right, a narrow
 /// pane top down.
@@ -771,6 +774,8 @@ function GraphCanvas({
   const [full, setFull] = useState(false);
   const { setViewport } = useReactFlow();
   const canvasRef = useRef<HTMLDivElement | null>(null);
+  const frameRef = useRef<HTMLDivElement | null>(null);
+  const [frameWidth, setFrameWidth] = useState(0);
   const fit = useCallback(() => {
     const element = canvasRef.current;
     if (element === null) return;
@@ -874,6 +879,18 @@ function GraphCanvas({
     };
   }, [fit]);
 
+  // The frame is as tall as its graph needs at the width it is given.
+  useEffect(() => {
+    const element = frameRef.current;
+    if (element === null) return;
+    const observer = new ResizeObserver((entries) => {
+      const width = entries[0]?.contentRect.width;
+      if (width !== undefined) setFrameWidth(width);
+    });
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, []);
+
   const close = useCallback(() => setPicked(null), []);
   // Escape closes the innermost thing first: the task panel, then the full-screen view.
   const onKeyDown = useCallback(
@@ -895,7 +912,7 @@ function GraphCanvas({
   );
 
   const pickedNode = picked === null ? undefined : view.nodes.get(picked);
-  const frame = frameHeights(layout, pickedNode !== undefined);
+  const height = frameHeight(layout, frameWidth, pickedNode !== undefined);
   const panelIds = pickedNode === undefined ? CANVAS_ONLY : CANVAS_AND_PANEL;
 
   if (layout.nodes.length === 0) return null;
@@ -907,17 +924,10 @@ function GraphCanvas({
           role="region"
           aria-label="Compiled workflow graph"
           data-testid="workflow-graph"
+          ref={frameRef}
           onKeyDown={onKeyDown}
           data-fullscreen={full ? 'true' : undefined}
-          style={
-            full
-              ? undefined
-              : {
-                  aspectRatio: `${layout.width} / ${layout.height}`,
-                  minHeight: `min(${frame.min}px, 780px, 64vh)`,
-                  maxHeight: `min(${frame.max}px, 780px, 64vh)`,
-                }
-          }
+          style={full ? undefined : { height: `min(${height + FRAME_BORDER}px, 780px, 64vh)` }}
           className={cn(
             'border border-rule-hard bg-paper',
             full ? 'fixed inset-0 z-40 h-screen w-screen' : 'relative w-full'

@@ -5,7 +5,7 @@ import {
   FIT_MAX_ZOOM,
   FIT_MIN_ZOOM,
   fitViewport,
-  frameHeights,
+  frameHeight,
   INSTANCE_H,
   INSTANCE_INDENT,
   isPill,
@@ -691,19 +691,33 @@ describe('fitting the view', () => {
     expect(Number.isFinite(view.x) && Number.isFinite(view.y)).toBe(true);
   });
 
-  it('sizes the frame to hold the graph at the floor and no more than it needs at the top', () => {
-    expect(frameHeights({ width: 2000, height: 354 }, false)).toEqual({
-      min: Math.ceil(354 * FIT_MIN_ZOOM + 52),
-      max: Math.ceil(354 * FIT_MAX_ZOOM + 52),
-    });
-    expect(frameHeights({ width: 400, height: 40 }, false)).toEqual({ min: 240, max: 240 });
+  /// The frame is as tall as the graph at the zoom its width allows: a wide frame holds a long
+  /// graph larger, and a frame never pads a short graph with empty canvas.
+  it('sizes the frame to the graph at the zoom its width allows', () => {
+    const graph = { width: 1400, height: 300 };
+    expect(frameHeight(graph, 1424, false)).toBe(300 + 52);
+    expect(frameHeight(graph, 1704, false)).toBe(Math.ceil(300 * 1.2 + 52));
+    expect(frameHeight(graph, 4000, false)).toBe(Math.ceil(300 * FIT_MAX_ZOOM + 52));
+    expect(frameHeight(graph, 600, false)).toBe(Math.ceil(300 * FIT_MIN_ZOOM + 52));
+    expect(frameHeight(graph, 0, false)).toBe(Math.ceil(300 * FIT_MIN_ZOOM + 52));
+    expect(frameHeight({ width: 400, height: 40 }, 1000, false)).toBe(200);
+  });
+
+  /// The frame's height matches what the fit then draws: no slack above or below the graph.
+  it('leaves no slack between the frame and the graph it fits', () => {
+    const graph = { width: 1400, height: 300 };
+    const height = frameHeight(graph, 1124, false);
+    const view = fitViewport(graph, { width: 1124, height });
+    expect(view.y).toBeCloseTo(40, 0);
+    expect(view.zoom).toBeCloseTo(1100 / 1400);
   });
 
   /// The task panel opens inside the frame, so a short graph must not leave it a sliver.
   it('gives an open task panel room to read in, however short the graph', () => {
-    expect(frameHeights({ width: 400, height: 40 }, true)).toEqual({ min: 480, max: 480 });
-    const tall = frameHeights({ width: 400, height: 900 }, true);
-    expect(tall).toEqual(frameHeights({ width: 400, height: 900 }, false));
+    expect(frameHeight({ width: 400, height: 40 }, 1000, true)).toBe(480);
+    expect(frameHeight({ width: 400, height: 900 }, 1000, true)).toBe(
+      frameHeight({ width: 400, height: 900 }, 1000, false)
+    );
   });
 });
 
