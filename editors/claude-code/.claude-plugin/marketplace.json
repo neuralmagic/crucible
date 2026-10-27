@@ -1,0 +1,14 @@
+{
+  "name": "crucible",
+  "description": "Editor integration for crucible workflow Starlark.",
+  "owner": {
+    "name": "crucible"
+  },
+  "plugins": [
+    {
+      "name": "crucible-lsp",
+      "source": "./crucible-lsp",
+      "description": "Runs crucible-lsp on crucible workflow files (*.star): errors after each edit, definitions, references, hover, and symbols."
+    }
+  ]
+}

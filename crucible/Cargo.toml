@@ -39,6 +39,8 @@ glob = "0.3"
 # denial-of-service vector here), and the lite build has no dependencies and is already in the
 # lockfile via the AWS SDK, so it costs nothing new.
 regex-lite = "0.1"
+# Parses a declared param `pattern` for the placeholder generator. Already linked via starlark.
+regex-syntax = "0.8"
 # Comment-preserving TOML surgery for the pack freeze rewrite (pin [repo], inject [deploy], pin the
 # sandboxed [agent] backend); the deserialize-only `Manifest` can't round-trip, so a targeted edit
 # keeps the agent's authored comments. Already in the tree as `toml`'s own backing crate.

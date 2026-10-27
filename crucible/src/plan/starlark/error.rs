@@ -569,19 +569,42 @@ pub enum CompileError {
     #[error(
         "task(s) constructed but not included in the workflow: {}; add them to \
          workflow(tasks = ...) or delete them",
-        .sites.join(", ")
+        Site::list(.sites)
     )]
-    DroppedTasks { sites: Vec<String> },
+    DroppedTasks { sites: Vec<Site> },
     #[error(
         "session string reference(s) {} appear before any session() declaration; declare sessions \
          before binding them",
-        .sites.join(", ")
+        Site::list(.sites)
     )]
-    LateSessionDeclaration { sites: Vec<String> },
+    LateSessionDeclaration { sites: Vec<Site> },
     #[error(
         "session(s) declared but never bound to a task: {}; bind with session = <declaration> or \
          delete them",
-        .sites.join(", ")
+        Site::list(.sites)
     )]
-    UnboundSessions { sites: Vec<String> },
+    UnboundSessions { sites: Vec<Site> },
+}
+
+/// A named site an error points at.
+#[derive(Debug, Clone)]
+pub struct Site {
+    pub name: String,
+    pub at: FileSpan,
+}
+
+impl Site {
+    fn list(sites: &[Site]) -> String {
+        sites
+            .iter()
+            .map(Site::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for Site {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?} ({})", self.name, self.at)
+    }
 }

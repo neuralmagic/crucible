@@ -34,6 +34,14 @@ pub enum ParamType {
 }
 
 impl ParamType {
+    pub const ALL: [ParamType; 5] = [
+        ParamType::String,
+        ParamType::Int,
+        ParamType::Number,
+        ParamType::Bool,
+        ParamType::StringList,
+    ];
+
     pub fn parse(name: &str) -> Option<Self> {
         match name {
             "string" => Some(ParamType::String),
@@ -122,7 +130,7 @@ pub struct ParamSpec {
 }
 
 /// Every field a declaration may carry, for the did-you-mean on a typo.
-const FIELDS: &[&str] = &[
+pub const FIELDS: &[&str] = &[
     "type", "required", "default", "doc", "pattern", "min", "max", "choices",
 ];
 
@@ -305,11 +313,8 @@ fn spec(name: &str, expression: &Expr) -> Result<ParamSpec> {
     let ty = ParamType::parse(&ty_name).ok_or_else(|| CompileError::UnknownParamType {
         param: name.to_owned(),
         got: ty_name.clone(),
-        suggestion: diag::suggest(
-            &ty_name,
-            ["string", "int", "number", "bool", "list<string>"],
-        )
-        .map(str::to_owned),
+        suggestion: diag::suggest(&ty_name, ParamType::ALL.map(ParamType::as_str))
+            .map(str::to_owned),
     })?;
 
     let required =

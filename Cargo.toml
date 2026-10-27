@@ -8,6 +8,7 @@ members = [
     "forge",
     "crucible-controller",
     "crux",
+    "crucible-lsp",
     "crucible-kueue",
     "crucible-mcp-auth",
     "buildit",

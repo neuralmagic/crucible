@@ -204,11 +204,6 @@ opentelemetry-proto = { version = "0.33", default-features = false, features = [
     "with-serde",
 ] }
 prost = "0.14"
-# Compile-on-save's placeholder for an unvalued required parameter: `regex-syntax` parses the
-# parameter's declared `pattern` into the HIR the generator walks, `regex` confirms the string it
-# built matches before it reaches the engine's argv. Both are already in the tree via jsonschema.
-regex = "1"
-regex-syntax = "0.8"
 cedar-policy = "4.12.0"
 
 # A Postgres the controller runs itself, for `DATABASE_URL=embedded`.
