@@ -1,0 +1,144 @@
+#:schema ../schema/adr.schema.json
+
+[govctl]
+id = "ADR-0069"
+title = "A launch sets agent settings per task and the checkout ref, within bounds the manifest declares"
+status = "proposed"
+date = "2026-10-27"
+refs = [
+    "RFC-0001:C-MANIFEST",
+    "RFC-0001:C-WORKFLOW",
+    "RFC-0001:C-WIRE",
+    "RFC-0001:C-CAPABILITY-DISCLOSURE",
+    "RFC-0002:C-PLAYBOOK-PARAMS",
+    "RFC-0002:C-PLAYBOOK-RERUN",
+    "ADR-0054",
+    "ADR-0065",
+]
+
+[content]
+context = """
+Two launch-time choices have no home. A playbook with several agent tasks needs a different model or reasoning effort per task, chosen when it is launched rather than when the pack is written. And a pack needs to run against a branch under test rather than the branch its manifest names. A pack can pin `model`, `harness` and `effort` on each `agent()`, `[agent]` sets them for the whole run, a launch can replace `[agent]`'s harness and model for the whole run, and `[repo].ref` is fixed in the manifest. Nothing lets a launch change one task or the checkout.
+
+An engine prototype of the chosen direction established the constraints below; the first three ruled out the obvious designs.
+
+- A string parameter a launcher supplied cannot reach any constructor argument but a prompt. The compiler marks it as outside text and refuses it elsewhere ([[ADR-0054]]), so `agent(model = param("review_model"))` and `workflow(ref = param("sha"))` compile only while the parameter takes its default. The params route for this need does not exist today.
+- `crucible.toml` is read without parameters in several places: the controller stores `[agent]` requirements at import, the exposure is computed from it, and the LSP and `crucible check` read it. Its fields are typed (`gpus` is an integer), and it is the reviewed surface: commands, credentials, egress and images.
+- A `session()` is one conversation under one agent config. Its defaults fill its tasks' unset knobs at compile time and a conflicting pin is a compile error.
+- Defaults already exist at two levels: `[agent]` for the run and `session()` for a group of tasks. A third, workflow-wide default would add nothing a launch-wide value does not.
+- A rerun refuses a reused task whose compiled definition changed ([[RFC-0002:C-PLAYBOOK-RERUN]]), and the run identity hashes a compiled graph and the workspace's starting commit ([[RFC-0001:C-WIRE]]). Neither sees the run-level knobs on the engine's argument set. A resume and a rerun restore the commit the run started from, not the ref that produced it.
+- Every launch path stores and replays a parameter map: launch rows, standing launches, schedules, webhook mappings, portal forms, rerun and resume. The controller validates that map against a JSON Schema with `additionalProperties: false`, and quotes each value into the work pod's command line.
+- An injected inference binding ([[ADR-0065]]) replaces the run-level model, but a task's own pin is applied after it and wins.
+- A harness or effort a task pinned was parsed only when its turn started, so a typo failed the run after it had spent money.
+- The clone checked out `[repo].ref` with `git checkout <name>` and ignored a failure, so a misspelled ref ran on the default branch. That form also cannot resolve a fully qualified ref (`refs/heads/x`, what a push webhook sends) or a pull request ref.
+- A branch is code nobody reviewed. Command and evaluate tasks run outside the sandbox with their executor's reach ([[RFC-0001:C-CAPABILITY-DISCLOSURE]]), so whatever they call from the workspace comes from the branch. A pull request ref is code from a fork, and a forge may serve a fork's commit by id through the parent repository.
+- A pack whose `setup_cmd` builds the workspace never clones, and a manifest that lives inside its own workspace is read from that workspace's commit."""
+decision = """
+**Addressing.** A launch sets a value in the same name=value map as declared parameters: `<task>.<setting>` for one agent task, `*.<setting>` for every agent task, `repo.ref` for the checkout. The agent settings are `harness`, `model` and `effort`. A declared parameter name may not contain a dot, so the two kinds of name cannot collide. A task name may, so an agent address splits at its last dot; `ref` is only a repo setting, so `repo.ref` cannot be read as a task named `repo`.
+
+**Precedence.** The more specific value wins, and at equal specificity the launch wins:
+
+```text
+[agent] < run-wide launch flags < *.<setting> < the task's own value < <task>.<setting>
+```
+
+`*.<setting>` fills each agent task that leaves the setting unset, and `<task>.<setting>` replaces what that task sets. Both are written onto the compiled tasks, not onto the run's knobs, so the rendered graph, the rerun definition digest and the run identity cover them without new rules. A launch that sets a run-wide harness or model both as a flag and as `*.<setting>` is refused. `repo.ref` replaces `[repo].ref` for the run.
+
+**Bounds.** The manifest declares what a launch may change, as static TOML readable without compiling the workflow, the same shape as an `[outputs]` scope bound to a parameter. `[agent.overrides]` names the settings a launch may set (`allow`) and, optionally, the models it may name (`models`). `[repo.overrides]` names the refs it may check out (`refs`), as globs over branch and tag short names where `*` stops at `/` and `**` crosses it. A pull request ref matches only a pattern that spells `refs/pull/`, so fork code is never admitted by a broad pattern. Without a table a launch changes nothing. A composite manifest refuses `[agent.overrides]`, since a composite takes no launch values, and `[repo.overrides]` is refused beside a `setup_cmd` or without a repo to clone.
+
+**Checks.** Every value is read and checked before anything is cloned or dispatched: the setting is known and allowed, the value parses (harness and effort case-insensitively, as a turn reads them; a model is one argument's worth of characters and is listed when `models` is set; a ref follows git's ref grammar as libgit2 checks it and does not start with `-`), and an agent address names a task that exists, runs an agent and is not in a session. A task-addressed value is refused on a session's task because it would split the session's config. A ref is refused when the manifest lives inside the workspace, since the checked-out ref would supply its own manifest. The harness and effort parse also runs when a plan is validated, so a pack's own typo fails at compile time for a compiled graph, an inline one, and a plan file alike; a written `[repo].ref` is held to the same ref grammar.
+
+**Checkout.** The clone fetches the ref by name from the origin and checks it out detached, so a short name, a fully qualified ref, a tag and a pull request ref resolve alike. A commit the clone already holds is checked out without a fetch. A ref that cannot be fetched or checked out fails the run, and the clone is removed so no later run reuses it at the default branch. A launched commit is kept only when a branch or tag the patterns admit holds it in the fresh clone; otherwise the clone is removed and the run refused. A fresh run with a launched ref needs a fresh workspace; a resume or rerun keeps the commit its run recorded.
+
+**Scope.** This decision covers agent settings on playbook and custom graphs and the checkout of a single-repo pack. A sandbox, a prompt, a command and an image are never launch settings."""
+consequences = """
+- One launch can run each agent task on its own model or effort, or the whole pack against a branch under test, within what the pack allows, and a misaddressed or disallowed value fails before anything is spent.
+- Launch values ride the existing parameter map, so launch rows, schedules, standing launches, webhook mappings, rerun and resume store them unchanged, and a push webhook can map `repo.ref` from the pushed ref or commit. The controller's launch schema still refuses dotted names; it needs generated properties per agent task, read from the graph it compiles at registration, and a `repo.ref` property when the pack declares patterns. A graph whose task names depend on parameter values cannot list those tasks ahead of a launch, and the controller's rerun compile has to split launch values from declared parameters before binding, as the engine does.
+- `*.model` on a task beats an injected inference binding, where the run-wide flag loses to it. That matches how a task's own pin already behaves and differs from the flag. Which one is right depends on whether a binding is a model choice or an endpoint that can serve one model; until that is settled, `models` is how a pack keeps launch values to models its deployment serves.
+- A session can only be changed as a whole: `*.<setting>` reaches all of its tasks alike, and no address reaches one of them. Addressing a session by name is a possible follow-up.
+- `[repo.overrides]` widens what runs on the executor to every branch its patterns match. A pack that runs repository scripts in command tasks should name narrow patterns. A pack that admits `refs/pull/` runs code from forks there. A commit pin is admitted only through the branches and tags a clone fetches, so a commit that only a pull request ref holds is refused even under a `refs/pull/` pattern; launch the pull request ref instead.
+- A misspelled `[repo].ref`, which used to run on the default branch, now fails the run. A pack whose written ref breaks git's grammar fails to load.
+- A local fresh run with a launched ref refuses an existing workspace instead of reusing a checkout of some other ref; remove the workspace to launch again.
+- The checks add amendments to [[RFC-0001:C-MANIFEST]] (`[agent.overrides]`, `[repo.overrides]`, the ref grammar and the checkout), to [[RFC-0002:C-PLAYBOOK-PARAMS]] (addressed names, dots reserved) and to [[RFC-0001:C-WORKFLOW]] (harness and effort refused at validation). A pack with a misspelled harness or effort that has never run now fails to compile instead of failing its first turn.
+- The plan IR still carries harness and effort as strings, parsed in two places. Typing them is a follow-up.
+- Not covered: sandbox resources (GPUs) need per-task sandbox sizing in the IR and the sandbox driver. Composite components take no launch ref. The scored lane's candidate turn is not an agent task and takes no address, and `deploy render` takes parameters only for playbooks."""
+
+[[content.alternatives]]
+text = "Address launch values per task and per repo in the launch parameter map, bounded by [agent.overrides] and [repo.overrides], most specific value wins"
+status = "accepted"
+pros = [
+    "Every launch path already stores and replays the parameter map.",
+    "Values are checked against a closed vocabulary or git's ref grammar before dispatch, so outside text needs no exemption from the prompt-only rule.",
+    "Agent settings are written onto compiled tasks, and a ref decides the starting commit, so the rerun digest, the run identity and the rendered graph cover both.",
+    "The manifest stays static and reviewed; the bounds are readable without compiling.",
+]
+cons = [
+    "The controller's launch schema has to generate a property per agent task and setting, and one for the ref.",
+    "Dotted names become reserved in params blocks.",
+]
+
+[[content.alternatives]]
+text = "Template allowlisted crucible.toml fields with parameters"
+status = "rejected"
+pros = ["One place for every value a launch changes, including the ref and GPU counts."]
+cons = [
+    "Every reader that parses the manifest without parameters sees an unresolved value, and a typed field cannot hold one.",
+    "Run-wide fields only; it cannot give one task its own model.",
+    "Moves part of the reviewed surface to launch time.",
+]
+rejection_reason = "The manifest is read before parameters exist, and the agent need is per task."
+
+[[content.alternatives]]
+text = "Declare a parameter per task and setting and pass it to agent() and workflow()"
+status = "rejected"
+pros = ["Uses the existing params block, its schema and its launch form."]
+cons = [
+    "A supplied string is refused outside a prompt, so it works only for defaults.",
+    "Relaxing that per argument puts value checks in each constructor.",
+    "One parameter per task and setting; the launch form grows with the graph.",
+]
+rejection_reason = "It does not work for supplied values, and making it work means exempting outside text argument by argument."
+
+[[content.alternatives]]
+text = "A workflow-wide defaults argument, after Airflow's default_args"
+status = "rejected"
+pros = ["Familiar to Airflow users."]
+cons = [
+    "[agent] and session() already provide run-wide and group defaults.",
+    "Adds a layer that *.<setting> would have to sit above.",
+]
+rejection_reason = "Redundant with the defaults that exist."
+
+[[content.alternatives]]
+text = "A separate settings field on the launch request"
+status = "rejected"
+pros = ["Settings and parameters stay apart on the wire."]
+cons = ["Launch rows, standing launches, schedules, webhook mappings, portal forms, rerun and resume would each need the new field."]
+rejection_reason = "The parameter map already reaches every launch path."
+
+[[content.alternatives]]
+text = "Apply *.<setting> to the run's knobs instead of the tasks"
+status = "rejected"
+pros = ["Reaches the scored lane's candidate turn, which is not an agent task."]
+cons = ["The rerun digest and the run identity do not see run-level knobs, so a rerun would reuse tasks that ran on a different model."]
+rejection_reason = "A change the rerun and identity cannot see is a change they cannot refuse."
+
+[[content.alternatives]]
+text = "Let a launch check out any ref of the configured repository"
+status = "rejected"
+pros = ["No patterns to maintain; the repository URL is already reviewed."]
+cons = [
+    "Any branch, including one nobody reviewed, runs code on the executor through command tasks.",
+    "Pull request refs and commit ids reach fork code.",
+]
+rejection_reason = "The repository URL bounds where code comes from, not which code; the pack has to bound which refs."
+
+[[content.alternatives]]
+text = "Check out refs with a shallow clone of the named branch"
+status = "rejected"
+pros = ["Smaller clones."]
+cons = [
+    "`clone --branch` takes a branch or tag, not a commit or a pull request ref.",
+    "A commit pin cannot be checked against the branches that hold it without their history.",
+]
+rejection_reason = "A full clone plus an explicit fetch resolves every ref form and keeps the history the pin check reads."
