@@ -101,7 +101,7 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
 
       <ParamsSection launch={launch} />
 
-      {runId !== null && <RunTaskGraph runId={runId} />}
+      {runId !== null && <RunTaskGraph runId={runId} engineBounds />}
 
       {runId !== null && detail.runs[0]?.status !== 'running' && (
         <RerunSection detail={detail} runId={runId} />
