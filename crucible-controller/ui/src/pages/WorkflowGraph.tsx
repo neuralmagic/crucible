@@ -11,8 +11,6 @@ import {
 import type { KeyboardEvent, ReactNode } from 'react';
 import {
   BaseEdge,
-  Background,
-  BackgroundVariant,
   ControlButton,
   Controls,
   EdgeLabelRenderer,
@@ -1022,7 +1020,6 @@ function GraphCanvas({
                     onEdgeMouseLeave={() => setHoveredEdge(null)}
                     onPaneClick={close}
                   >
-                    <Background variant={BackgroundVariant.Dots} gap={12} size={1} />
                     <Controls showInteractive={false} showFitView={false}>
                       <ControlButton onClick={fit} title="Fit view" aria-label="Fit view">
                         <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 30" aria-hidden>
