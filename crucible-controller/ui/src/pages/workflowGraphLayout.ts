@@ -583,7 +583,9 @@ export function layoutWorkflow(
   };
 
   const placed = new Map<string, LaidOutNode>();
-  const bends = new Map<string, Along>();
+  // A bend is a straight run through its layer's lane: the edge turns only in the gutters, never
+  // inside a column where it could cut through a card.
+  const bends = new Map<string, [Along, Along]>();
   const nodes: LaidOutNode[] = [];
   layers.forEach((layer, layerNo) => {
     const cards = layer.filter((c) => byName.has(c));
@@ -591,7 +593,11 @@ export function layoutWorkflow(
     const start = alongAt[layerNo] ?? PAD;
     const depth = depths[layerNo] ?? alongSize;
     layerBends.forEach((name, k) => {
-      bends.set(name, [start + depth / 2, laneAt(layer) + k * BEND_GAP]);
+      const lane = laneAt(layer) + k * BEND_GAP;
+      bends.set(name, [
+        [start, lane],
+        [start + depth, lane],
+      ]);
     });
     cards.forEach((name, order) => {
       const node = byName.get(name);
@@ -632,9 +638,12 @@ export function layoutWorkflow(
     if (from === undefined || to === undefined) return;
     const chain = chains[i] ?? [];
     const points: Along[] = [port(from, true)];
+    const straight = new Set<number>();
     for (const cell of chain.slice(1, -1)) {
       const bend = bends.get(cell);
-      if (bend !== undefined) points.push(bend);
+      if (bend === undefined) continue;
+      straight.add(points.length);
+      points.push(...bend);
     }
     points.push(port(to, false));
 
@@ -646,6 +655,11 @@ export function layoutWorkflow(
       const a = points[p];
       const b = points[p + 1];
       if (a === undefined || b === undefined) continue;
+      if (straight.has(p)) {
+        const [lx, ly] = toXY(direction, b);
+        path += ` L ${lx} ${ly}`;
+        continue;
+      }
       const bend = Math.max(24, (b[0] - a[0]) / 2);
       const c1: Along = [a[0] + bend, a[1]];
       const c2: Along = [b[0] - bend, b[1]];

@@ -621,6 +621,39 @@ describe('gutters and labels', () => {
     expect(skip.labelX).toBeLessThan(x(layout, 'sink'));
   });
 
+  /// A bend runs straight through the column it crosses and turns only in the gutters, so it cannot
+  /// cut through a card in that column on its way into or out of the lane.
+  it('runs a bend straight along its lane through the whole layer', () => {
+    const bentDoc: WorkflowGraphDoc = {
+      workflow_type: 'playbook',
+      result: null,
+      nodes: [task('root'), task('mid'), task('low'), task('sink')],
+      edges: [edge('root', 'mid'), edge('root', 'low'), edge('mid', 'sink'), edge('low', 'sink'), edge('root', 'sink')],
+    };
+    for (const direction of ['LR', 'TD'] as const) {
+      const layout = layoutWorkflow(bentDoc, direction);
+      const skip = layout.edges.find((e) => e.from === 'root' && e.to === 'sink');
+      if (skip === undefined) throw new Error('skip edge missing');
+      const runs = [...skip.path.matchAll(/([\d.-]+) ([\d.-]+) L ([\d.-]+) ([\d.-]+)/g)].map((m) =>
+        m.slice(1, 5).map(Number)
+      );
+      expect(runs).toHaveLength(1);
+      const [x1, y1, x2, y2] = runs[0] ?? [];
+      const column = layout.nodes.filter((n) => n.layer === 1);
+      const along = direction === 'LR' ? [x1, x2] : [y1, y2];
+      const across = direction === 'LR' ? [y1, y2] : [x1, x2];
+      expect(across[0]).toBe(across[1]);
+      const starts = column.map((n) => (direction === 'LR' ? n.x : n.y));
+      const ends = column.map((n) => (direction === 'LR' ? n.x + n.width : n.y + n.height));
+      expect(along[0]).toBeLessThanOrEqual(Math.min(...starts));
+      expect(along[1]).toBeGreaterThanOrEqual(Math.max(...ends));
+      const far = Math.max(
+        ...column.map((n) => (direction === 'LR' ? n.y + n.height : n.x + n.width))
+      );
+      expect(across[0]).toBeGreaterThan(far);
+    }
+  });
+
   /// A layer of one card does not send an edge bending through it past a taller layer elsewhere.
   it('runs a bend just past the cards of the layer it crosses', () => {
     const lanes: WorkflowGraphDoc = {
