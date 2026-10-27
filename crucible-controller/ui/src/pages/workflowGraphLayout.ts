@@ -22,6 +22,8 @@ export interface LaidOutNode {
   width: number;
   height: number;
   isResult: boolean;
+  /// A runtime instance of a mapped task: drawn as a row under its deck, in the deck's layer.
+  instance: { deck: string; index: number } | null;
 }
 
 export interface LaidOutEdge {
@@ -74,6 +76,66 @@ export const STACK_STEP = 4;
 const BEND_GUTTER = 14;
 const BEND_GAP = 12;
 export const STACK_CARDS = 2;
+/// An instance row: its height, its width top down, how far it is indented under its deck left to
+/// right, and the gap between rows.
+export const INSTANCE_H = 24;
+const INSTANCE_W = 136;
+export const INSTANCE_INDENT = 12;
+export const INSTANCE_GAP = 4;
+
+/// The zoom a fitted graph is clamped to: below the floor its text is unreadable, so a long graph
+/// is shown from its start and panned instead.
+export const FIT_MIN_ZOOM = 0.85;
+export const FIT_MAX_ZOOM = 1.35;
+/// Room the fit leaves around the graph; the top clears the toolbar.
+const FIT_PAD = { top: 40, right: 12, bottom: 12, left: 12 };
+const FRAME_MIN_H = 240;
+
+export interface Viewport {
+  x: number;
+  y: number;
+  zoom: number;
+}
+
+/// The viewport that fits a graph into a canvas: as large as fits, clamped to a legible zoom,
+/// centred where it fits and anchored at its start where it does not.
+export function fitViewport(
+  graph: { width: number; height: number },
+  canvas: { width: number; height: number }
+): Viewport {
+  const roomW = canvas.width - FIT_PAD.left - FIT_PAD.right;
+  const roomH = canvas.height - FIT_PAD.top - FIT_PAD.bottom;
+  const fits = Math.min(roomW / Math.max(1, graph.width), roomH / Math.max(1, graph.height));
+  const zoom = Math.min(FIT_MAX_ZOOM, Math.max(FIT_MIN_ZOOM, fits));
+  const offset = (start: number, room: number, size: number) =>
+    size * zoom <= room ? start + (room - size * zoom) / 2 : start;
+  return {
+    x: offset(FIT_PAD.left, roomW, graph.width),
+    y: offset(FIT_PAD.top, roomH, graph.height),
+    zoom,
+  };
+}
+
+/// The heights the in-page frame may take: enough to hold the graph at the legible floor, and no
+/// more than it needs at the largest zoom.
+export function frameHeights(graph: { width: number; height: number }): {
+  min: number;
+  max: number;
+} {
+  const pad = FIT_PAD.top + FIT_PAD.bottom;
+  return {
+    min: Math.max(FRAME_MIN_H, Math.ceil(graph.height * FIT_MIN_ZOOM + pad)),
+    max: Math.max(FRAME_MIN_H, Math.ceil(graph.height * FIT_MAX_ZOOM + pad)),
+  };
+}
+
+/// The mapped task an instance came from. The executor names an instance `node[item]` and a
+/// declared name may not hold a bracket, so the prefix is the node it was mapped from.
+export function mappedFrom(name: string): string | null {
+  const cut = name.indexOf('[');
+  if (cut <= 0 || !name.endsWith(']')) return null;
+  return name.slice(0, cut);
+}
 
 /// A point in layout space: how far along the layers, and how far across them.
 type Along = [along: number, across: number];
@@ -98,6 +160,24 @@ function onCubic(
   return [at(0), at(1)];
 }
 
+/// The point on a cubic whose `along` is the one asked for: along each segment the layout draws,
+/// `along` only grows, so halving the interval converges on it.
+function atAlong(
+  along: number,
+  p0: [number, number],
+  p1: [number, number],
+  p2: [number, number],
+  p3: [number, number]
+): [number, number] {
+  let [lo, hi] = [0, 1];
+  for (let step = 0; step < 24; step += 1) {
+    const mid = (lo + hi) / 2;
+    if (onCubic(mid, p0, p1, p2, p3)[0] < along) lo = mid;
+    else hi = mid;
+  }
+  return onCubic((lo + hi) / 2, p0, p1, p2, p3);
+}
+
 /// Longest path from a root. A dependency on a name the graph does not carry is ignored, and a
 /// cycle (which the engine rejects, but the wire can still carry) stops at the repeated node
 /// rather than recursing forever.
@@ -119,6 +199,15 @@ function layerOf(
   };
   for (const node of nodes) walk(node.name, new Set());
   return done;
+}
+
+function median(xs: number[]): number | null {
+  if (xs.length === 0) return null;
+  const sorted = [...xs].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1
+    ? (sorted[mid] ?? 0)
+    : ((sorted[mid - 1] ?? 0) + (sorted[mid] ?? 0)) / 2;
 }
 
 function positions(layers: string[][]): Map<string, number> {
@@ -242,54 +331,71 @@ export function edgeReads(edge: WorkflowGraphEdge): string[] {
   ];
 }
 
-/// The gap between layers. Left to right, a label sits across the gutter it is drawn in, so a
-/// gutter widens to hold the widest `when` or narrowed-field label; top down it lies along it.
-function gapFor(edges: readonly WorkflowGraphEdge[], direction: LayoutDirection): number {
+/// The gutter an edge's label needs. Left to right, a label sits across the gutter its last
+/// segment is drawn in, so that gutter widens to hold its `when` or narrowed-field label; top down
+/// it lies along it.
+function labelGap(edge: WorkflowGraphEdge, direction: LayoutDirection): number {
   if (direction === 'TD') return LAYER_GAP;
-  const widest = edges.reduce((most, edge) => {
-    const reads = edgeReads(edge).join(' · ');
-    return reads === '' ? most : Math.max(most, reads.length + (edge.join === 'all' ? 0 : 8));
-  }, 0);
+  const reads = edgeReads(edge).join(' · ');
+  if (reads === '') return LAYER_GAP;
+  const chars = reads.length + (edge.join === 'all' ? 0 : 8);
   // The label is centred past the middle of the gutter, so the gap is a little over its width.
-  return Math.max(LAYER_GAP, Math.ceil(widest * LABEL_CHAR * 1.15) + LABEL_PAD);
+  return Math.max(LAYER_GAP, Math.ceil(chars * LABEL_CHAR * 1.15) + LABEL_PAD);
 }
 
 /// Lay the compiled graph out in dependency layers, left to right or top down, in the flow's own
-/// coordinates: every task gets the same box, and a layer is centred against the widest one. An
-/// edge that spans more than one layer is broken at a bend in each layer it crosses, so it routes
-/// through the gutters instead of running under the tasks in between. The layout is worked out
-/// along and across the layers and only turned into x and y at the end, so the two directions are
-/// the same picture transposed.
+/// coordinates: every task gets the same box, and a layer is centred against the widest one. A
+/// mapped task's runtime instances are rows under its card, in its layer, so a fan-out does not
+/// cost the graph a layer; the edge from a deck to its own instance is the row's placement and is
+/// not drawn. An edge that spans more than one layer is broken at a bend in each layer it crosses,
+/// so it routes through the gutters instead of running under the tasks in between. Each gutter is
+/// as wide as the labels drawn in it. The layout is worked out along and across the layers and
+/// only turned into x and y at the end, so the two directions are the same picture transposed.
 export function layoutWorkflow(
   graph: WorkflowGraphDoc,
   direction: LayoutDirection = 'LR'
 ): WorkflowLayout {
   const known = new Set(graph.nodes.map((n) => n.name));
   const edges = graph.edges.filter((e) => known.has(e.from) && known.has(e.to));
+  const deckOf = (name: string): string | null => {
+    const deck = mappedFrom(name);
+    return deck !== null && known.has(deck) ? deck : null;
+  };
+  const headOf = (name: string): string => deckOf(name) ?? name;
+
+  const heads = graph.nodes.filter((n) => deckOf(n.name) === null);
+  const members = new Map<string, WorkflowGraphNode[]>();
+  for (const node of graph.nodes) {
+    const deck = deckOf(node.name);
+    if (deck !== null) members.set(deck, [...(members.get(deck) ?? []), node]);
+  }
+  const drawn = edges.filter((e) => headOf(e.from) !== headOf(e.to));
 
   const parents = new Map<string, string[]>();
-  for (const edge of edges) {
-    parents.set(edge.to, [...(parents.get(edge.to) ?? []), edge.from]);
+  for (const edge of drawn) {
+    const [from, to] = [headOf(edge.from), headOf(edge.to)];
+    parents.set(to, [...(parents.get(to) ?? []), from]);
   }
-  const layerIndex = layerOf(graph.nodes, parents);
+  const layerIndex = layerOf(heads, parents);
 
-  // Cells are tasks plus the bends long edges are broken at; they are what the layers hold and
-  // what the ordering sees.
+  // Cells are decks and plain tasks plus the bends long edges are broken at; they are what the
+  // layers hold and what the ordering sees.
   const prefix = bendPrefix(known);
   const cellLayer = new Map<string, number>(layerIndex);
-  const chains = new Map<string, string[]>();
+  const chains: string[][] = [];
   const segments: WorkflowGraphEdge[] = [];
-  edges.forEach((edge, i) => {
-    const from = layerIndex.get(edge.from) ?? 0;
-    const to = layerIndex.get(edge.to) ?? 0;
-    const chain = [edge.from];
+  drawn.forEach((edge, i) => {
+    const [head, tail] = [headOf(edge.from), headOf(edge.to)];
+    const from = layerIndex.get(head) ?? 0;
+    const to = layerIndex.get(tail) ?? 0;
+    const chain = [head];
     for (let layer = from + 1; layer < to; layer += 1) {
       const bend = `${prefix}${i}:${layer}`;
       cellLayer.set(bend, layer);
       chain.push(bend);
     }
-    chain.push(edge.to);
-    chains.set(`${edge.from}\u0000${edge.to}`, chain);
+    chain.push(tail);
+    chains.push(chain);
     for (let step = 0; step + 1 < chain.length; step += 1) {
       const a = chain[step];
       const b = chain[step + 1];
@@ -307,7 +413,7 @@ export function layoutWorkflow(
 
   const grouped: string[][] = [];
   const cells = [
-    ...graph.nodes.map((n) => n.name),
+    ...heads.map((n) => n.name),
     ...[...cellLayer.keys()].filter((k) => k.startsWith(prefix)),
   ];
   for (const cell of cells) {
@@ -319,25 +425,118 @@ export function layoutWorkflow(
 
   const alongSize = direction === 'LR' ? NODE_W : NODE_H;
   const acrossSize = direction === 'LR' ? NODE_H : NODE_W;
+  const instanceAlong = direction === 'LR' ? NODE_W - INSTANCE_INDENT : INSTANCE_H;
+  const instanceAcross = direction === 'LR' ? INSTANCE_H : INSTANCE_W;
+  // Left to right the rows hang under the card, indented; top down they sit beside it, centred
+  // on it, so no edge into or out of a row runs through the card or another row.
+  const instanceInset = direction === 'LR' ? INSTANCE_INDENT : (NODE_H - INSTANCE_H) / 2;
   const stack = STACK_CARDS * STACK_STEP;
-  const layerGap = gapFor(edges, direction);
-  const layerPitch = alongSize + layerGap;
-  const rowPitch = acrossSize + stack + ROW_GAP;
+  const extentOf = (head: string): number =>
+    acrossSize + stack + (members.get(head)?.length ?? 0) * (instanceAcross + INSTANCE_GAP);
+
   const byName = new Map(graph.nodes.map((n) => [n.name, n]));
-  const widest = layers.reduce(
-    (most, layer) => Math.max(most, layer.filter((c) => byName.has(c)).length),
-    0
-  );
-  // Bends live in a gutter lane past every card, so a layer-skipping edge routes around the
-  // occupied rows instead of threading between them and reading as a root-to-leaf link.
-  const mostBends = layers.reduce(
-    (most, layer) => Math.max(most, layer.filter((c) => !byName.has(c)).length),
-    0
-  );
-  const cardRegion = Math.max(rowPitch, widest * rowPitch - ROW_GAP);
-  const gutter = mostBends > 0 ? BEND_GUTTER + mostBends * BEND_GAP : 0;
-  const acrossExtent = cardRegion + gutter + PAD * 2;
-  const alongExtent = Math.max(1, layers.length) * layerPitch - layerGap + PAD * 2;
+  const memberOffset = (index: number): number =>
+    acrossSize + stack + INSTANCE_GAP + index * (instanceAcross + INSTANCE_GAP);
+  const middleOffset = (name: string): number => {
+    const deck = deckOf(name);
+    if (deck === null) return acrossSize / 2;
+    const index = (members.get(deck) ?? []).findIndex((m) => m.name === name);
+    return memberOffset(Math.max(0, index)) + instanceAcross / 2;
+  };
+
+  // Each card sits level with the median of what feeds it straight from the layer before; the
+  // layer is packed in order, then shifted by its mean displacement so it stays balanced on its
+  // parents. A deck lines up with the deck it reads per element, and row with row.
+  const topOf = new Map<string, number>();
+  let previous: { top: number; bottom: number } | null = null;
+  layers.forEach((layer, layerNo) => {
+    const cards = layer.filter((c) => byName.has(c));
+    const wanted = cards.map((card) =>
+      median(
+        drawn
+          .filter((e) => headOf(e.to) === card && layerIndex.get(headOf(e.from)) === layerNo - 1)
+          .map((e) => (topOf.get(headOf(e.from)) ?? 0) + middleOffset(e.from) - middleOffset(e.to))
+      )
+    );
+    let cursor: number | null = null;
+    const tops = cards.map((card, i) => {
+      const want = wanted[i] ?? null;
+      const top: number = cursor === null ? (want ?? 0) : Math.max(want ?? cursor, cursor);
+      cursor = top + extentOf(card) + ROW_GAP;
+      return top;
+    });
+    const pulled = tops.flatMap((top, i) => {
+      const want = wanted[i] ?? null;
+      return want === null ? [] : [top - want];
+    });
+    const span = cards.reduce((total, c) => total + extentOf(c), 0) + ROW_GAP * (cards.length - 1);
+    const shift =
+      pulled.length > 0
+        ? pulled.reduce((a, b) => a + b, 0) / pulled.length
+        : previous === null
+          ? 0
+          : -((previous.top + previous.bottom - span) / 2);
+    cards.forEach((card, i) => topOf.set(card, Math.round((tops[i] ?? 0) - shift)));
+    const placedTops = cards.map((card) => topOf.get(card) ?? 0);
+    previous = {
+      top: Math.min(...placedTops),
+      bottom: Math.max(...cards.map((card) => (topOf.get(card) ?? 0) + extentOf(card))),
+    };
+  });
+  const lowest = Math.min(0, ...topOf.values());
+  for (const [card, top] of topOf) topOf.set(card, top - lowest + PAD);
+  const bottomOf = (layer: string[]): number =>
+    Math.max(
+      PAD,
+      ...layer.filter((c) => byName.has(c)).map((c) => (topOf.get(c) ?? PAD) + extentOf(c))
+    );
+
+  // Bends live in a lane past the cards of their own layer, so a layer-skipping edge routes
+  // around the occupied rows instead of threading between them and reading as a root-to-leaf
+  // link, without detouring past cards in layers it never crosses.
+  const laneAt = (layer: string[]): number => bottomOf(layer) + BEND_GUTTER;
+  const acrossExtent =
+    layers.reduce((most, layer) => {
+      const bendCount = layer.filter((c) => !byName.has(c)).length;
+      const reach = bendCount === 0 ? bottomOf(layer) : laneAt(layer) + (bendCount - 1) * BEND_GAP;
+      return Math.max(most, reach);
+    }, PAD + acrossSize + stack) + PAD;
+
+  const gaps = layers.slice(1).map(() => LAYER_GAP);
+  for (const edge of drawn) {
+    const gap = (layerIndex.get(headOf(edge.to)) ?? 0) - 1;
+    if (gap < 0 || gap >= gaps.length) continue;
+    gaps[gap] = Math.max(gaps[gap] ?? LAYER_GAP, labelGap(edge, direction));
+  }
+  const alongAt: number[] = [];
+  layers.forEach((_, layerNo) => {
+    const before = alongAt[layerNo - 1];
+    alongAt.push(before === undefined ? PAD : before + alongSize + (gaps[layerNo - 1] ?? LAYER_GAP));
+  });
+  const alongExtent = (alongAt[alongAt.length - 1] ?? PAD) + alongSize + PAD;
+
+  const place = (
+    node: WorkflowGraphNode,
+    layer: number,
+    order: number,
+    at: Along,
+    size: Along,
+    instance: LaidOutNode['instance']
+  ): LaidOutNode => {
+    const [x, y] = toXY(direction, at);
+    const [width, height] = toXY(direction, size);
+    return {
+      node,
+      layer,
+      order,
+      x,
+      y,
+      width,
+      height,
+      isResult: graph.result === node.name,
+      instance,
+    };
+  };
 
   const placed = new Map<string, LaidOutNode>();
   const bends = new Map<string, Along>();
@@ -345,46 +544,46 @@ export function layoutWorkflow(
   layers.forEach((layer, layerNo) => {
     const cards = layer.filter((c) => byName.has(c));
     const layerBends = layer.filter((c) => !byName.has(c));
-    const span = cards.length * rowPitch - ROW_GAP;
-    const first = PAD + (cardRegion - span) / 2;
-    const along = PAD + layerNo * layerPitch;
+    const along = alongAt[layerNo] ?? PAD;
     layerBends.forEach((name, k) => {
-      bends.set(name, [along + alongSize / 2, PAD + cardRegion + BEND_GUTTER + k * BEND_GAP]);
+      bends.set(name, [along + alongSize / 2, laneAt(layer) + k * BEND_GAP]);
     });
     cards.forEach((name, order) => {
       const node = byName.get(name);
-      if (node === undefined) {
-        return;
-      }
-      const [x, y] = toXY(direction, [along, first + order * rowPitch]);
-      const laid: LaidOutNode = {
-        node,
-        layer: layerNo,
-        order,
-        x,
-        y,
-        width: NODE_W,
-        height: NODE_H,
-        isResult: graph.result === node.name,
-      };
-      placed.set(name, laid);
-      nodes.push(laid);
+      if (node === undefined) return;
+      const across = topOf.get(name) ?? PAD;
+      const card = place(node, layerNo, order, [along, across], [alongSize, acrossSize], null);
+      placed.set(name, card);
+      nodes.push(card);
+      (members.get(name) ?? []).forEach((member, index) => {
+        const row = place(
+          member,
+          layerNo,
+          order,
+          [along + instanceInset, across + memberOffset(index)],
+          [instanceAlong, instanceAcross],
+          { deck: name, index }
+        );
+        placed.set(member.name, row);
+        nodes.push(row);
+      });
     });
   });
 
-  // Where an edge leaves a card and where it lands: the middle of the side facing the next layer.
+  // Where an edge leaves a box and where it lands: the middle of the side facing the next layer.
   const port = (laid: LaidOutNode, leaving: boolean): Along => {
-    const along = direction === 'LR' ? laid.x : laid.y;
-    const across = direction === 'LR' ? laid.y : laid.x;
-    return [leaving ? along + alongSize : along, across + acrossSize / 2];
+    const [along, across] = direction === 'LR' ? [laid.x, laid.y] : [laid.y, laid.x];
+    const [length, breadth] =
+      direction === 'LR' ? [laid.width, laid.height] : [laid.height, laid.width];
+    return [leaving ? along + length : along, across + breadth / 2];
   };
 
   const laidEdges: LaidOutEdge[] = [];
-  for (const edge of edges) {
+  drawn.forEach((edge, i) => {
     const from = placed.get(edge.from);
     const to = placed.get(edge.to);
-    if (from === undefined || to === undefined) continue;
-    const chain = chains.get(`${edge.from}\u0000${edge.to}`) ?? [edge.from, edge.to];
+    if (from === undefined || to === undefined) return;
+    const chain = chains[i] ?? [];
     const points: Along[] = [port(from, true)];
     for (const cell of chain.slice(1, -1)) {
       const bend = bends.get(cell);
@@ -395,9 +594,10 @@ export function layoutWorkflow(
     const start = toXY(direction, points[0] ?? [0, 0]);
     let path = `M ${start[0]} ${start[1]}`;
     let label: Along = [0, 0];
-    for (let i = 0; i + 1 < points.length; i += 1) {
-      const a = points[i];
-      const b = points[i + 1];
+    const gapBefore = gaps[(layerIndex.get(headOf(edge.to)) ?? 1) - 1] ?? LAYER_GAP;
+    for (let p = 0; p + 1 < points.length; p += 1) {
+      const a = points[p];
+      const b = points[p + 1];
       if (a === undefined || b === undefined) continue;
       const bend = Math.max(24, (b[0] - a[0]) / 2);
       const c1: Along = [a[0] + bend, a[1]];
@@ -406,8 +606,9 @@ export function layoutWorkflow(
       const [c2x, c2y] = toXY(direction, c2);
       const [bx, by] = toXY(direction, b);
       path += ` C ${c1x} ${c1y}, ${c2x} ${c2y}, ${bx} ${by}`;
-      // The last gutter: a join label belongs next to the task that waits, not out in the graph.
-      label = onCubic(0.55, a, c1, c2, b);
+      // The middle of the last gutter: a join label belongs next to the task that waits, not out
+      // in the graph or over the layer a bend runs through.
+      label = atAlong(b[0] - gapBefore / 2, a, c1, c2, b);
     }
     const files = byName.get(edge.from)?.emits_files ?? [];
     const fileLabel =
@@ -433,6 +634,13 @@ export function layoutWorkflow(
       required: edge.required,
       aligned: edge.aligned,
     });
+  });
+
+  // Tracing an instance lights its deck: the row is the deck dealt out.
+  const lineage = new Map<string, string[]>();
+  for (const edge of edges) lineage.set(edge.to, [...(lineage.get(edge.to) ?? []), edge.from]);
+  for (const [deck, rows] of members) {
+    for (const row of rows) lineage.set(row.name, [...(lineage.get(row.name) ?? []), deck]);
   }
 
   const [width, height] = toXY(direction, [alongExtent, acrossExtent]);
@@ -441,7 +649,7 @@ export function layoutWorkflow(
     edges: laidEdges,
     width,
     height,
-    ancestry: ancestryOf(graph.nodes, parents),
+    ancestry: ancestryOf(graph.nodes, lineage),
     crossings,
   };
 }

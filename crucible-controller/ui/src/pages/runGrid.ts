@@ -3,7 +3,6 @@
 // whose `latestResults` keeps only where a task ended up. This keeps every attempt it made.
 
 import {
-  mappedFrom,
   sum,
   timedResults,
   toneOf,
@@ -12,6 +11,7 @@ import {
   type TaskTone,
 } from './taskGraph';
 import type { ExternalLinkRef } from '../ui';
+import { mappedFrom } from './workflowGraphLayout';
 
 type TaskAgent = NonNullable<TaskResult['agent']>;
 

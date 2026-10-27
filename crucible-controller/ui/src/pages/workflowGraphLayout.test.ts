@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest';
 import {
   countCrossings,
   edgeReads,
+  FIT_MAX_ZOOM,
+  FIT_MIN_ZOOM,
+  fitViewport,
+  frameHeights,
+  INSTANCE_H,
+  INSTANCE_INDENT,
   layoutWorkflow,
+  mappedFrom,
   NODE_H,
   NODE_W,
   type WorkflowGraphDoc,
@@ -429,5 +436,258 @@ describe('what an edge reads', () => {
     expect(laid('triage', 'fix').aligned).toBe(true);
     expect(laid('scan', 'triage').aligned).toBe(false);
     expect(laid('scan', 'triage').reads).toBeNull();
+  });
+});
+
+/// seed → triage ⇒ fix → report as a run draws it: triage dealt out to two instances, fix to the
+/// one triage let through, each fix instance fed by its own triage instance.
+describe('runtime instances', () => {
+  const over = { over_task: 'seed', over_field: 'items', max_fanout: null };
+  const when = { route: 'triage', question: 'tier', labels: ['high', 'low'] };
+  const RUN: WorkflowGraphDoc = {
+    workflow_type: 'run',
+    result: null,
+    nodes: [
+      task('seed'),
+      task('triage', { kind: 'route', fanout: over, required: false }),
+      task('fix', { kind: 'agent', fanout: over, required: false }),
+      task('report'),
+      task('triage[a]', { kind: 'route', required: false }),
+      task('triage[b]', { kind: 'route', required: false }),
+      task('fix[a]', { kind: 'agent', required: false }),
+    ],
+    edges: [
+      edge('seed', 'triage', { required: false }),
+      edge('triage', 'fix', { aligned: true, when, required: false }),
+      edge('triage[a]', 'fix[a]', {
+        aligned: true,
+        when: { route: 'triage[a]', question: 'tier', labels: ['high'] },
+        required: false,
+      }),
+      edge('triage', 'triage[a]', { required: false }),
+      edge('triage', 'triage[b]', { required: false }),
+      edge('fix[a]', 'report'),
+    ],
+  };
+  const at = (layout: ReturnType<typeof layoutWorkflow>, name: string) => {
+    const found = layout.nodes.find((n) => n.node.name === name);
+    if (found === undefined) throw new Error(`${name} is not in the layout`);
+    return found;
+  };
+  const ends = (path: string): number[][] => {
+    const start = /^M ([\d.-]+) ([\d.-]+)/.exec(path);
+    const lands = [...path.matchAll(/C [\d.-]+ [\d.-]+, [\d.-]+ [\d.-]+, ([\d.-]+) ([\d.-]+)/g)];
+    return [
+      [Number(start?.[1]), Number(start?.[2])],
+      ...lands.map((m) => [Number(m[1]), Number(m[2])]),
+    ];
+  };
+
+  it('names the deck an instance was dealt from', () => {
+    expect(mappedFrom('fix[a]')).toBe('fix');
+    expect(mappedFrom('fix[a[b]]')).toBe('fix');
+    expect(mappedFrom('fix')).toBeNull();
+    expect(mappedFrom('[a]')).toBeNull();
+    expect(mappedFrom('fix[a')).toBeNull();
+  });
+
+  it("draws an instance as a row under its deck, in the deck's layer", () => {
+    const layout = layoutWorkflow(RUN);
+    const deck = at(layout, 'triage');
+    const first = at(layout, 'triage[a]');
+    const second = at(layout, 'triage[b]');
+    expect(deck.instance).toBeNull();
+    expect(first.instance).toEqual({ deck: 'triage', index: 0 });
+    expect(second.instance).toEqual({ deck: 'triage', index: 1 });
+    expect([first.layer, second.layer]).toEqual([deck.layer, deck.layer]);
+    expect(first.x).toBe(deck.x + INSTANCE_INDENT);
+    expect(first.x + first.width).toBe(deck.x + NODE_W);
+    expect(first.height).toBe(INSTANCE_H);
+    expect(first.y).toBeGreaterThan(deck.y + NODE_H);
+    expect(second.y).toBeGreaterThan(first.y + INSTANCE_H);
+  });
+
+  it('spends no layer on a fan-out', () => {
+    const layout = layoutWorkflow(RUN);
+    expect(['seed', 'triage', 'fix', 'report'].map((name) => at(layout, name).layer)).toEqual([
+      0, 1, 2, 3,
+    ]);
+    expect(at(layout, 'fix[a]').layer).toBe(2);
+  });
+
+  /// The row's place under its deck already says it is the deck's; an edge to it would run
+  /// backwards into the card it hangs from.
+  it('does not draw the edge from a deck to its own instance, and traces it all the same', () => {
+    const layout = layoutWorkflow(RUN);
+    expect(layout.edges.map((e) => `${e.from}->${e.to}`).sort()).toEqual([
+      'fix[a]->report',
+      'seed->triage',
+      'triage->fix',
+      'triage[a]->fix[a]',
+    ]);
+    expect([...(layout.ancestry.get('fix[a]') ?? [])].sort()).toEqual([
+      'fix',
+      'fix[a]',
+      'seed',
+      'triage',
+      'triage[a]',
+    ]);
+  });
+
+  it('lines a deck up with the deck it reads per element, and row with row', () => {
+    const layout = layoutWorkflow(RUN);
+    expect(at(layout, 'fix').y).toBe(at(layout, 'triage').y);
+    expect(at(layout, 'fix[a]').y).toBe(at(layout, 'triage[a]').y);
+    const pair = layout.edges.find((e) => e.from === 'triage[a]');
+    if (pair === undefined) throw new Error('per-element edge missing');
+    const [start, end] = ends(pair.path);
+    const row = at(layout, 'triage[a]');
+    expect(start).toEqual([row.x + row.width, row.y + INSTANCE_H / 2]);
+    expect(end?.[1]).toBe(start?.[1]);
+  });
+
+  /// Top down a row under the card would put the card in the way of every edge into the row.
+  it('sits instance rows beside the card top down, level with it', () => {
+    const layout = layoutWorkflow(RUN, 'TD');
+    const deck = at(layout, 'triage');
+    const first = at(layout, 'triage[a]');
+    const second = at(layout, 'triage[b]');
+    expect(first.x).toBeGreaterThan(deck.x + NODE_W);
+    expect(second.x).toBeGreaterThan(first.x + first.width);
+    expect(first.y + INSTANCE_H / 2).toBe(deck.y + NODE_H / 2);
+    expect(first.layer).toBe(deck.layer);
+  });
+});
+
+describe('gutters and labels', () => {
+  const over = { over_task: 'seed', over_field: 'items', max_fanout: null };
+  const doc: WorkflowGraphDoc = {
+    workflow_type: 'playbook',
+    result: null,
+    nodes: [
+      task('seed'),
+      task('triage', { kind: 'route', fanout: over }),
+      task('fix', { fanout: over }),
+      task('report'),
+    ],
+    edges: [
+      edge('seed', 'triage'),
+      edge('triage', 'fix', {
+        aligned: true,
+        when: { route: 'triage', question: 'tier', labels: ['high', 'low'] },
+      }),
+      edge('fix', 'report'),
+    ],
+  };
+  const x = (layout: ReturnType<typeof layoutWorkflow>, name: string) =>
+    layout.nodes.find((n) => n.node.name === name)?.x ?? 0;
+
+  it('sizes each gutter to the labels drawn in it, not to the widest in the graph', () => {
+    const layout = layoutWorkflow(doc);
+    expect(x(layout, 'triage') - x(layout, 'seed') - NODE_W).toBe(44);
+    expect(x(layout, 'fix') - x(layout, 'triage') - NODE_W).toBeGreaterThan(
+      'tier: high|low'.length * 5.6
+    );
+    expect(x(layout, 'report') - x(layout, 'fix') - NODE_W).toBe(44);
+  });
+
+  it('centres a label in the gutter before the task that reads it', () => {
+    const layout = layoutWorkflow(doc);
+    const read = layout.edges.find((e) => e.to === 'fix');
+    if (read === undefined) throw new Error('when edge missing');
+    const gutterMiddle = (x(layout, 'triage') + NODE_W + x(layout, 'fix')) / 2;
+    expect(Math.abs(read.labelX - gutterMiddle)).toBeLessThan(0.5);
+  });
+
+  it('keeps a bent edge label out of the layer it bends through', () => {
+    const bent: WorkflowGraphDoc = {
+      workflow_type: 'playbook',
+      result: null,
+      nodes: [task('root'), task('mid'), task('sink')],
+      edges: [edge('root', 'mid'), edge('mid', 'sink'), edge('root', 'sink', { keyed: ['notes'] })],
+    };
+    const layout = layoutWorkflow(bent);
+    const skip = layout.edges.find((e) => e.from === 'root' && e.to === 'sink');
+    if (skip === undefined) throw new Error('bent edge missing');
+    expect(skip.labelX).toBeGreaterThan(x(layout, 'mid') + NODE_W);
+    expect(skip.labelX).toBeLessThan(x(layout, 'sink'));
+  });
+
+  /// A layer of one card does not send an edge bending through it past a taller layer elsewhere.
+  it('runs a bend just past the cards of the layer it crosses', () => {
+    const lanes: WorkflowGraphDoc = {
+      workflow_type: 'playbook',
+      result: null,
+      nodes: ['root', 'a1', 'a2', 'a3', 'b', 'sink'].map((name) => task(name)),
+      edges: [
+        edge('root', 'a1'),
+        edge('root', 'a2'),
+        edge('root', 'a3'),
+        edge('a1', 'b'),
+        edge('a2', 'b'),
+        edge('a3', 'b'),
+        edge('b', 'sink'),
+        edge('root', 'sink'),
+      ],
+    };
+    const layout = layoutWorkflow(lanes);
+    const skip = layout.edges.find((e) => e.from === 'root' && e.to === 'sink');
+    if (skip === undefined) throw new Error('skip edge missing');
+    const ys = [...skip.path.matchAll(/C [\d.-]+ [\d.-]+, [\d.-]+ [\d.-]+, [\d.-]+ ([\d.-]+)/g)].map(
+      (m) => Number(m[1])
+    );
+    const bottom = (names: string[]) =>
+      Math.max(
+        ...layout.nodes.filter((n) => names.includes(n.node.name)).map((n) => n.y + n.height)
+      );
+    const [throughA, throughB] = ys;
+    expect(throughA).toBeGreaterThan(bottom(['a1', 'a2', 'a3']));
+    expect(throughB).toBeGreaterThan(bottom(['b']));
+    expect(throughB).toBeLessThan(bottom(['a1', 'a2', 'a3']));
+  });
+});
+
+describe('fitting the view', () => {
+  it('draws a small graph at the largest zoom, centred', () => {
+    const view = fitViewport({ width: 200, height: 100 }, { width: 1000, height: 600 });
+    expect(view.zoom).toBe(FIT_MAX_ZOOM);
+    expect(view.x).toBeCloseTo(12 + (976 - 200 * FIT_MAX_ZOOM) / 2);
+    expect(view.y).toBeCloseTo(40 + (548 - 100 * FIT_MAX_ZOOM) / 2);
+  });
+
+  it('fills the room with a graph that fits between the bounds', () => {
+    const view = fitViewport({ width: 1000, height: 300 }, { width: 1124, height: 800 });
+    expect(view.zoom).toBeCloseTo(1.1);
+    expect(view.x).toBeCloseTo(12);
+    expect(view.y).toBeCloseTo(40 + (748 - 330) / 2);
+  });
+
+  /// Shrinking a long graph to fit makes every label unreadable: it is drawn at the floor and from
+  /// its start, and the reader pans along it.
+  it('holds a long graph at the legible floor and shows it from its start', () => {
+    const view = fitViewport({ width: 3000, height: 300 }, { width: 1000, height: 400 });
+    expect(view.zoom).toBe(FIT_MIN_ZOOM);
+    expect(view.x).toBe(12);
+    expect(view.y).toBeCloseTo(40 + (348 - 300 * FIT_MIN_ZOOM) / 2);
+  });
+
+  it('anchors a graph taller than the room at its top', () => {
+    const view = fitViewport({ width: 400, height: 3000 }, { width: 1000, height: 400 });
+    expect(view.zoom).toBe(FIT_MIN_ZOOM);
+    expect(view.y).toBe(40);
+  });
+
+  it('survives a canvas not measured yet', () => {
+    const view = fitViewport({ width: 400, height: 300 }, { width: 0, height: 0 });
+    expect(view.zoom).toBe(FIT_MIN_ZOOM);
+    expect(Number.isFinite(view.x) && Number.isFinite(view.y)).toBe(true);
+  });
+
+  it('sizes the frame to hold the graph at the floor and no more than it needs at the top', () => {
+    expect(frameHeights({ width: 2000, height: 354 })).toEqual({
+      min: Math.ceil(354 * FIT_MIN_ZOOM + 52),
+      max: Math.ceil(354 * FIT_MAX_ZOOM + 52),
+    });
+    expect(frameHeights({ width: 400, height: 40 })).toEqual({ min: 240, max: 240 });
   });
 });

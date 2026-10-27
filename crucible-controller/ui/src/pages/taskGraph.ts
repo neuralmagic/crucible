@@ -4,7 +4,12 @@
 
 import type { components } from '../api/schema';
 import { shownLinks, type ExternalLinkRef } from '../ui/ExternalLink';
-import type { WorkflowGraphDoc, WorkflowGraphEdge, WorkflowGraphNode } from './workflowGraphLayout';
+import {
+  mappedFrom,
+  type WorkflowGraphDoc,
+  type WorkflowGraphEdge,
+  type WorkflowGraphNode,
+} from './workflowGraphLayout';
 
 export type PlanTask = components['schemas']['PlanTaskDto'];
 export type TaskResult = components['schemas']['TaskResultDto'];
@@ -328,14 +333,6 @@ export function fanoutStates(
     state.started += unreported;
   }
   return states;
-}
-
-/// The mapped task an instance came from. The executor names an instance `node[item]` and a
-/// declared name may not hold a bracket, so the prefix is the node it was mapped from.
-export function mappedFrom(name: string): string | null {
-  const cut = name.indexOf('[');
-  if (cut <= 0 || !name.endsWith(']')) return null;
-  return name.slice(0, cut);
 }
 
 /// One provider a mapped task's instances linked out to, and how many urls they reported there.
