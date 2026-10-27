@@ -214,12 +214,15 @@ test.describe('the run task graph', () => {
   });
 });
 
+const openGrid = (page: Page) => page.locator('summary', { hasText: 'Grid' }).click();
+
 test.describe('the run task grid', () => {
   /// The grid holds what the graph drops: every attempt, in the column of the iteration it came
   /// from. `read` failed on iter 0 and passed on iter 1, and both squares are there to see.
   test('draws every attempt as tasks down and iterations across', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     const grid = page.getByTestId('run-grid');
     await expect(grid).toBeVisible();
@@ -255,14 +258,16 @@ test.describe('the run task grid', () => {
   test('totals duration and cost across a retried task', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     const grid = page.getByTestId('run-grid');
     const row = grid.locator('[data-task-row="read"]');
     // 31s on iter 0 plus 240s on iter 1.
     await expect(row.locator('xpath=following-sibling::*[1]')).toHaveAttribute('title', '4m 31s');
 
-    await expect(page.getByText('pass 3', { exact: true })).toBeVisible();
-    await expect(page.getByText('fail 2', { exact: true })).toBeVisible();
+    const summary = page.locator('summary', { hasText: 'Grid' });
+    await expect(summary).toContainText('5 attempts · 2 failed · 3 passed');
+    await expect(summary.getByText('· 2 failed')).toHaveClass(/text-red/);
   });
 
   /// What an agent instance actually ran with, beside the attempt it ran. The mapped parent runs
@@ -271,6 +276,7 @@ test.describe('the run task grid', () => {
   test('names the provider, model and effort each agent task ran with', async ({ page }) => {
     await stubApi(page);
     await ready(page, `/runs/${encodeURIComponent(TRIAGE_RUN)}`);
+    await openGrid(page);
 
     const grid = page.getByTestId('run-grid');
     const cell = (task: string, col: string) =>
@@ -296,6 +302,7 @@ test.describe('the run task grid', () => {
   test('melds a run of attempts that ended the same way', async ({ page }) => {
     await stubApi(page);
     await ready(page, `/runs/${RETRY_RUN}`);
+    await openGrid(page);
 
     const row = page.getByTestId('run-grid').locator('[data-task="probe"]');
     await expect(row).toHaveCount(3);
@@ -312,6 +319,7 @@ test.describe('the run task grid', () => {
   test('opens the first attempt of a melded block', async ({ page }) => {
     await stubApi(page);
     await ready(page, `/runs/${RETRY_RUN}`);
+    await openGrid(page);
 
     await page.getByTestId('run-grid').locator('[data-task="probe"]').nth(2).click();
     await expect(page.getByText('iter 6', { exact: true })).toBeVisible();
@@ -321,6 +329,7 @@ test.describe('the run task grid', () => {
   test('opens a picked attempt and its evidence', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     await page
       .getByTestId('run-grid')
@@ -362,6 +371,7 @@ test.describe('external results', () => {
   test('shows a picked attempt its own links', async ({ page }) => {
     await stubApi(page);
     await ready(page, RUN);
+    await openGrid(page);
 
     const attempts = sectionOf(page, 'Grid');
     await page.getByTestId('run-grid').locator('[data-task="rank"][data-iter="1"]').click();

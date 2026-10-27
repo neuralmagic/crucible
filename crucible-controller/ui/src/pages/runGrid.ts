@@ -209,6 +209,34 @@ export function runGridView(tasks: PlanTask[], reported: TaskResult[]): RunGrid 
   return { iters, rows, maxSecs, counts };
 }
 
+const OUTCOME: Record<string, string> = {
+  pass: 'passed',
+  fail: 'failed',
+  transport: 'lost',
+  blocked: 'blocked',
+  truncated: 'truncated',
+  skipped: 'skipped',
+};
+
+export interface AttemptsSummary {
+  attempts: string;
+  outcomes: { status: string; label: string }[];
+}
+
+/** How many attempts a run made and how they ended, for the grid's header line. */
+export function attemptsSummary(counts: RunGrid['counts']): AttemptsSummary {
+  const total = counts.reduce((sum, c) => sum + c.count, 0);
+  const attempts = `${total} ${total === 1 ? 'attempt' : 'attempts'}`;
+  const [only] = counts;
+  if (counts.length === 1 && only?.status === 'pass') {
+    return { attempts, outcomes: [{ status: 'pass', label: 'all passed' }] };
+  }
+  return {
+    attempts,
+    outcomes: counts.map((c) => ({ status: c.status, label: `${c.count} ${OUTCOME[c.status] ?? c.status}` })),
+  };
+}
+
 /// A stretch of adjacent iterations a row reported the same status across, drawn as one block.
 export interface GridSegment {
   /// How many columns the block spans.
