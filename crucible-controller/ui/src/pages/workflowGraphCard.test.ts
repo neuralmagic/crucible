@@ -407,7 +407,8 @@ describe('the one status signal', () => {
     expect(statusMark(ran({ tone: 'fail', status: 'fail' }))).toBe('fail');
     expect(statusMark(ran({ tone: 'fail', status: 'transport' }))).toBe('fail');
     expect(statusMark(ran({ tone: 'none', status: 'pending', reported: false }))).toBe('active');
-    for (const status of ['never ran', 'skipped', 'blocked', 'not_taken']) {
+    expect(statusMark(ran({ tone: 'none', status: 'blocked' }))).toBe('blocked');
+    for (const status of ['never ran', 'skipped', 'not_taken', 'truncated']) {
       expect(statusMark(ran({ tone: 'none', status }))).toBe('idle');
     }
   });

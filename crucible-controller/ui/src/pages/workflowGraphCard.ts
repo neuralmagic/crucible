@@ -32,13 +32,15 @@ export function kindGlyph(node: WorkflowGraphNode): string {
   return '·';
 }
 
-/// How a node's status dot reads: passed, failed, not reached yet in a run still going, or ended
-/// some other way (skipped, blocked, not taken, never ran).
-export type StatusMark = 'pass' | 'fail' | 'active' | 'idle';
+/// How a node's status dot reads: passed, failed, never dispatched because something upstream
+/// stopped it, not reached yet in a run still going, or ended some other way (skipped, not taken,
+/// never ran).
+export type StatusMark = 'pass' | 'fail' | 'blocked' | 'active' | 'idle';
 
 export function statusMark(runtime: TaskRuntime): StatusMark {
   if (runtime.tone === 'pass') return 'pass';
   if (runtime.tone === 'fail') return 'fail';
+  if (runtime.status === 'blocked') return 'blocked';
   return runtime.status === 'pending' ? 'active' : 'idle';
 }
 

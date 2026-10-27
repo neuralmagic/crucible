@@ -98,14 +98,16 @@ export interface WorkflowGraphProps {
 const MARK_BORDER: Record<StatusMark, string> = {
   pass: 'border-green',
   fail: 'border-red',
-  active: 'border-amber',
+  blocked: 'border-amber',
+  active: 'border-blue',
   idle: '',
 };
 
 const MARK_DOT: Record<StatusMark, string> = {
   pass: 'bg-green',
   fail: 'bg-red',
-  active: 'animate-pulse bg-amber',
+  blocked: 'bg-amber',
+  active: 'animate-pulse bg-blue',
   idle: 'border border-ink-3',
 };
 
