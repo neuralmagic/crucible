@@ -1,19 +1,19 @@
 # The OpenShell fork
 
 Crucible pins `openshell-core` and `openshell-policy` to a fork,
-[`wseaton/OpenShell`](https://github.com/wseaton/OpenShell), branch `crucible/v0.1.2`, instead of
+[`wseaton/OpenShell`](https://github.com/wseaton/OpenShell), branch `crucible/v0.1.5`, instead of
 upstream [`nvidia/OpenShell`](https://github.com/nvidia/OpenShell). This page records the
 reasons for the fork, so that you do not have to find them in the Git history.
 
 ## Reason for the fork
 
-The branch must **rebase without conflicts**. `crucible/v0.1.2` is the upstream release tag
-`v0.1.2` with a small stack of commits that Crucible needs. The module docs in
+The branch must **rebase without conflicts**. `crucible/v0.1.5` is the upstream release tag
+`v0.1.5` with a small stack of commits that Crucible needs. The module docs in
 `crucible/src/openshell/mod.rs` give the result: the control-plane boundary is the native
 `openshell.v1` gRPC API of the gateway, and the shipped gateway, supervisor, and sandbox
 runtime binaries are built from the exact pinned rev.
 
-The pin follows a release tag, not upstream `main`. Upstream v0.1.2 has everything that
+The pin follows a release tag, not upstream `main`. Upstream v0.1.5 has everything that
 Crucible needs from upstream, so the only difference is the fork-only stack below.
 
 ## Pin mechanics
@@ -30,17 +30,21 @@ There is one rev, and five consumers use it. All of them get it from `Cargo.lock
 
 ## The divergence ledger
 
-Fork-only commits on `crucible/v0.1.2`, relative to upstream `v0.1.2` (`6648bd0c`), checked
-2026-10-21:
+Fork-only commits on `crucible/v0.1.5`, relative to upstream `v0.1.5` (`bdb956f2`), checked
+2026-10-27:
 
 | sha | What | Why crucible needs it | Upstreamable? |
 | --- | --- | --- | --- |
-| `3441f91a` | `feat(kubernetes): answer driver-supplied static hosts in the supervisor`: the kubernetes driver accepts `pod.host_aliases` (hostname to IP) in a sandbox's `driver_config`, validates it, and the network supervisor answers those names before its resolver, with every policy and destination check still applied | Deployments reach hosts with no public DNS record (`[cluster].host_aliases`); stock v0.1.2 rejects the key, and sandbox egress is resolved by the supervisor, not by pod `hostAliases` | Yes, upstream PR pending |
-| `46dcbe04` | `fix(providers): restore supervisor-backed GCP metadata discovery`, a cherry-pick of upstream `f7273e48` (#3973): the seccomp network broker relays connects to `127.0.0.1:8174` to the supervisor, which serves the GCE metadata emulator again | v0.1.2 still injects `GCE_METADATA_HOST=127.0.0.1:8174` for `google-cloud` providers but dropped the emulator in the sandbox split, so Vertex-authenticated turns fail with `ECONNREFUSED` refreshing the token | Already upstream; drop when rebasing onto a tag that contains `f7273e48` |
-| `aeeecb7d` | `Pass StaticHosts to the metadata proxy tests`: the cherry-picked tests call two functions that `3441f91a` gave an extra argument | Keeps the fork's test suite compiling | No, fork-only; dropped once either commit above is |
-| `50978123` | `Move noyalib to 0.0.58`: clears RUSTSEC-2026-0333; `openshell-policy-schema` now rejects explicit nulls itself, since 0.0.58 deserializes `null` into a struct | `cargo audit` and `cargo deny` fail on noyalib 0.0.28 | Yes |
+| `8350ed52` | `feat(kubernetes): answer driver-supplied static hosts in the supervisor`: the kubernetes driver accepts `pod.host_aliases` (hostname to IP) in a sandbox's `driver_config`, validates it, and the network supervisor answers those names before its resolver, with every policy and destination check still applied. Static hosts are driver-supplied, so they answer both name-authorized and IP-constrained lookups, unlike the sandbox's `/etc/hosts` (upstream #4602) | Deployments reach hosts with no public DNS record (`[cluster].host_aliases`); stock v0.1.5 rejects the key, and sandbox egress is resolved by the supervisor, not by pod `hostAliases` | Yes, no upstream PR yet |
 
-Dropped at this pin, relative to the previous `crucible/grpc-base` stack:
+Dropped at this pin, relative to `crucible/v0.1.2`:
+
+- **`46dcbe04`**, the cherry-pick of `f7273e48` (#3973). v0.1.5 contains it.
+- **`aeeecb7d`**, the metadata proxy test fixup. It is part of `8350ed52`.
+- **`50978123`**, noyalib 0.0.58. v0.1.5 has noyalib 0.0.53, which RUSTSEC-2026-0333 lists as
+  patched.
+
+Dropped at the `crucible/v0.1.2` pin, relative to the previous `crucible/grpc-base` stack:
 
 - **`fix(driver-kubernetes): pin ndots=1 on sandbox pods`.** Not kept. If sandbox DNS lookups
   fail with the separate supervisor pod, it returns as a new ledger row.
@@ -67,15 +71,24 @@ Dropped at this pin, relative to the previous `crucible/grpc-base` stack:
 - The sandbox RBAC adds the supervisor pod lifecycle, Services, bootstrap Secrets,
   NetworkPolicies, and admission metadata reads, as in the upstream helm chart.
 
-`MIN_GATEWAY_VERSION` in `grpc.rs` is `0.1.2`. The v0.1.2 wire changes (name-addressed RPCs,
-Timestamp and enum fields) do not work with older gateways.
+## Changes in v0.1.3 to v0.1.5 that Crucible adapted to
+
+- The gateway's `bundled-z3` feature is now `vendored-z3` (#3275). `openshell-gateway.yml`
+  builds with it.
+- `KubernetesComputeConfig` gained `supervisor_otlp_endpoint`, `supervisor_ocsf_export`,
+  `supervisor_gateway_name`, `allowed_pod_annotations`, and `allowed_pod_labels`.
+- `gateway.toml` sets `config_delivery_mode = "push"` (#4320): the gateway sends policy changes
+  over the supervisor session instead of waiting for the supervisor's poll. A supervisor
+  without push support keeps polling.
+
+`MIN_GATEWAY_VERSION` in `grpc.rs` is `0.1.5`. Older gateways reject the
+`config_delivery_mode` key in `gateway.toml`. The protos from v0.1.2 to v0.1.5 only add.
 
 ## Pending upstream contributions
 
 Changes that would remove the fork:
 
-- **Static hosts** (`3441f91a`). When upstream merges it, and the next release tag has the GCP
-  metadata fix and noyalib 0.0.53 or later, the fork is only a release pin.
+- **Static hosts** (`8350ed52`). When upstream merges it, the fork is only a release pin.
 - **Upload and download RPCs.** File transfer still uses the `openshell` CLI (SSH-tar over the
   `CreateSshSession` relay of the gateway), because no RPC supports it. This is one of the two
   remaining CLI uses that `crucible/src/openshell/mod.rs` names. With a native upload and
