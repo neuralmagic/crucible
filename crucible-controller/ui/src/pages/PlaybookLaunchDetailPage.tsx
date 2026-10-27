@@ -34,6 +34,7 @@ import {
 } from './launchView';
 import { AgentProviderTag } from './ProviderIcon';
 import { runLabel } from './runLabel';
+import { runStatusColor } from './runStatus';
 import { formatCost } from './runReport';
 import { RerunSection } from './RerunSection';
 import { LaunchWallTime } from './LaunchWallTime';
@@ -98,7 +99,9 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
                 <Identifier variant="inline" to={launchRunPath(launch.key, run.run_id)}>
                   {runLabel(run)}
                 </Identifier>
-                {run.status !== 'finished' && <span>{run.status}</span>}
+                {run.status !== 'finished' && (
+                  <Status status={run.status} tone={statusTone(runStatusColor(run.status))} />
+                )}
               </span>
             ))}
             {originLinks(detail).map((link) => {

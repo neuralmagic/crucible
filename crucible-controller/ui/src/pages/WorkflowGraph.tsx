@@ -449,7 +449,7 @@ function InstanceRow({ laid }: { laid: LaidOutNode }) {
 }
 
 /// The room a pill keeps for the link chip drawn over its end, in characters of its note.
-const PILL_LINK_CHARS = 8;
+const PILL_LINK_CHROME = 3;
 
 /// A plain command task in a run, drawn as one line: how it ended, its name, and what its attempts
 /// cost when that is anything worth saying.
@@ -752,7 +752,9 @@ function GraphCanvas({
     for (const node of graph.nodes) {
       const state = runtime.get(node.name);
       const note = state === undefined ? null : runtimeLine(state);
-      const linked = links?.get(node.name)?.kind === 'links' ? PILL_LINK_CHARS : 0;
+      const drawn = links?.get(node.name);
+      const first = drawn?.kind === 'links' ? drawn.links[0] : undefined;
+      const linked = first === undefined ? 0 : first.label.length + PILL_LINK_CHROME;
       const chars = (note?.length ?? 0) + linked;
       if (chars > 0) trailing.set(node.name, chars);
     }
