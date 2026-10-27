@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-FIELD-SOURCES"
+title = "Every field comes from the controller"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Every predicate field MUST come from controller records. No field MUST come from agent text or from a task's report about itself. A signature over values the agent chose vouches for nothing.
+
+The subject, repository, base, and pull request are what the controller pushed, not what the task reported. Check entries MUST come from the engine's record of tasks it ran, sent on the run's token, never from a task's report that a check passed.
+
+The controller MUST produce exactly one statement per push it completes, including a push that changed nothing because the branch already held the commit. A push the controller refused MUST NOT get a statement. A commit pushed by any other means MUST NOT get a statement.
+"""

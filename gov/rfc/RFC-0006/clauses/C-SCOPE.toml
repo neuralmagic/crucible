@@ -1,0 +1,22 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-SCOPE"
+title = "Scope"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+Tasks change repositories they do not own and propose those changes as pull requests under the deployment's forge identity. Today a pack that wants this ships its own push logic: it holds a forge credential, builds commits, picks branches, and opens or updates pull requests. Every pack reimplements it, the credential reaches the run, and nothing records which run, model, or compute produced a commit except what the run printed.
+
+This RFC moves pushing to the controller and makes every push carry a signed provenance statement:
+
+- a task hands the controller a change and, optionally, agent-written text for the pull request; the controller builds the commit, pushes it with a forge credential it mints for that push, and opens or updates the pull request;
+- the controller signs a statement binding the commit to the run and task that produced it and to the facts it recorded about that run; anyone holding the deployment's public key can check a statement without reaching the controller;
+- public artifacts carry only an opaque reference to a statement. The statement names models, providers, images, and clusters, and stays with the controller, which discloses it to callers its API admits.
+
+A statement attests origin. It does not say the commit is correct or safe; the check results it carries say which checks the engine ran and how they ended.
+
+Commits stay reproducible: the same change on the same base produces the same commit SHA on every rerun, and nothing run-specific is written into a commit.
+"""

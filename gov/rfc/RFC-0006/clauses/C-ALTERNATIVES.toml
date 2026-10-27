@@ -1,0 +1,26 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-ALTERNATIVES"
+title = "Alternatives considered"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+**Pack-owned push logic.** It works, but every pack reimplements branch reuse, commit identity, sign-off, reproducible SHAs, and pull request updates, and each one holds a forge credential the run can read. A run that holds the credential can push anything the credential allows, so nothing it reports about a push can be signed as fact.
+
+**Pushing from the run supervisor.** The engine already publishes kept candidates, so it could push for every task. It would still hold a write credential inside the run, and the facts a statement records would come from the run, not from the controller that launched it.
+
+**Commit trailers with run ids.** A trailer is public, so it names internal runs to anyone reading the repository, and it is unsigned, so anyone can write one. It also changes the commit SHA on every rerun.
+
+**Git notes.** Notes live under refs most hosting services neither display nor fetch by default, need push access to a separate ref, can be rewritten by anyone with that access, and are as public as the repository.
+
+**Unsigned text in the pull request description.** Anyone who can edit the description can change it, and it publishes the same internal details a trailer does.
+
+**SLSA build provenance as the predicate.** SLSA Provenance v1 describes a build turning source into an artifact. A commit an agent wrote is not a build output, and fitting run, model, and check results into its build definition would make SLSA-aware verifiers read claims about a build that never happened. A predicate type of its own says what it means; a later version can add SLSA statements for the images a run builds, where the model fits.
+
+**Keyless signing with Sigstore.** Fulcio certificates and Rekor entries remove key custody, but the public Rekor log records every entry and the signing identity, which exposes each statement's existence, timing, and the deployment's identity. A private transparency log would avoid that and is a candidate for a later version once key custody under [[RFC-0006:C-KEYS]] has run in practice.
+
+**Signing the commit itself.** A commit signature proves which key pushed it, which is the forge identity, not which run produced it. It is part of the commit object, so a run-specific signature would change the SHA on every rerun.
+"""

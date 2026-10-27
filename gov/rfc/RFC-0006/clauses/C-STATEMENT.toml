@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-STATEMENT"
+title = "Statement and envelope"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A statement MUST be an in-toto Statement v1 (`_type` `https://in-toto.io/Statement/v1`) with exactly one subject. The subject's `name` MUST be the repository's clone URL and its `digest` MUST hold the commit SHA under the key `gitCommit`. The `predicateType` MUST be `https://github.com/neuralmagic/crucible/provenance/commit/v1`.
+
+A statement MUST be carried in a DSSE envelope with payload type `application/vnd.in-toto+json`. Each signature MUST carry a `keyid` naming a key in the key set of [[RFC-0006:C-KEYS]].
+
+The controller MUST store an envelope as the exact bytes it signed and serves, and MUST compute the envelope digest over those bytes. It MUST NOT re-serialize a stored envelope, since a different serialization is a different digest.
+
+One commit MAY have several statements, one per push that produced it. A rerun that pushes the same commit MUST get its own statement and MUST NOT reuse an earlier run's.
+"""

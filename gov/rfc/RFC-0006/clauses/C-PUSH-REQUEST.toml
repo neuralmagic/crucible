@@ -1,0 +1,26 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PUSH-REQUEST"
+title = "Tasks request pushes"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+A task proposes a change by asking the engine for a push, never by pushing or opening a pull request itself, and the engine sends the push request to the controller on the run's token. A sandboxed task MUST reach the engine's push only through the broker. This adds a grant to those [[RFC-0004:C-RUN-EVIDENCE]] lists: requesting pushes for the run the token was minted for. The push route MUST sit under `/api/evidence/runs/{run}/pushes`, so a deployment that exposes evidence routes to remote clusters exposes it too. The controller MUST NOT give a run the credential it pushes with or any credential minted from the same key.
+
+A pack that uses controller pushes MUST declare, in its `draft-pr` output, a branch template, a commit message template, and pull request title and description templates, and MAY declare a path list. Templates MUST render only from the run's parameters; agent text enters only at the slots the title and description templates mark.
+
+A push request MUST carry:
+
+- the target repository and base branch, which MUST resolve from the pack's `draft-pr` declaration under [[RFC-0001:C-OUTPUTS]];
+- the base commit SHA the change was made on;
+- the change, as a git bundle;
+- the task that produced it;
+- optional agent text for the pull request title and description.
+
+The controller MUST refuse a request whose target is outside the declaration, whose count is spent, whose bundle does not contain a commit descending from the base, or whose tree equals the base tree. Where the declaration lists paths, the controller MUST refuse a change that touches any other path. Each refusal MUST fail the request naming the reason, MUST be recorded on the run's ledger, and MUST NOT by itself end the run.
+
+The reply MUST carry the commit SHA, the pull request URL, and the envelope digest of the push's statement, so later tasks in the run can act on the pull request.
+"""

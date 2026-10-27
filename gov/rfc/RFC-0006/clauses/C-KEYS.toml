@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-KEYS"
+title = "Signing keys"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The controller MUST sign with a private key it holds. The key MUST NOT be delivered to a run supervisor, a sandbox, or any pod the controller dispatches; signing MUST happen in the controller's process.
+
+A key's id MUST be the SHA-256 digest of its public key bytes. The controller MUST serve its key set at `GET /api/provenance/keys` without authentication. Each entry MUST carry the key id, the algorithm, the public key, the time it became active, and, once set, the time it was retired or revoked. A deployment SHOULD also publish the key set somewhere that does not depend on the controller, so a statement can be checked when the controller is gone.
+
+Rotation MUST add the new key before it signs anything and MUST mark the old key retired, not remove it. A statement signed by a retired key while it was active MUST keep verifying. A key marked revoked MUST fail verification for statements whose `signed_at` is at or after the revocation time; statements before it MUST be reported as signed by a revoked key, so the verifier can decide.
+
+Keyless signing through a public Sigstore instance is out of scope for this version; see [[RFC-0006:C-ALTERNATIVES]].
+"""

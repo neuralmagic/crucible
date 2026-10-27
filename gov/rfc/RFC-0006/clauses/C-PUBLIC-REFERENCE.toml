@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PUBLIC-REFERENCE"
+title = "Public reference"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The pull request description MUST carry the provenance reference of the push that last updated it, on a line of its own: `Crucible-Provenance: sha256:<hex>`. Earlier statements for the same commit stay retrievable by commit SHA under [[RFC-0006:C-STORAGE]].
+
+The reference MUST be the envelope digest, never the digest of the statement alone: the signature is part of what is hashed, so nobody without the private key can confirm a guess at the predicate's values from the reference.
+
+A provenance reference MUST NOT be written into a commit message, trailer, or note. A commit's SHA MUST NOT depend on any statement.
+
+Nothing public beyond the reference MAY name the run, model, provider, image, or cluster.
+"""

@@ -1,0 +1,25 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-VERIFY"
+title = "Verification"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Verifying an envelope against a commit means, in order:
+
+1. the SHA-256 digest of the envelope bytes equals the expected envelope digest, when one was given;
+2. the payload type is `application/vnd.in-toto+json`;
+3. at least one signature's key id is in the key set, and that key was active at the statement's `signed_at` and not revoked at or before it;
+4. that signature verifies over the DSSE pre-authentication encoding of the payload type and payload;
+5. the statement's `_type` and `predicateType` are those of [[RFC-0006:C-STATEMENT]];
+6. the subject's `gitCommit` equals the commit SHA, and its name equals the repository, when one was given.
+
+A verification result MUST name the first step that failed.
+
+The controller MUST serve verification at `POST /api/provenance/verify`, taking an envelope digest or a commit SHA and an optional repository, and returning one result per envelope.
+
+`crux verify <digest|sha>` MUST run the same steps on the client: it fetches the envelopes from the controller, verifies each locally, and prints one result per envelope with the predicate's fields. It MUST accept a key set file in place of the controller's key route, and with one MUST NOT trust keys the controller serves. It MUST exit non-zero when any envelope fails.
+"""

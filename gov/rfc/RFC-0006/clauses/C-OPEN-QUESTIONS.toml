@@ -1,0 +1,18 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-OPEN-QUESTIONS"
+title = "Open questions"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+- **Forge-signed commits.** A forge that signs commits it creates through its API marks them verified, but signs with its own key and the current time, so the same change no longer produces the same SHA. Whether a pack may choose a verified commit over a reproducible one.
+- **More than one commit.** A push is one commit. Whether a pack needs a series, and how the controller would keep a series reproducible.
+- **Ready pull requests.** Whether a pack may declare that its pushes open ready pull requests instead of drafts, and whether that needs its own output kind.
+- **Other forges.** Forges without app credentials scoped per repository need another way to meet [[RFC-0006:C-PUSH-CREDENTIAL]].
+- **Signing key custody.** One key per controller deployment, or one per organization shared across deployments; held as a controller secret or in an external key manager that signs on request; who may rotate and revoke.
+- **Storage and retention.** Whether envelopes live in the controller's database or its evidence store, and whether they must outlive the run's evidence, given a statement is only useful while the commit it names exists.
+- **Disclosure.** Whether a deployment may publish a statement with some fields removed, and how a verifier tells a redacted statement from a forged one when the signature covers the full payload.
+"""

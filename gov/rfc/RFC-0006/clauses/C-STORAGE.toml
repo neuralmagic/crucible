@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-STORAGE"
+title = "Storage and lookup"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The controller MUST store every envelope it signs and MUST serve it by envelope digest at `GET /api/provenance/{digest}` and by subject at `GET /api/provenance/commits/{sha}`, which MUST return every envelope whose subject is that commit, newest first. Both routes MUST be open to any caller the human API admits and MUST refuse every other caller, including run and pod tokens.
+
+A stored envelope MUST be immutable. The controller MUST NOT delete an envelope while a run that produced it is retained.
+
+The run's page and its record MUST list the envelopes the run produced.
+"""

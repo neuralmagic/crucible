@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PUSH-COMMIT"
+title = "The controller builds the commit"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The controller MUST create the pushed commit itself from the tip tree of the change. Only the tree comes from the task; the bundle's own commits, authors, dates, and messages MUST be discarded.
+
+The commit MUST have the base commit as its only parent. Its author and committer MUST both be the deployment's forge identity, and its message MUST end with a `Signed-off-by` trailer for that identity. Its author and committer dates MUST be the base commit's committer date. Its message MUST be the pack's declared message template rendered with the run's parameters; agent text MUST NOT enter the commit message.
+
+Given the same base, tree, template, and parameters, two pushes MUST produce the same commit SHA. A rerun that reproduces an earlier change MUST therefore push the same commit.
+"""

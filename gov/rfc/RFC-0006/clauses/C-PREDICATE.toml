@@ -1,0 +1,28 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PREDICATE"
+title = "Provenance predicate"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The predicate MUST record:
+
+- `run`: the run id;
+- `task`: the task id in the compiled workflow;
+- `playbook`: the pack id and version, or the draft id and draft version, the run was launched from;
+- `plan`: the digest of the compiled workflow and its parameter schema the run was launched with;
+- `model` and `provider`: the model and provider the controller resolved for the task at dispatch;
+- `sandbox_image`: the image the task's sandbox ran, by digest; a tag alone MUST NOT be recorded;
+- `cluster`: the cluster the controller dispatched the run to;
+- `base`: the base commit SHA;
+- `pull_request`: the pull request URL;
+- `checks`: one entry per check the engine ran for the task (a command or evaluate task whose exit status the run supervisor observed), with the check's name, its outcome, and the digest of its captured output;
+- `signed_at`: the time the controller signed.
+
+A field whose value the controller does not have MUST be absent; it MUST NOT be filled with a placeholder or a guess. A verifier reads an absent field as unknown.
+
+The predicate MUST NOT carry secrets, credential names, prompts, agent text, or transcripts.
+"""

@@ -1,0 +1,16 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-PUSH-BRANCH"
+title = "Branches and pull requests"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+The branch MUST be the pack's declared branch template rendered with the run's parameters, so reruns for the same target reuse the same branch.
+
+When the branch does not exist, the controller MUST create it at the new commit. When its tip is the new commit, the push MUST NOT change it. When its tip is a commit whose author and committer are both the deployment's forge identity, the controller MUST move the branch to the new commit. Otherwise the controller MUST refuse the push: it never overwrites a commit someone else made.
+
+When an open pull request from the branch to the base exists, the controller MUST update its description; otherwise it MUST open one as a draft. The title and description MUST be the pack's declared templates rendered with the run's parameters, with the agent text placed where the template says, after the controller strips any line that begins with `Crucible-Provenance:`. The controller MUST then add the provenance reference of [[RFC-0006:C-PUBLIC-REFERENCE]].
+"""

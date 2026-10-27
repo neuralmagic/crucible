@@ -1,0 +1,14 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-MIGRATION"
+title = "Migration"
+kind = "normative"
+status = "active"
+
+[content]
+text = """
+Until a pack moves to controller pushes it MAY keep pushing with its own logic and a forge credential of its own. Its commits get no statement, and the disclosure of [[RFC-0001:C-CAPABILITY-DISCLOSURE]] MUST list that credential.
+
+The engine's publish-on-keep `draft-pr` MUST move to the controller push. The broker's approval `draft-pr` SHOULD move too, so every `draft-pr` write has one mediation point and one count.
+"""

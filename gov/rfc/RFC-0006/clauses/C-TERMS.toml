@@ -1,0 +1,19 @@
+#:schema ../../../schema/clause.schema.json
+
+[govctl]
+id = "C-TERMS"
+title = "Terms"
+kind = "informative"
+status = "active"
+
+[content]
+text = """
+- **Push**: a `draft-pr` write under [[RFC-0001:C-OUTPUTS]] that the controller performs: one commit on a branch of a target repository, and the pull request that proposes it.
+- **Change**: the tree a task wants committed, delivered as a git bundle whose tip descends from a named base commit.
+- **Statement**: an in-toto Statement v1 whose subject is one commit and whose predicate is defined in [[RFC-0006:C-PREDICATE]].
+- **Envelope**: a DSSE envelope carrying one statement as its payload and one or more signatures.
+- **Envelope digest**: the SHA-256 digest of the envelope's stored bytes, written `sha256:<hex>`.
+- **Provenance reference**: the line `Crucible-Provenance: sha256:<hex>` naming one envelope digest.
+- **Controller records**: what the controller itself resolved, performed, or stored for a run: its launch, the compiled workflow, the dispatch, the provider resolution, the pushes it made, and the run's evidence delivered under [[RFC-0004:C-RUN-EVIDENCE]].
+- **Agent text**: anything an agent writes. It is payload, never a fact a statement vouches for.
+"""
