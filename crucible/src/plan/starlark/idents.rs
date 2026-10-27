@@ -55,7 +55,7 @@ pub(crate) fn scan(module: &AstModule, lane: WorkflowType) -> Idents {
 /// The lane decides which constructors exist, so it has to be known before the globals are built.
 /// An unreadable or absent declaration yields the default and the evaluator reports the real
 /// error, which keeps this pre-pass out of the business of diagnosing anything.
-pub(crate) fn declared_lane(module: &AstModule) -> WorkflowType {
+pub fn declared_lane(module: &AstModule) -> WorkflowType {
     let mut lane = WorkflowType::default();
     find_lane(Visit::Stmt(module.statement()), &mut lane);
     lane

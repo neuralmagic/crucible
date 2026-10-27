@@ -1,0 +1,225 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Crucible Starlark",
+  "scopeName": "source.crucible-starlark",
+  "patterns": [
+    {
+      "include": "#statement"
+    }
+  ],
+  "repository": {
+    "statement": {
+      "patterns": [
+        {
+          "include": "#comment"
+        },
+        {
+          "include": "#string"
+        },
+        {
+          "include": "#def"
+        },
+        {
+          "include": "#keyword"
+        },
+        {
+          "include": "#constant"
+        },
+        {
+          "include": "#number"
+        },
+        {
+          "include": "#dsl-call"
+        },
+        {
+          "include": "#builtin-call"
+        },
+        {
+          "include": "#call"
+        },
+        {
+          "include": "#arguments"
+        },
+        {
+          "include": "#operator"
+        }
+      ]
+    },
+    "comment": {
+      "name": "comment.line.number-sign.crucible-starlark",
+      "match": "#.*$"
+    },
+    "string": {
+      "patterns": [
+        {
+          "name": "string.quoted.triple.crucible-starlark",
+          "begin": "(?<![A-Za-z0-9_])([rRbBfF]{0,2})(\"\"\")",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.type.string.crucible-starlark"
+            },
+            "2": {
+              "name": "punctuation.definition.string.begin.crucible-starlark"
+            }
+          },
+          "end": "\"\"\"",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.crucible-starlark"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escape"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.triple.crucible-starlark",
+          "begin": "(?<![A-Za-z0-9_])([rRbBfF]{0,2})(''')",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.type.string.crucible-starlark"
+            },
+            "2": {
+              "name": "punctuation.definition.string.begin.crucible-starlark"
+            }
+          },
+          "end": "'''",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.crucible-starlark"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escape"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.double.crucible-starlark",
+          "begin": "(?<![A-Za-z0-9_])([rRbBfF]{0,2})(\")",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.type.string.crucible-starlark"
+            },
+            "2": {
+              "name": "punctuation.definition.string.begin.crucible-starlark"
+            }
+          },
+          "end": "(\")|((?<!\\\\)$)",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.crucible-starlark"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escape"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.crucible-starlark",
+          "begin": "(?<![A-Za-z0-9_])([rRbBfF]{0,2})(')",
+          "beginCaptures": {
+            "1": {
+              "name": "storage.type.string.crucible-starlark"
+            },
+            "2": {
+              "name": "punctuation.definition.string.begin.crucible-starlark"
+            }
+          },
+          "end": "(')|((?<!\\\\)$)",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.crucible-starlark"
+            }
+          },
+          "patterns": [
+            {
+              "include": "#escape"
+            }
+          ]
+        }
+      ]
+    },
+    "escape": {
+      "name": "constant.character.escape.crucible-starlark",
+      "match": "\\\\."
+    },
+    "def": {
+      "match": "\\b(def)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+      "captures": {
+        "1": {
+          "name": "storage.type.function.crucible-starlark"
+        },
+        "2": {
+          "name": "entity.name.function.crucible-starlark"
+        }
+      }
+    },
+    "keyword": {
+      "name": "keyword.control.crucible-starlark",
+      "match": "\\b(and|break|continue|elif|else|for|if|in|lambda|load|not|or|pass|return)\\b"
+    },
+    "constant": {
+      "name": "constant.language.crucible-starlark",
+      "match": "\\b(True|False|None)\\b"
+    },
+    "number": {
+      "name": "constant.numeric.crucible-starlark",
+      "match": "\\b(0[xX][0-9A-Fa-f]+|0[oO][0-7]+|0[bB][01]+|[0-9]+(\\.[0-9]*)?([eE][+-]?[0-9]+)?)\\b"
+    },
+    "dsl-call": {
+      "name": "support.function.dsl.crucible-starlark",
+      "match": "\\b(agent|apply|choice|command|decide|default_autoresearch|evaluate|grade|measure|noul|param|prompt_file|propose|report|route|schema_file|score|session|skill|top_k|workflow)(?=\\s*\\()"
+    },
+    "builtin-call": {
+      "name": "support.function.builtin.crucible-starlark",
+      "match": "\\b(abs|all|any|bool|bytes|chr|dict|dir|enumerate|fail|float|getattr|hasattr|hash|int|len|list|max|min|ord|range|repr|reversed|sorted|str|tuple|type|zip)(?=\\s*\\()"
+    },
+    "call": {
+      "name": "entity.name.function.call.crucible-starlark",
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)(?=\\s*\\()"
+    },
+    "arguments": {
+      "begin": "\\(",
+      "end": "\\)",
+      "beginCaptures": {
+        "0": {
+          "name": "punctuation.section.arguments.begin.crucible-starlark"
+        }
+      },
+      "endCaptures": {
+        "0": {
+          "name": "punctuation.section.arguments.end.crucible-starlark"
+        }
+      },
+      "patterns": [
+        {
+          "include": "#keyword-argument"
+        },
+        {
+          "include": "#statement"
+        }
+      ]
+    },
+    "keyword-argument": {
+      "match": "\\b([A-Za-z_][A-Za-z0-9_]*)\\s*(=)(?!=)",
+      "captures": {
+        "1": {
+          "name": "variable.parameter.crucible-starlark"
+        },
+        "2": {
+          "name": "keyword.operator.assignment.crucible-starlark"
+        }
+      }
+    },
+    "operator": {
+      "name": "keyword.operator.crucible-starlark",
+      "match": "==|!=|<=|>=|//=?|\\*\\*|[-+*/%<>|&^~]=?|="
+    }
+  }
+}

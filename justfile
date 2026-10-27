@@ -32,6 +32,21 @@ install-tools:
     for f in tools/*.nu; do [ -e "$f" ] && ln -sf "$PWD/$f" "{{cargo_bin}}/$(basename "$f" .nu)"; done
     @echo "linked tools -> {{cargo_bin}}"
 
+# Install the workflow Starlark language server, `crucible-lsp`, onto PATH. See editors/README.md.
+lsp-install:
+    cargo install --locked --path crucible-lsp
+    crucible-lsp --version
+
+# Package the VS Code extension and install it with an editor's CLI: `code`, `cursor`, `codium`...
+vscode-install editor="code":
+    cd editors/vscode && bun install --frozen-lockfile && bun run check && bun run build && bun run package
+    {{editor}} --install-extension editors/vscode/crucible-starlark.vsix --force
+
+# Install the Claude Code plugin for `crucible-lsp`. A running session needs `/reload-plugins`.
+claude-install:
+    claude plugin marketplace add ./editors/claude-code
+    claude plugin install crucible-lsp@crucible
+
 # Build the whole Rust workspace, the scored loop included.
 build-loop:
     cd crucible-controller/ui && bun install --frozen-lockfile && bun run build
