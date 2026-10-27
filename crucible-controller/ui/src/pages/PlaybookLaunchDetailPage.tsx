@@ -231,33 +231,25 @@ function ParamsSection({ launch }: { launch: LaunchDetail['launch'] }) {
         ) : (
           <dl
             data-testid="launch-params"
-            className="m-0 grid grid-cols-[auto_1fr] gap-x-3.5 gap-y-1 font-mono text-data"
+            className="m-0 grid grid-cols-[repeat(auto-fill,minmax(13rem,1fr))] gap-x-6 gap-y-1 font-mono text-data"
           >
             {entries.map(([name, value]) => (
-              <MetaRow key={name} label={name}>
-                <span className="break-all text-ink-2">{String(value)}</span>
-              </MetaRow>
+              <div key={name} className="flex min-w-0 items-baseline gap-2">
+                <dt className="flex-none text-ink-3">{name}</dt>
+                <dd className="m-0 min-w-0 truncate text-ink-2" title={String(value)}>
+                  {String(value)}
+                </dd>
+              </div>
             ))}
           </dl>
         )}
-        <div className="mt-3 flex flex-wrap items-center gap-3">
-          <Mono size="micro" tone="ink-3">
-            {launch.schema_digest}
-          </Mono>
+        <div className="mt-2 flex flex-wrap items-center gap-3 text-micro">
+          <CopyText value={launch.schema_digest} />
           {launch.schema_drifted && (
             <Status status="form moved since" tone="amber" pulse={false} />
           )}
         </div>
       </SectionBody>
     </Section>
-  );
-}
-
-function MetaRow({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <div className="contents">
-      <dt className="text-ink-3">{label}</dt>
-      <dd className="m-0 text-ink-2">{children}</dd>
-    </div>
   );
 }
