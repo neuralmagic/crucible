@@ -342,6 +342,21 @@ test.describe('the run task grid', () => {
   });
 });
 
+test.describe('the run header', () => {
+  /// The run id is cut to fit the header line and copies whole.
+  test('copies the whole run id from its cut chip', async ({ page, context }) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    await stubApi(page);
+    await ready(page, RUN);
+
+    const chip = page.getByRole('button', { name: 'Copy RUN-0412' });
+    await expect(chip).toHaveAttribute('title', 'RUN-0412');
+    await chip.click();
+    await expect(chip).toHaveText(/copied/);
+    expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('RUN-0412');
+  });
+});
+
 test.describe('external results', () => {
   const sectionOf = (page: Page, header: string) =>
     page

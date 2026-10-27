@@ -24,6 +24,7 @@ import { useAppBrand, useAppTheme } from '../appTheme';
 import {
   Breadcrumb,
   Button,
+  CopyText,
   cn,
   createDataColumnHelper,
   DataTable,
@@ -235,7 +236,7 @@ export function RunDetailPage() {
               </>
             ) : (
               <>
-                {run.name && <span>{run.run_id}</span>}
+
                 {run.issue_key && (
                   <Identifier variant="inline" to={detailPath(run.issue_key)}>
                     {run.issue_key}
@@ -257,6 +258,8 @@ export function RunDetailPage() {
               <span title={absoluteTime(created) ?? undefined}>started {relativeTime(created)}</span>
             )}
             <RunLinks runId={runId} />
+            <CopyText value={run.run_id} />
+            {run.image_digest && <CopyText value={run.image_digest} />}
           </>
         }
         aside={specs.length > 0 ? <Spec items={specs} /> : undefined}
