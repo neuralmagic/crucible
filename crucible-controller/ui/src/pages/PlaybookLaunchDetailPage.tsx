@@ -6,6 +6,7 @@ import type { components } from '../api/schema';
 import {
   Breadcrumb,
   Button,
+  CopyText,
   DetailHeader,
   Empty,
   Identifier,
@@ -21,15 +22,23 @@ import {
 import type { SpecItem } from '../ui';
 import { issueStatusColor } from './issueStatus';
 import { absoluteTime, relativeTime } from './journeyView';
-import { dispatchTone, graphRunId, originLabel, originLinks, relaunchPath } from './launchView';
+import {
+  dispatchTone,
+  graphRunId,
+  launchLabel,
+  launchRunPath,
+  originLabel,
+  originLinks,
+  relaunchPath,
+} from './launchView';
 import { AgentProviderTag } from './ProviderIcon';
 import { runLabel } from './runLabel';
 import { formatCost } from './runReport';
 import { RerunSection } from './RerunSection';
+import { RunLinks } from './RunLinks';
 import { RunTaskGraph } from './RunTaskGraph';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
-type LaunchRun = components['schemas']['LaunchRunDto'];
 
 /// One launch: what it was authorized to run, where its dispatch got to, and the graph its run
 /// drew. A playbook row never ranks and never scopes, so none of the issue journey applies to it —
@@ -47,7 +56,9 @@ export function PlaybookLaunchDetailPage() {
 
   return (
     <>
-      <Breadcrumb items={[{ label: 'Playbook runs', to: '/playbook-runs' }, { label: key }]} />
+      <Breadcrumb
+        items={[{ label: 'Playbook runs', to: '/playbook-runs' }, { label: launchLabel(key) }]}
+      />
       {detail.isError ? (
         <Empty title="Launch unavailable" description={formatError(detail.error)} />
       ) : detail.isPending ? (
@@ -62,22 +73,41 @@ export function PlaybookLaunchDetailPage() {
 function LaunchView({ detail }: { detail: LaunchDetail }) {
   const { launch, dispatch } = detail;
   const runId = graphRunId(detail);
-  const specs: SpecItem[] = [
-    { label: 'Cost', value: formatCost(launch.cost_usd), note: `/ $${launch.max_cost.toFixed(2)}` },
-    { label: 'Time cap', value: launch.max_time },
-    { label: 'Runs', value: String(launch.runs) },
-  ];
+  const cost = launch.cost_usd ?? null;
+  const specs: SpecItem[] =
+    cost !== null && cost > 0
+      ? [{ label: 'Cost', value: formatCost(cost), note: `/ $${launch.max_cost.toFixed(2)}` }]
+      : [];
+  const dispatchNews =
+    dispatch.state !== 'dispatched' || Boolean(dispatch.failure) || dispatch.failures > 0;
 
   return (
     <>
       <DetailHeader
-        title={launch.key}
+        title={launch.playbook}
         badge={
           <Status status={launch.status} tone={statusTone(issueStatusColor(launch.status))} />
         }
         description={launch.description ?? undefined}
         meta={
           <>
+            {detail.runs.map((run) => (
+              <span key={run.run_id} className="flex items-center gap-1.5">
+                <Identifier variant="inline" to={launchRunPath(launch.key, run.run_id)}>
+                  {runLabel(run)}
+                </Identifier>
+                {run.status !== 'finished' && <span>{run.status}</span>}
+              </span>
+            ))}
+            {originLinks(detail).map((link) =>
+              link.to === null ? (
+                <span key={link.label}>{link.value}</span>
+              ) : (
+                <Link key={link.label} className="text-ink-2 hover:text-ink" to={link.to}>
+                  {link.value}
+                </Link>
+              ),
+            )}
             <span>{originLabel(launch.origin)}</span>
             {launch.created_by && <span>by {launch.created_by}</span>}
             {launch.agent_provider && (
@@ -89,15 +119,24 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
             <span title={absoluteTime(launch.created_at) ?? undefined}>
               launched {relativeTime(launch.created_at) ?? launch.created_at}
             </span>
+            {runId !== null && <RunLinks runId={runId} />}
+            <CopyText value={launch.key} />
           </>
         }
-        aside={<Spec items={specs} />}
+        aside={
+          <div className="flex items-start gap-3">
+            {specs.length > 0 && <Spec items={specs} />}
+            <Button
+              className="uppercase"
+              render={<Link to={relaunchPath(launch.playbook, launch.key)} />}
+            >
+              Relaunch
+            </Button>
+          </div>
+        }
       />
 
-      <div className="grid grid-cols-2 max-wide:grid-cols-1">
-        <DispatchSection detail={detail} />
-        <OriginSection detail={detail} />
-      </div>
+      {dispatchNews && <DispatchSection detail={detail} />}
 
       <ParamsSection launch={launch} />
 
@@ -138,11 +177,11 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
   );
 }
 
-/// Dispatch, first-class: whether the engine ever started, the error that stopped an attempt that
-/// did not, and the runs that did. Nothing about this is a ranking verdict, which is where a
-/// launch's failure used to land.
+/// Dispatch, first-class: whether the engine ever started and the error that stopped an attempt
+/// that did not. Nothing about this is a ranking verdict, which is where a launch's failure used to
+/// land.
 function DispatchSection({ detail }: { detail: LaunchDetail }) {
-  const { dispatch, runs } = detail;
+  const { dispatch } = detail;
   return (
     <Section>
       <SectionHeader
@@ -171,72 +210,6 @@ function DispatchSection({ detail }: { detail: LaunchDetail }) {
             )}
           </div>
         )}
-        {runs.length > 0 && <RunList launchKey={detail.launch.key} runs={runs} />}
-      </SectionBody>
-    </Section>
-  );
-}
-
-function RunList({ launchKey, runs }: { launchKey: string; runs: readonly LaunchRun[] }) {
-  return (
-    <ul className="m-0 list-none p-0">
-      {runs.map((run) => (
-        <li
-          key={run.run_id}
-          className="flex items-center gap-3 border-b border-rule py-1.5 last:border-b-0"
-        >
-          <Identifier
-            variant="inline"
-            to={`/playbook-runs/${encodeURIComponent(launchKey)}/runs/${encodeURIComponent(run.run_id)}`}
-          >
-            {runLabel(run)}
-          </Identifier>
-          <Mono size="data" tone="ink-2">
-            {run.status}
-          </Mono>
-          <Mono size="data" tone="ink-3">
-            {run.dispatch === 'local' ? 'ran locally' : (run.pod ?? 'pod')}
-          </Mono>
-          <span className="flex-1" />
-          <Mono size="data" tone="ink-2">
-            {formatCost(run.cost_usd)}
-          </Mono>
-        </li>
-      ))}
-    </ul>
-  );
-}
-
-/// Where the launch came from, and the way back to it.
-function OriginSection({ detail }: { detail: LaunchDetail }) {
-  const { launch } = detail;
-  return (
-    <Section>
-      <SectionHeader title="Origin" />
-      <SectionBody>
-        <dl className="m-0 grid grid-cols-[auto_1fr] gap-x-3.5 gap-y-1 font-mono text-data">
-          <MetaRow label="origin">{originLabel(launch.origin)}</MetaRow>
-          {originLinks(detail).map((link) => (
-            <MetaRow key={link.label} label={link.label}>
-              {link.to === null ? (
-                <span className="text-ink-2">{link.value}</span>
-              ) : (
-                <Identifier variant="inline" to={link.to}>
-                  {link.value}
-                </Identifier>
-              )}
-            </MetaRow>
-          ))}
-          <MetaRow label="dedupe">{launch.advance_dedupe ? 'advances' : 'untouched'}</MetaRow>
-        </dl>
-        <div className="mt-3">
-          <Button
-            className="uppercase"
-            render={<Link to={relaunchPath(launch.playbook, launch.key)} />}
-          >
-            Relaunch
-          </Button>
-        </div>
       </SectionBody>
     </Section>
   );
@@ -248,7 +221,10 @@ function ParamsSection({ launch }: { launch: LaunchDetail['launch'] }) {
   const entries = Object.entries(launch.params);
   return (
     <Section>
-      <SectionHeader title="Parameters" note={`max $${launch.max_cost.toFixed(2)} / ${launch.max_time}`} />
+      <SectionHeader
+        title="Parameters"
+        note={`max $${launch.max_cost.toFixed(2)} / ${launch.max_time}${launch.advance_dedupe ? ' · dedupe advances' : ''}`}
+      />
       <SectionBody>
         {entries.length === 0 ? (
           <Mono tone="ink-3">no params</Mono>

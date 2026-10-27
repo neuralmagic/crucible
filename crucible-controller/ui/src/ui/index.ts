@@ -70,5 +70,7 @@ export type { InfoTipProps } from './InfoTip';
 export { Tooltip } from './Tooltip';
 export type { TooltipProps, TooltipSide } from './Tooltip';
 export { Facets, Applied } from './Facets';
-export { formatStamp } from './format';
+export { formatStamp, middleTruncate } from './format';
+export { CopyText } from './CopyText';
+export type { CopyTextProps } from './CopyText';
 export type { FacetOption, FacetRow, AppliedFilter } from './Facets';

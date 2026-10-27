@@ -4,6 +4,8 @@ import {
   detailPath,
   dispatchTone,
   graphRunId,
+  launchLabel,
+  launchRunPath,
   launchVersion,
   originLabel,
   originLinks,
@@ -68,6 +70,18 @@ describe('originLinks', () => {
     const links = originLinks(detail({}, { origin: 'schedule', schedule: 'nightly' }));
     expect(links.map((l) => l.label)).toEqual(['pack', 'schedule']);
     expect(links[1]).toEqual({ label: 'schedule', value: 'nightly', to: null });
+  });
+});
+
+describe('launchLabel', () => {
+  it('names a launch by its pack and the head of its id', () => {
+    expect(launchLabel('playbook:cve-triage:01a17b0f-9665-74df-9539-96935bb86827')).toBe('cve-triage 01a17b0f');
+    expect(launchLabel('playbook:survey:0199')).toBe('survey 0199');
+    expect(launchLabel('INFERENG-77')).toBe('INFERENG-77');
+  });
+
+  it('links a launch run under its launch', () => {
+    expect(launchRunPath('playbook:survey:0199', 'RUN 1')).toBe('/playbook-runs/playbook%3Asurvey%3A0199/runs/RUN%201');
   });
 });
 

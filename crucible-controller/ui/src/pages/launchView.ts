@@ -13,6 +13,19 @@ export function isLaunchKey(key: string): boolean {
   return key.startsWith('playbook:');
 }
 
+/** A launch key as a reader names it: its pack and the head of its id. */
+export function launchLabel(key: string): string {
+  const match = /^playbook:(.+):([0-9a-f-]+)$/i.exec(key);
+  const pack = match?.[1];
+  const id = match?.[2];
+  return pack === undefined || id === undefined ? key : `${pack} ${id.slice(0, 8)}`;
+}
+
+/** A launch's run, on the run page nested under the launch. */
+export function launchRunPath(key: string, runId: string): string {
+  return `${launchPath(key)}/runs/${encodeURIComponent(runId)}`;
+}
+
 export function launchPath(key: string): string {
   return `/playbook-runs/${encodeURIComponent(key)}`;
 }
