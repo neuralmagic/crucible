@@ -655,6 +655,7 @@ function PlanEdge({ id }: EdgeProps) {
 }
 
 const NODE_TYPES: NodeTypes = { task: TaskCard };
+const PRO_OPTIONS = { hideAttribution: true };
 const EDGE_TYPES: EdgeTypes = { plan: PlanEdge };
 
 interface TaskPanelProps {
@@ -1004,6 +1005,7 @@ function GraphCanvas({
                     edges={edges}
                     nodeTypes={NODE_TYPES}
                     edgeTypes={EDGE_TYPES}
+                    proOptions={PRO_OPTIONS}
                     minZoom={0.2}
                     maxZoom={2}
                     nodesDraggable={false}
