@@ -25,6 +25,26 @@ pub struct BuilderPod {
     pub name: String,
 }
 
+/// The scheduling gate Kueue holds a pod behind until it admits the pod's workload.
+pub const KUEUE_GATE: &str = "kueue.x-k8s.io/admission";
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Release {
+    Released,
+    /// Still gated when the wait ended, by these gates.
+    Held(Vec<String>),
+}
+
+fn scheduling_gates(pod: &Pod) -> Vec<&str> {
+    pod.spec
+        .as_ref()
+        .and_then(|s| s.scheduling_gates.as_deref())
+        .unwrap_or_default()
+        .iter()
+        .map(|g| g.name.as_str())
+        .collect()
+}
+
 pub(crate) fn unique_name() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,6 +77,34 @@ impl BuilderPod {
         Self {
             pods: Api::namespaced(client, namespace),
             name: name.to_string(),
+        }
+    }
+
+    /// Wait until no scheduling gate holds the pod, as Kueue holds one it has not admitted.
+    pub async fn wait_ungated(&self, timeout: Duration) -> Result<Release> {
+        let ungated = |p: Option<&Pod>| p.is_none_or(|p| scheduling_gates(p).is_empty());
+        let watched = tokio::time::timeout(
+            timeout,
+            await_condition(self.pods.clone(), &self.name, ungated),
+        )
+        .await;
+        match watched {
+            Ok(Ok(Some(_))) => Ok(Release::Released),
+            Ok(Ok(None)) => bail!("pod {} was deleted before it was scheduled", self.name),
+            Ok(Err(e)) => Err(e).with_context(|| format!("waiting for pod {}", self.name)),
+            Err(_) => {
+                let pod = self
+                    .pods
+                    .get(&self.name)
+                    .await
+                    .with_context(|| format!("reading pod {}", self.name))?;
+                Ok(Release::Held(
+                    scheduling_gates(&pod)
+                        .into_iter()
+                        .map(String::from)
+                        .collect(),
+                ))
+            }
         }
     }
 

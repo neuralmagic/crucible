@@ -5,7 +5,9 @@
 # Unconfined, emptyDir volumes, no host namespaces, no service account token or other Secret, no
 # node, runtime, toleration, sysctl or SELinux overrides, and AppArmor unconfined for that container
 # alone. Admission defaults are admitted: the not-ready and unreachable tolerations every pod gets,
-# a global default PriorityClass, and an SELinux level an OpenShift SCC assigns.
+# a global default PriorityClass, and an SELinux level an OpenShift SCC assigns. So is Kueue
+# admitting the pod: the update that lifts its kueue.x-k8s.io/admission gate may add the
+# ResourceFlavor's tolerations.
 # `crucible deploy` renders it with a binding to the builder namespace; buildit's tests check its
 # own builder pod passes and the escapes do not.
 apiVersion: admissionregistration.k8s.io/v1
@@ -87,8 +89,14 @@ spec:
     - expression: >-
         !has(object.spec.tolerations) || object.spec.tolerations.all(t, has(t.key) &&
         t.key in ['node.kubernetes.io/not-ready', 'node.kubernetes.io/unreachable'] &&
-        has(t.effect) && t.effect == 'NoExecute')
-      message: a pod here tolerates only the not-ready and unreachable taints every pod gets
+        has(t.effect) && t.effect == 'NoExecute') ||
+        (request.operation == 'UPDATE' && has(oldObject.spec.schedulingGates) &&
+        oldObject.spec.schedulingGates.exists(g, g.name == 'kueue.x-k8s.io/admission') &&
+        (!has(object.spec.schedulingGates) ||
+        !object.spec.schedulingGates.exists(g, g.name == 'kueue.x-k8s.io/admission')))
+      message: >-
+        a pod here tolerates only the not-ready and unreachable taints every pod gets, and its
+        Kueue flavor's on admission
     - expression: >-
         (!has(object.spec.hostNetwork) || object.spec.hostNetwork == false) &&
         (!has(object.spec.hostPID) || object.spec.hostPID == false) &&

@@ -9,6 +9,7 @@
 
 use crate::openshell::gateway::ComputeDriver;
 use anyhow::{Context, Result};
+use crucible_contract::agent_servers::BuilderPods;
 use forge::fleet::{ClusterEntry, ClusterIdentity, FleetFile};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -352,10 +353,22 @@ pub struct BuilditCfg {
     #[serde(default = "default_builder_egress")]
     pub egress: Vec<BuilderEgress>,
     /// The ResourceQuota `hard` limits of the builder namespace. Default: 16 pods and no GPUs.
-    /// Builder pods request no CPU or memory, so a `requests.cpu` or `requests.memory` limit would
-    /// refuse every one.
+    /// A `requests.cpu` or `requests.memory` limit refuses every builder pod whose `builders`
+    /// request no CPU or memory.
     #[serde(default = "default_builder_quota")]
     pub quota: BTreeMap<String, String>,
+    /// The Kueue LocalQueue in `namespace` builder pods are submitted to. Needed where Kueue
+    /// manages the namespace and holds pods that name no queue.
+    #[serde(default)]
+    pub queue: Option<KubeName>,
+    /// Builder pods on every cluster: `node_arch`, `max_builds`, `pod_deadline_secs`, `requests`
+    /// and `limits`. Unset, they run on the loop pod's architecture with buildit's defaults.
+    #[serde(default)]
+    pub builders: BuilderPods,
+    /// Builder pods on one cluster, each setting replacing `builders`' there:
+    /// `cluster_builders = { east = { node_arch = "amd64" } }`.
+    #[serde(default)]
+    pub cluster_builders: BTreeMap<String, BuilderPods>,
 }
 
 /// An IP network builder pods may reach, on `ports`, less the networks in `except` (such as the
@@ -398,6 +411,14 @@ impl BuilditCfg {
     /// Whether runs on dispatch cluster `cluster` get buildit.
     pub fn serves(&self, cluster: &str) -> bool {
         self.clusters.iter().any(|c| c == cluster)
+    }
+
+    /// Builder pods on dispatch cluster `cluster`.
+    pub fn builders_on(&self, cluster: &str) -> BuilderPods {
+        match self.cluster_builders.get(cluster) {
+            Some(on) => on.over(&self.builders),
+            None => self.builders.clone(),
+        }
     }
 
     /// The `[buildit] egress` networks that reach every address (`0.0.0.0/0`, `::/0`) with no

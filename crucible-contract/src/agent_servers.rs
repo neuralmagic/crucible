@@ -4,7 +4,9 @@
 //! An empty or absent list grants nothing.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
+use std::num::NonZeroU32;
 
 /// Loop-pod env carrying the run's servers, a JSON list of [`AgentServer`].
 pub const ENV_AGENT_SERVERS: &str = "CRUCIBLE_AGENT_SERVERS";
@@ -103,6 +105,94 @@ pub struct BuilditSite {
     /// The one repository it pushes to; none, it pushes nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub push_repo: Option<String>,
+    /// The Kueue LocalQueue its builder pods are submitted to; none, they carry no queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue: Option<String>,
+    /// Where and how large its builder pods are.
+    #[serde(default, skip_serializing_if = "BuilderPods::is_unset")]
+    pub builders: BuilderPods,
+}
+
+/// buildit's builder pods: the node architecture they run on, how many a sandbox may have live,
+/// how long each lives, and their resources. Each field unset is buildit's own default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BuilderPods {
+    /// The `kubernetes.io/arch` their nodes carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_arch: Option<NodeArch>,
+    /// Live builder pods per sandbox; `build` is refused past this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_builds: Option<NonZeroU32>,
+    /// A builder pod's lifetime, its `activeDeadlineSeconds`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod_deadline_secs: Option<NonZeroU32>,
+    /// Resource requests, `{ cpu = "8" }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests: Option<BTreeMap<String, String>>,
+    /// Resource limits, `{ cpu = "32", memory = "64Gi" }`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<BTreeMap<String, String>>,
+}
+
+impl BuilderPods {
+    pub fn is_unset(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// These settings, taking each one unset here from `base`.
+    pub fn over(&self, base: &Self) -> Self {
+        Self {
+            node_arch: self.node_arch.or(base.node_arch),
+            max_builds: self.max_builds.or(base.max_builds),
+            pod_deadline_secs: self.pod_deadline_secs.or(base.pod_deadline_secs),
+            requests: self.requests.clone().or_else(|| base.requests.clone()),
+            limits: self.limits.clone().or_else(|| base.limits.clone()),
+        }
+    }
+}
+
+/// A node architecture, as the `kubernetes.io/arch` label names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeArch {
+    Amd64,
+    Arm64,
+    Ppc64le,
+    S390x,
+}
+
+impl NodeArch {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Amd64 => "amd64",
+            Self::Arm64 => "arm64",
+            Self::Ppc64le => "ppc64le",
+            Self::S390x => "s390x",
+        }
+    }
+
+    /// The architecture of the node this process runs on, `None` for one Kubernetes has no
+    /// label value for.
+    pub fn host() -> Option<Self> {
+        Self::of(std::env::consts::ARCH, cfg!(target_endian = "little"))
+    }
+
+    fn of(rust_arch: &str, little_endian: bool) -> Option<Self> {
+        match rust_arch {
+            "x86_64" => Some(Self::Amd64),
+            "aarch64" => Some(Self::Arm64),
+            "powerpc64" if little_endian => Some(Self::Ppc64le),
+            "s390x" => Some(Self::S390x),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for NodeArch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// `servers` as [`ENV_AGENT_SERVERS`] carries them.
@@ -150,6 +240,8 @@ mod tests {
                     run_issuer: "https://hub.example=https://hub.example/jwks".into(),
                     namespace: "builds".into(),
                     push_repo: None,
+                    queue: Some("builders".into()),
+                    builders: BuilderPods::default(),
                 })),
             },
         ];
@@ -163,5 +255,92 @@ mod tests {
             "remote is the default"
         );
         assert!(decode(r#"[{"name": "x", "url": "u", "scopes": [], "extra": 1}]"#).is_err());
+    }
+
+    #[test]
+    fn builder_pods_ride_the_env_only_when_set() {
+        let site = |builders| BuilditSite {
+            run_issuer: "https://hub.example=https://hub.example/jwks".into(),
+            namespace: "builds".into(),
+            push_repo: None,
+            queue: None,
+            builders,
+        };
+        let plain = serde_json::to_value(site(BuilderPods::default())).unwrap();
+        assert!(plain.get("builders").is_none(), "{plain}");
+        let pinned = site(BuilderPods {
+            node_arch: Some(NodeArch::Amd64),
+            max_builds: NonZeroU32::new(2),
+            pod_deadline_secs: NonZeroU32::new(3600),
+            requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
+            limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+        });
+        let raw = serde_json::to_value(&pinned).unwrap();
+        assert_eq!(
+            raw["builders"],
+            serde_json::json!({
+                "node_arch": "amd64",
+                "max_builds": 2,
+                "pod_deadline_secs": 3600,
+                "requests": {"cpu": "8"},
+                "limits": {"cpu": "32"},
+            })
+        );
+        assert_eq!(serde_json::from_value::<BuilditSite>(raw).unwrap(), pinned);
+        assert!(serde_json::from_str::<BuilderPods>(r#"{"node_arch": "x86_64"}"#).is_err());
+        assert!(serde_json::from_str::<BuilderPods>(r#"{"max_builds": 0}"#).is_err());
+        assert!(serde_json::from_str::<BuilderPods>(r#"{"cpu": "8"}"#).is_err());
+    }
+
+    #[test]
+    fn a_cluster_s_builder_pods_override_the_defaults_field_by_field() {
+        let base = BuilderPods {
+            node_arch: Some(NodeArch::Arm64),
+            max_builds: NonZeroU32::new(4),
+            pod_deadline_secs: None,
+            requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
+            limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+        };
+        let cluster = BuilderPods {
+            node_arch: Some(NodeArch::Amd64),
+            pod_deadline_secs: NonZeroU32::new(600),
+            limits: Some(BTreeMap::new()),
+            ..BuilderPods::default()
+        };
+        assert_eq!(
+            cluster.over(&base),
+            BuilderPods {
+                node_arch: Some(NodeArch::Amd64),
+                max_builds: NonZeroU32::new(4),
+                pod_deadline_secs: NonZeroU32::new(600),
+                requests: Some(BTreeMap::from([("cpu".into(), "8".into())])),
+                limits: Some(BTreeMap::new()),
+            }
+        );
+        assert_eq!(BuilderPods::default().over(&base), base);
+        assert_eq!(base.over(&BuilderPods::default()), base);
+    }
+
+    #[test]
+    fn node_arches_are_kubernetes_label_values() {
+        assert_eq!(NodeArch::of("x86_64", true), Some(NodeArch::Amd64));
+        assert_eq!(NodeArch::of("aarch64", true), Some(NodeArch::Arm64));
+        assert_eq!(NodeArch::of("powerpc64", true), Some(NodeArch::Ppc64le));
+        assert_eq!(NodeArch::of("powerpc64", false), None);
+        assert_eq!(NodeArch::of("s390x", false), Some(NodeArch::S390x));
+        assert_eq!(NodeArch::of("riscv64", true), None);
+        assert!(NodeArch::host().is_some(), "{}", std::env::consts::ARCH);
+        for arch in [
+            NodeArch::Amd64,
+            NodeArch::Arm64,
+            NodeArch::Ppc64le,
+            NodeArch::S390x,
+        ] {
+            assert_eq!(
+                serde_json::to_value(arch).unwrap(),
+                serde_json::json!(arch.as_str())
+            );
+            assert_eq!(arch.to_string(), arch.as_str());
+        }
     }
 }

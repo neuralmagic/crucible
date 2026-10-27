@@ -5,7 +5,7 @@
 //! ([`crate::openshell::agent_servers`]).
 
 use anyhow::{Context, Result};
-use crucible_contract::agent_servers::BuilditSite;
+use crucible_contract::agent_servers::{BuilditSite, NodeArch};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -42,6 +42,8 @@ pub struct RunSite<'a> {
     /// The run pod's name, the `run_id` claim of this run's tokens.
     pub run_id: &'a str,
     pub push_authfile: Option<&'a str>,
+    /// The loop pod's architecture, where builder pods run unless the site names one.
+    pub arch: Option<NodeArch>,
 }
 
 impl Buildit<'_> {
@@ -75,8 +77,26 @@ impl Buildit<'_> {
         if jwks.scheme() == "http" {
             args.push("--insecure-jwks-http".to_string());
         }
+        if let Some(queue) = &self.site.queue {
+            args.extend(["--queue", queue].map(String::from));
+        }
         if let (Some(repo), Some(authfile)) = (&self.site.push_repo, run.push_authfile) {
             args.extend(["--push-repo", repo, "--push-authfile", authfile].map(String::from));
+        }
+        let pods = &self.site.builders;
+        if let Some(arch) = pods.node_arch.or(run.arch) {
+            args.extend(["--node-arch".to_string(), arch.to_string()]);
+        }
+        if let Some(n) = pods.max_builds {
+            args.extend(["--max-builds".to_string(), n.to_string()]);
+        }
+        if let Some(secs) = pods.pod_deadline_secs {
+            args.extend(["--pod-deadline".to_string(), secs.to_string()]);
+        }
+        for (flag, resources) in [("--request", &pods.requests), ("--limit", &pods.limits)] {
+            for (key, qty) in resources.iter().flatten() {
+                args.extend([flag.to_string(), format!("{key}={qty}")]);
+            }
         }
         Ok(args)
     }
@@ -101,6 +121,7 @@ impl Buildit<'_> {
         let run = RunSite {
             run_id: &run_id,
             push_authfile: push_authfile.as_deref(),
+            arch: NodeArch::host(),
         };
         Command::new("buildit")
             .args(self.args(&run, &policy.to_string_lossy())?)
@@ -127,6 +148,9 @@ impl Buildit<'_> {
 #[cfg(test)]
 mod tests {
     use crate::openshell::buildit::*;
+    use crucible_contract::agent_servers::BuilderPods;
+    use std::collections::BTreeMap;
+    use std::num::NonZeroU32;
 
     const ISSUER: &str =
         "https://crucible.hub.example=https://crucible-ext.hub.example/.well-known/jwks.json";
@@ -137,6 +161,8 @@ mod tests {
             run_issuer: issuer.into(),
             namespace: "crucible-builds".into(),
             push_repo: push.map(str::to_string),
+            queue: None,
+            builders: BuilderPods::default(),
         }
     }
 
@@ -154,6 +180,7 @@ mod tests {
         let run = RunSite {
             run_id: "crucible-run-brave-otter",
             push_authfile: Some("/etc/quay/push.json"),
+            arch: None,
         };
         let plain = site(ISSUER, None);
         let args = buildit(&plain).args(&run, "/tmp/policy.toml").unwrap();
@@ -182,6 +209,15 @@ mod tests {
             "no repo: {args:?}"
         );
         assert!(!args.contains(&"--insecure-jwks-http".to_string()));
+        assert!(!args.contains(&"--queue".to_string()), "no queue: {args:?}");
+        let queued = BuilditSite {
+            queue: Some("builders".into()),
+            ..plain.clone()
+        };
+        assert_eq!(
+            flag(&buildit(&queued).args(&run, "/p").unwrap(), "--queue").as_deref(),
+            Some("builders")
+        );
 
         let pushing = site(ISSUER, Some("quay.io/example/crucible-smoke"));
         let args = buildit(&pushing).args(&run, "/p").unwrap();
@@ -230,6 +266,7 @@ mod tests {
                 &RunSite {
                     run_id: "r",
                     push_authfile: None,
+                    arch: None,
                 },
                 "/p",
             )
@@ -247,10 +284,81 @@ mod tests {
         let run = RunSite {
             run_id: "r",
             push_authfile: None,
+            arch: None,
         };
         assert_eq!(
             buildit(&s).args(&run, "/p"),
             Err(BadIssuer("https://crucible.hub.example".into()))
         );
+    }
+
+    fn builder_flags(args: &[String]) -> Vec<&str> {
+        let at = args
+            .iter()
+            .position(|a| a == "--namespace")
+            .map_or(args.len(), |i| i + 2);
+        args[at..]
+            .iter()
+            .map(String::as_str)
+            .filter(|a| *a != "--insecure-jwks-http")
+            .collect()
+    }
+
+    #[test]
+    fn builder_pods_run_on_the_site_s_arch_with_its_limits() {
+        let mut s = site(ISSUER, None);
+        s.builders = BuilderPods {
+            node_arch: Some(NodeArch::Amd64),
+            max_builds: NonZeroU32::new(2),
+            pod_deadline_secs: NonZeroU32::new(3600),
+            requests: Some(BTreeMap::from([
+                ("cpu".into(), "8".into()),
+                ("memory".into(), "16Gi".into()),
+            ])),
+            limits: Some(BTreeMap::from([("cpu".into(), "32".into())])),
+        };
+        let on_arm = RunSite {
+            run_id: "r",
+            push_authfile: None,
+            arch: Some(NodeArch::Arm64),
+        };
+        let args = buildit(&s).args(&on_arm, "/p").unwrap();
+        assert_eq!(
+            builder_flags(&args),
+            [
+                "--node-arch",
+                "amd64",
+                "--max-builds",
+                "2",
+                "--pod-deadline",
+                "3600",
+                "--request",
+                "cpu=8",
+                "--request",
+                "memory=16Gi",
+                "--limit",
+                "cpu=32",
+            ],
+            "the site's arch wins over the loop pod's"
+        );
+    }
+
+    #[test]
+    fn builder_pods_default_to_the_loop_pod_s_arch_and_buildit_s_limits() {
+        let s = site(ISSUER, None);
+        let run = |arch| RunSite {
+            run_id: "r",
+            push_authfile: None,
+            arch,
+        };
+        let args = buildit(&s).args(&run(Some(NodeArch::Arm64)), "/p").unwrap();
+        assert_eq!(builder_flags(&args), ["--node-arch", "arm64"]);
+        let args = buildit(&s).args(&run(None), "/p").unwrap();
+        assert!(builder_flags(&args).is_empty(), "{args:?}");
+
+        let mut unbounded = site(ISSUER, None);
+        unbounded.builders.requests = Some(BTreeMap::new());
+        let args = buildit(&unbounded).args(&run(None), "/p").unwrap();
+        assert!(builder_flags(&args).is_empty(), "{args:?}");
     }
 }

@@ -4,7 +4,7 @@
 //! and JSON. `validate` checks the supported version and graph structure before execution.
 pub mod admission;
 pub mod decide;
-pub(crate) mod diag;
+pub mod diag;
 pub mod exec;
 pub mod history;
 pub mod ir;
