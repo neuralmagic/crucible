@@ -889,6 +889,74 @@ describe('implied edges', () => {
   });
 });
 
+/// root -> a -> b -> sink is the longest path; root -> side -> sink and the dead end off a are
+/// not, and an instance stands where its deck does.
+describe('the spine', () => {
+  const over = { over_task: 'root', over_field: 'items', max_fanout: null };
+  const doc: WorkflowGraphDoc = {
+    workflow_type: 'run',
+    result: null,
+    nodes: [
+      task('root'),
+      task('a', { fanout: over }),
+      task('b'),
+      task('sink'),
+      task('side'),
+      task('dead'),
+      task('a[x]'),
+    ],
+    edges: [
+      edge('root', 'a'),
+      edge('a', 'a[x]'),
+      edge('a[x]', 'b'),
+      edge('b', 'sink'),
+      edge('root', 'side'),
+      edge('side', 'sink'),
+      edge('a', 'dead'),
+    ],
+  };
+  const layout = layoutWorkflow(doc);
+  const node = (name: string) => layout.nodes.find((n) => n.node.name === name)?.spine;
+  const step = (from: string, to: string) =>
+    layout.edges.find((e) => e.from === from && e.to === to)?.spine;
+
+  it('puts the tasks of a longest root-to-sink path on it, an instance with its deck', () => {
+    expect(['root', 'a', 'a[x]', 'b', 'sink'].map(node)).toEqual([true, true, true, true, true]);
+    expect(['side', 'dead'].map(node)).toEqual([false, false]);
+  });
+
+  it('puts only the steps between consecutive spine tasks on it', () => {
+    expect([step('root', 'a'), step('a[x]', 'b'), step('b', 'sink')]).toEqual([true, true, true]);
+    expect([step('root', 'side'), step('side', 'sink'), step('a', 'dead')]).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it('keeps every longest path on it when there are several', () => {
+    const twin: WorkflowGraphDoc = {
+      workflow_type: 'playbook',
+      result: null,
+      nodes: ['s', 'p', 'q', 't'].map((name) => task(name)),
+      edges: [edge('s', 'p'), edge('s', 'q'), edge('p', 't'), edge('q', 't')],
+    };
+    const both = layoutWorkflow(twin);
+    expect(both.nodes.every((n) => n.spine)).toBe(true);
+    expect(both.edges.every((e) => e.spine)).toBe(true);
+  });
+
+  it('survives a cycle on the wire', () => {
+    const loop: WorkflowGraphDoc = {
+      workflow_type: 'playbook',
+      result: null,
+      nodes: ['a', 'b'].map((name) => task(name)),
+      edges: [edge('a', 'b'), edge('b', 'a')],
+    };
+    expect(layoutWorkflow(loop).nodes).toHaveLength(2);
+  });
+});
+
 /// What an edge carries is plumbing: shown on demand, so it never widens a gutter.
 describe('plumbing labels', () => {
   it('leaves a gutter narrow for an edge that only narrows a field or stages a file', () => {

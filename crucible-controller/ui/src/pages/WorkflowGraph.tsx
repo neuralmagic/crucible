@@ -565,10 +565,11 @@ function OutputCard({ id, output }: { id: string; output: OutputNode }) {
 
 interface EdgeMarkers {
   arrow: string;
+  arrowSpine: string;
   arrowLit: string;
 }
 
-const EdgeMarkersContext = createContext<EdgeMarkers>({ arrow: '', arrowLit: '' });
+const EdgeMarkersContext = createContext<EdgeMarkers>({ arrow: '', arrowSpine: '', arrowLit: '' });
 
 /// One dependency, drawn on the path the layout routed through the gutters. An edge into an
 /// advisory task is dashed, and one its consumer joins on carries the join.
@@ -580,8 +581,10 @@ function PlanEdge({ id }: EdgeProps) {
 
   const lit = view.lit !== null && view.lit.has(laid.from) && view.lit.has(laid.to);
   const dim = view.lit !== null && !lit;
-  const tone = lit ? 'var(--ink)' : 'var(--ink-3)';
-  const width = lit ? 1.6 : 1;
+  const tone = lit ? 'var(--ink)' : laid.spine ? 'var(--ink-2)' : 'var(--ink-3)';
+  const width = lit ? 1.6 : laid.spine ? 1.4 : 1;
+  // The spine is drawn whole, advisory or not: it is the line a reader follows first.
+  const dashed = !laid.required && !laid.spine;
   const untaken = view.runtime.get(laid.to)?.status === 'not_taken';
   const fade = dim ? 0.15 : untaken ? 0.45 : 1;
   const double = laid.aligned && !untaken;
@@ -598,7 +601,7 @@ function PlanEdge({ id }: EdgeProps) {
           style={{
             stroke: tone,
             strokeWidth: width * 2 + 2.5,
-            strokeDasharray: laid.required ? undefined : '3 3',
+            strokeDasharray: dashed ? '3 3' : undefined,
             opacity: fade,
           }}
         />
@@ -606,11 +609,11 @@ function PlanEdge({ id }: EdgeProps) {
       <BaseEdge
         id={id}
         path={laid.path}
-        markerEnd={`url(#${lit ? markers.arrowLit : markers.arrow})`}
+        markerEnd={`url(#${lit ? markers.arrowLit : laid.spine ? markers.arrowSpine : markers.arrow})`}
         style={{
           stroke: double ? 'var(--paper)' : tone,
           strokeWidth: double ? 2.5 : width,
-          strokeDasharray: untaken ? '2 4' : laid.required || double ? undefined : '3 3',
+          strokeDasharray: untaken ? '2 4' : dashed && !double ? '3 3' : undefined,
           opacity: fade,
         }}
       />
@@ -733,7 +736,11 @@ function GraphCanvas({
 }: WorkflowGraphProps) {
   const marker = useId().replace(/:/g, '');
   const markers = useMemo(
-    () => ({ arrow: `arrow-${marker}`, arrowLit: `arrow-lit-${marker}` }),
+    () => ({
+      arrow: `arrow-${marker}`,
+      arrowSpine: `arrow-spine-${marker}`,
+      arrowLit: `arrow-lit-${marker}`,
+    }),
     [marker]
   );
   const [vertical, setVertical] = useDeviceFlag(VERTICAL_KEY, false);
@@ -960,6 +967,7 @@ function GraphCanvas({
             <defs>
               {[
                 { id: markers.arrow, tone: 'var(--ink-3)' },
+                { id: markers.arrowSpine, tone: 'var(--ink-2)' },
                 { id: markers.arrowLit, tone: 'var(--ink)' },
               ].map(({ id, tone }) => (
                 <marker

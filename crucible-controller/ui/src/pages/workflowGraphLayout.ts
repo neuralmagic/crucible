@@ -24,6 +24,8 @@ export interface LaidOutNode {
   isResult: boolean;
   /// A runtime instance of a mapped task: drawn as a row under its deck, in the deck's layer.
   instance: { deck: string; index: number } | null;
+  /// On a longest path from a root to a sink: the run's main line, which a reader follows first.
+  spine: boolean;
 }
 
 export interface LaidOutEdge {
@@ -48,6 +50,8 @@ export interface LaidOutEdge {
   /// A longer path already orders the two ends and the edge says nothing but plumbing, so it is
   /// drawn only while traced.
   implied: boolean;
+  /// Joins two consecutive tasks on a longest path from a root to a sink.
+  spine: boolean;
 }
 
 export interface WorkflowLayout {
@@ -405,6 +409,36 @@ export function layoutWorkflow(
   }
   const layerIndex = layerOf(heads, parents);
 
+  // A task is on the spine when the longest path into it plus the longest path out of it is the
+  // longest path in the graph.
+  const children = new Map<string, string[]>();
+  for (const [to, from] of parents) {
+    for (const head of from) children.set(head, [...(children.get(head) ?? []), to]);
+  }
+  const heightOf = new Map<string, number>();
+  const reach = (name: string, seen: Set<string>): number => {
+    const cached = heightOf.get(name);
+    if (cached !== undefined) return cached;
+    if (seen.has(name)) return 0;
+    seen.add(name);
+    let most = 0;
+    for (const child of children.get(name) ?? []) most = Math.max(most, reach(child, seen) + 1);
+    seen.delete(name);
+    heightOf.set(name, most);
+    return most;
+  };
+  const longest = heads.reduce(
+    (most, node) => Math.max(most, (layerIndex.get(node.name) ?? 0) + reach(node.name, new Set())),
+    0
+  );
+  const onSpine = (head: string): boolean =>
+    (layerIndex.get(head) ?? 0) + (heightOf.get(head) ?? 0) === longest;
+  const spineStep = (from: string, to: string): boolean =>
+    onSpine(from) &&
+    onSpine(to) &&
+    (layerIndex.get(to) ?? 0) === (layerIndex.get(from) ?? 0) + 1 &&
+    (layerIndex.get(from) ?? 0) + 1 + (heightOf.get(to) ?? 0) === longest;
+
   // Cells are decks and plain tasks plus the bends long edges are broken at; they are what the
   // layers hold and what the ordering sees.
   const prefix = bendPrefix(known);
@@ -575,6 +609,7 @@ export function layoutWorkflow(
       height,
       isResult: graph.result === node.name,
       instance,
+      spine: onSpine(headOf(node.name)),
     };
   };
 
@@ -714,6 +749,7 @@ export function layoutWorkflow(
         edge.join !== 'passed' &&
         edge.join !== 'settled' &&
         roundabout(headOf(edge.from), headOf(edge.to)),
+      spine: spineStep(headOf(edge.from), headOf(edge.to)),
     });
   });
 
