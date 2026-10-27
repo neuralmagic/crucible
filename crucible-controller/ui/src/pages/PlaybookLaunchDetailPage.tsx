@@ -27,6 +27,7 @@ import {
   graphRunId,
   launchLabel,
   launchRunPath,
+  launchVersion,
   originLabel,
   originLinks,
   relaunchPath,
@@ -35,6 +36,7 @@ import { AgentProviderTag } from './ProviderIcon';
 import { runLabel } from './runLabel';
 import { formatCost } from './runReport';
 import { RerunSection } from './RerunSection';
+import { LaunchWallTime } from './LaunchWallTime';
 import { RunLinks } from './RunLinks';
 import { RunTaskGraph } from './RunTaskGraph';
 
@@ -99,16 +101,17 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
                 {run.status !== 'finished' && <span>{run.status}</span>}
               </span>
             ))}
-            {originLinks(detail).map((link) =>
-              link.to === null ? (
-                <span key={link.label}>{link.value}</span>
+            {originLinks(detail).map((link) => {
+              const text = link.label === 'draft' ? launchVersion(launch) : link.value;
+              return link.to === null ? (
+                <span key={link.label}>{text}</span>
               ) : (
                 <Link key={link.label} className="text-ink-2 hover:text-ink" to={link.to}>
-                  {link.value}
+                  {text}
                 </Link>
-              ),
-            )}
-            <span>{originLabel(launch.origin)}</span>
+              );
+            })}
+            {launch.origin !== 'draft' && <span>{originLabel(launch.origin)}</span>}
             {launch.created_by && <span>by {launch.created_by}</span>}
             {launch.agent_provider && (
               <span>
@@ -119,6 +122,7 @@ function LaunchView({ detail }: { detail: LaunchDetail }) {
             <span title={absoluteTime(launch.created_at) ?? undefined}>
               launched {relativeTime(launch.created_at) ?? launch.created_at}
             </span>
+            <LaunchWallTime launchKey={launch.key} />
             {runId !== null && <RunLinks runId={runId} />}
             <CopyText value={launch.key} />
           </>

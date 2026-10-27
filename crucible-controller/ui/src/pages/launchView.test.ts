@@ -5,6 +5,7 @@ import {
   dispatchTone,
   graphRunId,
   launchLabel,
+  launchWallSecs,
   launchRunPath,
   launchVersion,
   originLabel,
@@ -82,6 +83,37 @@ describe('launchLabel', () => {
 
   it('links a launch run under its launch', () => {
     expect(launchRunPath('playbook:survey:0199', 'RUN 1')).toBe('/playbook-runs/playbook%3Asurvey%3A0199/runs/RUN%201');
+  });
+});
+
+describe('launchWallSecs', () => {
+  const ev = (from: string, to: string, ts: string) => ({ from, to, ts });
+
+  it('measures from the move into running to the move out of it', () => {
+    expect(
+      launchWallSecs([
+        ev('new', 'new', '2026-10-27T01:53:01Z'),
+        ev('new', 'running', '2026-10-27T01:53:04Z'),
+        ev('running', 'running', '2026-10-27T01:53:04Z'),
+        ev('running', 'done', '2026-10-27T02:03:19Z'),
+      ]),
+    ).toBe(615);
+  });
+
+  it('reads the trail in time order and measures a failure the same way', () => {
+    expect(
+      launchWallSecs([
+        ev('running', 'failed', '2026-10-27T02:00:30Z'),
+        ev('new', 'running', '2026-10-27T02:00:00Z'),
+      ]),
+    ).toBe(30);
+  });
+
+  it('is null while the launch runs, before it starts, or on a bad stamp', () => {
+    expect(launchWallSecs([ev('new', 'running', '2026-10-27T02:00:00Z')])).toBeNull();
+    expect(launchWallSecs([ev('new', 'new', '2026-10-27T02:00:00Z')])).toBeNull();
+    expect(launchWallSecs([])).toBeNull();
+    expect(launchWallSecs([ev('new', 'running', 'soon'), ev('running', 'done', 'later')])).toBeNull();
   });
 });
 

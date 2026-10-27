@@ -14,6 +14,7 @@ import { MarkdownView } from './MarkdownView';
 import { flowThemeStyle, injectFlowTheme } from './flowTheme';
 import { AgentProviderTag } from './ProviderIcon';
 import { RunAgentTools } from './RunAgentTools';
+import { LaunchWallTime } from './LaunchWallTime';
 import { RunLinks } from './RunLinks';
 import { useLiveEvents } from '../api/useLiveEvents';
 import { formatError } from '../api/errors';
@@ -230,6 +231,7 @@ export function RunDetailPage() {
                 <span title={absoluteTime(launch.created_at) ?? undefined}>
                   started {relativeTime(launch.created_at) ?? launch.created_at}
                 </span>
+                <LaunchWallTime launchKey={launch.key} />
               </>
             ) : (
               <>

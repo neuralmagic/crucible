@@ -5,6 +5,7 @@ import type { components } from '../api/schema';
 
 type LaunchDetail = components['schemas']['PlaybookLaunchDetailDto'];
 type PlaybookRun = components['schemas']['PlaybookRunDto'];
+type IssueEvent = components['schemas']['EventDto'];
 type DispatchState = components['schemas']['DispatchState'];
 
 /// A launch key addresses itself: `playbook:{pack}:{uuidv7}`. Its detail is the launch view, never
@@ -68,6 +69,19 @@ export function launchVersion(launch: Pick<PlaybookRun, 'draft_version' | 'schem
     return `draft v${launch.draft_version}`;
   }
   return launch.schema_digest.replace(/^sha256:/, '').slice(0, 12);
+}
+
+/// How long a launch ran, in seconds: from its move into running to the move that took it out of
+/// running. Null while it still runs, or when its trail holds no such pair.
+export function launchWallSecs(events: readonly Pick<IssueEvent, 'from' | 'to' | 'ts'>[]): number | null {
+  const trail = [...events].sort((a, b) => Date.parse(a.ts) - Date.parse(b.ts));
+  const start = trail.findIndex((e) => e.to === 'running' && e.from !== 'running');
+  const started = trail[start];
+  if (started === undefined) return null;
+  const ended = trail.slice(start + 1).find((e) => e.from === 'running' && e.to !== 'running');
+  if (ended === undefined) return null;
+  const secs = (Date.parse(ended.ts) - Date.parse(started.ts)) / 1000;
+  return Number.isFinite(secs) && secs >= 0 ? secs : null;
 }
 
 /// Where a launch came from, as links back. A draft launch points at the studio that fired it, any
