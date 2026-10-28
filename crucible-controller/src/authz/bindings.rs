@@ -425,6 +425,20 @@ pub static BINDINGS: &[Binding] = &[
         Route,
     ),
     bind(
+        "POST",
+        "/api/playbook-drafts/{id}/rename",
+        R::PlaybookDraft,
+        V::Update,
+        Route,
+    ),
+    bind(
+        "POST",
+        "/api/playbook-drafts/{id}/clone",
+        R::PlaybookDraft,
+        V::Create,
+        Route,
+    ),
+    bind(
         "GET",
         "/api/playbook-drafts/{id}/files",
         R::PlaybookDraft,
