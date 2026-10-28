@@ -75,11 +75,8 @@ pub async fn complete_run(
             parsed.best_score,
         );
     }
-    // A run that ERRORED parks (retryable — `done` means solved-or-exhausted, and completing on an
-    // error buried the first live loop failure as terminal; Will's call 2026-07-07). The engine's
-    // own shutdown reason and the failing task's note ride the park so the next person needs no
-    // session forensics.
-    if parsed.outcome.as_deref() == Some("error") {
+    // A ceiling outcome is resumable and cannot establish successful completion.
+    if matches!(parsed.outcome.as_deref(), Some("error" | "budget")) {
         let park_reason = ParkReason::RunErrored {
             engine_reason: parsed.outcome_reason.clone(),
             cause: parsed

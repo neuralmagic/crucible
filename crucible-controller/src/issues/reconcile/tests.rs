@@ -2149,6 +2149,58 @@ async fn complete_run_parks_an_errored_outcome(pool: PgPool) -> Result<()> {
     Ok(())
 }
 
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn complete_run_parks_a_run_that_reached_its_wall_clock_ceiling(pool: PgPool) -> Result<()> {
+    let (db, _dir) = db_with(pool);
+    crate::issues::store::upsert_issue(db.pool(), &sample_issue("owner/repo#8")).await?;
+    assert!(
+        crate::issues::store::claim_issue(db.pool(), "owner/repo#8", Status::New, Status::Running)
+            .await?
+    );
+    let scope_id = crate::issues::store::insert_scope(
+        db.pool(),
+        &NewScope {
+            issue: "owner/repo#8".into(),
+            pack_digest: Some("v1:abc".into()),
+            check_outcome: Some("PASS".into()),
+        },
+    )
+    .await?;
+    let log = [
+        r#"{"v":1,"kind":"phase","phase":"baseline","iter":0}"#,
+        r#"{"v":1,"kind":"shutdown","outcome":"budget","reason":"wall-clock ceiling reached"}"#,
+    ]
+    .join("\n");
+
+    complete_run(
+        &db,
+        "owner/repo#8",
+        Some(scope_id),
+        "run-8",
+        Some("loop-8"),
+        &log,
+        None,
+    )
+    .await?;
+
+    let iss = crate::issues::store::get_issue(db.pool(), "owner/repo#8")
+        .await?
+        .unwrap();
+    assert_eq!(
+        iss.status,
+        Status::Parked,
+        "a timed out run parks, never done"
+    );
+    assert!(
+        iss.parked_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("wall-clock ceiling reached")),
+        "the engine's shutdown reason rides the park: {:?}",
+        iss.parked_reason
+    );
+    Ok(())
+}
+
 /// The live failure: the park read `run errored: short-circuited at scan`, which names where the
 /// run stopped and not why, and the pod carrying the real chain was deleted on collection. The
 /// failing task's note has to ride the park too.
