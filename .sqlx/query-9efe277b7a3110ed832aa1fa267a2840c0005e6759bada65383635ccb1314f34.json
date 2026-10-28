@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO playbook_items (playbook, store, key, created_at)\n         SELECT $1, $2, k, $4 FROM unnest($3::text[]) AS k ORDER BY k\n         ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9efe277b7a3110ed832aa1fa267a2840c0005e6759bada65383635ccb1314f34"
+}

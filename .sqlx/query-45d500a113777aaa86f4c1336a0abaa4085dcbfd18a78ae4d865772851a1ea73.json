@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT l.playbook FROM runs r JOIN playbook_launches l ON l.key = r.issue\n         WHERE r.run_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "playbook",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_launches",
+            "name": "playbook"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "45d500a113777aaa86f4c1336a0abaa4085dcbfd18a78ae4d865772851a1ea73"
+}

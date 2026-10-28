@@ -149,6 +149,10 @@ pub(crate) fn dispatch(cli: Cli) -> Result<()> {
         return crate::scope::rank_grounded::run(args);
     }
 
+    if let Some(Cmd::Items { action }) = &cli.command {
+        return crate::cli::items::run(action);
+    }
+
     if let Some(Cmd::Plan { action }) = &cli.command {
         return match action {
             crate::cli::PlanAction::CompileWorkflow {

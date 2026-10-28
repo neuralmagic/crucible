@@ -85,6 +85,11 @@ fn main() -> std::process::ExitCode {
                 if error.is::<plan::cli::NoValidVerdict>() || error.is::<cli::setup::EndedAtSetup>()
                 {
                     crucible::plan::INVALID_VERDICT_EXIT
+                } else if matches!(
+                    error.downcast_ref::<cli::items::ItemsCliError>(),
+                    Some(cli::items::ItemsCliError::Refused { .. })
+                ) {
+                    cli::items::REFUSED_EXIT
                 } else {
                     1
                 },
