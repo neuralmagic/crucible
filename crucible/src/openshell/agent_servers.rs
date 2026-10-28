@@ -274,6 +274,7 @@ mod tests {
             namespace: "builds".into(),
             push_repo: None,
             queue: None,
+            builders: Default::default(),
         }));
         let servers = granted(&[
             server("kueue", KUEUE, Transport::Remote),

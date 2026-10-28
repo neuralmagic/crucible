@@ -355,8 +355,9 @@ pub struct GrantedServer<'a> {
 /// secret and gives the sandbox no placeholder.
 pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto::ProviderProfile {
     use openshell_core::proto::{
-        NetworkAccessPreset, NetworkEndpoint, ProviderCredentialTokenGrant, ProviderProfile,
-        ProviderProfileCategory, ProviderProfileCredential,
+        NetworkAccessPreset, NetworkEndpoint, ProviderCredentialTokenGrant,
+        ProviderCredentialTokenGrantType, ProviderProfile, ProviderProfileCategory,
+        ProviderProfileCredential,
     };
     ProviderProfile {
         id: server.profile_id.to_string(),
@@ -373,6 +374,7 @@ pub fn token_grant_profile(server: &GrantedServer<'_>) -> openshell_core::proto:
                 audience: server.url.to_string(),
                 jwt_svid_audience: server.svid_audience.to_string(),
                 scopes: server.scopes.to_vec(),
+                grant_type: ProviderCredentialTokenGrantType::ClientCredentials as i32,
                 ..Default::default()
             }),
             ..Default::default()
@@ -563,6 +565,29 @@ pub fn aws_s3_profile() -> openshell_core::proto::ProviderProfile {
 #[cfg(test)]
 mod tests {
     use crate::openshell::provider::*;
+
+    #[test]
+    fn a_token_grant_profile_names_the_grant_type_the_gateway_stores() {
+        use openshell_core::proto::ProviderCredentialTokenGrantType;
+        let profile = token_grant_profile(&GrantedServer {
+            profile_id: "kueue-grant",
+            name: "kueue",
+            host: "kueue.example.svc",
+            port: 8850,
+            url: "http://kueue.example.svc:8850/mcp",
+            token_endpoint: "http://controller.example.svc:8080/oauth/token",
+            svid_audience: "http://controller.example.svc:8080",
+            scopes: &[],
+        });
+        let grant = profile.credentials[0]
+            .token_grant
+            .as_ref()
+            .expect("a token-grant credential");
+        assert_eq!(
+            grant.grant_type,
+            ProviderCredentialTokenGrantType::ClientCredentials as i32
+        );
+    }
 
     #[test]
     fn provider_identity_constants_are_stable() {

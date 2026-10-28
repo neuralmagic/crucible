@@ -59,7 +59,7 @@ fn from_pattern(pattern: &str) -> Option<String> {
     let hir = regex_syntax::parse(pattern).ok()?;
     let mut out = String::new();
     emit(&hir, &mut out)?;
-    regex::Regex::new(pattern)
+    regex_lite::Regex::new(pattern)
         .ok()?
         .is_match(&out)
         .then_some(out)
@@ -144,7 +144,7 @@ mod tests {
         let property = json!({"type": "string", "pattern": pattern});
         let value = placeholder("p", &property).unwrap_or_else(|| panic!("no value for {pattern}"));
         assert!(
-            regex::Regex::new(pattern)
+            regex_lite::Regex::new(pattern)
                 .expect("pattern compiles")
                 .is_match(&value),
             "{value:?} does not match {pattern}"

@@ -1,0 +1,70 @@
+{
+  "name": "crucible-starlark",
+  "displayName": "Crucible Starlark",
+  "description": "Syntax highlighting for crucible workflow files, plus errors, completion, hover, and go to definition from crucible-lsp.",
+  "version": "0.5.1",
+  "publisher": "crucible",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "crucible-starlark",
+        "aliases": [
+          "Crucible Starlark",
+          "starlark"
+        ],
+        "extensions": [
+          ".star"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "crucible-starlark",
+        "scopeName": "source.crucible-starlark",
+        "path": "./syntaxes/crucible-starlark.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "Crucible",
+      "properties": {
+        "crucible.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to crucible-lsp. Empty runs crucible-lsp from PATH (just lsp-install)."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "crucible.restartServer",
+        "title": "Crucible: Restart Language Server"
+      }
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js --minify",
+    "package": "vsce package --no-dependencies --skip-license --allow-missing-repository --out crucible-starlark.vsix"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "@types/vscode": "~1.91.0",
+    "@vscode/vsce": "^4.0.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^7.0.2"
+  }
+}

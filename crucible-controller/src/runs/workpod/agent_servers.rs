@@ -86,9 +86,11 @@ pub fn access(
                 name: s.name.clone(),
                 url: s.url.clone(),
                 scopes: s.scopes.clone(),
-                transport: s.transport(&tokens.svid_audience).with_context(|| {
-                    format!("deriving {}'s key set URI from the agent issuer", s.name)
-                })?,
+                transport: s
+                    .transport(&tokens.svid_audience, cluster)
+                    .with_context(|| {
+                        format!("deriving {}'s key set URI from the agent issuer", s.name)
+                    })?,
             })
         })
         .collect::<anyhow::Result<_>>()?;
@@ -118,7 +120,9 @@ pub fn access(
 mod tests {
     use crate::runs::workpod::agent_servers::*;
     use crucible::deploy::profile::DeployProfile;
-    use crucible_contract::agent_servers::{BuilditSite, LocalServer, Transport};
+    use crucible_contract::agent_servers::{
+        BuilderPods, BuilditSite, LocalServer, NodeArch, Transport,
+    };
 
     const SOCKET: &str = "/run/spire/agent.sock";
 
@@ -267,6 +271,36 @@ mod tests {
         );
     }
 
+    /// The loop pod gets the builder pods of the cluster its run was dispatched onto.
+    #[test]
+    fn buildit_ships_its_cluster_s_builder_pods() {
+        let all = servers(&format!(
+            "{BUILDIT}\
+             [buildit.builders]\nmax_builds = 2\nrequests = {{ cpu = \"8\" }}\n\
+             [buildit.cluster_builders.k8s]\nnode_arch = \"amd64\"\n"
+        ));
+        let builders = |cluster| {
+            let delivery = access(&all, cluster, &tokens(), SOCKET).unwrap().unwrap();
+            match &granted_servers(&delivery)[0].transport {
+                Transport::Local(LocalServer::Buildit(site)) => site.builders.clone(),
+                Transport::Remote => panic!("buildit runs in the loop pod"),
+            }
+        };
+        let shared = BuilderPods {
+            max_builds: std::num::NonZeroU32::new(2),
+            requests: Some([("cpu".to_string(), "8".to_string())].into()),
+            ..BuilderPods::default()
+        };
+        assert_eq!(builders("ocp"), shared);
+        assert_eq!(
+            builders("k8s"),
+            BuilderPods {
+                node_arch: Some(NodeArch::Amd64),
+                ..shared
+            }
+        );
+    }
+
     #[test]
     fn buildit_is_an_entry_served_in_the_loop_pod_with_its_issuer_and_push_repo() {
         let all = servers(&format!("{KUEUE}{BUILDIT}"));
@@ -285,6 +319,7 @@ mod tests {
                     namespace: "crucible-builds".into(),
                     push_repo: Some("quay.io/example/crucible-smoke".into()),
                     queue: Some("builders".into()),
+                    builders: BuilderPods::default(),
                 })),
             }]
         );
