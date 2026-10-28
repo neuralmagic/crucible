@@ -3423,6 +3423,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/origin/files",
         "/api/playbook-drafts/{id}/tarball",
         "/api/playbook-drafts/{id}/versions",
+        "/api/playbook-drafts/{id}/rename",
+        "/api/playbook-drafts/{id}/clone",
         "/api/playbook-drafts/{id}/launch",
         "/api/playbook-drafts/{id}/graduate",
         "/api/playbook-drafts/{id}/publish",

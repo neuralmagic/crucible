@@ -685,6 +685,37 @@ pub async fn draft_delete(c: &Client, draft_id: &str) -> Result<String> {
     Ok(format!("deleted draft {draft_id}\n"))
 }
 
+/// Move a draft to a new id. Its saves, secret bindings, shares, standing launches and launches
+/// follow it.
+pub async fn draft_rename(c: &Client, draft_id: &str, to: &str, as_json: bool) -> Result<String> {
+    if as_json {
+        return json(&c.rename_draft::<Value>(draft_id, to).await?);
+    }
+    let renamed: dto::DraftRenamed = c.rename_draft(draft_id, to).await?;
+    Ok(render::draft_renamed(&renamed, &studio_url(c, &renamed.id)))
+}
+
+/// Copy a draft's newest save into a new draft. A binding comes along only when the caller could
+/// bind its secret themselves; a reference-mode secret needs a Vault token this client never
+/// sends, so its bindings are reported as left behind.
+pub async fn draft_clone(
+    c: &Client,
+    draft_id: &str,
+    to: &str,
+    description: Option<&str>,
+    as_json: bool,
+) -> Result<String> {
+    if as_json {
+        return json(&c.clone_draft::<Value>(draft_id, to, description).await?);
+    }
+    let cloned: dto::DraftCloned = c.clone_draft(draft_id, to, description).await?;
+    Ok(render::draft_cloned(
+        draft_id,
+        &cloned,
+        &studio_url(c, &cloned.id),
+    ))
+}
+
 /// Register a draft's newest compiling version as a playbook, with no review.
 pub async fn draft_publish(
     c: &Client,
