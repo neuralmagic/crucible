@@ -19,6 +19,10 @@ pub(crate) enum RerunRefusal {
     NotPlaybook(String),
     #[error("run {0} has not finished, so it cannot be rerun")]
     NotFinished(String),
+    #[error(
+        "run {0} has no stored git memory (run-commits); select a parent with a retained checkpoint"
+    )]
+    NoGitMemory(String),
     #[error("the pack this rerun would run is gone: {0}")]
     NoPack(String),
     #[error("the pack this rerun would run does not compile: {0}")]
@@ -55,7 +59,10 @@ pub struct RerunPreviewDto {
 }
 
 /// The parent run and the launch it came from.
-async fn parent(db: &Db, run_id: &str) -> Result<(String, PlaybookLaunch), RerunRefusal> {
+async fn parent(
+    db: &Db,
+    run_id: &str,
+) -> Result<(crate::runs::model::RunDispatch, PlaybookLaunch), RerunRefusal> {
     let run = crate::runs::store::get_run(db.pool(), run_id)
         .await?
         .ok_or_else(|| RerunRefusal::NoRun(run_id.to_string()))?;
@@ -65,7 +72,7 @@ async fn parent(db: &Db, run_id: &str) -> Result<(String, PlaybookLaunch), Rerun
     let launch = crate::launches::store::get_playbook_launch(db.pool(), &key)
         .await?
         .ok_or_else(|| RerunRefusal::NotPlaybook(run_id.to_string()))?;
-    Ok((key, launch))
+    Ok((run.dispatch, launch))
 }
 
 /// Preview a rerun of `run_id` from `from`.
@@ -74,10 +81,22 @@ pub(crate) async fn preview(
     run_id: &str,
     from: &[String],
 ) -> Result<RerunPreviewDto, RerunRefusal> {
-    let (_, launch) = parent(db, run_id).await?;
+    let (dispatch, launch) = parent(db, run_id).await?;
     let session = crate::runs::blob_store::get_run_session(db.pool(), run_id)
         .await?
         .ok_or_else(|| RerunRefusal::NotFinished(run_id.to_string()))?;
+    if dispatch == crate::runs::model::RunDispatch::Pod
+        && crate::runs::blob_store::get_run_bundle(
+            db.pool(),
+            run_id,
+            crucible_contract::ArtifactKind::RunCommits,
+        )
+        .await
+        .with_context(|| format!("reading git memory for rerun parent {run_id}"))?
+        .is_none()
+    {
+        return Err(RerunRefusal::NoGitMemory(run_id.to_string()));
+    }
     let (draft_version, tree) = match launch.draft_version {
         Some(_) => crate::playbooks::drafts::version_tree(db.pool(), &launch.playbook, None)
             .await?
@@ -369,9 +388,79 @@ mod tests {
         )
         .await
         .unwrap();
+        crate::runs::store::set_run_dispatch(pool, run_id, crate::runs::model::RunDispatch::Local)
+            .await
+            .unwrap();
         crate::runs::blob_store::put_run_session(pool, run_id, log.as_bytes())
             .await
             .unwrap();
+    }
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn a_pod_rerun_without_retained_git_memory_is_refused_before_dispatch(pool: PgPool) {
+        pin(&pool, WORKFLOW).await;
+        crate::testing::launch_playbook(&pool, "playbook:survey:1").await;
+        crate::runs::store::insert_run(
+            &pool,
+            &NewRun {
+                run_id: "run-pod-parent".to_string(),
+                scope: None,
+                issue: Some("playbook:survey:1".to_string()),
+                identity_digest: None,
+                status: "error".to_string(),
+                pod: Some("run-pod-parent".to_string()),
+                session_uri: None,
+                best_score: None,
+                cost_usd: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::runs::store::set_run_dispatch(
+            &pool,
+            "run-pod-parent",
+            crate::runs::model::RunDispatch::Pod,
+        )
+        .await
+        .unwrap();
+        crate::runs::blob_store::put_run_session(
+            &pool,
+            "run-pod-parent",
+            session(WORKFLOW).as_bytes(),
+        )
+        .await
+        .unwrap();
+        let db = Db::new(pool.clone());
+        assert!(matches!(
+            preview(&db, "run-pod-parent", &[]).await,
+            Err(RerunRefusal::NoGitMemory(run)) if run == "run-pod-parent"
+        ));
+        assert!(matches!(
+            admit(&db, "survey", false, "run-pod-parent", &[]).await,
+            Err(RerunRefusal::NoGitMemory(run)) if run == "run-pod-parent"
+        ));
+        let start = serde_json::json!({
+            "run": "run-pod-parent", "started_at": "2026-10-28T12:00:00Z",
+            "base": "abc", "base_tree": "def", "plan": "sha256:p",
+        })
+        .to_string();
+        crate::runs::blob_store::put_run_bundle(
+            &pool,
+            "run-pod-parent",
+            crucible_contract::ArtifactKind::RunCommits,
+            tar_gz(&[
+                ("tasks.json", b"[]"),
+                ("playbook-run.json", start.as_bytes()),
+            ]),
+        )
+        .await
+        .unwrap();
+        assert!(preview(&db, "run-pod-parent", &[]).await.is_ok());
+        assert!(
+            admit(&db, "survey", false, "run-pod-parent", &[])
+                .await
+                .is_ok()
+        );
     }
 
     #[sqlx::test(migrator = "crate::MIGRATOR")]
