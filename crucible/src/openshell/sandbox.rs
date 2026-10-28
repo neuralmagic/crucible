@@ -25,9 +25,18 @@ const _: () = assert!("ci-".len() + 16 == MAX_NAME_LEN);
 /// sharing a gateway. The broker gets this exact string at spawn (`BROKER_SANDBOX_NAME`) rather
 /// than re-deriving it; neither component is a durable ID.
 pub fn name_for(workspace: &std::path::Path) -> String {
+    name_for_identity(workspace, run_id())
+}
+
+/// An invocation-specific sandbox identity within the gateway's DNS limit.
+pub fn fresh_name_for(workspace: &std::path::Path) -> String {
+    name_for_identity(workspace, &uuid::Uuid::now_v7().simple().to_string())
+}
+
+fn name_for_identity(workspace: &std::path::Path, identity: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
-    run_id().hash(&mut h);
+    identity.hash(&mut h);
     workspace.hash(&mut h);
     format!("ci-{:016x}", h.finish())
 }
@@ -95,6 +104,18 @@ mod tests {
             a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'),
             "container-name safe: {a}"
         );
+    }
+
+    #[test]
+    fn a_fresh_turn_cannot_reuse_a_sandbox_left_by_an_ambiguous_create() {
+        let workspace = std::path::Path::new("/state/workspace");
+        let first = fresh_name_for(workspace);
+        let retry = fresh_name_for(workspace);
+        assert_ne!(first, retry);
+        assert_ne!(retry, name_for(workspace));
+        assert_eq!(first.len(), MAX_NAME_LEN);
+        assert_eq!(retry.len(), MAX_NAME_LEN);
+        assert!(retry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 
     #[test]
