@@ -774,8 +774,8 @@ impl CrucibleMcp {
     }
 
     #[tool(
-        description = "Delete a draft and every version of it. Admin only. Gone is gone; the id \
-        is free for crucible_draft_create again."
+        description = "Delete a draft, every version of it, and its secret bindings, shares and \
+        schedules. Admin only. Gone is gone; the id is free for crucible_draft_create again."
     )]
     async fn crucible_draft_delete(&self, Parameters(a): Parameters<DraftIdArgs>) -> String {
         flatten(ops::draft_delete(&self.client, &a.draft_id).await)

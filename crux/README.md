@@ -162,7 +162,7 @@ times would otherwise print twelve copies of the same verdict. `(any)` means the
 *one* dependency passes, so a red dependency above it is not necessarily what is blocking it.
 `--mermaid` emits a flowchart.
 
-### Drafts: `draft-create` / `draft-pull` / `draft-push` / `draft-preview` / `draft-launch` / `draft-graduate` / `draft-delete`
+### Drafts: `draft-create` / `draft-pull` / `draft-push` / `draft-preview` / `draft-launch` / `draft-graduate` / `draft-rename` / `draft-clone` / `draft-delete`
 
 ```
 $ crux draft-create calibrate --description "EPP calibration sweep"   # version 1, a skeleton
@@ -171,6 +171,8 @@ $ crux draft-push calibrate ./calibrate --base-version 1              # save the
 $ crux draft-preview calibrate                                        # compile: digest + diagnostics
 $ crux draft-launch calibrate --params '{"repo":"o/n"}' --max-cost 4 --max-time 30m
 $ crux draft-graduate calibrate --repo wren/packs --path packs/calibrate
+$ crux draft-rename calibrate epp-sweep                                # bindings and runs follow
+$ crux draft-clone epp-sweep epp-sweep-gpu                            # newest save, same origin
 ```
 
 A push carries the version it edited from, and a save that another editor overtook comes back as
@@ -178,6 +180,9 @@ the refusal naming the version that landed since, not as an error: re-pull, merg
 Pull and push read the directory the way the controller does: `state/`, `workspace/` and `.git`
 are skipped and listed as `ignored`, a symlink is refused, and `local tree:` prints the
 directory's `tree1:` digest.
+A rename moves the draft's saves, secret bindings, shares, schedules and launches to the new id. A
+clone copies only the bindings you could make yourself and lists the rest; a reference-mode secret
+needs your Vault token, which `crux` never sends, so bind those from the UI.
 `skills/draft-a-playbook/SKILL.md` is the full authoring workflow.
 
 ### `providers`
