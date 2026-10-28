@@ -1006,16 +1006,17 @@ mod tests {
             "precondition: no db yet"
         );
 
+        let latest = crate::MIGRATOR.iter().map(|m| m.version).max();
         let pool = connect(&url).await?;
         assert!(
             sqlx::Postgres::database_exists(&url).await?,
             "connect creates the database"
         );
-        assert_eq!(crate::schema_version(&pool).await?, 70);
+        assert_eq!(Some(crate::schema_version(&pool).await?), latest);
 
         // Idempotent: re-opening an already-migrated DB is a no-op, not an error.
         let pool2 = connect(&url).await?;
-        assert_eq!(crate::schema_version(&pool2).await?, 70);
+        assert_eq!(Some(crate::schema_version(&pool2).await?), latest);
         pool.close().await;
         pool2.close().await;
         let _ = sqlx::Postgres::drop_database(&url).await;
