@@ -3,6 +3,7 @@
 pub(crate) mod build;
 pub(crate) mod check;
 pub(crate) mod init;
+pub(crate) mod items;
 pub(crate) mod ps;
 pub(crate) mod run;
 #[cfg(feature = "autoresearch")]
@@ -98,6 +99,12 @@ pub(crate) enum Cmd {
     Deploy {
         #[command(subcommand)]
         action: DeployAction,
+    },
+    /// The item store of the playbook this run was launched from: labels its runs keep per item,
+    /// and which run holds each. Runs inside a playbook run pod.
+    Items {
+        #[command(subcommand)]
+        action: items::ItemsAction,
     },
     /// Work-graph plans: compile and inspect a plan without executing it.
     Plan {

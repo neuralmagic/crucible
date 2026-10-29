@@ -34,6 +34,7 @@ pub mod event_log;
 pub mod identity;
 pub mod images;
 pub mod issues;
+pub(crate) mod items;
 pub mod launches;
 pub mod ledger;
 pub mod mcp;
@@ -300,6 +301,9 @@ impl Surface {
             .merge(push_router)
             .merge(mcp_router)
             .merge(oidc_mirror::router(mirror));
+        let router = router.merge(items::api::router(items::api::ItemsState {
+            db: db.clone(),
+        }));
         // The sandbox bind, like the evidence routes, authenticates with the run's own pod token.
         let router = match agent_auth {
             Some(state) => router
@@ -556,6 +560,12 @@ mod tests {
                 "{method} {path} is served"
             );
         }
+
+        assert_ne!(
+            answer(router, Method::POST, "/api/items/runs/run-1/tickets/claim").await,
+            answer(router, Method::POST, "/api/no-such-route").await,
+            "the item store is served without agent config"
+        );
 
         let (status, body) = answer(router, Method::GET, "/api/whoami").await;
         assert_eq!(status, StatusCode::OK);

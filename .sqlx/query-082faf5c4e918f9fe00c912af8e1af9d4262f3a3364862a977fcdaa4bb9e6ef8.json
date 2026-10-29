@@ -1,0 +1,86 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT i.key, i.labels AS \"labels: Json<Labels>\", i.held_by, i.updated_at,\n                      i.updated_by,\n                      EXISTS (SELECT 1 FROM pod_tokens t\n                              WHERE t.run_id = i.held_by AND t.revoked_at IS NULL\n                                AND t.expires_at > $4) AS \"live!\"\n               FROM playbook_items i\n               WHERE i.playbook = $1 AND i.store = $2 AND i.key = ANY($3)\n               ORDER BY i.key",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_items",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "labels: Json<Labels>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "playbook_items",
+            "name": "labels"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "held_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_items",
+            "name": "held_by"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "updated_at",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_items",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "updated_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "playbook_items",
+            "name": "updated_by"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "TextArray",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "082faf5c4e918f9fe00c912af8e1af9d4262f3a3364862a977fcdaa4bb9e6ef8"
+}

@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE playbook_items SET labels = $4, updated_by = $5, updated_at = $6\n             WHERE playbook = $1 AND store = $2 AND key = $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0358257c8c1fb2613b96241718adf7b4f13fb170e1e1365b4c665dc35da5a46f"
+}
