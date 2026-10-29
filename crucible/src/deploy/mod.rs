@@ -53,7 +53,8 @@ pub fn render_yaml(manifest_path: &Path, profile_path: &Path, opts: &RenderOpts)
         }
         render::render(input, manifest_dir, manifest_file, &profile, opts)
     } else {
-        let manifest = Manifest::load(manifest_path)?;
+        let variant = opts.playbook.as_ref().and_then(|p| p.variant.as_ref());
+        let manifest = Manifest::load_variant(manifest_path, variant)?;
         if manifest.is_task() {
             eprintln!(
                 "[crucible deploy] WARNING: task mode: no [judge] — this pod keeps and \

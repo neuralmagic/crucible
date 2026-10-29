@@ -516,6 +516,10 @@ mod tests {
                 "0071_draft_rename.sql",
                 "a9999e61f3897eec7ba509031a43fda9aefc23e1393ac8e84af5dcf73f4adb62",
             ),
+            (
+                "0072_manifest_variants.sql",
+                "820c18c5010b64c2c133de3afc5833ab9b689a574848a4097bee3bc39ba64b95",
+            ),
         ];
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
         for (name, want) in pinned {

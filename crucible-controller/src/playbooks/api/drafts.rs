@@ -1206,7 +1206,7 @@ pub(crate) async fn launch_playbook_draft(
             Err(e) => return crate::playbooks::api::registry::unreadable_tree(e),
         };
     if let Err(refusal) =
-        crate::playbooks::api::registry::check_plan(tree, &params, &max_time).await
+        crate::playbooks::api::registry::check_plan(tree, &params, &max_time, None).await
     {
         return refusal;
     }

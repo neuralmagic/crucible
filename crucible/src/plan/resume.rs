@@ -7,6 +7,7 @@ use std::time::Duration;
 use crucible_contract::session::SessionEvent;
 use serde::{Deserialize, Serialize};
 
+use crate::manifest::variant::VariantName;
 use crate::plan::exec::{
     FanoutSummary, Prior, TaskResult, TaskStatus, UnknownTaskStatus, row_task,
 };
@@ -29,6 +30,9 @@ pub struct RunStart {
     #[serde(default)]
     pub base_tree: String,
     pub plan: String,
+    /// The manifest variant the run reads; absent for the base manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<VariantName>,
 }
 
 /// The compiled graph's content digest. Parameter values and the cost ceiling are bound into
@@ -73,6 +77,16 @@ pub enum ResumeError {
          ({then}); the pack, its parameters, or the cost ceiling changed, so this is a different run"
     )]
     PlanChanged { then: String, now: String },
+    #[error(
+        "this resume reads {}, but the interrupted run read {}; a different variant is a \
+         different run",
+        variant_label(.now.as_ref()),
+        variant_label(.then.as_ref())
+    )]
+    VariantChanged {
+        then: Option<VariantName>,
+        now: Option<VariantName>,
+    },
     #[error("the session log settles {task:?} before admitting a graph")]
     NotAdmitted { task: String },
     #[error("the session log settles {task:?}, which this plan cannot produce")]
@@ -84,24 +98,46 @@ pub enum ResumeError {
     },
 }
 
+fn variant_label(variant: Option<&VariantName>) -> String {
+    variant.map_or("the base manifest".to_owned(), |v| format!("[variant.{v}]"))
+}
+
 impl RunStart {
-    pub fn begin(run: &str, base: String, base_tree: String, plan: &ValidPlan) -> Self {
+    pub fn begin(
+        run: &str,
+        base: String,
+        base_tree: String,
+        plan: &ValidPlan,
+        variant: Option<VariantName>,
+    ) -> Self {
         RunStart {
             run: run.to_string(),
             started_at: jiff::Timestamp::now(),
             base,
             base_tree,
             plan: plan_digest(plan),
+            variant,
         }
     }
 
     /// Whether this process is the same run, running the same graph, as the one that wrote the
     /// record.
-    pub fn continues(&self, run: &str, plan: &ValidPlan) -> Result<(), ResumeError> {
+    pub fn continues(
+        &self,
+        run: &str,
+        plan: &ValidPlan,
+        variant: Option<&VariantName>,
+    ) -> Result<(), ResumeError> {
         if self.run != run {
             return Err(ResumeError::OtherRun {
                 then: self.run.clone(),
                 now: run.to_string(),
+            });
+        }
+        if self.variant.as_ref() != variant {
+            return Err(ResumeError::VariantChanged {
+                then: self.variant.clone(),
+                now: variant.cloned(),
             });
         }
         let digest = plan_digest(plan);
@@ -267,6 +303,7 @@ pub fn fold_log(
 
 #[cfg(test)]
 mod tests {
+    use crate::manifest::variant::VariantName;
     use crate::plan::exec::Prior;
     use crate::plan::exec::TaskStatus;
     use crate::plan::ir::{Plan, TaskName, ValidPlan};
@@ -323,6 +360,7 @@ mod tests {
             base: "abc".into(),
             base_tree: String::new(),
             plan: plan_digest(plan),
+            variant: None,
         }
     }
 
@@ -330,18 +368,62 @@ mod tests {
     fn a_run_continues_only_itself_running_the_same_graph() {
         let plan = graph(1.0);
         let started = start("crucible-run-a", &plan);
-        assert!(started.continues("crucible-run-a", &plan).is_ok());
+        assert!(started.continues("crucible-run-a", &plan, None).is_ok());
         assert!(matches!(
-            started.continues("crucible-run-b", &plan),
+            started.continues("crucible-run-b", &plan, None),
             Err(ResumeError::OtherRun { then, now }) if then == "crucible-run-a" && now == "crucible-run-b"
         ));
         assert!(
             matches!(
-                started.continues("crucible-run-a", &graph(2.0)),
+                started.continues("crucible-run-a", &graph(2.0), None),
                 Err(ResumeError::PlanChanged { .. })
             ),
             "a raised cost ceiling is a different run"
         );
+    }
+
+    #[test]
+    fn a_resume_under_another_variant_is_a_different_run() {
+        let plan = graph(1.0);
+        let offline = VariantName::parse("offline").unwrap();
+        let started = RunStart {
+            variant: Some(offline.clone()),
+            ..start("crucible-run-a", &plan)
+        };
+        assert!(
+            started
+                .continues("crucible-run-a", &plan, Some(&offline))
+                .is_ok()
+        );
+        let error = started
+            .continues("crucible-run-a", &plan, None)
+            .unwrap_err();
+        assert!(
+            matches!(&error, ResumeError::VariantChanged { then: Some(v), now: None } if v == &offline),
+            "{error}"
+        );
+        assert!(
+            error.to_string().contains(
+                "reads the base manifest, but the interrupted run read [variant.offline]"
+            ),
+            "{error}"
+        );
+        let base = start("crucible-run-a", &plan);
+        assert!(matches!(
+            base.continues("crucible-run-a", &plan, Some(&offline)),
+            Err(ResumeError::VariantChanged {
+                then: None,
+                now: Some(_)
+            })
+        ));
+
+        let record = serde_json::to_value(&base).unwrap();
+        assert!(record.get("variant").is_none(), "{record}");
+        let reread: RunStart = serde_json::from_value(record).unwrap();
+        assert_eq!(reread.variant, None);
+        let reread: RunStart =
+            serde_json::from_value(serde_json::to_value(&started).unwrap()).unwrap();
+        assert_eq!(reread.variant, Some(offline));
     }
 
     #[test]

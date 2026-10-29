@@ -525,7 +525,7 @@ mod tests {
     }
 
     fn start(plan: &ValidPlan) -> RunStart {
-        RunStart::begin("parent-run", "abc".into(), "tree".into(), plan)
+        RunStart::begin("parent-run", "abc".into(), "tree".into(), plan, None)
     }
 
     fn read(dir: &Dir) -> ParentDir {
