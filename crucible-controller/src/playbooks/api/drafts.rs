@@ -1333,7 +1333,12 @@ pub(crate) async fn graduate_playbook_draft(
     }
     let repo = normalize_repo(body.repo.trim()).to_string();
     let path = body.path.unwrap_or_default().trim().to_string();
-    let token = match body.github_secret_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let token = match body
+        .github_secret_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(secret_id) => match personal_github_pat(&state, &caller, secret_id).await {
             Ok(token) => Some(token),
             Err(response) => return response,
@@ -1378,7 +1383,7 @@ async fn personal_github_pat(
     secret_id: &str,
 ) -> Result<String, Response> {
     let Some(actor) = caller.actor() else {
-        return forbidden("a personal GitHub secret needs a signed-in user");
+        return Err(forbidden("a personal GitHub secret needs a signed-in user"));
     };
     let row = match crate::secrets::store::get(state.db.pool(), secret_id).await {
         Ok(Some(row)) => row,
