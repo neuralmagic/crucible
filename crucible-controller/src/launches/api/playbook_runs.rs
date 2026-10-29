@@ -7,7 +7,7 @@ use crate::launches::model::PlaybookRun;
 
 use crate::launches::one_shots::{CancelOutcome, NewOneShot, OneShot};
 
-use crate::playbooks::api::registry::authorize_launch;
+use crate::playbooks::api::admission::{Admissible, LaunchRequest, admit, decide_launch};
 
 use axum::extract::{Path, State};
 
@@ -399,14 +399,26 @@ pub(crate) async fn create_one_shot(
             message: format!("fire_at {fire_at} is in the past; launch it now instead"),
         }]);
     }
-    let authorized = match authorize_launch(
+    let pack = match crate::playbooks::api::registry::readable_playbook(
         &state,
         &caller,
         &body.playbook,
-        &body.params,
-        body.max_cost,
-        &body.max_time,
-        body.schema_digest.as_deref(),
+        crate::authz::action::Verb::Read,
+    )
+    .await
+    {
+        Ok(pack) => pack,
+        Err(refusal) => return refusal,
+    };
+    let authorized = match admit(
+        &state,
+        pack,
+        LaunchRequest {
+            params: &body.params,
+            max_cost: body.max_cost,
+            max_time: &body.max_time,
+            schema_digest: body.schema_digest.as_deref(),
+        },
     )
     .await
     {
@@ -456,9 +468,7 @@ pub(crate) async fn create_one_shot(
     {
         return denied.into_response();
     }
-    if let Err(denied) =
-        crate::playbooks::api::registry::decide_launch(&state, &caller, &authorized.pack).await
-    {
+    if let Err(denied) = decide_launch(&state, &caller, authorized.pack.target()).await {
         return denied;
     }
     let actor = saver.actor.as_deref();
