@@ -5,6 +5,7 @@ import { trimmedParams, type ParamFieldSpec } from './playbookLaunchForm';
 
 type DraftDiagnostic = components['schemas']['Diagnostic'];
 type LaunchDraftBody = components['schemas']['LaunchDraftBody'];
+type CloneDraftBody = components['schemas']['CloneDraftBody'];
 
 /// The pack's paths in the order the file tree lists them. A pack is read manifest-first, so it is
 /// edited in that order, and the studio opens on whatever comes first.
@@ -208,6 +209,25 @@ export function saveBody(state: StudioState): {
   base_version: number;
 } {
   return { files: { ...state.files }, base_version: state.base };
+}
+
+export interface CloneForm {
+  to: string;
+  description: string;
+  vaultToken: string;
+}
+
+export const EMPTY_CLONE: CloneForm = { to: '', description: '', vaultToken: '' };
+
+/// A blank description takes the source draft's, and a blank token sends none.
+export function cloneDraftBody(form: CloneForm): CloneDraftBody {
+  const description = form.description.trim();
+  const vaultToken = form.vaultToken.trim();
+  return {
+    id: form.to.trim(),
+    ...(description.length === 0 ? {} : { description }),
+    ...(vaultToken.length === 0 ? {} : { vault_token: vaultToken }),
+  };
 }
 
 /// Somebody else's save that overtook this one. The controller answers a stale base with 409 and

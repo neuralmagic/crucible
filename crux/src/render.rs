@@ -895,6 +895,37 @@ pub fn draft_graduated(id: &str, ack: &dto::GraduateAck) -> String {
     )
 }
 
+pub fn draft_renamed(r: &dto::DraftRenamed, studio_url: &str) -> String {
+    format!(
+        "renamed draft {} to {}\nmoved: {} secret bindings, {} shares, {} standing launches, {} \
+         launches\nstudio: {studio_url}\n",
+        r.prior, r.id, r.bindings, r.shares, r.standing_launches, r.launches
+    )
+}
+
+pub fn draft_cloned(source: &str, c: &dto::DraftCloned, studio_url: &str) -> String {
+    let mut out = format!(
+        "cloned draft {source} to {} at version {}\n",
+        c.id, c.version
+    );
+    if !c.bindings.is_empty() {
+        let names: Vec<&str> = c
+            .bindings
+            .iter()
+            .map(|b| b.declared_name.as_str())
+            .collect();
+        out.push_str(&format!("bound: {}\n", names.join(", ")));
+    }
+    if !c.left_bindings.is_empty() {
+        out.push_str("not copied:\n");
+        for left in &c.left_bindings {
+            out.push_str(&format!("  {}: {}\n", left.declared_name, left.reason));
+        }
+    }
+    out.push_str(&format!("studio: {studio_url}\n"));
+    out
+}
+
 /// A publish that landed: the playbook is registered already, and the draft stays the place to
 /// edit it.
 pub fn draft_published(id: &str, ack: &dto::PublishAck) -> String {

@@ -6739,17 +6739,17 @@ async fn burst_backlog_respects_the_tight_rank_cap_no_bypass(pool: PgPool) -> Re
 /// Seed a registered playbook whose stored tarball is a minimal build-free pack. Registration
 /// itself is covered in `playbooks.rs`; this is the row a launch is adopted against.
 async fn seed_registered_playbook(db: &Db, id: &str) {
+    seed_registered_playbook_with(db, id, crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH).await;
+}
+
+async fn seed_registered_playbook_with(db: &Db, id: &str, source: &str) {
     let dir = tempfile::tempdir().expect("tempdir");
     std::fs::write(
         dir.path().join("crucible.toml"),
         crate::testing::fixtures::PLAYBOOK_PACK_MANIFEST,
     )
     .expect("manifest");
-    std::fs::write(
-        dir.path().join("workflow.star"),
-        crate::testing::fixtures::WORKFLOW_TOPIC_DEPTH,
-    )
-    .expect("source");
+    std::fs::write(dir.path().join("workflow.star"), source).expect("source");
     let tar_gz = crate::playbooks::packs::tar_pack_tree(dir.path()).expect("tar");
     let bytes = tar_gz.len() as i64;
     let digest = crucible_contract::content_digest(&tar_gz);
@@ -8028,6 +8028,56 @@ async fn a_playbook_launch_without_its_row_parks(pool: PgPool) -> Result<()> {
         issue.parked_reason.as_deref().map(ParkReason::parse),
         Some(ParkReason::PlaybookLaunchMissing)
     );
+    Ok(())
+}
+
+/// A launch that reached the queue with a `max_time` shorter than a task's declared timeout (a
+/// schedule firing, a draft head that moved) parks at dispatch with the engine's own refusal,
+/// rather than dispatching a pod the engine exits from at startup.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_launch_shorter_than_a_task_timeout_parks_at_dispatch(pool: PgPool) -> Result<()> {
+    let _g = crate::ENV_LOCK.lock().await;
+    let (db, dir) = db_with(pool);
+    let cfg = cfg_with(dir.path(), Profile::default());
+    let key = "playbook:survey:0199c0de-7c2c-71a5-8000-a";
+    seed_registered_playbook_with(
+        &db,
+        "survey",
+        concat!(
+            "params = {\n",
+            "    \"topic\": {\"type\": \"string\", \"required\": True},\n",
+            "    \"depth\": {\"type\": \"string\", \"default\": \"shallow\"},\n",
+            "}\n",
+            "\n",
+            "prepare = command(name = \"prepare\", run = \"true\", timeout = \"110m\")\n",
+            "\n",
+            "workflow(type = \"playbook\", tasks = [prepare], result = prepare)\n",
+        ),
+    )
+    .await;
+    adopt_launch(&db, key, 3.0).await;
+
+    reconcile(&db, &cfg, key).await?;
+
+    let issue = crate::issues::store::get_issue(db.pool(), key)
+        .await?
+        .expect("issue");
+    assert_eq!(issue.status, Status::Parked);
+    assert_eq!(issue.parked_by, Some(crate::model::ParkedBy::Machine));
+    assert_eq!(
+        issue.parked_reason.as_deref().map(ParkReason::parse),
+        Some(ParkReason::PlanRefused {
+            detail: "task \"prepare\" declares timeout 110m, longer than this run's --max-time \
+                     30m. The run's ceiling is the longest any task may declare; shorten the \
+                     timeout or raise --max-time"
+                .to_string()
+        })
+    );
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs WHERE issue = $1")
+        .bind(key)
+        .fetch_one(db.pool())
+        .await?;
+    assert_eq!(runs, 0, "nothing was dispatched");
     Ok(())
 }
 

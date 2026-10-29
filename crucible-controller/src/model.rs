@@ -186,6 +186,9 @@ pub enum ParkReason {
     /// The launch's pack is legacy bytes that cannot be a tree. Deterministic: the same bytes are
     /// refused on every attempt.
     PackUnconvertible { digest: String, reason: String },
+    /// The launch's graph, compiled with its own values, does not compile or declares a task
+    /// timeout past its `max_time`. Deterministic: the engine refuses the same launch at startup.
+    PlanRefused { detail: String },
     /// A playbook launch's stored row is gone, so there is nothing to dispatch. Never expected —
     /// the row is written in the same transaction as the issue — but a launch must not run on
     /// guessed values, so the row parks instead.
@@ -316,6 +319,7 @@ impl std::fmt::Display for ParkReason {
             Self::PackUnconvertible { digest, reason } => {
                 write!(f, "pack {digest} is unconvertible: {reason}")
             }
+            Self::PlanRefused { detail } => write!(f, "plan refused: {detail}"),
             Self::UnsupportedTurnOption { option } => {
                 write!(f, "unsupported turn option: {option}")
             }
@@ -365,6 +369,11 @@ impl ParkReason {
         }
         if let Some(detail) = s.strip_prefix("secrets: ") {
             return Self::SecretsUnresolved {
+                detail: detail.to_string(),
+            };
+        }
+        if let Some(detail) = s.strip_prefix("plan refused: ") {
+            return Self::PlanRefused {
                 detail: detail.to_string(),
             };
         }

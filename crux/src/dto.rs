@@ -689,6 +689,33 @@ pub struct PublishAck {
     pub exposure_changed: bool,
 }
 
+/// `POST /api/playbook-drafts/{id}/rename`: the new id, and how much followed it there.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftRenamed {
+    pub id: String,
+    pub prior: String,
+    pub bindings: i64,
+    pub shares: i64,
+    pub standing_launches: i64,
+    pub launches: i64,
+}
+
+/// `POST /api/playbook-drafts/{id}/clone`: the copy, the bindings it took, and the ones it left.
+#[derive(Debug, Clone, Deserialize)]
+pub struct DraftCloned {
+    pub id: String,
+    pub version: i64,
+    pub bindings: Vec<SecretBinding>,
+    pub left_bindings: Vec<LeftBinding>,
+}
+
+/// A binding a clone did not copy, by the name the pack declares it under.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LeftBinding {
+    pub declared_name: String,
+    pub reason: String,
+}
+
 /// `POST /api/playbook-drafts/{id}/graduate`: the export PR the draft was pushed to.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GraduateAck {

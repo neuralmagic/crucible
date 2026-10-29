@@ -26,6 +26,8 @@ use crate::secrets::{
     SecretValue, Visibility,
 };
 
+use anyhow::Context as _;
+
 use axum::extract::{Path, Query, State};
 
 use axum::http::StatusCode;
@@ -255,10 +257,10 @@ pub struct BindSecretBody {
 /// metadata that points at nothing.
 #[allow(clippy::result_large_err)]
 fn vault(state: &ApiState) -> Result<&VaultClient, Response> {
-    state.vault.as_deref().ok_or_else(|| {
-        unavailable("this deployment has no Vault client, so the secrets registry is off")
-    })
+    state.vault.as_deref().ok_or_else(|| unavailable(NO_VAULT))
 }
+
+const NO_VAULT: &str = "this deployment has no Vault client, so the secrets registry is off";
 
 /// The secret `id` names, decided for `verb` against its owner. A caller who may not read it is
 /// told it does not exist (RFC-0003 C-READ-SCOPING).
@@ -287,34 +289,101 @@ async fn owned(
 /// The verification read a reference performs: one KV read of the pointed-at path with the
 /// caller's own Vault token. The token is borrowed here and dropped with the request; so are the
 /// bytes the read returns, once they have been asked the agent-visible question.
-#[allow(clippy::result_large_err)]
 async fn verify_reference(
     client: &VaultClient,
     raw_reference: &str,
     token: Option<&str>,
     visibility: Visibility,
-) -> Result<String, Response> {
+) -> Result<String, BindRefusal> {
     let reference = client
         .reference(raw_reference)
-        .map_err(|e| unprocessable(e.to_string()))?;
+        .map_err(|e| BindRefusal::invalid(e.to_string()))?;
     let token = token
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .ok_or_else(|| {
-            unprocessable(
-                "a reference is verified with your own Vault token; supply vault_token".to_string(),
+            BindRefusal::invalid(
+                "a reference is verified with your own Vault token; supply vault_token",
             )
         })?;
     let token = VaultToken::new(token);
     let value = client
         .read_reference(&token, &reference)
         .await
-        .map_err(|e| forbidden(format!("the reference did not verify: {e}")))?;
+        .map_err(|e| BindRefusal::forbidden(format!("the reference did not verify: {e}")))?;
     if let Some(value) = value {
         crate::secrets::check_agent_visible_value(visibility, &SecretValue::new(value))
-            .map_err(|e| unprocessable(e.to_string()))?;
+            .map_err(|e| BindRefusal::invalid(e.to_string()))?;
     }
     Ok(reference.to_string())
+}
+
+/// Why a secret's value may not reach a new binding right now. The bind route answers with it; a
+/// draft clone records the message against the binding it leaves behind.
+#[derive(Debug)]
+pub(crate) struct BindRefusal {
+    status: StatusCode,
+    pub(crate) message: String,
+}
+
+impl BindRefusal {
+    fn invalid(message: impl Into<String>) -> Self {
+        BindRefusal {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        BindRefusal {
+            status: StatusCode::FORBIDDEN,
+            message: message.into(),
+        }
+    }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        BindRefusal {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
+}
+
+impl IntoResponse for BindRefusal {
+    fn into_response(self) -> Response {
+        (self.status, Json(ErrorBody::new(self.message))).into_response()
+    }
+}
+
+/// The Vault reads a new binding of `row` takes: a reference is re-verified with the binder's own
+/// token, and an agent-visible managed secret has the value stored now checked, not whatever the
+/// registration saw. A minted secret stores no bytes and needs neither.
+async fn check_bindable(
+    state: &ApiState,
+    row: &SecretRow,
+    vault_token: Option<&str>,
+) -> Result<(), BindRefusal> {
+    let reads_vault = row.mode == SecretMode::Reference
+        || (row.visibility == Visibility::AgentVisible && row.mode == SecretMode::Managed);
+    if !reads_vault {
+        return Ok(());
+    }
+    let client = state
+        .vault
+        .as_deref()
+        .ok_or_else(|| BindRefusal::unavailable(NO_VAULT))?;
+    if row.mode == SecretMode::Reference {
+        return verify_reference(client, &row.vault_path, vault_token, row.visibility)
+            .await
+            .map(|_| ());
+    }
+    let (value, _) = crate::secrets::read::current_value(client, row)
+        .await
+        .map_err(|e| {
+            BindRefusal::unavailable(format!("the bound value could not be checked: {e}"))
+        })?;
+    crate::secrets::check_agent_visible_value(row.visibility, &SecretValue::new(value))
+        .map_err(|e| BindRefusal::invalid(e.to_string()))
 }
 
 /// Prove a hub-consumed kubeconfig can actually run work before it is registered as a dispatch
@@ -461,7 +530,7 @@ pub(crate) async fn register_secret(
                     .await
                 {
                     Ok(pointer) => (SecretMode::Reference, pointer),
-                    Err(refusal) => return refusal,
+                    Err(refusal) => return refusal.into_response(),
                 }
             } else {
                 // The exclusivity check above leaves exactly one, so this is the value branch.
@@ -1010,45 +1079,15 @@ pub(crate) async fn bind_secret(
             Err(e) => return AppError::from(e).into_response(),
         }
     }
-    if row.mode == SecretMode::Reference {
-        let client = match vault(&state) {
-            Ok(client) => client,
-            Err(refusal) => return refusal,
-        };
-        if let Err(refusal) = verify_reference(
-            client,
-            &row.vault_path,
-            body.vault_token.as_deref(),
-            row.visibility,
-        )
-        .await
-        {
-            return refusal;
-        }
-    }
-    // The value stored now, not whatever the registration saw. A reference was asked the same
-    // question by its re-verification read above; a minted secret stores no bytes.
-    if row.visibility == Visibility::AgentVisible && row.mode == SecretMode::Managed {
-        let client = match vault(&state) {
-            Ok(client) => client,
-            Err(refusal) => return refusal,
-        };
-        let value = match crate::secrets::read::current_value(client, &row).await {
-            Ok((value, _)) => SecretValue::new(value),
-            Err(e) => return unavailable(format!("the bound value could not be checked: {e}")),
-        };
-        if let Err(e) = crate::secrets::check_agent_visible_value(row.visibility, &value) {
-            return unprocessable(e.to_string());
-        }
+    if let Err(refusal) = check_bindable(&state, &row, body.vault_token.as_deref()).await {
+        return refusal.into_response();
     }
 
     let binding_id = uuid::Uuid::now_v7().to_string();
-    let mut tx = match state.db.pool().begin().await {
-        Ok(tx) => tx,
-        Err(e) => return AppError::from(e).into_response(),
-    };
-    let stored = store::insert_binding(
-        &mut tx,
+    let stored = store_binding(
+        &state,
+        &caller,
+        &row,
         &store::NewBinding {
             id: &binding_id,
             secret_id: &id,
@@ -1061,39 +1100,134 @@ pub(crate) async fn bind_secret(
             schema_digest: body.schema_digest.as_deref(),
             created_by: caller.actor_principals().login(),
         },
+        None,
     )
     .await;
-    let stored = match stored {
-        Ok(stored) => stored,
-        Err(e @ store::StoreError::Duplicate { .. }) => return conflict(e.to_string()),
-        Err(store::StoreError::Internal(e)) => return AppError::from(e).into_response(),
-    };
-    if let Err(e) = store::audit(
+    match stored {
+        Ok(stored) => (StatusCode::CREATED, Json(SecretBindingDto::from(stored))).into_response(),
+        Err(e @ store::StoreError::Duplicate { .. }) => conflict(e.to_string()),
+        Err(store::StoreError::Internal(e)) => AppError::from(e).into_response(),
+    }
+}
+
+/// Store `new` with its bind audit row in one transaction. `source` names the scope a copy was
+/// taken from.
+async fn store_binding(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    row: &SecretRow,
+    new: &store::NewBinding<'_>,
+    source: Option<&str>,
+) -> Result<BindingRow, store::StoreError> {
+    let mut tx = state
+        .db
+        .pool()
+        .begin()
+        .await
+        .context("opening the bind transaction")?;
+    let stored = store::insert_binding(&mut tx, new).await?;
+    let mut detail = format!(
+        "{} {} as {} {}",
+        stored.scope_kind.as_str(),
+        stored.scope_id,
+        stored.projection_kind.as_str(),
+        stored.projection
+    );
+    if let Some(source) = source {
+        detail.push_str(&format!(", copied from {source}"));
+    }
+    store::audit(
         &mut tx,
         &store::NewAudit {
-            secret_id: Some(&id),
+            secret_id: Some(&row.id),
             secret_name: row.name.as_str(),
             owner: &row.owner,
             action: AuditAction::Bind,
             actor: caller.actor(),
             subject: caller.subject_label(),
-            detail: Some(&format!(
-                "{} {} as {} {}",
-                stored.scope_kind.as_str(),
-                stored.scope_id,
-                stored.projection_kind.as_str(),
-                stored.projection
-            )),
+            detail: Some(&detail),
         },
     )
-    .await
+    .await?;
+    tx.commit().await.context("committing the bind")?;
+    Ok(stored)
+}
+
+/// A binding a draft clone did not copy, by the name the pack declares it under.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LeftBindingDto {
+    pub declared_name: String,
+    pub reason: String,
+}
+
+/// Copy each binding on playbook scope `from` onto `to` that `caller` could make through the bind
+/// route: `bind` on its secret, then the same Vault checks. A copy is audited as a bind; the rest
+/// come back with the reason they stayed behind.
+pub(crate) async fn copy_playbook_bindings(
+    state: &ApiState,
+    caller: &crate::authz::Caller,
+    from: &str,
+    to: &str,
+    vault_token: Option<&str>,
+) -> anyhow::Result<(Vec<BindingRow>, Vec<LeftBindingDto>)> {
+    let mut copied = Vec::new();
+    let mut left = Vec::new();
+    let source = format!("{} {from}", ScopeKind::Playbook.as_str());
+    for (binding, secret) in
+        store::bindings_for_scope(state.db.pool(), ScopeKind::Playbook, from).await?
     {
-        return AppError::from(e).into_response();
+        let resource = crate::authz::decision::Resource::new(
+            crate::authz::action::ResourceType::Secret,
+            &secret.id,
+            secret.owner.clone(),
+        );
+        let refusal = match crate::authz::owner::decide_on(
+            state,
+            caller,
+            &resource,
+            crate::authz::action::Verb::Bind,
+        )
+        .await
+        {
+            Ok(_) => check_bindable(state, &secret, vault_token)
+                .await
+                .err()
+                .map(|r| r.message),
+            Err(crate::authz::owner::Refused::Denied(crate::authz::owner::Denied::Unrecorded(
+                e,
+            ))) => return Err(e),
+            Err(_) => Some("you may not bind its secret".to_string()),
+        };
+        if let Some(reason) = refusal {
+            left.push(LeftBindingDto {
+                declared_name: binding.declared_name.to_string(),
+                reason,
+            });
+            continue;
+        }
+        let id = uuid::Uuid::now_v7().to_string();
+        let new = store::NewBinding {
+            id: &id,
+            secret_id: &binding.secret_id,
+            scope_kind: ScopeKind::Playbook,
+            scope_id: to,
+            projection_kind: binding.projection_kind,
+            projection: &binding.projection,
+            declared_name: &binding.declared_name,
+            pack_rev: binding.pack_rev.as_deref(),
+            schema_digest: binding.schema_digest.as_deref(),
+            created_by: caller.actor_principals().login(),
+        };
+        match store_binding(state, caller, &secret, &new, Some(&source)).await {
+            Ok(stored) => copied.push(stored),
+            Err(e @ store::StoreError::Duplicate { .. }) => left.push(LeftBindingDto {
+                declared_name: binding.declared_name.to_string(),
+                reason: e.to_string(),
+            }),
+            Err(store::StoreError::Internal(e)) => return Err(e),
+        }
     }
-    if let Err(e) = tx.commit().await {
-        return AppError::from(e).into_response();
-    }
-    (StatusCode::CREATED, Json(SecretBindingDto::from(stored))).into_response()
+    Ok((copied, left))
 }
 
 /// `DELETE /api/secrets/{id}/bindings/{binding_id}` — detach a secret from a scope.

@@ -321,6 +321,18 @@ async fn authorize_schedule(
     let params = crate::playbooks::registry::validate_params(&schema, &body.params)
         .map_err(invalid_fields)?;
     let version = latest.version;
+    let tree = match crate::playbooks::drafts::version_tree(
+        state.db.pool(),
+        &body.playbook,
+        Some(version),
+    )
+    .await
+    {
+        Ok(Some((_, tree))) => tree,
+        Ok(None) => return Err(not_found(format!("no draft {:?}", body.playbook))),
+        Err(e) => return Err(crate::playbooks::api::registry::unreadable_tree(e)),
+    };
+    crate::playbooks::api::registry::check_plan(tree, &params, &max_time).await?;
     let pack = crate::playbooks::registry::PlaybookRow {
         exposure_digest: None,
         id: draft.id.clone(),
