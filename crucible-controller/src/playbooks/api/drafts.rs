@@ -1391,7 +1391,9 @@ async fn personal_github_pat(
         Err(e) => return Err(AppError::from(e).into_response()),
     };
     if row.owner != *actor {
-        return Err(forbidden(format!("secret {secret_id:?} is not owned by {actor}")));
+        return Err(forbidden(format!(
+            "secret {secret_id:?} is not owned by {actor}"
+        )));
     }
     if row.kind != crate::secrets::SecretKind::Opaque
         || row.visibility != crate::secrets::Visibility::BrokerOnly
