@@ -1582,6 +1582,7 @@ The engine starts it with these arguments (`Buildit::args`, `crucible/src/opensh
 | `--namespace` | the entry's builder namespace, `[buildit] namespace` |
 | `--insecure-jwks-http` | when the JWKS URI is plain http |
 | `--push-repo`, `--push-authfile` | when the entry has a push repository and the loop pod has a push authfile |
+| `--socket`, `--socket-workdir` | `<state dir>/buildit.sock` and the run's workspace ([8.6](#86-the-runs-own-socket)) |
 
 ### 8.2 Who may call it
 
@@ -1706,6 +1707,39 @@ the same user, and nothing stops a process a step left behind when `push` starts
 could read the authfile while the push holds it, then push to any tag, or any repository the
 credential reaches. Until the push moves to a container of its own, give `[secrets]
 push_authfile` a credential scoped to the one push repository.
+
+### 8.6 The run's own socket
+
+The same `buildit mcp` also serves its tools on a unix socket, `<state dir>/buildit.sock` (mode
+0600), for the run's deterministic tasks. The socket takes no token. Every call on it is the run
+itself, under the sandbox name `loop-<first 16 hex of sha256(run id)>`, which no openshell sandbox
+(`ci-<hex>`) and no other run takes. That name scopes `--max-builds`, `clean` and every lookup the
+way a sandbox name does, and buildit refuses any token that names it. The shipped tool policy, the
+builder namespace, the queue and the push repository are the same as over HTTP.
+
+The engine exports the socket as `CRUCIBLE_BUILDIT_SOCKET` to `command` and `evaluate` tasks only
+(`ShellRunner`, `crucible/src/plan/runner.rs`). Agent turns and sandboxes never get it, and route and
+report tasks spawn nothing. Before such a task runs, the engine starts the run's buildit if the
+controller granted one (`run_buildit`, `crucible/src/openshell/agent_servers.rs`), and the task
+fails as a transport error when buildit does not come up. With the variable set, `buildit build`,
+`status`, `run`, `push`, `logs` and `clean` call the socket. Each prints one JSON object on stdout
+and exits nonzero on failure:
+
+```sh
+buildit build -c image/            # waits for the build to end; --no-wait returns at once
+buildit context-digest image/      # the context_digest a build of image/ reports
+```
+
+A build on the socket reads its context from the run's workspace. The CLI sends `-c` as an
+absolute path, and buildit refuses one outside the workspace, so a task in an isolated worktree
+cannot build its own copy. `run` writes `fetch_paths` to `<workspace>/.buildit/<build id>/`.
+
+Every build reply carries `context_digest`: a sha256 over the context archive buildit uploaded,
+one record per entry sorted by path (path, file mode bits, content hash or symlink target; owners,
+times and directory modes do not count). buildit keeps it on the builder pod, so `status`, a
+completed build task and `push` report it after a server restart too. `buildit context-digest
+<dir>` stages a directory the way a build does and computes the same digest with the same code,
+so a script can check that what was built is what it prepared.
 
 ## 9. Configuration reference and feature flags
 

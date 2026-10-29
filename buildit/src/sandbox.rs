@@ -98,16 +98,39 @@ pub enum Workspace {
 }
 
 impl Workspace {
+    /// The context a build names: a subdirectory of the workspace, or for a local workspace an
+    /// absolute path inside it as well.
+    pub fn context(&self, raw: &str) -> Result<RelPath> {
+        let path = Path::new(raw);
+        let (Workspace::Local { dir }, true) = (self, path.is_absolute()) else {
+            return RelPath::parse(raw);
+        };
+        let real = dir
+            .canonicalize()
+            .with_context(|| format!("resolving the workspace {}", dir.display()))?;
+        let rel = path
+            .strip_prefix(dir)
+            .or_else(|_| path.strip_prefix(&real))
+            .map_err(|_| anyhow!("context {raw} is outside the workspace {}", dir.display()))?;
+        RelPath::parse(
+            rel.to_str()
+                .ok_or_else(|| anyhow!("path {raw:?} is not utf-8"))?,
+        )
+    }
+
     pub fn fetch_context(&self, name: &SandboxName, ctx: &RelPath, dest: &Path) -> Result<()> {
-        fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
         match self {
-            Workspace::Openshell { workdir } => openshell(&[
-                "sandbox",
-                "download",
-                name.as_str(),
-                &format!("{}/{}", workdir.0, ctx.as_str()),
-                &dest.to_string_lossy(),
-            ])?,
+            Workspace::Openshell { workdir } => {
+                fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+                openshell(&[
+                    "sandbox",
+                    "download",
+                    name.as_str(),
+                    &format!("{}/{}", workdir.0, ctx.as_str()),
+                    &dest.to_string_lossy(),
+                ])?;
+                sanitize(dest)
+            }
             Workspace::Local { dir } => {
                 let mut at = dir.clone();
                 for part in ctx.as_str().split('/') {
@@ -119,10 +142,9 @@ impl Workspace {
                         bail!("the context {} goes through a symlink", ctx.as_str());
                     }
                 }
-                copy_tree(&at, dest)?;
+                stage_local(&at, dest)
             }
         }
-        sanitize(dest)
     }
 
     // `results` is a directory named for the build id; it lands at .buildit/<id>
@@ -170,6 +192,13 @@ fn openshell(args: &[&str]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Stages the local directory `src` as a build context at `dest`: copied, then sanitized.
+pub fn stage_local(src: &Path, dest: &Path) -> Result<()> {
+    fs::create_dir_all(dest).with_context(|| format!("creating {}", dest.display()))?;
+    copy_tree(src, dest)?;
+    sanitize(dest)
 }
 
 // copies files, dirs and links; never writes through a link already in `dest`
@@ -276,6 +305,40 @@ mod tests {
         for bad in ["rel", "/", "/a/../b", "/a//b", "/a b"] {
             assert!(SandboxDir::parse(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn a_local_workspace_takes_absolute_contexts_inside_it_alone() {
+        let work = tempfile::tempdir().unwrap();
+        let w = work.path();
+        let real = w.canonicalize().unwrap();
+        let local = Workspace::Local {
+            dir: w.to_path_buf(),
+        };
+        let at = |raw: &str| local.context(raw).map(|r| r.as_str().to_string());
+        assert_eq!(at("svc/api").unwrap(), "svc/api");
+        assert_eq!(at(&format!("{}/svc/api", w.display())).unwrap(), "svc/api");
+        assert_eq!(
+            at(&format!("{}/svc/./api/", real.display())).unwrap(),
+            "svc/api"
+        );
+        for bad in [
+            "/elsewhere/svc".to_string(),
+            w.display().to_string(),
+            format!("{}/svc/../../x", w.display()),
+            format!("{}/svc/.git", w.display()),
+            format!("{}-sibling/svc", w.display()),
+        ] {
+            assert!(at(&bad).is_err(), "{bad:?}");
+        }
+        let e = at("/elsewhere/svc").unwrap_err();
+        assert!(format!("{e:#}").contains("outside the workspace"), "{e:#}");
+
+        let sandbox = Workspace::Openshell {
+            workdir: SandboxDir::parse("/sandbox/w").unwrap(),
+        };
+        assert_eq!(sandbox.context("svc").unwrap().as_str(), "svc");
+        assert!(sandbox.context("/sandbox/w/svc").is_err());
     }
 
     #[test]

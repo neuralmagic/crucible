@@ -189,6 +189,44 @@ MCP_TOKENS_FILE=/run/crucible/buildit.tokens buildit mcp
 BUILDIT_E2E_KUBECONTEXT=kind-dev cargo test -- --ignored   # e2e on a disposable cluster
 ```
 
+### The run's socket and the CLI client
+
+`--socket <path> --socket-workdir <dir>` also serves the tools on a unix socket
+(mode 0600) to one caller with no token: the run itself, as sandbox
+`loop-<hash of --run-id>` (`loop` without one). Its builds are kept apart from
+every sandbox's by that name, under the same policy, namespace, queue, push
+repository and limits, and no token may name it. Contexts are directories of
+`--socket-workdir`, given relative or absolute; `run` writes `fetch_paths`
+under it.
+
+With `CRUCIBLE_BUILDIT_SOCKET` (or `--server <socket>`) set, `buildit build`,
+`status`, `run`, `push`, `logs` and `clean` call that server over MCP and print
+one JSON object on stdout. They exit 1 when the call fails, when a build ends
+other than `succeeded`, or when a `run`'s command exits nonzero or times out;
+usage errors exit 2. Without it, `buildit build` and `clean` work on the cluster
+as before.
+
+```sh
+export CRUCIBLE_BUILDIT_SOCKET=/run/state/buildit.sock
+buildit build -c svc --target base     # blocks until the build ends; --no-wait returns at once
+buildit run buildit-1a2b --fetch /out -- sh -c 'make test'
+buildit push buildit-1a2b              # {"image": "repo@sha256:...", "context_digest": ...}
+buildit clean                          # every build of this caller
+```
+
+### Context digest
+
+Build replies, `status`, completed build tasks and `push` report
+`context_digest`, the sha256 of the context buildit uploaded. It hashes one
+record per archive entry, sorted by path: `D NUL path NUL` for a directory,
+`F NUL path NUL mode NUL sha256(content) NUL` for a file (mode as four octal
+digits), `L NUL path NUL target NUL` for a symlink. Owners, times, directory and
+symlink modes and archive order do not count. buildit keeps it as the builder
+pod's `buildit.dev/context-digest` annotation. `buildit context-digest <dir>`
+stages a directory as a local workspace build does (`.dockerignore`, the
+excluded names, links that leave the context dropped) and prints the same
+digest, so a caller can check that what was built is what it prepared.
+
 ## How it compares
 
 - **`docker buildx` (kubernetes driver)** — the closest relative. It keeps a

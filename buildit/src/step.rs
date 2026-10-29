@@ -128,7 +128,7 @@ set -C; true > "$1.claim" 2>/dev/null"#;
 
 const RECORD: &str = r#"cat > "$1.published.part" && mv "$1.published.part" "$1.published" && rm -f "$1.tar" "$1.fetch-err""#;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
     Running,

@@ -403,7 +403,7 @@ async fn try_turn(
         args.mcp.iter().map(|s| s.key.as_str()),
     )?;
     for s in agent_servers.iter() {
-        tokio::task::block_in_place(|| s.start_local())
+        tokio::task::block_in_place(|| s.start_local(args.buildit_socket.as_ref()))
             .with_context(|| format!("starting the run's {}", s.server.name))?;
         ensure_token_grant_provider(
             &gw,

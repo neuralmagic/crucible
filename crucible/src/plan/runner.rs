@@ -28,12 +28,18 @@ pub const INPUTS_FILE_ENV: &str = "CRUCIBLE_INPUTS_FILE";
 /// Linux refuses any one environment string over 128 KiB, and the whole environment shares
 /// `ARG_MAX` with argv.
 const INPUTS_ENV_MAX: usize = 64 * 1024;
+/// The run's buildit socket, set for command and evaluate tasks alone; `buildit` calls the server
+/// there.
+pub const BUILDIT_SOCKET_ENV: &str = "CRUCIBLE_BUILDIT_SOCKET";
 
 pub struct ShellRunner {
     pub workdir: PathBuf,
     /// Stand-in command for `Agent` tasks (receives the prompt and knobs via env). `None`
     /// means agent tasks are refused: `plan run` without `--agent-cmd` is command-only.
     pub agent_cmd: Option<String>,
+    /// The run's buildit socket, exported to command and evaluate tasks as
+    /// [`BUILDIT_SOCKET_ENV`].
+    pub buildit_socket: Option<PathBuf>,
 }
 
 impl TaskRunner for ShellRunner {
@@ -86,6 +92,7 @@ impl ShellRunner {
         let mut cmd = Command::new("sh");
         cmd.arg("-c").current_dir(&self.workdir);
         crate::inference::withhold_from_task(&mut cmd);
+        cmd.env_remove(BUILDIT_SOCKET_ENV);
         cmd.env(crate::plan::TASK_NAME_ENV, &task.name.0);
         let mut env_inputs = inputs.clone();
         let history = match task.task {
@@ -116,6 +123,9 @@ impl ShellRunner {
         match &task.task {
             TaskKind::Command { command } | TaskKind::Evaluate { command, .. } => {
                 cmd.arg(command);
+                if let Some(socket) = &self.buildit_socket {
+                    cmd.env(BUILDIT_SOCKET_ENV, socket);
+                }
             }
             TaskKind::Agent {
                 prompt,
@@ -488,6 +498,7 @@ mod tests {
         ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: None,
+            buildit_socket: None,
         }
     }
 
@@ -961,6 +972,7 @@ mod tests {
         let mut r = ShellRunner {
             workdir: std::env::temp_dir(),
             agent_cmd: Some("true".into()),
+            buildit_socket: None,
         };
         let a = r.run(&t, 1, &BTreeMap::new(), None);
         match a.outcome {
@@ -1003,6 +1015,36 @@ mod tests {
         let out = run_plan(vec![t], None);
         assert_eq!(out.results[&"a".into()].status, TaskStatus::Fail);
         assert!(matches!(out.exit, PlanExit::ShortCircuit { .. }));
+    }
+
+    #[test]
+    fn the_buildit_socket_reaches_command_and_evaluate_tasks_and_never_an_agent() {
+        let show = r#"printf '{"socket":"%s","pass":true}\n' "${CRUCIBLE_BUILDIT_SOCKET-unset}""#;
+        let mut agent = command("a", "unused", &[]);
+        agent.task = TaskKind::Agent {
+            prompt: "build it".into(),
+            harness: None,
+            model: None,
+            effort: None,
+            sandbox: None,
+        };
+        let mut r = ShellRunner {
+            agent_cmd: Some(show.into()),
+            buildit_socket: Some("/runs/r1/pack/state/buildit.sock".into()),
+            ..runner()
+        };
+        let seen =
+            |r: &mut ShellRunner, task: &Task| match r.run(task, 1, &BTreeMap::new(), None).outcome
+            {
+                AttemptOutcome::Pass(v) => v["socket"].clone(),
+                other => panic!("{}: {other:?}", task.name),
+            };
+        let socket = "/runs/r1/pack/state/buildit.sock";
+        assert_eq!(seen(&mut r, &command("c", show, &[])), socket);
+        assert_eq!(seen(&mut r, &evaluate("e", show, None)), socket);
+        assert_eq!(seen(&mut r, &agent), "unset");
+        r.buildit_socket = None;
+        assert_eq!(seen(&mut r, &command("c", show, &[])), "unset");
     }
 
     #[test]

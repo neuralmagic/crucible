@@ -183,6 +183,7 @@ pub(crate) fn run_from_manifest(mut args: Args) -> Result<()> {
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
+    args.buildit_socket = Some(crate::openshell::buildit::RunSocket::of(&p));
     let world = m.build_world(workspace.clone());
     let judge = m.build_judge(workspace, frozen_injects)?;
 
@@ -301,6 +302,7 @@ fn run_composite(mut args: Args, manifest_path: PathBuf) -> Result<()> {
     args.workflow = m.workflow.clone();
     args.workflow_frozen_injects = Vec::new();
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
+    args.buildit_socket = Some(crate::openshell::buildit::RunSocket::of(&p));
     let world = m.build_world(&manifest_dir)?;
     let judge = m.build_judge(&manifest_dir)?;
     drive_loop(args, p, prep, world, judge, &m.mcp)

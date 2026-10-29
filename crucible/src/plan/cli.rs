@@ -778,6 +778,7 @@ pub fn run(
                         workdir: std::env::current_dir()
                             .context("resolving the working directory")?,
                         agent_cmd,
+                        buildit_socket: None,
                     }),
                     None,
                 )

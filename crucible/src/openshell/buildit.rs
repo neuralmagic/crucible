@@ -6,6 +6,7 @@
 
 use anyhow::{Context, Result};
 use crucible_contract::agent_servers::{BuilditSite, NodeArch};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,23 @@ struct BootTimeout {
     seconds: u64,
 }
 
+/// Where the run's own command and evaluate tasks reach its buildit: a unix socket in the run's
+/// state dir, whose builds read their contexts from the run's workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSocket {
+    pub path: PathBuf,
+    pub workdir: PathBuf,
+}
+
+impl RunSocket {
+    pub(crate) fn of(paths: &crate::args::Paths) -> Self {
+        Self {
+            path: paths.state.join("buildit.sock"),
+            workdir: paths.workspace.clone(),
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("buildit's run issuer {0:?} is not <issuer>=<jwks uri>")]
 pub struct BadIssuer(String);
@@ -34,6 +52,7 @@ pub struct Buildit<'a> {
     /// The name sandboxes reach the loop pod by.
     pub host: &'a str,
     pub port: u16,
+    pub socket: Option<&'a RunSocket>,
 }
 
 /// What `buildit mcp` runs as for this run.
@@ -98,14 +117,26 @@ impl Buildit<'_> {
                 args.extend([flag.to_string(), format!("{key}={qty}")]);
             }
         }
+        if let Some(socket) = self.socket {
+            for (flag, path) in [
+                ("--socket", &socket.path),
+                ("--socket-workdir", &socket.workdir),
+            ] {
+                args.extend([flag.to_string(), path.to_string_lossy().into_owned()]);
+            }
+        }
         Ok(args)
+    }
+
+    fn listening(&self, probe: &str) -> bool {
+        crate::control::broker::port_open(probe) && self.socket.is_none_or(|s| accepts(&s.path))
     }
 
     /// Start buildit for this run unless it is already listening, and wait until it accepts
     /// connections. It is the loop pod's child for the run's lifetime, like the broker.
     pub fn ensure_running(&self) -> Result<()> {
         let probe = format!("127.0.0.1:{}", self.port);
-        if crate::control::broker::port_open(&probe) {
+        if self.listening(&probe) {
             return Ok(());
         }
         let run_id = std::env::var(crucible_contract::ENV_POD_NAME)
@@ -132,17 +163,25 @@ impl Buildit<'_> {
             .context("spawning buildit")?;
         let deadline = Instant::now() + BOOT_TIMEOUT;
         while Instant::now() < deadline {
-            if crate::control::broker::port_open(&probe) {
+            if self.listening(&probe) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        let probe = match self.socket {
+            Some(socket) => format!("{probe} and {}", socket.path.display()),
+            None => probe,
+        };
         Err(BootTimeout {
             probe,
             seconds: BOOT_TIMEOUT.as_secs(),
         }
         .into())
     }
+}
+
+fn accepts(socket: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket).is_ok()
 }
 
 #[cfg(test)]
@@ -172,6 +211,7 @@ mod tests {
             url: URL,
             host: "host.openshell.internal",
             port: 8848,
+            socket: None,
         }
     }
 
@@ -260,6 +300,7 @@ mod tests {
             url: "http://host.openshell.internal:9000/mcp",
             host: "host.openshell.internal",
             port: 9000,
+            socket: None,
         };
         let args = elsewhere
             .args(
@@ -276,6 +317,53 @@ mod tests {
             args.windows(2)
                 .any(|w| w == ["--resource", "http://host.openshell.internal:9000/mcp"])
         );
+    }
+
+    #[test]
+    fn the_runs_own_socket_sits_in_its_state_dir_and_builds_from_its_workspace() {
+        let dir = std::path::Path::new("/runs/r1/pack");
+        let paths = crate::args::Paths::for_manifest(dir.join("ws"), dir.join("state"), dir, None);
+        let socket = RunSocket::of(&paths);
+        assert_eq!(socket.path, dir.join("state/buildit.sock"));
+        assert_eq!(socket.workdir, dir.join("ws"));
+        let s = site(ISSUER, None);
+        let run = RunSite {
+            run_id: "r",
+            push_authfile: None,
+            arch: None,
+        };
+        let served = Buildit {
+            socket: Some(&socket),
+            ..buildit(&s)
+        };
+        let args = served.args(&run, "/p").unwrap();
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--socket", "/runs/r1/pack/state/buildit.sock"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--socket-workdir", "/runs/r1/pack/ws"])
+        );
+        let args = buildit(&s).args(&run, "/p").unwrap();
+        assert!(!args.iter().any(|a| a.starts_with("--socket")), "{args:?}");
+    }
+
+    #[test]
+    fn only_a_socket_something_listens_on_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("buildit.sock");
+        assert!(!accepts(&socket));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert!(accepts(&socket));
+        drop(listener);
+        assert!(
+            socket.exists() && !accepts(&socket),
+            "a dead server's socket"
+        );
+        let file = dir.path().join("file");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!accepts(&file));
     }
 
     #[test]
