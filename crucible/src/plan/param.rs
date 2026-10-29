@@ -1,5 +1,10 @@
 use serde::{Deserialize, Serialize};
 
+/// Whether a supplied name addresses a launch setting rather than a declared parameter.
+pub fn is_address(name: &str) -> bool {
+    name.contains('.')
+}
+
 /// A bound parameter value.
 ///
 /// Stores and reloads as the JSON the value already is (`42`, `true`, `["a"]`), not as a tagged

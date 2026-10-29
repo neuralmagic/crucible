@@ -466,7 +466,7 @@ fn check_composite(manifest_path: &Path) -> Result<CheckOutcome> {
                 continue;
             };
             if let Err(e) =
-                crate::cli::workspace::clone_repo(&src, repo.git_ref.as_deref(), &c.workspace)
+                crate::cli::workspace::clone_repo(&src, repo.git_ref.as_ref(), &c.workspace)
             {
                 out.findings
                     .push(format!("cloning component `{}` failed: {e:#}", c.name));

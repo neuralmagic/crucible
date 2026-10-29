@@ -188,6 +188,9 @@ impl Params {
             let name = literal_string(&key.node).ok_or(CompileError::ParamsNotLiteral {
                 detail: "every parameter name must be a string literal".to_string(),
             })?;
+            if crate::plan::param::is_address(&name) {
+                return Err(CompileError::ParamNameHasDot { param: name });
+            }
             specs.push(spec(&name, &value.node)?);
         }
         Ok(Params(specs))
