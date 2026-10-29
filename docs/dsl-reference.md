@@ -328,6 +328,7 @@ Read out of the object the task returns.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
+| `note` | `str` | Why the task failed or was skipped, recorded as its note: in place of the default note when `status` is `"fail"` or `"skipped"`, and after the exit status in place of the stderr tail when a command exits nonzero. The control plane shows it as a parked run's reason. Read only from a result that fails or skips. |
 | `complete` | `bool` | `true` on a passing main-graph task of a playbook ends the run early and valid: nothing else in the main graph dispatches, undispatched tasks stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it in `emits`. |
 | `reason` | `str` | Why the run completed early, recorded with the shutdown. A task may not list it in `emits`. |
 
