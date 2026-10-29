@@ -1127,7 +1127,6 @@ pub(crate) async fn launch_playbook_draft(
         Ok(v) => v,
         Err(fields) => return invalid_fields(fields),
     };
-
     let saver = match crate::playbooks::api::saver::resolve_saver(
         &state,
         &caller,
@@ -1198,6 +1197,19 @@ pub(crate) async fn launch_playbook_draft(
             }
             Err(e) => return AppError::from(anyhow::Error::new(e)).into_response(),
         };
+    let tree =
+        match crate::playbooks::drafts::version_tree(state.db.pool(), &id, Some(latest.version))
+            .await
+        {
+            Ok(Some((_, tree))) => tree,
+            Ok(None) => return not_found(format!("no draft {id:?}")),
+            Err(e) => return crate::playbooks::api::registry::unreadable_tree(e),
+        };
+    if let Err(refusal) =
+        crate::playbooks::api::registry::check_plan(tree, &params, &max_time).await
+    {
+        return refusal;
+    }
     let exposure_dto = match ExposureDto::try_from(&exposure) {
         Ok(dto) => dto,
         Err(e) => return AppError::from(e).into_response(),
