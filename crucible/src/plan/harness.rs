@@ -42,6 +42,9 @@ use crate::plan::STAGED_INPUTS;
 /// task's: a pipeline that captures a little at every stage can still fill a disk.
 const MAX_CAPTURED_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Upstream results larger than this reach an agent as a file instead of inline in its prompt.
+const MAX_INLINE_INPUTS_BYTES: usize = 64 * 1024;
+
 /// A declared path resolved inside the workspace, or why it is refused. Symlinks are refused per
 /// component and a second name is refused outright, for the same reason the pack's own paths are:
 /// resolving a path cannot see a hard link.
@@ -626,7 +629,7 @@ fn agent_prompt(
     let inputs_json =
         serde_json::to_string_pretty(&upstream).context("serializing upstream task results")?;
 
-    let inputs_section = if inputs_json.len() > 64 * 1024 {
+    let inputs_section = if inputs_json.len() > MAX_INLINE_INPUTS_BYTES {
         let declared = format!("{STAGED_INPUTS}/.task-results.json");
         let path = confined(workspace, &declared).map_err(anyhow::Error::msg)?;
 
