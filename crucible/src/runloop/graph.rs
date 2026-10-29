@@ -1040,6 +1040,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         });
     }
     for id in 0..cfg.n {
@@ -1067,6 +1068,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         });
     }
     tasks.push(Task {
@@ -1094,6 +1096,7 @@ fn wide_template(cfg: &WideConfig, prep: &Prepared, direction: Direction) -> Res
         timeout: None,
         history: None,
         repair: 0,
+        optional: Vec::new(),
     });
     Plan {
         version: 1,

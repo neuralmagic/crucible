@@ -1535,6 +1535,22 @@ mod tests {
     }
 
     #[test]
+    fn a_multiline_param_validates_as_the_text_typed() {
+        let schema = declared_params(
+            "params = {\"log\": {\"type\": \"string\", \"required\": True, \"multiline\": True}}\n\
+             workflow(type = \"playbook\", tasks = [])\n",
+            Path::new("workflow.star"),
+        )
+        .expect("schema");
+        assert_eq!(schema["properties"]["log"]["x-multiline"], true);
+        let log = "panic at step 3\n  at foo.rs:12\n";
+        assert_eq!(
+            validate_params(&schema, &params(&[("log", log)])).expect("valid"),
+            serde_json::json!({"log": log})
+        );
+    }
+
+    #[test]
     fn a_value_that_is_not_its_type_names_the_param_and_the_type() {
         for (key, value, expected) in [
             ("rounds", "seven", "a whole number"),

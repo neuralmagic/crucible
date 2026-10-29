@@ -11,7 +11,7 @@ since = "0.1.0"
 text = """
 A workflow source MAY declare its parameters in a params block. The block MUST be the source's first statement and MUST be a literal: it MUST NOT contain a call, an interpolation, or a reference to a variable. The engine MUST be able to read the block without evaluating the source, so that an unevaluated or untrusted source can still be introspected. Only the source a run names may declare parameters; a loaded library MUST NOT.
 
-A declared parameter MUST have one of these types: string, integer, number, boolean, or list of strings. A declaration MAY carry a human-readable description, a default, a required flag, and a value constraint: a pattern for a string, a minimum and maximum for a numeric type, or an enumerated choice set. A parameter declared required MUST NOT also declare a default.
+A declared parameter MUST have one of these types: string, integer, number, boolean, or list of strings. A declaration MAY carry a human-readable description, a default, a required flag, and a value constraint: a pattern for a string, a minimum and maximum for a numeric type, or an enumerated choice set. A string declaration MAY also carry a multiline flag, which tells a launch form to take the value in a text area and MUST NOT change how the value binds; the engine MUST reject it on any other type. A parameter declared required MUST NOT also declare a default.
 
 Parameter values MUST be bound during compilation. The compiled graph MUST contain no unresolved parameter reference, so that the rendered graph shows exactly what will run and the frozen artifact remains fully static. Where a manifest field admits a parameter, it MUST be substituted at the same point, so that no parameter survives into execution unresolved.
 

@@ -1806,6 +1806,7 @@ fn dependency_inputs(
             .filter_map(|d| {
                 results
                     .get(d)
+                    .filter(|r| !(r.status == TaskStatus::NotTaken && t.optional.contains(d)))
                     .filter(|r| {
                         r.fanout.is_some()
                             || matches!(r.status, TaskStatus::Pass | TaskStatus::Skipped)
@@ -2380,7 +2381,11 @@ fn dependencies_allow(
             .depends_on
             .iter()
             .filter(|d| !per_element.contains(*d))
-            .all(|d| results.get(d).map(|r| r.status) == Some(TaskStatus::Pass)),
+            .all(|d| {
+                results
+                    .get(d)
+                    .is_some_and(|r| satisfies_all(t, d, r.status))
+            }),
         Join::Passed if !per_element.is_empty() => true,
         // Only passing outputs feed a lossy join. A mapped node contributes when any of its
         // instances passed, so a fan-out reads the same as a set of siblings.
@@ -2391,6 +2396,15 @@ fn dependencies_allow(
         // Every dependency already holds a result by the caller's guard, so terminality is
         // established and no status blocks the dispatch.
         Join::Settled => true,
+    }
+}
+
+/// Whether dependency `d`, settled as `status`, lets `t` dispatch under `join = "all"`.
+fn satisfies_all(t: &Task, d: &TaskName, status: TaskStatus) -> bool {
+    match status {
+        TaskStatus::Pass => true,
+        TaskStatus::NotTaken => t.optional.contains(d),
+        _ => false,
     }
 }
 
@@ -2510,7 +2524,7 @@ impl DeclaredStatus {
 /// The note a self-declaring task gave, or a stand-in naming what it declared.
 fn declared_note(value: &Value, declared: DeclaredStatus) -> String {
     value
-        .get("note")
+        .get(crate::plan::ir::NOTE_FIELD)
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("task declared status={}", declared.as_str()))
@@ -2893,7 +2907,7 @@ fn not_taken(
         && let Some(d) = t
             .depends_on
             .iter()
-            .filter(|d| !per_element.contains(*d))
+            .filter(|d| !per_element.contains(*d) && !t.optional.contains(d))
             .find(|d| status(d) == Some(TaskStatus::NotTaken))
     {
         return Some((
@@ -2993,14 +3007,14 @@ fn instance_gate(
         Join::All => {
             if let Some(d) = per_element
                 .iter()
-                .find(|d| status(d) == TaskStatus::NotTaken)
+                .find(|d| !t.optional.contains(*d) && status(d) == TaskStatus::NotTaken)
             {
                 return not_taken(
                     TaskEvent::BranchNotTaken,
                     format!("dependency {} was not taken", instance_name(d, key)),
                 );
             }
-            if per_element.iter().any(|d| status(d) != TaskStatus::Pass) {
+            if per_element.iter().any(|d| !satisfies_all(t, d, status(d))) {
                 return blocked();
             }
         }
@@ -3545,6 +3559,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -4338,6 +4353,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -4402,6 +4418,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         });
         let plan = valid(tasks, 10.0);
         let mut r = ScriptRunner::new();
@@ -4613,6 +4630,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         tasks.push(pick);
         let plan = valid(tasks, 10.0);
@@ -5349,6 +5367,98 @@ mod tests {
         assert_eq!(verify.status, TaskStatus::NotTaken);
         assert_eq!(verify.note.as_deref(), Some("dependency fix was not taken"));
         assert!(out.valid);
+    }
+
+    fn with_optional(mut t: Task, optional: &[&str]) -> Task {
+        t.optional = optional.iter().map(|d| (*d).into()).collect();
+        t
+    }
+
+    /// classify -> gate(area) -> fix [scheduler] -> verify
+    ///                        -> punt [frontend, uncertain]
+    ///             classify, optional(fix) -> report
+    fn optional_fix(required: bool) -> ValidPlan {
+        valid(
+            vec![
+                task("classify", &[], "any", true),
+                gate("area", area(&[]), true),
+                when(
+                    task("fix", &["gate"], "any", required),
+                    "area",
+                    &["scheduler"],
+                ),
+                task("verify", &["fix"], "any", required),
+                when(
+                    task("punt", &["gate"], "any", true),
+                    "area",
+                    &["frontend", "uncertain"],
+                ),
+                with_optional(
+                    task("report", &["classify", "fix"], "any", required),
+                    &["fix"],
+                ),
+            ],
+            10.0,
+        )
+    }
+
+    fn run_optional_fix(
+        required: bool,
+        setup: fn(&mut ScriptRunner),
+    ) -> (PlanOutcome, ScriptRunner) {
+        let mut r = ScriptRunner::new();
+        setup(&mut r);
+        let out = execute(
+            &optional_fix(required),
+            &any_substrate(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        (out, r)
+    }
+
+    #[test]
+    fn an_all_join_dispatches_past_an_optional_dependency_that_was_not_taken() {
+        let (out, r) = run_optional_fix(true, |r| r.on("classify", 1, says_frontend, 0.1));
+        assert_eq!(names(&r), ["classify", "punt", "report"]);
+        assert_eq!(out.results[&"fix".into()].status, TaskStatus::NotTaken);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        let seen = &r.seen_inputs["report"];
+        assert!(seen.contains(&"classify".to_string()), "{seen:?}");
+        assert!(!seen.contains(&"fix".to_string()), "{seen:?}");
+        let verify = &out.results[&"verify".into()];
+        assert_eq!(verify.status, TaskStatus::NotTaken);
+        assert_eq!(verify.note.as_deref(), Some("dependency fix was not taken"));
+        assert!(out.valid);
+        assert_eq!(out.exit, PlanExit::Completed);
+    }
+
+    #[test]
+    fn an_optional_dependency_that_ran_reaches_its_dependent_as_any_other() {
+        let (out, r) = run_optional_fix(true, |r| {
+            r.on("classify", 1, says_scheduler, 0.1);
+            r.outputs
+                .insert("fix".into(), serde_json::json!({"patched": true}));
+        });
+        assert_eq!(names(&r), ["classify", "fix", "verify", "report"]);
+        assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert_eq!(
+            r.seen_values["report"][&"fix".into()],
+            serde_json::json!({"patched": true})
+        );
+    }
+
+    #[test]
+    fn an_optional_dependency_that_failed_still_blocks_its_all_join() {
+        let (out, r) = run_optional_fix(false, |r| {
+            r.on("classify", 1, says_scheduler, 0.1);
+            r.on("fix", 1, breaks, 0.1);
+        });
+        assert_eq!(names(&r), ["classify", "fix"]);
+        let report = &out.results[&"report".into()];
+        assert_eq!(report.status, TaskStatus::Blocked);
+        assert_eq!(report.blocked, Some(BlockedReason::DependencyDidNotPass));
     }
 
     #[test]
@@ -10350,6 +10460,84 @@ mod tests {
             );
         }
         assert_eq!(out.results[&"report".into()].status, TaskStatus::Pass);
+        assert!(out.valid);
+    }
+
+    /// prepare -> gate[k] -> quick[k] (quick) | deep[k] (deep, uncertain);
+    ///            quick[k] -> review[k] (optional) ; prepare, optional(quick) -> tail
+    fn optional_quick_plan() -> ValidPlan {
+        valid(
+            vec![
+                task("prepare", &[], "any", true),
+                depth_gate(),
+                when_on(
+                    over_members(task("quick", &["prepare", "gate"], "any", false)),
+                    "gate",
+                    "depth",
+                    &["quick"],
+                ),
+                when_on(
+                    over_members(task("deep", &["prepare", "gate"], "any", false)),
+                    "gate",
+                    "depth",
+                    &["deep", "uncertain"],
+                ),
+                with_optional(
+                    over_members(task("review", &["prepare", "quick"], "any", false)),
+                    &["quick"],
+                ),
+                with_optional(
+                    task("tail", &["prepare", "quick"], "any", false),
+                    &["quick"],
+                ),
+            ],
+            10.0,
+        )
+    }
+
+    #[test]
+    fn an_aligned_instance_dispatches_past_its_optional_untaken_instance() {
+        let mut r = ScriptRunner::new();
+        per_element_setup(&mut r);
+        let out = execute(
+            &optional_quick_plan(),
+            &deciding(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        for key in ["a", "b", "c"] {
+            let name = TaskName(format!("review[{key}]"));
+            assert_eq!(out.results[&name].status, TaskStatus::Pass, "{name}");
+        }
+        assert_eq!(
+            r.seen_values["review[a]"][&"quick".into()],
+            serde_json::json!({"verdict": "a"})
+        );
+        assert!(!r.seen_inputs["review[b]"].contains(&"quick".to_string()));
+        assert_eq!(out.results[&"quick".into()].status, TaskStatus::Pass);
+        assert!(r.seen_inputs["tail"].contains(&"quick".to_string()));
+    }
+
+    #[test]
+    fn a_fold_that_settled_not_taken_gives_its_optional_dependent_no_entry() {
+        let mut r = ScriptRunner::new();
+        per_element_setup(&mut r);
+        for key in ["a", "b", "c"] {
+            r.outputs
+                .insert(format!("gate[{key}]"), decided("depth", "settled"));
+        }
+        let out = execute(
+            &optional_quick_plan(),
+            &deciding(),
+            ExecCfg::default(),
+            &mut r,
+            |_, _| {},
+        );
+        assert_eq!(out.results[&"quick".into()].status, TaskStatus::NotTaken);
+        assert_eq!(out.results[&"tail".into()].status, TaskStatus::Pass);
+        assert!(r.seen_inputs["tail"].contains(&"prepare".to_string()));
+        assert!(!r.seen_inputs["tail"].contains(&"quick".to_string()));
         assert!(out.valid);
     }
 

@@ -53,6 +53,9 @@ changed = [
     "C-TASK-FILES: a declared file may carry a schema, validated from the captured copy when the task passes",
     "C-TASK-FILES: an absent or mismatched file is a repair note for an agent task that declares repair",
     "C-PLAYBOOK-BUDGET admits each fan-out lane against settled and in-flight spend under a bounded width, and the cost ceiling blocks only tasks that can spend, so commands after it still run; C-SETTLED-JOIN and C-PLAYBOOK-LANE follow",
+    "C-PLAYBOOK-PARAMS: a string parameter may carry a multiline flag for launch forms; it does not change binding",
+    "C-SETTLED-JOIN: a failing task's own note, from a self-declared failure or a command's nonzero exit, is the note the engine records",
+    "C-SETTLED-JOIN: an all-join task gets no entry for an optional dependency that settled not taken (RFC-0001:C-ROUTE)",
     "C-PLAYBOOK-RESUME: a resume reads the manifest variant the interrupted run read",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

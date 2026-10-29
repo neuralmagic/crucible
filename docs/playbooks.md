@@ -339,6 +339,9 @@ crucible plan params --file workflow.star           # the JSON Schema, without r
 crucible plan run --manifest crucible.toml --param topic=slag --max-cost 1 --max-time 5m
 ```
 
+A string parameter that sets `"multiline": True` takes its value in a text area on the control
+plane's launch, schedule and ask forms. The value is still one string.
+
 Parameters go into prompts and skill arguments. They do not go into a command line. If you
 put a parameter into `run`, the compiler rejects the pack:
 

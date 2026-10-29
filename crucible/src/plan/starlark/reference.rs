@@ -64,7 +64,7 @@ fn task_knobs() -> Vec<Kwarg> {
     vec![
         Kwarg::new(
             "depends_on",
-            "list[task]",
+            "list[task | optional(task)]",
             "Dependencies. Readiness decides execution order; declaration order does not.",
         ),
         Kwarg::new(
@@ -113,10 +113,12 @@ fn task_knobs() -> Vec<Kwarg> {
         Kwarg::new(
             "emits_files",
             "list[str] | dict[str, schema | None]",
-            "Workspace files the task produces. A dependent is staged with the declared files of \
-             every dependency that passed. The dict form maps a path to `schema_file(...)` or \
-             `None`; a file with a schema must hold JSON the schema admits when the task passes, \
-             or the task fails.",
+            "Workspace files the task produces. A task is staged with the declared files of \
+             every ancestor that passed, not only its direct dependencies, under \
+             `inputs/<producer>/`; a `join = \"settled\"` task also gets those of a direct \
+             dependency that failed. JSON outputs, unlike files, come from direct dependencies \
+             only. The dict form maps a path to `schema_file(...)` or `None`; a file with a \
+             schema must hold JSON the schema admits when the task passes, or the task fails.",
         ),
         Kwarg::new(
             "over",
@@ -190,8 +192,9 @@ fn when_kwarg() -> Kwarg {
         "route.question",
         "Run only on a listed answer to one question of a `route()` this task depends on. \
          Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, \
-         and every `all`-join dependent is not taken with it. Rejoin branches with \
-         `join = \"passed\"` or `join = \"settled\"`. Playbook and custom workflows only.",
+         and every `all`-join dependent is not taken with it unless it lists the task as \
+         `optional(...)`. Rejoin branches with `join = \"passed\"` or `join = \"settled\"`. \
+         Playbook and custom workflows only.",
     )
 }
 
@@ -677,6 +680,17 @@ pub fn functions() -> Vec<Function> {
             ],
         },
         Function {
+            name: "optional",
+            lane: Lane::Routed,
+            purpose: "Mark an entry of `depends_on` that may settle `not_taken`. Under \
+                      `join = \"all\"` the task dispatches past it as though it passed, and its \
+                      inputs carry no entry for it; one that failed or was blocked still blocks. \
+                      Refused under another join, on a dependency that can never settle \
+                      `not_taken`, and on a task the reviewer revises.",
+            positional: Some("task"),
+            kwargs: vec![],
+        },
+        Function {
             name: "default_autoresearch",
             lane: Lane::Scored,
             purpose: "Expand the built-in propose/apply/measure/decide loop into visible nodes, \
@@ -720,6 +734,14 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
             "status",
             declared_status_type(),
             "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+        ),
+        Reserved::new(
+            crate::plan::ir::NOTE_FIELD,
+            "str",
+            "Why the task failed or was skipped, recorded as its note: in place of the default \
+             note when `status` is `\"fail\"` or `\"skipped\"`, and after the exit status in \
+             place of the stderr tail when a command exits nonzero. The control plane shows it as \
+             a parked run's reason. Read only from a result that fails or skips.",
         ),
         Reserved::new(
             crate::plan::ir::COMPLETE_FIELD,
@@ -1031,7 +1053,7 @@ mod tests {
         let results = super::reserved_result_fields();
         assert_eq!(
             results.iter().map(|row| row.name).collect::<Vec<_>>(),
-            ["status"]
+            ["status", crate::plan::ir::NOTE_FIELD]
                 .into_iter()
                 .chain(crate::plan::ir::RESERVED_OUTPUTS)
                 .collect::<Vec<_>>(),
