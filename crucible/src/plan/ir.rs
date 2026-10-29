@@ -46,6 +46,8 @@ pub const FILES_INPUT: &str = "files";
 pub const COMPLETE_FIELD: &str = "complete";
 /// The output field carrying an early completion's reason.
 pub const REASON_FIELD: &str = "reason";
+/// The output field a failing or skipped task states its own reason in.
+pub const NOTE_FIELD: &str = "note";
 /// Output fields a task may not declare in `emits`.
 pub const RESERVED_OUTPUTS: [&str; 2] = [COMPLETE_FIELD, REASON_FIELD];
 
