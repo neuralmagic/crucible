@@ -139,12 +139,53 @@ test.describe('the launch view', () => {
     await ready(page, FAILED);
 
     await expect(page.getByTestId('dispatch-state')).toContainText('failed');
+    await expect(page.getByText('why it did not start')).toBeVisible();
     await expect(page.getByTestId('dispatch-failure')).toContainText(
       'needs a deploy profile',
     );
+    await expect(page.getByTestId('dispatch-failure')).toHaveClass(/text-red/);
     await expect(page.getByText('3 failed')).toBeVisible();
     await expect(page.getByText('Ranking rationale')).toHaveCount(0);
     await expect(page.getByText('Journey')).toHaveCount(0);
+  });
+
+  /// A launch whose retry dispatched keeps its earlier failure, as a past attempt rather than the
+  /// reason it did not start.
+  test('shows a failure before a successful dispatch as the last failed attempt', async ({ page }) => {
+    await stubApi(page);
+    await ready(page, LAUNCH);
+
+    await expect(page.getByTestId('dispatch-state')).toContainText('dispatched');
+    await expect(page.getByText('last failed attempt')).toBeVisible();
+    await expect(page.getByText('why it did not start')).toHaveCount(0);
+    const failure = page.getByTestId('dispatch-failure');
+    await expect(failure).toContainText('etcdserver: request timed out');
+    await expect(failure).toHaveClass(/text-ink-2/);
+    await expect(failure).not.toHaveClass(/text-red/);
+    await expect(page.getByText('1 failed', { exact: true })).toBeVisible();
+  });
+
+  /// A launch that dispatched on its first attempt has nothing to say about dispatch.
+  test('shows no dispatch block for a clean dispatch', async ({ page }) => {
+    await stubApi(page);
+    const detail = ROUTES['/api/playbook-runs/playbook:survey:0199'];
+    if (typeof detail !== 'object' || detail === null || Array.isArray(detail)) {
+      throw new Error('launch 0199 fixture is not an object');
+    }
+    const body = {
+      ...detail,
+      dispatch: { state: 'dispatched', failure: null, failed_at: null, failures: 0 },
+    };
+    await page.route('**/api/playbook-runs/playbook%3Asurvey%3A0199', (route: Route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(body) }),
+    );
+    await ready(page, LAUNCH);
+
+    await expect(page.getByTestId('launch-params')).toBeVisible();
+    await expect(page.getByTestId('dispatch-state')).toHaveCount(0);
+    await expect(page.getByTestId('dispatch-failure')).toHaveCount(0);
+    await expect(page.getByText('last failed attempt')).toHaveCount(0);
+    await expect(page.getByText('why it did not start')).toHaveCount(0);
   });
 
   /// A launch that resolved no credentials says which one, and offers the page that fixes it —

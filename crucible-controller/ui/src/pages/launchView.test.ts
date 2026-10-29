@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { components } from '../api/schema';
 import {
   detailPath,
+  dispatchFailure,
   dispatchTone,
   graphRunId,
   launchLabel,
@@ -153,6 +154,36 @@ describe('dispatchTone', () => {
     expect(dispatchTone('failed')).toBe('red');
     expect(dispatchTone('pending')).toBe('grey');
     expect(dispatchTone('dispatched')).toBe('blue');
+  });
+});
+
+describe('dispatchFailure', () => {
+  const error = 'creating the pack ConfigMap: etcdserver: request timed out';
+  const at = '2026-10-29T14:02:11Z';
+
+  it('names the failure that keeps a launch from starting, in red', () => {
+    expect(
+      dispatchFailure({ state: 'failed', failure: error, failed_at: at, failures: 2 }),
+    ).toEqual({ label: 'why it did not start', error, at, blocking: true });
+  });
+
+  it('shows a failure behind a dispatched launch as its last failed attempt', () => {
+    expect(
+      dispatchFailure({ state: 'dispatched', failure: error, failed_at: at, failures: 1 }),
+    ).toEqual({ label: 'last failed attempt', error, at, blocking: false });
+  });
+
+  it('shows nothing for a launch no attempt failed', () => {
+    expect(
+      dispatchFailure({ state: 'dispatched', failure: null, failed_at: null, failures: 0 }),
+    ).toBeNull();
+    expect(
+      dispatchFailure({ state: 'pending', failure: null, failed_at: null, failures: 0 }),
+    ).toBeNull();
+  });
+
+  it('carries no time when the failed event had none', () => {
+    expect(dispatchFailure({ state: 'failed', failure: error, failures: 1 })?.at).toBeNull();
   });
 });
 
