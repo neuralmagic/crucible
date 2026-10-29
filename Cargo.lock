@@ -6920,6 +6920,8 @@ dependencies = [
  "http",
  "http-body",
  "http-body-util",
+ "hyper",
+ "hyper-util",
  "indexmap 2.14.2",
  "libc",
  "pastey",

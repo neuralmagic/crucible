@@ -3035,6 +3035,7 @@ mod tests {
             workflow: None,
             workflow_frozen_injects: Vec::new(),
             workflow_toolbox_exclude: Vec::new(),
+            buildit_socket: None,
             watch_feedback: false,
         };
         let paths = Paths {

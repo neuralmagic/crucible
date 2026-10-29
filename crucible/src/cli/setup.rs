@@ -431,6 +431,7 @@ pub(crate) fn prep_plan_runner_with_params(
     start_mcp(&mut args, &m.mcp).map_err(|e| end_run_at_setup(&p, e))?;
     args.workflow_frozen_injects = m.frozen_inject_pairs(&manifest_dir)?;
     args.workflow_toolbox_exclude = m.agent.toolbox_exclude.clone();
+    args.buildit_socket = Some(crate::openshell::buildit::RunSocket::of(&p));
     // A playbook's git memory is per task; the scored loop owns the same repository for
     // keep/discard of whole candidates and must not find per-task commits inside an iteration.
     let commit_per_task = m

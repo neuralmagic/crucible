@@ -22,7 +22,8 @@ fn check(args: &BuildArgs) -> Result<()> {
 
 pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
     check(args)?;
-    let authfile = auth::registry_of(&args.image).and_then(|r| auth::minimal_authfile(&r));
+    let image = args.image()?;
+    let authfile = auth::registry_of(image).and_then(|r| auth::minimal_authfile(&r));
     let authfile = match (authfile, args.no_push) {
         (Ok(authfile), _) => authfile,
         (Err(e), true) => {
@@ -36,7 +37,7 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
         "context: {}  dockerfile: {}  ->  {}  (ns={}, backend={:?}, mode={:?})",
         args.context.display(),
         args.dockerfile,
-        args.image,
+        image,
         args.namespace,
         args.backend,
         args.mode
@@ -90,10 +91,10 @@ pub async fn run(client: kube::Client, args: &BuildArgs) -> Result<()> {
 
     match outcome? {
         Some(digest) => {
-            tracing::info!("pushed {}", args.image);
-            println!("{}", pinned_ref(&args.image, &digest));
+            tracing::info!("pushed {}", image);
+            println!("{}", pinned_ref(image, &digest));
         }
-        None => tracing::info!("built {} without pushing it", args.image),
+        None => tracing::info!("built {} without pushing it", image),
     }
     Ok(())
 }
@@ -105,10 +106,11 @@ async fn detach(
     authfile: &[u8],
     idle_nodes: &[String],
 ) -> Result<()> {
+    let image = args.image()?;
     let tar = context::tar_bytes(&args.context)?;
     tracing::info!("context tar: {} KiB", tar.len() / 1024);
-    let ctx_ref = oci::context_reference(&args.image, &tar);
-    let registry = auth::registry_of(&args.image)?;
+    let ctx_ref = oci::context_reference(image, &tar);
+    let registry = auth::registry_of(image)?;
     let (user, pass) = auth::basic_credentials(&registry)?;
     let reg_auth = oci_client::secrets::RegistryAuth::Basic(user, pass);
     let ctx_labels = if args.context_labels.is_empty() {
@@ -127,7 +129,7 @@ async fn detach(
         &args.namespace,
         args.backend,
         &job::DetachArgs {
-            image: &args.image,
+            image,
             dockerfile: &args.dockerfile,
             target: args.target.as_deref(),
             build_args: &args.build_args,
@@ -152,6 +154,7 @@ async fn detach(
 // --output render: print manifests as YAML, touch nothing
 pub fn render(args: &BuildArgs) -> Result<()> {
     check(args)?;
+    let image = args.image()?;
     let name = crate::pod::unique_name();
     let resources = args.resources();
     match args.mode {
@@ -167,12 +170,12 @@ pub fn render(args: &BuildArgs) -> Result<()> {
         }
         Mode::Job => {
             let tar = context::tar_bytes(&args.context)?;
-            let ctx_ref = oci::context_reference(&args.image, &tar);
+            let ctx_ref = oci::context_reference(image, &tar);
             let spec = args.backend.job_spec(
                 &name,
                 &args.namespace,
                 &job::DetachArgs {
-                    image: &args.image,
+                    image,
                     dockerfile: &args.dockerfile,
                     target: args.target.as_deref(),
                     build_args: &args.build_args,
@@ -204,6 +207,7 @@ async fn drive(
     tarball: &[u8],
     authfile: &[u8],
 ) -> Result<Option<String>> {
+    let image = args.image()?;
     let backend = args.backend;
     pod.wait_ready(Duration::from_secs(180)).await?;
 
@@ -220,7 +224,7 @@ async fn drive(
         if push { " + pushing" } else { "" }
     );
     for step in backend.build_steps(
-        &args.image,
+        image,
         &args.dockerfile,
         args.target.as_deref(),
         push,

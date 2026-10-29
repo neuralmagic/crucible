@@ -211,6 +211,10 @@ pub(crate) struct Args {
     /// Toolbox exclusions for per-task harness overrides.
     #[arg(skip)]
     pub workflow_toolbox_exclude: Vec<String>,
+    /// Where the run's buildit serves the run's own command and evaluate tasks, fixed from the
+    /// run's top-level paths so every task and turn starts it the same way.
+    #[arg(skip)]
+    pub buildit_socket: Option<crate::openshell::buildit::RunSocket>,
     /// Opt-in: when publish-on-keep opens draft PR(s), spawn a detached `crucible watch-pr` pointed
     /// at them, reseeding this run's `STEER.md` from review comments so the NEXT run picks up feedback
     /// without a human running `watch-pr` by hand. Best-effort: spawn failure only logs (the PR still
