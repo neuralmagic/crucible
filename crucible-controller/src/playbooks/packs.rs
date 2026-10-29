@@ -100,6 +100,15 @@ pub(crate) fn deliverable(root: &Path) -> Result<Deliverable, PackRefusal> {
 /// The pack manifest's file name, at the pack root.
 pub(crate) const MANIFEST: &str = "crucible.toml";
 
+/// A row's `variant` column. A stored name the engine no longer accepts is an error rather than
+/// a silent fall back to the base manifest.
+pub(crate) fn variant_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<VariantName>> {
+    sqlx::Row::try_get::<Option<String>, _>(row, "variant")?
+        .map(|v| VariantName::parse(&v))
+        .transpose()
+        .context("decoding a stored manifest variant")
+}
+
 /// The pack's manifest as a run of `variant` reads it: the base for `None`, otherwise the base
 /// with the variant's top-level tables in place.
 pub(crate) fn manifest_text(pack_root: &Path, variant: Option<&VariantName>) -> Result<String> {

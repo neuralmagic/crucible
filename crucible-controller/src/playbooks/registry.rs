@@ -241,7 +241,7 @@ impl PlaybookRow {
             created_by: row.try_get("created_by")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
-            variant: variant_from_row(row)?,
+            variant: crate::playbooks::packs::variant_from_row(row)?,
         })
     }
 
@@ -912,15 +912,6 @@ struct NewRow {
     variant: Option<VariantName>,
 }
 
-/// A row's `variant` column. A stored name the engine no longer accepts is an error rather than
-/// a silent fall back to the base manifest.
-pub(crate) fn variant_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<VariantName>> {
-    row.try_get::<Option<String>, _>("variant")?
-        .map(|v| VariantName::parse(&v))
-        .transpose()
-        .context("decoding a stored manifest variant")
-}
-
 /// Write `row` in one transaction: refuse an unaccepted exposure change and an id a live draft
 /// holds, then store the tree, insert or re-pin, and record the tree as one of the id's
 /// revisions.
@@ -1235,7 +1226,7 @@ pub async fn rederive_stale(pool: &PgPool) -> Result<usize> {
     let mut updated = 0usize;
     for row in rows {
         let id: String = row.try_get("id")?;
-        let variant = variant_from_row(&row)?;
+        let variant = crate::playbooks::packs::variant_from_row(&row)?;
         let tree = pack(pool, &id).await;
         let extracted = tokio::task::spawn_blocking(move || {
             let tree = tree

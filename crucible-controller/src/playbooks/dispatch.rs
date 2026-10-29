@@ -393,7 +393,7 @@ pub async fn backfill_pack_agents(pool: &sqlx::PgPool) -> Result<usize> {
                     continue;
                 }
             };
-            let variant = crate::playbooks::registry::variant_from_row(&row)?;
+            let variant = crate::playbooks::packs::variant_from_row(&row)?;
             let agent = tokio::task::spawn_blocking(move || {
                 let pack = crate::playbooks::packs::materialize_tree(&tree)?;
                 pack_agent(pack.path(), variant.as_ref())

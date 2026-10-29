@@ -159,7 +159,7 @@ impl PackImport {
             created_at: row.try_get("created_at")?,
             resolved_by: row.try_get("resolved_by")?,
             resolved_at: row.try_get("resolved_at")?,
-            variant: crate::playbooks::registry::variant_from_row(row)?,
+            variant: crate::playbooks::packs::variant_from_row(row)?,
         })
     }
 
