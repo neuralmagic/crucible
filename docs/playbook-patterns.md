@@ -59,6 +59,18 @@ If the route does not select the answer of a branch, the branch settles `not_tak
 not dispatch, does not spend, and does not change the verdict. A task that depends on it with
 the default `join = "all"` is also not taken. For this reason, `filed` uses `join = "passed"`.
 
+To run a task whether or not one branch was taken, keep `join = "all"` and mark that
+dependency `optional(...)`:
+
+```python
+summary = command(name = "summary", run = "./summarize.sh",
+                  depends_on = [read, optional(oncall)])
+```
+
+`summary` runs when `oncall` passed or was not taken, and its inputs have no `oncall` entry
+in the second case. If `oncall` failed, `summary` is blocked as before. Every other dependency
+keeps the `all` rule.
+
 **Source of the answer.** Set exactly one of these two:
 
 | | Answered by | Cost |

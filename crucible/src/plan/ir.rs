@@ -549,6 +549,10 @@ pub struct Task {
     pub keyed: Vec<OutputRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub when: Option<When>,
+    /// Dependencies that satisfy an `all` join by settling not taken. Such a dependency gives the
+    /// task no input entry.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<TaskName>,
     /// Sends a failing verdict back to a dependency (see [`Revise`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revise: Option<Revise>,
@@ -566,6 +570,33 @@ pub struct Task {
 
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+/// Tasks that carry a `when`, or reach one through `all` joins on dependencies not declared
+/// optional.
+pub(crate) fn may_settle_not_taken(tasks: &[Task]) -> BTreeSet<&TaskName> {
+    let mut conditional: BTreeSet<&TaskName> = tasks
+        .iter()
+        .filter(|t| t.when.is_some())
+        .map(|t| &t.name)
+        .collect();
+    loop {
+        let grown: Vec<&TaskName> = tasks
+            .iter()
+            .filter(|t| {
+                t.join == Join::All
+                    && !conditional.contains(&t.name)
+                    && t.depends_on
+                        .iter()
+                        .any(|d| !t.optional.contains(d) && conditional.contains(d))
+            })
+            .map(|t| &t.name)
+            .collect();
+        if grown.is_empty() {
+            return conditional;
+        }
+        conditional.extend(grown);
+    }
 }
 
 /// A reviewer's bounded send-back: when the reviewer settles failing, `tasks` run again with the
@@ -776,6 +807,25 @@ pub enum PlanError {
     },
     #[error("task {task:?} lists dependency {dependency:?} twice")]
     RepeatedDependency { task: String, dependency: String },
+    #[error("task {task:?}: optional names {dependency:?}, which is not one of its dependencies")]
+    OptionalNotADependency { task: String, dependency: String },
+    #[error("task {task:?} lists optional dependency {dependency:?} twice")]
+    RepeatedOptional { task: String, dependency: String },
+    #[error(
+        "task {task:?}: an optional dependency needs join = \"all\"; a {join:?} join already \
+         dispatches past a dependency that was not taken"
+    )]
+    OptionalOutsideAllJoin { task: String, join: &'static str },
+    #[error(
+        "task {task:?}: optional dependency {dependency:?} can never settle not taken: it has \
+         no when and joins no conditional task with join = \"all\""
+    )]
+    OptionalNeverNotTaken { task: String, dependency: String },
+    #[error(
+        "task {task:?}: optional names {target:?}, which it revises; a reviewer reviews what its \
+         targets produced"
+    )]
+    OptionalReviseTarget { task: String, target: String },
     #[error("task {task:?}: join = \"passed\" needs at least one dependency")]
     JoinPassedWithoutDependencies { task: String },
     #[error("task {task:?}: join = \"settled\" needs at least one dependency")]
@@ -1360,6 +1410,35 @@ impl Plan {
                         dependency_stage,
                     });
                 }
+            }
+            let mut optional = BTreeSet::new();
+            for d in &t.optional {
+                if !t.depends_on.contains(d) {
+                    return Err(PlanError::OptionalNotADependency {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                if !optional.insert(d) {
+                    return Err(PlanError::RepeatedOptional {
+                        task: task(),
+                        dependency: d.0.clone(),
+                    });
+                }
+                if let Some(revise) = &t.revise
+                    && revise.tasks.contains(d)
+                {
+                    return Err(PlanError::OptionalReviseTarget {
+                        task: task(),
+                        target: d.0.clone(),
+                    });
+                }
+            }
+            if !t.optional.is_empty() && t.join != Join::All {
+                return Err(PlanError::OptionalOutsideAllJoin {
+                    task: task(),
+                    join: t.join.as_str(),
+                });
             }
             if let Some(depth) = t.history {
                 if !(1..=crucible_contract::history::MAX_HISTORY_DEPTH).contains(&depth) {
@@ -1976,6 +2055,15 @@ impl Plan {
                 }
             }
         }
+        let conditional = may_settle_not_taken(&self.tasks);
+        for t in &self.tasks {
+            if let Some(d) = t.optional.iter().find(|d| !conditional.contains(d)) {
+                return Err(PlanError::OptionalNeverNotTaken {
+                    task: t.name.0.clone(),
+                    dependency: d.0.clone(),
+                });
+            }
+        }
         let mut handled: BTreeMap<(&TaskName, &QuestionId), BTreeSet<&Label>> = BTreeMap::new();
         for t in &self.tasks {
             if let Some(when) = &t.when {
@@ -2183,6 +2271,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -2283,6 +2372,95 @@ mod tests {
     #[test]
     fn a_fully_routed_question_validates() {
         plan(routed()).validate().unwrap();
+    }
+
+    fn optional_on(mut task: Task, optional: &[&str]) -> Task {
+        task.optional = optional.iter().map(|d| (*d).into()).collect();
+        task
+    }
+
+    #[test]
+    fn an_optional_dependency_on_a_conditional_task_validates_and_round_trips() {
+        let mut tasks = routed();
+        tasks.push(optional_on(agent("report", &["scan", "fix"]), &["fix"]));
+        tasks.push(agent("verify", &["fix"]));
+        tasks.push(optional_on(agent("summary", &["verify"]), &["verify"]));
+        let original = plan(tasks);
+        let text = toml::to_string(&original).unwrap();
+        assert!(text.contains(r#"optional = ["fix"]"#), "{text}");
+        let json = serde_json::to_value(&original).unwrap();
+        assert!(json["task"][0].get("optional").is_none(), "{json}");
+        for back in [
+            Plan::from_toml_str(&text).unwrap(),
+            Plan::from_json_str(&json.to_string()).unwrap(),
+        ] {
+            assert_eq!(back.tasks[4].optional, vec![TaskName::from("fix")]);
+            assert_eq!(back.tasks[6].optional, vec![TaskName::from("verify")]);
+            back.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn an_optional_dependency_is_refused_where_it_cannot_apply() {
+        let with = |task: Task| {
+            let mut tasks = routed();
+            tasks.push(task);
+            plan(tasks).validate().unwrap_err()
+        };
+        assert_eq!(
+            with(optional_on(agent("report", &["scan"]), &["fix"])),
+            PlanError::OptionalNotADependency {
+                task: "report".into(),
+                dependency: "fix".into(),
+            }
+        );
+        assert_eq!(
+            with(optional_on(agent("report", &["fix"]), &["fix", "fix"])),
+            PlanError::RepeatedOptional {
+                task: "report".into(),
+                dependency: "fix".into(),
+            }
+        );
+        for join in [Join::Passed, Join::Settled] {
+            let mut report = optional_on(agent("report", &["fix"]), &["fix"]);
+            report.join = join;
+            assert_eq!(
+                with(report),
+                PlanError::OptionalOutsideAllJoin {
+                    task: "report".into(),
+                    join: join.as_str(),
+                }
+            );
+        }
+        assert_eq!(
+            with(optional_on(agent("report", &["scan", "fix"]), &["scan"])),
+            PlanError::OptionalNeverNotTaken {
+                task: "report".into(),
+                dependency: "scan".into(),
+            }
+        );
+
+        let mut tasks = routed();
+        tasks.push(optional_on(agent("report", &["fix"]), &["fix"]));
+        tasks.push(optional_on(agent("tail", &["report"]), &["report"]));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::OptionalNeverNotTaken {
+                task: "tail".into(),
+                dependency: "report".into(),
+            },
+            "a task that dispatches past every untaken dependency is not conditional"
+        );
+
+        let mut tasks = routed();
+        tasks.push(optional_on(reviewer("check", &["fix"], "fix", 3), &["fix"]));
+        assert_eq!(
+            plan(tasks).validate().unwrap_err(),
+            PlanError::OptionalReviseTarget {
+                task: "check".into(),
+                target: "fix".into(),
+            }
+        );
     }
 
     #[test]
@@ -2823,6 +3001,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let err = plan(vec![t]).validate().unwrap_err();
         assert_eq!(
@@ -2975,6 +3154,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 

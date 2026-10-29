@@ -1358,6 +1358,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: sandboxed_args(),
@@ -1519,6 +1520,7 @@ mod tests {
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         }
     }
 
@@ -3505,6 +3507,7 @@ workflow(type = "playbook", tasks = [analyze, implement, report])
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         };
         let mut runner = HarnessRunner {
             args: <crate::cli::Cli as clap::Parser>::try_parse_from(["crucible"])

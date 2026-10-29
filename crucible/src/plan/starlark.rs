@@ -442,6 +442,8 @@ enum Value {
     Answer(values::AnswerRef),
     /// `schema_file(path)`.
     Schema(SchemaFile),
+    /// `optional(task)`: a dependency whose settling not taken satisfies an `all` join.
+    Optional(TaskName),
     /// A starlark value outside the DSL's own space: a dict, a function, a struct. The `take_*`
     /// helpers report it with the same wrong-type sentence a wrong scalar gets.
     Opaque,
@@ -557,7 +559,7 @@ const SCORED_FUNCTIONS: &[&str] = &[
 ];
 
 /// Typed decisions, present in the playbook and custom lanes and absent from autoresearch.
-const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "route", "score"];
+const ROUTED_FUNCTIONS: &[&str] = &["choice", "noul", "optional", "route", "score"];
 
 /// The callable surface of one lane, for unknown-function suggestions. A playbook author is
 /// never offered a constructor the lane would then refuse. Built from the two tables above so a
@@ -812,7 +814,7 @@ fn constructor(
     }
     if matches!(
         function,
-        "prompt_file" | "schema_file" | "param" | "default_autoresearch"
+        "prompt_file" | "schema_file" | "param" | "optional" | "default_autoresearch"
     ) {
         return Err(CompileError::NotOnePositional {
             function: function.to_owned(),
@@ -910,6 +912,7 @@ fn constructor(
             timeout: None,
             history: None,
             repair: 0,
+            optional: Vec::new(),
         },
         "top_k" => {
             let k = take_int(&mut named, "k")?;
@@ -952,6 +955,7 @@ fn constructor(
                 when: None,
                 history: None,
                 repair: 0,
+                optional: Vec::new(),
             }
         }
         "route" => {
@@ -974,9 +978,11 @@ fn constructor(
                 (None, Some(task)) => (Decider::Output { task }, "any"),
                 _ => return Err(CompileError::RouteDecider { task: name.0 }),
             };
+            let (depends_on, optional) = take_dependencies(&mut named)?;
             let task = Task {
                 task: TaskKind::Route { questions, decider },
-                depends_on: take_task_names(&mut named)?,
+                depends_on,
+                optional,
                 session: None,
                 needs: needs.to_owned(),
                 required: take_bool_default(&mut named, "required", true)?,
@@ -1229,10 +1235,12 @@ fn dsl_task(
 ) -> Result<Task> {
     let when = take_when(named, state, &name)?;
     let repair = take_repair(named, &kind)?;
+    let (depends_on, optional) = take_dependencies(named)?;
     let task = Task {
         name,
         task: kind,
-        depends_on: take_task_names(named)?,
+        depends_on,
+        optional,
         session,
         needs: take_string_default(named, "needs", "any")?,
         required: take_bool_default(named, "required", true)?,
@@ -1725,6 +1733,7 @@ fn engine(name: &str, op: EngineOp, source: Option<TaskName>, depends_on: Vec<Ta
         timeout: None,
         history: None,
         repair: 0,
+        optional: Vec::new(),
     }
 }
 
@@ -2128,6 +2137,32 @@ fn take_task_names(named: &mut BTreeMap<String, Value>) -> Result<Vec<TaskName>>
     take_named_task_names_optional(named, "depends_on")
 }
 
+/// `depends_on` where an entry may be `optional(...)`: every dependency, and the optional ones.
+fn take_dependencies(
+    named: &mut BTreeMap<String, Value>,
+) -> Result<(Vec<TaskName>, Vec<TaskName>)> {
+    let Some(value) = named.remove("depends_on") else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let Value::List(entries) = value else {
+        return Err(CompileError::TaskNamesNotList {
+            argument: "depends_on".to_owned(),
+        });
+    };
+    let mut depends_on = Vec::with_capacity(entries.len());
+    let mut optional = Vec::new();
+    for entry in entries {
+        match entry {
+            Value::Optional(name) => {
+                optional.push(name.clone());
+                depends_on.push(name);
+            }
+            entry => depends_on.push(task_name_entry("depends_on", entry)?),
+        }
+    }
+    Ok((depends_on, optional))
+}
+
 fn take_named_task_names(named: &mut BTreeMap<String, Value>, name: &str) -> Result<Vec<TaskName>> {
     if !named.contains_key(name) {
         return Err(CompileError::MissingArgument {
@@ -2154,14 +2189,21 @@ fn task_names(argument: &str, value: Value) -> Result<Vec<TaskName>> {
     };
     names
         .into_iter()
-        .map(|name| match name {
-            Value::String(name) => Ok(TaskName(name)),
-            Value::Task(task) => Ok(task.name),
-            _ => Err(CompileError::TaskNameEntryWrongType {
-                argument: argument.to_owned(),
-            }),
-        })
+        .map(|name| task_name_entry(argument, name))
         .collect()
+}
+
+fn task_name_entry(argument: &str, entry: Value) -> Result<TaskName> {
+    match entry {
+        Value::String(name) => Ok(TaskName(name)),
+        Value::Task(task) => Ok(task.name),
+        Value::Optional(_) => Err(CompileError::OptionalOutsideDependsOn {
+            argument: argument.to_owned(),
+        }),
+        _ => Err(CompileError::TaskNameEntryWrongType {
+            argument: argument.to_owned(),
+        }),
+    }
 }
 
 fn isolation(isolated: bool) -> Option<Isolation> {
@@ -3313,6 +3355,80 @@ workflow(type = "playbook", tasks = [classify, gate, fix, punt, page, wrap], res
         assert_eq!(when("page").as_deref(), Some("gate.urgent in yes"));
         assert_eq!(when("wrap"), None);
         let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    fn with_report(dependencies: &str) -> String {
+        ROUTED
+            .replace(
+                "workflow(type = \"playbook\", tasks = [classify, gate, fix, punt, page, wrap], result = wrap)",
+                &format!(
+                    "report = command(name = \"report\", run = \"./report.sh\", {dependencies})\n\
+                     workflow(type = \"playbook\", tasks = [classify, gate, fix, punt, page, wrap, report], result = wrap)"
+                ),
+            )
+    }
+
+    #[test]
+    fn optional_marks_a_dependency_in_the_compiled_graph() {
+        let pack = temp_pack("routed-optional");
+        for dependencies in [
+            "depends_on = [classify, optional(fix)]",
+            "depends_on = [\"classify\", optional(\"fix\")]",
+        ] {
+            let source = with_report(dependencies);
+            let compiled = compile_source(&source, &pack.join("workflow.star"), &pack).unwrap();
+            let report = compiled
+                .workflow
+                .tasks
+                .iter()
+                .find(|t| t.name.0 == "report")
+                .unwrap();
+            assert_eq!(report.depends_on, ["classify".into(), "fix".into()]);
+            assert_eq!(report.optional, [TaskName::from("fix")]);
+            let text = toml::to_string(&compiled.workflow).unwrap();
+            assert!(text.contains("optional = [\"fix\"]"), "{text}");
+            let back: WorkflowCfg = toml::from_str(&text).unwrap();
+            back.validate().unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&pack);
+    }
+
+    #[test]
+    fn optional_is_refused_where_it_cannot_apply() {
+        let cases = [
+            (
+                "depends_on = [optional(fix), punt], join = \"passed\"",
+                "an optional dependency needs join = \"all\"",
+            ),
+            (
+                "depends_on = [optional(classify)]",
+                "optional dependency \"classify\" can never settle not taken",
+            ),
+            (
+                "depends_on = [fix], revise = [optional(fix)], max_rounds = 2",
+                "here revise takes plain tasks",
+            ),
+            (
+                "depends_on = [optional(fix, punt)]",
+                "optional() takes exactly one positional argument",
+            ),
+        ];
+        for (dependencies, expected) in cases {
+            let err = routed_error("routed-optional-refused", &with_report(dependencies));
+            assert!(err.contains(expected), "{dependencies}: {err}");
+        }
+    }
+
+    #[test]
+    fn optional_is_not_callable_in_an_autoresearch_workflow() {
+        let names: BTreeSet<String> = lane_globals(WorkflowType::Autoresearch)
+            .names()
+            .map(|name| name.as_str().to_owned())
+            .collect();
+        assert!(!names.contains("optional"));
+        for lane in [WorkflowType::Playbook, WorkflowType::Custom] {
+            assert!(dsl_functions(lane).contains(&"optional"), "{lane:?}");
+        }
     }
 
     #[test]
