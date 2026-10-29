@@ -2524,7 +2524,7 @@ impl DeclaredStatus {
 /// The note a self-declaring task gave, or a stand-in naming what it declared.
 fn declared_note(value: &Value, declared: DeclaredStatus) -> String {
     value
-        .get("note")
+        .get(crate::plan::ir::NOTE_FIELD)
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("task declared status={}", declared.as_str()))

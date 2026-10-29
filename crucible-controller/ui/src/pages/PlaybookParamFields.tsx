@@ -1,5 +1,5 @@
 import { Mono } from '../ui';
-import { FormGrid, TextField } from './formControls';
+import { FormGrid, TextAreaField, TextField } from './formControls';
 import { spellingOf, type ParamFieldSpec } from './playbookLaunchForm';
 
 export interface PlaybookParamFieldsProps {
@@ -23,28 +23,31 @@ export function PlaybookParamFields({
 }: PlaybookParamFieldsProps) {
   return (
     <FormGrid>
-      {specs.map((spec, index) => (
-        <TextField
-          key={spec.name}
-          id={`${idPrefix}-param-${spec.name}`}
-          label={<Mono size="label">{spec.name}</Mono>}
-          required={spec.required}
-          mono
-          autoFocus={index === 0}
-          value={values[spec.name] ?? ''}
-          onChange={(value) => {
+      {specs.map((spec, index) => {
+        const field = {
+          id: `${idPrefix}-param-${spec.name}`,
+          label: <Mono size="label">{spec.name}</Mono>,
+          required: spec.required,
+          mono: true,
+          autoFocus: index === 0,
+          value: values[spec.name] ?? '',
+          onChange: (value: string) => {
             onChange(spec.name, value);
-          }}
-          onBlur={() => {
+          },
+          onBlur: () => {
             onBlur(spec.name);
-          }}
-          error={errors.get(spec.name) ?? null}
-          hint={
+          },
+          error: errors.get(spec.name) ?? null,
+          hint:
             spec.description ??
-            (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined))
-          }
-        />
-      ))}
+            (spec.pattern !== null ? `Must match ${spec.pattern}` : (spellingOf(spec.valueType) ?? undefined)),
+        };
+        return spec.multiline ? (
+          <TextAreaField key={spec.name} rows={8} {...field} />
+        ) : (
+          <TextField key={spec.name} {...field} />
+        );
+      })}
     </FormGrid>
   );
 }
