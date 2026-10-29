@@ -55,11 +55,15 @@ struct SecretEntry {
 /// Read the declared secrets out of a pack tree's manifest. A tree with no manifest, or a manifest
 /// with no `[[secret]]`, declares none; a malformed entry is an error, because a pack that names a
 /// credential the registry cannot resolve must not launch quietly without it.
-pub fn declared_secrets(pack_root: &Path) -> Result<Vec<DeclaredSecret>> {
-    let manifest = pack_root.join("crucible.toml");
-    let Ok(text) = std::fs::read_to_string(&manifest) else {
+pub fn declared_secrets(
+    pack_root: &Path,
+    variant: Option<&crucible::manifest::variant::VariantName>,
+) -> Result<Vec<DeclaredSecret>> {
+    let manifest = pack_root.join(crate::playbooks::packs::MANIFEST);
+    if !manifest.is_file() {
         return Ok(Vec::new());
-    };
+    }
+    let text = crate::playbooks::packs::manifest_text(pack_root, variant)?;
     parse_declared(&text).with_context(|| format!("reading the secrets block of {manifest:?}"))
 }
 
@@ -214,7 +218,7 @@ name = "bare"
     fn an_absent_manifest_declares_nothing() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(
-            declared_secrets(dir.path())
+            declared_secrets(dir.path(), None)
                 .expect("no manifest is no error")
                 .is_empty()
         );
@@ -224,7 +228,28 @@ name = "bare"
     fn a_manifest_on_disk_is_read() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("crucible.toml"), MANIFEST).expect("write");
-        assert_eq!(declared_secrets(dir.path()).expect("parses").len(), 3);
+        assert_eq!(declared_secrets(dir.path(), None).expect("parses").len(), 3);
+    }
+
+    /// A variant's `[[secret]]` replaces the base's whole, so a launch of that variant is bound
+    /// against the variant's declarations only.
+    #[test]
+    fn a_variant_declares_its_own_secrets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("crucible.toml"),
+            format!("{MANIFEST}\n[[variant.offline.secret]]\nname = \"fixture-token\"\n"),
+        )
+        .expect("write");
+        let offline = crucible::manifest::variant::VariantName::parse("offline").expect("name");
+        let declared = declared_secrets(dir.path(), Some(&offline)).expect("parses");
+        assert_eq!(
+            declared.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            ["fixture-token"]
+        );
+        assert_eq!(declared_secrets(dir.path(), None).expect("parses").len(), 3);
+        let unknown = crucible::manifest::variant::VariantName::parse("online").expect("name");
+        assert!(declared_secrets(dir.path(), Some(&unknown)).is_err());
     }
 
     #[test]

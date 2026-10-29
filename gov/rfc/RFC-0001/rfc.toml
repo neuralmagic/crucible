@@ -81,6 +81,7 @@ changed = [
     "C-MANIFEST: [repo].ref follows git's ref-name rules and never begins with -; the clone fetches the ref and checks it out detached, and a ref that does not resolve fails setup instead of running on the default branch",
     "C-WORKFLOW: a harness or effort no turn can read is rejected at validation instead of at dispatch",
     "C-ROUTE: an all-join task may declare a dependency optional, so one that settled not taken satisfies the join and gives no input entry; C-WORKFLOW adds the optional constructor",
+    "C-MANIFEST: a manifest may declare [variant.<name>] tables; a run that names one reads its top-level tables in place of the base's, and every variant is validated on load",
 ]
 
 [[changelog]]

@@ -20,6 +20,7 @@ mod resources;
 mod search;
 mod secret;
 mod selftest;
+pub mod variant;
 mod wiring;
 mod world;
 
@@ -44,6 +45,7 @@ pub use selftest::SelftestCfg;
 pub use world::WorldCfg;
 
 use crate::crucible::Direction;
+use crate::manifest::variant::{VariantName, Variants};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -336,6 +338,9 @@ pub struct Manifest {
     /// MCP servers by `[mcp.<key>]`, started on the loop pod.
     #[serde(default)]
     pub mcp: BTreeMap<String, McpCfg>,
+    /// The `[variant.<name>]` this manifest was read as; `None` for the base.
+    #[serde(skip)]
+    pub variant: Option<VariantName>,
     /// What the launch set, already applied to `repo` and the workflow's tasks. Never read from
     /// TOML.
     #[serde(skip)]
@@ -1085,10 +1090,41 @@ fn validate_artifacts(artifacts: &[Artifact]) -> Result<()> {
 
 impl Manifest {
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_variant(path, None)
+    }
+
+    /// Load `variant` of the manifest at `path`, or its base for `None`. Every variant the
+    /// manifest declares is validated, whichever is selected.
+    pub fn load_variant(path: &Path, variant: Option<&VariantName>) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading manifest {}", path.display()))?;
-        let m: Self = toml::from_str(&text)
-            .with_context(|| format!("parsing manifest {}", path.display()))?;
+        Self::parse_variant(&text, variant, &format!("manifest {}", path.display()))
+    }
+
+    /// Parse `text`, naming it `source` in errors.
+    fn parse_variant(text: &str, variant: Option<&VariantName>, source: &str) -> Result<Self> {
+        let parsing = || format!("parsing {source}");
+        let document: toml::Table = toml::from_str(text).with_context(parsing)?;
+        if variant.is_none() && !document.contains_key(variant::VARIANT_TABLE) {
+            let m: Self = toml::from_str(text).with_context(parsing)?;
+            m.validate()?;
+            return Ok(m);
+        }
+        let variants = Variants::split(document).with_context(parsing)?;
+        for name in variants.names() {
+            Self::from_document(variants.resolve(Some(name))?, &parsing)
+                .with_context(|| format!("[variant.{name}] of {source}"))?;
+        }
+        let mut m =
+            Self::from_document(variants.resolve(variant).with_context(parsing)?, &parsing)?;
+        m.variant = variant.cloned();
+        Ok(m)
+    }
+
+    fn from_document(document: toml::Table, parsing: &dyn Fn() -> String) -> Result<Self> {
+        let m: Self = toml::Value::Table(document)
+            .try_into()
+            .with_context(parsing)?;
         m.validate()?;
         Ok(m)
     }
@@ -1105,21 +1141,29 @@ impl Manifest {
     /// *whether* to prefer a frozen source; when one exists, its content, not the initial
     /// parse, is what's returned.
     pub fn load_frozen(manifest_path: &Path) -> Result<Self> {
-        let working_tree = Self::load(manifest_path)?;
+        Self::load_frozen_variant(manifest_path, None)
+    }
+
+    /// [`Self::load_frozen`] for `variant`, which also decides where the workspace is.
+    pub fn load_frozen_variant(
+        manifest_path: &Path,
+        variant: Option<&VariantName>,
+    ) -> Result<Self> {
+        let working_tree = Self::load_variant(manifest_path, variant)?;
         let manifest_dir = manifest_path
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let workspace = manifest_dir.join(&working_tree.workspace.dir);
         load_frozen_generic(manifest_path, working_tree, &workspace, |text| {
-            let m: Self = toml::from_str(text).with_context(|| {
-                format!(
-                    "parsing manifest {} at its workspace base commit",
+            Self::parse_variant(
+                text,
+                variant,
+                &format!(
+                    "manifest {} at its workspace base commit",
                     manifest_path.display()
-                )
-            })?;
-            m.validate()?;
-            Ok(m)
+                ),
+            )
         })
     }
 
@@ -3518,6 +3562,103 @@ dst = "traces/median_block.txt"
             ),
             "{err:#}"
         );
+    }
+
+    const VARIANTS: &str = r#"
+        [repo]
+        path = "."
+        [judge]
+        measure_cmd = "./m.nu"
+        direction = "higher"
+        objective = "value"
+        [agent]
+        backend = "openshell"
+        model = "base-model"
+        goal = "g"
+        [variant.offline.agent]
+        backend = "command"
+        agent_cmd = "./stand-in.sh"
+        goal = "g"
+    "#;
+
+    fn offline() -> VariantName {
+        VariantName::parse("offline").unwrap()
+    }
+
+    #[test]
+    fn a_variant_replaces_its_tables_and_the_base_reads_as_written() {
+        let base = Manifest::parse_variant(VARIANTS, None, "manifest test").unwrap();
+        assert_eq!(base.agent.backend, AgentBackend::Openshell);
+        assert_eq!(base.agent.model, "base-model");
+        assert_eq!(base.variant, None);
+
+        let selected =
+            Manifest::parse_variant(VARIANTS, Some(&offline()), "manifest test").unwrap();
+        assert_eq!(selected.agent.backend, AgentBackend::Command);
+        assert_eq!(selected.agent.agent_cmd.as_deref(), Some("./stand-in.sh"));
+        assert_eq!(
+            selected.agent.model,
+            default_model(),
+            "[agent] is replaced whole, so the base model does not carry over"
+        );
+        assert_eq!(selected.variant, Some(offline()));
+        assert_eq!(
+            selected.judge.map(|j| j.measure_cmd),
+            base.judge.map(|j| j.measure_cmd)
+        );
+    }
+
+    #[test]
+    fn every_declared_variant_is_validated_whichever_is_selected() {
+        let broken = format!("{VARIANTS}\n[variant.broken.agent]\nbakend = \"command\"\n");
+        for selected in [None, Some(offline())] {
+            let error = Manifest::parse_variant(&broken, selected.as_ref(), "manifest test")
+                .err()
+                .map(|e| format!("{e:#}"))
+                .unwrap_or_default();
+            assert!(
+                error.contains("[variant.broken] of manifest test"),
+                "{error}"
+            );
+            assert!(error.contains("bakend"), "{error}");
+        }
+        let unknown = Manifest::parse_variant(
+            VARIANTS,
+            Some(&VariantName::parse("ofline").unwrap()),
+            "manifest test",
+        )
+        .err()
+        .map(|e| format!("{e:#}"))
+        .unwrap_or_default();
+        assert!(unknown.contains("did you mean \"offline\"?"), "{unknown}");
+    }
+
+    #[test]
+    fn a_manifest_without_variants_keeps_its_parse_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible.toml");
+        std::fs::write(
+            &path,
+            "[repo]\npath = \".\"\n[agnet]\nbackend = \"command\"\n",
+        )
+        .unwrap();
+        let error = format!("{:#}", Manifest::load(&path).err().unwrap());
+        assert!(
+            error.contains(&format!("parsing manifest {}", path.display())),
+            "{error}"
+        );
+        assert!(error.contains("line 3"), "{error}");
+    }
+
+    #[test]
+    fn a_frozen_load_reads_the_selected_variant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("crucible.toml");
+        std::fs::write(&path, VARIANTS).unwrap();
+        let m = Manifest::load_frozen_variant(&path, Some(&offline())).unwrap();
+        assert_eq!(m.agent.backend, AgentBackend::Command);
+        assert_eq!(m.variant, Some(offline()));
+        assert_eq!(Manifest::load_frozen(&path).unwrap().variant, None);
     }
 }
 

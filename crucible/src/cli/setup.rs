@@ -309,6 +309,7 @@ pub(crate) fn prep_plan_runner(
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
     prep_plan_runner_with_params(
         manifest_path,
+        None,
         &std::collections::BTreeMap::new(),
         crate::openshell::gateway::ComputeDriver::Podman,
         crate::args::AgentOverride::default(),
@@ -443,12 +444,13 @@ pub(crate) fn state_dir(manifest_path: &Path) -> std::path::PathBuf {
 
 pub(crate) fn prep_plan_runner_with_params(
     manifest_path: &Path,
+    variant: Option<&manifest::variant::VariantName>,
     params: &std::collections::BTreeMap<String, String>,
     compute_driver: crate::openshell::gateway::ComputeDriver,
     agent: crate::args::AgentOverride,
     start: Start,
 ) -> Result<(crate::plan::harness::HarnessRunner, manifest::Manifest)> {
-    let mut m = manifest::Manifest::load_frozen(manifest_path)?;
+    let mut m = manifest::Manifest::load_frozen_variant(manifest_path, variant)?;
     let manifest_dir = manifest::manifest_dir(manifest_path);
     m.resolve_workflow_with(&manifest_dir, params)?;
     if let Some(all) = m.launch.all() {

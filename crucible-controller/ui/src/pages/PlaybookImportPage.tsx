@@ -19,11 +19,14 @@ import {
 import { FormActions, FormError, FormGrid, TextField } from './formControls';
 import {
   candidatesBody,
+  importOptions,
   INITIAL_IMPORT,
+  optionKey,
   proposeBody,
   withCandidates,
   withSelection,
   withSource,
+  type ImportOption,
   type ImportState,
 } from './playbookImportWizard';
 
@@ -48,14 +51,14 @@ export function PlaybookImportPage() {
 
   const { source, candidates, selected, rev } = state;
 
-  const handleSelect = async (path: string) => {
+  const handleSelect = async (option: ImportOption) => {
     setError(null);
-    setState((previous) => withSelection(previous, path));
+    setState((previous) => withSelection(previous, optionKey(option)));
     try {
-      const dto = await propose.mutateAsync({ body: proposeBody(source, path, owner) });
+      const dto = await propose.mutateAsync({ body: proposeBody(source, option, owner) });
       void navigate(`/playbooks/import/${dto.id}`);
     } catch (err: unknown) {
-      setState((previous) => withSelection(previous, ''));
+      setState((previous) => withSelection(previous, null));
       setError(formatError(err));
     }
   };
@@ -66,8 +69,9 @@ export function PlaybookImportPage() {
       const dto = await listCandidates.mutateAsync({ body: candidatesBody(source) });
       const listed = withCandidates(state, dto);
       setState(listed);
-      const lone = listed.candidates?.length === 1 ? listed.candidates[0] : undefined;
-      if (lone !== undefined) await handleSelect(lone.path);
+      const options = importOptions(listed.candidates ?? []);
+      const lone = options.length === 1 ? options[0] : undefined;
+      if (lone !== undefined) await handleSelect(lone);
     } catch (err: unknown) {
       setState((previous) => ({ ...previous, candidates: null, selected: null }));
       setError(formatError(err));
@@ -174,24 +178,30 @@ export function PlaybookImportPage() {
             </SectionBody>
           ) : (
             <ul className="m-0 list-none p-0">
-              {candidates.map((candidate) => (
-                <li key={candidate.path} className="border-b border-rule">
-                  <button
-                    type="button"
-                    disabled={propose.isPending}
-                    aria-pressed={candidate.path === selected}
-                    onClick={() => {
-                      void handleSelect(candidate.path);
-                    }}
-                    className={`flex w-full cursor-pointer items-baseline gap-3 px-4.5 py-2.5 text-left font-mono text-data hover:bg-hi ${
-                      candidate.path === selected ? 'bg-hi font-semibold text-ink' : 'text-ink-2'
-                    }`}
-                  >
-                    <span>{candidate.path === '' ? '(repo root)' : candidate.path}</span>
-                    <span className="text-ink-3">{candidate.workflow_file}</span>
-                  </button>
-                </li>
-              ))}
+              {importOptions(candidates).map((option) => {
+                const key = optionKey(option);
+                return (
+                  <li key={key} className="border-b border-rule">
+                    <button
+                      type="button"
+                      disabled={propose.isPending}
+                      aria-pressed={key === selected}
+                      onClick={() => {
+                        void handleSelect(option);
+                      }}
+                      className={`flex w-full cursor-pointer items-baseline gap-3 px-4.5 py-2.5 text-left font-mono text-data hover:bg-hi ${
+                        key === selected ? 'bg-hi font-semibold text-ink' : 'text-ink-2'
+                      }`}
+                    >
+                      <span>{option.path === '' ? '(repo root)' : option.path}</span>
+                      <span className="text-ink-3">{option.workflowFile}</span>
+                      {option.variant === null ? null : (
+                        <span className="text-ink-3">variant {option.variant}</span>
+                      )}
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           )}
         </Section>

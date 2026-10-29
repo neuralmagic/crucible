@@ -497,6 +497,7 @@ fn compile_tree(root: &Path) -> CompiledTree {
         root,
         &BTreeMap::new(),
         crate::playbooks::preview::Unvalued::Placeholder,
+        None,
     ) {
         Ok(preview) => CompiledTree {
             params_schema: preview.params_schema,
@@ -516,7 +517,7 @@ fn compile_tree(root: &Path) -> CompiledTree {
             schema_digest: None,
             graph: None,
             diagnostics: vec![parse_diagnostic(&format!("{e}"), root)],
-            agent: crate::playbooks::dispatch::pack_agent(root).ok(),
+            agent: crate::playbooks::dispatch::pack_agent(root, None).ok(),
         },
     }
 }
@@ -1089,7 +1090,7 @@ pub async fn exposure_of(
     let extraction = tokio::task::spawn_blocking(move || {
         let pack = crate::playbooks::packs::materialize_tree(&tree)
             .map_err(crate::playbooks::exposure::ExtractError::Internal)?;
-        crate::playbooks::exposure::extract(pack.path(), None)
+        crate::playbooks::exposure::extract(pack.path(), None, None)
     })
     .await
     .context("joining the draft exposure worker")

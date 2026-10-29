@@ -96,6 +96,15 @@ pub struct HttpTransport {
     auth: Auth,
 }
 
+/// Where an import fetches a pack, and the manifest variant it reads.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct PackImportSource<'a> {
+    pub repo: &'a str,
+    pub git_ref: Option<&'a str>,
+    pub path: Option<&'a str>,
+    pub variant: Option<&'a str>,
+}
+
 pub struct Client {
     transport: std::sync::Arc<dyn Transport>,
 }
@@ -548,12 +557,9 @@ impl Client {
 
     pub async fn import_pack<T: DeserializeOwned>(
         &self,
-        repo: &str,
-        git_ref: Option<&str>,
-        path: Option<&str>,
+        source: &PackImportSource<'_>,
     ) -> Result<T> {
-        let body = serde_json::json!({ "repo": repo, "git_ref": git_ref, "path": path });
-        self.post("/api/playbooks/imports", Some(&body)).await
+        self.post("/api/playbooks/imports", Some(source)).await
     }
 
     pub async fn create_draft<T: DeserializeOwned>(

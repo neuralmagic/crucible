@@ -1816,6 +1816,7 @@ mod tests {
 
         let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
+            None,
             &BTreeMap::new(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
@@ -1890,6 +1891,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
         let turns = |pairs: &[(&str, &str)], flags: crate::args::AgentOverride| {
             let (runner, m) = crate::cli::setup::prep_plan_runner_with_params(
                 &manifest,
+                None,
                 &params(pairs),
                 crate::openshell::gateway::ComputeDriver::Podman,
                 flags,
@@ -1945,6 +1947,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
 
         let twice = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
+            None,
             &params(&[("*.model", "launched-all")]),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
@@ -1990,6 +1993,7 @@ workflow(type = "playbook", tasks = [plan, review, ship])
         let prep = |r: &str, start: crate::cli::setup::Start| {
             crate::cli::setup::prep_plan_runner_with_params(
                 &manifest,
+                None,
                 &BTreeMap::from([("repo.ref".to_string(), r.to_string())]),
                 crate::openshell::gateway::ComputeDriver::Podman,
                 crate::args::AgentOverride::default(),
@@ -5012,6 +5016,7 @@ workflow(type = "playbook", tasks = [echo])
         .unwrap();
         let mut runner = crate::cli::setup::prep_plan_runner_with_params(
             &manifest_path,
+            None,
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),
