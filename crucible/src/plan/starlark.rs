@@ -5661,6 +5661,10 @@ workflow(type = "playbook", tasks = [a])
                 "\"x\": {\"type\": \"string\"}",
                 "neither required nor defaulted",
             ),
+            (
+                "\"x\": {\"type\": \"list<string>\", \"default\": [], \"multiline\": True}",
+                "declares multiline but is a list<string>",
+            ),
         ];
         for (decl, expected) in bad {
             let source =
@@ -5711,6 +5715,10 @@ workflow(type = "playbook", tasks = [a])
             (
                 "\"x\": {\"type\": 5, \"default\": \"d\"}",
                 "field type must be a string literal",
+            ),
+            (
+                "\"x\": {\"type\": \"string\", \"default\": \"d\", \"multiline\": 1}",
+                "field multiline must be True or False",
             ),
         ];
         for (decl, expected) in bad {
