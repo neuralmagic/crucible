@@ -93,30 +93,12 @@ pub(crate) async fn preview(
     let playbook = launch.playbook.clone();
     tokio::task::spawn_blocking(move || {
         let pack = crate::playbooks::packs::materialize_tree(&tree)?;
-        let plan = compiled_plan(pack.path(), &params)?;
+        let plan = crate::playbooks::registry::compiled_plan(pack.path(), &params)
+            .map_err(RerunRefusal::Compile)?;
         decide(&plan, &run, &playbook, draft_version, &session, &from)
     })
     .await
     .context("joining the rerun preview")?
-}
-
-/// The graph a run of the pack at `root` executes with `params`.
-fn compiled_plan(
-    root: &Path,
-    params: &BTreeMap<String, String>,
-) -> Result<crucible::plan::ir::ValidPlan, RerunRefusal> {
-    let source = crate::playbooks::registry::workflow_source(root)
-        .map_err(|e| RerunRefusal::Compile(e.to_string()))?;
-    let compiled = crucible::plan::starlark::compile_file_with(
-        &source,
-        crucible::plan::starlark::parent_or_cwd(&source),
-        params,
-    )
-    .map_err(|e| RerunRefusal::Compile(crucible::errors::report(&e)))?;
-    compiled
-        .workflow
-        .playbook_plan()
-        .map_err(|e| RerunRefusal::Compile(format!("{e:#}")))
 }
 
 fn decide(
@@ -301,9 +283,7 @@ struct UnsafeEntry(String);
 mod tests {
     use crate::client::Db;
     use crate::runs::model::NewRun;
-    use crate::runs::rerun::{
-        RerunRefusal, admit, compiled_plan, materialize_parent, preview, unpack,
-    };
+    use crate::runs::rerun::{RerunRefusal, admit, materialize_parent, preview, unpack};
     use crate::testing::fixtures::write_playbook_pack;
     use sqlx::PgPool;
     use std::collections::BTreeMap;
@@ -332,7 +312,7 @@ mod tests {
     fn session(source: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
         let root = write_playbook_pack(dir.path(), source);
-        let plan = compiled_plan(&root, &BTreeMap::new()).unwrap();
+        let plan = crate::playbooks::registry::compiled_plan(&root, &BTreeMap::new()).unwrap();
         let defs = crucible::plan::rerun::definition_digests(&plan);
         let tasks: Vec<serde_json::Value> = plan
             .tasks_topo()

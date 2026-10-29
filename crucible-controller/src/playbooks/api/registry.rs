@@ -979,7 +979,38 @@ pub(crate) async fn authorize_pack(
     Ok((pack, schema, max_time))
 }
 
-/// Validate one launch request against the registry: [`authorize_pack`], then the values.
+/// Refuse a launch of `tree` the engine would refuse at startup: compiled with the launch's
+/// validated values, its graph does not compile or declares a task timeout past `max_time`.
+#[allow(clippy::result_large_err)]
+pub(crate) async fn check_plan(
+    tree: crucible_contract::pack_tree::PackTree,
+    params: &serde_json::Value,
+    max_time: &crate::model::MaxTime,
+) -> Result<(), Response> {
+    let params = crate::launches::store::stored_params(params);
+    match crate::playbooks::registry::check_tree_runnable(tree, params, max_time.clone()).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(field)) => Err(invalid_fields(vec![field])),
+        Err(e) => Err(AppError::from(e).into_response()),
+    }
+}
+
+/// The response for a pack tree a launch could not read: a 422 naming why when the stored bytes
+/// cannot be a tree, a 500 otherwise.
+pub(crate) fn unreadable_tree(e: anyhow::Error) -> Response {
+    if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
+        .is_some()
+    {
+        return invalid_fields(vec![crate::playbooks::registry::FieldError {
+            field: String::new(),
+            message: format!("{e:#}"),
+        }]);
+    }
+    AppError::from(e).into_response()
+}
+
+/// Validate one launch request against the registry: [`authorize_pack`], then the values, then
+/// the graph those values compile.
 #[allow(clippy::result_large_err)]
 pub(crate) async fn authorize_launch(
     state: &ApiState,
@@ -996,6 +1027,12 @@ pub(crate) async fn authorize_launch(
         Ok(v) => v,
         Err(fields) => return Err(invalid_fields(fields)),
     };
+    let tree = match crate::playbooks::registry::pack(state.db.pool(), id).await {
+        Ok(Some(tree)) => tree,
+        Ok(None) => return Err(not_found(format!("no playbook {id:?}"))),
+        Err(e) => return Err(unreadable_tree(e)),
+    };
+    check_plan(tree, &params, &max_time).await?;
     Ok(AuthorizedLaunch {
         pack,
         params,
