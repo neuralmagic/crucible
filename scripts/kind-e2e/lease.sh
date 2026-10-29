@@ -32,18 +32,20 @@ new_draft "$DRAFT-ltamper" "$WORK/localtamper"
 crux draft-publish "$DRAFT-ltamper" --playbook "$DRAFT-ltpub" --json >"$WORK/publish-O.json"
 LOCAL_TAMPER=$(playbook_tree "$DRAFT-ltpub")
 tamper_file "$LOCAL_TAMPER" check.sh
-launch O-tamper launch "$DRAFT-ltpub"
-settle O-tamper "$KEY"
+if crux launch "$DRAFT-ltpub" --max-cost 1 --max-time 5m >"$WORK/launch-O-tamper.log" 2>&1; then
+    fail "[O] a registered playbook whose stored tree was tampered with launched"
+fi
+grep -qF "$LOCAL_TAMPER no longer matches its stored files" "$WORK/launch-O-tamper.log" ||
+    fail "[O] the tampered launch refusal does not name the tree: $(cat "$WORK/launch-O-tamper.log")"
 watch_stop
-expect_parked O-tamper "$LOCAL_TAMPER no longer matches its stored files"
-for key in "$BLOCK" "$LOCAL_KEY" "$KEY"; do
+for key in "$BLOCK" "$LOCAL_KEY"; do
     [ "$(pods_seen O "$key")" = 0 ] || fail "[O] the local executor created a pod for $key"
 done
 LOCAL_PACK=$(ls -d "$WORK/scratch/local-runs/$(slug "$LOCAL_KEY")"-*/pack)
 [ "$(cat "$LOCAL_PACK/STEER.md")" = "frozen
 $STEER_STAMP
 kind-steer-marker" ] || fail "[O] the local run's STEER.md is: $(cat "$LOCAL_PACK/STEER.md")"
-pass "[O] the local executor ran the stored tree with its steering and parked the tampered one"
+pass "[O] the local executor ran the stored tree with its steering and refused the tampered one"
 
 # ---- scenario J ----------------------------------------------------------------------------
 # rerun_pack <dir> <check command>: produce -> edit -> check -> consume, each appending its name to

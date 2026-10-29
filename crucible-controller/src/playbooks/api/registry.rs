@@ -996,11 +996,9 @@ pub(crate) async fn check_plan(
 }
 
 /// The response for a pack tree a launch could not read: a 422 naming why when the stored bytes
-/// cannot be a tree, a 500 otherwise.
+/// cannot be a tree or no longer match it, a 500 otherwise.
 pub(crate) fn unreadable_tree(e: anyhow::Error) -> Response {
-    if e.downcast_ref::<crate::playbooks::pack_trees::Unconvertible>()
-        .is_some()
-    {
+    if crate::playbooks::pack_trees::is_unreadable(&e) {
         return invalid_fields(vec![crate::playbooks::registry::FieldError {
             field: String::new(),
             message: format!("{e:#}"),
