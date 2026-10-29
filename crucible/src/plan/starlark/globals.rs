@@ -145,6 +145,14 @@ pub(crate) fn routed(builder: &mut GlobalsBuilder) {
         dispatch("optional", args, kwargs, eval)
     }
 
+    fn pick<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch("pick", args, kwargs, eval)
+    }
+
     fn route<'v>(
         #[starlark(args)] args: UnpackTuple<Value<'v>>,
         #[starlark(kwargs)] kwargs: SmallMap<String, Value<'v>>,

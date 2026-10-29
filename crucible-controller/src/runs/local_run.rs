@@ -251,7 +251,15 @@ pub(crate) async fn start(
         "FORGE_STORAGE_ROOT".to_string(),
         forge_root(&dir).to_string_lossy().into_owned(),
     ));
-    env.retain(|(name, _)| name != crucible_contract::ENV_RUN_NAME);
+    env.retain(|(name, _)| {
+        ![
+            crucible_contract::ENV_RUN_NAME,
+            crucible_contract::ENV_CONTROLLER_URL,
+            crucible_contract::ENV_POD_TOKEN,
+        ]
+        .contains(&name.as_str())
+    });
+    env.extend(controller_env(db, cfg, run_id, deadline).await?);
     env.push((
         crucible_contract::ENV_RUN_NAME.to_string(),
         run_id.to_string(),
@@ -424,6 +432,36 @@ async fn open_engine_log(dir: &Path) -> Option<Arc<Mutex<tokio::fs::File>>> {
             None
         }
     }
+}
+
+/// Where a local run reaches the controller that spawned it when no public URL is configured: the
+/// controller's default loopback bind.
+const LOCAL_CONTROLLER_URL: &str = "http://127.0.0.1:8870";
+
+/// What a local run reaches its own controller with: the controller's URL and a pod token for this
+/// run, which revokes when the run completes.
+async fn controller_env(
+    db: &Db,
+    cfg: &ControllerCfg,
+    run_id: &str,
+    lifetime: std::time::Duration,
+) -> Result<Vec<(String, String)>> {
+    let token = crate::runs::pod_token::mint(
+        db.pool(),
+        &crate::runs::pod_token::Subject::Run(run_id.to_owned()),
+        None,
+        lifetime,
+    )
+    .await?;
+    Ok(vec![
+        (
+            crucible_contract::ENV_CONTROLLER_URL.to_string(),
+            cfg.public_url
+                .clone()
+                .unwrap_or_else(|| LOCAL_CONTROLLER_URL.to_string()),
+        ),
+        (crucible_contract::ENV_POD_TOKEN.to_string(), token),
+    ])
 }
 
 /// Read one of the child's pipes to EOF, logging every line, mirroring it into the run's engine

@@ -220,10 +220,10 @@ impl ShellRunner {
                 );
             }
             TaskKind::Route {
-                decider: Decider::Output { .. },
+                decider: Decider::Output { .. } | Decider::Human { .. },
                 ..
             } => {
-                return Attempt::failed(0.0, "output-decided route reached the runner".to_string());
+                return Attempt::failed(0.0, "engine-decided route reached the runner".to_string());
             }
             TaskKind::TopK { .. } => {
                 // The executor owns reducers; reaching the runner is an executor bug.

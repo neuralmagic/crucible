@@ -48,6 +48,7 @@ notes = "Initial draft"
 added = [
     "C-ACT-AS, acting as a team narrows the subject to that team principal",
     "C-WEBHOOK-DELIVERY, C-WEBHOOK-SETTLEMENT, C-WEBHOOK-LIFECYCLE, webhook triggers",
+    "C-ACTIONS: runs define approve, answering a decision request; C-APPROVALS grants it to the launch owner by default and never to a run principal",
 ]
 changed = [
     "C-PRINCIPALS and C-TEAM-UX defer to C-ACT-AS",
