@@ -1,4 +1,4 @@
-import { Section, SectionBody, SectionHeader } from '../ui';
+import { FoldSection, SectionBody } from '../ui';
 import { agentToolRows, type AgentTool } from './agentToolsView';
 
 /** The MCP servers the run's agent was granted at dispatch; nothing when it was granted none. */
@@ -6,8 +6,7 @@ export function RunAgentTools({ tools }: { tools: readonly AgentTool[] }) {
   const rows = agentToolRows(tools);
   if (rows.length === 0) return null;
   return (
-    <Section>
-      <SectionHeader title="Agent tools" note="MCP servers this run's agent could use" />
+    <FoldSection title="Agent tools" note={`${rows.length} MCP ${rows.length === 1 ? 'server' : 'servers'}`}>
       <SectionBody>
         <ul className="grid gap-2 font-mono text-data">
           {rows.map((row) => (
@@ -23,6 +22,6 @@ export function RunAgentTools({ tools }: { tools: readonly AgentTool[] }) {
           ))}
         </ul>
       </SectionBody>
-    </Section>
+    </FoldSection>
   );
 }
