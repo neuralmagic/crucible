@@ -271,13 +271,37 @@ impl ParsedRun {
         Ok(())
     }
 
-    /// The note of the first task attempt that failed outright — what an errored run's park reason
-    /// carries as its diagnosis. `skipped`/`blocked` attempts are downstream of that failure rather
-    /// than the cause of it, so they are passed over; a status the engine does not know reads as a
-    /// failure, matching [`crate::runs::task_evidence`]. `None` when no failing attempt left a note.
+    /// The first unresolved task failure, preferring a captured problem over its exit status.
     pub(crate) fn failure_cause(&self) -> Option<String> {
-        let failed = self
+        let mut last = BTreeMap::new();
+        for (index, result) in self.task_results.iter().enumerate() {
+            last.insert((result.iter, result.task.as_str()), index);
+        }
+
+        let current: Vec<_> = self
             .task_results
+            .iter()
+            .enumerate()
+            .filter(|(index, result)| {
+                if last.get(&(result.iter, result.task.as_str())) != Some(index) {
+                    return false;
+                }
+
+                let Some((node, instance)) = result.task.split_once('[') else {
+                    return true;
+                };
+
+                let Some(parent) = last.get(&(result.iter, node)) else {
+                    return true;
+                };
+
+                !instance.starts_with("round-")
+                    && self.task_results[*parent].status.parse() != Ok(TaskStatus::Pass)
+            })
+            .map(|(_, result)| result)
+            .collect();
+
+        let failed = current
             .iter()
             .filter(|r| {
                 matches!(
@@ -285,11 +309,19 @@ impl ParsedRun {
                     TaskStatus::Fail | TaskStatus::Transport | TaskStatus::Truncated
                 )
             })
-            .map(|r| r.note.trim())
-            .find(|note| !note.is_empty())
-            .map(str::to_owned);
+            .find_map(|r| {
+                r.output
+                    .as_ref()
+                    .and_then(|output| output.get("problem"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|problem| !problem.is_empty())
+                    .map(|problem| format!("{}: {problem}", r.task))
+                    .or_else(|| (!r.note.trim().is_empty()).then(|| r.note.trim().to_owned()))
+            });
+
         failed.or_else(|| {
-            self.task_results.iter().find_map(|r| {
+            current.iter().find_map(|r| {
                 r.blocked
                     .as_ref()
                     .map(|b| format!("{} {}", r.task, blocked_cause(b, &r.note)))
@@ -1357,6 +1389,39 @@ mod tests {
             );
             assert_eq!(parse_session(&log).failure_cause().as_deref(), Some(want));
         }
+    }
+
+    #[test]
+    fn a_recovered_review_timeout_cannot_hide_the_current_build_problem() {
+        let log = [
+            r#"{"v":1,"kind":"task_result","task":"impact_assessment[round-1]","status":"fail","iter":0,"note":"timed out: the task ran past its 10m limit"}"#,
+            r#"{"v":1,"kind":"task_result","task":"planning_check[round-1]","status":"fail","iter":0,"note":"exit 1: "}"#,
+            r#"{"v":1,"kind":"task_result","task":"impact_assessment","status":"pass","iter":0}"#,
+            r#"{"v":1,"kind":"task_result","task":"planning_check","status":"pass","iter":0}"#,
+            r#"{"v":1,"kind":"task_result","task":"pick_review[candidate]","status":"fail","iter":0,"note":"old review failure"}"#,
+            r#"{"v":1,"kind":"task_result","task":"pick_review","status":"pass","iter":0}"#,
+            r#"{"v":1,"kind":"task_result","task":"build","status":"fail","iter":0,"note":"exit 1: ","output":{"pass":false,"problem":"source layer cannot package changed test paths"}}"#,
+            r#"{"v":1,"kind":"task_result","task":"failure_investigation","status":"transport","iter":0,"note":"agent exited without a verdict"}"#,
+        ].join("\n");
+
+        assert_eq!(
+            parse_session(&log).failure_cause().as_deref(),
+            Some("build: source layer cannot package changed test paths")
+        );
+    }
+
+    #[test]
+    fn a_failed_mapped_review_keeps_its_specific_final_attempt_reason() {
+        let log = [
+            r#"{"v":1,"kind":"task_result","task":"review[candidate]","status":"transport","iter":0,"note":"old gateway failure"}"#,
+            r#"{"v":1,"kind":"task_result","task":"review[candidate]","status":"fail","iter":0,"note":"timed out at 30m"}"#,
+            r#"{"v":1,"kind":"task_result","task":"review","status":"fail","iter":0,"note":"1 of 1 instances failed"}"#,
+        ].join("\n");
+
+        assert_eq!(
+            parse_session(&log).failure_cause().as_deref(),
+            Some("timed out at 30m")
+        );
     }
 
     #[test]
