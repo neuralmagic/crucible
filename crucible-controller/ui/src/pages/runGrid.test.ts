@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { barShare, blockedLine, formatSecs, meldRow, runGridView } from './runGrid';
+import { attemptsSummary, barShare, blockedLine, formatSecs, meldRow, runGridView } from './runGrid';
 import type { PlanTask, TaskResult } from './taskGraph';
 
 const task = (name: string, depends_on: string[] = []): PlanTask => ({
@@ -210,6 +210,41 @@ describe('counts', () => {
       { status: 'fail', tone: 'fail', count: 1 },
       { status: 'skipped', tone: 'none', count: 1 },
     ]);
+  });
+});
+
+describe('attemptsSummary', () => {
+  it('says all passed when every attempt passed', () => {
+    expect(attemptsSummary([{ status: 'pass', tone: 'pass', count: 15 }])).toEqual({
+      attempts: '15 attempts',
+      outcomes: [{ status: 'pass', label: 'all passed' }],
+    });
+  });
+
+  it('counts each ending otherwise, in the order the grid tallied them', () => {
+    expect(
+      attemptsSummary([
+        { status: 'pass', tone: 'pass', count: 12 },
+        { status: 'fail', tone: 'fail', count: 1 },
+        { status: 'blocked', tone: 'none', count: 1 },
+        { status: 'transport', tone: 'fail', count: 1 },
+        { status: 'odd', tone: 'none', count: 1 },
+      ]),
+    ).toEqual({
+      attempts: '16 attempts',
+      outcomes: [
+        { status: 'pass', label: '12 passed' },
+        { status: 'fail', label: '1 failed' },
+        { status: 'blocked', label: '1 blocked' },
+        { status: 'transport', label: '1 lost' },
+        { status: 'odd', label: '1 odd' },
+      ],
+    });
+  });
+
+  it('speaks of one attempt in the singular, and of none', () => {
+    expect(attemptsSummary([{ status: 'fail', tone: 'fail', count: 1 }]).attempts).toBe('1 attempt');
+    expect(attemptsSummary([])).toEqual({ attempts: '0 attempts', outcomes: [] });
   });
 });
 

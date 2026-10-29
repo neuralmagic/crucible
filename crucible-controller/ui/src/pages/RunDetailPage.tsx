@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useLocation, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   $api,
@@ -14,6 +14,7 @@ import { MarkdownView } from './MarkdownView';
 import { flowThemeStyle, injectFlowTheme } from './flowTheme';
 import { AgentProviderTag } from './ProviderIcon';
 import { RunAgentTools } from './RunAgentTools';
+import { LaunchWallTime } from './LaunchWallTime';
 import { RunLinks } from './RunLinks';
 import { useLiveEvents } from '../api/useLiveEvents';
 import { formatError } from '../api/errors';
@@ -23,6 +24,7 @@ import { useAppBrand, useAppTheme } from '../appTheme';
 import {
   Breadcrumb,
   Button,
+  CopyText,
   cn,
   createDataColumnHelper,
   DataTable,
@@ -68,11 +70,13 @@ import { buildCostBreakdown, type TaskCostRow } from './costBreakdown';
 import { RunTaskGraph, type RunGraph } from './RunTaskGraph';
 import { latestResults, toneOf } from './taskGraph';
 import { RunTaskGrid } from './RunTaskGrid';
+import { planOrder } from './runGrid';
 import { absoluteTime, relativeTime } from './journeyView';
-import { detailPath } from './launchView';
+import { detailPath, isLaunchKey, launchPath, launchVersion } from './launchView';
 import {
   downloadName,
   imageMimeType,
+  listedFiles,
   parseRunFilePath,
   prettyJson,
   producerOf,
@@ -128,6 +132,13 @@ export function RunDetailPage() {
   const isLiveRun = runDetail.data?.run.status === 'running';
   const flowProbe = useFlowArtifact(runId, runDetail.data !== undefined && !isLiveRun && !isPlaybook);
   const flowAbsent = isLiveRun || flowProbe.isError || flowProbe.data === null;
+  const launchKeyOfRun = runDetail.data?.run.issue_key ?? '';
+  const launch = $api.useQuery(
+    'get',
+    '/api/playbook-runs/{key}',
+    { params: { path: { key: launchKeyOfRun } } },
+    { enabled: isLaunchKey(launchKeyOfRun) },
+  ).data?.launch;
 
   // When the live stream ends because the run finished or is no longer running, refetch the run's
   // queries so the freshly-ingested record replaces the live pane (mirrors the old RunsPage behavior).
@@ -175,8 +186,11 @@ export function RunDetailPage() {
   const vsBaseline = percentChange(run.best_score, baseline);
   const improved = vsBaseline === null ? null : lowerIsBetter ? vsBaseline < 0 : vsBaseline > 0;
 
+  const cost = run.cost_usd ?? launch?.cost_usd ?? null;
   const specs: SpecItem[] = isPlaybook
-    ? [{ label: 'Cost', value: formatCost(run.cost_usd) }]
+    ? cost !== null && cost > 0
+      ? [{ label: 'Cost', value: formatCost(cost) }]
+      : []
     : [
         {
           label: 'Best score',
@@ -209,13 +223,28 @@ export function RunDetailPage() {
         }
         meta={
           <>
-            {run.name && <span>{run.run_id}</span>}
-            {run.issue_key && (
-              <Identifier variant="inline" to={detailPath(run.issue_key)}>
-                {run.issue_key}
-              </Identifier>
+            {launch ? (
+              <>
+                <Link className="text-ink-2 hover:text-ink" to={launchPath(launch.key)}>
+                  {launch.playbook}
+                </Link>
+                <span>{launchVersion(launch)}</span>
+                <span title={absoluteTime(launch.created_at) ?? undefined}>
+                  started {relativeTime(launch.created_at) ?? launch.created_at}
+                </span>
+                <LaunchWallTime launchKey={launch.key} />
+              </>
+            ) : (
+              <>
+
+                {run.issue_key && (
+                  <Identifier variant="inline" to={detailPath(run.issue_key)}>
+                    {run.issue_key}
+                  </Identifier>
+                )}
+                {run.repo && <span>{run.repo}</span>}
+              </>
             )}
-            {run.repo && <span>{run.repo}</span>}
             {run.dispatch === 'local' && <span>ran locally</span>}
             {run.dispatch !== 'local' && run.cluster !== 'hub' && (
               <span title={run.namespace ?? undefined}>on {clusterLabel(run.cluster)}</span>
@@ -228,9 +257,12 @@ export function RunDetailPage() {
             {created !== null && (
               <span title={absoluteTime(created) ?? undefined}>started {relativeTime(created)}</span>
             )}
+            <RunLinks runId={runId} />
+            <CopyText value={run.run_id} />
+            {run.image_digest && <CopyText value={run.image_digest} />}
           </>
         }
-        aside={<Spec items={specs} />}
+        aside={specs.length > 0 ? <Spec items={specs} /> : undefined}
       />
 
       {prUrls.length > 0 && (
@@ -244,7 +276,6 @@ export function RunDetailPage() {
         </Section>
       )}
 
-      <RunLinks runId={runId} />
       {agentTools ? <RunAgentTools tools={runDetail.data?.agent_tools ?? []} /> : null}
 
       {isLiveRun && (
@@ -1241,7 +1272,8 @@ function FilesPanel({
     return out;
   }, [graph.data]);
   const entries = listing.data?.files ?? [];
-  const selection = selectRunFile(entries, fileKey);
+  const order = useMemo(() => planOrder(graph.data?.tasks ?? []), [graph.data]);
+  const selection = selectRunFile(entries, fileKey, order);
   const anchor = useRef<HTMLDivElement>(null);
   const anchored = useRef(false);
   const openedOnDeepLink = useRef(fileKey !== null);
@@ -1295,13 +1327,15 @@ function FilesPanel({
   }
 
   const selectedKey = selection.state === 'found' ? selection.file.key : null;
+  const listed = listedFiles(entries, selectedKey);
+  const empty = entries.length - listed.length;
 
   return (
     <div ref={anchor}>
       <Section>
         <SectionHeader
           title="Files"
-          note={`${entries.length} files`}
+          note={`${listed.length} files${empty > 0 ? ` · ${empty} empty` : ''}`}
           actions={
             selection.state === 'found' && (
               <CopyLinkButton route={{ launchKey, runId, fileKey: selection.file.key }} />
@@ -1320,7 +1354,7 @@ function FilesPanel({
             minSize="3rem"
             className="overflow-y-auto bg-surface"
           >
-            {entries.map((e) => (
+            {listed.map((e) => (
               <div
                 key={e.key}
                 className={cn(
