@@ -263,7 +263,10 @@ pub(crate) async fn get_tree(
     }
     let tree = PackTree::new(files).with_context(|| format!("pack tree {digest}"))?;
     if &tree.digest() != digest {
-        bail!("pack tree {digest} no longer matches its stored files");
+        return Err(Tampered {
+            digest: digest.clone(),
+        }
+        .into());
     }
     Ok(Some(tree))
 }
@@ -366,6 +369,19 @@ pub(crate) async fn superseded_in(
 pub(crate) struct Unconvertible {
     pub(crate) digest: String,
     pub(crate) reason: String,
+}
+
+/// A stored tree whose files no longer hash to its digest.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("pack tree {digest} no longer matches its stored files")]
+pub(crate) struct Tampered {
+    pub(crate) digest: TreeDigest,
+}
+
+/// Whether `e` is a pack that can never be read, [`Unconvertible`] or [`Tampered`], rather than a
+/// failure to read it.
+pub(crate) fn is_unreadable(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<Unconvertible>().is_some() || e.downcast_ref::<Tampered>().is_some()
 }
 
 /// The refusal for legacy bytes that conversion recorded as unconvertible, `None` for any others.

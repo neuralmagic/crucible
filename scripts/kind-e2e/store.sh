@@ -318,12 +318,14 @@ fi
 grep -qF "$TAMPER_TREE no longer matches its stored files" "$WORK/launch-T-draft.log" ||
     fail "[T] the draft launch refusal does not name the tree: $(cat "$WORK/launch-T-draft.log")"
 pass "[T] the draft launch is refused naming the tampered tree"
-watch_start T
-launch T launch "$DRAFT-tpub"
-settle T "$KEY"
-watch_stop
-expect_parked T "$TAMPER_TREE no longer matches its stored files"
-expect_no_pod T "$KEY"
+if crux launch "$DRAFT-tpub" --max-cost 1 --max-time 5m >"$WORK/launch-T.log" 2>&1; then
+    fail "[T] a registered playbook whose stored tree was tampered with launched"
+fi
+grep -qF "$TAMPER_TREE no longer matches its stored files" "$WORK/launch-T.log" ||
+    fail "[T] the registered launch refusal does not name the tree: $(cat "$WORK/launch-T.log")"
+[ "$(sql -c "SELECT count(*) FROM playbook_launches WHERE playbook = '$DRAFT-tpub'")" = 0 ] ||
+    fail "[T] the refused registered launch stored a launch"
+pass "[T] the registered launch is refused naming the tampered tree"
 
 # ---- scenario I ----------------------------------------------------------------------------
 log "[I] importing a pack from a local git repo"
