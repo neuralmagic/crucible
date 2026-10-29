@@ -19,8 +19,32 @@ export interface ImportState {
   /// The commit the listing resolved to.
   rev: string | null;
   candidates: readonly ImportCandidateDto[] | null;
-  /// The pack directory being proposed, while that POST is in flight.
+  /// The [`optionKey`] of the option being proposed, while that POST is in flight.
   selected: string | null;
+}
+
+/// One thing a listing can propose: a pack directory, read as its base manifest or as one of the
+/// variants it declares.
+export interface ImportOption {
+  path: string;
+  workflowFile: string;
+  variant: string | null;
+}
+
+/// Each candidate's base manifest, then each variant it declares.
+export function importOptions(candidates: readonly ImportCandidateDto[]): ImportOption[] {
+  return candidates.flatMap((candidate) => [
+    { path: candidate.path, workflowFile: candidate.workflow_file, variant: null },
+    ...candidate.variants.map((variant) => ({
+      path: candidate.path,
+      workflowFile: candidate.workflow_file,
+      variant,
+    })),
+  ]);
+}
+
+export function optionKey(option: ImportOption): string {
+  return JSON.stringify([option.path, option.variant]);
 }
 
 export const INITIAL_IMPORT: ImportState = {
@@ -44,8 +68,8 @@ export function withCandidates(
   return { ...state, rev: listed.rev, candidates: listed.candidates, selected: null };
 }
 
-export function withSelection(state: ImportState, path: string): ImportState {
-  return { ...state, selected: path };
+export function withSelection(state: ImportState, key: string | null): ImportState {
+  return { ...state, selected: key };
 }
 
 export function candidatesBody(source: ImportSource): ImportCandidatesBody {
@@ -53,10 +77,14 @@ export function candidatesBody(source: ImportSource): ImportCandidatesBody {
   return { repo: source.repo.trim(), git_ref: gitRef.length > 0 ? gitRef : null };
 }
 
-/// The POST that turns a picked candidate into a durable row. The server fetches and compiles;
+/// The POST that turns a picked option into a durable row. The server fetches and compiles;
 /// nothing about the pack rides this body.
-export function proposeBody(source: ImportSource, path: string, owner: string): ProposeImportBody {
-  return { ...candidatesBody(source), path, owner };
+export function proposeBody(
+  source: ImportSource,
+  option: ImportOption,
+  owner: string
+): ProposeImportBody {
+  return { ...candidatesBody(source), path: option.path, owner, variant: option.variant };
 }
 
 /// The values a re-compile runs with. Blanks are dropped rather than compiled against empty

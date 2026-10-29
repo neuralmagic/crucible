@@ -217,6 +217,9 @@ export function PlaybookImportReviewPage() {
               {row.git_ref === null || row.git_ref === undefined ? '' : ` · ${row.git_ref}`}
             </div>
             <div data-testid="import-rev">pinned at {row.rev.slice(0, 12)}</div>
+            {row.variant === null || row.variant === undefined ? null : (
+              <div data-testid="import-variant">variant {row.variant}</div>
+            )}
             <div>
               proposed by {row.proposed_by ?? 'an anonymous caller'} at {row.created_at}
             </div>

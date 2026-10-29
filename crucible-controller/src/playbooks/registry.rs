@@ -17,6 +17,7 @@
 use crate::playbooks::pack_trees::PACK_COLS;
 use crate::playbooks::packs::{Deliverable, MaterializedPack};
 use anyhow::{Context, Result};
+use crucible::manifest::variant::VariantName;
 use crucible::plan::starlark::declared_params;
 use crucible::plan::starlark::params::ParamType;
 use crucible_contract::content_digest;
@@ -89,6 +90,8 @@ pub struct RegisterPlaybook {
     /// The exposure digest the caller reviewed. Re-registering an id whose declared exposure
     /// changed is refused with [`RegisterError::ExposureChanged`] unless this names the new digest.
     pub accept_exposure_digest: Option<String>,
+    /// The manifest variant every launch of this registration runs; `None` is the base manifest.
+    pub variant: Option<VariantName>,
 }
 
 /// A draft version to store under `id` without a git round trip.
@@ -208,12 +211,14 @@ pub struct PlaybookRow {
     pub created_by: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+    /// The manifest variant the registration runs; `None` is the base manifest.
+    pub variant: Option<VariantName>,
 }
 
 const PLAYBOOK_COLS: &str = "id, description, repo, git_ref, rev, path, source_draft, \
      source_draft_version, tar_digest, tree_digest, schema_digest, agent_backend, \
      agent_sandbox_image, agent_requirements, core_rev, exposure_digest, owner, created_by, \
-     created_at, updated_at";
+     created_at, updated_at, variant";
 
 impl PlaybookRow {
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
@@ -236,6 +241,7 @@ impl PlaybookRow {
             created_by: row.try_get("created_by")?,
             created_at: row.try_get("created_at")?,
             updated_at: row.try_get("updated_at")?,
+            variant: variant_from_row(row)?,
         })
     }
 
@@ -459,6 +465,8 @@ pub struct ImportCandidate {
     pub path: String,
     /// The `[workflow].file` it declares, relative to the pack directory.
     pub workflow_file: String,
+    /// The manifest variants it declares, in name order.
+    pub variants: Vec<VariantName>,
 }
 
 /// How deep under a checkout root a pack directory is looked for.
@@ -476,7 +484,7 @@ pub(crate) fn enumerate_candidates(checkout: &Path) -> Vec<ImportCandidate> {
         if found.len() >= CANDIDATE_MAX {
             break;
         }
-        if let Ok(source) = workflow_source(&dir)
+        if let Ok(source) = workflow_source(&dir, None)
             && let Ok(rel) = source.strip_prefix(&dir)
         {
             let path = dir
@@ -484,9 +492,14 @@ pub(crate) fn enumerate_candidates(checkout: &Path) -> Vec<ImportCandidate> {
                 .unwrap_or(&dir)
                 .to_string_lossy()
                 .to_string();
+            let variants = std::fs::read_to_string(dir.join(crate::playbooks::packs::MANIFEST))
+                .map_err(anyhow::Error::from)
+                .and_then(|text| crucible::manifest::variant::declared(&text))
+                .unwrap_or_default();
             found.push(ImportCandidate {
                 path,
                 workflow_file: rel.to_string_lossy().to_string(),
+                variants,
             });
         }
         if depth >= CANDIDATE_MAX_DEPTH {
@@ -579,19 +592,21 @@ impl PackWorkflowKind {
 }
 
 /// The workflow source a registered pack declares, resolved against the pack root.
-pub(crate) fn workflow_source(pack: &Path) -> Result<PathBuf, RegisterError> {
-    workflow_source_for(pack, PackWorkflowKind::Playbook)
+pub(crate) fn workflow_source(
+    pack: &Path,
+    variant: Option<&VariantName>,
+) -> Result<PathBuf, RegisterError> {
+    workflow_source_for(pack, PackWorkflowKind::Playbook, variant)
 }
 
 /// Resolve the workflow source while keeping the accepted family explicit at non-registry doors.
 pub(crate) fn workflow_source_for(
     pack: &Path,
     kind: PackWorkflowKind,
+    variant: Option<&VariantName>,
 ) -> Result<PathBuf, RegisterError> {
-    let manifest = pack.join("crucible.toml");
-    let text = std::fs::read_to_string(&manifest).map_err(|e| {
-        RegisterError::Invalid(format!("reading the pack's crucible.toml failed: {e}"))
-    })?;
+    let text = crate::playbooks::packs::manifest_text(pack, variant)
+        .map_err(|e| RegisterError::Invalid(format!("reading the pack's crucible.toml: {e:#}")))?;
     let parsed: ManifestWorkflow = toml::from_str(&text)
         .map_err(|e| RegisterError::Invalid(format!("parsing the pack's crucible.toml: {e}")))?;
     let workflow = parsed.workflow.ok_or_else(|| {
@@ -627,8 +642,11 @@ pub(crate) fn workflow_source_for(
 /// of `plan params`) and return it with its digest. A refused source carries the engine's
 /// diagnostic verbatim — that `file:line:col` compile error is the whole reason extraction happens
 /// at registration. Blocking.
-fn extract_params_schema(pack: &Path) -> Result<(serde_json::Value, String), RegisterError> {
-    let source = workflow_source(pack)?;
+fn extract_params_schema(
+    pack: &Path,
+    variant: Option<&VariantName>,
+) -> Result<(serde_json::Value, String), RegisterError> {
+    let source = workflow_source(pack, variant)?;
     let text = std::fs::read_to_string(&source)
         .with_context(|| format!("reading {}", source.display()))
         .map_err(RegisterError::Internal)?;
@@ -643,8 +661,9 @@ fn extract_params_schema(pack: &Path) -> Result<(serde_json::Value, String), Reg
 pub(crate) fn compiled_plan(
     root: &Path,
     params: &std::collections::BTreeMap<String, String>,
+    variant: Option<&VariantName>,
 ) -> Result<crucible::plan::ir::ValidPlan, String> {
-    let source = workflow_source(root).map_err(|e| e.to_string())?;
+    let source = workflow_source(root, variant).map_err(|e| e.to_string())?;
     let compiled = crucible::plan::starlark::compile_file_with(
         &source,
         crucible::plan::starlark::parent_or_cwd(&source),
@@ -663,8 +682,9 @@ pub(crate) fn check_runnable(
     root: &Path,
     params: &std::collections::BTreeMap<String, String>,
     max_time: &crate::model::MaxTime,
+    variant: Option<&VariantName>,
 ) -> Result<(), FieldError> {
-    let plan = compiled_plan(root, params).map_err(|message| FieldError {
+    let plan = compiled_plan(root, params, variant).map_err(|message| FieldError {
         field: String::new(),
         message: format!("the pack does not compile with these values: {message}"),
     })?;
@@ -681,10 +701,16 @@ pub(crate) async fn check_tree_runnable(
     tree: PackTree,
     params: std::collections::BTreeMap<String, String>,
     max_time: crate::model::MaxTime,
+    variant: Option<VariantName>,
 ) -> Result<Result<(), FieldError>> {
     tokio::task::spawn_blocking(move || {
         let pack = crate::playbooks::packs::materialize_tree(&tree)?;
-        Ok(check_runnable(pack.path(), &params, &max_time))
+        Ok(check_runnable(
+            pack.path(),
+            &params,
+            &max_time,
+            variant.as_ref(),
+        ))
     })
     .await
     .context("joining the launch plan check")?
@@ -695,8 +721,11 @@ pub(crate) async fn check_tree_runnable(
 ///
 /// A launch of a registered playbook renders no `--pr-repo`, so neither does this: the `draft-pr`
 /// default a run resolves is the manifest's own `[publish].pr_repo` or nothing.
-fn extract_exposure(pack: &Path) -> Result<crate::playbooks::exposure::Exposure, RegisterError> {
-    crate::playbooks::exposure::extract(pack, None).map_err(|e| match e {
+fn extract_exposure(
+    pack: &Path,
+    variant: Option<&VariantName>,
+) -> Result<crate::playbooks::exposure::Exposure, RegisterError> {
+    crate::playbooks::exposure::extract(pack, None, variant).map_err(|e| match e {
         crate::playbooks::exposure::ExtractError::Refused(msg) => {
             RegisterError::Compile(format!("extracting the pack's exposure: {msg}"))
         }
@@ -746,7 +775,7 @@ pub async fn register(
                 expected_rev: req.expected_rev.as_deref(),
             },
         )?;
-        let extracted = extract(fetched.scratch.path())?;
+        let extracted = extract(fetched.scratch.path(), req.variant.as_ref())?;
         Ok::<_, RegisterError>((req, fetched.rev, fetched.pack, extracted))
     })
     .await
@@ -765,6 +794,7 @@ pub async fn register(
             pack,
             replaces: None,
             accept_exposure_digest: req.accept_exposure_digest,
+            variant: req.variant,
         },
         extracted,
         actor,
@@ -809,7 +839,7 @@ pub async fn publish_draft(
         let scratch = crate::playbooks::packs::materialize_tree(pack.tree())
             .context("writing the draft pack to scratch")
             .map_err(RegisterError::Internal)?;
-        let extracted = extract(scratch.path())?;
+        let extracted = extract(scratch.path(), None)?;
         Ok::<_, RegisterError>((req, pack, extracted))
     })
     .await
@@ -828,6 +858,7 @@ pub async fn publish_draft(
             pack,
             replaces: Some(req.replaces),
             accept_exposure_digest: req.accept_exposure_digest,
+            variant: None,
         },
         extracted,
         actor,
@@ -853,10 +884,11 @@ struct Extracted {
 }
 
 /// Extract everything a registry row records about an unpacked pack. Blocking.
-fn extract(pack: &Path) -> Result<Extracted, RegisterError> {
-    let (schema, schema_digest) = extract_params_schema(pack)?;
-    let exposure = crate::playbooks::exposure::Extraction::Declared(extract_exposure(pack)?);
-    let agent = crate::playbooks::dispatch::pack_agent(pack)
+fn extract(pack: &Path, variant: Option<&VariantName>) -> Result<Extracted, RegisterError> {
+    let (schema, schema_digest) = extract_params_schema(pack, variant)?;
+    let exposure =
+        crate::playbooks::exposure::Extraction::Declared(extract_exposure(pack, variant)?);
+    let agent = crate::playbooks::dispatch::pack_agent(pack, variant)
         .map_err(|e| RegisterError::Invalid(format!("{e:#}")))?;
     Ok(Extracted {
         schema,
@@ -877,6 +909,16 @@ struct NewRow {
     /// `Some` pins whether a row under `id` must already exist; `None` takes either.
     replaces: Option<bool>,
     accept_exposure_digest: Option<String>,
+    variant: Option<VariantName>,
+}
+
+/// A row's `variant` column. A stored name the engine no longer accepts is an error rather than
+/// a silent fall back to the base manifest.
+pub(crate) fn variant_from_row(row: &sqlx::postgres::PgRow) -> Result<Option<VariantName>> {
+    row.try_get::<Option<String>, _>("variant")?
+        .map(|v| VariantName::parse(&v))
+        .transpose()
+        .context("decoding a stored manifest variant")
 }
 
 /// Write `row` in one transaction: refuse an unaccepted exposure change and an id a live draft
@@ -964,9 +1006,9 @@ async fn store(
                                   tar_bytes, params_schema, schema_digest, agent_backend,
                                   agent_sandbox_image, core_rev, created_by, created_at,
                                   updated_at, exposure, exposure_digest, agent_requirements, owner,
-                                  source_draft, source_draft_version, tree_digest)
+                                  source_draft, source_draft_version, tree_digest, variant)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16,
-                   $17, $18, $19, $20, $21, $22, $23)
+                   $17, $18, $19, $20, $21, $22, $23, $24)
            ON CONFLICT (id) DO UPDATE SET
                description = excluded.description, repo = excluded.repo,
                git_ref = excluded.git_ref, rev = excluded.rev, path = excluded.path,
@@ -980,7 +1022,7 @@ async fn store(
                agent_requirements = excluded.agent_requirements,
                core_rev = excluded.core_rev, updated_at = excluded.updated_at,
                exposure = excluded.exposure, exposure_digest = excluded.exposure_digest,
-               tree_digest = excluded.tree_digest"#,
+               tree_digest = excluded.tree_digest, variant = excluded.variant"#,
     )
     .bind(&row.id)
     .bind(row.description.trim())
@@ -1009,6 +1051,7 @@ async fn store(
     .bind(source_draft)
     .bind(source_draft_version)
     .bind(tree_digest.as_str())
+    .bind(row.variant.as_ref().map(VariantName::as_str))
     .execute(&mut *tx)
     .await
     .context("storing the playbook row")
@@ -1138,10 +1181,10 @@ pub async fn files(
 }
 
 /// Copy a registered pack into launch `key`'s `pack_tarballs` row, so the launch runs the pack it
-/// was authorized against even after the registry is re-pinned, and the registry row's exposure
-/// onto the launch row when it records none. One statement, so both come from the same registry
-/// revision, and the blob never round-trips through the controller. `false` when the id is
-/// unknown.
+/// was authorized against even after the registry is re-pinned, the registry row's exposure onto
+/// the launch row when it records none, and the row's manifest variant. One statement, so all
+/// three come from the same registry revision, and the blob never round-trips through the
+/// controller. `false` when the id is unknown.
 pub(crate) async fn copy_pack_to_launch<'e>(
     ex: impl sqlx::PgExecutor<'e>,
     id: &str,
@@ -1149,7 +1192,8 @@ pub(crate) async fn copy_pack_to_launch<'e>(
 ) -> Result<bool> {
     let copied: i64 = sqlx::query_scalar(
         r#"WITH p AS (
-               SELECT tar_gz, tar_digest, tar_bytes, tree_digest, exposure, exposure_digest
+               SELECT tar_gz, tar_digest, tar_bytes, tree_digest, exposure, exposure_digest,
+                      variant
                FROM playbooks WHERE id = $1
            ), pack AS (
                INSERT INTO pack_tarballs (issue_slug, tar_gz, digest, bytes, created_at, tree_digest)
@@ -1158,10 +1202,13 @@ pub(crate) async fn copy_pack_to_launch<'e>(
                    tar_gz = excluded.tar_gz, digest = excluded.digest, bytes = excluded.bytes,
                    created_at = excluded.created_at, tree_digest = excluded.tree_digest
                RETURNING 1
-           ), exposure AS (
+           ), launch AS (
                UPDATE playbook_launches pl
-               SET exposure = p.exposure, exposure_digest = p.exposure_digest
-               FROM p WHERE pl.key = $2 AND pl.exposure IS NULL
+               SET exposure = COALESCE(pl.exposure, p.exposure),
+                   exposure_digest = CASE WHEN pl.exposure IS NULL THEN p.exposure_digest
+                                          ELSE pl.exposure_digest END,
+                   variant = p.variant
+               FROM p WHERE pl.key = $2
            )
            SELECT count(*) FROM pack"#,
     )
@@ -1180,14 +1227,15 @@ pub(crate) async fn copy_pack_to_launch<'e>(
 /// a pin bump must not leave a registered playbook with no form to render.
 pub async fn rederive_stale(pool: &PgPool) -> Result<usize> {
     let core_rev = core_rev()?;
-    let ids: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM playbooks WHERE core_rev <> $1 ORDER BY id")
-            .bind(&core_rev)
-            .fetch_all(pool)
-            .await
-            .context("listing playbooks registered against an older engine revision")?;
+    let rows = sqlx::query("SELECT id, variant FROM playbooks WHERE core_rev <> $1 ORDER BY id")
+        .bind(&core_rev)
+        .fetch_all(pool)
+        .await
+        .context("listing playbooks registered against an older engine revision")?;
     let mut updated = 0usize;
-    for id in ids {
+    for row in rows {
+        let id: String = row.try_get("id")?;
+        let variant = variant_from_row(&row)?;
         let tree = pack(pool, &id).await;
         let extracted = tokio::task::spawn_blocking(move || {
             let tree = tree
@@ -1195,9 +1243,11 @@ pub async fn rederive_stale(pool: &PgPool) -> Result<usize> {
                 .map_err(RegisterError::Internal)?;
             let pack = crate::playbooks::packs::materialize_tree(&tree)
                 .map_err(RegisterError::Internal)?;
-            let (schema, digest) = extract_params_schema(pack.path())?;
-            let exposure =
-                crate::playbooks::exposure::Extraction::Declared(extract_exposure(pack.path())?);
+            let (schema, digest) = extract_params_schema(pack.path(), variant.as_ref())?;
+            let exposure = crate::playbooks::exposure::Extraction::Declared(extract_exposure(
+                pack.path(),
+                variant.as_ref(),
+            )?);
             Ok::<_, RegisterError>((schema, digest, exposure))
         })
         .await
@@ -1882,7 +1932,113 @@ mod tests {
             path: String::new(),
             expected_rev: None,
             accept_exposure_digest: None,
+            variant: None,
         }
+    }
+
+    /// A registration names the manifest variant every launch runs. Its form and agent are read
+    /// off that variant, a launch copies it with the pack, and a variant the pack does not declare
+    /// registers nothing.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_registration_reads_and_launches_its_variant(pool: PgPool) {
+        let _g = crate::ENV_LOCK.lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = format!(
+            "{PLAYBOOK_REPO_MANIFEST}\n[variant.offline.agent]\nbackend = \"command\"\n\
+             agent_cmd = \"./stand-in.sh\"\n\n[variant.offline.workflow]\ntype = \"playbook\"\n\
+             file = \"offline.star\"\n"
+        );
+        let repo = fixture_repo(dir.path(), &manifest);
+        std::fs::write(Path::new(&repo).join("offline.star"), WORKFLOW_TOPIC_DEPTH)
+            .expect("variant source");
+        run_git(&["-C", &repo, "add", "-A"]);
+        run_git(&["-C", &repo, "commit", "--quiet", "-m", "offline"]);
+        let offline = VariantName::parse("offline").expect("variant name");
+
+        register(
+            &pool,
+            &PackGit::default(),
+            RegisterPlaybook {
+                variant: Some(offline.clone()),
+                ..request("survey", &repo)
+            },
+            Some("wren"),
+        )
+        .await
+        .expect("register the variant");
+        let row = get(&pool, "survey").await.expect("get").expect("row");
+        assert_eq!(row.variant, Some(offline.clone()));
+        assert_eq!(
+            row.agent.as_ref().map(|a| a.backend.as_str()),
+            Some("command")
+        );
+        assert_eq!(
+            schema(&pool, "survey").await.expect("schema"),
+            Some(schema_of(WORKFLOW_TOPIC_DEPTH)),
+            "the form is the variant's workflow source"
+        );
+
+        register(
+            &pool,
+            &PackGit::default(),
+            request("base", &repo),
+            Some("wren"),
+        )
+        .await
+        .expect("register the base");
+        let base = get(&pool, "base").await.expect("get").expect("row");
+        assert_eq!(base.variant, None);
+        assert_eq!(
+            base.agent.as_ref().map(|a| a.backend.as_str()),
+            Some("local")
+        );
+        assert_eq!(
+            schema(&pool, "base").await.expect("schema"),
+            Some(schema_of(WORKFLOW_TOPIC))
+        );
+
+        let refused = register(
+            &pool,
+            &PackGit::default(),
+            RegisterPlaybook {
+                variant: Some(VariantName::parse("online").expect("variant name")),
+                ..request("other", &repo)
+            },
+            Some("wren"),
+        )
+        .await
+        .expect_err("an undeclared variant registers nothing");
+        assert!(
+            format!("{refused}").contains("no variant \"online\""),
+            "{refused}"
+        );
+        assert!(get(&pool, "other").await.expect("get").is_none());
+
+        let launch = crate::testing::launch_playbook(&pool, "playbook:survey:1").await;
+        assert_eq!(launch.variant, Some(offline.clone()));
+        register(
+            &pool,
+            &PackGit::default(),
+            request("survey", &repo),
+            Some("wren"),
+        )
+        .await
+        .expect("re-register on the base");
+        assert_eq!(
+            get(&pool, "survey")
+                .await
+                .expect("get")
+                .expect("row")
+                .variant,
+            None
+        );
+        assert_eq!(
+            crate::launches::store::launch_variant(&pool, "playbook:survey:1")
+                .await
+                .expect("variant"),
+            Some(offline),
+            "a launch keeps the variant it was authorized with"
+        );
     }
 
     #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
@@ -2273,10 +2429,12 @@ mod tests {
                 ImportCandidate {
                     path: "packs/survey".to_string(),
                     workflow_file: "workflow.star".to_string(),
+                    variants: Vec::new(),
                 },
                 ImportCandidate {
                     path: "packs/nested/audit".to_string(),
                     workflow_file: "workflow.star".to_string(),
+                    variants: Vec::new(),
                 },
             ],
             "shallowest first, and only registrable playbook packs"
@@ -2294,7 +2452,32 @@ mod tests {
             vec![ImportCandidate {
                 path: String::new(),
                 workflow_file: "workflow.star".to_string(),
+                variants: Vec::new(),
             }]
+        );
+    }
+
+    /// A candidate lists the variants its manifest declares, so an import can pick one before
+    /// anything is proposed.
+    #[test]
+    fn enumerate_candidates_lists_each_packs_variants() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = format!(
+            "{PLAYBOOK_REPO_MANIFEST}\n[variant.offline.agent]\nbackend = \"command\"\n\
+             [variant.e2e.agent]\nbackend = \"command\"\n"
+        );
+        let repo = fixture_repo(dir.path(), &manifest);
+        let found = enumerate_candidates(Path::new(&repo));
+        assert_eq!(
+            found
+                .iter()
+                .map(|c| c
+                    .variants
+                    .iter()
+                    .map(VariantName::as_str)
+                    .collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![vec!["e2e", "offline"]]
         );
     }
 

@@ -109,12 +109,14 @@ pub struct PackImport {
     pub created_at: String,
     pub resolved_by: Option<String>,
     pub resolved_at: Option<String>,
+    /// The manifest variant the import previews and registers; `None` is the base manifest.
+    pub variant: Option<crucible::manifest::variant::VariantName>,
 }
 
 const COLUMNS: &str = "id, repo, git_ref, path, rev, tree_digest, params_schema, schema_digest, \
                        graph, diagnostics, agent_backend, agent_sandbox_image, agent_requirements, declared_secrets, \
                        exposure, exposure_digest, core_rev, status, playbook, draft_id, owner, proposed_by, created_at, resolved_by, \
-                       resolved_at";
+                       resolved_at, variant";
 
 impl PackImport {
     fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self> {
@@ -157,6 +159,7 @@ impl PackImport {
             created_at: row.try_get("created_at")?,
             resolved_by: row.try_get("resolved_by")?,
             resolved_at: row.try_get("resolved_at")?,
+            variant: crate::playbooks::registry::variant_from_row(row)?,
         })
     }
 
@@ -189,6 +192,7 @@ pub async fn propose(
     source: PackSource<'_>,
     actor: Option<&str>,
     owner: &crate::authz::model::Principal,
+    variant: Option<crucible::manifest::variant::VariantName>,
 ) -> Result<Proposed, ImportError> {
     validate_path(source.path).map_err(RegisterError::Invalid)?;
     let core_rev = crate::playbooks::registry::core_rev()?;
@@ -199,6 +203,7 @@ pub async fn propose(
         source.path.to_string(),
     );
     let git = git.clone();
+    let previewed = variant.clone();
     let fetched = tokio::task::spawn_blocking(move || {
         let (repo, git_ref, path) = owned;
         let fetched = crate::playbooks::registry::fetch_pack(
@@ -214,6 +219,7 @@ pub async fn propose(
             fetched.scratch.path(),
             &BTreeMap::new(),
             crate::playbooks::preview::Unvalued::Refuse,
+            previewed.as_ref(),
         )?;
         Ok::<_, RegisterError>((fetched.rev, fetched.pack, preview))
     })
@@ -252,9 +258,9 @@ pub async fn propose(
                                      agent_backend, agent_sandbox_image, declared_secrets,
                                      exposure, exposure_digest,
                                      core_rev, status, proposed_by, created_at, agent_requirements,
-                                     owner, tree_digest)
+                                     owner, tree_digest, variant)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18,
-                   'pending', $19, $20, $21, $22, $23)
+                   'pending', $19, $20, $21, $22, $23, $24)
            RETURNING {COLUMNS}"#
     ))
     .bind(&id)
@@ -280,6 +286,7 @@ pub async fn propose(
     .bind(preview.agent.as_ref().map(|a| a.requirements_json()))
     .bind(owner.to_string())
     .bind(tree_digest.as_str())
+    .bind(variant.as_ref().map(|v| v.as_str()))
     .fetch_one(&mut *tx)
     .await
     .context("storing a pack import")?;
@@ -325,6 +332,7 @@ pub async fn compile(
     let tree = pack(pool, id)
         .await?
         .ok_or_else(|| ImportError::NotFound(format!("no pack import {id:?}")))?;
+    let variant = get(pool, id).await?.and_then(|import| import.variant);
     let preview = tokio::task::spawn_blocking(move || {
         let pack = crate::playbooks::packs::materialize_tree(&tree)
             .context("writing the frozen import to scratch")
@@ -333,6 +341,7 @@ pub async fn compile(
             pack.path(),
             &params,
             crate::playbooks::preview::Unvalued::Refuse,
+            variant.as_ref(),
         )
     })
     .await
@@ -398,6 +407,7 @@ pub async fn register(
             path: import.path.clone(),
             expected_rev: Some(import.rev.clone()),
             accept_exposure_digest: import.exposure_digest.clone(),
+            variant: import.variant.clone(),
         },
         actor,
     )
@@ -498,7 +508,7 @@ pub async fn propose_as_draft(
     owner: &crate::authz::model::Principal,
 ) -> Result<(Proposed, SavedVersion), ImportError> {
     crate::playbooks::drafts::ensure_available(pool, draft_id, description).await?;
-    let proposed = propose(pool, git, source, actor, owner).await?;
+    let proposed = propose(pool, git, source, actor, owner, None).await?;
     let saved = open_as_draft(pool, &proposed.import.id, draft_id, description, actor).await?;
     Ok((proposed, saved))
 }
@@ -548,6 +558,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes")
@@ -581,6 +592,81 @@ mod tests {
         );
     }
 
+    /// An import previews the variant it names, and the registration it becomes runs that
+    /// variant.
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn an_import_previews_and_registers_its_variant(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = format!(
+            "{PLAYBOOK_REPO_MANIFEST}\n[[secret]]\nname = \"pr_token\"\n\n\
+             [variant.offline.agent]\nbackend = \"command\"\nagent_cmd = \"./stand-in.sh\"\n\n\
+             [[variant.offline.secret]]\nname = \"fixture_token\"\n"
+        );
+        let repo = git_pack_repo(dir.path(), &manifest, WORKFLOW_NO_PARAMS);
+        let offline = crucible::manifest::variant::VariantName::parse("offline").expect("name");
+
+        let import = propose(
+            &pool,
+            &PackGit::default(),
+            source(&repo),
+            Some("agent"),
+            &crate::authz::model::Principal::platform(),
+            Some(offline.clone()),
+        )
+        .await
+        .expect("proposes")
+        .import;
+        assert_eq!(import.variant, Some(offline.clone()));
+        assert_eq!(
+            import.agent.as_ref().map(|a| a.backend.as_str()),
+            Some("command")
+        );
+        let declared: Vec<&str> = import
+            .declared_secrets
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
+        assert_eq!(declared, vec!["fixture_token"]);
+        assert_eq!(
+            get(&pool, &import.id)
+                .await
+                .expect("reads")
+                .expect("row")
+                .variant,
+            Some(offline.clone())
+        );
+
+        register(
+            &pool,
+            &PackGit::default(),
+            &import.id,
+            "survey",
+            "a survey",
+            Some("wren"),
+        )
+        .await
+        .expect("registers");
+        let row = crate::playbooks::registry::get(&pool, "survey")
+            .await
+            .expect("reads")
+            .expect("row");
+        assert_eq!(row.variant, Some(offline));
+
+        let refused = propose(
+            &pool,
+            &PackGit::default(),
+            source(&repo),
+            Some("agent"),
+            &crate::authz::model::Principal::platform(),
+            Some(crucible::manifest::variant::VariantName::parse("online").expect("name")),
+        )
+        .await;
+        assert!(
+            format!("{:?}", refused.err()).contains("no variant"),
+            "an undeclared variant previews nothing"
+        );
+    }
+
     /// The whole point of the row: the fetch and the compile happen once, and what the link opens
     /// afterwards is the pack that was proposed, not whatever the branch holds now.
     #[sqlx::test(migrator = "crate::MIGRATOR")]
@@ -594,6 +680,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes")
@@ -650,6 +737,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes")
@@ -720,6 +808,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes")
@@ -767,6 +856,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes")
@@ -809,6 +899,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes")
@@ -819,6 +910,7 @@ mod tests {
             source(&repo),
             Some("wren"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes")
@@ -858,6 +950,7 @@ mod tests {
             source(&repo),
             Some("agent"),
             &crate::authz::model::Principal::platform(),
+            None,
         )
         .await
         .expect("proposes");

@@ -181,6 +181,7 @@ pub(crate) async fn launch_pack(
             crate::playbooks::registry::PackWorkflowKind::Autoresearch,
             &std::collections::BTreeMap::new(),
             crate::playbooks::preview::Unvalued::Refuse,
+            None,
         )?;
         Ok::<_, crate::playbooks::registry::RegisterError>((fetched, preview))
     })

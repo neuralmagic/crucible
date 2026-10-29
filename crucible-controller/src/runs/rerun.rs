@@ -91,10 +91,12 @@ pub(crate) async fn preview(
     let from: Vec<TaskName> = from.iter().cloned().map(TaskName).collect();
     let run = run_id.to_string();
     let playbook = launch.playbook.clone();
+    let variant = launch.variant.clone();
     tokio::task::spawn_blocking(move || {
         let pack = crate::playbooks::packs::materialize_tree(&tree)?;
-        let plan = crate::playbooks::registry::compiled_plan(pack.path(), &params)
-            .map_err(RerunRefusal::Compile)?;
+        let plan =
+            crate::playbooks::registry::compiled_plan(pack.path(), &params, variant.as_ref())
+                .map_err(RerunRefusal::Compile)?;
         decide(&plan, &run, &playbook, draft_version, &session, &from)
     })
     .await
@@ -312,7 +314,8 @@ mod tests {
     fn session(source: &str) -> String {
         let dir = tempfile::tempdir().unwrap();
         let root = write_playbook_pack(dir.path(), source);
-        let plan = crate::playbooks::registry::compiled_plan(&root, &BTreeMap::new()).unwrap();
+        let plan =
+            crate::playbooks::registry::compiled_plan(&root, &BTreeMap::new(), None).unwrap();
         let defs = crucible::plan::rerun::definition_digests(&plan);
         let tasks: Vec<serde_json::Value> = plan
             .tasks_topo()

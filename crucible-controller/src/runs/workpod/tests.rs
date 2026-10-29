@@ -2563,7 +2563,7 @@ async fn a_pack_sandbox_image_without_the_label_still_launches_the_run(
     let tmp = tempfile::tempdir()?;
     let profile = crate::testing::fixtures::write_deploy_profile(tmp.path());
     let pack = crate::testing::fixtures::write_loop_pack(tmp.path());
-    let pack_sandbox = crate::playbooks::dispatch::pack_agent(&pack)?
+    let pack_sandbox = crate::playbooks::dispatch::pack_agent(&pack, None)?
         .sandbox_image
         .expect("the fixture pack names a sandbox image");
     let reader = Arc::new(TableReader::new([(pack_sandbox.clone(), Ok(None))]));
@@ -2995,6 +2995,7 @@ async fn a_loop_run_exports_its_item_and_a_playbook_launch_exports_none(
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
             rerun: None,
+            variant: None,
         },
         None,
     )
@@ -3369,6 +3370,7 @@ async fn a_resolved_provider_reaches_the_playbook_wrapper(pool: sqlx::PgPool) ->
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::from_resolved(resolved.as_ref()),
             rerun: None,
+            variant: None,
         },
         None,
     )
@@ -3533,6 +3535,7 @@ async fn dispatch_run_renders_a_playbook_launch_from_its_stored_row(
             max_time: crate::model::MaxTime::parse("30m").expect("duration"),
             agent: AgentSelection::default(),
             rerun: None,
+            variant: None,
         },
         None,
     )
@@ -3613,6 +3616,7 @@ async fn dispatch_run_mints_the_run_token_into_its_secret(pool: sqlx::PgPool) ->
                 run: "playbook_survey_0199c0de-42".to_string(),
                 from: vec!["draft".to_string()],
             }),
+            variant: None,
         },
         None,
     )

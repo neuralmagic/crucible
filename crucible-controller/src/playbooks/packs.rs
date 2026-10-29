@@ -13,6 +13,7 @@
 use crate::playbooks::pack_trees::EncodedPack;
 use crate::runs::blob_store::StoredPack;
 use anyhow::{Context, Result};
+use crucible::manifest::variant::VariantName;
 use crucible_contract::pack_tree::{
     OverBudget, PackTree, ReadPack, TreeDigest, TreeError, check_delivery_budget, walk_dir,
 };
@@ -94,6 +95,19 @@ impl Deliverable {
 /// The pack at `root`, refused when it is not a pack or is over the delivery budget.
 pub(crate) fn deliverable(root: &Path) -> Result<Deliverable, PackRefusal> {
     Deliverable::new(walk_dir(root)?)
+}
+
+/// The pack manifest's file name, at the pack root.
+pub(crate) const MANIFEST: &str = "crucible.toml";
+
+/// The pack's manifest as a run of `variant` reads it: the base for `None`, otherwise the base
+/// with the variant's top-level tables in place.
+pub(crate) fn manifest_text(pack_root: &Path, variant: Option<&VariantName>) -> Result<String> {
+    let path = pack_root.join(MANIFEST);
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    crucible::manifest::variant::effective_text(&text, variant)
+        .with_context(|| format!("parsing {}", path.display()))
 }
 
 /// Gzip-tar a pack working tree the way the controller stored packs before tree storage.

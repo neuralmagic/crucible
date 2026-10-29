@@ -333,14 +333,18 @@ pub enum ExtractError {
 /// Compute the exposure of the pack at `pack_root` with the linked engine. `pr_repo` is the
 /// publish target a launch would be rendered with, which the engine folds into the `draft-pr`
 /// default the same way it does at run time; `None` (or empty) where the caller has none.
-pub fn extract(pack_root: &Path, pr_repo: Option<&str>) -> Result<Exposure, ExtractError> {
+pub fn extract(
+    pack_root: &Path,
+    pr_repo: Option<&str>,
+    variant: Option<&crucible::manifest::variant::VariantName>,
+) -> Result<Exposure, ExtractError> {
     let manifest = pack_root.join(MANIFEST);
     if !manifest.is_file() {
         return Err(ExtractError::Refused(format!(
             "the pack has no {MANIFEST}, so it discloses no exposure"
         )));
     }
-    let loaded = crucible::manifest::Manifest::load(&manifest)
+    let loaded = crucible::manifest::Manifest::load_variant(&manifest, variant)
         .map_err(|e| ExtractError::Refused(format!("{e:#}")))?;
     let computed = crucible::exposure::compute(&loaded, pr_repo.filter(|r| !r.is_empty()));
     let value = serde_json::to_value(&computed).context("encoding the computed exposure")?;
@@ -516,7 +520,7 @@ mod tests {
     fn a_stored_manifest_extracts_the_document_the_engine_computes() {
         let dir = tempfile::tempdir().expect("scratch");
         let root = pack(dir.path(), crate::testing::fixtures::LOOP_PACK_MANIFEST);
-        let exposure = extract(root, Some("wren/repo-fork")).expect("extracts");
+        let exposure = extract(root, Some("wren/repo-fork"), None).expect("extracts");
         assert_eq!(exposure.version, 1);
         let lines = exposure.output_lines();
         assert!(
@@ -530,8 +534,10 @@ mod tests {
             .expect("stores");
         assert!(stored.0.is_some() && stored.1.is_some());
         assert_eq!(
-            extract(root, Some("")).expect("extracts").output_lines(),
-            extract(root, None).expect("extracts").output_lines(),
+            extract(root, Some(""), None)
+                .expect("extracts")
+                .output_lines(),
+            extract(root, None, None).expect("extracts").output_lines(),
             "an empty target is no target"
         );
     }
@@ -539,14 +545,14 @@ mod tests {
     #[test]
     fn a_pack_the_engine_cannot_load_is_refused() {
         let dir = tempfile::tempdir().expect("scratch");
-        let err = extract(dir.path(), None).expect_err("no manifest");
+        let err = extract(dir.path(), None, None).expect_err("no manifest");
         assert!(
             matches!(&err, ExtractError::Refused(m) if m.contains(MANIFEST)),
             "{err}"
         );
 
         let root = pack(dir.path(), "[agent]\nbackend = 7\n");
-        let err = extract(root, None).expect_err("a malformed manifest");
+        let err = extract(root, None, None).expect_err("a malformed manifest");
         assert!(matches!(err, ExtractError::Refused(_)), "{err}");
     }
 
