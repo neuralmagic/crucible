@@ -2,7 +2,8 @@
 // kept out of the renderer so the mapping is testable without a flow.
 
 import { formatCost } from './runReport';
-import type { FanOutState, RouteDecision, TaskRuntime } from './taskGraph';
+import type { ExternalLinkRef } from '../ui';
+import type { FanOutState, NodeLinks, RouteDecision, TaskRuntime } from './taskGraph';
 import type { WorkflowGraphNode } from './workflowGraphLayout';
 
 /// A field the wire may carry as absent, null, or a string.
@@ -20,6 +21,28 @@ export function badgeFor(node: WorkflowGraphNode): string {
   if (node.kind === 'command') return 'CMD';
   if (node.kind === 'engine') return 'ENGINE';
   return 'TASK';
+}
+
+/// The glyph a card shows for what runs the task; `badgeFor` is its name.
+export function kindGlyph(node: WorkflowGraphNode): string {
+  if (node.kind === 'route') return '◇';
+  if ((node.fanout ?? null) !== null) return '≡';
+  if (node.kind === 'agent') return '✦';
+  if (node.kind === 'command') return '›';
+  if (node.kind === 'engine') return '⚙';
+  return '·';
+}
+
+/// How a node's status dot reads: passed, failed, never dispatched because something upstream
+/// stopped it, not reached yet in a run still going, or ended some other way (skipped, not taken,
+/// never ran).
+export type StatusMark = 'pass' | 'fail' | 'blocked' | 'active' | 'idle';
+
+export function statusMark(runtime: TaskRuntime): StatusMark {
+  if (runtime.tone === 'pass') return 'pass';
+  if (runtime.tone === 'fail') return 'fail';
+  if (runtime.status === 'blocked') return 'blocked';
+  return runtime.status === 'pending' ? 'active' : 'idle';
 }
 
 /// One line of secondary text, or none. A mapped task says what it maps over, since that is what
@@ -117,15 +140,17 @@ export function sourceFor(node: WorkflowGraphNode): { label: string; body: strin
   return null;
 }
 
-/// A run's node state, as the card's status line reads it: where the task ended, how many attempts
-/// it took, and what those attempts cost.
+/// A run's node state, as the card's status line reads it: the iteration it ended in when that was
+/// a retry, how many attempts it took, and what those attempts cost and took. A zero says nothing,
+/// so it is left out, and a task with nothing to say has no line.
 export function runtimeLine(runtime: TaskRuntime): string | null {
   if (!runtime.reported) return null;
-  const parts = [`iter ${runtime.latestIter}`];
+  const parts: string[] = [];
+  if (runtime.latestIter > 0) parts.push(`iter ${runtime.latestIter}`);
   if (runtime.attempts > 1) parts.push(`${runtime.attempts} attempts`);
-  if (runtime.costUsd !== null) parts.push(formatCost(runtime.costUsd));
-  if (runtime.secs !== null) parts.push(formatSecs(runtime.secs));
-  return parts.join(' · ');
+  if (runtime.costUsd !== null && runtime.costUsd > 0) parts.push(formatCost(runtime.costUsd));
+  if (runtime.secs !== null && runtime.secs > 0) parts.push(formatSecs(runtime.secs));
+  return parts.length === 0 ? null : parts.join(' · ');
 }
 
 /// The width to read a fan-out against, or null when there is none to read it against. A run
@@ -158,6 +183,12 @@ export function fanoutLine(state: FanOutState): string {
   return parts.join(' · ');
 }
 
+/// How many instances a mapped task came to: the items it was spread over, or the instances that
+/// started when the run cannot say how many items there were.
+export function fanoutCount(state: FanOutState): number {
+  return state.items ?? state.started;
+}
+
 /// The fan-out's own rows in the task panel, listed above the run's.
 export function fanoutRows(state: FanOutState): DetailRow[] {
   return [
@@ -185,4 +216,25 @@ export function runtimeRows(runtime: TaskRuntime): DetailRow[] {
     { label: 'cost', value: formatCost(runtime.costUsd) },
     { label: 'took', value: runtime.secs === null ? '—' : formatSecs(runtime.secs) },
   ];
+}
+
+/// The chip drawn over a pill's end: its one link as it is, several as a count under one mark (the
+/// provider's, when they share one). The links themselves are on the run's header.
+export type PillChip =
+  | { kind: 'link'; link: ExternalLinkRef }
+  | { kind: 'count'; provider: string; count: number };
+
+export function pillChip(drawn: NodeLinks | null): PillChip | null {
+  if (drawn === null || drawn.kind !== 'links') return null;
+  const [first, second] = drawn.links;
+  if (first === undefined) return null;
+  if (second === undefined) return { kind: 'link', link: first };
+  const shared = drawn.links.every((link) => link.provider === first.provider);
+  return { kind: 'count', provider: shared ? first.provider : '', count: drawn.links.length };
+}
+
+/// The room a pill chip takes, in characters of the pill's note: its text plus the mark and gaps.
+export function pillChipChars(chip: PillChip | null): number {
+  if (chip === null) return 0;
+  return (chip.kind === 'link' ? chip.link.label.length : String(chip.count).length) + 3;
 }

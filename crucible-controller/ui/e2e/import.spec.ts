@@ -378,7 +378,9 @@ test.describe('pack import wizard', () => {
     await expect(graph.locator('.react-flow__edges svg path.react-flow__edge-path').first()).toBeVisible();
     const hostile = graph.getByRole('button', { name: 'ENGINE <img src=x onerror="alert(1)">' });
     await expect(hostile).toBeVisible();
-    await expect(hostile.locator('span[title]')).toHaveText('<img src=x onerror="alert(1)">');
+    await expect(hostile.locator('span[title]:not([aria-hidden])')).toHaveText(
+      '<img src=x onerror="alert(1)">'
+    );
     expect(await graph.locator('img').count(), 'no element was parsed out of the name').toBe(0);
     expect(injected, 'nothing in a task name executed').toEqual([]);
   });

@@ -13,6 +13,7 @@ import {
   runFilePath,
   runFileUrl,
   runPath,
+  listedFiles,
   selectRunFile,
   shouldAnchorFiles,
   textKind,
@@ -157,6 +158,15 @@ describe('inlineKind', () => {
   });
 });
 
+describe('listedFiles', () => {
+  it('leaves out empty captures, but never the open one', () => {
+    const empty = file({ key: 'apply/apply.log', path: 'apply.log', size_bytes: 0 });
+    const report = file();
+    expect(listedFiles([empty, report], null)).toEqual([report]);
+    expect(listedFiles([empty, report], 'apply/apply.log')).toEqual([empty, report]);
+  });
+});
+
 describe('selectRunFile', () => {
   const entries = [
     file({ key: 'assess[1]/VERDICT.json', path: 'VERDICT.json', task: 'assess', instance: '1' }),
@@ -179,6 +189,24 @@ describe('selectRunFile', () => {
 
   it('falls back to the report when nothing was requested', () => {
     expect(selectRunFile(entries, null)).toEqual({ state: 'found', file: entries[1] });
+  });
+
+  it('picks the report of the task latest in plan order', () => {
+    const early = file({ key: 'apply/REPORT.md', path: 'REPORT.md', task: 'apply' });
+    const sink = file({ key: 'report/REPORT.md', path: 'REPORT.md', task: 'report' });
+    const stray = file({ key: 'gone/REPORT.md', path: 'REPORT.md', task: 'gone' });
+    expect(selectRunFile([early, sink, stray], null, ['apply', 'report'])).toEqual({ state: 'found', file: sink });
+    expect(selectRunFile([sink, early], null, ['report', 'apply'])).toEqual({ state: 'found', file: early });
+    expect(selectRunFile([stray, early], null, [])).toEqual({ state: 'found', file: stray });
+  });
+
+  it('opens a captured file before an empty one, unless only empty ones exist', () => {
+    const empty = file({ key: 'report/REPORT.md', path: 'REPORT.md', task: 'report', size_bytes: 0 });
+    const log = file({ key: 'apply/apply.log', path: 'apply.log', task: 'apply', size_bytes: 0 });
+    const json = file({ key: 'apply/SUMMARY.json', path: 'SUMMARY.json', task: 'apply' });
+    expect(selectRunFile([log, empty, json], null, ['apply', 'report'])).toEqual({ state: 'found', file: json });
+    expect(selectRunFile([log, empty], null)).toEqual({ state: 'found', file: log });
+    expect(selectRunFile([log, json], 'apply/apply.log')).toEqual({ state: 'found', file: log });
   });
 
   it('falls back to any markdown, then to the first entry', () => {
