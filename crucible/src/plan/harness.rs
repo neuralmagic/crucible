@@ -1782,6 +1782,7 @@ mod tests {
 
         let (overridden, _) = crate::cli::setup::prep_plan_runner_with_params(
             &manifest,
+            None,
             &BTreeMap::new(),
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride {
@@ -4777,6 +4778,7 @@ workflow(type = "playbook", tasks = [echo])
         .unwrap();
         let mut runner = crate::cli::setup::prep_plan_runner_with_params(
             &manifest_path,
+            None,
             &supplied,
             crate::openshell::gateway::ComputeDriver::Podman,
             crate::args::AgentOverride::default(),

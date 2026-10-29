@@ -114,6 +114,24 @@ Rules:
   very first run), it hard-warns and trusts the working tree for that run only; later runs freeze
   to the base commit. A manifest that lives outside the workspace (any out-of-workspace pack) is
   unaffected.
+- **Variants.** One manifest can carry per-environment variants as `[variant.<name>]` tables:
+
+  ```toml
+  [agent]
+  backend = "openshell"
+
+  [variant.offline.agent]
+  backend = "command"
+  agent_cmd = "./stand-in.sh"
+  ```
+
+  `plan run --variant offline`, `check --variant offline` and `deploy render --playbook
+  --variant offline` read the variant: each top-level table it names replaces the base table of
+  the same name whole (`[variant.offline.agent]` replaces all of `[agent]`; nothing is merged
+  below the top level). Without `--variant` the base is read, without any `[variant]` table.
+  Every declared variant is validated on every load, and `crucible check` compiles every
+  variant's graph, so a broken variant fails whichever one runs. A resume must name the variant
+  the run started with. A composite manifest declares no variants.
 
 ### 1.1 The gate self-test (`crucible check`, ADR-0014 S1)
 
