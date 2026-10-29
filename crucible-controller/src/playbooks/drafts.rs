@@ -534,6 +534,8 @@ pub enum DraftSeed<'a> {
     },
     /// A pending import's frozen tree, at the rev it was taken at.
     Import { id: &'a str, tree: &'a PackTree },
+    /// Another draft's newest save. The copy takes that draft's origin as its own.
+    Draft { id: &'a str },
 }
 
 /// The origin columns one create writes.
@@ -573,12 +575,17 @@ pub async fn ensure_available(
     id: &str,
     description: &str,
 ) -> Result<(), DraftError> {
-    validate_id(id).map_err(DraftError::Invalid)?;
     if description.trim().is_empty() {
         return Err(DraftError::Invalid(
             "description must be non-empty".to_string(),
         ));
     }
+    id_available(pool, id).await
+}
+
+/// Whether `id` is a valid slug that neither a draft nor the registry holds.
+async fn id_available(pool: &PgPool, id: &str) -> Result<(), DraftError> {
+    validate_id(id).map_err(DraftError::Invalid)?;
     if crate::playbooks::registry::get(pool, id)
         .await
         .map_err(DraftError::Internal)?
@@ -673,6 +680,25 @@ pub async fn create(
                     digest: digest.flatten(),
                 },
             )
+        }
+        DraftSeed::Draft { id: source } => {
+            let draft = get(pool, source)
+                .await
+                .map_err(DraftError::Internal)?
+                .ok_or_else(|| DraftError::NotFound(format!("no draft {source:?}")))?;
+            let head = files(pool, source, None)
+                .await?
+                .ok_or_else(|| DraftError::NotFound(format!("no draft {source:?}")))?;
+            let origin = draft
+                .origin
+                .map(|o| SeededOrigin {
+                    playbook: o.playbook,
+                    import_id: o.import_id,
+                    rev: o.rev,
+                    digest: o.digest,
+                })
+                .unwrap_or_default();
+            (head.files, origin)
         }
         DraftSeed::Skeleton => (
             BTreeMap::from([
@@ -1217,14 +1243,274 @@ pub async fn version_tree(
         .map(|(head, tree)| (head.version, tree)))
 }
 
-/// Drop a draft and every version it holds.
-pub async fn delete(pool: &PgPool, id: &str) -> Result<bool> {
-    let res = sqlx::query("DELETE FROM playbook_drafts WHERE id = $1")
+/// What a draft delete took with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Dropped {
+    pub bindings: u64,
+    pub shares: u64,
+    pub standing_launches: u64,
+}
+
+/// Drop a draft and everything keyed on its id, so a draft created at that id later inherits
+/// nothing: its versions, its shares, the standing launches on its head, the import's link to it,
+/// and the secret bindings on its playbook scope unless a registered playbook holds the same id.
+/// Each dropped binding is audited as an unbind. `None` when there is no such draft.
+pub async fn delete(
+    pool: &PgPool,
+    id: &str,
+    actor: Option<&crate::authz::model::Principal>,
+    subject: Option<String>,
+) -> Result<Option<Dropped>> {
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the draft delete transaction")?;
+    let deleted = sqlx::query("DELETE FROM playbook_drafts WHERE id = $1")
         .bind(id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .context("deleting a playbook draft")?;
-    Ok(res.rows_affected() > 0)
+    if deleted.rows_affected() == 0 {
+        return Ok(None);
+    }
+    let bindings = sqlx::query(
+        "WITH gone AS (
+             DELETE FROM secret_bindings
+             WHERE scope_kind = 'playbook' AND scope_id = $1
+               AND NOT EXISTS (SELECT 1 FROM playbooks WHERE id = $1)
+             RETURNING secret_id
+         )
+         SELECT g.secret_id, s.name, s.owner
+         FROM gone g JOIN secrets s ON s.id = g.secret_id
+         ORDER BY s.name",
+    )
+    .bind(id)
+    .fetch_all(&mut *tx)
+    .await
+    .context("dropping the draft's bindings")?;
+    for row in &bindings {
+        let secret_id: String = row.try_get("secret_id")?;
+        let name: String = row.try_get("name")?;
+        let owner = crate::authz::model::Principal::parse(&row.try_get::<String, _>("owner")?)?;
+        crate::secrets::store::audit(
+            &mut tx,
+            &crate::secrets::store::NewAudit {
+                secret_id: Some(&secret_id),
+                secret_name: &name,
+                owner: &owner,
+                action: crate::secrets::AuditAction::Unbind,
+                actor,
+                subject: subject.clone(),
+                detail: Some(&format!("playbook {id}, draft deleted")),
+            },
+        )
+        .await?;
+    }
+    let shares = sqlx::query(
+        "DELETE FROM resource_shares WHERE resource_type = 'playbook_draft' AND resource_id = $1",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .context("dropping the draft's shares")?
+    .rows_affected();
+    let standing_launches = sqlx::query(
+        "DELETE FROM playbook_standing_launches WHERE playbook = $1 AND target_kind = 'draft_head'",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await
+    .context("dropping the standing launches on the draft's head")?
+    .rows_affected();
+    sqlx::query("UPDATE pack_imports SET draft_id = NULL WHERE draft_id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .context("unlinking the import the draft was opened from")?;
+    tx.commit().await.context("committing the draft delete")?;
+    Ok(Some(Dropped {
+        bindings: bindings.len() as u64,
+        shares,
+        standing_launches,
+    }))
+}
+
+/// How much followed a draft to its new id.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Moved {
+    pub bindings: u64,
+    pub shares: u64,
+    pub standing_launches: u64,
+    pub launches: u64,
+}
+
+/// Rename draft `from` to `to`, and with it everything keyed on its id: its versions, the secret
+/// bindings on its playbook scope, its shares, the playbook it publishes into, the import it was
+/// opened from, the standing launches on its head, and its launches. A launch keeps the key and
+/// title it was minted with. Each moved binding is audited as a bind onto `to`.
+pub async fn rename(
+    pool: &PgPool,
+    from: &str,
+    to: &str,
+    actor: Option<&crate::authz::model::Principal>,
+    subject: Option<String>,
+) -> Result<Moved, DraftError> {
+    if from == to {
+        return Err(DraftError::Invalid(format!("draft {from} is already {to}")));
+    }
+    id_available(pool, to).await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .context("opening the draft rename transaction")
+        .map_err(DraftError::Internal)?;
+    let retired: Option<Option<String>> =
+        sqlx::query_scalar("SELECT retired_at FROM playbook_drafts WHERE id = $1 FOR UPDATE")
+            .bind(from)
+            .fetch_optional(&mut *tx)
+            .await
+            .context("locking the draft for a rename")
+            .map_err(DraftError::Internal)?;
+    match retired {
+        None => return Err(DraftError::NotFound(format!("no draft {from:?}"))),
+        Some(Some(_)) => {
+            return Err(DraftError::Conflict(format!(
+                "draft {from} retired when its graduated pack was imported"
+            )));
+        }
+        Some(None) => {}
+    }
+    let now = crate::clock::now_rfc3339();
+    sqlx::query("UPDATE playbook_drafts SET id = $2, updated_at = $3 WHERE id = $1")
+        .bind(from)
+        .bind(to)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                DraftError::Conflict(format!("draft {to:?} already exists"))
+            }
+            e => DraftError::Internal(anyhow::Error::new(e).context("renaming the draft")),
+        })?;
+
+    let bindings = sqlx::query(
+        "WITH moved AS (
+             UPDATE secret_bindings SET scope_id = $2
+             WHERE scope_kind = 'playbook' AND scope_id = $1
+             RETURNING secret_id, projection_kind, projection
+         )
+         SELECT m.secret_id, m.projection_kind, m.projection, s.name, s.owner
+         FROM moved m JOIN secrets s ON s.id = m.secret_id
+         ORDER BY s.name, m.projection",
+    )
+    .bind(from)
+    .bind(to)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => DraftError::Conflict(format!(
+            "secret bindings left by an earlier {to} collide with this draft's; unbind them first"
+        )),
+        e => DraftError::Internal(anyhow::Error::new(e).context("moving the draft's bindings")),
+    })?;
+    for row in &bindings {
+        let secret_id: String = row.try_get("secret_id").map_err(internal)?;
+        let name: String = row.try_get("name").map_err(internal)?;
+        let owner = crate::authz::model::Principal::parse(
+            &row.try_get::<String, _>("owner").map_err(internal)?,
+        )
+        .map_err(|e| DraftError::Internal(e.into()))?;
+        let projection_kind: String = row.try_get("projection_kind").map_err(internal)?;
+        let projection: String = row.try_get("projection").map_err(internal)?;
+        crate::secrets::store::audit(
+            &mut tx,
+            &crate::secrets::store::NewAudit {
+                secret_id: Some(&secret_id),
+                secret_name: &name,
+                owner: &owner,
+                action: crate::secrets::AuditAction::Bind,
+                actor,
+                subject: subject.clone(),
+                detail: Some(&format!(
+                    "playbook {to} as {projection_kind} {projection}, renamed from playbook {from}"
+                )),
+            },
+        )
+        .await
+        .map_err(DraftError::Internal)?;
+    }
+
+    let shares = sqlx::query(
+        "UPDATE resource_shares SET resource_id = $2
+         WHERE resource_type = 'playbook_draft' AND resource_id = $1",
+    )
+    .bind(from)
+    .bind(to)
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(db) if db.is_unique_violation() => DraftError::Conflict(format!(
+            "shares left by an earlier draft {to} collide with this draft's"
+        )),
+        e => DraftError::Internal(anyhow::Error::new(e).context("moving the draft's shares")),
+    })?
+    .rows_affected();
+    for (sql, what) in [
+        (
+            "UPDATE playbooks SET source_draft = $2 WHERE source_draft = $1",
+            "re-pointing the playbook the draft publishes into",
+        ),
+        (
+            "UPDATE pack_imports SET draft_id = $2 WHERE draft_id = $1",
+            "re-pointing the import the draft was opened from",
+        ),
+    ] {
+        sqlx::query(sql)
+            .bind(from)
+            .bind(to)
+            .execute(&mut *tx)
+            .await
+            .context(what)
+            .map_err(DraftError::Internal)?;
+    }
+    let standing_launches = sqlx::query(
+        "UPDATE playbook_standing_launches SET playbook = $2, updated_at = $3
+         WHERE playbook = $1 AND target_kind = 'draft_head'",
+    )
+    .bind(from)
+    .bind(to)
+    .bind(&now)
+    .execute(&mut *tx)
+    .await
+    .context("moving the standing launches on the draft's head")
+    .map_err(DraftError::Internal)?
+    .rows_affected();
+    let launches = sqlx::query(
+        "UPDATE playbook_launches SET playbook = $2
+         WHERE playbook = $1 AND draft_version IS NOT NULL",
+    )
+    .bind(from)
+    .bind(to)
+    .execute(&mut *tx)
+    .await
+    .context("moving the draft's launches")
+    .map_err(DraftError::Internal)?
+    .rows_affected();
+    tx.commit()
+        .await
+        .context("committing the draft rename")
+        .map_err(DraftError::Internal)?;
+    Ok(Moved {
+        bindings: bindings.len() as u64,
+        shares,
+        standing_launches,
+        launches,
+    })
+}
+
+fn internal(e: sqlx::Error) -> DraftError {
+    DraftError::Internal(e.into())
 }
 
 /// Copy a draft version's tarball into `slug`'s `pack_tarballs` row, so a draft launch dispatches
@@ -1993,13 +2279,23 @@ mod tests {
         assert!(matches!(clash, DraftError::Conflict(_)), "{clash:#}");
         assert!(matches!(dup, DraftError::Conflict(_)), "{dup:#}");
 
-        assert!(delete(&pool, "studio").await.expect("delete"));
+        assert!(
+            delete(&pool, "studio", None, None)
+                .await
+                .expect("delete")
+                .is_some()
+        );
         let left: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_draft_versions")
             .fetch_one(&pool)
             .await
             .expect("count");
         assert_eq!(left, 0, "versions cascade with their draft");
-        assert!(!delete(&pool, "studio").await.expect("delete"));
+        assert!(
+            delete(&pool, "studio", None, None)
+                .await
+                .expect("delete")
+                .is_none()
+        );
     }
 
     /// A pack tarball holding `files`, the way the registry and an import both store one.
@@ -2524,6 +2820,686 @@ mod tests {
 
     /// Text shaped like a pack's docs: headings over lines drawn from a pool of 512 sentences, so
     /// gzip finds the repeated phrasing it finds in written prose (about 7x).
+    fn alice() -> crate::authz::model::Principal {
+        crate::authz::model::Principal::parse("user:alice").expect("principal")
+    }
+
+    /// Register a secret named `secret` and bind it to playbook scope `scope` as `pr_token`.
+    async fn bind_secret(pool: &PgPool, scope: &str, secret: &str) -> String {
+        let name = crate::secrets::SecretName::parse(secret).expect("name");
+        let declared = crate::secrets::SecretName::parse("pr_token").expect("declared");
+        let id = uuid::Uuid::now_v7().to_string();
+        let mut conn = pool.acquire().await.expect("conn");
+        crate::secrets::store::insert(
+            &mut conn,
+            &crate::secrets::store::NewSecret {
+                id: &id,
+                name: &name,
+                owner: &alice(),
+                kind: crate::secrets::SecretKind::Opaque,
+                visibility: crate::secrets::Visibility::BrokerOnly,
+                consumer: crate::secrets::ConsumerClass::Run,
+                mode: crate::secrets::SecretMode::Managed,
+                vault_path: &format!("user:alice/{id}"),
+                current_version: Some(1),
+                created_by: Some("alice"),
+            },
+        )
+        .await
+        .expect("register");
+        crate::secrets::store::insert_binding(
+            &mut conn,
+            &crate::secrets::store::NewBinding {
+                id: &uuid::Uuid::now_v7().to_string(),
+                secret_id: &id,
+                scope_kind: crate::secrets::ScopeKind::Playbook,
+                scope_id: scope,
+                projection_kind: crate::secrets::ProjectionKind::Env,
+                projection: "PR_TOKEN",
+                declared_name: &declared,
+                pack_rev: None,
+                schema_digest: None,
+                created_by: Some("alice"),
+            },
+        )
+        .await
+        .expect("bind");
+        id
+    }
+
+    async fn scope_bindings(pool: &PgPool, scope: &str) -> Vec<String> {
+        crate::secrets::store::bindings_for_scope(pool, crate::secrets::ScopeKind::Playbook, scope)
+            .await
+            .expect("bindings")
+            .into_iter()
+            .map(|(b, _)| b.declared_name.to_string())
+            .collect()
+    }
+
+    async fn launch(pool: &PgPool, key: &str, playbook: &str, draft_version: Option<i64>) {
+        let max_time = crate::model::MaxTime::parse("30m").expect("duration");
+        let params = serde_json::json!({});
+        let mut tx = pool.begin().await.expect("tx");
+        crate::launches::store::insert_playbook_launch_with(
+            &mut tx,
+            key,
+            &crate::launches::model::NewPlaybookLaunch {
+                playbook,
+                repo: "owner/repo",
+                title: playbook,
+                params: &params,
+                schema_digest: "sha256:schema",
+                max_cost: 1.0,
+                max_time: &max_time,
+                advance_dedupe: false,
+                dedupe_schedule: None,
+                origin: crate::model::LaunchOrigin::Draft,
+                draft_version,
+                created_by: Some("alice"),
+                launcher_groups: None,
+                rerun: None,
+            },
+            &crate::playbooks::exposure::Extraction::Absent,
+        )
+        .await
+        .expect("insert launch");
+        tx.commit().await.expect("commit");
+    }
+
+    async fn launch_playbook_of(pool: &PgPool, key: &str) -> String {
+        crate::launches::store::get_playbook_launch(pool, key)
+            .await
+            .expect("read launch")
+            .expect("launch")
+            .playbook
+    }
+
+    async fn standing_launch(pool: &PgPool, id: &str, playbook: &str) {
+        sqlx::query(
+            "INSERT INTO playbook_standing_launches \
+             (id, trigger, playbook, params, schema_digest, max_cost, max_time, advance_dedupe, \
+              enabled, target_kind, created_at, updated_at) VALUES \
+             ($1, 'schedule', $2, '{}'::jsonb, 'sha256:schema', 1, '5m', false, true, \
+              'draft_head', 'now', 'now')",
+        )
+        .bind(id)
+        .bind(playbook)
+        .execute(pool)
+        .await
+        .expect("standing launch");
+    }
+
+    async fn column(pool: &PgPool, sql: &str, key: &str) -> Option<String> {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(key)
+            .fetch_optional(pool)
+            .await
+            .expect("read")
+    }
+
+    /// A rename takes everything keyed on the draft id along: its saves, the secrets bound to it,
+    /// its shares, the playbook it publishes into, the import it came from, the schedules on its
+    /// head, and its launches. A queued launch then resolves the moved binding when it starts.
+    /// Another draft's rows, and a registered launch that only shares the old id, stay put.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_rename_moves_everything_keyed_on_the_draft_id(pool: PgPool) {
+        for id in ["studio", "other"] {
+            create(
+                &pool,
+                id,
+                "a drafted pack",
+                DraftSeed::Skeleton,
+                Some("alice"),
+                &alice(),
+            )
+            .await
+            .expect("create");
+        }
+        save_version(&pool, "studio", skeleton(), Some("alice"), None)
+            .await
+            .expect("save");
+        let secret = bind_secret(&pool, "studio", "studio_token").await;
+        bind_secret(&pool, "other", "other_token").await;
+        crate::authz::store::upsert_share(
+            &mut pool.acquire().await.expect("conn"),
+            &crate::authz::store::ShareRow {
+                resource_type: "playbook_draft".to_string(),
+                resource_id: "studio".to_string(),
+                grantee: "user:bob".to_string(),
+                role: "editor".to_string(),
+                not_after: None,
+                created_by: Some("alice".to_string()),
+                created_at: "now".to_string(),
+                updated_at: "now".to_string(),
+            },
+        )
+        .await
+        .expect("share");
+        sqlx::query(
+            "INSERT INTO playbooks (id, description, rev, tar_gz, tar_digest, tar_bytes, \
+             params_schema, schema_digest, core_rev, created_at, updated_at, source_draft, \
+             source_draft_version) \
+             VALUES ('published', 'd', 'sha256:1', '\\x00'::bytea, 'sha256:1', 1, '{}'::jsonb, \
+             'sha256:2', 'pin', 'now', 'now', 'studio', 2)",
+        )
+        .execute(&pool)
+        .await
+        .expect("publish");
+        sqlx::query(
+            "INSERT INTO pack_imports (id, repo, git_ref, path, rev, tar_gz, tar_digest, \
+             tar_bytes, diagnostics, core_rev, status, created_at, draft_id) \
+             VALUES ('imp-1', 'o/r', 'main', 'packs/studio', 'ccc', '\\x00'::bytea, 'sha256:3', \
+             1, '[]'::jsonb, 'pin', 'pending', 'now', 'studio')",
+        )
+        .execute(&pool)
+        .await
+        .expect("import");
+        standing_launch(&pool, "nightly", "studio").await;
+        standing_launch(&pool, "elsewhere", "other").await;
+        launch(&pool, "playbook:studio:queued", "studio", Some(2)).await;
+        launch(&pool, "playbook:studio:registered", "studio", None).await;
+
+        let moved = rename(&pool, "studio", "survey-v2", Some(&alice()), None)
+            .await
+            .expect("rename");
+        assert_eq!(
+            moved,
+            Moved {
+                bindings: 1,
+                shares: 1,
+                standing_launches: 1,
+                launches: 1,
+            }
+        );
+
+        assert!(get(&pool, "studio").await.expect("read").is_none());
+        let renamed = get(&pool, "survey-v2")
+            .await
+            .expect("read")
+            .expect("the draft under its new id");
+        assert_eq!(renamed.description, "a drafted pack");
+        assert_eq!(renamed.owner, alice());
+        assert_eq!(renamed.published_playbook.as_deref(), Some("published"));
+        assert_eq!(
+            versions(&pool, "survey-v2")
+                .await
+                .expect("versions")
+                .iter()
+                .map(|v| v.version)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(
+            versions(&pool, "studio")
+                .await
+                .expect("versions")
+                .is_empty()
+        );
+        assert_eq!(
+            latest(&pool, "survey-v2")
+                .await
+                .expect("latest")
+                .map(|v| v.version),
+            Some(2)
+        );
+
+        assert_eq!(scope_bindings(&pool, "survey-v2").await, vec!["pr_token"]);
+        assert!(scope_bindings(&pool, "studio").await.is_empty());
+        assert_eq!(scope_bindings(&pool, "other").await, vec!["pr_token"]);
+        let resolved = crate::secrets::launch::resolve(
+            &pool,
+            &crate::secrets::launch::Scope::playbook("survey-v2"),
+            &[crate::secrets::manifest::DeclaredSecret {
+                name: crate::secrets::SecretName::parse("pr_token").expect("name"),
+                kind: crate::secrets::SecretKind::Opaque,
+                projection: None,
+            }],
+            &crate::authz::model::Principals::new(Some("alice"), &[]),
+            crate::secrets::launch::Revision::Draft,
+            None,
+        )
+        .await
+        .expect("resolve")
+        .expect("the moved binding resolves");
+        assert_eq!(resolved.len(), 1);
+        let trail = crate::secrets::store::audit_for_secret(&pool, &secret, 10)
+            .await
+            .expect("trail");
+        let entry = trail.first().expect("an audit row");
+        assert_eq!(entry.action, crate::secrets::AuditAction::Bind);
+        assert_eq!(entry.actor.as_deref(), Some("user:alice"));
+        assert_eq!(
+            entry.detail.as_deref(),
+            Some("playbook survey-v2 as env PR_TOKEN, renamed from playbook studio")
+        );
+
+        let shares = crate::authz::store::shares_of(&pool, "playbook_draft", "survey-v2")
+            .await
+            .expect("shares");
+        assert_eq!(
+            shares
+                .iter()
+                .map(|s| s.grantee.as_str())
+                .collect::<Vec<_>>(),
+            vec!["user:bob"]
+        );
+        assert!(
+            crate::authz::store::shares_of(&pool, "playbook_draft", "studio")
+                .await
+                .expect("shares")
+                .is_empty()
+        );
+        assert_eq!(
+            column(
+                &pool,
+                "SELECT source_draft FROM playbooks WHERE id = $1",
+                "published"
+            )
+            .await
+            .as_deref(),
+            Some("survey-v2")
+        );
+        assert_eq!(
+            column(
+                &pool,
+                "SELECT draft_id FROM pack_imports WHERE id = $1",
+                "imp-1"
+            )
+            .await
+            .as_deref(),
+            Some("survey-v2")
+        );
+        let standing = "SELECT playbook FROM playbook_standing_launches WHERE id = $1";
+        assert_eq!(
+            column(&pool, standing, "nightly").await.as_deref(),
+            Some("survey-v2")
+        );
+        assert_eq!(
+            column(&pool, standing, "elsewhere").await.as_deref(),
+            Some("other")
+        );
+        assert_eq!(
+            launch_playbook_of(&pool, "playbook:studio:queued").await,
+            "survey-v2"
+        );
+        assert_eq!(
+            launch_playbook_of(&pool, "playbook:studio:registered").await,
+            "studio"
+        );
+    }
+
+    /// A rename is refused before anything moves when the new id is not a free slug, the draft is
+    /// unknown or retired, or bindings an earlier draft left on the new id would collide; a
+    /// refusal mid-transaction leaves the draft where it was.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_refused_rename_moves_nothing(pool: PgPool) {
+        for id in ["studio", "other"] {
+            create(
+                &pool,
+                id,
+                "a drafted pack",
+                DraftSeed::Skeleton,
+                Some("alice"),
+                &alice(),
+            )
+            .await
+            .expect("create");
+        }
+        sqlx::query(
+            "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, tar_digest, \
+             tar_bytes, params_schema, schema_digest, core_rev, created_at, updated_at) \
+             VALUES ('survey', 'd', 'o/r', 'aaa', 'packs/survey', '\\x00'::bytea, 'sha256:1', 1, \
+             '{}'::jsonb, 'sha256:2', 'pin', 'now', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed registry");
+
+        for (to, why) in [("studio", "its own id"), ("Not_A_Slug", "a bad slug")] {
+            assert!(
+                matches!(
+                    rename(&pool, "studio", to, Some(&alice()), None).await,
+                    Err(DraftError::Invalid(_))
+                ),
+                "{why}"
+            );
+        }
+        for (to, why) in [
+            ("other", "another draft"),
+            ("survey", "a registered playbook"),
+        ] {
+            assert!(
+                matches!(
+                    rename(&pool, "studio", to, Some(&alice()), None).await,
+                    Err(DraftError::Conflict(_))
+                ),
+                "{why}"
+            );
+        }
+        assert!(matches!(
+            rename(&pool, "missing", "fresh", Some(&alice()), None).await,
+            Err(DraftError::NotFound(_))
+        ));
+
+        bind_secret(&pool, "studio", "studio_token").await;
+        bind_secret(&pool, "fresh", "leftover_token").await;
+        match rename(&pool, "studio", "fresh", Some(&alice()), None).await {
+            Err(DraftError::Conflict(msg)) => assert!(msg.contains("unbind"), "{msg}"),
+            other => panic!("expected a binding collision, got {other:?}"),
+        }
+        assert!(get(&pool, "fresh").await.expect("read").is_none());
+        assert_eq!(versions(&pool, "studio").await.expect("versions").len(), 1);
+        assert_eq!(scope_bindings(&pool, "studio").await, vec!["pr_token"]);
+
+        sqlx::query("UPDATE playbook_drafts SET retired_at = 'now' WHERE id = 'other'")
+            .execute(&pool)
+            .await
+            .expect("retire");
+        match rename(&pool, "other", "renamed", Some(&alice()), None).await {
+            Err(DraftError::Conflict(msg)) => assert!(msg.contains("retired"), "{msg}"),
+            other => panic!("expected a retired refusal, got {other:?}"),
+        }
+        assert!(get(&pool, "other").await.expect("read").is_some());
+    }
+
+    async fn count(pool: &PgPool, sql: &str, key: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .expect("count")
+    }
+
+    /// A delete takes everything keyed on the draft id with it, so a draft created at that id
+    /// afterwards starts with no bindings, shares, or schedules it never asked for, and the bound
+    /// secret is free to delete. Another draft's rows stay.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_new_draft_inherits_nothing_from_a_deleted_one_at_its_id(pool: PgPool) {
+        for id in ["studio", "other"] {
+            create(
+                &pool,
+                id,
+                "a drafted pack",
+                DraftSeed::Skeleton,
+                Some("alice"),
+                &alice(),
+            )
+            .await
+            .expect("create");
+        }
+        let secret = bind_secret(&pool, "studio", "studio_token").await;
+        bind_secret(&pool, "other", "other_token").await;
+        for draft in ["studio", "other"] {
+            crate::authz::store::upsert_share(
+                &mut pool.acquire().await.expect("conn"),
+                &crate::authz::store::ShareRow {
+                    resource_type: "playbook_draft".to_string(),
+                    resource_id: draft.to_string(),
+                    grantee: "user:bob".to_string(),
+                    role: "editor".to_string(),
+                    not_after: None,
+                    created_by: Some("alice".to_string()),
+                    created_at: "now".to_string(),
+                    updated_at: "now".to_string(),
+                },
+            )
+            .await
+            .expect("share");
+        }
+        standing_launch(&pool, "nightly", "studio").await;
+        standing_launch(&pool, "elsewhere", "other").await;
+        sqlx::query(
+            "INSERT INTO playbook_schedules (id, cron_expr, tz, next_due_at) \
+             VALUES ('nightly', '0 3 * * *', 'UTC', 'later')",
+        )
+        .execute(&pool)
+        .await
+        .expect("schedule");
+        sqlx::query(
+            "INSERT INTO pack_imports (id, repo, git_ref, path, rev, tar_gz, tar_digest, \
+             tar_bytes, diagnostics, core_rev, status, created_at, draft_id) \
+             VALUES ('imp-1', 'o/r', 'main', 'packs/studio', 'ccc', '\\x00'::bytea, 'sha256:3', \
+             1, '[]'::jsonb, 'pin', 'pending', 'now', 'studio')",
+        )
+        .execute(&pool)
+        .await
+        .expect("import");
+
+        let dropped = delete(&pool, "studio", Some(&alice()), None)
+            .await
+            .expect("delete")
+            .expect("the draft was there");
+        assert_eq!(
+            dropped,
+            Dropped {
+                bindings: 1,
+                shares: 1,
+                standing_launches: 1,
+            }
+        );
+
+        let trail = crate::secrets::store::audit_for_secret(&pool, &secret, 10)
+            .await
+            .expect("trail");
+        let entry = trail.first().expect("an audit row");
+        assert_eq!(entry.action, crate::secrets::AuditAction::Unbind);
+        assert_eq!(entry.actor.as_deref(), Some("user:alice"));
+        assert_eq!(
+            entry.detail.as_deref(),
+            Some("playbook studio, draft deleted")
+        );
+        assert!(
+            crate::secrets::store::bindings_for_secret(&pool, &secret)
+                .await
+                .expect("bindings")
+                .is_empty(),
+            "nothing holds the secret back from deletion"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM playbook_schedules WHERE id = $1",
+                "nightly"
+            )
+            .await,
+            0,
+            "the trigger sidecar goes with its standing launch"
+        );
+        let linked: Option<String> =
+            sqlx::query_scalar("SELECT draft_id FROM pack_imports WHERE id = 'imp-1'")
+                .fetch_one(&pool)
+                .await
+                .expect("read");
+        assert_eq!(linked, None);
+
+        create(
+            &pool,
+            "studio",
+            "someone else's",
+            DraftSeed::Skeleton,
+            Some("bob"),
+            &alice(),
+        )
+        .await
+        .expect("the id is free again");
+        assert!(scope_bindings(&pool, "studio").await.is_empty());
+        assert!(
+            crate::authz::store::shares_of(&pool, "playbook_draft", "studio")
+                .await
+                .expect("shares")
+                .is_empty()
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT count(*) FROM playbook_standing_launches WHERE playbook = $1",
+                "studio"
+            )
+            .await,
+            0
+        );
+
+        assert_eq!(scope_bindings(&pool, "other").await, vec!["pr_token"]);
+        assert_eq!(
+            crate::authz::store::shares_of(&pool, "playbook_draft", "other")
+                .await
+                .expect("shares")
+                .len(),
+            1
+        );
+        assert_eq!(
+            column(
+                &pool,
+                "SELECT playbook FROM playbook_standing_launches WHERE id = $1",
+                "elsewhere"
+            )
+            .await
+            .as_deref(),
+            Some("other")
+        );
+    }
+
+    /// A retired draft can share its id with the playbook its graduated pack registered as, and
+    /// the bindings on that id are the playbook's: deleting the draft leaves them.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn deleting_a_retired_draft_keeps_its_registered_namesakes_bindings(pool: PgPool) {
+        create(
+            &pool,
+            "survey",
+            "a drafted pack",
+            DraftSeed::Skeleton,
+            Some("alice"),
+            &alice(),
+        )
+        .await
+        .expect("create");
+        bind_secret(&pool, "survey", "survey_token").await;
+        sqlx::query("UPDATE playbook_drafts SET retired_at = 'now' WHERE id = 'survey'")
+            .execute(&pool)
+            .await
+            .expect("retire");
+        sqlx::query(
+            "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, tar_digest, \
+             tar_bytes, params_schema, schema_digest, core_rev, created_at, updated_at) \
+             VALUES ('survey', 'd', 'o/r', 'aaa', 'packs/survey', '\\x00'::bytea, 'sha256:1', 1, \
+             '{}'::jsonb, 'sha256:2', 'pin', 'now', 'now')",
+        )
+        .execute(&pool)
+        .await
+        .expect("register the graduated pack");
+
+        let dropped = delete(&pool, "survey", Some(&alice()), None)
+            .await
+            .expect("delete")
+            .expect("the draft was there");
+        assert_eq!(dropped.bindings, 0);
+        assert_eq!(scope_bindings(&pool, "survey").await, vec!["pr_token"]);
+    }
+
+    /// A clone opens on the source's newest save, takes the source's origin as its own, and
+    /// leaves the source untouched. It cannot take an id that is already a draft.
+    #[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+    async fn a_clone_starts_from_the_newest_save_with_the_same_origin(pool: PgPool) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registered = BTreeMap::from([
+            ("crucible.toml".to_string(), SKELETON_MANIFEST.to_string()),
+            (
+                "workflow.star".to_string(),
+                "params = {}\n# registered\n".to_string(),
+            ),
+        ]);
+        sqlx::query(
+            "INSERT INTO playbooks (id, description, repo, rev, path, tar_gz, tar_digest, \
+             tar_bytes, params_schema, schema_digest, core_rev, created_at, updated_at) \
+             VALUES ('survey', 'd', 'o/r', 'aaa', 'packs/survey', $1, 'sha256:1', 1, '{}'::jsonb, \
+             'sha256:2', 'pin', 'now', 'now')",
+        )
+        .bind(packed(dir.path(), &registered))
+        .execute(&pool)
+        .await
+        .expect("seed registry");
+        create(
+            &pool,
+            "studio",
+            "a drafted pack",
+            DraftSeed::Template {
+                id: "survey",
+                expected_rev: None,
+                expected_digest: None,
+            },
+            Some("alice"),
+            &alice(),
+        )
+        .await
+        .expect("template");
+        let mut edited = skeleton();
+        edited.insert("notes.md".to_string(), "second save\n".to_string());
+        save_version(&pool, "studio", edited.clone(), Some("alice"), None)
+            .await
+            .expect("save");
+
+        let bob = crate::authz::model::Principal::parse("user:bob").expect("principal");
+        let cloned = create(
+            &pool,
+            "copy",
+            "a variant",
+            DraftSeed::Draft { id: "studio" },
+            Some("bob"),
+            &bob,
+        )
+        .await
+        .expect("clone");
+        assert_eq!(cloned.version, 1);
+        assert_eq!(cloned.saved_by.as_deref(), Some("bob"));
+
+        let copy = get(&pool, "copy").await.expect("read").expect("the copy");
+        let source = get(&pool, "studio")
+            .await
+            .expect("read")
+            .expect("the source");
+        assert_eq!(copy.description, "a variant");
+        assert_eq!(copy.owner, bob);
+        let origin = copy.origin.expect("an origin");
+        assert_eq!(origin.kind, OriginKind::Playbook);
+        assert_eq!(origin.playbook.as_deref(), Some("survey"));
+        assert_eq!(origin.rev.as_deref(), Some("aaa"));
+        assert_eq!(Some(origin), source.origin);
+        assert_eq!(
+            files(&pool, "copy", None)
+                .await
+                .expect("files")
+                .expect("a save")
+                .files,
+            edited
+        );
+        assert_eq!(versions(&pool, "studio").await.expect("versions").len(), 2);
+
+        assert!(matches!(
+            create(
+                &pool,
+                "studio",
+                "d",
+                DraftSeed::Draft { id: "copy" },
+                None,
+                &bob
+            )
+            .await,
+            Err(DraftError::Conflict(_))
+        ));
+        assert!(matches!(
+            create(
+                &pool,
+                "orphan",
+                "d",
+                DraftSeed::Draft { id: "missing" },
+                None,
+                &bob
+            )
+            .await,
+            Err(DraftError::NotFound(_))
+        ));
+    }
+
     fn pack_prose(len: usize, seed: u64) -> String {
         const WORDS: [&str; 48] = [
             "the", "pack", "run", "agent", "tree", "file", "step", "build", "image", "draft",

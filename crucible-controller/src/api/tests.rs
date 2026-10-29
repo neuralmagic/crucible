@@ -3423,6 +3423,8 @@ async fn openapi_spec_contains_all_api_routes(pool: PgPool) -> Result<()> {
         "/api/playbook-drafts/{id}/origin/files",
         "/api/playbook-drafts/{id}/tarball",
         "/api/playbook-drafts/{id}/versions",
+        "/api/playbook-drafts/{id}/rename",
+        "/api/playbook-drafts/{id}/clone",
         "/api/playbook-drafts/{id}/launch",
         "/api/playbook-drafts/{id}/graduate",
         "/api/playbook-drafts/{id}/publish",
@@ -9254,6 +9256,121 @@ async fn a_draft_launches_with_ceilings_and_freezes_its_version(pool: PgPool) ->
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    Ok(())
+}
+
+/// A workflow whose `prepare` task declares a 110 minute timeout.
+const TIMED_WORKFLOW: &str = concat!(
+    "params = {\n",
+    "    \"topic\": {\"type\": \"string\", \"required\": True, \"pattern\": \"^[a-z ]+$\"},\n",
+    "    \"depth\": {\"type\": \"string\", \"required\": True},\n",
+    "}\n",
+    "\n",
+    "prepare = command(name = \"prepare\", run = \"true\", timeout = \"110m\")\n",
+    "\n",
+    "workflow(type = \"playbook\", tasks = [prepare], result = prepare)\n",
+);
+
+/// What the engine refuses a one hour run of [`TIMED_WORKFLOW`] with.
+const TIMED_REFUSAL: &str = "task \"prepare\" declares timeout 110m, longer than this run's \
+                             --max-time 1h. The run's ceiling is the longest any task may \
+                             declare; shorten the timeout or raise --max-time";
+
+async fn launch_count(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM playbook_launches")
+        .fetch_one(pool)
+        .await
+        .expect("count launches")
+}
+
+/// A draft launch whose `max_time` is shorter than a task's declared timeout is refused with the
+/// engine's own message on `max_time`, and adopts nothing; one that covers the timeout launches.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_draft_launch_shorter_than_a_task_timeout_is_refused(pool: PgPool) -> Result<()> {
+    let (db, _d) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    let created = post_admin(
+        &app,
+        "/api/playbook-drafts",
+        serde_json::json!({"id": "studio", "description": "a drafted pack"}),
+    )
+    .await;
+    assert_eq!(created.0, StatusCode::CREATED, "{}", created.1);
+    let mut files = draft_files();
+    files["workflow.star"] = serde_json::json!(TIMED_WORKFLOW);
+    let saved = post_admin(
+        &app,
+        "/api/playbook-drafts/studio/versions",
+        serde_json::json!({"files": files}),
+    )
+    .await;
+    assert_eq!(saved.0, StatusCode::OK, "{}", saved.1);
+    let launch = |max_time: &str| {
+        serde_json::json!({
+            "params": {"topic": "attention", "depth": "deep"},
+            "max_cost": 1.0,
+            "max_time": max_time,
+        })
+    };
+
+    let (status, body) = post_admin(&app, "/api/playbook-drafts/studio/launch", launch("1h")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["field"], "max_time", "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+    assert_eq!(
+        launch_count(&pool).await,
+        0,
+        "a refused launch adopts nothing"
+    );
+
+    let (status, body) = post_admin(&app, "/api/playbook-drafts/studio/launch", launch("2h")).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(launch_count(&pool).await, 1);
+    Ok(())
+}
+
+/// A registered launch, and a one-shot deferring one, is refused the same way: both authorize
+/// through the same path, so a deferred launch cannot store a ceiling its firing would fail on.
+#[sqlx::test(migrator = "crucible_controller::MIGRATOR")]
+async fn a_registered_launch_shorter_than_a_task_timeout_is_refused(pool: PgPool) -> Result<()> {
+    let (db, dir) = db_with(pool.clone());
+    let app = app_with_admins(db, vec!["wren".to_string()]);
+    register_survey(&app, dir.path(), TIMED_WORKFLOW).await;
+    let launch = |max_time: &str| {
+        serde_json::json!({
+            "params": {"topic": "attention", "depth": "deep"},
+            "max_cost": 1.0,
+            "max_time": max_time,
+        })
+    };
+
+    let (status, body) = post_launch(&app, "survey", launch("1h")).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["field"], "max_time", "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+
+    let mut deferred = launch("1h");
+    deferred["playbook"] = serde_json::json!("survey");
+    deferred["fire_at"] = serde_json::json!("2099-01-01T00:00:00Z");
+    let (status, body) = post_admin(&app, "/api/one-shots", deferred).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["fields"][0]["message"], TIMED_REFUSAL, "{body}");
+    let one_shots: i64 = sqlx::query_scalar("SELECT count(*) FROM playbook_one_shots")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(one_shots, 0, "a refused one-shot stores nothing");
+    assert_eq!(
+        launch_count(&pool).await,
+        0,
+        "a refused launch adopts nothing"
+    );
+
+    let (status, body) = post_launch(&app, "survey", launch("110m")).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a timeout equal to the ceiling fits: {body}"
+    );
     Ok(())
 }
 

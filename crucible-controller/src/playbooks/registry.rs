@@ -638,6 +638,58 @@ fn extract_params_schema(pack: &Path) -> Result<(serde_json::Value, String), Reg
     Ok((schema, digest))
 }
 
+/// The graph a run of the pack at `root` executes with `params`. `Err` is the engine's own
+/// diagnostic. Blocking.
+pub(crate) fn compiled_plan(
+    root: &Path,
+    params: &std::collections::BTreeMap<String, String>,
+) -> Result<crucible::plan::ir::ValidPlan, String> {
+    let source = workflow_source(root).map_err(|e| e.to_string())?;
+    let compiled = crucible::plan::starlark::compile_file_with(
+        &source,
+        crucible::plan::starlark::parent_or_cwd(&source),
+        params,
+    )
+    .map_err(|e| crucible::errors::report(&e))?;
+    compiled
+        .workflow
+        .playbook_plan()
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// Refuse a launch of the pack at `root` the engine would refuse at startup: its graph does not
+/// compile with `params`, or a task declares a timeout past `max_time`. Blocking.
+pub(crate) fn check_runnable(
+    root: &Path,
+    params: &std::collections::BTreeMap<String, String>,
+    max_time: &crate::model::MaxTime,
+) -> Result<(), FieldError> {
+    let plan = compiled_plan(root, params).map_err(|message| FieldError {
+        field: String::new(),
+        message: format!("the pack does not compile with these values: {message}"),
+    })?;
+    plan.check_timeouts(std::time::Duration::from_secs(max_time.secs()))
+        .map_err(|e| FieldError {
+            field: "max_time".to_string(),
+            message: e.to_string(),
+        })
+}
+
+/// [`check_runnable`] against `tree`, off the async runtime. The outer `Err` is a failure to
+/// materialize the tree, not a refusal.
+pub(crate) async fn check_tree_runnable(
+    tree: PackTree,
+    params: std::collections::BTreeMap<String, String>,
+    max_time: crate::model::MaxTime,
+) -> Result<Result<(), FieldError>> {
+    tokio::task::spawn_blocking(move || {
+        let pack = crate::playbooks::packs::materialize_tree(&tree)?;
+        Ok(check_runnable(pack.path(), &params, &max_time))
+    })
+    .await
+    .context("joining the launch plan check")?
+}
+
 /// Compute the pack's declared exposure with the linked engine; a manifest it refuses refuses
 /// the registration. Blocking.
 ///

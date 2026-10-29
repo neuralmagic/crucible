@@ -762,7 +762,8 @@ pub(crate) async fn save_playbook_draft(
     }
 }
 
-/// `DELETE /api/playbook-drafts/{id}` — drop a draft and every version it holds.
+/// `DELETE /api/playbook-drafts/{id}` — drop a draft, every version it holds, and its secret
+/// bindings, shares, and standing launches.
 #[utoipa::path(
     delete,
     path = "/api/playbook-drafts/{id}",
@@ -784,16 +785,26 @@ pub(crate) async fn delete_playbook_draft(
     {
         return Ok(refused);
     }
-    if !crate::playbooks::drafts::delete(state.db.pool(), &id).await? {
+    let Some(dropped) = crate::playbooks::drafts::delete(
+        state.db.pool(),
+        &id,
+        caller.actor(),
+        caller.subject_label(),
+    )
+    .await?
+    else {
         return Ok(not_found(format!("no draft {id:?}")));
-    }
+    };
     state
         .audit(
             crate::event_log::Event::now(
                 &format!("draft:{id}"),
                 "deleted",
                 "deleted",
-                Some(&format!("draft {id} deleted")),
+                Some(&format!(
+                    "draft {id} deleted with {} secret bindings, {} shares, {} standing launches",
+                    dropped.bindings, dropped.shares, dropped.standing_launches
+                )),
                 None,
             )
             .by(identity.as_deref()),
@@ -801,6 +812,218 @@ pub(crate) async fn delete_playbook_draft(
         )
         .await;
     Ok(StatusCode::NO_CONTENT.into_response())
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct RenameDraftBody {
+    /// The new id: a lowercase slug no draft or registered playbook holds.
+    id: String,
+}
+
+/// A renamed draft, and how much followed it to the new id.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftRenamedDto {
+    pub id: String,
+    pub prior: String,
+    pub bindings: i64,
+    pub shares: i64,
+    pub standing_launches: i64,
+    pub launches: i64,
+}
+
+/// `POST /api/playbook-drafts/{id}/rename` — move a draft to a new id, with its versions, secret
+/// bindings, shares, standing launches, and launches.
+#[utoipa::path(
+    post,
+    path = "/api/playbook-drafts/{id}/rename",
+    params(("id" = String, Path, description = "Draft id")),
+    request_body = RenameDraftBody,
+    responses(
+        (status = 200, description = "Draft renamed", body = DraftRenamedDto),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No draft with that id", body = ErrorBody),
+        (status = 409, description = "The new id is taken, the draft retired, or bindings or shares left on the new id collide", body = ErrorBody),
+        (status = 422, description = "Bad id, or the draft's own", body = ErrorBody)
+    )
+)]
+pub(crate) async fn rename_playbook_draft(
+    State(state): State<ApiState>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+    Json(body): Json<RenameDraftBody>,
+) -> Response {
+    if let Some(msg) = require_non_empty(&[("id", &body.id)]) {
+        return unprocessable(msg);
+    }
+    if let Err(refused) =
+        readable_draft(&state, &caller, &id, crate::authz::action::Verb::Update).await
+    {
+        return refused;
+    }
+    let to = body.id.trim().to_string();
+    let moved = match crate::playbooks::drafts::rename(
+        state.db.pool(),
+        &id,
+        &to,
+        caller.actor(),
+        caller.subject_label(),
+    )
+    .await
+    {
+        Ok(moved) => moved,
+        Err(e) => return draft_refusal(e),
+    };
+    state
+        .audit(
+            crate::event_log::Event::now(
+                &format!("draft:{to}"),
+                "renamed",
+                "renamed",
+                Some(&format!("draft {id} renamed to {to}")),
+                None,
+            )
+            .by(identity.as_deref()),
+            "rename_playbook_draft",
+        )
+        .await;
+    Json(DraftRenamedDto {
+        id: to,
+        prior: id,
+        bindings: moved.bindings as i64,
+        shares: moved.shares as i64,
+        standing_launches: moved.standing_launches as i64,
+        launches: moved.launches as i64,
+    })
+    .into_response()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CloneDraftBody {
+    /// The copy's id: a lowercase slug no draft or registered playbook holds.
+    id: String,
+    /// Absent ⇒ the source draft's.
+    #[serde(default)]
+    description: Option<String>,
+    /// The principal to own the copy: `user:<login>` or `team:<slug>` the caller acts as; absent
+    /// means the caller.
+    #[serde(default)]
+    owner: Option<String>,
+    /// The caller's own Vault token, to copy bindings of reference-mode secrets. Never stored.
+    #[serde(default)]
+    vault_token: Option<String>,
+}
+
+/// A cloned draft: its first version, the bindings it took, and the ones it left behind.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DraftClonedDto {
+    pub id: String,
+    pub version: i64,
+    pub bindings: Vec<crate::secrets::api::SecretBindingDto>,
+    pub left_bindings: Vec<crate::secrets::api::LeftBindingDto>,
+}
+
+/// `POST /api/playbook-drafts/{id}/clone` — copy a draft's newest save into a new draft with the
+/// same origin. Each secret binding is copied only if the caller could bind that secret
+/// themselves; shares and standing launches stay with the source.
+#[utoipa::path(
+    post,
+    path = "/api/playbook-drafts/{id}/clone",
+    params(("id" = String, Path, description = "Draft id")),
+    request_body = CloneDraftBody,
+    responses(
+        (status = 201, description = "Draft cloned", body = DraftClonedDto),
+        (status = 403, description = "The active policy denies the caller this action", body = ErrorBody),
+        (status = 404, description = "No draft with that id", body = ErrorBody),
+        (status = 409, description = "The new id is already a draft or a registered playbook", body = ErrorBody),
+        (status = 422, description = "Bad id or description", body = ErrorBody)
+    )
+)]
+pub(crate) async fn clone_playbook_draft(
+    State(state): State<ApiState>,
+    identity: crate::identity::session::Identity,
+    caller: crate::authz::Caller,
+    Path(id): Path<String>,
+    Json(body): Json<CloneDraftBody>,
+) -> Response {
+    if let Some(msg) = require_non_empty(&[("id", &body.id)]) {
+        return unprocessable(msg);
+    }
+    let source = match readable_draft(&state, &caller, &id, crate::authz::action::Verb::Read).await
+    {
+        Ok(source) => source,
+        Err(refused) => return refused,
+    };
+    let owner = match crate::authz::owner::owner_for_create(
+        &state,
+        &caller,
+        body.owner.as_deref(),
+        crate::authz::action::ResourceType::PlaybookDraft,
+    )
+    .await
+    {
+        Ok(owner) => owner,
+        Err(refused) => return refused,
+    };
+    let to = body.id.trim().to_string();
+    let description = body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .unwrap_or(&source.description);
+    let actor = identity.as_deref();
+    let saved = match crate::playbooks::drafts::create(
+        state.db.pool(),
+        &to,
+        description,
+        crate::playbooks::drafts::DraftSeed::Draft { id: &id },
+        actor,
+        &owner,
+    )
+    .await
+    {
+        Ok(saved) => saved,
+        Err(e) => return draft_refusal(e),
+    };
+    state
+        .audit(
+            crate::event_log::Event::now(
+                &format!("draft:{to}"),
+                "created",
+                "created",
+                Some(&format!("draft {to} cloned from draft {id}")),
+                None,
+            )
+            .by(actor),
+            "clone_playbook_draft",
+        )
+        .await;
+    let (copied, left) = match crate::secrets::api::copy_playbook_bindings(
+        &state,
+        &caller,
+        &id,
+        &to,
+        body.vault_token.as_deref(),
+    )
+    .await
+    {
+        Ok(bindings) => bindings,
+        Err(e) => return AppError::from(e).into_response(),
+    };
+    (
+        StatusCode::CREATED,
+        Json(DraftClonedDto {
+            id: to,
+            version: saved.version,
+            bindings: copied
+                .into_iter()
+                .map(crate::secrets::api::SecretBindingDto::from)
+                .collect(),
+            left_bindings: left,
+        }),
+    )
+        .into_response()
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -904,7 +1127,6 @@ pub(crate) async fn launch_playbook_draft(
         Ok(v) => v,
         Err(fields) => return invalid_fields(fields),
     };
-
     let saver = match crate::playbooks::api::saver::resolve_saver(
         &state,
         &caller,
@@ -975,6 +1197,19 @@ pub(crate) async fn launch_playbook_draft(
             }
             Err(e) => return AppError::from(anyhow::Error::new(e)).into_response(),
         };
+    let tree =
+        match crate::playbooks::drafts::version_tree(state.db.pool(), &id, Some(latest.version))
+            .await
+        {
+            Ok(Some((_, tree))) => tree,
+            Ok(None) => return not_found(format!("no draft {id:?}")),
+            Err(e) => return crate::playbooks::api::registry::unreadable_tree(e),
+        };
+    if let Err(refusal) =
+        crate::playbooks::api::registry::check_plan(tree, &params, &max_time).await
+    {
+        return refusal;
+    }
     let exposure_dto = match ExposureDto::try_from(&exposure) {
         Ok(dto) => dto,
         Err(e) => return AppError::from(e).into_response(),

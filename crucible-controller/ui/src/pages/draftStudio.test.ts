@@ -3,6 +3,7 @@ import { NO_AGENT_PICK } from './agentPick';
 import type { ParamFieldSpec } from './playbookLaunchForm';
 import {
   anchorOf,
+  cloneDraftBody,
   draftLaunchBody,
   EMPTY_STUDIO,
   flaggedFiles,
@@ -309,6 +310,20 @@ describe('a draft names what it is based on', () => {
     expect(shortRev(`sha256:${'cd'.repeat(32)}`)).toBe('sha256:cdcdcdcd');
     expect(shortRev('4d5e6f708192a3b4')).toBe('4d5e6f70');
     expect(shortRev(null)).toBe('');
+  });
+});
+
+describe('cloneDraftBody', () => {
+  it('sends only the id when description and token are blank', () => {
+    expect(cloneDraftBody({ to: ' survey-v2 ', description: '  ', vaultToken: ' ' })).toEqual({
+      id: 'survey-v2',
+    });
+  });
+
+  it('trims a description and a token it sends', () => {
+    expect(
+      cloneDraftBody({ to: 'copy', description: ' a variant ', vaultToken: ' hvs.aaa ' })
+    ).toEqual({ id: 'copy', description: 'a variant', vault_token: 'hvs.aaa' });
   });
 });
 

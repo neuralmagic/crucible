@@ -32,12 +32,11 @@ any language. It does not need a Rust integration.
 
 A playbook run does these steps:
 
-1. It compiles the plan.
-2. It admits the plan against the capabilities that the substrate offers.
-3. It executes the tasks in dependency order in one workspace.
+1. It compiles the plan into an IR
+2. It admits the plan against the capabilities that the substrate (cluster) offers
+3. It executes the tasks in dependency order in one workspace
 
-A branch that no answer selects settles `not_taken` and spends nothing. A revise pair runs
-its rounds. The run ends when the result task settles or the budget is spent.
+The run ends when the result task reaches completion or the total run budget (agent cost or time) is spent.
 
 A scored (autoresearch) run puts the same graph in a keep-or-discard loop. In each
 iteration, Crucible:
@@ -51,7 +50,7 @@ iteration, Crucible:
 6. restores the last accepted state for all other candidates.
 
 The default world records accepted states as Git commits and uses Git to restore rejected
-states. A domain that changes state outside Git can add snapshot and restore commands in
+states. A domain that changes state outside Git (like on the cluster itself) can add snapshot and restore commands in
 `[world]`.
 
 The manifest, the judge, and the frozen injected evaluation files make up the evaluation
@@ -62,8 +61,8 @@ behavior. [ADR-0001](docs/adr/0001-adaptive-harness.md) gives the trust model.
 
 `crucible-controller/` runs the outer loop around the engine. It contains:
 
-- a Postgres ledger of issues, scopes, runs, and launches;
-- a daemon that reconciles the ledger into loop pods on one or more clusters;
+- a Postgres database of issues, scopes, runs, and launches;
+- a daemon that reconciles the db into loop pods on one or more clusters;
 - an HTTP API and the embedded React UI;
 - teams, team workspaces, and policy-based authorization ([RFC-0003](docs/rfc/RFC-0003.md));
 - native OIDC login;
@@ -89,12 +88,11 @@ The controller links the engine in-process ([RFC-0004](docs/rfc/RFC-0004.md)). I
 ## Why not Argo or Tekton
 
 Crucible executes its own graph. It does not delegate to Argo Workflows, Tekton, or a
-similar system. The graph itself is ordinary. The differences are in the loop around the
-graph and the state under it.
+similar system. The differences are in the loop around the graph and the state under it.
 
-Starlark control flow unrolls into tasks at compile time, and no task is created during a
-run. Execution over that fixed task set can repeat. A `revise` pair dispatches a settled task
-again with the reviewer's verdict under `revision`. This continues until the task stops
+Starlark control flow unrolls into tasks at compile time, which means that task level dynamacism interior
+to a workflow run is not supported. Execution over that fixed task set can repeat. 
+A `revise` pair dispatches a settled task again with the reviewer's verdict under `revision`. This continues until the task stops
 failing or `max_rounds` is spent. A scored run repeats the whole graph in each iteration and
 carries the accepted state, the best score, and the remaining budget forward.
 
@@ -102,11 +100,14 @@ A workflow engine would have to host both cycles. Tekton has no loop construct: 
 cannot reference itself, and `matrix` covers only fan-out. Argo expresses iteration as
 template recursion, which keeps the nodes of every round in one workflow object.
 
-The executor has four properties that neither system provides:
+Crucible's executor has properties that neither system provides:
 
 - **One workspace.** Tasks share one Git checkout. They stage dependency files into it and
   return results through a workspace file. Argo and Tekton pass parameters and archived
   artifacts between pods.
+- **Loops.** Crucible supports `revise` style looping and re-entrancy
+- **Decision Model Branching.** Use your favorite systemone or decision model to route between
+  options in the graph.
 - **Validity is separate from scheduling.** Capability truncation is computed before any
   dispatch. Transport failures retry. Measured failures do not retry. An advisory failure
   blocks its dependents but does not invalidate the run.
@@ -302,7 +303,7 @@ workflow(
 )
 ```
 
-A playbook has no judge. It branches on a `route()`, and a task that settles failing can
+A playbook does not need a judge. This example branches on a `route()`, and a task that results as failed can
 send a dependency back:
 
 ```python
@@ -335,12 +336,11 @@ filed = command(name = "filed", run = "./act.sh filed",
 workflow(type = "playbook", tasks = [read, gate, oncall, backlog, filed], result = filed)
 ```
 
-A branch that no answer selects settles `not_taken`. It does not dispatch, does not spend,
-and does not invalidate the run. For this reason, `filed` joins on `join = "passed"`.
-`otherwise` takes every answer that no other task claims. If you add an option to the
+A branch that no answer selects resolves as  `not_taken`. For this reason, `filed` joins 
+on `join = "passed"`. `otherwise` would be the opposite. If you add an option to the
 question, the new answer goes to the `otherwise` task.
 
-The revise pair is the other run-time cycle. `review` runs `author` again with its verdict
+The revise pair is the other supported run-time cycle. `review` runs `author` again with its verdict
 under `revision` until `review` stops failing or the rounds are spent:
 
 ```python

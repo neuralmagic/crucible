@@ -41,6 +41,41 @@ pub(crate) async fn launch(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Resul
     Ok(())
 }
 
+/// Record `e` on `key`'s event log as a failed dispatch, and hand it back.
+async fn dispatch_failed(db: &Db, key: &str, e: anyhow::Error) -> anyhow::Error {
+    let _ = db
+        .events()
+        .append(&Event::now(
+            key,
+            "new",
+            "new",
+            Some(PLAYBOOK_DISPATCH_FAILED),
+            Some(&crate::model::truncate_chain(&format!("{e:#}"))),
+        ))
+        .await;
+    e
+}
+
+/// Why the engine would refuse `launch` at startup, judged against the pack it froze. `None` when
+/// it would start, or when no pack is stored for the dispatch to fail on.
+async fn plan_refusal(
+    db: &Db,
+    key: &str,
+    launch: &crate::launches::model::PlaybookLaunch,
+) -> Result<Option<String>> {
+    let Some(pack) = crate::playbooks::packs::materialize_pack(db.pool(), key).await? else {
+        return Ok(None);
+    };
+    let params = launch.params.iter().cloned().collect();
+    let max_time = launch.max_time.clone();
+    let checked = tokio::task::spawn_blocking(move || {
+        crate::playbooks::registry::check_runnable(pack.path(), &params, &max_time)
+    })
+    .await
+    .context("joining the launch plan check")?;
+    Ok(checked.err().map(|field| field.message))
+}
+
 async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let day = crate::clock::today_utc();
     if db
@@ -63,6 +98,22 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
         .await?;
         return Ok(());
     };
+    let refusal = match plan_refusal(db, &issue.key, &launch).await {
+        Ok(refusal) => refusal,
+        Err(e) => return Err(dispatch_failed(db, &issue.key, e).await),
+    };
+    if let Some(detail) = refusal {
+        crate::issues::transitions::park(
+            db.pool(),
+            db.events(),
+            &issue.key,
+            Status::New,
+            &ParkReason::PlanRefused { detail },
+            ParkedBy::Machine,
+        )
+        .await?;
+        return Ok(());
+    }
 
     let run_id = new_run_id(&issue.key);
     // Both a draft test-fire and a registered launch resolve the playbook scope's bindings, against
@@ -232,19 +283,7 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
             db.ledger_append(None, "capped", 0.0).await?;
             return Ok(());
         }
-        Err(e) => {
-            let _ = db
-                .events()
-                .append(&Event::now(
-                    &issue.key,
-                    "new",
-                    "new",
-                    Some(PLAYBOOK_DISPATCH_FAILED),
-                    Some(&crate::model::truncate_chain(&format!("{e:#}"))),
-                ))
-                .await;
-            return Err(e);
-        }
+        Err(e) => return Err(dispatch_failed(db, &issue.key, e).await),
     };
 
     if let Started::SecretsRefused(detail) = &started {

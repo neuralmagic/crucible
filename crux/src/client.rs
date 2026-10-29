@@ -623,6 +623,31 @@ impl Client {
         .map(|_| ())
     }
 
+    /// Move a draft to `to`, with everything keyed on its id.
+    pub async fn rename_draft<T: DeserializeOwned>(&self, id: &str, to: &str) -> Result<T> {
+        let body = serde_json::json!({ "id": to });
+        self.post(
+            &format!("/api/playbook-drafts/{}/rename", encode(id)),
+            Some(&body),
+        )
+        .await
+    }
+
+    /// Copy a draft's newest save into a new draft `to`.
+    pub async fn clone_draft<T: DeserializeOwned>(
+        &self,
+        id: &str,
+        to: &str,
+        description: Option<&str>,
+    ) -> Result<T> {
+        let body = serde_json::json!({ "id": to, "description": description });
+        self.post(
+            &format!("/api/playbook-drafts/{}/clone", encode(id)),
+            Some(&body),
+        )
+        .await
+    }
+
     /// Export the newest compiling version as a PR against `repo`.
     pub async fn graduate_draft<T: DeserializeOwned>(
         &self,
