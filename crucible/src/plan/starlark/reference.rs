@@ -724,6 +724,14 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
             "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
         ),
         Reserved::new(
+            crate::plan::ir::NOTE_FIELD,
+            "str",
+            "Why the task failed or was skipped, recorded as its note: in place of the default \
+             note when `status` is `\"fail\"` or `\"skipped\"`, and after the exit status in \
+             place of the stderr tail when a command exits nonzero. The control plane shows it as \
+             a parked run's reason. Read only from a result that fails or skips.",
+        ),
+        Reserved::new(
             crate::plan::ir::COMPLETE_FIELD,
             "bool",
             "`true` on a passing main-graph task of a playbook ends the run early and valid: \
@@ -1033,7 +1041,7 @@ mod tests {
         let results = super::reserved_result_fields();
         assert_eq!(
             results.iter().map(|row| row.name).collect::<Vec<_>>(),
-            ["status"]
+            ["status", crate::plan::ir::NOTE_FIELD]
                 .into_iter()
                 .chain(crate::plan::ir::RESERVED_OUTPUTS)
                 .collect::<Vec<_>>(),
