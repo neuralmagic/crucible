@@ -4,11 +4,16 @@ import {
   detailPath,
   dispatchTone,
   graphRunId,
+  launchLabel,
+  launchWallSecs,
+  launchRunPath,
+  launchVersion,
   originLabel,
   originLinks,
   relaunchPath,
   rerunLaunchBody,
   rerunRows,
+  rerunSummary,
   withTask,
 } from './launchView';
 
@@ -67,6 +72,71 @@ describe('originLinks', () => {
     const links = originLinks(detail({}, { origin: 'schedule', schedule: 'nightly' }));
     expect(links.map((l) => l.label)).toEqual(['pack', 'schedule']);
     expect(links[1]).toEqual({ label: 'schedule', value: 'nightly', to: null });
+  });
+});
+
+describe('launchLabel', () => {
+  it('names a launch by its pack and the head of its id', () => {
+    expect(launchLabel('playbook:cve-triage:01a17b0f-9665-74df-9539-96935bb86827')).toBe('cve-triage 01a17b0f');
+    expect(launchLabel('playbook:survey:0199')).toBe('survey 0199');
+    expect(launchLabel('INFERENG-77')).toBe('INFERENG-77');
+  });
+
+  it('links a launch run under its launch', () => {
+    expect(launchRunPath('playbook:survey:0199', 'RUN 1')).toBe('/playbook-runs/playbook%3Asurvey%3A0199/runs/RUN%201');
+  });
+});
+
+describe('launchWallSecs', () => {
+  const ev = (from: string, to: string, ts: string) => ({ from, to, ts });
+
+  it('measures from the move into running to the move out of it', () => {
+    expect(
+      launchWallSecs([
+        ev('new', 'new', '2026-10-27T01:53:01Z'),
+        ev('new', 'running', '2026-10-27T01:53:04Z'),
+        ev('running', 'running', '2026-10-27T01:53:04Z'),
+        ev('running', 'done', '2026-10-27T02:03:19Z'),
+      ]),
+    ).toBe(615);
+  });
+
+  it('reads the trail in time order and measures a failure the same way', () => {
+    expect(
+      launchWallSecs([
+        ev('running', 'failed', '2026-10-27T02:00:30Z'),
+        ev('new', 'running', '2026-10-27T02:00:00Z'),
+      ]),
+    ).toBe(30);
+  });
+
+  it('is null while the launch runs, before it starts, or on a bad stamp', () => {
+    expect(launchWallSecs([ev('new', 'running', '2026-10-27T02:00:00Z')])).toBeNull();
+    expect(launchWallSecs([ev('new', 'new', '2026-10-27T02:00:00Z')])).toBeNull();
+    expect(launchWallSecs([])).toBeNull();
+    expect(launchWallSecs([ev('new', 'running', 'soon'), ev('running', 'done', 'later')])).toBeNull();
+  });
+});
+
+describe('rerunSummary', () => {
+  const row = (task: string, state: 'reused' | 'reruns' | 'changed') => ({ task, state, costUsd: null });
+
+  it('says all reused when nothing would run again', () => {
+    expect(rerunSummary([row('a', 'reused'), row('b', 'reused')])).toBe('2 tasks · all reused');
+  });
+
+  it('counts each state otherwise, leaving out the ones at zero', () => {
+    expect(rerunSummary([row('a', 'reused'), row('b', 'reruns'), row('c', 'reruns')])).toBe('3 tasks · 1 reused · 2 rerun');
+    expect(rerunSummary([row('a', 'changed')])).toBe('1 task · 1 changed');
+    expect(rerunSummary([])).toBe('0 tasks');
+  });
+});
+
+describe('launchVersion', () => {
+  it('names a draft launch by its save and a registered one by its schema digest', () => {
+    expect(launchVersion({ draft_version: 126, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('draft v126');
+    expect(launchVersion({ draft_version: null, schema_digest: 'sha256:8484c6b8284cf62cf6' })).toBe('8484c6b8284c');
+    expect(launchVersion({ schema_digest: 'deadbeef' })).toBe('deadbeef');
   });
 });
 

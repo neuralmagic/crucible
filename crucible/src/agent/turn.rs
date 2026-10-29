@@ -201,8 +201,7 @@ impl TurnCost {
     }
 }
 
-/// Render an event as a human-readable line for the headless console. `None` for events that stay quiet
-/// in a log (init/result/lifecycle); token/tool/text/thinking/retry/error show.
+/// Render observable activity and failed results for the headless console.
 pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
     match ev {
         AgentEvent::Text { delta } => Some(delta.clone()),
@@ -234,6 +233,15 @@ pub(crate) fn human_line(ev: &AgentEvent) -> Option<String> {
             error_type,
             message,
         } => Some(format!("\u{274c} Error: {error_type}: {message}")),
+        AgentEvent::Result {
+            is_error: true,
+            subtype,
+            error,
+            ..
+        } => Some(format!(
+            "\u{274c} Error: {subtype}: {}",
+            error.as_deref().unwrap_or("agent reported a failed turn"),
+        )),
         _ => None,
     }
 }
@@ -244,6 +252,24 @@ mod tests {
     use crate::agent::turn::TurnCost;
     use crucible_contract::event::AgentEvent;
     use crucible_contract::inference::{TokenPrice, UsdPerMtok};
+
+    #[test]
+    fn a_failed_result_is_visible_without_a_separate_error_event() {
+        let event = AgentEvent::Result {
+            subtype: "error_during_execution".into(),
+            is_error: true,
+            turns: 0,
+            cost_usd: 0.0,
+            error: Some("Prompt too long".into()),
+        };
+
+        assert!(
+            crate::agent::turn::human_line(&event)
+                .unwrap()
+                .contains("Prompt too long")
+        );
+        assert!(crate::agent::turn::human_line(&result(0.0)).is_none());
+    }
 
     fn result(cost_usd: f64) -> AgentEvent {
         AgentEvent::Result {

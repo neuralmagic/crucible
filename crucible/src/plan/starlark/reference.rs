@@ -113,10 +113,12 @@ fn task_knobs() -> Vec<Kwarg> {
         Kwarg::new(
             "emits_files",
             "list[str] | dict[str, schema | None]",
-            "Workspace files the task produces. A dependent is staged with the declared files of \
-             every dependency that passed. The dict form maps a path to `schema_file(...)` or \
-             `None`; a file with a schema must hold JSON the schema admits when the task passes, \
-             or the task fails.",
+            "Workspace files the task produces. A task is staged with the declared files of \
+             every ancestor that passed, not only its direct dependencies, under \
+             `inputs/<producer>/`; a `join = \"settled\"` task also gets those of a direct \
+             dependency that failed. JSON outputs, unlike files, come from direct dependencies \
+             only. The dict form maps a path to `schema_file(...)` or `None`; a file with a \
+             schema must hold JSON the schema admits when the task passes, or the task fails.",
         ),
         Kwarg::new(
             "over",

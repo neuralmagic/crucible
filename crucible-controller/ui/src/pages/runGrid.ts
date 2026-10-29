@@ -3,7 +3,6 @@
 // whose `latestResults` keeps only where a task ended up. This keeps every attempt it made.
 
 import {
-  mappedFrom,
   sum,
   timedResults,
   toneOf,
@@ -12,6 +11,7 @@ import {
   type TaskTone,
 } from './taskGraph';
 import type { ExternalLinkRef } from '../ui';
+import { mappedFrom } from './workflowGraphLayout';
 
 type TaskAgent = NonNullable<TaskResult['agent']>;
 
@@ -70,7 +70,7 @@ export interface RunGrid {
 /// order so a plan whose tasks are independent reads the way its author wrote it. A dependency cycle
 /// the planner let through leaves tasks unemitted; they follow in declaration order rather than
 /// vanishing from the grid.
-function planOrder(tasks: PlanTask[]): string[] {
+export function planOrder(tasks: PlanTask[]): string[] {
   const known = new Set(tasks.map((t) => t.name));
   const pending = new Map(
     tasks.map((t) => [t.name, new Set(t.depends_on.filter((dep) => known.has(dep)))]),
@@ -207,6 +207,34 @@ export function runGridView(tasks: PlanTask[], reported: TaskResult[]): RunGrid 
   const counts = [...tally].map(([status, count]) => ({ status, tone: toneOf(status), count }));
 
   return { iters, rows, maxSecs, counts };
+}
+
+const OUTCOME: Record<string, string> = {
+  pass: 'passed',
+  fail: 'failed',
+  transport: 'lost',
+  blocked: 'blocked',
+  truncated: 'truncated',
+  skipped: 'skipped',
+};
+
+export interface AttemptsSummary {
+  attempts: string;
+  outcomes: { status: string; label: string }[];
+}
+
+/** How many attempts a run made and how they ended, for the grid's header line. */
+export function attemptsSummary(counts: RunGrid['counts']): AttemptsSummary {
+  const total = counts.reduce((sum, c) => sum + c.count, 0);
+  const attempts = `${total} ${total === 1 ? 'attempt' : 'attempts'}`;
+  const [only] = counts;
+  if (counts.length === 1 && only?.status === 'pass') {
+    return { attempts, outcomes: [{ status: 'pass', label: 'all passed' }] };
+  }
+  return {
+    attempts,
+    outcomes: counts.map((c) => ({ status: c.status, label: `${c.count} ${OUTCOME[c.status] ?? c.status}` })),
+  };
 }
 
 /// A stretch of adjacent iterations a row reported the same status across, drawn as one block.
