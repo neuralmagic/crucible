@@ -1387,31 +1387,31 @@ async fn personal_github_pat(
     };
     let row = match crate::secrets::store::get(state.db.pool(), secret_id).await {
         Ok(Some(row)) => row,
-        Ok(None) => return not_found(format!("no secret {secret_id:?}")),
-        Err(e) => return AppError::from(e).into_response(),
+        Ok(None) => return Err(not_found(format!("no secret {secret_id:?}"))),
+        Err(e) => return Err(AppError::from(e).into_response()),
     };
     if row.owner != *actor {
-        return forbidden(format!("secret {secret_id:?} is not owned by {actor}"));
+        return Err(forbidden(format!("secret {secret_id:?} is not owned by {actor}")));
     }
     if row.kind != crate::secrets::SecretKind::Opaque
         || row.visibility != crate::secrets::Visibility::BrokerOnly
         || row.mode == crate::secrets::SecretMode::Minted
     {
-        return unprocessable(
+        return Err(unprocessable(
             "a GitHub credential is an opaque, broker-only, stored secret; minted App tokens are \
              not personal PATs",
-        );
+        ));
     }
     let Some(vault) = state.vault.as_deref() else {
-        return unavailable(
+        return Err(unavailable(
             "this deployment has no Vault client, so personal GitHub secrets are off",
-        );
+        ));
     };
     let (token, _) = crate::secrets::read::current_value(vault, &row)
         .await
         .map_err(|e| unavailable(format!("reading secret {}: {e}", row.name)))?;
     if token.trim().is_empty() {
-        return unprocessable(format!("secret {} is empty", row.name));
+        return Err(unprocessable(format!("secret {} is empty", row.name)));
     }
     Ok(token)
 }
