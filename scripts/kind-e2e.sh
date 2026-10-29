@@ -31,8 +31,9 @@
 #   L  a version whose bytes change on a live controller loses its tree; it is read, downloaded,
 #      and delivered from its legacy bytes, and converts to the downloaded tree at the next boot; a
 #      registry row whose bytes change is inspected, templated, and launched from them alike
-#   T  a stored tree whose files were tampered with refuses its draft launch and parks its
-#      registered launch without a pod; the startup agent backfill skips it and fills the rest
+#   T  a stored tree whose files were tampered with refuses its draft and registered launches,
+#      and parks a launch queued before the tamper without a pod; the startup agent backfill skips
+#      it and fills the rest
 #   E  a restart re-derives a stale registry row from its tree, not its bytes
 #   I  a git pack is proposed, compiled, registered, opened as a draft, and registered directly,
 #      each holding the same tree with state/ ignored, named tree_digest through the API and crux;
@@ -50,7 +51,8 @@
 #   Q  an approved direct autoresearch pack plans and delivers the tree its scope froze, not one
 #      written to its pack row afterwards, and its approval evidence reads SCOPE.md from the
 #      stored tree (needs the controller built with the autoresearch lane)
-#   O  the local executor runs a stored tree with its steering beside it, and parks a tampered tree
+#   O  the local executor runs a stored tree with its steering beside it; a tampered tree refuses
+#      its launch and parks one queued before the tamper
 #   V  conversion makes a draft-sourced rev its tree and pins a secret binding and a fork to it, so
 #      neither is stale or moved across restarts and an identical republish, while new content
 #      stales and moves them; a launch is checked against the tree it froze; a pre-tree digest is
@@ -554,6 +556,37 @@ expect_parked() {
         fail "[$1] expected a park naming '$2', got '$STATUS': $reason"
     fi
     pass "[$1] parked: $reason"
+}
+
+# expect_launch_refused <label> <reason fragment> <crux launch command...>: the launch is refused
+# naming the reason.
+expect_launch_refused() {
+    local label="$1" reason="$2"
+    shift 2
+    if crux "$@" --max-cost 1 --max-time 5m >"$WORK/refused-$label.log" 2>&1; then
+        fail "[$label] $1 launched"
+    fi
+    grep -qF -- "$reason" "$WORK/refused-$label.log" ||
+        fail "[$label] the refusal does not name '$reason': $(cat "$WORK/refused-$label.log")"
+    pass "[$label] $1 refused naming '$reason'"
+}
+
+# hold_dispatch / release_dispatch <label>: a zero daily ceiling keeps every new launch from
+# dispatching; the release drops the override, back to the boot ceiling.
+hold_dispatch() {
+    api PUT /api/config/overrides '{"daily_cost_ceiling":0,"justification":"kind e2e"}'
+    [ "$HTTP" = 200 ] || fail "[$1] zeroing the daily ceiling: $HTTP $(cat "$WORK/api.json")"
+}
+release_dispatch() {
+    api PUT /api/config/overrides '{"justification":"kind e2e"}'
+    [ "$HTTP" = 200 ] || fail "[$1] dropping the daily ceiling override: $HTTP $(cat "$WORK/api.json")"
+    crux reconcile >/dev/null
+}
+# held <label> <key>: the launch is still new, with no run.
+held() {
+    crux reconcile >/dev/null
+    [ "$(crux playbook-run "$2" | jq -r '.launch.status + " " + (.runs | length | tostring)')" = "new 0" ] ||
+        fail "[$1] $2 dispatched while the ceiling held it"
 }
 
 # pods_seen <watch label> <key>: how many pod events the watch saw for the launch.
