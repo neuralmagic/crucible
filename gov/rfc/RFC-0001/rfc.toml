@@ -77,6 +77,7 @@ changed = [
     "a decision binding may speak decisions, the OpenAI Decisions API, reached at OpenAI's address when it names no URL (C-INFERENCE, C-ROUTE)",
     "the capability a model-decided route needs is decision, not systemone, since it names the role rather than one API (C-ROUTE)",
     "C-ROUTE-EACH: the cost ceiling blocks only an element whose decision asks the decision model (RFC-0002:C-PLAYBOOK-BUDGET)",
+    "C-ROUTE: an all-join task may declare a dependency optional, so one that settled not taken satisfies the join and gives no input entry; C-WORKFLOW adds the optional constructor",
 ]
 
 [[changelog]]

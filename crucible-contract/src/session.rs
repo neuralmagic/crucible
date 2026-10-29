@@ -120,6 +120,10 @@ pub struct PlanTaskWire {
     pub kind: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// The dependencies whose settling not taken satisfies the task's `all` join. Empty when it
+    /// declares none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional: Vec<String>,
     /// Logical durable agent session; empty means a fresh turn.
     #[serde(default)]
     pub session: String,
@@ -975,6 +979,7 @@ mod tests {
                 timeout: "10m".into(),
                 history_depth: 5,
                 definition: String::new(),
+                optional: Vec::new(),
             }],
             history_record: "propose-a".into(),
         });
@@ -1046,6 +1051,7 @@ mod tests {
             timeout: String::new(),
             history_depth: 0,
             definition: String::new(),
+            optional: Vec::new(),
         };
         let written = |revise: Vec<String>| {
             serde_json::to_value(task(revise)).expect("encodes")["revise"].clone()

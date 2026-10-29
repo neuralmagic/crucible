@@ -778,6 +778,11 @@ satisfied, or it joins `all` on a task that settled that way. It was never dispa
 nothing, and is not a failure. A `plan_admitted` task carries an additive `when` string,
 `route.question in a|b`, empty when the task is unconditional.
 
+A `plan_admitted` task carries `optional` (contract 1.20.0), the dependencies declared with
+`optional(...)`, omitted when there are none. A task joining `all` dispatches past such a
+dependency that settled `not_taken`, and its inputs carry no entry for it. An engine older than
+1.20.0 ignores `optional` in a compiled graph and settles the task `not_taken` instead.
+
 A `task_result` event carries an additive `links` array (contract 1.12.0), omitted when empty:
 the external results the task reported, one object per url with `url`, `provider`
 (`github`/`gitlab`/`jira`/`other`), `kind` (`pull_request`/`merge_request`/`branch`/`commit`/
