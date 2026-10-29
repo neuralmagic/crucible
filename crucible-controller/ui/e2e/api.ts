@@ -1000,7 +1000,7 @@ export const ROUTES: Record<string, Json> = {
     source_exists: true,
     dispatch: {
       state: 'dispatched',
-      failure: 'dispatch_run needs a deploy profile: set CONTROLLER_DEPLOY_PROFILE',
+      failure: 'creating the pack ConfigMap: etcdserver: request timed out',
       failed_at: '2026-08-21T09:00:10Z',
       failures: 1,
     },
