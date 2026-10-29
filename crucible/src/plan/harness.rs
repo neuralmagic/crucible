@@ -625,19 +625,23 @@ fn agent_prompt(
     let history = upstream.remove(&history_key);
     let inputs_json =
         serde_json::to_string_pretty(&upstream).context("serializing upstream task results")?;
+
     let inputs_section = if inputs_json.len() > 64 * 1024 {
         let declared = format!("{STAGED_INPUTS}/.task-results.json");
         let path = confined(workspace, &declared).map_err(anyhow::Error::msg)?;
+
         std::fs::create_dir_all(workspace.join(STAGED_INPUTS))
             .context("creating the agent inputs directory")?;
         engine_mode(&path);
         std::fs::write(&path, &inputs_json).context("writing complete agent task inputs")?;
+
         let mut permissions = std::fs::metadata(&path)
             .context("reading agent input file permissions")?
             .permissions();
         permissions.set_readonly(true);
         std::fs::set_permissions(&path, permissions)
             .context("making agent task inputs read-only")?;
+
         format!(
             "Full upstream task results are in `{declared}` ({} bytes). Read and query this JSON file as needed; it contains every upstream result.",
             inputs_json.len(),
@@ -645,6 +649,7 @@ fn agent_prompt(
     } else {
         format!("Upstream task results, as JSON:\n\n{inputs_json}")
     };
+
     let history_section = match history {
         Some(history) => crate::plan::history::history_section(&history)
             .context("rendering agent task history")?,
@@ -5250,24 +5255,39 @@ workflow(type = "playbook", tasks = [author, repro])
         let dir = playbook_pack(
             "large-agent-input-backend",
             r#"
-produce = command(name = "produce", run = "python3 -c 'import json; print(json.dumps({\"blob\": \"x\" * 180000}))'")
-review = agent(name = "review", prompt = "Inspect all upstream results.", depends_on = [produce])
+produce = command(
+    name = "produce",
+    run = "python3 -c 'import json; print(json.dumps({\"blob\": \"x\" * 180000}))'"
+)
+review = agent(
+    name = "review",
+    prompt = "Inspect all upstream results.",
+    depends_on = [produce]
+)
 workflow(type = "playbook", tasks = [produce, review])
 "#,
         );
+
         let script = dir.join("read-inputs.py");
         std::fs::write(
             &script,
-            r#"import json,os,pathlib
+            r#"import json, os, pathlib
+
 assert len(os.environ['CRUCIBLE_PROMPT']) < 4096
-path=pathlib.Path('inputs/.task-results.json')
+
+path = pathlib.Path('inputs/.task-results.json')
 assert path.stat().st_mode & 0o222 == 0
-inputs=json.loads(path.read_text())
+
+inputs = json.loads(path.read_text())
 assert inputs['produce']['blob'] == 'x' * 180000
-pathlib.Path('PLAN_TASK_RESULT.json').write_text(json.dumps({'saw':len(inputs['produce']['blob'])}))
+
+pathlib.Path('PLAN_TASK_RESULT.json').write_text(
+    json.dumps({'saw': len(inputs['produce']['blob'])})
+)
 "#,
         )
         .unwrap();
+
         let manifest = dir.join("crucible.toml");
         let text = std::fs::read_to_string(&manifest).unwrap();
         let text = text
@@ -5282,6 +5302,7 @@ pathlib.Path('PLAN_TASK_RESULT.json').write_text(json.dumps({'saw':len(inputs['p
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(manifest, text).unwrap();
+
         let out = run_playbook(&dir);
         assert!(out.valid, "{:?}", out.results);
         assert_eq!(
@@ -5308,18 +5329,22 @@ pathlib.Path('PLAN_TASK_RESULT.json').write_text(json.dumps({'saw':len(inputs['p
             serde_json::json!({"detail": "evidence".repeat(20000)}),
         )]);
         let prompt = agent_prompt("Review the evidence.", &inputs, &dir).unwrap();
+
         assert!(prompt.len() < 4096);
         assert!(prompt.contains("inputs/.task-results.json"));
+
         let path = dir.join("inputs/.task-results.json");
         let held: BTreeMap<TaskName, Value> =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(held, inputs);
         assert!(std::fs::metadata(&path).unwrap().permissions().readonly());
+
         let updated = BTreeMap::from([(
             TaskName("measurement".into()),
             serde_json::json!({"detail": "changed".repeat(20000)}),
         )]);
         agent_prompt("Review again.", &updated, &dir).unwrap();
+
         let held: BTreeMap<TaskName, Value> =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(held, updated);
@@ -5333,10 +5358,12 @@ pathlib.Path('PLAN_TASK_RESULT.json').write_text(json.dumps({'saw':len(inputs['p
         std::fs::write(&outside, "untouched").unwrap();
         std::fs::create_dir(dir.join("inputs")).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("inputs/.task-results.json")).unwrap();
+
         let inputs = BTreeMap::from([(
             TaskName("measurement".into()),
             serde_json::json!({"detail": "evidence".repeat(20000)}),
         )]);
+
         assert!(agent_prompt("Review.", &inputs, &dir).is_err());
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "untouched");
     }

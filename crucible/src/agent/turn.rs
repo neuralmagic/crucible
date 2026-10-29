@@ -262,6 +262,7 @@ mod tests {
             cost_usd: 0.0,
             error: Some("Prompt too long".into()),
         };
+
         assert!(
             crate::agent::turn::human_line(&event)
                 .unwrap()

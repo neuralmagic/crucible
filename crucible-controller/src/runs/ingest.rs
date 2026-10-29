@@ -277,6 +277,7 @@ impl ParsedRun {
         for (index, result) in self.task_results.iter().enumerate() {
             last.insert((result.iter, result.task.as_str()), index);
         }
+
         let current: Vec<_> = self
             .task_results
             .iter()
@@ -285,17 +286,21 @@ impl ParsedRun {
                 if last.get(&(result.iter, result.task.as_str())) != Some(index) {
                     return false;
                 }
+
                 let Some((node, instance)) = result.task.split_once('[') else {
                     return true;
                 };
+
                 let Some(parent) = last.get(&(result.iter, node)) else {
                     return true;
                 };
+
                 !instance.starts_with("round-")
                     && self.task_results[*parent].status.parse() != Ok(TaskStatus::Pass)
             })
             .map(|(_, result)| result)
             .collect();
+
         let failed = current
             .iter()
             .filter(|r| {
@@ -314,6 +319,7 @@ impl ParsedRun {
                     .map(|problem| format!("{}: {problem}", r.task))
                     .or_else(|| (!r.note.trim().is_empty()).then(|| r.note.trim().to_owned()))
             });
+
         failed.or_else(|| {
             current.iter().find_map(|r| {
                 r.blocked
@@ -1397,6 +1403,7 @@ mod tests {
             r#"{"v":1,"kind":"task_result","task":"build","status":"fail","iter":0,"note":"exit 1: ","output":{"pass":false,"problem":"source layer cannot package changed test paths"}}"#,
             r#"{"v":1,"kind":"task_result","task":"failure_investigation","status":"transport","iter":0,"note":"agent exited without a verdict"}"#,
         ].join("\n");
+
         assert_eq!(
             parse_session(&log).failure_cause().as_deref(),
             Some("build: source layer cannot package changed test paths")
@@ -1410,6 +1417,7 @@ mod tests {
             r#"{"v":1,"kind":"task_result","task":"review[candidate]","status":"fail","iter":0,"note":"timed out at 30m"}"#,
             r#"{"v":1,"kind":"task_result","task":"review","status":"fail","iter":0,"note":"1 of 1 instances failed"}"#,
         ].join("\n");
+
         assert_eq!(
             parse_session(&log).failure_cause().as_deref(),
             Some("timed out at 30m")

@@ -2166,6 +2166,7 @@ async fn complete_run_parks_a_run_that_reached_its_wall_clock_ceiling(pool: PgPo
         },
     )
     .await?;
+
     let log = [
         r#"{"v":1,"kind":"phase","phase":"baseline","iter":0}"#,
         r#"{"v":1,"kind":"shutdown","outcome":"budget","reason":"wall-clock ceiling reached"}"#,
@@ -2186,6 +2187,7 @@ async fn complete_run_parks_a_run_that_reached_its_wall_clock_ceiling(pool: PgPo
     let iss = crate::issues::store::get_issue(db.pool(), "owner/repo#8")
         .await?
         .unwrap();
+
     assert_eq!(
         iss.status,
         Status::Parked,

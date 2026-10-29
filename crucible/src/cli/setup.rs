@@ -493,14 +493,19 @@ mod tests {
         "#,
         )
         .unwrap();
+
         prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+
         let ws = dir.join("workspace");
         fs::create_dir(ws.join("evidence")).unwrap();
         fs::write(ws.join("evidence/probe.zip"), b"retained separately").unwrap();
         fs::write(ws.join("change.py"), "print('changed')\n").unwrap();
+
         crucible_vcs::git_memory::snapshot(&ws, "task probe").unwrap();
+
         let repo = git2::Repository::open(&ws).unwrap();
         let tree = repo.head().unwrap().peel_to_tree().unwrap();
+
         assert!(tree.get_path(Path::new("evidence/probe.zip")).is_err());
         assert!(tree.get_path(Path::new("change.py")).is_ok());
         assert_eq!(

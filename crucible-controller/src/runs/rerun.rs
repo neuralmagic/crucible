@@ -85,6 +85,7 @@ pub(crate) async fn preview(
     let session = crate::runs::blob_store::get_run_session(db.pool(), run_id)
         .await?
         .ok_or_else(|| RerunRefusal::NotFinished(run_id.to_string()))?;
+
     if dispatch == crate::runs::model::RunDispatch::Pod
         && crate::runs::blob_store::get_run_bundle(
             db.pool(),
@@ -97,6 +98,7 @@ pub(crate) async fn preview(
     {
         return Err(RerunRefusal::NoGitMemory(run_id.to_string()));
     }
+
     let (draft_version, tree) = match launch.draft_version {
         Some(_) => crate::playbooks::drafts::version_tree(db.pool(), &launch.playbook, None)
             .await?
@@ -400,6 +402,7 @@ mod tests {
     async fn a_pod_rerun_without_retained_git_memory_is_refused_before_dispatch(pool: PgPool) {
         pin(&pool, WORKFLOW).await;
         crate::testing::launch_playbook(&pool, "playbook:survey:1").await;
+
         crate::runs::store::insert_run(
             &pool,
             &NewRun {
@@ -430,6 +433,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         let db = Db::new(pool.clone());
         assert!(matches!(
             preview(&db, "run-pod-parent", &[]).await,
@@ -439,6 +443,7 @@ mod tests {
             admit(&db, "survey", false, "run-pod-parent", &[]).await,
             Err(RerunRefusal::NoGitMemory(run)) if run == "run-pod-parent"
         ));
+
         let start = serde_json::json!({
             "run": "run-pod-parent", "started_at": "2026-10-28T12:00:00Z",
             "base": "abc", "base_tree": "def", "plan": "sha256:p",
@@ -455,6 +460,7 @@ mod tests {
         )
         .await
         .unwrap();
+
         assert!(preview(&db, "run-pod-parent", &[]).await.is_ok());
         assert!(
             admit(&db, "survey", false, "run-pod-parent", &[])

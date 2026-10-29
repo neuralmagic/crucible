@@ -111,6 +111,7 @@ mod tests {
         let workspace = std::path::Path::new("/state/workspace");
         let first = fresh_name_for(workspace);
         let retry = fresh_name_for(workspace);
+
         assert_ne!(first, retry);
         assert_ne!(retry, name_for(workspace));
         assert_eq!(first.len(), MAX_NAME_LEN);
