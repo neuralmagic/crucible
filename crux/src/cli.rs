@@ -580,9 +580,31 @@ enum Command {
         json: bool,
     },
 
-    /// Delete a draft and every version of it. Admin only; the id is free to create again.
+    /// Delete a draft, every version of it, and its secret bindings, shares and schedules. Admin
+    /// only; the id is free to create again.
     DraftDelete {
         draft_id: String,
+    },
+
+    /// Rename a draft. Its saves, secret bindings, shares, standing launches and launches follow.
+    DraftRename {
+        draft_id: String,
+        /// The new id.
+        to: String,
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Copy a draft's newest save into a new draft, with the bindings you could make yourself.
+    DraftClone {
+        draft_id: String,
+        /// The copy's id.
+        to: String,
+        /// Defaults to the source draft's.
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        json: bool,
     },
 
     /// Publish a draft: register its newest compiling version as a playbook, with no review.
@@ -929,6 +951,15 @@ pub async fn run() -> Result<()> {
             .await?
         }
         Command::DraftDelete { draft_id } => ops::draft_delete(&client, &draft_id).await?,
+        Command::DraftRename { draft_id, to, json } => {
+            ops::draft_rename(&client, &draft_id, &to, json).await?
+        }
+        Command::DraftClone {
+            draft_id,
+            to,
+            description,
+            json,
+        } => ops::draft_clone(&client, &draft_id, &to, description.as_deref(), json).await?,
         Command::DraftGraduate {
             draft_id,
             repo,

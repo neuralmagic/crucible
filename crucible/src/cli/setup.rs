@@ -494,10 +494,13 @@ pub(crate) fn prep_plan_runner_with_params(
     // The harness's own files, plus where a task's staged inputs land. Without this a playbook's
     // per-task commit sweeps in the toolbox, the results log, and every artifact an ancestor
     // handed this task, and each task's commit reads as though it produced all of them.
-    crucible_vcs::git_memory::install_harness_excludes(
-        &workspace,
-        &[format!("{}/", crate::plan::STAGED_INPUTS)],
-    );
+    let excludes: Vec<String> = m
+        .workspace
+        .carried_paths()
+        .into_iter()
+        .chain(std::iter::once(format!("{}/", crate::plan::STAGED_INPUTS)))
+        .collect();
+    crucible_vcs::git_memory::install_harness_excludes(&workspace, &excludes);
     std::fs::create_dir_all(&p.state)
         .with_context(|| format!("creating state dir {}", p.state.display()))?;
     // Default Args (as if `crucible` ran flagless) carrying the launch's own agent flags, then
@@ -559,6 +562,51 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_playbook_keeps_carried_artifacts_out_of_git_memory() {
+        let dir = tempdir("playbook-carried-evidence");
+        fs::write(dir.join("tool.py"), "print('ok')\n").unwrap();
+        fs::write(
+            dir.join("workflow.star"),
+            "t = command(name = \"t\", run = \"python3 tool.py\")\nworkflow(type = \"playbook\", tasks = [t])\n",
+        ).unwrap();
+        fs::write(
+            dir.join("crucible.toml"),
+            r#"
+            [workspace]
+            inject = ["tool.py"]
+            carry_forward = ["evidence/"]
+            [agent]
+            backend = "command"
+            agent_cmd = "true"
+            goal = "g"
+            [workflow]
+            type = "playbook"
+            file = "workflow.star"
+        "#,
+        )
+        .unwrap();
+
+        prep_plan_runner(&dir.join("crucible.toml")).unwrap();
+
+        let ws = dir.join("workspace");
+        fs::create_dir(ws.join("evidence")).unwrap();
+        fs::write(ws.join("evidence/probe.zip"), b"retained separately").unwrap();
+        fs::write(ws.join("change.py"), "print('changed')\n").unwrap();
+
+        crucible_vcs::git_memory::snapshot(&ws, "task probe").unwrap();
+
+        let repo = git2::Repository::open(&ws).unwrap();
+        let tree = repo.head().unwrap().peel_to_tree().unwrap();
+
+        assert!(tree.get_path(Path::new("evidence/probe.zip")).is_err());
+        assert!(tree.get_path(Path::new("change.py")).is_ok());
+        assert_eq!(
+            fs::read(ws.join("evidence/probe.zip")).unwrap(),
+            b"retained separately"
+        );
     }
 
     #[test]

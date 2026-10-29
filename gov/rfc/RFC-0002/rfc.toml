@@ -54,5 +54,6 @@ changed = [
     "C-TASK-FILES: an absent or mismatched file is a repair note for an agent task that declares repair",
     "C-PLAYBOOK-BUDGET admits each fan-out lane against settled and in-flight spend under a bounded width, and the cost ceiling blocks only tasks that can spend, so commands after it still run; C-SETTLED-JOIN and C-PLAYBOOK-LANE follow",
     "C-PLAYBOOK-PARAMS: a supplied dotted name is a launch setting (<task>.<setting>, *.<setting>, repo.ref), checked before dispatch and written onto the compiled tasks; a declared parameter name cannot contain a dot",
+    "C-PLAYBOOK-PARAMS: a string parameter may carry a multiline flag for launch forms; it does not change binding",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]

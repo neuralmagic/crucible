@@ -563,36 +563,6 @@ struct BadDuration {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "task {task:?} declares timeout {timeout}, longer than this run's --max-time {ceiling}. The \
-     run's ceiling is the longest any task may declare; shorten the timeout or raise --max-time"
-)]
-struct TimeoutPastCeiling {
-    task: String,
-    timeout: crucible::duration::TaskTimeout,
-    ceiling: String,
-}
-
-/// Refuse a plan whose task declares a limit the operator's wall-clock ceiling does not allow.
-fn check_timeouts(plan: &ValidPlan, ceiling: Option<std::time::Duration>) -> Result<()> {
-    let Some(ceiling) = ceiling else {
-        return Ok(());
-    };
-    match plan
-        .tasks_topo()
-        .find_map(|t| Some((t, t.timeout?)).filter(|(_, limit)| limit.get() > ceiling))
-    {
-        Some((task, timeout)) => Err(TimeoutPastCeiling {
-            task: task.name.0.clone(),
-            timeout,
-            ceiling: crucible::duration::Shown(ceiling).to_string(),
-        }
-        .into()),
-        None => Ok(()),
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
 #[error("{manifest} declares no [workflow]; pass --file, or give the manifest a graph to compile")]
 struct NoGraph {
     manifest: String,
@@ -822,7 +792,9 @@ pub fn run(
             }
             (None, None) => unreachable!("clap requires --file without --manifest"),
         };
-    check_timeouts(&plan, ceilings.wall_clock)?;
+    if let Some(ceiling) = ceilings.wall_clock {
+        plan.check_timeouts(ceiling)?;
+    }
     // A task under a deadline runs in a process group of its own, where the terminal's SIGINT
     // does not reach it.
     let _ = ctrlc::set_handler(|| {

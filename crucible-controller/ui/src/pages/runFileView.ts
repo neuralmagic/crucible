@@ -129,18 +129,31 @@ export type FileSelection =
 
 /**
  * A requested key must resolve to that file or to nothing: silently showing a different file would
- * make a shared link lie. With no key requested the report is what a reader came for.
+ * make a shared link lie. With no key requested the report is what a reader came for, and of
+ * several, the one from the task latest in `order` (plan order), which reports on the run whole.
  */
-export function selectRunFile(entries: readonly RunFile[], requested: string | null): FileSelection {
+export function selectRunFile(
+  entries: readonly RunFile[],
+  requested: string | null,
+  order: readonly string[] = [],
+): FileSelection {
   if (requested !== null) {
     const hit = entries.find((e) => e.key === requested);
     return hit === undefined ? { state: 'missing', key: requested } : { state: 'found', file: hit };
   }
+  const rank = (e: RunFile) => order.indexOf(e.task);
+  const captured = entries.filter((e) => e.size_bytes !== 0);
+  const report = captured
+    .filter((e) => e.path.toLowerCase() === 'report.md')
+    .reduce<RunFile | undefined>((best, e) => (best === undefined || rank(e) > rank(best) ? e : best), undefined);
   const fallback =
-    entries.find((e) => e.path.toLowerCase() === 'report.md') ??
-    entries.find((e) => inlineKind(e.path) === 'markdown') ??
-    entries[0];
+    report ?? captured.find((e) => inlineKind(e.path) === 'markdown') ?? captured[0] ?? entries[0];
   return fallback === undefined ? { state: 'empty' } : { state: 'found', file: fallback };
+}
+
+/** The files worth listing: an empty capture is left out unless it is the one open. */
+export function listedFiles(entries: readonly RunFile[], openKey: string | null): RunFile[] {
+  return entries.filter((e) => e.size_bytes !== 0 || e.key === openKey);
 }
 
 /**

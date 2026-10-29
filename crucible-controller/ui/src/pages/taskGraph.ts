@@ -4,7 +4,12 @@
 
 import type { components } from '../api/schema';
 import { shownLinks, type ExternalLinkRef } from '../ui/ExternalLink';
-import type { WorkflowGraphDoc, WorkflowGraphEdge, WorkflowGraphNode } from './workflowGraphLayout';
+import {
+  mappedFrom,
+  type WorkflowGraphDoc,
+  type WorkflowGraphEdge,
+  type WorkflowGraphNode,
+} from './workflowGraphLayout';
 
 export type PlanTask = components['schemas']['PlanTaskDto'];
 export type TaskResult = components['schemas']['TaskResultDto'];
@@ -330,14 +335,6 @@ export function fanoutStates(
   return states;
 }
 
-/// The mapped task an instance came from. The executor names an instance `node[item]` and a
-/// declared name may not hold a bracket, so the prefix is the node it was mapped from.
-export function mappedFrom(name: string): string | null {
-  const cut = name.indexOf('[');
-  if (cut <= 0 || !name.endsWith(']')) return null;
-  return name.slice(0, cut);
-}
-
 /// One provider a mapped task's instances linked out to, and how many urls they reported there.
 export interface ProviderCount {
   provider: string;
@@ -473,12 +470,13 @@ export function runGraphView(source: RunGraphSource): RunGraphView {
     // declared task node and making the consumer look like their sibling.
     const producers = instances.get(edge.from) ?? [edge.from];
     // An aligned edge whose consumer has expanded too is read per element: each instance pairs
-    // with its counterpart, and the deck-to-deck edge keeps what the consumer reads off it.
+    // with its counterpart and carries the answer its route gave, in place of the deck-to-deck
+    // edge, which would say the same thing again.
     const paired = edge.aligned
       ? pairedInstances(edge, producers, latest, source.decisions)
       : [];
     if (paired.length > 0) {
-      edges.push(edge, ...paired);
+      edges.push(...paired);
       for (const pair of paired) pairedTargets.add(pair.to);
       continue;
     }
