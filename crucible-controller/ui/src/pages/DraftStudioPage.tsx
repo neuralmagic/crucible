@@ -25,6 +25,7 @@ import {
   Note,
   Notice,
   NumberInputField,
+  SelectField,
   TextField,
 } from './formControls';
 import { useMediaQuery } from '../useMediaQuery';
@@ -70,6 +71,7 @@ import {
 
 type CompileDto = components['schemas']['DraftCompileDto'];
 type LeftBinding = components['schemas']['LeftBindingDto'];
+type SecretDto = components['schemas']['SecretDto'];
 
 /// The stored tree, read outside the query cache so the buffers are not reloaded.
 async function fetchDraftFiles(id: string): Promise<Record<string, string>> {
@@ -110,6 +112,10 @@ function DraftStudio({ id }: { id: string }) {
     params: { path: { id } },
   });
   const caps = $api.useQuery('get', '/api/config/playbook-caps');
+  const whoami = $api.useQuery('get', '/api/whoami');
+  const secrets = $api.useQuery('get', '/api/secrets', {
+    enabled: whoami.data?.user != null,
+  });
   const origin = draft.data?.origin ?? null;
   const moved = originMovedLabel(origin);
   const originFiles = $api.useQuery(
@@ -152,6 +158,7 @@ function DraftStudio({ id }: { id: string }) {
 
   const [gradRepo, setGradRepo] = useState('');
   const [gradPath, setGradPath] = useState('');
+  const [gradSecretId, setGradSecretId] = useState('');
   const [gradError, setGradError] = useState<string | null>(null);
   const [prUrl, setPrUrl] = useState<string | null>(null);
 
@@ -178,6 +185,26 @@ function DraftStudio({ id }: { id: string }) {
     if (publishTarget === null) return;
     setPublishTo((previous) => (previous.length === 0 ? publishTarget : previous));
   }, [publishTarget]);
+
+  const personalGithubSecrets = useMemo(() => {
+    const login = whoami.data?.user ?? null;
+    if (login === null) return [] as SecretDto[];
+    return (secrets.data ?? []).filter(
+      secret =>
+        secret.owner === `user:${login}` &&
+        secret.kind === 'opaque' &&
+        secret.visibility === 'broker_only' &&
+        secret.mode !== 'minted',
+    );
+  }, [secrets.data, whoami.data?.user]);
+
+  const githubSecretOptions = useMemo(
+    () => [
+      { value: '', label: 'Controller identity' },
+      ...personalGithubSecrets.map(secret => ({ value: secret.id, label: secret.name })),
+    ],
+    [personalGithubSecrets],
+  );
 
   const first = stored.data;
   useEffect(() => {
@@ -338,7 +365,11 @@ function DraftStudio({ id }: { id: string }) {
     try {
       const ack = await graduate.mutateAsync({
         params: { path: { id } },
-        body: { repo: gradRepo.trim(), path: gradPath.trim() },
+        body: {
+          repo: gradRepo.trim(),
+          path: gradPath.trim(),
+          ...(gradSecretId === '' ? {} : { github_secret_id: gradSecretId }),
+        },
       });
       setPrUrl(ack.pr_url);
       void draft.refetch();
@@ -739,6 +770,14 @@ function DraftStudio({ id }: { id: string }) {
                   value={gradPath}
                   onChange={setGradPath}
                   hint="The pack directory inside that repo. Blank is the repo root."
+                />
+                <SelectField
+                  id="studio-grad-secret"
+                  label="GitHub credential"
+                  value={gradSecretId}
+                  onChange={setGradSecretId}
+                  options={githubSecretOptions}
+                  hint="A personal opaque, broker-only secret pushes and opens the PR as you."
                 />
               </FormGrid>
             </SectionBody>
