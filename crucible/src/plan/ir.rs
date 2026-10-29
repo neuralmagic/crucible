@@ -687,6 +687,35 @@ impl ValidPlan {
             })
             .collect()
     }
+
+    /// Refuse a plan whose task declares a timeout the run's wall-clock ceiling does not allow.
+    pub fn check_timeouts(&self, ceiling: std::time::Duration) -> Result<(), TimeoutPastCeiling> {
+        match self
+            .tasks_topo()
+            .find_map(|t| Some((t, t.timeout?)).filter(|(_, limit)| limit.get() > ceiling))
+        {
+            Some((task, timeout)) => Err(TimeoutPastCeiling {
+                task: task.name.clone(),
+                timeout,
+                ceiling,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
+/// A task whose declared timeout is longer than the run's `--max-time`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "task {:?} declares timeout {timeout}, longer than this run's --max-time {}. The run's \
+     ceiling is the longest any task may declare; shorten the timeout or raise --max-time",
+    task.0,
+    crate::duration::Shown(*ceiling)
+)]
+pub struct TimeoutPastCeiling {
+    pub task: TaskName,
+    pub timeout: TaskTimeout,
+    pub ceiling: std::time::Duration,
 }
 
 pub struct ReviseLoop<'a> {
@@ -4510,6 +4539,57 @@ emits = ["lines"]
                 task: "fold".into(),
                 kind: "top_k",
             }
+        );
+    }
+
+    #[test]
+    fn a_timeout_past_the_wall_clock_ceiling_is_refused_naming_the_task() {
+        let timed = |name: &str, deps: &[&str], timeout: &str| {
+            let mut t = agent(name, deps);
+            t.timeout = Some(timeout.parse().unwrap());
+            t
+        };
+        let graph = plan(vec![
+            agent("scan", &[]),
+            timed("prepare", &["scan"], "110m"),
+            timed("report", &["prepare"], "3h"),
+        ])
+        .validate()
+        .unwrap();
+        let hour = std::time::Duration::from_secs(3600);
+
+        let refused = graph.check_timeouts(hour).unwrap_err();
+        assert_eq!(
+            refused,
+            TimeoutPastCeiling {
+                task: "prepare".into(),
+                timeout: "110m".parse().unwrap(),
+                ceiling: hour,
+            },
+            "the first task in dependency order past the ceiling is the one named"
+        );
+        assert_eq!(
+            refused.to_string(),
+            "task \"prepare\" declares timeout 110m, longer than this run's --max-time 1h. The \
+             run's ceiling is the longest any task may declare; shorten the timeout or raise \
+             --max-time"
+        );
+        assert_eq!(
+            graph.check_timeouts(2 * hour).unwrap_err().task,
+            TaskName::from("report")
+        );
+        assert_eq!(
+            graph.check_timeouts(3 * hour),
+            Ok(()),
+            "a timeout equal to the ceiling fits"
+        );
+        assert_eq!(
+            plan(vec![agent("a", &[])])
+                .validate()
+                .unwrap()
+                .check_timeouts(std::time::Duration::from_secs(1)),
+            Ok(()),
+            "a task without a timeout is bounded by the ceiling alone"
         );
     }
 
