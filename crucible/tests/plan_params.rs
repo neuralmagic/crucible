@@ -168,6 +168,47 @@ fn the_schema_is_the_same_declaration() {
     assert_eq!(schema["required"], serde_json::json!(["repo"]));
 }
 
+#[test]
+fn a_multiline_string_is_marked_in_the_schema_and_binds_as_typed() {
+    let source = r#"
+params = {
+    "log": {"type": "string", "required": True, "multiline": True},
+    "title": {"type": "string", "default": "t", "multiline": False},
+}
+"#;
+    let params = read_params(source, Path::new("workflow.star")).expect("read declarations");
+    let multiline: Vec<(&str, bool)> = params
+        .specs()
+        .iter()
+        .map(|s| (s.name.as_str(), s.multiline))
+        .collect();
+    assert_eq!(multiline, vec![("log", true), ("title", false)]);
+
+    let schema = params.json_schema();
+    assert_eq!(schema["properties"]["log"]["type"], "string");
+    assert_eq!(schema["properties"]["log"]["x-multiline"], true);
+    assert!(schema["properties"]["title"].get("x-multiline").is_none());
+
+    let log = "error: boom\n  at step 3\n";
+    let bound = params
+        .bind(&supplied(&[("log", log)]))
+        .expect("bind a value with newlines");
+    assert_eq!(bound["log"], ParamValue::String(log.into()));
+
+    let stored = serde_json::to_string(&params).expect("serialize");
+    let reloaded: Params = serde_json::from_str(&stored).expect("deserialize");
+    assert_eq!(reloaded, params);
+}
+
+/// A declaration stored before `multiline` existed reloads as a single-line string.
+#[test]
+fn a_declaration_stored_without_multiline_reloads_as_single_line() {
+    let stored = r#"[{"name": "topic", "ty": "string", "required": false,
+        "default": "x", "doc": "", "pattern": null, "min": null, "max": null, "choices": []}]"#;
+    let reloaded: Params = serde_json::from_str(stored).expect("deserialize");
+    assert!(!reloaded.specs()[0].multiline);
+}
+
 /// A launcher stores what it read and binds against it later, with no engine in between. This is
 /// what lets a registration keep the declarations instead of a JSON Schema it would have to
 /// re-interpret.
