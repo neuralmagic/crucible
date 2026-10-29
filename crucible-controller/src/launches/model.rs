@@ -82,6 +82,8 @@ pub(crate) struct PlaybookLaunch {
     pub exposure: Option<crate::playbooks::exposure::Exposure>,
     /// The finished run this launch reruns, if it is a rerun.
     pub rerun: Option<RerunOf>,
+    /// The manifest variant the launch runs, copied from the registry row with its pack.
+    pub variant: Option<crucible::manifest::variant::VariantName>,
 }
 
 /// Where a schedule's cursor reads its next value: a dotted path into the run result, whose first
