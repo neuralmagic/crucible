@@ -1,7 +1,9 @@
 use crate::api::dto::*;
 use crate::api::state::*;
 use crate::daemon::queue::IssueKey;
-use crate::playbooks::api::admission::{Admissible, LaunchRequest, admit, decide_launch};
+use crate::playbooks::api::admission::{
+    Admissible, LaunchRequest, UNREADABLE_MANIFEST, admit, decide_launch,
+};
 use crate::playbooks::registry::{PlaybookRow, PlaybookSource, RegisterError, RegisterPlaybook};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -625,23 +627,6 @@ pub struct PlaybookLaunchAck {
     /// The capability preflight this launch passed: the resolved digest, what it matched, and
     /// the warnings it proceeds under (an unverified-image override among them).
     pub image: crate::playbooks::preflight::ImagePreflight,
-}
-
-/// What a pack whose manifest never parsed is refused with. A launch would fail at the engine's
-/// first read of it, so it is refused here instead.
-pub(crate) const UNREADABLE_MANIFEST: &str =
-    "the pack's crucible.toml did not parse, so what substrate its agent needs is unknown";
-
-/// A launch this deployment has no substrate for. Refused here, at launch, rather than discovered
-/// at the bottom of a failed reconcile: the pack is fine, this deployment is what cannot run it.
-pub(crate) fn undispatchable(refusal: String) -> Response {
-    refused(
-        "this deployment cannot dispatch the pack's agent backend",
-        vec![crate::playbooks::registry::FieldError {
-            field: String::new(),
-            message: refusal,
-        }],
-    )
 }
 
 /// Launch a registered playbook: validate the supplied values against the pack's stored schema,
