@@ -6,7 +6,7 @@
 
 #![allow(clippy::disallowed_macros)]
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use crucible_contract::pack_tree::{PackFilePath, PackTree, TreeDigest};
 use sqlx::postgres::PgRow;
 use sqlx::{Connection, PgConnection, PgExecutor, Row};
@@ -291,7 +291,7 @@ pub(crate) async fn read_file(
         return Ok(None);
     };
     if crucible_contract::artifact::sha256_hex(&content) != sha256 {
-        bail!("{path} of pack tree {digest} no longer matches its stored hash");
+        anyhow::bail!("{path} of pack tree {digest} no longer matches its stored hash");
     }
     Ok(Some(content))
 }
