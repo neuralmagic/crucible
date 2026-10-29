@@ -8,7 +8,7 @@ name: OpenShell gateway image
 # mirror upstream's build-images.yml: gateway and supervisor for glibc, sandbox for musl.
 #
 # Runs rarely: on Cargo.lock changes (a rev bump) and manual dispatch. The build is heavy
-# (bundled-z3 is a C++ compile; the OpenShell workspace is large), which is why it lives
+# (vendored-z3 is a C++ compile; the OpenShell workspace is large), which is why it lives
 # here instead of inside the loop-image build — the cost amortizes to once per rev bump.
 #
 # FIRST-RUN ORDERING: docker.yml fails fast if ghcr.io/neuralmagic/openshell-gateway:sha-<rev>
@@ -95,7 +95,7 @@ jobs:
           fi
 
       # The hosted runner needs disk headroom: the OpenShell workspace target/ plus
-      # bundled-z3's C++ objects are large.
+      # vendored-z3's C++ objects are large.
       - name: Free runner disk
         if: steps.exists.outputs.skip != 'true'
         run: |
@@ -140,17 +140,17 @@ jobs:
           # Cache keyed on the fork's lockfile, not this repo's.
           cache-workspaces: openshell-src
 
-      - name: Build gateway + CLI (glibc, bundled z3)
+      - name: Build gateway + CLI (glibc, vendored z3)
         if: steps.exists.outputs.skip != 'true'
         working-directory: openshell-src
         run: |
-          # bundled-z3 statically compiles z3 into the gateway binary, so the loop image needs
+          # vendored-z3 statically compiles z3 into the gateway binary, so the loop image needs
           # no libz3 at runtime (UBI10 does not ship one). The gateway binary is its own crate
           # (openshell-gateway) since v0.1.2; openshell-server is now only its library.
           cargo build --release --locked \
             -p openshell-cli --bin openshell \
             -p openshell-gateway --bin openshell-gateway \
-            --features openshell-gateway/bundled-z3
+            --features openshell-gateway/vendored-z3
           tasks/scripts/verify-glibc-symbols.sh 2.39 target/release/openshell target/release/openshell-gateway
           mkdir -p ../dist/bin
           cp target/release/openshell target/release/openshell-gateway ../dist/bin/
@@ -185,7 +185,7 @@ jobs:
           rm -rf target
 
       # Prove the glibc binaries load on the loop image's runtime base BEFORE pushing: every
-      # dynamic dep must resolve (bundled-z3 done right leaves no libz3 dep).
+      # dynamic dep must resolve (vendored-z3 done right leaves no libz3 dep).
       - name: Smoke binaries on the runtime base
         if: steps.exists.outputs.skip != 'true'
         run: |

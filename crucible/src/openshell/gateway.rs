@@ -476,7 +476,7 @@ pub fn gateway_toml(
     client_tls_secret: &str,
 ) -> Result<String> {
     let mut s = format!(
-        "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:{port}\"\ncompute_driver = \"{}\"\n",
+        "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:{port}\"\ncompute_driver = \"{}\"\nconfig_delivery_mode = \"push\"\n",
         driver.as_str()
     );
     if let Some(endpoint) = otlp_endpoint {
@@ -556,7 +556,7 @@ pub fn gateway_toml(
     Ok(s)
 }
 
-/// Every field v0.1.2's `KubernetesComputeConfig` (`crates/openshell-driver-kubernetes/src/
+/// Every field v0.1.5's `KubernetesComputeConfig` (`crates/openshell-driver-kubernetes/src/
 /// config.rs`) accepts. That struct is `deny_unknown_fields`, so a name outside this list kills
 /// the gateway on startup, and its log lands in `gateway.log`, not the pod log. Re-derive it
 /// from the struct whenever the pin moves.
@@ -587,6 +587,9 @@ pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
     "proxy_connect_by_hostname",
     "proxy_ca_bundle",
     "grpc_endpoint",
+    "supervisor_otlp_endpoint",
+    "supervisor_ocsf_export",
+    "supervisor_gateway_name",
     "ssh_socket_path",
     "client_tls_secret_name",
     "host_gateway_ip",
@@ -594,6 +597,8 @@ pub(crate) const UPSTREAM_KUBERNETES_COMPUTE_CONFIG_FIELDS: &[&str] = &[
     "workspace_default_storage_size",
     "workspace_storage_class",
     "default_runtime_class_name",
+    "allowed_pod_annotations",
+    "allowed_pod_labels",
     "sa_token_ttl_secs",
     "provider_spiffe_workload_api_socket_path",
     "sandbox_uid",
@@ -1308,8 +1313,8 @@ mod tests {
     use crate::openshell::gateway::*;
 
     // Frozen snapshots of the schema version 2 podman rendering.
-    const PODMAN_NO_IMAGE: &str = "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_driver = \"podman\"\n";
-    const PODMAN_WITH_IMAGE: &str = "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_driver = \"podman\"\n\n[openshell.drivers.podman]\nsupervisor_image = \"registry.example.com/epp-sandbox:x\"\n";
+    const PODMAN_NO_IMAGE: &str = "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_driver = \"podman\"\nconfig_delivery_mode = \"push\"\n";
+    const PODMAN_WITH_IMAGE: &str = "[openshell]\nversion = 2\n\n[openshell.gateway]\nbind_address = \"0.0.0.0:17670\"\ncompute_driver = \"podman\"\nconfig_delivery_mode = \"push\"\n\n[openshell.drivers.podman]\nsupervisor_image = \"registry.example.com/epp-sandbox:x\"\n";
 
     fn images(supervisor: Option<&str>, sandbox_runtime: Option<&str>) -> DriverImages {
         DriverImages {
@@ -1577,6 +1582,10 @@ mod tests {
         assert_eq!(
             parsed["openshell"]["gateway"]["compute_driver"].as_str(),
             Some("kubernetes")
+        );
+        assert_eq!(
+            parsed["openshell"]["gateway"]["config_delivery_mode"].as_str(),
+            Some("push")
         );
         assert!(
             parsed["openshell"]["gateway"]
