@@ -142,6 +142,7 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
         params,
         max_cost,
         max_time,
+        variant,
         ..
     } = opts
     {
@@ -149,6 +150,10 @@ fn run_argv(manifest: &Path, opts: &RunRenderOpts) -> Vec<String> {
         argv.push(format!("{max_cost}"));
         argv.push("--max-time".to_string());
         argv.push(max_time.as_str().to_string());
+        if let Some(variant) = variant {
+            argv.push("--variant".to_string());
+            argv.push(variant.to_string());
+        }
         for (name, value) in params {
             argv.push("--param".to_string());
             argv.push(format!("{name}={value}"));
@@ -627,6 +632,7 @@ mod tests {
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
             rerun: None,
+            variant: None,
         };
         assert_eq!(playbook.tracker_item("playbook:fences:0199"), None);
         let looped = RunRenderOpts::Loop {
@@ -652,6 +658,7 @@ mod tests {
             max_time: MaxTime::parse("30m").expect("duration"),
             agent: crate::playbooks::providers::AgentSelection::default(),
             rerun: None,
+            variant: None,
         };
         assert_eq!(
             run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts),
@@ -672,6 +679,27 @@ mod tests {
         );
     }
 
+    /// A launch's manifest variant reaches `plan run` ahead of its params.
+    #[test]
+    fn a_variant_reaches_the_local_argv() {
+        let opts = RunRenderOpts::Playbook {
+            params: vec![("topic".to_string(), "t".to_string())],
+            max_cost: 4.5,
+            max_time: MaxTime::parse("30m").expect("duration"),
+            agent: crate::playbooks::providers::AgentSelection::default(),
+            rerun: None,
+            variant: Some(
+                crucible::manifest::variant::VariantName::parse("offline").expect("name"),
+            ),
+        };
+        let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
+        assert_eq!(
+            argv[8..],
+            ["--variant", "offline", "--param", "topic=t"],
+            "{argv:?}"
+        );
+    }
+
     /// The pair the registry resolved reaches `plan run` as the flags the engine parses, spelled
     /// the way its `--harness` value enum reads them.
     #[test]
@@ -685,6 +713,7 @@ mod tests {
                 model: Some("gpt-5.6-luna".to_string()),
             },
             rerun: None,
+            variant: None,
         };
         let argv = run_argv(Path::new("/runs/r1/pack/crucible.toml"), &opts);
         assert_eq!(

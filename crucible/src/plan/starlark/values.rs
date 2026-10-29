@@ -344,6 +344,21 @@ impl Display for SchemaValue {
 #[starlark_value(type = "schema")]
 impl<'v> StarlarkValue<'v> for SchemaValue {}
 
+/// `optional(task)`: an entry of `depends_on` whose settling not taken satisfies an `all` join.
+#[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
+pub(crate) struct OptionalValue(#[allocative(skip)] pub(crate) TaskName);
+
+starlark_simple_value!(OptionalValue);
+
+impl Display for OptionalValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "optional({})", self.0)
+    }
+}
+
+#[starlark_value(type = "optional")]
+impl<'v> StarlarkValue<'v> for OptionalValue {}
+
 #[derive(Debug, ProvidesStaticType, NoSerialize, Allocative)]
 pub(crate) struct WorkflowValue(#[allocative(skip)] pub(crate) WorkflowCfg);
 

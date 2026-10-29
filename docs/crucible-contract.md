@@ -114,6 +114,24 @@ Rules:
   very first run), it hard-warns and trusts the working tree for that run only; later runs freeze
   to the base commit. A manifest that lives outside the workspace (any out-of-workspace pack) is
   unaffected.
+- **Variants.** One manifest can carry per-environment variants as `[variant.<name>]` tables:
+
+  ```toml
+  [agent]
+  backend = "openshell"
+
+  [variant.offline.agent]
+  backend = "command"
+  agent_cmd = "./stand-in.sh"
+  ```
+
+  `plan run --variant offline`, `check --variant offline` and `deploy render --playbook
+  --variant offline` read the variant: each top-level table it names replaces the base table of
+  the same name whole (`[variant.offline.agent]` replaces all of `[agent]`; nothing is merged
+  below the top level). Without `--variant` the base is read, without any `[variant]` table.
+  Every declared variant is validated on every load, and `crucible check` compiles every
+  variant's graph, so a broken variant fails whichever one runs. A resume must name the variant
+  the run started with. A composite manifest declares no variants.
 
 ### 1.1 The gate self-test (`crucible check`, ADR-0014 S1)
 
@@ -777,6 +795,11 @@ A `task_result` event's `status` may be `not_taken` (contract 1.6.0): the task's
 satisfied, or it joins `all` on a task that settled that way. It was never dispatched, cost
 nothing, and is not a failure. A `plan_admitted` task carries an additive `when` string,
 `route.question in a|b`, empty when the task is unconditional.
+
+A `plan_admitted` task carries `optional` (contract 1.20.0), the dependencies declared with
+`optional(...)`, omitted when there are none. A task joining `all` dispatches past such a
+dependency that settled `not_taken`, and its inputs carry no entry for it. An engine older than
+1.20.0 ignores `optional` in a compiled graph and settles the task `not_taken` instead.
 
 A `task_result` event carries an additive `links` array (contract 1.12.0), omitted when empty:
 the external results the task reported, one object per url with `url`, `provider`

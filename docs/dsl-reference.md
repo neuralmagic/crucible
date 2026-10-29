@@ -26,7 +26,7 @@ An agent turn driven by a prompt.
 | `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
@@ -41,7 +41,7 @@ An agent turn driven by a prompt.
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
@@ -60,7 +60,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `sandbox` | `str` | An `[agent.sandbox.<name>]`: its image, and only the secrets, relay files, broker reach, and egress it lists. Unset runs in the `[agent]` sandbox. |
 | `session` | `session \| str` | Join a durable conversation. A task in a session cannot be isolated. |
 | `repair` | `int` | Repair turns, up to 3. When a passing turn's output misses a declared field or file, or breaks its type or schema, the same session is resumed with the masked validation notes and asked to fix it in place, then checked again. Repairs share the attempt's timeout and cost. Default 0; refused on `command` and `evaluate`. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
@@ -75,7 +75,7 @@ An agent turn whose prompt is a skill's instructions plus its arguments.
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
@@ -87,7 +87,7 @@ A deterministic shell task in the candidate workspace.
 | --- | --- | --- |
 | `name` | `str` | Task identity, unique within the workflow. |
 | `run` | `str` | The command, run through `sh -c`. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
@@ -102,7 +102,7 @@ A deterministic shell task in the candidate workspace.
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
@@ -116,7 +116,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `run` | `str` | The command, run through `sh -c`. |
 | `threshold` | `number` | Grade the emitted score against this bound. An explicit `pass` wins. |
 | `direction` | `"lower" \| "higher"` | Which side of the threshold passes. |
-| `depends_on` | `list[task]` | Dependencies. Readiness decides execution order; declaration order does not. |
+| `depends_on` | `list[task \| optional(task)]` | Dependencies. Readiness decides execution order; declaration order does not. |
 | `needs` | `str` | The substrate capability the task needs, such as `"decision"`. The default `"any"` runs everywhere. A required task whose capability is unavailable truncates the plan before dispatch; an advisory one is skipped with its dependents. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependencies must have passed: `all` every one, `passed` at least one and only those are forwarded, `settled` none — it dispatches once every dependency is terminal, whatever it settled as, unless the run has already halted, and forwards each one as {status, note, output, files}. |
 | `required` | `bool` | False makes the task advisory: it blocks dependents but cannot invalidate the run. |
@@ -131,7 +131,7 @@ A measurement command. Its last non-empty stdout line is a JSON object; `pass = 
 | `timeout` | `str` | How long one attempt may run, as `90s`, `10m`, or `2h`. At the limit the attempt's whole process group is killed and the task settles failed with a note naming the limit; it is not retried. The run's `--max-time` bounds every attempt as well, and a playbook refuses a timeout longer than it before dispatching anything. |
 | `stage` | `"iteration" \| "epilogue"` | `epilogue` runs once after the loop concludes, and only if the run kept a candidate. |
 | `history` | `int` | Read this many earlier runs of the launch series, from 1 to the engine's ceiling of 30, under `history`. A run launched outside a series gets an empty list. Playbooks only. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
@@ -287,7 +287,7 @@ Engine-owned decision: answers typed questions about its dependencies' outputs a
 | `required` | `bool` | False makes the route advisory. |
 | `join` | `"all" \| "passed" \| "settled"` | Which dependency outputs form the state, as on any task. |
 | `stage` | `"iteration" \| "epilogue"` | As on any task. |
-| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
+| `when` | `route.question` | Run only on a listed answer to one question of a `route()` this task depends on. Otherwise the task settles `not_taken`: no dispatch, no spend, no effect on validity, and every `all`-join dependent is not taken with it unless it lists the task as `optional(...)`. Rejoin branches with `join = "passed"` or `join = "settled"`. Playbook and custom workflows only. |
 | `answers` | `str \| list[str]` | The answers `when` accepts: labels the question declares, or `"uncertain"`. Defaults to `"yes"` for a noul and is required for a choice or a score. |
 | `otherwise` | `bool` | In place of `answers`: every answer no other task lists and the question does not `drop`, `"uncertain"` included. Expanded at compile time. An unreachable `otherwise` is an error. |
 
@@ -331,6 +331,12 @@ An ordinal question for `route()`. It answers its most probable level, the lowes
 | `levels` | `list[str] \| dict[str, str \| None]` | At least two distinct identifier labels, lowest first in the order written, optionally each with a description the model sees. `"uncertain"` is reserved. |
 | `drop` | `str \| list[str]` | Answers that deliberately lead nowhere, so no `when` has to list them. |
 
+### `optional()`
+
+Mark an entry of `depends_on` that may settle `not_taken`. Under `join = "all"` the task dispatches past it as though it passed, and its inputs carry no entry for it; one that failed or was blocked still blocks. Refused under another join, on a dependency that can never settle `not_taken`, and on a task the reviewer revises.
+
+Takes one positional argument, `task`.
+
 ## Reserved fields
 
 Names the engine reads and writes for itself. They are not constructor arguments; they appear in a task's own JSON output and in the inputs it receives.
@@ -342,6 +348,7 @@ Read out of the object the task returns.
 | Field | Type | Meaning |
 | --- | --- | --- |
 | `status` | `"pass" \| "fail" \| "skipped"` | Settles the task, overriding an exit code or `pass`. Any other value is ignored. |
+| `note` | `str` | Why the task failed or was skipped, recorded as its note: in place of the default note when `status` is `"fail"` or `"skipped"`, and after the exit status in place of the stderr tail when a command exits nonzero. The control plane shows it as a parked run's reason. Read only from a result that fails or skips. |
 | `complete` | `bool` | `true` on a passing main-graph task of a playbook ends the run early and valid: nothing else in the main graph dispatches, undispatched tasks stay unsettled, and epilogue tasks still run. The shutdown outcome is `complete`. A task may not list it in `emits`. |
 | `reason` | `str` | Why the run completed early, recorded with the shutdown. A task may not list it in `emits`. |
 

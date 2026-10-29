@@ -792,6 +792,7 @@ pub fn pack_import(i: &dto::PackImport, preview_url: &str) -> String {
         or_dash(i.git_ref.as_deref())
     ));
     line(&mut out, "path", Some(&i.path));
+    line(&mut out, "variant", i.variant.as_deref());
     out.push_str(&format!("rev: {}\n", i.rev));
     line(&mut out, "tree", i.tree_digest.as_deref());
     out.push_str(&format!(
@@ -2608,6 +2609,21 @@ mod tests {
         );
         assert!(out.contains("repo: owner/packs @ main\n"), "{out}");
         assert!(out.contains("path: packs/calibrate\n"), "{out}");
+        assert!(
+            !out.contains("variant:"),
+            "the base manifest prints no variant: {out}"
+        );
+        let offline = pack_import(
+            &dto::PackImport {
+                variant: Some("offline".to_string()),
+                ..import()
+            },
+            "https://c.example.com/playbooks/import/0192f4a1",
+        );
+        assert!(
+            offline.contains("path: packs/calibrate\nvariant: offline\nrev: 9f1c2b3\n"),
+            "{offline}"
+        );
         assert!(out.contains("rev: 9f1c2b3\n"), "{out}");
         assert!(out.contains("tree: tree1:aa\n"), "{out}");
         assert!(out.contains("schema: sha256:bb\n"), "{out}");

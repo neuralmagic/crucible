@@ -424,6 +424,10 @@ enum Command {
         /// The pack directory inside the repo. Omit for the repo root.
         #[arg(long)]
         path: Option<String>,
+        /// The `[variant.<name>]` of the pack's manifest to preview and register. Omit for the
+        /// base manifest.
+        #[arg(long)]
+        variant: Option<String>,
         /// The registry id to propose registering under; prefills the review page.
         #[arg(long)]
         id: Option<String>,
@@ -829,15 +833,19 @@ pub async fn run() -> Result<()> {
             repo,
             git_ref,
             path,
+            variant,
             id,
             description,
             json,
         } => {
             ops::playbook_import(
                 &client,
-                &repo,
-                git_ref.as_deref(),
-                path.as_deref(),
+                &crate::client::PackImportSource {
+                    repo: &repo,
+                    git_ref: git_ref.as_deref(),
+                    path: path.as_deref(),
+                    variant: variant.as_deref(),
+                },
                 id.as_deref(),
                 description.as_deref(),
                 json,
