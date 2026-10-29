@@ -329,7 +329,8 @@ pub fn functions() -> Vec<Function> {
                     Kwarg::new(
                         "threshold",
                         "number",
-                        "Grade the emitted score against this bound. An explicit `pass` wins.",
+                        "Grade the emitted score against this bound. `pass = false` fails a score \
+                         within it; `pass` cannot pass a score outside it.",
                     ),
                     Kwarg::new(
                         "direction",
@@ -733,15 +734,19 @@ pub fn reserved_result_fields() -> Vec<Reserved> {
         Reserved::new(
             "status",
             declared_status_type(),
-            "Settles the task, overriding an exit code or `pass`. Any other value is ignored.",
+            "`\"fail\"` or `\"skipped\"` settles the task that way, whatever its exit status, \
+             `pass` or threshold. `\"pass\"` cannot pass a task that exited nonzero or did not \
+             pass its grade. Any other value is ignored.",
         ),
         Reserved::new(
             crate::plan::ir::NOTE_FIELD,
             "str",
-            "Why the task failed or was skipped, recorded as its note: in place of the default \
-             note when `status` is `\"fail\"` or `\"skipped\"`, and after the exit status in \
-             place of the stderr tail when a command exits nonzero. The control plane shows it as \
-             a parked run's reason. Read only from a result that fails or skips.",
+            "Why the task failed or was skipped, recorded as its note when it is a non-blank \
+             string: after the exit status in place of the stderr tail when a command exits \
+             nonzero, before the threshold and log handles when an evaluation does not pass, and \
+             in place of the default note when `status` is `\"fail\"` or `\"skipped\"`. The \
+             control plane shows it as a parked run's reason. Read only from a result that fails \
+             or skips.",
         ),
         Reserved::new(
             crate::plan::ir::COMPLETE_FIELD,
