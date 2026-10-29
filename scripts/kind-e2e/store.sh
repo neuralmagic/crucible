@@ -311,15 +311,14 @@ new_draft "$DRAFT-tamper" "$WORK/tamper"
 crux draft-publish "$DRAFT-tamper" --playbook "$DRAFT-tpub" --json >"$WORK/publish-T.json"
 TAMPER_TREE=$(playbook_tree "$DRAFT-tpub")
 [ "$TAMPER_TREE" = "$(draft_tree "$DRAFT-tamper" 2)" ] || fail "[T] the published row does not hold the draft's tree"
-tamper_file "$TAMPER_TREE" check.sh
-if crux draft-launch "$DRAFT-tamper" --max-cost 1 --max-time 5m >"$WORK/launch-T-draft.log" 2>&1; then
-    fail "[T] a draft whose stored tree was tampered with launched"
-fi
-grep -qF "$TAMPER_TREE no longer matches its stored files" "$WORK/launch-T-draft.log" ||
-    fail "[T] the draft launch refusal does not name the tree: $(cat "$WORK/launch-T-draft.log")"
-pass "[T] the draft launch is refused naming the tampered tree"
 watch_start T
+hold_dispatch T
 launch T launch "$DRAFT-tpub"
+held T "$KEY"
+tamper_file "$TAMPER_TREE" check.sh
+expect_launch_refused T-draft "$TAMPER_TREE no longer matches its stored files" draft-launch "$DRAFT-tamper"
+expect_launch_refused T-registered "$TAMPER_TREE no longer matches its stored files" launch "$DRAFT-tpub"
+release_dispatch T
 settle T "$KEY"
 watch_stop
 expect_parked T "$TAMPER_TREE no longer matches its stored files"
@@ -927,34 +926,17 @@ done
     fail "[V] a refused firing launched"
 pass "[V] an adopted and a draft-head schedule fail their firing naming the reason and count toward auto-disable"
 
-# hold_dispatch / release_dispatch: a zero daily ceiling keeps every new launch from dispatching.
-hold_dispatch() {
-    api PUT /api/config/overrides '{"daily_cost_ceiling":0,"justification":"kind e2e"}'
-    [ "$HTTP" = 200 ] || fail "[V] zeroing the daily ceiling: $HTTP $(cat "$WORK/api.json")"
-}
-release_dispatch() {
-    api PUT /api/config/overrides '{"daily_cost_ceiling":100,"justification":"kind e2e"}'
-    [ "$HTTP" = 200 ] || fail "[V] raising the daily ceiling: $HTTP $(cat "$WORK/api.json")"
-    crux reconcile >/dev/null
-}
-# held <key>: the launch is still new, with no run.
-held() {
-    crux reconcile >/dev/null
-    [ "$(crux playbook-run "$1" | jq -r '.launch.status + " " + (.runs | length | tostring)')" = "new 0" ] ||
-        fail "[V] $1 dispatched while the ceiling held it"
-}
-
-hold_dispatch
+hold_dispatch V
 launch V-disp draft-launch "$DRAFT-vdisp"
 V_DISP="$KEY"
-held "$V_DISP"
+held V "$V_DISP"
 sql -v slug="$(slug "$V_DISP")" <<'SQL'
 UPDATE pack_tarballs SET tar_gz = s.tar_gz, digest = s.digest, bytes = s.bytes
 FROM (SELECT tar_gz, digest, bytes FROM pack_tarballs WHERE issue_slug = 'kind_e2e_vsym') s
 WHERE issue_slug = :'slug';
 SQL
 [ -z "$(launch_tree "$V_DISP")" ] || fail "[V] the queued launch kept its tree"
-release_dispatch
+release_dispatch V
 settle V-disp "$V_DISP"
 expect_parked V-disp "pack $V_SYM_DIGEST is unconvertible: $V_SYM_REASON"
 [ "$(jq '.runs | length' "$WORK/run-V-disp.json")" = 0 ] || fail "[V] the unconvertible launch recorded a run"
@@ -1032,18 +1014,18 @@ api DELETE "/api/secrets/$V_SECRET/bindings/$V_BINDING"
 bind_vpin "$V_TREE2"
 expect_http V 201 '"scope_id":"e2e-vpub"'
 V_BINDING=$(jq -r .id "$WORK/api.json")
-hold_dispatch
+hold_dispatch V
 launch V-frozen launch e2e-vpub
 V_FROZEN="$KEY"
-held "$V_FROZEN"
+held V "$V_FROZEN"
 [ "$(launch_tree "$V_FROZEN")" = "$V_TREE2" ] || fail "[V] the queued launch froze $(launch_tree "$V_FROZEN")"
 echo '# version 4' >>"$WORK/vpin/check.sh"
 crux draft-push "$DRAFT-vpin" "$WORK/vpin" --base-version 3 --json >"$WORK/push-V4.json"
 crux draft-publish "$DRAFT-vpin" --playbook e2e-vpub --json >"$WORK/publish-V4.json"
 V_TREE3=$(playbook_tree e2e-vpub)
 [ "$V_TREE3" != "$V_TREE2" ] || fail "[V] the second republish kept $V_TREE2"
-held "$V_FROZEN"
-release_dispatch
+held V "$V_FROZEN"
+release_dispatch V
 settle V-frozen "$V_FROZEN"
 expect_parked V-frozen "this launch resolved 1 binding(s)"
 launch V-repinned launch e2e-vpub

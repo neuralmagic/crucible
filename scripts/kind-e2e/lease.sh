@@ -31,8 +31,12 @@ $OK_JSON"
 new_draft "$DRAFT-ltamper" "$WORK/localtamper"
 crux draft-publish "$DRAFT-ltamper" --playbook "$DRAFT-ltpub" --json >"$WORK/publish-O.json"
 LOCAL_TAMPER=$(playbook_tree "$DRAFT-ltpub")
-tamper_file "$LOCAL_TAMPER" check.sh
+hold_dispatch O-tamper
 launch O-tamper launch "$DRAFT-ltpub"
+held O-tamper "$KEY"
+tamper_file "$LOCAL_TAMPER" check.sh
+expect_launch_refused O-tamper "$LOCAL_TAMPER no longer matches its stored files" launch "$DRAFT-ltpub"
+release_dispatch O-tamper
 settle O-tamper "$KEY"
 watch_stop
 expect_parked O-tamper "$LOCAL_TAMPER no longer matches its stored files"
