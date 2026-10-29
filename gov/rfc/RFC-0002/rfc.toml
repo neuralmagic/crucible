@@ -57,5 +57,6 @@ changed = [
     "C-SETTLED-JOIN: a failing task's own note, from a self-declared failure or a command's nonzero exit, is the note the engine records",
     "C-SETTLED-JOIN: an all-join task gets no entry for an optional dependency that settled not taken (RFC-0001:C-ROUTE)",
     "C-PLAYBOOK-RESUME: a resume reads the manifest variant the interrupted run read",
+    "C-SETTLED-JOIN: a failing evaluation's own note is recorded with its threshold and log handles, and a declared status fails or skips a task whatever its exit status or grade but never passes one",
 ]
 fixed = ["C-PLAYBOOK-LANE no longer claims git memory survives a resume; C-PLAYBOOK-RESUME governs the rebuilt workspace"]
