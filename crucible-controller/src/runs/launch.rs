@@ -63,17 +63,65 @@ async fn plan_refusal(
     key: &str,
     launch: &crate::launches::model::PlaybookLaunch,
 ) -> Result<Option<String>> {
-    let Some(pack) = crate::playbooks::packs::materialize_pack(db.pool(), key).await? else {
+    let slug = crate::model::sanitize_key(key);
+    let Some(tree) = crate::runs::blob_store::get_pack(db.pool(), &slug).await? else {
         return Ok(None);
     };
-    let params = launch.params.iter().cloned().collect();
-    let max_time = launch.max_time.clone();
-    let checked = tokio::task::spawn_blocking(move || {
-        crate::playbooks::registry::check_runnable(pack.path(), &params, &max_time)
-    })
-    .await
-    .context("joining the launch plan check")?;
+    let checked = crate::playbooks::registry::check_tree_runnable(
+        tree,
+        launch.params.iter().cloned().collect(),
+        launch.max_time.clone(),
+    )
+    .await?;
     Ok(checked.err().map(|field| field.message))
+}
+
+/// The same image preflight the launch endpoint ran, against the catalog as it stands now and the
+/// harness this dispatch actually resolved. The inner `Err` is why the launch parks.
+async fn preflight_image(
+    db: &Db,
+    issue: &Issue,
+    pack_agent: Option<&crate::playbooks::dispatch::PackAgent>,
+    dispatch: Option<&crate::playbooks::providers::ResolvedDispatch>,
+) -> Result<Result<crate::runs::model::RunImage, ParkReason>> {
+    let Some(pack_agent) = pack_agent else {
+        return Ok(Ok(crate::runs::model::RunImage::default()));
+    };
+    let resolved = dispatch.map(|d| crate::playbooks::preflight::ResolvedHarness {
+        harness: d.harness,
+        provider: d.provider.id.clone(),
+        source: if issue.agent_provider.is_some() {
+            crate::playbooks::preflight::HarnessSource::Pin
+        } else {
+            crate::playbooks::preflight::HarnessSource::Default
+        },
+    });
+    let catalog = crate::images::store::list_images(db.pool()).await?;
+    let pack = crate::playbooks::preflight::preflight_pack(pack_agent, resolved.as_ref(), &catalog);
+    if pack.refused() {
+        return Ok(Err(ParkReason::ImagePreflightRefused {
+            image: pack
+                .image
+                .reference
+                .unwrap_or_else(|| "(no image)".to_string()),
+            detail: pack
+                .refusals
+                .iter()
+                .map(|r| match r.field.as_str() {
+                    "sandbox_image" => r.message.clone(),
+                    field => format!("{field}: {}", r.message),
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        }));
+    }
+    let verdict = pack.image;
+    Ok(Ok(crate::runs::model::RunImage {
+        reference: verdict.reference,
+        digest: verdict.digest,
+        capability_digest: verdict.capability_digest,
+        overridden: verdict.overridden,
+    }))
 }
 
 async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
@@ -139,63 +187,20 @@ async fn start(db: &Db, cfg: &ControllerCfg, issue: &Issue) -> Result<()> {
     let dispatch =
         crate::playbooks::providers::resolve_for_issue(db.pool(), issue, WorkloadClass::Playbook)
             .await?;
-    // The same preflight the launch endpoint ran, against the catalog as it stands now and the
-    // harness this dispatch actually resolved. A refusal parks rather than spends.
-    let image = match pack_agent.as_ref() {
-        Some(pack_agent) => {
-            let resolved =
-                dispatch
-                    .as_ref()
-                    .map(|d| crate::playbooks::preflight::ResolvedHarness {
-                        harness: d.harness,
-                        provider: d.provider.id.clone(),
-                        source: if issue.agent_provider.is_some() {
-                            crate::playbooks::preflight::HarnessSource::Pin
-                        } else {
-                            crate::playbooks::preflight::HarnessSource::Default
-                        },
-                    });
-            let catalog = crate::images::store::list_images(db.pool()).await?;
-            let pack = crate::playbooks::preflight::preflight_pack(
-                pack_agent,
-                resolved.as_ref(),
-                &catalog,
-            );
-            if pack.refused() {
-                crate::issues::transitions::park(
-                    db.pool(),
-                    db.events(),
-                    &issue.key,
-                    Status::New,
-                    &ParkReason::ImagePreflightRefused {
-                        image: pack
-                            .image
-                            .reference
-                            .unwrap_or_else(|| "(no image)".to_string()),
-                        detail: pack
-                            .refusals
-                            .iter()
-                            .map(|r| match r.field.as_str() {
-                                "sandbox_image" => r.message.clone(),
-                                field => format!("{field}: {}", r.message),
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    },
-                    ParkedBy::Machine,
-                )
-                .await?;
-                return Ok(());
-            }
-            let verdict = pack.image;
-            crate::runs::model::RunImage {
-                reference: verdict.reference,
-                digest: verdict.digest,
-                capability_digest: verdict.capability_digest,
-                overridden: verdict.overridden,
-            }
+    let image = match preflight_image(db, issue, pack_agent.as_ref(), dispatch.as_ref()).await? {
+        Ok(image) => image,
+        Err(reason) => {
+            crate::issues::transitions::park(
+                db.pool(),
+                db.events(),
+                &issue.key,
+                Status::New,
+                &reason,
+                ParkedBy::Machine,
+            )
+            .await?;
+            return Ok(());
         }
-        None => crate::runs::model::RunImage::default(),
     };
     let agent = crate::playbooks::providers::AgentSelection::from_resolved(dispatch.as_ref());
     let decision = crate::playbooks::providers::resolve_decision(
